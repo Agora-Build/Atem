@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Independent check of the r9 vectors (session-v1 R9.12).
 
-Recomputes, with Python's standard library and the `cryptography` package
-only (no code of this repository), what `crates/atem-client` computed for
-the r9 vector files: canonical JSON (RFC 8785 for the subset the vectors
-use: objects, arrays, strings, integers, booleans), `enc` (a 4-byte
-big-endian length before every field), hashes, key derivations, and every
-Ed25519 and P-256 signature (P-256 as 64-byte r||s, low S required).
+Recomputes and verifies, with Python's standard library and the
+`cryptography` package only (no code of this repository), the cryptographic
+values `crates/atem-client` computed for the r9 vector files: canonical
+JSON (RFC 8785 for the subset the vectors use: objects, arrays, strings,
+integers, booleans), `enc` (a 4-byte big-endian length before every field),
+hashes, key derivations, and every Ed25519 and P-256 signature (P-256 as
+64-byte r||s, low S required), a host's `enc_sig` included. It doesn't
+derive a verifier's verdicts: `expect` and each `reason` are checked by the
+Rust runner (`crates/atem-client/tests/vectors.rs`) and the binding suites.
 
 Usage: python3 -I scripts/check-r9-vectors.py designs/protocol/fixtures
 
@@ -421,20 +424,27 @@ BAD_SIGNATURES = {
 }
 
 
-def check_arrays(case, value, path=()):
+def check_arrays(case, value, path=(), out_of_order=None):
+    """Every array is at a set or sequence path and canonical for it. With
+    `out_of_order` (a vector refused `array_not_canonical`), a set out of
+    order is collected there instead of failing."""
     if isinstance(value, dict):
         for key, inner in value.items():
-            check_arrays(case, inner, path + (key,))
+            check_arrays(case, inner, path + (key,), out_of_order)
     elif isinstance(value, list):
         if path in SET_PATHS:
             raw = [v.encode() for v in value]
-            case.check(raw == sorted(set(raw)), f"{'.'.join(path)} a canonical set")
+            canonical = raw == sorted(set(raw))
+            if out_of_order is None:
+                case.check(canonical, f"{'.'.join(path)} a canonical set")
+            elif not canonical:
+                out_of_order.append(".".join(path))
         elif path in SEQUENCE_PATHS:
             case.check(len(value) == len(set(value)), f"{'.'.join(path)} without duplicates")
         else:
             case.fail(f"{'.'.join(path)}: no array is allowed there")
         for inner in value:
-            check_arrays(case, inner, path + ("[]",))
+            check_arrays(case, inner, path + ("[]",), out_of_order)
 
 
 def host_key_name(host_id, host_trust_gen):
@@ -508,7 +518,12 @@ def check_membership_log(file, data, report, context):
             else:
                 case.check(True, "jcs computed")
             case.check(len(text.encode()) <= MAX_BODY_BYTES, "body within 4096 bytes")
-            check_arrays(case, body)
+            if vector.get("reason") == "array_not_canonical":
+                out_of_order = []
+                check_arrays(case, body, out_of_order=out_of_order)
+                case.check(bool(out_of_order), f"{', '.join(out_of_order) or 'no set'} out of order (array_not_canonical)")
+            else:
+                check_arrays(case, body)
             signing_input = enc(["atem-membership-entry-v1", text])
             if "signing_input_hex" in vector:
                 case.equal(signing_input.hex(), vector["signing_input_hex"], "signing input")
@@ -593,8 +608,20 @@ def check_membership_log(file, data, report, context):
                     "kit_sig by the current recovery key",
                 )
 
-            # The host's enc_sig over its encryption key (II.4.1).
-            if body["action"] == "host_enc_key":
+            # The host's enc_sig over its encryption key (II.4.1), wherever
+            # the binding's own fields parse (`enc_sig_input_hex` given).
+            if body["action"] == "host_enc_key" and "enc_sig_input_hex" not in vector:
+                gen = body["host_trust_gen"]
+                broken = (
+                    not isinstance(gen, int)
+                    or gen < 1
+                    or body["enc_key"].get("alg") != "x25519"
+                    or len(b64u_decode(body["enc_key"]["pub"])) != 32
+                    or len(b64u_decode(body["enc_sig"])) != 64
+                )
+                case.check(broken, "no enc_sig input: its binding's fields don't parse")
+                case.check(vector.get("reason") in ("malformed", "wrong_alg"), "refused for the binding's shape")
+            elif body["action"] == "host_enc_key":
                 enc_pub = b64u_decode(body["enc_key"]["pub"])
                 enc_input = enc(
                     [
@@ -617,6 +644,19 @@ def check_membership_log(file, data, report, context):
                     case.check(not ok, "enc_sig refused (bad_enc_sig)")
                 else:
                     case.check(ok, "enc_sig by the host_key of its generation")
+                # A reused key replays the very binding an earlier entry of
+                # its chain carried (bodies are public).
+                if vector.get("reason") == "enc_key_reused":
+                    earlier = [
+                        b["seq"]
+                        for b in before
+                        if b["action"] == "host_enc_key"
+                        and b["host_id"] == body["host_id"]
+                        and b["host_trust_gen"] == body["host_trust_gen"]
+                        and b["enc_key"] == body["enc_key"]
+                        and b["enc_sig"] == body["enc_sig"]
+                    ]
+                    case.check(bool(earlier), f"replays the enc_sig of seq {earlier[0] if earlier else '?'}")
 
             # What a verifier derives: key ids, and keys as their entries set them.
             for host_id, state in vector.get("expect", {}).get("host_enc_keys", {}).items():
@@ -637,7 +677,9 @@ def check_membership_log(file, data, report, context):
                     )
 
             if vector.get("valid") is False:
-                case.check(True, f"refused ({vector.get('reason', 'see note')}; the verifier's rule)")
+                # Not derived here: the verdict and its reason are checked
+                # by the Rust runner and the binding suites (R9.12).
+                case.check(True, f"refused ({vector.get('reason', 'see note')}; verdict not derived here)")
 
     with report.case(file, "log L") as case:
         case.equal(by_label["E1"]["entry_hash"], genesis_hash, "genesis_hash = E1's entry_hash")

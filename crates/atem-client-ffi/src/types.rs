@@ -271,6 +271,10 @@ data_enum! {
         AlreadyRevoked,
         /// A `host_sender_readmit` of a host that isn't revoked.
         NotRevoked,
+        /// A `host_enc_key` of a key already set for that host since its
+        /// newest `add_host` (current, previous, retired or no longer
+        /// kept): ask the host for a new key.
+        EncKeyReused,
     }
 }
 

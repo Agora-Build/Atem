@@ -142,6 +142,11 @@ fun main(args: Array<String>) {
         for (v in vectors) {
             val label = v["label"].s()
             if (label == "K7_current_no_kit_sig") continue
+            // A set out of order: the signed-object parse itself refuses it.
+            if (v.obj()["reason"] == "array_not_canonical") {
+                throwsCode("array_not_canonical") { signedObjectInfo(Json.write(v["entry"])) }
+                continue
+            }
             val info = signedObjectInfo(Json.write(v["entry"]))
             v.obj()["jcs"]?.let { eq(info.bodyJcs, it, "$label jcs") }
             v.obj()["signing_input_hex"]?.let { eq(hex(info.signingInput), it, "$label input") }
@@ -358,8 +363,10 @@ fun main(args: Array<String>) {
     // The vectors of `others` that follow a `chain` on log L (P*, EK*, HS*): a
     // valid one carries `expect`, the state a verifier derives after it (read
     // here through the log's queries); a refused one `valid: false` and
-    // `reason` (`evaluate` stops with it at index 0). The five actions are
-    // also rebuilt by their builders, byte for byte, and a manager signs them
+    // `reason` (`evaluate` stops with it at index 0; a body the signed-object
+    // parse refuses, `array_not_canonical`, never reaches the log: `evaluate`
+    // throws). The five actions are also rebuilt by their builders, byte for
+    // byte, where a builder can write the body, and a manager signs them
     // through the foreign provider under purposes that name them.
     val fiveActions = setOf("project_set", "project_remove", "host_sender_revoke", "host_sender_readmit", "host_enc_key")
     val delegated = mlog["others"].arr().filter { it.obj().containsKey("chain") }
@@ -371,6 +378,15 @@ fun main(args: Array<String>) {
     }
     fun hostKeyName(hostId: String, gen: Long) = if (gen == 1L) hostId else "$hostId-gen-$gen"
     fun encKeyOf(k: Any?) = PublicKeyData(KeyAlg.X25519, b64u(k["pub"].s()))
+    // A body's key object with the alg it names (a vector may carry another).
+    fun keyOf(k: Any?) = PublicKeyData(
+        when (val alg = k["alg"].s()) {
+            "x25519" -> KeyAlg.X25519
+            "ed25519" -> KeyAlg.ED25519
+            "p256" -> KeyAlg.P256
+            else -> error(alg)
+        },
+        b64u(k["pub"].s()))
     fun stateOf(log: MembershipLog): Map<String, Any?> {
         val hosts = LinkedHashMap<String, Any?>()
         val senders = LinkedHashMap<String, Any?>()
@@ -421,7 +437,8 @@ fun main(args: Array<String>) {
             val log = logAfter(strs(v["chain"]))
             if (v.obj()["valid"] == false) {
                 refused++
-                eq(log.evaluate(listOf(entry(label)), now).stop, CarriageStop.Invalid(0uL, v["reason"].s()), label)
+                if (v["reason"].s() == "array_not_canonical") throwsCode("array_not_canonical") { log.evaluate(listOf(entry(label)), now) }
+                else eq(log.evaluate(listOf(entry(label)), now).stop, CarriageStop.Invalid(0uL, v["reason"].s()), label)
                 continue
             }
             valid++
@@ -438,7 +455,7 @@ fun main(args: Array<String>) {
                 eq(log.hostProjects(id), inEffect, "$label $id")
             }
         }
-        check(valid >= 28 && refused >= 17) { "$valid valid, $refused refused" }
+        check(valid >= 34 && refused >= 35) { "$valid valid, $refused refused" }
     }
     fun buildAction(body: Any?): String {
         val at = body["signed_at"].l().toULong()
@@ -447,20 +464,31 @@ fun main(args: Array<String>) {
             "project_remove" -> projectRemoveAction(body["name"].s(), at)
             "host_sender_revoke" -> hostSenderRevokeAction(body["host_id"].s(), body["interrupt_running"] as Boolean, at)
             "host_sender_readmit" -> hostSenderReadmitAction(body["host_id"].s(), at)
-            "host_enc_key" -> hostEncKeyAction(body["host_id"].s(), body["host_trust_gen"].l().toULong(), encKeyOf(body["enc_key"]), body["enc_sig"].s(), body["retire_previous"] == true, at)
+            "host_enc_key" -> hostEncKeyAction(body["host_id"].s(), body["host_trust_gen"].l().toULong(), keyOf(body["enc_key"]), body["enc_sig"].s(), body["retire_previous"] == true, at)
             else -> error(action)
         }
     }
-    check("device-list actions: the builders reproduce the vectors; check_change advises on a redundant revoke or readmit") {
+    // A body no builder writes: another signer's entry (a builder's action is
+    // drafted for the signer that asks), or a shape outside the builders'
+    // inputs (`retire_previous: false`, a revoke without `interrupt_running`,
+    // a field the action doesn't have, a set out of order).
+    fun unbuildable(v: Any?): Boolean {
+        val body = v["entry"]["body"]
+        return body["signer"] != "dev-mac" ||
+            body["retire_previous"] == false ||
+            (body["action"] == "host_sender_revoke" && body["interrupt_running"] !is Boolean) ||
+            v.obj()["reason"] in setOf<Any?>("unknown_field", "array_not_canonical")
+    }
+    check("device-list actions: the builders reproduce the vectors; check_change advises on a redundant revoke or readmit and a reused key") {
         var built = 0
         for (v in delegated.filter { fiveActions.contains(it["entry"]["body"]["action"].s()) }) {
             val label = v["label"].s()
             val body = v["entry"]["body"]
-            // `retire_previous: false` has one form, omitted: no builder writes it.
-            if (body["retire_previous"] == false) continue
+            if (unbuildable(v)) continue
             // A shape the verifier refuses by itself is the builder's refusal too.
-            if (v.obj()["reason"] == "bad_project") {
-                throwsCode("bad_project") { buildAction(body) }
+            val reason = v.obj()["reason"]
+            if (reason in setOf<Any?>("bad_project", "malformed", "wrong_alg")) {
+                throwsCode(reason as String) { buildAction(body) }
                 continue
             }
             val log = logAfter(strs(v["chain"]))
@@ -468,14 +496,15 @@ fun main(args: Array<String>) {
             built++
             val signedAt = body["signed_at"].l().toULong()
             eq(log.draftEntry("dev-mac", signedAt, action), v["jcs"], label)
-            val want = when (v.obj()["reason"]) {
+            val want = when (reason) {
                 "already_revoked" -> ChangeRefusalInfo.AlreadyRevoked
                 "not_revoked" -> ChangeRefusalInfo.NotRevoked
+                "enc_key_reused" -> ChangeRefusalInfo.EncKeyReused
                 else -> null
             }
             eq(log.checkChange(action, signedAt), want, "$label check_change")
         }
-        check(built >= 28) { "$built built" }
+        check(built >= 38) { "$built built" }
     }
     check("device-list actions: shapes the verifier refuses by itself") {
         val two = listOf("host-a", "host-b")
@@ -512,12 +541,13 @@ fun main(args: Array<String>) {
         eq(verify(hostKey("host-a"), account, genesis, "host-a", 1uL, PublicKeyData(KeyAlg.ED25519, key.raw), sig), false, "an Ed25519 enc_key")
         eq(verify(hostKey("host-a"), account, "not hex", "host-a", 1uL, key, sig), false, "a malformed genesis")
         eq(verify(hostKey("host-a"), account, genesis, "host-a", 1uL, key, "AAAA"), false, "a short signature")
-        // Every enc_sig of the vectors verifies under the host key of its generation, but the bad one.
-        for (v in delegated.filter { it["entry"]["body"]["action"] == "host_enc_key" }) {
+        // Every enc_sig of the vectors whose binding fields parse (they carry
+        // enc_sig_input_hex) verifies under the host key of its generation, but the bad one.
+        for (v in delegated.filter { it.obj().containsKey("enc_sig_input_hex") }) {
             val b = v["entry"]["body"]
             val gen = b["host_trust_gen"].l()
             eq(verify(hostKey(hostKeyName(b["host_id"].s(), gen)), account, genesis, b["host_id"].s(), gen.toULong(), encKeyOf(b["enc_key"]), b["enc_sig"].s()),
-                v["label"].s() != "EK8_bad_enc_sig", v["label"].s())
+                v.obj()["reason"] != "bad_enc_sig", v["label"].s())
         }
     }
     check("device-list actions: a manager signs each under a purpose that names it (R9.6 rule 4)") {

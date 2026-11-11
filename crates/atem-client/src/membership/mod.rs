@@ -178,12 +178,15 @@ pub enum Invalid {
     /// A `host_enc_key` whose `enc_sig` doesn't verify with the `host_key`
     /// of the host's newest `add_host` (II.4.1).
     BadEncSig,
-    /// A `host_enc_key` whose `enc_key` is the host's current key at
-    /// `seq-1`: its previous key would be the current one (the same kid),
-    /// and `retire_previous` would retire the live key. Every pairing and
-    /// `atem pair verify` makes a new key, so nothing legitimate sets the
-    /// current one again.
-    SameEncKey,
+    /// A `host_enc_key` whose `enc_key` (its 32 bytes as written) a
+    /// `host_enc_key` already set for the host since its newest `add_host`:
+    /// the current key, the previous one, a retired one or one no longer
+    /// kept (II.4.1). Entry bodies are public, so each earlier key's
+    /// `enc_sig` is in every copy of the log; refusing reuse keeps a
+    /// retired key retired. Every pairing and `atem pair verify` makes a
+    /// new key, so nothing legitimate sets one again. (A key of an earlier
+    /// generation is `host_trust_gen_not_current` with its old `enc_sig`.)
+    EncKeyReused,
     /// The log (or its member or host list) is full.
     LogFull,
     /// More than 64 entries or 256 KiB in one carriage.
@@ -231,7 +234,7 @@ impl Invalid {
             Invalid::NotRevoked => "not_revoked",
             Invalid::HostTrustGenNotCurrent => "host_trust_gen_not_current",
             Invalid::BadEncSig => "bad_enc_sig",
-            Invalid::SameEncKey => "same_enc_key",
+            Invalid::EncKeyReused => "enc_key_reused",
             Invalid::LogFull => "log_full",
             Invalid::CarriageTooLarge => "carriage_too_large",
         }
@@ -1225,7 +1228,7 @@ impl Membership {
                 };
                 host_enc_key::check(
                     &host.record,
-                    d.host_enc_keys.get(host_id),
+                    &d.host_enc_keys,
                     &self.account_id,
                     &self.genesis_hash,
                     *host_trust_gen,

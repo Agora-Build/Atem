@@ -653,7 +653,9 @@ impl MembershipLog {
     /// service change that grants anything new, e.g. a renewal, within
     /// 24 h of that service's last grant; narrowing and `remove` are never
     /// paced and never restart the 24 h; `AlreadyRevoked`/`NotRevoked` for
-    /// a host sender's revoke or readmit the verifier would refuse). Advisory, for signers only: hosts accept any valid entry.
+    /// a host sender's revoke or readmit the verifier would refuse;
+    /// `EncKeyReused` for a `host_enc_key` of a key already set for that
+    /// host since its newest `add_host`). Advisory, for signers only: hosts accept any valid entry.
     /// A malformed action is `Invalid`/`Membership` as in `draft_entry`.
     pub fn check_change(
         &self,
@@ -684,6 +686,7 @@ impl MembershipLog {
                 }),
                 Err(ChangeRefusal::AlreadyRevoked) => Some(ChangeRefusalInfo::AlreadyRevoked),
                 Err(ChangeRefusal::NotRevoked) => Some(ChangeRefusalInfo::NotRevoked),
+                Err(ChangeRefusal::EncKeyReused) => Some(ChangeRefusalInfo::EncKeyReused),
             },
         )
     }

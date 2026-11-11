@@ -6,9 +6,9 @@ use atem_client::domain::SignLabel;
 use atem_client::encoding::{Hash32, b64u, hex, hex_decode_array};
 use atem_client::keys::enc_kid;
 use atem_client::membership::{
-    Action, Check, Effect, EncKey, Entry, HostEncKeys, HostNow, HostRecord, Invalid, Member,
-    MemberKind, Membership, PreviousEncKey, Role, check_body, check_change, draft_on, host_enc_key,
-    host_enc_sig_input, sign_entry, sign_host_enc_key, verify_host_enc_sig,
+    Action, ChangeRefusal, Check, Effect, EncKey, Entry, HostEncKeys, HostNow, HostRecord, Invalid,
+    Member, MemberKind, Membership, PreviousEncKey, Role, check_body, check_change, draft_on,
+    host_enc_key, host_enc_sig_input, sign_entry, sign_host_enc_key, verify_host_enc_sig,
 };
 use atem_client::{Alg, Error, KeyId, PublicKey, SoftwareKeys};
 use serde_json::{Value, json};
@@ -96,6 +96,26 @@ impl Log {
 
     fn check(&self, action: &Action) -> Check {
         self.m.check_next(&self.sign(action).unwrap())
+    }
+
+    /// `check`, and the same verdict from fresh verifiers that replayed
+    /// the same entries: the stored form read back, and the chain verified
+    /// from its genesis (the keys set in a generation are derived state).
+    fn check_everywhere(&self, action: &Action) -> Check {
+        let entry = self.sign(action).unwrap();
+        let here = self.m.check_next(&entry);
+        let back = Membership::from_stored(ACCOUNT, &self.genesis(), &self.m.to_stored()).unwrap();
+        assert_eq!(back.check_next(&entry), here, "the stored form: {action:?}");
+        let fresh =
+            Membership::verify_chain(ACCOUNT, &self.genesis(), self.m.entries(), &now(self.at))
+                .unwrap()
+                .membership;
+        assert_eq!(
+            fresh.check_next(&entry),
+            here,
+            "the chain replayed: {action:?}"
+        );
+        here
     }
 
     /// Signed, carried and committed as a host does; the effects.
@@ -514,22 +534,26 @@ fn retire_previous_retires_at_once() {
     );
 }
 
+// A key a `host_enc_key` set for a host since its newest `add_host` never
+// comes back (`enc_key_reused`): the current key, the previous one, a
+// retired one, or one no longer kept. Every entry body is public, so
+// anyone holding the log holds a valid `{enc_pub, enc_sig}` for each of
+// them; refusing reuse keeps a retired key retired. Another generation
+// needs the host's `enc_sig` by that generation's `host_key` (the binding
+// names `host_trust_gen`), so the rule is per generation.
+
 #[test]
-fn same_enc_key_refused() {
+fn the_current_key_set_again_is_refused() {
     let mut log = Log::new();
     log.add_host("host-a", 1);
     log.add_host("host-b", 1);
     let k1 = log.enc_key("1");
-    let k2 = log.enc_key("2");
     let s1 = log.set_key("host-a", 1, &k1, false);
-    // The current key set again, with or without `retire_previous`: the
-    // previous key would be the current one (same kid), and retiring it
-    // would retire the live key.
     for retire_previous in [false, true] {
         let again = log.entry("host-a", 1, &k1, retire_previous);
-        assert_eq!(log.check(&again), invalid(Invalid::SameEncKey));
+        assert_eq!(log.check_everywhere(&again), invalid(Invalid::EncKeyReused));
     }
-    assert_eq!(Invalid::SameEncKey.code(), "same_enc_key");
+    assert_eq!(Invalid::EncKeyReused.code(), "enc_key_reused");
     assert_eq!(
         *log.keys("host-a").unwrap(),
         HostEncKeys {
@@ -537,32 +561,145 @@ fn same_enc_key_refused() {
             previous: None,
         }
     );
-    // A key that is only the previous one may come back; another host's
-    // current key is another host's.
-    let s2 = log.set_key("host-a", 1, &k2, false);
-    assert_eq!(log.check(&log.entry("host-a", 1, &k1, false)), Check::Valid);
-    assert_eq!(log.check(&log.entry("host-b", 1, &k2, false)), Check::Valid);
-    // The binding is checked first: another key's `enc_sig` is `bad_enc_sig`
-    // even over the current key.
-    let wrong = log.enc_sig("host-a", 1, &k1);
-    let action = host_enc_key("host-a", 1, &k2, &wrong, false, log.at).unwrap();
-    assert_eq!(log.check(&action), invalid(Invalid::BadEncSig));
-    // A newer `add_host` voids the keys: nothing is current, so the same
-    // key under the new generation is a new key there.
-    let host_key = log
-        .hosts
-        .generate(host_key_id("host-a", 2), Alg::Ed25519)
-        .unwrap();
-    log.apply(Action::AddHost {
-        host: HostRecord {
-            host_id: "host-a".into(),
-            host_trust_gen: 2,
-            host_key,
-        },
-    });
-    assert_eq!(log.keys("host-a"), None);
-    assert_eq!(log.check(&log.entry("host-a", 2, &k2, false)), Check::Valid);
-    assert_ne!(s1, s2);
+    // Another host's keys are its own: the same bytes, vouched for by
+    // host-b, are a new key for host-b.
+    assert_eq!(log.check(&log.entry("host-b", 1, &k1, false)), Check::Valid);
+}
+
+#[test]
+fn the_previous_key_set_again_is_refused() {
+    let mut log = Log::new();
+    log.add_host("host-a", 1);
+    let k1 = log.enc_key("1");
+    let k2 = log.enc_key("2");
+    log.set_key("host-a", 1, &k1, false);
+    log.set_key("host-a", 1, &k2, false);
+    // k1 is the previous key, not retired: still never set again.
+    assert!(
+        !log.keys("host-a")
+            .unwrap()
+            .previous
+            .as_ref()
+            .unwrap()
+            .retired
+    );
+    for retire_previous in [false, true] {
+        let back = log.entry("host-a", 1, &k1, retire_previous);
+        assert_eq!(log.check_everywhere(&back), invalid(Invalid::EncKeyReused));
+    }
+    // The binding is checked first: k1 with another key's `enc_sig` is
+    // `bad_enc_sig`, not a reuse.
+    let wrong = log.enc_sig("host-a", 1, &k2);
+    let action = host_enc_key("host-a", 1, &k1, &wrong, false, log.at).unwrap();
+    assert_eq!(log.check_everywhere(&action), invalid(Invalid::BadEncSig));
+}
+
+#[test]
+fn a_retired_key_set_again_is_refused() {
+    let mut log = Log::new();
+    log.add_host("host-a", 1);
+    let k1 = log.enc_key("1");
+    let k2 = log.enc_key("2");
+    let k3 = log.enc_key("3");
+    log.set_key("host-a", 1, &k1, false);
+    // A suspected compromise: k1 retired at once.
+    log.set_key("host-a", 1, &k2, true);
+    assert!(
+        log.keys("host-a")
+            .unwrap()
+            .previous
+            .as_ref()
+            .unwrap()
+            .retired
+    );
+    let retired = log.entry("host-a", 1, &k1, false);
+    assert_eq!(
+        log.check_everywhere(&retired),
+        invalid(Invalid::EncKeyReused)
+    );
+    // A routine rotation: k2 previous, k1 no longer kept. Neither comes back.
+    log.set_key("host-a", 1, &k3, false);
+    for key in [&k1, &k2, &k3] {
+        let again = log.entry("host-a", 1, key, true);
+        assert_eq!(log.check_everywhere(&again), invalid(Invalid::EncKeyReused));
+    }
+    // A key never set is a new key.
+    let k4 = log.enc_key("4");
+    assert_eq!(
+        log.check_everywhere(&log.entry("host-a", 1, &k4, true)),
+        Check::Valid
+    );
+}
+
+#[test]
+fn reuse_is_judged_since_the_newest_add_host() {
+    let mut log = Log::new();
+    log.add_host("host-a", 1);
+    let k1 = log.enc_key("1");
+    let k2 = log.enc_key("2");
+    log.set_key("host-a", 1, &k1, false);
+    log.set_key("host-a", 1, &k2, true);
+    // Re-verification (a newer add_host) voids the keys: generation 1's
+    // bindings no longer apply (`host_trust_gen_not_current`), and k1 is a
+    // new key for generation 2 once the host vouches for it again.
+    log.add_host("host-a", 2);
+    let replay = log.entry("host-a", 1, &k1, false);
+    assert_eq!(
+        log.check_everywhere(&replay),
+        invalid(Invalid::HostTrustGenNotCurrent)
+    );
+    assert_eq!(
+        log.check_everywhere(&log.entry("host-a", 2, &k1, false)),
+        Check::Valid
+    );
+    log.set_key("host-a", 2, &k1, false);
+    assert_eq!(
+        log.check_everywhere(&log.entry("host-a", 2, &k1, false)),
+        invalid(Invalid::EncKeyReused)
+    );
+    // A removal voids them too; after a re-add the host starts afresh.
+    log.remove_host("host-a");
+    log.add_host("host-a", 3);
+    assert_eq!(
+        log.check_everywhere(&log.entry("host-a", 3, &k1, false)),
+        Check::Valid
+    );
+    assert_eq!(
+        log.check_everywhere(&log.entry("host-a", 3, &k2, false)),
+        Check::Valid
+    );
+}
+
+#[test]
+fn check_change_refuses_a_reused_key() {
+    let mut log = Log::new();
+    log.add_host("host-a", 1);
+    let k1 = log.enc_key("1");
+    let k2 = log.enc_key("2");
+    let k3 = log.enc_key("3");
+    log.set_key("host-a", 1, &k1, false);
+    log.set_key("host-a", 1, &k2, false);
+    // The drafting guard: a manager handed a key already set (two managers
+    // given the same key, one redrafting after the relay's CAS failure)
+    // doesn't sign an entry every verifier refuses.
+    for key in [&k1, &k2] {
+        let again = log.entry("host-a", 1, key, false);
+        assert_eq!(
+            check_change(&log.m, &again, log.at),
+            Err(ChangeRefusal::EncKeyReused)
+        );
+    }
+    assert_eq!(ChangeRefusal::EncKeyReused.code(), "enc_key_reused");
+    assert_eq!(
+        check_change(&log.m, &log.entry("host-a", 1, &k3, true), log.at),
+        Ok(())
+    );
+    // A newer add_host starts the next generation afresh.
+    log.add_host("host-a", 2);
+    assert_eq!(
+        check_change(&log.m, &log.entry("host-a", 2, &k1, false), log.at),
+        Ok(())
+    );
 }
 
 #[test]

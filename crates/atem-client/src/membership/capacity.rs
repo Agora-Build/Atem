@@ -10,7 +10,8 @@
 //! the verifier's own counters against its own limits, so the two can't
 //! drift; [`check_change`] is what a managing device asks before it drafts
 //! an entry, so a bot's renewals can't use up the list, and a host
-//! sender's redundant revoke or readmit isn't drafted at all.
+//! sender's redundant revoke or readmit, or a host encryption key set
+//! before, isn't drafted at all.
 use super::entry::{Action, MemberKind, RolesChange, Scope};
 use super::{HostSenderState, MAX_ENTRIES, MAX_HOSTS, MAX_MEMBERS, MemberStatus, Membership};
 
@@ -155,6 +156,11 @@ pub enum ChangeRefusal {
     /// A `host_sender_readmit` of a host that isn't revoked (the verifier
     /// would refuse it, `not_revoked`; II.3.1).
     NotRevoked,
+    /// A `host_enc_key` of a key already set for that host since its newest
+    /// `add_host` (the verifier would refuse it, `enc_key_reused`; II.4.1):
+    /// e.g. two managers handed the same key, the second redrafting after
+    /// the relay's compare-and-swap failure.
+    EncKeyReused,
 }
 
 impl ChangeRefusal {
@@ -166,6 +172,7 @@ impl ChangeRefusal {
             ChangeRefusal::ServiceChangeTooSoon { .. } => "service_change_too_soon",
             ChangeRefusal::AlreadyRevoked => "already_revoked",
             ChangeRefusal::NotRevoked => "not_revoked",
+            ChangeRefusal::EncKeyReused => "enc_key_reused",
         }
     }
 }
@@ -180,8 +187,9 @@ impl std::error::Error for ChangeRefusal {}
 
 /// Whether a signer should draft `action` as the next entry of `log` at
 /// `now_ms` (the signer's clock, as its `signed_at` would be). Advisory
-/// and deterministic; it judges capacity, pace and a host sender's
-/// redundant drafts only (the verifier still judges the entry itself):
+/// and deterministic; it judges capacity, pace, a host sender's redundant
+/// drafts and a reused host encryption key only (the verifier still judges
+/// the entry itself):
 ///
 /// - a full log ([`MAX_ENTRIES`]) refuses every action;
 /// - full members refuse `add` and `recovery_add`;
@@ -209,9 +217,11 @@ impl std::error::Error for ChangeRefusal {}
 ///   the entry lands), nor must a rotation with `retire_previous` after a
 ///   suspected compromise; it adds no member or host. Each is signed by a
 ///   manager with a fresh confirmation, so nothing drafts them in bulk.
-///   Whether the entry is valid (a current host, its newest generation, the
-///   host's `enc_sig`, a key other than the host's current one) is the
-///   verifier's to judge: there is no drafting guard for `same_enc_key`;
+///   A key already set for that host since its newest `add_host` is
+///   refused ([`ChangeRefusal::EncKeyReused`]): the drafting guard for the
+///   verifier's `enc_key_reused`. The rest of the entry's validity (a
+///   current host, its newest generation, the host's `enc_sig`) is the
+///   verifier's to judge;
 /// - every other action (genesis, a native's roles, removals, recovery and
 ///   kit entries, K backups) is never paced.
 ///
@@ -291,7 +301,15 @@ pub fn check_change(log: &Membership, action: &Action, now_ms: u64) -> Result<()
             Some(HostSenderState::Revoked { .. }) => Ok(()),
             Some(HostSenderState::Authorized { .. }) | None => Err(ChangeRefusal::NotRevoked),
         },
-        Action::HostEncKey { .. } => Ok(()),
+        Action::HostEncKey {
+            host_id, enc_key, ..
+        } => {
+            if log.derived.host_enc_keys.was_set(host_id, enc_key) {
+                Err(ChangeRefusal::EncKeyReused)
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 

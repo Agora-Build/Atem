@@ -52,8 +52,10 @@ fn now() -> HostClock {
     }
 }
 
+/// The entry's wire JSON as the vector holds it (one the signed-object
+/// parse refuses, a set out of order, included).
 fn wire(v: &Vectors, label: &str) -> String {
-    v.object(label).to_json().to_string()
+    v.wire(label).to_string()
 }
 
 fn wires(v: &Vectors, labels: &[&str]) -> Vec<String> {
@@ -94,6 +96,34 @@ fn x25519(b64u: &str) -> PublicKeyData {
     }
 }
 
+/// A key object of a body, with the alg it names.
+fn key_of(key: &Value) -> PublicKeyData {
+    PublicKeyData {
+        alg: match key["alg"].as_str().unwrap() {
+            "x25519" => KeyAlg::X25519,
+            "ed25519" => KeyAlg::Ed25519,
+            "p256" => KeyAlg::P256,
+            other => panic!("{other}"),
+        },
+        raw: atem_client::encoding::b64u_decode(key["pub"].as_str().unwrap()).unwrap(),
+    }
+}
+
+/// A body no builder writes: another signer's entry (a builder's action is
+/// drafted for the signer that asks), or a shape outside the builders'
+/// inputs (`retire_previous: false`, a revoke without `interrupt_running`,
+/// a field the action doesn't have, a set out of order).
+fn unbuildable(vector: &Value) -> bool {
+    let body = &vector["entry"]["body"];
+    body["signer"] != "dev-mac"
+        || body.get("retire_previous") == Some(&Value::Bool(false))
+        || (body["action"] == "host_sender_revoke" && !body["interrupt_running"].is_boolean())
+        || matches!(
+            vector.get("reason").and_then(Value::as_str),
+            Some("unknown_field" | "array_not_canonical")
+        )
+}
+
 /// The vectors of the delegated host-work families (`P*`, `EK*`, `HS*`:
 /// each has a `chain`): valid ones with `expect`, refused ones with
 /// `valid: false` and `reason`. Some are `add_host` / `remove_host` entries
@@ -115,11 +145,11 @@ fn is_five(vector: &Value) -> bool {
     )
 }
 
-/// The builder's action JSON for a vector's body; `None` for a body the
-/// builder can't write (`retire_previous: false` has one form, omitted).
-fn built(body: &Value) -> Option<Result<String, AtemError>> {
+/// The builder's action JSON for a vector's body (one `unbuildable`
+/// doesn't refuse).
+fn built(body: &Value) -> Result<String, AtemError> {
     let at = body["signed_at"].as_u64().unwrap();
-    Some(match body["action"].as_str().unwrap() {
+    match body["action"].as_str().unwrap() {
         "project_set" => project_set_action(
             body["project"]["name"].as_str().unwrap().into(),
             strs(&body["project"]["hosts"]),
@@ -135,21 +165,16 @@ fn built(body: &Value) -> Option<Result<String, AtemError>> {
         "host_sender_readmit" => {
             host_sender_readmit_action(body["host_id"].as_str().unwrap().into(), at)
         }
-        "host_enc_key" => {
-            if body.get("retire_previous") == Some(&Value::Bool(false)) {
-                return None;
-            }
-            host_enc_key_action(
-                body["host_id"].as_str().unwrap().into(),
-                body["host_trust_gen"].as_u64().unwrap(),
-                x25519(body["enc_key"]["pub"].as_str().unwrap()),
-                body["enc_sig"].as_str().unwrap().into(),
-                body.get("retire_previous") == Some(&Value::Bool(true)),
-                at,
-            )
-        }
+        "host_enc_key" => host_enc_key_action(
+            body["host_id"].as_str().unwrap().into(),
+            body["host_trust_gen"].as_u64().unwrap(),
+            key_of(&body["enc_key"]),
+            body["enc_sig"].as_str().unwrap().into(),
+            body.get("retire_previous") == Some(&Value::Bool(true)),
+            at,
+        ),
         other => panic!("{other}"),
-    })
+    }
 }
 
 fn detail(e: &AtemError) -> String {
@@ -161,12 +186,14 @@ fn detail(e: &AtemError) -> String {
 
 /// Every vector's body, rebuilt by the builder, is what `draft_entry` makes
 /// on the vector's chain (`jcs`, byte for byte); `check_change` agrees with
-/// the verifier on the redundant revoke and readmit; a shape the verifier
-/// refuses on its own is refused by the builder with its detail.
+/// the verifier on the redundant revoke and readmit and on a reused host
+/// key; a shape the verifier refuses on its own is refused by the builder
+/// with its detail.
 #[test]
 fn every_builder_goes_through_draft_entry_and_check_change() {
     let v = Vectors::load();
     let mut built_ok = 0;
+    let mut unbuilt = Vec::new();
     for vector in delegated_vectors(&v).into_iter().filter(|x| is_five(x)) {
         let label = vector["label"].as_str().unwrap();
         let body = &vector["entry"]["body"];
@@ -174,19 +201,17 @@ fn every_builder_goes_through_draft_entry_and_check_change() {
         let chain: Vec<&str> = chain.iter().map(String::as_str).collect();
         let log = log_after(&v, &chain);
         let reason = vector.get("reason").and_then(Value::as_str);
-        let Some(action) = built(body) else {
-            // Not expressible by a builder: `malformed`, from the strict parse.
-            assert_eq!(label, "EK8_retire_false");
+        if unbuildable(vector) {
+            unbuilt.push(label);
             continue;
-        };
-        let action = match action {
+        }
+        let action = match built(body) {
             Ok(action) => action,
             Err(e) => {
                 // A shape the verifier refuses by itself: the builder says so.
                 assert_eq!(Some(detail(&e).as_str()), reason, "{label}: {e:?}");
-                assert_eq!(e.code(), "membership_invalid", "{label}");
                 assert!(
-                    ["bad_project", "malformed"].contains(&detail(&e).as_str()),
+                    ["bad_project", "malformed", "wrong_alg"].contains(&detail(&e).as_str()),
                     "{label}"
                 );
                 continue;
@@ -204,15 +229,27 @@ fn every_builder_goes_through_draft_entry_and_check_change() {
         let want = match reason {
             Some("already_revoked") => Some(ChangeRefusalInfo::AlreadyRevoked),
             Some("not_revoked") => Some(ChangeRefusalInfo::NotRevoked),
+            Some("enc_key_reused") => Some(ChangeRefusalInfo::EncKeyReused),
             _ => None,
         };
         assert_eq!(advice, want, "{label}");
     }
-    // Every five-action vector reproduces through its builder, but
-    // EK8_retire_false (no builder writes `retire_previous: false`) and the
-    // three shapes the builder itself refuses (P9_bad_name, P9_one_host,
-    // P9_unknown_op).
-    assert!(built_ok >= 28, "{built_ok}");
+    // Every five-action vector reproduces through its builder, but those no
+    // builder writes and the shapes the builder itself refuses.
+    assert_eq!(
+        unbuilt,
+        [
+            "EK8_retire_false",
+            "HS7_revoke_no_interrupt",
+            "HS8_readmit_interrupt",
+            "P9_unknown_field",
+            "P9_hosts_unsorted",
+            "P9_hosts_duplicate",
+            "HS7_revoke_by_service",
+            "P9_set_by_recovery",
+        ]
+    );
+    assert!(built_ok >= 38, "{built_ok}");
 }
 
 /// What the vectors' `expect` writes down, read through the queries.
@@ -309,8 +346,15 @@ fn the_queries_read_the_vectors_expect_and_refusals_carry_their_reason() {
         let entry = wire(&v, label);
         if vector.get("valid") == Some(&Value::Bool(false)) {
             refused += 1;
-            let result = log.evaluate(vec![entry], now()).unwrap();
             let reason = vector["reason"].as_str().unwrap();
+            if reason == "array_not_canonical" {
+                // The signed-object parse refuses it before the log sees
+                // it: `evaluate` fails with that code, nothing is carried.
+                let e = log.evaluate(vec![entry], now()).unwrap_err();
+                assert_eq!(e.code(), reason, "{label}");
+                continue;
+            }
+            let result = log.evaluate(vec![entry], now()).unwrap();
             assert_eq!(
                 result.stop,
                 Some(CarriageStop::Invalid {
@@ -351,7 +395,7 @@ fn the_queries_read_the_vectors_expect_and_refusals_carry_their_reason() {
         }
     }
     assert!(
-        valid >= 28 && refused >= 17,
+        valid >= 34 && refused >= 35,
         "{valid} valid, {refused} refused"
     );
 }
@@ -575,11 +619,12 @@ fn verify_host_enc_sig_binds_every_field() {
         "not base64url!"
     ));
     assert!(!check(&a, ACCOUNT, &genesis, "host-a", 1, &key, "AAAA"));
-    // Every enc_sig of the vectors verifies with the host key of its generation
+    // Every enc_sig of the vectors whose binding fields parse (they carry
+    // `enc_sig_input_hex`) verifies with the host key of its generation,
     // except the one that is bad.
     for vector in delegated_vectors(&v) {
         let body = &vector["entry"]["body"];
-        if body["action"] != "host_enc_key" {
+        if vector.get("enc_sig_input_hex").is_none() {
             continue;
         }
         let label = vector["label"].as_str().unwrap();

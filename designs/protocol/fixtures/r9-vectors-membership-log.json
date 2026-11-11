@@ -2273,8 +2273,8 @@
       "entry_hash": "4480db62f877c98007f2cf3dc6155fcfc19dfe2c35fd38523f467c12de4cb9f2",
       "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"host_enc_key\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA\"},\"enc_sig\":\"Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"host_trust_gen\":1,\"prev_hash\":\"d3c9030aa3ddc59f51702f668fbe0f93faef08b06a6b8b0ced74b19344c24cda\",\"retire_previous\":true,\"seq\":8,\"signed_at\":1793620808000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
       "label": "EK8_same_key",
-      "note": "host-a's current key (host_enc_key 1) set again with retire_previous: true on EK7_set: invalid (the previous key would be the live one, same kid, and retired): same_enc_key",
-      "reason": "same_enc_key",
+      "note": "host-a's current key (host_enc_key 1) set again with retire_previous: true on EK7_set: invalid (a key set for the host since its newest add_host never comes back; here the previous key would be the live one, same kid, and retired): enc_key_reused",
+      "reason": "enc_key_reused",
       "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d76310000021e7b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f73745f656e635f6b6579222c22656e635f6b6579223a7b22616c67223a22783235353139222c22707562223a22566d486750645231596d62674d304f5368726d4735582d66514b6946663855627465755934474e396d6941227d2c22656e635f736967223a224d656d3834616645385f4f4136617a3949686f2d62713358757131562d6b753235666d6646716e42787a4f6636723051486d364d584974583150656563354d583750394e4549484d446e31666c424f543269665a4141222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a312c22707265765f68617368223a2264336339303330616133646463353966353137303266363638666265306639336661656630386230366136623862306365643734623139333434633234636461222c227265746972655f70726576696f7573223a747275652c22736571223a382c227369676e65645f6174223a313739333632303830383030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
       "valid": false
     },
@@ -3307,6 +3307,1095 @@
       "note": "project_set \"astation\" with ops [deploy, message] on P8_set: invalid (an op outside launch, message, notify, prompt): bad_project",
       "reason": "bad_project",
       "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000001837b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2270726f6a6563745f736574222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22707265765f68617368223a2266653532313462396431343366633137383966623031366234323431353334386262313433363963373562303266653735363831356262636461373066326165222c2270726f6a656374223a7b22686f737473223a5b22686f73742d61222c22686f73742d62225d2c226e616d65223a226173746174696f6e222c226f7073223a5b226465706c6f79222c226d657373616765225d7d2c22736571223a392c227369676e65645f6174223a313739333632303830393030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [
+        "EK7_set",
+        "EK8_rotate"
+      ],
+      "enc_sig_input_hex": "000000146174656d2d686f73742d656e632d6b65792d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d61000000080000000000000001000000205661e03dd4756266e033439286b986e57f9f40a8857fc51bb5eb98e0637d9a20",
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "host_enc_key",
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "prev_hash": "a7ed3a834e41bfd954f67fe43587b4d039561aae3fd236f0f0165d2f5aae45a1",
+          "seq": 9,
+          "signed_at": 1793620809000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "BbaOvSboE3CEcVAimUCZ_BulYPKdM8MVBg-WCrzv9mpzLlhiZikkPW2FAn7dEFFwTeIMQ25sNXnvPiW9-jf3Vg"
+      },
+      "entry_hash": "6a7f478cd3ef59df3826f423477f974de44554d490ec501673eb7519125508e0",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"host_enc_key\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA\"},\"enc_sig\":\"Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"host_trust_gen\":1,\"prev_hash\":\"a7ed3a834e41bfd954f67fe43587b4d039561aae3fd236f0f0165d2f5aae45a1\",\"seq\":9,\"signed_at\":1793620809000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "EK9_previous_again",
+      "note": "host_enc_key 1 on EK8_rotate, where it is host-a's previous key (not retired), set again with its own enc_sig (EK7_set's): invalid (a key set for the host since its newest add_host never comes back): enc_key_reused",
+      "reason": "enc_key_reused",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000002077b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f73745f656e635f6b6579222c22656e635f6b6579223a7b22616c67223a22783235353139222c22707562223a22566d486750645231596d62674d304f5368726d4735582d66514b6946663855627465755934474e396d6941227d2c22656e635f736967223a224d656d3834616645385f4f4136617a3949686f2d62713358757131562d6b753235666d6646716e42787a4f6636723051486d364d584974583150656563354d583750394e4549484d446e31666c424f543269665a4141222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a312c22707265765f68617368223a2261376564336138333465343162666439353466363766653433353837623464303339353631616165336664323336663066303136356432663561616534356131222c22736571223a392c227369676e65645f6174223a313739333632303830393030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [
+        "EK7_set",
+        "EK8_rotate",
+        "EK9_rotate_retire"
+      ],
+      "enc_sig_input_hex": "000000146174656d2d686f73742d656e632d6b65792d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d61000000080000000000000001000000204f818193a8493b71dac868295b1449ec71b088ce9e49cd9967e5764975f8b871",
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "host_enc_key",
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "T4GBk6hJO3HayGgpWxRJ7HGwiM6eSc2ZZ-V2SXX4uHE"
+          },
+          "enc_sig": "cq-vZoheFAYyaLKbpYoYH2G5P0TkD1QwMC1mlIT1IdI8I2i3S2hHJkRlIpwE1ztCQOtlJASkCWvabhDFUz8SCg",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "prev_hash": "5386ff90666d8bc382c9314b98dc8e6a18b024a6b9437b5b1501f84a11fd3380",
+          "seq": 10,
+          "signed_at": 1793620810000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "uA7sU5Z3r9Clz3HRhYIYanPBjC3kqDhUtWNulhE4smBGjA_KKAxaehKfsPqC2stW2h0T0v86SBi2aGNiVbko8A"
+      },
+      "entry_hash": "e5a1c80ea5c83a08f6918561be67d78c353e6cccb515605b783874f881cc9ec2",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"host_enc_key\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"T4GBk6hJO3HayGgpWxRJ7HGwiM6eSc2ZZ-V2SXX4uHE\"},\"enc_sig\":\"cq-vZoheFAYyaLKbpYoYH2G5P0TkD1QwMC1mlIT1IdI8I2i3S2hHJkRlIpwE1ztCQOtlJASkCWvabhDFUz8SCg\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"host_trust_gen\":1,\"prev_hash\":\"5386ff90666d8bc382c9314b98dc8e6a18b024a6b9437b5b1501f84a11fd3380\",\"seq\":10,\"signed_at\":1793620810000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "EK10_retired_again",
+      "note": "host_enc_key 2 on EK9_rotate_retire, which retired it (retire_previous), set again with its own enc_sig (EK8_rotate's): invalid (a retired key stays retired): enc_key_reused",
+      "reason": "enc_key_reused",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000002087b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f73745f656e635f6b6579222c22656e635f6b6579223a7b22616c67223a22783235353139222c22707562223a22543447426b36684a4f334861794767705778524a37484777694d36655363325a5a2d563253585834754845227d2c22656e635f736967223a2263712d765a6f686546415979614c4b6270596f59483247355030546b443151774d43316d6c4954314964493849326933533268484a6b526c49707745317a7443514f746c4a41536b4357766162684446557a38534367222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a312c22707265765f68617368223a2235333836666639303636366438626333383263393331346239386463386536613138623032346136623934333762356231353031663834613131666433333830222c22736571223a31302c227369676e65645f6174223a313739333632303831303030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [
+        "EK7_set",
+        "EK8_rotate",
+        "EK9_rotate_retire"
+      ],
+      "enc_sig_input_hex": "000000146174656d2d686f73742d656e632d6b65792d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d61000000080000000000000001000000205661e03dd4756266e033439286b986e57f9f40a8857fc51bb5eb98e0637d9a20",
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "host_enc_key",
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "prev_hash": "5386ff90666d8bc382c9314b98dc8e6a18b024a6b9437b5b1501f84a11fd3380",
+          "seq": 10,
+          "signed_at": 1793620810000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "c9hgDnKkWXvyrL_28XnBcuisDePZSTQI_VFsdAAhFqU-qABV_W4s-Y5Y2HZmn1P-VZENYNbG7La2so765GO_cw"
+      },
+      "entry_hash": "4b73911f6d44a1af535b32f0a93c43e2aeb911b463d7dbdda80ea3b819a60c90",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"host_enc_key\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA\"},\"enc_sig\":\"Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"host_trust_gen\":1,\"prev_hash\":\"5386ff90666d8bc382c9314b98dc8e6a18b024a6b9437b5b1501f84a11fd3380\",\"seq\":10,\"signed_at\":1793620810000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "EK10_dropped_again",
+      "note": "host_enc_key 1 on EK9_rotate_retire, no longer kept (one previous key only), set again with its own enc_sig (EK7_set's): invalid: enc_key_reused",
+      "reason": "enc_key_reused",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000002087b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f73745f656e635f6b6579222c22656e635f6b6579223a7b22616c67223a22783235353139222c22707562223a22566d486750645231596d62674d304f5368726d4735582d66514b6946663855627465755934474e396d6941227d2c22656e635f736967223a224d656d3834616645385f4f4136617a3949686f2d62713358757131562d6b753235666d6646716e42787a4f6636723051486d364d584974583150656563354d583750394e4549484d446e31666c424f543269665a4141222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a312c22707265765f68617368223a2235333836666639303636366438626333383263393331346239386463386536613138623032346136623934333762356231353031663834613131666433333830222c22736571223a31302c227369676e65645f6174223a313739333632303831303030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [
+        "HS7_remove_host_a",
+        "HS8_revoke_removed"
+      ],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "host_sender_readmit",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "prev_hash": "3744ce349799b6a7550a89608aaab938debc6d3061596deab3d7818ba63e2fa1",
+          "seq": 9,
+          "signed_at": 1793620809000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "7mmYBBHUhmflNoPx-DWZ7lY-CvqzOm_v7I07VpJh0Gobv_bYkiOULG98C2hHD3sMWlaQRha6mAw1e5FhmveY-g"
+      },
+      "entry_hash": "0844fc2d993e036c67659e76aad73c4fad2e808c12a297e1f04dc9dba0d9e190",
+      "expect": {
+        "host_enc_keys": {},
+        "host_senders": {
+          "host-a": {
+            "seq": 9,
+            "state": "authorized"
+          }
+        },
+        "hosts": {},
+        "projects": {}
+      },
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"host_sender_readmit\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"prev_hash\":\"3744ce349799b6a7550a89608aaab938debc6d3061596deab3d7818ba63e2fa1\",\"seq\":9,\"signed_at\":1793620809000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "HS9_readmit_removed",
+      "note": "host_sender_readmit host-a on HS8_revoke_removed, where host-a is removed and revoked: valid (a readmit needs revoked, not a current host): authorized(9), no membership epoch, and it sends nothing until an add_host makes it current",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000001497b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f73745f73656e6465725f726561646d6974222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22707265765f68617368223a2233373434636533343937393962366137353530613839363038616161623933386465626336643330363135393664656162336437383138626136336532666131222c22736571223a392c227369676e65645f6174223a313739333632303830393030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d"
+    },
+    {
+      "chain": [
+        "P7_add_host_b"
+      ],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "host_sender_revoke",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "interrupt_running": false,
+          "prev_hash": "ac770ee1db37fce117f4d0031ae2bbfebff5f030d93a9df26b9f35a5b1a52901",
+          "seq": 8,
+          "signed_at": 1793620808000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "L3f9P4kpwSydh5qbrIGFE44XY3BTcMKe-lhvrSPCqwlDD-_b9oXrL5yji0Hh0vr4xVNYBqByWb-zMkAfC1ra2w"
+      },
+      "entry_hash": "58f4b76476a93a12d4b847041b6f3972fd8993753dcf1965197f337e2bfdde92",
+      "expect": {
+        "host_enc_keys": {},
+        "host_senders": {
+          "host-a": {
+            "membership_epoch": 2,
+            "seq": 8,
+            "state": "revoked"
+          },
+          "host-b": {
+            "membership_epoch": 7,
+            "seq": 7,
+            "state": "authorized"
+          }
+        },
+        "hosts": {
+          "host-a": 1,
+          "host-b": 1
+        },
+        "projects": {}
+      },
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"host_sender_revoke\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"interrupt_running\":false,\"prev_hash\":\"ac770ee1db37fce117f4d0031ae2bbfebff5f030d93a9df26b9f35a5b1a52901\",\"seq\":8,\"signed_at\":1793620808000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "P8_revoke_a",
+      "note": "host_sender_revoke host-a, interrupt_running false, on P7_add_host_b: host-a revoked(8), host-b still authorized(7)",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000001627b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f73745f73656e6465725f7265766f6b65222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22696e746572727570745f72756e6e696e67223a66616c73652c22707265765f68617368223a2261633737306565316462333766636531313766346430303331616532626266656266663566303330643933613964663236623966333561356231613532393031222c22736571223a382c227369676e65645f6174223a313739333632303830383030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d"
+    },
+    {
+      "chain": [
+        "P7_add_host_b",
+        "P8_revoke_a"
+      ],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "project_set",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "prev_hash": "58f4b76476a93a12d4b847041b6f3972fd8993753dcf1965197f337e2bfdde92",
+          "project": {
+            "hosts": [
+              "host-a",
+              "host-b"
+            ],
+            "name": "astation",
+            "ops": [
+              "launch",
+              "message",
+              "notify",
+              "prompt"
+            ]
+          },
+          "seq": 9,
+          "signed_at": 1793620809000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "QH_iaWhimyUJZ1SmFJA0fhMQswlqfqJPDL0kNM4bhjowc8MnH-TSwutqxkkDvB_X0JP-6fJqjSVJpx6qnkbLLg"
+      },
+      "entry_hash": "aa87a1fa7c99f299e0ddfbaada2561e74acca654a637bfa0b3793525df781374",
+      "expect": {
+        "host_enc_keys": {},
+        "host_senders": {
+          "host-a": {
+            "membership_epoch": 2,
+            "seq": 8,
+            "state": "revoked"
+          },
+          "host-b": {
+            "membership_epoch": 7,
+            "seq": 7,
+            "state": "authorized"
+          }
+        },
+        "hosts": {
+          "host-a": 1,
+          "host-b": 1
+        },
+        "projects": {
+          "astation": {
+            "hosts": [
+              "host-a",
+              "host-b"
+            ],
+            "members": [
+              "host-a",
+              "host-b"
+            ],
+            "ops": [
+              "launch",
+              "message",
+              "notify",
+              "prompt"
+            ]
+          }
+        }
+      },
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"project_set\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"58f4b76476a93a12d4b847041b6f3972fd8993753dcf1965197f337e2bfdde92\",\"project\":{\"hosts\":[\"host-a\",\"host-b\"],\"name\":\"astation\",\"ops\":[\"launch\",\"message\",\"notify\",\"prompt\"]},\"seq\":9,\"signed_at\":1793620809000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "P9_set_revoked",
+      "note": "project_set \"astation\" listing host-a and host-b on P8_revoke_a, where host-a is revoked: valid (a listed host must be current; its sending state is apart): both are members, and host-a stays revoked(8), so it sends nothing until readmitted",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000001957b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2270726f6a6563745f736574222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22707265765f68617368223a2235386634623736343736613933613132643462383437303431623666333937326664383939333735336463663139363531393766333337653262666464653932222c2270726f6a656374223a7b22686f737473223a5b22686f73742d61222c22686f73742d62225d2c226e616d65223a226173746174696f6e222c226f7073223a5b226c61756e6368222c226d657373616765222c226e6f74696679222c2270726f6d7074225d7d2c22736571223a392c227369676e65645f6174223a313739333632303830393030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d"
+    },
+    {
+      "chain": [
+        "HS7_revoke"
+      ],
+      "enc_sig_input_hex": "000000146174656d2d686f73742d656e632d6b65792d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d61000000080000000000000001000000205661e03dd4756266e033439286b986e57f9f40a8857fc51bb5eb98e0637d9a20",
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "host_enc_key",
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "prev_hash": "c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3",
+          "seq": 8,
+          "signed_at": 1793620808000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "ml1yTvo2VZwGip5NnpE9XviQHbNkjQwUnYmSXqGids97U26aZsFy6pp3SvDugIW9PHVPiJ8_uqgxKXibjkY5gA"
+      },
+      "entry_hash": "589f02c79ed1b540b7f1f091d99ab1cb8afb92561b0a7a6268cff7c9897b0e7d",
+      "expect": {
+        "host_enc_keys": {
+          "host-a": {
+            "current": {
+              "enc_kid": "f7b299b3a3dc69cc",
+              "host_trust_gen": 1,
+              "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA",
+              "seq": 8
+            }
+          }
+        },
+        "host_senders": {
+          "host-a": {
+            "membership_epoch": 2,
+            "seq": 7,
+            "state": "revoked"
+          }
+        },
+        "hosts": {
+          "host-a": 1
+        },
+        "projects": {}
+      },
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"host_enc_key\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA\"},\"enc_sig\":\"Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"host_trust_gen\":1,\"prev_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":8,\"signed_at\":1793620808000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "HS8_enc_key_revoked",
+      "note": "host_enc_key host-a (host_enc_key 1) on HS7_revoke, where host-a is revoked: valid (its keys are apart from its sending state): host-a's current key, and host-a stays revoked(7)",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000002077b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f73745f656e635f6b6579222c22656e635f6b6579223a7b22616c67223a22783235353139222c22707562223a22566d486750645231596d62674d304f5368726d4735582d66514b6946663855627465755934474e396d6941227d2c22656e635f736967223a224d656d3834616645385f4f4136617a3949686f2d62713358757131562d6b753235666d6646716e42787a4f6636723051486d364d584974583150656563354d583750394e4549484d446e31666c424f543269665a4141222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a312c22707265765f68617368223a2263363761323633383330666138363734306235313566323030636661643131336163353234326134666239323437353361653932663236393565396662316233222c22736571223a382c227369676e65645f6174223a313739333632303830383030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d"
+    },
+    {
+      "chain": [
+        "P7_add_host_b",
+        "P8_set",
+        "P9_narrow",
+        "P10_remove"
+      ],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "project_set",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "prev_hash": "6dfc8aa3f2cbd189d06faa8da3f5d1e23e82ea9cc80cdf43392f6aff5b286276",
+          "project": {
+            "hosts": [
+              "host-a",
+              "host-b"
+            ],
+            "name": "astation",
+            "ops": [
+              "launch"
+            ]
+          },
+          "seq": 11,
+          "signed_at": 1793620811000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "U8mcujOK6K0clNUMxDwRkWuakRYkTQy3PAt4dodQMDRWptUNGLIuH4g-L5CB7QK8a_RbKq1Q0pDot4mDq_dk_g"
+      },
+      "entry_hash": "7f0e88dfb1cd88a7e4ab712b017a78d701e549df6d9e8e79db19ceda068e2e44",
+      "expect": {
+        "host_enc_keys": {},
+        "host_senders": {
+          "host-a": {
+            "membership_epoch": 2,
+            "seq": 2,
+            "state": "authorized"
+          },
+          "host-b": {
+            "membership_epoch": 7,
+            "seq": 7,
+            "state": "authorized"
+          }
+        },
+        "hosts": {
+          "host-a": 1,
+          "host-b": 1
+        },
+        "projects": {
+          "astation": {
+            "hosts": [
+              "host-a",
+              "host-b"
+            ],
+            "members": [
+              "host-a",
+              "host-b"
+            ],
+            "ops": [
+              "launch"
+            ]
+          }
+        }
+      },
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"project_set\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"6dfc8aa3f2cbd189d06faa8da3f5d1e23e82ea9cc80cdf43392f6aff5b286276\",\"project\":{\"hosts\":[\"host-a\",\"host-b\"],\"name\":\"astation\",\"ops\":[\"launch\"]},\"seq\":11,\"signed_at\":1793620811000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "P11_set_after_remove",
+      "note": "project_set \"astation\" with ops [launch] on P10_remove: valid (unlike a device id, a project name may be set again after its project_remove): a new project of that name",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d76310000017a7b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2270726f6a6563745f736574222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22707265765f68617368223a2236646663386161336632636264313839643036666161386461336635643165323365383265613963633830636466343333393266366166663562323836323736222c2270726f6a656374223a7b22686f737473223a5b22686f73742d61222c22686f73742d62225d2c226e616d65223a226173746174696f6e222c226f7073223a5b226c61756e6368225d7d2c22736571223a31312c227369676e65645f6174223a313739333632303831313030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d"
+    },
+    {
+      "chain": [
+        "P7_add_host_b",
+        "P8_set",
+        "P9_narrow"
+      ],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "project_set",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "prev_hash": "4f0f1113b0607374ed8e9a479f2dd91ab1cdf329f936754cb45f19d2aed391f4",
+          "project": {
+            "hosts": [
+              "host-a",
+              "host-b"
+            ],
+            "name": "chisel",
+            "ops": [
+              "launch"
+            ]
+          },
+          "seq": 10,
+          "signed_at": 1793620810000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "WroaWZTPeGcnWKnC7m-nI-VJryI2H_bo8jQu6RqhKBMyDk1aWkEHgl82hVLBzi0jv-zM-JCtVdoPZZCSYRG_Gw"
+      },
+      "entry_hash": "d5485f6089f746d04d5e698c0adc2d42573797f8abe114d81a66a562762b3b7f",
+      "expect": {
+        "host_enc_keys": {},
+        "host_senders": {
+          "host-a": {
+            "membership_epoch": 2,
+            "seq": 2,
+            "state": "authorized"
+          },
+          "host-b": {
+            "membership_epoch": 7,
+            "seq": 7,
+            "state": "authorized"
+          }
+        },
+        "hosts": {
+          "host-a": 1,
+          "host-b": 1
+        },
+        "projects": {
+          "astation": {
+            "hosts": [
+              "host-a",
+              "host-b"
+            ],
+            "members": [
+              "host-a",
+              "host-b"
+            ],
+            "ops": [
+              "message"
+            ]
+          },
+          "chisel": {
+            "hosts": [
+              "host-a",
+              "host-b"
+            ],
+            "members": [
+              "host-a",
+              "host-b"
+            ],
+            "ops": [
+              "launch"
+            ]
+          }
+        }
+      },
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"project_set\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"4f0f1113b0607374ed8e9a479f2dd91ab1cdf329f936754cb45f19d2aed391f4\",\"project\":{\"hosts\":[\"host-a\",\"host-b\"],\"name\":\"chisel\",\"ops\":[\"launch\"]},\"seq\":10,\"signed_at\":1793620810000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "P10_second_project",
+      "note": "project_set \"chisel\" listing host-a and host-b with ops [launch] on P9_narrow (\"astation\": [message]): two projects over the same hosts; between host-a and host-b the grant is the union, launch and message, and each host is a member of both",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000001787b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2270726f6a6563745f736574222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22707265765f68617368223a2234663066313131336230363037333734656438653961343739663264643931616231636466333239663933363735346362343566313964326165643339316634222c2270726f6a656374223a7b22686f737473223a5b22686f73742d61222c22686f73742d62225d2c226e616d65223a2263686973656c222c226f7073223a5b226c61756e6368225d7d2c22736571223a31302c227369676e65645f6174223a313739333632303831303030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d"
+    },
+    {
+      "chain": [],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "host_sender_revoke",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "prev_hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 7,
+          "signed_at": 1793620807000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "bfOpqVIqAHTwv1SJaABgV1Qt9lNxwEzEnkpvYNezJ49WJNs68bnrUB9H24vHfuChvz9XogpB1QoGO78M0HaJ1w"
+      },
+      "entry_hash": "371b8f4be1b64610c1ec4fac56cfb129ae08055c02bc107f161a13281b49360f",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"host_sender_revoke\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"prev_hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":7,\"signed_at\":1793620807000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "HS7_revoke_no_interrupt",
+      "note": "host_sender_revoke host-a on E6 without interrupt_running: invalid (a required boolean, written as false too): malformed",
+      "reason": "malformed",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000001487b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f73745f73656e6465725f7265766f6b65222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22707265765f68617368223a2262656231383436396235383363316161393831623039646138656434363135333865613631373136393364333435663633313035633561623564306165613739222c22736571223a372c227369676e65645f6174223a313739333632303830373030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [
+        "HS7_revoke"
+      ],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "host_sender_readmit",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "interrupt_running": false,
+          "prev_hash": "c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3",
+          "seq": 8,
+          "signed_at": 1793620808000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "z-zDQO57mkIEsgBXaRjMno-jnTTyq9sr5hRh7yemaCd7L1ViHe40EHAN6-eE40iSVwk4jBxb_UTeFSBa66Otug"
+      },
+      "entry_hash": "920d365ad4051df49d61d1fd9b944f7cfaf339594158dd5466a0de343290d78b",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"host_sender_readmit\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"interrupt_running\":false,\"prev_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":8,\"signed_at\":1793620808000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "HS8_readmit_interrupt",
+      "note": "host_sender_readmit host-a on HS7_revoke carrying interrupt_running: false: invalid (a readmit has host_id only): unknown_field",
+      "reason": "unknown_field",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000001637b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f73745f73656e6465725f726561646d6974222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22696e746572727570745f72756e6e696e67223a66616c73652c22707265765f68617368223a2263363761323633383330666138363734306235313566323030636661643131336163353234326134666239323437353361653932663236393565396662316233222c22736571223a382c227369676e65645f6174223a313739333632303830383030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "host_enc_key",
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 0,
+          "prev_hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 7,
+          "signed_at": 1793620807000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "1WOar_dju_VVs2RWZsLmF84YYPfH0UeTYShbaYEpRpljf7U1bjZVZcjuQO1kfzGgOPhp4hQ3NqhUz3VGGS5-Zg"
+      },
+      "entry_hash": "7004b51112086825ec3250984cdee5cac0576e9254a60bed264b0cffd712a729",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"host_enc_key\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA\"},\"enc_sig\":\"Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"host_trust_gen\":0,\"prev_hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":7,\"signed_at\":1793620807000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "EK7_gen_zero",
+      "note": "host_enc_key host-a on E6 with host_trust_gen 0 (EK7_set's key and enc_sig otherwise): invalid (a generation is at least 1): malformed",
+      "reason": "malformed",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000002077b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f73745f656e635f6b6579222c22656e635f6b6579223a7b22616c67223a22783235353139222c22707562223a22566d486750645231596d62674d304f5368726d4735582d66514b6946663855627465755934474e396d6941227d2c22656e635f736967223a224d656d3834616645385f4f4136617a3949686f2d62713358757131562d6b753235666d6646716e42787a4f6636723051486d364d584974583150656563354d583750394e4549484d446e31666c424f543269665a4141222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a302c22707265765f68617368223a2262656231383436396235383363316161393831623039646138656434363135333865613631373136393364333435663633313035633561623564306165613739222c22736571223a372c227369676e65645f6174223a313739333632303830373030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "host_enc_key",
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZ",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "prev_hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 7,
+          "signed_at": 1793620807000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "2SMaNq_zKal-_vtahsiWODjggmcvCu89r8Q-DXpUAzNGLDk5QtmejSHGeWJeGP1ZxQ0U60JmfbJwXpcKcAtfGA"
+      },
+      "entry_hash": "98a1826dbf50b154b7da48276e10fc12e3af15adce57c9e0f4b2a55f2e24d304",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"host_enc_key\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA\"},\"enc_sig\":\"Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZ\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"host_trust_gen\":1,\"prev_hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":7,\"signed_at\":1793620807000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "EK7_short_enc_sig",
+      "note": "host_enc_key host-a on E6 whose enc_sig is 63 bytes (EK7_set's without its last byte): invalid (exactly 64 bytes): malformed",
+      "reason": "malformed",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000002057b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f73745f656e635f6b6579222c22656e635f6b6579223a7b22616c67223a22783235353139222c22707562223a22566d486750645231596d62674d304f5368726d4735582d66514b6946663855627465755934474e396d6941227d2c22656e635f736967223a224d656d3834616645385f4f4136617a3949686f2d62713358757131562d6b753235666d6646716e42787a4f6636723051486d364d584974583150656563354d583750394e4549484d446e31666c424f543269665a222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a312c22707265765f68617368223a2262656231383436396235383363316161393831623039646138656434363135333865613631373136393364333435663633313035633561623564306165613739222c22736571223a372c227369676e65645f6174223a313739333632303830373030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "host_enc_key",
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAAA",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "prev_hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 7,
+          "signed_at": 1793620807000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "V9ZGFVHnwa5GZKQkNKbCPaALOM7_0FwCbvMy9nqnZ4km4XBXpKexxsvM6sjhLuIGGlH4PZMQ4o6eI2AGnHVTCg"
+      },
+      "entry_hash": "8557724ad8e6027504cb21f8452e0d49eaae074465f3c32cacb40742b540504a",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"host_enc_key\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA\"},\"enc_sig\":\"Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAAA\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"host_trust_gen\":1,\"prev_hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":7,\"signed_at\":1793620807000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "EK7_long_enc_sig",
+      "note": "host_enc_key host-a on E6 whose enc_sig is 65 bytes (EK7_set's and a zero byte): invalid (exactly 64 bytes): malformed",
+      "reason": "malformed",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000002087b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f73745f656e635f6b6579222c22656e635f6b6579223a7b22616c67223a22783235353139222c22707562223a22566d486750645231596d62674d304f5368726d4735582d66514b6946663855627465755934474e396d6941227d2c22656e635f736967223a224d656d3834616645385f4f4136617a3949686f2d62713358757131562d6b753235666d6646716e42787a4f6636723051486d364d584974583150656563354d583750394e4549484d446e31666c424f543269665a414141222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a312c22707265765f68617368223a2262656231383436396235383363316161393831623039646138656434363135333865613631373136393364333435663633313035633561623564306165613739222c22736571223a372c227369676e65645f6174223a313739333632303830373030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "host_enc_key",
+          "enc_key": {
+            "alg": "ed25519",
+            "pub": "ma83XDqxm6EF2qRk7IN4a9VFv5TX8wRPAdlUZYziNY4"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "prev_hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 7,
+          "signed_at": 1793620807000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "6goom764M5PzT3MebpAXMDiWb_SmNhqQbJ1_-pY5J_MKgG28Gq0ASse7JWvw4RBQqOP2-sJ_PT-oEg46EwP4lA"
+      },
+      "entry_hash": "45d5e1a794b9138c492e1810fddbc913d2b56a6a63f4b5f4202bc4b470769273",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"host_enc_key\",\"enc_key\":{\"alg\":\"ed25519\",\"pub\":\"ma83XDqxm6EF2qRk7IN4a9VFv5TX8wRPAdlUZYziNY4\"},\"enc_sig\":\"Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"host_trust_gen\":1,\"prev_hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":7,\"signed_at\":1793620807000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "EK7_ed25519_enc_key",
+      "note": "host_enc_key host-a on E6 whose enc_key is host-a's own Ed25519 host_key (alg ed25519): invalid (an encryption key is x25519 only): wrong_alg",
+      "reason": "wrong_alg",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000002087b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f73745f656e635f6b6579222c22656e635f6b6579223a7b22616c67223a2265643235353139222c22707562223a226d613833584471786d3645463271526b37494e3461395646763554583877525041646c555a597a694e5934227d2c22656e635f736967223a224d656d3834616645385f4f4136617a3949686f2d62713358757131562d6b753235666d6646716e42787a4f6636723051486d364d584974583150656563354d583750394e4549484d446e31666c424f543269665a4141222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a312c22707265765f68617368223a2262656231383436396235383363316161393831623039646138656434363135333865613631373136393364333435663633313035633561623564306165613739222c22736571223a372c227369676e65645f6174223a313739333632303830373030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [
+        "P7_add_host_b",
+        "P8_set"
+      ],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "project_set",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "prev_hash": "fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae",
+          "project": {
+            "hosts": [
+              "host-a",
+              "host-b"
+            ],
+            "name": "astation",
+            "note": "x",
+            "ops": [
+              "message"
+            ]
+          },
+          "seq": 9,
+          "signed_at": 1793620809000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "acXCwPGLlUD0ICsrCLDlqhomSDEEKI2GBJbzy5EV0sYs5wgsBb6aGVkIaE-rm2x7Ji706jhi4K4sAF2h3Y9zbw"
+      },
+      "entry_hash": "a60ae3f9632fb0023c02fbc9465c50663e8918fdd225203ca2a3fb5c7b81f5d6",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"project_set\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae\",\"project\":{\"hosts\":[\"host-a\",\"host-b\"],\"name\":\"astation\",\"note\":\"x\",\"ops\":[\"message\"]},\"seq\":9,\"signed_at\":1793620809000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "P9_unknown_field",
+      "note": "project_set \"astation\" on P8_set whose project carries a fourth field, note: invalid (exactly name, hosts and ops): unknown_field",
+      "reason": "unknown_field",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000001857b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2270726f6a6563745f736574222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22707265765f68617368223a2266653532313462396431343366633137383966623031366234323431353334386262313433363963373562303266653735363831356262636461373066326165222c2270726f6a656374223a7b22686f737473223a5b22686f73742d61222c22686f73742d62225d2c226e616d65223a226173746174696f6e222c226e6f7465223a2278222c226f7073223a5b226d657373616765225d7d2c22736571223a392c227369676e65645f6174223a313739333632303830393030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [
+        "P7_add_host_b",
+        "P8_set"
+      ],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "project_set",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "prev_hash": "fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae",
+          "project": {
+            "hosts": [
+              "host-b",
+              "host-a"
+            ],
+            "name": "astation",
+            "ops": [
+              "message"
+            ]
+          },
+          "seq": 9,
+          "signed_at": 1793620809000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "4WFATMW7Wwasddc2OKo5G7t1D9pn7B6Bky1ocYqKGHpCQe-HX1IlnP5_4nle-f1jxa5Bkh6gBviiIucVMPTvwA"
+      },
+      "entry_hash": "3bf6054c39461e37a96a53c63c942ee114b89e2f5928e583a0d03fd7c68415e0",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"project_set\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae\",\"project\":{\"hosts\":[\"host-b\",\"host-a\"],\"name\":\"astation\",\"ops\":[\"message\"]},\"seq\":9,\"signed_at\":1793620809000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "P9_hosts_unsorted",
+      "note": "project_set \"astation\" on P8_set listing [host-b, host-a]: invalid (project.hosts is a set, sorted by bytes with no duplicates, refused by the signed-object parse before the action's own rules): array_not_canonical",
+      "reason": "array_not_canonical",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d76310000017a7b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2270726f6a6563745f736574222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22707265765f68617368223a2266653532313462396431343366633137383966623031366234323431353334386262313433363963373562303266653735363831356262636461373066326165222c2270726f6a656374223a7b22686f737473223a5b22686f73742d62222c22686f73742d61225d2c226e616d65223a226173746174696f6e222c226f7073223a5b226d657373616765225d7d2c22736571223a392c227369676e65645f6174223a313739333632303830393030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [
+        "P7_add_host_b",
+        "P8_set"
+      ],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "project_set",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "prev_hash": "fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae",
+          "project": {
+            "hosts": [
+              "host-a",
+              "host-a",
+              "host-b"
+            ],
+            "name": "astation",
+            "ops": [
+              "message"
+            ]
+          },
+          "seq": 9,
+          "signed_at": 1793620809000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "PEdY4hASJd0RLKUBXisZtvtxr93FdJBcJ9dM7UG0eUBIzOgFPLXybjrvgW3NBKLVToDng7W-1JQiRBPesVfgkQ"
+      },
+      "entry_hash": "24cd951a55ecb2631d9b2848f83dae8d961a83a8f7de39f1898a23e14fb33d88",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"project_set\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae\",\"project\":{\"hosts\":[\"host-a\",\"host-a\",\"host-b\"],\"name\":\"astation\",\"ops\":[\"message\"]},\"seq\":9,\"signed_at\":1793620809000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "P9_hosts_duplicate",
+      "note": "project_set \"astation\" on P8_set listing [host-a, host-a, host-b]: invalid (a set has no duplicates): array_not_canonical",
+      "reason": "array_not_canonical",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000001837b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2270726f6a6563745f736574222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22707265765f68617368223a2266653532313462396431343366633137383966623031366234323431353334386262313433363963373562303266653735363831356262636461373066326165222c2270726f6a656374223a7b22686f737473223a5b22686f73742d61222c22686f73742d61222c22686f73742d62225d2c226e616d65223a226173746174696f6e222c226f7073223a5b226d657373616765225d7d2c22736571223a392c227369676e65645f6174223a313739333632303830393030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [
+        "P7_add_host_b",
+        "P8_set"
+      ],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "project_set",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "prev_hash": "fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae",
+          "project": {
+            "hosts": [
+              "host-a",
+              "host-b"
+            ],
+            "name": "astation",
+            "ops": []
+          },
+          "seq": 9,
+          "signed_at": 1793620809000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "0DUtAOl6llF4ICHVy2fOQmmoxwytzIrhZo5ocRSELykbmTctuoa6w6P9G_1crNc-LWodXHpXYaDs20YirsQ2Nw"
+      },
+      "entry_hash": "974d6eac0bb376427f1843c894139bcfd6aea9d96edb0c9f3208a4e6b1c5407e",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"project_set\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae\",\"project\":{\"hosts\":[\"host-a\",\"host-b\"],\"name\":\"astation\",\"ops\":[]},\"seq\":9,\"signed_at\":1793620809000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "P9_empty_ops",
+      "note": "project_set \"astation\" on P8_set with ops []: invalid (an empty array is a canonical set, and the project's rule wants a non-empty one): bad_project",
+      "reason": "bad_project",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000001717b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2270726f6a6563745f736574222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22707265765f68617368223a2266653532313462396431343366633137383966623031366234323431353334386262313433363963373562303266653735363831356262636461373066326165222c2270726f6a656374223a7b22686f737473223a5b22686f73742d61222c22686f73742d62225d2c226e616d65223a226173746174696f6e222c226f7073223a5b5d7d2c22736571223a392c227369676e65645f6174223a313739333632303830393030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [
+        "P7_add_host_b",
+        "P8_set"
+      ],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "project_set",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "prev_hash": "fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae",
+          "project": {
+            "hosts": [
+              "h-00",
+              "h-01",
+              "h-02",
+              "h-03",
+              "h-04",
+              "h-05",
+              "h-06",
+              "h-07",
+              "h-08",
+              "h-09",
+              "h-10",
+              "h-11",
+              "h-12",
+              "h-13",
+              "h-14",
+              "h-15",
+              "h-16",
+              "h-17",
+              "h-18",
+              "h-19",
+              "h-20",
+              "h-21",
+              "h-22",
+              "h-23",
+              "h-24",
+              "h-25",
+              "h-26",
+              "h-27",
+              "h-28",
+              "h-29",
+              "h-30",
+              "h-31",
+              "h-32",
+              "h-33",
+              "h-34",
+              "h-35",
+              "h-36",
+              "h-37",
+              "h-38",
+              "h-39",
+              "h-40",
+              "h-41",
+              "h-42",
+              "h-43",
+              "h-44",
+              "h-45",
+              "h-46",
+              "h-47",
+              "h-48",
+              "h-49",
+              "h-50",
+              "h-51",
+              "h-52",
+              "h-53",
+              "h-54",
+              "h-55",
+              "h-56",
+              "h-57",
+              "h-58",
+              "h-59",
+              "h-60",
+              "h-61",
+              "h-62",
+              "h-63"
+            ],
+            "name": "astation",
+            "ops": [
+              "message"
+            ]
+          },
+          "seq": 9,
+          "signed_at": 1793620809000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "oaCkmWfbwv9CvgAUmGkB-PL3YvLocLfXTqbX3wCz9BVu2HsE1foQf5YRdFeCuaHM7nX08He9FOLNWIm-qabUhA"
+      },
+      "entry_hash": "6ba7b63c9579b443a68a369663057d38d69075a00c8b99c40fb2565ee0e94e6b",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"project_set\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae\",\"project\":{\"hosts\":[\"h-00\",\"h-01\",\"h-02\",\"h-03\",\"h-04\",\"h-05\",\"h-06\",\"h-07\",\"h-08\",\"h-09\",\"h-10\",\"h-11\",\"h-12\",\"h-13\",\"h-14\",\"h-15\",\"h-16\",\"h-17\",\"h-18\",\"h-19\",\"h-20\",\"h-21\",\"h-22\",\"h-23\",\"h-24\",\"h-25\",\"h-26\",\"h-27\",\"h-28\",\"h-29\",\"h-30\",\"h-31\",\"h-32\",\"h-33\",\"h-34\",\"h-35\",\"h-36\",\"h-37\",\"h-38\",\"h-39\",\"h-40\",\"h-41\",\"h-42\",\"h-43\",\"h-44\",\"h-45\",\"h-46\",\"h-47\",\"h-48\",\"h-49\",\"h-50\",\"h-51\",\"h-52\",\"h-53\",\"h-54\",\"h-55\",\"h-56\",\"h-57\",\"h-58\",\"h-59\",\"h-60\",\"h-61\",\"h-62\",\"h-63\"],\"name\":\"astation\",\"ops\":[\"message\"]},\"seq\":9,\"signed_at\":1793620809000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "P9_64_hosts",
+      "note": "project_set \"astation\" on P8_set listing the 64 hosts h-00 to h-63, none of them added: within the bound of 2 to 64, so judged against the chain: not_a_host",
+      "reason": "not_a_host",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000003287b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2270726f6a6563745f736574222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22707265765f68617368223a2266653532313462396431343366633137383966623031366234323431353334386262313433363963373562303266653735363831356262636461373066326165222c2270726f6a656374223a7b22686f737473223a5b22682d3030222c22682d3031222c22682d3032222c22682d3033222c22682d3034222c22682d3035222c22682d3036222c22682d3037222c22682d3038222c22682d3039222c22682d3130222c22682d3131222c22682d3132222c22682d3133222c22682d3134222c22682d3135222c22682d3136222c22682d3137222c22682d3138222c22682d3139222c22682d3230222c22682d3231222c22682d3232222c22682d3233222c22682d3234222c22682d3235222c22682d3236222c22682d3237222c22682d3238222c22682d3239222c22682d3330222c22682d3331222c22682d3332222c22682d3333222c22682d3334222c22682d3335222c22682d3336222c22682d3337222c22682d3338222c22682d3339222c22682d3430222c22682d3431222c22682d3432222c22682d3433222c22682d3434222c22682d3435222c22682d3436222c22682d3437222c22682d3438222c22682d3439222c22682d3530222c22682d3531222c22682d3532222c22682d3533222c22682d3534222c22682d3535222c22682d3536222c22682d3537222c22682d3538222c22682d3539222c22682d3630222c22682d3631222c22682d3632222c22682d3633225d2c226e616d65223a226173746174696f6e222c226f7073223a5b226d657373616765225d7d2c22736571223a392c227369676e65645f6174223a313739333632303830393030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [
+        "P7_add_host_b",
+        "P8_set"
+      ],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "project_set",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "prev_hash": "fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae",
+          "project": {
+            "hosts": [
+              "h-00",
+              "h-01",
+              "h-02",
+              "h-03",
+              "h-04",
+              "h-05",
+              "h-06",
+              "h-07",
+              "h-08",
+              "h-09",
+              "h-10",
+              "h-11",
+              "h-12",
+              "h-13",
+              "h-14",
+              "h-15",
+              "h-16",
+              "h-17",
+              "h-18",
+              "h-19",
+              "h-20",
+              "h-21",
+              "h-22",
+              "h-23",
+              "h-24",
+              "h-25",
+              "h-26",
+              "h-27",
+              "h-28",
+              "h-29",
+              "h-30",
+              "h-31",
+              "h-32",
+              "h-33",
+              "h-34",
+              "h-35",
+              "h-36",
+              "h-37",
+              "h-38",
+              "h-39",
+              "h-40",
+              "h-41",
+              "h-42",
+              "h-43",
+              "h-44",
+              "h-45",
+              "h-46",
+              "h-47",
+              "h-48",
+              "h-49",
+              "h-50",
+              "h-51",
+              "h-52",
+              "h-53",
+              "h-54",
+              "h-55",
+              "h-56",
+              "h-57",
+              "h-58",
+              "h-59",
+              "h-60",
+              "h-61",
+              "h-62",
+              "h-63",
+              "h-64"
+            ],
+            "name": "astation",
+            "ops": [
+              "message"
+            ]
+          },
+          "seq": 9,
+          "signed_at": 1793620809000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "2Ve03S55HidNqTCFdWl5TPQO1Lt-0F8efvkDQ4jVgBQJrdNSOTWpYMb6Wt_TsEMr3btb7QyRe410Igb61Yk9RA"
+      },
+      "entry_hash": "8a55acf4c7f42211d8de752da14067b9e1d82699cdb3e12ef4f366eda79c571e",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"project_set\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae\",\"project\":{\"hosts\":[\"h-00\",\"h-01\",\"h-02\",\"h-03\",\"h-04\",\"h-05\",\"h-06\",\"h-07\",\"h-08\",\"h-09\",\"h-10\",\"h-11\",\"h-12\",\"h-13\",\"h-14\",\"h-15\",\"h-16\",\"h-17\",\"h-18\",\"h-19\",\"h-20\",\"h-21\",\"h-22\",\"h-23\",\"h-24\",\"h-25\",\"h-26\",\"h-27\",\"h-28\",\"h-29\",\"h-30\",\"h-31\",\"h-32\",\"h-33\",\"h-34\",\"h-35\",\"h-36\",\"h-37\",\"h-38\",\"h-39\",\"h-40\",\"h-41\",\"h-42\",\"h-43\",\"h-44\",\"h-45\",\"h-46\",\"h-47\",\"h-48\",\"h-49\",\"h-50\",\"h-51\",\"h-52\",\"h-53\",\"h-54\",\"h-55\",\"h-56\",\"h-57\",\"h-58\",\"h-59\",\"h-60\",\"h-61\",\"h-62\",\"h-63\",\"h-64\"],\"name\":\"astation\",\"ops\":[\"message\"]},\"seq\":9,\"signed_at\":1793620809000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "P9_65_hosts",
+      "note": "project_set \"astation\" on P8_set listing the 65 hosts h-00 to h-64: invalid (2 to 64 hosts, judged at parse, before whether they are current): bad_project",
+      "reason": "bad_project",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d76310000032f7b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2270726f6a6563745f736574222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22707265765f68617368223a2266653532313462396431343366633137383966623031366234323431353334386262313433363963373562303266653735363831356262636461373066326165222c2270726f6a656374223a7b22686f737473223a5b22682d3030222c22682d3031222c22682d3032222c22682d3033222c22682d3034222c22682d3035222c22682d3036222c22682d3037222c22682d3038222c22682d3039222c22682d3130222c22682d3131222c22682d3132222c22682d3133222c22682d3134222c22682d3135222c22682d3136222c22682d3137222c22682d3138222c22682d3139222c22682d3230222c22682d3231222c22682d3232222c22682d3233222c22682d3234222c22682d3235222c22682d3236222c22682d3237222c22682d3238222c22682d3239222c22682d3330222c22682d3331222c22682d3332222c22682d3333222c22682d3334222c22682d3335222c22682d3336222c22682d3337222c22682d3338222c22682d3339222c22682d3430222c22682d3431222c22682d3432222c22682d3433222c22682d3434222c22682d3435222c22682d3436222c22682d3437222c22682d3438222c22682d3439222c22682d3530222c22682d3531222c22682d3532222c22682d3533222c22682d3534222c22682d3535222c22682d3536222c22682d3537222c22682d3538222c22682d3539222c22682d3630222c22682d3631222c22682d3632222c22682d3633222c22682d3634225d2c226e616d65223a226173746174696f6e222c226f7073223a5b226d657373616765225d7d2c22736571223a392c227369676e65645f6174223a313739333632303830393030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [
+        "P7_add_host_b",
+        "P8_set"
+      ],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "project_remove",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "name": "Astation",
+          "prev_hash": "fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae",
+          "seq": 9,
+          "signed_at": 1793620809000,
+          "signer": "dev-mac",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "hpo94N8ANTINIqIiysBYQyr0xkQGxy3N_NX5UkXDVIMWn7rpt978nHofkFN5CkVCDRgOXudW8bUuMFb-1PMwHw"
+      },
+      "entry_hash": "3fbd156450047e7d58db259f5df494066318e702e40822f059dd05755f0a1b5b",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"project_remove\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"name\":\"Astation\",\"prev_hash\":\"fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae\",\"seq\":9,\"signed_at\":1793620809000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "P9_remove_bad_name",
+      "note": "project_remove \"Astation\" on P8_set (\"astation\" is in effect): invalid (a name outside [a-z0-9-], refused at parse before whether a project of that name is in effect): bad_project",
+      "reason": "bad_project",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000001437b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2270726f6a6563745f72656d6f7665222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226e616d65223a224173746174696f6e222c22707265765f68617368223a2266653532313462396431343366633137383966623031366234323431353334386262313433363963373562303266653735363831356262636461373066326165222c22736571223a392c227369676e65645f6174223a313739333632303830393030302c227369676e6572223a226465762d6d6163222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "host_sender_revoke",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "interrupt_running": false,
+          "prev_hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 7,
+          "signed_at": 1793620807000,
+          "signer": "svc-discord",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "g3ev2gSA99LE0-tWloeLD_ghQ23_8_dfa0JWOtDodZQvs_OTRILqey-Z8vggqlhDQtvm4yowJ1sJtlNNgbRPBw"
+      },
+      "entry_hash": "9e221fd16373c021cb98ac74804e5e1907b232da8388cc45613bfc47eac084d6",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"host_sender_revoke\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-a\",\"interrupt_running\":false,\"prev_hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":7,\"signed_at\":1793620807000,\"signer\":\"svc-discord\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "HS7_revoke_by_service",
+      "note": "host_sender_revoke host-a on E6 signed by svc-discord, a service member in effect: invalid (only a native manager signs these actions): signer_not_manager",
+      "reason": "signer_not_manager",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d7631000001667b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f73745f73656e6465725f7265766f6b65222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22696e746572727570745f72756e6e696e67223a66616c73652c22707265765f68617368223a2262656231383436396235383363316161393831623039646138656434363135333865613631373136393364333435663633313035633561623564306165613739222c22736571223a372c227369676e65645f6174223a313739333632303830373030302c227369676e6572223a227376632d646973636f7264222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
+      "valid": false
+    },
+    {
+      "chain": [
+        "P7_add_host_b",
+        "P8_set"
+      ],
+      "entry": {
+        "body": {
+          "account_id": "acct-test-1",
+          "action": "project_set",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "prev_hash": "fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae",
+          "project": {
+            "hosts": [
+              "host-a",
+              "host-b"
+            ],
+            "name": "astation",
+            "ops": [
+              "message"
+            ]
+          },
+          "seq": 9,
+          "signed_at": 1793620809000,
+          "signer": "recovery",
+          "type": "atem-membership-entry",
+          "v": 1
+        },
+        "sig": "WnKhFJxE8UWzw6S4ABOzkFVzJXyr8FwjXQlPezUKZ7Sl4FKdiKCKuqy12CBKyNebV7KAWIxa1_Ywtja0iW0RDQ"
+      },
+      "entry_hash": "bb22e383f10b6b3311572f83eb6ac0eedbebac9eba61872b87d8f73c678d3887",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"action\":\"project_set\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"fe5214b9d143fc1789fb016b42415348bb14369c75b02fe756815bbcda70f2ae\",\"project\":{\"hosts\":[\"host-a\",\"host-b\"],\"name\":\"astation\",\"ops\":[\"message\"]},\"seq\":9,\"signed_at\":1793620809000,\"signer\":\"recovery\",\"type\":\"atem-membership-entry\",\"v\":1}",
+      "label": "P9_set_by_recovery",
+      "note": "project_set \"astation\" on P8_set signed by the recovery key (kit 1): invalid (the recovery key signs recovery_add only): recovery_signer_action",
+      "reason": "recovery_signer_action",
+      "signing_input_hex": "000000186174656d2d6d656d626572736869702d656e7472792d76310000017b7b226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2270726f6a6563745f736574222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22707265765f68617368223a2266653532313462396431343366633137383966623031366234323431353334386262313433363963373562303266653735363831356262636461373066326165222c2270726f6a656374223a7b22686f737473223a5b22686f73742d61222c22686f73742d62225d2c226e616d65223a226173746174696f6e222c226f7073223a5b226d657373616765225d7d2c22736571223a392c227369676e65645f6174223a313739333632303830393030302c227369676e6572223a227265636f76657279222c2274797065223a226174656d2d6d656d626572736869702d656e747279222c2276223a317d",
       "valid": false
     }
   ],

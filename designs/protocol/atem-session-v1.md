@@ -1963,9 +1963,16 @@ II.2.2, II.3.1, II.4.1) adds the five actions `project_set`,
 `host_enc_key`. The shared core's verifier (`atem_client::membership`)
 and Atem's host accept them today; Atem never signs one. A strict
 verifier that doesn't know an action refuses the whole chain at that
-entry (`membership_invalid`, detail `malformed`, "unknown action"), so
-no later entry reaches it, revocations included. Astation therefore
-signs none until every strict verifier of the account knows them (Atem
+entry (`membership_invalid`), so no later entry reaches it, revocations
+included. Which detail it names follows the order of its checks: in
+Atem's verifiers without these actions (the shared core before them),
+every signed object's arrays are checked against the table of known
+array paths before the action is read, so a `project_set`, whose
+`project.hosts` and `project.ops` are at paths that table doesn't know,
+is `array_not_canonical`; the other four carry no array and are
+`malformed` ("unknown action"). Another implementation may name another
+detail; the refusal at that entry is what the gate is about. Astation
+therefore signs none until every strict verifier of the account knows them (Atem
 hosts, Station replicas, native controllers and other SDK consumers),
 starting with an enumerated test account; an unknown, offline or
 unconfirmed verifier keeps signing off, removing an obsolete verifier is
@@ -1989,7 +1996,13 @@ three fields:
   requires for `agent.notify`).
 - A name, host count, host id or op outside these rules is
   `bad_project`; another field in `project` is `unknown_field`; a
-  missing or mistyped one `malformed`.
+  missing one, or one of another JSON type, `malformed` (`hosts` or `ops`
+  that isn't an array included). Inside the two sets it is the set rule
+  that speaks: an element of `hosts` or `ops` that isn't a string, like a
+  list not sorted by bytes or holding a duplicate, is
+  `array_not_canonical`, from the check every signed object gets before
+  its action's rules ("Arrays", above). An empty `ops` is a canonical set,
+  so it is `bad_project`.
 - The body is the project's whole new state: it replaces any project of
   that name (narrowing included). The same state may be set again as a
   new entry; that is how a re-added host comes back.
@@ -2006,9 +2019,12 @@ three fields:
 
 `project_remove{name}` needs a project **in effect** with that name:
 set and not removed since. Otherwise it is `not_a_project` (a name
-outside the grammar `bad_project`). A project whose hosts all left
+outside the grammar `bad_project`, judged at parse before whether a
+project of that name is in effect). A project whose hosts all left
 through `remove_host` is still in effect: it grants nothing, and it may
-be removed.
+be removed. A name may be set again after its `project_remove`, unlike a
+`device_id` (never reused): the new `project_set` is a new project of
+that name.
 
 A host is a **member** of a project while the project's latest
 `project_set` lists it and no `remove_host` of the host follows that
@@ -2040,6 +2056,9 @@ is its authorization generation:
 - The **membership epoch** of a host: the `seq` of its first `add_host`
   after its last `remove_host` (its first `add_host` if it was never
   removed); none while it is removed.
+- The sending state is apart from the rest: a revoked host may be listed
+  by a `project_set` and get a `host_enc_key`, and a removed host may be
+  revoked and readmitted (it sends nothing until it is current again).
 
 Key changes never change authorization. What each entry about a host H
 does to what a verifier derives:
@@ -2079,23 +2098,33 @@ order:
    with `genesis_hash` as its 32 raw bytes (R9.1). One that doesn't
    verify is `bad_enc_sig`, kept apart from the entry's own
    `bad_signature`.
-4. `enc_key` isn't the host's **current** key at `seq-1`, else
-   `same_enc_key`: setting it again would make the previous key the live
-   one (the same `enc_kid`), and `retire_previous` would retire it.
-   Every pairing and `atem pair verify` makes a new key, so nothing
-   legitimate sets the current one again. A key that is only the
-   previous one, or one a newer `add_host` voided, is a new key.
+4. `enc_key` is no key a `host_enc_key` set for that host since its
+   newest `add_host` (the current key at `seq-1`, the previous one, a
+   retired one or one no longer kept), else `enc_key_reused`. The `enc_sig`
+   binding proves the host vouched for the key in this generation, not
+   that it is the host's newest, and every entry body is public: anyone
+   holding the log holds a valid `{enc_pub, enc_sig}` for each earlier
+   key. Refusing reuse keeps a retired key retired (and setting the
+   current key again would make the previous key the live one). Keys are
+   compared as the 32 bytes written: another encoding of the same X25519
+   point needs its own `enc_sig` from the host. Across generations a
+   replay is already refused by rule 2: `enc_sig` names
+   `host_trust_gen`, so a key of an earlier generation comes back only if
+   the host vouches for it again with the new `host_key`, as a new key
+   (the set is empty after each `add_host`). Every pairing and `atem pair
+   verify` makes a new key, so nothing legitimate sets one again.
 
 `retire_previous` has one form: absent (false) or `true`. Present as
 `false`, or as anything but `true`, it is `malformed`, so each meaning
 has one `entry_hash` (unlike `interrupt_running`, which is always
 written). The valid entry's key becomes the host's current key, and the
 key it replaces (one, if any) the **previous** key, which drops any
-older one: retired at once when the entry carries `retire_previous:
-true` (a suspected compromise), otherwise kept by the receiving host for
-24 h on its own clock from when it applied the entry (the host's rule,
-not the verifier's). `retire_previous: true` with no previous key is
-valid and retires nothing. A newer `add_host` of the host and its
+older one (dropped, yet still never set again, rule 4): retired at once
+when the entry carries `retire_previous: true` (a suspected compromise),
+otherwise kept by the receiving host for 24 h on its own clock from when
+it applied the entry (the host's rule, not the verifier's).
+`retire_previous: true` with no previous key is valid and retires
+nothing. A newer `add_host` of the host and its
 `remove_host` void both keys; an entry for the new generation starts
 with no previous key. The key id is R9.9's `enc_kid`.
 
@@ -2118,7 +2147,9 @@ as `invalid` evidence, no freeze).
 *Signers.* `check_change` never paces these actions (only the full log
 refuses them) and refuses to draft a revoke of a host already revoked
 (`already_revoked`) or a readmit of a host that isn't revoked
-(`not_revoked`), so two managers acting at once see "already done". The
+(`not_revoked`), so two managers acting at once see "already done", and
+a `host_enc_key` of a key already set for that host since its newest
+`add_host` (`enc_key_reused`: two managers handed the same key). The
 typed builders (`project_set`, `project_remove`, `host_sender_revoke`,
 `host_sender_readmit`, `host_enc_key`) produce exactly the verifier's
 forms: canonical sets, never an added op, `retire_previous` omitted when
@@ -2127,7 +2158,7 @@ false.
 Details of `membership_invalid` for these actions: `bad_project`,
 `not_a_project`, `not_a_host` (`project_set`, `host_enc_key`, as for
 `remove_host`), `unknown_host`, `already_revoked`, `not_revoked`,
-`host_trust_gen_not_current`, `bad_enc_sig` and `same_enc_key`; shape
+`host_trust_gen_not_current`, `bad_enc_sig` and `enc_key_reused`; shape
 errors as for every action (`malformed`, `unknown_field`, `wrong_alg`,
 `bad_key`, `array_not_canonical`, `too_large`).
 
@@ -3882,7 +3913,10 @@ host encryption keys (`EK7_set`, `EK8_rotate` without and
 `EK8_reverify_a` voiding them, `EK9_set_gen_2`; `EK8_remove_host_a`
 voiding them by a removal, `EK9_readd_a` carrying none over and
 `EK10_set_after_readd` setting the voided key again as a new one;
-refused: `EK8_same_key` `same_enc_key`, `EK8_bad_enc_sig`
+refused: `EK8_same_key` (the current key), `EK9_previous_again` (the
+previous key), `EK10_retired_again` (a retired key) and
+`EK10_dropped_again` (a key no longer kept) `enc_key_reused`, each
+with the `enc_sig` its first entry carried, `EK8_bad_enc_sig`
 `bad_enc_sig`, `EK8_retire_false` `malformed`, `EK9_stale_gen`
 `host_trust_gen_not_current`, `EK7_not_a_host` (never added) and
 `EK9_removed_host` (removed) `not_a_host`) and host
@@ -3892,15 +3926,36 @@ removed and added again, `HS8_reverify_a`, `HS9_remove_host_a`,
 a removed host revoked, `HS7_remove_host_a`, `HS8_revoke_removed`;
 refused: `HS8_revoke_again` `already_revoked`,
 `HS7_readmit_authorized` and `HS7_readmit_unknown` `not_revoked`,
-`HS7_revoke_unknown` `unknown_host`), with the test keys they add to
-`r9-vectors-keys`. The independent check is
+`HS7_revoke_unknown` `unknown_host`). Beside them, the readings a
+verifier written from this text could get wrong: valid, a removed and
+revoked host readmitted (`HS9_readmit_removed`), a revoked host listed
+by a project (`P8_revoke_a`, `P9_set_revoked`) and given a key
+(`HS8_enc_key_revoked`), a project name set again after its removal
+(`P11_set_after_remove`), two projects over the same hosts, their ops a
+union (`P10_second_project`); refused, `HS7_revoke_no_interrupt`
+(`interrupt_running` missing) and `EK7_gen_zero` (`host_trust_gen` 0),
+`EK7_short_enc_sig` and `EK7_long_enc_sig` (an `enc_sig` of 63 and 65
+bytes) `malformed`, `EK7_ed25519_enc_key` `wrong_alg`,
+`HS8_readmit_interrupt` (`interrupt_running` on a readmit) and
+`P9_unknown_field` (a fourth field in `project`) `unknown_field`,
+`P9_hosts_unsorted` and `P9_hosts_duplicate` `array_not_canonical` (the
+signed-object parse refuses them before the action is read),
+`P9_empty_ops`, `P9_65_hosts` and `P9_remove_bad_name` `bad_project`,
+`P9_64_hosts` `not_a_host` (64 hosts are within the bound, so the chain
+judges them), `HS7_revoke_by_service` `signer_not_manager` and
+`P9_set_by_recovery` `recovery_signer_action`. With them come the test
+keys they add to `r9-vectors-keys`. The independent check is
 `scripts/check-r9-vectors.py` (Python, the `cryptography` package only;
 `python3 -I scripts/check-r9-vectors.py designs/protocol/fixtures`):
-today it recomputes every value of `r9-vectors-keys` and
-`r9-vectors-membership-log` (canonical JSON, `enc`, entry hashes, key
-derivations, every Ed25519 and low-S P-256 signature, `kit_sig` and
-`enc_sig`) and exits non-zero on a mismatch; it grows a checker per
-file. Scenarios
+today it recomputes and verifies every cryptographic value of
+`r9-vectors-keys` and `r9-vectors-membership-log` (canonical JSON,
+`enc`, entry hashes, key derivations and `enc_kid`s, every Ed25519 and
+low-S P-256 signature by the key its chain names, `kit_sig` and each
+`enc_sig` whose binding fields parse) and the arrays' canonical forms,
+and exits non-zero on a mismatch; it grows a checker per file. It
+derives no verdict: `expect` and each refusal's `reason` are checked by
+the Rust runner (`crates/atem-client/tests/vectors.rs`) and the binding
+conformance suites. Scenarios
 (`kind: "scenario"`): chain (`valid-suffix`, `rollback`,
 `removed-signer-conflict`, `current-manager-conflict`, `unknown-carrier`,
 `honest-concurrent-appends`, `relay-cas-failure`, `signature-retry`,

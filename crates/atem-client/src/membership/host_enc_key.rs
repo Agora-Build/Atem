@@ -11,14 +11,23 @@
 //!   `enc(["atem-host-enc-key-v1", account_id, genesis_hash, host_id,
 //!   u64(host_trust_gen), enc_pub])`, with `genesis_hash` as its 32 raw bytes
 //!   (§R9.1: hashes inside `enc` are raw). The manager gets `{enc_pub,
-//!   enc_sig}` from the host over its channel; the binding verifies on its
-//!   own, so the carrier needs no trust.
+//!   enc_sig}` from the host over its channel. The binding proves the host
+//!   vouched for this key in this generation; it doesn't prove the key is
+//!   the host's newest. Every entry body is public, so anyone holding the
+//!   log holds a valid pair for each key the host had: the reuse rule
+//!   below keeps those from coming back, and a carrier can offer only a
+//!   key the host vouched for in this generation and that was never set.
 //! - **Valid** when the host is current, `host_trust_gen` is its newest
 //!   `add_host`'s (else `host_trust_gen_not_current`), `enc_sig` verifies
 //!   with that `add_host`'s `host_key` (else `bad_enc_sig`), and `enc_key`
-//!   isn't the host's current key (else `same_enc_key`: its previous key
-//!   would be the live one, same kid, and `retire_previous` would retire
-//!   it). The entry itself is signed by a native manager like every entry.
+//!   (its 32 bytes as written) is no key a `host_enc_key` set for the host
+//!   since that `add_host`: not the current key, the previous one, a
+//!   retired one or one no longer kept (else `enc_key_reused`). A retired
+//!   key stays retired. A key of an earlier generation can't come back
+//!   with its old `enc_sig` either: the binding names that generation
+//!   (`host_trust_gen_not_current`); only the host, vouching again with the
+//!   new `host_key`, makes it a key of the new generation. The entry
+//!   itself is signed by a native manager like every entry.
 //! - **Rotation.** A newer entry for the same generation replaces the key
 //!   and keeps the one it replaced as the previous key (one only); with
 //!   `retire_previous` (after a suspected compromise) the previous key is
@@ -32,7 +41,7 @@
 //! The key's id is R9.9's `enc_kid` ([`crate::keys::enc_kid`]). Atem never
 //! signs these entries. Astation signs them only once every strict verifier
 //! of the account knows them (the signing gate, II.2.2).
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain::{SignLabel, SigningInput};
 use crate::encoding::{Hash32, u64_field};
@@ -93,6 +102,11 @@ pub struct HostEncKeys {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct EncKeys {
     by_host: BTreeMap<String, HostEncKeys>,
+    /// The 32 bytes (as written) of every key a `host_enc_key` set for the
+    /// host since its newest `add_host`: current, previous, retired or no
+    /// longer kept. None is set again (`enc_key_reused`). A set, so replay
+    /// in entry order always derives the same one.
+    set_since_add: BTreeMap<String, BTreeSet<Vec<u8>>>,
 }
 
 impl EncKeys {
@@ -118,24 +132,38 @@ impl EncKeys {
                 previous,
             },
         );
+        self.set_since_add
+            .entry(host_id.to_owned())
+            .or_default()
+            .insert(key.as_bytes().to_vec());
     }
 
-    /// A newer `add_host` of the host, or its `remove_host`: both keys go.
+    /// A newer `add_host` of the host, or its `remove_host`: both keys go,
+    /// and the next generation starts with no key set.
     pub(super) fn void(&mut self, host_id: &str) {
         self.by_host.remove(host_id);
+        self.set_since_add.remove(host_id);
     }
 
     pub(super) fn get(&self, host_id: &str) -> Option<&HostEncKeys> {
         self.by_host.get(host_id)
     }
+
+    /// Whether a `host_enc_key` set `key` for `host_id` since its newest
+    /// `add_host` (compared as the 32 bytes written).
+    pub(super) fn was_set(&self, host_id: &str, key: &PublicKey) -> bool {
+        self.set_since_add
+            .get(host_id)
+            .is_some_and(|set| set.contains(key.as_bytes()))
+    }
 }
 
 /// The chain rule (II.4.1) for a `host_enc_key` of a current host whose
-/// newest `add_host` is `host` and whose keys at `seq-1` are `keys` (the
-/// caller refuses one that isn't current, `not_a_host`).
+/// newest `add_host` is `host`, with the hosts' keys at `seq-1` in `keys`
+/// (the caller refuses one that isn't current, `not_a_host`).
 pub(super) fn check(
     host: &HostRecord,
-    keys: Option<&HostEncKeys>,
+    keys: &EncKeys,
     account_id: &str,
     genesis_hash: &Hash32,
     host_trust_gen: u64,
@@ -161,9 +189,12 @@ pub(super) fn check(
         enc_sig,
     )
     .map_err(|_| Invalid::BadEncSig)?;
-    // Only after the binding: a key the host vouched for, set again.
-    if keys.is_some_and(|k| k.current.key == *enc_key) {
-        return Err(Invalid::SameEncKey);
+    // Only after the binding: a key the host vouched for, set before in
+    // this generation (the current, previous, a retired or a dropped key).
+    // Across generations a replay is already refused above: the binding
+    // names `host_trust_gen`.
+    if keys.was_set(&host.host_id, enc_key) {
+        return Err(Invalid::EncKeyReused);
     }
     Ok(())
 }
@@ -288,11 +319,16 @@ mod tests {
         assert_eq!(previous.key, EncKey::new(&x(1), 3, 1));
         assert!(!previous.retired);
         assert_eq!(previous.replaced_at_seq, 5);
-        // A retiring one retires it; only one previous key is kept.
+        // A retiring one retires it; only one previous key is kept, but
+        // every key set since the add_host is remembered.
         keys.set("a", &x(3), 1, true, 6);
         let previous = keys.get("a").unwrap().previous.clone().unwrap();
         assert_eq!(previous.key, EncKey::new(&x(2), 5, 1));
         assert!(previous.retired);
+        for key in [x(1), x(2), x(3)] {
+            assert!(keys.was_set("a", &key));
+        }
+        assert!(!keys.was_set("a", &x(4)));
         // Another host is apart; voiding drops both keys of one host.
         keys.set("b", &x(4), 2, true, 7);
         assert_eq!(keys.get("b").unwrap().previous, None);
@@ -300,6 +336,9 @@ mod tests {
         assert_eq!(keys.get("a"), None);
         assert_eq!(current(&keys, "b"), Some((x(4), 7)));
         keys.void("z");
+        // A void forgets the keys set since the newest add_host too.
+        assert!(!keys.was_set("a", &x(1)));
+        assert!(keys.was_set("b", &x(4)));
         // After a void, a new key starts without a previous one.
         keys.set("a", &x(5), 2, false, 9);
         assert_eq!(keys.get("a").unwrap().previous, None);
@@ -326,41 +365,54 @@ mod tests {
             &[9; 32],
         )
         .unwrap();
-        assert_eq!(check(&host, None, "acct", &genesis, 2, &enc, &sig), Ok(()));
+        let none = EncKeys::default();
+        assert_eq!(check(&host, &none, "acct", &genesis, 2, &enc, &sig), Ok(()));
         assert_eq!(
-            check(&host, None, "acct", &genesis, 1, &enc, &sig),
+            check(&host, &none, "acct", &genesis, 1, &enc, &sig),
             Err(Invalid::HostTrustGenNotCurrent)
         );
         assert_eq!(
-            check(&host, None, "acct", &genesis, 2, &x(8), &sig),
+            check(&host, &none, "acct", &genesis, 2, &x(8), &sig),
             Err(Invalid::BadEncSig)
         );
         assert_eq!(
-            check(&host, None, "other", &genesis, 2, &enc, &sig),
+            check(&host, &none, "other", &genesis, 2, &enc, &sig),
             Err(Invalid::BadEncSig)
         );
         // The same 32 bytes as an Ed25519 key: never an encryption key.
         let ed = crate::kit::recovery_key_of_seed(&[6; 32]);
         assert_eq!(
-            check(&host, None, "acct", &genesis, 2, &ed, &sig),
+            check(&host, &none, "acct", &genesis, 2, &ed, &sig),
             Err(Invalid::WrongAlg)
         );
-        // The current key set again is refused once its binding verifies;
-        // a key that is only the previous one isn't.
+        // A key set before in this generation is refused once its binding
+        // verifies: as the current key, as the previous one, and once a
+        // later rotation dropped it.
         let mut keys = EncKeys::default();
         keys.set("host-a", &enc, 2, false, 3);
         assert_eq!(
-            check(&host, keys.get("host-a"), "acct", &genesis, 2, &enc, &sig),
-            Err(Invalid::SameEncKey)
+            check(&host, &keys, "acct", &genesis, 2, &enc, &sig),
+            Err(Invalid::EncKeyReused)
         );
         assert_eq!(
-            check(&host, keys.get("host-a"), "acct", &genesis, 1, &enc, &sig),
+            check(&host, &keys, "acct", &genesis, 1, &enc, &sig),
             Err(Invalid::HostTrustGenNotCurrent)
         );
         keys.set("host-a", &x(8), 2, true, 4);
         assert_eq!(
-            check(&host, keys.get("host-a"), "acct", &genesis, 2, &enc, &sig),
-            Ok(())
+            check(&host, &keys, "acct", &genesis, 2, &enc, &sig),
+            Err(Invalid::EncKeyReused)
         );
+        keys.set("host-a", &x(7), 2, false, 5);
+        assert_eq!(
+            check(&host, &keys, "acct", &genesis, 2, &enc, &sig),
+            Err(Invalid::EncKeyReused)
+        );
+        // Another host's keys are apart; a void starts afresh.
+        keys.set("host-b", &enc, 1, false, 6);
+        keys.void("host-a");
+        assert!(!keys.was_set("host-a", &enc));
+        assert!(keys.was_set("host-b", &enc));
+        assert_eq!(check(&host, &keys, "acct", &genesis, 2, &enc, &sig), Ok(()));
     }
 }

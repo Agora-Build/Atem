@@ -464,6 +464,7 @@ fn signer_of(label: &str, signer: &str) -> SigExpect {
         (_, "dev-ipad") => SigExpect::Valid("dev-ipad"),
         (_, "dev-newmac") => SigExpect::Valid("dev-newmac"),
         (_, "dev-evil") => SigExpect::Valid("dev-evil"),
+        (_, "svc-discord") => SigExpect::Valid("svc-discord"),
         other => panic!("no signer for {other:?}"),
     }
 }
@@ -490,7 +491,7 @@ fn chain_reason(label: &str) -> Option<&'static str> {
         "P7_not_a_host" | "EK7_not_a_host" => {
             Some("invalid: host-b isn't a current host: not_a_host")
         }
-        "EK8_same_key" => Some("invalid: the host's current key set again: same_enc_key"),
+        "EK8_same_key" => Some("invalid: the host's current key set again: enc_key_reused"),
         "EK8_bad_enc_sig" => Some("invalid: enc_sig over another key's binding: bad_enc_sig"),
         "EK8_retire_false" => Some("invalid: retire_previous present as false: malformed"),
         "EK9_stale_gen" => {
@@ -507,6 +508,28 @@ fn chain_reason(label: &str) -> Option<&'static str> {
         "P9_bad_name" => Some("invalid: a name outside [a-z0-9-]: bad_project"),
         "P9_one_host" => Some("invalid: one host listed: bad_project"),
         "P9_unknown_op" => Some("invalid: an unknown op: bad_project"),
+        "EK9_previous_again" => Some("invalid: the host's previous key set again: enc_key_reused"),
+        "EK10_retired_again" => Some("invalid: a retired key set again: enc_key_reused"),
+        "EK10_dropped_again" => Some("invalid: a key no longer kept set again: enc_key_reused"),
+        "HS7_revoke_no_interrupt" => Some("invalid: a revoke without interrupt_running: malformed"),
+        "HS8_readmit_interrupt" => Some("invalid: interrupt_running on a readmit: unknown_field"),
+        "EK7_gen_zero" => Some("invalid: host_trust_gen 0: malformed"),
+        "EK7_short_enc_sig" | "EK7_long_enc_sig" => {
+            Some("invalid: an enc_sig of 63 or 65 bytes: malformed")
+        }
+        "EK7_ed25519_enc_key" => Some("invalid: an Ed25519 enc_key: wrong_alg"),
+        "P9_unknown_field" => Some("invalid: a fourth field in project: unknown_field"),
+        "P9_hosts_unsorted" | "P9_hosts_duplicate" => {
+            Some("invalid: project.hosts isn't a canonical set: array_not_canonical")
+        }
+        "P9_empty_ops" => Some("invalid: no ops: bad_project"),
+        "P9_64_hosts" => Some("invalid: 64 hosts, none added: not_a_host"),
+        "P9_65_hosts" => Some("invalid: 65 hosts: bad_project"),
+        "P9_remove_bad_name" => Some("invalid: a name outside [a-z0-9-]: bad_project"),
+        "HS7_revoke_by_service" => Some("invalid: signed by a service: signer_not_manager"),
+        "P9_set_by_recovery" => {
+            Some("invalid: the recovery key signs recovery_add only: recovery_signer_action")
+        }
         _ => None,
     }
 }
@@ -750,6 +773,39 @@ fn membership_log() {
             let hash = Hash32::of_enc(&[b"atem-membership-hash-v1", body_jcs.as_bytes()]);
             assert_eq!(hash.to_hex(), s(vector, "entry_hash"));
             run.pass(format!("{label}: jcs, signing input, entry_hash"));
+            continue;
+        }
+        if vector.get("reason") == Some(&Value::from("array_not_canonical")) {
+            // Refused by the signed-object parse itself (a set out of
+            // order), before the action is read: its values are checked
+            // from the body as written.
+            assert_eq!(
+                SignedObject::from_strict(&strict(&vector["entry"])),
+                Err(Error::ArrayNotCanonical),
+                "{label}"
+            );
+            let body_jcs = jcs(body).unwrap();
+            assert_eq!(body_jcs, s(vector, "jcs"), "{label}");
+            let input = SigningInput::new(SignLabel::MembershipEntry, body_jcs.as_bytes());
+            assert_eq!(hex(input.as_bytes()), s(vector, "signing_input_hex"));
+            let hash = Hash32::of_enc(&[b"atem-membership-hash-v1", body_jcs.as_bytes()]);
+            assert_eq!(hash.to_hex(), s(vector, "entry_hash"), "{label}");
+            let SigExpect::Valid(name) = signer_of(label, s(body, "signer")) else {
+                panic!("{label}: a valid signature expected");
+            };
+            let sig = b64u_decode(s(&vector["entry"], "sig")).unwrap();
+            book.signer_public(name).verify(&input, &sig).unwrap();
+            assert_eq!(
+                sign(&book.provider, &book.signer(name), &input).unwrap(),
+                sig,
+                "{label}: deterministic signature"
+            );
+            let reason = chain_reason(label).unwrap();
+            assert_eq!(context.refusal(label), "array_not_canonical", "{label}");
+            assert!(reason.ends_with("array_not_canonical"), "{label}");
+            run.pass(format!(
+                "{label}: refused array_not_canonical by the signed-object parse; jcs, signing input, entry_hash, signature by {name}"
+            ));
             continue;
         }
         let object = SignedObject::from_strict(&strict(&vector["entry"]))
@@ -2619,35 +2675,58 @@ impl<'a> Delegated<'a> {
         edit: impl FnOnce(&mut Value),
         outcome: Result<Value, &str>,
     ) {
+        self.push_by("dev-mac", label, chain, note, action, edit, outcome);
+    }
+
+    /// `push`, drafted for and signed by `signer` (a member's `auth` key,
+    /// or `recovery`, the kit's key). A body the signed-object parse
+    /// refuses (a set out of order) is signed over its `jcs` as it stands,
+    /// so the vector shows exactly that refusal.
+    #[allow(clippy::too_many_arguments)]
+    fn push_by(
+        &mut self,
+        signer: &str,
+        label: &str,
+        chain: &[&str],
+        note: &str,
+        action: &Action,
+        edit: impl FnOnce(&mut Value),
+        outcome: Result<Value, &str>,
+    ) {
         let m = self.chain(chain);
         let seq = m.head().seq + 1;
-        let mut body = m.draft("dev-mac", DELEGATED_T0 + seq * 1000, action);
+        let mut body = m.draft(signer, DELEGATED_T0 + seq * 1000, action);
         edit(&mut body);
-        let object =
-            SignedObject::sign(&self.book.provider, &self.book.signer("dev-mac"), body).unwrap();
+        let key = self.book.signer(signer);
+        let (wire, text, input, hash, object) =
+            match SignedObject::sign(&self.book.provider, &key, body.clone()) {
+                Ok(object) => (
+                    object.to_json(),
+                    object.jcs().to_owned(),
+                    object.signing_input(),
+                    object.entry_hash().unwrap(),
+                    Some(object),
+                ),
+                Err(Error::ArrayNotCanonical) => {
+                    let text = jcs(&body).unwrap();
+                    let input = SigningInput::new(SignLabel::MembershipEntry, text.as_bytes());
+                    let sig = sign(&self.book.provider, &key, &input).unwrap();
+                    let hash = Hash32::of_enc(&[b"atem-membership-hash-v1", text.as_bytes()]);
+                    let wire = serde_json::json!({"body": body, "sig": b64u(&sig)});
+                    (wire, text, input, hash, None)
+                }
+                Err(e) => panic!("{label}: {e}"),
+            };
         let mut v = serde_json::json!({
             "label": label,
             "note": note,
             "chain": chain,
-            "entry": object.to_json(),
-            "jcs": object.jcs(),
-            "signing_input_hex": hex(object.signing_input().as_bytes()),
-            "entry_hash": object.entry_hash().unwrap().to_hex(),
+            "entry": wire,
+            "jcs": text,
+            "signing_input_hex": hex(input.as_bytes()),
+            "entry_hash": hash.to_hex(),
         });
-        if let Action::HostEncKey {
-            host_id,
-            host_trust_gen,
-            enc_key,
-            ..
-        } = action
-        {
-            let input = atem_client::membership::host_enc_sig_input(
-                "acct-test-1",
-                &self.genesis,
-                host_id,
-                *host_trust_gen,
-                enc_key.as_32().unwrap(),
-            );
+        if let Some(input) = self.binding_input(&body) {
             v["enc_sig_input_hex"] = hex(input.as_bytes()).into();
         }
         match outcome {
@@ -2657,10 +2736,31 @@ impl<'a> Delegated<'a> {
                 v["reason"] = reason.into();
             }
         }
-        if let Ok(entry) = Entry::parse(object) {
+        if let Some(Ok(entry)) = object.map(Entry::parse) {
             self.entries.insert(label.to_owned(), entry);
         }
         self.vectors.push(v);
+    }
+
+    /// The host's `enc_sig` signing input of a `host_enc_key` body, from
+    /// its fields as written: only when the binding's own fields parse (a
+    /// generation of at least 1, an X25519 key, a 64-byte `enc_sig`).
+    fn binding_input(&self, body: &Value) -> Option<SigningInput> {
+        if body["action"] != "host_enc_key" {
+            return None;
+        }
+        let host_trust_gen = body["host_trust_gen"].as_u64().filter(|g| *g >= 1)?;
+        let enc_key = PublicKey::from_json_as(&body["enc_key"], Alg::X25519).ok()?;
+        let enc_sig = b64u_decode(body["enc_sig"].as_str()?).ok()?;
+        (enc_sig.len() == 64).then(|| {
+            atem_client::membership::host_enc_sig_input(
+                "acct-test-1",
+                &self.genesis,
+                body["host_id"].as_str().unwrap(),
+                host_trust_gen,
+                enc_key.as_32().unwrap(),
+            )
+        })
     }
 }
 
@@ -2902,10 +3002,10 @@ fn delegated_vectors(book: &Book, file: &Value) -> Vec<Value> {
     g.push(
         "EK8_same_key",
         &ek7,
-        "host-a's current key (host_enc_key 1) set again with retire_previous: true on EK7_set: invalid (the previous key would be the live one, same kid, and retired): same_enc_key",
+        "host-a's current key (host_enc_key 1) set again with retire_previous: true on EK7_set: invalid (a key set for the host since its newest add_host never comes back; here the previous key would be the live one, same kid, and retired): enc_key_reused",
         &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, true),
         no_edit,
-        Err("same_enc_key"),
+        Err("enc_key_reused"),
     );
     g.push(
         "EK8_bad_enc_sig",
@@ -3174,6 +3274,232 @@ fn delegated_vectors(book: &Book, file: &Value) -> Vec<Value> {
         |body: &mut Value| body["project"]["ops"] = serde_json::json!(["deploy", "message"]),
         Err("bad_project"),
     );
+
+    // ---- PR 2 review: a key set in a generation never comes back
+    // (`enc_key_reused`), and the readings a verifier written from the
+    // text could get wrong (appended, so earlier vectors keep their place)
+    let ek9_rr = ["EK7_set", "EK8_rotate", "EK9_rotate_retire"];
+    g.push(
+        "EK9_previous_again",
+        &["EK7_set", "EK8_rotate"],
+        "host_enc_key 1 on EK8_rotate, where it is host-a's previous key (not retired), set again with its own enc_sig (EK7_set's): invalid (a key set for the host since its newest add_host never comes back): enc_key_reused",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, false),
+        no_edit,
+        Err("enc_key_reused"),
+    );
+    g.push(
+        "EK10_retired_again",
+        &ek9_rr,
+        "host_enc_key 2 on EK9_rotate_retire, which retired it (retire_previous), set again with its own enc_sig (EK8_rotate's): invalid (a retired key stays retired): enc_key_reused",
+        &g.enc_entry("host-a", 1, "host-a-enc-2", &sig_a1_2, false),
+        no_edit,
+        Err("enc_key_reused"),
+    );
+    g.push(
+        "EK10_dropped_again",
+        &ek9_rr,
+        "host_enc_key 1 on EK9_rotate_retire, no longer kept (one previous key only), set again with its own enc_sig (EK7_set's): invalid: enc_key_reused",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, false),
+        no_edit,
+        Err("enc_key_reused"),
+    );
+    g.push(
+        "HS9_readmit_removed",
+        &["HS7_remove_host_a", "HS8_revoke_removed"],
+        "host_sender_readmit host-a on HS8_revoke_removed, where host-a is removed and revoked: valid (a readmit needs revoked, not a current host): authorized(9), no membership epoch, and it sends nothing until an add_host makes it current",
+        &readmit("host-a"),
+        no_edit,
+        Ok(expect(none.clone(), none.clone(), a("authorized", 9, None), none.clone())),
+    );
+    let revoked_ab = serde_json::json!({
+        "host-a": sender("revoked", 8, Some(2)),
+        "host-b": sender("authorized", 7, Some(7)),
+    });
+    g.push(
+        "P8_revoke_a",
+        &p7,
+        "host_sender_revoke host-a, interrupt_running false, on P7_add_host_b: host-a revoked(8), host-b still authorized(7)",
+        &revoke("host-a", false),
+        no_edit,
+        Ok(expect(ab.clone(), none.clone(), revoked_ab.clone(), none.clone())),
+    );
+    g.push(
+        "P9_set_revoked",
+        &["P7_add_host_b", "P8_revoke_a"],
+        "project_set \"astation\" listing host-a and host-b on P8_revoke_a, where host-a is revoked: valid (a listed host must be current; its sending state is apart): both are members, and host-a stays revoked(8), so it sends nothing until readmitted",
+        &set_ab(&all_ops),
+        no_edit,
+        Ok(expect(ab.clone(), astation(&["host-a", "host-b"], &all), revoked_ab.clone(), none.clone())),
+    );
+    g.push(
+        "HS8_enc_key_revoked",
+        &hs7,
+        "host_enc_key host-a (host_enc_key 1) on HS7_revoke, where host-a is revoked: valid (its keys are apart from its sending state): host-a's current key, and host-a stays revoked(7)",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, false),
+        no_edit,
+        Ok(expect(
+            a1.clone(),
+            none.clone(),
+            a("revoked", 7, Some(2)),
+            keys_of(g.key_info("host-a-enc-1", 8, 1), None),
+        )),
+    );
+    g.push(
+        "P11_set_after_remove",
+        &["P7_add_host_b", "P8_set", "P9_narrow", "P10_remove"],
+        "project_set \"astation\" with ops [launch] on P10_remove: valid (unlike a device id, a project name may be set again after its project_remove): a new project of that name",
+        &set_ab(&[ProjectOp::Launch]),
+        no_edit,
+        Ok(expect(ab.clone(), astation(&["host-a", "host-b"], &["launch"]), senders_ab.clone(), none.clone())),
+    );
+    let two = ["host-a", "host-b"];
+    g.push(
+        "P10_second_project",
+        &["P7_add_host_b", "P8_set", "P9_narrow"],
+        "project_set \"chisel\" listing host-a and host-b with ops [launch] on P9_narrow (\"astation\": [message]): two projects over the same hosts; between host-a and host-b the grant is the union, launch and message, and each host is a member of both",
+        &project_set("chisel", two, [ProjectOp::Launch], DELEGATED_T0).unwrap(),
+        no_edit,
+        Ok(expect(
+            ab.clone(),
+            serde_json::json!({
+                "astation": project_state(&two, &two, &["message"]),
+                "chisel": project_state(&two, &two, &["launch"]),
+            }),
+            senders_ab.clone(),
+            none.clone(),
+        )),
+    );
+    g.push(
+        "HS7_revoke_no_interrupt",
+        &[],
+        "host_sender_revoke host-a on E6 without interrupt_running: invalid (a required boolean, written as false too): malformed",
+        &revoke("host-a", false),
+        |body: &mut Value| {
+            body.as_object_mut().unwrap().remove("interrupt_running");
+        },
+        Err("malformed"),
+    );
+    g.push(
+        "HS8_readmit_interrupt",
+        &hs7,
+        "host_sender_readmit host-a on HS7_revoke carrying interrupt_running: false: invalid (a readmit has host_id only): unknown_field",
+        &readmit("host-a"),
+        |body: &mut Value| body["interrupt_running"] = false.into(),
+        Err("unknown_field"),
+    );
+    g.push(
+        "EK7_gen_zero",
+        &[],
+        "host_enc_key host-a on E6 with host_trust_gen 0 (EK7_set's key and enc_sig otherwise): invalid (a generation is at least 1): malformed",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, false),
+        |body: &mut Value| body["host_trust_gen"] = 0.into(),
+        Err("malformed"),
+    );
+    let short = b64u(&sig_a1_1[..63]);
+    g.push(
+        "EK7_short_enc_sig",
+        &[],
+        "host_enc_key host-a on E6 whose enc_sig is 63 bytes (EK7_set's without its last byte): invalid (exactly 64 bytes): malformed",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, false),
+        move |body: &mut Value| body["enc_sig"] = short.into(),
+        Err("malformed"),
+    );
+    let long = b64u(&[&sig_a1_1[..], &[0]].concat());
+    g.push(
+        "EK7_long_enc_sig",
+        &[],
+        "host_enc_key host-a on E6 whose enc_sig is 65 bytes (EK7_set's and a zero byte): invalid (exactly 64 bytes): malformed",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, false),
+        move |body: &mut Value| body["enc_sig"] = long.into(),
+        Err("malformed"),
+    );
+    let host_a_key = g.host_key("host-a", 1).to_json();
+    g.push(
+        "EK7_ed25519_enc_key",
+        &[],
+        "host_enc_key host-a on E6 whose enc_key is host-a's own Ed25519 host_key (alg ed25519): invalid (an encryption key is x25519 only): wrong_alg",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, false),
+        move |body: &mut Value| body["enc_key"] = host_a_key,
+        Err("wrong_alg"),
+    );
+    g.push(
+        "P9_unknown_field",
+        &p8,
+        "project_set \"astation\" on P8_set whose project carries a fourth field, note: invalid (exactly name, hosts and ops): unknown_field",
+        &set_ab(&[ProjectOp::Message]),
+        |body: &mut Value| body["project"]["note"] = "x".into(),
+        Err("unknown_field"),
+    );
+    g.push(
+        "P9_hosts_unsorted",
+        &p8,
+        "project_set \"astation\" on P8_set listing [host-b, host-a]: invalid (project.hosts is a set, sorted by bytes with no duplicates, refused by the signed-object parse before the action's own rules): array_not_canonical",
+        &set_ab(&[ProjectOp::Message]),
+        |body: &mut Value| body["project"]["hosts"] = serde_json::json!(["host-b", "host-a"]),
+        Err("array_not_canonical"),
+    );
+    g.push(
+        "P9_hosts_duplicate",
+        &p8,
+        "project_set \"astation\" on P8_set listing [host-a, host-a, host-b]: invalid (a set has no duplicates): array_not_canonical",
+        &set_ab(&[ProjectOp::Message]),
+        |body: &mut Value| {
+            body["project"]["hosts"] = serde_json::json!(["host-a", "host-a", "host-b"])
+        },
+        Err("array_not_canonical"),
+    );
+    g.push(
+        "P9_empty_ops",
+        &p8,
+        "project_set \"astation\" on P8_set with ops []: invalid (an empty array is a canonical set, and the project's rule wants a non-empty one): bad_project",
+        &set_ab(&[ProjectOp::Message]),
+        |body: &mut Value| body["project"]["ops"] = serde_json::json!([]),
+        Err("bad_project"),
+    );
+    let hosts = |n: usize| (0..n).map(|i| format!("h-{i:02}")).collect::<Vec<_>>();
+    g.push(
+        "P9_64_hosts",
+        &p8,
+        "project_set \"astation\" on P8_set listing the 64 hosts h-00 to h-63, none of them added: within the bound of 2 to 64, so judged against the chain: not_a_host",
+        &project_set("astation", hosts(64), [ProjectOp::Message], DELEGATED_T0).unwrap(),
+        no_edit,
+        Err("not_a_host"),
+    );
+    let sixty_five = hosts(65);
+    g.push(
+        "P9_65_hosts",
+        &p8,
+        "project_set \"astation\" on P8_set listing the 65 hosts h-00 to h-64: invalid (2 to 64 hosts, judged at parse, before whether they are current): bad_project",
+        &set_ab(&[ProjectOp::Message]),
+        move |body: &mut Value| body["project"]["hosts"] = serde_json::json!(sixty_five),
+        Err("bad_project"),
+    );
+    g.push(
+        "P9_remove_bad_name",
+        &p8,
+        "project_remove \"Astation\" on P8_set (\"astation\" is in effect): invalid (a name outside [a-z0-9-], refused at parse before whether a project of that name is in effect): bad_project",
+        &project_remove("astation", DELEGATED_T0).unwrap(),
+        |body: &mut Value| body["name"] = "Astation".into(),
+        Err("bad_project"),
+    );
+    g.push_by(
+        "svc-discord",
+        "HS7_revoke_by_service",
+        &[],
+        "host_sender_revoke host-a on E6 signed by svc-discord, a service member in effect: invalid (only a native manager signs these actions): signer_not_manager",
+        &revoke("host-a", false),
+        no_edit,
+        Err("signer_not_manager"),
+    );
+    g.push_by(
+        "recovery",
+        "P9_set_by_recovery",
+        &p8,
+        "project_set \"astation\" on P8_set signed by the recovery key (kit 1): invalid (the recovery key signs recovery_add only): recovery_signer_action",
+        &set_ab(&[ProjectOp::Message]),
+        no_edit,
+        Err("recovery_signer_action"),
+    );
     g.vectors
 }
 
@@ -3311,6 +3637,18 @@ fn delegated_in_context(run: &mut Run, ctx: &Context, book: &Book, file: &Value)
                     .collect();
                 assert_eq!(got, want, "{label}: ops {x} → {y}");
             }
+            // The projects each host's membership of is in effect.
+            for h in ["host-a", "host-b"] {
+                let mut want: Vec<&str> = expected["projects"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, p)| p["members"].as_array().unwrap().iter().any(|m| m == h))
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                want.sort_unstable();
+                assert_eq!(m.host_projects(h), want, "{label}: projects of {h}");
+            }
             run.pass(format!("{label}: valid on L + {chain:?}, expect matches"));
         } else {
             assert_eq!(vector["valid"], false, "{label}");
@@ -3362,6 +3700,14 @@ fn delegated_in_context(run: &mut Run, ctx: &Context, book: &Book, file: &Value)
                 verified.unwrap_or_else(|e| panic!("{label}: {e}"));
             }
             run.pass(format!("{label}: enc_sig input and signature"));
+        } else if vector["entry"]["body"]["action"] == "host_enc_key" {
+            // No binding input: the binding's own fields don't parse (a
+            // generation of 0, a key that isn't X25519, an enc_sig that
+            // isn't 64 bytes), and the entry is refused at parse for it.
+            let reason = vector.get("reason").and_then(Value::as_str);
+            assert!(matches!(reason, Some("malformed" | "wrong_alg")), "{label}");
+            assert!(ctx.parse(label).is_err(), "{label}");
+            run.pass(format!("{label}: no binding input, refused at parse"));
         }
     }
 

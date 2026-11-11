@@ -174,6 +174,11 @@ final class ConformanceTests: XCTestCase {
             for v in vectors {
                 let label = s(v["label"])
                 if label == "K7_current_no_kit_sig" { continue }
+                // A set out of order: the signed-object parse itself refuses it.
+                if (v["reason"] as? String) == "array_not_canonical" {
+                    try throwsCode("array_not_canonical") { _ = try signedObjectInfo(json: js(v["entry"]!)) }
+                    continue
+                }
                 let info = try signedObjectInfo(json: js(v["entry"]!))
                 if let j = v["jcs"] { try eq(info.bodyJcs, s(j), "\(label) jcs") }
                 if let i = v["signing_input_hex"] { try eq(hex(info.signingInput), s(i), "\(label) input") }
@@ -404,8 +409,10 @@ final class ConformanceTests: XCTestCase {
         // The vectors of `others` that follow a `chain` on log L (P*, EK*, HS*): a
         // valid one carries `expect`, the state a verifier derives after it (read
         // here through the log's queries); a refused one `valid: false` and
-        // `reason` (`evaluate` stops with it at index 0). The five actions are
-        // also rebuilt by their builders, byte for byte, and a manager signs them
+        // `reason` (`evaluate` stops with it at index 0; a body the signed-object
+        // parse refuses, `array_not_canonical`, never reaches the log: `evaluate`
+        // throws). The five actions are also rebuilt by their builders, byte for
+        // byte, where a builder can write the body, and a manager signs them
         // through the foreign provider under purposes that name them.
         let fiveActions: Set<String> = ["project_set", "project_remove", "host_sender_revoke", "host_sender_readmit", "host_enc_key"]
         let delegated = a(mlog["others"]).map(o).filter { $0["chain"] != nil }
@@ -416,6 +423,17 @@ final class ConformanceTests: XCTestCase {
         }
         func hostKeyName(_ hostId: String, _ gen: UInt64) -> String { gen == 1 ? hostId : "\(hostId)-gen-\(gen)" }
         func encKeyOf(_ k: Any?) -> PublicKeyData { PublicKeyData(alg: .x25519, raw: b64u(s(o(k)["pub"]))) }
+        // A body's key object with the alg it names (a vector may carry another).
+        func keyOf(_ k: Any?) throws -> PublicKeyData {
+            let alg: KeyAlg
+            switch s(o(k)["alg"]) {
+            case "x25519": alg = .x25519
+            case "ed25519": alg = .ed25519
+            case "p256": alg = .p256
+            default: throw Failure(description: "unknown alg \(s(o(k)["alg"]))")
+            }
+            return PublicKeyData(alg: alg, raw: b64u(s(o(k)["pub"])))
+        }
         func stateOf(_ log: MembershipLog) throws -> [String: Any] {
             var hosts: [String: Any] = [:]
             var senders: [String: Any] = [:]
@@ -469,7 +487,11 @@ final class ConformanceTests: XCTestCase {
                 let log = try logAfter(a(v["chain"]).map(s))
                 if (v["valid"] as? Bool) == false {
                     refused += 1
-                    try eq(try log.evaluate(entries: [entry(label)], now: now).stop, .invalid(index: 0, code: s(v["reason"])), label)
+                    if s(v["reason"]) == "array_not_canonical" {
+                        try throwsCode("array_not_canonical") { _ = try log.evaluate(entries: [entry(label)], now: now) }
+                    } else {
+                        try eq(try log.evaluate(entries: [entry(label)], now: now).stop, .invalid(index: 0, code: s(v["reason"])), label)
+                    }
                     continue
                 }
                 valid += 1
@@ -487,7 +509,7 @@ final class ConformanceTests: XCTestCase {
                     try eq(log.hostProjects(hostId: id), inEffect, "\(label) \(id)")
                 }
             }
-            if !(valid >= 28 && refused >= 17) { throw Failure(description: "\(valid) valid, \(refused) refused") }
+            if !(valid >= 34 && refused >= 35) { throw Failure(description: "\(valid) valid, \(refused) refused") }
         }
         func buildAction(_ body: [String: Any]) throws -> String {
             let at = u(body["signed_at"])
@@ -502,22 +524,33 @@ final class ConformanceTests: XCTestCase {
             case "host_sender_readmit":
                 return try hostSenderReadmitAction(hostId: s(body["host_id"]), signedAt: at)
             case "host_enc_key":
-                return try hostEncKeyAction(hostId: s(body["host_id"]), hostTrustGen: u(body["host_trust_gen"]), encKey: encKeyOf(body["enc_key"]),
+                return try hostEncKeyAction(hostId: s(body["host_id"]), hostTrustGen: u(body["host_trust_gen"]), encKey: keyOf(body["enc_key"]),
                                             encSigB64u: s(body["enc_sig"]), retirePrevious: (body["retire_previous"] as? Bool) == true, signedAt: at)
             default:
                 throw Failure(description: "unknown action \(s(body["action"]))")
             }
         }
-        check("device-list actions: the builders reproduce the vectors; check_change advises on a redundant revoke or readmit") {
+        // A body no builder writes: another signer's entry (a builder's action is
+        // drafted for the signer that asks), or a shape outside the builders'
+        // inputs (`retire_previous: false`, a revoke without `interrupt_running`,
+        // a field the action doesn't have, a set out of order).
+        func unbuildable(_ v: [String: Any]) -> Bool {
+            let body = o(o(v["entry"])["body"])
+            let reason = v["reason"] as? String
+            return s(body["signer"]) != "dev-mac"
+                || (body["retire_previous"] as? Bool) == false
+                || (s(body["action"]) == "host_sender_revoke" && !(body["interrupt_running"] is Bool))
+                || reason == "unknown_field" || reason == "array_not_canonical"
+        }
+        check("device-list actions: the builders reproduce the vectors; check_change advises on a redundant revoke or readmit and a reused key") {
             var built = 0
             for v in delegated.filter({ fiveActions.contains(s(o(o($0["entry"])["body"])["action"])) }) {
                 let label = s(v["label"])
                 let body = o(o(v["entry"])["body"])
-                // `retire_previous: false` has one form, omitted: no builder writes it.
-                if (body["retire_previous"] as? Bool) == false { continue }
+                if unbuildable(v) { continue }
                 // A shape the verifier refuses by itself is the builder's refusal too.
-                if (v["reason"] as? String) == "bad_project" {
-                    try throwsCode("bad_project") { _ = try buildAction(body) }
+                if let reason = v["reason"] as? String, ["bad_project", "malformed", "wrong_alg"].contains(reason) {
+                    try throwsCode(reason) { _ = try buildAction(body) }
                     continue
                 }
                 let log = try logAfter(a(v["chain"]).map(s))
@@ -528,9 +561,10 @@ final class ConformanceTests: XCTestCase {
                 var want: ChangeRefusalInfo? = nil
                 if (v["reason"] as? String) == "already_revoked" { want = .alreadyRevoked }
                 if (v["reason"] as? String) == "not_revoked" { want = .notRevoked }
+                if (v["reason"] as? String) == "enc_key_reused" { want = .encKeyReused }
                 try eq(try log.checkChange(actionJson: action, nowMs: signedAt), want, "\(label) check_change")
             }
-            if built < 28 { throw Failure(description: "\(built) built") }
+            if built < 38 { throw Failure(description: "\(built) built") }
         }
         check("device-list actions: shapes the verifier refuses by itself") {
             let two = ["host-a", "host-b"]
@@ -568,12 +602,13 @@ final class ConformanceTests: XCTestCase {
             try eq(verify(hostKey("host-a"), account, genesis, "host-a", 1, PublicKeyData(alg: .ed25519, raw: enc.raw), sig), false, "an Ed25519 enc_key")
             try eq(verify(hostKey("host-a"), account, "not hex", "host-a", 1, enc, sig), false, "a malformed genesis")
             try eq(verify(hostKey("host-a"), account, genesis, "host-a", 1, enc, "AAAA"), false, "a short signature")
-            // Every enc_sig of the vectors verifies under the host key of its generation, but the bad one.
-            for v in delegated.filter({ s(o(o($0["entry"])["body"])["action"]) == "host_enc_key" }) {
+            // Every enc_sig of the vectors whose binding fields parse (they carry
+            // enc_sig_input_hex) verifies under the host key of its generation, but the bad one.
+            for v in delegated.filter({ $0["enc_sig_input_hex"] != nil }) {
                 let b = o(o(v["entry"])["body"])
                 let gen = u(b["host_trust_gen"])
                 try eq(verify(hostKey(hostKeyName(s(b["host_id"]), gen)), account, genesis, s(b["host_id"]), gen, encKeyOf(b["enc_key"]), s(b["enc_sig"])),
-                       s(v["label"]) != "EK8_bad_enc_sig", s(v["label"]))
+                       (v["reason"] as? String) != "bad_enc_sig", s(v["label"]))
             }
         }
         check("device-list actions: a manager signs each under a purpose that names it (R9.6 rule 4)") {

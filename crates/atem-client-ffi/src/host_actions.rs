@@ -103,8 +103,9 @@ pub fn host_sender_readmit_action(host_id: String, signed_at: u64) -> Result<Str
 /// `verify_host_enc_sig` first). `retire_previous` retires the key this one
 /// replaces at once (after a suspected compromise); false is omitted from
 /// the body (its only form). That the host is current, the generation its
-/// newest, `enc_sig` valid and the key another than its current one is the
-/// verifier's to judge.
+/// newest, `enc_sig` valid and the key none set for the host since its
+/// newest `add_host` (`enc_key_reused`; `check_change` says it first) is
+/// the verifier's to judge.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn host_enc_key_action(
     host_id: String,

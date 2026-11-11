@@ -444,11 +444,13 @@ impl MembershipLog {
     }
     /// `null` to go ahead, else `{type: "log_full" | "members_full" |
     /// "hosts_full" | "service_change_too_soon" | "already_revoked" |
-    /// "not_revoked", lastSignedAt?, retryAt?}` (advisory, for signers:
-    /// `service_change_too_soon` carries `lastSignedAt` and `retryAt`;
-    /// `already_revoked` is a `host_sender_revoke` of a host already
-    /// revoked, `not_revoked` a `host_sender_readmit` of one that isn't
-    /// revoked, a host never added included).
+    /// "not_revoked" | "enc_key_reused", lastSignedAt?, retryAt?}`
+    /// (advisory, for signers: `service_change_too_soon` carries
+    /// `lastSignedAt` and `retryAt`; `already_revoked` is a
+    /// `host_sender_revoke` of a host already revoked, `not_revoked` a
+    /// `host_sender_readmit` of one that isn't revoked, a host never added
+    /// included; `enc_key_reused` a `host_enc_key` of a key already set for
+    /// that host since its newest `add_host`).
     #[wasm_bindgen(js_name = checkChange)]
     pub fn check_change(&self, action_json: String, now_ms: f64) -> JsResult<JsValue> {
         ok(self.0.check_change(action_json, ms(now_ms)?))

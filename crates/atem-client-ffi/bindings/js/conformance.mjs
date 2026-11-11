@@ -110,6 +110,11 @@ check("log L verifies to its head", () => eq(logL().head(), { seq: mlog.head.seq
 check("every entry: jcs, signing input, entry_hash", () => {
   for (const v of [...mlog.log, ...mlog.others]) {
     if (v.label === "K7_current_no_kit_sig") continue;
+    // A set out of order: the signed-object parse itself refuses it.
+    if (v.reason === "array_not_canonical") {
+      throwsCode(() => m.signedObjectInfo(str(v.entry)), "array_not_canonical");
+      continue;
+    }
     const info = m.signedObjectInfo(str(v.entry));
     if (v.jcs !== undefined) eq(info.bodyJcs, v.jcs, `${v.label} jcs`);
     if (v.signing_input_hex !== undefined) eq(hex(info.signingInput), v.signing_input_hex, `${v.label} input`);
@@ -303,9 +308,11 @@ check("project keys and hashes (§R9.6)", () => {
 // The vectors of `others` that follow a `chain` on log L (P*, EK*, HS*): a
 // valid one carries `expect`, the state a verifier derives after it (read
 // here through the log's queries); a refused one `valid: false` and `reason`
-// (`evaluate` stops with it at index 0). `project_set`, `project_remove`,
-// `host_sender_revoke`, `host_sender_readmit` and `host_enc_key` are also
-// rebuilt by their builders, byte for byte.
+// (`evaluate` stops with it at index 0; a body the signed-object parse
+// refuses, `array_not_canonical`, never reaches the log: `evaluate` throws).
+// `project_set`, `project_remove`, `host_sender_revoke`,
+// `host_sender_readmit` and `host_enc_key` are also rebuilt by their
+// builders, byte for byte, where a builder can write the body.
 const FIVE = ["project_set", "project_remove", "host_sender_revoke", "host_sender_readmit", "host_enc_key"];
 const delegated = mlog.others.filter((v) => v.chain !== undefined);
 const sorted = (v) =>
@@ -352,7 +359,8 @@ check("device-list actions: the queries read every vector's expect, refusals car
     const log = logAfter(v.chain);
     if (v.valid === false) {
       refused++;
-      eq(log.evaluate([entry(v.label)], NOW).stop, { type: "invalid", index: 0, code: v.reason }, v.label);
+      if (v.reason === "array_not_canonical") throwsCode(() => log.evaluate([entry(v.label)], NOW), v.reason);
+      else eq(log.evaluate([entry(v.label)], NOW).stop, { type: "invalid", index: 0, code: v.reason }, v.label);
       continue;
     }
     valid++;
@@ -364,7 +372,7 @@ check("device-list actions: the queries read every vector's expect, refusals car
     for (const [a, b] of [["host-a", "host-b"], ["host-b", "host-a"], ["host-a", "host-a"]]) eq(log.projectOpsBetween(a, b), opsBetween(v.expect, a, b), `${v.label} ${a} ${b}`);
     for (const id of ["host-a", "host-b"]) eq(log.hostProjects(id), Object.entries(v.expect.projects).filter(([, p]) => p.members.includes(id)).map(([name]) => name).sort(), `${v.label} ${id}`);
   }
-  if (valid < 28 || refused < 17) throw new Error(`${valid} valid, ${refused} refused`);
+  if (valid < 34 || refused < 35) throw new Error(`${valid} valid, ${refused} refused`);
 });
 const buildAction = (body) => {
   const at = body.signed_at;
@@ -377,15 +385,25 @@ const buildAction = (body) => {
     default: throw new Error(body.action);
   }
 };
-check("device-list actions: the builders reproduce the vectors; check_change advises on a redundant revoke or readmit", () => {
+// A body no builder writes: another signer's entry (a builder's action is
+// drafted for the signer that asks), or a shape outside the builders' inputs
+// (`retire_previous: false`, a revoke without `interrupt_running`, a field
+// the action doesn't have, a set out of order).
+const unbuildable = (v) =>
+  v.entry.body.signer !== "dev-mac" ||
+  v.entry.body.retire_previous === false ||
+  (v.entry.body.action === "host_sender_revoke" && typeof v.entry.body.interrupt_running !== "boolean") ||
+  v.reason === "unknown_field" ||
+  v.reason === "array_not_canonical";
+const ADVICE = ["already_revoked", "not_revoked", "enc_key_reused"];
+check("device-list actions: the builders reproduce the vectors; check_change advises on a redundant revoke or readmit and a reused key", () => {
   let built = 0;
   for (const v of delegated.filter((x) => FIVE.includes(x.entry.body.action))) {
     const body = v.entry.body;
-    // `retire_previous: false` has one form, omitted: no builder writes it.
-    if (body.retire_previous === false) continue;
+    if (unbuildable(v)) continue;
     // A shape the verifier refuses by itself is the builder's refusal too.
-    if (v.reason === "bad_project") {
-      throwsCode(() => buildAction(body), "bad_project");
+    if (["bad_project", "malformed", "wrong_alg"].includes(v.reason)) {
+      throwsCode(() => buildAction(body), v.reason);
       continue;
     }
     const log = logAfter(v.chain);
@@ -393,9 +411,9 @@ check("device-list actions: the builders reproduce the vectors; check_change adv
     built++;
     eq(log.draftEntry("dev-mac", body.signed_at, action), v.jcs, v.label);
     const advice = log.checkChange(action, body.signed_at);
-    eq(advice, v.reason === "already_revoked" || v.reason === "not_revoked" ? { type: v.reason } : null, `${v.label} check_change`);
+    eq(advice, ADVICE.includes(v.reason) ? { type: v.reason } : null, `${v.label} check_change`);
   }
-  if (built < 28) throw new Error(`${built} built`);
+  if (built < 38) throw new Error(`${built} built`);
 });
 check("device-list actions: shapes the verifier refuses by itself", () => {
   const two = ["host-a", "host-b"];
@@ -428,11 +446,12 @@ check("device-list actions: verifyHostEncSig binds every field of a host's enc_s
   eq(verify(hostA, ACCOUNT, GENESIS, "host-a", 1, { alg: "ed25519", raw: key.raw }, ek.enc_sig), false, "an Ed25519 enc_key");
   eq(verify(hostA, ACCOUNT, "not hex", "host-a", 1, key, ek.enc_sig), false, "a malformed genesis");
   eq(verify(hostA, ACCOUNT, GENESIS, "host-a", 1, key, "AAAA"), false, "a short signature");
-  // Every enc_sig of the vectors verifies under the host key of its generation, but the bad one.
-  for (const v of delegated.filter((x) => x.entry.body.action === "host_enc_key")) {
+  // Every enc_sig of the vectors whose binding fields parse (they carry
+  // enc_sig_input_hex) verifies under the host key of its generation, but the bad one.
+  for (const v of delegated.filter((x) => x.enc_sig_input_hex !== undefined)) {
     const b = v.entry.body;
     const host = ["ed25519", unhex(keys[hostKeyName(b.host_id, b.host_trust_gen)].host_key.pub_hex)];
-    eq(verify(host, ACCOUNT, GENESIS, b.host_id, b.host_trust_gen, encKeyOf(b.enc_key), b.enc_sig), v.label !== "EK8_bad_enc_sig", v.label);
+    eq(verify(host, ACCOUNT, GENESIS, b.host_id, b.host_trust_gen, encKeyOf(b.enc_key), b.enc_sig), v.reason !== "bad_enc_sig", v.label);
   }
 });
 
