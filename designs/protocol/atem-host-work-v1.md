@@ -77,7 +77,8 @@ R9.6 gains three ops for service `scope.ops` and browser grant `ops`:
 A native member needs the `control` role for the `launch` and `notify`
 requests; the `message` requests are open to every native member. The channel
 checks the op before decoding (`forbidden`). Existing grants don't gain these
-ops. Membership verifiers older than these ops reject signed entries that
+ops. `alert_list` (§11.3) is no op: it answers native members holding
+`control` and nobody else. Membership verifiers older than these ops reject signed entries that
 carry them: upgrade every verifier on the account before enrolling one.
 
 ### Host checks
@@ -762,10 +763,10 @@ request's `id`:
 |---|---|
 | `forbidden` | a missing op or local consent, out of scope, an unknown id or another principal's, a sender mismatch |
 | `unauthorized` | the caller's authority is no longer current |
-| `stale_target` | the host triple doesn't match |
+| `stale_target` | the host triple doesn't match; an `alert_list` cursor the host has no alert for (§11.3) |
 | `invalid_request` | decoding, a field rule, an expiry, an upload gap, bad PNG bytes |
 | `request_id_reused` | the same id with other content; another result for a task already `completed`, another resolution for a task already resolved (§11.2) |
-| `busy` | hosting off, too many queued requests, a capacity limit or storage failure, the live-session limit, cancel or complete in the wrong state, an op of a feature the host doesn't list (§11.2) |
+| `busy` | hosting off, too many queued requests, a capacity limit or storage failure, the live-session limit, cancel or complete in the wrong state, an op of a feature the host doesn't list (§11.2, §11.3) |
 
 After a lost reply, query (`host_launch_query`, `work_query`, `reply_query`,
 `message_query`) or resend the same content with a fresh `id`. Never mint a
@@ -832,14 +833,15 @@ three features, defined in `atem_client::session::host_work`
 | Feature | Ops |
 |---|---|
 | `host.delegated` | `work_interrupt`, `work_resolve` (§11.2) |
-| `host.alerts` | `alert_list` (Part I; written in a later section) |
+| `host.alerts` | `alert_list` (§11.3), and the push hint of kind `outcome_unknown` (session-v1 R9.9) |
 | `host.senders` | `control_records` (session-v1 R9.3, R9.8; §11.1), `host_enc_key_get` (written later) |
 
 **No host advertises them in this version**, and a host refuses each of
 their ops as it refuses any op of a feature it doesn't list: a session op
 (`control_records`) is `unsupported_version` with no effect (session-v1
 R9.8; **Atem's choice of code, for Astation to confirm**), and a host-work
-request (`work_interrupt`, `work_resolve`) is `busy` (§7, §11.2). Clients check
+request (`work_interrupt`, `work_resolve`, `alert_list`) is `busy` (§7, §11.2,
+§11.3). Clients check
 `welcome.features` first; the client core
 refuses to send `control_records` to a host that doesn't list
 `host.senders` (`host feature not available`).
@@ -1228,3 +1230,120 @@ v4, the second a status `detail` of at most 1024 bytes.
 Vectors: `fixtures/host-work/requests-v1.json` (the requests, valid and
 invalid, and `work` results with `resolved`: each kind of resolver, a bare
 or unknown one, and `null`).
+
+### 11.3 `alert_list` (`host.alerts`)
+
+An unknown outcome needs a person (design I.4.6, owner decision): when a
+task becomes `outcome_unknown` the host records an **alert**, and the owner's
+devices show it with **Mark failed** and **Mark done**, each a `work_resolve`
+(§11.2) by the owner. This section is the alert's wire: a query, and the
+push hint that tells the owner's devices (session-v1 R9.9, "`outcome_unknown`
+hint"). Both belong to feature `host.alerts`.
+
+```json
+{"v":1,"id":"…","host":{…},"op":"alert_list"}
+{"v":1,"id":"…","host":{…},"op":"alert_list","after":"<alert_id>"}
+```
+
+In §1's form: `v: 1`, a fresh `id`, the `host`, exactly these fields (`after`
+omitted for the first page, never `null`), and the request serializes back to
+the same JSON. `after` is a UUID v4, the `alert_id` of the last alert the
+caller has.
+
+**Authority.** `alert_list` answers **native members holding `control`** at
+the host's head, the members that get approval hints (design I.4.6, "New
+rule"). A service never does, whatever its ops, and nor does a browser or a
+native member without `control`: `forbidden`, from the channel, before
+decoding. It is not a `notify` request: the op a service would need doesn't
+exist. (**Atem's choice of shape, for Astation to confirm**: the design says
+"native members with `control`", and a request of its own, checked like
+`control_records`, keeps a service with `notify` from reading the owner's
+alerts.)
+
+**Result.** An `alerts` result (§7's envelope):
+
+```json
+{"kind":"alerts","alerts":[
+  {"alert_id":"<UUID v4>","kind":"outcome_unknown","host_id":"<atem_device_id>",
+   "session_id":"ses-…","task_id":"<UUID>","sender":"service:svc-1",
+   "reason":"agent exited","created_at":1793264006000}],
+ "more":false}
+```
+
+| Field | Rule |
+|---|---|
+| `alert_id` | a UUID v4 the host chose, kept with the alert |
+| `kind` | `outcome_unknown`, the one kind; a reader refuses any other |
+| `host_id` | the host's own `atem_device_id`, the `host` of the result; another host's is refused |
+| `session_id` | the task's target session (`ses-` and 12 characters) |
+| `task_id` | the task: a UUID v4, or the UUID v5 of a local selector's resolution (sender `local`; `work_query` and `work_resolve` take UUID v4 only, so the owner resolves such a task on the host with `atem task resolve`) |
+| `sender` | the principal that enqueued the task: `member:<id>`, `service:<id>`, `browser:<id>` or `host:<id>` (an id of 1-128 bytes of `[A-Za-z0-9._:-]`), or the literal `local` |
+| `reason` | why the outcome is unknown, for people: 1-256 bytes, no control character (`agent exited`, `write interrupted`, `deadline passed; outcome unknown`) |
+| `created_at` | Unix ms on the host's wall clock: when the task became `outcome_unknown` |
+| `more` | `true` when alerts follow this page; then the page isn't empty |
+
+Every field is **Atem's choice, for Astation to confirm**: the design says
+only that the alert "names the host, session, task and sender, and why the
+outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
+`detail` may be 1,024 bytes).
+
+- **Order and pages.** Oldest first: strictly ascending by `(created_at,
+  alert_id)`, so no alert repeats within a page. At most **64** alerts per
+  result (**Atem's choice**: a host holds at most 256 unresolved outcomes,
+  design I.4.6, so a full list is four pages of about 450 bytes an alert). A
+  caller asks for the next page with `after` equal to the last `alert_id` it
+  read, until `more` is `false`. A page never carries its `after`.
+- **An unknown cursor.** An `after` the host has no alert for (the alert
+  ended, or never was) is `stale_target`, detail `unknown alert`; the caller
+  lists again from the start (**Atem's choice of code, for Astation to
+  confirm**: the host triple is what §7's `stale_target` usually names, but a
+  cursor that no longer points at anything is a stale target too).
+- **What is listed.** Exactly the tasks that are `outcome_unknown` and
+  unresolved, one alert each. An alert ends when its task is resolved
+  (`work_resolve`, or the host's command) or a reply moves it to
+  `awaiting_result` (design I.4.6, "Ending"); an ended alert is no longer
+  listed. A task reaches `outcome_unknown` once, so an alert is never raised
+  twice for one. The host keeps an alert for every unresolved outcome; at 32
+  unresolved on a host the `reason` of a new alert says so (for example
+  `agent exited; 32 outcomes unresolved on this host`) within the 256 bytes
+  (design I.4.6 says only that "the alert says so"). At 64 unresolved from one
+  sender the host refuses that sender's new tasks (`busy`, detail `too many
+  unresolved outcomes`), and at 256 on the host every sender's new remote
+  tasks, until the owner resolves some (design I.4.6, "Capacity").
+- **Reminders.** The daily reminder while any stay unresolved is Astation's,
+  from this list; the host sends none.
+- **What it doesn't do.** The query changes nothing and records nothing. It is
+  read-only: a repeat gives the current list.
+
+**The push hint.** The host signs an `outcome_unknown` hint per recipient
+when an alert is raised: a body of `atem-push-hint` with a `kind`, the task,
+session, sender and reason sealed to the recipient's `enc_key`. Session-v1
+R9.9 specifies it; the shared vectors are `r9-vectors-push-hint`
+(`outcome_unknown*`).
+
+**Client core.** `Attached::send` refuses `alert_list` unless
+`welcome.features` lists `host.alerts` (`host feature not available`),
+decodes it with the host's rules and tracks it until the host answers. A
+result answers `alert_list` when it is an `alerts` result for that exchange's
+host and none of its alerts is the request's `after`; it is read as strictly
+as every result: the alert's fields, this host's `host_id`, the order, 64 at
+most.
+
+**Not advertised yet.** No host lists `host.alerts` in this version. A host
+refuses `alert_list` with `busy`, detail `host.alerts is not advertised`,
+after the channel's authority check (a service, a browser and a native member
+without `control` learn `forbidden`) and before decoding: the code every
+host-work request the host can't take has (§1, §7). Nothing is read, queued
+or recorded (**Atem's choice of code, for Astation to confirm**, as for
+§11.2). The hint is never sent either.
+
+**Compatibility: enable `host.alerts` together.** An older reader of
+push hints refuses the new `kind` (`malformed`), and an older reader of a
+`host_work_result` refuses the `alerts` kind. A host therefore sends the hint
+and answers the query only behind `host.alerts`, which Atem and Astation
+enable together, once the relay and every client verify the new hint body.
+
+Vectors: `fixtures/host-work/requests-v1.json` (the requests, valid and
+invalid, and the `alerts` results: an empty page, a page, every sender and
+the bounds, and each refusal), `fixtures/r9-vectors-push-hint.json` (the
+hints).

@@ -1684,6 +1684,181 @@
           "data": ""
         }
       }
+    },
+    {
+      "name": "alert_list_first_page",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "alert_list"
+        }
+      }
+    },
+    {
+      "name": "alert_list_after",
+      "valid": true,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "alert_list",
+          "after": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34"
+        }
+      }
+    },
+    {
+      "name": "alert_list_after_must_be_uuid_v4",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "alert_list",
+          "after": "6ba7b810-9dad-51d1-80b4-00c04fd430c8"
+        }
+      }
+    },
+    {
+      "name": "alert_list_after_not_an_id",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "alert_list",
+          "after": "not-an-alert"
+        }
+      }
+    },
+    {
+      "name": "alert_list_after_null",
+      "valid": false,
+      "raw": "{\"type\": \"session\", \"data\": {\"v\": 1, \"id\": \"11111111-1111-4111-8111-111111111111\", \"host\": {\"account_id\": \"account\", \"atem_device_id\": \"host\", \"host_trust_gen\": 1}, \"op\": \"alert_list\", \"after\": null}}"
+    },
+    {
+      "name": "alert_list_after_empty",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "alert_list",
+          "after": ""
+        }
+      }
+    },
+    {
+      "name": "alert_list_unknown_field",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "alert_list",
+          "limit": 10
+        }
+      }
+    },
+    {
+      "name": "alert_list_host_must_be_valid",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": -1
+          },
+          "op": "alert_list"
+        }
+      }
+    },
+    {
+      "name": "alert_list_needs_a_host",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "op": "alert_list"
+        }
+      }
+    },
+    {
+      "name": "alert_list_version",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 2,
+          "id": "11111111-1111-4111-8111-111111111111",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "alert_list"
+        }
+      }
+    },
+    {
+      "name": "alert_list_id_must_be_uuid_v4",
+      "valid": false,
+      "message": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "id": "x",
+          "host": {
+            "account_id": "account",
+            "atem_device_id": "host",
+            "host_trust_gen": 1
+          },
+          "op": "alert_list"
+        }
+      }
     }
   ],
   "results": [
@@ -2493,6 +2668,866 @@
             "detail": "the agent is working",
             "result": null
           }
+        }
+      }
+    },
+    {
+      "name": "alerts_empty",
+      "valid": true,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alerts_page",
+      "valid": true,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1793264006000
+            },
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000002",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1793264006000
+            },
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000003",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000003",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1793264007000
+            }
+          ],
+          "more": true
+        }
+      }
+    },
+    {
+      "name": "alerts_senders",
+      "valid": true,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "6ba7b810-9dad-51d1-80b4-00c04fd430c8",
+              "sender": "local",
+              "reason": "agent exited",
+              "created_at": 1
+            },
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000002",
+              "sender": "member:dev-phone",
+              "reason": "write interrupted",
+              "created_at": 2
+            },
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000003",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000003",
+              "sender": "browser:grant-1",
+              "reason": "agent exited",
+              "created_at": 3
+            },
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000004",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000004",
+              "sender": "host:host-b",
+              "reason": "agent exited",
+              "created_at": 4
+            },
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000005",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000005",
+              "sender": "service:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "reason": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+              "created_at": 5
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alerts_more_needs_an_alert",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [],
+          "more": true
+        }
+      }
+    },
+    {
+      "name": "alerts_more_missing",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "alerts_more_null",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1
+            }
+          ],
+          "more": null
+        }
+      }
+    },
+    {
+      "name": "alerts_unknown_result_field",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1
+            }
+          ],
+          "more": false,
+          "next": "x"
+        }
+      }
+    },
+    {
+      "name": "alerts_unknown_alert_field",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1,
+              "task": "x"
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_needs_a_reason",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_kind_is_outcome_unknown",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "expired",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_reason_not_empty",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_reason_at_most_256_bytes",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_reason_without_control_characters",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "a\nb",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_sender_is_a_principal",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "phone",
+              "reason": "agent exited",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_sender_has_an_id",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "member:",
+              "reason": "agent exited",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_sender_unknown_kind",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "admin:x",
+              "reason": "agent exited",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_task_id_is_a_uuid",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "task-1",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_id_is_uuid_v4",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "6ba7b810-9dad-51d1-80b4-00c04fd430c8",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_session_id",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-A",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_is_this_hosts",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "other-host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_time_is_a_safe_integer",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 9007199254740992
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alerts_in_order",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000002",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1
+            },
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alerts_by_time_first",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 2
+            },
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000002",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alerts_never_repeat",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1
+            },
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000001",
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000001",
+              "sender": "service:svc-1",
+              "reason": "agent exited",
+              "created_at": 1
+            }
+          ],
+          "more": false
         }
       }
     }

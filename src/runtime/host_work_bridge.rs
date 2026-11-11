@@ -946,10 +946,13 @@ impl HostBridge {
                 store.save_work(&r).map_err(|_| "busy")?;
                 Ok(ResultBody::Work { work: r.status })
             }
-            // `host.delegated`'s ops: the channel refuses them while the host
-            // doesn't advertise the feature (none does yet, step 3), so none
-            // gets here; one that did would be refused, never half-served.
-            Request::WorkInterrupt { .. } | Request::WorkResolve { .. } => Err("busy"),
+            // `host.delegated`'s and `host.alerts`' ops: the channel refuses
+            // them while the host doesn't advertise the feature (none does
+            // yet, step 3), so none gets here; one that did would be refused,
+            // never half-served.
+            Request::WorkInterrupt { .. }
+            | Request::WorkResolve { .. }
+            | Request::AlertList { .. } => Err("busy"),
             Request::Publish { .. }
             | Request::MessageQuery { .. }
             | Request::AttachmentPut { .. } => unreachable!(),

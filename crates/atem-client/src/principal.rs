@@ -134,6 +134,10 @@ pub enum Need {
     /// `control_records` (delegated host work, II.3.1): a `native` member;
     /// the records' own signatures carry the authority.
     ControlRecords,
+    /// `alert_list` (delegated host work, I.4.6, feature `host.alerts`): a
+    /// `native` member holding `control`, the members that get approval
+    /// hints. A service never does, whatever its ops, nor a browser.
+    Alerts,
 }
 
 impl Need {
@@ -165,6 +169,7 @@ impl Need {
             ("session", "revoke_grant") => Need::RevokeGrant,
             ("session", "host_policy_set" | "host_policy_get") => Need::HostPolicy,
             ("session", "control_records") => Need::ControlRecords,
+            ("session", "alert_list") => Need::Alerts,
             ("session", "host_profiles" | "host_launch" | "host_launch_query") => {
                 Need::Op(Op::Launch)
             }
@@ -768,6 +773,7 @@ impl Authority {
             (_, Need::Control) => control,
             (_, Need::RevokeGrant) => self.client_kind != ClientKind::Browser && control,
             (_, Need::HostPolicy | Need::ControlRecords) => self.client_kind == ClientKind::Native,
+            (_, Need::Alerts) => self.client_kind == ClientKind::Native && control,
             (None, Need::Seen) => control,
             (Some(scope), Need::Seen) => control && scope.ops.contains(&Op::Approval),
             (None, Need::Op(Op::View | Op::Message)) => true,

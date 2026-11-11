@@ -1832,7 +1832,7 @@ Planned:
 | `atem-membership-entry` | `atem-membership-entry-v1` | a manager at `seq-1`, or the current recovery key (R9.5) |
 | (`kit_sig` beside a `set_recovery_key` entry with `kit: "current"`) | `atem-recovery-cosign-v1` over the same `jcs(body)` | the current recovery key (R9.5) |
 | `atem-browser-grant` | `atem-browser-grant-v1` | a native member with `control` (R9.6) |
-| `atem-push-hint` | `atem-push-hint-v1` | the host's `host_channel_key` (R9.9) |
+| `atem-push-hint` | `atem-push-hint-v1` | the host's `host_channel_key` (R9.9; the open and resolved approval hints, and the planned `outcome_unknown` kind, which has the same label and seal domain `atem-push-seal-v1`) |
 | `atem-seen` | `atem-seen-v1` | the host's `host_channel_key` (R9.9) |
 | `atem-host-route` | `atem-host-route-v1` | the host's `host_channel_key` (R9.7b) |
 | (`enc_sig` inside a `host_enc_key` entry; planned, R9.2 "Host senders and projects") | `atem-host-enc-key-v1` over fields, never a body: `enc([label, account_id, genesis_hash, host_id, u64(host_trust_gen), enc_pub])` | the host's `host_channel_key` (its newest `add_host`'s `host_key`) |
@@ -3547,7 +3547,8 @@ replaced key, also for a proof at an ancestor head; `relay_replies`:
   today `control_records`, whose feature
   `host.senders` no host advertises (detail `host.senders is not
   advertised`). The host-work ops of a feature it doesn't list are
-  host-work-v1's (`busy` while hosting is off, §1).
+  host-work-v1's (`busy`, detail naming the feature, host-work-v1 §11.2
+  and §11.3; `busy` also while hosting is off, §1).
 - One principal may have several attachments (a phone and its widget);
   each is fenced separately by `attachment_gen`, together by the
   principal's `control_gen`.
@@ -3779,6 +3780,62 @@ Open envelope (signed by `host_channel_key`):
   (Astation r3 review 4); an object from another trust generation,
   session or process never matches.
 
+**`outcome_unknown` hint** (planned: part of feature `host.alerts`, which no
+host advertises yet; delegated host-work I.4.6, host-work-v1 §11.3; **new
+body, for Astation to confirm**). When a task's outcome becomes unknown, the
+host signs one hint per recipient, as for an open approval hint, to tell the
+owner's devices that a person is needed. It is a second body of the same
+`type`, signed under the same label (`atem-push-hint-v1`) by
+`host_channel_key`, told apart by a `kind` field that no approval hint has;
+it has neither `state` nor `session_id`, `process_gen` or `approval_id`:
+
+```json
+{"body":{"type":"atem-push-hint","v":1,"kind":"outcome_unknown","account_id":"…","genesis_hash":"…",
+         "host_id":"host-a","host_trust_gen":1,"alert_id":"<uuid v4>",
+         "created_at":1793264006000,"expires_at":1793264606000,
+         "recipient":{"device_id":"dev-phone","enc_kid":"<16 hex>"},"sealed_hash":"<hex>"},
+ "sig":"…","enc":"<b64u>","ct":"<b64u>"}
+```
+
+- Sealed part: the same suite, `enc_kid` and `sealed_hash` rules, empty AAD,
+  to the recipient's `enc_key`, `info = enc(["atem-push-seal-v1",
+  account_id, genesis_hash, host_id, u64(host_trust_gen),
+  "outcome_unknown", alert_id, u64(created_at), u64(expires_at), device_id,
+  enc_kid])` (11 fields, where an approval hint's has 12, so neither kind's
+  sealed part opens as the other's), plaintext `jcs({"reason":…,
+  "sender":…, "session_id":…, "task_id":…})`: the task (a UUID v4, or the
+  v5 of a local selector's resolution), its session id, its sender
+  (`member:<id>`, `service:<id>`, `browser:<id>`, `host:<id>` or `local`) and
+  why the outcome is unknown (1-256 bytes, no control character). The
+  body names the alert, never the task: nothing the owner reads is in the
+  clear. No new label: it is the push hint's own, and the seal's. **Atem's
+  choices, for Astation to confirm:** the sealed facts (the design's "the
+  host, session, task and sender, and why": the host is the body's
+  `host_id`), their bounds, the `kind` discriminator, and an `alert_id` (the
+  host's own UUID v4, the `alert_id` of `alert_list`) as the identity.
+- Identity: `(account_id, genesis_hash, host_id, host_trust_gen, alert_id)`
+  plus `recipient.device_id`; every match and deduplication uses all of it. A
+  `push_ack` entry is `{"kind":"outcome_unknown", "account_id", "genesis_hash",
+  "host_id", "host_trust_gen", "alert_id", "device_id"}` (exactly those
+  seven).
+- Verification is as for an open hint, in the same order and with the same
+  clock rules (below): exact fields (an unknown field, a `state`, an
+  approval's ids and an unknown `kind` are `malformed`), signature by the
+  host's newest key, binding, `expires_at > created_at` and ≤ 900 000,
+  skew, staleness; duplicates as for opens (identical bytes idempotent, the
+  same identity with other bytes refused `duplicate`, the first stays); then
+  the sealed part (`bad_sealed`). A verifier of approval hints refuses it
+  `malformed`, so no host sends one before the relay and every client verify
+  it: it ships with `host.alerts`, which Atem and Astation enable together.
+- Delivery and schedule are an open hint's: the host keeps and resends it
+  until acknowledged or `expires_at + 300 000` (its window is at most
+  900 000 ms, so a notification is pushed at most for a quarter of an hour);
+  the relay schedules the stages of "Schedule" below from the signed
+  `created_at` with the same guard. There is **no resolved hint and no seen**
+  for an alert: nothing cancels a stage, and an alert's own state is read
+  with `alert_list` (it lasts until its task is resolved). The daily reminder
+  is Astation's. **Atem's choice, for Astation to confirm.**
+
 **Verification** (relay and clients; `now` is the verifier's clock):
 signature by the newest `add_host` key of `host_id` in its verified log;
 account/genesis/host binding; `expires_at > created_at`; `expires_at −
@@ -3914,7 +3971,12 @@ Vectors: `r9-vectors-push-hint` (two recipients with their HPKE inputs,
 resolved, seen, a seen from another `process_gen`, two hints whose
 mobile stage lands exactly on the guard (`open_g75`) and 1 ms before it
 (`open_g75001`), and the refused cases: skew, `expires_at` ≤
-`created_at`, too long, conflicting duplicate).
+`created_at`, too long, conflicting duplicate; and the `outcome_unknown`
+hints: one alert for two recipients and another at the bounds, with their
+HPKE inputs and ack entries, and the refused cases: an unknown field, a
+`state` beside the kind, an unknown kind, an approval's id, an upper-case
+`enc_kid`, binding, `expires_at` ≤ `created_at`, too long, skew, a
+conflicting duplicate and a swapped sealed part).
 
 ### R9.10 Several devices at once
 

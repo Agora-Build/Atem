@@ -22,6 +22,7 @@
 //!   host-work design III.2): per-prompt tags, counted blocks, escaping.
 use rand_core::{OsRng, RngCore};
 
+pub mod alerts;
 pub mod chat;
 pub mod client;
 pub mod framing;

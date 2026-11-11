@@ -3170,18 +3170,19 @@ mod control_records {
 }
 
 /// `work_interrupt` and `work_resolve` (delegated host-work design I.4.5,
-/// plan Task 17) are host-work ops of `host.delegated`, which no host
-/// advertises in step 3: refused as any host-work op of a feature the host
-/// doesn't list is (`busy`, host-work-v1 §1 and §7, here with the feature
-/// named), after the channel's own authority check and before anything is
-/// decoded, so nothing reaches the runtime's host-work queue.
+/// plan Task 17) are host-work ops of `host.delegated`, and `alert_list`
+/// (I.4.6, plan Task 18) of `host.alerts`; no host advertises either feature
+/// in step 3: refused as any host-work op of a feature the host doesn't list
+/// is (`busy`, host-work-v1 §1 and §7, here with the feature named), after
+/// the channel's own authority check and before anything is decoded, so
+/// nothing reaches the runtime's host-work queue.
 mod delegated_work_ops {
     use super::*;
     use atem_client::session::host_work::{ALERTS_FEATURE, DELEGATED_FEATURE, SENDERS_FEATURE};
 
     const ID: &str = "aaaaaaaa-0000-4000-8000-0000000000d1";
     const TASK: &str = "aaaaaaaa-0000-4000-8000-0000000000d2";
-    const OPS: [&str; 2] = ["work_interrupt", "work_resolve"];
+    const OPS: [&str; 3] = ["work_interrupt", "work_resolve", "alert_list"];
 
     /// The request a newer client would send (the client core never sends
     /// either to a host that didn't advertise the feature), built from the
@@ -3189,13 +3190,16 @@ mod delegated_work_ops {
     fn message(rig: &mut Rig, handle: &str, op: &str) -> Vec<u8> {
         let w = welcome(rig, handle);
         let mut data = json!({
-            "v": 1, "id": ID, "op": op, "task_id": TASK,
+            "v": 1, "id": ID, "op": op,
             "host": {
                 "account_id": w.account_id,
                 "atem_device_id": w.atem_device_id,
                 "host_trust_gen": w.host_trust_gen,
             },
         });
+        if op != "alert_list" {
+            data["task_id"] = json!(TASK);
+        }
         if op == "work_resolve" {
             data["resolution"] = json!({"kind": "failed", "detail": "agent exited"});
         }
@@ -3223,11 +3227,14 @@ mod delegated_work_ops {
         (e.code.clone(), e.detail.clone())
     }
 
-    fn not_advertised() -> (String, Option<String>) {
-        (
-            "busy".into(),
-            Some("host.delegated is not advertised".into()),
-        )
+    /// The refusal of `op`: `busy`, naming the feature the op belongs to.
+    fn not_advertised(op: &str) -> (String, Option<String>) {
+        let feature = if op == "alert_list" {
+            ALERTS_FEATURE
+        } else {
+            DELEGATED_FEATURE
+        };
+        ("busy".into(), Some(format!("{feature} is not advertised")))
     }
 
     #[test]
@@ -3251,8 +3258,13 @@ mod delegated_work_ops {
         for op in OPS {
             // A native member holding `control` has the right to a
             // directed-work op, and the feature isn't there.
-            assert_eq!(refusal(&mut rig, "ch-phone", op), not_advertised(), "{op}");
-            // A service without `notify` has no right to it either way.
+            assert_eq!(
+                refusal(&mut rig, "ch-phone", op),
+                not_advertised(op),
+                "{op}"
+            );
+            // A service without `notify` has no right to it either way
+            // (`alert_list` is for native members: a service never has it).
             assert_eq!(refusal(&mut rig, "ch-bot", op).0, "forbidden", "{op}");
         }
         // The channels are as they were, and no host-work request, relay
@@ -3284,7 +3296,11 @@ mod delegated_work_ops {
         assert!(!features.iter().any(|f| f == DELEGATED_FEATURE));
         for _ in 0..2 {
             for op in OPS {
-                assert_eq!(refusal(&mut rig, "ch-phone", op), not_advertised(), "{op}");
+                assert_eq!(
+                    refusal(&mut rig, "ch-phone", op),
+                    not_advertised(op),
+                    "{op}"
+                );
             }
         }
         assert!(rig.engine.take_host_work().is_empty());

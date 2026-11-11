@@ -715,6 +715,7 @@ impl Attached {
                         | "work_complete"
                         | "work_interrupt"
                         | "work_resolve"
+                        | "alert_list"
                         | "message_publish"
                         | "message_query"
                         | "attachment_put"

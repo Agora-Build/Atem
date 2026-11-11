@@ -1956,3 +1956,102 @@ mod delegated_work_ops {
         );
     }
 }
+
+/// `alert_list` (delegated host-work design I.4.6) on the client: a host-work
+/// request of `host.alerts`, sent only to a host that advertised it, read as
+/// the host reads it, and tracked until the host answers.
+mod alert_list_op {
+    use super::*;
+    use atem_client::session::host_work::ALERTS_FEATURE;
+
+    const MINE: &str = "aaaaaaaa-0000-4000-8000-0000000000f1";
+
+    /// The message an app builds, for the host `attached` is on.
+    fn message(attached: &Attached, id: &str, after: Option<&str>) -> Value {
+        let w = attached.welcome();
+        let mut data = json!({
+            "v": 1, "id": id, "op": "alert_list",
+            "host": {
+                "account_id": w.account_id,
+                "atem_device_id": w.atem_device_id,
+                "host_trust_gen": w.host_trust_gen,
+            },
+        });
+        if let Some(after) = after {
+            data["after"] = json!(after);
+        }
+        json!({"type": "session", "data": data})
+    }
+
+    #[test]
+    fn client_refuses_without_feature() {
+        let world = World::new(&L);
+        let log = world.log(&L);
+        let now = || world.mono();
+        let phone = Device::native(&world, "dev-phone", log);
+        let mut wire = world.tcp();
+        let mut attached = phone.connect(&mut wire).unwrap();
+        assert!(
+            !attached
+                .welcome()
+                .features
+                .iter()
+                .any(|f| f == ALERTS_FEATURE)
+        );
+        let sent = message(&attached, MINE, None);
+        assert_eq!(
+            attached.send(&sent, now()).err(),
+            Some(ConnectError::Request("host feature not available"))
+        );
+        // The channel carries on: nothing was sealed.
+        assert_eq!(list(&mut attached, &mut wire, now()), vec![SES_A, SES_B]);
+
+        // With the feature the same message goes, once while it waits.
+        world.core.lock().unwrap().welcome_override =
+            Some(|w| w.features.push(ALERTS_FEATURE.into()));
+        let mut wire = world.tcp();
+        let mut attached = phone.connect(&mut wire).unwrap();
+        assert!(
+            attached
+                .welcome()
+                .features
+                .iter()
+                .any(|f| f == ALERTS_FEATURE)
+        );
+        let sent = message(&attached, MINE, None);
+        attached.send(&sent, now()).unwrap();
+        assert_eq!(
+            attached.send(&sent, now()).err(),
+            Some(ConnectError::Request("duplicate host work message id"))
+        );
+        // A cursor is the id of an alert (a UUID v4); another host's target
+        // or anything the host wouldn't read is refused before sealing.
+        let after = message(
+            &attached,
+            "aaaaaaaa-0000-4000-8000-0000000000f2",
+            Some("aaaaaaaa-0000-4000-8000-0000000000f3"),
+        );
+        attached.send(&after, now()).unwrap();
+        let bad = message(
+            &attached,
+            "aaaaaaaa-0000-4000-8000-0000000000f4",
+            Some("not-an-alert"),
+        );
+        assert_eq!(
+            attached.send(&bad, now()).err(),
+            Some(ConnectError::Request("invalid_request"))
+        );
+        let mut stale = message(&attached, "aaaaaaaa-0000-4000-8000-0000000000f5", None);
+        stale["data"]["host"]["host_trust_gen"] = json!(99);
+        assert_eq!(
+            attached.send(&stale, now()).err(),
+            Some(ConnectError::Request("stale host target"))
+        );
+        let mut extra = message(&attached, "aaaaaaaa-0000-4000-8000-0000000000f6", None);
+        extra["data"]["limit"] = json!(10);
+        assert_eq!(
+            attached.send(&extra, now()).err(),
+            Some(ConnectError::Request("invalid_request"))
+        );
+    }
+}

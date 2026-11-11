@@ -453,14 +453,15 @@ fn error(code: &str, re: Option<&str>, detail: Option<&str>) -> SessionError {
 
 /// The feature of an op that exists only for delegated host work (plan
 /// decision 4): `control_records` is `host.senders`'s; `work_interrupt` and
-/// `work_resolve` are `host.delegated`'s. `alert_list` (`host.alerts`) and
-/// `host_enc_key_get` (`host.senders`) join it when they are specified.
+/// `work_resolve` are `host.delegated`'s; `alert_list` is `host.alerts`'s.
+/// `host_enc_key_get` (`host.senders`) joins them when it is specified.
 fn delegated_feature_of(op: &str) -> Option<&'static str> {
     match op {
         "control_records" => Some(atem_client::session::host_work::SENDERS_FEATURE),
         "work_interrupt" | "work_resolve" => {
             Some(atem_client::session::host_work::DELEGATED_FEATURE)
         }
+        "alert_list" => Some(atem_client::session::host_work::ALERTS_FEATURE),
         _ => None,
     }
 }
@@ -1693,15 +1694,17 @@ impl R9Host {
                         | "work_complete"
                         | "work_interrupt"
                         | "work_resolve"
+                        | "alert_list"
                         | "message_publish"
                         | "message_query"
                         | "attachment_put"
                 )
             ) {
                 // A host-work op of a feature this host doesn't advertise
-                // (`host.delegated`'s, none in step 3) is refused as every
-                // host-work request the host can't take is (`busy`, host-work
-                // v1 §7), naming the feature; it is never decoded or queued.
+                // (`host.delegated`'s and `host.alerts`', none in step 3) is
+                // refused as every host-work request the host can't take is
+                // (`busy`, host-work v1 §7), naming the feature; it is never
+                // decoded or queued.
                 if let Some(feature) = unadvertised {
                     refuse(
                         self,

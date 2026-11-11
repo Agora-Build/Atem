@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::alerts::{self, Alert};
 use super::wire::{Target, is_digest, is_opaque_id, is_session_id, is_uuid_v4, is_uuid_v5};
 use crate::canonical::MAX_SAFE_INTEGER;
 
@@ -285,6 +286,18 @@ pub enum Request {
         task_id: String,
         resolution: Resolution,
     },
+    /// The host's alerts (`host.alerts`, I.4.6): an unresolved
+    /// `outcome_unknown` task each, oldest first, [`alerts::MAX_PAGE`] at a
+    /// time. `after` is the `alert_id` of the last alert the caller has;
+    /// omitted for the first page.
+    #[serde(rename = "alert_list")]
+    AlertList {
+        v: u8,
+        id: String,
+        host: HostTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
     #[serde(rename = "message_publish")]
     Publish {
         v: u8,
@@ -350,6 +363,7 @@ impl Request {
             | Self::Complete { id, .. }
             | Self::WorkInterrupt { id, .. }
             | Self::WorkResolve { id, .. }
+            | Self::AlertList { id, .. }
             | Self::Publish { id, .. }
             | Self::MessageQuery { id, .. } => id,
         }
@@ -368,6 +382,7 @@ impl Request {
             | Self::Complete { host, .. }
             | Self::WorkInterrupt { host, .. }
             | Self::WorkResolve { host, .. }
+            | Self::AlertList { host, .. }
             | Self::Publish { host, .. }
             | Self::MessageQuery { host, .. } => host,
         }
@@ -391,6 +406,8 @@ impl Request {
             REPLY_FEATURE
         } else if matches!(self, Self::WorkInterrupt { .. } | Self::WorkResolve { .. }) {
             DELEGATED_FEATURE
+        } else if matches!(self, Self::AlertList { .. }) {
+            ALERTS_FEATURE
         } else {
             WORK_FEATURE
         }
@@ -468,6 +485,7 @@ impl Request {
                     task_id, result, ..
                 } => is_uuid_v4(task_id) && result.valid(),
                 Self::Profiles { .. } => true,
+                Self::AlertList { after, .. } => after.as_deref().is_none_or(is_uuid_v4),
                 Self::Publish { host, message, .. } => {
                     message.valid() && message.recipients.iter().any(|r| &r.host == host)
                 }
@@ -697,6 +715,13 @@ pub enum ResultBody {
     Message {
         message: super::messages::MessageReceipt,
     },
+    /// The host's alerts, oldest first (`host.alerts`, I.4.6): at most
+    /// [`alerts::MAX_PAGE`]; `more` when others follow (and then the page
+    /// isn't empty, so its last alert is the next request's `after`).
+    Alerts {
+        alerts: Vec<Alert>,
+        more: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -748,6 +773,16 @@ impl Response {
             ResultBody::Work { work } => work.valid(),
             ResultBody::Reply { reply } => reply.as_ref().is_none_or(ResultReply::valid),
             ResultBody::Message { message } => message.valid(),
+            // Every alert is this host's own, in the host's order; a page
+            // that goes on has a last alert to go on from.
+            ResultBody::Alerts { alerts, more } => {
+                alerts.len() <= alerts::MAX_PAGE
+                    && alerts
+                        .iter()
+                        .all(|a| a.valid() && a.host_id == r.host.atem_device_id)
+                    && alerts::in_order(alerts)
+                    && (!*more || !alerts.is_empty())
+            }
         };
         if !valid {
             return Err("invalid host work result");
@@ -824,6 +859,10 @@ impl Response {
                         }
                     }
             }
+            // `alert_list`: a page that never repeats the cursor it follows.
+            (ResultBody::Alerts { alerts, .. }, Request::AlertList { after, .. }) => after
+                .as_ref()
+                .is_none_or(|after| alerts.iter().all(|a| &a.alert_id != after)),
             _ => false,
         }
     }
@@ -872,6 +911,22 @@ mod tests {
                 );
             }
         }
+        // `alert_list` (`host.alerts`, I.4.6): the first page and a page after
+        // a cursor, and what a host refuses.
+        for (name, valid) in [
+            ("alert_list_first_page", true),
+            ("alert_list_after", true),
+            ("alert_list_after_must_be_uuid_v4", false),
+            ("alert_list_after_null", false),
+            ("alert_list_unknown_field", false),
+        ] {
+            assert!(
+                cases
+                    .iter()
+                    .any(|c| c["name"] == name && c["valid"] == valid),
+                "{name}"
+            );
+        }
         for case in cases {
             let raw = case
                 .get("raw")
@@ -914,6 +969,24 @@ mod tests {
                 cases
                     .iter()
                     .any(|c| c["name"] == name && c["valid"] == false),
+                "{name}"
+            );
+        }
+        // Alerts results (`alert_list`): a page, the senders an alert may
+        // name, and every strictness rule.
+        for (name, valid) in [
+            ("alerts_empty", true),
+            ("alerts_page", true),
+            ("alerts_senders", true),
+            ("alerts_more_needs_an_alert", false),
+            ("alert_kind_is_outcome_unknown", false),
+            ("alerts_in_order", false),
+            ("alert_is_this_hosts", false),
+        ] {
+            assert!(
+                cases
+                    .iter()
+                    .any(|c| c["name"] == name && c["valid"] == valid),
                 "{name}"
             );
         }
