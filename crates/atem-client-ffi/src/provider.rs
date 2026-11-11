@@ -168,9 +168,13 @@ pub fn describe(input: &SigningInput) -> (SigningPurpose, Option<String>) {
         SignLabel::ChannelClient => (SigningPurpose::Channel, None),
         // A host's `enc_sig` signs fields, not a body (II.4.1).
         SignLabel::ChannelHost | SignLabel::HostEncKey => (SigningPurpose::HostSigning, None),
-        SignLabel::PushHint | SignLabel::Seen | SignLabel::HostRoute => {
-            (SigningPurpose::HostSigning, body())
-        }
+        // Signed bodies the host makes with its `host_key`: an envelope and
+        // a result between hosts (II.4.2, II.4.4) too.
+        SignLabel::PushHint
+        | SignLabel::Seen
+        | SignLabel::HostRoute
+        | SignLabel::Envelope
+        | SignLabel::Result => (SigningPurpose::HostSigning, body()),
         SignLabel::BrowserGrant => (SigningPurpose::BrowserGrant, body()),
         SignLabel::RecoveryCosign => (SigningPurpose::Kit, body()),
         SignLabel::MembershipEntry => {

@@ -20,7 +20,8 @@ use crate::provider::{KeyId, KeyProvider, sign};
 /// A signed body's `jcs` is at most this long (§R9.1).
 pub const MAX_BODY_BYTES: usize = 4096;
 /// Bound on a whole signed object as it arrives (body, signatures, and a
-/// push hint's sealed part).
+/// push hint's sealed part). A mailbox object has its own, larger bound
+/// (`host_mail::MAX_MAIL_OBJECT_BYTES`).
 pub const MAX_OBJECT_BYTES: usize = 16 * 1024;
 
 /// How an array field is encoded (§R9.2 "Arrays").
@@ -149,7 +150,8 @@ fn sequence_ok(items: &[&str], max: usize) -> Result<()> {
     Ok(())
 }
 
-/// A push hint's sealed part (§R9.9), beside the body like `sig`.
+/// A sealed part beside the body like `sig`: a push hint's (§R9.9), an
+/// envelope's or a result's (delegated host-work II.4.2, II.4.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedPart {
     pub enc: Vec<u8>,
@@ -220,11 +222,21 @@ impl SignedObject {
             }),
             _ => return Err(Error::Malformed("enc and ct come together")),
         };
-        // Only a push hint carries a sealed part. Whether a given hint must
-        // (an open one is sealed per recipient, §R9.9) is the hint layer's
-        // rule: the shared vectors refuse unsealed open hints for their times.
-        if sealed.is_some() && label != SignLabel::PushHint {
-            return Err(Error::Malformed("only a push hint has enc and ct"));
+        // Only a push hint and the two mailbox objects (an envelope and a
+        // result, delegated host-work II.4.2 and II.4.4) carry a sealed part.
+        // Whether a given hint must (an open one is sealed per recipient,
+        // §R9.9) is the hint layer's rule: the shared vectors refuse unsealed
+        // open hints for their times. A mailbox object always must, and
+        // `host_mail` refuses one without.
+        if sealed.is_some()
+            && !matches!(
+                label,
+                SignLabel::PushHint | SignLabel::Envelope | SignLabel::Result
+            )
+        {
+            return Err(Error::Malformed(
+                "only a push hint, an envelope or a result has enc and ct",
+            ));
         }
 
         let allowed = 2 + usize::from(kit_sig.is_some()) + 2 * usize::from(sealed.is_some());
@@ -266,7 +278,7 @@ impl SignedObject {
         Ok(())
     }
 
-    /// Attaches a push hint's sealed part.
+    /// Attaches a sealed part (a push hint's, an envelope's or a result's).
     pub fn with_sealed(mut self, sealed: SealedPart) -> Self {
         self.sealed = Some(sealed);
         self
@@ -455,6 +467,27 @@ mod tests {
     fn a_body_over_4096_bytes_is_refused() {
         let big = "x".repeat(MAX_BODY_BYTES);
         assert_eq!(parse(&entry(json!({"pad": big}))), Err(Error::TooLarge));
+    }
+
+    #[test]
+    fn only_push_hints_and_mailbox_objects_carry_enc_and_ct() {
+        let with =
+            |ty: &str| json!({"body": {"type": ty, "v": 1}, "sig": "AA", "enc": "AA", "ct": "AA"});
+        for ty in ["atem-push-hint", "atem-envelope", "atem-result"] {
+            assert!(parse(&with(ty)).is_ok(), "{ty}");
+        }
+        for ty in [
+            "atem-seen",
+            "atem-membership-entry",
+            "atem-browser-grant",
+            "atem-host-route",
+        ] {
+            assert!(matches!(parse(&with(ty)), Err(Error::Malformed(_))), "{ty}");
+        }
+        // One of the two alone is never allowed.
+        let mut lone = with("atem-envelope");
+        lone.as_object_mut().unwrap().remove("ct");
+        assert!(matches!(parse(&lone), Err(Error::Malformed(_))));
     }
 
     #[test]

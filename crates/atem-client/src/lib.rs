@@ -58,6 +58,13 @@
 //!
 //! - [`host_route`]: the host route proof a host signs for the relay's
 //!   challenge, and the relay's verifier against its log.
+//!
+//! Delegated host work's host-to-host objects (design II.4):
+//!
+//! - [`host_principal`]: the `host:<host_id>` principal of a host sender;
+//! - [`host_mail`]: `atem-envelope` and `atem-result`, built, sealed to the
+//!   receiving host's `enc_key`, signed by the sending host's `host_key`, and
+//!   opened (a receiver's checks are a later part).
 
 pub mod backup;
 pub mod backup_writer;
@@ -68,6 +75,7 @@ pub mod connect;
 pub mod domain;
 pub mod encoding;
 pub mod error;
+pub mod host_mail;
 pub mod host_principal;
 pub mod host_route;
 pub mod hpke;

@@ -12,6 +12,9 @@ use crate::host_principal::parse_host_principal;
 
 pub const FEATURE: &str = "host.messages";
 pub const MAX_RECIPIENTS: usize = 32;
+/// A message serializes to at most this many bytes (host-work-v1 §5; also the
+/// Message inside a host sender's envelope, delegated host-work II.4.2).
+pub const MAX_MESSAGE_BYTES: usize = 240 * 1024;
 
 /// Recipients are resolved before publication; retries never expand a role again.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,7 +197,7 @@ impl Message {
             })
             && self.context.len() <= 8
             && self.context.iter().all(ContextSnapshot::valid)
-            && serde_json::to_vec(self).is_ok_and(|b| b.len() <= 240 * 1024)
+            && serde_json::to_vec(self).is_ok_and(|b| b.len() <= MAX_MESSAGE_BYTES)
             && self.recipients.iter().all(|r| {
                 is_uuid_v4(&r.recipient_id)
                     && ids.insert(&r.recipient_id)
@@ -358,27 +361,34 @@ pub struct MessageReceipt {
     pub recipients: Vec<RecipientReceipt>,
 }
 
+/// This host's recipients' receipts (a message receipt's, or a status
+/// object's, delegated host-work II.4.4): one to `MAX_RECIPIENTS`, distinct
+/// recipient ids, each delivery one this host can send.
+pub fn recipients_valid(recipients: &[RecipientReceipt]) -> bool {
+    let mut ids = BTreeSet::new();
+    recipients.len() <= MAX_RECIPIENTS
+        && !recipients.is_empty()
+        && recipients.iter().all(|r| {
+            is_uuid_v4(&r.recipient_id)
+                && ids.insert(&r.recipient_id)
+                && match &r.delivery {
+                    Delivery::Stored => true,
+                    Delivery::Refused { code } => {
+                        matches!(code.as_str(), "forbidden" | "stale_target")
+                    }
+                    Delivery::Work { work } => work.task_id == r.recipient_id && work.valid(),
+                }
+        })
+}
+
 impl MessageReceipt {
     pub fn valid(&self) -> bool {
-        let mut ids = BTreeSet::new();
         is_uuid_v4(&self.message_id)
             && is_digest(&self.digest)
             && ["member:", "service:"]
                 .iter()
                 .any(|p| self.sender.strip_prefix(p).is_some_and(is_opaque_id))
-            && self.recipients.len() <= MAX_RECIPIENTS
-            && !self.recipients.is_empty()
-            && self.recipients.iter().all(|r| {
-                is_uuid_v4(&r.recipient_id)
-                    && ids.insert(&r.recipient_id)
-                    && match &r.delivery {
-                        Delivery::Stored => true,
-                        Delivery::Refused { code } => {
-                            matches!(code.as_str(), "forbidden" | "stale_target")
-                        }
-                        Delivery::Work { work } => work.task_id == r.recipient_id && work.valid(),
-                    }
-            })
+            && recipients_valid(&self.recipients)
     }
 
     pub fn answers(&self, message: &Message, host: &HostTarget) -> bool {
