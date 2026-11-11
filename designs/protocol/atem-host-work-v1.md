@@ -939,8 +939,9 @@ names its reason; the reasons are stable and snake_case.
    beyond this host's head, this list settles it, in this order: a host no
    `add_host` names (`unknown_sender`); a generation below its newest
    `add_host`'s (`stale_sender_generation`, at any head); a removed host (an
-   envelope, or a result claiming a generation the host never had:
-   `removed_sender`); a generation above its newest (`generation_ahead`); a
+   envelope, at any head as below, or a result claiming a generation the
+   host never had: `removed_sender`); a generation above its newest
+   (`generation_ahead`); a
    host held `revoked` (an envelope: `revoked_sender`); `authorized(g)` with
    `signed_at_head.seq` below `g` (`signed_at_head_before_generation`); the
    claimed generation's `add_host` after `signed_at_head.seq`
@@ -972,49 +973,64 @@ storage and its receipts are the host's.
   `signed_at_head`.
 - **Pending** (`Pending{host_id, host_trust_gen}`, the claimed pair) only
   when `signed_at_head.seq` is beyond this host's head and the sender's
-  standing here doesn't settle it: entries this host hasn't seen may add
-  the sender (unknown here), add it again (removed), readmit it (revoked)
-  or bring its newer generation, and no sender can know the hash of an
-  entry that doesn't exist. A generation below the sender's newest is
-  refused at any head. Step 5 runs first, on the body's times, and a
-  failure is refused. **Within this host's list** (`signed_at_head.seq` at
-  or below its head), a generation the list doesn't hold there is refused
-  `generation_ahead`, never pending: the list the sender signed at is the
-  one this host holds. A pending object is judged again after each
-  device-list advance, until it expires (the design's limits: 64 per
-  claimed pair, 256 in all; pending objects don't hold the gate).
+  standing here doesn't settle it: entries this host hasn't seen may add the
+  sender (unknown here), add it again at a newer generation (removed),
+  readmit it (revoked) or bring its newer generation, and no sender can know
+  the hash of an entry that doesn't exist. Step 5 runs first, on the body's
+  times, and a failure is refused. Two claims are settled at any head,
+  because `add_host` generations strictly rise: a generation below the
+  sender's newest (`stale_sender_generation`), and an envelope from a
+  removed host at the generation it last held (`removed_sender`, after the
+  body's times when the head is beyond this host's): no entry this host
+  lacks can bring that generation back. A removed host's result at that
+  generation still waits, to be kept as data. **Within this host's list**
+  (`signed_at_head.seq` at or below its head), a generation the list doesn't
+  hold there is refused `generation_ahead`, never pending: the list the
+  sender signed at is the one this host holds. A pending object is judged
+  again after each device-list advance, until it expires (the design's
+  limits: 64 per claimed pair, 256 in all; pending objects don't hold the
+  gate).
 - **Verify before waiting.** When this list already holds the `add_host` of
-  the claimed `(host_id, host_trust_gen)` (a current or removed host at its
-  newest generation), the signature is checked with that `add_host`'s key
-  before the object waits, since that pair has exactly one key forever: a
-  failure is `bad_signature`, so junk can't fill a known sender's pending
-  slots. A sender this list doesn't name, or a generation above its newest,
-  has no key yet, and its object waits unverified.
+  the claimed `(host_id, host_trust_gen)` (a current host at its newest
+  generation, or a removed host's result), the signature is checked with
+  that `add_host`'s key before the object waits, since that pair has exactly
+  one key forever: a failure is `bad_signature`, so junk can't fill a known
+  sender's pending slots. A sender this list doesn't name, or a generation
+  above its newest, has no key yet, and its object waits unverified.
 
 | Verdict | When | What the host does |
 |---|---|---|
 | `Open{plain, sender}` | checks 1 to 6 passed; `sender` is `host:<host_id>` | step 7 |
 | `Pending{host_id, host_trust_gen}` | above | keeps it, not done; judges it again |
-| `Refused{reason, evidence}` | before the signature verified (steps 1 to 4, and step 5 on a waiting object) | marks it done and keeps `evidence = SHA-256(enc([jcs(body), sig, enc, ct]))` (`enc` and `ct` empty when absent); tells nobody |
+| `Refused{reason, evidence}` | before the signature verified (steps 1 to 4, and step 5 on an object signed beyond this host's head) | marks it done and keeps `evidence = SHA-256(enc([jcs(body), sig, enc, ct]))` (`enc` and `ct` empty when absent); tells nobody |
 | `RefusedAuthenticated{object_id, reason}` | steps 5 and 6 after the signature verified | marks it done; reports it to the sender as `{"kind":"status","object_id":<id>,"refused":"invalid_request"}`, whatever the reason (for a result, nothing is reported back) |
 | `Unavailable{error}` | a local failure: the key provider failed (the key missing, locked, or not the one its kid names) | decides nothing; judges it again later |
 
 A seal that doesn't open under the key is `open_failed`, the sender's
 doing, whichever provider holds the key: through the bindings' key provider
-it is `ProviderError.Failed{reason: "open_failed"}` from `hpke_open`
-(atem-client-bindings.md §3).
+it is `ProviderError.OpenFailed` from `hpke_open` (atem-client-bindings.md
+§3).
 
-**Verdicts over time.** A refused object is done: the host keeps its
-evidence and never judges it again, and at any later head its bytes are
-refused too (a later head keeps every entry up to `signed_at_head.seq`, and
-a generation once below the newest stays below). An object that opened may
-be refused at a later head, as the sender's standing changes (revoked,
-removed, re-verified): the verdict is the one at the time the host judges
-it, and the host's start check re-checks the sender's standing before work
-starts (design I.4.3). The vectors show both: a request that opens on the
-list it was signed at and is `revoked_sender`, `removed_sender`,
-`stale_sender_generation` or `signed_at_head_before_generation` after a
-revoke, a removal, a re-verification or a readmit.
+**Verdicts over time.** Finality is the host's own rule: an object it judged
+(opened or refused) is done, marked done in the mailbox, and never judged
+again; the same `id` with the same bytes again is a duplicate, acknowledged
+with the first verdict (design II.4.2, "Duplicates"); only a pending object
+is judged again. So a refusal never later becomes Open. Refusals of the
+sender, its signature and the body's times (steps 3 to 5) also don't depend
+on what this host holds later: at any later head the same bytes are refused
+too (a later head keeps every entry up to `signed_at_head.seq`, and
+generations only rise). The others are final by the rule alone: they depend
+on this host itself, its own trust generation, the keys it accepts (an
+object sealed to a key this host hasn't applied yet is refused
+`enc_key_not_accepted` for good, "The recipient's keys" below) and its
+clock. The converse doesn't hold: bytes that opened would be refused at a
+later head once the sender's standing changes (revoked, removed,
+re-verified). An Open is the verdict when the host judged it, and the host's
+start check re-checks the sender's standing before work starts (design
+I.4.3). The vectors show both: a request that opens on the list it was
+signed at is `revoked_sender`, `removed_sender`, `stale_sender_generation`
+or `signed_at_head_before_generation` after a revoke, a removal, a
+re-verification or a readmit.
 
 **The sending host's result check** (design II.4.4; `accept_result`). The
 same checks for an `atem-result`, against the outbox row it answers (the
@@ -1042,10 +1058,12 @@ comes before its generation.
 **The recipient's keys.** A host accepts mail sealed to its current host
 encryption key, and to the previous one only inside its 24 h window,
 counted on its own clock from when it applied the rotation, and never after
-a rotation with `retire_previous` (R9.2). It may also accept a key it
-generated and handed out but whose `host_enc_key` its own list hasn't
-applied yet: a sender whose list has the entry seals to it. Mail to any
-other key is `enc_key_not_accepted`.
+a rotation with `retire_previous` (R9.2). It **should** also accept a key
+it generated and handed out but whose `host_enc_key` its own list hasn't
+applied yet: a sender whose list already has the entry seals to it, and
+that mail refused `enc_key_not_accepted` would be lost, since the refusal
+is final and the sender's resend of the same bytes is a duplicate. Mail to
+any other key is `enc_key_not_accepted`.
 
 **Open items, for Astation.** Both wait for cross-host `select`
 (collaboration §5): the wire form of `no_match` in a status (a selector of

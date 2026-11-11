@@ -3921,7 +3921,9 @@ core's builders, and checks naming every verdict and reason of the
 receiver's checks and of the sending host's result check: a re-signed and
 a redirected copy, stale, newer and unheld generations, a tampered
 `sealed_hash`, `signed_at_head` before the sender's generation or naming a
-wrong hash, revoked, removed and unknown senders, expiry and every time
+wrong hash, revoked, removed and unknown senders (a removed host's
+envelope refused even when signed beyond the receiver's head, its result
+waiting), expiry and every time
 check, mismatched plaintext ids, attachments, a plaintext with `null`, a
 retired previous key, a result from a host the row didn't go to, a dropped
 reply, results of revoked and removed hosts kept as data, and an object at
