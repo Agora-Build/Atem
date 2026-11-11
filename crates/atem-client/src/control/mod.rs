@@ -9,12 +9,17 @@
 //! native manager's later `interrupt_running` after a device-list revoke,
 //! bound to no feed (II.3.1).
 //!
-//! This module parses and builds the object only: what holds for the record
-//! alone. Who may sign which action, against which key of the device list,
-//! is the verifier's (I.5.4); applying it is the host's (I.5.5).
+//! [`record`] parses and builds the object: what holds for the record
+//! alone. [`verify`] checks who may sign which action, against which key of
+//! the device list (I.5.4). Applying it is the host's (I.5.5).
 pub mod record;
+pub mod verify;
 
 pub use record::{
     CONTROL_TYPE, ControlAbout, ControlAction, ControlBody, ControlError, ControlFeed,
     ControlPrincipal, ControlRecord, ControlSigner, KNOWN_BY, MAX_BY_CHARS, build_control,
+    principal_key_of,
+};
+pub use verify::{
+    ControlCheck, PendingReason, RefusalReason, VerifiedControl, VerifiedSigner, verify_control,
 };

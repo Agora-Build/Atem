@@ -36,14 +36,17 @@
 //! Absent fields are omitted, never `null`; no other field is allowed,
 //! in the body or in `about`. The parse checks only the record itself: the
 //! signature, which key may sign which action and whether the principal
-//! exists are the verifier's, against the device list (I.5.4).
+//! exists are the verifier's, against the device list (I.5.4,
+//! [`super::verify`]).
 use serde_json::{Map, Value, json};
 
 use crate::canonical::MAX_SAFE_INTEGER;
 use crate::domain::SignLabel;
 use crate::encoding::Hash32;
 use crate::error::{Error, Result};
+use crate::keys::PublicKey;
 use crate::membership::entry::{RECOVERY_SIGNER, id_ok};
+use crate::membership::service_key_fingerprint;
 use crate::provider::{KeyId, KeyProvider};
 use crate::session::wire::is_uuid_v4;
 use crate::signed::SignedObject;
@@ -589,6 +592,15 @@ pub fn build_control(
     let value = body.to_json();
     ControlBody::read(&value)?;
     SignedObject::sign(provider, key, value)
+}
+
+/// A service record's `principal_key` for the principal's `auth_key`: the
+/// SHA-256 of the key's raw bytes, which is exactly the integration's
+/// `r9Svc` ([`service_key_fingerprint`], one definition), so a Station can
+/// cross-check a record against the Portal feed (decision 8). An X25519
+/// key is no `auth_key` (`wrong_alg`).
+pub fn principal_key_of(auth_key: &PublicKey) -> Result<Hash32> {
+    Hash32::from_hex(&service_key_fingerprint(auth_key)?)
 }
 
 /// A device id: an opaque id that isn't the reserved `recovery` signer.
