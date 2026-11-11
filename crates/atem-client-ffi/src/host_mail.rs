@@ -200,7 +200,7 @@ impl MailRecipientData {
             .collect::<Result<Vec<_>>>()?;
         Ok(Recipient {
             host_id: self.host_id.clone(),
-            host_trust_gen: self.host_trust_gen,
+            host_trust_gen: safe_int(self.host_trust_gen, "host_trust_gen")?,
             keys,
         })
     }
@@ -238,16 +238,23 @@ fn mail_object(object_json: &str) -> Result<SignedObject> {
     Ok(SignedObject::from_strict(&value)?)
 }
 
-fn utf8(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
+/// A verdict's plaintext as the canonical JSON it was read from. An error
+/// (none for a plaintext the core just read) decides nothing.
+fn plain_text(
+    bytes: atem_client::Result<zeroize::Zeroizing<Vec<u8>>>,
+) -> std::result::Result<String, (String, String)> {
+    match bytes {
+        Ok(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
+        Err(e) => Err((e.code().into(), e.to_string())),
+    }
 }
 
 impl From<EnvelopeVerdict> for EnvelopeVerdictInfo {
     fn from(v: EnvelopeVerdict) -> Self {
         match v {
-            EnvelopeVerdict::Open { plain, sender } => EnvelopeVerdictInfo::Open {
-                plain_json: plain.to_bytes().map(|b| utf8(&b)).unwrap_or_default(),
-                sender,
+            EnvelopeVerdict::Open { plain, sender } => match plain_text(plain.to_bytes()) {
+                Ok(plain_json) => EnvelopeVerdictInfo::Open { plain_json, sender },
+                Err((code, detail)) => EnvelopeVerdictInfo::Unavailable { code, detail },
             },
             EnvelopeVerdict::Pending {
                 host_id,
@@ -276,20 +283,23 @@ impl From<EnvelopeVerdict> for EnvelopeVerdictInfo {
 
 impl From<ResultVerdict> for ResultVerdictInfo {
     fn from(v: ResultVerdict) -> Self {
-        let text = |plain: ResultPlain| plain.to_bytes().map(|b| utf8(&b)).unwrap_or_default();
+        let unavailable = |(code, detail)| ResultVerdictInfo::Unavailable { code, detail };
         match v {
-            ResultVerdict::Accepted { plain, sender } => ResultVerdictInfo::Accepted {
-                plain_json: text(plain),
-                sender,
+            ResultVerdict::Accepted { plain, sender } => match plain_text(plain.to_bytes()) {
+                Ok(plain_json) => ResultVerdictInfo::Accepted { plain_json, sender },
+                Err(e) => unavailable(e),
             },
             ResultVerdict::NotDelivered {
                 plain,
                 sender,
                 reason,
-            } => ResultVerdictInfo::NotDelivered {
-                plain_json: text(plain),
-                sender,
-                reason: reason.into(),
+            } => match plain_text(plain.to_bytes()) {
+                Ok(plain_json) => ResultVerdictInfo::NotDelivered {
+                    plain_json,
+                    sender,
+                    reason: reason.into(),
+                },
+                Err(e) => unavailable(e),
             },
             ResultVerdict::Pending {
                 host_id,
@@ -559,4 +569,61 @@ pub fn accept_result(
         &crate::provider::Platform(provider),
         now_ms,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A trust generation enters the core only as a safe integer, as every
+    /// other generation input does.
+    #[test]
+    fn a_receiver_generation_above_2_53_is_refused() {
+        let me = |host_trust_gen| MailRecipientData {
+            host_id: "host-b".into(),
+            host_trust_gen,
+            keys: vec![],
+        };
+        assert!(me(1).to_recipient().is_ok());
+        let err = me(1 << 53).to_recipient().unwrap_err();
+        assert_eq!(err.code(), "not_canonical");
+    }
+
+    /// A verdict whose plaintext can't be written back is no Open or
+    /// Accepted with an empty plaintext: nothing is decided.
+    #[test]
+    fn a_plaintext_that_does_not_serialize_is_unavailable() {
+        let bad_envelope = EnvelopePlain::Cancel {
+            task_id: "not a task id".into(),
+        };
+        let got = EnvelopeVerdictInfo::from(EnvelopeVerdict::Open {
+            plain: bad_envelope,
+            sender: "host:host-a".into(),
+        });
+        assert!(
+            matches!(got, EnvelopeVerdictInfo::Unavailable { .. }),
+            "{got:?}"
+        );
+        let bad_result = || ResultPlain::Refusal {
+            object_id: "not an id".into(),
+            refused: "not a code".into(),
+        };
+        let accepted = ResultVerdictInfo::from(ResultVerdict::Accepted {
+            plain: bad_result(),
+            sender: "host:host-b".into(),
+        });
+        assert!(
+            matches!(accepted, ResultVerdictInfo::Unavailable { .. }),
+            "{accepted:?}"
+        );
+        let kept = ResultVerdictInfo::from(ResultVerdict::NotDelivered {
+            plain: bad_result(),
+            sender: "host:host-b".into(),
+            reason: "result not delivered: sender revoked",
+        });
+        assert!(
+            matches!(kept, ResultVerdictInfo::Unavailable { .. }),
+            "{kept:?}"
+        );
+    }
 }

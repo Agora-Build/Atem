@@ -701,6 +701,20 @@ fun main(args: Array<String>) {
             n++
         }
         check(n >= 44) { "$n checks" }
+        // Through a platform provider (the JDK's crypto, as an app's
+        // Keystore would): the request opens, and the re-signed copy's seal
+        // doesn't (ProviderException.OpenFailed), so it is refused
+        // authenticated, open_failed, as through the software store.
+        val jdk = JdkKeys()
+        val encB = keys["host-b-enc-1"]["enc"]
+        jdk.addX25519("host-b-enc-1", unhex(encB["secret_hex"].s()), unhex(encB["pub_hex"].s()))
+        for (label in listOf("request_opens", "resigned")) {
+            val c = mail["checks"].arr().first { it["label"] == label }
+            val got = openEnvelope(Json.write(mailObject.getValue(c["object"].s())["object"]), mailList(c["chain"].arr().map { it.s() }),
+                mailRecipient(c["receiver"]), jdk, c["now"].l().toULong())
+            val (verdict, plain) = envelopeVerdict(got)
+            mailExpect(c, verdict, plain)
+        }
     }
     check("host mail: every result check's verdict (acceptResult)") {
         val store = mailStore()

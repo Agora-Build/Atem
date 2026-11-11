@@ -799,6 +799,21 @@ final class ConformanceTests: XCTestCase {
                 n += 1
             }
             if n < 44 { throw Failure(description: "\(n) checks") }
+            #if canImport(CryptoKit)
+            // Through a platform provider (CryptoKit, as Astation's): the
+            // request opens, and the re-signed copy's seal doesn't
+            // (ProviderError.OpenFailed), so it is refused authenticated,
+            // open_failed, as through the software store.
+            let platform = CryptoKitKeys()
+            try platform.addX25519("host-b-enc-1", secret: unhex(s(key("host-b-enc-1", "enc")["secret_hex"])))
+            for label in ["request_opens", "resigned"] {
+                let c = mailChecks.first { s($0["label"]) == label }!
+                let object = js(mailObject[s(c["object"])]!["object"]!)
+                let got = try openEnvelope(objectJson: object, log: try mailList(a(c["chain"]).map(s)), me: try mailRecipient(c["receiver"]), provider: platform, nowMs: u(c["now"]))
+                let (verdict, plain) = envelopeVerdict(got)
+                try mailExpect(c, verdict, plain)
+            }
+            #endif
         }
         check("host mail: every result check's verdict (acceptResult)") {
             let store = try mailStore()

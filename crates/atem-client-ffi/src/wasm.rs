@@ -1863,7 +1863,7 @@ pub fn seal_result(
 
 /// `sealEnvelope` with the ephemeral `DeriveKeyPair(ikmE)` (known-answer
 /// vectors only).
-#[cfg(all(feature = "software-keys", feature = "test-vectors"))]
+#[cfg(all(feature = "software-keys", feature = "test-vectors", feature = "host"))]
 #[wasm_bindgen(js_name = sealEnvelopeWithIkm)]
 pub fn seal_envelope_with_ikm(
     store: &SoftwareKeyStore,
@@ -1885,7 +1885,7 @@ pub fn seal_envelope_with_ikm(
 
 /// `sealResult` with the ephemeral `DeriveKeyPair(ikmE)` (known-answer
 /// vectors only).
-#[cfg(all(feature = "software-keys", feature = "test-vectors"))]
+#[cfg(all(feature = "software-keys", feature = "test-vectors", feature = "host"))]
 #[wasm_bindgen(js_name = sealResultWithIkm)]
 pub fn seal_result_with_ikm(
     store: &SoftwareKeyStore,

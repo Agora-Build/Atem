@@ -578,20 +578,25 @@ trait AppKeyProvider (Swift protocol / Kotlin interface):
   sign(SignRequest{key_id, purpose, fresh_confirmation, label, input, body_json}) -> bytes
   x25519(key_id, peer) -> 32 bytes
   hpke_open(key_id, enc, ct, info, aad) -> plaintext
-errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
+errors: ProviderError.Cancelled{reason} | UnknownKey | OpenFailed | Failed{reason}
 ```
 
-- **A seal that doesn't open** (planned, for host mail; needs Astation's
-  agreement). When `hpke_open`'s AEAD refuses the ciphertext, or `enc`
-  isn't a valid X25519 public key, fail with `Failed{reason:
-  "open_failed"}` (for example on CryptoKit's authentication failure, or
-  the JDK's `AEADBadTagException`): the core then reads it as the seal's own
-  failure (`open_failed`), as it does for a seal it opens itself, and the
-  host refuses the object. Any other failure (a missing or locked key, a
-  cancelled prompt) is the provider's: the host decides nothing and tries
-  again later (`Unavailable`). A provider that reports a failed open
-  another way only delays that refusal to the object's expiry.
-  `SoftwareKeyStore` does this already.
+- **`ProviderError.OpenFailed`** (planned, for host mail; **for Astation's
+  agreement**: a new error case its providers can construct, a source
+  change for an app that switches over `ProviderError` exhaustively). From
+  `hpke_open` only, when the seal doesn't open under the key: the AEAD
+  refuses the ciphertext (CryptoKit's authentication failure, the JDK's
+  `AEADBadTagException`), or `enc` isn't a valid X25519 public key. The
+  core reads it as the seal's own failure (`open_failed`), as it reads
+  `UnknownKey` as `unknown_key`, and the host refuses the object as the
+  sender's doing. Any other failure (a missing or locked key, a cancelled
+  prompt, the provider's own fault) is `Failed` or `Cancelled`: the host
+  decides nothing and tries again later (`Unavailable`). A provider that
+  reports a failed open another way only delays that refusal to the
+  object's expiry. `SoftwareKeyStore` returns it for exactly those cases.
+  WASM has no foreign provider (JS passes a `SoftwareKeyStore`), so there
+  a failed open is the core's `open_failed` code already, as `unknown_key`
+  is.
 
 - **Formats.** P-256: public key SEC1 uncompressed (65 bytes); signature
   ECDSA over SHA-256 of `input`, 64-byte `r‖s`, either S (the core
@@ -837,9 +842,10 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   `null`, a dropped reply and a key that isn't the `enc_kid`'s, and seals a
   plaintext's canonical form only), and every check's verdict and reason
   through `open_envelope` and `accept_result`, with the plaintext an open
-  gives (the largest by its length and SHA-256). Kotlin and Swift seal and
-  open through `SoftwareKeyStore.provider()`, so a failed open reaches the
-  core as `Failed{reason: "open_failed"}` (§3).
+  gives (the largest by its length and SHA-256). Kotlin and Swift also open
+  the request and the re-signed copy through their own platform providers
+  (`JdkKeys`, `CryptoKitKeys`), whose failed open is
+  `ProviderError.OpenFailed` (§3): the same verdicts.
 - **Device-list actions** (`tests/host_actions.rs`, Rust; four conformance
   checks in JS, five in Kotlin and Swift, of the 49 and 50 above): every
   `P*`/`EK*`/`HS*` vector of

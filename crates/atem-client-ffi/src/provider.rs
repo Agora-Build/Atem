@@ -48,6 +48,11 @@ pub enum ProviderError {
     Cancelled { reason: String },
     /// No key by that id.
     UnknownKey,
+    /// `hpke_open` only: the seal doesn't open under this key (the AEAD
+    /// refuses the ciphertext, or `enc` isn't a valid X25519 public key).
+    /// The sender's doing, not the provider's: the core judges the object
+    /// (planned, for host mail; a new case for Astation's providers).
+    OpenFailed,
     /// Any other platform failure.
     Failed { reason: String },
 }
@@ -57,6 +62,7 @@ impl std::fmt::Display for ProviderError {
         match self {
             ProviderError::Cancelled { reason } => write!(f, "cancelled: {reason}"),
             ProviderError::UnknownKey => f.write_str("unknown key"),
+            ProviderError::OpenFailed => f.write_str("the seal doesn't open under this key"),
             ProviderError::Failed { reason } => write!(f, "failed: {reason}"),
         }
     }
@@ -90,9 +96,9 @@ pub trait AppKeyProvider: Send + Sync {
     /// HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305 (CryptoKit `HPKE`,
     /// Tink). A seal that doesn't open under the key (the AEAD refuses it,
     /// or `enc` isn't a valid X25519 public key) fails with
-    /// `Failed { reason: "open_failed" }` ([`OPEN_FAILED`]): the core then
-    /// judges the object, as it does its own seal that doesn't open; any
-    /// other failure is the provider's, and decides nothing.
+    /// [`ProviderError::OpenFailed`]: the core then judges the object, as it
+    /// does its own seal that doesn't open; any other failure is the
+    /// provider's, and decides nothing.
     fn hpke_open(
         &self,
         key_id: String,
@@ -226,14 +232,11 @@ pub fn sign_request(key: &KeyId, input: &SigningInput) -> SignRequest {
     }
 }
 
-/// `ProviderError::Failed`'s reason for a seal that doesn't open under the
-/// key (`AppKeyProvider::hpke_open`).
-pub const OPEN_FAILED: &str = "open_failed";
-
 #[cfg(feature = "uniffi")]
 fn provider_error(e: ProviderError) -> atem_client::Error {
     match e {
         ProviderError::UnknownKey => atem_client::Error::UnknownKey,
+        ProviderError::OpenFailed => atem_client::Error::OpenFailed,
         other => atem_client::Error::Provider(other.to_string()),
     }
 }
@@ -289,12 +292,7 @@ impl KeyProvider for Platform {
                 aad.to_vec(),
             )
             .map(Zeroizing::new)
-            .map_err(|e| match e {
-                ProviderError::Failed { reason } if reason == OPEN_FAILED => {
-                    atem_client::Error::OpenFailed
-                }
-                other => provider_error(other),
-            })
+            .map_err(provider_error)
     }
 }
 
@@ -479,15 +477,13 @@ impl AppKeyProvider for SoftwareKeyStore {
     ) -> Result<Vec<u8>, ProviderError> {
         KeyProvider::hpke_open(self, &KeyId(key_id), &enc, &ct, &info, &aad)
             .map(|p| p.to_vec())
-            .map_err(|e| ProviderError::Failed {
-                reason: match e {
-                    // The seal doesn't open under this key (the contract's
-                    // `open_failed`, `AppKeyProvider::hpke_open`).
-                    atem_client::Error::OpenFailed
-                    | atem_client::Error::ZeroSharedSecret
-                    | atem_client::Error::BadKey
-                    | atem_client::Error::WeakKey => OPEN_FAILED.into(),
-                    other => other.to_string(),
+            .map_err(|e| match e {
+                // The seal doesn't open under this key: an AEAD refusal or
+                // an `enc` that isn't a key (`open_with_secret`). Anything
+                // else is the store's own.
+                atem_client::Error::OpenFailed => ProviderError::OpenFailed,
+                other => ProviderError::Failed {
+                    reason: other.to_string(),
                 },
             })
     }
@@ -591,10 +587,10 @@ mod tests {
         }
     }
 
-    /// A seal that doesn't open under the key is `open_failed` through a
-    /// platform provider too (`AppKeyProvider::hpke_open`), so the core
-    /// judges the object; a key the provider doesn't have stays the
-    /// provider's failure.
+    /// A seal that doesn't open under the key is `ProviderError::OpenFailed`
+    /// from a platform provider (`AppKeyProvider::hpke_open`) and the core's
+    /// `OpenFailed` through it, so the core judges the object; a key the
+    /// provider doesn't have stays the provider's failure.
     #[cfg(all(feature = "software-keys", feature = "uniffi"))]
     #[test]
     fn a_seal_that_does_not_open_is_open_failed_through_the_platform() {
@@ -603,7 +599,7 @@ mod tests {
         let public = KeyProvider::public_key(&*store, &KeyId::new("enc")).unwrap();
         let sealed =
             atem_client::hpke::seal(public.as_32().unwrap(), b"info", b"", b"plain").unwrap();
-        let platform = Platform(store.provider());
+        let platform = Platform(store.clone().provider());
         let enc_key = KeyId::new("enc");
         let open =
             |info: &[u8], ct: &[u8]| platform.hpke_open(&enc_key, &sealed.enc, ct, info, b"");
@@ -615,6 +611,37 @@ mod tests {
         let mut flipped = sealed.ct.clone();
         flipped[0] ^= 1;
         assert_eq!(open(b"info", &flipped), Err(atem_client::Error::OpenFailed));
+        // The store itself, as a foreign provider: the typed case, for an
+        // AEAD refusal and for an `enc` that isn't a key.
+        let foreign = |enc: &[u8], ct: &[u8], info: &[u8]| {
+            AppKeyProvider::hpke_open(
+                &*store,
+                "enc".into(),
+                enc.to_vec(),
+                ct.to_vec(),
+                info.to_vec(),
+                vec![],
+            )
+        };
+        assert_eq!(
+            foreign(&sealed.enc, &flipped, b"info"),
+            Err(ProviderError::OpenFailed)
+        );
+        assert_eq!(
+            foreign(&[1u8; 31], &sealed.ct, b"info"),
+            Err(ProviderError::OpenFailed)
+        );
+        assert!(matches!(
+            AppKeyProvider::hpke_open(
+                &*store,
+                "gone".into(),
+                sealed.enc.to_vec(),
+                sealed.ct.clone(),
+                b"info".to_vec(),
+                vec![]
+            ),
+            Err(ProviderError::Failed { .. } | ProviderError::UnknownKey)
+        ));
         let missing =
             platform.hpke_open(&KeyId::new("gone"), &sealed.enc, &sealed.ct, b"info", b"");
         assert!(
