@@ -436,10 +436,23 @@ A phone receiving a hint (APNs/FCM payload):
 2. `book.offer(hint)` on its `PushHintBook` (`accepted` → show,
    `idempotent` → already shown, `ignored_after_resolved`, or refused
    `duplicate`/`bad_sealed`); a resolved hint replaces the notification;
-3. `hint.open(provider, enc_key_id, device_id)` → `HintContent{tool,
-   summary}` (HPKE open by the provider; refused for another device or
-   `enc_key` before anything is opened). A locked device shows a generic
-   hint instead.
+3. `hint.open(provider, enc_key_id, device_id)` → `HintContent`: an
+   approval hint's `Approval{tool, summary}`, or an `outcome_unknown` hint's
+   `OutcomeUnknown{task_id, session_id, sender, reason}` (HPKE open by the
+   provider; refused for another device or `enc_key` before anything is
+   opened). A locked device shows a generic hint instead.
+
+`verify_push_hint` takes both kinds of hint (the body's `kind`, which only
+the planned `outcome_unknown` hint of `host.alerts` has, tells them apart;
+session-v1 R9.9, host-work-v1 §11.3). `hint.state()` is `Open`, `Resolved`
+or `OutcomeUnknown{device_id, enc_kid, sealed_hash}`; `hint.approval()` and
+`hint.alert()` (an `AlertRef`: the account, genesis, host, trust generation
+and `alert_id`) each fail `malformed` for the other kind; `book.offer`,
+`ack_json`, `json`, `check_sealed`, `created_at` and `expires_at` serve both.
+An `outcome_unknown` hint has no resolved hint and no seen. **Binding API
+change** (for Astation's review): `HintContent` was a record `{tool,
+summary}` and `approval()` could not fail; no host sends the new kind until
+`host.alerts` is advertised.
 
 The relay: `verify_push_hint(…, Relay)`, its book, `push_stages(created_at,
 recipient)`, `push_send_now(…)`, `push_next_due(…)`, `push_guard(expires_at)`

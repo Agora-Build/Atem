@@ -982,10 +982,77 @@ final class ConformanceTests: XCTestCase {
                 let provider = store.provider()
                 #endif
                 let plain = o(try JSONSerialization.jsonObject(with: utf8(s(d["plain_jcs"]))))
-                try eq(try hint.open(provider: provider, encKeyId: "enc", deviceId: device), HintContent(tool: s(plain["tool"]), summary: s(plain["summary"])))
+                try eq(try hint.open(provider: provider, encKeyId: "enc", deviceId: device), .approval(tool: s(plain["tool"]), summary: s(plain["summary"])))
                 let other = device == "dev-phone" ? "dev-mac" : "dev-phone"
                 try throwsCode("malformed") { _ = try hint.open(provider: provider, encKeyId: "enc", deviceId: other) }
+                try throwsCode("malformed") { _ = try hint.alert() }
             }
+        }
+        // The outcome_unknown hints (delegated host work, I.4.6).
+        let alertHints = a(push["outcome_unknown"]).map(o)
+        let alertDetails = a(push["outcome_unknown_details"]).map(o)
+        let alertAcks = a(push["outcome_unknown_acks"]).map(o)
+        func providerFor(_ device: String) throws -> AppKeyProvider {
+            #if canImport(CryptoKit)
+            let keysCK = CryptoKitKeys()
+            try keysCK.addX25519("enc", secret: unhex(s(secrets[device])))
+            return keysCK
+            #else
+            let store = SoftwareKeyStore()
+            try store.insertX25519(keyId: "enc", secret: unhex(s(secrets[device])))
+            return store.provider()
+            #endif
+        }
+        func verified(_ h: [String: Any]) throws -> PushHint {
+            try verifyPushHint(hintJson: js(h), log: logL(), nowMs: nowP, verifier: .client)
+        }
+        check("outcome_unknown hints verify and open for their device only") {
+            for (i, h) in alertHints.enumerated() {
+                let d = alertDetails[i]
+                let device = s(d["device_id"])
+                let body = o(h["body"])
+                let hint = try verified(h)
+                try eq(hint.state(), .outcomeUnknown(deviceId: device, encKid: s(d["enc_kid"]), sealedHash: s(d["sealed_hash"])))
+                try eq(hex(try signedObjectInfo(json: js(h)).signingInput), s(d["signing_input_hex"]))
+                try hint.checkSealed()
+                try eq(hint.createdAt(), u(body["created_at"]))
+                try eq(hint.expiresAt(), u(body["expires_at"]))
+                try eq(try hint.alert(), AlertRef(accountId: s(body["account_id"]), genesisHash: s(body["genesis_hash"]), hostId: s(body["host_id"]), hostTrustGen: u(body["host_trust_gen"]), alertId: s(body["alert_id"])))
+                try throwsCode("malformed") { _ = try hint.approval() }
+                try eq(canon(try JSONSerialization.jsonObject(with: utf8(hint.ackJson()))), canon(alertAcks[i]))
+                let facts = o(d["facts"])
+                try eq(try hint.open(provider: providerFor(device), encKeyId: "enc", deviceId: device), .outcomeUnknown(taskId: s(facts["task_id"]), sessionId: s(facts["session_id"]), sender: s(facts["sender"]), reason: s(facts["reason"])))
+                let other = device == "dev-phone" ? "dev-mac" : "dev-phone"
+                try throwsCode("malformed") { _ = try hint.open(provider: providerFor(device), encKeyId: "enc", deviceId: other) }
+            }
+        }
+        check("outcome_unknown hints: refusals, dedup and acks") {
+            let cases = a(push["outcome_unknown_invalid"]).map(o)
+            for c in cases {
+                let code = s(c["code"])
+                if ["malformed", "binding", "invalid_times", "skew"].contains(code) {
+                    for verifier in [PushVerifier.client, PushVerifier.relay] {
+                        try throwsCode(code) { _ = try verifyPushHint(hintJson: js(c["hint"]!), log: logL(), nowMs: nowP, verifier: verifier) }
+                    }
+                }
+            }
+            let book = PushHintBook()
+            try eq(try book.offer(hint: verified(alertHints[0])), .accepted)
+            try eq(try book.offer(hint: verified(alertHints[0])), .idempotent)
+            try eq(try book.offer(hint: verified(alertHints[1])), .accepted)
+            let duplicate = cases.first { s($0["code"]) == "duplicate" }!
+            try throwsCode("duplicate") { _ = try book.offer(hint: verified(o(duplicate["hint"]))) }
+            // A swapped sealed part verifies (its body and signature are the
+            // host's) and is refused where the sealed part counts.
+            let swapped = try verified(o(cases.first { s($0["code"]) == "bad_sealed" }!["hint"]))
+            try throwsCode("bad_sealed") { try swapped.checkSealed() }
+            try throwsCode("bad_sealed") { _ = try PushHintBook().offer(hint: swapped) }
+            try throwsCode("open_failed") { _ = try swapped.open(provider: providerFor("dev-phone"), encKeyId: "enc", deviceId: "dev-phone") }
+            // The ack entries, and an approval hint is no alert.
+            let acks = try alertHints.map { try verified($0).ackJson() }
+            try eq(try parsePushAck(messageJson: pushAckMessage(acks: acks)), acks)
+            try eq(try acks.map { canon(try JSONSerialization.jsonObject(with: utf8($0))) }, alertAcks.map { canon($0) })
+            try throwsCode("malformed") { _ = try verified(opens[0]).alert() }
         }
         let resolved = o(push["resolved"])
         let seenVec = o(push["seen"])
@@ -1065,6 +1132,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 51)
+        XCTAssertEqual(passed, 53)
     }
 }

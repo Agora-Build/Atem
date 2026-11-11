@@ -586,18 +586,34 @@ record! {
     }
 }
 
-data_enum! {
-    pub enum HintStateInfo {
-        Open { device_id: String, enc_kid: String, sealed_hash: String },
-        Resolved { reason: String, resolved_at: u64 },
+record! {
+    /// The alert an `outcome_unknown` hint is about.
+    pub struct AlertRef {
+        pub account_id: String,
+        pub genesis_hash: String,
+        pub host_id: String,
+        pub host_trust_gen: u64,
+        pub alert_id: String,
     }
 }
 
-record! {
-    /// A hint's sealed content (the redacted tool and summary).
-    pub struct HintContent {
-        pub tool: String,
-        pub summary: String,
+data_enum! {
+    /// Where a hint stands: an approval's `open` or `resolved`, or an
+    /// `outcome_unknown` hint (delegated host work, I.4.6), which like an
+    /// open hint names its recipient and sealed part.
+    pub enum HintStateInfo {
+        Open { device_id: String, enc_kid: String, sealed_hash: String },
+        Resolved { reason: String, resolved_at: u64 },
+        OutcomeUnknown { device_id: String, enc_kid: String, sealed_hash: String },
+    }
+}
+
+data_enum! {
+    /// A hint's sealed content: an approval's redacted tool and summary, or
+    /// an `outcome_unknown` hint's task, session, sender and reason.
+    pub enum HintContent {
+        Approval { tool: String, summary: String },
+        OutcomeUnknown { task_id: String, session_id: String, sender: String, reason: String },
     }
 }
 

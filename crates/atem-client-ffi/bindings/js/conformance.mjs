@@ -695,10 +695,62 @@ check("open hints verify and open for their device only", () => {
     const store = new m.SoftwareKeyStore();
     store.insertX25519("enc", unhex(push.recipient_secrets[d.device_id]));
     const plain = JSON.parse(d.plain_jcs);
-    eq(hint.open(store, "enc", d.device_id), { tool: plain.tool, summary: plain.summary });
+    eq(hint.open(store, "enc", d.device_id), { type: "approval", tool: plain.tool, summary: plain.summary });
+    throwsCode(() => hint.alert(), "malformed");
     const other = d.device_id === "dev-phone" ? "dev-mac" : "dev-phone";
     throwsCode(() => hint.open(store, "enc", other), "malformed");
   });
+});
+check("outcome_unknown hints verify and open for their device only", () => {
+  push.outcome_unknown.forEach((h, i) => {
+    const d = push.outcome_unknown_details[i];
+    const hint = m.verifyPushHint(str(h), logL(), NOWP, "client");
+    eq(hint.state(), { type: "outcome_unknown", deviceId: d.device_id, encKid: d.enc_kid, sealedHash: d.sealed_hash });
+    eq(hex(m.signedObjectInfo(str(h)).signingInput), d.signing_input_hex);
+    hint.checkSealed();
+    eq(hint.createdAt(), h.body.created_at);
+    eq(hint.expiresAt(), h.body.expires_at);
+    eq(hint.alert(), { accountId: h.body.account_id, genesisHash: h.body.genesis_hash, hostId: h.body.host_id, hostTrustGen: h.body.host_trust_gen, alertId: h.body.alert_id });
+    throwsCode(() => hint.approval(), "malformed");
+    eq(JSON.parse(hint.ackJson()), push.outcome_unknown_acks[i]);
+    const store = new m.SoftwareKeyStore();
+    store.insertX25519("enc", unhex(push.recipient_secrets[d.device_id]));
+    eq(hint.open(store, "enc", d.device_id), { type: "outcome_unknown", taskId: d.facts.task_id, sessionId: d.facts.session_id, sender: d.facts.sender, reason: d.facts.reason });
+    const other = d.device_id === "dev-phone" ? "dev-mac" : "dev-phone";
+    throwsCode(() => hint.open(store, "enc", other), "malformed");
+  });
+});
+check("outcome_unknown hints: refusals, dedup and acks", () => {
+  const sealedTo = (device) => {
+    const store = new m.SoftwareKeyStore();
+    store.insertX25519("enc", unhex(push.recipient_secrets[device]));
+    return store;
+  };
+  for (const c of push.outcome_unknown_invalid) {
+    if (["malformed", "binding", "invalid_times", "skew"].includes(c.code)) {
+      for (const verifier of ["client", "relay"]) {
+        throwsCode(() => m.verifyPushHint(str(c.hint), logL(), NOWP, verifier), c.code);
+      }
+    }
+  }
+  const verified = (h) => m.verifyPushHint(str(h), logL(), NOWP, "client");
+  const book = new m.PushHintBook();
+  eq(book.offer(verified(push.outcome_unknown[0])), "accepted");
+  eq(book.offer(verified(push.outcome_unknown[0])), "idempotent");
+  eq(book.offer(verified(push.outcome_unknown[1])), "accepted");
+  const duplicate = push.outcome_unknown_invalid.find((c) => c.code === "duplicate");
+  throwsCode(() => book.offer(verified(duplicate.hint)), "duplicate");
+  // A swapped sealed part verifies (its body and signature are the host's)
+  // and is refused where the sealed part counts.
+  const swapped = verified(push.outcome_unknown_invalid.find((c) => c.code === "bad_sealed").hint);
+  throwsCode(() => swapped.checkSealed(), "bad_sealed");
+  throwsCode(() => new m.PushHintBook().offer(swapped), "bad_sealed");
+  throwsCode(() => swapped.open(sealedTo("dev-phone"), "enc", "dev-phone"), "open_failed");
+  // The ack entries, and an approval hint is no alert.
+  const acks = push.outcome_unknown.map((h) => verified(h).ackJson());
+  eq(m.parsePushAck(m.pushAckMessage(acks)), acks);
+  eq(acks.map((a) => JSON.parse(a)), push.outcome_unknown_acks);
+  throwsCode(() => m.verifyPushHint(str(push.open[0]), logL(), NOWP, "client").alert(), "malformed");
 });
 check("resolved and seen", () => {
   const r = m.verifyPushHint(str(push.resolved), logL(), NOWP, "client");
