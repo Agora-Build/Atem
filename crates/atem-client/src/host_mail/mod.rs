@@ -25,7 +25,11 @@
 //!   and [`unseal_result`], and [`seal_info`];
 //! - [`verified`]: [`VerifiedMail`], an object whose signature verified with
 //!   the sender's key. The only way to open one: `unseal_*` take it, so an
-//!   unverified object can't be opened (it doesn't compile).
+//!   unverified object can't be opened (it doesn't compile);
+//! - [`receive`]: the receiver's checks 1 to 6 of II.4.2 ([`open_envelope`])
+//!   and the sending host's check of a result, II.4.4 ([`accept_result`]):
+//!   they judge from the host's device list, identity, keys and clock, and
+//!   return a verdict (open, pending, refused, refused-authenticated).
 //!
 //! Signature: Ed25519 by the sender's `host_key` over `enc([label,
 //! jcs(body)])` with `atem-envelope-v1` or `atem-result-v1` (a different
@@ -33,11 +37,12 @@
 //! by the receiver with the key of the sender's newest `add_host`, never one
 //! the object names. Seal: `atem-envelope-seal-v1` or `atem-result-seal-v1`.
 //!
-//! This module builds, seals, opens and reads. It judges nothing a receiver
-//! decides from its own state and clock (the sender's authorization, its
-//! generation and `signed_at_head`, the times, that the plaintext's ids equal
-//! the body's, the route and project checks): those are the receiver's
-//! checks (II.4.2 steps 2 to 7).
+//! [`body`], [`seal`] and [`verified`] build, seal, open and read: they judge
+//! nothing a receiver decides from its own state and clock (the sender's
+//! authorization, its generation and `signed_at_head`, the times, that the
+//! plaintext's ids equal the body's): those are [`receive`]'s checks (II.4.2
+//! steps 1 to 6). Step 7, the host-work checks of a message (route, project,
+//! ops, target), and what is stored, counted or delivered are the host's.
 //!
 //! **Bounds.** A signed body's `jcs` is at most 4,096 bytes (R9.1). What is
 //! sealed is bounded by [`MAX_PLAINTEXT_BYTES`] (240 KiB): a request's
@@ -57,6 +62,7 @@ use crate::session::messages::MAX_MESSAGE_BYTES;
 use crate::signed::SignedObject;
 
 pub mod body;
+pub mod receive;
 pub mod seal;
 #[cfg(test)]
 mod test_support;
@@ -64,6 +70,10 @@ pub mod verified;
 
 pub use body::{
     EnvelopePlain, HostRef, MailBody, MailFields, MailKind, REFUSAL_CODES, ResultPlain,
+};
+pub use receive::{
+    EnvelopeVerdict, ExpectedResult, Recipient, ResultVerdict, accept_result, evidence_hash,
+    open_envelope,
 };
 pub use seal::{seal_envelope, seal_info, seal_result, unseal_envelope, unseal_result};
 #[cfg(feature = "test-vectors")]

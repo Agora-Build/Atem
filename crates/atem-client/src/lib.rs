@@ -63,8 +63,9 @@
 //!
 //! - [`host_principal`]: the `host:<host_id>` principal of a host sender;
 //! - [`host_mail`]: `atem-envelope` and `atem-result`, built, sealed to the
-//!   receiving host's `enc_key`, signed by the sending host's `host_key`, and
-//!   opened (a receiver's checks are a later part).
+//!   receiving host's `enc_key`, signed by the sending host's `host_key`,
+//!   and opened by a receiver's checks 1 to 6 (II.4.2) and the sending host's
+//!   check of a result (II.4.4).
 
 pub mod backup;
 pub mod backup_writer;
