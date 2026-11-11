@@ -885,7 +885,7 @@ restart; interrupting a turn that has already ended does nothing.
 
 | Store | Holds |
 |---|---|
-| `host-work.sqlite` | Tasks and admission records, attempts, launches, messages, replies, return grants, control records, per-feed cursors and per-principal state, interrupt intents, alerts, the clock floor. **Changed to match Atem's spec:** the host's highest wall-clock reading, with its `boot_id` and boot-time stamp (I.6.5; boot time by owner decision 2026-11-10), and the repair's anchor reading (host-work-v1 §11.6). **Changed for host senders (owner decision 2026-11-07):** host principals' `interrupt_running` records and the intents they create, bound to no feed; their sending authorization is derived from the device list (II.3.1); mailbox cursors, the hashes of mailbox objects already processed, objects pending a device-list advance, and the sealed bytes of objects this host sends, kept for resending (II.4) |
+| `host-work.sqlite` | Tasks and admission records, attempts, launches, messages, replies, return grants, control records, per-feed cursors and per-principal state, interrupt intents, alerts, the clock floor. **Changed to match Atem's spec:** the host's highest wall-clock reading, with its `boot_id` and boot-time stamp (I.6.5; boot time by owner decision 2026-11-10), and the repair's anchor, a copy of that record from before a forward jump (host-work-v1 §11.6). **Changed for host senders (owner decision 2026-11-07):** host principals' `interrupt_running` records and the intents they create, bound to no feed; their sending authorization is derived from the device list (II.3.1); mailbox cursors, the hashes of mailbox objects already processed, objects pending a device-list advance, and the sealed bytes of objects this host sends, kept for resending (II.4) |
 | The session-v1 journal (revised, I.7) | Prompt receipts: `accepted` (fsync before the reply), `executing` (fsync before the first side effect), `completed`, `rejected`, `outcome_unknown`; the refusal list |
 | The device list (R9, extended) | Grants, removals and narrowing, as signed entries. **Changed for host senders:** project grants too (II.2.2) |
 
@@ -969,8 +969,11 @@ host-work-v1 §11.6, "Clocks".
   on macOS); the earlier text said `CLOCK_MONOTONIC`, which, like `mach_absolute_time`, stops during suspend, so a
   laptop's sleep would look like a forward jump that never comes back, and a wall clock corrected during sleep could
   fail the repair's 60 s check. Session-v1 §3's lease deadlines keep `CLOCK_MONOTONIC`. The host updates the record
-  at least once a minute and at shutdown, as R9.5 persists its waits. "Boot time since" a reading counts only within
-  the boot it was recorded in:
+  at least once a minute and at shutdown, as R9.5 persists its waits. **Filled in by Atem's spec** (host-work-v1
+  §11.6): each update records `H` itself (the later of the wall clock and `wall_hw` plus the boot time since it was
+  recorded), so within a boot the record's prediction never decreases except at the repair below, and a clock set
+  back, even in small steps, never pulls it down. "Boot time since" a reading counts only within the boot it was
+  recorded in:
   - the same `boot_id`: `H = max(wall clock, wall_hw + boot time since wall_hw was recorded)`;
   - after a reboot (another `boot_id`): `H = max(wall clock, wall_hw)` until a new reading is recorded. Time while the
     machine was off never counts, as in R9.5.
@@ -994,9 +997,14 @@ host-work-v1 §11.6, "Clocks".
     Suppose the wall clock jumps forward and later comes back to the trajectory the boot time predicts from before the
     jump (within 60 s). The jump was undone, so `wall_hw` and the floor drop to the current wall clock. This is safe:
     they never fall below the pre-jump trajectory, so nothing settled is revived, and jumping a clock forward and back
-    gains an attacker nothing. **Filled in by Atem's spec** (host-work-v1 §11.6): the host keeps the last reading
-    before the jump (an anchor) to predict the trajectory from, and lowers the two values, never raising them, to the
-    later of the current wall clock and that trajectory.
+    gains an attacker nothing. **Filled in by Atem's spec** (host-work-v1 §11.6):
+    - **The anchor.** At the first reading more than 60 s above the record's prediction, the host keeps a copy of the
+      `wall_hw` record as it stood before the jump. The copy never changes afterwards, so its prediction never
+      decreases.
+    - **The repair.** A later reading in that boot within 60 s of the anchor's prediction lowers the two values,
+      never raising them, to the later of that reading and the anchor's prediction.
+    - **Why this holds.** Since the record itself never walks back, neither value ever ends below the record's
+      pre-jump trajectory. A clock set back in small steps before the jump moves nothing.
   - **Across a reboot.** If `wall_hw` or the floor is more than 10 minutes ahead of the wall clock, and the OS reports
     its clock synchronized, Atem lowers both to the current wall clock.
     - On Linux the OS's report is `adjtimex`'s status without `STA_UNSYNC`: chrony and systemd-timesyncd clear it

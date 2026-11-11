@@ -1476,13 +1476,16 @@ The sender's channel and online status are not conditions.
 - At **64** unresolved from one sender, the host refuses that sender's
   requests that would make a new task (`work_enqueue`, and
   `message_publish` with an agent recipient): `busy`, detail `too many
-  unresolved outcomes`.
+  unresolved outcomes`. A host sender's request envelopes count the same
+  way (design II.9). Their refusal travels back as the envelope's status
+  object, whose form is the envelopes' (design II.4.4, specified with
+  host senders).
 - At **256** unresolved on the host, it refuses such requests from every
-  remote sender, with the same code and detail, until the owner resolves
-  some. Local tasks are never refused for unresolved outcomes. Which
-  requests count, and the one detail for both limits, are **Atem's
-  choice, for Astation to confirm**: the design says "new tasks" and
-  "new remote tasks", and names the 64's detail only.
+  remote sender, host senders included, with the same code and detail,
+  until the owner resolves some. Local tasks are never refused for
+  unresolved outcomes. Which requests count, and the one detail for both
+  limits, are **Atem's choice, for Astation to confirm**: the design says
+  "new tasks" and "new remote tasks", and names the 64's detail only.
 
 #### Details
 
@@ -1521,12 +1524,27 @@ stays as the design gives it.
   like a forward jump that never comes back.) Boot time counts only
   within the boot it was read in (its `boot_id`). Session-v1 §3's lease
   deadlines keep `CLOCK_MONOTONIC`.
-- **The host's own time `H`.** The host keeps `wall_hw`, the highest
-  wall-clock reading it has seen, with its `boot_id` and boot time. It
-  updates it at least once a minute and at shutdown. In the same boot,
-  `H = max(wall clock, wall_hw + boot time since wall_hw was recorded)`.
-  After a reboot, `H = max(wall clock, wall_hw)` until a new reading. `H`
-  never includes `station_time`.
+- **The host's own time `H`.** The host keeps the `wall_hw` record: a
+  value, the `boot_id` and the boot time it was recorded at. Its
+  **prediction** at boot time `b` of the same boot is `wall_hw + (b −
+  the recorded boot time)`.
+  - In the same boot, `H = max(wall clock, the prediction)`.
+  - After a reboot, `H = max(wall clock, wall_hw)` until a new record.
+  - `H` never includes `station_time`.
+
+  The host updates the record at least once a minute and at shutdown.
+  **Each update records `H` itself**: the value becomes `max(wall clock,
+  prediction)`, stamped with the current `boot_id` and boot time. So
+  within a boot the prediction never decreases, except at a repair
+  (below). A wall clock set back, all at once or in small steps, never
+  pulls it down. Recording the highest raw reading instead would let a
+  set-back reading that is still above the stored value replace a higher
+  prediction. **Atem's fill-in** of the design's "the highest wall-clock
+  reading".
+  - **Its cost.** If the boot-time counter runs faster than the wall
+    clock the OS corrects (on macOS, `mach_continuous_time` isn't slewed),
+    the prediction runs ahead by that rate error: tens of ppm, under a
+    minute a month. Deadlines then fall that much early, never late.
 - **The clock floor** is the latest `station_time` the host has seen,
   with the boot time it was seen at. It takes a `station_time` only up to
   `H` plus 10 minutes. One further ahead closes the gate for that origin
@@ -1547,22 +1565,58 @@ stays as the design gives it.
   and HTTP `Date` headers are no time service. A clock that jumped
   forward and was corrected would otherwise expire tasks early for good,
   so Atem repairs `wall_hw` and the floor itself:
-  - **A jump undone within one boot.** Boot time since a reading
-    predicts where the wall clock should be. Atem keeps, beside
-    `wall_hw`, the **anchor**: the last reading (wall clock, `boot_id`,
-    boot time) at which the wall clock was within 60 s of that
-    prediction. It follows every such reading, so ordinary drift and slew
-    never accumulate. A reading more than 60 s ahead of the prediction is
-    a forward jump: the anchor stays where it was, and `wall_hw` rises
-    as usual. When a later reading in the same boot is back within 60 s
-    of the trajectory the anchor predicts, the jump was undone. `wall_hw`
-    and the floor are then lowered, never raised, to the later of the
-    current wall clock and that trajectory, and the anchor moves to the
-    reading. This is safe: neither falls below the pre-jump trajectory,
-    so nothing settled is revived, and jumping a clock forward and back
-    gains an attacker nothing. (The anchor, and "the later of", are
-    Atem's fill-in of the owner's "come back to the trajectory the boot
-    time predicts from before the jump (within 60 s)".)
+  - **A jump undone within one boot.** The rule, **Atem's fill-in** of
+    the owner's "comes back to the trajectory the boot time predicts from
+    before the jump (within 60 s)":
+    1. **A forward jump** is a wall-clock reading more than 60 s above
+       the `wall_hw` record's prediction. Before the record takes that
+       reading, and only if no anchor is pending, Atem keeps a copy of the
+       record as it stood: the **anchor** (its value, `boot_id` and boot
+       time). The anchor never changes after that. Its prediction is the
+       anchor's value plus the boot time since its boot time, so it never
+       decreases.
+    2. **While an anchor is pending**, the record goes on as usual: it
+       takes the jumped readings, so `H` follows the jumped clock. A
+       further jump keeps the first anchor.
+    3. **The jump is undone** when a later reading in the anchor's boot is
+       within 60 s of the anchor's prediction (above or below it). Then
+       `wall_hw`, and the floor if its own prediction is higher, are
+       lowered, never raised, to `max(that reading, the anchor's
+       prediction)`, stamped now. The anchor is dropped.
+    4. **Nothing else ends an anchor** in its boot. A reading more than
+       60 s below its prediction is a clock set back: "host clock went
+       back" past 10 minutes, as above, and no repair. A reboot drops the
+       anchor (the next bullet's rule applies).
+  - **The invariant.** Within a boot, the record's prediction never
+    decreases except at a repair. A repair never sets `wall_hw` or the
+    floor below the anchor's prediction, and the anchor's prediction is
+    the record's own trajectory from before the jump. So a repair never
+    lowers anything below where it stood before the jump. Nothing settled
+    is revived, and moving a clock forward and back gains an attacker
+    nothing.
+  - **The small-steps-back attack, worked through.** Suppose the true
+    time is `T` and the record's prediction is on it.
+    1. The attacker sets the clock back 50 s a minute, for 30 minutes.
+       Each update records `max(wall clock, prediction)`, so the
+       prediction stays at `T`. No reading is ahead of it, so no anchor is
+       made. Past 10 minutes behind, "host clock went back" fires.
+    2. The attacker sets the clock to `T`: within 60 s of the prediction,
+       so it's no jump, and nothing changes.
+    3. It sets the clock to `T` + 2 min: a jump, anchored at `T`'s
+       trajectory, and `wall_hw` rises to `T` + 2 min.
+    4. Back to `T`: within 60 s of the anchor, so the jump is undone, and
+       `wall_hw` becomes `max(T, T)` = `T`. Back to `T` − 25 min instead:
+       more than 60 s below the anchor, so there is no repair, and
+       `wall_hw` stays at least `T` + 2 min.
+
+    Either way nothing ends below `T`. With the earlier rule, an anchor
+    that followed readings down, the same steps lowered `wall_hw` and the
+    floor to `T` − 25 min.
+  - **The bound that remains.** A repair can't tell an attacker's jump
+    from the OS's own step. If the OS stepped a slow clock forward (its
+    correction) and the clock is later set back onto the old trajectory,
+    the repair returns `wall_hw` to that trajectory: never below where it
+    stood before the step, which is the owner's guarantee.
   - **After a reboot.** Boot time doesn't cross a reboot. If `wall_hw` or
     the floor is more than 10 minutes ahead of the wall clock, and the
     OS reports its clock synchronized, Atem lowers both to the current

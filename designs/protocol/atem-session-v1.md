@@ -4193,6 +4193,13 @@ sets versus sequences (R9.2). Still open:
    an older backup. Astation's clients should reconnect a manager
    promptly when a host reports held; services and view-only devices
    wait.
+8. **A new host encryption key on request** (planned, delegated host work;
+   R9.14 item 8). `host_enc_key_get` returns the key a host holds, and a
+   host makes one only at pairing, at `atem pair verify` and at the first
+   start of a build that knows it. The agreed design's rotation within a
+   trust generation (II.4.1), its answer to `enc_key_reused`, and its
+   compromise remedy (`retire_previous`) need a way to ask the host for a
+   new key: a flag on the op, or a local command. Needed before step 4.
 
 ### R9.14 Delegated host work (planned; not advertised)
 
@@ -4329,14 +4336,24 @@ agreement.
       bytes are dropped at the write boundary);
    3. it writes the interrupt.
 
-   It is no submission: like local input, it has no receipt of its own.
-   The attempt's prompt receipt completes with the turn's outcome
-   (`interrupted`, §6). An intent stays pending until the turn was
-   interrupted or ended, or the attempt was withdrawn. It is carried out
-   again after a restart, and interrupting a turn that has already ended
-   does nothing. A native takeover can't defeat it: a lease taken over
-   during the turn is revoked again on the next pass while the intent is
-   pending.
+   - **The order.** The turn check comes first, so a controller of
+     another task's turn loses nothing. The design lists the epoch bump
+     and the lease revocation first, then "in the same pass, the session
+     host drops the interrupt if the current turn isn't the task's". This
+     reading is **Atem's choice, for Astation to confirm**.
+   - **No receipt.** It is no submission: like local input, it has no
+     receipt of its own (**Atem's reading**; the design says "as local
+     input does", not whether it has one). The attempt's prompt receipt
+     completes with the turn's outcome (`interrupted`, §6).
+   - **Pending until done.** An intent stays pending until the turn was
+     interrupted or ended, or the attempt was withdrawn. The interrupt is
+     written **once per turn** in a runtime's run. On later passes while
+     the intent is pending, only the lease revocation repeats: a lease a
+     native takes over during the turn is revoked again on the next pass,
+     so a takeover can't defeat the owner's choice. After a restart a
+     pending intent is carried out again, writing once more if that turn
+     is still the session's current turn; a turn that has already ended
+     makes it do nothing.
 
 6. **§H recovery.** The `host-work` principal's requests are never
    confirmed. Before anything is dispatched, each recovered `accepted`
@@ -4402,7 +4419,11 @@ agreement.
        `add_host`'s `host_key`) over `enc(["atem-host-enc-key-v1",
        account_id, genesis_hash, host_id, u64(host_trust_gen),
        enc_pub])`. These are the entry's own forms, so the manager copies
-       them into the entry (`HostEncKey::action`).
+       them into the entry (`HostEncKey::action`). The shape is **Atem's
+       choice, for Astation to confirm**: the design says the manager gets
+       `{enc_pub, enc_sig}`. This answer carries `enc_key` as the entry's
+       `{alg, pub}` object, and names `host_id` and `host_trust_gen` so it
+       can be bound to the channel (below).
      - **Who may ask.** Native members holding `manage` at the host's
        head. The host checks `manage` each time it handles a request, as
        for the host policy (R9.8a); a native without it gets `forbidden`.
@@ -4420,26 +4441,41 @@ agreement.
      - **The client** takes an answer only for a request it sent on that
        channel, from the channel's host (`atem_device_id`) at its trust
        generation. Anything else is a malformed host message (`unbound
-       host enc key`), and the channel closes. `Attached::
+       host enc key`), and the channel closes (**Atem's choice, for
+       Astation to confirm**). `Attached::
        send_host_enc_key_get` sends the request, and the generic `send`
        checks a hand-built one the same way: the feature, the host's own
        reading, a fresh id, at most 64 waiting. The answer arrives as a
        `session` family event.
-     - **No trust in the carrier.** The binding verifies on its own. The
-       manager's verifier checks `enc_sig` against the `host_key` of the
-       host's newest `add_host` in its own log (`not_a_host`,
-       `host_trust_gen_not_current`, `bad_enc_sig`). `check_change`
-       reports `enc_key_reused` before anything is signed. A relay or a
-       channel can't offer a key the host didn't vouch for in this
-       generation.
-     - **Not in this version (needs Astation's agreement):** how a
-       manager asks a host for a *new* key, for a routine rotation, after
-       `enc_key_reused`, or after a suspected compromise
-       (`retire_previous`). A host makes a key at pairing, at `atem pair
-       verify` (which voids the old one anyway) and at the first start of
-       a build that knows it. This op returns the key the host holds.
-       Rotation within a trust generation needs either a request flag or
-       a local command.
+     - **No trust in the carrier; verify before signing.** The binding
+       verifies on its own.
+       - **Before it asks the owner for the fresh confirmation,** the
+         manager checks the answer against its own log. It verifies
+         `enc_sig` with `verify_host_enc_sig` (in every binding), using
+         the `host_key` of the host's newest `add_host`, and that
+         `host_trust_gen` is that `add_host`'s. It runs `check_change`,
+         which reports `enc_key_reused`.
+       - **Neither the client core** (`on_frame`) **nor `check_change`
+         verifies `enc_sig`.** A tampered answer that skipped this check
+         would cost the owner a confirmation for an entry every verifier
+         refuses (`not_a_host`, `host_trust_gen_not_current`,
+         `bad_enc_sig`).
+       - A relay or a channel can't offer a key the host didn't vouch for
+         in this generation.
+     - **Open (needs Astation's agreement before step 4):** how a manager
+       asks a host for a *new* key.
+       - **What needs it.** The agreed design relies on a new key for a
+         routine rotation (II.4.1), after `enc_key_reused`, and after a
+         suspected compromise (`retire_previous`, VI "Plain host keys";
+         VII.B test 32).
+       - **Today a host makes a key** only at pairing, at `atem pair
+         verify` (which voids the old one anyway) and at the first start
+         of a build that knows the key. This op returns the key the host
+         holds.
+       - **What it would take:** rotation within a trust generation needs
+         a request flag (for example `rotate: true`, made by a manager) or
+         a local command.
+       - Listed in R9.13 (item 8).
 
 **Errors and details (additions).** Receipt details: `withdrawn by the
 host` (items 3, 4), `withdrawn at recovery` (item 6). `request_id_reused`

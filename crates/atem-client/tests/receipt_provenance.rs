@@ -212,9 +212,12 @@ fn old_receipts_unchanged() {
         let mut found = Vec::new();
         walk(&fixture, &mut found);
         for original in found {
-            // Expectations match a few paths only; whole messages decode.
-            let Ok(Envelope::Session(msg)) = wire::decode(original.to_string().as_bytes()) else {
-                continue;
+            // Only whole messages have `type` and `data` (an expectation
+            // names its paths under `match`), so every one found must decode:
+            // a receipt this reader no longer takes is a regression.
+            let decoded = wire::decode(original.to_string().as_bytes());
+            let Ok(Envelope::Session(msg)) = decoded else {
+                panic!("{file:?}: a fixture receipt no longer decodes: {decoded:?}\n{original}");
             };
             let receipts = match &msg.op {
                 Op::Receipt(r) => vec![r.clone()],
@@ -232,7 +235,9 @@ fn old_receipts_unchanged() {
             seen += 1;
         }
     }
-    assert!(seen >= 5, "only {seen} whole receipts in the fixtures");
+    // Pinned: a receipt that went missing from the walk would hide a
+    // regression as surely as one skipped.
+    assert_eq!(seen, 5, "whole receipts in the fixtures");
 
     let r8_keys = [
         "request_id",
