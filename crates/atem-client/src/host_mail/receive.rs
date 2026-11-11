@@ -15,7 +15,10 @@
 //! 3. **The sender.** A current host, at exactly its newest `add_host`
 //!    generation; `authorized(g)` at this list's head; `signed_at_head.seq`
 //!    at least `g`; and this list's entry at `signed_at_head.seq` has
-//!    `signed_at_head.hash`.
+//!    `signed_at_head.hash`. What this list's head settles is refused: a
+//!    sender it doesn't know, has removed or holds `revoked`, a generation
+//!    below the sender's newest, a `signed_at_head` before `g` or with
+//!    another hash.
 //! 4. **The signature**, with the key of the sender's newest `add_host`
 //!    ([`VerifiedMail::verify`]: the only way to a [`VerifiedMail`], which is
 //!    all `unseal_*` take).
@@ -25,12 +28,18 @@
 //!    request) the Message's id, times and sender equal to the body's and a
 //!    Message a host sender may send ([`Message::valid_from_host`]).
 //!
-//! A `sender.host_trust_gen`, or a `signed_at_head.seq`, beyond this host's
-//! head can't be judged yet (it may lack the sender's new `add_host`, or its
-//! readmit): step 5 runs first on the body's times, and an object that passes
-//! is [`EnvelopeVerdict::Pending`], to be judged again after each device-list
-//! advance. Everything decidable now is decided first: a head this list
-//! has that names another hash is refused even for a newer generation.
+//! **Pending.** A `signed_at_head.seq` beyond this host's head can't be
+//! judged yet, whatever the sender's standing in this list: entries this host
+//! hasn't seen may add the sender (unknown here), re-add it (removed),
+//! readmit it (revoked) or bring its newer generation, and no sender can know
+//! the hash of an entry that doesn't exist. Likewise a `sender.host_trust_gen`
+//! above the newest this list holds for a current host. Step 5 runs first, on
+//! the body's times (the signature can't be checked yet); an object that
+//! fails it is [`EnvelopeVerdict::Refused`], one that passes is
+//! [`EnvelopeVerdict::Pending`], to be judged again after each device-list
+//! advance. When the head is not beyond this list's, that head settles the
+//! standing: an unknown sender at or below it is `unknown_sender`, a removed
+//! one `removed_sender`, a revoked one `revoked_sender`.
 //!
 //! **Refused or refused-authenticated.** Until step 4 passes, nothing says who
 //! sent the object, so a failure is [`EnvelopeVerdict::Refused`] (kept as
@@ -42,9 +51,14 @@
 //! [`accept_result`] is the sending host's side of II.4.4: the same checks 1
 //! to 6 for an `atem-result` (`atem-result-v1`, `atem-result-seal-v1`), with
 //! these differences: the sender must be the recipient host of the outbox row
-//! ([`ExpectedResult`]), check 3's `authorized` part doesn't apply to a
-//! result (the delivery rule decides what happens to a revoked host's, and
-//! that rule stays in the host), and step 6's plaintext must answer the row.
+//! ([`ExpectedResult`]); check 3's `authorized` and `current` parts don't
+//! refuse a result: a result of a host this list holds revoked, or has
+//! removed, is verified (with the key that host last held, a removed host's
+//! from [`Membership::removed_host`]) and returned as
+//! [`ResultVerdict::NotDelivered`], to be kept as data (II.4.4); and step 6's
+//! plaintext must answer the row. A result that doesn't verify is refused.
+//! The delivery rule itself (the return grant, route and project) stays in
+//! the host.
 //!
 //! This module only judges. It never marks anything done, stores, counts
 //! pending objects or delivers a result.
@@ -83,13 +97,18 @@ pub mod reason {
     /// Check 2: `enc_kid` names none of the keys the caller accepts (a retired
     /// previous key, an older one, or none of this host's).
     pub const ENC_KEY_NOT_ACCEPTED: &str = "enc_key_not_accepted";
-    /// Check 3: a host no `add_host` ever named.
+    /// Check 3: no `add_host` here names the sender, and `signed_at_head` is
+    /// not beyond this head (which would make the object wait).
     pub const UNKNOWN_SENDER: &str = "unknown_sender";
-    /// Check 3: a host that was removed (its key left the list with it).
+    /// Check 3: the sender was removed, and `signed_at_head` is not beyond
+    /// this head (or it names a generation the removed host never had).
+    /// Only an envelope: a removed host's result is kept as data.
     pub const REMOVED_SENDER: &str = "removed_sender";
     /// Check 3: `sender.host_trust_gen` is below the sender's newest `add_host`.
     pub const STALE_SENDER_GENERATION: &str = "stale_sender_generation";
-    /// Check 3: the sender is `revoked` in this list.
+    /// Check 3: the sender is `revoked` in this list and `signed_at_head` is
+    /// not beyond this head. Only an envelope: a revoked host's result is
+    /// kept as data.
     pub const REVOKED_SENDER: &str = "revoked_sender";
     /// Check 3: `signed_at_head.seq` is below the sender's authorization
     /// generation.
@@ -129,6 +148,12 @@ pub mod reason {
     pub const INVALID_MESSAGE: &str = "invalid_message";
     /// A result's plaintext doesn't answer the outbox row.
     pub const DOES_NOT_ANSWER_OUTBOX_ROW: &str = "does_not_answer_outbox_row";
+    /// A verified result of a host this list holds `revoked`: kept as data
+    /// (II.4.4's return-grant detail).
+    pub const NOT_DELIVERED_SENDER_REVOKED: &str = "result not delivered: sender revoked";
+    /// A verified result of a host this list has removed: kept as data
+    /// (II.4.4's return-grant detail).
+    pub const NOT_DELIVERED_SENDER_REMOVED: &str = "result not delivered: sender removed";
 }
 
 use reason::*;
@@ -180,9 +205,10 @@ pub enum EnvelopeVerdict {
         object_id: String,
         reason: &'static str,
     },
-    /// The key provider failed (the key is missing, locked, not the declared
-    /// one): nothing is decided and nothing is the sender's fault. The host
-    /// doesn't mark the object done and tries again later.
+    /// A local failure, not the sender's, so retryable: the key provider
+    /// failed (the key is missing or locked, or isn't the one its kid names).
+    /// Nothing is decided; the host doesn't mark the object done and judges it
+    /// again later.
     Unavailable { error: Error },
 }
 
@@ -210,10 +236,22 @@ pub struct ExpectedResult {
 /// What the sending host decides about a result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResultVerdict {
-    /// Checks 1 to 6 passed and the plaintext answers the row. `sender` is
-    /// `host:<host_id>`. Whether it is delivered into a session is the
-    /// host's delivery rule.
+    /// Checks 1 to 6 passed, the plaintext answers the row, and the sender is
+    /// a current, `authorized` host. `sender` is `host:<host_id>`. Whether it
+    /// is delivered into a session is the host's delivery rule (the return
+    /// grant, the route, the project).
     Accepted { plain: ResultPlain, sender: String },
+    /// The result verified (with the key its sender last held) and answers the
+    /// row, but its sender is a host this list holds revoked or has removed
+    /// (II.4.4): it is **not delivered**, only kept as data (stored with the
+    /// outbox row, shown by `atem message status`, never prompted). `reason` is
+    /// the return grant's detail: [`reason::NOT_DELIVERED_SENDER_REVOKED`] or
+    /// [`reason::NOT_DELIVERED_SENDER_REMOVED`] (revoked when both apply).
+    NotDelivered {
+        plain: ResultPlain,
+        sender: String,
+        reason: &'static str,
+    },
     /// As [`EnvelopeVerdict::Pending`].
     Pending {
         host_id: String,
@@ -231,7 +269,7 @@ pub enum ResultVerdict {
         object_id: String,
         reason: &'static str,
     },
-    /// As [`EnvelopeVerdict::Unavailable`].
+    /// As [`EnvelopeVerdict::Unavailable`]: a local failure, retryable.
     Unavailable { error: Error },
 }
 
@@ -261,7 +299,7 @@ pub fn open_envelope(
     now_ms: u64,
 ) -> EnvelopeVerdict {
     let (mail, key) = match admit(MailKind::Envelope, obj, list, me, None, now_ms) {
-        Admission::Verified { mail, key } => (mail, key),
+        Admission::Verified { mail, key, .. } => (mail, key),
         Admission::Pending {
             host_id,
             host_trust_gen,
@@ -325,7 +363,10 @@ pub fn open_envelope(
 /// `authorized` rule, see the module documentation), then that the plaintext
 /// answers `outbox`: a status names its `message_id`, a refusal names the
 /// request's or one of its cancel or complete envelopes' ids, a result names
-/// a task of the recorded resolution. The delivery rule stays in the host.
+/// a task of the recorded resolution. A verified result of a revoked or
+/// removed host is [`ResultVerdict::NotDelivered`] (kept as data), one that
+/// doesn't verify is refused. The delivery rule (return grant, route,
+/// project) stays in the host.
 pub fn accept_result(
     obj: &SignedObject,
     list: &Membership,
@@ -334,8 +375,12 @@ pub fn accept_result(
     provider: &dyn KeyProvider,
     now_ms: u64,
 ) -> ResultVerdict {
-    let (mail, key) = match admit(MailKind::Result, obj, list, me, Some(outbox), now_ms) {
-        Admission::Verified { mail, key } => (mail, key),
+    let (mail, key, standing) = match admit(MailKind::Result, obj, list, me, Some(outbox), now_ms) {
+        Admission::Verified {
+            mail,
+            key,
+            standing,
+        } => (mail, key, standing),
         Admission::Pending {
             host_id,
             host_trust_gen,
@@ -372,9 +417,21 @@ pub fn accept_result(
     if !answers {
         return refuse(DOES_NOT_ANSWER_OUTBOX_ROW);
     }
-    ResultVerdict::Accepted {
-        plain,
-        sender: host_principal(&body.sender.host_id),
+    let sender = host_principal(&body.sender.host_id);
+    // II.4.4: a result of a revoked or removed host verified, but isn't
+    // delivered; it is kept as data.
+    match standing {
+        Standing::Current => ResultVerdict::Accepted { plain, sender },
+        Standing::Revoked => ResultVerdict::NotDelivered {
+            plain,
+            sender,
+            reason: NOT_DELIVERED_SENDER_REVOKED,
+        },
+        Standing::Removed => ResultVerdict::NotDelivered {
+            plain,
+            sender,
+            reason: NOT_DELIVERED_SENDER_REMOVED,
+        },
     }
 }
 
@@ -383,10 +440,11 @@ pub fn accept_result(
 #[allow(clippy::large_enum_variant)]
 enum Admission {
     /// The signature verified and the times passed. `key` is the recipient's
-    /// key the object is sealed to, with its kid.
+    /// key the object is sealed to, with its kid; `standing` is the sender's.
     Verified {
         mail: VerifiedMail,
         key: (KeyId, [u8; 8]),
+        standing: Standing,
     },
     Pending {
         host_id: String,
@@ -400,6 +458,18 @@ enum Admission {
         object_id: String,
         reason: &'static str,
     },
+}
+
+/// A verified sender's standing in this list. Only a result can have another
+/// than `Current`: an envelope of a revoked or removed host is refused.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    /// A current, `authorized` host.
+    Current,
+    /// Held `revoked` (also when removed since: a removal keeps the state).
+    Revoked,
+    /// Removed.
+    Removed,
 }
 
 /// Step 5 on a body's times, with the clock `now_ms`.
@@ -463,28 +533,49 @@ fn admit(
     if expected.is_some_and(|row| *sender != row.recipient) {
         return refuse(NOT_THE_RECIPIENT);
     }
-    let Some(state) = list.host_sender_state(&sender.host_id) else {
-        return refuse(UNKNOWN_SENDER);
+    let signed_at = body.signed_at_head;
+    // A head beyond this list's can't be judged yet: entries this host lacks
+    // may add the sender, re-add it, readmit it or bring its newer generation,
+    // and no sender can know the hash of an entry that doesn't exist. Such an
+    // object waits (after step 5 on the body's times, the signature can't be
+    // checked yet). A refusal below is only for what this head settles.
+    let head_ahead = signed_at.seq > list.head().seq;
+    let wait = || match check_times(body.created_at, body.expires_at, now_ms) {
+        Ok(()) => Admission::Pending {
+            host_id: sender.host_id.clone(),
+            host_trust_gen: sender.host_trust_gen,
+        },
+        Err(reason) => refuse(reason),
     };
-    let Some(host) = list.host(&sender.host_id) else {
-        return refuse(REMOVED_SENDER);
+    // The sender's newest `add_host`, current or removed: a removed host's
+    // key still verifies what it signed before it left (a result kept as data).
+    let (known, removed) = match list.host(&sender.host_id) {
+        Some(host) => (Some(host), false),
+        None => (list.removed_host(&sender.host_id), true),
+    };
+    let Some(host) = known else {
+        return if head_ahead {
+            wait()
+        } else {
+            refuse(UNKNOWN_SENDER)
+        };
     };
     if sender.host_trust_gen < host.host_trust_gen {
         return refuse(STALE_SENDER_GENERATION);
     }
     let generation_ahead = sender.host_trust_gen > host.host_trust_gen;
-    let signed_at = body.signed_at_head;
-    let head_ahead = signed_at.seq > list.head().seq;
-    // What this list can decide about the head the sender signed at. A head
-    // beyond it can't be judged yet (it may hold a readmit this list lacks),
-    // and no sender can know the hash of an entry that doesn't exist.
+    let state = list.host_sender_state(&sender.host_id);
     if !head_ahead {
+        // This head settles the sender's standing.
+        if removed && (kind == MailKind::Envelope || generation_ahead) {
+            return refuse(REMOVED_SENDER);
+        }
         match state {
-            // The delivery rule decides about a revoked host's results.
-            HostSenderState::Revoked { .. } if kind == MailKind::Envelope => {
+            // A revoked host's results are kept as data, not refused.
+            Some(HostSenderState::Revoked { .. }) if kind == MailKind::Envelope => {
                 return refuse(REVOKED_SENDER);
             }
-            HostSenderState::Authorized { generation } if signed_at.seq < generation => {
+            Some(HostSenderState::Authorized { generation }) if signed_at.seq < generation => {
                 return refuse(SIGNED_AT_HEAD_BEFORE_GENERATION);
             }
             _ => {}
@@ -493,16 +584,14 @@ fn admit(
             return refuse(SIGNED_AT_HEAD_WRONG_HASH);
         }
     }
-    if generation_ahead || head_ahead {
-        // 5 first, on the body's times: the signature can't be checked yet.
-        return match check_times(body.created_at, body.expires_at, now_ms) {
-            Ok(()) => Admission::Pending {
-                host_id: sender.host_id.clone(),
-                host_trust_gen: sender.host_trust_gen,
-            },
-            Err(reason) => refuse(reason),
-        };
+    if head_ahead || generation_ahead {
+        return wait();
     }
+    let standing = match state {
+        Some(HostSenderState::Revoked { .. }) => Standing::Revoked,
+        _ if removed => Standing::Removed,
+        _ => Standing::Current,
+    };
 
     // 4. The signature, with the key of the sender's newest `add_host`.
     let Ok(mail) = VerifiedMail::verify(obj, &host.host_key) else {
@@ -519,6 +608,7 @@ fn admit(
     Admission::Verified {
         mail,
         key: key.clone(),
+        standing,
     }
 }
 
@@ -1332,10 +1422,55 @@ mod tests {
     fn removed_sender_refused() {
         let mut w = World::new();
         let me = w.recipient("host-b", true);
-        let f = w.fields("host-a", "host-b");
-        let object = w.envelope(&f, &w.request(&f));
+        let before = w.fields("host-a", "host-b");
         w.remove_host("host-a");
+        // Signed before the removal, and at it: this head holds the removal.
+        let mut at_removal = before.clone();
+        at_removal.signed_at_head = w.head();
+        for f in [before, at_removal] {
+            let object = w.envelope(&f, &w.request(&f));
+            assert_eq!(w.open(&object, &me), refused(REMOVED_SENDER, &object));
+        }
+    }
+
+    /// Entries this host hasn't seen may re-add a removed host (II.4.2): its
+    /// envelope signed at a head beyond ours waits.
+    #[test]
+    fn a_removed_sender_with_a_head_beyond_ours_is_pending() {
+        let mut w = World::new();
+        let me = w.recipient("host-b", true);
+        w.remove_host("host-a");
+        let before = w.m.clone();
+        // Re-added at a new generation (authorized, as it was), then signs.
+        w.add_host("host-a", 2);
+        let f = w.fields("host-a", "host-b");
+        assert!(f.signed_at_head.seq > before.head().seq);
+        let object = w.envelope(&f, &w.request(&f));
+        assert_eq!(
+            open_envelope(&object, &before, &me, &w.encs, NOW),
+            pending("host-a", 2)
+        );
+        assert!(matches!(w.open(&object, &me), EnvelopeVerdict::Open { .. }));
+        // The same claim at its old generation, for a head that doesn't
+        // exist yet: pending; once the list reaches that seq it is refused.
+        let mut w = World::new();
+        let me = w.recipient("host-b", true);
+        let mut f = w.fields("host-a", "host-b");
+        w.remove_host("host-a");
+        f.signed_at_head = Head {
+            seq: w.head().seq + 1,
+            hash: Hash32([0x66; 32]),
+        };
+        let object = w.envelope(&f, &w.request(&f));
+        assert_eq!(w.open(&object, &me), pending("host-a", 1));
+        w.add_host("host-c", 2);
         assert_eq!(w.open(&object, &me), refused(REMOVED_SENDER, &object));
+        // The time checks on the body's times come first.
+        let mut late = f.clone();
+        late.signed_at_head.seq = w.head().seq + 1;
+        late.expires_at = NOW - 500;
+        let object = w.envelope(&late, &w.request(&late));
+        assert_eq!(w.open(&object, &me), refused(EXPIRED, &object));
     }
 
     #[test]
@@ -1348,8 +1483,45 @@ mod tests {
         w.hosts
             .generate(host_key_id("host-nobody", 1), Alg::Ed25519)
             .unwrap();
+        // At this host's head, and at an older head with its right hash:
+        // this head settles it.
+        for head in [
+            w.head(),
+            Head {
+                seq: 2,
+                hash: w.m.entry_hash_at(2).unwrap(),
+            },
+        ] {
+            f.signed_at_head = head;
+            let object = w.envelope(&f, &w.request(&f));
+            assert_eq!(w.open(&object, &me), refused(UNKNOWN_SENDER, &object));
+        }
+    }
+
+    /// Entries this host hasn't seen may add the sender (II.4.2): an unknown
+    /// sender's envelope signed at a head beyond ours waits.
+    #[test]
+    fn an_unknown_sender_with_a_head_beyond_ours_is_pending() {
+        let mut w = World::new();
+        let me = w.recipient("host-b", true);
+        let before = w.m.clone();
+        w.add_host("host-nobody", 1);
+        let f = w.fields("host-nobody", "host-b");
+        assert!(f.signed_at_head.seq > before.head().seq);
         let object = w.envelope(&f, &w.request(&f));
-        assert_eq!(w.open(&object, &me), refused(UNKNOWN_SENDER, &object));
+        assert_eq!(
+            open_envelope(&object, &before, &me, &w.encs, NOW),
+            pending("host-nobody", 1)
+        );
+        assert!(matches!(w.open(&object, &me), EnvelopeVerdict::Open { .. }));
+        // The time checks on the body's times come first.
+        let mut late = f.clone();
+        late.expires_at = NOW - 500;
+        let object = w.envelope(&late, &w.request(&late));
+        assert_eq!(
+            open_envelope(&object, &before, &me, &w.encs, NOW),
+            refused(EXPIRED, &object)
+        );
     }
 
     // ----------------------------------------------------------- check 4
@@ -1850,28 +2022,209 @@ mod tests {
         ));
     }
 
-    /// The delivery rule is the host's (II.4.4): a result of a host this host
-    /// holds revoked is still a verified answer the host keeps as data.
+    /// II.4.4: a result of a host this list holds revoked is not delivered
+    /// but kept as data.
     #[test]
-    fn a_revoked_hosts_result_is_still_accepted_for_the_host_to_judge() {
+    fn a_revoked_hosts_result_is_kept_as_data() {
         let mut w = World::new();
         let outbox = expected(&w);
         w.revoke("host-b");
         let f = w.fields("host-b", "host-a");
+        for plain in [
+            status(ID),
+            ResultPlain::Result {
+                task_id: REPLY_ID.into(),
+                reply: reply(0),
+            },
+        ] {
+            let object = result(&w, &f, &plain);
+            assert_eq!(
+                accept(&w, &object, &outbox),
+                ResultVerdict::NotDelivered {
+                    plain,
+                    sender: "host:host-b".into(),
+                    reason: NOT_DELIVERED_SENDER_REVOKED,
+                }
+            );
+        }
+        // A bad signature is refused, kept or not.
         let object = result(&w, &f, &status(ID));
-        assert!(matches!(
+        let junk = edited(&object, |v| v["sig"] = json!(b64u(&[1u8; 64])));
+        assert_eq!(
+            accept(&w, &junk, &outbox),
+            result_refused(BAD_SIGNATURE, &junk)
+        );
+        // Another host's signature isn't the sender's.
+        let as_c = w.resigned(MailKind::Result, &object, &host_key_id("host-c", 1), |_| {});
+        assert_eq!(
+            accept(&w, &as_c, &outbox),
+            result_refused(BAD_SIGNATURE, &as_c)
+        );
+        // It still has to answer the row, and to name a head this list has.
+        let object = result(&w, &f, &status("8b3e4c60-5d9f-4a0c-9e23-4f7b9c1d5e60"));
+        assert_eq!(
             accept(&w, &object, &outbox),
-            ResultVerdict::Accepted { .. }
-        ));
-        // Signed before B's generation as an authorized host would be: not
-        // applicable while it is revoked; a removed host's result can't be
-        // verified (its key left the list with it).
+            result_refused_authenticated(DOES_NOT_ANSWER_OUTBOX_ROW)
+        );
+        let mut bad = f.clone();
+        bad.signed_at_head.hash = Hash32([5; 32]);
+        let object = result(&w, &bad, &status(ID));
+        assert_eq!(
+            accept(&w, &object, &outbox),
+            result_refused(SIGNED_AT_HEAD_WRONG_HASH, &object)
+        );
+    }
+
+    /// II.4.4: a result of a removed host is verified with the key it last
+    /// held, and is kept as data.
+    #[test]
+    fn a_removed_hosts_result_is_kept_as_data() {
+        let mut w = World::new();
+        let outbox = expected(&w);
+        let f = w.fields("host-b", "host-a");
+        w.remove_host("host-b");
+        let kept = |plain: ResultPlain| ResultVerdict::NotDelivered {
+            plain,
+            sender: "host:host-b".into(),
+            reason: NOT_DELIVERED_SENDER_REMOVED,
+        };
+        // Signed before the removal, and at it.
+        let mut at_removal = f.clone();
+        at_removal.signed_at_head = w.head();
+        for f in [&f, &at_removal] {
+            let object = result(&w, f, &status(ID));
+            assert_eq!(accept(&w, &object, &outbox), kept(status(ID)));
+        }
+        // A bad signature, or another host's, is refused.
+        let object = result(&w, &f, &status(ID));
+        let junk = edited(&object, |v| v["sig"] = json!(b64u(&[1u8; 64])));
+        assert_eq!(
+            accept(&w, &junk, &outbox),
+            result_refused(BAD_SIGNATURE, &junk)
+        );
+        let as_c = w.resigned(MailKind::Result, &object, &host_key_id("host-c", 1), |_| {});
+        assert_eq!(
+            accept(&w, &as_c, &outbox),
+            result_refused(BAD_SIGNATURE, &as_c)
+        );
+        // The row's other rules hold: the answer, the head's hash.
+        let object = result(&w, &f, &status("8b3e4c60-5d9f-4a0c-9e23-4f7b9c1d5e60"));
+        assert_eq!(
+            accept(&w, &object, &outbox),
+            result_refused_authenticated(DOES_NOT_ANSWER_OUTBOX_ROW)
+        );
+        let mut bad = f.clone();
+        bad.signed_at_head.hash = Hash32([5; 32]);
+        let object = result(&w, &bad, &status(ID));
+        assert_eq!(
+            accept(&w, &object, &outbox),
+            result_refused(SIGNED_AT_HEAD_WRONG_HASH, &object)
+        );
+        // A generation the list never gave the removed host, at a head the
+        // list has: settled (past its head it would wait).
+        let mut never = f.clone();
+        never.sender.host_trust_gen = 2;
+        never.signed_at_head = w.head();
+        w.hosts
+            .generate(host_key_id("host-b", 2), Alg::Ed25519)
+            .unwrap();
+        let mut row = outbox.clone();
+        row.recipient.host_trust_gen = 2;
+        let object = result(&w, &never, &status(ID));
+        assert_eq!(
+            accept_result(
+                &object,
+                &w.m,
+                &w.recipient("host-a", true),
+                &row,
+                &w.encs,
+                NOW
+            ),
+            result_refused(REMOVED_SENDER, &object)
+        );
+        // Revoked and then removed: still revoked (a removal keeps the state).
+        let mut w = World::new();
+        let outbox = expected(&w);
+        let f = w.fields("host-b", "host-a");
+        w.revoke("host-b");
         w.remove_host("host-b");
         let object = result(&w, &f, &status(ID));
         assert_eq!(
             accept(&w, &object, &outbox),
-            result_refused(REMOVED_SENDER, &object)
+            ResultVerdict::NotDelivered {
+                plain: status(ID),
+                sender: "host:host-b".into(),
+                reason: NOT_DELIVERED_SENDER_REVOKED,
+            }
         );
+    }
+
+    /// A removed host, once re-added, is judged by its newest key: a result
+    /// with the key it held before the removal is for a generation this list
+    /// has replaced.
+    #[test]
+    fn a_removed_hosts_result_beyond_our_head_waits_and_a_readded_one_is_stale() {
+        let mut w = World::new();
+        let outbox = expected(&w);
+        let f = w.fields("host-b", "host-a");
+        w.remove_host("host-b");
+        let before = w.m.clone();
+        let mut ahead = f.clone();
+        w.add_host("host-c", 2);
+        ahead.signed_at_head = w.head();
+        let object = result(&w, &ahead, &status(ID));
+        let verdict = |list: &Membership| {
+            accept_result(
+                &object,
+                list,
+                &w.recipient("host-a", true),
+                &outbox,
+                &w.encs,
+                NOW,
+            )
+        };
+        assert_eq!(
+            verdict(&before),
+            ResultVerdict::Pending {
+                host_id: "host-b".into(),
+                host_trust_gen: 1,
+            }
+        );
+        assert!(matches!(
+            verdict(&w.m),
+            ResultVerdict::NotDelivered {
+                reason: NOT_DELIVERED_SENDER_REMOVED,
+                ..
+            }
+        ));
+        // Re-added at generation 2: the old key's result is stale.
+        w.add_host("host-b", 2);
+        let object = result(&w, &f, &status(ID));
+        assert_eq!(
+            accept(&w, &object, &outbox),
+            result_refused(STALE_SENDER_GENERATION, &object)
+        );
+    }
+
+    #[test]
+    fn a_removed_hosts_last_key_is_its_newest_add_host() {
+        let mut w = World::new();
+        // A current host and a host never named have none.
+        assert_eq!(w.m.removed_host("host-a"), None);
+        assert_eq!(w.m.removed_host("host-nobody"), None);
+        w.add_host("host-a", 2);
+        let newest = w.m.host("host-a").unwrap().clone();
+        assert_eq!(newest.host_trust_gen, 2);
+        w.remove_host("host-a");
+        assert_eq!(w.m.host("host-a"), None);
+        assert_eq!(w.m.removed_host("host-a"), Some(&newest));
+        // The stored form and a replay agree.
+        let back = Membership::from_stored(ACCOUNT, &w.m.genesis_hash(), &w.m.to_stored()).unwrap();
+        assert_eq!(back.removed_host("host-a"), Some(&newest));
+        // A re-add makes it current again, with its new key.
+        w.add_host("host-a", 3);
+        assert_eq!(w.m.removed_host("host-a"), None);
+        assert_eq!(w.m.host("host-a").unwrap().host_trust_gen, 3);
     }
 
     #[test]

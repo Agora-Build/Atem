@@ -969,6 +969,19 @@ impl Membership {
             .map(|h| &h.record)
     }
 
+    /// A removed host's newest key: the record of its last `add_host`. `None`
+    /// for a current host (use [`host`](Self::host)) and for a host no
+    /// `add_host` ever named. A removed host can't send, but what it signed
+    /// before it was removed still verifies with this key (a result kept as
+    /// data, delegated host-work II.4.4).
+    pub fn removed_host(&self, host_id: &str) -> Option<&HostRecord> {
+        self.derived
+            .hosts
+            .get(host_id)
+            .filter(|h| h.removed)
+            .map(|h| &h.record)
+    }
+
     /// The current recovery key (genesis, or the newest replacement in
     /// effect here).
     pub fn recovery_key(&self) -> &PublicKey {
