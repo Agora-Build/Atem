@@ -333,9 +333,11 @@ capacity limit or on a storage failure). The reply follows the durable
 | `outcome_unknown` | the submission is uncertain, or its receipt is gone (detail `receipt no longer available`); never resubmitted; `expired` at `expires_at` |
 
 `receipt_id` (UUID v4, fixed at enqueue) is the session-v1 `request_id` of the
-prompt. `detail` is display text of at most 1024 bytes; clients don't parse
+prompt; behind `host.delegated` it is the current attempt's own id (§11.2).
+`detail` is display text of at most 1024 bytes; clients don't parse
 it. `result` is a context snapshot exactly when the state is `completed`, else
-`null`.
+`null`. A resolved task's status also carries `resolved` (§11.2); it is
+omitted otherwise.
 
 ### Dispatch
 
@@ -763,7 +765,7 @@ request's `id`:
 | `stale_target` | the host triple doesn't match |
 | `invalid_request` | decoding, a field rule, an expiry, an upload gap, bad PNG bytes |
 | `request_id_reused` | the same id with other content |
-| `busy` | hosting off, too many queued requests, a capacity limit or storage failure, the live-session limit, cancel or complete in the wrong state |
+| `busy` | hosting off, too many queued requests, a capacity limit or storage failure, the live-session limit, cancel or complete in the wrong state, an op of a feature the host doesn't list (§11.2) |
 
 After a lost reply, query (`host_launch_query`, `work_query`, `reply_query`,
 `message_query`) or resend the same content with a fresh `id`. Never mint a
@@ -829,7 +831,7 @@ three features, defined in `atem_client::session::host_work`
 
 | Feature | Ops |
 |---|---|
-| `host.delegated` | `work_interrupt`, `work_resolve` (Part I; written in a later section) |
+| `host.delegated` | `work_interrupt`, `work_resolve` (§11.2) |
 | `host.alerts` | `alert_list` (Part I; written in a later section) |
 | `host.senders` | `control_records` (session-v1 R9.3, R9.8; §11.1), `host_enc_key_get` (written later) |
 
@@ -1144,3 +1146,67 @@ They run in `crates/atem-client/tests/vectors.rs`, in the bindings'
 principal with that `record_id`, and each step's position against the
 stations) and derives no verdict.
 Every SDK package's checksum manifest lists the file.
+
+### 11.2 `work_interrupt` and `work_resolve`
+
+Two directed-work requests of `host.delegated` (design I.4.5, I.4.6), in
+§1's form: `v: 1`, a fresh `id`, the `host`, exactly these fields, and
+they serialize back to the same JSON.
+
+```json
+{"v":1,"id":"…","host":{…},"op":"work_interrupt","task_id":"<UUID v4>"}
+{"v":1,"id":"…","host":{…},"op":"work_resolve","task_id":"<UUID v4>",
+ "resolution":{"kind":"failed","detail":"agent exited"}}
+{"v":1,"id":"…","host":{…},"op":"work_resolve","task_id":"<UUID v4>",
+ "resolution":{"kind":"done","result":{"kind":"vault","id":"…","version":1,"text":"…","digest":"…"}}}
+```
+
+| Field | Rule |
+|---|---|
+| `task_id` | a UUID v4 |
+| `resolution.kind` | `failed` or `done`, exactly its fields |
+| `failed.detail` | 1–1024 bytes, no control character: the detail the task then shows |
+| `done.result` | a context snapshot, with `work_complete`'s checks (a `result` kind is local only) |
+
+**Authority.** Both are directed-work requests: the channel checks `notify`
+before decoding (`forbidden`; a native member needs `control`), as for every
+op of §2. The host then checks, each time, that the caller is the task's
+sender (the principal and key that enqueued it) with current authority, or
+the owner (a native member holding `control` at the head); for
+`work_interrupt` the sender also holds `interrupt`. A task the caller may
+not name is `forbidden`, as for `work_query`.
+
+**Results** are `work` results (§4 "Status").
+
+- `work_interrupt` interrupts the task's turn when it is the session's
+  current turn. Otherwise nothing happens: the result is the task's status
+  as it is, with `detail` `not running`.
+- `work_resolve` settles an `outcome_unknown` task; a task in any other
+  state, unless it was resolved, is `forbidden`. `failed` makes it `failed`
+  with the given `detail`; `done` makes it `completed` with that `result`.
+  The same resolution again returns the recorded status; another
+  resolution of a resolved task is `request_id_reused`.
+- A task resolved by either path has `resolved`: `{"by":"member:<id>"|
+  "service:<id>"|"local","at":<ms>}`, the resolver and the host's wall clock
+  then. It is omitted before, and appears on `failed` and `completed`
+  statuses only.
+- `receipt_id` is the id of the task's current attempt (design I.6.4): a
+  new dispatch after an attempt proven side-effect-free has a new one. It is
+  opaque to a client, which compares it with nothing; a client that
+  needs a task's identity uses `task_id`.
+
+**Client core.** `Attached::send` refuses both unless `welcome.features`
+lists `host.delegated` (`host feature not available`). A result answers
+`work_interrupt` when it is that task's status; it answers `work_resolve`
+when it is that task's status, `resolved`, and settled the way the request
+asked (`failed`; or `completed` with exactly its `result`).
+
+**Not advertised yet.** No host lists `host.delegated` in this version. A
+host refuses both with `busy`, detail `host.delegated is not advertised`,
+after the channel's `notify` check and before decoding: the code a host-work
+request the host can't take has (§1, §7), unlike `control_records`, which is
+a session op (§11, `unsupported_version`). Nothing is queued or recorded
+(**Atem's choice of code, for Astation to confirm**).
+
+Vectors: `fixtures/host-work/requests-v1.json` (the requests, valid and
+invalid, and `work` results with `resolved`).

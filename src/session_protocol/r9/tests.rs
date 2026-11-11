@@ -3168,3 +3168,146 @@ mod control_records {
         assert!(rig.engine.take_host_work().is_empty());
     }
 }
+
+/// `work_interrupt` and `work_resolve` (delegated host-work design I.4.5,
+/// plan Task 17) are host-work ops of `host.delegated`, which no host
+/// advertises in step 3: refused as any host-work op of a feature the host
+/// doesn't list is (`busy`, host-work-v1 §1 and §7, here with the feature
+/// named), after the channel's own authority check and before anything is
+/// decoded, so nothing reaches the runtime's host-work queue.
+mod delegated_work_ops {
+    use super::*;
+    use atem_client::session::host_work::{ALERTS_FEATURE, DELEGATED_FEATURE, SENDERS_FEATURE};
+
+    const ID: &str = "aaaaaaaa-0000-4000-8000-0000000000d1";
+    const TASK: &str = "aaaaaaaa-0000-4000-8000-0000000000d2";
+    const OPS: [&str; 2] = ["work_interrupt", "work_resolve"];
+
+    /// The request a newer client would send (the client core never sends
+    /// either to a host that didn't advertise the feature), built from the
+    /// channel's welcome.
+    fn message(rig: &mut Rig, handle: &str, op: &str) -> Vec<u8> {
+        let w = welcome(rig, handle);
+        let mut data = json!({
+            "v": 1, "id": ID, "op": op, "task_id": TASK,
+            "host": {
+                "account_id": w.account_id,
+                "atem_device_id": w.atem_device_id,
+                "host_trust_gen": w.host_trust_gen,
+            },
+        });
+        if op == "work_resolve" {
+            data["resolution"] = json!({"kind": "failed", "detail": "agent exited"});
+        }
+        json!({"type": "session", "data": data})
+            .to_string()
+            .into_bytes()
+    }
+
+    /// What `handle` got back for `op` handed to the host: exactly one
+    /// message, an error naming the request.
+    fn refusal(rig: &mut Rig, handle: &str, op: &str) -> (String, Option<String>) {
+        let plain = message(rig, handle, op);
+        let (att, authority) = match &rig.engine.chans[handle].phase {
+            Phase::Open(a) => (a.attachment.clone(), a.authority.clone()),
+            _ => panic!("{handle} is open"),
+        };
+        rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
+        rig.pump();
+        let events = rig.events(handle);
+        assert_eq!(events.len(), 1, "{op}: {events:?}");
+        let CEvent::Error(e) = &events[0] else {
+            panic!("an error: {events:?}");
+        };
+        assert_eq!(e.re.as_deref(), Some(ID), "{op}");
+        (e.code.clone(), e.detail.clone())
+    }
+
+    fn not_advertised() -> (String, Option<String>) {
+        (
+            "busy".into(),
+            Some("host.delegated is not advertised".into()),
+        )
+    }
+
+    #[test]
+    fn host_refuses_unadvertised() {
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-bot", bot());
+        for handle in ["ch-phone", "ch-bot"] {
+            for feature in [DELEGATED_FEATURE, ALERTS_FEATURE, SENDERS_FEATURE] {
+                assert!(
+                    !welcome(&mut rig, handle)
+                        .features
+                        .iter()
+                        .any(|f| f == feature),
+                    "{feature}"
+                );
+            }
+        }
+        for op in OPS {
+            // A native member holding `control` has the right to a
+            // directed-work op, and the feature isn't there.
+            assert_eq!(refusal(&mut rig, "ch-phone", op), not_advertised(), "{op}");
+            // A service without `notify` has no right to it either way.
+            assert_eq!(refusal(&mut rig, "ch-bot", op).0, "forbidden", "{op}");
+        }
+        // The channels are as they were, and no host-work request, relay
+        // message or fence came of it.
+        assert_eq!(rig.engine.status().attachments, 2);
+        assert_eq!(
+            rig.list("ch-phone"),
+            vec![SID.to_string(), SID_B.to_string()]
+        );
+        assert_eq!(rig.list("ch-bot"), vec![SID.to_string()]);
+        assert!(rig.engine.take_host_work().is_empty());
+        assert!(rig.relay.is_empty());
+    }
+
+    /// Hosting on changes nothing: the host-work features are advertised,
+    /// `host.delegated` still is not, and neither op is queued for the
+    /// runtime, however often it is asked.
+    #[test]
+    fn delegated_ops_refused_with_hosting_on_until_advertised() {
+        let mut rig = Rig::new();
+        rig.engine.enable_host_work(true);
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        let features = welcome(&mut rig, "ch-phone").features;
+        assert!(
+            features.iter().any(|f| f == "host.work"),
+            "hosting is on: {features:?}"
+        );
+        assert!(!features.iter().any(|f| f == DELEGATED_FEATURE));
+        for _ in 0..2 {
+            for op in OPS {
+                assert_eq!(refusal(&mut rig, "ch-phone", op), not_advertised(), "{op}");
+            }
+        }
+        assert!(rig.engine.take_host_work().is_empty());
+        // A host-work op of an advertised feature is still queued, so the
+        // refusal is the feature's, not a change to the others.
+        let plain = {
+            let w = welcome(&mut rig, "ch-phone");
+            json!({"type": "session", "data": {
+                "v": 1, "id": ID, "op": "work_query", "task_id": TASK,
+                "host": {
+                    "account_id": w.account_id,
+                    "atem_device_id": w.atem_device_id,
+                    "host_trust_gen": w.host_trust_gen,
+                },
+            }})
+            .to_string()
+            .into_bytes()
+        };
+        let (att, authority) = match &rig.engine.chans["ch-phone"].phase {
+            Phase::Open(a) => (a.attachment.clone(), a.authority.clone()),
+            _ => panic!("open"),
+        };
+        rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
+        assert_eq!(rig.engine.take_host_work().len(), 1);
+    }
+}

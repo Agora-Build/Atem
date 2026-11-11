@@ -168,9 +168,15 @@ impl Need {
             ("session", "host_profiles" | "host_launch" | "host_launch_query") => {
                 Need::Op(Op::Launch)
             }
+            // Directed work. `work_interrupt` and `work_resolve` (delegated
+            // host work, I.4.5) are directed-work requests like the rest: the
+            // channel checks `notify` before decoding and a native member
+            // needs `control`; the host then checks `interrupt` for
+            // `work_interrupt`.
             (
                 "session",
-                "work_enqueue" | "work_query" | "reply_query" | "work_cancel" | "work_complete",
+                "work_enqueue" | "work_query" | "reply_query" | "work_cancel" | "work_complete"
+                | "work_interrupt" | "work_resolve",
             ) => Need::Op(Op::Notify),
             ("session", "message_publish" | "message_query" | "attachment_put") => Need::Op(Op::Message),
             ("session", "membership") => Need::Op(Op::View),

@@ -452,12 +452,15 @@ fn error(code: &str, re: Option<&str>, detail: Option<&str>) -> SessionError {
 }
 
 /// The feature of an op that exists only for delegated host work (plan
-/// decision 4): `control_records` is `host.senders`'s. `work_interrupt` and
-/// `work_resolve` (`host.delegated`), `alert_list` (`host.alerts`) and
+/// decision 4): `control_records` is `host.senders`'s; `work_interrupt` and
+/// `work_resolve` are `host.delegated`'s. `alert_list` (`host.alerts`) and
 /// `host_enc_key_get` (`host.senders`) join it when they are specified.
 fn delegated_feature_of(op: &str) -> Option<&'static str> {
     match op {
         "control_records" => Some(atem_client::session::host_work::SENDERS_FEATURE),
+        "work_interrupt" | "work_resolve" => {
+            Some(atem_client::session::host_work::DELEGATED_FEATURE)
+        }
         _ => None,
     }
 }
@@ -1668,6 +1671,15 @@ impl R9Host {
             return Vec::new();
         }
         if family == "session" {
+            // The feature of a delegated-work op this host doesn't
+            // advertise, if the op is one: after the authority check (a
+            // principal outside the op's right still learns `forbidden`),
+            // before anything is read.
+            let unadvertised = data
+                .get("op")
+                .and_then(Value::as_str)
+                .and_then(delegated_feature_of)
+                .filter(|feature| !self.advertised_features().iter().any(|f| f == feature));
             if matches!(
                 data.get("op").and_then(Value::as_str),
                 Some(
@@ -1679,12 +1691,24 @@ impl R9Host {
                         | "reply_query"
                         | "work_cancel"
                         | "work_complete"
+                        | "work_interrupt"
+                        | "work_resolve"
                         | "message_publish"
                         | "message_query"
                         | "attachment_put"
                 )
             ) {
-                if !self.host_work_enabled || self.host_work_requests.len() >= 64 {
+                // A host-work op of a feature this host doesn't advertise
+                // (`host.delegated`'s, none in step 3) is refused as every
+                // host-work request the host can't take is (`busy`, host-work
+                // v1 §7), naming the feature; it is never decoded or queued.
+                if let Some(feature) = unadvertised {
+                    refuse(
+                        self,
+                        code::BUSY,
+                        Some(&format!("{feature} is not advertised")),
+                    );
+                } else if !self.host_work_enabled || self.host_work_requests.len() >= 64 {
                     refuse(self, code::BUSY, Some("agent hosting is disabled or busy"));
                 } else {
                     match atem_client::session::host_work::Request::decode(plain) {
@@ -1697,15 +1721,8 @@ impl R9Host {
                 }
                 return Vec::new();
             }
-            // An op of a feature this host doesn't advertise: after the
-            // authority check (a principal outside the op's right still
-            // learns `forbidden`), before anything is read.
-            if let Some(feature) = data
-                .get("op")
-                .and_then(Value::as_str)
-                .and_then(delegated_feature_of)
-                && !self.advertised_features().iter().any(|f| f == feature)
-            {
+            // A session op of such a feature: `unsupported_version`.
+            if let Some(feature) = unadvertised {
                 refuse(
                     self,
                     code::UNSUPPORTED_VERSION,

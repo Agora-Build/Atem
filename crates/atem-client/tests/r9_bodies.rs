@@ -427,6 +427,18 @@ fn one_authority_check_per_request() {
         need("session", json!({"op": "reply_query"})),
         Need::Op(Op::Notify)
     );
+    // The delegated ops are directed-work requests: the channel checks
+    // `notify` before decoding them (the host then checks `interrupt` for
+    // `work_interrupt`), and a native member needs `control`.
+    for op in ["work_interrupt", "work_resolve"] {
+        assert_eq!(
+            need("session", json!({ "op": op })),
+            need("session", json!({"op": "work_cancel"})),
+            "{op}"
+        );
+        assert_eq!(need("session", json!({ "op": op })), Need::Op(Op::Notify));
+    }
+    assert!(Op::Notify.is_control());
     assert!(!Op::Message.is_control());
     assert_eq!(
         need("terminal", json!({"op": "input"})),

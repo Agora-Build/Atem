@@ -1836,3 +1836,123 @@ mod control_records {
         assert_eq!(error_code(&events).as_deref(), Some("forbidden"));
     }
 }
+
+/// `work_interrupt` and `work_resolve` (delegated host-work design I.4.5)
+/// on the client: host-work requests of `host.delegated`, sent only to a
+/// host that advertised it, read as the host reads them, and tracked until
+/// the host answers.
+mod delegated_work_ops {
+    use super::*;
+    use atem_client::session::host_work::DELEGATED_FEATURE;
+
+    const MINE: &str = "aaaaaaaa-0000-4000-8000-0000000000e1";
+    const TASK: &str = "aaaaaaaa-0000-4000-8000-0000000000e2";
+
+    /// The message an app builds for `op`, for the host `attached` is on.
+    fn message(attached: &Attached, id: &str, op: &str) -> Value {
+        let w = attached.welcome();
+        let mut data = json!({
+            "v": 1, "id": id, "op": op, "task_id": TASK,
+            "host": {
+                "account_id": w.account_id,
+                "atem_device_id": w.atem_device_id,
+                "host_trust_gen": w.host_trust_gen,
+            },
+        });
+        if op == "work_resolve" {
+            data["resolution"] = json!({"kind": "failed", "detail": "agent exited"});
+        }
+        json!({"type": "session", "data": data})
+    }
+
+    fn advertise_delegated(world: &World) {
+        world.core.lock().unwrap().welcome_override =
+            Some(|w| w.features.push(DELEGATED_FEATURE.into()));
+    }
+
+    /// A host that doesn't advertise `host.delegated` is never sent either
+    /// op: the request fails before anything is sealed, so the channel
+    /// carries on (its next record is the next in sequence).
+    #[test]
+    fn client_refuses_without_feature() {
+        let world = World::new(&L);
+        let log = world.log(&L);
+        let now = || world.mono();
+        let phone = Device::native(&world, "dev-phone", log);
+        let mut wire = world.tcp();
+        let mut attached = phone.connect(&mut wire).unwrap();
+        assert!(
+            !attached
+                .welcome()
+                .features
+                .iter()
+                .any(|f| f == DELEGATED_FEATURE)
+        );
+        for op in ["work_interrupt", "work_resolve"] {
+            let sent = message(&attached, MINE, op);
+            assert_eq!(
+                attached.send(&sent, now()).err(),
+                Some(ConnectError::Request("host feature not available")),
+                "{op}"
+            );
+        }
+        assert_eq!(list(&mut attached, &mut wire, now()), vec![SES_A, SES_B]);
+
+        // With the feature the same messages go (the host's own reading of
+        // them first), each once while it waits for its answer.
+        advertise_delegated(&world);
+        let mut wire = world.tcp();
+        let mut attached = phone.connect(&mut wire).unwrap();
+        assert!(
+            attached
+                .welcome()
+                .features
+                .iter()
+                .any(|f| f == DELEGATED_FEATURE)
+        );
+        let interrupt = message(&attached, MINE, "work_interrupt");
+        attached.send(&interrupt, now()).unwrap();
+        assert_eq!(
+            attached.send(&interrupt, now()).err(),
+            Some(ConnectError::Request("duplicate host work message id"))
+        );
+        let resolve = message(
+            &attached,
+            "aaaaaaaa-0000-4000-8000-0000000000e3",
+            "work_resolve",
+        );
+        attached.send(&resolve, now()).unwrap();
+        // Refused for what they are: another host's, or not what the host
+        // would read.
+        let mut stale = message(
+            &attached,
+            "aaaaaaaa-0000-4000-8000-0000000000e4",
+            "work_resolve",
+        );
+        stale["data"]["host"]["host_trust_gen"] = json!(99);
+        assert_eq!(
+            attached.send(&stale, now()).err(),
+            Some(ConnectError::Request("stale host target"))
+        );
+        let mut bad = message(
+            &attached,
+            "aaaaaaaa-0000-4000-8000-0000000000e5",
+            "work_resolve",
+        );
+        bad["data"]["resolution"] = json!({"kind": "done"});
+        assert_eq!(
+            attached.send(&bad, now()).err(),
+            Some(ConnectError::Request("invalid_request"))
+        );
+        let mut extra = message(
+            &attached,
+            "aaaaaaaa-0000-4000-8000-0000000000e6",
+            "work_interrupt",
+        );
+        extra["data"]["resolution"] = json!({"kind": "failed", "detail": "x"});
+        assert_eq!(
+            attached.send(&extra, now()).err(),
+            Some(ConnectError::Request("invalid_request"))
+        );
+    }
+}

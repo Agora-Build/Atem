@@ -713,6 +713,8 @@ impl Attached {
                         | "reply_query"
                         | "work_cancel"
                         | "work_complete"
+                        | "work_interrupt"
+                        | "work_resolve"
                         | "message_publish"
                         | "message_query"
                         | "attachment_put"

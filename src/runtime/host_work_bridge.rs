@@ -865,6 +865,7 @@ impl HostBridge {
                         state: WorkState::Queued,
                         detail: "waiting for a ready agent".into(),
                         result: None,
+                        resolved: None,
                     },
                     turn_id: None,
                 };
@@ -945,6 +946,10 @@ impl HostBridge {
                 store.save_work(&r).map_err(|_| "busy")?;
                 Ok(ResultBody::Work { work: r.status })
             }
+            // `host.delegated`'s ops: the channel refuses them while the host
+            // doesn't advertise the feature (none does yet, step 3), so none
+            // gets here; one that did would be refused, never half-served.
+            Request::WorkInterrupt { .. } | Request::WorkResolve { .. } => Err("busy"),
             Request::Publish { .. }
             | Request::MessageQuery { .. }
             | Request::AttachmentPut { .. } => unreachable!(),
@@ -1123,6 +1128,7 @@ impl HostBridge {
                         state: WorkState::Queued,
                         detail: "waiting for a ready agent".into(),
                         result: None,
+                        resolved: None,
                     },
                     turn_id: None,
                 };
@@ -2293,6 +2299,7 @@ principals = ["local"]
                 state,
                 detail: String::new(),
                 result: None,
+                resolved: None,
             },
             task,
             turn_id: None,
@@ -2814,6 +2821,7 @@ principals = ["local"]
                     state: WorkState::Completed,
                     detail: String::new(),
                     result: None,
+                    resolved: None,
                 },
                 task,
                 turn_id: None,
@@ -4060,6 +4068,7 @@ launch = "on_message"
                     state: WorkState::AwaitingResult,
                     detail: "agent submission receipt reconciled; task completion requires an explicit result".into(),
                     result: None,
+                    resolved: None,
                 },
                 task,
                 turn_id: Some("turn-0".into()),
@@ -4837,6 +4846,7 @@ launch = "on_message"
                             state: WorkState::Queued,
                             detail: String::new(),
                             result: None,
+                            resolved: None,
                         },
                         turn_id: None,
                         authorization_expires_at: None,
