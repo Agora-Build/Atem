@@ -1894,8 +1894,8 @@ mod control_state_tests {
                     ),
                 ),
                 // B's cover is newer than A's: B's feed covers it from its
-                // cover on. A cover never releases (ruling T11a): A's hold
-                // stays in force.
+                // cover on. A cover never releases: A's hold stays in
+                // force.
                 Step::new(
                     &b(3, C::Cover),
                     at(B, 5),

@@ -24,8 +24,8 @@
 //!   manager's `interrupt_running`; the host's own key signs nothing. The
 //!   host must have an `add_host` in the log, current or removed, and the
 //!   record's `revoke_seq` must name this list's `host_sender_revoke` of
-//!   that host (ruling T10a): beyond the head it is pending, any other
-//!   entry is refused. A readmit since changes nothing: the interrupt is for
+//!   that host: beyond the head it is pending, any other entry is
+//!   refused. A readmit since changes nothing: the interrupt is for
 //!   the tasks admitted before that revoke (II.3.1). Whether the host
 //!   applied that revoke (its applied device-list `seq` reached it) is the
 //!   application's (I.5.5). A host principal's `release` (or `cover`,
@@ -307,7 +307,7 @@ fn service_key(rec: &ControlRecord, list: &Membership, id: &str) -> Verdict<(u64
 }
 
 /// A host principal's `revoke_seq` names this list's `host_sender_revoke`
-/// of `host_id` (ruling T10a). An entry there that isn't one is refused,
+/// of `host_id`. An entry there that isn't one is refused,
 /// whatever the list holds later (a committed entry never changes); beyond
 /// the head, the record waits (after an unknown host, which can't have a
 /// revoke in the list yet).
@@ -1064,7 +1064,7 @@ mod verify_control_tests {
         }
     }
 
-    /// Controller ruling T9a: a host principal's `release` (or `cover`,
+    /// A host principal's `release` (or `cover`,
     /// `hold`, `revoke`) is refused at parse, as `NotForHostPrincipal`, so
     /// it never reaches `verify_control`; the caller keeps the bytes as
     /// evidence (I.5.4).
@@ -1236,7 +1236,7 @@ mod verify_control_tests {
         append(list, keys, "mac", Action::AddHost { host })
     }
 
-    /// Ruling T10a: `revoke_seq` names that host's `host_sender_revoke`.
+    /// `revoke_seq` names that host's `host_sender_revoke`.
     #[test]
     fn host_interrupt_matching_revoke_valid() {
         let keys = keys();
@@ -1263,7 +1263,7 @@ mod verify_control_tests {
         );
     }
 
-    /// Ruling T10a: a `revoke_seq` beyond the head waits, and verifies once
+    /// A `revoke_seq` beyond the head waits, and verifies once
     /// the list holds that host's revoke there.
     #[test]
     fn host_interrupt_revoke_beyond_head_pending() {
@@ -1288,7 +1288,7 @@ mod verify_control_tests {
         );
     }
 
-    /// Ruling T10a: another host's revoke is no revoke of this host.
+    /// Another host's revoke is no revoke of this host.
     #[test]
     fn host_interrupt_other_hosts_revoke_refused() {
         let keys = keys();
@@ -1313,7 +1313,7 @@ mod verify_control_tests {
         );
     }
 
-    /// Ruling T10a: an entry that isn't a `host_sender_revoke` at all: the
+    /// An entry that isn't a `host_sender_revoke` at all: the
     /// genesis, the host's own `add_host`, a service `add`, and a readmit
     /// of the host.
     #[test]

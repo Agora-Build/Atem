@@ -836,7 +836,8 @@ three features, defined in `atem_client::session::host_work`
 **No host advertises them in this version**, and a host refuses each of
 their ops as it refuses any op of a feature it doesn't list: a session op
 (`control_records`) is `unsupported_version` with no effect (session-v1
-R9.8; ruling T12a). Clients check `welcome.features` first; the client core
+R9.8; **Atem's choice of code, for Astation to confirm**). Clients check
+`welcome.features` first; the client core
 refuses to send `control_records` to a host that doesn't list
 `host.senders` (`host feature not available`).
 
@@ -899,12 +900,12 @@ of `origin`, `feed_id`, `principal_key`, `interrupt_running` or
 
 | Code | When |
 |---|---|
-| the signed-object layer's (`not_strict_json`, `too_large`, `null_value`, `unknown_type`, `array_not_canonical`, `malformed`) | not a signed object of R9.1's form |
+| the signed-object layer's (`not_strict_json`, `too_large`, `null_value`, `unknown_type`, `array_not_canonical`, `malformed`, `kit_sig_unexpected`) | not a signed object of R9.1's form (a `kit_sig` beside the body is `kit_sig_unexpected`) |
 | `wrong_type` | a signed object of another type |
 | `unknown_field` | a field outside the body's, or outside `about`'s |
 | `malformed` | a field missing, mistyped or out of its grammar (the error names it) |
 | `field_not_allowed` | a field this form doesn't take: `origin`, `feed_id`, `principal_key`, `about.integration_id` on a host principal's record, `interrupt_running` beside another action than `revoke`, `revoke_seq` on a service's |
-| `not_for_host_principal` | a host principal's `cover`, `revoke`, `hold` or `release` (ruling T9a: refused at parse; in a feed it is kept as evidence like a verification refusal) |
+| `not_for_host_principal` | a host principal's `cover`, `revoke`, `hold` or `release` (refused at parse; in a feed it is kept as evidence like a verification refusal) |
 
 #### Signers and verification
 
@@ -920,8 +921,8 @@ signer the body names, never from the record.
 | a host's own key | nothing (`host_key_signed`) |
 
 A host principal's `interrupt_running` must name, in `revoke_seq`, that
-host's own `host_sender_revoke` in the list (ruling T10a): beyond the head
-it waits, any other entry there is refused. A readmit since then changes
+host's own `host_sender_revoke` in the list: beyond the head it waits, any
+other entry there is refused. A readmit since then changes
 nothing: the interrupt is for the tasks admitted before that revoke.
 
 The verdict (`verify_control`): **valid**, **pending** (stored and verified
@@ -939,7 +940,7 @@ alerted, the scan cursor moves past it):
 | `wrong_account` | `account_id` or `genesis_hash` isn't the list's |
 | `bad_signature` | the signature doesn't verify under the named signer's key |
 | `key_mismatch` | `principal_key` names no key the service ever had |
-| `signer_not_allowed` | a manager's `cover`, `hold` or `release`; a `member:` signer that isn't a native manager (a native without `manage`, a service, a cancelled `recovery_add`) |
+| `signer_not_allowed` | a manager's `cover`, `hold` or `release`; a `member:` signer that isn't a native manager (a native without `manage`, a service, a cancelled `recovery_add`). A native the list holds without `manage` is refused even when a promotion beyond the host's head would make it a manager (**Atem's proposal, for Astation's agreement**: it narrows design I.5.4's "pending until the list holds it" to signers the list doesn't hold yet, and adds this re-delivery case beside `removed_manager`). Delivering the same record again once the host's list holds the promotion is enough: a refused record takes no `record_id`, so it is verified again |
 | `removed_manager` | its native signer was a manager and was removed or lost `manage` before the host applied it (its signature verifies under that signer's old key): the strict rule of I.5.4; Astation signs it again with a current manager (the same stop, a new `record_id`) |
 | `host_key_signed` | a host principal's record naming the host as its signer |
 | `not_a_service` | `service:<id>` names a native member |
@@ -966,18 +967,31 @@ frozen (R9.4) or the host is held after a write fault (R9.3).
   moves past it. The feed calls and acknowledgments are written in a later
   section.
 - **Channels.** `control_records{id, records}` (session-v1 R9.3, R9.8):
-  host principals' records only (ruling T12c), from native members only,
-  after `membership` up to the carrier's head (ruling T10b). A record the
-  parser refuses fails the whole message `invalid_request`: nothing
-  applied, one refusal line in runtime.log (ruling T12b). A carrier gets
-  no authority from carrying.
+  host principals' records only. A service's record travels only in its
+  Station's feed: a message holding one, alone or beside host principals'
+  records, is refused whole, `invalid_request`, and the host applies
+  nothing of it. Sent by native members only, after `membership` up to
+  the carrier's head (**Atem's proposal, for Astation's agreement**: a
+  record signed by a native the host's list holds without `manage` is
+  refused, `signer_not_allowed`, and delivering the same record again
+  after the `membership` that brings the host to the promotion is
+  enough). A record the parser refuses fails the whole message
+  `invalid_request`: nothing applied, one refusal line in runtime.log
+  (**Atem's choice, for Astation to confirm**; in a feed, by contrast, a
+  record that doesn't parse is refused on its own and kept as evidence). A
+  carrier gets no authority from carrying.
 
 #### Application and per-effect results
 
 Each record is applied in one `host-work.sqlite` transaction with what it
 does and the scan cursor (design I.5.5; the reference implementation is
 `atem_client::control::ControlState`, exported to the bindings as
-`ControlStateHandle`). A record's **effects** are, by action:
+`ControlStateHandle`). Applying a record doesn't change the current state:
+it gives the record's results and the next state, which the host stores in
+that transaction and adopts only once the transaction committed. A failed
+transaction therefore loses no effect: the record applied again to the
+state kept gives the same results and actions. A record's **effects** are,
+by action:
 
 | `action` | Effects |
 |---|---|
@@ -1002,13 +1016,22 @@ a host's first `applied` or `duplicate` for the revocation).
 
 The rules:
 
-1. **Idempotent by `record_id`.** A record that counted (`applied` or
-   `duplicate`) is kept with the SHA-256 of its body's `jcs`; the same body
-   again is `duplicate` for every effect, whatever its signature bytes, its
-   position or what the list says now (a revoke whose signer was removed
-   since stays applied). Another body under that `record_id` is `refused`
-   and kept as evidence; the first counts. A record kept pending or refused
-   takes no `record_id`.
+1. **Idempotent by principal and `record_id`** (**Atem's proposal, for
+   Astation's and Auth/Portal's agreement**; it amends design I.5.4's "the
+   first one counts" for stops). A record that counted (`applied` or
+   `duplicate`) is kept, under its principal, with the SHA-256 of its
+   body's `jcs`; the same body again is `duplicate` for every effect,
+   whatever its signature bytes, its position or what the list says now (a
+   revoke whose signer was removed since stays applied). One principal's
+   record never blocks another principal's record with the same
+   `record_id`: whoever holds one service's key can't pre-empt a native
+   stop of another principal by using its id first. Another body under a
+   `record_id` the same principal's record counted with is verified first
+   (pending or refused as any record). A verified one is kept as evidence
+   and alerted, and the first body keeps the id; a stop (`hold`, `revoke`,
+   `interrupt_running`) still applies its effects (a stop only ever adds),
+   while a `cover` or `release` is `refused`. A record kept pending or
+   refused takes no `record_id`.
 2. **Verification** (above): `pending` waits for every effect; `refused` is
    evidence. A list of another account or genesis applies nothing.
 3. **A revoke is final**, from any feed or from none.
@@ -1016,44 +1039,77 @@ The rules:
    (`pending`) while the service isn't revoked on this host. A host
    principal's interrupt waits until host-work's applied device-list `seq`
    reaches `revoke_seq` (its cancellations and the revoke's own interrupt
-   intents are durable then; ruling T10a), and is a `duplicate` when the
+   intents are durable then), and is a `duplicate` when the
    revoke entry itself carried `interrupt_running: true`.
 5. **Coverage** is per Station (origin), ordered by `(issued_at,
-   record_id)` (ruling T11a, **for Astation's and Auth/Portal's
-   agreement**). A `cover` read at its own feed's position starts it.
+   record_id)` (**Atem's proposal, for Astation's and Auth/Portal's
+   agreement**). A `cover` read at its own feed's position (the position's
+   origin and `feed_id` are the body's) starts it.
    Another Station's cover takes it over only when strictly newer than the
    newest cover taken from the covering Station; an older or equal one is
    `refused` and changes nothing. The same Station's cover is a
    `duplicate`; a newer one from another `feed_id` of that origin (the
    feed after a reset) moves the coverage's ordering to that feed. **A
    cover never releases**: a hold survives every coverage change.
-6. **Hold and release** follow feed order within the coverage's current
-   feed: taken only from it, at their own feed's position, after that
-   feed's cover and after the last hold or release taken there. One that
-   asks for the recorded hold state is a `duplicate`; one that would change
-   it is `applied` when in order, else `refused`. So only a release from
-   the current covering feed, after its cover, lifts a hold.
+6. **A stop always wins: a hold applies from any feed; only a release
+   follows feed order** (**Atem's proposal, for Astation's and
+   Auth/Portal's agreement**; it amends design I.5.5 step 4, "the last in
+   feed order wins", to hold for releases only). A verified `hold` applies
+   wherever it was read: in or out of order, from a feed that covers the
+   principal or not, or with no coverage at all (`duplicate` while a hold
+   is in force). Holding is never unsafe: whoever can sign the hold holds
+   the principal's key, which can already sign a revoke. A `release` is
+   taken only from the coverage's current feed, at its own position there,
+   after that feed's cover and after the last hold or release taken from
+   that feed (a hold read at its own feed's position counts there whether
+   or not that feed covers the principal); it lifts every hold, another
+   feed's included. A release while no hold is in force is a `duplicate`;
+   else one in order is `applied` and any other `refused`. A hold replayed
+   is a `duplicate` by its `record_id` and holds nothing again.
 7. **After a revoke**, `cover`, `hold` and `release` change nothing: a
    `duplicate` when they ask for what is recorded, else `refused`.
 
-**Resets.** A reset's snapshot (design I.5.2) re-issues, for each principal
-the Station currently covers, its `cover` first, signed anew (so newer),
-then its current hold or release, signed anew, and its revoke and
-interrupt records as they are or signed anew. On a host that applied the
-old feed each re-issued record is a `duplicate` (the cover moves the
-ordering to the new feed); on one that never saw it they apply, so a reset
-loses no stop.
+**Resets** (**Atem's proposal, for Astation's and Auth/Portal's
+agreement**: design I.5.2's snapshot re-issues "the latest revoke, hold or
+release and interrupt state" and names no cover). A reset's snapshot is
+taken from the Station's current effective state (the Portal's Station
+feed), never from a restored backup's view. It re-issues, for each
+principal the Station currently covers, its `cover` first, signed anew (so
+newer than the old feed's), then its current hold or release, signed anew,
+and its revoke and interrupt records as they are or signed anew. The
+snapshot's cover moves the coverage's ordering to the new feed (a
+`duplicate` on a host that applied the old feed). On a host that applied
+the old feed each re-issued record is a `duplicate`; on one that never saw
+it they apply. A snapshot whose cover isn't newer than the coverage's
+leaves the coverage on the old feed: its holds, revokes and interrupts
+still apply, so no stop is lost, but its releases are refused until a
+newer cover arrives.
 
-**Stations: the trust model** (ruling T11b, **for Astation's and
+**Stations: the trust model** (**Atem's proposal, for Astation's and
 Auth/Portal's agreement**). The principal's own key may sign every action,
 so whoever holds it controls coverage and can always sign a newer cover;
-ordering can't stop a key holder. So a Station re-issues covers only for
-principals it currently covers; a Station that hands an integration over
-stops signing for it, and the key leaves with it (or the integration is
-created again as a new principal); a Station whose clock went back signs
-covers that take nothing and fails closed (its holds and releases are
-refused until it signs a newer cover); and a revoke is final whoever holds
-the key. A misbehaving former key holder can lift a pause, never a revoke,
+ordering can't stop a key holder. The Station's duties:
+
+- A reset's snapshot comes from the current effective state (the Portal's
+  Station feed), never from a restored backup: a Station restored from a
+  backup taken before a hold would otherwise re-issue the release that
+  came before it, with a newer cover, and lift the pause.
+- A Station's covers' `issued_at` only rises: each cover it signs for a
+  principal is newer, by `(issued_at, record_id)`, than any cover issued
+  for that principal before, a handed-over integration's included (the
+  handover carries the last cover's `issued_at`).
+- A Station re-issues covers only for principals it currently covers.
+- A Station that hands an integration over stops signing for it, and the
+  key leaves with it (or the integration is created again as a new
+  principal).
+- A revoke is final whoever holds the key.
+
+A cover that isn't newer than the coverage's cover (a Station whose clock
+is behind that cover's `issued_at`, say) takes nothing: from the covering
+Station it is a `duplicate` that leaves the coverage on its feed, from
+another Station it is `refused`. That Station's holds still apply, and its
+releases from a feed the coverage isn't on are refused until a newer cover
+arrives. A misbehaving former key holder can lift a pause, never a revoke,
 until the owner revokes the integration. A Station learns of its own
 removal only through the Portal's two-phase removal (its integrations go
 `revoking` with reason `station_removed`, it issues and serves their
@@ -1071,10 +1127,20 @@ before the host received it (refused) and its re-signed copy, an
 reason and the parse codes, and `ControlState` sequences with each step's
 per-effect results (a stale cover from another Station, a newer one taking
 coverage with the hold persisting until the new feed releases, a reset,
-a host interrupt waiting for the list and for host-work's applied `seq`).
+a host interrupt waiting for the list and for host-work's applied `seq`, a
+hold from a Station whose cover wasn't newer and after a reset whose cover
+isn't newer (applied, its release refused), a service's interrupt waiting
+for its revocation, holds and releases out of order in one feed, a hold
+with no coverage, the old Station's cover replayed after a move, an
+`issued_at` tie broken by `record_id`, record ids per principal, and
+another body under a counted id: a stop applies, a release or cover is
+refused). Each step's position is `{origin, feed_id, feed_seq}`; a state
+keeps the records that counted by principal, then `record_id`.
 They run in `crates/atem-client/tests/vectors.rs`, in the bindings'
 `tests/control.rs` and in the Swift, Kotlin and WASM conformance suites;
 `scripts/check-r9-vectors.py` recomputes their cryptographic values
 (`jcs`, signing inputs, every signature by the key its chain names, the
-`r9Svc` values, the record digests a state keeps) and derives no verdict.
+`r9Svc` values, the record digests a state keeps, each a body of that
+principal with that `record_id`, and each step's position against the
+stations) and derives no verdict.
 Every SDK package's checksum manifest lists the file.
