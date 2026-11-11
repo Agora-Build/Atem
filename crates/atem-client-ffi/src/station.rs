@@ -244,7 +244,11 @@ fn alert_info(alert: &LedgerAlert) -> LedgerAlertInfo {
         LedgerAlert::ReportRefused { report_id } => LedgerAlertInfo::ReportRefused {
             report_id: report_id.clone(),
         },
-        LedgerAlert::ReportingStopped { dropped } => LedgerAlertInfo::ReportingStopped {
+        LedgerAlert::ReportingStopped { client_id } => LedgerAlertInfo::ReportingStopped {
+            client_id: client_id.clone(),
+        },
+        LedgerAlert::ReportsDropped { client_id, dropped } => LedgerAlertInfo::ReportsDropped {
+            client_id: client_id.clone(),
             dropped: dropped.clone(),
         },
     }
@@ -399,7 +403,10 @@ pub fn relay_membership_fetch_result(head: LogHead, entries: Vec<String>) -> Res
 }
 
 /// The class of the Portal's HTTP `status` for a report (Auth/Portal's): a
-/// network error or a timeout, which has no status, is `Retry`.
+/// network error or a timeout, which has no status, is `Retry`; never pass
+/// a "no response" sentinel such as 0 (no status the Portal answers with:
+/// `Refuse`). Never follow a 3xx: it would carry the `station.report`
+/// bearer wherever it points.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn report_answer(status: u16) -> ReportAnswerKind {
     match ReportAnswer::of_status(status) {
@@ -419,8 +426,9 @@ pub fn report_answer(status: u16) -> ReportAnswerKind {
 /// revocation) and the native-signed records still to re-sign.
 ///
 /// **A handle never changes.** `record`, `ack`, `tick`, `confirm`,
-/// `refuse` and `stop_reporting` return an `AckTransition`; the handle they
-/// were called on stays as it was, so it is safe to share across threads.
+/// `refuse`, `stop_reporting` and `resume_reporting` return an
+/// `AckTransition`; the handle they were called on stays as it was, so it
+/// is safe to share across threads.
 ///
 /// **Persistence.** In one transaction, store `next.to_json()` (it holds
 /// every report not yet settled, so the intents are in it). Only once it
@@ -613,11 +621,27 @@ impl AckLedgerHandle {
         transition(self.ledger.refuse(&report_id))
     }
 
-    /// The Portal answered `403` (`ReportAnswerKind::StopReporting`): every
-    /// pending report is settled unsent, none is made from now on, and one
-    /// `ReportingStopped` alert is raised.
-    pub fn stop_reporting(&self) -> AckTransition {
-        transition(self.ledger.stop_reporting())
+    /// The Portal answered `403` (`ReportAnswerKind::StopReporting`) to the
+    /// report client `client_id` (the Station's client at Auth): the ledger
+    /// records the ID and holds every report, none sent, until
+    /// `resume_reporting`; counting and reports go on. One
+    /// `ReportingStopped` alert; a ledger already stopped changes nothing.
+    /// `Invalid{malformed}` for an ID that isn't 1 to 128 characters of
+    /// `[A-Za-z0-9._:-]`.
+    pub fn stop_reporting(&self, client_id: String) -> Result<AckTransition> {
+        Ok(transition(self.ledger.stop_reporting(&client_id)?))
+    }
+
+    /// The Station reports again as the report client `client_id` (at
+    /// start; the built-in Station's ID comes from its configuration and
+    /// always resumes). The stop's own ID clears the stop and keeps every
+    /// report. Another ID is another Station at Auth (a removed Station
+    /// registered again, with new integrations): every pending report is
+    /// dropped (done unsent, a `ReportsDropped` alert) and the revocations
+    /// the ledger has make no more reports. A ledger not stopped changes
+    /// nothing.
+    pub fn resume_reporting(&self, client_id: String) -> Result<AckTransition> {
+        Ok(transition(self.ledger.resume_reporting(&client_id)?))
     }
 
     /// What to send now, in order: every report not yet settled whose
@@ -637,13 +661,20 @@ impl AckLedgerHandle {
         self.ledger.resign_alerts()
     }
 
-    /// The reports the Portal refused for good, and those a stop dropped.
+    /// The reports the Portal refused for good, and those a resume under
+    /// another report client ID dropped.
     pub fn refused_reports(&self) -> Vec<String> {
         self.ledger.refused_reports()
     }
 
-    /// The Portal refused this Station's reports (`403`).
+    /// The Portal refused this Station's reports (`403`): every report is
+    /// held.
     pub fn reporting_stopped(&self) -> bool {
         self.ledger.reporting_stopped()
+    }
+
+    /// The report client ID reporting is stopped under, while it is.
+    pub fn stopped_client_id(&self) -> Option<String> {
+        self.ledger.stopped_client_id().map(str::to_owned)
     }
 }

@@ -392,6 +392,9 @@ struct AckRun {
     ledger: AckLedger,
     committed: Value,
     now: u64,
+    /// The Station's report client ID at Auth (`setup.report_client_id`;
+    /// a `resume_reporting` step changes it).
+    client_id: Option<String>,
     portal: BTreeMap<String, String>,
     report: Report,
 }
@@ -441,6 +444,7 @@ impl AckRun {
             committed: ledger.to_json(),
             ledger,
             now: setup["station_now_ms"].as_u64().unwrap(),
+            client_id: setup["report_client_id"].as_str().map(str::to_owned),
             portal: BTreeMap::new(),
             report: Report {
                 name: file["name"].as_str().unwrap().into(),
@@ -532,7 +536,7 @@ impl AckRun {
 
     /// Every step kind and the keys it takes (an unknown step or key
     /// fails the run).
-    const KINDS: [(&'static str, &'static [&'static str]); 13] = [
+    const KINDS: [(&'static str, &'static [&'static str]); 14] = [
         (
             "control_record",
             &["revoked_at_ms", "covered_hosts", "made", "commit"],
@@ -545,6 +549,7 @@ impl AckRun {
         ("expect_report", &[]),
         ("confirm", &[]),
         ("report_failure", &[]),
+        ("resume_reporting", &["alerts"]),
         ("expect_resign_alerts", &[]),
         ("expect_refused", &[]),
         ("expect_stopped", &[]),
@@ -643,7 +648,10 @@ impl AckRun {
                 let t = match answer {
                     ReportAnswer::Retry => None,
                     ReportAnswer::Refuse => Some(self.ledger.refuse(id)),
-                    ReportAnswer::StopReporting => Some(self.ledger.stop_reporting()),
+                    ReportAnswer::StopReporting => {
+                        let id = self.client_id.as_deref().expect("setup.report_client_id");
+                        Some(self.ledger.stop_reporting(id).unwrap())
+                    }
                     ReportAnswer::Confirm => panic!("{}: a 200 is a confirm step", self.name()),
                 };
                 let alerts: Vec<Value> = t
@@ -674,11 +682,23 @@ impl AckRun {
                     self.name()
                 );
             }
+            "resume_reporting" => {
+                // The Station restarts as this report client.
+                let id = step["resume_reporting"].as_str().unwrap();
+                self.client_id = Some(id.to_owned());
+                let t = self.ledger.resume_reporting(id).unwrap();
+                let alerts: Vec<Value> = t.alerts.iter().map(|a| a.to_json()).collect();
+                assert_eq!(json!(alerts), step["alerts"], "{}", self.name());
+                assert_eq!(t.intents, vec![], "{}", self.name());
+                self.commit(t);
+            }
             "expect_stopped" => {
-                assert_eq!(
-                    json!(self.ledger.reporting_stopped()),
-                    step["expect_stopped"]
-                );
+                // The stopped report client ID, or `false`.
+                let got = self
+                    .ledger
+                    .stopped_client_id()
+                    .map_or(json!(false), |id| json!(id));
+                assert_eq!(got, step["expect_stopped"], "{}", self.name());
             }
             "expect_portal" => {
                 let got: Vec<&String> = self.portal.keys().collect();

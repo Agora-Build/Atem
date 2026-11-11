@@ -1048,13 +1048,23 @@ record! {
 }
 
 data_enum! {
-    /// An operator alert a ledger transition raises, once.
+    /// An operator alert a ledger transition raises, once (the ledger keeps
+    /// what it is about: raise it again from `refused_reports` and
+    /// `stopped_client_id` after a restart if you may have lost it).
     pub enum LedgerAlertInfo {
         /// The Portal refused this report for good: done, never sent again.
         ReportRefused { report_id: String },
-        /// The Portal refused this Station's reports (`403`): the reports
-        /// `dropped` are done unsent, and none is made from now on.
-        ReportingStopped { dropped: Vec<String> },
+        /// The Portal refused the reports of the report client `client_id`
+        /// (`403`): every report is held, none sent, until a resume.
+        ReportingStopped { client_id: String },
+        /// Reporting resumed under another report client ID than
+        /// `client_id`, the stopped one (another Station at Auth): the
+        /// reports `dropped` are done unsent, and the revocations reported
+        /// before make no more.
+        ReportsDropped {
+            client_id: String,
+            dropped: Vec<String>,
+        },
     }
 }
 
@@ -1065,12 +1075,13 @@ unit_enum! {
         /// `200` (a repeat's recorded `200` too): `confirm`.
         Confirm,
         /// Send the same report again later, with backoff: a network error
-        /// or timeout, a 5xx, `429` (after `Retry-After`), `401` (after
-        /// refreshing the `station.report` token).
+        /// or timeout, a 5xx, `408`, `429` (after `Retry-After`), `401`
+        /// (after refreshing the `station.report` token).
         Retry,
-        /// Final, with an operator alert: `refuse`.
+        /// Final, with an operator alert: `refuse`. Never follow a 3xx.
         Refuse,
-        /// `403`: `stop_reporting` (one alert).
+        /// `403`: `stop_reporting` under the Station's report client ID (one
+        /// alert; every report held until `resume_reporting`).
         StopReporting,
     }
 }

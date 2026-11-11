@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "relay",
   "log": "r9-vectors-membership-log",
-  "note": "The Portal's answers to reports (Auth/Portal, 2026-11-10). 200 confirms; a network error, a timeout, a 5xx, a 429 (after its Retry-After) or a 401 (after refreshing the station.report token) is retried with the same report_id and body; a final refusal (400, 404, 409 report_id_reused or invalid_state, 413, 415, any other 4xx) settles the report with an operator alert, and the reports waiting for it go once the others are settled; a 403 settles every report and stops reporting, with one alert, while counting goes on. Here host-b's report is confirmed after a 401; host-c's is refused for good (409); the deadline's revoked{deadline_passed} waits for neither once both are settled, is retried after a 503 and a 429, and then gets a 403: reporting stops, and host-d applying the revocation later makes no report. A restart keeps the stop.",
+  "note": "The Portal's answers to reports (Auth/Portal, 2026-11-10). 200 confirms; a network error, a timeout, a 5xx, a 408, a 429 (after its Retry-After) or a 401 (after refreshing the station.report token) is retried with the same report_id and body; a final refusal (400, 404, 409 report_id_reused or invalid_state, 413, 415, any other 4xx) settles the report with an operator alert, and the reports waiting for it go once the others are settled. A 403 stops reporting under the Station's report client ID, with one alert: every report is held (none sent) while counting and reports go on, and a restart keeps the stop. A resume under the same ID (an operator fixed the token) clears the stop and keeps every report; a resume under another ID is another Station at Auth (a removed Station registered again, with new integrations): the held reports are dropped with an alert, and the revocation reported before makes no more. Here host-b's report is confirmed after a 401; host-c's is refused for good (409); the deadline's revoked{deadline_passed} waits for neither once both are settled, is retried after a 503, a 429 and a 408, and then gets a 403; host-d's late report is held, both go after a resume under the same ID; host-d's report gets a 403 again, and a resume under another ID drops it; host-e's later ack reports nothing.",
   "setup": {
     "station": {
       "origin": "https://station-dev.agora.build",
@@ -36,9 +36,17 @@
         "host_id": "host-d",
         "host_trust_gen": 1,
         "connection_id": "relay-1:host-d"
+      },
+      "host-e": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-e",
+        "host_trust_gen": 1,
+        "connection_id": "relay-1:host-e"
       }
     },
-    "station_now_ms": 1793620940000
+    "station_now_ms": 1793620940000,
+    "report_client_id": "station-dev-client-1"
   },
   "steps": [
     {
@@ -47,7 +55,8 @@
       "covered_hosts": [
         "host-b",
         "host-c",
-        "host-d"
+        "host-d",
+        "host-e"
       ],
       "made": []
     },
@@ -186,7 +195,8 @@
             "kind": "revoked",
             "outcome": "deadline_passed",
             "pending_hosts": [
-              "host-d"
+              "host-d",
+              "host-e"
             ]
           },
           "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
@@ -208,6 +218,13 @@
       }
     },
     {
+      "report_failure": {
+        "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1",
+        "status": 408,
+        "answer": "retry"
+      }
+    },
+    {
       "expect_report": [
         {
           "not_before": [
@@ -219,7 +236,8 @@
             "kind": "revoked",
             "outcome": "deadline_passed",
             "pending_hosts": [
-              "host-d"
+              "host-d",
+              "host-e"
             ]
           },
           "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
@@ -234,9 +252,7 @@
         "alerts": [
           {
             "kind": "reporting_stopped",
-            "dropped": [
-              "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
-            ]
+            "client_id": "station-dev-client-1"
           }
         ]
       }
@@ -245,12 +261,11 @@
       "expect_report": []
     },
     {
-      "expect_stopped": true
+      "expect_stopped": "station-dev-client-1"
     },
     {
       "expect_refused": [
-        "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d",
-        "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+        "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
       ]
     },
     {
@@ -277,6 +292,137 @@
         ]
       },
       "link": "host-d",
+      "made": [
+        "revocation_applied:0143d00880a70bdec04ead8c451aaab6fe19a26969ac341d263063104442c068"
+      ]
+    },
+    {
+      "expect_report": []
+    },
+    {
+      "restart": true
+    },
+    {
+      "expect_stopped": "station-dev-client-1"
+    },
+    {
+      "expect_report": []
+    },
+    {
+      "resume_reporting": "station-dev-client-1",
+      "alerts": []
+    },
+    {
+      "expect_stopped": false
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [
+            "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca",
+            "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+          ],
+          "report": {
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revoked",
+            "outcome": "deadline_passed",
+            "pending_hosts": [
+              "host-d",
+              "host-e"
+            ]
+          },
+          "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+        },
+        {
+          "not_before": [],
+          "report": {
+            "host": "host-d",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revocation_applied",
+            "record_id": "00000000-0000-4000-8000-000000000004"
+          },
+          "report_id": "revocation_applied:0143d00880a70bdec04ead8c451aaab6fe19a26969ac341d263063104442c068"
+        }
+      ]
+    },
+    {
+      "confirm": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [],
+          "report": {
+            "host": "host-d",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revocation_applied",
+            "record_id": "00000000-0000-4000-8000-000000000004"
+          },
+          "report_id": "revocation_applied:0143d00880a70bdec04ead8c451aaab6fe19a26969ac341d263063104442c068"
+        }
+      ]
+    },
+    {
+      "report_failure": {
+        "report_id": "revocation_applied:0143d00880a70bdec04ead8c451aaab6fe19a26969ac341d263063104442c068",
+        "status": 403,
+        "answer": "stop_reporting",
+        "alerts": [
+          {
+            "kind": "reporting_stopped",
+            "client_id": "station-dev-client-1"
+          }
+        ]
+      }
+    },
+    {
+      "resume_reporting": "station-dev-client-2",
+      "alerts": [
+        {
+          "kind": "reports_dropped",
+          "client_id": "station-dev-client-1",
+          "dropped": [
+            "revocation_applied:0143d00880a70bdec04ead8c451aaab6fe19a26969ac341d263063104442c068"
+          ]
+        }
+      ]
+    },
+    {
+      "expect_stopped": false
+    },
+    {
+      "expect_report": []
+    },
+    {
+      "expect_refused": [
+        "revocation_applied:0143d00880a70bdec04ead8c451aaab6fe19a26969ac341d263063104442c068",
+        "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+      ]
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-e",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 1,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000004",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-e",
       "made": []
     },
     {
@@ -286,14 +432,15 @@
       "restart": true
     },
     {
-      "expect_stopped": true
+      "expect_stopped": false
     },
     {
       "expect_report": []
     },
     {
       "expect_portal": [
-        "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+        "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca",
+        "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
       ]
     }
   ]

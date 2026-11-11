@@ -842,8 +842,8 @@ def ids_in(step):
     failure = step.get("report_failure", {})
     if "report_id" in failure:
         out.append(failure["report_id"])
-    for alert in failure.get("alerts", []):
-        out += [alert["report_id"]] if "report_id" in alert else alert["dropped"]
+    for alert in failure.get("alerts", []) + step.get("alerts", []):
+        out += [alert["report_id"]] if "report_id" in alert else alert.get("dropped", [])
     out += step.get("expect_refused", []) + step.get("expect_portal", [])
     if "replica" in step:
         out += ids_in(step["replica"])

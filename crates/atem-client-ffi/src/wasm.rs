@@ -1359,10 +1359,23 @@ impl AckLedgerHandle {
     pub fn refuse(&self, report_id: String) -> JsResult<AckTransition> {
         ack_transition(self.0.refuse(report_id))
     }
-    /// The Portal answered `403` (`stop_reporting`).
+    /// The Portal answered `403` to the report client `clientId`
+    /// (`stop_reporting`): every report held until a resume.
     #[wasm_bindgen(js_name = stopReporting)]
-    pub fn stop_reporting(&self) -> JsResult<AckTransition> {
-        ack_transition(self.0.stop_reporting())
+    pub fn stop_reporting(&self, client_id: String) -> JsResult<AckTransition> {
+        ack_transition(err(self.0.stop_reporting(client_id))?)
+    }
+    /// The Station reports again as the report client `clientId`
+    /// (`resume_reporting`): the stop's own ID keeps every report, another
+    /// drops them.
+    #[wasm_bindgen(js_name = resumeReporting)]
+    pub fn resume_reporting(&self, client_id: String) -> JsResult<AckTransition> {
+        ack_transition(err(self.0.resume_reporting(client_id))?)
+    }
+    /// The report client ID reporting is stopped under, or `undefined`.
+    #[wasm_bindgen(js_name = stoppedClientId)]
+    pub fn stopped_client_id(&self) -> Option<String> {
+        self.0.stopped_client_id()
     }
     /// What to send now, in order: `[{reportId, report: {type, …},
     /// notBefore}]`.
@@ -1375,7 +1388,8 @@ impl AckLedgerHandle {
     pub fn resign_alerts(&self) -> Vec<String> {
         self.0.resign_alerts()
     }
-    /// The reports refused for good, and those a stop dropped.
+    /// The reports refused for good, and those a resume under another
+    /// report client ID dropped.
     #[wasm_bindgen(js_name = refusedReports)]
     pub fn refused_reports(&self) -> Vec<String> {
         self.0.refused_reports()
@@ -1402,8 +1416,9 @@ impl AckTransition {
     pub fn intents(&self) -> JsValue {
         self.intents.clone()
     }
-    /// The operator alerts it raised: `{type: "report_refused", reportId}`
-    /// or `{type: "reporting_stopped", dropped}`.
+    /// The operator alerts it raised: `{type: "report_refused", reportId}`,
+    /// `{type: "reporting_stopped", clientId}` or `{type:
+    /// "reports_dropped", clientId, dropped}`.
     #[wasm_bindgen(getter)]
     pub fn alerts(&self) -> JsValue {
         self.alerts.clone()

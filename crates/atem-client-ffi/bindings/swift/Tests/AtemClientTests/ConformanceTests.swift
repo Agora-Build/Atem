@@ -881,7 +881,8 @@ final class ConformanceTests: XCTestCase {
         func alertOf(_ alert: LedgerAlertInfo) -> [String: Any] {
             switch alert {
             case let .reportRefused(reportId): return ["kind": "report_refused", "report_id": reportId]
-            case let .reportingStopped(dropped): return ["kind": "reporting_stopped", "dropped": dropped]
+            case let .reportingStopped(clientId): return ["kind": "reporting_stopped", "client_id": clientId]
+            case let .reportsDropped(clientId, dropped): return ["kind": "reports_dropped", "client_id": clientId, "dropped": dropped]
             }
         }
         func answerOf(_ answer: ReportAnswerKind) -> String {
@@ -912,6 +913,7 @@ final class ConformanceTests: XCTestCase {
                 var ledger = try AckLedgerHandle(origin: s(st["origin"]), accountId: s(st["account_id"]), genesisHash: s(st["genesis_hash"]))
                 var committed = ledger.toJson()
                 var now = u(setup["station_now_ms"])
+                var clientId = setup["report_client_id"] as? String
                 func input(_ on: AckLedgerHandle, _ step: [String: Any]) throws -> AckTransition? {
                     if let label = step["control_record"] {
                         let at = step["revoked_at_ms"].map { u($0) } ?? now
@@ -971,8 +973,12 @@ final class ConformanceTests: XCTestCase {
                         try sendable(id)
                         let answer = fl["status"] is String ? "retry" : answerOf(reportAnswer(status: UInt16(u(fl["status"]))))
                         try eq(answer, s(fl["answer"]), "\(name) answer")
-                        let t: AckTransition? = answer == "refuse" ? ledger.refuse(reportId: id)
-                            : answer == "stop_reporting" ? ledger.stopReporting() : nil
+                        let t: AckTransition?
+                        switch answer {
+                        case "refuse": t = ledger.refuse(reportId: id)
+                        case "stop_reporting": t = try ledger.stopReporting(clientId: clientId!)
+                        default: t = nil
+                        }
                         let alerts: [[String: Any]] = t?.alerts.map(alertOf) ?? []
                         try eq(canon(alerts), canon(fl["alerts"] ?? [Any]()), "\(name) alerts")
                         if let t = t { commit(t) }
@@ -981,8 +987,18 @@ final class ConformanceTests: XCTestCase {
                         try eq(ledger.resignAlerts(), want, "\(name) resign alerts")
                     } else if let want = step["expect_refused"] {
                         try eq(ledger.refusedReports(), a(want).map(s), "\(name) refused")
+                    } else if let id = step["resume_reporting"] {
+                        clientId = s(id)
+                        let t = try ledger.resumeReporting(clientId: s(id))
+                        try eq(canon(t.alerts.map(alertOf)), canon(step["alerts"]!), "\(name) resume alerts")
+                        try eq(t.intents, [ReportIntentInfo](), "\(name) resume")
+                        commit(t)
                     } else if let want = step["expect_stopped"] {
-                        try eq(ledger.reportingStopped(), want as! Bool, "\(name) stopped")
+                        // The stopped report client ID, or false.
+                        let id = want as? String
+                        if id == nil { try eq(want as! Bool, false, "\(name) stopped") }
+                        try eq(ledger.stoppedClientId(), id, "\(name) stopped")
+                        try eq(ledger.reportingStopped(), id != nil, "\(name) stopped")
                     } else if step["expect_portal"] == nil {
                         // expect_portal is the Portal's side: no Portal model here.
                         throw Failure(description: "unknown step \(canon(step))")
@@ -1010,8 +1026,15 @@ final class ConformanceTests: XCTestCase {
             let id = t1.intents[0].reportId
             try eq(t1.next.refuse(reportId: id).alerts, [LedgerAlertInfo.reportRefused(reportId: id)])
             try eq(t1.next.pendingReports().count, 1)
-            try eq(t1.next.stopReporting().next.reportingStopped(), true)
+            let stopped = try t1.next.stopReporting(clientId: "station-1").next
+            try eq(stopped.reportingStopped(), true)
+            try eq(stopped.stoppedClientId(), "station-1")
+            try eq(stopped.pendingReports(), [ReportIntentInfo]())
             try eq(t1.next.reportingStopped(), false)
+            // The same report client ID keeps every report; another drops them.
+            try eq(try stopped.resumeReporting(clientId: "station-1").next.pendingReports(), t1.next.pendingReports())
+            try eq(try stopped.resumeReporting(clientId: "station-2").alerts, [LedgerAlertInfo.reportsDropped(clientId: "station-1", dropped: [id])])
+            try throwsCode("malformed") { _ = try l.stopReporting(clientId: "a b") }
             let text = t1.next.toJson()
             try eq(try AckLedgerHandle.fromJson(stateJson: text).toJson(), text)
             try throwsCode("malformed") { _ = try AckLedgerHandle.fromJson(stateJson: "[") }
@@ -1070,7 +1093,7 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("not_strict") { _ = try relayDecodeToStation(message: "{") }
         }
         check("Station: the Portal's statuses in their classes") {
-            let want: [(UInt16, String)] = [(200, "confirm"), (401, "retry"), (429, "retry"), (500, "retry"), (503, "retry"),
+            let want: [(UInt16, String)] = [(200, "confirm"), (401, "retry"), (408, "retry"), (429, "retry"), (500, "retry"), (503, "retry"),
                                             (400, "refuse"), (404, "refuse"), (409, "refuse"), (413, "refuse"), (415, "refuse"),
                                             (204, "refuse"), (302, "refuse"), (403, "stop_reporting")]
             for (status, answer) in want { try eq(answerOf(reportAnswer(status: status)), answer, "\(status)") }
@@ -1279,6 +1302,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 51)
+        XCTAssertEqual(passed, 59)
     }
 }

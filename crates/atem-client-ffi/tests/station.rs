@@ -69,8 +69,11 @@ fn alert_json(a: &LedgerAlertInfo) -> Value {
         LedgerAlertInfo::ReportRefused { report_id } => {
             json!({"kind": "report_refused", "report_id": report_id})
         }
-        LedgerAlertInfo::ReportingStopped { dropped } => {
-            json!({"kind": "reporting_stopped", "dropped": dropped})
+        LedgerAlertInfo::ReportingStopped { client_id } => {
+            json!({"kind": "reporting_stopped", "client_id": client_id})
+        }
+        LedgerAlertInfo::ReportsDropped { client_id, dropped } => {
+            json!({"kind": "reports_dropped", "client_id": client_id, "dropped": dropped})
         }
     }
 }
@@ -92,6 +95,7 @@ struct Station {
     ledger: Arc<AckLedgerHandle>,
     committed: String,
     now: u64,
+    client_id: Option<String>,
 }
 
 impl Station {
@@ -126,6 +130,7 @@ impl Station {
             committed: ledger.to_json(),
             ledger,
             now: setup["station_now_ms"].as_u64().unwrap(),
+            client_id: setup["report_client_id"].as_str().map(str::to_owned),
         }
     }
 
@@ -236,7 +241,10 @@ impl Station {
             assert_eq!(answer, f["answer"], "{}", self.name);
             let t = match answer {
                 "refuse" => Some(self.ledger.refuse(id)),
-                "stop_reporting" => Some(self.ledger.stop_reporting()),
+                "stop_reporting" => {
+                    let id = self.client_id.clone().expect("setup.report_client_id");
+                    Some(self.ledger.stop_reporting(id).unwrap())
+                }
                 _ => None,
             };
             let alerts: Vec<Value> = t
@@ -258,8 +266,20 @@ impl Station {
             assert_eq!(self.ledger.resign_alerts(), want, "{}", self.name);
         } else if let Some(want) = step.get("expect_refused") {
             assert_eq!(json!(self.ledger.refused_reports()), *want, "{}", self.name);
+        } else if let Some(id) = step.get("resume_reporting") {
+            self.client_id = Some(s(id));
+            let t = self.ledger.resume_reporting(s(id)).unwrap();
+            let alerts: Vec<Value> = t.alerts.iter().map(alert_json).collect();
+            assert_eq!(json!(alerts), step["alerts"], "{}", self.name);
+            assert!(t.intents.is_empty());
+            self.commit(t);
         } else if let Some(want) = step.get("expect_stopped") {
-            assert_eq!(json!(self.ledger.reporting_stopped()), *want);
+            let got = self
+                .ledger
+                .stopped_client_id()
+                .map_or(json!(false), |id| json!(id));
+            assert_eq!(got, *want, "{}", self.name);
+            assert_eq!(self.ledger.reporting_stopped(), *want != json!(false));
         } else {
             // The Portal's side: no Portal model here.
             assert!(step.get("expect_portal").is_some(), "{}: {step}", self.name);
@@ -318,8 +338,27 @@ fn a_call_never_changes_its_handle_and_the_state_loads_only_as_written() {
         refused.alerts,
         vec![LedgerAlertInfo::ReportRefused { report_id: id }]
     );
-    let stopped = station.ledger.stop_reporting();
+    let stopped = station.ledger.stop_reporting("station-1".into()).unwrap();
     assert!(stopped.next.reporting_stopped() && !station.ledger.reporting_stopped());
+    assert_eq!(
+        stopped.next.stopped_client_id().as_deref(),
+        Some("station-1")
+    );
+    assert!(stopped.next.pending_reports().is_empty());
+    // The same report client ID keeps every report; another drops them.
+    let resumed = stopped.next.resume_reporting("station-1".into()).unwrap();
+    assert_eq!(
+        resumed.next.pending_reports(),
+        station.ledger.pending_reports()
+    );
+    let other = stopped.next.resume_reporting("station-2".into()).unwrap();
+    assert!(matches!(
+        &other.alerts[..],
+        [LedgerAlertInfo::ReportsDropped { client_id, .. }] if client_id == "station-1"
+    ));
+    assert!(other.next.pending_reports().is_empty());
+    let bad = station.ledger.stop_reporting("a b".into());
+    assert_eq!(code(bad.unwrap_err()), "malformed");
 
     // The state loads as written, and only so.
     let text = t1.next.to_json();
@@ -351,15 +390,15 @@ fn a_call_never_changes_its_handle_and_the_state_loads_only_as_written() {
         "malformed"
     );
     let stopped = stopped.next.to_json();
-    let reopened = stopped.replace("\"stopped\":true", "\"stopped\":false");
     assert!(
-        AckLedgerHandle::from_json(reopened).is_ok(),
-        "a stop's settled reports stay settled"
-    );
-    assert!(
-        AckLedgerHandle::from_json(stopped)
+        AckLedgerHandle::from_json(stopped.clone())
             .unwrap()
             .reporting_stopped()
+    );
+    let bad = stopped.replace("\"stopped\":\"station-1\"", "\"stopped\":true");
+    assert_eq!(
+        code(AckLedgerHandle::from_json(bad).unwrap_err()),
+        "stored_invalid"
     );
 
     // Refusals at the boundary.
@@ -558,6 +597,7 @@ fn the_portals_statuses_fall_in_their_classes() {
     for (status, want) in [
         (200, A::Confirm),
         (401, A::Retry),
+        (408, A::Retry),
         (429, A::Retry),
         (500, A::Retry),
         (503, A::Retry),

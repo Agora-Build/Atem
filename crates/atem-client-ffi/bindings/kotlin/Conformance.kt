@@ -785,7 +785,8 @@ fun main(args: Array<String>) {
         "report_id" to i.reportId)
     fun alertOf(a: LedgerAlertInfo): Map<String, Any?> = when (a) {
         is LedgerAlertInfo.ReportRefused -> mapOf("kind" to "report_refused", "report_id" to a.reportId)
-        is LedgerAlertInfo.ReportingStopped -> mapOf("kind" to "reporting_stopped", "dropped" to a.dropped)
+        is LedgerAlertInfo.ReportingStopped -> mapOf("kind" to "reporting_stopped", "client_id" to a.clientId)
+        is LedgerAlertInfo.ReportsDropped -> mapOf("kind" to "reports_dropped", "client_id" to a.clientId, "dropped" to a.dropped)
     }
     fun answerOf(a: ReportAnswerKind) = when (a) {
         ReportAnswerKind.CONFIRM -> "confirm"
@@ -806,6 +807,7 @@ fun main(args: Array<String>) {
         var ledger = AckLedgerHandle(st["origin"].s(), st["account_id"].s(), st["genesis_hash"].s())
         var committed = ledger.toJson()
         var now = setup["station_now_ms"].l().toULong()
+        var clientId = setup.obj()["report_client_id"] as String?
         fun input(on: AckLedgerHandle, step: Any?): AckTransition? {
             val o = step.obj()
             return when {
@@ -873,7 +875,7 @@ fun main(args: Array<String>) {
                     eq(answer, fl["answer"], "$name answer")
                     val t = when (answer) {
                         "refuse" -> ledger.refuse(id)
-                        "stop_reporting" -> ledger.stopReporting()
+                        "stop_reporting" -> ledger.stopReporting(clientId!!)
                         else -> null
                     }
                     eq(canon(t?.alerts?.map(::alertOf) ?: emptyList<Any?>()), canon(fl.obj()["alerts"] ?: emptyList<Any?>()), "$name alerts")
@@ -882,7 +884,17 @@ fun main(args: Array<String>) {
                 "expect_resign_alerts" in o -> eq(ledger.resignAlerts(),
                     strs(o["expect_resign_alerts"]).map { ctlByLabel.getValue(it)["record"]["body"]["record_id"].s() }.sorted(), "$name resign alerts")
                 "expect_refused" in o -> eq(ledger.refusedReports(), strs(o["expect_refused"]), "$name refused")
-                "expect_stopped" in o -> eq(ledger.reportingStopped(), o["expect_stopped"], "$name stopped")
+                "resume_reporting" in o -> {
+                    clientId = o["resume_reporting"].s()
+                    val t = ledger.resumeReporting(clientId!!)
+                    eq(canon(t.alerts.map(::alertOf)), canon(o["alerts"]), "$name resume alerts")
+                    eq(t.intents, emptyList<ReportIntentInfo>(), "$name resume")
+                    commit(t)
+                }
+                "expect_stopped" in o -> {
+                    eq(ledger.stoppedClientId() ?: false, o["expect_stopped"], "$name stopped")
+                    eq(ledger.reportingStopped(), o["expect_stopped"] != false, "$name stopped")
+                }
                 "expect_portal" in o -> {} // the Portal's side: no Portal model here
                 else -> throw AssertionError("unknown step ${Json.write(step)}")
             }
@@ -907,8 +919,15 @@ fun main(args: Array<String>) {
         val id = t1.intents[0].reportId
         eq(t1.next.refuse(id).alerts, listOf(LedgerAlertInfo.ReportRefused(id)))
         eq(t1.next.pendingReports().size, 1)
-        eq(t1.next.stopReporting().next.reportingStopped(), true)
+        val stopped = t1.next.stopReporting("station-1").next
+        eq(stopped.reportingStopped(), true)
+        eq(stopped.stoppedClientId(), "station-1")
+        eq(stopped.pendingReports(), emptyList<ReportIntentInfo>())
         eq(t1.next.reportingStopped(), false)
+        // The same report client ID keeps every report; another drops them.
+        eq(stopped.resumeReporting("station-1").next.pendingReports(), t1.next.pendingReports())
+        eq(stopped.resumeReporting("station-2").alerts, listOf(LedgerAlertInfo.ReportsDropped("station-1", listOf(id))))
+        throwsCode("malformed") { l.stopReporting("a b") }
         val text = t1.next.toJson()
         eq(AckLedgerHandle.fromJson(text).toJson(), text)
         throwsCode("malformed") { AckLedgerHandle.fromJson("[") }
@@ -953,7 +972,7 @@ fun main(args: Array<String>) {
         throwsCode("not_strict") { relayDecodeToStation("{") }
     }
     check("Station: the Portal's statuses in their classes") {
-        for ((status, want) in listOf(200 to "confirm", 401 to "retry", 429 to "retry", 500 to "retry", 503 to "retry",
+        for ((status, want) in listOf(200 to "confirm", 401 to "retry", 408 to "retry", 429 to "retry", 500 to "retry", 503 to "retry",
             400 to "refuse", 404 to "refuse", 409 to "refuse", 413 to "refuse", 415 to "refuse", 204 to "refuse",
             302 to "refuse", 403 to "stop_reporting")) {
             eq(answerOf(reportAnswer(status.toUShort())), want, "$status")

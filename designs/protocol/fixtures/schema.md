@@ -333,9 +333,10 @@ after the commit, and a restart reloads the committed state. Setup:
 device list), `records` (the vectors file the records' labels name:
 `r9-vectors-host-work-control`), `integrations` (`integration_id` →
 principal), `links` (each link's verified association by name: `{account_id,
-genesis_hash, host_id, host_trust_gen, connection_id}`) and
-`station_now_ms` (the Station's clock at the start). Every ledger call is
-made at the Station's clock.
+genesis_hash, host_id, host_trust_gen, connection_id}`),
+`station_now_ms` (the Station's clock at the start) and, in a fixture with
+a `403` or a resume, `report_client_id` (the Station's report client ID at
+Auth). Every ledger call is made at the Station's clock.
 
 | step | meaning |
 |---|---|
@@ -347,9 +348,10 @@ made at the Station's clock.
 | `{"replica": step}` | two replicas load the same committed state and process `step` (a record, an ack or a tick): the same next state and intents, byte for byte; the first commits, the second's compare-and-swap fails and it processes `step` again on the new state, making nothing |
 | `{"expect_report": [intent]}` | what the Station sends now, in order (`pending_reports`), exactly: each `{"not_before": [report_id], "report": {…}, "report_id": "…"}`, the report `{"kind": "revocation_applied", "integration_id", "host", "record_id"}` or `{"kind": "revoked", "integration_id", "outcome", "pending_hosts"}` |
 | `{"confirm": report_id}` | the Station POSTs that report (it must be sendable now) and the Portal answers `200` (for a repeat, its recorded `200`): `confirm`, committed |
-| `{"report_failure": {"report_id", "status": n \| "no_answer", "code"?, "reached"?: true, "answer", "alerts"?: [alert]}}` | the Station POSTs that report and the Portal's answer is `status` (`no_answer`: a network error or a timeout; `reached`: the Portal recorded it before the answer was lost; `code`: the Portal's error code, for the reader). `answer` is its class (`ReportAnswer`: `retry`, `refuse`, `stop_reporting`): `retry` changes nothing, `refuse` is `refuse(report_id)` and `stop_reporting` is `stop_reporting()`, committed, and `alerts` are the operator alerts that transition raised (`{"kind": "report_refused", "report_id"}`, `{"kind": "reporting_stopped", "dropped": [report_id]}`; none when absent) |
+| `{"report_failure": {"report_id", "status": n \| "no_answer", "code"?, "reached"?: true, "answer", "alerts"?: [alert]}}` | the Station POSTs that report and the Portal's answer is `status` (`no_answer`: a network error or a timeout; `reached`: the Portal recorded it before the answer was lost; `code`: the Portal's error code, for the reader). `answer` is its class (`ReportAnswer`: `retry`, `refuse`, `stop_reporting`): `retry` changes nothing, `refuse` is `refuse(report_id)` and `stop_reporting` is `stop_reporting(client_id)` under the Station's current report client ID, committed, and `alerts` are the operator alerts that transition raised (`{"kind": "report_refused", "report_id"}`, `{"kind": "reporting_stopped", "client_id"}`; none when absent) |
+| `{"resume_reporting": client_id, "alerts": [alert]}` | the Station restarts as the report client `client_id` (its current one from then on) and calls `resume_reporting(client_id)`, committed: the same ID as the stop's keeps every report, another ID drops them (`{"kind": "reports_dropped", "client_id": <the stopped ID>, "dropped": [report_id]}`) |
 | `{"expect_resign_alerts": [label]}` | the records still alerted for re-signing (`resign_alerts`), by label |
-| `{"expect_refused": [report_id]}`, `{"expect_stopped": bool}` | the reports refused for good (and those a stop dropped), sorted; whether reporting stopped |
+| `{"expect_refused": [report_id]}`, `{"expect_stopped": client_id \| false}` | the reports refused for good (and those a resume under another report client ID dropped), sorted; the report client ID reporting is stopped under, or `false` |
 | `{"expect_portal": [report_id]}` | the report ids the Portal recorded, sorted, each with one body (a runner without a Portal model skips it) |
 
 An unknown step or key fails the run. The report ids are known answers:

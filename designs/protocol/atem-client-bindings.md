@@ -1071,8 +1071,9 @@ to re-sign. Keep one per device list your Station serves.
 | `tick(now_ms)` | your timer: a revocation 24 hours past `revoked_at_ms` gets its `revoked{deadline_passed}` report |
 | `pending_reports()` | what to send now, in order: `ReportIntentInfo{report_id, report, not_before}`, `report` being `RevocationApplied{integration_id, host, record_id}` or `Revoked{integration_id, outcome, pending_hosts}` |
 | `report_answer(status)` | the class of the Portal's HTTP status: `Confirm`, `Retry`, `Refuse`, `StopReporting` (below) |
-| `confirm(report_id)`, `refuse(report_id)`, `stop_reporting()` | the Portal accepted the report; refused it for good (settled, never sent again, a `ReportRefused` alert); answered `403` (every pending report settled unsent, none made from now on, one `ReportingStopped` alert) |
-| `resign_alerts()`, `refused_reports()`, `reporting_stopped()` | the native-signed records not yet in force on every host they cover, for every effect they carry (`record_id`s: Astation alerts the owner to re-sign those whose signer was removed); the reports settled unsent; whether reporting stopped |
+| `confirm(report_id)`, `refuse(report_id)` | the Portal accepted the report; refused it for good (settled, never sent again, a `ReportRefused` alert) |
+| `stop_reporting(client_id)`, `resume_reporting(client_id)` | the Portal answered `403` to your report client `client_id` (your `station.report` client at Auth): the ledger records the ID and holds every report, none sent, until a resume (one `ReportingStopped` alert; refused `Invalid{malformed}` for an ID that isn't 1 to 128 characters of `[A-Za-z0-9._:-]`); you report again as `client_id`: the stop's own ID clears the stop and keeps every report, another ID drops them (below) |
+| `resign_alerts()`, `refused_reports()`, `reporting_stopped()`, `stopped_client_id()` | the native-signed records not yet in force on every host they cover, for every effect they carry (`record_id`s: Astation alerts the owner to re-sign those whose signer was removed); the reports settled unsent (refused for good, or dropped by a resume under another ID); whether reporting is stopped, and under which report client ID |
 
 Every call that moves the ledger returns `AckTransition{next, intents,
 alerts}` and never changes the handle it was called on. JS: `new
@@ -1080,11 +1081,14 @@ AckLedgerHandle(origin, accountId, genesisHash)`,
 `AckLedgerHandle.fromJson(text)`, `toJson()`, `record(recordJson,
 revokedAtMs, coveredHosts, nowMs)`, `ack({accountId, genesisHash, hostId,
 hostTrustGen, connectionId}, ackJson, nowMs)`, `tick(nowMs)`,
-`confirm(id)`, `refuse(id)`, `stopReporting()`, `pendingReports()` (plain
-objects: `{reportId, report: {type: "revocation_applied" | "revoked", …},
-notBefore}`), `resignAlerts()`, `refusedReports()`, `reportingStopped()`;
-`AckTransition` has the getters `next`, `intents` and `alerts` (`{type:
-"report_refused", reportId}`, `{type: "reporting_stopped", dropped}`);
+`confirm(id)`, `refuse(id)`, `stopReporting(clientId)`,
+`resumeReporting(clientId)`, `pendingReports()` (plain objects:
+`{reportId, report: {type: "revocation_applied" | "revoked", …},
+notBefore}`), `resignAlerts()`, `refusedReports()`, `reportingStopped()`,
+`stoppedClientId()` (a string, or `undefined`); `AckTransition` has the
+getters `next`, `intents` and `alerts` (`{type: "report_refused",
+reportId}`, `{type: "reporting_stopped", clientId}`, `{type:
+"reports_dropped", clientId, dropped}`);
 `reportAnswer(status)` gives `"confirm"`, `"retry"`, `"refuse"` or
 `"stop_reporting"`.
 
@@ -1128,13 +1132,35 @@ it can't tell a superseded connection from the current one.
 5. **Delivery.** After each commit, POST `pending_reports()` in order to
    the Portal (`POST /api/v1/stations/reports`, the `report_id` as
    `reportId`; the HTTP body is Auth/Portal's, `platform.md`), and act on
-   each answer by `report_answer(status)`. `Confirm`, `refuse` and
+   each answer by `report_answer(status)`. `confirm`, `refuse` and
    `stop_reporting` are transitions: commit each, and raise its `alerts`
-   once it committed.
-6. **At start**, load the state with `from_json` and send
+   once it committed. A `403` is for your report client, not one ledger:
+   call `stop_reporting` on every ledger you keep (raise one operator
+   alert for the Station).
+6. **At start**, load the state with `from_json`, call
+   `resume_reporting` with your current report client ID (commit it like
+   any transition), raise again the alerts the state still holds (a
+   crash between a commit and its alert loses the alert, never its cause:
+   `refused_reports()`, `stopped_client_id()`), and send
    `pending_reports()` again. On any `Stored` error, keep reporting
    stopped for that device list and never start again from an empty
    ledger: it would lose the deadlines and the per-host counts.
+
+**The 403 stop and its resume** (agreed with Auth/Portal; **for
+Astation's confirmation**, whose built-in Station takes its report client
+ID from its configuration and always resumes). A `403` stops reporting
+under the report client ID that got it: the ledger records the ID, holds
+every report (none is sent, none is dropped) and goes on counting and
+making reports. When the Station reports again (after a restart, say once
+an operator fixed a misconfigured token) it resumes with its report client
+ID:
+
+- **the same ID** clears the stop: every held report goes, in order;
+- **another ID** is another Station at Auth (a removed Station that is
+  registered again, with new integrations): the held reports are dropped
+  (settled unsent, among `refused_reports()`, a `ReportsDropped` alert),
+  and the revocations the ledger has make no more reports; counting goes
+  on, and a revocation that starts later reports as usual.
 
 **`report_id` and the Portal's idempotency.** A report's id comes from its
 identity only, never from time, order or a counter: `<kind>:` + lowercase
@@ -1158,11 +1184,16 @@ body with `409 report_id_reused` (the first stands). A revocation has one
 |---|---|---|
 | `200`, the recorded `200` of a repeated `reportId` included | `Confirm` | `confirm` |
 | a network error, a timeout, any 5xx (`503` and unknown ones too) | `Retry` | send the same report (same `reportId`, same body) again later, with backoff |
+| `408` | `Retry` | the same, like a timeout |
 | `429` | `Retry` | the same, after its `Retry-After` |
 | `401` | `Retry` | refresh the `station.report` token, then the same |
 | `409 report_id_reused`, `400`, `404`, `409 invalid_state`, `413`, `415`, any other 4xx | `Refuse` | `refuse`: final, with an operator alert |
-| `403` | `StopReporting` | `stop_reporting`: final for every report, stop reporting, alert once |
-| any other status (1xx, 3xx, a 2xx other than `200`) | `Refuse` | final, with an operator alert (**Atem's choice, for Auth/Portal to confirm**: the Portal answers none of these) |
+| `403` | `StopReporting` | `stop_reporting(client_id)` on every ledger: every report held, none sent, one alert, until a resume (above) |
+| any other status (1xx, 3xx, a 2xx other than `200`) | `Refuse` | final, with an operator alert (agreed with Auth/Portal: the Portal answers none of these). **Never follow a 3xx**: it would carry the `station.report` bearer wherever it points |
+
+A network error or a timeout has no status: it is `Retry`, so never pass a
+"no response" sentinel such as `0` to `report_answer`, which takes it for
+a status the Portal never answers with (`Refuse`).
 
 A report that waits for another (`not_before`) goes once that one is
 settled, confirmed or refused. Keep sending `revocation_applied` after a

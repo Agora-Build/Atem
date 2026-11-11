@@ -1329,7 +1329,7 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
   `control_ack` has no answer, the host sends the in-force results
   (`applied` or `duplicate`) of its `revoke` and `interrupt_running`
   records and its host-sender revoke entries again on every (re)connection
-  to the Station and at most every 10 minutes while connected. Counting is
+  to the Station and every 10 minutes while connected. Counting is
   idempotent at the Station, so a result sent again counts nothing twice,
   and a Station that lost a transition before its commit gets it back.
 - **What the Station counts.** Per host and per effect of a principal (its
@@ -1374,7 +1374,9 @@ Station's own revoke is recorded, naming the native record.
   is persisted, so a restart never moves the deadline. An ack or a record
   is counted after any deadline its time has passed, so the outcome
   depends on time, never on when the Station looked; an own revoke recorded
-  after its own deadline is final at once.
+  after its own deadline is final at once (**Atem's choice, for Auth/Portal
+  to confirm**): `all_applied` when every covered host already has the
+  revocation in force (through a native revoke), else `deadline_passed`.
 - **Order.** A `revoked` report is delivered only after the per-host
   reports made before it, so the Portal never sees `all_applied` ahead of
   a covered host's `revocation_applied`, nor `deadline_passed` ahead of
@@ -1407,13 +1409,36 @@ for host `host-b`, and
 |---|---|
 | `200`, the recorded `200` of a repeated `reportId` included | done |
 | a network error, a timeout, a 5xx (`503` and unknown ones too) | send again later, with backoff, the same `reportId` and body |
+| `408` | the same, like a timeout |
 | `429` | the same, after its `Retry-After` |
 | `401` | refresh the `station.report` token, then the same |
 | `409 report_id_reused`, `400`, `404`, `409 invalid_state`, `413`, `415`, any other 4xx | final, with an operator alert |
-| `403` | final for every report, and stop reporting (one alert) |
-| a status the Portal never answers with (1xx, 3xx, a 2xx other than `200`) | final, with an operator alert (**Atem's choice, for Auth/Portal to confirm**) |
+| `403` | stop reporting under the Station's report client ID: every report held, none sent, one alert, until a resume (below) |
+| a status the Portal never answers with (1xx, 3xx, a 2xx other than `200`) | final, with an operator alert. A 3xx is never followed: it would carry the `station.report` bearer wherever it points |
 
 A report waiting for another goes once that one is settled, done or final.
+A network error or a timeout has no status; a client library's "no
+response" sentinel (such as `0`) is a network error, not a status.
+
+**The 403 stop and its resume** (**changed agreed meaning, agreed with
+Auth/Portal, for Astation's confirmation**: Auth/Portal's first answer made
+a `403` final for every report). A `403` is the Portal refusing the
+Station's report client (its `station.report` client at Auth), so the
+Station stops reporting on every ledger it keeps, with one operator alert.
+Each ledger records the report client ID, holds every report (none is sent,
+none is dropped) and goes on counting and making reports. When the Station
+reports again, at its next start (after an operator fixed a misconfigured
+token, say), it resumes each ledger with its report client ID:
+
+- **the same ID** clears the stop and keeps every report, sent in order;
+- **another ID** is another Station at Auth (a removed Station registered
+  again, with new integrations): the held reports are dropped, with an
+  operator alert, and the revocations reported before make no more reports;
+  counting goes on (the re-sign alerts need it), and a revocation that
+  starts later reports as usual.
+
+The built-in Station takes its report client ID from its configuration and
+always resumes.
 
 **The Station's duties** (**Atem's proposal, for Astation's and
 Auth/Portal's agreement**):
@@ -1434,6 +1459,11 @@ Auth/Portal's agreement**):
   re-signed record included). The reference ledger refuses another body
   under a `record_id` it tracks, but a `cover`, `hold` or `release` id it
   doesn't track can't be checked against a later revoke.
+- **Raise every operator alert once its transition committed.** The
+  ledger keeps what an alert is about (the reports refused or dropped, the
+  stopped report client ID), so a Station that may have lost one (a crash
+  between the commit and the alert) raises it again from the state at
+  start.
 - **No pruning in this version.** The ledger keeps every revocation and
   every tracked record, bounded per account (revoke and interrupt records,
   at most 64 covered hosts each), as long as the principal exists (I.5.2's
@@ -1471,8 +1501,11 @@ revocation's own time across a restart, a late host still reported),
 `r9-control-ack-durable` (a crash before the commit, after it, and after
 delivery before the confirmation; a Portal failure and its retry; a lost
 ack sent again; two replicas; duplicate acks for an original and its
-re-signed copy) and `r9-control-ack-portal-refusals` (retries, a final
-refusal with its alert, a `403` that stops reporting). They run in
+re-signed copy) and `r9-control-ack-portal-refusals` (retries after a
+`401`, a `503`, a `429` and a `408`, a final refusal with its alert, a
+`403` that holds every report across a restart, a resume under the same
+report client ID that sends them, and a resume under another that drops
+them and retires the revocation). They run in
 `crates/atem-client/tests/r9_fixtures.rs` against `AckLedger`, in the
 bindings' `tests/station.rs` and in the Swift, Kotlin and WASM conformance
 suites through `AckLedgerHandle`; `scripts/check-r9-vectors.py` recomputes

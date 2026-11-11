@@ -602,7 +602,6 @@ check("control records: a failed commit loses no effect (apply leaves its handle
   throwsCode(() => state.apply(record, logL(), { feedId: ctl.stations.A.feed_id, feedSeq: 1 }, 6), "malformed");
 });
 
-// ---------------------------------------------------------------- recovery
 // ------------------------------- delegated host work: the Station's side
 // r9-control-ack-*: every acknowledgment fixture through AckLedgerHandle as
 // a Station persists it (each call's next state committed before the
@@ -619,7 +618,11 @@ const intentOut = (i) => ({
   report_id: i.reportId,
 });
 const alertOut = (a) =>
-  a.type === "report_refused" ? { kind: "report_refused", report_id: a.reportId } : { kind: "reporting_stopped", dropped: a.dropped };
+  a.type === "report_refused"
+    ? { kind: "report_refused", report_id: a.reportId }
+    : a.type === "reporting_stopped"
+      ? { kind: "reporting_stopped", client_id: a.clientId }
+      : { kind: "reports_dropped", client_id: a.clientId, dropped: a.dropped };
 const linkOf = (l) => ({ accountId: l.account_id, genesisHash: l.genesis_hash, hostId: l.host_id, hostTrustGen: l.host_trust_gen, connectionId: l.connection_id });
 const ctlRecord = (label) => str(ctlByLabel[label].record);
 const ACKS = readdirSync(fixturesDir)
@@ -635,6 +638,7 @@ for (const name of ACKS) {
     let ledger = new m.AckLedgerHandle(st.origin, st.account_id, st.genesis_hash);
     let committed = ledger.toJson();
     let now = setup.station_now_ms;
+    let clientId = setup.report_client_id;
     const input = (on, step) => {
       if (step.control_record !== undefined) return on.record(ctlRecord(step.control_record), step.revoked_at_ms ?? now, step.covered_hosts, now);
       if (step.control_ack !== undefined) {
@@ -688,15 +692,22 @@ for (const name of ACKS) {
         sendable(fl.report_id);
         const answer = typeof fl.status === "number" ? m.reportAnswer(fl.status) : "retry";
         eq(answer, fl.answer, `${name} answer`);
-        const t = answer === "refuse" ? ledger.refuse(fl.report_id) : answer === "stop_reporting" ? ledger.stopReporting() : undefined;
+        const t = answer === "refuse" ? ledger.refuse(fl.report_id) : answer === "stop_reporting" ? ledger.stopReporting(clientId) : undefined;
         eq(canon(t === undefined ? [] : t.alerts.map(alertOut)), canon(fl.alerts ?? []), `${name} alerts`);
         if (t !== undefined) commit(t);
       } else if ("expect_resign_alerts" in step) {
         eq(ledger.resignAlerts(), step.expect_resign_alerts.map((l) => ctlByLabel[l].record.body.record_id).sort(), `${name} resign alerts`);
       } else if ("expect_refused" in step) {
         eq(ledger.refusedReports(), step.expect_refused, `${name} refused`);
+      } else if ("resume_reporting" in step) {
+        clientId = step.resume_reporting;
+        const t = ledger.resumeReporting(clientId);
+        eq(canon(t.alerts.map(alertOut)), canon(step.alerts), `${name} resume alerts`);
+        eq(t.intents, [], `${name} resume`);
+        commit(t);
       } else if ("expect_stopped" in step) {
-        eq(ledger.reportingStopped(), step.expect_stopped, `${name} stopped`);
+        eq(ledger.stoppedClientId() ?? false, step.expect_stopped, `${name} stopped`);
+        eq(ledger.reportingStopped(), step.expect_stopped !== false, `${name} stopped`);
       } else if (!("expect_portal" in step)) {
         // expect_portal is the Portal's side: no Portal model here.
         throw new Error(`unknown step ${str(step)}`);
@@ -722,8 +733,13 @@ check("Station acks: a call never changes its handle; the state loads only as wr
   const id = t1.intents[0].reportId;
   eq(t1.next.refuse(id).alerts, [{ type: "report_refused", reportId: id }]);
   eq(t1.next.pendingReports().length, 1);
-  eq(t1.next.stopReporting().next.reportingStopped(), true);
+  const stopped = t1.next.stopReporting("station-1").next;
+  eq([stopped.reportingStopped(), stopped.stoppedClientId(), stopped.pendingReports()], [true, "station-1", []]);
   eq(t1.next.reportingStopped(), false);
+  // The same report client ID keeps every report; another drops them.
+  eq(stopped.resumeReporting("station-1").next.pendingReports(), t1.next.pendingReports());
+  eq(stopped.resumeReporting("station-2").alerts, [{ type: "reports_dropped", clientId: "station-1", dropped: [id] }]);
+  throwsCode(() => l.stopReporting("a b"), "malformed");
   const text = t1.next.toJson();
   eq(m.AckLedgerHandle.fromJson(text).toJson(), text);
   throwsCode(() => m.AckLedgerHandle.fromJson("["), "malformed");
@@ -776,11 +792,12 @@ check("Station calls: fixture acks read and write back; pages, heads and fetches
   throwsCode(() => m.relayDecodeToStation("{"), "not_strict");
 });
 check("Station: the Portal's statuses in their classes", () => {
-  const want = { 200: "confirm", 401: "retry", 429: "retry", 500: "retry", 503: "retry", 400: "refuse", 404: "refuse", 409: "refuse", 413: "refuse", 415: "refuse", 204: "refuse", 302: "refuse", 403: "stop_reporting" };
+  const want = { 200: "confirm", 401: "retry", 408: "retry", 429: "retry", 500: "retry", 503: "retry", 400: "refuse", 404: "refuse", 409: "refuse", 413: "refuse", 415: "refuse", 204: "refuse", 302: "refuse", 403: "stop_reporting" };
   for (const [status, answer] of Object.entries(want)) eq(m.reportAnswer(Number(status)), answer, status);
   throwsCode(() => m.reportAnswer(200.5), "malformed");
 });
 
+// ---------------------------------------------------------------- recovery
 const kit1 = () => m.RecoveryKit.read(unhex(rec.R_hex), rec.kit.account_id, rec.kit.genesis_hash, unhex(rec.kit.kit_tag_hex));
 check("kit 1: tag, recovery key, X25519 key", () => {
   const kit = kit1();
