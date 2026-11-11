@@ -7,11 +7,12 @@
 //!
 //! 1. **Strict parse and pin.** The body's exact fields ([`MailBody`]), the
 //!    `type`, and `account_id` and `genesis_hash` equal this list's.
-//! 2. **The recipient.** It is this host, at its current trust generation,
-//!    and `enc_kid` names one of the keys the caller passes in
+//! 2. **The recipient.** It is this host, at its current trust generation
+//!    (both final), and `enc_kid` names one of the keys the caller passes in
 //!    [`Recipient::keys`] (its current key; its previous one only while the 24 h
 //!    window and a rotation's `retire_previous` allow it, which is the
-//!    caller's to say).
+//!    caller's to say). The key part waits when `signed_at_head` is beyond
+//!    this head (below): this host's own new `host_enc_key` may be there.
 //! 3. **The sender.** A current host, at exactly its newest `add_host`
 //!    generation; `authorized(g)` at this list's head; `signed_at_head.seq`
 //!    at least `g`; and this list's entry at `signed_at_head.seq` has
@@ -24,10 +25,12 @@
 //!    hash.
 //! 4. **The signature**, with the key of the sender's newest `add_host`
 //!    ([`VerifiedMail::verify`]: the only way to a [`VerifiedMail`], which is
-//!    all `unseal_*` take).
+//!    all `unseal_*` take), and `sealed_hash` naming `enc` and `ct`: the
+//!    signature never covered a sealed part its `sealed_hash` doesn't name, so
+//!    such a copy isn't the sender's (`sealed_hash_mismatch`, unauthenticated).
 //! 5. **The times.** `expires_at` after `created_at`, at most 24 h later, not
 //!    passed; `created_at` at most 60 s ahead of the caller's clock.
-//! 6. **`sealed_hash`, the open, the plaintext's strict parse**, and (for a
+//! 6. **The open and the plaintext's strict parse**, and (for a
 //!    request) the Message's id, times and sender equal to the body's and a
 //!    Message a host sender may send ([`Message::valid_from_host`]).
 //!
@@ -35,7 +38,9 @@
 //! judged yet, whatever the sender's standing in this list: entries this host
 //! hasn't seen may add the sender (unknown here), re-add it at a newer
 //! generation (removed), readmit it (revoked) or bring its newer generation,
-//! and no sender can know the hash of an entry that doesn't exist. Two claims
+//! and no sender can know the hash of an entry that doesn't exist; and they
+//! may hold this host's own new `host_enc_key`, so a key it doesn't list
+//! waits too (it opens once the caller lists the key). Two claims
 //! are settled at any head: a generation below the sender's newest
 //! (`stale_sender_generation`), and an envelope from a removed host at the
 //! generation it last held (`removed_sender`, after the body's times): that
@@ -57,12 +62,14 @@
 //! refusals. The host marks every refused object done and never judges it
 //! again (host-work-v1 §11.5); this module only judges.
 //!
-//! **Refused or refused-authenticated.** Until step 4 passes, nothing says who
-//! sent the object, so a failure is [`EnvelopeVerdict::Refused`] (kept as
-//! evidence; nothing is told to anyone). After it, the sender is
-//! authenticated and a failure of step 5 or 6 is
+//! **Refused or refused-authenticated.** Until step 4 passes (the signature,
+//! and the sealed part it names), nothing says the sender sent this copy, so
+//! a failure is [`EnvelopeVerdict::Refused`] (kept as evidence under its
+//! hash; nothing is told to anyone, and it claims no id). After it, the copy
+//! is the sender's, intact, and a failure of step 5 or 6 is
 //! [`EnvelopeVerdict::RefusedAuthenticated`]: the host answers it with a
 //! status naming the object's id and `refused: "invalid_request"` (II.4.4).
+//! Only a verified, intact copy claims its id (host-work-v1 §11.5).
 //!
 //! [`accept_result`] is the sending host's side of II.4.4: the same checks 1
 //! to 6 for an `atem-result` (`atem-result-v1`, `atem-result-seal-v1`), with
@@ -113,7 +120,9 @@ pub mod reason {
     /// Check 2: the recipient's trust generation isn't this host's current one.
     pub const RECIPIENT_GENERATION: &str = "recipient_generation_not_current";
     /// Check 2: `enc_kid` names none of the keys the caller accepts (a retired
-    /// previous key, an older one, or none of this host's).
+    /// previous key, an older one, or none of this host's), and
+    /// `signed_at_head` isn't beyond this head (else the object waits: this
+    /// host's own new key may be in the entries it lacks).
     pub const ENC_KEY_NOT_ACCEPTED: &str = "enc_key_not_accepted";
     /// Check 3: no `add_host` here names the sender, and `signed_at_head` is
     /// not beyond this head (which would make the object wait).
@@ -153,7 +162,8 @@ pub mod reason {
     pub const EXPIRED: &str = "expired";
     /// Check 5: `created_at` is more than 60 s ahead of the clock.
     pub const CREATED_TOO_FAR_AHEAD: &str = "created_too_far_ahead";
-    /// Check 6: `sealed_hash` doesn't name `enc` and `ct`.
+    /// Check 4: `sealed_hash` doesn't name `enc` and `ct`. The signature never
+    /// covered them, so the copy isn't the sender's: refused unauthenticated.
     pub const SEALED_HASH_MISMATCH: &str = "sealed_hash_mismatch";
     /// Check 6: the sealed part doesn't open (another `info`, another key,
     /// tampering).
@@ -222,19 +232,24 @@ use reason::*;
 pub struct Recipient {
     /// This host's `host_id`.
     pub host_id: String,
-    /// This host's current trust generation.
+    /// This host's current trust generation: its own, from its pairing
+    /// (`pairing/trust_gen`), never one read from its device list, which may
+    /// lag behind its own new `add_host` (after `atem pair verify`): every
+    /// mail sent to its new generation would be refused
+    /// `recipient_generation_not_current` for good.
     pub host_trust_gen: u64,
     /// The keys that may open mail now, each with its `enc_kid`: the current
     /// `enc_key`, and the previous one only while its 24 h window (counted on
     /// this host's clock from when it applied the rotation) is open and the
-    /// rotation didn't `retire_previous`. A kid not listed is refused.
+    /// rotation didn't `retire_previous`. A kid not listed waits when the
+    /// object is signed at a head beyond this host's, and is refused
+    /// otherwise.
     ///
     /// The caller should also list a key it generated and handed out, and
     /// hasn't retired, before that key's `host_enc_key` entry applies here: a
-    /// sender whose list already has the entry seals to it, and that mail
-    /// would otherwise be refused as `enc_key_not_accepted` for good (a
-    /// refused object is done, and the sender's resend of the same bytes is a
-    /// duplicate).
+    /// sender whose list already has the entry seals to it, and the mail then
+    /// opens at once instead of waiting for this host's list to reach the
+    /// sender's head.
     pub keys: Vec<(KeyId, [u8; 8])>,
 }
 
@@ -251,22 +266,27 @@ pub enum EnvelopeVerdict {
         plain: EnvelopePlain,
         sender: String,
     },
-    /// The claimed sender generation, or the head the sender signed at, is
-    /// beyond this host's list, and the body's times passed: kept, judged
-    /// again after each device-list advance. `host_id` and `host_trust_gen`
-    /// are the *claimed* ones (the pending bound is per claimed pair).
+    /// The head the sender signed at is beyond this host's list (and with it,
+    /// maybe, the sender's newer generation or the key the object is sealed
+    /// to), and the body's times passed: kept, judged again after each
+    /// device-list advance and each change of the keys the caller accepts.
+    /// `host_id` and `host_trust_gen` are the *claimed* ones (the pending
+    /// bound is per claimed pair).
     Pending {
         host_id: String,
         host_trust_gen: u64,
     },
-    /// Refused before the signature verified. Nothing is reported to anyone.
-    /// `evidence` is [`evidence_hash`] of the received object.
+    /// Refused before the copy was shown to be the sender's (its signature,
+    /// and the sealed part it names). Nothing is reported to anyone, and it
+    /// claims no id: the host keeps it under `evidence`, [`evidence_hash`] of
+    /// the received object.
     Refused {
         reason: &'static str,
         evidence: Hash32,
     },
-    /// Refused after the signature verified: the sender is authenticated, so
-    /// the host reports it (a status naming `object_id`, II.4.4).
+    /// Refused after the signature verified and the sealed part matched: the
+    /// copy is the sender's, so the host reports it (a status naming
+    /// `object_id`, II.4.4), and it claims the id.
     RefusedAuthenticated {
         object_id: String,
         reason: &'static str,
@@ -603,23 +623,26 @@ fn admit(
     let Ok(kid) = hex_decode_array::<8>(&body.enc_kid) else {
         return refuse(MALFORMED);
     };
-    let Some(key) = me.keys.iter().find(|(_, accepted)| *accepted == kid) else {
+    let signed_at = body.signed_at_head;
+    // A head beyond this list's can't be judged yet: entries this host lacks
+    // may add the sender, re-add it at a newer generation, readmit it or bring
+    // its newer generation, or bring this host's own new `host_enc_key` (the
+    // key the object is sealed to), and no sender can know the hash of an
+    // entry that doesn't exist. Such an object waits (after step 5 on the
+    // body's times; see `wait`). A refusal below is only for what this head
+    // settles: at a head this list holds, it knows the list the sender
+    // signed at.
+    let head_ahead = signed_at.seq > list.head().seq;
+    let key = me.keys.iter().find(|(_, accepted)| *accepted == kid);
+    if key.is_none() && !head_ahead {
         return refuse(ENC_KEY_NOT_ACCEPTED);
-    };
+    }
 
     // 3. The sender. A result is only taken from the host the row went to.
     let sender = &body.sender;
     if expected.is_some_and(|row| *sender != row.recipient) {
         return refuse(NOT_THE_RECIPIENT);
     }
-    let signed_at = body.signed_at_head;
-    // A head beyond this list's can't be judged yet: entries this host lacks
-    // may add the sender, re-add it, readmit it or bring its newer generation,
-    // and no sender can know the hash of an entry that doesn't exist. Such an
-    // object waits (after step 5 on the body's times; see `wait`). A refusal
-    // below is only for what this head settles: at a head this list holds, it
-    // knows the list the sender signed at.
-    let head_ahead = signed_at.seq > list.head().seq;
     let wait = |key: Option<&PublicKey>| {
         if let Err(reason) = check_times(body.created_at, body.expires_at, now_ms) {
             return refuse(reason);
@@ -699,16 +722,28 @@ fn admit(
         // Only a generation this list holds has a known key.
         return wait((!generation_ahead).then_some(&host.host_key));
     }
+    // At a head this list holds, check 2's key: deferred above only for a
+    // head beyond it.
+    let Some(key) = key else {
+        return refuse(ENC_KEY_NOT_ACCEPTED);
+    };
     let standing = match state {
         Some(HostSenderState::Revoked { .. }) => Standing::Revoked,
         _ if removed => Standing::Removed,
         _ => Standing::Current,
     };
 
-    // 4. The signature, with the key of the sender's newest `add_host`.
+    // 4. The signature, with the key of the sender's newest `add_host`, and
+    // the sealed part it names: a copy whose `enc` and `ct` the signed
+    // `sealed_hash` doesn't name isn't the sender's (the signature never
+    // covered them), so it is refused unauthenticated, before any verdict
+    // that would claim the object's id.
     let Ok(mail) = VerifiedMail::verify(obj, &host.host_key) else {
         return refuse(BAD_SIGNATURE);
     };
+    if !obj.sealed().is_some_and(|sealed| mail.body().names(sealed)) {
+        return refuse(SEALED_HASH_MISMATCH);
+    }
 
     // 5. The times; the sender is authenticated now.
     if let Err(reason) = check_times(body.created_at, body.expires_at, now_ms) {
@@ -741,11 +776,9 @@ fn open_with<T>(
     provider: &dyn KeyProvider,
     unseal: fn(&dyn KeyProvider, &KeyId, &VerifiedMail) -> Result<T, Error>,
 ) -> Result<T, Failed> {
-    let Some(sealed) = mail.object().sealed() else {
+    // `admit` checked the sealed part is the one `sealed_hash` names.
+    if mail.object().sealed().is_none() {
         return Err(Failed::Refused(MALFORMED));
-    };
-    if !mail.body().names(sealed) {
-        return Err(Failed::Refused(SEALED_HASH_MISMATCH));
     }
     // The key the caller named behind its kid must be that key.
     match provider.public_key(&key.0).and_then(|k| enc_kid_bytes(&k)) {
@@ -758,9 +791,9 @@ fn open_with<T>(
         Err(error) => return Err(Failed::Unavailable(error)),
     }
     unseal(provider, &key.0, mail).map_err(|error| match error {
-        Error::OpenFailed | Error::ZeroSharedSecret | Error::BadKey | Error::WeakKey => {
-            Failed::Refused(OPEN_FAILED)
-        }
+        // The seal doesn't open: the AEAD, or a low-order `enc`. A bad or
+        // weak key is the provider's own, and decides nothing.
+        Error::OpenFailed | Error::ZeroSharedSecret => Failed::Refused(OPEN_FAILED),
         Error::NullValue => Failed::Refused(PLAINTEXT_NULL),
         Error::TooLarge => Failed::Refused(PLAINTEXT_TOO_LARGE),
         Error::Strict(_)
@@ -1973,10 +2006,21 @@ mod tests {
             ct[3] ^= 1;
             v["ct"] = json!(b64u(&ct));
         });
+        // The signature never covered those bytes: the copy isn't the
+        // sender's, so it is refused unauthenticated (kept as evidence, not
+        // reported, claiming no id).
         assert_eq!(
             w.open(&flipped, &me),
-            refused_authenticated(SEALED_HASH_MISMATCH)
+            refused(SEALED_HASH_MISMATCH, &flipped)
         );
+        // Intact before any authenticated verdict: a damaged copy that has
+        // also expired is still `sealed_hash_mismatch`, never `expired`.
+        assert_eq!(
+            w.open_at(&flipped, &me, f.expires_at),
+            refused(SEALED_HASH_MISMATCH, &flipped)
+        );
+        // The sender's own copy still opens.
+        assert!(matches!(w.open(&object, &me), EnvelopeVerdict::Open { .. }));
         // The sender signs a body whose hash names nothing it sealed.
         let (_, old) = MailBody::from_object(&object).unwrap();
         let mut body = old;
@@ -1988,10 +2032,7 @@ mod tests {
         )
         .unwrap()
         .with_sealed(object.sealed().unwrap().clone());
-        assert_eq!(
-            w.open(&lying, &me),
-            refused_authenticated(SEALED_HASH_MISMATCH)
-        );
+        assert_eq!(w.open(&lying, &me), refused(SEALED_HASH_MISMATCH, &lying));
     }
 
     // ----------------------------------------------------------- check 5
@@ -2234,6 +2275,156 @@ mod tests {
         );
     }
 
+    /// Mail sealed to a key this host hasn't applied yet (its own new
+    /// `host_enc_key` lies in entries beyond its head): an unknown `enc_kid`
+    /// waits when `signed_at_head` is beyond this head, after the sender
+    /// checks, the times and the signature of a held pair; at a head this
+    /// list holds it is refused.
+    #[test]
+    fn a_key_this_host_has_not_applied_waits_when_the_head_is_beyond() {
+        let mut w = World::new();
+        let old_keys = w.recipient("host-b", true);
+        let before = w.m.clone();
+        w.set_enc_key("host-b", 1, false);
+        let f = w.fields("host-a", "host-b");
+        assert!(f.signed_at_head.seq > before.head().seq);
+        let object = w.envelope(&f, &w.request(&f));
+        let judge =
+            |object: &SignedObject, now| open_envelope(object, &before, &old_keys, &w.encs, now);
+        assert_eq!(judge(&object, NOW), pending("host-a", 1));
+        // The rotation applied and the keys rebuilt: it opens.
+        assert!(matches!(
+            w.open(&object, &w.recipient("host-b", true)),
+            EnvelopeVerdict::Open { .. }
+        ));
+        // Applied but not listed: this head settles it.
+        assert_eq!(
+            w.open(&object, &old_keys),
+            refused(ENC_KEY_NOT_ACCEPTED, &object)
+        );
+        // A held pair's signature is checked before waiting.
+        let junk = edited(&object, |v| v["sig"] = json!(b64u(&[1u8; 64])));
+        assert_eq!(judge(&junk, NOW), refused(BAD_SIGNATURE, &junk));
+        // The times first.
+        assert_eq!(judge(&object, f.expires_at), refused(EXPIRED, &object));
+        // Another host, or another generation of this one, is never pending.
+        let other = Recipient {
+            host_id: "host-c".into(),
+            ..old_keys.clone()
+        };
+        assert_eq!(
+            open_envelope(&object, &before, &other, &w.encs, NOW),
+            refused(NOT_FOR_THIS_HOST, &object)
+        );
+        let regen = Recipient {
+            host_trust_gen: 2,
+            ..old_keys.clone()
+        };
+        assert_eq!(
+            open_envelope(&object, &before, &regen, &w.encs, NOW),
+            refused(RECIPIENT_GENERATION, &object)
+        );
+
+        // A stale generation is refused at any head, key or not.
+        let mut w = World::new();
+        let old_keys = w.recipient("host-b", true);
+        let mut f = w.fields("host-a", "host-b");
+        w.add_host("host-a", 2);
+        let mid = w.m.clone();
+        w.set_enc_key("host-b", 1, false);
+        f.enc_kid = crate::keys::enc_kid(&w.enc_pub("host-b")).unwrap();
+        f.signed_at_head = w.head();
+        let object = w.envelope(&f, &w.request(&f));
+        assert_eq!(
+            open_envelope(&object, &mid, &old_keys, &w.encs, NOW),
+            refused(STALE_SENDER_GENERATION, &object)
+        );
+
+        // A result sealed to the asking host's new key: the same.
+        let mut w = World::new();
+        let outbox = expected(&w);
+        let old_a = w.recipient("host-a", true);
+        let before = w.m.clone();
+        w.set_enc_key("host-a", 1, false);
+        let f = w.fields("host-b", "host-a");
+        let object = result(&w, &f, &status(ID));
+        assert_eq!(
+            accept_result(&object, &before, &old_a, &outbox, &w.encs, NOW),
+            ResultVerdict::Pending {
+                host_id: "host-b".into(),
+                host_trust_gen: 1,
+            }
+        );
+        assert!(matches!(
+            accept(&w, &object, &outbox),
+            ResultVerdict::Accepted { .. }
+        ));
+        assert_eq!(
+            accept_result(&object, &w.m, &old_a, &outbox, &w.encs, NOW),
+            result_refused(ENC_KEY_NOT_ACCEPTED, &object)
+        );
+    }
+
+    /// A provider whose open fails for its own reasons (a bad or weak key of
+    /// its own) decides nothing; a seal that doesn't open (the AEAD, or a
+    /// low-order `enc`) is the sender's `open_failed`.
+    #[test]
+    fn only_a_seal_that_does_not_open_is_open_failed() {
+        struct FailingOpen<'a> {
+            keys: &'a SoftwareKeys,
+            error: Error,
+        }
+        impl KeyProvider for FailingOpen<'_> {
+            fn public_key(&self, key: &KeyId) -> Result<PublicKey, Error> {
+                self.keys.public_key(key)
+            }
+            fn sign(&self, key: &KeyId, input: &crate::SigningInput) -> Result<Vec<u8>, Error> {
+                self.keys.sign(key, input)
+            }
+            fn x25519(
+                &self,
+                key: &KeyId,
+                peer: &[u8; 32],
+            ) -> Result<zeroize::Zeroizing<[u8; 32]>, Error> {
+                self.keys.x25519(key, peer)
+            }
+            fn hpke_open(
+                &self,
+                _: &KeyId,
+                _: &[u8],
+                _: &[u8],
+                _: &[u8],
+                _: &[u8],
+            ) -> Result<zeroize::Zeroizing<Vec<u8>>, Error> {
+                Err(self.error.clone())
+            }
+        }
+        let w = World::new();
+        let me = w.recipient("host-b", true);
+        let f = w.fields("host-a", "host-b");
+        let object = w.envelope(&f, &w.request(&f));
+        for (error, open_failed) in [
+            (Error::OpenFailed, true),
+            (Error::ZeroSharedSecret, true),
+            (Error::BadKey, false),
+            (Error::WeakKey, false),
+        ] {
+            let provider = FailingOpen {
+                keys: &w.encs,
+                error: error.clone(),
+            };
+            let verdict = open_envelope(&object, &w.m, &me, &provider, NOW);
+            if open_failed {
+                assert_eq!(verdict, refused_authenticated(OPEN_FAILED), "{error:?}");
+            } else {
+                assert!(
+                    matches!(verdict, EnvelopeVerdict::Unavailable { .. }),
+                    "{error:?}: {verdict:?}"
+                );
+            }
+        }
+    }
+
     // ------------------------------------------------------------ results
 
     /// B ran the work for A: the result's sender is B, its recipient A, and
@@ -2424,6 +2615,16 @@ mod tests {
         assert_eq!(
             accept(&w, &junk, &outbox),
             result_refused(BAD_SIGNATURE, &junk)
+        );
+        // A sealed part the signature never covered: unauthenticated.
+        let flipped = edited(&object, |v| {
+            let mut ct = crate::encoding::b64u_decode(v["ct"].as_str().unwrap()).unwrap();
+            ct[3] ^= 1;
+            v["ct"] = json!(b64u(&ct));
+        });
+        assert_eq!(
+            accept(&w, &flipped, &outbox),
+            result_refused(SEALED_HASH_MISMATCH, &flipped)
         );
         // B's head is beyond A's: pending, not refused.
         let before = w.m.clone();

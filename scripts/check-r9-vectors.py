@@ -314,6 +314,7 @@ KEY_LABELS = {
     "host-a-gen-3/host_key": "host-a host_channel_key gen 3",
     "host-b/host_key": "host-b host_channel_key",
     "host-b-enc-1/enc": "host-b host_enc_key 1",
+    "host-b-enc-2/enc": "host-b host_enc_key 2",
     "host-b-gen-2/host_key": "host-b host_channel_key gen 2",
 }
 
@@ -906,9 +907,10 @@ def reply_ok(r):
         and r["state"] == "submitted"
         and safe_int(r.get("submitted_at"))
         and r["dropped"] is False
-        # A dropped reply keeps its digest without its text: `dropped`
-        # alone refuses it.
-        and (r["dropped"] is True or r["digest"] == sha256(r["text"].encode()).hex())
+        # Its format only, as the core checks it: the runtime's digest covers
+        # more than the text.
+        and isinstance(r["digest"], str)
+        and re.fullmatch(HEX64, r["digest"]) is not None
         and isinstance(r["context"], list)
         and all(snapshot_ok(s) for s in r["context"])
     )
@@ -1033,16 +1035,18 @@ def mail_verdict(wire, call, hosts, receiver_keys, receiver, now, outbox):
         return refused("not_for_this_host")
     if recipient["host_trust_gen"] != receiver["host_trust_gen"]:
         return refused("recipient_generation_not_current")
+    # The key part waits when the head is beyond this host's: its own new
+    # host_enc_key may be in the entries it lacks.
+    head = body["signed_at_head"]
+    ahead = head["seq"] > hosts.head
     secret = receiver_keys.get(recipient["enc_kid"])
-    if secret is None:
+    if secret is None and not ahead:
         return refused("enc_key_not_accepted")
     # 3. The sender (a result's: only the host the outbox row went to).
     sender = body["sender"]
     sid, sgen = sender["host_id"], sender["host_trust_gen"]
     if outbox is not None and (sid, sgen) != (outbox["recipient"]["host_id"], outbox["recipient"]["host_trust_gen"]):
         return refused("not_the_recipient")
-    head = body["signed_at_head"]
-    ahead = head["seq"] > hosts.head
     signing_input = mail_signing_input(body)
     sig = b64u_decode(wire["sig"])
 
@@ -1087,17 +1091,21 @@ def mail_verdict(wire, call, hosts, receiver_keys, receiver, now, outbox):
             return refused(mail_times(body, now) or "removed_sender")
         return wait(None if generation_ahead else key)
     standing = "revoked" if state == "revoked" else "removed" if removed else "current"
-    # 4. The signature, with the key of the sender's newest add_host.
+    if secret is None:
+        return refused("enc_key_not_accepted")
+    # 4. The signature, with the key of the sender's newest add_host, and the
+    # sealed part it names: a copy whose enc and ct the signed sealed_hash
+    # doesn't name isn't the sender's, so it is refused unauthenticated.
     if not verify("ed25519", key, sig, signing_input):
         return refused("bad_signature")
-    # 5. The times (the sender is authenticated now).
+    enc_bytes, ct = b64u_decode(wire["enc"]), b64u_decode(wire["ct"])
+    if sha256(enc([enc_bytes, ct])).hex() != body["sealed_hash"]:
+        return refused("sealed_hash_mismatch")
+    # 5. The times (the copy is the sender's, intact, now).
     reason = mail_times(body, now)
     if reason:
         return authenticated(reason)
-    # 6. sealed_hash, the open, the plaintext.
-    enc_bytes, ct = b64u_decode(wire["enc"]), b64u_decode(wire["ct"])
-    if sha256(enc([enc_bytes, ct])).hex() != body["sealed_hash"]:
-        return authenticated("sealed_hash_mismatch")
+    # 6. The open, the plaintext.
     try:
         plain = hpke_open(secret, enc_bytes, ct, mail_seal_info(body))
     except Exception:

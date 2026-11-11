@@ -2418,7 +2418,7 @@ const DELEGATED_T0: u64 = 1_793_620_800_000;
 /// The test keys the delegated-action vectors add to `r9-vectors-keys`:
 /// `(name, part, label, note)`, secret = SHA-256(enc(["atem-r9-test-key",
 /// label])). `enc` parts are X25519, `host_key` parts Ed25519.
-const DELEGATED_KEYS: [(&str, &str, &str, &str); 8] = [
+const DELEGATED_KEYS: [(&str, &str, &str, &str); 9] = [
     (
         "host-a-enc-1",
         "enc",
@@ -2460,6 +2460,12 @@ const DELEGATED_KEYS: [(&str, &str, &str, &str); 8] = [
         "enc",
         "host-b host_enc_key 1",
         "host-b's host encryption key (label \"host-b host_enc_key 1\")",
+    ),
+    (
+        "host-b-enc-2",
+        "enc",
+        "host-b host_enc_key 2",
+        "host-b's second host encryption key (label \"host-b host_enc_key 2\"): the host-envelope vectors' rotation of host-b",
     ),
     (
         "host-b-gen-2",
@@ -4537,6 +4543,13 @@ fn host_envelope_vectors(book: &Book) -> Value {
             host_id: "host-b".into(),
         },
     );
+    let rotate_b = g.enc_key(MAIL_B1, "host-b-enc-2", false);
+    g.entry(
+        "M11_rotate_b",
+        &b,
+        "host_enc_key: host-b rotates to host-b-enc-2 (a key it handed out)",
+        rotate_b,
+    );
 
     // Envelopes from host-a to host-b, sealed to host-b-enc-1, signed at B's
     // head (but where the point is another).
@@ -4734,6 +4747,20 @@ fn host_envelope_vectors(book: &Book) -> Value {
         MailPlain::Envelope(cancel(&task)),
         "host-b-enc-1",
     );
+    let f = g.fields(
+        "cancel_to_new_key",
+        MAIL_A1,
+        MAIL_B1,
+        "host-b-enc-2",
+        &on_b(&["M11_rotate_b"]),
+    );
+    g.seal(
+        "cancel_to_new_key",
+        "a cancel sealed to host-b's new key host-b-enc-2, signed at the head of B + M11_rotate_b (seq 11), where host-a's list has the rotation",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-2",
+    );
     let f = g.fields("cancel_to_a", MAIL_B1, MAIL_A1, "host-a-enc-1", &b);
     g.seal(
         "cancel_to_a",
@@ -4819,7 +4846,7 @@ fn host_envelope_vectors(book: &Book) -> Value {
     );
     g.edit(
         "tampered_ct",
-        "the request with a byte of its ciphertext flipped in transit",
+        "the request with a byte of its ciphertext changed after signing: not the sender's copy",
         "request",
         |v| {
             let mut ct = b64u_decode(v["ct"].as_str().unwrap()).unwrap();
@@ -5064,14 +5091,25 @@ fn host_envelope_vectors(book: &Book) -> Value {
         e,
         "a tampered sealed_hash breaks the signature",
     );
-    let e = g.refused_authenticated("tampered_ct", "sealed_hash_mismatch");
+    let e = g.refused("tampered_ct", "sealed_hash_mismatch");
     at(
         &mut g,
         "tampered_ct",
         "tampered_ct",
         &b,
         e,
-        "the sealed_hash names other bytes than the sealed part",
+        "the signed sealed_hash names other bytes than the sealed part: the signature never covered them, so the copy isn't the sender's (refused unauthenticated, claiming no id; the sender's own copy still opens)",
+    );
+    let e = g.refused("tampered_ct", "sealed_hash_mismatch");
+    g.check(
+        "tampered_ct_expired",
+        "the same copy at its expires_at: intact before any authenticated verdict, so still sealed_hash_mismatch, never expired",
+        "tampered_ct",
+        &b,
+        to_b,
+        MAIL_EXPIRES,
+        None,
+        e,
     );
     let e = g.refused("request", "signed_at_head_before_generation");
     at(
@@ -5137,6 +5175,49 @@ fn host_envelope_vectors(book: &Book) -> Value {
         MAIL_EXPIRES,
         None,
         e,
+    );
+    at(
+        &mut g,
+        "revoked_sender_head_ahead_pending",
+        "removed_head_ahead",
+        &on_b(&["M11_revoke_a"]),
+        mail_pending(MAIL_A1),
+        "a revoked host's envelope signed beyond the receiver's head waits: a readmit may be among the entries it lacks",
+    );
+    at(
+        &mut g,
+        "readmitted_sender_opens",
+        "removed_head_ahead",
+        &on_b(&["M11_revoke_a", "M12_readmit_a"]),
+        mail_open("host-a"),
+        "the same object once the list has the readmit it was signed after",
+    );
+    at(
+        &mut g,
+        "new_key_head_ahead_pending",
+        "cancel_to_new_key",
+        &b,
+        mail_pending(MAIL_A1),
+        "sealed to a key host-b handed out but hasn't applied (its host_enc_key is beyond its head): it waits",
+    );
+    g.check(
+        "new_key_opens",
+        "once host-b applies the rotation and lists the key, it opens",
+        "cancel_to_new_key",
+        &on_b(&["M11_rotate_b"]),
+        (MAIL_B1, &["host-b-enc-2", "host-b-enc-1"]),
+        MAIL_NOW,
+        None,
+        mail_open("host-a"),
+    );
+    let e = g.refused("cancel_to_new_key", "enc_key_not_accepted");
+    at(
+        &mut g,
+        "new_key_not_listed",
+        "cancel_to_new_key",
+        &on_b(&["M11_rotate_b"]),
+        e,
+        "the rotation applied but the key not listed: this head settles it",
     );
     let e = g.refused("evil_at_head_9", "unknown_sender");
     at(
