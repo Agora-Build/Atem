@@ -1837,6 +1837,199 @@ mod control_records {
     }
 }
 
+/// `host_enc_key_get` (delegated host-work design II.4.1): a native
+/// manager gets the host's `{enc_key, enc_sig}` over its channel, to draft
+/// the `host_enc_key` entry. Sent only to a host that advertised
+/// `host.senders`, and its answer taken only for that request, from that
+/// host at its trust generation.
+mod host_enc_key_get {
+    use super::*;
+    use atem_client::membership::{Action, check_change, verify_host_enc_sig};
+    use atem_client::session::host_work::SENDERS_FEATURE;
+    use atem_client::session::r9::{HostEncKey, host_enc_key_get};
+    use support::host::HOST_ENC_PUB;
+
+    const MINE: &str = "aaaaaaaa-0000-4000-8000-0000000000f3";
+
+    fn advertise_senders(world: &World) {
+        world.core.lock().unwrap().welcome_override =
+            Some(|w| w.features.push(SENDERS_FEATURE.into()));
+    }
+
+    /// The `host_enc_key` a family event carries, if it is one.
+    fn answer_of(events: &[Event]) -> Option<HostEncKey> {
+        events.iter().find_map(|e| match e {
+            Event::Family(f) => f
+                .data
+                .as_ref()
+                .filter(|d| d["op"] == "host_enc_key")
+                .map(|d| HostEncKey::from_data(d).expect("a host_enc_key")),
+            _ => None,
+        })
+    }
+
+    /// A host that doesn't advertise `host.senders` is never sent the op,
+    /// by the method or by the generic `send`: nothing is sealed, so the
+    /// channel carries on.
+    #[test]
+    fn client_refuses_without_feature() {
+        let world = World::new(&L);
+        let now = || world.mono();
+        let mac = Device::native(&world, "dev-mac", world.log(&L));
+        let mut wire = world.tcp();
+        let mut attached = mac.connect(&mut wire).unwrap();
+        assert_eq!(
+            attached.send_host_enc_key_get(now()).err(),
+            Some(ConnectError::Request("host feature not available"))
+        );
+        assert_eq!(
+            attached.send(&host_enc_key_get(MINE), now()).err(),
+            Some(ConnectError::Request("host feature not available"))
+        );
+        assert_eq!(list(&mut attached, &mut wire, now()), vec![SES_A, SES_B]);
+    }
+
+    /// The answer is everything a manager needs to draft the entry: the
+    /// host's key and its `enc_sig`, which verifies with the `host_key` of
+    /// the host's newest `add_host` in the manager's own log, and an action
+    /// the drafting guard takes.
+    #[test]
+    fn the_answer_drafts_the_entry() {
+        let world = World::new(&L);
+        let now = || world.mono();
+        advertise_senders(&world);
+        let log = world.log(&L);
+        let mac = Device::native(&world, "dev-mac", log.clone());
+        let mut wire = world.tcp();
+        let mut attached = mac.connect(&mut wire).unwrap();
+        let (id, frame) = attached.send_host_enc_key_get(now()).unwrap();
+        let events = exchange(&mut attached, &mut wire, &frame, now(), |e| {
+            answer_of(e).is_some()
+        });
+        let answer = answer_of(&events).unwrap();
+        let w = attached.welcome();
+        assert!(answer.answers(&id, &w.atem_device_id, w.host_trust_gen));
+        assert_eq!(answer.enc_key.as_bytes(), HOST_ENC_PUB);
+        let host = log.host(&answer.host_id).expect("a current host");
+        assert_eq!(host.host_trust_gen, answer.host_trust_gen);
+        assert_eq!(
+            verify_host_enc_sig(
+                &host.host_key,
+                log.account_id(),
+                &log.genesis_hash(),
+                &answer.host_id,
+                answer.host_trust_gen,
+                &HOST_ENC_PUB,
+                &answer.enc_sig,
+            ),
+            Ok(())
+        );
+        let action = answer.action(false, WALL).unwrap();
+        assert!(matches!(action, Action::HostEncKey { .. }));
+        assert_eq!(check_change(&log, &action, WALL), Ok(()));
+        // The generic `send` is checked like the method: a hand-built
+        // request goes, and its answer is taken; its id is busy until then.
+        let message = host_enc_key_get(MINE);
+        let frame = attached.send(&message, now()).unwrap();
+        assert_eq!(
+            attached.send(&message, now()).err(),
+            Some(ConnectError::Request("duplicate host enc key id"))
+        );
+        let mut bad = message.clone();
+        bad["data"]["extra"] = json!(1);
+        assert_eq!(
+            attached.send(&bad, now()).err(),
+            Some(ConnectError::Request("not a host_enc_key_get message"))
+        );
+        let events = exchange(&mut attached, &mut wire, &frame, now(), |e| {
+            answer_of(e).is_some()
+        });
+        assert_eq!(answer_of(&events).unwrap().re, MINE);
+        assert!(
+            attached.send(&message, now()).is_ok(),
+            "answered: free again"
+        );
+    }
+
+    /// An answer to nothing the client asked, or from another host or
+    /// trust generation than the channel's, is a malformed host message.
+    #[test]
+    fn an_answer_that_answers_nothing_asked_is_refused() {
+        type Rewrite = fn(&mut HostEncKey);
+        let cases: [(Rewrite, &str); 3] = [
+            (
+                |a| a.re = "aaaaaaaa-0000-4000-8000-0000000000f1".into(),
+                "another request",
+            ),
+            (|a| a.host_id = "host-b".into(), "another host"),
+            (|a| a.host_trust_gen += 1, "another trust generation"),
+        ];
+        for (rewrite, why) in cases {
+            let world = World::new(&L);
+            let now = || world.mono();
+            advertise_senders(&world);
+            world.core.lock().unwrap().host_enc_key_override = Some(rewrite);
+            let mac = Device::native(&world, "dev-mac", world.log(&L));
+            let mut wire = world.tcp();
+            let mut attached = mac.connect(&mut wire).unwrap();
+            let (_, frame) = attached.send_host_enc_key_get(now()).unwrap();
+            wire.send(&frame);
+            let reply = wire.recv().expect("a reply");
+            assert_eq!(
+                attached.on_frame(&reply, now()).err(),
+                Some(ConnectError::Malformed("unbound host enc key")),
+                "{why}"
+            );
+        }
+    }
+
+    /// At most 64 requests wait for their answers; an answer, or an error
+    /// naming the request, frees its place.
+    #[test]
+    fn outstanding_requests_are_bounded_and_answers_clear_them() {
+        let world = World::new(&L);
+        let now = || world.mono();
+        advertise_senders(&world);
+        let log = world.log(&L);
+        let drain = |attached: &mut Attached, wire: &mut Wire, n: usize| {
+            for _ in 0..n {
+                let reply = wire.recv().expect("a reply");
+                attached.on_frame(&reply, now()).unwrap();
+            }
+        };
+        let mac = Device::native(&world, "dev-mac", log.clone());
+        let mut wire = world.tcp();
+        let mut attached = mac.connect(&mut wire).unwrap();
+        for _ in 0..64 {
+            let (_, frame) = attached.send_host_enc_key_get(now()).unwrap();
+            wire.send(&frame);
+        }
+        assert_eq!(
+            attached.send_host_enc_key_get(now()).err(),
+            Some(ConnectError::Request("too many host enc key requests"))
+        );
+        drain(&mut attached, &mut wire, 64);
+        let (_, frame) = attached.send_host_enc_key_get(now()).unwrap();
+        wire.send(&frame);
+        drain(&mut attached, &mut wire, 1);
+        // Refused by the host (a service is no native): an error with `re`
+        // frees the place too.
+        let bot = Device::service(&world, "svc-discord", log);
+        let mut wire = world.tcp();
+        let mut attached = bot.connect(&mut wire).unwrap();
+        for _ in 0..64 {
+            let (_, frame) = attached.send_host_enc_key_get(now()).unwrap();
+            wire.send(&frame);
+        }
+        drain(&mut attached, &mut wire, 64);
+        let (_, frame) = attached.send_host_enc_key_get(now()).unwrap();
+        let events = exchange(&mut attached, &mut wire, &frame, now(), |e| {
+            error_code(e).is_some()
+        });
+        assert_eq!(error_code(&events).as_deref(), Some("forbidden"));
+    }
+}
+
 /// `work_interrupt` and `work_resolve` (delegated host-work design I.4.5)
 /// on the client: host-work requests of `host.delegated`, sent only to a
 /// host that advertised it, read as the host reads them, and tracked until

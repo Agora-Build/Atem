@@ -3327,3 +3327,80 @@ mod delegated_work_ops {
         assert_eq!(rig.engine.take_host_work().len(), 1);
     }
 }
+
+/// `host_enc_key_get` (delegated host-work design II.4.1, feature
+/// `host.senders`): refused like `control_records` until the host
+/// advertises the feature.
+mod host_enc_key_get {
+    use super::*;
+    use atem_client::session::host_work::SENDERS_FEATURE;
+    use atem_client::session::r9::host_enc_key_get;
+
+    const ID: &str = "aaaaaaaa-0000-4000-8000-0000000000e1";
+
+    /// What `handle` got back for a `host_enc_key_get` the host was handed
+    /// (as a misbehaving or newer client's would arrive: the client core
+    /// never sends it to a host that didn't advertise `host.senders`):
+    /// exactly one message, an error naming the request.
+    fn refusal(rig: &mut Rig, handle: &str) -> (String, Option<String>) {
+        let (att, authority) = match &rig.engine.chans[handle].phase {
+            Phase::Open(a) => (a.attachment.clone(), a.authority.clone()),
+            _ => panic!("{handle} is open"),
+        };
+        let plain = host_enc_key_get(ID).to_string().into_bytes();
+        rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
+        rig.pump();
+        let events = rig.events(handle);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let CEvent::Error(e) = &events[0] else {
+            panic!("an error: {events:?}");
+        };
+        assert_eq!(e.re.as_deref(), Some(ID));
+        (e.code.clone(), e.detail.clone())
+    }
+
+    #[test]
+    fn host_refuses_unadvertised() {
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-bot", bot());
+        rig.advance(1000);
+        let browser = browser_of(&mut rig, 1);
+        rig.connect("ch-browser", browser);
+        for handle in ["ch-phone", "ch-bot", "ch-browser"] {
+            assert!(
+                !welcome(&mut rig, handle)
+                    .features
+                    .iter()
+                    .any(|f| f == SENDERS_FEATURE),
+                "{handle}"
+            );
+        }
+        // A native member: the op is the feature's, so it is not supported
+        // here (whether it holds `manage` is the handler's question, which
+        // this host never reaches).
+        assert_eq!(
+            refusal(&mut rig, "ch-phone"),
+            (
+                "unsupported_version".into(),
+                Some("host.senders is not advertised".into())
+            )
+        );
+        // A service or a browser has no right to it either way.
+        assert_eq!(refusal(&mut rig, "ch-bot").0, "forbidden");
+        assert_eq!(refusal(&mut rig, "ch-browser").0, "forbidden");
+        // With hosting on, the same: the feature is still not advertised.
+        rig.engine.enable_host_work(true);
+        assert_eq!(refusal(&mut rig, "ch-phone").0, "unsupported_version");
+        // The channels are as they were, and nothing else came of it.
+        assert_eq!(rig.engine.status().attachments, 3);
+        assert_eq!(
+            rig.list("ch-phone"),
+            vec![SID.to_string(), SID_B.to_string()]
+        );
+        assert!(rig.engine.take_host_work().is_empty());
+        assert!(rig.relay.is_empty());
+    }
+}

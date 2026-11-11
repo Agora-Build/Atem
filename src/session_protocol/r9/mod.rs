@@ -6,7 +6,8 @@
 //! `approval_seen`, and the fences: each attachment is fenced on its own
 //! (its `attachment_gen`), a principal's attachments together (its §H
 //! `control_gen`). An op of a feature the welcome doesn't list (today
-//! `control_records`, of `host.senders`) is `unsupported_version`.
+//! `control_records` and `host_enc_key_get`, of `host.senders`) is
+//! `unsupported_version`.
 //!
 //! Sans-I/O. The transport seam is the channel envelope ([`envelope`]):
 //! [`R9Host::link_up`]/[`R9Host::link_down`] for Atem's link, every
@@ -452,12 +453,14 @@ fn error(code: &str, re: Option<&str>, detail: Option<&str>) -> SessionError {
 }
 
 /// The feature of an op that exists only for delegated host work (plan
-/// decision 4): `control_records` is `host.senders`'s; `work_interrupt` and
-/// `work_resolve` are `host.delegated`'s; `alert_list` is `host.alerts`'s.
-/// `host_enc_key_get` (`host.senders`) joins them when it is specified.
+/// decision 4): `control_records` and `host_enc_key_get` are
+/// `host.senders`'s; `work_interrupt` and `work_resolve` are
+/// `host.delegated`'s; `alert_list` is `host.alerts`'s.
 fn delegated_feature_of(op: &str) -> Option<&'static str> {
     match op {
-        "control_records" => Some(atem_client::session::host_work::SENDERS_FEATURE),
+        "control_records" | "host_enc_key_get" => {
+            Some(atem_client::session::host_work::SENDERS_FEATURE)
+        }
         "work_interrupt" | "work_resolve" => {
             Some(atem_client::session::host_work::DELEGATED_FEATURE)
         }

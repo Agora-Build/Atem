@@ -4935,6 +4935,8 @@ principals = ["browser:b"]
             updated_at: 1,
             lease: None,
             result: None,
+            task_id: None,
+            sender: None,
         };
         use wire::{ReceiptKind, ReceiptState};
         assert!(turn_interrupted(&receipt(

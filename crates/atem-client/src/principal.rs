@@ -138,6 +138,11 @@ pub enum Need {
     /// `native` member holding `control`, the members that get approval
     /// hints. A service never does, whatever its ops, nor a browser.
     Alerts,
+    /// `host_enc_key_get` (delegated host work, II.4.1, feature
+    /// `host.senders`): a `native` member; the host also checks `manage` at
+    /// its current head when it handles the request, as for the host
+    /// policy (the answer drafts a device-list entry only a manager signs).
+    HostEncKey,
 }
 
 impl Need {
@@ -170,6 +175,7 @@ impl Need {
             ("session", "host_policy_set" | "host_policy_get") => Need::HostPolicy,
             ("session", "control_records") => Need::ControlRecords,
             ("session", "alert_list") => Need::Alerts,
+            ("session", "host_enc_key_get") => Need::HostEncKey,
             ("session", "host_profiles" | "host_launch" | "host_launch_query") => {
                 Need::Op(Op::Launch)
             }
@@ -772,7 +778,9 @@ impl Authority {
         match (&self.scope, need) {
             (_, Need::Control) => control,
             (_, Need::RevokeGrant) => self.client_kind != ClientKind::Browser && control,
-            (_, Need::HostPolicy | Need::ControlRecords) => self.client_kind == ClientKind::Native,
+            (_, Need::HostPolicy | Need::ControlRecords | Need::HostEncKey) => {
+                self.client_kind == ClientKind::Native
+            }
             (_, Need::Alerts) => self.client_kind == ClientKind::Native && control,
             (None, Need::Seen) => control,
             (Some(scope), Need::Seen) => control && scope.ops.contains(&Op::Approval),

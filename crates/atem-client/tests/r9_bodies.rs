@@ -81,6 +81,10 @@ fn a_grant_has_exactly_its_fields_and_a_p256_browser_key() {
         "a browser carries no control records"
     );
     assert!(!a.allows(Need::Alerts), "a browser is shown no alerts");
+    assert!(
+        !a.allows(Need::HostEncKey),
+        "a browser never asks for the host's encryption key"
+    );
     let g = BrowserGrant::parse(resign(&book, "dev-mac/auth", control.clone())).unwrap();
     assert_eq!(
         Authority::of_grant(&g, &log, "host-a", 1, 1_793_264_001_000, &|_| false),
@@ -556,6 +560,22 @@ fn one_authority_check_per_request() {
         Err(Denied::Forbidden),
         "a native member without control"
     );
+
+    // `host_enc_key_get` (design II.4.1) is a native member's: the channel
+    // admits no service or browser; whether the native holds `manage` at the
+    // head is the host's question when it handles the request (as for the
+    // host policy), so a native without `control` passes here too.
+    assert_eq!(
+        need("session", json!({"op": "host_enc_key_get"})),
+        Need::HostEncKey
+    );
+    assert_eq!(
+        bot.authorize(Need::HostEncKey, None),
+        Err(Denied::Forbidden),
+        "a service is no native"
+    );
+    assert_eq!(phone.authorize(Need::HostEncKey, None), Ok(()));
+    assert_eq!(viewer.authorize(Need::HostEncKey, None), Ok(()));
     let _ = book;
 }
 

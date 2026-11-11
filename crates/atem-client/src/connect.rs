@@ -9,7 +9,8 @@
 //!                    ── finish(hello) ──▶
 //! AwaitWelcome::on_frame ◀── rec 0 ─────── welcome | session error
 //! Attached: list / acquire / submit / receipt_query / approval_seen /
-//!           revoke_grant / membership / control_records, and on_frame → events
+//!           revoke_grant / membership / control_records / host_enc_key_get,
+//!           and on_frame → events
 //! ```
 //!
 //! Sans-I/O like the channel: the caller moves frames, passes the monotonic
@@ -21,7 +22,7 @@
 //! client verified (another revision, channel, principal or kind, a head
 //! behind the signed `accept`, or another entry at a seq the client holds
 //! on the same chain) is refused and the channel dropped.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::{Value, json};
 
@@ -433,6 +434,7 @@ impl AwaitWelcome {
         let mut attached = Attached {
             host_work: HashMap::new(),
             control_records: HashMap::new(),
+            host_enc_key: HashSet::new(),
             host_policy: HostPolicyTracker::new(&welcome, false),
             channel: self.channel,
             authorization_deadline: now_ms + lifetime,
@@ -562,6 +564,8 @@ pub struct Attached {
     /// `control_records` requests awaiting their results: the request's
     /// `id` and the `record_id`s it carried, in order.
     control_records: HashMap<String, Vec<String>>,
+    /// `host_enc_key_get` requests awaiting their answers, by `id`.
+    host_enc_key: HashSet<String>,
     channel: Channel,
     welcome: Welcome,
     host_head: HostHead,
@@ -693,13 +697,16 @@ impl Attached {
     }
 
     /// Any session-family message the app built (terminal-v1, chat-v1). Host
-    /// work ops and `control_records` are checked first, as their own
-    /// methods check them: against the features the host advertised, with
-    /// their request tracked until the host answers.
+    /// work ops, `control_records` and `host_enc_key_get` are checked first,
+    /// as their own methods check them: against the features the host
+    /// advertised, with their request tracked until the host answers.
     pub fn send(&mut self, message: &Value, now_ms: u64) -> Result<Vec<u8>, ConnectError> {
         let data = &message["data"];
         if message["type"] == "session" && data["op"] == "control_records" {
             return self.send_control_records_message(message, now_ms);
+        }
+        if message["type"] == "session" && data["op"] == "host_enc_key_get" {
+            return self.send_host_enc_key_get_message(message, now_ms);
         }
         if message["type"] == "session"
             && matches!(
@@ -1064,6 +1071,49 @@ impl Attached {
         Ok(frame)
     }
 
+    /// `host_enc_key_get`: a native manager asks the host for the encryption
+    /// key it vouches for, to draft the `host_enc_key` entry
+    /// ([`crate::session::r9::host_enc_key_get`]). Only to a host that
+    /// advertised `host.senders` ("host feature not available" otherwise:
+    /// nothing is sealed). The answer, a `host_enc_key` of this channel's
+    /// host at its trust generation, arrives as a `session`
+    /// [`Event::Family`] message (read it with
+    /// [`crate::session::r9::HostEncKey::from_data`]).
+    pub fn send_host_enc_key_get(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<(String, Vec<u8>), ConnectError> {
+        let id = new_id();
+        let frame = self.send(&crate::session::r9::host_enc_key_get(&id), now_ms)?;
+        Ok((id, frame))
+    }
+
+    /// A `host_enc_key_get` message, however it was built: read as the host
+    /// reads it, sent only to a host that advertised `host.senders` and
+    /// tracked until its answer comes ([`Attached::on_frame`] takes no
+    /// answer nobody asked for).
+    fn send_host_enc_key_get_message(
+        &mut self,
+        message: &Value,
+        now_ms: u64,
+    ) -> Result<Vec<u8>, ConnectError> {
+        let senders = crate::session::host_work::SENDERS_FEATURE;
+        if !self.welcome.features.iter().any(|f| f == senders) {
+            return Err(ConnectError::Request("host feature not available"));
+        }
+        let request = crate::session::r9::HostEncKeyGet::decode(message.to_string().as_bytes())
+            .map_err(ConnectError::Request)?;
+        if self.host_enc_key.contains(&request.id) {
+            return Err(ConnectError::Request("duplicate host enc key id"));
+        }
+        if self.host_enc_key.len() >= 64 {
+            return Err(ConnectError::Request("too many host enc key requests"));
+        }
+        let frame = self.seal(message, now_ms)?;
+        self.host_enc_key.insert(request.id);
+        Ok(frame)
+    }
+
     /// Opens one record and runs it through the machines. A failed record
     /// closes the channel (`ConnectError::Channel`).
     pub fn on_frame(&mut self, frame: &[u8], now_ms: u64) -> Result<Vec<Event>, ConnectError> {
@@ -1131,10 +1181,26 @@ impl Attached {
                     request: None,
                 })]);
             }
+            Incoming::HostEncKey(answer) => {
+                let w = &self.welcome;
+                let bound = self.host_enc_key.contains(&answer.re)
+                    && answer.answers(&answer.re, &w.atem_device_id, w.host_trust_gen);
+                if !bound {
+                    return Err(ConnectError::Malformed("unbound host enc key"));
+                }
+                self.host_enc_key.remove(&answer.re);
+                return Ok(vec![Event::Family(FamilyMessage {
+                    family: "session".into(),
+                    data: Some(answer.to_json()["data"].clone()),
+                    binding: None,
+                    request: None,
+                })]);
+            }
             Incoming::Error(error) => {
                 if let Some(re) = &error.re {
                     self.host_work.remove(re);
                     self.control_records.remove(re);
+                    self.host_enc_key.remove(re);
                 }
                 // r8's machines see r8's errors (a lease request's refusal).
                 if let Ok(Envelope::Session(msg)) = wire::decode(&plain) {
