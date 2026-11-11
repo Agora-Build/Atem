@@ -14,9 +14,11 @@
 //!   enc_sig}` from the host over its channel; the binding verifies on its
 //!   own, so the carrier needs no trust.
 //! - **Valid** when the host is current, `host_trust_gen` is its newest
-//!   `add_host`'s (else `host_trust_gen_not_current`), and `enc_sig`
-//!   verifies with that `add_host`'s `host_key` (else `bad_enc_sig`). The
-//!   entry itself is signed by a native manager like every entry.
+//!   `add_host`'s (else `host_trust_gen_not_current`), `enc_sig` verifies
+//!   with that `add_host`'s `host_key` (else `bad_enc_sig`), and `enc_key`
+//!   isn't the host's current key (else `same_enc_key`: its previous key
+//!   would be the live one, same kid, and `retire_previous` would retire
+//!   it). The entry itself is signed by a native manager like every entry.
 //! - **Rotation.** A newer entry for the same generation replaces the key
 //!   and keeps the one it replaced as the previous key (one only); with
 //!   `retire_previous` (after a suspected compromise) the previous key is
@@ -123,16 +125,17 @@ impl EncKeys {
         self.by_host.remove(host_id);
     }
 
-    fn get(&self, host_id: &str) -> Option<&HostEncKeys> {
+    pub(super) fn get(&self, host_id: &str) -> Option<&HostEncKeys> {
         self.by_host.get(host_id)
     }
 }
 
 /// The chain rule (II.4.1) for a `host_enc_key` of a current host whose
-/// newest `add_host` is `host` (the caller refuses one that isn't current,
-/// `not_a_host`).
+/// newest `add_host` is `host` and whose keys at `seq-1` are `keys` (the
+/// caller refuses one that isn't current, `not_a_host`).
 pub(super) fn check(
     host: &HostRecord,
+    keys: Option<&HostEncKeys>,
     account_id: &str,
     genesis_hash: &Hash32,
     host_trust_gen: u64,
@@ -157,7 +160,12 @@ pub(super) fn check(
         enc_pub,
         enc_sig,
     )
-    .map_err(|_| Invalid::BadEncSig)
+    .map_err(|_| Invalid::BadEncSig)?;
+    // Only after the binding: a key the host vouched for, set again.
+    if keys.is_some_and(|k| k.current.key == *enc_key) {
+        return Err(Invalid::SameEncKey);
+    }
+    Ok(())
 }
 
 impl Membership {
@@ -318,24 +326,41 @@ mod tests {
             &[9; 32],
         )
         .unwrap();
-        assert_eq!(check(&host, "acct", &genesis, 2, &enc, &sig), Ok(()));
+        assert_eq!(check(&host, None, "acct", &genesis, 2, &enc, &sig), Ok(()));
         assert_eq!(
-            check(&host, "acct", &genesis, 1, &enc, &sig),
+            check(&host, None, "acct", &genesis, 1, &enc, &sig),
             Err(Invalid::HostTrustGenNotCurrent)
         );
         assert_eq!(
-            check(&host, "acct", &genesis, 2, &x(8), &sig),
+            check(&host, None, "acct", &genesis, 2, &x(8), &sig),
             Err(Invalid::BadEncSig)
         );
         assert_eq!(
-            check(&host, "other", &genesis, 2, &enc, &sig),
+            check(&host, None, "other", &genesis, 2, &enc, &sig),
             Err(Invalid::BadEncSig)
         );
         // The same 32 bytes as an Ed25519 key: never an encryption key.
         let ed = crate::kit::recovery_key_of_seed(&[6; 32]);
         assert_eq!(
-            check(&host, "acct", &genesis, 2, &ed, &sig),
+            check(&host, None, "acct", &genesis, 2, &ed, &sig),
             Err(Invalid::WrongAlg)
+        );
+        // The current key set again is refused once its binding verifies;
+        // a key that is only the previous one isn't.
+        let mut keys = EncKeys::default();
+        keys.set("host-a", &enc, 2, false, 3);
+        assert_eq!(
+            check(&host, keys.get("host-a"), "acct", &genesis, 2, &enc, &sig),
+            Err(Invalid::SameEncKey)
+        );
+        assert_eq!(
+            check(&host, keys.get("host-a"), "acct", &genesis, 1, &enc, &sig),
+            Err(Invalid::HostTrustGenNotCurrent)
+        );
+        keys.set("host-a", &x(8), 2, true, 4);
+        assert_eq!(
+            check(&host, keys.get("host-a"), "acct", &genesis, 2, &enc, &sig),
+            Ok(())
         );
     }
 }

@@ -515,6 +515,57 @@ fn retire_previous_retires_at_once() {
 }
 
 #[test]
+fn same_enc_key_refused() {
+    let mut log = Log::new();
+    log.add_host("host-a", 1);
+    log.add_host("host-b", 1);
+    let k1 = log.enc_key("1");
+    let k2 = log.enc_key("2");
+    let s1 = log.set_key("host-a", 1, &k1, false);
+    // The current key set again, with or without `retire_previous`: the
+    // previous key would be the current one (same kid), and retiring it
+    // would retire the live key.
+    for retire_previous in [false, true] {
+        let again = log.entry("host-a", 1, &k1, retire_previous);
+        assert_eq!(log.check(&again), invalid(Invalid::SameEncKey));
+    }
+    assert_eq!(Invalid::SameEncKey.code(), "same_enc_key");
+    assert_eq!(
+        *log.keys("host-a").unwrap(),
+        HostEncKeys {
+            current: enc_key_of(&k1, s1, 1),
+            previous: None,
+        }
+    );
+    // A key that is only the previous one may come back; another host's
+    // current key is another host's.
+    let s2 = log.set_key("host-a", 1, &k2, false);
+    assert_eq!(log.check(&log.entry("host-a", 1, &k1, false)), Check::Valid);
+    assert_eq!(log.check(&log.entry("host-b", 1, &k2, false)), Check::Valid);
+    // The binding is checked first: another key's `enc_sig` is `bad_enc_sig`
+    // even over the current key.
+    let wrong = log.enc_sig("host-a", 1, &k1);
+    let action = host_enc_key("host-a", 1, &k2, &wrong, false, log.at).unwrap();
+    assert_eq!(log.check(&action), invalid(Invalid::BadEncSig));
+    // A newer `add_host` voids the keys: nothing is current, so the same
+    // key under the new generation is a new key there.
+    let host_key = log
+        .hosts
+        .generate(host_key_id("host-a", 2), Alg::Ed25519)
+        .unwrap();
+    log.apply(Action::AddHost {
+        host: HostRecord {
+            host_id: "host-a".into(),
+            host_trust_gen: 2,
+            host_key,
+        },
+    });
+    assert_eq!(log.keys("host-a"), None);
+    assert_eq!(log.check(&log.entry("host-a", 2, &k2, false)), Check::Valid);
+    assert_ne!(s1, s2);
+}
+
+#[test]
 fn newer_add_host_voids_keys() {
     let mut log = Log::new();
     log.add_host("host-a", 1);

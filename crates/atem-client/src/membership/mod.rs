@@ -178,6 +178,12 @@ pub enum Invalid {
     /// A `host_enc_key` whose `enc_sig` doesn't verify with the `host_key`
     /// of the host's newest `add_host` (II.4.1).
     BadEncSig,
+    /// A `host_enc_key` whose `enc_key` is the host's current key at
+    /// `seq-1`: its previous key would be the current one (the same kid),
+    /// and `retire_previous` would retire the live key. Every pairing and
+    /// `atem pair verify` makes a new key, so nothing legitimate sets the
+    /// current one again.
+    SameEncKey,
     /// The log (or its member or host list) is full.
     LogFull,
     /// More than 64 entries or 256 KiB in one carriage.
@@ -225,6 +231,7 @@ impl Invalid {
             Invalid::NotRevoked => "not_revoked",
             Invalid::HostTrustGenNotCurrent => "host_trust_gen_not_current",
             Invalid::BadEncSig => "bad_enc_sig",
+            Invalid::SameEncKey => "same_enc_key",
             Invalid::LogFull => "log_full",
             Invalid::CarriageTooLarge => "carriage_too_large",
         }
@@ -1218,6 +1225,7 @@ impl Membership {
                 };
                 host_enc_key::check(
                     &host.record,
+                    d.host_enc_keys.get(host_id),
                     &self.account_id,
                     &self.genesis_hash,
                     *host_trust_gen,
