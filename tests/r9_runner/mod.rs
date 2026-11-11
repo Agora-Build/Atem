@@ -115,6 +115,9 @@ pub fn not_expressible(scenario: &Value) -> Option<String> {
             "the client refusing an accept with the wrong head: no host acts in it (crates/atem-client/tests/channel_fixtures.rs)".into()
         }
         (_, Some("client")) => "the client's K backup and restore machines (relay CAS, envelopes, the kit): no host acts in it (crates/atem-client/tests/scenarios.rs)".into(),
+        (_, Some("relay")) if name.starts_with("r9-control-ack-") => {
+            "the Station's acknowledgment ledger and its reports to the Portal: the Station's (Astation's); Atem runs it against atem-client's reference AckLedger (crates/atem-client/tests/r9_fixtures.rs)".into()
+        }
         (_, Some("relay")) if name.starts_with("r9-chain-") => {
             "the relay's CAS appends: Astation's relay; Atem's reference check is crates/atem-client/tests/scenarios.rs (and membership_e2e::honest_concurrent_appends_never_fork)".into()
         }

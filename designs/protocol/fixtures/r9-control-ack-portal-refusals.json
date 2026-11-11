@@ -1,0 +1,300 @@
+{
+  "name": "r9-control-ack-portal-refusals",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "relay",
+  "log": "r9-vectors-membership-log",
+  "note": "The Portal's answers to reports (Auth/Portal, 2026-11-10). 200 confirms; a network error, a timeout, a 5xx, a 429 (after its Retry-After) or a 401 (after refreshing the station.report token) is retried with the same report_id and body; a final refusal (400, 404, 409 report_id_reused or invalid_state, 413, 415, any other 4xx) settles the report with an operator alert, and the reports waiting for it go once the others are settled; a 403 settles every report and stops reporting, with one alert, while counting goes on. Here host-b's report is confirmed after a 401; host-c's is refused for good (409); the deadline's revoked{deadline_passed} waits for neither once both are settled, is retried after a 503 and a 429, and then gets a 403: reporting stops, and host-d applying the revocation later makes no report. A restart keeps the stop.",
+  "setup": {
+    "station": {
+      "origin": "https://station-dev.agora.build",
+      "account_id": "acct-test-1",
+      "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89"
+    },
+    "records": "r9-vectors-host-work-control",
+    "integrations": {
+      "i-01jc5zq9x8w7v6t5s4r3q2p1n0": "service:svc-discord"
+    },
+    "links": {
+      "host-b": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "connection_id": "relay-1:host-b"
+      },
+      "host-c": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-c",
+        "host_trust_gen": 1,
+        "connection_id": "relay-1:host-c"
+      },
+      "host-d": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-d",
+        "host_trust_gen": 1,
+        "connection_id": "relay-1:host-d"
+      }
+    },
+    "station_now_ms": 1793620940000
+  },
+  "steps": [
+    {
+      "control_record": "S4_revoke",
+      "revoked_at_ms": 1793620903000,
+      "covered_hosts": [
+        "host-b",
+        "host-c",
+        "host-d"
+      ],
+      "made": []
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 1,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000004",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-b",
+      "made": [
+        "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+      ]
+    },
+    {
+      "report_failure": {
+        "report_id": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca",
+        "status": 401,
+        "answer": "retry"
+      }
+    },
+    {
+      "confirm": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-c",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 1,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000004",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-c",
+      "made": [
+        "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+      ]
+    },
+    {
+      "report_failure": {
+        "report_id": "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d",
+        "status": 409,
+        "code": "report_id_reused",
+        "answer": "refuse",
+        "alerts": [
+          {
+            "kind": "report_refused",
+            "report_id": "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+          }
+        ]
+      }
+    },
+    {
+      "expect_report": []
+    },
+    {
+      "expect_refused": [
+        "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+      ]
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-c",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 1,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000004",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-c",
+      "made": []
+    },
+    {
+      "advance_ms": 86363000
+    },
+    {
+      "tick": true,
+      "made": [
+        "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+      ]
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [
+            "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca",
+            "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+          ],
+          "report": {
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revoked",
+            "outcome": "deadline_passed",
+            "pending_hosts": [
+              "host-d"
+            ]
+          },
+          "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+        }
+      ]
+    },
+    {
+      "report_failure": {
+        "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1",
+        "status": 503,
+        "answer": "retry"
+      }
+    },
+    {
+      "report_failure": {
+        "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1",
+        "status": 429,
+        "answer": "retry"
+      }
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [
+            "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca",
+            "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+          ],
+          "report": {
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revoked",
+            "outcome": "deadline_passed",
+            "pending_hosts": [
+              "host-d"
+            ]
+          },
+          "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+        }
+      ]
+    },
+    {
+      "report_failure": {
+        "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1",
+        "status": 403,
+        "answer": "stop_reporting",
+        "alerts": [
+          {
+            "kind": "reporting_stopped",
+            "dropped": [
+              "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "expect_report": []
+    },
+    {
+      "expect_stopped": true
+    },
+    {
+      "expect_refused": [
+        "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d",
+        "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+      ]
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-d",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 1,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000004",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-d",
+      "made": []
+    },
+    {
+      "expect_report": []
+    },
+    {
+      "restart": true
+    },
+    {
+      "expect_stopped": true
+    },
+    {
+      "expect_report": []
+    },
+    {
+      "expect_portal": [
+        "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+      ]
+    }
+  ]
+}

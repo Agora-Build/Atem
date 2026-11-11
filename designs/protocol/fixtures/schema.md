@@ -321,6 +321,43 @@ client's records unwraps them. Without `link_up` no link exists.
 New `assert` keys: `channels` (channels open on the link),
 `attachments` (as r8).
 
+Station acknowledgment steps (`r9-control-ack-*`, `side: "relay"`;
+delegated host-work design I.5.8 and test 48, host-work-v1 §11.4). The
+fixture plays the hosts and the Portal against a Station's
+acknowledgment ledger (the reference is `atem_client::control::AckLedger`,
+exported to the bindings as `AckLedgerHandle`), with the Station's
+persistence: each transition's next state and its report intents are
+committed together before any POST, the Station adopts the next state only
+after the commit, and a restart reloads the committed state. Setup:
+`station` (`{origin, account_id, genesis_hash}`: the ledger's Station and
+device list), `records` (the vectors file the records' labels name:
+`r9-vectors-host-work-control`), `integrations` (`integration_id` →
+principal), `links` (each link's verified association by name: `{account_id,
+genesis_hash, host_id, host_trust_gen, connection_id}`) and
+`station_now_ms` (the Station's clock at the start). Every ledger call is
+made at the Station's clock.
+
+| step | meaning |
+|---|---|
+| `{"control_record": label, "revoked_at_ms"?: n, "covered_hosts": [host], "made": [report_id], "commit"?: false}` | the Station stores the record `label` in its feed and records it (`revoked_at_ms`, default the clock: when the Portal revoked the integration, for the Station's own first revoke); `made`: the report ids the transition made, in order; `commit: false`: the Station dies before the commit, and the transition is lost |
+| `{"control_ack": message, "link": name, "made": [report_id], "commit"?: false, "refused"?: code}` | a host's `control_ack` (the complete wire message, read with the strict reader) arrives on the link `name`; `refused`: the ledger refuses it whole with that code (`not_the_link`, `other_account`, `other_station`, `not_the_record`, `incomplete_link`, `malformed`) and nothing changes |
+| `{"tick": true, "made": [report_id], "commit"?: false}` | the Station's timer, at its clock |
+| `{"advance_ms": n}` | the Station's clock moves |
+| `{"restart": true}` | the Station restarts: it reloads its last committed state |
+| `{"replica": step}` | two replicas load the same committed state and process `step` (a record, an ack or a tick): the same next state and intents, byte for byte; the first commits, the second's compare-and-swap fails and it processes `step` again on the new state, making nothing |
+| `{"expect_report": [intent]}` | what the Station sends now, in order (`pending_reports`), exactly: each `{"not_before": [report_id], "report": {…}, "report_id": "…"}`, the report `{"kind": "revocation_applied", "integration_id", "host", "record_id"}` or `{"kind": "revoked", "integration_id", "outcome", "pending_hosts"}` |
+| `{"confirm": report_id}` | the Station POSTs that report (it must be sendable now) and the Portal answers `200` (for a repeat, its recorded `200`): `confirm`, committed |
+| `{"report_failure": {"report_id", "status": n \| "no_answer", "code"?, "reached"?: true, "answer", "alerts"?: [alert]}}` | the Station POSTs that report and the Portal's answer is `status` (`no_answer`: a network error or a timeout; `reached`: the Portal recorded it before the answer was lost; `code`: the Portal's error code, for the reader). `answer` is its class (`ReportAnswer`: `retry`, `refuse`, `stop_reporting`): `retry` changes nothing, `refuse` is `refuse(report_id)` and `stop_reporting` is `stop_reporting()`, committed, and `alerts` are the operator alerts that transition raised (`{"kind": "report_refused", "report_id"}`, `{"kind": "reporting_stopped", "dropped": [report_id]}`; none when absent) |
+| `{"expect_resign_alerts": [label]}` | the records still alerted for re-signing (`resign_alerts`), by label |
+| `{"expect_refused": [report_id]}`, `{"expect_stopped": bool}` | the reports refused for good (and those a stop dropped), sorted; whether reporting stopped |
+| `{"expect_portal": [report_id]}` | the report ids the Portal recorded, sorted, each with one body (a runner without a Portal model skips it) |
+
+An unknown step or key fails the run. The report ids are known answers:
+`scripts/check-r9-vectors.py` recomputes every one in these files from its
+definition (host-work-v1 §11.4, "Reports") and its report's integration
+and host. They run in `crates/atem-client/tests/r9_fixtures.rs` and in the
+Swift, Kotlin and WASM conformance suites (through `AckLedgerHandle`).
+
 In r9 scenarios `advance_ms` moves the host's (or relay's) monotonic
 and wall clocks together, and `set_wall_clock` the wall clock only.
 `expect_push` takes `due_at` (the stage's due time on the relay's clock,

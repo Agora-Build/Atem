@@ -242,6 +242,21 @@ pub enum LedgerAlert {
     ReportingStopped { dropped: Vec<String> },
 }
 
+impl LedgerAlert {
+    /// `{"kind":"report_refused","report_id":"…"}` or
+    /// `{"kind":"reporting_stopped","dropped":[…]}`.
+    pub fn to_json(&self) -> Value {
+        match self {
+            LedgerAlert::ReportRefused { report_id } => {
+                json!({"kind": "report_refused", "report_id": report_id})
+            }
+            LedgerAlert::ReportingStopped { dropped } => {
+                json!({"kind": "reporting_stopped", "dropped": dropped})
+            }
+        }
+    }
+}
+
 /// A report to the Portal, keyed by integration (the HTTP shape is Auth/
 /// Portal's, `platform.md`: `state` is [`Report::kind`], with `host` and
 /// `recordId`, or `outcome` and `pendingHosts`).
@@ -3093,6 +3108,10 @@ mod ack_ledger_tests {
                 report_id: a[0].report_id.clone()
             }]
         );
+        assert_eq!(
+            t.alerts[0].to_json(),
+            json!({"kind": "report_refused", "report_id": a[0].report_id})
+        );
         assert_eq!(l.pending_reports(), a, "the ledger refused on is unchanged");
         l = t.next;
         assert_eq!(l.pending_reports(), vec![]);
@@ -3127,6 +3146,10 @@ mod ack_ledger_tests {
         assert_eq!(
             t.alerts,
             vec![LedgerAlert::ReportingStopped { dropped: ids(&a) }]
+        );
+        assert_eq!(
+            t.alerts[0].to_json(),
+            json!({"kind": "reporting_stopped", "dropped": ids(&a)})
         );
         assert!(!l.reporting_stopped(), "the ledger stopped on is unchanged");
         l = t.next;

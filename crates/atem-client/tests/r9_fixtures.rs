@@ -1,12 +1,18 @@
 //! Runs the r9 push, seen, principal and multi-device scenarios
 //! (`designs/protocol/fixtures/r9-push-*`, `r9-seen-*`, `r9-approval-seen`,
-//! `r9-service-scope-and-expiry`, `r9-browser-grant`, `r9-multi-device-*`).
+//! `r9-service-scope-and-expiry`, `r9-browser-grant`, `r9-multi-device-*`),
+//! and the Station's acknowledgment scenarios (`r9-control-ack-*`, test 48).
 //!
 //! - `side: "relay"` scenarios run in full against the crate's reference
 //!   relay (`push::RelayLedger`: verification, the full-identity book, the
 //!   schedule from the signed `created_at`, seen, acks), the fixture
 //!   playing hosts and devices; a device opens its sealed part with its own
-//!   key.
+//!   key. The `r9-control-ack-*` ones run against the reference Station
+//!   ledger (`control::AckLedger`), the fixture playing the hosts and the
+//!   Portal, with the Station's persistence: a transition's next state and
+//!   its report intents committed together before any POST, adopted only
+//!   after the commit, restarts from the committed state, and replicas
+//!   serialized by compare-and-swap.
 //! - `side: "host"` scenarios run the client machines (`connect`) against
 //!   the test host of `support/host.rs`, built from the crate's responder
 //!   role and host-side decisions: admission and the welcome, §R9.6
@@ -19,7 +25,12 @@ mod support;
 
 use std::collections::{BTreeMap, VecDeque};
 
+use atem_client::canonical::jcs;
 use atem_client::connect::{Attached, ConnectError, Connector, Event, Identity};
+use atem_client::control::{
+    AckLedger, ControlRecord, LedgerTransition, LinkAssociation, ReportAnswer, ToStation,
+};
+use atem_client::encoding::Hash32;
 use atem_client::membership::Membership;
 use atem_client::principal::{Need, Op as AuthOp};
 use atem_client::push::{
@@ -363,6 +374,327 @@ fn run_relay(file: &Value, v: &Vectors, book: &Book) -> Report {
         run.report.name,
         run.pushes
     );
+    run.report
+}
+
+// --------------------------------------------- Station acknowledgments
+
+/// The Station side of `r9-control-ack-*` (test 48): the reference
+/// `AckLedger` with the Station's persistence around it. `committed` is
+/// the last state the Station committed; `ledger` is the state it adopted
+/// (the committed one, as `from_json` reads it after a restart). The
+/// Portal keeps the first body it recorded per `report_id` and answers a
+/// repeat with its recorded answer.
+struct AckRun {
+    /// The vectors' control records, by label.
+    records: BTreeMap<String, ControlRecord>,
+    links: BTreeMap<String, LinkAssociation>,
+    ledger: AckLedger,
+    committed: Value,
+    now: u64,
+    portal: BTreeMap<String, String>,
+    report: Report,
+}
+
+impl AckRun {
+    fn new(file: &Value) -> Self {
+        let setup = &file["setup"];
+        let records = load(setup["records"].as_str().unwrap())["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                let wire = v["record"].to_string();
+                (
+                    v["label"].as_str().unwrap().to_owned(),
+                    ControlRecord::parse(wire.as_bytes()),
+                )
+            })
+            .filter_map(|(label, parsed)| parsed.ok().map(|r| (label, r)))
+            .collect();
+        let station = &setup["station"];
+        let genesis = |v: &Value| Hash32::from_hex(v.as_str().unwrap()).unwrap();
+        let links = setup["links"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(name, l)| {
+                let link = LinkAssociation {
+                    account_id: l["account_id"].as_str().unwrap().into(),
+                    genesis_hash: genesis(&l["genesis_hash"]),
+                    host_id: l["host_id"].as_str().unwrap().into(),
+                    host_trust_gen: l["host_trust_gen"].as_u64().unwrap(),
+                    connection_id: l["connection_id"].as_str().unwrap().into(),
+                };
+                (name.clone(), link)
+            })
+            .collect();
+        let ledger = AckLedger::new(
+            station["origin"].as_str().unwrap(),
+            station["account_id"].as_str().unwrap(),
+            genesis(&station["genesis_hash"]),
+        )
+        .unwrap();
+        AckRun {
+            records,
+            links,
+            committed: ledger.to_json(),
+            ledger,
+            now: setup["station_now_ms"].as_u64().unwrap(),
+            portal: BTreeMap::new(),
+            report: Report {
+                name: file["name"].as_str().unwrap().into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.report.name
+    }
+
+    /// The transition an input step makes on `ledger`: a record, an ack
+    /// or a tick, at the Station's clock.
+    fn input(&self, ledger: &AckLedger, step: &Value) -> Option<LedgerTransition> {
+        if let Some(label) = step.get("control_record") {
+            let label = label.as_str().unwrap();
+            let rec = &self.records[label];
+            let covered: Vec<String> = step["covered_hosts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h.as_str().unwrap().to_owned())
+                .collect();
+            let revoked_at = step
+                .get("revoked_at_ms")
+                .map_or(self.now, |v| v.as_u64().unwrap());
+            let t = ledger.record(rec, revoked_at, &covered, self.now);
+            return Some(t.unwrap_or_else(|e| panic!("{}: record {label}: {e}", self.name())));
+        }
+        if let Some(message) = step.get("control_ack") {
+            // The Station reads the bytes as received, strictly.
+            let ToStation::ControlAck(ack) = ToStation::decode(message.to_string().as_bytes())
+                .unwrap_or_else(|e| panic!("{}: ack: {e}", self.name()))
+            else {
+                panic!("{}: not a control_ack", self.name());
+            };
+            let link = &self.links[step["link"].as_str().unwrap()];
+            let t = ledger.ack(link, &ack, self.now);
+            return match step.get("refused") {
+                Some(code) => {
+                    let e = t.expect_err("refused");
+                    assert_eq!(Some(e.code()), code.as_str(), "{}", self.name());
+                    None
+                }
+                None => Some(t.unwrap_or_else(|e| panic!("{}: ack: {e}", self.name()))),
+            };
+        }
+        if step.get("tick").is_some() {
+            return Some(ledger.tick(self.now));
+        }
+        panic!("{}: not an input step: {step}", self.name())
+    }
+
+    fn check_made(&self, t: &LedgerTransition, step: &Value) {
+        let made: Vec<String> = t.intents.iter().map(|i| i.report_id.clone()).collect();
+        let want: Vec<String> = step["made"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(made, want, "{}: made by {step}", self.name());
+        assert!(t.alerts.is_empty(), "{}", self.name());
+    }
+
+    /// Persists `t` (its next state with its intents) and adopts it.
+    fn commit(&mut self, t: LedgerTransition) {
+        self.committed = t.next.to_json();
+        self.ledger = t.next;
+    }
+
+    /// The Station POSTs the report `id` (sendable now); `recorded`: the
+    /// Portal recorded it (one body per `report_id`, for good).
+    fn post(&mut self, id: &str, recorded: bool) {
+        let intent = self
+            .ledger
+            .pending_reports()
+            .into_iter()
+            .find(|i| i.report_id == id)
+            .unwrap_or_else(|| panic!("{}: {id} is not sendable", self.name()));
+        if recorded {
+            let body = jcs(&intent.report.to_json()).unwrap();
+            let name = self.report.name.clone();
+            let first = self.portal.entry(id.to_owned()).or_insert(body.clone());
+            assert_eq!(*first, body, "{name}: one report_id, one body");
+        }
+    }
+
+    /// Every step kind and the keys it takes (an unknown step or key
+    /// fails the run).
+    const KINDS: [(&'static str, &'static [&'static str]); 13] = [
+        (
+            "control_record",
+            &["revoked_at_ms", "covered_hosts", "made", "commit"],
+        ),
+        ("control_ack", &["link", "made", "commit", "refused"]),
+        ("tick", &["made", "commit"]),
+        ("replica", &[]),
+        ("advance_ms", &[]),
+        ("restart", &[]),
+        ("expect_report", &[]),
+        ("confirm", &[]),
+        ("report_failure", &[]),
+        ("expect_resign_alerts", &[]),
+        ("expect_refused", &[]),
+        ("expect_stopped", &[]),
+        ("expect_portal", &[]),
+    ];
+
+    /// The step's kind, its keys checked.
+    fn kind_of(&self, step: &Value) -> &'static str {
+        let o = step.as_object().unwrap();
+        let (kind, keys) = AckRun::KINDS
+            .iter()
+            .find(|(kind, _)| o.contains_key(*kind))
+            .unwrap_or_else(|| panic!("{}: unknown step {step}", self.name()));
+        for key in o.keys() {
+            assert!(
+                key == kind || keys.contains(&key.as_str()),
+                "{}: unknown key {key} in {step}",
+                self.name()
+            );
+        }
+        kind
+    }
+
+    fn step(&mut self, step: &Value) {
+        match self.kind_of(step) {
+            "control_record" | "control_ack" | "tick" => {
+                let Some(t) = self.input(&self.ledger, step) else {
+                    self.report.pass();
+                    return;
+                };
+                self.check_made(&t, step);
+                if step.get("commit") != Some(&json!(false)) {
+                    self.commit(t);
+                }
+            }
+            "replica" => {
+                // Two replicas load the same committed state and process
+                // the same input: the same next state and intents.
+                let inner = &step["replica"];
+                let r1 = AckLedger::from_json(&self.committed).unwrap();
+                let r2 = AckLedger::from_json(&self.committed).unwrap();
+                let (t1, t2) = (
+                    self.input(&r1, inner).unwrap(),
+                    self.input(&r2, inner).unwrap(),
+                );
+                assert_eq!(t1, t2, "{}", self.name());
+                assert_eq!(
+                    jcs(&t1.next.to_json()).unwrap(),
+                    jcs(&t2.next.to_json()).unwrap()
+                );
+                self.check_made(&t1, inner);
+                // The first commits; the second's compare-and-swap fails,
+                // and it processes the input again on the new state.
+                self.commit(t1);
+                let again = AckLedger::from_json(&self.committed).unwrap();
+                let t = self.input(&again, inner).unwrap();
+                assert_eq!(t.intents, vec![], "{}: the replica that lost", self.name());
+                assert_eq!(t.next.to_json(), self.committed, "{}", self.name());
+            }
+            "advance_ms" => self.now += step["advance_ms"].as_u64().unwrap(),
+            "restart" => {
+                self.ledger = AckLedger::from_json(&self.committed).unwrap();
+                assert_eq!(self.ledger.to_json(), self.committed, "{}", self.name());
+            }
+            "expect_report" => {
+                let got: Vec<Value> = self
+                    .ledger
+                    .pending_reports()
+                    .iter()
+                    .map(|i| i.to_json())
+                    .collect();
+                assert_eq!(json!(got), step["expect_report"], "{}", self.name());
+            }
+            "confirm" => {
+                let id = step["confirm"].as_str().unwrap();
+                self.post(id, true);
+                let t = self.ledger.confirm(id);
+                self.commit(t);
+            }
+            "report_failure" => {
+                let f = &step["report_failure"];
+                let known = ["report_id", "status", "code", "reached", "answer", "alerts"];
+                assert!(
+                    f.as_object()
+                        .unwrap()
+                        .keys()
+                        .all(|k| known.contains(&k.as_str()))
+                );
+                let id = f["report_id"].as_str().unwrap();
+                self.post(id, f["reached"] == json!(true));
+                let answer = match &f["status"] {
+                    Value::String(s) if s == "no_answer" => ReportAnswer::Retry,
+                    status => ReportAnswer::of_status(status.as_u64().unwrap() as u16),
+                };
+                assert_eq!(Some(answer.code()), f["answer"].as_str(), "{}", self.name());
+                let t = match answer {
+                    ReportAnswer::Retry => None,
+                    ReportAnswer::Refuse => Some(self.ledger.refuse(id)),
+                    ReportAnswer::StopReporting => Some(self.ledger.stop_reporting()),
+                    ReportAnswer::Confirm => panic!("{}: a 200 is a confirm step", self.name()),
+                };
+                let alerts: Vec<Value> = t
+                    .iter()
+                    .flat_map(|t| t.alerts.iter().map(|a| a.to_json()))
+                    .collect();
+                assert_eq!(json!(alerts), f.get("alerts").cloned().unwrap_or(json!([])));
+                if let Some(t) = t {
+                    assert_eq!(t.intents, vec![], "{}", self.name());
+                    self.commit(t);
+                }
+            }
+            "expect_resign_alerts" => {
+                let mut want: Vec<String> = step["expect_resign_alerts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|l| self.records[l.as_str().unwrap()].record_id().to_owned())
+                    .collect();
+                want.sort();
+                assert_eq!(self.ledger.resign_alerts(), want, "{}", self.name());
+            }
+            "expect_refused" => {
+                assert_eq!(
+                    json!(self.ledger.refused_reports()),
+                    step["expect_refused"],
+                    "{}",
+                    self.name()
+                );
+            }
+            "expect_stopped" => {
+                assert_eq!(
+                    json!(self.ledger.reporting_stopped()),
+                    step["expect_stopped"]
+                );
+            }
+            "expect_portal" => {
+                let got: Vec<&String> = self.portal.keys().collect();
+                assert_eq!(json!(got), step["expect_portal"], "{}", self.name());
+            }
+            _ => unreachable!(),
+        }
+        self.report.pass();
+    }
+}
+
+fn run_control_ack(file: &Value) -> Report {
+    let mut run = AckRun::new(file);
+    for step in file["steps"].as_array().unwrap() {
+        run.step(step);
+    }
     run.report
 }
 
@@ -877,4 +1209,31 @@ fn r9_push_seen_principal_and_multi_device_scenarios() {
         passed += report.passed;
     }
     eprintln!("total: {passed} checked, pending {pending:?}");
+}
+
+/// Test 48's relay fixtures (`r9-control-ack-*`): the Station's
+/// acknowledgment ledger, its persistence and the Portal's answers.
+#[test]
+fn r9_control_ack_scenarios() {
+    let mut names: Vec<String> = std::fs::read_dir(fixtures_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with("r9-control-ack-") && n.ends_with(".json"))
+        .map(|n| n.trim_end_matches(".json").to_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 5, "{names:?}");
+    let mut passed = 0;
+    for name in &names {
+        let file = load(name);
+        assert_eq!(file["name"], *name);
+        assert_eq!(file["requires"], "r9");
+        assert_eq!(file["kind"], "scenario");
+        assert_eq!(file["side"], "relay");
+        let report = run_control_ack(&file);
+        eprintln!("{name}: {} checked", report.passed);
+        assert!(report.pending.is_empty() && report.passed > 0, "{name}");
+        passed += report.passed;
+    }
+    eprintln!("total: {passed} checked");
 }
