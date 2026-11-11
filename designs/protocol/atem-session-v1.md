@@ -4346,14 +4346,24 @@ agreement.
      input does", not whether it has one). The attempt's prompt receipt
      completes with the turn's outcome (`interrupted`, §6).
    - **Pending until done.** An intent stays pending until the turn was
-     interrupted or ended, or the attempt was withdrawn. The interrupt is
-     written **once per turn** in a runtime's run. On later passes while
-     the intent is pending, only the lease revocation repeats: a lease a
-     native takes over during the turn is revoked again on the next pass,
-     so a takeover can't defeat the owner's choice. After a restart a
-     pending intent is carried out again, writing once more if that turn
-     is still the session's current turn; a turn that has already ended
-     makes it do nothing.
+     interrupted or ended, or the attempt was withdrawn.
+     - The interrupt is **delivered once per turn** in a runtime's run:
+       written, and reported written by the worker.
+     - **A consumed write is written again.** If the worker reports the
+       write consumed rather than written, the runtime writes it again on
+       the next pass. On Codex this happens when an approval hook is
+       waiting: the Esc only hands the approval to Codex's own dialog
+       (what a remote interrupt reports as "the approval was handed to
+       the terminal; interrupt again to stop the turn"). Each consumed
+       write releases a waiting hook, so the repeats end, and a turn is
+       never left in the dialog past its task's deadline.
+     - On later passes while the intent is pending, only the lease
+       revocation repeats: a lease a native takes over during the turn
+       is revoked again on the next pass, so a takeover can't defeat the
+       owner's choice.
+     - After a restart a pending intent is carried out again, delivering
+       once more if that turn is still the session's current turn; a
+       turn that has already ended makes it do nothing.
 
 6. **§H recovery.** The `host-work` principal's requests are never
    confirmed. Before anything is dispatched, each recovered `accepted`
