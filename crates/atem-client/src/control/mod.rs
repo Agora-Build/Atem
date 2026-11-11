@@ -26,8 +26,8 @@ pub mod state;
 pub mod verify;
 
 pub use ledger::{
-    AckLedger, AckRefusal, LedgerTransition, LinkAssociation, REVOCATION_DEADLINE_MS,
-    RecordRefusal, Report, ReportIntent, RevokedOutcome,
+    AckLedger, AckRefusal, LedgerAlert, LedgerTransition, LinkAssociation, REVOCATION_DEADLINE_MS,
+    RecordRefusal, Report, ReportAnswer, ReportIntent, RevokedOutcome,
 };
 pub use record::{
     CONTROL_TYPE, ControlAbout, ControlAction, ControlBody, ControlError, ControlFeed,
