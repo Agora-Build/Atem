@@ -191,13 +191,21 @@ pub fn ed25519_public_to_x25519(key: &PublicKey) -> Result<[u8; 32]> {
 }
 
 /// `enc_kid = hex(SHA-256(enc(["atem-enc-kid-v1", x25519_pub]))[0..8])`: the
-/// short id of a member's `enc_key` (§R9.9).
+/// short id of a member's `enc_key` (§R9.9), or a host's (delegated
+/// host-work design II.4.1).
 pub fn enc_kid(enc_key: &PublicKey) -> Result<String> {
+    enc_kid_bytes(enc_key).map(|kid| hex(&kid))
+}
+
+/// The 8 bytes [`enc_kid`] is the hex of.
+pub fn enc_kid_bytes(enc_key: &PublicKey) -> Result<[u8; 8]> {
     if enc_key.alg != Alg::X25519 {
         return Err(Error::WrongAlg);
     }
     let hash = Hash32::of_enc(&[crate::domain::ENC_KID.as_bytes(), &enc_key.bytes]);
-    Ok(hex(&hash.0[..8]))
+    let mut kid = [0u8; 8];
+    kid.copy_from_slice(&hash.0[..8]);
+    Ok(kid)
 }
 
 /// Normalizes a P-256 `r‖s` to low S (signers may produce either; §R9.1

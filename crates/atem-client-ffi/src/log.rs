@@ -198,6 +198,13 @@ pub(crate) fn effect_info(effect: &Effect) -> MembershipEffect {
             host_id: host_id.clone(),
             seq: *seq,
         },
+        Effect::HostEncKeySet {
+            host_id,
+            retire_previous,
+        } => MembershipEffect::HostEncKeySet {
+            host_id: host_id.clone(),
+            retire_previous: *retire_previous,
+        },
         Effect::VetoReplaced(h) => MembershipEffect::VetoReplaced { head: (*h).into() },
         Effect::Evidence(reason) => MembershipEffect::Evidence {
             reason: reason.as_str().into(),

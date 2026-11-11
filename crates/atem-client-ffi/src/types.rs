@@ -301,6 +301,7 @@ data_enum! {
         ProjectRemoved { name: String },
         HostSenderRevoked { host_id: String, seq: u64, interrupt_running: bool },
         HostSenderReadmitted { host_id: String, seq: u64 },
+        HostEncKeySet { host_id: String, retire_previous: bool },
         VetoReplaced { head: LogHead },
         Evidence { reason: String },
         Frozen,

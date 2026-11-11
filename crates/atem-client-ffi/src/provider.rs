@@ -137,7 +137,9 @@ impl PublicKeyData {
 
 // No `From<SignLabel> for SignLabelKind`: the bindings name the labels an
 // app signs or checks; the host route label (§R9.7b) is the host's only
-// (the relay verifies it in Rust) and has no binding kind.
+// (the relay verifies it in Rust) and has no binding kind, nor has a host's
+// `enc_sig` (delegated host-work II.4.1: the host signs it, the verifier
+// checks it inside a `host_enc_key` entry).
 
 impl From<SignLabelKind> for SignLabel {
     fn from(label: SignLabelKind) -> Self {
@@ -164,7 +166,8 @@ pub fn describe(input: &SigningInput) -> (SigningPurpose, Option<String>) {
     };
     match input.label() {
         SignLabel::ChannelClient => (SigningPurpose::Channel, None),
-        SignLabel::ChannelHost => (SigningPurpose::HostSigning, None),
+        // A host's `enc_sig` signs fields, not a body (II.4.1).
+        SignLabel::ChannelHost | SignLabel::HostEncKey => (SigningPurpose::HostSigning, None),
         SignLabel::PushHint | SignLabel::Seen | SignLabel::HostRoute => {
             (SigningPurpose::HostSigning, body())
         }
@@ -488,6 +491,14 @@ mod tests {
             assert!(request.body_json.unwrap().contains(action));
             assert_eq!(request.label, "atem-membership-entry-v1");
         }
+        let enc_sig = sign_request(
+            &KeyId::new("k"),
+            &SigningInput::fields(SignLabel::HostEncKey, &[b"acct", &[7u8; 32]]),
+        );
+        assert_eq!(enc_sig.purpose, SigningPurpose::HostSigning);
+        assert!(!enc_sig.fresh_confirmation);
+        assert_eq!(enc_sig.body_json, None);
+        assert_eq!(enc_sig.label, "atem-host-enc-key-v1");
         let channel = sign_request(
             &KeyId::new("k"),
             &SigningInput::new(SignLabel::ChannelClient, &[7u8; 32]),

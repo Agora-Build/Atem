@@ -52,6 +52,7 @@ use crate::signed::SignedObject;
 pub mod capacity;
 pub mod draft;
 pub mod entry;
+pub mod host_enc_key;
 pub mod host_senders;
 pub mod projects;
 pub mod publish;
@@ -67,6 +68,10 @@ pub use draft::{check_body, draft_on, sign_entry, sign_entry_cosigned};
 pub use entry::{
     Action, Entry, HostRecord, KBackupRecord, KitMode, Member, MemberKind, RECOVERY_SIGNER, Role,
     RolesChange, Scope,
+};
+pub use host_enc_key::{
+    EncKey, HostEncKeys, PreviousEncKey, host_enc_key, host_enc_sig_input, sign_host_enc_key,
+    verify_host_enc_sig,
 };
 pub use host_senders::{HostSenderState, host_sender_readmit, host_sender_revoke};
 pub use projects::{
@@ -138,7 +143,8 @@ pub enum Invalid {
     ServiceExpiry,
     BadScope,
     /// A host that isn't current where the action needs one: a
-    /// `remove_host` of it, or a `project_set` listing it.
+    /// `remove_host` of it, a `project_set` listing it, or a
+    /// `host_enc_key` for it.
     NotAHost,
     /// `add_host` whose `host_trust_gen` isn't above every earlier one.
     HostTrustGenNotIncreasing,
@@ -166,6 +172,12 @@ pub enum Invalid {
     /// A `host_sender_readmit` of a host that isn't `revoked` at `seq-1`
     /// (`authorized`, or never added; II.3.1).
     NotRevoked,
+    /// A `host_enc_key` whose `host_trust_gen` isn't the host's newest
+    /// `add_host`'s at `seq-1` (II.4.1).
+    HostTrustGenNotCurrent,
+    /// A `host_enc_key` whose `enc_sig` doesn't verify with the `host_key`
+    /// of the host's newest `add_host` (II.4.1).
+    BadEncSig,
     /// The log (or its member or host list) is full.
     LogFull,
     /// More than 64 entries or 256 KiB in one carriage.
@@ -211,6 +223,8 @@ impl Invalid {
             Invalid::AlreadyRevoked => "already_revoked",
             Invalid::UnknownHost => "unknown_host",
             Invalid::NotRevoked => "not_revoked",
+            Invalid::HostTrustGenNotCurrent => "host_trust_gen_not_current",
+            Invalid::BadEncSig => "bad_enc_sig",
             Invalid::LogFull => "log_full",
             Invalid::CarriageTooLarge => "carriage_too_large",
         }
@@ -502,6 +516,14 @@ pub enum Effect {
         host_id: String,
         seq: u64,
     },
+    /// The host's encryption key was set (II.4.1): its first for this
+    /// trust generation, or a rotation. The key it replaced is retired at
+    /// once with `retire_previous`; otherwise the host keeps it for 24 h
+    /// on its own clock from now (step 4).
+    HostEncKeySet {
+        host_id: String,
+        retire_previous: bool,
+    },
     /// Atem's veto at the head was replaced by an equivalent one (§R9.4 row 1).
     VetoReplaced(Head),
     Evidence(EvidenceReason),
@@ -525,8 +547,8 @@ struct HostState {
 }
 
 /// What follows from a chain prefix: members, hosts, keys, the newest K
-/// backup, projects, host senders. Pure function of the entries and the
-/// recorded decisions.
+/// backup, projects, host senders, host encryption keys. Pure function of
+/// the entries and the recorded decisions.
 #[derive(Debug, Clone, PartialEq)]
 struct Derived {
     members: BTreeMap<String, MemberState>,
@@ -539,6 +561,7 @@ struct Derived {
     k_backup: Option<KBackupRecord>,
     projects: projects::Projects,
     host_senders: host_senders::HostSenders,
+    host_enc_keys: host_enc_key::EncKeys,
 }
 
 impl Derived {
@@ -568,6 +591,7 @@ impl Derived {
             k_backup: None,
             projects: projects::Projects::default(),
             host_senders: host_senders::HostSenders::default(),
+            host_enc_keys: host_enc_key::EncKeys::default(),
         }
     }
 
@@ -629,6 +653,8 @@ impl Derived {
                     },
                 );
                 self.host_senders.host_added(&host.host_id, entry.seq);
+                // A newer `add_host` voids both keys (II.4.1).
+                self.host_enc_keys.void(&host.host_id);
             }
             Action::RemoveHost { host_id } => {
                 if let Some(host) = self.hosts.get_mut(host_id) {
@@ -636,6 +662,7 @@ impl Derived {
                 }
                 self.projects.host_removed(host_id);
                 self.host_senders.host_removed(host_id);
+                self.host_enc_keys.void(host_id);
             }
             Action::SetRecoveryKey { recovery_key, kit } => {
                 self.used_keys.push(recovery_key.clone());
@@ -653,6 +680,21 @@ impl Derived {
             }
             Action::HostSenderReadmit { host_id } => {
                 self.host_senders.readmit(host_id, entry.seq);
+            }
+            Action::HostEncKey {
+                host_id,
+                host_trust_gen,
+                enc_key,
+                retire_previous,
+                ..
+            } => {
+                self.host_enc_keys.set(
+                    host_id,
+                    enc_key,
+                    *host_trust_gen,
+                    *retire_previous,
+                    entry.seq,
+                );
             }
         }
     }
@@ -1162,6 +1204,27 @@ impl Membership {
                     return Err(Invalid::NotRevoked);
                 }
             }
+            // II.4.1: a current host, its newest `add_host`'s generation,
+            // and the host's `enc_sig` with that `add_host`'s key.
+            Action::HostEncKey {
+                host_id,
+                host_trust_gen,
+                enc_key,
+                enc_sig,
+                ..
+            } => {
+                let Some(host) = d.hosts.get(host_id).filter(|h| !h.removed) else {
+                    return Err(Invalid::NotAHost);
+                };
+                host_enc_key::check(
+                    &host.record,
+                    &self.account_id,
+                    &self.genesis_hash,
+                    *host_trust_gen,
+                    enc_key,
+                    enc_sig,
+                )?;
+            }
         }
         Ok(deferred)
     }
@@ -1241,6 +1304,14 @@ impl Membership {
             Action::HostSenderReadmit { host_id } => effects.push(Effect::HostSenderReadmitted {
                 host_id: host_id.clone(),
                 seq: head.seq,
+            }),
+            Action::HostEncKey {
+                host_id,
+                retire_previous,
+                ..
+            } => effects.push(Effect::HostEncKeySet {
+                host_id: host_id.clone(),
+                retire_previous: *retire_previous,
             }),
             _ => {}
         }

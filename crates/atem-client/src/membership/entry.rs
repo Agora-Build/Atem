@@ -7,7 +7,9 @@
 //! Ed25519, `enc_key` X25519, `host_key` and `recovery_key` Ed25519), id
 //! syntax, roles, scope and service expiry, a project's shape
 //! ([`super::projects`]), a host sender's revoke and readmit
-//! ([`super::host_senders`]), and who may sign which action.
+//! ([`super::host_senders`]), a host encryption key's shape
+//! ([`super::host_enc_key`](mod@super::host_enc_key)), and who may sign
+//! which action.
 //! Rules that need the chain (signer authority, ids never reused, version
 //! floors) are [`super::Membership`]'s.
 use std::collections::BTreeSet;
@@ -16,7 +18,7 @@ use serde_json::{Map, Value};
 
 use crate::backup::kid_ok;
 use crate::canonical::StrictValue;
-use crate::encoding::Hash32;
+use crate::encoding::{Hash32, b64u_decode_array};
 use crate::error::Error;
 use crate::keys::{Alg, PublicKey};
 use crate::signed::SignedObject;
@@ -218,6 +220,19 @@ pub enum Action {
     HostSenderReadmit {
         host_id: String,
     },
+    /// The host's encryption key for its newest `add_host` (delegated
+    /// host-work design II.4.1, option (b)): `enc_key` (X25519) with the
+    /// host's `enc_sig` over it (Ed25519 by that `add_host`'s `host_key`,
+    /// [`super::host_enc_key::host_enc_sig_input`]). A newer one for the
+    /// same generation rotates it; `retire_previous` (absent on the wire
+    /// means false) retires the previous key at once.
+    HostEncKey {
+        host_id: String,
+        host_trust_gen: u64,
+        enc_key: PublicKey,
+        enc_sig: Vec<u8>,
+        retire_previous: bool,
+    },
 }
 
 impl Action {
@@ -238,6 +253,7 @@ impl Action {
             Action::ProjectRemove { .. } => "project_remove",
             Action::HostSenderRevoke { .. } => "host_sender_revoke",
             Action::HostSenderReadmit { .. } => "host_sender_readmit",
+            Action::HostEncKey { .. } => "host_enc_key",
         }
     }
 
@@ -301,6 +317,13 @@ impl Entry {
             "add_host" => &["host"],
             "remove_host" | "host_sender_readmit" => &["host_id"],
             "host_sender_revoke" => &["host_id", "interrupt_running"],
+            "host_enc_key" => &[
+                "host_id",
+                "host_trust_gen",
+                "enc_key",
+                "enc_sig",
+                "retire_previous",
+            ],
             "set_recovery_key" => &["recovery_key", "kit"],
             "recovery_approve" | "recovery_veto" => &["target"],
             "k_backup" => &["k_backup"],
@@ -472,6 +495,33 @@ impl Entry {
             "host_sender_readmit" => Action::HostSenderReadmit {
                 host_id: host_id(body)?,
             },
+            "host_enc_key" => {
+                let host_id = host_id(body)?;
+                let host_trust_gen = u64_field(body, "host_trust_gen")?;
+                if host_trust_gen == 0 {
+                    return Err(Invalid::Malformed("host_trust_gen"));
+                }
+                // Encryption only, never signing (§R9.1).
+                let enc_key = key(field(body, "enc_key")?, &[Alg::X25519])?;
+                // An Ed25519 signature: exactly 64 bytes. Whether it
+                // verifies needs the host's key, from the chain.
+                let enc_sig: [u8; 64] = b64u_decode_array(str_field(body, "enc_sig")?)
+                    .map_err(|_| Invalid::Malformed("enc_sig"))?;
+                // Absent means false, so `false` has one form: omitted
+                // (§R9.1); present it is `true`.
+                let retire_previous = match body.get("retire_previous") {
+                    None => false,
+                    Some(Value::Bool(true)) => true,
+                    Some(_) => return Err(Invalid::Malformed("retire_previous")),
+                };
+                Action::HostEncKey {
+                    host_id,
+                    host_trust_gen,
+                    enc_key,
+                    enc_sig: enc_sig.to_vec(),
+                    retire_previous,
+                }
+            }
             _ => unreachable!("matched above"),
         };
 
@@ -575,7 +625,7 @@ fn key(value: &Value, algs: &[Alg]) -> Result<PublicKey, Invalid> {
 }
 
 /// The body's `host_id` (`remove_host`, `host_sender_revoke`,
-/// `host_sender_readmit`): an opaque id.
+/// `host_sender_readmit`, `host_enc_key`): an opaque id.
 fn host_id(body: &Map<String, Value>) -> Result<String, Invalid> {
     let host_id = str_field(body, "host_id")?;
     if !id_ok(host_id) {

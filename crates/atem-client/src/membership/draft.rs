@@ -111,6 +111,25 @@ impl Action {
                 interrupt_running,
             } => json!({"host_id": host_id, "interrupt_running": interrupt_running}),
             Action::HostSenderReadmit { host_id } => json!({"host_id": host_id}),
+            Action::HostEncKey {
+                host_id,
+                host_trust_gen,
+                enc_key,
+                enc_sig,
+                retire_previous,
+            } => {
+                let mut fields = json!({
+                    "host_id": host_id,
+                    "host_trust_gen": host_trust_gen,
+                    "enc_key": enc_key.to_json(),
+                    "enc_sig": crate::encoding::b64u(enc_sig),
+                });
+                // Absent means false (§R9.1: absent fields omitted).
+                if *retire_previous {
+                    fields["retire_previous"] = json!(true);
+                }
+                fields
+            }
         };
         match value {
             Value::Object(map) => map,
@@ -183,7 +202,7 @@ pub fn sign_entry_cosigned(
 }
 
 /// The action as the verifier parses it, for the typed builders (services,
-/// projects, host senders): drafted on a placeholder chain position
+/// projects, host senders, host encryption keys): drafted on a placeholder chain position
 /// (account, `seq`, hashes and signer don't affect the action's own rules)
 /// at `signed_at` (a service's expiry bound counts from it), then
 /// [`check_body`].

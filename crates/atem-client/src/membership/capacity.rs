@@ -203,6 +203,14 @@ impl std::error::Error for ChangeRefusal {}
 ///   added included): the drafting guard, so a manager doesn't sign an
 ///   entry every verifier refuses. A revoke of a host never added isn't
 ///   refused here: the verifier refuses it (`unknown_host`);
+/// - a host's encryption key (`host_enc_key`, II.4.1) takes one entry per
+///   host and rotation and is never paced: the key a host gets after
+///   `atem pair verify` must not wait (it gets no host-sender mail until
+///   the entry lands), nor must a rotation with `retire_previous` after a
+///   suspected compromise; it adds no member or host. Each is signed by a
+///   manager with a fresh confirmation, so nothing drafts them in bulk.
+///   Whether the entry is valid (a current host, its newest generation, the
+///   host's `enc_sig`) is the verifier's to judge;
 /// - every other action (genesis, a native's roles, removals, recovery and
 ///   kit entries, K backups) is never paced.
 ///
@@ -282,6 +290,7 @@ pub fn check_change(log: &Membership, action: &Action, now_ms: u64) -> Result<()
             Some(HostSenderState::Revoked { .. }) => Ok(()),
             Some(HostSenderState::Authorized { .. }) | None => Err(ChangeRefusal::NotRevoked),
         },
+        Action::HostEncKey { .. } => Ok(()),
     }
 }
 
