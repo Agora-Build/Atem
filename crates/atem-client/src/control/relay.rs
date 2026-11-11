@@ -1,4 +1,5 @@
-//! Station call wire types (delegated host-work design I.5.8, I.5.2, I.6.5):
+//! Station call wire types (delegated host-work design I.5.8, I.5.2, I.6.5;
+//! the contract is `designs/protocol/atem-host-work-v1.md` §11.4):
 //! the relay messages by which a host reads its Station's control feed,
 //! acknowledges what it applied, and fetches the device list itself.
 //!

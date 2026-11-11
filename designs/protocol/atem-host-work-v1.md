@@ -964,8 +964,7 @@ frozen (R9.4) or the host is held after a write fault (R9.3).
   field of the record) and verifies its records only after fetching the
   device list up to the head the Station announced (I.5.8). A record that
   doesn't parse is refused on its own and kept as evidence; the cursor
-  moves past it. The feed calls and acknowledgments are written in a later
-  section.
+  moves past it. The feed calls and acknowledgments are §11.4.
 - **Channels.** `control_records{id, records}` (session-v1 R9.3, R9.8):
   host principals' records only. A service's record travels only in its
   Station's feed: a message holding one, alone or beside host principals'
@@ -1144,3 +1143,337 @@ They run in `crates/atem-client/tests/vectors.rs`, in the bindings'
 principal with that `record_id`, and each step's position against the
 stations) and derives no verdict.
 Every SDK package's checksum manifest lists the file.
+
+### 11.4 Station calls and acknowledgments
+
+A host reads each Station's control feed, acknowledges what it applied and
+fetches its own device list over its one link; the Station counts the
+acknowledgments and reports revocations to the Portal (design I.5.8,
+"Transport", "Which host is calling", "Heads", "Acknowledgment" and
+"Delivery progress is not application"; I.6.5). **Planned:** the host
+makes none of these calls in this version. They are relay messages, not
+session ops, so no welcome feature gates them; they arrive with
+`host.senders` and delegated work. Types: `atem_client::control::relay`
+(every message, its reader and builder) and `atem_client::control::ledger`
+(the Station's reference acknowledgment ledger, `AckLedger`); for Station
+builders, the bindings' §9 ([atem-client-bindings.md](atem-client-bindings.md),
+"Station calls" and "The acknowledgment ledger").
+
+#### Messages
+
+Each is `{"type":"relay","op":…}` on Atem's one link, like `push_hint`
+(session-v1 R9.9).
+
+| `op` | Direction | Fields |
+|---|---|---|
+| `control_sync` | host → Station | `origin`, `feed_id?`, `after`: read the feed `(origin, feed_id)` after position `after`, the last position the host read (0: none) |
+| `control_sync_result` | Station → host | `origin`, `feed_id`, `head` (the feed's last position, 0 for an empty feed), `station_time` (ms, I.6.5), `records: [{feed_seq, record}]` (the records after `after`, ascending) |
+| `heads` | Station → host | `feeds: [{origin, feed_id, head, station_time}]` (each feed covering a principal with work on this host) and `membership: {seq, hash}` (the device list's head); stage 3 adds the host's mailbox head (II.5), an unknown field until then |
+| `control_ack` | host → Station | `account_id`, `genesis_hash`, `host_id`, `host_trust_gen` (the host's claim, below), `origin`, `feed_id`, `cursor` (the host's scan cursor in that feed), `results` |
+| `membership_fetch` | host → Station | `after`: the head `seq` the host holds (design I.5.8, "the host fetches the device list itself"; R9.3 allows it, and it gets no more trust than any carrier) |
+| `membership_fetch_result` | Station → host | `head: {seq, hash}` and `entries`: the signed entries after `after`, an R9.3 carriage |
+
+```json
+{"type":"relay","op":"control_sync","origin":"https://station-dev.agora.build",
+ "feed_id":"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b","after":2}
+{"type":"relay","op":"control_sync_result","origin":"https://station-dev.agora.build",
+ "feed_id":"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b","head":3,"station_time":1793620940000,
+ "records":[{"feed_seq":3,"record":{"body":{…},"sig":"…"}}]}
+{"type":"relay","op":"control_ack","account_id":"acct-test-1","genesis_hash":"<hex>",
+ "host_id":"host-b","host_trust_gen":1,"origin":"https://station-dev.agora.build",
+ "feed_id":"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b","cursor":3,
+ "results":[{"record_id":"00000000-0000-4000-8000-000000000005",
+   "effects":[{"effect":"revocation","result":"duplicate"},{"effect":"interrupt","result":"applied"}]},
+  {"entry":{"seq":7,"entry_hash":"<hex>"},"applied_seq":7,
+   "effects":[{"effect":"revocation","result":"applied"}]}]}
+```
+
+**Every message** is read strictly: at most 262,144 bytes as sent (R9.9's
+bound for every relay message), checked before any parse; one strict
+I-JSON parse (no duplicate key, integers only and at most 2^53 − 1, no lone
+surrogate); exactly its fields, an optional one omitted and never `null`;
+a count over its bound refused before any item is read; the grammars of the
+signed objects (an `origin` exact as `station_route::normalize_relay`
+writes it, `feed_id` and `record_id` UUID v4, ids of 1 to 128 characters of
+`[A-Za-z0-9._:-]`, lowercase hex hashes). A builder checks what the reader
+checks. The wire rules below are **Atem's proposal, for Astation's
+agreement** (the design names the messages, not these rules):
+
+1. At most 64 records in a `control_sync_result`, 64 results in a
+   `control_ack`, 64 feeds in a `heads` and 64 entries in a
+   `membership_fetch_result` (R9.3's carriage).
+2. A `control_sync` without `feed_id` (the host doesn't know the feed yet)
+   asks from the start: its `after` is 0. A cursor belongs to a feed.
+3. A result's `effects` are exactly the set its record carries, each once,
+   in this order: `cover`; `revocation`; `revocation`, `interrupt` (a revoke
+   with `interrupt_running: true`); `hold`; `release`; `interrupt` (an
+   `interrupt_running`). A host sender's revoke entry's: `revocation`, or
+   `revocation`, `interrupt`. A Station refuses an ack with a result that
+   names a record it tracks (a `revoke` or `interrupt_running`) with other
+   effects than that record carries.
+4. A result is exactly one of two forms: `{record_id, effects}` for a
+   record, or `{entry: {seq, entry_hash}, applied_seq, effects}` for a host
+   sender's device-list revoke (II.3.1), where `applied_seq` is host-work's
+   applied device-list `seq`.
+5. An entry result says `applied` or `duplicate` only once `applied_seq`
+   has reached `entry.seq` (the revoke's effects are durable then);
+   behind it only `pending` or `refused`.
+6. Nothing twice: a `record_id` or an entry `seq` in one ack, an
+   `(origin, feed_id)` in one `heads`.
+7. `feed_seq` ascends, each within `1..=head`; gaps are allowed (whether a
+   gap is a hole the cursor waits at is the host's).
+8. `membership_fetch_result` carries no echo of `after` and no `more`: the
+   host compares the new head with `head`, applies the entries as any
+   carriage (R9.3) and fetches again from its new head while it is behind.
+9. One `control_ack` names one feed and one cursor, even when its results
+   are all entry results or results for records bound to no feed (a host
+   principal's `interrupt_running`): it names the host's own Station feed
+   (the feed of the Station its link reaches) and its cursor there.
+
+**Real budgets.** The 256 KiB bound counts the whole message, so a Station
+fills a page below it: 64 records of the largest size (a 4,096-byte body
+`jcs` plus its signature and the item's own bytes) don't fit in one
+`control_sync_result`, nor a full R9.3 carriage (64 entries, 256 KiB of
+entries) in one `membership_fetch_result`. The Station sends fewer per
+message; `head` tells the host more remain.
+
+**A feed page's records are judged one at a time** (§11.1, "Carriage"). A
+`control_sync_result` keeps each `record` as the Station sent it, of any
+JSON type: the host parses each with the control parser, refuses one it
+doesn't parse on its own and keeps it as evidence, and the page, the
+feed's position and the records after it stand. **A page that isn't strict
+I-JSON as a whole** (a duplicate key, a fraction, an unsafe integer, a lone
+surrogate or nesting past the parser's depth, anywhere in it, inside a
+record too) **is a Station fault** (**Atem's proposal, for Astation's
+agreement**): the host refuses the page, keeps its cursor, keeps the gate
+for that origin closed (fail closed) and raises an owner alert ("Station
+sent a page that isn't strict JSON"), rate-limited to one an hour per
+origin as I.5.4's alerts are. **The Station's duty:** validate every record
+at intake with the shared parser (the bindings' `parse_control_record`;
+`relay_control_sync_result` refuses a record it doesn't parse) and serve
+only what it stored.
+
+#### Which host is calling
+
+No call has a field that names the caller. The Station takes the calling
+host from the link's verified association (design I.5.8, "Which host is
+calling"):
+
+- a routed relay link (session-v1 R9.7b, carrier B): its verified root,
+  host and connection binding;
+- a link the paired Astation authenticated (carrier A) and a call through
+  Astation's `:8080`: the authenticated transport's host association, never
+  a host id the caller picks; where it can't be verified, the Station
+  requires a fresh host-key challenge proof, which the host answers through
+  the proxy.
+
+A native token alone never fetches or acknowledges another host's feeds,
+results or mailbox, and Astation proxies no credentials to an arbitrary
+Station. A `control_ack`'s `account_id`, `genesis_hash`, `host_id` and
+`host_trust_gen` are the host's claim, carried so the Station can refuse
+one that isn't its link's: **an ack's authenticated association is the
+complete account, root, host, trust generation and connection
+association**. The Station refuses an ack whose claim differs from it,
+and counts the ack for the link's host, never the claim's. The connection
+is the Station's to fence at its transport: an ack from a connection of
+the host that isn't its current authenticated connection is refused there
+(**Atem's proposal, for Astation's agreement**: the reference ledger
+compares the four claims and requires a connection, but no message names a
+connection, so it can't tell a superseded connection from the current
+one).
+
+**Transport.** On the relay, the host calls over its own authenticated
+relay connection. On `:8080`, Astation proxies these calls and the heads to
+the Station unchanged (records are signed; Astation is a native manager),
+the host's device-list fetch included. With neither path the gate stays
+closed. These calls and the heads also run on a routed link (session-v1
+R9.7b; **changed for host senders, needs Astation's agreement**: today a
+routed link carries only channel envelopes and push relay messages).
+
+#### Heads, resets and the gate
+
+The Station announces `heads` on every (re)connection, then every 30
+seconds, and at once when it stores a record. The announced device-list
+head is the Station's word, not signed authority (R9.3). The host takes
+`station_time` within its cap only (I.6.5: the floor never rises past the
+host's time plus 10 minutes; a Station further ahead closes the gate for
+that origin and raises an owner alert). Resets, snapshots, coverage and the
+gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
+
+- **Reset.** An unknown `feed_id` for a known origin, or a head below the
+  stored cursor, is a reset: the gate for that origin stays closed until
+  the host has synced the new feed from position 0. The new feed starts
+  with a snapshot from the Station's current effective state.
+- **The gate**, per origin, opens only after the host applied that feed up
+  to the announced head and fetched the device list up to its head (or up
+  to a deferred entry, I.4.3), and, for host senders only (stage 3), its
+  mailbox up to its head. It closes on any disconnect, on a reset, and when
+  no head arrived for 60 seconds. While it is closed no unstarted remote
+  task of a principal that feed covers starts (`blocked`, `revocations not
+  yet checked`).
+
+#### Acknowledgments
+
+- **Durable before acknowledged.** A host acknowledges a record only after
+  its effects are durable: the host-work transaction that applies the
+  record (its effects, its intents and the scan cursor) commits first.
+- **The cursor is not application.** `cursor` says only how far the host
+  read the feed; it moves past records kept pending or refused. Each result
+  is the record's durable per-effect application result (§11.1:
+  `applied`, `duplicate`, `pending`, `refused`). Only `applied` and
+  `duplicate` say an effect is in force on that host; the Station counts
+  nothing from the cursor, `pending` or `refused`.
+- **When a host acknowledges** (**Atem's proposal, for Astation's
+  agreement**; the design leaves it open). After each page's transaction
+  committed, the results of that page's records, with the new cursor. Since
+  `control_ack` has no answer, the host sends the in-force results
+  (`applied` or `duplicate`) of its `revoke` and `interrupt_running`
+  records and its host-sender revoke entries again on every (re)connection
+  to the Station and at most every 10 minutes while connected. Counting is
+  idempotent at the Station, so a result sent again counts nothing twice,
+  and a Station that lost a transition before its commit gets it back.
+- **What the Station counts.** Per host and per effect of a principal (its
+  revocation, and the interrupt for that revocation: for a host principal,
+  per `revoke_seq`), once, through whichever record first said so. A
+  `duplicate` counts as done for every effect it names, so a host that
+  applied the original of a re-signed record is done for it, whichever
+  `record_id` its result names. Astation's re-sign alert (I.5.4) stays on a
+  native-signed record until every effect it carries is in force on every
+  host it covers.
+
+#### Reports (for Auth/Portal review)
+
+The Station reports a revocation's progress to the Portal (`POST
+/api/v1/stations/reports`; the HTTP body is Auth/Portal's, `platform.md`:
+`state`, `integrationId`, `reportId`, and `host` and `recordId`, or
+`outcome` and `pendingHosts`). A service's revocation starts at the
+Station's own `revoke` (signed with the integration's service key: the
+Portal revoked the integration), whose record fixes the integration
+(`about.integration_id`), the hosts its grant covered and the revocation's
+time; a later revoke of the same principal (a re-signed copy, a reset's
+snapshot) changes none of them. A native revoke of the same service
+appended earlier counts for its hosts, and they are reported once the
+Station's own revoke is recorded, naming the native record.
+
+- **`revocation_applied{host, record_id}`**: once per covered host and
+  revoked integration, at that host's first `applied` **or `duplicate`**
+  for the revocation's effect, naming the record whose result said so
+  (**changed agreed meaning, agreed by Auth/Portal, for Astation's
+  confirmation**: design I.5.8 and IV row 7 send it only at `applied`. A
+  host that applied the revocation through another record first, a native
+  revoke in another Station's feed it syncs, reports this Station's record
+  `duplicate`; it counts toward `all_applied`, so it must also reach the
+  Portal's Revoking count). A later `applied` or `duplicate` sends nothing
+  more. A host that applies the revocation after the deadline is still
+  reported (Auth/Portal: the Portal records it and lowers "n hosts didn't
+  confirm"); `revoked` is never sent again.
+- **`revoked{outcome, pending_hosts}`**: once per revocation:
+  `all_applied`, with no pending host, once every covered host has the
+  revocation in force; else `deadline_passed`, with the hosts that didn't
+  confirm (never none), 24 hours after the revocation's own time. That time
+  is persisted, so a restart never moves the deadline. An ack or a record
+  is counted after any deadline its time has passed, so the outcome
+  depends on time, never on when the Station looked; an own revoke recorded
+  after its own deadline is final at once.
+- **Order.** A `revoked` report is delivered only after the per-host
+  reports made before it, so the Portal never sees `all_applied` ahead of
+  a covered host's `revocation_applied`, nor `deadline_passed` ahead of
+  those made before the deadline (the second is **Atem's choice, for
+  Auth/Portal to confirm**).
+
+**`reportId`.** `<kind>:` followed by the lowercase hex SHA-256 of
+`enc(["atem-station-report-id-v1", kind, account_id, genesis_hash, principal,
+integration_id, host])`, where `kind` is `revocation_applied` or `revoked`,
+`genesis_hash` is its 32 raw bytes, `principal` is `service:<id>`, the
+host is left out for `revoked`, and `enc` puts a 4-byte big-endian length
+before every field (R9.1). It comes from the report's identity only, never
+from time, order or a counter, so a retry, a restart or a replica sends the
+same id with the same body; neither the record a `revocation_applied` names
+nor a `revoked`'s outcome is part of it (one final report and one per-host
+report per host and revocation). It is 72 or 83 characters of
+`[a-z0-9_:]`, within the Portal's 1 to 128 characters of
+`[A-Za-z0-9._:-]`, which the Portal treats as opaque: the same id with the
+same body gets the recorded answer and counts nothing again, the same id
+with another body `409 report_id_reused` (the first stands). Known answers,
+for account `acct-test-1`, the genesis of `r9-vectors-membership-log`,
+`service:svc-discord` and integration `i-01jc5zq9x8w7v6t5s4r3q2p1n0`:
+`revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca`
+for host `host-b`, and
+`revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1`.
+
+**The Portal's answers** (Auth/Portal's classes):
+
+| Answer | What the Station does |
+|---|---|
+| `200`, the recorded `200` of a repeated `reportId` included | done |
+| a network error, a timeout, a 5xx (`503` and unknown ones too) | send again later, with backoff, the same `reportId` and body |
+| `429` | the same, after its `Retry-After` |
+| `401` | refresh the `station.report` token, then the same |
+| `409 report_id_reused`, `400`, `404`, `409 invalid_state`, `413`, `415`, any other 4xx | final, with an operator alert |
+| `403` | final for every report, and stop reporting (one alert) |
+| a status the Portal never answers with (1xx, 3xx, a 2xx other than `200`) | final, with an operator alert (**Atem's choice, for Auth/Portal to confirm**) |
+
+A report waiting for another goes once that one is settled, done or final.
+
+**The Station's duties** (**Atem's proposal, for Astation's and
+Auth/Portal's agreement**):
+
+- **Persist before any HTTP.** A transition's next state and its report
+  intents are stored in one transaction before any report is sent, and the
+  Station acts on the next state only once that committed. A crash before
+  the commit loses nothing: the host acknowledges again and the same
+  transition gives the same reports; a crash after it is covered by the
+  stored intents, sent again after a restart with the same `reportId`.
+- **Serialize the transitions of one ledger** (compare-and-swap on the
+  stored state). Replicas give the same report only for serialized
+  transitions: the same state and the same ack at the same time give the
+  same reports byte for byte, but an ack processed at another time may pass
+  a deadline. A replica whose compare-and-swap failed starts again from the
+  new state.
+- **Record ids are unique per Station**: a fresh UUID v4 per record (a
+  re-signed record included). The reference ledger refuses another body
+  under a `record_id` it tracks, but a `cover`, `hold` or `release` id it
+  doesn't track can't be checked against a later revoke.
+- **No pruning in this version.** The ledger keeps every revocation and
+  every tracked record, bounded per account (revoke and interrupt records,
+  at most 64 covered hosts each), as long as the principal exists (I.5.2's
+  retention).
+- **A Station learns of its own removal only through the Portal's
+  two-phase removal** (decision 8): its integrations go `revoking` with
+  reason `station_removed`, it issues and serves their records and reports
+  them, then the removal completes. It never assumes it learned
+  `station_removed` another way: a removed Station can't read its feed.
+
+#### Bounds
+
+Every relay message, in either direction, is at most 256 KiB as sent
+(R9.9), and Atem drops a larger one unread. Stage 3's mailbox calls (II.4.3:
+put, stored, sync, done and the heads' mailbox head) carry one object each
+and may be up to 512 KiB (owner choice 13, so a host sender's Message keeps
+§5's 240 KiB bound): R9.9's drop-unread rule then exempts them up to that
+bound (**changed agreed meaning, needs Astation's agreement**; session-v1
+R9.9). Their wire is written with stage 3.
+
+#### Fixtures
+
+`fixtures/r9-control-ack-*.json` (`side: "relay"`, schema in
+`fixtures/schema.md`, "Station acknowledgment steps"; design test 48):
+`r9-control-ack-resign` (a native stop refused under the strict rule while
+the cursor moves past it, its re-sign alert kept, the re-signed copy
+applied, and a host that applied the original done for the copy),
+`r9-control-ack-per-effect` (a revoke that adds an interrupt, one
+`revocation_applied` per host and integration, a native revoke applied
+first and named, a host that applied the revocation through another
+Station's feed reporting this Station's record `duplicate`, an ack on
+another host's link refused, `all_applied` only after every per-host
+report), `r9-control-ack-deadline` (`deadline_passed` from the
+revocation's own time across a restart, a late host still reported),
+`r9-control-ack-durable` (a crash before the commit, after it, and after
+delivery before the confirmation; a Portal failure and its retry; a lost
+ack sent again; two replicas; duplicate acks for an original and its
+re-signed copy) and `r9-control-ack-portal-refusals` (retries, a final
+refusal with its alert, a `403` that stops reporting). They run in
+`crates/atem-client/tests/r9_fixtures.rs` against `AckLedger`, in the
+bindings' `tests/station.rs` and in the Swift, Kotlin and WASM conformance
+suites through `AckLedgerHandle`; `scripts/check-r9-vectors.py` recomputes
+every `reportId` in them. Every SDK package's checksum manifest lists them.

@@ -1,6 +1,7 @@
 //! The Station's reference acknowledgment ledger (delegated host-work design
 //! I.5.8, "Acknowledgment" and "Delivery progress is not application"; I.5.4,
-//! the re-sign alerts).
+//! the re-sign alerts; the contract is `designs/protocol/atem-host-work-v1.md`
+//! §11.4, "Acknowledgments" and "Reports").
 //!
 //! [`AckLedger`] is a Station's side of its hosts' [`ControlAck`]s, for one
 //! device list (an account and its root) at one Station (its exact `origin`):
