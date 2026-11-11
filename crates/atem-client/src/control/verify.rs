@@ -23,28 +23,34 @@
 //!   current manager.
 //! - **Host principals** (`host:<host_id>`): the only record is a native
 //!   manager's `interrupt_running`; the host's own key signs nothing. The
-//!   host must have an `add_host` in the log, current or removed. A host
-//!   principal's `release` (or `cover`, `hold`, `revoke`) never gets here:
-//!   [`ControlRecord::parse`] refuses it (`not_for_host_principal`).
-//!   Whether its `revoke_seq` names a revoke this host applied is the
-//!   application's (I.5.5, II.3.1), not this check's.
+//!   host must have an `add_host` in the log, current or removed, and the
+//!   record's `revoke_seq` must name this list's `host_sender_revoke` of
+//!   that host (ruling T10a): beyond the head it is pending, any other
+//!   entry is refused. A readmit since changes nothing: the interrupt is for
+//!   the tasks admitted before that revoke (II.3.1). Whether the host
+//!   applied that revoke (its applied device-list `seq` reached it) is the
+//!   application's (I.5.5). A host principal's `release` (or `cover`,
+//!   `hold`, `revoke`) never gets here: [`ControlRecord::parse`] refuses it
+//!   (`not_for_host_principal`).
 //!
 //! **Pending** (I.5.4, "Verification"): a principal or native signer the
-//! list doesn't hold yet (a `recovery_add` still waiting holds nothing), to
-//! be verified again after every device-list advance.
+//! list doesn't hold yet (a `recovery_add` still waiting holds nothing), or
+//! a host principal's `revoke_seq` beyond its head, to be verified again
+//! after every device-list advance.
 //!
 //! **Order.** The account; then what no list can make valid (a host's own
 //! key, a manager's `cover`, `hold` or `release`, a removed manager, a
-//! signer that never was a manager); then a principal the list doesn't
-//! hold, a native principal, the principal's key; then a signer the list
-//! doesn't hold; then the signature. A refusal that no advance could undo
-//! comes before a pending verdict.
+//! signer that never was a manager); then a host principal's `revoke_seq`
+//! naming another entry; then a principal the list doesn't hold, a native
+//! principal, the principal's key, a `revoke_seq` beyond the head; then a
+//! signer the list doesn't hold; then the signature. A refusal that no
+//! advance could undo comes before a pending verdict.
 //!
 //! The verdict holds for the list it was checked against: a host verifies
 //! a record against the head of the transaction that applies it, never a
 //! verdict from before (a manager removed in between is caught).
 use crate::keys::PublicKey;
-use crate::membership::{Head, MemberKind, MemberStatus, Membership};
+use crate::membership::{Action, Head, MemberKind, MemberStatus, Membership};
 
 use super::record::{
     ControlAction, ControlPrincipal, ControlRecord, ControlSigner, principal_key_of,
@@ -88,6 +94,8 @@ pub enum PendingReason {
     /// The list has no native member `member:<device_id>` names yet, or one
     /// whose `recovery_add` is still waiting.
     SignerUnknown,
+    /// A host principal's `revoke_seq` is beyond the list's head.
+    RevokeNotInList,
 }
 
 impl PendingReason {
@@ -96,6 +104,7 @@ impl PendingReason {
         match self {
             PendingReason::PrincipalUnknown => "principal_unknown",
             PendingReason::SignerUnknown => "signer_unknown",
+            PendingReason::RevokeNotInList => "revoke_not_in_list",
         }
     }
 }
@@ -125,6 +134,9 @@ pub enum RefusalReason {
     /// `service:<id>` names a native member, which is never a control
     /// record's principal.
     NotAService,
+    /// A host principal's `revoke_seq` names an entry that isn't a
+    /// `host_sender_revoke` of that host.
+    NotARevoke,
 }
 
 impl RefusalReason {
@@ -138,6 +150,7 @@ impl RefusalReason {
             RefusalReason::RemovedManager => "removed_manager",
             RefusalReason::HostKeySigned => "host_key_signed",
             RefusalReason::NotAService => "not_a_service",
+            RefusalReason::NotARevoke => "not_a_revoke",
         }
     }
 }
@@ -216,11 +229,7 @@ fn by_manager(rec: &ControlRecord, list: &Membership, device_id: &str) -> Verdic
         ControlPrincipal::Service(id) => {
             service_key(rec, list, id)?;
         }
-        ControlPrincipal::Host(host_id) => {
-            if list.host_sender_state(host_id).is_none() {
-                return Err(pending(PendingReason::PrincipalUnknown));
-            }
-        }
+        ControlPrincipal::Host(host_id) => host_revoke(rec, list, host_id)?,
     }
     let key = key.ok_or(pending(PendingReason::SignerUnknown))?;
     signed_by(rec, &key)?;
@@ -247,6 +256,31 @@ fn service_key(rec: &ControlRecord, list: &Membership, id: &str) -> Verdict<(u64
         .ok_or(refused(RefusalReason::KeyMismatch))
 }
 
+/// A host principal's `revoke_seq` names this list's `host_sender_revoke`
+/// of `host_id` (ruling T10a). An entry there that isn't one is refused,
+/// whatever the list holds later (a committed entry never changes); beyond
+/// the head, the record waits (after an unknown host, which can't have a
+/// revoke in the list yet).
+fn host_revoke(rec: &ControlRecord, list: &Membership, host_id: &str) -> Verdict<()> {
+    // The parse gives a host principal's record exactly this form.
+    let ControlAction::InterruptRunning {
+        revoke_seq: Some(seq),
+    } = rec.action()
+    else {
+        return Err(refused(RefusalReason::NotARevoke));
+    };
+    match list.entry(seq).map(|entry| &entry.action) {
+        Some(Action::HostSenderRevoke {
+            host_id: revoked, ..
+        }) if revoked == host_id => Ok(()),
+        Some(_) => Err(refused(RefusalReason::NotARevoke)),
+        None if list.host_sender_state(host_id).is_none() => {
+            Err(pending(PendingReason::PrincipalUnknown))
+        }
+        None => Err(pending(PendingReason::RevokeNotInList)),
+    }
+}
+
 fn signed_by(rec: &ControlRecord, key: &PublicKey) -> Verdict<()> {
     rec.object()
         .verify(key)
@@ -254,7 +288,7 @@ fn signed_by(rec: &ControlRecord, key: &PublicKey) -> Verdict<()> {
 }
 
 #[cfg(test)]
-mod tests {
+mod verify_control_tests {
     use super::*;
     use crate::control::record::{
         ControlAbout, ControlAction, ControlBody, ControlError, ControlFeed, ControlPrincipal,
@@ -266,8 +300,8 @@ mod tests {
         Action, HostRecord, Member, MemberKind, RECOVERY_SIGNER, Role, RolesChange,
     };
     use crate::membership::{
-        Check, HostNow, Invalid, ServiceScope, draft_on, host_sender_revoke, service_add,
-        service_key_fingerprint, service_renewal, sign_entry,
+        Check, HostNow, Invalid, ServiceScope, draft_on, host_sender_readmit, host_sender_revoke,
+        service_add, service_key_fingerprint, service_renewal, sign_entry,
     };
     use crate::provider::{KeyId, KeyProvider};
     use crate::signed::SignedObject;
@@ -325,6 +359,7 @@ mod tests {
         keys.insert_ed25519(KeyId::new("svc-ed"), &[7; 32]);
         keys.insert_ed25519(KeyId::new("svc-new"), &[8; 32]);
         keys.insert_ed25519(KeyId::new("host-a"), &[9; 32]);
+        keys.insert_ed25519(KeyId::new("host-b"), &[11; 32]);
         keys.insert_ed25519(KeyId::new("kit"), &[10; 32]);
         for (i, id) in ["mac", "phone", "ipad", "dev-new", "dev-kit"]
             .into_iter()
@@ -778,7 +813,7 @@ mod tests {
         // A principal the list doesn't know yet, whoever signs.
         let hold = service_body(&list, &keys, "svc-new", "svc-new", ControlAction::Hold);
         let stop = service_body(&list, &keys, "svc-new", "mac", revoke);
-        let host_b = host_body(&list, "host-b", manager("mac"), r);
+        let host_b = host_body(&list, "host-b", manager("mac"), list.head().seq + 1);
         assert_eq!(
             check(&list, &keys, "svc-new", &hold),
             pending(PendingReason::PrincipalUnknown)
@@ -1012,6 +1047,113 @@ mod tests {
         assert!(build_control(&keys, &KeyId::new("mac"), &body).is_err());
     }
 
+    /// Adds the host `host-b` (signed by `mac`); returns its `seq`.
+    fn add_host_b(list: &mut Membership, keys: &SoftwareKeys) -> u64 {
+        let host = HostRecord {
+            host_id: "host-b".into(),
+            host_trust_gen: 1,
+            host_key: key(keys, "host-b"),
+        };
+        append(list, keys, "mac", Action::AddHost { host })
+    }
+
+    /// Ruling T10a: `revoke_seq` names that host's `host_sender_revoke`.
+    #[test]
+    fn host_interrupt_matching_revoke_valid() {
+        let keys = keys();
+        let mut list = account(&keys);
+        add_host_b(&mut list, &keys);
+        let r_a = revoke_host(&mut list, &keys, "host-a");
+        let r_b = revoke_host(&mut list, &keys, "host-b");
+        for (host_id, r) in [("host-a", r_a), ("host-b", r_b)] {
+            let body = host_body(&list, host_id, manager("phone"), r);
+            assert_eq!(
+                check(&list, &keys, "phone", &body),
+                valid(&list, by_manager("phone")),
+                "{host_id}"
+            );
+        }
+        // A readmit since changes nothing: the interrupt is for the tasks
+        // admitted before that revoke (II.3.1).
+        let readmit = host_sender_readmit("host-a", T0).unwrap();
+        append(&mut list, &keys, "mac", readmit);
+        let body = host_body(&list, "host-a", manager("mac"), r_a);
+        assert_eq!(
+            check(&list, &keys, "mac", &body),
+            valid(&list, by_manager("mac"))
+        );
+    }
+
+    /// Ruling T10a: a `revoke_seq` beyond the head waits, and verifies once
+    /// the list holds that host's revoke there.
+    #[test]
+    fn host_interrupt_revoke_beyond_head_pending() {
+        let keys = keys();
+        let mut list = account(&keys);
+        let next = list.head().seq + 1;
+        let body = host_body(&list, "host-a", manager("mac"), next);
+        assert_eq!(
+            check(&list, &keys, "mac", &body),
+            pending(PendingReason::RevokeNotInList)
+        );
+        // Far beyond too.
+        let far = host_body(&list, "host-a", manager("mac"), next + 100);
+        assert_eq!(
+            check(&list, &keys, "mac", &far),
+            pending(PendingReason::RevokeNotInList)
+        );
+        assert_eq!(revoke_host(&mut list, &keys, "host-a"), next);
+        assert_eq!(
+            check(&list, &keys, "mac", &body),
+            valid(&list, by_manager("mac"))
+        );
+    }
+
+    /// Ruling T10a: another host's revoke is no revoke of this host.
+    #[test]
+    fn host_interrupt_other_hosts_revoke_refused() {
+        let keys = keys();
+        let mut list = account(&keys);
+        add_host_b(&mut list, &keys);
+        let r_b = revoke_host(&mut list, &keys, "host-b");
+        // host-a is still authorized; host-c was never added.
+        for host_id in ["host-a", "host-c"] {
+            let body = host_body(&list, host_id, manager("mac"), r_b);
+            assert_eq!(
+                check(&list, &keys, "mac", &body),
+                refused(RefusalReason::NotARevoke),
+                "{host_id}"
+            );
+        }
+        // Once host-a is revoked as well, r_b still names host-b's.
+        revoke_host(&mut list, &keys, "host-a");
+        let body = host_body(&list, "host-a", manager("mac"), r_b);
+        assert_eq!(
+            check(&list, &keys, "mac", &body),
+            refused(RefusalReason::NotARevoke)
+        );
+    }
+
+    /// Ruling T10a: an entry that isn't a `host_sender_revoke` at all: the
+    /// genesis, the host's own `add_host`, a service `add`, and a readmit
+    /// of the host.
+    #[test]
+    fn host_interrupt_not_a_revoke_refused() {
+        let keys = keys();
+        let mut list = account(&keys);
+        revoke_host(&mut list, &keys, "host-a");
+        let readmit = host_sender_readmit("host-a", T0).unwrap();
+        let readmit_seq = append(&mut list, &keys, "mac", readmit);
+        for seq in [1, HOST_A_SEQ, SVC_1_SEQ, readmit_seq] {
+            let body = host_body(&list, "host-a", manager("mac"), seq);
+            assert_eq!(
+                check(&list, &keys, "mac", &body),
+                refused(RefusalReason::NotARevoke),
+                "seq {seq}"
+            );
+        }
+    }
+
     #[test]
     fn keys_ever_and_current_manager_key() {
         let keys = keys();
@@ -1052,6 +1194,7 @@ mod tests {
         let codes = [
             PendingReason::PrincipalUnknown.code(),
             PendingReason::SignerUnknown.code(),
+            PendingReason::RevokeNotInList.code(),
             RefusalReason::WrongAccount.code(),
             RefusalReason::BadSignature.code(),
             RefusalReason::KeyMismatch.code(),
@@ -1059,6 +1202,7 @@ mod tests {
             RefusalReason::RemovedManager.code(),
             RefusalReason::HostKeySigned.code(),
             RefusalReason::NotAService.code(),
+            RefusalReason::NotARevoke.code(),
         ];
         let distinct: std::collections::BTreeSet<_> = codes.iter().collect();
         assert_eq!(distinct.len(), codes.len());
