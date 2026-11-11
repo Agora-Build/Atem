@@ -25,7 +25,8 @@ use atem_client::channel::{
 use atem_client::control::{
     Applied as ControlApplied, ControlAbout, ControlAction, ControlBody, ControlCheck,
     ControlError, ControlFeed, ControlPrincipal, ControlRecord, ControlSigner, ControlState,
-    FeedPos, HostAction, VerifiedSigner, build_control, principal_key_of, verify_control,
+    FeedPos, HostAction, Transition, VerifiedSigner, build_control, principal_key_of,
+    verify_control,
 };
 use atem_client::domain::{SignLabel, SigningInput};
 use atem_client::encoding::{Hash32, b64u, b64u_decode, enc, hex, u64_field};
@@ -4046,7 +4047,7 @@ fn control_step(
         "expect": expect,
     });
     if let Some((feed, feed_seq)) = pos {
-        v["pos"] = serde_json::json!({"feed_id": feed.1, "feed_seq": feed_seq});
+        v["pos"] = serde_json::json!({"origin": feed.0, "feed_id": feed.1, "feed_seq": feed_seq});
     }
     v
 }
@@ -4203,12 +4204,14 @@ impl<'a> ControlGen<'a> {
         let mut state = ControlState::new(&self.ctx.chain(&[]));
         for step in &steps {
             let chain = chain_labels(step);
-            state.apply(
-                &self.record(s(step, "record")),
-                &self.ctx.chain(&chain),
-                feed_pos(step),
-                step["host_applied_seq"].as_u64().unwrap(),
-            );
+            state = state
+                .apply(
+                    &self.record(s(step, "record")),
+                    &self.ctx.chain(&chain),
+                    feed_pos(step),
+                    step["host_applied_seq"].as_u64().unwrap(),
+                )
+                .next;
         }
         serde_json::json!({"label": label, "note": note, "steps": steps, "state": state.to_json()})
     }
@@ -4217,6 +4220,7 @@ impl<'a> ControlGen<'a> {
 /// A step's feed position.
 fn feed_pos(step: &Value) -> Option<FeedPos> {
     step.get("pos").map(|pos| FeedPos {
+        origin: s(pos, "origin").into(),
         feed_id: s(pos, "feed_id").into(),
         feed_seq: pos["feed_seq"].as_u64().unwrap(),
     })
@@ -4577,7 +4581,7 @@ fn control_vectors(book: &Book) -> Value {
     for (label, note, signed_with, body, code) in [
         (
             "P1_host_release",
-            "a host principal's release (ruling T9a: refused at parse)",
+            "a host principal's release: refused at parse",
             "dev-mac",
             host_release,
             "not_for_host_principal",
@@ -4627,6 +4631,104 @@ fn control_vectors(book: &Book) -> Value {
     ] {
         g.push_refused(label, note, signed_with, body, code);
     }
+
+    // ---- a stop always wins, record ids per principal, an issued_at tie
+    let mut body = g.svc(60, SVC, C::Cover, FEED_A2, "station");
+    body.issued_at = control_issued(1) - 1000;
+    g.push(
+        "A2_cover_not_newer",
+        "station-dev's reset snapshot cover, signed with a clock behind S1_cover's: not newer, so the coverage stays on the old feed",
+        "svc-discord",
+        &body,
+        vec![(l, own_())],
+    );
+    let body = g.svc(61, SVC, C::Hold, FEED_A, "owner");
+    g.push(
+        "S9_hold",
+        "a pause applied out of feed order (say it waited)",
+        "svc-discord",
+        &body,
+        vec![(l, own_())],
+    );
+    let body = g.svc(62, SVC, C::Release, FEED_A, "owner");
+    g.push(
+        "S10_release",
+        "a resume at a position before the feed's last hold or release",
+        "svc-discord",
+        &body,
+        vec![(l, own_())],
+    );
+    let body = g.svc(63, SVC, C::Release, FEED_A, "owner");
+    g.push(
+        "S11_release",
+        "a resume after the feed's last hold or release",
+        "svc-discord",
+        &body,
+        vec![(l, own_())],
+    );
+    let tie = control_issued(66);
+    let mut body = g.svc(64, SVC, C::Cover, FEED_A, "station");
+    body.issued_at = tie;
+    g.push(
+        "T1_cover_tie_lower_id",
+        "station-dev's cover issued at the same time as T2_cover_tie, with a lower record_id",
+        "svc-discord",
+        &body,
+        vec![(l, own_())],
+    );
+    let mut body = g.svc(65, SVC, C::Cover, FEED_B, "station");
+    body.issued_at = tie;
+    g.push(
+        "T2_cover_tie",
+        "station-b's cover",
+        "svc-discord",
+        &body,
+        vec![(l, own_())],
+    );
+    let body = g.svc(66, SVC, C::Cover, FEED_A, "station");
+    g.push(
+        "T3_cover_tie_higher_id",
+        "station-dev's cover issued at the same time as T2_cover_tie, with a higher record_id: newer",
+        "svc-discord",
+        &body,
+        vec![(l, own_())],
+    );
+    let mut body = g.svc(67, SVC, C::Cover, FEED_B, "station");
+    body.record_id = control_rid(30);
+    g.push(
+        "X1_cover_under_h1_id",
+        "svc-discord's own cover under the record_id of H1_interrupt_7 (host-a's): a record of another principal never blocks it",
+        "svc-discord",
+        &body,
+        vec![(l, own_())],
+    );
+    let mut body = g.svc(68, SVC, C::Hold, FEED_A, "owner");
+    body.record_id = control_rid(3);
+    g.push(
+        "X2_hold_under_s3_id",
+        "a pause under S3_release's record_id: a stop, it applies, and the reused id is evidence",
+        "svc-discord",
+        &body,
+        vec![(l, own_())],
+    );
+    let mut body = g.svc(69, SVC, C::Release, FEED_A, "owner");
+    body.record_id = control_rid(2);
+    g.push(
+        "X3_release_under_s2_id",
+        "a resume under S2_hold's record_id: refused, and the reused id is evidence",
+        "svc-discord",
+        &body,
+        vec![(l, own_())],
+    );
+    let mut body = g.svc(70, SVC, revoke(true), FEED_A, "owner");
+    body.record_id = control_rid(1);
+    g.push(
+        "X4_revoke_under_s1_id",
+        "a revoke with interrupt_running under S1_cover's record_id: a stop, it applies, and the reused id is evidence",
+        "svc-discord",
+        &body,
+        vec![(l, own_())],
+    );
 
     // ---- sequences: one host's control state, step by step
     let a = |n| Some((FEED_A, n));
@@ -4703,7 +4805,7 @@ fn control_vectors(book: &Book) -> Value {
         ),
         g.sequence(
             "Q4_cover_from_another_station",
-            "ruling T11a: a stale cover from another Station neither takes coverage nor releases; a newer one takes coverage and the hold persists until the new feed releases",
+            "covers are ordered by (issued_at, record_id): a stale cover from another Station neither takes coverage nor releases; a newer one takes coverage and the hold persists until the new feed releases",
             vec![
                 step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
                 step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
@@ -4717,7 +4819,7 @@ fn control_vectors(book: &Book) -> Value {
         ),
         g.sequence(
             "Q5_feed_reset",
-            "ruling T11a: a reset's newer cover (a duplicate) moves the ordering to the new feed; the old feed's release no longer applies",
+            "a reset's newer cover (a duplicate) moves the ordering to the new feed; the old feed's release no longer applies",
             vec![
                 step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
                 step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
@@ -4739,7 +4841,7 @@ fn control_vectors(book: &Book) -> Value {
         ),
         g.sequence(
             "Q7_host_interrupt",
-            "ruling T10a: pending until the list holds the revoke and host-work applied it (host_applied_seq); one interrupt per revoke_seq; a revoke entry with interrupt_running: true already interrupted",
+            "revoke_seq names that host's own revoke: pending until the list holds it and host-work applied it (host_applied_seq); one interrupt per revoke_seq; a revoke entry with interrupt_running: true already interrupted",
             vec![
                 control_step("H1_interrupt_7", &[], None, 6, applied("pending", &[("interrupt", "pending")], none.clone(), false)),
                 control_step("H1_interrupt_7", HS7, None, 6, applied("pending", &[("interrupt", "pending")], none.clone(), false)),
@@ -4776,6 +4878,136 @@ fn control_vectors(book: &Book) -> Value {
             "an about.by no host knows applies: about decides nothing",
             vec![step("S8_revoke_unknown_by", a(1), applied("applied", &[("revocation", "applied")], vec![act("revoke", SVC)], false))],
         ),
+        g.sequence(
+            "Q10_hold_from_a_station_that_lost_the_takeover",
+            "a stop always wins: the hold of a Station whose cover wasn't newer applies; its release is refused, the covering feed's release lifts the hold, and the hold replayed is a duplicate",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("B1_cover_stale", b(1), applied("refused", &[("cover", "refused")], none.clone(), false)),
+                step("B4_hold", b(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("B5_release", b(3), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("S3_release", a(2), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+                step("B4_hold", b(2), applied("duplicate", &[("hold", "duplicate")], none.clone(), false)),
+            ],
+        ),
+        g.sequence(
+            "Q11_reset_cover_not_newer",
+            "a reset whose snapshot cover isn't newer leaves the coverage on the old feed: the new feed's hold applies, its release is refused, and the old feed's release lifts the hold",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("A2_cover_not_newer", a2(1), applied("duplicate", &[("cover", "duplicate")], none.clone(), false)),
+                step("A2_hold", a2(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("A2_release", a2(3), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("S3_release", a(2), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q12_service_interrupt_waits",
+            "a service's interrupt_running waits for the service's revocation on this host, then applies once",
+            vec![
+                step("S6_interrupt", a(1), applied("pending", &[("interrupt", "pending")], none.clone(), false)),
+                step("S4_revoke", a(2), applied("applied", &[("revocation", "applied")], vec![act("revoke", SVC)], false)),
+                step(
+                    "S6_interrupt",
+                    a(1),
+                    applied("applied", &[("interrupt", "applied")], vec![act_interrupt(SVC, &control_rid(4))], false),
+                ),
+                step("S6_interrupt", a(1), applied("duplicate", &[("interrupt", "duplicate")], none.clone(), false)),
+            ],
+        ),
+        g.sequence(
+            "Q13_out_of_order_in_one_feed",
+            "within the covering feed a hold applied out of feed order still applies; a release must come after the feed's last hold or release",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("S3_release", a(5), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+                step("S9_hold", a(3), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("S10_release", a(4), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("S11_release", a(6), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q14_hold_with_no_coverage",
+            "a hold applies with no coverage at all; a release needs the covering feed, after its cover",
+            vec![
+                step("B4_hold", b(1), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("B2_release", b(2), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("B3_cover", b(3), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_B)], false)),
+                step("B5_release", b(4), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q15_old_cover_replayed_after_a_move",
+            "the old Station's cover replayed after the coverage moved is a duplicate that moves nothing back: the old feed's hold still applies, its release doesn't",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("B3_cover", b(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_B)], false)),
+                step("S1_cover", a(1), applied("duplicate", &[("cover", "duplicate")], none.clone(), false)),
+                step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("S3_release", a(3), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("B5_release", b(2), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q16_issued_at_tie",
+            "covers issued at the same time are ordered by record_id: the lower one doesn't take coverage, the higher one does",
+            vec![
+                step("T2_cover_tie", b(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_B)], false)),
+                step("T1_cover_tie_lower_id", a(1), applied("refused", &[("cover", "refused")], none.clone(), false)),
+                step("T3_cover_tie_higher_id", a(2), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q17_record_ids_per_principal",
+            "a record of one principal under another principal's record_id blocks nothing: idempotency is by principal and record_id",
+            vec![
+                control_step(
+                    "X1_cover_under_h1_id",
+                    HS7,
+                    b(1),
+                    7,
+                    applied("applied", &[("cover", "applied")], vec![act_cover(FEED_B)], false),
+                ),
+                control_step(
+                    "H1_interrupt_7",
+                    HS7,
+                    None,
+                    7,
+                    applied("applied", &[("interrupt", "applied")], vec![act_interrupt(HOST_A, "7")], false),
+                ),
+                control_step("X1_cover_under_h1_id", HS7, b(1), 7, applied("duplicate", &[("cover", "duplicate")], none.clone(), false)),
+                control_step("H1_interrupt_7", HS7, None, 7, applied("duplicate", &[("interrupt", "duplicate")], none.clone(), false)),
+            ],
+        ),
+        g.sequence(
+            "Q18_colliding_record_ids",
+            "another body under a record_id the same principal's record counted with is evidence, and the first body keeps the id: a stop (hold, revoke) still applies, a release or cover is refused",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("S3_release", a(3), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+                step("X2_hold_under_s3_id", a(4), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], true)),
+                step("X3_release_under_s2_id", a(5), applied("refused", &[("release", "refused")], none.clone(), true)),
+                step("V6_conflicting_id", a(6), applied("refused", &[("cover", "refused")], none.clone(), true)),
+                step(
+                    "X4_revoke_under_s1_id",
+                    a(7),
+                    applied(
+                        "applied",
+                        &[("revocation", "applied"), ("interrupt", "applied")],
+                        vec![act("revoke", SVC), act_interrupt(SVC, &control_rid(1))],
+                        true,
+                    ),
+                ),
+                step(
+                    "X4_revoke_under_s1_id",
+                    a(7),
+                    applied("duplicate", &[("revocation", "duplicate"), ("interrupt", "duplicate")], none.clone(), true),
+                ),
+                step("S1_cover", a(1), applied("duplicate", &[("cover", "duplicate")], none.clone(), false)),
+            ],
+        ),
     ];
 
     let svc_key = book.signer_public("svc-discord");
@@ -4783,7 +5015,7 @@ fn control_vectors(book: &Book) -> Value {
         "name": "r9-vectors-host-work-control",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; `state` is ControlState::to_json after the last step. Record ids are UUID v4 numbered by record; issued_at orders covers (ruling T11a).",
+        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (the records that counted kept by principal, then record_id). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused).",
         "account_id": "acct-test-1",
         "genesis_hash": genesis_hash().to_hex(),
         "stations": {
@@ -5004,13 +5236,19 @@ fn host_work_control() {
         let mut state = ControlState::new(&l);
         for (i, step) in q["steps"].as_array().unwrap().iter().enumerate() {
             let chain = chain_labels(step);
-            let got = state.apply(
+            let Transition { applied, next } = state.apply(
                 &by_label[s(step, "record")],
                 &ctx.chain(&chain),
                 feed_pos(step),
                 step["host_applied_seq"].as_u64().unwrap(),
             );
-            assert_eq!(applied_of(&got), step["expect"], "{label} step {}", i + 1);
+            assert_eq!(
+                applied_of(&applied),
+                step["expect"],
+                "{label} step {}",
+                i + 1
+            );
+            state = next;
         }
         assert_eq!(state.to_json(), q["state"], "{label}: state");
         let text = jcs(&q["state"]).unwrap();

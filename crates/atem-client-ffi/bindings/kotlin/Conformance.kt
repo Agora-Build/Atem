@@ -591,8 +591,9 @@ fun main(args: Array<String>) {
     // `parse_error`); the builders reproduce it byte for byte (a software
     // store, or the signing input and a signature); every sequence runs
     // through a ControlStateHandle with each step's per-effect results and
-    // the state it leaves; and a provider is asked under the purpose the
-    // record's signer gives.
+    // the state it leaves (a handle never changes, so a failed commit loses
+    // no effect); and a provider is asked under the purpose the record's
+    // signer gives.
     val ctl = load("r9-vectors-host-work-control")
     val ctlRecords = ctl["records"].arr()
     val ctlByLabel = ctlRecords.associateBy { it["label"].s() }
@@ -659,7 +660,7 @@ fun main(args: Array<String>) {
                 verdicts++
             }
         }
-        check(verdicts >= 41) { "$verdicts verdicts" }
+        check(verdicts >= 52) { "$verdicts verdicts" }
     }
     check("control records: the builders reproduce every record; a body the parse refuses is refused") {
         var built = 0
@@ -690,7 +691,7 @@ fun main(args: Array<String>) {
             eq(buildControlRecord(store.provider(), "k", body), canonical, label)
             built++
         }
-        check(built >= 33) { "$built built" }
+        check(built >= 44) { "$built built" }
     }
     fun controlActionOf(a: ControlHostAction): Map<String, Any?> = when (a) {
         is ControlHostAction.Revoke -> mapOf("type" to "revoke", "principal" to a.principal)
@@ -704,15 +705,17 @@ fun main(args: Array<String>) {
         "effects" to a.effects.map { mapOf("effect" to it.effect.name.lowercase(), "result" to it.result.name.lowercase()) },
         "actions" to a.actions.map(::controlActionOf),
         "evidence" to a.evidence)
+    fun ctlPos(p: Any?): ControlFeedPos? =
+        p?.let { ControlFeedPos(it["origin"].s(), it["feed_id"].s(), it["feed_seq"].l().toULong()) }
     check("control records: every sequence's per-effect results and its state through ControlStateHandle") {
         for (q in ctl["sequences"].arr()) {
             val label = q["label"].s()
-            val state = ControlStateHandle(logL())
+            var state = ControlStateHandle(logL())
             q["steps"].arr().forEachIndexed { i, step ->
-                val pos = step.obj()["pos"]?.let { ControlFeedPos(it["feed_id"].s(), it["feed_seq"].l().toULong()) }
                 val record = Json.write(ctlByLabel.getValue(step["record"].s())["record"])
-                val got = state.apply(record, logAfter(strs(step["chain"])), pos, step["host_applied_seq"].l().toULong())
-                eq(controlAppliedOf(got), step["expect"].obj(), "$label step ${i + 1}")
+                val t = state.apply(record, logAfter(strs(step["chain"])), ctlPos(step.obj()["pos"]), step["host_applied_seq"].l().toULong())
+                eq(controlAppliedOf(t.applied), step["expect"].obj(), "$label step ${i + 1}")
+                state = t.next
             }
             val text = canonicalJson(Json.write(q["state"]))
             eq(state.toJson(), text, label)
@@ -723,6 +726,22 @@ fun main(args: Array<String>) {
         throwsCode("account_mismatch") { ControlStateHandle.fromJson(logL(), text.replace("\"acct-test-1\"", "\"acct-other\"")) }
         throwsCode("unsupported_version") { ControlStateHandle.fromJson(logL(), text.replace("\"v\":1", "\"v\":2")) }
         throwsCode("malformed") { ControlStateHandle.fromJson(logL(), "[") }
+    }
+    check("control records: a failed commit loses no effect (apply leaves its handle as it was)") {
+        val state = ControlStateHandle(logL())
+        val before = state.toJson()
+        val record = Json.write(ctlByLabel.getValue("S5_revoke_interrupt")["record"])
+        val a = ctl["stations"]["A"]
+        val pos = ControlFeedPos(a["origin"].s(), a["feed_id"].s(), 1uL)
+        val first = state.apply(record, logL(), pos, 6uL)
+        eq(first.applied.actions.size, 2)
+        // The caller's transaction failed: apply again to the handle it kept.
+        eq(state.toJson(), before)
+        val again = state.apply(record, logL(), pos, 6uL)
+        eq(again.applied, first.applied, "the same results and actions")
+        eq(again.next.toJson(), first.next.toJson())
+        // Committed: the next state goes on, and the record is a duplicate.
+        eq(again.next.apply(record, logL(), pos, 6uL).applied.result, ControlResultKind.DUPLICATE)
     }
     check("control records: a Station's service key signs with no confirmation, a native manager's asks a fresh one") {
         val station = JdkKeys()

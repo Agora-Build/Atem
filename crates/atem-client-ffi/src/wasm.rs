@@ -921,41 +921,74 @@ impl ControlStateHandle {
             crate::control::ControlStateHandle::from_json(log.0.clone(), state_json),
         )?))
     }
-    /// The durable state (canonical JSON): store it after every `apply`.
+    /// The durable state (canonical JSON): store the next state's after
+    /// every `apply`.
     #[wasm_bindgen(js_name = toJson)]
     pub fn to_json(&self) -> String {
         self.0.to_json()
     }
-    /// Applies a record (`pos`: `{feedId, feedSeq}`, or `null`/`undefined`
-    /// over a channel): `{result, effects: [{effect, result}], actions:
-    /// [{type, principal, …}], evidence}`.
+    /// Applies a record to this state (`pos`: `{origin, feedId, feedSeq}`,
+    /// or `null`/`undefined` over a channel) and returns a
+    /// `ControlTransition`: `applied` (`{result, effects: [{effect,
+    /// result}], actions: [{type, principal, …}], evidence}`) and `next`,
+    /// the state after it. This handle doesn't change: use `next` once
+    /// your transaction storing `next.toJson()` committed.
     pub fn apply(
         &self,
         record_json: String,
         log: &MembershipLog,
         pos: JsValue,
         host_applied_seq: f64,
-    ) -> JsResult<JsValue> {
+    ) -> JsResult<ControlTransition> {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct P {
+            origin: String,
             feed_id: String,
             feed_seq: f64,
         }
         let pos = if pos.is_null() || pos.is_undefined() {
             None
         } else {
-            only_fields(&pos, &["feedId", "feedSeq"], "pos")?;
+            only_fields(&pos, &["origin", "feedId", "feedSeq"], "pos")?;
             let p: P = serde_wasm_bindgen::from_value(pos)
-                .map_err(|_| bad("pos {feedId, feedSeq}, or null"))?;
+                .map_err(|_| bad("pos {origin, feedId, feedSeq}, or null"))?;
             Some(ControlFeedPos {
+                origin: p.origin,
                 feed_id: p.feed_id,
                 feed_seq: ms(p.feed_seq)?,
             })
         };
-        ok(self
+        let transition = err(self
             .0
-            .apply(record_json, log.0.clone(), pos, ms(host_applied_seq)?))
+            .apply(record_json, log.0.clone(), pos, ms(host_applied_seq)?))?;
+        Ok(ControlTransition {
+            applied: to_js(&transition.applied)?,
+            next: transition.next,
+        })
+    }
+}
+
+/// What `ControlStateHandle.apply` gives (`crate::control::ControlTransition`).
+#[wasm_bindgen]
+pub struct ControlTransition {
+    applied: JsValue,
+    next: Arc<crate::control::ControlStateHandle>,
+}
+
+#[wasm_bindgen]
+impl ControlTransition {
+    /// What the record did: `{result, effects, actions, evidence}`.
+    #[wasm_bindgen(getter)]
+    pub fn applied(&self) -> JsValue {
+        self.applied.clone()
+    }
+    /// The state after the record: use it once the transaction storing
+    /// `next.toJson()` committed (until then the handle applied on is the
+    /// current state).
+    #[wasm_bindgen(getter)]
+    pub fn next(&self) -> ControlStateHandle {
+        ControlStateHandle(self.next.clone())
     }
 }
 

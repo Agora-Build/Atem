@@ -22,15 +22,18 @@
 //!   valid, pending or refused, with its reason).
 //! - **Apply** them: `ControlStateHandle` is the reference control state of
 //!   one device list (`ControlState`): `apply` gives each record's
-//!   per-effect results and the host actions. Persist `to_json()` after
-//!   every `apply`, in the same transaction as your own state, and load it
-//!   with `from_json` at start.
+//!   per-effect results and the host actions, and the next state as a new
+//!   handle; the handle applied on never changes. Persist the next state's
+//!   `to_json()` in the same transaction as your own state, use the next
+//!   handle once that transaction committed (keep the old one if it
+//!   failed: applying the record again gives the same results), and load
+//!   the state with `from_json` at start.
 //!
 //! Errors: a record its parse refuses is `Invalid{code}` (`malformed`,
 //! `unknown_field`, `field_not_allowed`, `not_for_host_principal`,
 //! `wrong_type`, or the signed-object layer's code); a state that doesn't
 //! load is `Stored{code}`.
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
 use atem_client::KeyId;
 use atem_client::canonical::{Numbers, parse_strict};
@@ -291,35 +294,57 @@ fn applied_info(applied: Applied) -> ControlApplied {
 
 /// The reference control state of one device list (I.5.5, I.5.8): which
 /// principals are revoked, interrupted, covered by which Station's feed,
-/// held or released, and every record that counted. `apply` is the host's
-/// rules, so a Station (or a test) predicts exactly what a host reports.
+/// held, and every record that counted. `apply` is the host's rules, so a
+/// Station (or a test) predicts exactly what a host reports.
 ///
-/// **Persistence.** Store `to_json()` after every `apply`, in the same
-/// transaction as the effects you act on (your cursor, acknowledgments,
-/// alerts), and load it with `from_json` at start; never re-apply records
-/// to rebuild it (a record verified then may not verify against today's
-/// list, and idempotency is by the records kept).
+/// **A handle never changes.** `apply` returns the record's results and the
+/// next state as a new handle (`ControlTransition`); the handle it was
+/// called on stays as it was, so it is safe to share across threads.
+///
+/// **Persistence.** In one transaction, store `next.to_json()` with what
+/// you do with the results (your cursor, acknowledgments, alerts). Once it
+/// committed, use `next` from then on; if it failed, keep the handle you
+/// applied on and apply the record again: the same results and actions
+/// come back, so no effect is lost. Load the state with `from_json` at
+/// start; never re-apply records to rebuild it (a record verified then may
+/// not verify against today's list, and idempotency is by the records
+/// kept).
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct ControlStateHandle {
-    state: Mutex<ControlState>,
+    state: ControlState,
 }
 
 impl ControlStateHandle {
-    fn lock(&self) -> MutexGuard<'_, ControlState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     pub(crate) fn wrap(state: ControlState) -> Arc<Self> {
-        Arc::new(ControlStateHandle {
-            state: Mutex::new(state),
-        })
+        Arc::new(ControlStateHandle { state })
     }
+}
+
+impl std::fmt::Debug for ControlStateHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlStateHandle").finish_non_exhaustive()
+    }
+}
+
+/// What `ControlStateHandle::apply` gives: the record's results and the
+/// state after it.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ControlTransition {
+    /// What the record did, and what the host does with it.
+    pub applied: ControlApplied,
+    /// The state after the record. Store `next.to_json()` in the
+    /// transaction that acts on `applied`, and use `next` once it
+    /// committed. Until then, and if it fails, the handle `apply` was
+    /// called on is the current state: it didn't change.
+    pub next: Arc<ControlStateHandle>,
 }
 
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 impl ControlStateHandle {
     /// The empty control state of `log`'s device list (its account and
-    /// genesis). Re-pairing (a new genesis) starts a new one.
+    /// genesis): for a device list that has none yet. Re-pairing (a new
+    /// genesis) starts a new one.
     #[cfg_attr(feature = "uniffi", uniffi::constructor)]
     pub fn new(log: Arc<MembershipLog>) -> Arc<Self> {
         Self::wrap(ControlState::new(&log.lock()))
@@ -330,8 +355,11 @@ impl ControlStateHandle {
     /// object, no `v`), `unsupported_version` (a `v` other than 1),
     /// `account_mismatch`, `genesis_mismatch` (another device list's state),
     /// `stored_invalid` (the state's own rules refuse it, or it isn't
-    /// exactly `to_json()`'s form). Nothing is loaded then: keep the work
-    /// it guards stopped, never start again from an empty state.
+    /// exactly `to_json()`'s form). Nothing is loaded then. A
+    /// `genesis_mismatch` after a re-pair (the stored state is the old
+    /// device list's) means the new list starts with `new`; on any other
+    /// error keep the work it guards stopped and never start again from an
+    /// empty state.
     #[cfg_attr(feature = "uniffi", uniffi::constructor)]
     pub fn from_json(log: Arc<MembershipLog>, state_json: String) -> Result<Arc<Self>> {
         if state_json.len() > MAX_CONTROL_STATE_JSON {
@@ -394,21 +422,25 @@ impl ControlStateHandle {
         Ok(Self::wrap(state))
     }
 
-    /// The durable state: canonical JSON (`"v": 1`). Store it after every
-    /// `apply`, in the same transaction as what you do with the result.
+    /// The durable state: canonical JSON (`"v": 1`). Store the next
+    /// state's after every `apply`, in the same transaction as what you do
+    /// with the result.
     pub fn to_json(&self) -> String {
-        canonical_lossy(&self.lock().to_json())
+        canonical_lossy(&self.state.to_json())
     }
 
     /// Verifies `record_json` against `log` (the device list at the head
-    /// of this transaction) and applies it: each effect's result, what the
-    /// host does, and whether to keep the record as evidence. `pos` is
-    /// where it was read: a feed the caller syncs whose `origin` and
-    /// `feed_id` are the record's own (`None` over a channel; hold, release
-    /// and cover need one). `host_applied_seq` is host-work's applied
-    /// device-list `seq` (a host principal's interrupt waits for it). A
-    /// list of another account or genesis applies nothing (`refused`, no
-    /// evidence); a frozen one applies nothing new (`pending`).
+    /// of this transaction) and applies it to this state: each effect's
+    /// result, what the host does, and whether to keep the record as
+    /// evidence, with the next state (`ControlTransition`). This handle
+    /// doesn't change. `pos` is where it was read: a feed the caller syncs
+    /// (`None` over a channel). A record whose body names another `origin`
+    /// or `feed_id` than `pos` counts as read at no position: its hold
+    /// still applies, its cover and release don't. `host_applied_seq` is
+    /// host-work's applied device-list `seq` (a host principal's interrupt
+    /// waits for it). A list of another account or genesis applies nothing
+    /// (`refused`, no evidence); a frozen one applies nothing new
+    /// (`pending`).
     ///
     /// Read `effects`, not only `result`: for the revocation, `duplicate`
     /// means "already in force on this host" and counts as done. Errors: a
@@ -420,19 +452,20 @@ impl ControlStateHandle {
         log: Arc<MembershipLog>,
         pos: Option<ControlFeedPos>,
         host_applied_seq: u64,
-    ) -> Result<ControlApplied> {
+    ) -> Result<ControlTransition> {
         let rec = record(&record_json)?;
         let pos = match pos {
             Some(pos) => Some(FeedPos {
                 feed_seq: safe_int(pos.feed_seq, "feed_seq")?,
+                origin: pos.origin,
                 feed_id: pos.feed_id,
             }),
             None => None,
         };
-        // The state's lock, then the log's: no call takes them the other
-        // way, and no provider runs here.
-        let mut state = self.lock();
-        let applied = state.apply(&rec, &log.lock(), pos, host_applied_seq);
-        Ok(applied_info(applied))
+        let transition = self.state.apply(&rec, &log.lock(), pos, host_applied_seq);
+        Ok(ControlTransition {
+            applied: applied_info(transition.applied),
+            next: Self::wrap(transition.next),
+        })
     }
 }

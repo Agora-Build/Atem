@@ -718,7 +718,9 @@ def check_host_work_control(file, data, report, context):
     signing input and signature (by the test key named, and that key is the
     one the chain names for the body's signer wherever the chain holds
     it), each service record's principal_key against the r9_svc of the
-    principal's auth_key, and the record digests a sequence's state keeps.
+    principal's auth_key, each step's position against the stations, and
+    the record digests a sequence's state keeps (by principal, then
+    record_id: the SHA-256 of a body of that principal with that id).
     Verdicts and per-effect results are the Rust runner's and the binding
     suites' (R9.12)."""
     keys = context["keys"]
@@ -741,6 +743,7 @@ def check_host_work_control(file, data, report, context):
 
     by_label = {}
     jcs_by_record_id = {}
+    stations = {(station["origin"], station["feed_id"]) for station in data["stations"].values()}
     for vector in data["records"]:
         label = vector["label"]
         by_label[label] = vector
@@ -752,7 +755,7 @@ def check_host_work_control(file, data, report, context):
             text = jcs(body)
             case.equal(text, vector["jcs"], "jcs")
             case.check(len(text.encode()) <= MAX_BODY_BYTES, "body within 4096 bytes")
-            jcs_by_record_id.setdefault(body["record_id"], set()).add(text)
+            jcs_by_record_id.setdefault((body["principal"], body["record_id"]), set()).add(text)
             signing_input = enc(["atem-host-work-control-v1", text])
             case.equal(signing_input.hex(), vector["signing_input_hex"], "signing input")
 
@@ -795,14 +798,19 @@ def check_host_work_control(file, data, report, context):
         with report.case(file, sequence["label"]) as case:
             for step in sequence["steps"]:
                 case.check(step["record"] in by_label, f"{step['record']} is a record of the file")
+                if "pos" in step:
+                    pos = step["pos"]
+                    case.equal(sorted(pos), ["feed_id", "feed_seq", "origin"], "a position {origin, feed_id, feed_seq}")
+                    case.check((pos["origin"], pos["feed_id"]) in stations, "a position in a station's feed")
             state = sequence["state"]
             case.equal((state["account_id"], state["genesis_hash"]), (data["account_id"], data["genesis_hash"]), "the state's account")
-            for record_id, digest in state["records"].items():
-                texts = jcs_by_record_id.get(record_id, set())
-                case.check(
-                    digest in {sha256(t.encode()).hex() for t in texts},
-                    f"{record_id[-4:]}: the SHA-256 of a record body with that id",
-                )
+            for principal, digests in state["records"].items():
+                for record_id, digest in digests.items():
+                    texts = jcs_by_record_id.get((principal, record_id), set())
+                    case.check(
+                        digest in {sha256(t.encode()).hex() for t in texts},
+                        f"{principal} {record_id[-4:]}: the SHA-256 of a record body of that principal with that id",
+                    )
 
 
 # ---------------------------------------------------------------------- main

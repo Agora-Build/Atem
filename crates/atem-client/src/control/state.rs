@@ -3,12 +3,16 @@
 //! progress is not application").
 //!
 //! [`ControlState`] is a host's control state: pure and deterministic (no
-//! clocks, no I/O). The host stores [`ControlState::to_json`] in the same
-//! `host-work.sqlite` transaction as the [`HostAction`]s a record's
-//! application returns and its scan cursor, and resumes with
-//! [`ControlState::from_json`]. A state belongs to one device list (its
-//! account and genesis); re-pairing starts a new one (II.3.1, "After a
-//! freeze").
+//! clocks, no I/O). [`ControlState::apply`] never changes the state it is
+//! called on: it returns the record's results and the next state
+//! ([`Transition`]). The host stores the next state's
+//! [`ControlState::to_json`] in the same `host-work.sqlite` transaction as
+//! the [`HostAction`]s it returns and its scan cursor, and adopts the next
+//! state only once that transaction committed; if the transaction fails,
+//! it applies the record again to the state it kept, which gives the same
+//! results and actions. It resumes with [`ControlState::from_json`]. A
+//! state belongs to one device list (its account and genesis); re-pairing
+//! starts a new one (II.3.1, "After a freeze").
 //!
 //! **Verified in the transaction.** [`ControlState::apply`] verifies the
 //! record ([`verify_control`]) against the list it is given. That must be
@@ -29,24 +33,31 @@
 //! - `applied`: this record put it in force on this host;
 //! - `duplicate`: this host already had it in force: the same record, a
 //!   re-signed copy, a revoke of a revoked principal, an interrupt for a
-//!   revocation already interrupted. For the revocation, `duplicate` means
-//!   exactly "this host already has the revocation in force", which the
-//!   Station's ledger counts as applied there (decision 8);
+//!   revocation already interrupted, a hold while held. For the
+//!   revocation, `duplicate` means exactly "this host already has the
+//!   revocation in force", which the Station's ledger counts as applied
+//!   there (decision 8);
 //! - `pending`: not in force yet, and it can be later (see below);
 //! - `refused`: not in force, and never from this record.
 //!
 //! The record's result is `applied` when any effect is, `duplicate` when
 //! every effect is, else `pending` or `refused`.
 //!
-//! **The rules** (I.5.4, I.5.5):
-//! 1. **Idempotent by `record_id`.** A record that counted (`applied` or
-//!    `duplicate`) is kept with the SHA-256 of its body's `jcs`. The same
-//!    body again is `duplicate` for every effect, whatever its signature
-//!    bytes, its position or what the list says now: a revoke whose signer
-//!    was removed since stays applied. Another body under that `record_id`
-//!    is `refused` and `evidence`: the first counts. A record kept pending
-//!    or refused takes no `record_id`, so a forgery never blocks the
-//!    genuine record.
+//! **The rules** (I.5.4, I.5.5; rules 1, 5 and 6 as Atem proposes them for
+//! Astation's and Auth/Portal's agreement):
+//! 1. **Idempotent by principal and `record_id`.** A record that counted
+//!    (`applied` or `duplicate`) is kept, under its principal, with the
+//!    SHA-256 of its body's `jcs`. The same body again is `duplicate` for
+//!    every effect, whatever its signature bytes, its position or what the
+//!    list says now: a revoke whose signer was removed since stays
+//!    applied. A record of one principal never blocks another principal's
+//!    record with the same `record_id`. Another body under a `record_id`
+//!    this principal's record counted with is verified first; then it is
+//!    kept as `evidence`, and the first body keeps the id: a stop (`hold`,
+//!    `revoke`, `interrupt_running`) still applies its effects (a stop
+//!    only ever adds), while a `cover` or `release` is `refused`. A record
+//!    kept pending or refused takes no `record_id`, so a forgery never
+//!    blocks the genuine record.
 //! 2. **Verification.** A `Pending` verdict is `pending`; a `Refused` one
 //!    is `refused` and `evidence` (I.5.4: kept as evidence, alerted).
 //! 3. **A revoke is final**, from any feed or from none: a stop counts
@@ -61,46 +72,48 @@
 //!    interrupt"). That is host-work's applied device-list `seq`, whose
 //!    effects (the cancellations, and the revoke's own interrupt intents)
 //!    are durable, not the list's head (`verify_control` already checked
-//!    that `revoke_seq` names that host's `host_sender_revoke` in the list,
-//!    ruling T10a). A revoke entry that carried `interrupt_running: true`
-//!    applied its interrupt with it, so a later record for it is a
-//!    duplicate. Bound to no feed, a host principal's record counts from
-//!    any feed and over a channel alike.
-//! 5. **Coverage** (I.5.2) is per Station, and covers are ordered by
-//!    their `(issued_at, record_id)` (ruling T11a). A `cover` read at its
-//!    own feed's position starts it. Another Station's `cover` takes it
-//!    over only when strictly newer than the newest cover taken from the
-//!    covering Station; an older or equal one is `refused` and changes
-//!    nothing. Covers are signed by the principal's own key only (I.5.4),
-//!    so a replayed old cover can't take coverage back. The same Station's
-//!    `cover` is a `duplicate`; a newer one from another `feed_id` (its
-//!    feed after a reset) moves the coverage's order to that feed, from
-//!    its position (a [`HostAction::Cover`] names it). **A cover never
-//!    releases:** it only starts delegated execution for future tasks
-//!    (I.5.5 step 5), and a hold survives every coverage change.
-//! 6. **Hold and release** follow feed order within the coverage's
-//!    current feed: taken only from it, at their own feed's position (the
-//!    body's `feed_id`), after the coverage's cover there and after the
-//!    last hold or release taken in that feed. One that asks for the hold
-//!    state already recorded is a `duplicate` (and the latest in feed
-//!    order, if it is in order); one that would change it is `applied` if
-//!    it is in order, else `refused`. So only a release from the current
-//!    covering feed, after that feed's cover, lifts a hold.
+//!    that `revoke_seq` names that host's `host_sender_revoke` in the
+//!    list). A revoke entry that carried `interrupt_running: true` applied
+//!    its interrupt with it, so a later record for it is a duplicate.
+//!    Bound to no feed, a host principal's record counts from any feed and
+//!    over a channel alike.
+//! 5. **Coverage** (I.5.2) is per Station, and covers are ordered by their
+//!    `(issued_at, record_id)`. A `cover` read at its own feed's position
+//!    starts it. Another Station's `cover` takes it over only when strictly
+//!    newer than the newest cover taken from the covering Station; an
+//!    older or equal one is `refused` and changes nothing. Covers are
+//!    signed by the principal's own key only (I.5.4), so a replayed old
+//!    cover can't take coverage back. The same Station's `cover` is a
+//!    `duplicate`; a newer one from another `feed_id` (its feed after a
+//!    reset) moves the coverage's order to that feed, from its position (a
+//!    [`HostAction::Cover`] names it). **A cover never releases:** it only
+//!    starts delegated execution for future tasks (I.5.5 step 5), and a
+//!    hold survives every coverage change.
+//! 6. **A stop always wins: a hold applies from any feed, or from none;
+//!    only a release follows feed order.** A hold is `applied` unless one
+//!    is in force (`duplicate`). A release is taken only from the
+//!    coverage's current feed, read at its own position there, after that
+//!    feed's cover and after the last hold or release taken from that feed
+//!    (a hold read at its own feed's position counts there whether or not
+//!    that feed covers the principal); it lifts every hold, another feed's
+//!    included. A release while none is in force is a `duplicate`; else
+//!    one in order is `applied`, and any other `refused`.
 //! 7. **After a revoke**, `cover`, `hold` and `release` are ignored: they
 //!    change nothing, a `duplicate` when they ask for what is recorded
 //!    (the coverage's Station, the hold state), else `refused`. A revoked
 //!    principal is never released and never covered anew.
 //!
 //! **Resets** (I.5.2). A reset's snapshot re-issues each covered
-//! principal's state: first its `cover`, signed anew for the new feed (so
-//! newer than the old feed's), then its `hold` or `release`, also signed
-//! anew (they are taken only at their own feed's position), and its revoke
-//! and interrupt records as they are, or signed anew. The snapshot's cover
-//! moves the coverage's order to the new feed: its hold and release are
-//! ordered within it (`feed_seq` restarts), and the old feed's no longer
-//! apply. On a host that applied the old feed each re-issued record is a
-//! `duplicate`; on one that never saw it they apply, so a reset loses no
-//! stop.
+//! principal's state, from the Station's current effective state (never a
+//! restored backup's view): first its `cover`, signed anew for the new
+//! feed (so newer than the old feed's), then its `hold` or `release`, also
+//! signed anew, and its revoke and interrupt records as they are, or
+//! signed anew. The snapshot's cover moves the coverage's order to the new
+//! feed: its releases are ordered within it (`feed_seq` restarts), and the
+//! old feed's no longer apply. On a host that applied the old feed each
+//! re-issued record is a `duplicate`; on one that never saw it they apply.
+//! A snapshot whose cover isn't newer leaves the coverage on the old feed:
+//! its holds still apply, its releases are refused until a newer cover.
 //!
 //! **Pending records** are the host's to keep (bounded, I.5.4), and to
 //! apply again after every device-list advance, every advance of
@@ -121,10 +134,15 @@ use super::record::{ControlAction, ControlPrincipal, ControlRecord};
 use super::verify::{ControlCheck, verify_control};
 
 /// A record's position in the feed it was read from (I.5.3: `feed_seq`
-/// isn't a field of the record). `None` beside a record carried over a
-/// channel, which is bound to no feed.
+/// isn't a field of the record): the feed's Station `origin`, its
+/// `feed_id`, and the position. `None` beside a record carried over a
+/// channel, which is bound to no feed. A record is read at its own feed's
+/// position only when `origin` and `feed_id` are its body's; otherwise
+/// `apply` treats it as read at no position (a Station that copies another
+/// Station's `feed_id` gets no position in that feed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedPos {
+    pub origin: String,
     pub feed_id: String,
     pub feed_seq: u64,
 }
@@ -271,8 +289,8 @@ pub struct Applied {
     /// What the host does, in this transaction.
     pub actions: Vec<HostAction>,
     /// Keep the record as evidence and alert (I.5.4): it failed
-    /// verification, or reuses the `record_id` of a record that counted
-    /// with another body.
+    /// verification, or reuses the `record_id` of a record of the same
+    /// principal that counted with another body.
     pub evidence: bool,
 }
 
@@ -291,15 +309,26 @@ impl Applied {
     }
 }
 
+/// What applying a record gives ([`ControlState::apply`]): its results and
+/// the state after it. Store `next`'s [`ControlState::to_json`] in the
+/// transaction that carries out `applied.actions`, and adopt `next` only
+/// once it committed: until then the state applied on is the current one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transition {
+    pub applied: Applied,
+    pub next: ControlState,
+}
+
 /// A host's control state (the module docs give the rules).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlState {
     /// The device list it belongs to.
     account_id: String,
     genesis_hash: Hash32,
-    /// Every record that counted: its `record_id` and the SHA-256 of its
-    /// body's `jcs`.
-    records: BTreeMap<String, Hash32>,
+    /// Every record that counted, by principal (`service:<id>`,
+    /// `host:<host_id>`): its `record_id` and the SHA-256 of its body's
+    /// `jcs`.
+    records: BTreeMap<String, BTreeMap<String, Hash32>>,
     /// Service principals, by device id.
     services: BTreeMap<String, ServiceControl>,
     /// Host principals, by `host_id`: the `revoke_seq`s a record
@@ -315,8 +344,12 @@ struct ServiceControl {
     /// Its revocation's interrupt applied.
     interrupted: bool,
     coverage: Option<Coverage>,
-    /// The last hold or release taken, and where; `None` is released.
-    hold: Option<HoldAt>,
+    /// A hold is in force.
+    held: bool,
+    /// By feed (its origin, then its `feed_id`), the position of the last
+    /// hold or release taken from it: a release from the covering feed
+    /// comes after it.
+    order: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
 /// The Station whose feed covers a service: its feed's current
@@ -330,17 +363,11 @@ struct Coverage {
     cover: CoverKey,
 }
 
-/// Which of two covers is newer: `(issued_at, record_id)` (ruling T11a).
+/// Which of two covers is newer: `(issued_at, record_id)`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct CoverKey {
     issued_at: u64,
     record_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HoldAt {
-    held: bool,
-    at: FeedPos,
 }
 
 /// The effects' results and the host's actions, as a record is applied.
@@ -394,17 +421,35 @@ impl ControlState {
     /// device-list `seq` (II.3.1), not the list's head. The module docs
     /// give the rules.
     ///
-    /// The caller passes `pos` only for a record read from a feed it syncs
-    /// whose `origin` and `feed_id` are the record body's: [`FeedPos`]
-    /// carries no origin, so the state takes the body's. The host never
-    /// applies a record while it is held after a write fault (R9.3), which
-    /// the state can't see.
+    /// The state it is called on doesn't change: the [`Transition`] gives
+    /// the record's results and the next state, which the caller adopts
+    /// once the transaction storing it has committed. So a failed
+    /// transaction loses no effect: applying the record again to the state
+    /// kept gives the same results and actions.
+    ///
+    /// The caller passes `pos` for a record read from a feed it syncs; a
+    /// record whose body names another origin or `feed_id` than `pos` is
+    /// read at no position (its hold still applies; its cover and release
+    /// don't). The host never applies a record while it is held after a
+    /// write fault (R9.3), which the state can't see.
     ///
     /// A list of another account or genesis than the state's applies
     /// nothing (`refused`, no evidence: the caller's error, not the
     /// record's); a frozen one applies nothing new (`pending`; a record
     /// that counted is still a `duplicate`).
     pub fn apply(
+        &self,
+        rec: &ControlRecord,
+        list: &Membership,
+        pos: Option<FeedPos>,
+        host_applied_seq: u64,
+    ) -> Transition {
+        let mut next = self.clone();
+        let applied = next.apply_in_place(rec, list, pos, host_applied_seq);
+        Transition { applied, next }
+    }
+
+    fn apply_in_place(
         &mut self,
         rec: &ControlRecord,
         list: &Membership,
@@ -416,11 +461,15 @@ impl ControlState {
         if list.account_id() != self.account_id || list.genesis_hash() != self.genesis_hash {
             return Applied::all(action, Refused, false);
         }
+        let principal = rec.principal().name();
         let digest = Hash32::of(rec.object().jcs().as_bytes());
-        match self.records.get(rec.record_id()) {
-            Some(counted) if *counted == digest => return Applied::all(action, Duplicate, false),
-            Some(_) => return Applied::all(action, Refused, true),
-            None => {}
+        let counted = self
+            .records
+            .get(&principal)
+            .and_then(|ids| ids.get(rec.record_id()))
+            .copied();
+        if counted == Some(digest) {
+            return Applied::all(action, Duplicate, false);
         }
         if list.frozen().is_some() {
             return Applied::all(action, Pending, false);
@@ -429,6 +478,13 @@ impl ControlState {
             ControlCheck::Valid(_) => {}
             ControlCheck::Pending(_) => return Applied::all(action, Pending, false),
             ControlCheck::Refused(_) => return Applied::all(action, Refused, true),
+        }
+        // Another body under a record_id this principal's record counted
+        // with: evidence, and the first body keeps the id. A stop still
+        // applies (it only ever adds); a cover or release doesn't.
+        let collides = counted.is_some();
+        if collides && matches!(action, ControlAction::Cover | ControlAction::Release) {
+            return Applied::all(action, Refused, true);
         }
 
         let mut out = Outcome::default();
@@ -439,14 +495,17 @@ impl ControlState {
             }
         }
         let record_result = out.record_result();
-        if matches!(record_result, ApplicationResult::Applied | Duplicate) {
-            self.records.insert(rec.record_id().to_owned(), digest);
+        if !collides && matches!(record_result, ApplicationResult::Applied | Duplicate) {
+            self.records
+                .entry(principal)
+                .or_default()
+                .insert(rec.record_id().to_owned(), digest);
         }
         Applied {
             record_result,
             effects: out.effects,
             actions: out.actions,
-            evidence: false,
+            evidence: collides,
         }
     }
 
@@ -461,6 +520,7 @@ impl ControlState {
         let mut state = self.services.get(id).cloned().unwrap_or_default();
         // The parse gives every service record its feed.
         let (origin, feed_id) = rec.feed().unwrap_or_default();
+        let pos = positioned(pos, origin, feed_id);
         match rec.action() {
             ControlAction::Revoke { interrupt_running } => {
                 let revocation = match &state.revoked_by {
@@ -489,10 +549,10 @@ impl ControlState {
                     issued_at: rec.issued_at(),
                     record_id: rec.record_id().to_owned(),
                 };
-                cover(&mut state, principal, key, origin, feed_id, pos, out);
+                cover(&mut state, principal, key, pos, out);
             }
-            ControlAction::Hold => hold(&mut state, principal, true, origin, feed_id, pos, out),
-            ControlAction::Release => hold(&mut state, principal, false, origin, feed_id, pos, out),
+            ControlAction::Hold => hold(&mut state, principal, pos, out),
+            ControlAction::Release => release(&mut state, principal, pos, out),
         }
         if self.services.contains_key(id) || state != ServiceControl::default() {
             self.services.insert(id.to_owned(), state);
@@ -550,18 +610,25 @@ impl ControlState {
     /// ```json
     /// {"v":1,"account_id":"…","genesis_hash":"<hex>",
     ///  "hosts":{"<host_id>":{"interrupted":[<revoke_seq>,…]}},
-    ///  "records":{"<record_id>":"<hex SHA-256 of the body's jcs>"},
+    ///  "records":{"<principal>":{"<record_id>":"<hex SHA-256 of the body's jcs>"}},
     ///  "services":{"<device_id>":{
     ///    "coverage":{"cover":{"issued_at":<ms>,"record_id":"…"},
     ///                "feed_id":"…","origin":"…","since":<feed_seq>},
-    ///    "hold":{"feed_id":"…","feed_seq":<n>,"held":true},
-    ///    "interrupted":false,"revoked_by":"<record_id>"}}}
+    ///    "held":true,"interrupted":false,
+    ///    "order":{"<origin>":{"<feed_id>":<feed_seq>}},
+    ///    "revoked_by":"<record_id>"}}}
     /// ```
     pub fn to_json(&self) -> Value {
         let records: Map<String, Value> = self
             .records
             .iter()
-            .map(|(id, digest)| (id.clone(), json!(digest.to_hex())))
+            .map(|(principal, ids)| {
+                let ids: Map<String, Value> = ids
+                    .iter()
+                    .map(|(id, digest)| (id.clone(), json!(digest.to_hex())))
+                    .collect();
+                (principal.clone(), Value::Object(ids))
+            })
             .collect();
         let services: Map<String, Value> = self
             .services
@@ -587,7 +654,8 @@ impl ControlState {
     /// A state from [`ControlState::to_json`], read strictly: exactly its
     /// fields, its types and grammars, and its invariants (an interrupt
     /// only after a revocation, the revocation's and the coverage's cover
-    /// records among those that counted, sorted unique `revoke_seq`s).
+    /// records among those of that service that counted, sorted unique
+    /// `revoke_seq`s, no empty map).
     pub fn from_json(value: &Value) -> Result<Self> {
         let o = fields(
             value,
@@ -613,22 +681,39 @@ impl ControlState {
         let genesis_hash = hash(&o["genesis_hash"], "control state genesis_hash")?;
 
         let mut records = BTreeMap::new();
-        for (id, digest) in object(&o["records"], "control state records")? {
-            if !is_uuid_v4(id) {
-                return Err(Error::Malformed("control state record_id"));
+        for (principal, ids) in object(&o["records"], "control state records")? {
+            if ControlPrincipal::parse(principal)
+                .map(|p| p.name())
+                .as_deref()
+                != Some(principal)
+            {
+                return Err(Error::Malformed("control state records principal"));
             }
-            records.insert(id.clone(), hash(digest, "control state record digest")?);
+            let ids = object(ids, "control state records")?;
+            if ids.is_empty() {
+                return Err(Error::Malformed("control state records"));
+            }
+            let mut digests = BTreeMap::new();
+            for (id, digest) in ids {
+                if !is_uuid_v4(id) {
+                    return Err(Error::Malformed("control state record_id"));
+                }
+                digests.insert(id.clone(), hash(digest, "control state record digest")?);
+            }
+            records.insert(principal.clone(), digests);
         }
 
         let mut services = BTreeMap::new();
         for (id, state) in object(&o["services"], "control state services")? {
+            let principal = format!("service:{id}");
             if !matches!(
-                ControlPrincipal::parse(&format!("service:{id}")),
+                ControlPrincipal::parse(&principal),
                 Some(ControlPrincipal::Service(_))
             ) {
                 return Err(Error::Malformed("control state service"));
             }
-            services.insert(id.clone(), ServiceControl::from_json(state, &records)?);
+            let counted = records.get(&principal);
+            services.insert(id.clone(), ServiceControl::from_json(state, counted)?);
         }
 
         let mut hosts = BTreeMap::new();
@@ -684,41 +769,43 @@ fn interrupt(state: &mut ServiceControl, principal: String, revocation: String, 
     }
 }
 
-/// `pos`, when the record was read at its own feed's position.
-fn positioned(pos: Option<FeedPos>, feed_id: &str) -> Option<FeedPos> {
-    pos.filter(|pos| pos.feed_id == feed_id)
+/// `pos`, when the record was read at its own feed's position: the
+/// position's origin and `feed_id` are the body's.
+fn positioned(pos: Option<FeedPos>, origin: &str, feed_id: &str) -> Option<FeedPos> {
+    pos.filter(|pos| pos.origin == origin && pos.feed_id == feed_id)
 }
 
-/// A `cover` from `origin`'s feed `feed_id`, issued as `key` (ruling
-/// T11a). It never releases.
+/// A `cover` read at `pos` (its own feed's position, or none), issued as
+/// `key`. It never releases.
 fn cover(
     state: &mut ServiceControl,
     principal: String,
     key: CoverKey,
-    origin: &str,
-    feed_id: &str,
     pos: Option<FeedPos>,
     out: &mut Outcome,
 ) {
-    let Some(pos) = positioned(pos, feed_id) else {
+    let Some(pos) = pos else {
         out.effect(EffectKind::Cover, ApplicationResult::Refused);
         return;
     };
     let revoked = state.revoked_by.is_some();
-    let same_station = state.coverage.as_ref().is_some_and(|c| c.origin == origin);
+    let same_station = state
+        .coverage
+        .as_ref()
+        .is_some_and(|c| c.origin == pos.origin);
     let newer = state.coverage.as_ref().is_none_or(|c| key > c.cover);
     let result = if same_station {
         // The same coverage. A newer cover (nothing changes after a revoke)
         // is the newest; from another `feed_id`, the Station's feed after a
         // reset, it moves the coverage's order to that feed.
         if let Some(c) = state.coverage.as_mut().filter(|_| !revoked && newer) {
-            if c.feed_id != feed_id {
-                c.feed_id = feed_id.to_owned();
+            if c.feed_id != pos.feed_id {
+                c.feed_id = pos.feed_id.clone();
                 c.since = pos.feed_seq;
                 out.actions.push(HostAction::Cover {
                     principal,
-                    origin: origin.to_owned(),
-                    feed_id: feed_id.to_owned(),
+                    origin: pos.origin,
+                    feed_id: pos.feed_id,
                 });
             }
             c.cover = key;
@@ -730,78 +817,95 @@ fn cover(
         ApplicationResult::Refused
     } else {
         state.coverage = Some(Coverage {
-            origin: origin.to_owned(),
-            feed_id: feed_id.to_owned(),
+            origin: pos.origin.clone(),
+            feed_id: pos.feed_id.clone(),
             since: pos.feed_seq,
             cover: key,
         });
         out.actions.push(HostAction::Cover {
             principal,
-            origin: origin.to_owned(),
-            feed_id: feed_id.to_owned(),
+            origin: pos.origin,
+            feed_id: pos.feed_id,
         });
         ApplicationResult::Applied
     };
     out.effect(EffectKind::Cover, result);
 }
 
-/// A `hold` (`held`) or `release` from `origin`'s feed `feed_id`.
-fn hold(
-    state: &mut ServiceControl,
-    principal: String,
-    held: bool,
-    origin: &str,
-    feed_id: &str,
-    pos: Option<FeedPos>,
-    out: &mut Outcome,
-) {
-    let effect = if held {
-        EffectKind::Hold
-    } else {
-        EffectKind::Release
-    };
-    let Some(pos) = positioned(pos, feed_id) else {
-        out.effect(effect, ApplicationResult::Refused);
-        return;
-    };
-    let recorded = state.hold.as_ref().is_some_and(|h| h.held);
+/// The last hold or release taken from `pos`'s feed, at `pos` if later.
+fn take_order(state: &mut ServiceControl, pos: &FeedPos) {
+    let at = state
+        .order
+        .entry(pos.origin.clone())
+        .or_default()
+        .entry(pos.feed_id.clone())
+        .or_default();
+    *at = (*at).max(pos.feed_seq);
+}
+
+/// A `hold`, read at `pos` (its own feed's position, or none): a stop, it
+/// applies whichever feed it comes from.
+fn hold(state: &mut ServiceControl, principal: String, pos: Option<FeedPos>, out: &mut Outcome) {
     // Ignored after a revoke.
     if state.revoked_by.is_some() {
-        let result = if held == recorded {
+        let result = if state.held {
             ApplicationResult::Duplicate
         } else {
             ApplicationResult::Refused
         };
-        out.effect(effect, result);
+        out.effect(EffectKind::Hold, result);
         return;
     }
-    // Taken from the covering Station's current feed, after the coverage's
-    // cover there and after the last hold or release taken in that feed.
-    let in_order = state.coverage.as_ref().is_some_and(|c| {
-        c.origin == origin
-            && c.feed_id == pos.feed_id
-            && pos.feed_seq > c.since
-            && state
-                .hold
-                .as_ref()
-                .is_none_or(|h| h.at.feed_id != pos.feed_id || pos.feed_seq > h.at.feed_seq)
+    let result = if state.held {
+        ApplicationResult::Duplicate
+    } else {
+        state.held = true;
+        out.actions.push(HostAction::Hold(principal));
+        ApplicationResult::Applied
+    };
+    // A later release from this feed comes after it.
+    if let Some(pos) = &pos {
+        take_order(state, pos);
+    }
+    out.effect(EffectKind::Hold, result);
+}
+
+/// A `release`, read at `pos`: taken only from the coverage's current
+/// feed, after its cover and after the last hold or release taken from
+/// that feed; it lifts every hold.
+fn release(state: &mut ServiceControl, principal: String, pos: Option<FeedPos>, out: &mut Outcome) {
+    // Ignored after a revoke.
+    if state.revoked_by.is_some() {
+        let result = if state.held {
+            ApplicationResult::Refused
+        } else {
+            ApplicationResult::Duplicate
+        };
+        out.effect(EffectKind::Release, result);
+        return;
+    }
+    let in_order = pos.as_ref().is_some_and(|pos| {
+        state.coverage.as_ref().is_some_and(|c| {
+            c.origin == pos.origin && c.feed_id == pos.feed_id && pos.feed_seq > c.since
+        }) && state
+            .order
+            .get(&pos.origin)
+            .and_then(|feeds| feeds.get(&pos.feed_id))
+            .is_none_or(|last| pos.feed_seq > *last)
     });
-    let result = if held == recorded {
+    let result = if !state.held {
         ApplicationResult::Duplicate
     } else if in_order {
-        out.actions.push(if held {
-            HostAction::Hold(principal)
-        } else {
-            HostAction::Release(principal)
-        });
+        state.held = false;
+        out.actions.push(HostAction::Release(principal));
         ApplicationResult::Applied
     } else {
         ApplicationResult::Refused
     };
-    if in_order {
-        state.hold = Some(HoldAt { held, at: pos });
+    if let Some(pos) = pos.filter(|_| in_order) {
+        take_order(state, &pos);
     }
-    out.effect(effect, result);
+    out.effect(EffectKind::Release, result);
 }
 
 impl ServiceControl {
@@ -814,30 +918,43 @@ impl ServiceControl {
             });
             o.insert("coverage".into(), coverage);
         }
-        if let Some(h) = &self.hold {
-            let hold = json!({"feed_id": h.at.feed_id, "feed_seq": h.at.feed_seq, "held": h.held});
-            o.insert("hold".into(), hold);
-        }
+        o.insert("held".into(), json!(self.held));
         o.insert("interrupted".into(), json!(self.interrupted));
+        if !self.order.is_empty() {
+            let order: Map<String, Value> = self
+                .order
+                .iter()
+                .map(|(origin, feeds)| {
+                    let feeds: Map<String, Value> = feeds
+                        .iter()
+                        .map(|(feed_id, at)| (feed_id.clone(), json!(at)))
+                        .collect();
+                    (origin.clone(), Value::Object(feeds))
+                })
+                .collect();
+            o.insert("order".into(), Value::Object(order));
+        }
         if let Some(by) = &self.revoked_by {
             o.insert("revoked_by".into(), json!(by));
         }
         Value::Object(o)
     }
 
-    fn from_json(value: &Value, records: &BTreeMap<String, Hash32>) -> Result<Self> {
+    /// `records`: the records of this service that counted.
+    fn from_json(value: &Value, records: Option<&BTreeMap<String, Hash32>>) -> Result<Self> {
         let what = "control state service";
+        let counted = |id: &str| records.is_some_and(|ids| ids.contains_key(id));
         let o = fields(
             value,
-            &["interrupted"],
-            &["revoked_by", "coverage", "hold"],
+            &["held", "interrupted"],
+            &["revoked_by", "coverage", "order"],
             what,
         )?;
         let revoked_by = match o.get("revoked_by") {
             None => None,
             Some(by) => Some(
                 by.as_str()
-                    .filter(|by| records.contains_key(*by))
+                    .filter(|by| counted(by))
                     .ok_or(Error::Malformed("control state revoked_by"))?
                     .to_owned(),
             ),
@@ -846,18 +963,17 @@ impl ServiceControl {
             .as_bool()
             .filter(|interrupted| !interrupted || revoked_by.is_some())
             .ok_or(Error::Malformed("control state interrupted"))?;
+        let held = o["held"]
+            .as_bool()
+            .ok_or(Error::Malformed("control state held"))?;
         let coverage = match o.get("coverage") {
             None => None,
             Some(c) => {
                 let what = "control state coverage";
                 let c = fields(c, &["origin", "feed_id", "since", "cover"], &[], what)?;
-                let origin = c["origin"]
-                    .as_str()
-                    .filter(|origin| normalize_relay(origin).as_deref() == Ok(*origin))
-                    .ok_or(Error::Malformed(what))?;
                 let cover = fields(&c["cover"], &["issued_at", "record_id"], &[], what)?;
                 Some(Coverage {
-                    origin: origin.to_owned(),
+                    origin: origin(&c["origin"], what)?,
                     feed_id: feed_id(&c["feed_id"], what)?,
                     since: c["since"].as_u64().ok_or(Error::Malformed(what))?,
                     cover: CoverKey {
@@ -868,32 +984,41 @@ impl ServiceControl {
                         // The cover counted: it is among the records.
                         record_id: cover["record_id"]
                             .as_str()
-                            .filter(|id| records.contains_key(*id))
+                            .filter(|id| counted(id))
                             .ok_or(Error::Malformed(what))?
                             .to_owned(),
                     },
                 })
             }
         };
-        let hold = match o.get("hold") {
-            None => None,
-            Some(h) => {
-                let what = "control state hold";
-                let h = fields(h, &["held", "feed_id", "feed_seq"], &[], what)?;
-                Some(HoldAt {
-                    held: h["held"].as_bool().ok_or(Error::Malformed(what))?,
-                    at: FeedPos {
-                        feed_id: feed_id(&h["feed_id"], what)?,
-                        feed_seq: h["feed_seq"].as_u64().ok_or(Error::Malformed(what))?,
-                    },
-                })
+        let mut order = BTreeMap::new();
+        if let Some(feeds_by_origin) = o.get("order") {
+            let what = "control state order";
+            let feeds_by_origin = object(feeds_by_origin, what)?;
+            if feeds_by_origin.is_empty() {
+                return Err(Error::Malformed(what));
             }
-        };
+            for (at_origin, feeds) in feeds_by_origin {
+                let feeds = object(feeds, what)?;
+                if feeds.is_empty() {
+                    return Err(Error::Malformed(what));
+                }
+                let mut positions = BTreeMap::new();
+                for (id, at) in feeds {
+                    positions.insert(
+                        feed_id(&json!(id), what)?,
+                        at.as_u64().ok_or(Error::Malformed(what))?,
+                    );
+                }
+                order.insert(origin(&json!(at_origin), what)?, positions);
+            }
+        }
         Ok(ServiceControl {
             revoked_by,
             interrupted,
             coverage,
-            hold,
+            held,
+            order,
         })
     }
 }
@@ -929,6 +1054,15 @@ fn feed_id(value: &Value, what: &'static str) -> Result<String> {
     value
         .as_str()
         .filter(|id| is_uuid_v4(id))
+        .map(str::to_owned)
+        .ok_or(Error::Malformed(what))
+}
+
+/// A Station's exact origin, as `normalize_relay` writes it.
+fn origin(value: &Value, what: &'static str) -> Result<String> {
+    value
+        .as_str()
+        .filter(|origin| normalize_relay(origin).as_deref() == Ok(*origin))
         .map(str::to_owned)
         .ok_or(Error::Malformed(what))
 }
@@ -1000,9 +1134,36 @@ mod control_state_tests {
 
     fn at(feed: Feed, feed_seq: u64) -> Option<FeedPos> {
         Some(FeedPos {
+            origin: feed.0.into(),
             feed_id: feed.1.into(),
             feed_seq,
         })
+    }
+
+    /// Applies a record and adopts the next state (the caller's
+    /// transaction committed).
+    trait Adopt {
+        fn adopt(
+            &mut self,
+            rec: &ControlRecord,
+            list: &Membership,
+            pos: Option<FeedPos>,
+            host_applied_seq: u64,
+        ) -> Applied;
+    }
+
+    impl Adopt for ControlState {
+        fn adopt(
+            &mut self,
+            rec: &ControlRecord,
+            list: &Membership,
+            pos: Option<FeedPos>,
+            host_applied_seq: u64,
+        ) -> Applied {
+            let Transition { applied, next } = self.apply(rec, list, pos, host_applied_seq);
+            *self = next;
+            applied
+        }
     }
 
     /// Every key, by the id it signs as: natives `mac` (P-256) and `phone`
@@ -1286,7 +1447,7 @@ mod control_state_tests {
     /// Applies each step in order against `list`.
     fn run(state: &mut ControlState, list: &Membership, steps: Vec<Step>) {
         for (i, Step(rec, pos, applied_seq, want)) in steps.into_iter().enumerate() {
-            let got = state.apply(&rec, list, pos, applied_seq);
+            let got = state.adopt(&rec, list, pos, applied_seq);
             assert_eq!(
                 got,
                 want,
@@ -1354,7 +1515,7 @@ mod control_state_tests {
         let again = ControlRecord::parse(wire.to_string().as_bytes()).unwrap();
         assert_ne!(again.object().sig(), revoke.object().sig());
         assert_eq!(
-            state.apply(&again, &fx.list, None, 0),
+            state.adopt(&again, &fx.list, None, 0),
             dup(&[E::Revocation, E::Interrupt])
         );
     }
@@ -1529,19 +1690,10 @@ mod control_state_tests {
         let fx = Fx::new();
         let mut state = fx.state();
         let s = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A);
-        let held = out(
-            R::Applied,
-            &[(E::Hold, R::Applied)],
-            vec![H::Hold(service("svc-1"))],
-        );
-        let released = out(
-            R::Applied,
-            &[(E::Release, R::Applied)],
-            vec![H::Release(service("svc-1"))],
-        );
         // A hold or release elsewhere than at its own feed's position.
         let unplaced = fx.svc(11, "svc-1", "svc-1", C::Release, A);
-        // svc-2 has no coverage on this host.
+        // svc-2 has no coverage on this host: its hold applies all the same
+        // (a stop always wins).
         let uncovered = fx.svc(12, "svc-2", "svc-2", C::Hold, A);
         run(
             &mut state,
@@ -1556,19 +1708,19 @@ mod control_state_tests {
                         vec![cover_action("svc-1", A)],
                     ),
                 ),
-                Step::new(&s(2, C::Hold), at(A, 2), held.clone()),
+                Step::new(&s(2, C::Hold), at(A, 2), held("svc-1")),
                 // Held already: a duplicate, now the last in feed order.
                 Step::new(&s(3, C::Hold), at(A, 4), dup(&[E::Hold])),
                 // A release before the last hold in feed order: superseded.
                 Step::new(&s(4, C::Release), at(A, 3), all(R::Refused, &[E::Release])),
-                Step::new(&s(5, C::Release), at(A, 5), released.clone()),
-                Step::new(&s(6, C::Hold), at(A, 6), held.clone()),
+                Step::new(&s(5, C::Release), at(A, 5), released("svc-1")),
+                Step::new(&s(6, C::Hold), at(A, 6), held("svc-1")),
                 // Another record at the same position: not after it.
                 Step::new(&s(7, C::Release), at(A, 6), all(R::Refused, &[E::Release])),
                 Step::new(&unplaced, None, all(R::Refused, &[E::Release])),
                 Step::new(&unplaced, at(B, 7), all(R::Refused, &[E::Release])),
-                Step::new(&uncovered, at(A, 8), all(R::Refused, &[E::Hold])),
-                Step::new(&s(9, C::Release), at(A, 9), released),
+                Step::new(&uncovered, at(A, 8), held("svc-2")),
+                Step::new(&s(9, C::Release), at(A, 9), released("svc-1")),
                 Step::new(&unplaced, at(A, 10), dup(&[E::Release])),
             ],
         );
@@ -1685,17 +1837,31 @@ mod control_state_tests {
                         vec![H::Release(service("svc-1"))],
                     ),
                 ),
-                Step::new(&b(6, C::Hold), at(B, 3), all(R::Refused, &[E::Hold])),
+                // B's hold applies (a stop always wins); B's release can't
+                // lift it, A's can.
+                Step::new(&b(6, C::Hold), at(B, 3), held("svc-1")),
+                Step::new(&b(7, C::Release), at(B, 4), all(R::Refused, &[E::Release])),
             ],
         );
 
         // Another Station whose records name the covering feed's feed_id:
-        // still not the covering Station.
+        // still not the covering Station, in its own feed or in A's.
         let reusing: Feed = (B.0, A.1);
-        let hold = fx.svc(7, "svc-1", "svc-1", C::Hold, reusing);
+        let release = fx.svc(8, "svc-1", "svc-1", C::Release, reusing);
+        for pos in [at(A, 4), at(reusing, 4)] {
+            assert_eq!(
+                state.adopt(&release, &fx.list, pos, 0),
+                all(R::Refused, &[E::Release])
+            );
+        }
         assert_eq!(
-            state.apply(&hold, &fx.list, at(A, 4), 0),
-            all(R::Refused, &[E::Hold])
+            state.adopt(
+                &fx.svc(9, "svc-1", "svc-1", C::Release, A),
+                &fx.list,
+                at(A, 4),
+                0
+            ),
+            released("svc-1")
         );
     }
 
@@ -1909,7 +2075,11 @@ mod control_state_tests {
                         vec![H::Release(service("svc-1"))],
                     ),
                 ),
-                Step::new(&a(6, C::Hold), at(A, 4), all(R::Refused, &[E::Hold])),
+                // A still holds, though it no longer covers: a stop always
+                // wins. Only B's release lifts it.
+                Step::new(&a(6, C::Hold), at(A, 4), held("svc-1")),
+                Step::new(&a(7, C::Release), at(A, 5), all(R::Refused, &[E::Release])),
+                Step::new(&b(8, C::Release), at(B, 3), released("svc-1")),
             ],
         );
     }
@@ -1972,18 +2142,27 @@ mod control_state_tests {
                 // A cover of the old feed, older than A2's: the same Station
                 // (a duplicate) that doesn't move the order back.
                 Step::new(&old_cover, at(A, 8), dup(&[E::Cover])),
-                Step::new(&a(10, C::Hold), at(A, 9), all(R::Refused, &[E::Hold])),
-                Step::new(&a2(11, C::Hold), at(A2, 4), held),
+                // The old feed's hold still applies (a stop always wins); its
+                // release doesn't, A2's does.
+                Step::new(&a(10, C::Hold), at(A, 9), held),
+                Step::new(&a2(11, C::Hold), at(A2, 4), dup(&[E::Hold])),
+                Step::new(
+                    &a(12, C::Release),
+                    at(A, 10),
+                    all(R::Refused, &[E::Release]),
+                ),
+                Step::new(&a2(13, C::Release), at(A2, 5), released),
             ],
         );
     }
 
     #[test]
-    fn conflicting_body_same_id_refused_and_evidence() {
+    fn conflicting_body_same_id_is_evidence_and_the_first_keeps_the_id() {
         let fx = Fx::new();
         let mut state = fx.state();
         let first = fx.svc(1, "svc-1", "svc-1", revoke(false), A);
-        // Another body under the same record id, validly signed.
+        // Another body under the same record id, validly signed: a stop, so
+        // its effects apply (here the interrupt it adds), and evidence.
         let second = fx.svc(1, "svc-1", "svc-1", revoke(true), A);
         let interrupt = fx.svc(2, "svc-1", "mac", INTERRUPT, A);
         // A forgery (svc-2's key for svc-1's record) under the id a genuine
@@ -2006,38 +2185,29 @@ mod control_state_tests {
                 Step::new(
                     &second,
                     at(A, 2),
-                    evidence(all(R::Refused, &[E::Revocation, E::Interrupt])),
-                ),
-                // The first counts; the second changed nothing (its
-                // interrupt wasn't applied).
-                Step::new(&first, at(A, 1), dup(&[E::Revocation])),
-                Step::new(
-                    &interrupt,
-                    at(A, 3),
-                    out(
+                    evidence(out(
                         R::Applied,
-                        &[(E::Interrupt, R::Applied)],
+                        &[(E::Revocation, R::Duplicate), (E::Interrupt, R::Applied)],
                         vec![interrupt_action(service("svc-1"), rid(1))],
-                    ),
+                    )),
                 ),
-                Step::new(
-                    &second,
-                    None,
-                    evidence(all(R::Refused, &[E::Revocation, E::Interrupt])),
-                ),
+                // The first keeps the id.
+                Step::new(&first, at(A, 1), dup(&[E::Revocation])),
+                Step::new(&interrupt, at(A, 3), dup(&[E::Interrupt])),
+                Step::new(&second, None, evidence(dup(&[E::Revocation, E::Interrupt]))),
                 Step::new(&forged, at(A, 4), evidence(all(R::Refused, &[E::Hold]))),
+                // svc-1 is revoked: its cover is ignored.
                 Step::new(&genuine, at(A, 5), all(R::Refused, &[E::Cover])),
             ],
         );
-        // svc-1 is revoked, so its cover is ignored; on a fresh state the
-        // genuine record under the forged id applies.
+        // On a fresh state the genuine record under the forged id applies.
         let mut fresh = fx.state();
         assert_eq!(
-            fresh.apply(&forged, &fx.list, at(A, 4), 0),
+            fresh.adopt(&forged, &fx.list, at(A, 4), 0),
             evidence(all(R::Refused, &[E::Hold]))
         );
         assert_eq!(
-            fresh.apply(&genuine, &fx.list, at(A, 5), 0),
+            fresh.adopt(&genuine, &fx.list, at(A, 5), 0),
             out(
                 R::Applied,
                 &[(E::Cover, R::Applied)],
@@ -2045,7 +2215,7 @@ mod control_state_tests {
             )
         );
         assert_eq!(
-            fresh.apply(&forged, &fx.list, at(A, 4), 0),
+            fresh.adopt(&forged, &fx.list, at(A, 4), 0),
             evidence(all(R::Refused, &[E::Hold]))
         );
     }
@@ -2058,11 +2228,11 @@ mod control_state_tests {
         // list holds it.
         let unknown = fx.svc(1, "svc-new", "svc-new", C::Cover, A);
         let pending = all(R::Pending, &[E::Cover]);
-        assert_eq!(state.apply(&unknown, &fx.list, at(A, 1), 0), pending);
-        assert_eq!(state.apply(&unknown, &fx.list, at(A, 1), 0), pending);
+        assert_eq!(state.adopt(&unknown, &fx.list, at(A, 1), 0), pending);
+        assert_eq!(state.adopt(&unknown, &fx.list, at(A, 1), 0), pending);
         fx.add_service("svc-new");
         assert_eq!(
-            state.apply(&unknown, &fx.list, at(A, 1), 0),
+            state.adopt(&unknown, &fx.list, at(A, 1), 0),
             out(
                 R::Applied,
                 &[(E::Cover, R::Applied)],
@@ -2072,13 +2242,13 @@ mod control_state_tests {
         // A manager's hold: refused whatever the list holds, and evidence.
         let manager_hold = fx.svc(2, "svc-1", "mac", C::Hold, A);
         assert_eq!(
-            state.apply(&manager_hold, &fx.list, at(A, 2), 0),
+            state.adopt(&manager_hold, &fx.list, at(A, 2), 0),
             evidence(all(R::Refused, &[E::Hold]))
         );
         // A record of another account.
         let other = Fx::account("acct-test-2").svc(3, "svc-1", "svc-1", revoke(true), A);
         assert_eq!(
-            state.apply(&other, &fx.list, at(A, 3), 0),
+            state.adopt(&other, &fx.list, at(A, 3), 0),
             evidence(all(R::Refused, &[E::Revocation, E::Interrupt]))
         );
     }
@@ -2176,7 +2346,7 @@ mod control_state_tests {
         let mut applied_before = fx.state();
         assert_eq!(
             applied_before
-                .apply(&by_phone, &before, at(A, 1), 0)
+                .adopt(&by_phone, &before, at(A, 1), 0)
                 .record_result,
             R::Applied
         );
@@ -2232,7 +2402,7 @@ mod control_state_tests {
         // A record applied before its signer was removed stays applied: the
         // same record is acknowledged as a duplicate (a revoke is final).
         assert_eq!(
-            applied_before.apply(&by_phone, &fx.list, at(A, 1), 0),
+            applied_before.adopt(&by_phone, &fx.list, at(A, 1), 0),
             dup(&[E::Revocation, E::Interrupt])
         );
     }
@@ -2361,13 +2531,13 @@ mod control_state_tests {
             // The old feed's release no longer applies, even in its order.
             let old_release = s2(18, C::Release, A);
             assert_eq!(
-                state.apply(&old_release, &fx.list, at(A, 7), 0),
+                state.adopt(&old_release, &fx.list, at(A, 7), 0),
                 all(R::Refused, &[E::Release])
             );
             // The new feed continues the coverage: its release applies.
             let release = s2(16, C::Release, A2);
             assert_eq!(
-                state.apply(&release, &fx.list, at(A2, 9), 0),
+                state.adopt(&release, &fx.list, at(A2, 9), 0),
                 out(
                     R::Applied,
                     &[(E::Release, R::Applied)],
@@ -2377,7 +2547,7 @@ mod control_state_tests {
             // The old feed's identity is gone; nothing of svc-1 was lost.
             let release1 = s1(17, C::Release, A2);
             assert_eq!(
-                state.apply(&release1, &fx.list, at(A2, 10), 0),
+                state.adopt(&release1, &fx.list, at(A2, 10), 0),
                 all(R::Refused, &[E::Release])
             );
         };
@@ -2476,7 +2646,7 @@ mod control_state_tests {
             ControlCheck::Valid(_)
         ));
         assert_eq!(
-            state.apply(&theirs, &other.list, at(A, 1), 0),
+            state.adopt(&theirs, &other.list, at(A, 1), 0),
             all(R::Refused, &[E::Cover])
         );
 
@@ -2502,19 +2672,20 @@ mod control_state_tests {
             .next;
         assert!(frozen.frozen().is_some());
         assert_eq!(
-            state.apply(&cover, &frozen, at(A, 1), 0),
+            state.adopt(&cover, &frozen, at(A, 1), 0),
             all(R::Pending, &[E::Cover])
         );
         assert_eq!(state, fx.state());
         assert_eq!(
-            state.apply(&cover, &fx.list, at(A, 1), 0).record_result,
+            state.adopt(&cover, &fx.list, at(A, 1), 0).record_result,
             R::Applied
         );
     }
 
     /// A state with every part: svc-1 covered, held, revoked and
-    /// interrupted; svc-2 covered and released in feed B; host-a
-    /// interrupted after its revoke at `r`.
+    /// interrupted; svc-2 covered and released in feed B, then held from
+    /// feed A, which doesn't cover it; host-a interrupted after its revoke
+    /// at `r`, by a record under svc-1's cover's `record_id`.
     fn full_state(fx: &mut Fx) -> (ControlState, Vec<ControlRecord>, u64) {
         let r = fx.revoke_host(false);
         let records = vec![
@@ -2523,12 +2694,21 @@ mod control_state_tests {
             fx.svc(3, "svc-1", "mac", revoke(true), A),
             fx.svc(4, "svc-2", "svc-2", C::Cover, B),
             fx.svc(5, "svc-2", "svc-2", C::Release, B),
-            fx.host(6, "mac", r),
+            fx.host(1, "mac", r),
+            fx.svc(6, "svc-2", "svc-2", C::Hold, A),
         ];
-        let positions = [at(A, 1), at(A, 2), at(A, 3), at(B, 1), at(B, 2), None];
+        let positions = [
+            at(A, 1),
+            at(A, 2),
+            at(A, 3),
+            at(B, 1),
+            at(B, 2),
+            None,
+            at(A, 4),
+        ];
         let mut state = fx.state();
         for (rec, pos) in records.iter().zip(positions) {
-            let result = state.apply(rec, &fx.list, pos, r).record_result;
+            let result = state.adopt(rec, &fx.list, pos, r).record_result;
             assert!(
                 matches!(result, R::Applied | R::Duplicate),
                 "{}",
@@ -2559,10 +2739,12 @@ mod control_state_tests {
 
         let (state, records, r) = full_state(&mut fx);
         let json = state.to_json();
-        let mut digests = serde_json::Map::new();
+        // By principal: svc-1's cover and host-a's interrupt share an id.
+        let mut digests = json!({});
         for rec in &records {
-            digests.insert(rec.record_id().into(), json!(digest(rec)));
+            digests[rec.principal().name()][rec.record_id()] = json!(digest(rec));
         }
+        assert_eq!(digests["host:host-a"][rid(1)], json!(digest(&records[5])));
         assert_eq!(
             json,
             json!({
@@ -2576,7 +2758,8 @@ mod control_state_tests {
                             "origin": A.0, "feed_id": A.1, "since": 1,
                             "cover": {"issued_at": issued(1), "record_id": rid(1)},
                         },
-                        "hold": {"held": true, "feed_id": A.1, "feed_seq": 2},
+                        "held": true,
+                        "order": {A.0: {A.1: 2}},
                     },
                     "svc-2": {
                         "interrupted": false,
@@ -2584,7 +2767,8 @@ mod control_state_tests {
                             "origin": B.0, "feed_id": B.1, "since": 1,
                             "cover": {"issued_at": issued(4), "record_id": rid(4)},
                         },
-                        "hold": {"held": false, "feed_id": B.1, "feed_seq": 2},
+                        "held": true,
+                        "order": {A.0: {A.1: 4}, B.0: {B.1: 2}},
                     },
                 },
                 "hosts": {"host-a": {"interrupted": [r]}},
@@ -2608,8 +2792,8 @@ mod control_state_tests {
         ];
         for (rec, pos) in next {
             assert_eq!(
-                resumed.apply(&rec, &fx.list, pos.clone(), r),
-                original.apply(&rec, &fx.list, pos, r)
+                resumed.adopt(&rec, &fx.list, pos.clone(), r),
+                original.adopt(&rec, &fx.list, pos, r)
             );
         }
         assert_eq!(resumed, original);
@@ -2641,15 +2825,33 @@ mod control_state_tests {
             ),
             (
                 "record id",
-                Box::new(|j| j["records"]["not-a-uuid"] = json!("00".repeat(32))),
+                Box::new(|j| j["records"]["service:svc-1"]["not-a-uuid"] = json!("00".repeat(32))),
             ),
             (
                 "record digest",
-                Box::new(|j| j["records"][rid(1)] = json!("00")),
+                Box::new(|j| j["records"]["service:svc-1"][rid(1)] = json!("00")),
+            ),
+            (
+                "records not by principal",
+                Box::new(|j| j["records"][rid(1)] = json!("00".repeat(32))),
+            ),
+            (
+                "records principal",
+                Box::new(|j| j["records"]["svc-1"] = json!({rid(1): "00".repeat(32)})),
+            ),
+            (
+                "records of no principal",
+                Box::new(|j| j["records"]["service:recovery"] = json!({rid(1): "00".repeat(32)})),
+            ),
+            (
+                "a principal's records empty",
+                Box::new(|j| j["records"]["service:svc-3"] = json!({})),
             ),
             (
                 "service id",
-                Box::new(|j| j["services"]["recovery"] = json!({"interrupted": false})),
+                Box::new(|j| {
+                    j["services"]["recovery"] = json!({"held": false, "interrupted": false})
+                }),
             ),
             (
                 "service field",
@@ -2662,6 +2864,29 @@ mod control_state_tests {
             (
                 "revoked_by not a record",
                 Box::new(|j| j["services"]["svc-2"]["revoked_by"] = json!(rid(99))),
+            ),
+            (
+                "revoked_by another principal's record",
+                Box::new(|j| j["services"]["svc-2"]["revoked_by"] = json!(rid(3))),
+            ),
+            (
+                "cover another principal's record",
+                Box::new(|j| {
+                    j["services"]["svc-2"]["coverage"]["cover"]["record_id"] = json!(rid(1))
+                }),
+            ),
+            (
+                "held missing",
+                Box::new(|j| {
+                    j["services"]["svc-2"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("held");
+                }),
+            ),
+            (
+                "held not a boolean",
+                Box::new(|j| j["services"]["svc-2"]["held"] = json!(1)),
             ),
             (
                 "coverage origin",
@@ -2689,8 +2914,33 @@ mod control_state_tests {
                 Box::new(|j| j["services"]["svc-1"]["coverage"]["cover"]["issued_at"] = json!("1")),
             ),
             (
-                "hold feed",
-                Box::new(|j| j["services"]["svc-1"]["hold"]["feed_id"] = json!("feed")),
+                "the hold of an earlier form",
+                Box::new(|j| {
+                    j["services"]["svc-1"]["hold"] =
+                        json!({"held": true, "feed_id": A.1, "feed_seq": 2})
+                }),
+            ),
+            (
+                "order feed",
+                Box::new(|j| j["services"]["svc-1"]["order"][A.0] = json!({"feed": 2})),
+            ),
+            (
+                "order origin",
+                Box::new(|j| {
+                    j["services"]["svc-1"]["order"] = json!({"https://Station.example": {A.1: 2}})
+                }),
+            ),
+            (
+                "order position",
+                Box::new(|j| j["services"]["svc-1"]["order"][A.0][A.1] = json!("2")),
+            ),
+            (
+                "order empty",
+                Box::new(|j| j["services"]["svc-1"]["order"] = json!({})),
+            ),
+            (
+                "an origin's order empty",
+                Box::new(|j| j["services"]["svc-1"]["order"][A.0] = json!({})),
             ),
             (
                 "host seqs unsorted",
@@ -2715,6 +2965,334 @@ mod control_state_tests {
             assert!(ControlState::from_json(&bad).is_err(), "{what}");
         }
         assert_eq!(ControlState::from_json(&good).unwrap(), state);
+    }
+
+    fn held(id: &str) -> Applied {
+        out(
+            R::Applied,
+            &[(E::Hold, R::Applied)],
+            vec![H::Hold(service(id))],
+        )
+    }
+
+    fn released(id: &str) -> Applied {
+        out(
+            R::Applied,
+            &[(E::Release, R::Applied)],
+            vec![H::Release(service(id))],
+        )
+    }
+
+    /// A stop always wins (PR 3 review I1): after a reset whose snapshot
+    /// cover isn't newer than the coverage's, the coverage stays on the old
+    /// feed, yet the new feed's hold applies; only its release waits for a
+    /// newer cover, and the covering feed's release lifts the hold.
+    #[test]
+    fn a_hold_from_the_new_feed_after_a_reset_whose_cover_isnt_newer_applies() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let a = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A);
+        let a2 = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A2);
+        // The snapshot's cover, signed with a clock behind the old cover.
+        let old_cover = fx.svc_issued(2, "svc-1", C::Cover, A2, issued(1) - 1);
+        run(
+            &mut state,
+            &fx.list,
+            vec![
+                Step::new(
+                    &a(1, C::Cover),
+                    at(A, 1),
+                    out(
+                        R::Applied,
+                        &[(E::Cover, R::Applied)],
+                        vec![cover_action("svc-1", A)],
+                    ),
+                ),
+                // The same Station, not newer: the coverage stays on A.
+                Step::new(&old_cover, at(A2, 1), dup(&[E::Cover])),
+                Step::new(&a2(3, C::Hold), at(A2, 2), held("svc-1")),
+                Step::new(
+                    &a2(4, C::Release),
+                    at(A2, 3),
+                    all(R::Refused, &[E::Release]),
+                ),
+                Step::new(&a(5, C::Release), at(A, 2), released("svc-1")),
+            ],
+        );
+    }
+
+    /// A stop always wins: a Station whose cover lost the takeover (not
+    /// newer than the coverage's) still holds; its release is refused, and
+    /// the covering feed's release lifts the hold. A replayed hold is a
+    /// duplicate (its `record_id` counted): it holds nothing again.
+    #[test]
+    fn a_hold_from_a_station_that_lost_the_takeover_applies() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let a = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A);
+        let b = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, B);
+        let b_hold = b(6, C::Hold);
+        run(
+            &mut state,
+            &fx.list,
+            vec![
+                Step::new(
+                    &a(5, C::Cover),
+                    at(A, 1),
+                    out(
+                        R::Applied,
+                        &[(E::Cover, R::Applied)],
+                        vec![cover_action("svc-1", A)],
+                    ),
+                ),
+                // Issued before A's: B lost the takeover.
+                Step::new(&b(1, C::Cover), at(B, 1), all(R::Refused, &[E::Cover])),
+                Step::new(&b_hold, at(B, 2), held("svc-1")),
+                Step::new(&b(7, C::Release), at(B, 3), all(R::Refused, &[E::Release])),
+                Step::new(&a(8, C::Release), at(A, 2), released("svc-1")),
+                Step::new(&b_hold, at(B, 2), dup(&[E::Hold])),
+                Step::new(&a(9, C::Release), at(A, 3), dup(&[E::Release])),
+            ],
+        );
+    }
+
+    /// A hold with no coverage at all applies; a release needs one.
+    #[test]
+    fn a_hold_with_no_coverage_applies() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let s = |n: u32, action: ControlAction| fx.svc(n, "svc-2", "svc-2", action, A);
+        run(
+            &mut state,
+            &fx.list,
+            vec![
+                Step::new(&s(1, C::Hold), at(A, 1), held("svc-2")),
+                Step::new(&s(2, C::Release), at(A, 2), all(R::Refused, &[E::Release])),
+                // Once covered, a release after the cover lifts it.
+                Step::new(
+                    &s(3, C::Cover),
+                    at(A, 3),
+                    out(
+                        R::Applied,
+                        &[(E::Cover, R::Applied)],
+                        vec![cover_action("svc-2", A)],
+                    ),
+                ),
+                Step::new(&s(4, C::Release), at(A, 4), released("svc-2")),
+            ],
+        );
+    }
+
+    /// Within the covering feed, a hold read out of order (say it waited)
+    /// still applies; a release must follow the feed's last hold or
+    /// release.
+    #[test]
+    fn an_out_of_order_hold_applies_an_out_of_order_release_is_refused() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let s = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A);
+        run(
+            &mut state,
+            &fx.list,
+            vec![
+                Step::new(
+                    &s(1, C::Cover),
+                    at(A, 1),
+                    out(
+                        R::Applied,
+                        &[(E::Cover, R::Applied)],
+                        vec![cover_action("svc-1", A)],
+                    ),
+                ),
+                Step::new(&s(2, C::Hold), at(A, 2), held("svc-1")),
+                Step::new(&s(4, C::Release), at(A, 4), released("svc-1")),
+                Step::new(&s(3, C::Hold), at(A, 3), held("svc-1")),
+                // Not after the feed's last hold or release (at 4).
+                Step::new(&s(5, C::Release), at(A, 4), all(R::Refused, &[E::Release])),
+                Step::new(&s(6, C::Release), at(A, 5), released("svc-1")),
+            ],
+        );
+    }
+
+    /// Record ids are per principal (PR 3 review I2): one principal's
+    /// record under the `record_id` of another's never blocks it, so a
+    /// Station holding a service key can't pre-empt a native stop.
+    #[test]
+    fn record_ids_are_per_principal() {
+        let mut fx = Fx::new();
+        let r = fx.revoke_host(false);
+        let head = fx.list.head().seq;
+        let mut state = fx.state();
+        // svc-2's own cover, under the id the native records below use.
+        let squatter = fx.svc(1, "svc-2", "svc-2", C::Cover, B);
+        let native = fx.svc(1, "svc-1", "mac", revoke(true), A);
+        let host = fx.host(1, "mac", r);
+        run(
+            &mut state,
+            &fx.list,
+            vec![
+                Step::new(
+                    &squatter,
+                    at(B, 1),
+                    out(
+                        R::Applied,
+                        &[(E::Cover, R::Applied)],
+                        vec![cover_action("svc-2", B)],
+                    ),
+                ),
+                Step::new(
+                    &native,
+                    at(A, 1),
+                    out(
+                        R::Applied,
+                        &[(E::Revocation, R::Applied), (E::Interrupt, R::Applied)],
+                        vec![
+                            H::Revoke(service("svc-1")),
+                            interrupt_action(service("svc-1"), rid(1)),
+                        ],
+                    ),
+                ),
+                Step(
+                    host,
+                    None,
+                    head,
+                    out(
+                        R::Applied,
+                        &[(E::Interrupt, R::Applied)],
+                        vec![interrupt_action("host:host-a".into(), r.to_string())],
+                    ),
+                ),
+                Step::new(&squatter, at(B, 1), dup(&[E::Cover])),
+                Step::new(&native, at(A, 1), dup(&[E::Revocation, E::Interrupt])),
+            ],
+        );
+    }
+
+    /// The same principal's record under a counted `record_id` with another
+    /// body (PR 3 review I2): verified first; a stop (`hold`, `revoke`,
+    /// `interrupt_running`) still applies and is kept as evidence; a
+    /// `release` or `cover` is refused and kept as evidence. The first body
+    /// keeps the id.
+    #[test]
+    fn a_colliding_stop_applies_a_colliding_release_or_cover_is_refused() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let s = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A);
+        let cover = s(1, C::Cover);
+        // Under rid 3 (the release's), a hold; under rid 2 (the hold's), a
+        // release; under rid 1 (the cover's), a cover and a revoke.
+        let hold_on_3 = fx.svc(3, "svc-1", "svc-1", C::Hold, A);
+        let release_on_2 = fx.svc(2, "svc-1", "svc-1", C::Release, A);
+        let cover_on_1 = fx.svc_issued(1, "svc-1", C::Cover, A, issued(9));
+        let revoke_on_1 = fx.svc(1, "svc-1", "mac", revoke(true), A);
+        run(
+            &mut state,
+            &fx.list,
+            vec![
+                Step::new(
+                    &cover,
+                    at(A, 1),
+                    out(
+                        R::Applied,
+                        &[(E::Cover, R::Applied)],
+                        vec![cover_action("svc-1", A)],
+                    ),
+                ),
+                Step::new(&s(2, C::Hold), at(A, 2), held("svc-1")),
+                Step::new(&s(3, C::Release), at(A, 3), released("svc-1")),
+                Step::new(&hold_on_3, at(A, 4), evidence(held("svc-1"))),
+                Step::new(
+                    &release_on_2,
+                    at(A, 5),
+                    evidence(all(R::Refused, &[E::Release])),
+                ),
+                Step::new(
+                    &cover_on_1,
+                    at(A, 6),
+                    evidence(all(R::Refused, &[E::Cover])),
+                ),
+                Step::new(
+                    &revoke_on_1,
+                    at(A, 7),
+                    evidence(out(
+                        R::Applied,
+                        &[(E::Revocation, R::Applied), (E::Interrupt, R::Applied)],
+                        vec![
+                            H::Revoke(service("svc-1")),
+                            interrupt_action(service("svc-1"), rid(1)),
+                        ],
+                    )),
+                ),
+                Step::new(
+                    &revoke_on_1,
+                    None,
+                    evidence(dup(&[E::Revocation, E::Interrupt])),
+                ),
+                // The first bodies keep their ids.
+                Step::new(&cover, at(A, 1), dup(&[E::Cover])),
+                Step::new(&s(3, C::Release), at(A, 3), dup(&[E::Release])),
+            ],
+        );
+    }
+
+    /// A record under a colliding id is verified before the collision: one
+    /// the list can't verify yet waits, one that fails is refused for that.
+    #[test]
+    fn a_record_under_a_colliding_id_is_verified_first() {
+        let mut fx = Fx::new();
+        let mut state = fx.state();
+        let cover = fx.svc(1, "svc-1", "svc-1", C::Cover, A);
+        assert_eq!(
+            state.adopt(&cover, &fx.list, at(A, 1), 0).record_result,
+            R::Applied
+        );
+        // ipad isn't a member yet: its revoke under the cover's id waits.
+        let body = fx.service_body(1, "svc-1", "ipad", revoke(false), A);
+        let by_ipad = fx.sign(&body, "ipad");
+        assert_eq!(
+            state.adopt(&by_ipad, &fx.list, at(A, 2), 0),
+            all(R::Pending, &[E::Revocation])
+        );
+        // Once ipad is a manager, it applies, and the collision is evidence.
+        let ipad = native(&fx.keys, "ipad", &ALL);
+        fx.append("mac", Action::Add { member: ipad });
+        assert_eq!(
+            state.adopt(&by_ipad, &fx.list, at(A, 2), 0),
+            evidence(out(
+                R::Applied,
+                &[(E::Revocation, R::Applied)],
+                vec![H::Revoke(service("svc-1"))],
+            ))
+        );
+    }
+
+    /// A record is read at its own feed's position only when the position's
+    /// origin and `feed_id` are the body's (PR 3 review M1): a Station that
+    /// copies another's `feed_id` gets no position in that feed.
+    #[test]
+    fn a_position_of_another_origin_is_no_position() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let reusing: Feed = (B.0, A.1);
+        let cover = fx.svc(1, "svc-1", "svc-1", C::Cover, reusing);
+        let release = fx.svc(2, "svc-1", "svc-1", C::Release, reusing);
+        assert_eq!(
+            state.adopt(&cover, &fx.list, at(A, 1), 0),
+            all(R::Refused, &[E::Cover])
+        );
+        assert_eq!(
+            state.adopt(&release, &fx.list, at(A, 2), 0),
+            dup(&[E::Release])
+        );
+        // At its own origin's position it covers.
+        assert_eq!(
+            state.adopt(&cover, &fx.list, at(reusing, 1), 0),
+            out(
+                R::Applied,
+                &[(E::Cover, R::Applied)],
+                vec![cover_action("svc-1", reusing)],
+            )
+        );
     }
 
     #[test]

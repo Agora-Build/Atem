@@ -864,7 +864,8 @@ record! {
         pub revoke_seq: Option<u64>,
         /// A fresh UUID v4: the record's identity, kept before it is sent.
         pub record_id: String,
-        /// Milliseconds since the epoch (orders covers, ruling T11a).
+        /// Milliseconds since the epoch (orders covers by `(issued_at,
+        /// record_id)`).
         pub issued_at: u64,
         /// `about.integration_id`: Auth's client id (`i-…`).
         pub integration_id: Option<String>,
@@ -973,15 +974,20 @@ record! {
         pub effects: Vec<ControlEffectResult>,
         /// What the host does, in the same transaction.
         pub actions: Vec<ControlHostAction>,
-        /// Keep the record as evidence and alert (I.5.4).
+        /// Keep the record as evidence and alert (I.5.4): it failed
+        /// verification, or it reuses a `record_id` of the same principal
+        /// with another body (a stop still applies then; see `effects`).
         pub evidence: bool,
     }
 }
 
 record! {
-    /// Where a record was read: its feed's `feed_id` and its position
-    /// (`feed_seq`). None over a channel.
+    /// Where a record was read: its feed's Station `origin` and `feed_id`,
+    /// and its position (`feed_seq`). None over a channel. A record counts
+    /// as read at its own feed's position only when its body names the
+    /// same `origin` and `feed_id`.
     pub struct ControlFeedPos {
+        pub origin: String,
         pub feed_id: String,
         pub feed_seq: u64,
     }

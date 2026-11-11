@@ -465,7 +465,8 @@ check("device-list actions: verifyHostEncSig binds every field of a host's enc_s
 // builders reproduce it byte for byte (a software store, or the signing
 // input and a signature: a Station's KMS or WebCrypto); every sequence runs
 // through a ControlStateHandle with each step's per-effect results and the
-// state it leaves, which loads again only for its own device list.
+// state it leaves, which loads again only for its own device list; and a
+// handle never changes, so a failed commit loses no effect.
 const ctl = load("r9-vectors-host-work-control");
 const ctlByLabel = Object.fromEntries(ctl.records.map((r) => [r.label, r]));
 const CONTROL_FIELDS = ["type", "v", "account_id", "genesis_hash", "origin", "feed_id", "principal", "principal_key", "signer", "action", "interrupt_running", "revoke_seq", "record_id", "issued_at", "about"];
@@ -528,7 +529,7 @@ check("control records: every record parses and verifies on its chains as the ve
       verdicts++;
     }
   }
-  if (verdicts < 41) throw new Error(`${verdicts} verdicts`);
+  if (verdicts < 52) throw new Error(`${verdicts} verdicts`);
 });
 check("control records: the builders reproduce every record; a body the parse refuses is refused", () => {
   let built = 0;
@@ -558,18 +559,20 @@ check("control records: the builders reproduce every record; a body the parse re
     eq(m.buildControlRecord(store, "k", body), canonical, r.label);
     built++;
   }
-  if (built < 33) throw new Error(`${built} built`);
+  if (built < 44) throw new Error(`${built} built`);
   // A field the body doesn't name (here snake_case) is refused, never dropped.
   throwsCode(() => m.controlRecordSigningInput({ ...controlBodyOf(ctl.records[0].record.body), feed_id: "x" }), "malformed");
 });
 const controlActionOut = ({ feedId, ...rest }) => (feedId === undefined ? rest : { ...rest, feed_id: feedId });
+const ctlPos = (pos) => (pos === undefined ? null : { origin: pos.origin, feedId: pos.feed_id, feedSeq: pos.feed_seq });
 check("control records: every sequence's per-effect results and its state through ControlStateHandle", () => {
   for (const q of ctl.sequences) {
-    const state = new m.ControlStateHandle(logL());
+    let state = new m.ControlStateHandle(logL());
     q.steps.forEach((step, i) => {
-      const pos = step.pos === undefined ? null : { feedId: step.pos.feed_id, feedSeq: step.pos.feed_seq };
-      const got = state.apply(str(ctlByLabel[step.record].record), logAfter(step.chain), pos, step.host_applied_seq);
+      const t = state.apply(str(ctlByLabel[step.record].record), logAfter(step.chain), ctlPos(step.pos), step.host_applied_seq);
+      const got = t.applied;
       same({ ...got, actions: got.actions.map(controlActionOut) }, step.expect, `${q.label} step ${i + 1}`);
+      state = t.next;
     });
     const text = m.canonicalJson(str(q.state));
     eq(state.toJson(), text, q.label);
@@ -580,6 +583,23 @@ check("control records: every sequence's per-effect results and its state throug
   throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace('"acct-test-1"', '"acct-other"')), "account_mismatch");
   throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace('"v":1', '"v":2')), "unsupported_version");
   throwsCode(() => m.ControlStateHandle.fromJson(logL(), "["), "malformed");
+});
+check("control records: a failed commit loses no effect (apply leaves its handle as it was)", () => {
+  const state = new m.ControlStateHandle(logL());
+  const before = state.toJson();
+  const record = str(ctlByLabel.S5_revoke_interrupt.record);
+  const pos = ctlPos({ origin: ctl.stations.A.origin, feed_id: ctl.stations.A.feed_id, feed_seq: 1 });
+  const first = state.apply(record, logL(), pos, 6);
+  eq(first.applied.actions.length, 2);
+  // The caller's transaction failed: apply again to the handle it kept.
+  eq(state.toJson(), before);
+  const again = state.apply(record, logL(), pos, 6);
+  same(again.applied, first.applied, "the same results and actions");
+  eq(again.next.toJson(), first.next.toJson());
+  // Committed: the next state goes on, and the record is a duplicate.
+  eq(again.next.apply(record, logL(), pos, 6).applied.result, "duplicate");
+  // A position names its Station's origin too.
+  throwsCode(() => state.apply(record, logL(), { feedId: ctl.stations.A.feed_id, feedSeq: 1 }, 6), "malformed");
 });
 
 // ---------------------------------------------------------------- recovery

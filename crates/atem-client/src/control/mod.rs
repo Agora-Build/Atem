@@ -25,6 +25,7 @@ pub use record::{
 };
 pub use state::{
     ApplicationResult, Applied, ControlState, EffectKind, EffectResult, FeedPos, HostAction,
+    Transition,
 };
 pub use verify::{
     ControlCheck, PendingReason, RefusalReason, VerifiedControl, VerifiedSigner, verify_control,

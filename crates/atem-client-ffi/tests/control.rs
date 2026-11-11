@@ -242,7 +242,7 @@ fn every_record_parses_and_verifies_as_the_vectors_say() {
             checked += 1;
         }
     }
-    assert!(checked >= 41, "{checked} verdicts");
+    assert!(checked >= 52, "{checked} verdicts");
     // Not a record at all.
     let log = log_after(&v, &[]);
     assert_eq!(
@@ -374,7 +374,7 @@ fn the_builders_reproduce_every_record() {
         assert_eq!(request.label, "atem-host-work-control-v1");
         built += 1;
     }
-    assert!(built >= 33, "{built} built");
+    assert!(built >= 44, "{built} built");
     // A malformed field the builder takes: an unsafe integer, an X25519
     // signer, a hex that isn't one.
     let s1 = &file["records"][0];
@@ -420,12 +420,14 @@ fn the_sequences_through_the_state_handle() {
     let l = log_after(&v, &[]);
     for q in file["sequences"].as_array().unwrap() {
         let label = q["label"].as_str().unwrap();
-        let state = ControlStateHandle::new(l.clone());
+        let mut state = ControlStateHandle::new(l.clone());
         for (i, step) in q["steps"].as_array().unwrap().iter().enumerate() {
             let pos = step.get("pos").map(|p| ControlFeedPos {
+                origin: s(&p["origin"]),
                 feed_id: s(&p["feed_id"]),
                 feed_seq: p["feed_seq"].as_u64().unwrap(),
             });
+            let before = state.to_json();
             let got = state
                 .apply(
                     records[step["record"].as_str().unwrap()].clone(),
@@ -434,7 +436,15 @@ fn the_sequences_through_the_state_handle() {
                     step["host_applied_seq"].as_u64().unwrap(),
                 )
                 .unwrap();
-            assert_eq!(applied_json(&got), step["expect"], "{label} step {}", i + 1);
+            assert_eq!(
+                applied_json(&got.applied),
+                step["expect"],
+                "{label} step {}",
+                i + 1
+            );
+            // The handle applied on is unchanged; the next one goes on.
+            assert_eq!(state.to_json(), before, "{label} step {}", i + 1);
+            state = got.next;
         }
         let text = atem_client::canonical::jcs(&q["state"]).unwrap();
         assert_eq!(state.to_json(), text, "{label}");
@@ -520,13 +530,14 @@ fn the_state_loads_only_as_written_for_its_own_list() {
     );
     let s1 = file["records"][0]["record"].to_string();
     let state = ControlStateHandle::new(l.clone());
-    let refused = state.apply(s1.clone(), other, None, 6).unwrap();
+    let refused = state.apply(s1.clone(), other, None, 6).unwrap().applied;
     assert_eq!(refused.result, ControlResultKind::Refused);
     assert!(!refused.evidence && refused.actions.is_empty());
     // A position above 2^53 - 1 never enters the state.
-    let feed = file["stations"]["A"]["feed_id"].as_str().unwrap();
+    let station = &file["stations"]["A"];
     let unsafe_pos = ControlFeedPos {
-        feed_id: feed.into(),
+        origin: s(&station["origin"]),
+        feed_id: s(&station["feed_id"]),
         feed_seq: u64::MAX,
     };
     assert_eq!(
@@ -537,4 +548,54 @@ fn the_state_loads_only_as_written_for_its_own_list() {
         state.to_json(),
         ControlStateHandle::new(log_after(&v, &[])).to_json()
     );
+}
+
+/// A failed persistence transaction loses no effect (PR 3 review I4): the
+/// handle `apply` was called on is unchanged until the caller adopts the
+/// next state, so applying the same record again (after the caller's
+/// transaction failed) gives the same results and actions; once the next
+/// state is adopted, the record is a duplicate.
+#[test]
+fn a_failed_commit_loses_no_effect() {
+    let v = Vectors::load();
+    let file = control();
+    let l = log_after(&v, &[]);
+    let record = |label: &str| {
+        file["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["label"] == label)
+            .unwrap()["record"]
+            .to_string()
+    };
+    let station = &file["stations"]["A"];
+    let pos = |n| {
+        Some(ControlFeedPos {
+            origin: s(&station["origin"]),
+            feed_id: s(&station["feed_id"]),
+            feed_seq: n,
+        })
+    };
+    let state = ControlStateHandle::new(l.clone());
+    let before = state.to_json();
+    let first = state
+        .apply(record("S5_revoke_interrupt"), l.clone(), pos(1), 6)
+        .unwrap();
+    assert_eq!(first.applied.actions.len(), 2);
+    // The caller's transaction failed: nothing was stored, and the state
+    // it applies on next is the one it had.
+    assert_eq!(state.to_json(), before);
+    let again = state
+        .apply(record("S5_revoke_interrupt"), l.clone(), pos(1), 6)
+        .unwrap();
+    assert_eq!(again.applied, first.applied);
+    assert_eq!(again.next.to_json(), first.next.to_json());
+    // Committed this time: the next state goes on from it.
+    let state = again.next;
+    let after = state
+        .apply(record("S5_revoke_interrupt"), l, pos(1), 6)
+        .unwrap();
+    assert_eq!(after.applied.result, ControlResultKind::Duplicate);
+    assert!(after.applied.actions.is_empty());
 }

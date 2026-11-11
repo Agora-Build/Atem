@@ -659,7 +659,8 @@ final class ConformanceTests: XCTestCase {
         // `parse_error`); the builders reproduce it byte for byte (a software
         // store, or the signing input and a signature); every sequence runs
         // through a ControlStateHandle with each step's per-effect results and
-        // the state it leaves; and a provider is asked under the purpose the
+        // the state it leaves (a handle never changes, so a failed commit
+        // loses no effect); and a provider is asked under the purpose the
         // record's signer gives.
         let ctl = try load("r9-vectors-host-work-control")
         let ctlRecords = a(ctl["records"]).map(o)
@@ -731,7 +732,7 @@ final class ConformanceTests: XCTestCase {
                     verdicts += 1
                 }
             }
-            if verdicts < 41 { throw Failure(description: "\(verdicts) verdicts") }
+            if verdicts < 52 { throw Failure(description: "\(verdicts) verdicts") }
         }
         check("control records: the builders reproduce every record; a body the parse refuses is refused") {
             var built = 0
@@ -761,7 +762,7 @@ final class ConformanceTests: XCTestCase {
                 try eq(try buildControlRecord(provider: store.provider(), keyId: "k", body: body), canonical, label)
                 built += 1
             }
-            if built < 33 { throw Failure(description: "\(built) built") }
+            if built < 44 { throw Failure(description: "\(built) built") }
         }
         func controlActionOf(_ action: ControlHostAction) -> [String: Any] {
             switch action {
@@ -793,16 +794,19 @@ final class ConformanceTests: XCTestCase {
             let effects: [[String: Any]] = applied.effects.map { ["effect": effectCode($0.effect), "result": resultCode($0.result)] }
             return ["result": resultCode(applied.result), "effects": effects, "actions": applied.actions.map(controlActionOf), "evidence": applied.evidence]
         }
+        func ctlPos(_ v: Any?) -> ControlFeedPos? {
+            guard let p = v as? [String: Any] else { return nil }
+            return ControlFeedPos(origin: s(p["origin"]), feedId: s(p["feed_id"]), feedSeq: u(p["feed_seq"]))
+        }
         check("control records: every sequence's per-effect results and its state through ControlStateHandle") {
             for q in a(ctl["sequences"]).map(o) {
                 let label = s(q["label"])
-                let state = ControlStateHandle(log: try logL())
+                var state = ControlStateHandle(log: try logL())
                 for (i, step) in a(q["steps"]).map(o).enumerated() {
-                    var pos: ControlFeedPos? = nil
-                    if let p = step["pos"] as? [String: Any] { pos = ControlFeedPos(feedId: s(p["feed_id"]), feedSeq: u(p["feed_seq"])) }
                     let record = js(ctlByLabel[s(step["record"])]!["record"]!)
-                    let got = try state.apply(recordJson: record, log: try logAfter(a(step["chain"]).map(s)), pos: pos, hostAppliedSeq: u(step["host_applied_seq"]))
-                    try eq(canon(controlAppliedOf(got)), canon(o(step["expect"])), "\(label) step \(i + 1)")
+                    let t = try state.apply(recordJson: record, log: try logAfter(a(step["chain"]).map(s)), pos: ctlPos(step["pos"]), hostAppliedSeq: u(step["host_applied_seq"]))
+                    try eq(canon(controlAppliedOf(t.applied)), canon(o(step["expect"])), "\(label) step \(i + 1)")
+                    state = t.next
                 }
                 let text = try canonicalJson(json: js(q["state"]!))
                 try eq(state.toJson(), text, label)
@@ -813,6 +817,23 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("account_mismatch") { _ = try ControlStateHandle.fromJson(log: try logL(), stateJson: text.replacingOccurrences(of: "\"acct-test-1\"", with: "\"acct-other\"")) }
             try throwsCode("unsupported_version") { _ = try ControlStateHandle.fromJson(log: try logL(), stateJson: text.replacingOccurrences(of: "\"v\":1", with: "\"v\":2")) }
             try throwsCode("malformed") { _ = try ControlStateHandle.fromJson(log: try logL(), stateJson: "[") }
+        }
+        check("control records: a failed commit loses no effect (apply leaves its handle as it was)") {
+            let state = ControlStateHandle(log: try logL())
+            let before = state.toJson()
+            let record = js(ctlByLabel["S5_revoke_interrupt"]!["record"]!)
+            let station = o(o(ctl["stations"])["A"])
+            let pos = ControlFeedPos(origin: s(station["origin"]), feedId: s(station["feed_id"]), feedSeq: 1)
+            let first = try state.apply(recordJson: record, log: try logL(), pos: pos, hostAppliedSeq: 6)
+            try eq(first.applied.actions.count, 2)
+            // The caller's transaction failed: apply again to the handle it kept.
+            try eq(state.toJson(), before)
+            let again = try state.apply(recordJson: record, log: try logL(), pos: pos, hostAppliedSeq: 6)
+            try eq(canon(controlAppliedOf(again.applied)), canon(controlAppliedOf(first.applied)), "the same results and actions")
+            try eq(again.next.toJson(), first.next.toJson())
+            // Committed: the next state goes on, and the record is a duplicate.
+            let after = try again.next.apply(recordJson: record, log: try logL(), pos: pos, hostAppliedSeq: 6)
+            try eq(resultCode(after.applied.result), "duplicate")
         }
         check("control records: a Station's service key signs with no confirmation, a native manager's asks a fresh one") {
             #if canImport(CryptoKit)
@@ -1044,6 +1065,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 50)
+        XCTAssertEqual(passed, 51)
     }
 }

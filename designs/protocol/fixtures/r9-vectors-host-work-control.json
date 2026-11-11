@@ -3,7 +3,7 @@
   "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
   "kind": "vectors",
   "name": "r9-vectors-host-work-control",
-  "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; `state` is ControlState::to_json after the last step. Record ids are UUID v4 numbered by record; issued_at orders covers (ruling T11a).",
+  "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (the records that counted kept by principal, then record_id). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused).",
   "records": [
     {
       "checks": [
@@ -1292,7 +1292,7 @@
     {
       "jcs": "{\"about\":{\"by\":\"owner\"},\"account_id\":\"acct-test-1\",\"action\":\"release\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620950000,\"principal\":\"host:host-a\",\"record_id\":\"00000000-0000-4000-8000-000000000032\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1}",
       "label": "P1_host_release",
-      "note": "a host principal's release (ruling T9a: refused at parse)",
+      "note": "a host principal's release: refused at parse",
       "parse_error": "not_for_host_principal",
       "record": {
         "body": {
@@ -1494,6 +1494,414 @@
       },
       "signed_with": "svc-discord",
       "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d7631000002427b2261626f7574223a7b226279223a226f776e6572222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f6c64222c22666565645f6964223a2236663163326233612d346435652d346636302d386137622d396330643165326633613462222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22696e746572727570745f72756e6e696e67223a66616c73652c226973737565645f6174223a313739333632303935373030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d646973636f7264222c227072696e636970616c5f6b6579223a2235646239343963353730343038376665613236656366313964326566303966646133616462343465343835636636333436643233623833376637616666376635222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303339222c227369676e6572223a22736572766963653a7376632d646973636f7264222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [],
+          "key_seq": 5,
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620900000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-00000000003c\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "A2_cover_not_newer",
+      "note": "station-dev's reset snapshot cover, signed with a clock behind S1_cover's: not newer, so the coverage stays on the old feed",
+      "r9_svc": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+      "record": {
+        "body": {
+          "about": {
+            "by": "station",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "cover",
+          "feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "issued_at": 1793620900000,
+          "origin": "https://station-dev.agora.build",
+          "principal": "service:svc-discord",
+          "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+          "record_id": "00000000-0000-4000-8000-00000000003c",
+          "signer": "service:svc-discord",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "ZFSgVt6bBz06hNVF9ka_4MZxOUQTvUKtNGbRpciBkfqyYXTf4Xf8jjCxO3dYYzF7hfUxWH0qWh0bwQ0sOQOGCw"
+      },
+      "signed_with": "svc-discord",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d76310000022b7b2261626f7574223a7b226279223a2273746174696f6e222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22636f766572222c22666565645f6964223a2239613862376336642d356534662d346133622d386332642d316530663961386237633664222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226973737565645f6174223a313739333632303930303030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d646973636f7264222c227072696e636970616c5f6b6579223a2235646239343963353730343038376665613236656366313964326566303966646133616462343465343835636636333436643233623833376637616666376635222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303363222c227369676e6572223a22736572766963653a7376632d646973636f7264222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [],
+          "key_seq": 5,
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"hold\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620961000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-00000000003d\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "S9_hold",
+      "note": "a pause applied out of feed order (say it waited)",
+      "r9_svc": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+      "record": {
+        "body": {
+          "about": {
+            "by": "owner",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "hold",
+          "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "issued_at": 1793620961000,
+          "origin": "https://station-dev.agora.build",
+          "principal": "service:svc-discord",
+          "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+          "record_id": "00000000-0000-4000-8000-00000000003d",
+          "signer": "service:svc-discord",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "JCPkK1Ubt7rKjVBK8S1TZaLCfDliwtV1dcnPvAcCdF6hxVKiegLT0gfrva3ZmZSDAKpfKlNjK0JU5o0WRggvAw"
+      },
+      "signed_with": "svc-discord",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d7631000002287b2261626f7574223a7b226279223a226f776e6572222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f6c64222c22666565645f6964223a2236663163326233612d346435652d346636302d386137622d396330643165326633613462222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226973737565645f6174223a313739333632303936313030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d646973636f7264222c227072696e636970616c5f6b6579223a2235646239343963353730343038376665613236656366313964326566303966646133616462343465343835636636333436643233623833376637616666376635222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303364222c227369676e6572223a22736572766963653a7376632d646973636f7264222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [],
+          "key_seq": 5,
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"release\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620962000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-00000000003e\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "S10_release",
+      "note": "a resume at a position before the feed's last hold or release",
+      "r9_svc": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+      "record": {
+        "body": {
+          "about": {
+            "by": "owner",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "release",
+          "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "issued_at": 1793620962000,
+          "origin": "https://station-dev.agora.build",
+          "principal": "service:svc-discord",
+          "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+          "record_id": "00000000-0000-4000-8000-00000000003e",
+          "signer": "service:svc-discord",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "6TJWtOz8XflqmO9u51bf7vZuLTr-t-llTOffXg6n80Qy9wN6nmVmp8_UqI6AhjtFYh3c4rZxz2Wi_2qITcIhBw"
+      },
+      "signed_with": "svc-discord",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d76310000022b7b2261626f7574223a7b226279223a226f776e6572222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2272656c65617365222c22666565645f6964223a2236663163326233612d346435652d346636302d386137622d396330643165326633613462222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226973737565645f6174223a313739333632303936323030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d646973636f7264222c227072696e636970616c5f6b6579223a2235646239343963353730343038376665613236656366313964326566303966646133616462343465343835636636333436643233623833376637616666376635222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303365222c227369676e6572223a22736572766963653a7376632d646973636f7264222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [],
+          "key_seq": 5,
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"release\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620963000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-00000000003f\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "S11_release",
+      "note": "a resume after the feed's last hold or release",
+      "r9_svc": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+      "record": {
+        "body": {
+          "about": {
+            "by": "owner",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "release",
+          "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "issued_at": 1793620963000,
+          "origin": "https://station-dev.agora.build",
+          "principal": "service:svc-discord",
+          "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+          "record_id": "00000000-0000-4000-8000-00000000003f",
+          "signer": "service:svc-discord",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "Tjs8WxLI4UByMiGuE2H1Xr6Jt1SZWL3QOSYRULb552PKdNpaQwdRwRy4sNM_Ew98D2Y7zX7LMk0ApJOWqm8QBA"
+      },
+      "signed_with": "svc-discord",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d76310000022b7b2261626f7574223a7b226279223a226f776e6572222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2272656c65617365222c22666565645f6964223a2236663163326233612d346435652d346636302d386137622d396330643165326633613462222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226973737565645f6174223a313739333632303936333030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d646973636f7264222c227072696e636970616c5f6b6579223a2235646239343963353730343038376665613236656366313964326566303966646133616462343465343835636636333436643233623833376637616666376635222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303366222c227369676e6572223a22736572766963653a7376632d646973636f7264222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [],
+          "key_seq": 5,
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620966000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000040\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "T1_cover_tie_lower_id",
+      "note": "station-dev's cover issued at the same time as T2_cover_tie, with a lower record_id",
+      "r9_svc": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+      "record": {
+        "body": {
+          "about": {
+            "by": "station",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "cover",
+          "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "issued_at": 1793620966000,
+          "origin": "https://station-dev.agora.build",
+          "principal": "service:svc-discord",
+          "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+          "record_id": "00000000-0000-4000-8000-000000000040",
+          "signer": "service:svc-discord",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "gk6x6Byy0TeYHh2kdjMgPyHAYCZaj36vM4aP9u3frSaWIHzcMSCX8fd-IvSVkfLOy5utdor8AN4saoRR4gbdAw"
+      },
+      "signed_with": "svc-discord",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d76310000022b7b2261626f7574223a7b226279223a2273746174696f6e222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22636f766572222c22666565645f6964223a2236663163326233612d346435652d346636302d386137622d396330643165326633613462222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226973737565645f6174223a313739333632303936363030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d646973636f7264222c227072696e636970616c5f6b6579223a2235646239343963353730343038376665613236656366313964326566303966646133616462343465343835636636333436643233623833376637616666376635222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303430222c227369676e6572223a22736572766963653a7376632d646973636f7264222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [],
+          "key_seq": 5,
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620966000,\"origin\":\"https://station-b.example.com\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000041\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "T2_cover_tie",
+      "note": "station-b's cover",
+      "r9_svc": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+      "record": {
+        "body": {
+          "about": {
+            "by": "station",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "cover",
+          "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "issued_at": 1793620966000,
+          "origin": "https://station-b.example.com",
+          "principal": "service:svc-discord",
+          "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+          "record_id": "00000000-0000-4000-8000-000000000041",
+          "signer": "service:svc-discord",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "a7-Kui0J7cfmRysQ0U1QzBMWWpkETb72g4yYnT1-VW1rCe7idFJ0jHtRZqElx9UWPc7_V7t5kaW27Ibjui_wAw"
+      },
+      "signed_with": "svc-discord",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d7631000002297b2261626f7574223a7b226279223a2273746174696f6e222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22636f766572222c22666565645f6964223a2231643263336234612d356636652d346437632d623861392d306631653264336334623561222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226973737565645f6174223a313739333632303936363030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d622e6578616d706c652e636f6d222c227072696e636970616c223a22736572766963653a7376632d646973636f7264222c227072696e636970616c5f6b6579223a2235646239343963353730343038376665613236656366313964326566303966646133616462343465343835636636333436643233623833376637616666376635222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303431222c227369676e6572223a22736572766963653a7376632d646973636f7264222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [],
+          "key_seq": 5,
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620966000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000042\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "T3_cover_tie_higher_id",
+      "note": "station-dev's cover issued at the same time as T2_cover_tie, with a higher record_id: newer",
+      "r9_svc": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+      "record": {
+        "body": {
+          "about": {
+            "by": "station",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "cover",
+          "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "issued_at": 1793620966000,
+          "origin": "https://station-dev.agora.build",
+          "principal": "service:svc-discord",
+          "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+          "record_id": "00000000-0000-4000-8000-000000000042",
+          "signer": "service:svc-discord",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "dlTclH28-XoXnB4YvbcGNOuX73APJ-xKEgKsh4J0uWUY7_BtcLYUb-U2ml_2oThWujCcoXHP2vPgHrF8UW8NBQ"
+      },
+      "signed_with": "svc-discord",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d76310000022b7b2261626f7574223a7b226279223a2273746174696f6e222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22636f766572222c22666565645f6964223a2236663163326233612d346435652d346636302d386137622d396330643165326633613462222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226973737565645f6174223a313739333632303936363030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d646973636f7264222c227072696e636970616c5f6b6579223a2235646239343963353730343038376665613236656366313964326566303966646133616462343465343835636636333436643233623833376637616666376635222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303432222c227369676e6572223a22736572766963653a7376632d646973636f7264222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [],
+          "key_seq": 5,
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620967000,\"origin\":\"https://station-b.example.com\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-00000000001e\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "X1_cover_under_h1_id",
+      "note": "svc-discord's own cover under the record_id of H1_interrupt_7 (host-a's): a record of another principal never blocks it",
+      "r9_svc": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+      "record": {
+        "body": {
+          "about": {
+            "by": "station",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "cover",
+          "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "issued_at": 1793620967000,
+          "origin": "https://station-b.example.com",
+          "principal": "service:svc-discord",
+          "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+          "record_id": "00000000-0000-4000-8000-00000000001e",
+          "signer": "service:svc-discord",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "rJQaBF63whKcI_9m-sCkSkgU9i0Slg_H6GNqy8qaQHoiIg2pY3OPErZuqazf5jjefs2XJzVhpCIprvgdH_SnBw"
+      },
+      "signed_with": "svc-discord",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d7631000002297b2261626f7574223a7b226279223a2273746174696f6e222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22636f766572222c22666565645f6964223a2231643263336234612d356636652d346437632d623861392d306631653264336334623561222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226973737565645f6174223a313739333632303936373030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d622e6578616d706c652e636f6d222c227072696e636970616c223a22736572766963653a7376632d646973636f7264222c227072696e636970616c5f6b6579223a2235646239343963353730343038376665613236656366313964326566303966646133616462343465343835636636333436643233623833376637616666376635222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303165222c227369676e6572223a22736572766963653a7376632d646973636f7264222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [],
+          "key_seq": 5,
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"hold\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620968000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000003\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "X2_hold_under_s3_id",
+      "note": "a pause under S3_release's record_id: a stop, it applies, and the reused id is evidence",
+      "r9_svc": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+      "record": {
+        "body": {
+          "about": {
+            "by": "owner",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "hold",
+          "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "issued_at": 1793620968000,
+          "origin": "https://station-dev.agora.build",
+          "principal": "service:svc-discord",
+          "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+          "record_id": "00000000-0000-4000-8000-000000000003",
+          "signer": "service:svc-discord",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "4neW-oqP_xckXcH96uU7NFLYkVq8m0RVwdeX13XukVkP8P3AGCgwEX2NMRIv716Br5xRz7Ra8x53Bkc5XI6BDw"
+      },
+      "signed_with": "svc-discord",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d7631000002287b2261626f7574223a7b226279223a226f776e6572222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a22686f6c64222c22666565645f6964223a2236663163326233612d346435652d346636302d386137622d396330643165326633613462222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226973737565645f6174223a313739333632303936383030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d646973636f7264222c227072696e636970616c5f6b6579223a2235646239343963353730343038376665613236656366313964326566303966646133616462343465343835636636333436643233623833376637616666376635222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303033222c227369676e6572223a22736572766963653a7376632d646973636f7264222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [],
+          "key_seq": 5,
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"release\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620969000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000002\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "X3_release_under_s2_id",
+      "note": "a resume under S2_hold's record_id: refused, and the reused id is evidence",
+      "r9_svc": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+      "record": {
+        "body": {
+          "about": {
+            "by": "owner",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "release",
+          "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "issued_at": 1793620969000,
+          "origin": "https://station-dev.agora.build",
+          "principal": "service:svc-discord",
+          "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+          "record_id": "00000000-0000-4000-8000-000000000002",
+          "signer": "service:svc-discord",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "k0lnYLe_gBL3UB2oNgl2nvX3SWltUEGe_r0g8oodzDxgy7LbnmMmOtJjN-gbAidnDisX6eUR3-kkQ0ooz0s2DA"
+      },
+      "signed_with": "svc-discord",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d76310000022b7b2261626f7574223a7b226279223a226f776e6572222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a2272656c65617365222c22666565645f6964223a2236663163326233612d346435652d346636302d386137622d396330643165326633613462222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226973737565645f6174223a313739333632303936393030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d646973636f7264222c227072696e636970616c5f6b6579223a2235646239343963353730343038376665613236656366313964326566303966646133616462343465343835636636333436643233623833376637616666376635222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303032222c227369676e6572223a22736572766963653a7376632d646973636f7264222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
+    },
+    {
+      "checks": [
+        {
+          "chain": [],
+          "key_seq": 5,
+          "signer": "service:svc-discord",
+          "verdict": "valid"
+        }
+      ],
+      "jcs": "{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793620970000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1}",
+      "label": "X4_revoke_under_s1_id",
+      "note": "a revoke with interrupt_running under S1_cover's record_id: a stop, it applies, and the reused id is evidence",
+      "r9_svc": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+      "record": {
+        "body": {
+          "about": {
+            "by": "owner",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+          },
+          "account_id": "acct-test-1",
+          "action": "revoke",
+          "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "interrupt_running": true,
+          "issued_at": 1793620970000,
+          "origin": "https://station-dev.agora.build",
+          "principal": "service:svc-discord",
+          "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+          "record_id": "00000000-0000-4000-8000-000000000001",
+          "signer": "service:svc-discord",
+          "type": "atem-host-work-control",
+          "v": 1
+        },
+        "sig": "JmTFXHjxo0k7dFQOOmiYEF56PEUQsvCgaRogZtCxPVgZYF1APqe0wONBkCJS0Cb25ZB1FKGfCrRT_L_P8oY3DA"
+      },
+      "signed_with": "svc-discord",
+      "signing_input_hex": "000000196174656d2d686f73742d776f726b2d636f6e74726f6c2d7631000002437b2261626f7574223a7b226279223a226f776e6572222c22696e746567726174696f6e5f6964223a22692d30316a63357a7139783877377636743573347233713270316e30227d2c226163636f756e745f6964223a22616363742d746573742d31222c22616374696f6e223a227265766f6b65222c22666565645f6964223a2236663163326233612d346435652d346636302d386137622d396330643165326633613462222c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22696e746572727570745f72756e6e696e67223a747275652c226973737565645f6174223a313739333632303937303030302c226f726967696e223a2268747470733a2f2f73746174696f6e2d6465762e61676f72612e6275696c64222c227072696e636970616c223a22736572766963653a7376632d646973636f7264222c227072696e636970616c5f6b6579223a2235646239343963353730343038376665613236656366313964326566303966646133616462343465343835636636333436643233623833376637616666376635222c227265636f72645f6964223a2230303030303030302d303030302d343030302d383030302d303030303030303030303031222c227369676e6572223a22736572766963653a7376632d646973636f7264222c2274797065223a226174656d2d686f73742d776f726b2d636f6e74726f6c222c2276223a317d"
     }
   ],
   "requires": "r9",
@@ -1506,14 +1914,16 @@
         "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
         "hosts": {},
         "records": {
-          "00000000-0000-4000-8000-000000000001": "e37eba9f6b803a19f4e8f2334c6eca5ceb7eaec8d350f23c2e2261db7f273af8",
-          "00000000-0000-4000-8000-000000000002": "f4e9875284f0a3a6e8d5f6afd24a995dff71cec8e719521dcbc3b799223c8f75",
-          "00000000-0000-4000-8000-000000000003": "a1fb6626a764b90661437f0ce06fb33463eff575fc656e9498f35b53b3d056d2",
-          "00000000-0000-4000-8000-000000000004": "ae58de43d72197461f28d8bac191d02ee5fd5953ceb52767c6ec900128dc9518",
-          "00000000-0000-4000-8000-000000000005": "407e3e063faff21372f6cbbe0e94aa87eab0772701059666e4ae7062487ba811",
-          "00000000-0000-4000-8000-000000000006": "e68bfbf151d2de2ed9c9d0b66e9523c2a91f6723db45d56a4c0c0a53e6798f10",
-          "00000000-0000-4000-8000-000000000014": "d4d80a6bba5b3daccd084f87a537df626c842ac6cdbfcd128f3ab5e1e723f147",
-          "00000000-0000-4000-8000-000000000015": "9d7c15a9cff78b8951187944cb10393d6b94a8bc653b6d848c1f4f7a59c7a623"
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-000000000001": "e37eba9f6b803a19f4e8f2334c6eca5ceb7eaec8d350f23c2e2261db7f273af8",
+            "00000000-0000-4000-8000-000000000002": "f4e9875284f0a3a6e8d5f6afd24a995dff71cec8e719521dcbc3b799223c8f75",
+            "00000000-0000-4000-8000-000000000003": "a1fb6626a764b90661437f0ce06fb33463eff575fc656e9498f35b53b3d056d2",
+            "00000000-0000-4000-8000-000000000004": "ae58de43d72197461f28d8bac191d02ee5fd5953ceb52767c6ec900128dc9518",
+            "00000000-0000-4000-8000-000000000005": "407e3e063faff21372f6cbbe0e94aa87eab0772701059666e4ae7062487ba811",
+            "00000000-0000-4000-8000-000000000006": "e68bfbf151d2de2ed9c9d0b66e9523c2a91f6723db45d56a4c0c0a53e6798f10",
+            "00000000-0000-4000-8000-000000000014": "d4d80a6bba5b3daccd084f87a537df626c842ac6cdbfcd128f3ab5e1e723f147",
+            "00000000-0000-4000-8000-000000000015": "9d7c15a9cff78b8951187944cb10393d6b94a8bc653b6d848c1f4f7a59c7a623"
+          }
         },
         "services": {
           "svc-discord": {
@@ -1526,12 +1936,13 @@
               "origin": "https://station-dev.agora.build",
               "since": 1
             },
-            "hold": {
-              "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-              "feed_seq": 3,
-              "held": false
-            },
+            "held": false,
             "interrupted": true,
+            "order": {
+              "https://station-dev.agora.build": {
+                "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b": 3
+              }
+            },
             "revoked_by": "00000000-0000-4000-8000-000000000004"
           }
         },
@@ -1561,7 +1972,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 1
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S1_cover"
         },
@@ -1586,7 +1998,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 2
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S2_hold"
         },
@@ -1606,7 +2019,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 2
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S2_hold"
         },
@@ -1631,7 +2045,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 3
+            "feed_seq": 3,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S3_release"
         },
@@ -1656,7 +2071,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 4
+            "feed_seq": 4,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S4_revoke"
         },
@@ -1676,7 +2092,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 5
+            "feed_seq": 5,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "M1_revoke"
         },
@@ -1706,7 +2123,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 6
+            "feed_seq": 6,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S5_revoke_interrupt"
         },
@@ -1726,7 +2144,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 7
+            "feed_seq": 7,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "M2_interrupt"
         },
@@ -1746,7 +2165,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 8
+            "feed_seq": 8,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S6_interrupt"
         },
@@ -1766,7 +2186,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 9
+            "feed_seq": 9,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S7_hold_after_revoke"
         }
@@ -1780,10 +2201,13 @@
         "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
         "hosts": {},
         "records": {
-          "00000000-0000-4000-8000-000000000017": "dcb687a73e1e8d024371e636c1266b9526787299d9f13ec596a1f11319f7e525"
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-000000000017": "dcb687a73e1e8d024371e636c1266b9526787299d9f13ec596a1f11319f7e525"
+          }
         },
         "services": {
           "svc-discord": {
+            "held": false,
             "interrupted": true,
             "revoked_by": "00000000-0000-4000-8000-000000000017"
           }
@@ -1811,7 +2235,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 1
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "M3_revoke_by_removed_manager"
         },
@@ -1845,7 +2270,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 2
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "M4_revoke_resigned"
         },
@@ -1869,7 +2295,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 1
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "M3_revoke_by_removed_manager"
         }
@@ -1883,10 +2310,13 @@
         "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
         "hosts": {},
         "records": {
-          "00000000-0000-4000-8000-000000000018": "e42219331dc4487c037686186c37394bf42c18594512dfe93114605a64fdfcaa"
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-000000000018": "e42219331dc4487c037686186c37394bf42c18594512dfe93114605a64fdfcaa"
+          }
         },
         "services": {
           "svc-discord": {
+            "held": false,
             "interrupted": false,
             "revoked_by": "00000000-0000-4000-8000-000000000018"
           }
@@ -1910,7 +2340,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 1
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "M5_revoke_by_pending_member"
         },
@@ -1932,7 +2363,8 @@
           "host_applied_seq": 7,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 1
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "M5_revoke_by_pending_member"
         },
@@ -1960,7 +2392,8 @@
           "host_applied_seq": 8,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 1
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "M5_revoke_by_pending_member"
         }
@@ -1968,17 +2401,19 @@
     },
     {
       "label": "Q4_cover_from_another_station",
-      "note": "ruling T11a: a stale cover from another Station neither takes coverage nor releases; a newer one takes coverage and the hold persists until the new feed releases",
+      "note": "covers are ordered by (issued_at, record_id): a stale cover from another Station neither takes coverage nor releases; a newer one takes coverage and the hold persists until the new feed releases",
       "state": {
         "account_id": "acct-test-1",
         "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
         "hosts": {},
         "records": {
-          "00000000-0000-4000-8000-000000000001": "e37eba9f6b803a19f4e8f2334c6eca5ceb7eaec8d350f23c2e2261db7f273af8",
-          "00000000-0000-4000-8000-000000000002": "f4e9875284f0a3a6e8d5f6afd24a995dff71cec8e719521dcbc3b799223c8f75",
-          "00000000-0000-4000-8000-00000000000b": "5c606883c0f5f0faedb31815e56c92763c3335cfd7e4b67cde5a0da7703c6b87",
-          "00000000-0000-4000-8000-00000000000c": "32f62d78568cc30ca5cdd9cf33562c4be17e6a2039a56dc0033b7c830b69c8e5",
-          "00000000-0000-4000-8000-00000000000d": "74b2fb5381920608c721ca7b1ca46fb5ccb8d41ae75a1cc8c5a7fee14d8ed596"
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-000000000001": "e37eba9f6b803a19f4e8f2334c6eca5ceb7eaec8d350f23c2e2261db7f273af8",
+            "00000000-0000-4000-8000-000000000002": "f4e9875284f0a3a6e8d5f6afd24a995dff71cec8e719521dcbc3b799223c8f75",
+            "00000000-0000-4000-8000-00000000000b": "5c606883c0f5f0faedb31815e56c92763c3335cfd7e4b67cde5a0da7703c6b87",
+            "00000000-0000-4000-8000-00000000000c": "32f62d78568cc30ca5cdd9cf33562c4be17e6a2039a56dc0033b7c830b69c8e5",
+            "00000000-0000-4000-8000-00000000000d": "74b2fb5381920608c721ca7b1ca46fb5ccb8d41ae75a1cc8c5a7fee14d8ed596"
+          }
         },
         "services": {
           "svc-discord": {
@@ -1991,12 +2426,16 @@
               "origin": "https://station-b.example.com",
               "since": 3
             },
-            "hold": {
-              "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
-              "feed_seq": 5,
-              "held": false
-            },
-            "interrupted": false
+            "held": false,
+            "interrupted": false,
+            "order": {
+              "https://station-b.example.com": {
+                "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a": 5
+              },
+              "https://station-dev.agora.build": {
+                "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b": 2
+              }
+            }
           }
         },
         "v": 1
@@ -2025,7 +2464,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 1
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S1_cover"
         },
@@ -2050,7 +2490,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 2
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S2_hold"
         },
@@ -2070,7 +2511,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
-            "feed_seq": 1
+            "feed_seq": 1,
+            "origin": "https://station-b.example.com"
           },
           "record": "B1_cover_stale"
         },
@@ -2090,7 +2532,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
-            "feed_seq": 2
+            "feed_seq": 2,
+            "origin": "https://station-b.example.com"
           },
           "record": "B2_release"
         },
@@ -2117,7 +2560,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
-            "feed_seq": 3
+            "feed_seq": 3,
+            "origin": "https://station-b.example.com"
           },
           "record": "B3_cover"
         },
@@ -2137,7 +2581,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
-            "feed_seq": 4
+            "feed_seq": 4,
+            "origin": "https://station-b.example.com"
           },
           "record": "B4_hold"
         },
@@ -2157,7 +2602,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 3
+            "feed_seq": 3,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S3_release"
         },
@@ -2182,7 +2628,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
-            "feed_seq": 5
+            "feed_seq": 5,
+            "origin": "https://station-b.example.com"
           },
           "record": "B5_release"
         }
@@ -2190,17 +2637,19 @@
     },
     {
       "label": "Q5_feed_reset",
-      "note": "ruling T11a: a reset's newer cover (a duplicate) moves the ordering to the new feed; the old feed's release no longer applies",
+      "note": "a reset's newer cover (a duplicate) moves the ordering to the new feed; the old feed's release no longer applies",
       "state": {
         "account_id": "acct-test-1",
         "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
         "hosts": {},
         "records": {
-          "00000000-0000-4000-8000-000000000001": "e37eba9f6b803a19f4e8f2334c6eca5ceb7eaec8d350f23c2e2261db7f273af8",
-          "00000000-0000-4000-8000-000000000002": "f4e9875284f0a3a6e8d5f6afd24a995dff71cec8e719521dcbc3b799223c8f75",
-          "00000000-0000-4000-8000-00000000000e": "5a1f67f8dc86b375bc18be8be8d543410457df208337d0e273cbbcc6ded3b2cf",
-          "00000000-0000-4000-8000-00000000000f": "4b88f8b2d40e545b55e94095e7a4d3fe13bf041b5ea5085cf09eabab9358687a",
-          "00000000-0000-4000-8000-000000000010": "db5d9a4585b83917c23ea9dc1ecb0c630a031c4c4ba034bbad84d318b7e3324d"
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-000000000001": "e37eba9f6b803a19f4e8f2334c6eca5ceb7eaec8d350f23c2e2261db7f273af8",
+            "00000000-0000-4000-8000-000000000002": "f4e9875284f0a3a6e8d5f6afd24a995dff71cec8e719521dcbc3b799223c8f75",
+            "00000000-0000-4000-8000-00000000000e": "5a1f67f8dc86b375bc18be8be8d543410457df208337d0e273cbbcc6ded3b2cf",
+            "00000000-0000-4000-8000-00000000000f": "4b88f8b2d40e545b55e94095e7a4d3fe13bf041b5ea5085cf09eabab9358687a",
+            "00000000-0000-4000-8000-000000000010": "db5d9a4585b83917c23ea9dc1ecb0c630a031c4c4ba034bbad84d318b7e3324d"
+          }
         },
         "services": {
           "svc-discord": {
@@ -2213,12 +2662,14 @@
               "origin": "https://station-dev.agora.build",
               "since": 1
             },
-            "hold": {
-              "feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
-              "feed_seq": 3,
-              "held": false
-            },
-            "interrupted": false
+            "held": false,
+            "interrupted": false,
+            "order": {
+              "https://station-dev.agora.build": {
+                "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b": 2,
+                "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d": 3
+              }
+            }
           }
         },
         "v": 1
@@ -2247,7 +2698,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 1
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S1_cover"
         },
@@ -2272,7 +2724,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 2
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S2_hold"
         },
@@ -2299,7 +2752,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
-            "feed_seq": 1
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "A2_cover"
         },
@@ -2319,7 +2773,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
-            "feed_seq": 2
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "A2_hold"
         },
@@ -2339,7 +2794,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 3
+            "feed_seq": 3,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S3_release"
         },
@@ -2364,7 +2820,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
-            "feed_seq": 3
+            "feed_seq": 3,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "A2_release"
         }
@@ -2378,9 +2835,11 @@
         "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
         "hosts": {},
         "records": {
-          "00000000-0000-4000-8000-000000000001": "e37eba9f6b803a19f4e8f2334c6eca5ceb7eaec8d350f23c2e2261db7f273af8",
-          "00000000-0000-4000-8000-00000000000e": "5a1f67f8dc86b375bc18be8be8d543410457df208337d0e273cbbcc6ded3b2cf",
-          "00000000-0000-4000-8000-00000000000f": "4b88f8b2d40e545b55e94095e7a4d3fe13bf041b5ea5085cf09eabab9358687a"
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-000000000001": "e37eba9f6b803a19f4e8f2334c6eca5ceb7eaec8d350f23c2e2261db7f273af8",
+            "00000000-0000-4000-8000-00000000000e": "5a1f67f8dc86b375bc18be8be8d543410457df208337d0e273cbbcc6ded3b2cf",
+            "00000000-0000-4000-8000-00000000000f": "4b88f8b2d40e545b55e94095e7a4d3fe13bf041b5ea5085cf09eabab9358687a"
+          }
         },
         "services": {
           "svc-discord": {
@@ -2393,12 +2852,13 @@
               "origin": "https://station-dev.agora.build",
               "since": 1
             },
-            "hold": {
-              "feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
-              "feed_seq": 2,
-              "held": true
-            },
-            "interrupted": false
+            "held": true,
+            "interrupted": false,
+            "order": {
+              "https://station-dev.agora.build": {
+                "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d": 2
+              }
+            }
           }
         },
         "v": 1
@@ -2427,7 +2887,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
-            "feed_seq": 1
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "A2_cover"
         },
@@ -2452,7 +2913,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
-            "feed_seq": 2
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "A2_hold"
         },
@@ -2472,7 +2934,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 1
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S1_cover"
         },
@@ -2492,7 +2955,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 3
+            "feed_seq": 3,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S3_release"
         }
@@ -2500,7 +2964,7 @@
     },
     {
       "label": "Q7_host_interrupt",
-      "note": "ruling T10a: pending until the list holds the revoke and host-work applied it (host_applied_seq); one interrupt per revoke_seq; a revoke entry with interrupt_running: true already interrupted",
+      "note": "revoke_seq names that host's own revoke: pending until the list holds it and host-work applied it (host_applied_seq); one interrupt per revoke_seq; a revoke entry with interrupt_running: true already interrupted",
       "state": {
         "account_id": "acct-test-1",
         "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
@@ -2512,9 +2976,11 @@
           }
         },
         "records": {
-          "00000000-0000-4000-8000-00000000001e": "9ef0072b1a740b7b033ee654696fe97fa279dc64f5f99f4ceed8d2c301ba2dce",
-          "00000000-0000-4000-8000-00000000001f": "2dbd96b041a42bf8e49fbdf15494a96c1713505722006fc13fdabd08eff9791e",
-          "00000000-0000-4000-8000-000000000020": "05f2a1b4a9a176b3cb65bd7249abb59f1fafd58fcda6bb578681fc343cf4d1e8"
+          "host:host-a": {
+            "00000000-0000-4000-8000-00000000001e": "9ef0072b1a740b7b033ee654696fe97fa279dc64f5f99f4ceed8d2c301ba2dce",
+            "00000000-0000-4000-8000-00000000001f": "2dbd96b041a42bf8e49fbdf15494a96c1713505722006fc13fdabd08eff9791e",
+            "00000000-0000-4000-8000-000000000020": "05f2a1b4a9a176b3cb65bd7249abb59f1fafd58fcda6bb578681fc343cf4d1e8"
+          }
         },
         "services": {},
         "v": 1
@@ -2596,7 +3062,8 @@
           "host_applied_seq": 7,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 1
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "H2_interrupt_7_again"
         },
@@ -2687,7 +3154,9 @@
         "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
         "hosts": {},
         "records": {
-          "00000000-0000-4000-8000-000000000001": "e37eba9f6b803a19f4e8f2334c6eca5ceb7eaec8d350f23c2e2261db7f273af8"
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-000000000001": "e37eba9f6b803a19f4e8f2334c6eca5ceb7eaec8d350f23c2e2261db7f273af8"
+          }
         },
         "services": {
           "svc-discord": {
@@ -2700,6 +3169,7 @@
               "origin": "https://station-dev.agora.build",
               "since": 1
             },
+            "held": false,
             "interrupted": false
           }
         },
@@ -2729,7 +3199,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 1
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S1_cover"
         },
@@ -2749,7 +3220,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 2
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "V6_conflicting_id"
         },
@@ -2769,7 +3241,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 3
+            "feed_seq": 3,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "V2_bad_signature"
         },
@@ -2789,7 +3262,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 4
+            "feed_seq": 4,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "V1_wrong_account"
         },
@@ -2809,7 +3283,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 5
+            "feed_seq": 5,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "V3_key_mismatch"
         },
@@ -2829,7 +3304,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 6
+            "feed_seq": 6,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "M6_hold_by_manager"
         },
@@ -2849,7 +3325,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 7
+            "feed_seq": 7,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "V4_not_a_service"
         },
@@ -2869,7 +3346,8 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 8
+            "feed_seq": 8,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "V5_principal_unknown"
         }
@@ -2883,10 +3361,13 @@
         "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
         "hosts": {},
         "records": {
-          "00000000-0000-4000-8000-000000000008": "a1e9534ef1bb1d5e1c808adabe0430d5bf48f5af4a1a7133c866a3129d48b9b9"
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-000000000008": "a1e9534ef1bb1d5e1c808adabe0430d5bf48f5af4a1a7133c866a3129d48b9b9"
+          }
         },
         "services": {
           "svc-discord": {
+            "held": false,
             "interrupted": false,
             "revoked_by": "00000000-0000-4000-8000-000000000008"
           }
@@ -2915,9 +3396,1520 @@
           "host_applied_seq": 6,
           "pos": {
             "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-            "feed_seq": 1
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
           },
           "record": "S8_revoke_unknown_by"
+        }
+      ]
+    },
+    {
+      "label": "Q10_hold_from_a_station_that_lost_the_takeover",
+      "note": "a stop always wins: the hold of a Station whose cover wasn't newer applies; its release is refused, the covering feed's release lifts the hold, and the hold replayed is a duplicate",
+      "state": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "hosts": {},
+        "records": {
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-000000000001": "e37eba9f6b803a19f4e8f2334c6eca5ceb7eaec8d350f23c2e2261db7f273af8",
+            "00000000-0000-4000-8000-000000000003": "a1fb6626a764b90661437f0ce06fb33463eff575fc656e9498f35b53b3d056d2",
+            "00000000-0000-4000-8000-00000000000c": "32f62d78568cc30ca5cdd9cf33562c4be17e6a2039a56dc0033b7c830b69c8e5"
+          }
+        },
+        "services": {
+          "svc-discord": {
+            "coverage": {
+              "cover": {
+                "issued_at": 1793620901000,
+                "record_id": "00000000-0000-4000-8000-000000000001"
+              },
+              "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+              "origin": "https://station-dev.agora.build",
+              "since": 1
+            },
+            "held": false,
+            "interrupted": false,
+            "order": {
+              "https://station-b.example.com": {
+                "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a": 2
+              },
+              "https://station-dev.agora.build": {
+                "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b": 2
+              }
+            }
+          }
+        },
+        "v": 1
+      },
+      "steps": [
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "origin": "https://station-dev.agora.build",
+                "principal": "service:svc-discord",
+                "type": "cover"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S1_cover"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "refused"
+              }
+            ],
+            "evidence": false,
+            "result": "refused"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+            "feed_seq": 1,
+            "origin": "https://station-b.example.com"
+          },
+          "record": "B1_cover_stale"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "hold"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "hold",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+            "feed_seq": 2,
+            "origin": "https://station-b.example.com"
+          },
+          "record": "B4_hold"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "release",
+                "result": "refused"
+              }
+            ],
+            "evidence": false,
+            "result": "refused"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+            "feed_seq": 3,
+            "origin": "https://station-b.example.com"
+          },
+          "record": "B5_release"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "release"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "release",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S3_release"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "hold",
+                "result": "duplicate"
+              }
+            ],
+            "evidence": false,
+            "result": "duplicate"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+            "feed_seq": 2,
+            "origin": "https://station-b.example.com"
+          },
+          "record": "B4_hold"
+        }
+      ]
+    },
+    {
+      "label": "Q11_reset_cover_not_newer",
+      "note": "a reset whose snapshot cover isn't newer leaves the coverage on the old feed: the new feed's hold applies, its release is refused, and the old feed's release lifts the hold",
+      "state": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "hosts": {},
+        "records": {
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-000000000001": "e37eba9f6b803a19f4e8f2334c6eca5ceb7eaec8d350f23c2e2261db7f273af8",
+            "00000000-0000-4000-8000-000000000003": "a1fb6626a764b90661437f0ce06fb33463eff575fc656e9498f35b53b3d056d2",
+            "00000000-0000-4000-8000-00000000000f": "4b88f8b2d40e545b55e94095e7a4d3fe13bf041b5ea5085cf09eabab9358687a",
+            "00000000-0000-4000-8000-00000000003c": "d6124cd113deb22150fc12c0a412980826cfd92dbb49315370a80b9540808cff"
+          }
+        },
+        "services": {
+          "svc-discord": {
+            "coverage": {
+              "cover": {
+                "issued_at": 1793620901000,
+                "record_id": "00000000-0000-4000-8000-000000000001"
+              },
+              "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+              "origin": "https://station-dev.agora.build",
+              "since": 1
+            },
+            "held": false,
+            "interrupted": false,
+            "order": {
+              "https://station-dev.agora.build": {
+                "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b": 2,
+                "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d": 2
+              }
+            }
+          }
+        },
+        "v": 1
+      },
+      "steps": [
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "origin": "https://station-dev.agora.build",
+                "principal": "service:svc-discord",
+                "type": "cover"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S1_cover"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "duplicate"
+              }
+            ],
+            "evidence": false,
+            "result": "duplicate"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "A2_cover_not_newer"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "hold"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "hold",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "A2_hold"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "release",
+                "result": "refused"
+              }
+            ],
+            "evidence": false,
+            "result": "refused"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+            "feed_seq": 3,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "A2_release"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "release"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "release",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S3_release"
+        }
+      ]
+    },
+    {
+      "label": "Q12_service_interrupt_waits",
+      "note": "a service's interrupt_running waits for the service's revocation on this host, then applies once",
+      "state": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "hosts": {},
+        "records": {
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-000000000004": "ae58de43d72197461f28d8bac191d02ee5fd5953ceb52767c6ec900128dc9518",
+            "00000000-0000-4000-8000-000000000006": "e68bfbf151d2de2ed9c9d0b66e9523c2a91f6723db45d56a4c0c0a53e6798f10"
+          }
+        },
+        "services": {
+          "svc-discord": {
+            "held": false,
+            "interrupted": true,
+            "revoked_by": "00000000-0000-4000-8000-000000000004"
+          }
+        },
+        "v": 1
+      },
+      "steps": [
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "interrupt",
+                "result": "pending"
+              }
+            ],
+            "evidence": false,
+            "result": "pending"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S6_interrupt"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "revoke"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S4_revoke"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "revocation": "00000000-0000-4000-8000-000000000004",
+                "type": "interrupt"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "interrupt",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S6_interrupt"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "interrupt",
+                "result": "duplicate"
+              }
+            ],
+            "evidence": false,
+            "result": "duplicate"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S6_interrupt"
+        }
+      ]
+    },
+    {
+      "label": "Q13_out_of_order_in_one_feed",
+      "note": "within the covering feed a hold applied out of feed order still applies; a release must come after the feed's last hold or release",
+      "state": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "hosts": {},
+        "records": {
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-000000000001": "e37eba9f6b803a19f4e8f2334c6eca5ceb7eaec8d350f23c2e2261db7f273af8",
+            "00000000-0000-4000-8000-000000000002": "f4e9875284f0a3a6e8d5f6afd24a995dff71cec8e719521dcbc3b799223c8f75",
+            "00000000-0000-4000-8000-000000000003": "a1fb6626a764b90661437f0ce06fb33463eff575fc656e9498f35b53b3d056d2",
+            "00000000-0000-4000-8000-00000000003d": "2c0ab8f3c682f2bf06023ff29a00656395f203acf7e22435499afe13169a86e6",
+            "00000000-0000-4000-8000-00000000003f": "beace30c7aa3be9646329ae1826a6b54b6c8253d4b8d6cb348d06e3e48c41cb9"
+          }
+        },
+        "services": {
+          "svc-discord": {
+            "coverage": {
+              "cover": {
+                "issued_at": 1793620901000,
+                "record_id": "00000000-0000-4000-8000-000000000001"
+              },
+              "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+              "origin": "https://station-dev.agora.build",
+              "since": 1
+            },
+            "held": false,
+            "interrupted": false,
+            "order": {
+              "https://station-dev.agora.build": {
+                "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b": 6
+              }
+            }
+          }
+        },
+        "v": 1
+      },
+      "steps": [
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "origin": "https://station-dev.agora.build",
+                "principal": "service:svc-discord",
+                "type": "cover"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S1_cover"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "hold"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "hold",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S2_hold"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "release"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "release",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 5,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S3_release"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "hold"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "hold",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 3,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S9_hold"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "release",
+                "result": "refused"
+              }
+            ],
+            "evidence": false,
+            "result": "refused"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 4,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S10_release"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "release"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "release",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 6,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S11_release"
+        }
+      ]
+    },
+    {
+      "label": "Q14_hold_with_no_coverage",
+      "note": "a hold applies with no coverage at all; a release needs the covering feed, after its cover",
+      "state": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "hosts": {},
+        "records": {
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-00000000000b": "5c606883c0f5f0faedb31815e56c92763c3335cfd7e4b67cde5a0da7703c6b87",
+            "00000000-0000-4000-8000-00000000000c": "32f62d78568cc30ca5cdd9cf33562c4be17e6a2039a56dc0033b7c830b69c8e5",
+            "00000000-0000-4000-8000-00000000000d": "74b2fb5381920608c721ca7b1ca46fb5ccb8d41ae75a1cc8c5a7fee14d8ed596"
+          }
+        },
+        "services": {
+          "svc-discord": {
+            "coverage": {
+              "cover": {
+                "issued_at": 1793620911000,
+                "record_id": "00000000-0000-4000-8000-00000000000b"
+              },
+              "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+              "origin": "https://station-b.example.com",
+              "since": 3
+            },
+            "held": false,
+            "interrupted": false,
+            "order": {
+              "https://station-b.example.com": {
+                "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a": 4
+              }
+            }
+          }
+        },
+        "v": 1
+      },
+      "steps": [
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "hold"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "hold",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+            "feed_seq": 1,
+            "origin": "https://station-b.example.com"
+          },
+          "record": "B4_hold"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "release",
+                "result": "refused"
+              }
+            ],
+            "evidence": false,
+            "result": "refused"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+            "feed_seq": 2,
+            "origin": "https://station-b.example.com"
+          },
+          "record": "B2_release"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+                "origin": "https://station-b.example.com",
+                "principal": "service:svc-discord",
+                "type": "cover"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+            "feed_seq": 3,
+            "origin": "https://station-b.example.com"
+          },
+          "record": "B3_cover"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "release"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "release",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+            "feed_seq": 4,
+            "origin": "https://station-b.example.com"
+          },
+          "record": "B5_release"
+        }
+      ]
+    },
+    {
+      "label": "Q15_old_cover_replayed_after_a_move",
+      "note": "the old Station's cover replayed after the coverage moved is a duplicate that moves nothing back: the old feed's hold still applies, its release doesn't",
+      "state": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "hosts": {},
+        "records": {
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-000000000001": "e37eba9f6b803a19f4e8f2334c6eca5ceb7eaec8d350f23c2e2261db7f273af8",
+            "00000000-0000-4000-8000-000000000002": "f4e9875284f0a3a6e8d5f6afd24a995dff71cec8e719521dcbc3b799223c8f75",
+            "00000000-0000-4000-8000-00000000000b": "5c606883c0f5f0faedb31815e56c92763c3335cfd7e4b67cde5a0da7703c6b87",
+            "00000000-0000-4000-8000-00000000000d": "74b2fb5381920608c721ca7b1ca46fb5ccb8d41ae75a1cc8c5a7fee14d8ed596"
+          }
+        },
+        "services": {
+          "svc-discord": {
+            "coverage": {
+              "cover": {
+                "issued_at": 1793620911000,
+                "record_id": "00000000-0000-4000-8000-00000000000b"
+              },
+              "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+              "origin": "https://station-b.example.com",
+              "since": 1
+            },
+            "held": false,
+            "interrupted": false,
+            "order": {
+              "https://station-b.example.com": {
+                "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a": 2
+              },
+              "https://station-dev.agora.build": {
+                "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b": 2
+              }
+            }
+          }
+        },
+        "v": 1
+      },
+      "steps": [
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "origin": "https://station-dev.agora.build",
+                "principal": "service:svc-discord",
+                "type": "cover"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S1_cover"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+                "origin": "https://station-b.example.com",
+                "principal": "service:svc-discord",
+                "type": "cover"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+            "feed_seq": 1,
+            "origin": "https://station-b.example.com"
+          },
+          "record": "B3_cover"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "duplicate"
+              }
+            ],
+            "evidence": false,
+            "result": "duplicate"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S1_cover"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "hold"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "hold",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S2_hold"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "release",
+                "result": "refused"
+              }
+            ],
+            "evidence": false,
+            "result": "refused"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 3,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S3_release"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "release"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "release",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+            "feed_seq": 2,
+            "origin": "https://station-b.example.com"
+          },
+          "record": "B5_release"
+        }
+      ]
+    },
+    {
+      "label": "Q16_issued_at_tie",
+      "note": "covers issued at the same time are ordered by record_id: the lower one doesn't take coverage, the higher one does",
+      "state": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "hosts": {},
+        "records": {
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-000000000041": "c0544a8f59a836c6182a58185d51d16bc8061ab4689eafad947358105b93944a",
+            "00000000-0000-4000-8000-000000000042": "729a6103e15b69513a3dc358df16e2a58cb2a91a862ee0e6fb6b202360390f9f"
+          }
+        },
+        "services": {
+          "svc-discord": {
+            "coverage": {
+              "cover": {
+                "issued_at": 1793620966000,
+                "record_id": "00000000-0000-4000-8000-000000000042"
+              },
+              "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+              "origin": "https://station-dev.agora.build",
+              "since": 2
+            },
+            "held": false,
+            "interrupted": false
+          }
+        },
+        "v": 1
+      },
+      "steps": [
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+                "origin": "https://station-b.example.com",
+                "principal": "service:svc-discord",
+                "type": "cover"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+            "feed_seq": 1,
+            "origin": "https://station-b.example.com"
+          },
+          "record": "T2_cover_tie"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "refused"
+              }
+            ],
+            "evidence": false,
+            "result": "refused"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "T1_cover_tie_lower_id"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "origin": "https://station-dev.agora.build",
+                "principal": "service:svc-discord",
+                "type": "cover"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "T3_cover_tie_higher_id"
+        }
+      ]
+    },
+    {
+      "label": "Q17_record_ids_per_principal",
+      "note": "a record of one principal under another principal's record_id blocks nothing: idempotency is by principal and record_id",
+      "state": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "hosts": {
+          "host-a": {
+            "interrupted": [
+              7
+            ]
+          }
+        },
+        "records": {
+          "host:host-a": {
+            "00000000-0000-4000-8000-00000000001e": "9ef0072b1a740b7b033ee654696fe97fa279dc64f5f99f4ceed8d2c301ba2dce"
+          },
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-00000000001e": "ae40b4d1bb4c3922a5ea1817f51234d300a8aa4e9ccbe81c97dd41e7e62db0a2"
+          }
+        },
+        "services": {
+          "svc-discord": {
+            "coverage": {
+              "cover": {
+                "issued_at": 1793620967000,
+                "record_id": "00000000-0000-4000-8000-00000000001e"
+              },
+              "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+              "origin": "https://station-b.example.com",
+              "since": 1
+            },
+            "held": false,
+            "interrupted": false
+          }
+        },
+        "v": 1
+      },
+      "steps": [
+        {
+          "chain": [
+            "HS7_revoke"
+          ],
+          "expect": {
+            "actions": [
+              {
+                "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+                "origin": "https://station-b.example.com",
+                "principal": "service:svc-discord",
+                "type": "cover"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 7,
+          "pos": {
+            "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+            "feed_seq": 1,
+            "origin": "https://station-b.example.com"
+          },
+          "record": "X1_cover_under_h1_id"
+        },
+        {
+          "chain": [
+            "HS7_revoke"
+          ],
+          "expect": {
+            "actions": [
+              {
+                "principal": "host:host-a",
+                "revocation": "7",
+                "type": "interrupt"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "interrupt",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 7,
+          "record": "H1_interrupt_7"
+        },
+        {
+          "chain": [
+            "HS7_revoke"
+          ],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "duplicate"
+              }
+            ],
+            "evidence": false,
+            "result": "duplicate"
+          },
+          "host_applied_seq": 7,
+          "pos": {
+            "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+            "feed_seq": 1,
+            "origin": "https://station-b.example.com"
+          },
+          "record": "X1_cover_under_h1_id"
+        },
+        {
+          "chain": [
+            "HS7_revoke"
+          ],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "interrupt",
+                "result": "duplicate"
+              }
+            ],
+            "evidence": false,
+            "result": "duplicate"
+          },
+          "host_applied_seq": 7,
+          "record": "H1_interrupt_7"
+        }
+      ]
+    },
+    {
+      "label": "Q18_colliding_record_ids",
+      "note": "another body under a record_id the same principal's record counted with is evidence, and the first body keeps the id: a stop (hold, revoke) still applies, a release or cover is refused",
+      "state": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "hosts": {},
+        "records": {
+          "service:svc-discord": {
+            "00000000-0000-4000-8000-000000000001": "e37eba9f6b803a19f4e8f2334c6eca5ceb7eaec8d350f23c2e2261db7f273af8",
+            "00000000-0000-4000-8000-000000000002": "f4e9875284f0a3a6e8d5f6afd24a995dff71cec8e719521dcbc3b799223c8f75",
+            "00000000-0000-4000-8000-000000000003": "a1fb6626a764b90661437f0ce06fb33463eff575fc656e9498f35b53b3d056d2"
+          }
+        },
+        "services": {
+          "svc-discord": {
+            "coverage": {
+              "cover": {
+                "issued_at": 1793620901000,
+                "record_id": "00000000-0000-4000-8000-000000000001"
+              },
+              "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+              "origin": "https://station-dev.agora.build",
+              "since": 1
+            },
+            "held": true,
+            "interrupted": true,
+            "order": {
+              "https://station-dev.agora.build": {
+                "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b": 4
+              }
+            },
+            "revoked_by": "00000000-0000-4000-8000-000000000001"
+          }
+        },
+        "v": 1
+      },
+      "steps": [
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "origin": "https://station-dev.agora.build",
+                "principal": "service:svc-discord",
+                "type": "cover"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S1_cover"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "hold"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "hold",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 2,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S2_hold"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "release"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "release",
+                "result": "applied"
+              }
+            ],
+            "evidence": false,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 3,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S3_release"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "hold"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "hold",
+                "result": "applied"
+              }
+            ],
+            "evidence": true,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 4,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "X2_hold_under_s3_id"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "release",
+                "result": "refused"
+              }
+            ],
+            "evidence": true,
+            "result": "refused"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 5,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "X3_release_under_s2_id"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "refused"
+              }
+            ],
+            "evidence": true,
+            "result": "refused"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 6,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "V6_conflicting_id"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [
+              {
+                "principal": "service:svc-discord",
+                "type": "revoke"
+              },
+              {
+                "principal": "service:svc-discord",
+                "revocation": "00000000-0000-4000-8000-000000000001",
+                "type": "interrupt"
+              }
+            ],
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              },
+              {
+                "effect": "interrupt",
+                "result": "applied"
+              }
+            ],
+            "evidence": true,
+            "result": "applied"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 7,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "X4_revoke_under_s1_id"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "duplicate"
+              },
+              {
+                "effect": "interrupt",
+                "result": "duplicate"
+              }
+            ],
+            "evidence": true,
+            "result": "duplicate"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 7,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "X4_revoke_under_s1_id"
+        },
+        {
+          "chain": [],
+          "expect": {
+            "actions": [],
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "duplicate"
+              }
+            ],
+            "evidence": false,
+            "result": "duplicate"
+          },
+          "host_applied_seq": 6,
+          "pos": {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "feed_seq": 1,
+            "origin": "https://station-dev.agora.build"
+          },
+          "record": "S1_cover"
         }
       ]
     }
