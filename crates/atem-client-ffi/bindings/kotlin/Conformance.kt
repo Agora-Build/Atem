@@ -961,6 +961,7 @@ fun main(args: Array<String>) {
         val refusedPage = page.mapIndexed { i, r -> if (i == 1) RelayFeedRecord(r.feedSeq, ctlRecord("P4_unknown_field")) else r }
         throwsCode("unknown_field") { relayControlSyncResult(origin, feed, 3uL, 0uL, refusedPage) }
         throwsCode("malformed") { relayControlSyncResult(origin, feed, 2uL, 0uL, page) }
+        throwsCode("malformed") { relayControlSyncResult(origin, feed, 3uL, 0uL, listOf(page[1], page[0])) }
         val heads = listOf(RelayFeedHead(origin, feed, 3uL, 1793620940000uL))
         val hm = relayHeads(heads, mlogHead)
         eq(relayDecodeToHost(hm), RelayToHost.Heads(heads, mlogHead))

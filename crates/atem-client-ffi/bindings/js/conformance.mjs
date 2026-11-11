@@ -778,7 +778,7 @@ check("Station calls: fixture acks read and write back; pages, heads and fetches
   const refusedPage = page.map((r, i) => (i === 1 ? { ...r, recordJson: ctlRecord("P4_unknown_field") } : r));
   throwsCode(() => m.relayControlSyncResult(origin, feed, 3, 0, refusedPage), "unknown_field");
   throwsCode(() => m.relayControlSyncResult(origin, feed, 2, 0, page), "malformed");
-  throwsCode(() => m.relayControlSyncResult(origin, feed, 3, 0, [{ ...page[0], feed_seq: 1 }]), "malformed");
+  throwsCode(() => m.relayControlSyncResult(origin, feed, 3, 0, [page[1], page[0]]), "malformed");
   const membership = { seq: mlog.head.seq, hash: mlog.head.hash };
   const feeds = [{ origin, feedId: feed, head: 3, stationTime: 1793620940000 }];
   const hm = m.relayHeads(feeds, membership);

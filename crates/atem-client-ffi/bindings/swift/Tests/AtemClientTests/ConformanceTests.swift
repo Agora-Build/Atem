@@ -1080,6 +1080,7 @@ final class ConformanceTests: XCTestCase {
             refusedPage[1] = RelayFeedRecord(feedSeq: 2, recordJson: ctlRecord("P4_unknown_field"))
             try throwsCode("unknown_field") { _ = try relayControlSyncResult(origin: origin, feedId: feed, head: 3, stationTime: 0, records: refusedPage) }
             try throwsCode("malformed") { _ = try relayControlSyncResult(origin: origin, feedId: feed, head: 2, stationTime: 0, records: page) }
+            try throwsCode("malformed") { _ = try relayControlSyncResult(origin: origin, feedId: feed, head: 3, stationTime: 0, records: [page[1], page[0]]) }
             let heads = [RelayFeedHead(origin: origin, feedId: feed, head: 3, stationTime: 1_793_620_940_000)]
             let hm = try relayHeads(feeds: heads, membership: mlogHead)
             try eq(try relayDecodeToHost(message: hm), .heads(feeds: heads, membership: mlogHead))

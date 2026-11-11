@@ -2204,12 +2204,20 @@ mod ack_ledger_tests {
 
     #[test]
     fn a_revocation_covering_no_host_is_all_applied_at_once() {
+        // host-work-v1 §11.4 "Reports": nothing could apply it, so the
+        // revocation is complete when recorded: `revoked{all_applied,
+        // pending_hosts: []}` at once, with no per-host report.
         let mut l = ledger();
         let s = revoke(By::Own, false, 1);
         let got = l.rec(&s, T0, &[]);
         assert_eq!(
             reports(&got),
             vec![revoked(RevokedOutcome::AllApplied, &[])]
+        );
+        assert_eq!(
+            got[0].report.to_json(),
+            json!({"integration_id": INTEGRATION, "kind": "revoked",
+                "outcome": "all_applied", "pending_hosts": []})
         );
         assert_eq!(got[0].not_before, Vec::<String>::new());
         assert_eq!(l.pending_reports(), got);
@@ -2909,18 +2917,38 @@ mod ack_ledger_tests {
     /// relay's canonical sets can't drift apart (Task 14 review, minor 1).
     #[test]
     fn every_record_effect_set_is_an_ack_the_relay_reads() {
-        for action in [
-            ControlAction::Cover,
-            ControlAction::Revoke {
-                interrupt_running: false,
-            },
-            ControlAction::Revoke {
-                interrupt_running: true,
-            },
-            ControlAction::Hold,
-            ControlAction::Release,
-            ControlAction::InterruptRunning { revoke_seq: None },
-        ] {
+        // Every action, each after the one before: an exhaustive match with
+        // no wildcard, so a new `ControlAction` variant fails to compile
+        // here until it is chained in.
+        fn after(a: Option<ControlAction>) -> Option<ControlAction> {
+            use ControlAction::*;
+            match a {
+                None => Some(Cover),
+                Some(Cover) => Some(Revoke {
+                    interrupt_running: false,
+                }),
+                Some(Revoke {
+                    interrupt_running: false,
+                }) => Some(Revoke {
+                    interrupt_running: true,
+                }),
+                Some(Revoke {
+                    interrupt_running: true,
+                }) => Some(Hold),
+                Some(Hold) => Some(Release),
+                Some(Release) => Some(InterruptRunning { revoke_seq: None }),
+                Some(InterruptRunning { revoke_seq: None }) => Some(InterruptRunning {
+                    revoke_seq: Some(7),
+                }),
+                Some(InterruptRunning {
+                    revoke_seq: Some(_),
+                }) => None,
+            }
+        }
+        let actions: Vec<ControlAction> =
+            std::iter::successors(after(None), |a| after(Some(*a))).collect();
+        assert_eq!(actions.len(), 7);
+        for action in actions {
             let effects = EffectKind::of(action)
                 .into_iter()
                 .map(|effect| EffectResult {

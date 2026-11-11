@@ -957,10 +957,13 @@ frozen (R9.4) or the host is held after a write fault (R9.3).
 
 #### Carriage
 
-- **Feeds.** A Station's control feed carries every record of the
-  principals it covers, native managers' records included (Astation submits
-  them, the Station appends them), and host principals' interrupts (they
-  count from any feed). The host reads it in feed order (`feed_seq`, not a
+- **Feeds.** A Station keeps one control feed per account it serves (per
+  Station and account: its own `feed_id`, and each host's cursor in it;
+  **Atem's proposal, for Astation's and Auth/Portal's agreement**, §11.4
+  "One feed per account"). An account's feed carries every record of the
+  principals of that account the Station covers, native managers' records
+  included (Astation submits them, the Station appends them), and host
+  principals' interrupts (they count from any feed). The host reads it in feed order (`feed_seq`, not a
   field of the record) and verifies its records only after fetching the
   device list up to the head the Station announced (I.5.8). A record that
   doesn't parse is refused on its own and kept as evidence; the cursor
@@ -1241,7 +1244,9 @@ message; `head` tells the host more remain.
 `control_sync_result` keeps each `record` as the Station sent it, of any
 JSON type: the host parses each with the control parser, refuses one it
 doesn't parse on its own and keeps it as evidence, and the page, the
-feed's position and the records after it stand. **A page that isn't strict
+feed's position and the records after it stand. Evidence is the record as
+parsed, serialized again (not the bytes received): it stays verifiable,
+because a signature covers `jcs(body)`, never the bytes a Station sent. **A page that isn't strict
 I-JSON as a whole** (a duplicate key, a fraction, an unsafe integer, a lone
 surrogate or nesting past the parser's depth, anywhere in it, inside a
 record too) **is a Station fault** (**Atem's proposal, for Astation's
@@ -1264,8 +1269,23 @@ calling"):
 - a link the paired Astation authenticated (carrier A) and a call through
   Astation's `:8080`: the authenticated transport's host association, never
   a host id the caller picks; where it can't be verified, the Station
-  requires a fresh host-key challenge proof, which the host answers through
+  requires a fresh host-key challenge proof: session-v1 R9.7b's
+  `host_challenge{nonce, room}`, answered by `host_route{proof}` signed with
+  the host's `host_channel_key` at its device list's head, carried through
   the proxy.
+
+**One feed per account** (**Atem's proposal, for Astation's and
+Auth/Portal's agreement**; the design's "each Station's control feed"
+doesn't say whose records a link may read). The Station keeps one control
+feed per (Station, account), with its own `feed_id` and, on each host, its
+own cursor. `control_sync`, `heads` and `membership_fetch` answer only for
+the account of the calling link's verified association: `heads` names only
+that account's feeds, `control_sync` serves only them and
+`membership_fetch` only that account's device list. A request naming
+another account's feed (an `origin` and `feed_id` that aren't its account's
+feed at this Station) is refused, `forbidden`, and nothing of another
+account is served: no principal, `integration_id`, `about.by`, record id or
+revocation time of another account reaches the link.
 
 A native token alone never fetches or acknowledges another host's feeds,
 results or mailbox, and Astation proxies no credentials to an arbitrary
@@ -1328,10 +1348,19 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
   committed, the results of that page's records, with the new cursor. Since
   `control_ack` has no answer, the host sends the in-force results
   (`applied` or `duplicate`) of its `revoke` and `interrupt_running`
-  records and its host-sender revoke entries again on every (re)connection
-  to the Station and every 10 minutes while connected. Counting is
-  idempotent at the Station, so a result sent again counts nothing twice,
-  and a Station that lost a transition before its commit gets it back.
+  records and its host-sender revoke entries again, for a bounded time. The
+  Station's ledger settles a revocation at its deadline, 24 hours after the
+  revocation, whose time the service's own `revoke` carries as `issued_at`
+  (the host knows no other), so: the result of a service's own `revoke`
+  (signed with the service's key) is
+  sent again on every (re)connection and every 10 minutes while connected,
+  until that record's `issued_at` plus 25 hours on the host's clock (the
+  deadline plus 1 hour); any other in-force result (a native record, an
+  `interrupt_running`, a host sender's revoke entry), which no deadline
+  bounds, at most once per connection. The ack of the cursor itself goes
+  on. Counting is idempotent at the Station, so a result sent again counts
+  nothing twice, and a Station that lost a transition before its commit
+  gets it back.
 - **What the Station counts.** Per host and per effect of a principal (its
   revocation, and the interrupt for that revocation: for a host principal,
   per `revoke_seq`), once, through whichever record first said so. A
@@ -1353,7 +1382,10 @@ Portal revoked the integration), whose record fixes the integration
 time; a later revoke of the same principal (a re-signed copy, a reset's
 snapshot) changes none of them. A native revoke of the same service
 appended earlier counts for its hosts, and they are reported once the
-Station's own revoke is recorded, naming the native record.
+Station's own revoke is recorded, naming the native record. An own revoke
+whose grant covered no host is final at once, as `revoked{all_applied,
+pending_hosts: []}` with no per-host report: nothing could apply it, so the
+revocation is complete (**Atem's choice, for Auth/Portal to confirm**).
 
 - **`revocation_applied{host, record_id}`**: once per covered host and
   revoked integration, at that host's first `applied` **or `duplicate`**
@@ -1432,7 +1464,12 @@ response" sentinel (such as `0`) is a network error, not a status.
 Auth/Portal, for Astation's confirmation**: Auth/Portal's first answer made
 a `403` final for every report). A `403` is the Portal refusing the
 Station's report client (its `station.report` client at Auth), so the
-Station stops reporting on every ledger it keeps, with one operator alert.
+Station stops reporting on every ledger it keeps, in one transaction, with
+one operator alert. A Station whose store can't stop every ledger in one
+transaction first stops, at start and before any resume, every ledger not
+yet stopped under the report client ID a stopped ledger names; a crash
+part-way then never leaves some ledgers sending their old reports while
+the others drop theirs.
 Each ledger records the report client ID, holds every report (none is sent,
 none is dropped) and goes on counting and making reports. When the Station
 reports again, at its next start (after an operator fixed a misconfigured
@@ -1477,7 +1514,11 @@ Auth/Portal's agreement**):
 - **Record ids are unique per Station**: a fresh UUID v4 per record (a
   re-signed record included). The reference ledger refuses another body
   under a `record_id` it tracks, but a `cover`, `hold` or `release` id it
-  doesn't track can't be checked against a later revoke.
+  doesn't track can't be checked against a later revoke. So the Station
+  refuses at intake any record whose `record_id` its feed already stores,
+  whatever its action or principal, Astation's native records (whose ids
+  Astation mints) included: an ack names only the `record_id`, and a reused
+  one would make a host's results for it fail and its acks be refused.
 - **Raise every operator alert once its transition committed.** The
   ledger keeps what an alert is about (the reports refused, the reports
   dropped, the stopped report client ID), so a Station that may have lost
@@ -1517,7 +1558,9 @@ first and named, a host that applied the revocation through another
 Station's feed reporting this Station's record `duplicate`, an ack on
 another host's link refused, `all_applied` only after every per-host
 report), `r9-control-ack-deadline` (`deadline_passed` from the
-revocation's own time across a restart, a late host still reported),
+revocation's own time across a restart, a late host still reported, and,
+with a Portal outage across the deadline, delivered after the final made
+before it),
 `r9-control-ack-durable` (a crash before the commit, after it, and after
 delivery before the confirmation; a Portal failure and its retry; a lost
 ack sent again; two replicas; duplicate acks for an original and its

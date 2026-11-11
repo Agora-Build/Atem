@@ -1030,7 +1030,14 @@ trust model"):
 ### Station calls
 
 A host calls its Station over its one link (`{"type":"relay","op":…}`,
-host-work-v1 §11.4). Every message is read and written by the shared code:
+host-work-v1 §11.4). Every message is read and written by the shared code.
+Keep one control feed per (Station, account), with its own `feed_id`, and
+answer `control_sync`, `heads` and `membership_fetch` only for the account
+of the calling link's verified association: `heads` names only that
+account's feeds, `control_sync` serves only them, `membership_fetch` only
+its device list, and a request naming another account's feed is refused
+(`forbidden`; **Atem's proposal, for Astation's and Auth/Portal's
+agreement**).
 
 | call | what it does |
 |---|---|
@@ -1065,7 +1072,8 @@ to re-sign. Keep one per device list your Station serves.
 
 | call | what it does |
 |---|---|
-| `AckLedgerHandle::new(origin, account_id, genesis_hash)`, `from_json(state_json)`, `to_json()` | an empty ledger; the stored one (`Stored{code}`: `too_large` over 64 MiB, `malformed`, `unsupported_version`, `stored_invalid`); its durable state, canonical JSON (`"v": 1`) |
+| `AckLedgerHandle::new(origin, account_id, genesis_hash)`, `from_json(state_json)`, `to_json()` | an empty ledger (`origin` exact, as hosts compare it: `https://` and a lowercase host, a port only when not the default, no path; `http://` on a loopback address for development; else `Invalid{malformed}`); the stored one (`Stored{code}`: `too_large` over 64 MiB, `malformed`, `unsupported_version`, `stored_invalid`); its durable state, canonical JSON (`"v": 1`) |
+| `origin()`, `account_id()`, `genesis_hash()` | the Station and the device list the ledger is for (`genesis_hash` in lowercase hex): check them against the device list a stored state is loaded for |
 | `record(record_json, revoked_at_ms, covered_hosts, now_ms)` | a record you stored in your feed, before you serve it. Your own `revoke` (signed with the integration's service key) starts the revocation: `revoked_at_ms` is when the Portal revoked the integration, `covered_hosts` the hosts its grant covered. For any other record `covered_hosts` are the hosts its re-sign alert waits for. Refused (`Invalid{code}`): `other_account`, `other_station`, `record_id_reused` (another body under a `record_id` the ledger tracks), `malformed`, or the record's parse code |
 | `ack(link, ack_json, now_ms)` | a host's `control_ack` as received, on the link whose verified association is `link` (`LinkAssociationInfo{account_id, genesis_hash, host_id, host_trust_gen, connection_id}`). Refused whole, nothing counted: `incomplete_link`, `not_the_link` (the ack's account, root, host or trust generation isn't the link's), `other_account`, `other_station`, `not_the_record` (a result whose effects aren't the record's), or the reader's code |
 | `tick(now_ms)` | your timer: a revocation 24 hours past `revoked_at_ms` gets its `revoked{deadline_passed}` report |
@@ -1080,7 +1088,8 @@ alerts}` and never changes the handle it was called on. `made` lists what
 the call made; never send it: send the committed state's
 `pending_reports()`. JS: `new
 AckLedgerHandle(origin, accountId, genesisHash)`,
-`AckLedgerHandle.fromJson(text)`, `toJson()`, `record(recordJson,
+`AckLedgerHandle.fromJson(text)`, `toJson()`, `origin()`, `accountId()`,
+`genesisHash()`, `record(recordJson,
 revokedAtMs, coveredHosts, nowMs)`, `ack({accountId, genesisHash, hostId,
 hostTrustGen, connectionId}, ackJson, nowMs)`, `tick(nowMs)`,
 `confirm(id)`, `refuse(id)`, `stopReporting(clientId)`,
@@ -1101,8 +1110,9 @@ root, the host and its trust generation, and the connection. Take it from
 the link: a routed link's verified root, host and connection binding; for
 a link the paired Astation authenticated (carrier A) or a call through
 Astation's `:8080`, the authenticated transport's host association, or a
-fresh host-key challenge proof where that can't be verified (host-work-v1
-§11.4). Never from a field of the ack: the ledger refuses an ack whose
+fresh host-key challenge proof where that can't be verified (session-v1
+R9.7b's `host_challenge`/`host_route`, carried through the proxy;
+host-work-v1 §11.4). Never from a field of the ack: the ledger refuses an ack whose
 claim differs from `link`. **Fence connections at your transport**: an ack
 from a connection of the host that isn't its current authenticated
 connection (a superseded one) never reaches `ack`. The ledger compares the
@@ -1138,8 +1148,10 @@ it can't tell a superseded connection from the current one.
    each answer by `report_answer(status)`. `confirm`, `refuse` and
    `stop_reporting` are transitions: commit each, and raise its `alerts`
    once it committed. A `403` is for your report client, not one ledger:
-   call `stop_reporting` on every ledger you keep (raise one operator
-   alert for the Station).
+   call `stop_reporting` on every ledger you keep, in one transaction
+   (raise one operator alert for the Station). If your store can't, then
+   at start, before any resume, first stop every ledger not yet stopped
+   under the report client ID a stopped ledger names.
 6. **At start**, load the state with `from_json`, call
    `resume_reporting` with your current report client ID (commit it like
    any transition), raise again the alerts the state still holds (a

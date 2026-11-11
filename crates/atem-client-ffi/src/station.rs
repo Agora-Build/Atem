@@ -486,9 +486,11 @@ fn transition(t: LedgerTransition) -> AckTransition {
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 impl AckLedgerHandle {
     /// The empty ledger of the device list `account_id`/`genesis_hash`
-    /// (lowercase hex) at the Station `origin` (exact, as hosts compare it:
-    /// `https://` and a lowercase host, no path). `Invalid{malformed}`
-    /// otherwise.
+    /// (lowercase hex) at the Station `origin`, exact as hosts compare it
+    /// (`station_route::normalize_relay`'s form: `https://` and a lowercase
+    /// host, a port only when not the default, no path, trailing slash or
+    /// user info; `http://` on a loopback address for development).
+    /// `Invalid{malformed}` otherwise.
     #[cfg_attr(feature = "uniffi", uniffi::constructor)]
     pub fn new(origin: String, account_id: String, genesis_hash: String) -> Result<Arc<Self>> {
         let ledger = AckLedger::new(&origin, &account_id, hash_of(&genesis_hash)?)?;

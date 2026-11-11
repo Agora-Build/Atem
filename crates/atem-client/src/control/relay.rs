@@ -268,7 +268,9 @@ fn check_safe(n: u64, what: &'static str) -> Result<()> {
     }
 }
 
-/// A device-list head: exactly `{seq, hash}`, `seq` of at least 1.
+/// A device-list head: exactly `{seq, hash}`, `seq` of at least 1. Unlike
+/// `membership::Head::from_json` (which gives `None` for anything wrong), an
+/// extra field here is `unknown_field`, as in every relay message.
 fn read_head(value: &Value, what: &'static str) -> Result<Head> {
     let f = Fields::of(value, &["seq", "hash"], what)?;
     let seq = f.uint("seq").map_err(|_| RelayError::Malformed(what))?;
