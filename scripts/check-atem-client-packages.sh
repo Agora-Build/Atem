@@ -23,6 +23,20 @@ trap 'rm -rf "$WORK"' EXIT
 VECTORS="$ROOT/designs/protocol/fixtures/r9-vectors-pairing.json"
 
 (cd "$DIR" && sha256sum -c "atem-client-${VERSION}-SHA256SUMS.txt")
+# The shared vectors ship beside the bindings, each listed in the sums and
+# the same bytes as the repository's.
+for vector in \
+  host-work/requests-v1.json:host-work-requests-v1.json \
+  host-work/prompt-framing-v1.json:host-work-prompt-framing-v1.json \
+  r9-vectors-host-envelope.json:r9-vectors-host-envelope.json; do
+  source="$ROOT/designs/protocol/fixtures/${vector%%:*}"
+  shipped="atem-client-${VERSION}-${vector#*:}"
+  grep -q "  $shipped\$" "$DIR/atem-client-${VERSION}-SHA256SUMS.txt" ||
+    { echo "vectors: $shipped is not in the SHA256SUMS" >&2; exit 1; }
+  cmp -s "$source" "$DIR/$shipped" ||
+    { echo "vectors: $shipped differs from ${vector%%:*}" >&2; exit 1; }
+done
+echo "vectors: 3 files shipped, listed and unchanged"
 python3 - "$DIR/atem-client-${VERSION}-SOURCE.json" "${EXPECT_COMMIT:-}" <<'EOF'
 import json, re, sys
 pin = json.load(open(sys.argv[1]))
@@ -38,7 +52,7 @@ assert pin["toolchain"].get("rustc"), pin
 print("source pin:", pin["commit"], "dirty" if pin["tree_dirty"] else "clean")
 EOF
 # No test-only or host-role export ships.
-FORBIDDEN='SoftwareKeyStore|signSeen|sign_seen|admitCarrier|admit_carrier|AdmissionInfo'
+FORBIDDEN='SoftwareKeyStore|signSeen|sign_seen|admitCarrier|admit_carrier|AdmissionInfo|sealEnvelope|seal_envelope|openEnvelope|open_envelope|sealResult|seal_result|acceptResult|accept_result|MailFieldsData'
 
 WASM="$DIR/atem-client-${VERSION}-wasm.tar.gz"
 if [ -f "$WASM" ]; then
@@ -137,7 +151,7 @@ if [ -f "$ANDROID" ]; then
     [ "$ALIGNS" = 0x4000 ] || { echo "android $ABI: LOAD alignment '$ALIGNS', need 0x4000" >&2; exit 1; }
     SYMS=$("$READELF" --dyn-syms -W "$SO")
     [ -n "$SYMS" ] || { echo "android $ABI: no dynamic symbols read" >&2; exit 1; }
-    if grep -qiE 'sign_seen|admit_carrier|software_?key' <<<"$SYMS"; then
+    if grep -qiE 'sign_seen|admit_carrier|software_?key|seal_envelope|open_envelope|seal_result|accept_result' <<<"$SYMS"; then
       echo "android $ABI: a test-only or host-role symbol is exported" >&2
       exit 1
     fi

@@ -199,6 +199,10 @@ FILES+=("$WORK_VECTOR")
 FRAMING_VECTOR="atem-client-${VERSION}-host-work-prompt-framing-v1.json"
 cp designs/protocol/fixtures/host-work/prompt-framing-v1.json "$OUT/$FRAMING_VECTOR"
 FILES+=("$FRAMING_VECTOR")
+# Envelopes and results between hosts (host-work-v1 §11.5; planned).
+MAIL_VECTOR="atem-client-${VERSION}-r9-vectors-host-envelope.json"
+cp designs/protocol/fixtures/r9-vectors-host-envelope.json "$OUT/$MAIL_VECTOR"
+FILES+=("$MAIL_VECTOR")
 SUMS="atem-client-${VERSION}-SHA256SUMS.txt"
 (cd "$OUT" && sha256sum "${FILES[@]}" >"$SUMS")
 echo "Packaged into $OUT:"

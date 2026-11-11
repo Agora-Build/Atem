@@ -1677,3 +1677,275 @@ pub fn sign_seen(
         ms(seen_at)?,
     ))
 }
+
+// ------------------------------------- mail between hosts (host role; planned)
+
+/// `v` is a plain object with exactly the keys `fields` (serde-wasm-bindgen
+/// reads only the fields a struct names, so a misspelled one would pass
+/// unread).
+#[cfg(all(feature = "software-keys", feature = "host"))]
+fn mail_keys_only(v: &JsValue, fields: &[&str], what: &str) -> JsResult<()> {
+    use wasm_bindgen::JsCast;
+    let object = v
+        .dyn_ref::<js_sys::Object>()
+        .ok_or_else(|| bad(&format!("{what} is an object")))?;
+    for key in js_sys::Object::keys(object).iter() {
+        let key = key.as_string().unwrap_or_default();
+        if !fields.contains(&key.as_str()) {
+            return Err(bad(&format!("{what}: unknown field {key}")));
+        }
+    }
+    Ok(())
+}
+
+/// `{hostId, hostTrustGen}`.
+#[cfg(all(feature = "software-keys", feature = "host"))]
+fn mail_host(v: JsValue, what: &str) -> JsResult<crate::host_mail::MailHostData> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct H {
+        host_id: String,
+        host_trust_gen: f64,
+    }
+    mail_keys_only(&v, &["hostId", "hostTrustGen"], what)?;
+    let h: H = serde_wasm_bindgen::from_value(v)
+        .map_err(|_| bad(&format!("{what} {{hostId, hostTrustGen}}")))?;
+    Ok(crate::host_mail::MailHostData {
+        host_id: h.host_id,
+        host_trust_gen: ms(h.host_trust_gen)?,
+    })
+}
+
+/// A body's fields as JS passes them: `{accountId, genesisHash, sender,
+/// recipient, encKid, id, createdAt, expiresAt, signedAtHead: {seq, hash}}`.
+#[cfg(all(feature = "software-keys", feature = "host"))]
+fn mail_fields(v: JsValue) -> JsResult<crate::host_mail::MailFieldsData> {
+    let get =
+        |k: &str| js_sys::Reflect::get(&v, &JsValue::from_str(k)).unwrap_or(JsValue::UNDEFINED);
+    mail_keys_only(
+        &v,
+        &[
+            "accountId",
+            "genesisHash",
+            "sender",
+            "recipient",
+            "encKid",
+            "id",
+            "createdAt",
+            "expiresAt",
+            "signedAtHead",
+        ],
+        "mail fields",
+    )?;
+    let text = |k: &str| {
+        get(k)
+            .as_string()
+            .ok_or_else(|| bad(&format!("mail fields: {k} is a string")))
+    };
+    let time = |k: &str| {
+        get(k)
+            .as_f64()
+            .ok_or_else(|| bad(&format!("mail fields: {k} is a number")))
+            .and_then(ms)
+    };
+    let head_value = get("signedAtHead");
+    mail_keys_only(&head_value, &["seq", "hash"], "signedAtHead")?;
+    Ok(crate::host_mail::MailFieldsData {
+        account_id: text("accountId")?,
+        genesis_hash: text("genesisHash")?,
+        sender: mail_host(get("sender"), "sender")?,
+        recipient: mail_host(get("recipient"), "recipient")?,
+        enc_kid: text("encKid")?,
+        id: text("id")?,
+        created_at: time("createdAt")?,
+        expires_at: time("expiresAt")?,
+        signed_at_head: head(head_value)?,
+    })
+}
+
+/// `{hostId, hostTrustGen, keys: [{keyId, encKid}]}`.
+#[cfg(all(feature = "software-keys", feature = "host"))]
+fn mail_recipient(v: JsValue) -> JsResult<crate::host_mail::MailRecipientData> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct K {
+        key_id: String,
+        enc_kid: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct R {
+        host_id: String,
+        host_trust_gen: f64,
+        keys: Vec<K>,
+    }
+    mail_keys_only(&v, &["hostId", "hostTrustGen", "keys"], "recipient")?;
+    let r: R = serde_wasm_bindgen::from_value(v)
+        .map_err(|_| bad("recipient {hostId, hostTrustGen, keys: [{keyId, encKid}]}"))?;
+    Ok(crate::host_mail::MailRecipientData {
+        host_id: r.host_id,
+        host_trust_gen: ms(r.host_trust_gen)?,
+        keys: r
+            .keys
+            .into_iter()
+            .map(|k| crate::host_mail::MailKeyData {
+                key_id: k.key_id,
+                enc_kid: k.enc_kid,
+            })
+            .collect(),
+    })
+}
+
+/// `{recipient: {hostId, hostTrustGen}, messageId, cancelCompleteIds,
+/// taskIds}`.
+#[cfg(all(feature = "software-keys", feature = "host"))]
+fn mail_outbox(v: JsValue) -> JsResult<crate::host_mail::MailOutboxData> {
+    let get =
+        |k: &str| js_sys::Reflect::get(&v, &JsValue::from_str(k)).unwrap_or(JsValue::UNDEFINED);
+    mail_keys_only(
+        &v,
+        &["recipient", "messageId", "cancelCompleteIds", "taskIds"],
+        "outbox",
+    )?;
+    let ids = |k: &str| -> JsResult<Vec<String>> {
+        serde_wasm_bindgen::from_value(get(k))
+            .map_err(|_| bad(&format!("outbox: {k} is a list of ids")))
+    };
+    Ok(crate::host_mail::MailOutboxData {
+        recipient: mail_host(get("recipient"), "outbox recipient")?,
+        message_id: get("messageId")
+            .as_string()
+            .ok_or_else(|| bad("outbox: messageId is a string"))?,
+        cancel_complete_ids: ids("cancelCompleteIds")?,
+        task_ids: ids("taskIds")?,
+    })
+}
+
+/// Host role: an `atem-envelope` sealed to `recipientEncRaw` (an X25519 host
+/// encryption key) and signed with the software store's `hostKeyId`
+/// (`seal_envelope`).
+#[cfg(all(feature = "software-keys", feature = "host"))]
+#[wasm_bindgen(js_name = sealEnvelope)]
+pub fn seal_envelope(
+    store: &SoftwareKeyStore,
+    host_key_id: String,
+    fields: JsValue,
+    plain_json: String,
+    recipient_enc_raw: Vec<u8>,
+) -> JsResult<String> {
+    err(crate::host_mail::seal_envelope_with(
+        &*store.0,
+        &host_key_id,
+        &mail_fields(fields)?,
+        &plain_json,
+        &key("x25519", recipient_enc_raw)?,
+    ))
+}
+
+/// Host role: an `atem-result` (`seal_result`).
+#[cfg(all(feature = "software-keys", feature = "host"))]
+#[wasm_bindgen(js_name = sealResult)]
+pub fn seal_result(
+    store: &SoftwareKeyStore,
+    host_key_id: String,
+    fields: JsValue,
+    plain_json: String,
+    recipient_enc_raw: Vec<u8>,
+) -> JsResult<String> {
+    err(crate::host_mail::seal_result_with(
+        &*store.0,
+        &host_key_id,
+        &mail_fields(fields)?,
+        &plain_json,
+        &key("x25519", recipient_enc_raw)?,
+    ))
+}
+
+/// `sealEnvelope` with the ephemeral `DeriveKeyPair(ikmE)` (known-answer
+/// vectors only).
+#[cfg(all(feature = "software-keys", feature = "test-vectors"))]
+#[wasm_bindgen(js_name = sealEnvelopeWithIkm)]
+pub fn seal_envelope_with_ikm(
+    store: &SoftwareKeyStore,
+    host_key_id: String,
+    fields: JsValue,
+    plain_json: String,
+    recipient_enc_raw: Vec<u8>,
+    ikm_e: Vec<u8>,
+) -> JsResult<String> {
+    err(crate::host_mail::seal_envelope_with_ikm_with(
+        &*store.0,
+        &host_key_id,
+        &mail_fields(fields)?,
+        &plain_json,
+        &key("x25519", recipient_enc_raw)?,
+        &ikm_e,
+    ))
+}
+
+/// `sealResult` with the ephemeral `DeriveKeyPair(ikmE)` (known-answer
+/// vectors only).
+#[cfg(all(feature = "software-keys", feature = "test-vectors"))]
+#[wasm_bindgen(js_name = sealResultWithIkm)]
+pub fn seal_result_with_ikm(
+    store: &SoftwareKeyStore,
+    host_key_id: String,
+    fields: JsValue,
+    plain_json: String,
+    recipient_enc_raw: Vec<u8>,
+    ikm_e: Vec<u8>,
+) -> JsResult<String> {
+    err(crate::host_mail::seal_result_with_ikm_with(
+        &*store.0,
+        &host_key_id,
+        &mail_fields(fields)?,
+        &plain_json,
+        &key("x25519", recipient_enc_raw)?,
+        &ikm_e,
+    ))
+}
+
+/// Host role: the receiver's checks 1 to 6 (`open_envelope`): `{type:
+/// "open", plainJson, sender}`, `{type: "pending", hostId, hostTrustGen}`,
+/// `{type: "refused", reason, evidence}`, `{type: "refused_authenticated",
+/// objectId, reason}` or `{type: "unavailable", code, detail}`.
+#[cfg(all(feature = "software-keys", feature = "host"))]
+#[wasm_bindgen(js_name = openEnvelope)]
+pub fn open_envelope(
+    object_json: String,
+    log: &MembershipLog,
+    me: JsValue,
+    store: &SoftwareKeyStore,
+    now_ms: f64,
+) -> JsResult<JsValue> {
+    ok(crate::host_mail::open_envelope_with(
+        &object_json,
+        &log.0,
+        &mail_recipient(me)?,
+        &*store.0,
+        ms(now_ms)?,
+    ))
+}
+
+/// Host role: the sending host's check of a result (`accept_result`): as
+/// `openEnvelope`, with `{type: "accepted", plainJson, sender}` and `{type:
+/// "not_delivered", plainJson, sender, reason}` for a verified result.
+#[cfg(all(feature = "software-keys", feature = "host"))]
+#[wasm_bindgen(js_name = acceptResult)]
+pub fn accept_result(
+    object_json: String,
+    log: &MembershipLog,
+    me: JsValue,
+    outbox: JsValue,
+    store: &SoftwareKeyStore,
+    now_ms: f64,
+) -> JsResult<JsValue> {
+    ok(crate::host_mail::accept_result_with(
+        &object_json,
+        &log.0,
+        &mail_recipient(me)?,
+        &mail_outbox(outbox)?,
+        &*store.0,
+        ms(now_ms)?,
+    ))
+}

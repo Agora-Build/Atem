@@ -26,6 +26,8 @@
 //!   (`project_set`, `project_remove`, `host_sender_revoke`,
 //!   `host_sender_readmit`, `host_enc_key`): their builders, the host's
 //!   `enc_sig` check and the log's queries over the state they derive;
+//! - `host_mail` (feature `host`; planned, host role only): envelopes and
+//!   results between hosts, sealed and judged by the receiver's checks;
 //! - [`encoding`]: canonical JSON, `enc`, signing inputs and hashes.
 //!
 //! Contract for Astation: `designs/protocol/atem-client-bindings.md`.
@@ -46,6 +48,8 @@ pub mod connection;
 pub mod encoding;
 pub mod error;
 pub mod host_actions;
+#[cfg(feature = "host")]
+pub mod host_mail;
 pub mod kit;
 pub mod log;
 pub mod provider;

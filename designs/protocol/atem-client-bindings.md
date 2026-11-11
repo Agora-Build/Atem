@@ -527,6 +527,31 @@ key, `verify_host_enc_sig` on every `enc_sig` whose binding fields parse,
 and (Kotlin and Swift, whose providers see the request) the signing
 purposes.
 
+### Mail between hosts (delegated host work; planned, host role)
+
+The `atem-envelope` a host sender seals to another host of the account (a
+request, a cancel or a complete) and the `atem-result` the host that ran the
+work sends back (a status, a refusal or a result): host-work-v1 §11.5, the
+objects, seals, plaintexts, the receiver's checks and their verdicts. **Host
+role only** (feature `host`, never in an app build, like `sign_seen`):
+nothing sends them in this version, and an app never holds a host's keys.
+The bindings carry them so the Swift, Kotlin and WASM suites run
+`r9-vectors-host-envelope` through the host's own code.
+
+| call | effect |
+|---|---|
+| `seal_envelope(provider, host_key_id, fields, plain_json, recipient_enc)`, `seal_result(…)` | the object's wire JSON (canonical): `plain_json` (one plaintext shape, read by the receiver's own strict parse: no `null`, exactly its fields; its canonical form is what is sealed; within its bound) sealed to the recipient host's X25519 encryption key, whose `enc_kid` must be `fields.enc_kid` (`malformed` otherwise), and the body signed with the Ed25519 `host_key_id` (purpose `HostSigning`). `fields` is `MailFieldsData{account_id, genesis_hash, sender, recipient, enc_kid, id, created_at, expires_at, signed_at_head}` |
+| `seal_envelope_with_ikm(…, ikm_e)`, `seal_result_with_ikm(…, ikm_e)` | the same with the ephemeral `DeriveKeyPair(ikm_e)`: the vectors' objects byte for byte (feature `test-vectors`) |
+| `open_envelope(object_json, log, me, provider, now_ms)` | the receiver's checks 1 to 6 against its device list: `EnvelopeVerdictInfo` `Open{plain_json, sender}`, `Pending{host_id, host_trust_gen}`, `Refused{reason, evidence}`, `RefusedAuthenticated{object_id, reason}` or `Unavailable{code, detail}`. `me` is `MailRecipientData{host_id, host_trust_gen, keys}`: the keys it accepts now (`MailKeyData{key_id, enc_kid}`) |
+| `accept_result(object_json, log, me, outbox, provider, now_ms)` | the sending host's check of a result against its row `MailOutboxData{recipient, message_id, cancel_complete_ids, task_ids}`: `ResultVerdictInfo` `Accepted`, `NotDelivered{plain_json, sender, reason}` (a revoked or removed sender's result, kept as data), and the same `Pending`, `Refused`, `RefusedAuthenticated`, `Unavailable` |
+
+The verdict functions throw only for input that isn't a signed object at
+all (not strict JSON, over 512 KiB, no `body` or `sig`); anything about the
+object's content is a verdict. JS: `sealEnvelope`, `sealResult`,
+`sealEnvelopeWithIkm`, `sealResultWithIkm`, `openEnvelope`, `acceptResult`
+with a `SoftwareKeyStore` (builds with `software-keys` and `host`), the
+fields and records as camelCase objects, the verdicts as `{type, …}`.
+
 ### Encoding helpers
 
 `canonical_json`, `encode_fields`, `hash_fields` (SHA-256 of `enc`),
@@ -555,6 +580,18 @@ trait AppKeyProvider (Swift protocol / Kotlin interface):
   hpke_open(key_id, enc, ct, info, aad) -> plaintext
 errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
 ```
+
+- **A seal that doesn't open** (planned, for host mail; needs Astation's
+  agreement). When `hpke_open`'s AEAD refuses the ciphertext, or `enc`
+  isn't a valid X25519 public key, fail with `Failed{reason:
+  "open_failed"}` (for example on CryptoKit's authentication failure, or
+  the JDK's `AEADBadTagException`): the core then reads it as the seal's own
+  failure (`open_failed`), as it does for a seal it opens itself, and the
+  host refuses the object. Any other failure (a missing or locked key, a
+  cancelled prompt) is the provider's: the host decides nothing and tries
+  again later (`Unavailable`). A provider that reports a failed open
+  another way only delays that refusal to the object's expiry.
+  `SoftwareKeyStore` does this already.
 
 - **Formats.** P-256: public key SEC1 uncompressed (65 bytes); signature
   ECDSA over SHA-256 of `input`, 64-byte `r‖s`, either S (the core
@@ -696,7 +733,7 @@ Feature flags of `atem-client-ffi`:
 | `wasm` | the wasm-bindgen surface (`--no-default-features --features wasm`) |
 | `software-keys` | `SoftwareKeyStore` (bots, tests) |
 | `test-vectors` | raw primitive verification for the vectors (implies `software-keys`) |
-| `host` | host-role functions and types (`sign_seen`, `admit_carrier`, `AdmissionInfo`), for the conformance and host-side tests |
+| `host` | host-role functions and types (`sign_seen`, `admit_carrier`, `AdmissionInfo`, and host mail: `seal_envelope`, `seal_result`, `open_envelope`, `accept_result` and their records), for the conformance and host-side tests |
 
 Shipped artifacts use the defaults only (`wasm` alone for JS); the
 conformance builds add `software-keys,test-vectors,host`.
@@ -785,7 +822,7 @@ build and the JVM jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (45 checks in JS, 46 in Kotlin and in Swift: the same 45
+- **Conformance** (49 checks in JS, 50 in Kotlin and in Swift: the same 49
   in each language, plus one in Kotlin and Swift, whose provider sees the
   signing request and so the purposes of the five device-list actions; over
   `designs/protocol/fixtures/r9-vectors-*.json` and atem-client's own
@@ -793,8 +830,18 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   (with a Kotlin `AppKeyProvider` on the JDK's crypto: P-256 signing, HPKE
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
   (with a CryptoKit `AppKeyProvider`).
+- **Host mail** (planned, host role; four conformance checks per language,
+  of the 49 and 50 above): every entry of `r9-vectors-host-envelope`
+  extends log L to its hash, the builders reproduce every `built` object
+  byte for byte (a fresh seal opens, a builder refuses a plaintext with
+  `null`, a dropped reply and a key that isn't the `enc_kid`'s, and seals a
+  plaintext's canonical form only), and every check's verdict and reason
+  through `open_envelope` and `accept_result`, with the plaintext an open
+  gives (the largest by its length and SHA-256). Kotlin and Swift seal and
+  open through `SoftwareKeyStore.provider()`, so a failed open reaches the
+  core as `Failed{reason: "open_failed"}` (§3).
 - **Device-list actions** (`tests/host_actions.rs`, Rust; four conformance
-  checks in JS, five in Kotlin and Swift, of the 45 and 46 above): every
+  checks in JS, five in Kotlin and Swift, of the 49 and 50 above): every
   `P*`/`EK*`/`HS*` vector of
   `r9-vectors-membership-log` through the queries (`expect`) and the
   refusals (`reason`), the builders against the vectors' `jcs` and
@@ -804,7 +851,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   action through a recording provider under its own purpose and publishing
   it (the verifier takes the entry).
 - **Durable log** (`tests/stored_log.rs`, Rust; two conformance checks per
-  language, of the 45 above): a partly elapsed wait across a same-boot restart and a reboot,
+  language, of the 49 above): a partly elapsed wait across a same-boot restart and a reboot,
   the wall clock set back after restore, a wait-ended decision at its chain
   position (with the entry that relies on it), pending, approved and vetoed
   recovery and key-replacement records, a frozen log, corrupted, oversize,
