@@ -209,11 +209,13 @@ dependencies (`p256`, `ed25519-dalek`, `x25519-dalek`, `hkdf`,
 `chacha20poly1305`, `hpke`) and the repo's `enc`/`jcs`, and cross-checked
 with an independent implementation (Python `cryptography`:
 `python3 -I scripts/check-r9-vectors.py designs/protocol/fixtures`, which
-recomputes and verifies the cryptographic values of `r9-vectors-keys` and
-`r9-vectors-membership-log` today, one checker per file, and exits
-non-zero on a mismatch; it derives no verdict: `expect` and the refusal
-reasons are checked by `crates/atem-client/tests/vectors.rs` and the
-binding conformance suites). Test keys:
+recomputes and verifies the cryptographic values of `r9-vectors-keys`,
+`r9-vectors-membership-log` and `r9-vectors-host-envelope` today, one
+checker per file, and exits non-zero on a mismatch; it derives no verdict
+but the host-envelope checks', which it recomputes from the bytes and the
+device list: the other files' `expect` and refusal reasons are checked by
+`crates/atem-client/tests/vectors.rs` and the binding conformance suites).
+Test keys:
 secret = SHA-256(enc(["atem-r9-test-key", label])) (`r9-vectors-keys`).
 Hex fields end in `_hex`; wire objects use base64url without padding.
 Every implementation must reproduce every value; `valid: false` entries
@@ -231,6 +233,7 @@ and `negative`/`invalid` cases must be refused for the stated reason.
 | `r9-vectors-pairing` | `verifyCommit` with `host_trust_gen` (§R9.2): valid and invalid messages as exact bytes, the `add_host` generation checks, and when a verification attempt is void |
 | `r9-envelope-vectors` | the channel envelope (R9.7a): the three event shapes, valid and invalid handles and reasons, envelopes Atem refuses, and every bound (the largest legal record and its exact serialized sizes) |
 | `r9-vectors-push-hint` | two sealed, signed open hints (HPKE inputs including `ikmE`), a resolved hint, a host-signed seen, a seen from another `process_gen`, two hints at the 15 s guard (`open_g75`, `open_g75001`), and four refused hints |
+| `r9-vectors-host-envelope` | envelopes and results between hosts (planned, host-work-v1 §11.5). `entries`: device-list entries on log L signed by dev-mac (`M7`–`M10`: host-b, both hosts' `host_enc_key`, host-evil as a third host: list B, head 10; then one change each on B: host-a re-verified, revoked and readmitted, removed, rotating its key with and without `retire_previous`; host-b re-verified, revoked, removed), each with its `chain` after L and `entry_hash`. `objects`: each `{label, note, kind, object, jcs, signing_input_hex}` with `signed_with` (the `r9-vectors-keys` host key whose signature `sig` is), `built` (the builder makes it byte for byte), `sealed` (`to`, the key sealed to; `info_hex`, `sealed_hash`, `ikm_label` and `ikmE_hex` = SHA-256(enc(["atem-r9-test-ikm", ikm_label])); `plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB), `sealed_from` (the object whose sealed part it carries) or `edited_from` (the object it is, changed after signing). `checks`: `{label, note, object, call, chain, receiver{host_id, host_trust_gen, keys}, now, outbox?, expect}`: `call` is `open_envelope` or `accept_result` (with the sending host's `outbox` row), `expect` the verdict (`open`/`accepted` with `sender`, `not_delivered` with `sender` and `reason`, `pending` with the claimed `host_id` and `host_trust_gen`, `refused` with `reason` and `evidence`, `refused_authenticated` with `object_id` and `reason`); every reason of the receiver's checks has one |
 
 `kind: "scenario"` — `{name, requires, kind, side, log, note, setup,
 steps}`. `log` names the vectors file whose entry labels the scenario
