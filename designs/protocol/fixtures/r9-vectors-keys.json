@@ -78,6 +78,66 @@
         "secret_hex": "33f12d10a63332a050fc9a070b69b9b3b05f9a78f9a5c9bf9dcd8484691eaa50"
       }
     },
+    "host-a-enc-1": {
+      "enc": {
+        "pub_hex": "5661e03dd4756266e033439286b986e57f9f40a8857fc51bb5eb98e0637d9a20",
+        "secret_hex": "4677722d62f7c590e915e03dbef9a14a1a22d69f5ee1d84bb1c12778ea43c78e"
+      },
+      "note": "host-a's first host encryption key (label \"host-a host_enc_key 1\"), installed by host_enc_key entries (delegated host-work II.4.1)"
+    },
+    "host-a-enc-2": {
+      "enc": {
+        "pub_hex": "4f818193a8493b71dac868295b1449ec71b088ce9e49cd9967e5764975f8b871",
+        "secret_hex": "cabce41ba116b019a1f013e12da259cf8efe0a172bd54c3bcafddb4536d50c75"
+      },
+      "note": "host-a's second host encryption key (label \"host-a host_enc_key 2\")"
+    },
+    "host-a-enc-3": {
+      "enc": {
+        "pub_hex": "a39dbeff20b9d94927a87e6ac7e308a652b9c2855b5550d357e2df30572caa49",
+        "secret_hex": "c8ffcb8d7aa3c5d784e8c519499c53141014e540f171bb7425b8553d3b03fe6c"
+      },
+      "note": "host-a's third host encryption key (label \"host-a host_enc_key 3\")"
+    },
+    "host-a-gen-2": {
+      "host_key": {
+        "alg": "ed25519",
+        "pub_hex": "a4c170bc6646110f395a1a863615b57df0038040164652d6fdb23b233e49e601",
+        "secret_hex": "fcf140ab3bdfb2db9850ea41bbe9e34c05178b46c82283c602ec5c12f9cd38ec"
+      },
+      "note": "host-a's host_channel_key at host_trust_gen 2, after a re-verification (label \"host-a host_channel_key gen 2\")"
+    },
+    "host-a-gen-3": {
+      "host_key": {
+        "alg": "ed25519",
+        "pub_hex": "c0ed5f342a918a0be8275058fade069cc835b024f4967faa7c9979baded379b6",
+        "secret_hex": "112272537eddcb286086603904cc94bc8ecb0151f7d20be5be3cc0e15e8cc019"
+      },
+      "note": "host-a's host_channel_key at host_trust_gen 3, added again after its remove_host (label \"host-a host_channel_key gen 3\")"
+    },
+    "host-b": {
+      "host_key": {
+        "alg": "ed25519",
+        "pub_hex": "2c1c77d3cf24cfe374c81c29767ce4304b583a457a911f0f0cae34da8f3106c2",
+        "secret_hex": "ca45c5a83e71b650829cfbb61f4676189112045e50c50d2ff1896248d34a81f5"
+      },
+      "note": "the second host of the project vectors, host_trust_gen 1 (label \"host-b host_channel_key\")"
+    },
+    "host-b-enc-1": {
+      "enc": {
+        "pub_hex": "ebabb89efbb2f479d2b2285739e1ea6f58738ff4db3579a7d19631a0d31ea900",
+        "secret_hex": "4a9a3c93bb955567c48d96e2f2535d4f1d5fa9ed496222a97f34a4dded24b77a"
+      },
+      "note": "host-b's host encryption key (label \"host-b host_enc_key 1\")"
+    },
+    "host-b-gen-2": {
+      "host_key": {
+        "alg": "ed25519",
+        "pub_hex": "661c113a003bd9e40e95f910a3b71b72cae6322406351a60859ea92516921e4c",
+        "secret_hex": "9dc9bfdce15028eff43e5aa5c7985fefa9bbd6748c8d11202ae6daf7937a282e"
+      },
+      "note": "host-b's host_channel_key at host_trust_gen 2, added again after its remove_host (label \"host-b host_channel_key gen 2\")"
+    },
     "host-evil": {
       "host_key": {
         "alg": "ed25519",

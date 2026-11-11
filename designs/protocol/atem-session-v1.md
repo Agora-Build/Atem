@@ -1835,6 +1835,7 @@ Planned:
 | `atem-push-hint` | `atem-push-hint-v1` | the host's `host_channel_key` (R9.9) |
 | `atem-seen` | `atem-seen-v1` | the host's `host_channel_key` (R9.9) |
 | `atem-host-route` | `atem-host-route-v1` | the host's `host_channel_key` (R9.7b) |
+| (`enc_sig` inside a `host_enc_key` entry; planned, R9.2 "Host senders and projects") | `atem-host-enc-key-v1` over fields, never a body: `enc([label, account_id, genesis_hash, host_id, u64(host_trust_gen), enc_pub])` | the host's `host_channel_key` (its newest `add_host`'s `host_key`) |
 
 Other domain strings (never signing inputs of another kind):
 `atem-membership-hash-v1`, `atem-browser-grant-hash-v1`,
@@ -1879,6 +1880,11 @@ bodies differ (Astation review 2).
 | `recovery_approve` | `target` (hex `entry_hash`) | R9.5; `target` is a `recovery_add` or a `kit: "lost"` `set_recovery_key` in this log; a manager other than the target's signer. Ends the wait at once |
 | `recovery_veto` | `target` | R9.5; same `target` rule; any manager. Cancels the target if it is still pending on this host |
 | `k_backup` | `k_backup{blob_version, kids, recovery_key, backup_hash}` | R9.5; a manager; `blob_version` above every earlier one; `recovery_key` current or pending. Records the newest K backup (the restore's version floor) |
+| `project_set` | `project{name, hosts, ops}` | **Planned** (signing gate; "Host senders and projects" below). `name` 1–32 characters of `[a-z0-9-]`; `hosts` a set of 2–64 hosts, each current at `seq-1`; `ops` a non-empty set of `launch`, `message`, `notify`, `prompt`, `notify` only with `message` and `prompt`. The project's whole new state |
+| `project_remove` | `name` | **Planned** (below). A project in effect: set and not removed since |
+| `host_sender_revoke` | `host_id`, `interrupt_running` (boolean, required) | **Planned** (below). An `add_host` of `host_id` is in the log (current or removed), and its sending state at `seq-1` is `authorized` |
+| `host_sender_readmit` | `host_id` | **Planned** (below). Its sending state at `seq-1` is `revoked` |
+| `host_enc_key` | `host_id`, `host_trust_gen`, `enc_key{alg:"x25519",pub}`, `enc_sig`, `retire_previous?` (only `true`) | **Planned** (below). A current host; `host_trust_gen` its newest `add_host`'s; `enc_sig` by that `add_host`'s `host_key`; `enc_key` not the host's current key |
 
 `member`: `device_id` (opaque id, 1–128 bytes `[A-Za-z0-9._:-]`, never
 `recovery`), `kind`:
@@ -1897,7 +1903,7 @@ encoding:
 
 | kind | fields | rule |
 |---|---|---|
-| **set** | `member.roles`, `set_roles.roles`, `scope.hosts`, `scope.projects`, `scope.sessions`, `scope.ops`, a grant's `ops` | sorted ascending by bytes (UTF-8), no duplicates |
+| **set** | `member.roles`, `set_roles.roles`, `scope.hosts`, `scope.projects`, `scope.sessions`, `scope.ops`, a grant's `ops`; planned: `project.hosts`, `project.ops` | sorted ascending by bytes (UTF-8), no duplicates |
 | **sequence** | `k_backup.kids` (entry), the envelope's `kids` and its plaintext `keys` (R9.5) | in meaning order: the current key first, then retained previous generations newest first; no duplicate kid; never sorted. The entry's `kids`, the envelope's `kids` and the plaintext's `keys[].kid` are the same sequence |
 
 A set that isn't sorted, or any array with a duplicate, is invalid
@@ -1949,9 +1955,175 @@ limit at nearly full or full; runtime.log gets one line naming the
 limits when a commit moves a limit into nearly full or full, and one
 when a list opens already there.
 
+**Host senders and projects** (planned: signed only once every strict
+verifier of an account knows these actions, the signing gate). Delegated
+host work ([delegated-host-work.md](../delegated-host-work.md)
+II.2.2, II.3.1, II.4.1) adds the five actions `project_set`,
+`project_remove`, `host_sender_revoke`, `host_sender_readmit` and
+`host_enc_key`. The shared core's verifier (`atem_client::membership`)
+and Atem's host accept them today; Atem never signs one. A strict
+verifier that doesn't know an action refuses the whole chain at that
+entry (`membership_invalid`, detail `malformed`, "unknown action"), so
+no later entry reaches it, revocations included. Astation therefore
+signs none until every strict verifier of the account knows them (Atem
+hosts, Station replicas, native controllers and other SDK consumers),
+starting with an enumerated test account; an unknown, offline or
+unconfirmed verifier keeps signing off (delegated host work II.2.2 "The
+signing gate", I.8). Each is signed by a native manager, like every
+entry but `recovery_add` (the recovery key signing one is
+`recovery_signer_action`), with a fresh confirmation bound to the exact
+body (R9.6 rule 4). Every rule below is judged at `seq-1`, on the state
+the chain before the entry derives.
+
+*Projects.* `project_set{project{name, hosts, ops}}`, exactly these
+three fields:
+
+- `name`: 1–32 characters of `[a-z0-9-]` (the label grammar of agent
+  collaboration §4).
+- `hosts`: a set (above) of 2–64 host ids, each a **current** host at
+  `seq-1`: an `add_host` of it and no later `remove_host`. A listed host
+  that isn't current is `not_a_host`.
+- `ops`: a non-empty set from `launch`, `message`, `notify`, `prompt`;
+  `notify` only together with both `message` and `prompt` (as Auth
+  requires for `agent.notify`).
+- A name, host count, host id or op outside these rules is
+  `bad_project`; another field in `project` is `unknown_field`; a
+  missing or mistyped one `malformed`.
+- The body is the project's whole new state: it replaces any project of
+  that name (narrowing included). The same state may be set again as a
+  new entry; that is how a re-added host comes back.
+- The 4,096-byte body cap binds before 64 hosts when ids are long: with
+  all four ops, a 32-character name and the longest `account_id` and
+  `signer` (128 bytes each), 64 hosts fit only while their ids average
+  at most 50 bytes. Atem's host ids (its `atem_id`, 21 bytes for an ASCII
+  host name) fit easily. A body over the cap is `too_large`: the signer
+  refuses it before signing (`SignedObject::sign` checks the size
+  first), as every verifier refuses it, so nothing oversized is signed
+  (fail closed). The typed builder checks on a placeholder chain
+  position, so it may accept a list that the real `account_id`, `signer`
+  and `seq` then push over the cap.
+
+`project_remove{name}` needs a project **in effect** with that name:
+set and not removed since. Otherwise it is `not_a_project` (a name
+outside the grammar `bad_project`). A project whose hosts all left
+through `remove_host` is still in effect: it grants nothing, and it may
+be removed.
+
+A host is a **member** of a project while the project's latest
+`project_set` lists it and no `remove_host` of the host follows that
+entry. `remove_host` ends every membership of the host at once; an
+`add_host` after it (a re-add) brings none back, only a new
+`project_set` listing the host does; a newer `add_host` with no removal
+between (re-verification) keeps them. A project lets each member send
+every other member its ops: between hosts `a` and `b` the grant is the
+union of the ops of every project in effect having both as members, and
+nothing when `a = b` (`Membership::project_ops_between`).
+
+*Host senders.* Every host an `add_host` named has a sending state,
+keyed by `host_id`, never by a key; the `seq` of the entry that set it
+is its authorization generation:
+
+| state | entered by | generation |
+|---|---|---|
+| `authorized(g)` | the host's first `add_host`, or a `host_sender_readmit` | `g` = that entry's `seq` |
+| `revoked(r)` | a `host_sender_revoke` | `r` = its `seq` |
+
+- `host_sender_revoke{host_id, interrupt_running}`: `interrupt_running`
+  is a required boolean (written as `false` too). Valid when an
+  `add_host` of `host_id` is in the log, current or removed (else
+  `unknown_host`), and its state at `seq-1` is `authorized` (a revoke in
+  `revoked` is `already_revoked`).
+- `host_sender_readmit{host_id}`: valid when its state at `seq-1` is
+  `revoked`; anything else is `not_revoked` (a readmit in `authorized`,
+  and of a host never added).
+- The **membership epoch** of a host: the `seq` of its first `add_host`
+  after its last `remove_host` (its first `add_host` if it was never
+  removed); none while it is removed.
+
+Key changes never change authorization. What each entry about a host H
+does to what a verifier derives:
+
+| entry | H current | sending state | project memberships | encryption keys | membership epoch |
+|---|---|---|---|---|---|
+| H's first `add_host` | yes | `authorized(seq)` | none | none | `seq` |
+| a newer `add_host`, no removal (`atem pair verify`) | yes, new `host_key` | unchanged (a revoked H stays revoked) | unchanged | voided | unchanged |
+| `remove_host` | no | unchanged | all end | voided | none |
+| `add_host` after `remove_host` | yes, new `host_key` | unchanged (`authorized` if it was, `revoked` if it was) | none until a `project_set` lists H | none | this `seq` |
+| `host_sender_revoke` | unchanged | `revoked(seq)` | unchanged | unchanged | unchanged |
+| `host_sender_readmit` | unchanged | `authorized(seq)` | unchanged | unchanged | unchanged |
+| `host_enc_key` | unchanged | unchanged | unchanged | set (below) | unchanged |
+| `project_set`, `project_remove` | unchanged | unchanged | as the entry sets them | unchanged | unchanged |
+
+So a host removed and added again is in no project until a
+`project_set` lists it again and, if it was revoked, stays revoked until
+a native manager readmits it; re-verification never readmits.
+
+*The host encryption key.* `host_enc_key{host_id, host_trust_gen,
+enc_key{alg:"x25519",pub}, enc_sig, retire_previous?}`. Its shape, at
+parse: `host_id` an id, `host_trust_gen` an integer ≥ 1, `enc_key`
+pinned to `x25519` (`wrong_alg` otherwise), `enc_sig` base64url of
+exactly 64 bytes (`malformed` otherwise). Then, against the chain, in
+this order:
+
+1. `host_id` is a current host, else `not_a_host`.
+2. `host_trust_gen` is that host's newest `add_host`'s generation; older
+   or ahead is `host_trust_gen_not_current`.
+3. `enc_sig` is the host vouching for its key: pure Ed25519 by that
+   `add_host`'s `host_key` over `enc(["atem-host-enc-key-v1",
+   account_id, genesis_hash, host_id, u64(host_trust_gen), enc_pub])`,
+   with `genesis_hash` as its 32 raw bytes (R9.1). One that doesn't
+   verify is `bad_enc_sig`, kept apart from the entry's own
+   `bad_signature`.
+4. `enc_key` isn't the host's **current** key at `seq-1`, else
+   `same_enc_key`: setting it again would make the previous key the live
+   one (the same `enc_kid`), and `retire_previous` would retire it.
+   Every pairing and `atem pair verify` makes a new key, so nothing
+   legitimate sets the current one again. A key that is only the
+   previous one, or one a newer `add_host` voided, is a new key.
+
+`retire_previous` has one form: absent (false) or `true`. Present as
+`false`, or as anything but `true`, it is `malformed`, so each meaning
+has one `entry_hash` (unlike `interrupt_running`, which is always
+written). The valid entry's key becomes the host's current key, and the
+key it replaces (one, if any) the **previous** key, which drops any
+older one: retired at once when the entry carries `retire_previous:
+true` (a suspected compromise), otherwise kept by the receiving host for
+24 h on its own clock from when it applied the entry (the host's rule,
+not the verifier's). `retire_previous: true` with no previous key is
+valid and retires nothing. A newer `add_host` of the host and its
+`remove_host` void both keys; an entry for the new generation starts
+with no previous key. The key id is R9.9's `enc_kid`.
+
+*On a host today.* These entries are carried, verified, committed and
+frozen like every entry (R9.3, R9.4; a conflicting alternative is judged
+against `C[..seq-1]` with the states above at that position). They fence
+nothing: a host principal has no attachments, and their host-work
+effects (cancellations, interrupt intents, narrowing) belong to R9.3's
+step 4 together with host-work's applied device-list `seq` (delegated
+host work II.3.1, "Crash safety"), which isn't built. The host
+advertises no `host.delegated`, `host.alerts` or `host.senders`.
+
+*Signers.* `check_change` never paces these actions (only the full log
+refuses them) and refuses to draft a revoke of a host already revoked
+(`already_revoked`) or a readmit of a host that isn't revoked
+(`not_revoked`), so two managers acting at once see "already done". The
+typed builders (`project_set`, `project_remove`, `host_sender_revoke`,
+`host_sender_readmit`, `host_enc_key`) produce exactly the verifier's
+forms: canonical sets, never an added op, `retire_previous` omitted when
+false.
+
+Details of `membership_invalid` for these actions: `bad_project`,
+`not_a_project`, `not_a_host` (`project_set`, `host_enc_key`, as for
+`remove_host`), `unknown_host`, `already_revoked`, `not_revoked`,
+`host_trust_gen_not_current`, `bad_enc_sig` and `same_enc_key`; shape
+errors as for every action (`malformed`, `unknown_field`, `wrong_alg`,
+`bad_key`, `array_not_canonical`, `too_large`).
+
 Vectors: `r9-vectors-membership-log` (E1–E6 and the alternatives used
-by the scenarios); `r9-vectors-pairing` (`verifyCommit` and its
-`host_trust_gen` cases).
+by the scenarios; planned actions: the `P*` projects, `EK*` host
+encryption keys and `HS*` host-sender entries, each naming its `chain`
+after L and, when valid, the state a verifier derives, `expect`);
+`r9-vectors-pairing` (`verifyCommit` and its `host_trust_gen` cases).
 
 **Pairing (ceremony changes).** `verifyCommit` gains `host_trust_gen`:
 the binding's host trust generation, public, a JSON integer with
@@ -2763,10 +2935,16 @@ observe them; the shared core exposes signing as an effect):
    the background.
 4. Entry signing (`add`, `remove`, `set_roles`, `add_host`,
    `remove_host`, enrollment approval, `recovery_approve`,
-   `recovery_veto`, `set_recovery_key` of either kind) and recovery need
+   `recovery_veto`, `set_recovery_key` of either kind; planned, behind
+   the signing gate of R9.2 "Host senders and projects": `project_set`,
+   `project_remove`, `host_sender_revoke`, `host_sender_readmit` and
+   `host_enc_key`) and recovery need
    a **fresh**
    confirmation bound to the exact body shown (account, head and `seq`,
-   applicant keys, roles, scope, expiry); a confirmation never covers a
+   applicant keys, roles, scope, expiry; for the planned five, the
+   project's name, hosts and ops, the host and `interrupt_running`, or
+   the host, its generation, the key's `enc_kid` and `retire_previous`);
+   a confirmation never covers a
    changed body (R9.4 rule 3) and is never given in the background or a
    notification extension.
 5. Services hold a software key in their own secret store; their
@@ -3658,7 +3836,7 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 | `stale_target` | channel (clear) | `init` names another genesis, host id or trust generation |
 | `account_frozen` | channel (clear, advisory) and session | the host is frozen (R9.4); also closes every attachment when it freezes. A client never persists a freeze from the clear form |
 | `recovery_pending` | session | the principal is the subject of a `recovery_add` pending on this host, or is added only behind one; carries `entry_hash`, `effective_at` (R9.5) |
-| `membership_invalid` | session | a carried entry failed (R9.3); carries `head` (after the valid prefix), `index`, `detail` (e.g. `signer_not_manager`, `recovery_key_retired`, `kit_sig_missing`, `self_approval`, `not_a_recovery_entry`, `blob_version_not_increasing`, `array_not_canonical`), and `need_before` when the window starts after a divergence |
+| `membership_invalid` | session | a carried entry failed (R9.3); carries `head` (after the valid prefix), `index`, `detail` (e.g. `signer_not_manager`, `recovery_key_retired`, `kit_sig_missing`, `self_approval`, `not_a_recovery_entry`, `blob_version_not_increasing`, `array_not_canonical`; planned actions: the details of R9.2 "Host senders and projects"), and `need_before` when the window starts after a divergence |
 | `membership_incomplete` | session | `more` and the principal isn't in the chain yet; carries `head`; reconnect with the next window |
 | `unauthorized` | session | not a current member, removed, expired, grant revoked or issuer fenced (detail says which; the principal is authenticated) |
 | `forbidden` | session | also: an op outside a service's or grant's `ops` |
@@ -3677,7 +3855,35 @@ the crate's own dependencies and cross-checked independently):
 `r9-vectors-keys`, `r9-vectors-encoding`, `r9-vectors-membership-log`,
 `r9-vectors-recovery`, `r9-vectors-channel-handshake`,
 `r9-vectors-browser-grant`, `r9-vectors-push-hint`, `r9-vectors-pairing`,
-`r9-vectors-host-route`. Scenarios
+`r9-vectors-host-route`. The membership log also carries the planned
+actions of R9.2 "Host senders and projects" (signed only behind the
+signing gate): projects (`P7_add_host_b`, `P8_set`, the replacing
+`P9_narrow`, `P10_remove`; a host removed and added again,
+`P9_remove_host_b`, `P10_readd_host_b`, `P11_set_again`; a project
+emptied by `remove_host` and still removable, `P10_remove_host_a`,
+`P11_remove_emptied`; a re-verified host, `P9_reverify_a`; refused:
+`P11_remove_again` `not_a_project`, `P9_bad_project` `bad_project`,
+`P7_not_a_host` `not_a_host`), host encryption keys (`EK7_set`,
+`EK8_rotate` without and `EK9_rotate_retire` with `retire_previous`,
+`EK7_retire_first`, `EK8_reverify_a` voiding them, `EK9_set_gen_2`;
+refused: `EK8_same_key` `same_enc_key`, `EK8_bad_enc_sig`
+`bad_enc_sig`, `EK8_retire_false` `malformed`, `EK9_stale_gen`
+`host_trust_gen_not_current`, `EK7_not_a_host` `not_a_host`) and host
+senders (`HS7_revoke`, `HS8_readmit`; a revoked host re-verified,
+removed and added again, `HS8_reverify_a`, `HS9_remove_host_a`,
+`HS10_readd_host_a`, then `HS11_readmit` and `HS12_revoke_interrupt`;
+a removed host revoked, `HS7_remove_host_a`, `HS8_revoke_removed`;
+refused: `HS8_revoke_again` `already_revoked`,
+`HS7_readmit_authorized` and `HS7_readmit_unknown` `not_revoked`,
+`HS7_revoke_unknown` `unknown_host`), with the test keys they add to
+`r9-vectors-keys`. The independent check is
+`scripts/check-r9-vectors.py` (Python, the `cryptography` package only;
+`python3 -I scripts/check-r9-vectors.py designs/protocol/fixtures`):
+today it recomputes every value of `r9-vectors-keys` and
+`r9-vectors-membership-log` (canonical JSON, `enc`, entry hashes, key
+derivations, every Ed25519 and low-S P-256 signature, `kit_sig` and
+`enc_sig`) and exits non-zero on a mismatch; it grows a checker per
+file. Scenarios
 (`kind: "scenario"`): chain (`valid-suffix`, `rollback`,
 `removed-signer-conflict`, `current-manager-conflict`, `unknown-carrier`,
 `honest-concurrent-appends`, `relay-cas-failure`, `signature-retry`,

@@ -34,6 +34,7 @@ cargo test -p atem-core -p atem-core-ffi # Token library + C ABI tests (workspac
 cargo build --release && cargo test --release --bin atem perf_ -- --ignored --nocapture --test-threads=1 # Encrypted-path performance (src/memory/perf_tests.rs; prints numbers to compare with the budgets in designs/e2e-encryption.md "Performance"; perf_2c waits for a quiet host)
 ./scripts/check-atem-core-ffi.sh         # Build libatem_core_ffi.a, drive it from C (and Swift on macOS)
 cargo test -p atem-client -p atem-client-ffi # r9 client core + bindings: vectors, r9 client/relay fixtures, channel and end-to-end tests
+python3 -I scripts/check-r9-vectors.py designs/protocol/fixtures # independent check of the r9 vectors (Python `cryptography` only; keys and membership log today)
 ./scripts/check-atem-client-bindings.sh [kotlin] [wasm] [swift] [e2e] # binding conformance over the r9 vectors (toolchains from env: KOTLINC, JNA_JAR, WASM_BINDGEN)
 ./scripts/package-atem-client-bindings.sh <ver> <out> [wasm] [kotlin] [android] # binding packages + SHA256SUMS + SOURCE.json (android: ANDROID_NDK_HOME); check-atem-client-packages.sh checks them; Apple: package-atem-client-apple.sh
 cargo test --test runtime_fixtures_binary r9_fixtures -- --nocapture # r9 host scenarios against the real runtime (ATEM_FIXTURE=<name>[,…], ATEM_R9_PARALLEL)
@@ -225,6 +226,7 @@ scripts/
 ├── check-atem-core-ffi.sh # Build atem-core-ffi, run the C (and macOS Swift) consumers
 ├── package-atem-core-macos.sh # Universal AtemCore.xcframework + header + SHA-256 sums (macOS)
 ├── check-atem-client-bindings.sh, package-atem-client-bindings.sh, package-atem-client-apple.sh, check-atem-client-packages.sh, atem-client-source-pin.sh # atem-client bindings: conformance, packages (WASM, Kotlin/JVM, Android, SwiftPM), their check, the source pin
+├── check-r9-vectors.py   # independent check of the r9 vectors (session-v1 R9.12), one checker per file; Python `cryptography` only
 ├── package-atem-r9-harness.sh # NON-PRODUCTION: the r9 harness prebuilt (Linux x86_64) with atem, the fake agent, a run script and a sample transcript
 ├── update-convoai-toolkit.sh # Refresh vendored assets/convo/ (pinned upstream commit; deps from scripts/convoai-toolkit/package-lock.json, esbuild pinned; UPDATE_LOCK=1 re-resolves)
 └── test-create-agent.sh # ConvoAI agent creation (requires env vars)
