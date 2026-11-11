@@ -139,7 +139,8 @@ impl PublicKeyData {
 // app signs or checks; the host route label (§R9.7b) is the host's only
 // (the relay verifies it in Rust) and has no binding kind, nor has a host's
 // `enc_sig` (delegated host-work II.4.1: the host signs it, the verifier
-// checks it inside a `host_enc_key` entry).
+// checks it inside a `host_enc_key` entry). A control record (I.5.3) has
+// none yet either: an app signs one through `SigningPurpose::ControlRecord`.
 
 impl From<SignLabelKind> for SignLabel {
     fn from(label: SignLabelKind) -> Self {
@@ -172,6 +173,9 @@ pub fn describe(input: &SigningInput) -> (SigningPurpose, Option<String>) {
             (SigningPurpose::HostSigning, body())
         }
         SignLabel::BrowserGrant => (SigningPurpose::BrowserGrant, body()),
+        // A control record (delegated host-work I.5.3): a fresh confirmation
+        // of the exact body, as for a device-list entry.
+        SignLabel::HostWorkControl => (SigningPurpose::ControlRecord, body()),
         SignLabel::RecoveryCosign => (SigningPurpose::Kit, body()),
         SignLabel::MembershipEntry => {
             let body = body();
@@ -526,6 +530,7 @@ mod tests {
             (SignLabel::PushHint, SigningPurpose::HostSigning),
             (SignLabel::Seen, SigningPurpose::HostSigning),
             (SignLabel::ChannelHost, SigningPurpose::HostSigning),
+            (SignLabel::HostWorkControl, SigningPurpose::ControlRecord),
         ] {
             let request = sign_request(&KeyId::new("k"), &SigningInput::new(label, b"{}"));
             assert_eq!(request.purpose, purpose, "{label:?}");

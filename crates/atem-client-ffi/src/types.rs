@@ -57,6 +57,12 @@ unit_enum! {
         /// `retire_previous`: the key it replaces stops opening mail at
         /// once). Not the host's own `enc_sig`, which is `HostSigning`.
         HostEncKey,
+        /// A control record (`atem-host-work-control`, delegated host-work
+        /// I.5.3): a signed stop of a service or a host sender. A native
+        /// manager signs only `revoke` and `interrupt_running` (show the
+        /// principal, the action and `interrupt_running`); the principal's
+        /// own key (a Station's, for a service it hosts) may sign any action.
+        ControlRecord,
         /// `recovery_add`, `recovery_approve`, `recovery_veto`.
         Recovery,
         /// `set_recovery_key` and the current kit's co-signature.

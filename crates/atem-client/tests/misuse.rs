@@ -16,7 +16,7 @@ fn strict(value: &Value) -> StrictValue {
     StrictValue::parse(value.to_string().as_bytes(), usize::MAX).unwrap()
 }
 
-const LABELS: [SignLabel; 8] = [
+const LABELS: [SignLabel; 10] = [
     SignLabel::MembershipEntry,
     SignLabel::RecoveryCosign,
     SignLabel::BrowserGrant,
@@ -25,6 +25,8 @@ const LABELS: [SignLabel; 8] = [
     SignLabel::ChannelHost,
     SignLabel::ChannelClient,
     SignLabel::HostRoute,
+    SignLabel::HostEncKey,
+    SignLabel::HostWorkControl,
 ];
 
 fn provider() -> SoftwareKeys {

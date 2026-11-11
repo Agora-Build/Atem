@@ -28,6 +28,9 @@ pub enum SignLabel {
     /// host-work design II.4.1): Ed25519 by its `host_key` over
     /// [`SigningInput::fields`], not over a body.
     HostEncKey,
+    /// `atem-host-work-control` bodies: control records (delegated
+    /// host-work design I.5.3).
+    HostWorkControl,
 }
 
 impl SignLabel {
@@ -42,6 +45,7 @@ impl SignLabel {
             SignLabel::ChannelClient => "atem-ch1-client-sig-v1",
             SignLabel::HostRoute => "atem-host-route-v1",
             SignLabel::HostEncKey => "atem-host-enc-key-v1",
+            SignLabel::HostWorkControl => "atem-host-work-control-v1",
         }
     }
 
@@ -54,6 +58,7 @@ impl SignLabel {
             "atem-push-hint" => Some(SignLabel::PushHint),
             "atem-seen" => Some(SignLabel::Seen),
             "atem-host-route" => Some(SignLabel::HostRoute),
+            "atem-host-work-control" => Some(SignLabel::HostWorkControl),
             _ => None,
         }
     }
@@ -122,7 +127,7 @@ mod tests {
 
     /// Every label, in one list. The match fails to compile until a new
     /// label is listed here too, so the distinctness test covers it.
-    const LABELS: [SignLabel; 9] = [
+    const LABELS: [SignLabel; 10] = [
         SignLabel::MembershipEntry,
         SignLabel::RecoveryCosign,
         SignLabel::BrowserGrant,
@@ -132,6 +137,7 @@ mod tests {
         SignLabel::ChannelClient,
         SignLabel::HostRoute,
         SignLabel::HostEncKey,
+        SignLabel::HostWorkControl,
     ];
 
     const fn listed(label: SignLabel) -> usize {
@@ -145,6 +151,7 @@ mod tests {
             SignLabel::ChannelClient => 6,
             SignLabel::HostRoute => 7,
             SignLabel::HostEncKey => 8,
+            SignLabel::HostWorkControl => 9,
         }
     }
 
