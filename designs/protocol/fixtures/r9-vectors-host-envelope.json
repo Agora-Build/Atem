@@ -937,6 +937,31 @@
         "M10_add_host_evil"
       ],
       "expect": {
+        "evidence": "b7c0319da14fe60c950f13e4ce0cba67dae0bd3faee5a41c53d7e8cd42869515",
+        "reason": "sealed_hash_mismatch",
+        "verdict": "refused"
+      },
+      "label": "head_ahead_tampered_ct",
+      "note": "beyond B, from a known generation: verified means signed and intact, so a ciphertext variant is refused, never held",
+      "now": 1793620801000,
+      "object": "head_ahead_tampered_ct",
+      "receiver": {
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "keys": [
+          "host-b-enc-1"
+        ]
+      }
+    },
+    {
+      "call": "open_envelope",
+      "chain": [
+        "M7_add_host_b",
+        "M8_enc_a",
+        "M9_enc_b",
+        "M10_add_host_evil"
+      ],
+      "expect": {
         "object_id": "24fcff6b-c10f-47e2-ba6b-b2dd08bf02f7",
         "reason": "expired",
         "verdict": "refused_authenticated"
@@ -2116,7 +2141,7 @@
   "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
   "kind": "vectors",
   "name": "r9-vectors-host-envelope",
-  "note": "Envelopes and results between hosts (delegated host-work II.4.2, II.4.4; host-work-v1 §11.5). Each object is {body, sig, enc, ct}: the body signed by the sender's host_key (Ed25519) over enc([\"atem-envelope-v1\" or \"atem-result-v1\", jcs(body)]); the plaintext sealed with RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, to the recipient's host encryption key, info = enc([\"atem-envelope-seal-v1\" or \"atem-result-seal-v1\", account_id, genesis_hash (32 bytes), sender.host_id, u64(sender.host_trust_gen), recipient.host_id, u64(recipient.host_trust_gen), enc_kid, id, u64(created_at), u64(expires_at)]); sealed_hash = SHA-256(enc([enc, ct])). The sender's ephemeral is DeriveKeyPair(ikmE), ikmE = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Device lists: log L of r9-vectors-membership-log followed by `chain`, labels of `entries` (signed by dev-mac); the objects are signed at B = L + M7..M10 (head 10) unless their signed_at_head says otherwise. Objects: `signed_with` names the r9-vectors-keys host key whose signature `sig` is; `built` objects are what seal_envelope / seal_result make from the body's fields, `sealed.plaintext` and ikmE; `sealed` gives the seal's inputs and outputs (`plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB); `sealed_from` names the object whose sealed part it carries, `edited_from` the object it is after a change made after signing. Checks: `call` (open_envelope, or accept_result with `outbox`, the sending host's row) on L + `chain`, by `receiver` (its host_id, current host_trust_gen and the keys it accepts, r9-vectors-keys names), at `now`; `expect` is the verdict: open or accepted (with `sender`; the plaintext is the object's), not_delivered (with `sender` and the return grant's detail as `reason`), pending (the claimed host_id and host_trust_gen), refused (before the signature verified: `reason` and `evidence` = SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent) or refused_authenticated (after it: the object's id and `reason`).",
+  "note": "Envelopes and results between hosts (delegated host-work II.4.2, II.4.4; host-work-v1 §11.5). Each object is {body, sig, enc, ct}: the body signed by the sender's host_key (Ed25519) over enc([\"atem-envelope-v1\" or \"atem-result-v1\", jcs(body)]); the plaintext sealed with RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, to the recipient's host encryption key, info = enc([\"atem-envelope-seal-v1\" or \"atem-result-seal-v1\", account_id, genesis_hash (32 bytes), sender.host_id, u64(sender.host_trust_gen), recipient.host_id, u64(recipient.host_trust_gen), enc_kid, id, u64(created_at), u64(expires_at)]); sealed_hash = SHA-256(enc([enc, ct])). The sender's ephemeral is DeriveKeyPair(ikmE), ikmE = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Device lists: log L of r9-vectors-membership-log followed by `chain`, labels of `entries` (signed by dev-mac); the objects are signed at B = L + M7..M10 (head 10) unless their signed_at_head says otherwise. Objects: `signed_with` names the r9-vectors-keys host key whose signature `sig` is; `built` objects are what seal_envelope / seal_result make from the body's fields, `sealed.plaintext` and ikmE; `sealed` gives the seal's inputs and outputs (`plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB); `sealed_from` names the object whose sealed part it carries, `edited_from` the object it is after a change made after signing. Checks: `call` (open_envelope, or accept_result with `outbox`, the sending host's row) on L + `chain`, by `receiver` (its host_id, current host_trust_gen and the keys it accepts, r9-vectors-keys names), at `now`; `expect` is the verdict: open or accepted (with `sender`; the plaintext is the object's), not_delivered (with `sender` and the return grant's detail as `reason`), pending (the claimed host_id and host_trust_gen), refused (before the copy is shown to be the sender's, signed and intact (step 4): `reason` and `evidence` = SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent; it claims no id) or refused_authenticated (after it: the object's id and `reason`; it claims the id for its authenticated sender, (sender.host_id, id)).",
   "now": 1793620801000,
   "objects": [
     {
@@ -3116,7 +3141,7 @@
       "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"24fcff6b-c10f-47e2-ba6b-b2dd08bf02f7\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"9762f775c78d9a7768897219bd043a2c22fc333cfe5446ddf5b728c51c4eba59\",\"sender\":{\"host_id\":\"host-evil\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1}",
       "kind": "envelope",
       "label": "resigned",
-      "note": "host-evil strips the request and re-signs it as its own (sender host-evil): its signature verifies, but the seal's info binds host-a",
+      "note": "host-evil strips the request and re-signs it as its own (sender host-evil): its signature verifies, but the seal's info binds host-a. Its verdict claims (host-evil, id), never host-a's (host-a, id): host-a's own request, judged after it, still opens (request_opens)",
       "object": {
         "body": {
           "account_id": "acct-test-1",
@@ -3335,6 +3360,43 @@
         "sig": "uqiBW0n_Hk-NG-KiDs5WmxQy0pPToyHQqiHUm74LkiYkKsQaTmaT-lkm1NNicVjPOfE9fGDw1fMlvL_Hru8tDw"
       },
       "signing_input_hex": "000000106174656d2d656e76656c6f70652d7631000002267b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2232346663666636622d633130662d343765322d626136622d623264643038626630326637222c22726563697069656e74223a7b22656e635f6b6964223a2235313131616161323537383930396538222c22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2239373632663737356337386439613737363838393732313962643034336132633232666333333363666535343436646466356237323863353163346562613539222c2273656e646572223a7b22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2233343933386334333063653136636130636265333564366231663762626166303733623139353136656231313461396136353261386362396130633638323865222c22736571223a31307d2c2274797065223a226174656d2d656e76656c6f7065222c2276223a317d"
+    },
+    {
+      "built": false,
+      "edited_from": "head_ahead",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"a011e3f6-73e8-411e-be11-da410f3a4058\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"0a2b1812445c3f8cfeced11571ea68ccfa76169b788a779d98b901ea40c0a2b9\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"9ec8c6598eb8fb9a06b8a936ebf89c8801246b25bcaa2d37bc891e7920d79417\",\"seq\":11},\"type\":\"atem-envelope\",\"v\":1}",
+      "kind": "envelope",
+      "label": "head_ahead_tampered_ct",
+      "note": "head_ahead with a byte of its ciphertext changed after signing: a variant of a known sender's waiting object",
+      "object": {
+        "body": {
+          "account_id": "acct-test-1",
+          "created_at": 1793620800000,
+          "expires_at": 1793624400000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "id": "a011e3f6-73e8-411e-be11-da410f3a4058",
+          "recipient": {
+            "enc_kid": "5111aaa2578909e8",
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "sealed_hash": "0a2b1812445c3f8cfeced11571ea68ccfa76169b788a779d98b901ea40c0a2b9",
+          "sender": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "signed_at_head": {
+            "hash": "9ec8c6598eb8fb9a06b8a936ebf89c8801246b25bcaa2d37bc891e7920d79417",
+            "seq": 11
+          },
+          "type": "atem-envelope",
+          "v": 1
+        },
+        "ct": "irVwG7h_9Z0Xy1a1JmcGuSRvlu6znb5tDtaB_ZX3VaRrvgGpRAwk6dST3A_f-Cy7B7mpGyZ0z164cU2Atp8981JAOLGRaXOdKiJbGyxAjFRX_w",
+        "enc": "idWhv-xaQlUDPE6lLl80wBXeLP_uMOtsr0jqdudPBwA",
+        "sig": "oXtp991aagyMlqLxLDLRrmuyob_8oeCTbUDmDMis2qZvvIacQMsp27iKqG3MBPC2b41bQP1lBzxW2-52sENMDg"
+      },
+      "signing_input_hex": "000000106174656d2d656e76656c6f70652d7631000002267b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2261303131653366362d373365382d343131652d626531312d646134313066336134303538222c22726563697069656e74223a7b22656e635f6b6964223a2235313131616161323537383930396538222c22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2230613262313831323434356333663863666563656431313537316561363863636661373631363962373838613737396439386239303165613430633061326239222c2273656e646572223a7b22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2239656338633635393865623866623961303662386139333665626638396338383031323436623235626361613264333762633839316537393230643739343137222c22736571223a31317d2c2274797065223a226174656d2d656e76656c6f7065222c2276223a317d"
     },
     {
       "built": false,

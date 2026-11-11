@@ -15,9 +15,11 @@ use crate::keys::{Alg, PublicKey};
 use crate::signed::SignedObject;
 
 /// An envelope or a result whose `sig` verified with the sender's Ed25519
-/// `host_key`. Its fields are private to this module and
-/// [`verify`](Self::verify) is the only way to make one (no `Default`, no
-/// `Deserialize`, no `From`), so code that holds one has a verified object.
+/// `host_key` and whose sealed part is the one its signed `sealed_hash`
+/// names: the sender's own, intact copy. Its fields are private to this
+/// module and [`verify`](Self::verify) is the only way to make one (no
+/// `Default`, no `Deserialize`, no `From`), so code that holds one has a
+/// verified, intact object.
 ///
 /// Which key to verify with is the receiver's decision, made from its own
 /// device list (II.4.2 steps 2 and 3: the sender's newest `add_host`
@@ -34,15 +36,21 @@ impl VerifiedMail {
     /// Reads `object` as a mailbox object (II.4.2 step 1: its label, the
     /// body's exact fields, a sealed part of the right shape) and verifies its
     /// signature with `sender_key`, which must be an Ed25519 key (a host's
-    /// `host_key`, R9.2, R9.6). A signature by another key, a changed body or
-    /// a re-typed one is [`Error::BadSignature`]; a key of another algorithm
-    /// is [`Error::WrongAlg`].
+    /// `host_key`, R9.2, R9.6), then checks the sealed part is the one the
+    /// signed `sealed_hash` names. A signature by another key, a changed body
+    /// or a re-typed one is [`Error::BadSignature`]; a key of another
+    /// algorithm is [`Error::WrongAlg`]; a sealed part the body doesn't name
+    /// (the signature never covered it, so the copy isn't the sender's) is
+    /// [`Error::OpenFailed`], as `unseal_*` call it.
     pub fn verify(object: &SignedObject, sender_key: &PublicKey) -> Result<VerifiedMail> {
         let (kind, body) = MailBody::from_object(object)?;
         if sender_key.alg() != Alg::Ed25519 {
             return Err(Error::WrongAlg);
         }
         object.verify(sender_key)?;
+        if !object.sealed().is_some_and(|sealed| body.names(sealed)) {
+            return Err(Error::OpenFailed);
+        }
         Ok(VerifiedMail {
             object: object.clone(),
             kind,
@@ -195,6 +203,46 @@ mod tests {
             VerifiedMail::verify(&bare, &key),
             Err(Error::Malformed(_))
         ));
+    }
+
+    /// Verified means signed and intact: a sealed part the signed body's
+    /// `sealed_hash` doesn't name (a flipped bit in `enc` or `ct`, another
+    /// seal under the same `info`) is no copy of the sender's, though the
+    /// signature over the body still verifies.
+    #[test]
+    fn a_sealed_part_the_body_does_not_name_is_not_verified() {
+        let r = Rig::new();
+        let f = r.fields();
+        let object = request(&r);
+        let key = r.host_key_public();
+        let sealed = object.sealed().unwrap().clone();
+        let other = crate::hpke::seal(
+            r.enc_pub.as_32().unwrap(),
+            &crate::host_mail::seal_info(MailKind::Envelope, &f),
+            b"",
+            br#"{"kind":"cancel","task_id":"7a2d3b5f-4c8e-4f9b-8d12-3e6a8b0c4d5f"}"#,
+        )
+        .unwrap();
+        let mut flipped = sealed.clone();
+        flipped.ct[0] ^= 1;
+        let mut flipped_enc = sealed.clone();
+        flipped_enc.enc[0] ^= 1;
+        for part in [
+            flipped,
+            flipped_enc,
+            crate::signed::SealedPart {
+                enc: other.enc.to_vec(),
+                ct: other.ct,
+            },
+        ] {
+            let copy = object.clone().with_sealed(part);
+            copy.verify(&key).unwrap();
+            assert_eq!(
+                VerifiedMail::verify(&copy, &key).map(|_| ()),
+                Err(Error::OpenFailed)
+            );
+        }
+        assert!(VerifiedMail::verify(&object, &key).is_ok());
     }
 
     /// HPKE base mode is unauthenticated and `info` is public: anyone can

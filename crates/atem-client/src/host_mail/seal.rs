@@ -545,8 +545,10 @@ mod tests {
             assert!(!body.names(&part), "{which}");
             let tampered = object.clone().with_sealed(part);
             tampered.verify(&r.host_key_public()).unwrap();
+            // Not the sender's copy: it never becomes a `VerifiedMail`, so
+            // nothing can open it.
             assert_eq!(
-                unseal_envelope(&r.receiver, &r.enc_key, &verified(&r, &tampered)),
+                VerifiedMail::verify(&tampered, &r.host_key_public()).map(|_| ()),
                 Err(Error::OpenFailed),
                 "{which}"
             );
@@ -583,7 +585,7 @@ mod tests {
             "the forged part does open"
         );
         assert_eq!(
-            unseal_envelope(&r.receiver, &r.enc_key, &verified(&r, &swapped)),
+            VerifiedMail::verify(&swapped, &r.host_key_public()).map(|_| ()),
             Err(Error::OpenFailed)
         );
         // Moving a byte from one part to the other changes the hash too:

@@ -1052,12 +1052,16 @@ def mail_verdict(wire, call, hosts, receiver_keys, receiver, now, outbox):
 
     def wait(key):
         # Beyond this head: the body's times first, then (a pair this list
-        # holds has one key forever) the signature, then pending.
+        # holds has one key forever) the copy, signed and intact, then pending.
         reason = mail_times(body, now)
         if reason:
             return refused(reason)
+        # Verified means signed and intact: a variant of the sender's
+        # object can't take a waiting slot either.
         if key is not None and not verify("ed25519", key, sig, signing_input):
             return refused("bad_signature")
+        if key is not None and sha256(enc([b64u_decode(wire["enc"]), b64u_decode(wire["ct"])])).hex() != body["sealed_hash"]:
+            return refused("sealed_hash_mismatch")
         return {"verdict": "pending", "host_id": sid, "host_trust_gen": sgen}, None
 
     removed = sid not in hosts.current

@@ -48,8 +48,10 @@
 //! object that fails it is [`EnvelopeVerdict::Refused`]. Then, when this list
 //! already holds the claimed `(host_id, host_trust_gen)`'s `add_host` (a
 //! current host at its newest generation, or a removed host's result), the
-//! signature is checked before waiting, since that pair has exactly one key
-//! forever: a bad one is `bad_signature`, so junk can't fill a known sender's
+//! copy is verified before waiting, signed and intact, since that pair has
+//! exactly one key forever: a bad signature is `bad_signature` and a sealed
+//! part its `sealed_hash` doesn't name `sealed_hash_mismatch`, so neither
+//! junk nor a variant of the sender's own object can fill a known sender's
 //! waiting slots. Otherwise the signature can't be checked yet. An object
 //! that passes is [`EnvelopeVerdict::Pending`], to be judged again after each
 //! device-list advance. When the head is **not** beyond this list's, that
@@ -292,7 +294,8 @@ pub enum EnvelopeVerdict {
         reason: &'static str,
     },
     /// A local failure, not the sender's, so retryable: the key provider
-    /// failed (the key is missing or locked, or isn't the one its kid names).
+    /// failed (the key is missing, or isn't the one its kid names, or the
+    /// provider's own key is bad).
     /// Nothing is decided; the host doesn't mark the object done and judges it
     /// again later.
     Unavailable { error: Error },
@@ -407,7 +410,8 @@ pub fn open_envelope(
         object_id: body.id.clone(),
         reason,
     };
-    // 6. `sealed_hash`, the open, the plaintext's strict parse.
+    // 6. The open and the plaintext's strict parse (step 4 checked the sealed
+    // part is the one `sealed_hash` names).
     let plain = match open_with(&mail, &key, provider, unseal_envelope) {
         Ok(plain) => plain,
         Err(Failed::Refused(reason)) => return refuse(reason),
@@ -648,10 +652,13 @@ fn admit(
             return refuse(reason);
         }
         // A `(host_id, host_trust_gen)` this list holds has exactly one key
-        // forever (generations only rise), so the signature can be checked
-        // now: junk can't fill a known sender's waiting slots.
-        if key.is_some_and(|key| VerifiedMail::verify(obj, key).is_err()) {
-            return refuse(BAD_SIGNATURE);
+        // forever (generations only rise), so the copy can be verified now,
+        // signed and intact: neither junk nor a variant of the sender's own
+        // object can fill a known sender's waiting slots.
+        if let Some(key) = key
+            && let Err(reason) = verify_intact(obj, key)
+        {
+            return refuse(reason);
         }
         Admission::Pending {
             host_id: sender.host_id.clone(),
@@ -738,12 +745,10 @@ fn admit(
     // `sealed_hash` doesn't name isn't the sender's (the signature never
     // covered them), so it is refused unauthenticated, before any verdict
     // that would claim the object's id.
-    let Ok(mail) = VerifiedMail::verify(obj, &host.host_key) else {
-        return refuse(BAD_SIGNATURE);
+    let mail = match verify_intact(obj, &host.host_key) {
+        Ok(mail) => mail,
+        Err(reason) => return refuse(reason),
     };
-    if !obj.sealed().is_some_and(|sealed| mail.body().names(sealed)) {
-        return refuse(SEALED_HASH_MISMATCH);
-    }
 
     // 5. The times; the sender is authenticated now.
     if let Err(reason) = check_times(body.created_at, body.expires_at, now_ms) {
@@ -759,6 +764,16 @@ fn admit(
     }
 }
 
+/// Step 4: the signature with `key`, then the sealed part the signed
+/// `sealed_hash` names ([`VerifiedMail::verify`] checks both); the reason a
+/// copy fails, unauthenticated.
+fn verify_intact(obj: &SignedObject, key: &PublicKey) -> Result<VerifiedMail, &'static str> {
+    VerifiedMail::verify(obj, key).map_err(|error| match error {
+        Error::OpenFailed => SEALED_HASH_MISMATCH,
+        _ => BAD_SIGNATURE,
+    })
+}
+
 /// Why step 6's open didn't give a plaintext.
 enum Failed {
     /// The sender's doing: the object is refused.
@@ -767,16 +782,16 @@ enum Failed {
     Unavailable(Error),
 }
 
-/// Step 6 for a verified object: `sealed_hash`, then the open and the
-/// plaintext's strict parse through `unseal` (`unseal_envelope` or
-/// `unseal_result`, the only way to open one).
+/// Step 6 for a verified, intact object: the open and the plaintext's
+/// strict parse through `unseal` (`unseal_envelope` or `unseal_result`, the
+/// only way to open one).
 fn open_with<T>(
     mail: &VerifiedMail,
     key: &(KeyId, [u8; 8]),
     provider: &dyn KeyProvider,
     unseal: fn(&dyn KeyProvider, &KeyId, &VerifiedMail) -> Result<T, Error>,
 ) -> Result<T, Failed> {
-    // `admit` checked the sealed part is the one `sealed_hash` names.
+    // A `VerifiedMail`'s sealed part is the one its `sealed_hash` names.
     if mail.object().sealed().is_none() {
         return Err(Failed::Refused(MALFORMED));
     }
@@ -1555,6 +1570,14 @@ mod tests {
         // Another host's signature isn't the sender's either.
         let as_c = w.resigned(MailKind::Envelope, &real, &host_key_id("host-c", 1), |_| {});
         assert_eq!(judge(&as_c), refused(BAD_SIGNATURE, &as_c));
+        // Verified means signed and intact: a ciphertext variant of the
+        // sender's waiting object is refused, never held.
+        let variant = edited(&real, |v| {
+            let mut ct = crate::encoding::b64u_decode(v["ct"].as_str().unwrap()).unwrap();
+            ct[3] ^= 1;
+            v["ct"] = json!(b64u(&ct));
+        });
+        assert_eq!(judge(&variant), refused(SEALED_HASH_MISMATCH, &variant));
         // The time checks on the body's times still come first.
         let mut late = f.clone();
         late.expires_at = NOW - 500;
@@ -1988,6 +2011,45 @@ mod tests {
         assert_eq!(w.open(&kept_sig, &me), refused(BAD_SIGNATURE, &kept_sig));
     }
 
+    /// A claim on an id is the authenticated sender's: C's re-signed copy of
+    /// A's request, judged first, claims (host-c, id), never A's
+    /// (host-a, id), so A's own copy, judged after it, opens on its own.
+    #[test]
+    fn a_re_signed_copy_does_not_touch_the_senders_id() {
+        let w = World::new();
+        let me = w.recipient("host-b", true);
+        let f = w.fields("host-a", "host-b");
+        let object = w.envelope(&f, &w.request(&f));
+        let as_c = w.resigned(
+            MailKind::Envelope,
+            &object,
+            &host_key_id("host-c", 1),
+            |f| {
+                f.sender = HostRef {
+                    host_id: "host-c".into(),
+                    host_trust_gen: 1,
+                };
+            },
+        );
+        assert_eq!(w.open(&as_c, &me), refused_authenticated(OPEN_FAILED));
+        assert_eq!(
+            w.open(&object, &me),
+            EnvelopeVerdict::Open {
+                plain: w.request(&f),
+                sender: "host:host-a".into(),
+            }
+        );
+        // The two claims: the same id and `sealed_hash`, two senders.
+        let claim = |o: &SignedObject| {
+            let (_, body) = MailBody::from_object(o).unwrap();
+            (body.sender.host_id, body.id, body.sealed_hash)
+        };
+        let (c_sender, c_id, c_sealed) = claim(&as_c);
+        let (a_sender, a_id, a_sealed) = claim(&object);
+        assert_eq!((c_id, c_sealed), (a_id, a_sealed));
+        assert_ne!(c_sender, a_sender);
+    }
+
     #[test]
     fn tampered_sealed_hash_refused() {
         let w = World::new();
@@ -2302,7 +2364,7 @@ mod tests {
             w.open(&object, &old_keys),
             refused(ENC_KEY_NOT_ACCEPTED, &object)
         );
-        // A held pair's signature is checked before waiting.
+        // A held pair's copy is verified before waiting.
         let junk = edited(&object, |v| v["sig"] = json!(b64u(&[1u8; 64])));
         assert_eq!(judge(&junk, NOW), refused(BAD_SIGNATURE, &junk));
         // The times first.

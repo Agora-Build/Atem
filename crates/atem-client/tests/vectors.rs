@@ -4808,7 +4808,7 @@ fn host_envelope_vectors(book: &Book) -> Value {
     );
     g.resign(
         "resigned",
-        "host-evil strips the request and re-signs it as its own (sender host-evil): its signature verifies, but the seal's info binds host-a",
+        "host-evil strips the request and re-signs it as its own (sender host-evil): its signature verifies, but the seal's info binds host-a. Its verdict claims (host-evil, id), never host-a's (host-a, id): host-a's own request, judged after it, still opens (request_opens)",
         "request",
         MAIL_EVIL,
         |f| f.sender = MAIL_EVIL.host_ref(),
@@ -4848,6 +4848,16 @@ fn host_envelope_vectors(book: &Book) -> Value {
         "tampered_ct",
         "the request with a byte of its ciphertext changed after signing: not the sender's copy",
         "request",
+        |v| {
+            let mut ct = b64u_decode(v["ct"].as_str().unwrap()).unwrap();
+            ct[3] ^= 1;
+            v["ct"] = b64u(&ct).into();
+        },
+    );
+    g.edit(
+        "head_ahead_tampered_ct",
+        "head_ahead with a byte of its ciphertext changed after signing: a variant of a known sender's waiting object",
+        "head_ahead",
         |v| {
             let mut ct = b64u_decode(v["ct"].as_str().unwrap()).unwrap();
             ct[3] ^= 1;
@@ -5269,6 +5279,15 @@ fn host_envelope_vectors(book: &Book) -> Value {
         e,
         "beyond B, from a known generation: the signature is checked before waiting",
     );
+    let e = g.refused("head_ahead_tampered_ct", "sealed_hash_mismatch");
+    at(
+        &mut g,
+        "head_ahead_tampered_ct",
+        "head_ahead_tampered_ct",
+        &b,
+        e,
+        "beyond B, from a known generation: verified means signed and intact, so a ciphertext variant is refused, never held",
+    );
     let e = g.refused_authenticated("request", "expired");
     g.check(
         "expired",
@@ -5530,7 +5549,7 @@ fn host_envelope_vectors(book: &Book) -> Value {
         "name": "r9-vectors-host-envelope",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Envelopes and results between hosts (delegated host-work II.4.2, II.4.4; host-work-v1 §11.5). Each object is {body, sig, enc, ct}: the body signed by the sender's host_key (Ed25519) over enc([\"atem-envelope-v1\" or \"atem-result-v1\", jcs(body)]); the plaintext sealed with RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, to the recipient's host encryption key, info = enc([\"atem-envelope-seal-v1\" or \"atem-result-seal-v1\", account_id, genesis_hash (32 bytes), sender.host_id, u64(sender.host_trust_gen), recipient.host_id, u64(recipient.host_trust_gen), enc_kid, id, u64(created_at), u64(expires_at)]); sealed_hash = SHA-256(enc([enc, ct])). The sender's ephemeral is DeriveKeyPair(ikmE), ikmE = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Device lists: log L of r9-vectors-membership-log followed by `chain`, labels of `entries` (signed by dev-mac); the objects are signed at B = L + M7..M10 (head 10) unless their signed_at_head says otherwise. Objects: `signed_with` names the r9-vectors-keys host key whose signature `sig` is; `built` objects are what seal_envelope / seal_result make from the body's fields, `sealed.plaintext` and ikmE; `sealed` gives the seal's inputs and outputs (`plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB); `sealed_from` names the object whose sealed part it carries, `edited_from` the object it is after a change made after signing. Checks: `call` (open_envelope, or accept_result with `outbox`, the sending host's row) on L + `chain`, by `receiver` (its host_id, current host_trust_gen and the keys it accepts, r9-vectors-keys names), at `now`; `expect` is the verdict: open or accepted (with `sender`; the plaintext is the object's), not_delivered (with `sender` and the return grant's detail as `reason`), pending (the claimed host_id and host_trust_gen), refused (before the signature verified: `reason` and `evidence` = SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent) or refused_authenticated (after it: the object's id and `reason`).",
+        "note": "Envelopes and results between hosts (delegated host-work II.4.2, II.4.4; host-work-v1 §11.5). Each object is {body, sig, enc, ct}: the body signed by the sender's host_key (Ed25519) over enc([\"atem-envelope-v1\" or \"atem-result-v1\", jcs(body)]); the plaintext sealed with RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, to the recipient's host encryption key, info = enc([\"atem-envelope-seal-v1\" or \"atem-result-seal-v1\", account_id, genesis_hash (32 bytes), sender.host_id, u64(sender.host_trust_gen), recipient.host_id, u64(recipient.host_trust_gen), enc_kid, id, u64(created_at), u64(expires_at)]); sealed_hash = SHA-256(enc([enc, ct])). The sender's ephemeral is DeriveKeyPair(ikmE), ikmE = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Device lists: log L of r9-vectors-membership-log followed by `chain`, labels of `entries` (signed by dev-mac); the objects are signed at B = L + M7..M10 (head 10) unless their signed_at_head says otherwise. Objects: `signed_with` names the r9-vectors-keys host key whose signature `sig` is; `built` objects are what seal_envelope / seal_result make from the body's fields, `sealed.plaintext` and ikmE; `sealed` gives the seal's inputs and outputs (`plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB); `sealed_from` names the object whose sealed part it carries, `edited_from` the object it is after a change made after signing. Checks: `call` (open_envelope, or accept_result with `outbox`, the sending host's row) on L + `chain`, by `receiver` (its host_id, current host_trust_gen and the keys it accepts, r9-vectors-keys names), at `now`; `expect` is the verdict: open or accepted (with `sender`; the plaintext is the object's), not_delivered (with `sender` and the return grant's detail as `reason`), pending (the claimed host_id and host_trust_gen), refused (before the copy is shown to be the sender's, signed and intact (step 4): `reason` and `evidence` = SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent; it claims no id) or refused_authenticated (after it: the object's id and `reason`; it claims the id for its authenticated sender, (sender.host_id, id)).",
         "account_id": "acct-test-1",
         "genesis_hash": g.genesis.to_hex(),
         "now": MAIL_NOW,
