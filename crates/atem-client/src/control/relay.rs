@@ -45,11 +45,22 @@
 //! and host-work's applied device-list `seq`.
 //!
 //! **A feed's records are judged one at a time** (I.5.4). A
-//! `control_sync_result` holds each record as the raw signed object the
-//! Station sent: that it is an object is all the message checks, so one
-//! record the control parser refuses ([`FeedEntry::parse_record`]) never
-//! costs the message, the feed's position or the records after it; whether
-//! a record is valid and what it does is [`super::state`]'s.
+//! `control_sync_result` keeps each record's value as the Station sent it,
+//! of any JSON type, and checks nothing of it: one record the control
+//! parser refuses ([`FeedEntry::parse_record`]: not an object, no body, a
+//! `null` inside, the wrong shape) never costs the page, the feed's position
+//! or the records after it. The caller keeps such a record as evidence, and
+//! whether a record is valid and what it does is [`super::state`]'s.
+//!
+//! **A page that isn't strict JSON is refused whole.** The page is one
+//! strict I-JSON parse, so a duplicate key, a fraction, an unsafe integer, a
+//! lone surrogate or nesting past the parser's depth anywhere in it, inside
+//! a record too, is [`RelayError::NotStrict`] for the whole page. That is a
+//! Station fault, not a bad record: a Station validates every record at
+//! intake with the shared parser and serves only what it stored. The host
+//! then refuses the page, keeps its cursor, leaves the gate for that origin
+//! closed (fail closed) and raises a rate-limited alert; this layer only
+//! says which refusal it is.
 //!
 //! **Clocks** (I.6.5). `station_time` is the Station's unsigned word: here
 //! it is only a safe integer. The host's cap on it and its clock floor are
@@ -338,9 +349,10 @@ impl ControlSync {
 // --------------------------------------------------- control_sync_result
 
 /// One record of a feed at its position (`feed_seq` isn't a field of the
-/// record, I.5.3). The record is the raw signed object the Station sent,
-/// kept as it came (the host keeps one the parser refuses as evidence);
-/// [`FeedEntry::parse_record`] is the control parser's verdict on it.
+/// record, I.5.3). The record is the value the Station sent, of any JSON
+/// type, kept as it came (the host keeps one the parser refuses as
+/// evidence); [`FeedEntry::parse_record`] is the control parser's verdict
+/// on it, and the only judgement made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedEntry {
     pub feed_seq: u64,
@@ -356,7 +368,8 @@ impl FeedEntry {
         }
     }
 
-    /// The signed object as received (an object, nothing more is known).
+    /// The record's value as received (of any type: nothing is known of it
+    /// until [`FeedEntry::parse_record`]).
     pub fn raw(&self) -> &Value {
         &self.record
     }
@@ -365,7 +378,8 @@ impl FeedEntry {
     /// (I.5.3). Valid against the device list is [`super::verify`]'s.
     pub fn parse_record(&self) -> std::result::Result<ControlRecord, ControlError> {
         // The value came out of a strict parse (the reader's) or is a
-        // record's own wire object.
+        // record's own wire object; a value that isn't an object is refused
+        // by `from_value`.
         let object = SignedObject::from_value(&self.record).map_err(ControlError::Object)?;
         ControlRecord::from_signed(object)
     }
@@ -449,10 +463,8 @@ impl ControlSyncResult {
             .iter()
             .map(|item| {
                 let e = Fields::of(item, &["feed_seq", "record"], "records")?;
+                // Any strict-JSON value, of any type: judged per record.
                 let record = e.get("record")?;
-                if !record.is_object() {
-                    return Err(RelayError::Malformed("record"));
-                }
                 Ok(FeedEntry {
                     feed_seq: e.uint("feed_seq")?,
                     record: record.clone(),
@@ -1422,7 +1434,6 @@ mod tests {
         // …and a null inside them.
         for (op, message, field) in [
             ("control_sync_result", &result, "/records/0/feed_seq"),
-            ("control_sync_result", &result, "/records/0/record"),
             ("heads", &heads, "/feeds/0/station_time"),
             ("heads", &heads, "/membership/hash"),
             ("control_ack", &acks, "/results/0/record_id"),
@@ -1792,26 +1803,79 @@ mod tests {
         // Written again as received: the evidence is what the Station sent.
         assert_eq!(got.to_json().unwrap(), message);
 
-        // What isn't a signed object's shape at all is not a record: the
-        // message is refused, since there is nothing to keep as one.
-        for record in [json!(null), json!(7), json!("text"), json!([1])] {
-            let mut bad = message.clone();
-            bad["records"][1]["record"] = record.clone();
-            assert!(
-                is_malformed(read("control_sync_result", &bytes(&bad))),
-                "{record}"
+        // A record of any other type is no signed object, and is judged like
+        // any other record that isn't one: the page still reads (T14a).
+        for record in [
+            json!(null),
+            json!(7),
+            json!(true),
+            json!("text"),
+            json!([1]),
+            json!([]),
+        ] {
+            let mut odd = message.clone();
+            odd["records"][1]["record"] = record.clone();
+            let got =
+                ControlSyncResult::decode(&bytes(&odd)).unwrap_or_else(|e| panic!("{record}: {e}"));
+            assert_eq!(got.records.len(), 6, "{record}");
+            assert_eq!(got.records[1].raw(), &record);
+            assert!(got.records[1].parse_record().is_err(), "{record}");
+            // Its neighbours are read and judged on their own.
+            assert!(got.records[0].parse_record().is_ok(), "{record}");
+            assert!(got.records[5].parse_record().is_ok(), "{record}");
+            // Kept as received.
+            assert_eq!(got.to_json().unwrap(), odd, "{record}");
+        }
+        // A record that isn't there is no entry: the entry is malformed.
+        let mut missing = message.clone();
+        missing["records"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("record");
+        assert!(is_malformed(read("control_sync_result", &bytes(&missing))));
+    }
+
+    #[test]
+    fn a_page_that_is_not_strict_json_is_refused_whole() {
+        // The one thing a page can't survive: bytes that aren't strict I-JSON
+        // anywhere, a record's included (a duplicate key, a fraction, an
+        // unsafe integer, a lone surrogate, nesting past the parser's
+        // depth). That is a Station fault: it relays only what it stored
+        // after parsing it strictly. The host refuses the page, keeps its
+        // cursor, leaves the gate closed and alerts (rate limited); this
+        // layer says which refusal it is.
+        let message = json!({"type": "relay", "op": "control_sync_result", "origin": ORIGIN,
+        "feed_id": FEED, "head": 3, "station_time": STATION_TIME,
+        "records": [
+            {"feed_seq": 1, "record": service_record(1).object().to_json()},
+            {"feed_seq": 2, "record": {"pad": "PAD"}},
+            {"feed_seq": 3, "record": service_record(3).object().to_json()},
+        ]});
+        let text = String::from_utf8(bytes(&message)).unwrap();
+        assert!(ControlSyncResult::decode(text.as_bytes()).is_ok());
+        let deep = format!("{}1{}", "[".repeat(200), "]".repeat(200));
+        for (name, record) in [
+            ("duplicate key", "{\"a\":1,\"a\":2}".to_string()),
+            ("fraction", "{\"a\":1.5}".to_string()),
+            ("exponent", "{\"a\":1e2}".to_string()),
+            ("unsafe integer", "{\"a\":9007199254740992}".to_string()),
+            ("lone surrogate", "{\"a\":\"\\ud800\"}".to_string()),
+            ("too deep", deep),
+            ("not even JSON", "{\"a\":}".to_string()),
+        ] {
+            let bad = text.replacen("{\"pad\":\"PAD\"}", &record, 1);
+            assert_ne!(bad, text, "{name}");
+            assert_eq!(
+                ControlSyncResult::decode(bad.as_bytes()),
+                Err(RelayError::NotStrict),
+                "{name}"
+            );
+            assert_eq!(
+                ToHost::decode(bad.as_bytes()),
+                Err(RelayError::NotStrict),
+                "{name}"
             );
         }
-        // A record with a duplicate key is not strict JSON: the message is.
-        let text = String::from_utf8(bytes(&message)).unwrap().replacen(
-            "\"record\":{}",
-            "\"record\":{\"a\":1,\"a\":2}",
-            1,
-        );
-        assert_eq!(
-            ControlSyncResult::decode(text.as_bytes()),
-            Err(RelayError::NotStrict)
-        );
     }
 
     #[test]
