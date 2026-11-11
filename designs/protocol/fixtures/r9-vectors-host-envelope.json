@@ -580,6 +580,58 @@
       "chain": [
         "M7_add_host_b",
         "M8_enc_a",
+        "M9_enc_b",
+        "M10_add_host_evil",
+        "M11_remove_a"
+      ],
+      "expect": {
+        "evidence": "ef121fae1c71a9d471ce59c4f06490069dd45753c9e03b90b806be0a984311b4",
+        "reason": "removed_sender",
+        "verdict": "refused"
+      },
+      "label": "removed_sender_head_ahead",
+      "note": "a removed host at the generation it last held, signed beyond the receiver's head: refused at any head (that generation never returns)",
+      "now": 1793620801000,
+      "object": "removed_head_ahead",
+      "receiver": {
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "keys": [
+          "host-b-enc-1"
+        ]
+      }
+    },
+    {
+      "call": "open_envelope",
+      "chain": [
+        "M7_add_host_b",
+        "M8_enc_a",
+        "M9_enc_b",
+        "M10_add_host_evil",
+        "M11_remove_a"
+      ],
+      "expect": {
+        "evidence": "ef121fae1c71a9d471ce59c4f06490069dd45753c9e03b90b806be0a984311b4",
+        "reason": "expired",
+        "verdict": "refused"
+      },
+      "label": "removed_sender_head_ahead_times_first",
+      "note": "the same, at its expires_at: the body's times come first",
+      "now": 1793624400000,
+      "object": "removed_head_ahead",
+      "receiver": {
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "keys": [
+          "host-b-enc-1"
+        ]
+      }
+    },
+    {
+      "call": "open_envelope",
+      "chain": [
+        "M7_add_host_b",
+        "M8_enc_a",
         "M9_enc_b"
       ],
       "expect": {
@@ -1230,6 +1282,46 @@
       "note": "a result from a host the row didn't go to",
       "now": 1793620801000,
       "object": "evil_status",
+      "outbox": {
+        "cancel_complete_ids": [
+          "5708ecb4-c190-4bb2-b98d-c3752e859ffd",
+          "d04169ed-60c8-4915-8978-12f97a27b8a9"
+        ],
+        "message_id": "24fcff6b-c10f-47e2-ba6b-b2dd08bf02f7",
+        "recipient": {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        "task_ids": [
+          "2f72a9f3-a5a6-449c-b712-744927dcb0dd"
+        ]
+      },
+      "receiver": {
+        "host_id": "host-a",
+        "host_trust_gen": 1,
+        "keys": [
+          "host-a-enc-1"
+        ]
+      }
+    },
+    {
+      "call": "accept_result",
+      "chain": [
+        "M7_add_host_b",
+        "M8_enc_a",
+        "M9_enc_b",
+        "M10_add_host_evil",
+        "M11_remove_b"
+      ],
+      "expect": {
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "verdict": "pending"
+      },
+      "label": "removed_result_head_ahead_pending",
+      "note": "a removed host's result signed beyond the receiver's head waits (its signature checked first), to be kept as data",
+      "now": 1793620801000,
+      "object": "status_head_ahead",
       "outbox": {
         "cancel_complete_ids": [
           "5708ecb4-c190-4bb2-b98d-c3752e859ffd",
@@ -2744,6 +2836,51 @@
       "signing_input_hex": "000000106174656d2d656e76656c6f70652d7631000002287b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2237643230353662622d363266622d346338612d383736392d366135356338646436333534222c22726563697069656e74223a7b22656e635f6b6964223a2235313131616161323537383930396538222c22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2231346134333138666464366235653630666634363930366633313362323166326332386139343065613361663162616237333239316161386333306166643832222c2273656e646572223a7b22686f73745f6964223a22686f73742d6576696c222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2239633862633965656535383932313236366138353034666630316236333830323138366230643364633836336334393636653637313638323932313831623836222c22736571223a397d2c2274797065223a226174656d2d656e76656c6f7065222c2276223a317d"
     },
     {
+      "built": true,
+      "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"403f4846-a8bd-4b6d-99d5-03eab589f63a\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"379a9db1d7b98c98253211b8c49bfabb4f71bdfa90c1131d423ee5270e7f46e6\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"842261b5e60a980a2e023c5669107ff8884ed45b779d53123c59b81a40fe7575\",\"seq\":12},\"type\":\"atem-envelope\",\"v\":1}",
+      "kind": "envelope",
+      "label": "removed_head_ahead",
+      "note": "a cancel by host-a at generation 1, signed at the head of B + M11_revoke_a + M12_readmit_a (seq 12)",
+      "object": {
+        "body": {
+          "account_id": "acct-test-1",
+          "created_at": 1793620800000,
+          "expires_at": 1793624400000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "id": "403f4846-a8bd-4b6d-99d5-03eab589f63a",
+          "recipient": {
+            "enc_kid": "5111aaa2578909e8",
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "sealed_hash": "379a9db1d7b98c98253211b8c49bfabb4f71bdfa90c1131d423ee5270e7f46e6",
+          "sender": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "signed_at_head": {
+            "hash": "842261b5e60a980a2e023c5669107ff8884ed45b779d53123c59b81a40fe7575",
+            "seq": 12
+          },
+          "type": "atem-envelope",
+          "v": 1
+        },
+        "ct": "AYyUXAPjbQf0d8l9YQEkxoDX4Y7srxaX2RFgKXsZYCG47LWY8oSGhZzlQr9i_v3Or7waYOESEoOZaQ9yYmXsuLvSgEWzrPh89WcpVZfQDzP4WQ",
+        "enc": "s1qrMadsGiQPImctTDNLQlvw7V0Fwpviw7i9A33dI3E",
+        "sig": "tuptwvHzsZc-poJ4N5hbrD2JYTG542Ec_kz1-oWm_XILNJaYWfXcE-2po8byAJcYpABSJ6lRFFT_Eb13nP73Bw"
+      },
+      "sealed": {
+        "ikmE_hex": "0404c65dcf52837ab42fbe0228a798be826c9f6a3ce8082576ed93b23c5449d2",
+        "ikm_label": "host-envelope removed_head_ahead",
+        "info_hex": "000000156174656d2d656e76656c6f70652d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d6100000008000000000000000100000006686f73742d6200000008000000000000000100000010353131316161613235373839303965380000002434303366343834362d613862642d346236642d393964352d30336561623538396636336100000008000001a19c21720000000008000001a19c586080",
+        "plaintext": "{\"kind\":\"cancel\",\"task_id\":\"2f72a9f3-a5a6-449c-b712-744927dcb0dd\"}",
+        "sealed_hash": "379a9db1d7b98c98253211b8c49bfabb4f71bdfa90c1131d423ee5270e7f46e6",
+        "to": "host-b-enc-1"
+      },
+      "signed_with": "host-a",
+      "signing_input_hex": "000000106174656d2d656e76656c6f70652d7631000002267b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2234303366343834362d613862642d346236642d393964352d303365616235383966363361222c22726563697069656e74223a7b22656e635f6b6964223a2235313131616161323537383930396538222c22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2233373961396462316437623938633938323533323131623863343962666162623466373162646661393063313133316434323365653532373065376634366536222c2273656e646572223a7b22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2238343232363162356536306139383061326530323363353636393130376666383838346564343562373739643533313233633539623831613430666537353735222c22736571223a31327d2c2274797065223a226174656d2d656e76656c6f7065222c2276223a317d"
+    },
+    {
       "built": false,
       "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"24fcff6b-c10f-47e2-ba6b-b2dd08bf02f7\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"9762f775c78d9a7768897219bd043a2c22fc333cfe5446ddf5b728c51c4eba59\",\"sender\":{\"host_id\":\"host-evil\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1}",
       "kind": "envelope",
@@ -3182,6 +3319,51 @@
       },
       "signed_with": "host-evil",
       "signing_input_hex": "0000000e6174656d2d726573756c742d7631000002277b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2230616231333165312d643631352d343066652d613638642d373065623233336637333732222c22726563697069656e74223a7b22656e635f6b6964223a2266376232393962336133646336396363222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2239636237646338323538313632383737376166396435313064636361313332323263366139663965363734643463646334363535373236316334663338616665222c2273656e646572223a7b22686f73745f6964223a22686f73742d6576696c222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2233343933386334333063653136636130636265333564366231663762626166303733623139353136656231313461396136353261386362396130633638323865222c22736571223a31307d2c2274797065223a226174656d2d726573756c74222c2276223a317d"
+    },
+    {
+      "built": true,
+      "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"73d496ef-480b-4049-b898-56c4321d8ca7\",\"recipient\":{\"enc_kid\":\"f7b299b3a3dc69cc\",\"host_id\":\"host-a\",\"host_trust_gen\":1},\"sealed_hash\":\"54ba8607a42c23f099601a74a966904e9c49f231e4aa3098f76a949bf7f626a0\",\"sender\":{\"host_id\":\"host-b\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"842261b5e60a980a2e023c5669107ff8884ed45b779d53123c59b81a40fe7575\",\"seq\":12},\"type\":\"atem-result\",\"v\":1}",
+      "kind": "result",
+      "label": "status_head_ahead",
+      "note": "host-b's status for the request, signed at the head of B + M11_revoke_a + M12_readmit_a (seq 12)",
+      "object": {
+        "body": {
+          "account_id": "acct-test-1",
+          "created_at": 1793620800000,
+          "expires_at": 1793624400000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "id": "73d496ef-480b-4049-b898-56c4321d8ca7",
+          "recipient": {
+            "enc_kid": "f7b299b3a3dc69cc",
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "sealed_hash": "54ba8607a42c23f099601a74a966904e9c49f231e4aa3098f76a949bf7f626a0",
+          "sender": {
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "signed_at_head": {
+            "hash": "842261b5e60a980a2e023c5669107ff8884ed45b779d53123c59b81a40fe7575",
+            "seq": 12
+          },
+          "type": "atem-result",
+          "v": 1
+        },
+        "ct": "nTeRLQQjXI_XMvNKr8ajTHe12dI4aVj8OMbq9OyWBTZ7zOmnh3OWZXiSpE3x7-_rbWzpwO0VeErkkyMlvIgmseE35WkXxYZF9NtghXq6Aa_d6MAYTs1QM3yejMYU6IZL5055t0ad-n_mTOsP1ddTl_0yXQsfOCuPG7VPESHs3EnTR--qJW3z_F3NS3N6hOwMtwx7Q53pAxuwRM46ZQgmdTYPcN-bzZ47Qmb_Yb9-OwzyMWVVjYDLS3iA",
+        "enc": "_OzD6LUkO3LGQZ9gB7gmMM80vw5a_wFsf4mkVhZnbxM",
+        "sig": "KWhNKoGEfcjNLJzF6aUACmXxz-1rpyr6NlWa1KcLlCWpOdh6uGQgV7H1WiHJSxqTBRK8ahEJt_wvvCvlBJuyAg"
+      },
+      "sealed": {
+        "ikmE_hex": "e6ed1ba3936bcc7628c8a0fb7422ff53bcc4353ab5a9e88fcbc53bc2875b8222",
+        "ikm_label": "host-envelope status_head_ahead",
+        "info_hex": "000000136174656d2d726573756c742d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d6200000008000000000000000100000006686f73742d6100000008000000000000000100000010663762323939623361336463363963630000002437336434393665662d343830622d343034392d623839382d35366334333231643863613700000008000001a19c21720000000008000001a19c586080",
+        "plaintext": "{\"kind\":\"status\",\"message_id\":\"24fcff6b-c10f-47e2-ba6b-b2dd08bf02f7\",\"recipients\":[{\"delivery\":{\"state\":\"stored\"},\"recipient_id\":\"01c94a01-47ff-410c-9b6e-2fccc2163b13\"}]}",
+        "sealed_hash": "54ba8607a42c23f099601a74a966904e9c49f231e4aa3098f76a949bf7f626a0",
+        "to": "host-a-enc-1"
+      },
+      "signed_with": "host-b",
+      "signing_input_hex": "0000000e6174656d2d726573756c742d7631000002247b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2237336434393665662d343830622d343034392d623839382d353663343332316438636137222c22726563697069656e74223a7b22656e635f6b6964223a2266376232393962336133646336396363222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2235346261383630376134326332336630393936303161373461393636393034653963343966323331653461613330393866373661393439626637663632366130222c2273656e646572223a7b22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2238343232363162356536306139383061326530323363353636393130376666383838346564343562373739643533313233633539623831613430666537353735222c22736571223a31327d2c2274797065223a226174656d2d726573756c74222c2276223a317d"
     },
     {
       "built": false,

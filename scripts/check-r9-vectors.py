@@ -906,7 +906,9 @@ def reply_ok(r):
         and r["state"] == "submitted"
         and safe_int(r.get("submitted_at"))
         and r["dropped"] is False
-        and r["digest"] == sha256(r["text"].encode()).hex()
+        # A dropped reply keeps its digest without its text: `dropped`
+        # alone refuses it.
+        and (r["dropped"] is True or r["digest"] == sha256(r["text"].encode()).hex())
         and isinstance(r["context"], list)
         and all(snapshot_ok(s) for s in r["context"])
     )
@@ -1078,6 +1080,11 @@ def mail_verdict(wire, call, hosts, receiver_keys, receiver, now, outbox):
         if hosts.hashes.get(head["seq"]) != head["hash"]:
             return refused("signed_at_head_wrong_hash")
     if ahead:
+        # A removed host's generation never returns (add_host generations
+        # strictly rise): its envelope at that generation is refused at any
+        # head, after the body's times. Its result waits, to be kept as data.
+        if removed and envelope and not generation_ahead:
+            return refused(mail_times(body, now) or "removed_sender")
         return wait(None if generation_ahead else key)
     standing = "revoked" if state == "revoked" else "removed" if removed else "current"
     # 4. The signature, with the key of the sender's newest add_host.
@@ -1226,10 +1233,13 @@ def check_host_envelope(file, data, report, context):
                 case.equal((len(plain), sha256(plain).hex()), (sealed["plaintext_bytes"], sealed["plaintext_sha256"]), f"opens for {to}: its length and SHA-256")
             case.equal(hpke_seal(keys.public(to, "enc"), info, plain, ikm), (enc_bytes, ct), "sealed again from ikmE: the same enc and ct")
             plaintexts[label] = plain
-            value = json.loads(plain) if b"null" not in plain else None
-            if isinstance(value, dict) and value.get("kind") == "request":
-                message_size = len(jcs(value["message"]).encode())
-                case.check(True, f"Message {message_size} bytes, plaintext {len(plain)} (bounds {MAX_MESSAGE_BYTES}, +{REQUEST_WRAPPER_BYTES})")
+            # The objects at the bounds: a Message of exactly 240 KiB in its
+            # 29-byte wrapper, and one a byte longer.
+            at_bound = {"request_max": 0, "request_over": 1}
+            if label in at_bound:
+                message_size = len(jcs(json.loads(plain)["message"]).encode())
+                want = MAX_MESSAGE_BYTES + at_bound[label]
+                case.equal((message_size, len(plain)), (want, want + REQUEST_WRAPPER_BYTES), "Message and plaintext at the bound")
             if vector["built"]:
                 reason, _ = mail_plaintext(body["type"], plain)
                 case.equal(reason, None, "a builder's plaintext: strict, canonical, within its bound")

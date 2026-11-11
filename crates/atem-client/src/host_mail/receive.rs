@@ -33,23 +33,29 @@
 //!
 //! **Pending.** A `signed_at_head.seq` beyond this host's head can't be
 //! judged yet, whatever the sender's standing in this list: entries this host
-//! hasn't seen may add the sender (unknown here), re-add it (removed), readmit
-//! it (revoked) or bring its newer generation, and no sender can know the hash
-//! of an entry that doesn't exist. Step 5 runs first, on the body's times; an
+//! hasn't seen may add the sender (unknown here), re-add it at a newer
+//! generation (removed), readmit it (revoked) or bring its newer generation,
+//! and no sender can know the hash of an entry that doesn't exist. Two claims
+//! are settled at any head: a generation below the sender's newest
+//! (`stale_sender_generation`), and an envelope from a removed host at the
+//! generation it last held (`removed_sender`, after the body's times): that
+//! generation never returns. Step 5 runs first, on the body's times; an
 //! object that fails it is [`EnvelopeVerdict::Refused`]. Then, when this list
 //! already holds the claimed `(host_id, host_trust_gen)`'s `add_host` (a
-//! current or removed host at its newest generation), the signature is
-//! checked before waiting, since that pair has exactly one key forever: a bad
-//! one is `bad_signature`, so junk can't fill a known sender's waiting slots.
-//! Otherwise the signature can't be checked yet. An object that passes is
-//! [`EnvelopeVerdict::Pending`], to be judged again after each device-list
-//! advance. When the head is **not** beyond this list's, that head settles the
-//! standing and the generation: an unknown sender at or below it is
-//! `unknown_sender`, a removed one `removed_sender`, a revoked one
-//! `revoked_sender`, and a claimed generation the list doesn't hold, or whose
-//! `add_host` comes after `signed_at_head.seq`, is `generation_ahead`: at a
-//! head this list holds it knows the list the sender signed at (generations
-//! rise with `seq`), so every head gives the same verdict.
+//! current host at its newest generation, or a removed host's result), the
+//! signature is checked before waiting, since that pair has exactly one key
+//! forever: a bad one is `bad_signature`, so junk can't fill a known sender's
+//! waiting slots. Otherwise the signature can't be checked yet. An object
+//! that passes is [`EnvelopeVerdict::Pending`], to be judged again after each
+//! device-list advance. When the head is **not** beyond this list's, that
+//! head settles the standing and the generation: an unknown sender at or
+//! below it is `unknown_sender`, a removed one `removed_sender`, a revoked
+//! one `revoked_sender`, and a claimed generation the list doesn't hold, or
+//! whose `add_host` comes after `signed_at_head.seq`, is `generation_ahead`:
+//! at a head this list holds it knows the list the sender signed at
+//! (generations rise with `seq`), and no later entry changes those
+//! refusals. The host marks every refused object done and never judges it
+//! again (host-work-v1 §11.5); this module only judges.
 //!
 //! **Refused or refused-authenticated.** Until step 4 passes, nothing says who
 //! sent the object, so a failure is [`EnvelopeVerdict::Refused`] (kept as
@@ -112,9 +118,11 @@ pub mod reason {
     /// Check 3: no `add_host` here names the sender, and `signed_at_head` is
     /// not beyond this head (which would make the object wait).
     pub const UNKNOWN_SENDER: &str = "unknown_sender";
-    /// Check 3: the sender was removed, and `signed_at_head` is not beyond
-    /// this head (an envelope; also a result claiming a generation the removed
-    /// host never had). A removed host's result is otherwise kept as data.
+    /// Check 3: the sender was removed. An envelope at the generation it last
+    /// held, at any head (after the body's times when the head is beyond this
+    /// one: that generation never returns); an envelope or a result claiming
+    /// a generation the removed host never had, when `signed_at_head` is not
+    /// beyond this head. A removed host's result is otherwise kept as data.
     pub const REMOVED_SENDER: &str = "removed_sender";
     /// Check 3: `sender.host_trust_gen` is below the sender's newest `add_host`.
     pub const STALE_SENDER_GENERATION: &str = "stale_sender_generation";
@@ -171,6 +179,40 @@ pub mod reason {
     /// A verified result of a host this list has removed: kept as data
     /// (II.4.4's return-grant detail).
     pub const NOT_DELIVERED_SENDER_REMOVED: &str = "result not delivered: sender removed";
+
+    /// Every reason above, once (the shared vectors have a check for each).
+    pub const ALL: [&str; 30] = [
+        MALFORMED,
+        WRONG_KIND,
+        PIN_MISMATCH,
+        NOT_FOR_THIS_HOST,
+        RECIPIENT_GENERATION,
+        ENC_KEY_NOT_ACCEPTED,
+        UNKNOWN_SENDER,
+        REMOVED_SENDER,
+        STALE_SENDER_GENERATION,
+        GENERATION_AHEAD,
+        REVOKED_SENDER,
+        SIGNED_AT_HEAD_BEFORE_GENERATION,
+        SIGNED_AT_HEAD_WRONG_HASH,
+        NOT_THE_RECIPIENT,
+        BAD_SIGNATURE,
+        BAD_TIMES,
+        LIFETIME_TOO_LONG,
+        EXPIRED,
+        CREATED_TOO_FAR_AHEAD,
+        SEALED_HASH_MISMATCH,
+        OPEN_FAILED,
+        PLAINTEXT_NULL,
+        PLAINTEXT_TOO_LARGE,
+        PLAINTEXT_MALFORMED,
+        PLAINTEXT_MISMATCH,
+        ATTACHMENTS_NOT_ALLOWED,
+        INVALID_MESSAGE,
+        DOES_NOT_ANSWER_OUTBOX_ROW,
+        NOT_DELIVERED_SENDER_REVOKED,
+        NOT_DELIVERED_SENDER_REMOVED,
+    ];
 }
 
 use reason::*;
@@ -187,11 +229,12 @@ pub struct Recipient {
     /// this host's clock from when it applied the rotation) is open and the
     /// rotation didn't `retire_previous`. A kid not listed is refused.
     ///
-    /// The caller may also list a key it generated and handed out, and hasn't
-    /// retired, before that key's `host_enc_key` entry applies here: a sender
-    /// whose list already has the entry seals to it, and until this host
-    /// applies the entry that mail would be refused as `enc_key_not_accepted`
-    /// (and wait for a resend).
+    /// The caller should also list a key it generated and handed out, and
+    /// hasn't retired, before that key's `host_enc_key` entry applies here: a
+    /// sender whose list already has the entry seals to it, and that mail
+    /// would otherwise be refused as `enc_key_not_accepted` for good (a
+    /// refused object is done, and the sender's resend of the same bytes is a
+    /// duplicate).
     pub keys: Vec<(KeyId, [u8; 8])>,
 }
 
@@ -642,6 +685,17 @@ fn admit(
         }
     }
     if head_ahead {
+        // A removed host's envelope at the generation it last held is
+        // settled at any head: generations strictly rise, so no entry this
+        // host lacks can bring that one back (a re-add is a newer one). The
+        // body's times first, as for every object beyond this head. Its
+        // result waits, to be kept as data.
+        if removed && kind == MailKind::Envelope && !generation_ahead {
+            return match check_times(body.created_at, body.expires_at, now_ms) {
+                Err(reason) => refuse(reason),
+                Ok(()) => refuse(REMOVED_SENDER),
+            };
+        }
         // Only a generation this list holds has a known key.
         return wait((!generation_ahead).then_some(&host.host_key));
     }
@@ -1487,19 +1541,28 @@ mod tests {
         assert_eq!(judge(&junk), refused(BAD_SIGNATURE, &junk));
         assert_eq!(judge(&real), pending("host-a", 1));
 
-        // A removed host, at the generation it last held.
+        // A removed host's result, at the generation it last held (its
+        // envelope is refused at any head: that generation never returns).
         let mut w = World::new();
-        let me = w.recipient("host-b", true);
-        let mut f = w.fields("host-a", "host-b");
-        w.remove_host("host-a");
+        let outbox = expected(&w);
+        let mut f = w.fields("host-b", "host-a");
+        w.remove_host("host-b");
         f.signed_at_head = Head {
             seq: w.head().seq + 1,
             hash: Hash32([0x66; 32]),
         };
-        let real = w.envelope(&f, &w.request(&f));
+        let real = result(&w, &f, &status(ID));
         let junk = junk_sig(&real);
-        assert_eq!(w.open(&junk, &me), refused(BAD_SIGNATURE, &junk));
-        assert_eq!(w.open(&real, &me), pending("host-a", 1));
+        let a = w.recipient("host-a", true);
+        let judge = |object: &SignedObject| accept_result(object, &w.m, &a, &outbox, &w.encs, NOW);
+        assert_eq!(judge(&junk), result_refused(BAD_SIGNATURE, &junk));
+        assert_eq!(
+            judge(&real),
+            ResultVerdict::Pending {
+                host_id: "host-b".into(),
+                host_trust_gen: 1,
+            }
+        );
 
         // A result from the row's host, a head beyond ours.
         let mut w = World::new();
@@ -1716,10 +1779,12 @@ mod tests {
         }
     }
 
-    /// Entries this host hasn't seen may re-add a removed host (II.4.2): its
-    /// envelope signed at a head beyond ours waits.
+    /// Entries this host hasn't seen may re-add a removed host (II.4.2), at a
+    /// newer generation: its envelope signed at a head beyond ours waits. At
+    /// the generation the host last held, it is refused at any head, after
+    /// the body's times: generations strictly rise, so that one never returns.
     #[test]
-    fn a_removed_sender_with_a_head_beyond_ours_is_pending() {
+    fn a_removed_sender_at_a_newer_generation_waits_and_at_its_last_one_is_refused() {
         let mut w = World::new();
         let me = w.recipient("host-b", true);
         w.remove_host("host-a");
@@ -1735,7 +1800,7 @@ mod tests {
         );
         assert!(matches!(w.open(&object, &me), EnvelopeVerdict::Open { .. }));
         // The same claim at its old generation, for a head that doesn't
-        // exist yet: pending; once the list reaches that seq it is refused.
+        // exist yet: refused now, and once the list reaches that seq.
         let mut w = World::new();
         let me = w.recipient("host-b", true);
         let mut f = w.fields("host-a", "host-b");
@@ -1745,7 +1810,11 @@ mod tests {
             hash: Hash32([0x66; 32]),
         };
         let object = w.envelope(&f, &w.request(&f));
-        assert_eq!(w.open(&object, &me), pending("host-a", 1));
+        assert_eq!(w.open(&object, &me), refused(REMOVED_SENDER, &object));
+        // A junk signature changes nothing: it is refused before the
+        // signature is checked.
+        let junk = edited(&object, |v| v["sig"] = json!(b64u(&[1u8; 64])));
+        assert_eq!(w.open(&junk, &me), refused(REMOVED_SENDER, &junk));
         w.add_host("host-c", 2);
         assert_eq!(w.open(&object, &me), refused(REMOVED_SENDER, &object));
         // The time checks on the body's times come first.
@@ -1754,6 +1823,56 @@ mod tests {
         late.expires_at = NOW - 500;
         let object = w.envelope(&late, &w.request(&late));
         assert_eq!(w.open(&object, &me), refused(EXPIRED, &object));
+        // Re-added: a newer generation, so the old one is stale at any head.
+        w.add_host("host-a", 2);
+        let mut ahead = f.clone();
+        ahead.signed_at_head.seq = w.head().seq + 1;
+        let object = w.envelope(&ahead, &w.request(&ahead));
+        assert_eq!(
+            w.open(&object, &me),
+            refused(STALE_SENDER_GENERATION, &object)
+        );
+    }
+
+    /// Every reason a verdict names is in `reason::ALL`, once.
+    #[test]
+    fn every_reason_is_listed_once() {
+        let all: std::collections::BTreeSet<&str> = ALL.iter().copied().collect();
+        assert_eq!(all.len(), ALL.len());
+        for reason in [
+            MALFORMED,
+            WRONG_KIND,
+            PIN_MISMATCH,
+            NOT_FOR_THIS_HOST,
+            RECIPIENT_GENERATION,
+            ENC_KEY_NOT_ACCEPTED,
+            UNKNOWN_SENDER,
+            REMOVED_SENDER,
+            STALE_SENDER_GENERATION,
+            GENERATION_AHEAD,
+            REVOKED_SENDER,
+            SIGNED_AT_HEAD_BEFORE_GENERATION,
+            SIGNED_AT_HEAD_WRONG_HASH,
+            NOT_THE_RECIPIENT,
+            BAD_SIGNATURE,
+            BAD_TIMES,
+            LIFETIME_TOO_LONG,
+            EXPIRED,
+            CREATED_TOO_FAR_AHEAD,
+            SEALED_HASH_MISMATCH,
+            OPEN_FAILED,
+            PLAINTEXT_NULL,
+            PLAINTEXT_TOO_LARGE,
+            PLAINTEXT_MALFORMED,
+            PLAINTEXT_MISMATCH,
+            ATTACHMENTS_NOT_ALLOWED,
+            INVALID_MESSAGE,
+            DOES_NOT_ANSWER_OUTBOX_ROW,
+            NOT_DELIVERED_SENDER_REVOKED,
+            NOT_DELIVERED_SENDER_REMOVED,
+        ] {
+            assert!(all.contains(reason), "{reason}");
+        }
     }
 
     #[test]

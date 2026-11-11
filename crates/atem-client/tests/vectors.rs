@@ -4764,6 +4764,21 @@ fn host_envelope_vectors(book: &Book) -> Value {
         MailPlain::Envelope(cancel(&task)),
         "host-b-enc-1",
     );
+    let at_12 = on_b(&["M11_revoke_a", "M12_readmit_a"]);
+    let f = g.fields(
+        "removed_head_ahead",
+        MAIL_A1,
+        MAIL_B1,
+        "host-b-enc-1",
+        &at_12,
+    );
+    g.seal(
+        "removed_head_ahead",
+        "a cancel by host-a at generation 1, signed at the head of B + M11_revoke_a + M12_readmit_a (seq 12)",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-1",
+    );
     g.resign(
         "resigned",
         "host-evil strips the request and re-signs it as its own (sender host-evil): its signature verifies, but the seal's info binds host-a",
@@ -4870,6 +4885,20 @@ fn host_envelope_vectors(book: &Book) -> Value {
     g.seal(
         "evil_status",
         "a status for the request from host-evil, a host of the account the outbox row didn't go to",
+        f,
+        MailPlain::Result(status()),
+        "host-a-enc-1",
+    );
+    let f = g.fields(
+        "status_head_ahead",
+        MAIL_B1,
+        MAIL_A1,
+        "host-a-enc-1",
+        &on_b(&["M11_revoke_a", "M12_readmit_a"]),
+    );
+    g.seal(
+        "status_head_ahead",
+        "host-b's status for the request, signed at the head of B + M11_revoke_a + M12_readmit_a (seq 12)",
         f,
         MailPlain::Result(status()),
         "host-a-enc-1",
@@ -5088,6 +5117,26 @@ fn host_envelope_vectors(book: &Book) -> Value {
         &on_b(&["M11_remove_a"]),
         e,
         "the request that opened at B, once host-a is removed",
+    );
+    let e = g.refused("removed_head_ahead", "removed_sender");
+    at(
+        &mut g,
+        "removed_sender_head_ahead",
+        "removed_head_ahead",
+        &on_b(&["M11_remove_a"]),
+        e,
+        "a removed host at the generation it last held, signed beyond the receiver's head: refused at any head (that generation never returns)",
+    );
+    let e = g.refused("removed_head_ahead", "expired");
+    g.check(
+        "removed_sender_head_ahead_times_first",
+        "the same, at its expires_at: the body's times come first",
+        "removed_head_ahead",
+        &on_b(&["M11_remove_a"]),
+        to_b,
+        MAIL_EXPIRES,
+        None,
+        e,
     );
     let e = g.refused("evil_at_head_9", "unknown_sender");
     at(
@@ -5325,6 +5374,16 @@ fn host_envelope_vectors(book: &Book) -> Value {
         MAIL_NOW,
         Some(outbox(&request_id)),
         e,
+    );
+    g.check(
+        "removed_result_head_ahead_pending",
+        "a removed host's result signed beyond the receiver's head waits (its signature checked first), to be kept as data",
+        "status_head_ahead",
+        &on_b(&["M11_remove_b"]),
+        to_a,
+        MAIL_NOW,
+        Some(outbox(&request_id)),
+        mail_pending(MAIL_B1),
     );
     for (label, chain, detail, note) in [
         (
@@ -5689,42 +5748,8 @@ fn host_envelope() {
         .iter()
         .filter_map(|c| c["expect"].get("reason").and_then(Value::as_str))
         .collect();
-    {
-        use atem_client::host_mail::receive::reason::*;
-        for reason in [
-            MALFORMED,
-            WRONG_KIND,
-            PIN_MISMATCH,
-            NOT_FOR_THIS_HOST,
-            RECIPIENT_GENERATION,
-            ENC_KEY_NOT_ACCEPTED,
-            UNKNOWN_SENDER,
-            REMOVED_SENDER,
-            STALE_SENDER_GENERATION,
-            GENERATION_AHEAD,
-            REVOKED_SENDER,
-            SIGNED_AT_HEAD_BEFORE_GENERATION,
-            SIGNED_AT_HEAD_WRONG_HASH,
-            NOT_THE_RECIPIENT,
-            BAD_SIGNATURE,
-            BAD_TIMES,
-            LIFETIME_TOO_LONG,
-            EXPIRED,
-            CREATED_TOO_FAR_AHEAD,
-            SEALED_HASH_MISMATCH,
-            OPEN_FAILED,
-            PLAINTEXT_NULL,
-            PLAINTEXT_TOO_LARGE,
-            PLAINTEXT_MALFORMED,
-            PLAINTEXT_MISMATCH,
-            ATTACHMENTS_NOT_ALLOWED,
-            INVALID_MESSAGE,
-            DOES_NOT_ANSWER_OUTBOX_ROW,
-            NOT_DELIVERED_SENDER_REVOKED,
-            NOT_DELIVERED_SENDER_REMOVED,
-        ] {
-            assert!(reasons.contains(reason), "no check refuses for {reason}");
-        }
+    for reason in atem_client::host_mail::receive::reason::ALL {
+        assert!(reasons.contains(reason), "no check refuses for {reason}");
     }
     run.pass("every reason of host_mail::receive has a check");
     run.finish();
