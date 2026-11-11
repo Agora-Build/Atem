@@ -1403,7 +1403,32 @@ impl MembershipHost {
                     all.get_or_insert((FenceReason::HostRemoved, seq));
                     continue;
                 }
-                _ => continue,
+                // No fence: another host's removal, a member added, a key
+                // changed, recoveries (their own pass), evidence, a freeze
+                // (fenced on its own path).
+                Change::HostRemoved { .. }
+                | Change::MemberAdded { .. }
+                | Change::HostKeyChanged { .. }
+                | Change::RecoveryPending { .. }
+                | Change::RecoveryActive { .. }
+                | Change::RecoveryCancelled { .. }
+                | Change::RecoveryKeyReplaced
+                | Change::KBackupRecorded { .. }
+                | Change::VetoReplaced(_)
+                | Change::Evidence(_)
+                | Change::Frozen => continue,
+                // Delegated host-work (design II.2.2, II.3.1, II.4.1): no
+                // fence in step 3. A host principal has no attachments here;
+                // cancelling a revoked host's unstarted tasks, interrupt
+                // intents and re-checking a project's tasks are host-work's
+                // effects, which belong to R9.3's step 4 and come in step 4
+                // with host-work's own applied device-list seq (II.3.1,
+                // "Crash safety: effects belong to R9.3's step 4").
+                Change::ProjectSet { .. }
+                | Change::ProjectRemoved { .. }
+                | Change::HostSenderRevoked { .. }
+                | Change::HostSenderReadmitted { .. }
+                | Change::HostEncKeySet { .. } => continue,
             };
             if let Some(state) = eval.next.member(device) {
                 list.push(Fence {
@@ -1434,7 +1459,24 @@ impl MembershipHost {
                     all = Some(seq);
                     continue;
                 }
-                _ => continue,
+                // No fence: the rest of the device list's own actions.
+                Action::RemoveHost { .. }
+                | Action::Genesis { .. }
+                | Action::Add { .. }
+                | Action::AddHost { .. }
+                | Action::RecoveryAdd { .. }
+                | Action::SetRecoveryKey { .. }
+                | Action::RecoveryApprove { .. }
+                | Action::RecoveryVeto { .. }
+                | Action::KBackup(_) => continue,
+                // The new actions (see `planned_fences`): nothing to fence
+                // or replay in step 3; their host-work effects are step 4's,
+                // keyed to host-work's applied seq, not to this one.
+                Action::ProjectSet { .. }
+                | Action::ProjectRemove { .. }
+                | Action::HostSenderRevoke { .. }
+                | Action::HostSenderReadmit { .. }
+                | Action::HostEncKey { .. } => continue,
             };
             if let Some(state) = self.m.member(&device) {
                 let principal = principal_of(&state.member);

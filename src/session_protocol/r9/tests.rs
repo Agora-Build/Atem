@@ -583,6 +583,67 @@ fn a_phone_a_bot_and_a_browser_are_admitted_on_one_link() {
     assert_eq!(rig.list("ch-browser"), vec![SID.to_string()]);
 }
 
+/// Step 3 teaches the host the new device-list entries (project grants,
+/// host-sender revocation, host encryption keys) and advertises nothing: a
+/// welcome after the host carried them lists the features it listed before,
+/// none of `host.delegated`, `host.alerts` or `host.senders`, and nobody is
+/// fenced (a host principal has no attachments; the host-work effects come
+/// in step 4, design II.3.1 "Crash safety").
+#[test]
+fn welcome_features_unchanged() {
+    const NEVER: [&str; 3] = ["host.delegated", "host.alerts", "host.senders"];
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("ch-phone", phone());
+    rig.advance(1000);
+    rig.connect("ch-bot", bot());
+    let before = welcome(&mut rig, "ch-phone").features;
+    assert!(before.iter().any(|f| f == "membership.carry"));
+    for feature in NEVER {
+        assert!(!before.iter().any(|f| f == feature), "{feature}");
+    }
+    assert_eq!(welcome(&mut rig, "ch-bot").features, before);
+    // The Mac connects with the new entries in its hello.
+    let host_head = rig.log.log.head();
+    let signed_at = r9log::host_now().wall_ms;
+    let genesis = rig.log.genesis_hash();
+    for action in r9log::delegated_actions(
+        ACCOUNT,
+        &genesis,
+        HOST,
+        1,
+        &secret("host seed"),
+        "host-other",
+        signed_at,
+    ) {
+        rig.log.append(r9log::MAC, action);
+    }
+    let client_log = rig.log.log.clone();
+    assert_eq!(client_log.head().seq, host_head.seq + 7);
+    rig.advance(1000);
+    rig.connect_with(
+        "ch-mac",
+        Identity::native(r9log::MAC, r9log::auth(r9log::MAC)),
+        Some(&client_log),
+    );
+    let after = welcome(&mut rig, "ch-mac");
+    assert_eq!(after.head, client_log.head());
+    assert_eq!(rig.m.as_ref().unwrap().head(), client_log.head());
+    assert_eq!(after.features, before);
+    for feature in NEVER {
+        assert!(!after.features.iter().any(|f| f == feature), "{feature}");
+    }
+    // Nobody was fenced: the phone and the bot are attached as before.
+    assert_eq!(rig.engine.status().attachments, 3);
+    assert_eq!(rig.rt.host.welcomed_attachments(), 3);
+    assert_eq!(welcome(&mut rig, "ch-phone").features, before);
+    assert_eq!(
+        rig.list("ch-phone"),
+        vec![SID.to_string(), SID_B.to_string()]
+    );
+    assert_eq!(rig.list("ch-bot"), vec![SID.to_string()]);
+}
+
 /// Out of scope and nonexistent are both `unknown_session`; an op outside
 /// the ops is `forbidden`.
 #[test]
