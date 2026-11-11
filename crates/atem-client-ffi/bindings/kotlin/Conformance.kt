@@ -927,7 +927,10 @@ fun main(args: Array<String>) {
         eq(t1.next.reportingStopped(), false)
         // The same report client ID keeps every report; another drops them.
         eq(stopped.resumeReporting("station-1").next.pendingReports(), t1.next.pendingReports())
-        eq(stopped.resumeReporting("station-2").alerts, listOf(LedgerAlertInfo.ReportsDropped("station-1", listOf(id))))
+        val other = stopped.resumeReporting("station-2")
+        eq(other.alerts, listOf(LedgerAlertInfo.ReportsDropped("station-1", listOf(id))))
+        eq(other.next.droppedReports(), listOf(id))
+        eq(other.next.droppedClientIds(), listOf("station-1"))
         throwsCode("malformed") { l.stopReporting("a b") }
         val text = t1.next.toJson()
         eq(AckLedgerHandle.fromJson(text).toJson(), text)

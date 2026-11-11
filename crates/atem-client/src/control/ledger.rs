@@ -251,7 +251,8 @@ impl ReportAnswer {
 
 /// An operator alert a transition raises, once. The ledger keeps what it
 /// is about ([`AckLedger::refused_reports`],
-/// [`AckLedger::stopped_client_id`], [`AckLedger::dropped_reports`]), so a
+/// [`AckLedger::stopped_client_id`], [`AckLedger::dropped_reports`] with
+/// [`AckLedger::dropped_client_ids`]), so a
 /// Station that died between the commit and the alert raises it again from
 /// the state at start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -562,8 +563,9 @@ pub struct AckLedger {
     /// The reports the Portal refused for good.
     refused: BTreeSet<String>,
     /// The reports a resume under another report client ID than the
-    /// stop's dropped unsent.
-    dropped: BTreeSet<String>,
+    /// stop's dropped unsent, each with the report client ID it was dropped
+    /// under (the stopped one).
+    dropped: BTreeMap<String, String>,
     /// The report client ID the Portal refused (`403`): every report is
     /// held until a resume.
     stopped: Option<String>,
@@ -650,7 +652,7 @@ impl AckLedger {
             done: BTreeMap::new(),
             pending: Vec::new(),
             refused: BTreeSet::new(),
-            dropped: BTreeSet::new(),
+            dropped: BTreeMap::new(),
             stopped: None,
         })
     }
@@ -922,7 +924,8 @@ impl AckLedger {
             return Ok(next.with(Vec::new()));
         }
         let dropped: Vec<String> = next.pending.drain(..).map(|p| p.intent.report_id).collect();
-        next.dropped.extend(dropped.iter().cloned());
+        next.dropped
+            .extend(dropped.iter().map(|id| (id.clone(), stopped.clone())));
         let mut t = next.with(Vec::new());
         t.alerts.push(LedgerAlert::ReportsDropped {
             client_id: stopped.clone(),
@@ -940,7 +943,14 @@ impl AckLedger {
     /// dropped unsent (sorted): kept, like the refusals, so a Station that
     /// may have lost the alert raises it again.
     pub fn dropped_reports(&self) -> Vec<String> {
-        self.dropped.iter().cloned().collect()
+        self.dropped.keys().cloned().collect()
+    }
+
+    /// The report client ID each report of [`AckLedger::dropped_reports`]
+    /// was dropped under (the stopped one), in the same order: one per
+    /// dropped report, so an alert raised again at start names it.
+    pub fn dropped_client_ids(&self) -> Vec<String> {
+        self.dropped.values().cloned().collect()
     }
 
     /// The Portal refused this Station's reports: every report is held.
@@ -1025,7 +1035,7 @@ impl AckLedger {
     ///    "revoked_at_ms":…,"covered":[…],"outcome"?:"all_applied"}},
     ///  "done":[{"principal","effect","revoke_seq"?,"host","record_id"}],
     ///  "pending":[{"principal","report_id","report":{…},"not_before":[…]}],
-    ///  "refused":["<report_id>"],"dropped":["<report_id>"],
+    ///  "refused":["<report_id>"],"dropped":{"<report_id>":"<client id>"},
     ///  "stopped"?:"<report client id>"}
     /// ```
     pub fn to_json(&self) -> Value {
@@ -1171,11 +1181,16 @@ impl AckLedger {
             }
             ledger.refused.insert(id);
         }
-        for id in id_list(&o["dropped"], "ack ledger dropped")? {
-            if !made.contains(&id) || ids.contains(&id) || ledger.refused.contains(&id) {
-                return Err(Error::Malformed("ack ledger dropped"));
+        for (id, client_id) in object(&o["dropped"], "ack ledger dropped")? {
+            let settled_once =
+                made.contains(id) && !ids.contains(id) && !ledger.refused.contains(id);
+            let by = client_id.as_str().filter(|c| id_ok(c));
+            match (settled_once, by) {
+                (true, Some(by)) => {
+                    ledger.dropped.insert(id.clone(), by.to_owned());
+                }
+                _ => return Err(Error::Malformed("ack ledger dropped")),
             }
-            ledger.dropped.insert(id);
         }
         ledger.stopped = match o.get("stopped") {
             None => None,
@@ -3486,8 +3501,10 @@ mod ack_ledger_tests {
         l = t.next;
         assert!(!l.reporting_stopped());
         assert_eq!(l.pending_reports(), vec![]);
-        // Kept apart from the refusals, so a Station raises them again.
+        // Kept apart from the refusals, each with the client ID it was
+        // dropped under, so a Station raises the alert again whole.
         assert_eq!(l.dropped_reports(), ids(&a));
+        assert_eq!(l.dropped_client_ids(), vec![CLIENT.to_owned()]);
         assert_eq!(l.refused_reports(), Vec::<String>::new());
         // The revocation reports on: a late host, then the final, which
         // waits for nothing dropped (a dropped report is settled).
@@ -3508,8 +3525,14 @@ mod ack_ledger_tests {
             vec![]
         );
         let v = l.to_json();
-        assert_eq!(v["dropped"], json!(ids(&a)));
+        assert_eq!(v["dropped"], json!({a[0].report_id.clone(): CLIENT}));
         assert_eq!(AckLedger::from_json(&v).unwrap(), l);
+        let mut bad = v.clone();
+        bad["dropped"][a[0].report_id.as_str()] = json!("a b");
+        assert!(
+            AckLedger::from_json(&bad).is_err(),
+            "a client ID out of grammar"
+        );
         // Not stopped, a resume compares no ID: it changes nothing.
         let t = l.resume_reporting(CLIENT).unwrap();
         assert_eq!((t.next, t.made, t.alerts), (l.clone(), vec![], vec![]));
@@ -3547,26 +3570,26 @@ mod ack_ledger_tests {
                 }),
             ),
             (
-                "dropped not a list",
-                Box::new(|v| v["dropped"] = json!("x")),
+                "dropped not an object",
+                Box::new(|v| v["dropped"] = json!([])),
             ),
             (
                 "dropped and pending",
                 Box::new({
                     let rb = rb.clone();
-                    move |v| v["dropped"] = json!([rb.clone()])
+                    move |v| v["dropped"] = json!({rb.clone(): "c-1"})
                 }),
             ),
             (
                 "dropped and refused",
                 Box::new({
                     let ra = ra.clone();
-                    move |v| v["dropped"] = json!([ra.clone()])
+                    move |v| v["dropped"] = json!({ra.clone(): "c-1"})
                 }),
             ),
             (
                 "dropped, never made",
-                Box::new(|v| v["dropped"] = json!([format!("revoked:{}", "0".repeat(64))])),
+                Box::new(|v| v["dropped"] = json!({format!("revoked:{}", "0".repeat(64)): "c-1"})),
             ),
             (
                 "a revocation retired",

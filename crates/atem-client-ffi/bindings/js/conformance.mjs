@@ -740,7 +740,9 @@ check("Station acks: a call never changes its handle; the state loads only as wr
   eq(t1.next.reportingStopped(), false);
   // The same report client ID keeps every report; another drops them.
   eq(stopped.resumeReporting("station-1").next.pendingReports(), t1.next.pendingReports());
-  eq(stopped.resumeReporting("station-2").alerts, [{ type: "reports_dropped", clientId: "station-1", dropped: [id] }]);
+  const other = stopped.resumeReporting("station-2");
+  eq(other.alerts, [{ type: "reports_dropped", clientId: "station-1", dropped: [id] }]);
+  eq([other.next.droppedReports(), other.next.droppedClientIds()], [[id], ["station-1"]]);
   throwsCode(() => l.stopReporting("a b"), "malformed");
   const text = t1.next.toJson();
   eq(m.AckLedgerHandle.fromJson(text).toJson(), text);

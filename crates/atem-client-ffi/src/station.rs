@@ -678,6 +678,12 @@ impl AckLedgerHandle {
         self.ledger.dropped_reports()
     }
 
+    /// The report client ID each report of `dropped_reports` was dropped
+    /// under (the stopped one), in the same order.
+    pub fn dropped_client_ids(&self) -> Vec<String> {
+        self.ledger.dropped_client_ids()
+    }
+
     /// The Portal refused this Station's reports (`403`): every report is
     /// held.
     pub fn reporting_stopped(&self) -> bool {

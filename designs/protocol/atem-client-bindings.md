@@ -1073,7 +1073,7 @@ to re-sign. Keep one per device list your Station serves.
 | `report_answer(status)` | the class of the Portal's HTTP status: `Confirm`, `Retry`, `Refuse`, `StopReporting` (below) |
 | `confirm(report_id)`, `refuse(report_id)` | the Portal accepted the report; refused it for good (settled, never sent again, a `ReportRefused` alert) |
 | `stop_reporting(client_id)`, `resume_reporting(client_id)` | the Portal answered `403` to your report client `client_id` (your `station.report` client at Auth): the ledger records the ID and holds every report, none sent, until a resume (one `ReportingStopped` alert; refused `Invalid{malformed}` for an ID that isn't 1 to 128 characters of `[A-Za-z0-9._:-]`); you report again as `client_id`: the stop's own ID clears the stop and keeps every report, another ID drops the reports pending then (below); a ledger not stopped changes nothing, whatever the ID |
-| `resign_alerts()`, `refused_reports()`, `dropped_reports()`, `reporting_stopped()`, `stopped_client_id()` | the native-signed records not yet in force on every host they cover, for every effect they carry (`record_id`s: Astation alerts the owner to re-sign those whose signer was removed); the reports refused for good; the reports a resume under another ID dropped; whether reporting is stopped, and under which report client ID |
+| `resign_alerts()`, `refused_reports()`, `dropped_reports()`, `dropped_client_ids()`, `reporting_stopped()`, `stopped_client_id()` | the native-signed records not yet in force on every host they cover, for every effect they carry (`record_id`s: Astation alerts the owner to re-sign those whose signer was removed); the reports refused for good; the reports a resume under another ID dropped, and the report client ID each was dropped under (the stopped one; the same order); whether reporting is stopped, and under which report client ID |
 
 Every call that moves the ledger returns `AckTransition{next, made,
 alerts}` and never changes the handle it was called on. `made` lists what
@@ -1087,6 +1087,7 @@ hostTrustGen, connectionId}, ackJson, nowMs)`, `tick(nowMs)`,
 `resumeReporting(clientId)`, `pendingReports()` (plain objects:
 `{reportId, report: {type: "revocation_applied" | "revoked", …},
 notBefore}`), `resignAlerts()`, `refusedReports()`, `droppedReports()`,
+`droppedClientIds()`,
 `reportingStopped()`, `stoppedClientId()` (a string, or `undefined`); `AckTransition` has the
 getters `next`, `made` and `alerts` (`{type: "report_refused",
 reportId}`, `{type: "reporting_stopped", clientId}`, `{type:
@@ -1143,7 +1144,8 @@ it can't tell a superseded connection from the current one.
    `resume_reporting` with your current report client ID (commit it like
    any transition), raise again the alerts the state still holds (a
    crash between a commit and its alert loses the alert, never its cause:
-   `refused_reports()`, `dropped_reports()`, `stopped_client_id()`), and
+   `refused_reports()`, `dropped_reports()` with `dropped_client_ids()`,
+   `stopped_client_id()`), and
    send
    `pending_reports()` again. On any `Stored` error, keep reporting
    stopped for that device list and never start again from an empty

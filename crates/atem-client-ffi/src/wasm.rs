@@ -1398,6 +1398,12 @@ impl AckLedgerHandle {
     pub fn dropped_reports(&self) -> Vec<String> {
         self.0.dropped_reports()
     }
+    /// The report client ID each of `droppedReports()` was dropped under,
+    /// in the same order.
+    #[wasm_bindgen(js_name = droppedClientIds)]
+    pub fn dropped_client_ids(&self) -> Vec<String> {
+        self.0.dropped_client_ids()
+    }
     /// The Portal refused this Station's reports (`403`).
     #[wasm_bindgen(js_name = reportingStopped)]
     pub fn reporting_stopped(&self) -> bool {

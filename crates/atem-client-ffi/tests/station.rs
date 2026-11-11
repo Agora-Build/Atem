@@ -356,6 +356,14 @@ fn a_call_never_changes_its_handle_and_the_state_loads_only_as_written() {
         [LedgerAlertInfo::ReportsDropped { client_id, .. }] if client_id == "station-1"
     ));
     assert!(other.next.pending_reports().is_empty());
+    assert_eq!(
+        other.next.dropped_client_ids(),
+        vec!["station-1".to_owned()]
+    );
+    assert_eq!(
+        other.next.dropped_reports(),
+        vec![station.ledger.pending_reports()[0].report_id.clone()]
+    );
     let bad = station.ledger.stop_reporting("a b".into());
     assert_eq!(code(bad.unwrap_err()), "malformed");
 

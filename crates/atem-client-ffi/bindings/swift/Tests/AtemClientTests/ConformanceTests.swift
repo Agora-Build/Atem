@@ -1035,7 +1035,10 @@ final class ConformanceTests: XCTestCase {
             try eq(t1.next.reportingStopped(), false)
             // The same report client ID keeps every report; another drops them.
             try eq(try stopped.resumeReporting(clientId: "station-1").next.pendingReports(), t1.next.pendingReports())
-            try eq(try stopped.resumeReporting(clientId: "station-2").alerts, [LedgerAlertInfo.reportsDropped(clientId: "station-1", dropped: [id])])
+            let other = try stopped.resumeReporting(clientId: "station-2")
+            try eq(other.alerts, [LedgerAlertInfo.reportsDropped(clientId: "station-1", dropped: [id])])
+            try eq(other.next.droppedReports(), [id])
+            try eq(other.next.droppedClientIds(), ["station-1"])
             try throwsCode("malformed") { _ = try l.stopReporting(clientId: "a b") }
             let text = t1.next.toJson()
             try eq(try AckLedgerHandle.fromJson(stateJson: text).toJson(), text)
