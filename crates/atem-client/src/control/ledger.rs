@@ -38,7 +38,7 @@
 //! is [`AckLedger::confirm`]; a network error, a timeout, a 5xx, a `408`, a
 //! `429` (after its `Retry-After`) or a `401` (after refreshing the token)
 //! is sent again later with the same `report_id` and body, after a restart
-//! too (`pending_reports` lists every intent until it is settled); a final
+//! too (`pending_reports` offers every report until it is settled); a final
 //! refusal (`400`, `404`, `409`, `413`, `415`, any other 4xx) is
 //! [`AckLedger::refuse`]: done, never sent again, and an operator alert; a
 //! `403` is [`AckLedger::stop_reporting`] under the Station's report client
@@ -416,10 +416,12 @@ impl Report {
     }
 }
 
-/// A report the Station owes the Portal: send it with its `report_id`
-/// until it is settled ([`AckLedger::confirm`]ed or
-/// [`AckLedger::refuse`]d), once every intent `not_before` names (a
-/// `report_id`) is settled.
+/// A report the Station owes the Portal, with its `report_id`. Send it only
+/// as [`AckLedger::pending_reports`] of the committed state offers it (in
+/// the order its principal's reports were made, never while reporting is
+/// stopped), until it is settled: [`AckLedger::confirm`]ed,
+/// [`AckLedger::refuse`]d or dropped by a resume under another report
+/// client ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportIntent {
     pub report_id: String,
@@ -441,15 +443,17 @@ impl ReportIntent {
 }
 
 /// What a transition gives: the next ledger (persist its
-/// [`AckLedger::to_json`] and adopt it once committed), the intents it
-/// made, which `next` holds until they are settled, and the operator alerts
-/// it raises (raise them once it committed). Send `next`'s
-/// [`AckLedger::pending_reports`], never `intents`: an intent made while
-/// reporting is stopped is held there, not sent.
+/// [`AckLedger::to_json`] and adopt it once committed), `made`, what the
+/// call made (`next` holds each until it is settled), and the operator
+/// alerts it raised (raise them once it committed). Send the committed
+/// state's [`AckLedger::pending_reports`], never `made`: a report made
+/// while reporting is stopped is held, and one made after an earlier report
+/// of its principal waits for it. After a restart, send the committed
+/// state's `pending_reports`, never stored transitions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerTransition {
     pub next: AckLedger,
-    pub intents: Vec<ReportIntent>,
+    pub made: Vec<ReportIntent>,
     pub alerts: Vec<LedgerAlert>,
 }
 
@@ -1195,7 +1199,7 @@ impl AckLedger {
     fn with(self, intents: Vec<ReportIntent>) -> LedgerTransition {
         LedgerTransition {
             next: self,
-            intents,
+            made: intents,
             alerts: Vec::new(),
         }
     }
@@ -1904,19 +1908,19 @@ mod ack_ledger_tests {
         fn rec(&mut self, r: &ControlRecord, at: u64, covered: &[&str]) -> Vec<ReportIntent> {
             let t = self.record(r, at, &hosts(covered), at).unwrap();
             *self = t.next;
-            t.intents
+            t.made
         }
 
         fn ack_by(&mut self, host: &str, results: Vec<AckResult>, now: u64) -> Vec<ReportIntent> {
             let t = self.ack(&link(host), &ack(host, results), now).unwrap();
             *self = t.next;
-            t.intents
+            t.made
         }
 
         fn tick_at(&mut self, now: u64) -> Vec<ReportIntent> {
             let t = self.tick(now);
             *self = t.next;
-            t.intents
+            t.made
         }
 
         fn confirm_id(&mut self, id: &str) {
@@ -1998,7 +2002,7 @@ mod ack_ledger_tests {
         let mut far = ack("a", vec![]);
         far.cursor = 1_000;
         let t = l.ack(&link("a"), &far, T0 + 1).unwrap();
-        assert_eq!((t.next, t.intents), (before.clone(), vec![]));
+        assert_eq!((t.next, t.made), (before.clone(), vec![]));
         for result in [R::Pending, R::Refused] {
             let t = l
                 .ack(
@@ -2007,7 +2011,7 @@ mod ack_ledger_tests {
                     T0 + 1,
                 )
                 .unwrap();
-            assert_eq!((t.next, t.intents), (before.clone(), vec![]));
+            assert_eq!((t.next, t.made), (before.clone(), vec![]));
         }
         assert_eq!(l.pending_reports(), vec![]);
         // Only `applied` or `duplicate` counts.
@@ -2128,7 +2132,7 @@ mod ack_ledger_tests {
         ] {
             let r = rec(By::Own, action, n);
             let t = l.record(&r, T0, &hosts(&["a"]), T0).unwrap();
-            assert_eq!((t.next, t.intents), (before.clone(), vec![]));
+            assert_eq!((t.next, t.made), (before.clone(), vec![]));
             let kind = match action {
                 ControlAction::Cover => E::Cover,
                 ControlAction::Hold => E::Hold,
@@ -2141,7 +2145,7 @@ mod ack_ledger_tests {
                     T0,
                 )
                 .unwrap();
-            assert_eq!((t.next, t.intents), (before.clone(), vec![]));
+            assert_eq!((t.next, t.made), (before.clone(), vec![]));
         }
         // A record the ledger never saw, and a host sender's revoke entry.
         let unknown = revoke(By::Own, false, 99);
@@ -2166,14 +2170,14 @@ mod ack_ledger_tests {
                 T0,
             )
             .unwrap();
-        assert_eq!((t.next, t.intents), (before.clone(), vec![]));
+        assert_eq!((t.next, t.made), (before.clone(), vec![]));
         // Beside them, a tracked record's result counts as usual.
         let mixed = l.ack(
             &link("a"),
             &ack("a", vec![entry, res(&s, &[(E::Revocation, R::Applied)])]),
             T0,
         );
-        assert_eq!(reports(&mixed.unwrap().intents), vec![applied("a", &s)]);
+        assert_eq!(reports(&mixed.unwrap().made), vec![applied("a", &s)]);
         // A host the revocation doesn't cover is never reported.
         let c = l.ack_by("c", vec![res(&s, &[(E::Revocation, R::Applied)])], T0);
         assert_eq!(c, vec![]);
@@ -2421,7 +2425,7 @@ mod ack_ledger_tests {
         let before = l.clone();
         for id in [&fin.report_id, &ra.report_id, &"revoked:nope".to_owned()] {
             let t = l.confirm(id);
-            assert_eq!((t.next, t.intents), (before.clone(), vec![]));
+            assert_eq!((t.next, t.made), (before.clone(), vec![]));
         }
         // `deadline_passed` waits for the per-host reports made before it.
         let (mut l, s) = revoked_ledger();
@@ -2594,7 +2598,7 @@ mod ack_ledger_tests {
         // The host resends its first ack after all (its answer was lost):
         // nothing is counted twice.
         let t = st.load().ack(&link("a"), &ack_a(), T0 + 1).unwrap();
-        assert_eq!(t.intents, vec![]);
+        assert_eq!(t.made, vec![]);
         st.commit(t);
 
         // Two replicas load the same state and process the same ack: the
@@ -2631,7 +2635,7 @@ mod ack_ledger_tests {
             .unwrap();
         let replica = l.clone().ack(&link("a"), &a, T0 + 5 * HOUR).unwrap();
         assert_eq!(live, restarted);
-        assert_eq!(ids(&live.intents), ids(&replica.intents));
+        assert_eq!(ids(&live.made), ids(&replica.made));
         // The id comes from the report's identity, never from time, a
         // counter or the order of events: `a` reports through another
         // record, later, after `b`.
@@ -2644,14 +2648,14 @@ mod ack_ledger_tests {
             vec![res(&n, &[(E::Revocation, R::Applied)])],
             T0 + HOUR,
         );
-        assert_eq!(via_n[0].report_id, live.intents[0].report_id);
+        assert_eq!(via_n[0].report_id, live.made[0].report_id);
 
         // Known answer: SHA-256 of enc(["atem-station-report-id-v1",
         // "revocation_applied", account, genesis (raw), principal,
         // integration, host]), computed independently with Python's
         // hashlib.
         assert_eq!(
-            live.intents[0].report_id,
+            live.made[0].report_id,
             "revocation_applied:078ccdbdd6b5148ded0176c622edf34bcda5d856223d19909be0b60e84bf8a8c"
         );
         let mut all = l.clone();
@@ -2702,7 +2706,7 @@ mod ack_ledger_tests {
         let mut a = ack(&long, vec![res(&s, &[(E::Revocation, R::Applied)])]);
         a.account_id = long.clone();
         let t = l.ack(&big, &a, T0).unwrap();
-        for intent in &t.intents {
+        for intent in &t.made {
             assert!(fits(&intent.report_id), "{}", intent.report_id);
         }
     }
@@ -2747,17 +2751,17 @@ mod ack_ledger_tests {
                 .unwrap();
             let replica = current.clone().ack(&link(host), a, T0 + HOUR).unwrap();
             for t in [&first, &retry, &restart, &replica] {
-                note(&t.intents);
+                note(&t.made);
                 note(&t.next.pending_reports());
             }
             for (x, y) in [(&first, &retry), (&first, &restart)] {
-                let bx: Vec<String> = x.intents.iter().map(bytes).collect();
-                let by: Vec<String> = y.intents.iter().map(bytes).collect();
+                let bx: Vec<String> = x.made.iter().map(bytes).collect();
+                let by: Vec<String> = y.made.iter().map(bytes).collect();
                 assert_eq!(bx, by);
             }
             current = first.next;
         }
-        note(&current.tick(T0 + DAY).intents);
+        note(&current.tick(T0 + DAY).made);
         assert_eq!(seen.len(), 3);
         for (id, bodies) in &seen {
             assert_eq!(bodies.len(), 1, "{id}");
@@ -2969,7 +2973,7 @@ mod ack_ledger_tests {
         let mut l = ledger();
         l.rec(&s, T0, &["a", "b"]);
         let t = l.record(&s, T0 + HOUR, &hosts(&["c"]), T0 + HOUR).unwrap();
-        assert_eq!((t.next, t.intents), (l.clone(), vec![]));
+        assert_eq!((t.next, t.made), (l.clone(), vec![]));
         // Another body under a record id the ledger holds: an ack naming
         // that id would be ambiguous.
         let reused = rec(
@@ -3286,7 +3290,7 @@ mod ack_ledger_tests {
         let mut a = ack("a", vec![res(&s, &[(E::Revocation, R::Applied)])]);
         a.feed_id = FEED2.into();
         let t = l.ack(&link("a"), &a, T0).unwrap();
-        assert_eq!(reports(&t.intents), vec![applied("a", &s)]);
+        assert_eq!(reports(&t.made), vec![applied("a", &s)]);
         l = t.next;
         assert_eq!(
             l.ack_by("a", vec![res(&s, &[(E::Revocation, R::Duplicate)])], T0),
@@ -3326,7 +3330,7 @@ mod ack_ledger_tests {
         let (mut l, s) = revoked_ledger();
         let a = l.ack_by("a", vec![res(&s, &[(E::Revocation, R::Applied)])], T0);
         let t = l.refuse(&a[0].report_id);
-        assert_eq!(t.intents, vec![]);
+        assert_eq!(t.made, vec![]);
         assert_eq!(
             t.alerts,
             vec![LedgerAlert::ReportRefused {
@@ -3345,7 +3349,7 @@ mod ack_ledger_tests {
         // late confirmation of a refused report changes nothing either.
         for id in [a[0].report_id.as_str(), "revoked:nope"] {
             let t = l.refuse(id);
-            assert_eq!((t.next, t.intents, t.alerts), (l.clone(), vec![], vec![]));
+            assert_eq!((t.next, t.made, t.alerts), (l.clone(), vec![], vec![]));
         }
         assert_eq!(l.confirm(&a[0].report_id).next, l);
         // A report waiting for a refused one goes once the others are
@@ -3372,7 +3376,7 @@ mod ack_ledger_tests {
         let (mut l, s) = revoked_ledger();
         let a = l.ack_by("a", vec![res(&s, &[(E::Revocation, R::Applied)])], T0);
         let t = l.stop_reporting(CLIENT).unwrap();
-        assert_eq!(t.intents, vec![]);
+        assert_eq!(t.made, vec![]);
         assert_eq!(
             t.alerts,
             vec![LedgerAlert::ReportingStopped {
@@ -3412,7 +3416,7 @@ mod ack_ledger_tests {
         // A second stop, under any ID: nothing new, no second alert.
         for id in [CLIENT, CLIENT2] {
             let t = l.stop_reporting(id).unwrap();
-            assert_eq!((t.next, t.intents, t.alerts), (l.clone(), vec![], vec![]));
+            assert_eq!((t.next, t.made, t.alerts), (l.clone(), vec![], vec![]));
         }
         let v = l.to_json();
         assert_eq!(v["stopped"], json!(CLIENT));
@@ -3433,12 +3437,12 @@ mod ack_ledger_tests {
         let a = l.ack_by("a", vec![res(&s, &[(E::Revocation, R::Applied)])], T0);
         // Not stopped: a resume changes nothing.
         let t = l.resume_reporting(CLIENT).unwrap();
-        assert_eq!((t.next, t.intents, t.alerts), (l.clone(), vec![], vec![]));
+        assert_eq!((t.next, t.made, t.alerts), (l.clone(), vec![], vec![]));
         l = l.stop_reporting(CLIENT).unwrap().next;
         let b = l.ack_by("b", vec![res(&s, &[(E::Revocation, R::Applied)])], T0);
         let stopped = l.clone();
         let t = l.resume_reporting(CLIENT).unwrap();
-        assert_eq!((t.intents.clone(), t.alerts.clone()), (vec![], vec![]));
+        assert_eq!((t.made.clone(), t.alerts.clone()), (vec![], vec![]));
         assert!(
             stopped.reporting_stopped(),
             "the ledger resumed on is unchanged"
@@ -3467,7 +3471,7 @@ mod ack_ledger_tests {
         let a = l.ack_by("a", vec![res(&s, &[(E::Revocation, R::Applied)])], T0);
         l = l.stop_reporting(CLIENT).unwrap().next;
         let t = l.resume_reporting(CLIENT2).unwrap();
-        assert_eq!(t.intents, vec![]);
+        assert_eq!(t.made, vec![]);
         assert_eq!(
             t.alerts,
             vec![LedgerAlert::ReportsDropped {
@@ -3508,7 +3512,7 @@ mod ack_ledger_tests {
         assert_eq!(AckLedger::from_json(&v).unwrap(), l);
         // Not stopped, a resume compares no ID: it changes nothing.
         let t = l.resume_reporting(CLIENT).unwrap();
-        assert_eq!((t.next, t.intents, t.alerts), (l.clone(), vec![], vec![]));
+        assert_eq!((t.next, t.made, t.alerts), (l.clone(), vec![], vec![]));
     }
 
     #[test]
@@ -3615,20 +3619,20 @@ mod ack_ledger_tests {
         let s = revoke(By::Own, false, 1);
         let late = l.record(&s, T0, &hosts(&["a", "b"]), T0 + DAY).unwrap();
         assert_eq!(
-            reports(&late.intents),
+            reports(&late.made),
             vec![
                 applied("a", &n),
                 revoked(RevokedOutcome::DeadlinePassed, &["b"])
             ]
         );
-        assert_eq!(late.intents[1].not_before, ids(&late.intents[..1]));
+        assert_eq!(late.made[1].not_before, ids(&late.made[..1]));
         // Before its deadline: only the host in force.
         let t = l.record(&s, T0, &hosts(&["a", "b"]), T0 + DAY - 1).unwrap();
-        assert_eq!(reports(&t.intents), vec![applied("a", &n)]);
+        assert_eq!(reports(&t.made), vec![applied("a", &n)]);
         // Every covered host in force: all applied, whenever it is recorded.
         let t = l.record(&s, T0, &hosts(&["a"]), T0 + 2 * DAY).unwrap();
         assert_eq!(
-            reports(&t.intents),
+            reports(&t.made),
             vec![applied("a", &n), revoked(RevokedOutcome::AllApplied, &[])]
         );
         // Any record passes the deadlines of earlier revocations first, as a
@@ -3638,12 +3642,12 @@ mod ack_ledger_tests {
             .record(&interrupt(By::Native, 3), T0, &hosts(&["a"]), T0 + DAY)
             .unwrap();
         assert_eq!(
-            reports(&t.intents),
+            reports(&t.made),
             vec![revoked(RevokedOutcome::DeadlinePassed, &["a", "b"])]
         );
         let again = l
             .record(&revoke(By::Own, false, 1), T0, &[], T0 + DAY)
             .unwrap();
-        assert_eq!(reports(&again.intents), reports(&t.intents));
+        assert_eq!(reports(&again.made), reports(&t.made));
     }
 }

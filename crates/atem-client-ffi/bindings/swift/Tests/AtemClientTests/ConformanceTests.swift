@@ -931,7 +931,7 @@ final class ConformanceTests: XCTestCase {
                     throw Failure(description: "not an input: \(canon(step))")
                 }
                 func made(_ t: AckTransition, _ step: [String: Any]) throws {
-                    try eq(t.intents.map { $0.reportId }, a(step["made"]).map(s), "\(name) made")
+                    try eq(t.made.map { $0.reportId }, a(step["made"]).map(s), "\(name) made")
                     try eq(t.alerts, [LedgerAlertInfo](), "\(name) alerts")
                 }
                 func commit(_ t: AckTransition) {
@@ -953,11 +953,11 @@ final class ConformanceTests: XCTestCase {
                         let t1 = try input(try AckLedgerHandle.fromJson(stateJson: committed), inner)!
                         let t2 = try input(try AckLedgerHandle.fromJson(stateJson: committed), inner)!
                         try eq(t1.next.toJson(), t2.next.toJson(), "\(name) replicas' states")
-                        try eq(t1.intents, t2.intents, "\(name) replicas' intents")
+                        try eq(t1.made, t2.made, "\(name) replicas' intents")
                         try made(t1, inner)
                         commit(t1)
                         let lost = try input(try AckLedgerHandle.fromJson(stateJson: committed), inner)!
-                        try eq(lost.intents, [ReportIntentInfo](), "\(name) the replica that lost")
+                        try eq(lost.made, [ReportIntentInfo](), "\(name) the replica that lost")
                     } else if let ms = step["advance_ms"] {
                         now += u(ms)
                     } else if step["restart"] != nil {
@@ -993,7 +993,7 @@ final class ConformanceTests: XCTestCase {
                         clientId = s(id)
                         let t = try ledger.resumeReporting(clientId: s(id))
                         try eq(canon(t.alerts.map(alertOf)), canon(step["alerts"]!), "\(name) resume alerts")
-                        try eq(t.intents, [ReportIntentInfo](), "\(name) resume")
+                        try eq(t.made, [ReportIntentInfo](), "\(name) resume")
                         commit(t)
                     } else if let want = step["expect_stopped"] {
                         // The stopped report client ID, or false.
@@ -1023,9 +1023,9 @@ final class ConformanceTests: XCTestCase {
             // The commit failed: the handle is as it was, and the same call again gives the same.
             try eq(l.toJson(), before)
             try eq(t1.next.toJson(), t2.next.toJson())
-            try eq(t1.intents, t2.intents)
-            try eq(t1.intents.count, 1)
-            let id = t1.intents[0].reportId
+            try eq(t1.made, t2.made)
+            try eq(t1.made.count, 1)
+            let id = t1.made[0].reportId
             try eq(t1.next.refuse(reportId: id).alerts, [LedgerAlertInfo.reportRefused(reportId: id)])
             try eq(t1.next.pendingReports().count, 1)
             let stopped = try t1.next.stopReporting(clientId: "station-1").next

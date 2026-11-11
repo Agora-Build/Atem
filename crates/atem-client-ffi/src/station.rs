@@ -21,8 +21,10 @@
 //!   acknowledgments at one Station: what each covered host has in force,
 //!   the reports owed to the Portal and the re-sign alerts. A handle never
 //!   changes: every call that moves it returns an `AckTransition` whose
-//!   `next` state and intents the Station persists in one transaction
-//!   before any HTTP, and adopts only once that committed.
+//!   `next` state (which holds every report not yet settled) the Station
+//!   persists in one transaction before any HTTP, and adopts only once
+//!   that committed; it sends that state's `pending_reports()`, never the
+//!   transition's `made`.
 //!
 //! Errors: input a reader, a builder or the ledger refuses is
 //! `Invalid{code}` (the relay's `too_large`, `not_strict`, `wrong_message`,
@@ -431,9 +433,10 @@ pub fn report_answer(status: u16) -> ReportAnswerKind {
 /// is safe to share across threads.
 ///
 /// **Persistence.** In one transaction, store `next.to_json()` (it holds
-/// every report not yet settled, so the intents are in it). Only once it
-/// committed, use `next`, then POST `pending_reports()` and raise the
-/// transition's alerts. If the commit failed, keep the handle you called
+/// every report not yet settled). Only once it committed, use `next`, then
+/// POST its `pending_reports()` and raise the transition's alerts. After a
+/// restart, send the committed state's `pending_reports()`, never stored
+/// transitions. If the commit failed, keep the handle you called
 /// on: the host resends its ack, and the same call gives the same next
 /// state and the same report ids. Serialize transitions of one ledger
 /// (compare-and-swap on the stored state): a replica whose commit lost
@@ -464,16 +467,17 @@ pub struct AckTransition {
     /// and use `next` once it committed; until then (and if it failed) the
     /// handle called on is the current state.
     pub next: Arc<AckLedgerHandle>,
-    /// The reports this call made, in delivery order (`next` holds them
-    /// until settled; send `next.pending_reports()`).
-    pub intents: Vec<ReportIntentInfo>,
+    /// What this call made, in the order made. Never send these: `next`
+    /// holds each until it is settled, and its `pending_reports()` offers
+    /// them in order (none while reporting is stopped).
+    pub made: Vec<ReportIntentInfo>,
     /// Raise these once the transaction committed.
     pub alerts: Vec<LedgerAlertInfo>,
 }
 
 fn transition(t: LedgerTransition) -> AckTransition {
     AckTransition {
-        intents: t.intents.iter().map(intent_info).collect(),
+        made: t.made.iter().map(intent_info).collect(),
         alerts: t.alerts.iter().map(alert_info).collect(),
         next: AckLedgerHandle::wrap(t.next),
     }

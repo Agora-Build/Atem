@@ -1036,9 +1036,11 @@ data_enum! {
 }
 
 record! {
-    /// A report to send with its `report_id` (the Portal's `reportId`)
-    /// until it is settled, once every report `not_before` names is
-    /// settled.
+    /// A report, with its `report_id` (the Portal's `reportId`). Send it
+    /// only as the committed state's `pending_reports()` offers it (in the
+    /// order its principal's reports were made, never while reporting is
+    /// stopped), until it is settled: confirmed, refused, or dropped by a
+    /// resume under another report client ID.
     pub struct ReportIntentInfo {
         pub report_id: String,
         pub report: StationReport,

@@ -826,7 +826,7 @@ fun main(args: Array<String>) {
             }
         }
         fun made(t: AckTransition, step: Any?) {
-            eq(t.intents.map { it.reportId }, strs(step["made"]), "$name made")
+            eq(t.made.map { it.reportId }, strs(step["made"]), "$name made")
             eq(t.alerts, emptyList<LedgerAlertInfo>(), "$name alerts")
         }
         fun commit(t: AckTransition) {
@@ -851,10 +851,10 @@ fun main(args: Array<String>) {
                     val t1 = input(AckLedgerHandle.fromJson(committed), inner)!!
                     val t2 = input(AckLedgerHandle.fromJson(committed), inner)!!
                     eq(t1.next.toJson(), t2.next.toJson(), "$name replicas' states")
-                    eq(t1.intents, t2.intents, "$name replicas' intents")
+                    eq(t1.made, t2.made, "$name replicas' intents")
                     made(t1, inner)
                     commit(t1)
-                    eq(input(AckLedgerHandle.fromJson(committed), inner)!!.intents, emptyList<ReportIntentInfo>(), "$name the replica that lost")
+                    eq(input(AckLedgerHandle.fromJson(committed), inner)!!.made, emptyList<ReportIntentInfo>(), "$name the replica that lost")
                 }
                 "advance_ms" in o -> now += o["advance_ms"].l().toULong()
                 "restart" in o -> {
@@ -889,7 +889,7 @@ fun main(args: Array<String>) {
                     clientId = o["resume_reporting"].s()
                     val t = ledger.resumeReporting(clientId!!)
                     eq(canon(t.alerts.map(::alertOf)), canon(o["alerts"]), "$name resume alerts")
-                    eq(t.intents, emptyList<ReportIntentInfo>(), "$name resume")
+                    eq(t.made, emptyList<ReportIntentInfo>(), "$name resume")
                     commit(t)
                 }
                 "expect_stopped" in o -> {
@@ -915,9 +915,9 @@ fun main(args: Array<String>) {
         // The commit failed: the handle is as it was, and the same call again gives the same.
         eq(l.toJson(), before)
         eq(t1.next.toJson(), t2.next.toJson())
-        eq(t1.intents, t2.intents)
-        eq(t1.intents.size, 1)
-        val id = t1.intents[0].reportId
+        eq(t1.made, t2.made)
+        eq(t1.made.size, 1)
+        val id = t1.made[0].reportId
         eq(t1.next.refuse(id).alerts, listOf(LedgerAlertInfo.ReportRefused(id)))
         eq(t1.next.pendingReports().size, 1)
         val stopped = t1.next.stopReporting("station-1").next

@@ -653,7 +653,7 @@ for (const name of ACKS) {
       throw new Error(`not an input: ${str(step)}`);
     };
     const made = (t, step) => {
-      eq(t.intents.map((i) => i.reportId), step.made, `${name} made`);
+      eq(t.made.map((i) => i.reportId), step.made, `${name} made`);
       eq(t.alerts, [], `${name} alerts`);
     };
     const commit = (t) => {
@@ -673,10 +673,10 @@ for (const name of ACKS) {
         const t1 = input(m.AckLedgerHandle.fromJson(committed), step.replica);
         const t2 = input(m.AckLedgerHandle.fromJson(committed), step.replica);
         eq(t1.next.toJson(), t2.next.toJson(), `${name} replicas' states`);
-        eq(t1.intents, t2.intents, `${name} replicas' intents`);
+        eq(t1.made, t2.made, `${name} replicas' intents`);
         made(t1, step.replica);
         commit(t1);
-        eq(input(m.AckLedgerHandle.fromJson(committed), step.replica).intents, [], `${name} the replica that lost`);
+        eq(input(m.AckLedgerHandle.fromJson(committed), step.replica).made, [], `${name} the replica that lost`);
       } else if ("advance_ms" in step) {
         now += step.advance_ms;
       } else if ("restart" in step) {
@@ -705,7 +705,7 @@ for (const name of ACKS) {
         clientId = step.resume_reporting;
         const t = ledger.resumeReporting(clientId);
         eq(canon(t.alerts.map(alertOut)), canon(step.alerts), `${name} resume alerts`);
-        eq(t.intents, [], `${name} resume`);
+        eq(t.made, [], `${name} resume`);
         commit(t);
       } else if ("expect_stopped" in step) {
         eq(ledger.stoppedClientId() ?? false, step.expect_stopped, `${name} stopped`);
@@ -730,9 +730,9 @@ check("Station acks: a call never changes its handle; the state loads only as wr
   // The commit failed: the handle is as it was, and the same call again gives the same.
   eq(l.toJson(), before);
   eq(t1.next.toJson(), t2.next.toJson());
-  eq(t1.intents, t2.intents);
-  eq(t1.intents.length, 1);
-  const id = t1.intents[0].reportId;
+  eq(t1.made, t2.made);
+  eq(t1.made.length, 1);
+  const id = t1.made[0].reportId;
   eq(t1.next.refuse(id).alerts, [{ type: "report_refused", reportId: id }]);
   eq(t1.next.pendingReports().length, 1);
   const stopped = t1.next.stopReporting("station-1").next;

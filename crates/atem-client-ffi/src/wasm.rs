@@ -1248,7 +1248,7 @@ pub struct AckLedgerHandle(Arc<crate::station::AckLedgerHandle>);
 
 fn ack_transition(t: crate::station::AckTransition) -> JsResult<AckTransition> {
     Ok(AckTransition {
-        intents: to_js(&t.intents)?,
+        made: to_js(&t.made)?,
         alerts: to_js(&t.alerts)?,
         next: t.next,
     })
@@ -1408,17 +1408,18 @@ impl AckLedgerHandle {
 /// What a ledger call gives (`crate::station::AckTransition`).
 #[wasm_bindgen]
 pub struct AckTransition {
-    intents: JsValue,
+    made: JsValue,
     alerts: JsValue,
     next: Arc<crate::station::AckLedgerHandle>,
 }
 
 #[wasm_bindgen]
 impl AckTransition {
-    /// The reports the call made: `[{reportId, report, notBefore}]`.
+    /// What the call made: `[{reportId, report, notBefore}]`. Never send
+    /// these: send `next.pendingReports()` once the state committed.
     #[wasm_bindgen(getter)]
-    pub fn intents(&self) -> JsValue {
-        self.intents.clone()
+    pub fn made(&self) -> JsValue {
+        self.made.clone()
     }
     /// The operator alerts it raised: `{type: "report_refused", reportId}`,
     /// `{type: "reporting_stopped", clientId}` or `{type:

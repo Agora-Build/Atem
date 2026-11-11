@@ -1423,7 +1423,8 @@ for host `host-b`, and
 | `403` | stop reporting under the Station's report client ID: every report held, none sent, one alert, until a resume (below) |
 | a status the Portal never answers with (1xx, 3xx, a 2xx other than `200`) | final, with an operator alert. A 3xx is never followed: it would carry the `station.report` bearer wherever it points |
 
-A report waiting for another goes once that one is settled, done or final.
+A report waiting for another goes once that one is settled: done, final or
+dropped.
 A network error or a timeout has no status; a client library's "no
 response" sentinel (such as `0`) is a network error, not a status.
 
@@ -1449,7 +1450,9 @@ client changes without a stop changes nothing in its ledgers.
   (`dropped_reports`); nothing else changes, so every revocation reports on
   as usual under the new ID (a host that applies it later, its final
   `revoked`), and the Portal's answers decide what becomes of them (a
-  refusal is final, with an alert). No revocation is ever silenced.
+  refusal is final, with an alert). No revocation is ever silenced. A
+  final made after such a drop goes without the dropped per-host reports
+  (they are settled unsent), and may be `all_applied`.
 
 The built-in Station takes its report client ID from its configuration and
 always resumes.
@@ -1461,8 +1464,10 @@ Auth/Portal's agreement**):
   intents are stored in one transaction before any report is sent, and the
   Station acts on the next state only once that committed. A crash before
   the commit loses nothing: the host acknowledges again and the same
-  transition gives the same reports; a crash after it is covered by the
-  stored intents, sent again after a restart with the same `reportId`.
+  transition gives the same reports; after a crash after it, the Station
+  sends the committed state's pending reports (the reference ledger's
+  `pending_reports()`), never stored transitions, with the same
+  `reportId`s.
 - **Serialize the transitions of one ledger** (compare-and-swap on the
   stored state). Replicas give the same report only for serialized
   transitions: the same state and the same ack at the same time give the

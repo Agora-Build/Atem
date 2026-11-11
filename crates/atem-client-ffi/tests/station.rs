@@ -166,7 +166,7 @@ impl Station {
     }
 
     fn check_made(&self, t: &AckTransition, step: &Value) {
-        let made: Vec<&str> = t.intents.iter().map(|i| i.report_id.as_str()).collect();
+        let made: Vec<&str> = t.made.iter().map(|i| i.report_id.as_str()).collect();
         assert_eq!(json!(made), step["made"], "{}: {step}", self.name);
         assert!(t.alerts.is_empty(), "{}", self.name);
     }
@@ -207,12 +207,12 @@ impl Station {
                 self.input(&r2, inner).unwrap(),
             );
             assert_eq!(t1.next.to_json(), t2.next.to_json(), "{}", self.name);
-            assert_eq!(t1.intents, t2.intents, "{}", self.name);
+            assert_eq!(t1.made, t2.made, "{}", self.name);
             self.check_made(&t1, inner);
             self.commit(t1);
             let again = AckLedgerHandle::from_json(self.committed.clone()).unwrap();
             let t = self.input(&again, inner).unwrap();
-            assert!(t.intents.is_empty(), "{}", self.name);
+            assert!(t.made.is_empty(), "{}", self.name);
         } else if let Some(ms) = step.get("advance_ms") {
             self.now += ms.as_u64().unwrap();
         } else if step.get("restart").is_some() {
@@ -229,7 +229,7 @@ impl Station {
         } else if let Some(id) = step.get("confirm") {
             self.sendable(id.as_str().unwrap());
             let t = self.ledger.confirm(s(id));
-            assert!(t.intents.is_empty() && t.alerts.is_empty());
+            assert!(t.made.is_empty() && t.alerts.is_empty());
             self.commit(t);
         } else if let Some(f) = step.get("report_failure") {
             let id = s(&f["report_id"]);
@@ -273,7 +273,7 @@ impl Station {
             let t = self.ledger.resume_reporting(s(id)).unwrap();
             let alerts: Vec<Value> = t.alerts.iter().map(alert_json).collect();
             assert_eq!(json!(alerts), step["alerts"], "{}", self.name);
-            assert!(t.intents.is_empty());
+            assert!(t.made.is_empty());
             self.commit(t);
         } else if let Some(want) = step.get("expect_stopped") {
             let got = self
@@ -327,11 +327,8 @@ fn a_call_never_changes_its_handle_and_the_state_loads_only_as_written() {
     // gives the same next state and report ids.
     assert_eq!(station.ledger.to_json(), before);
     let t2 = station.input(&station.ledger, &ack).unwrap();
-    assert_eq!(
-        (t1.next.to_json(), &t1.intents),
-        (t2.next.to_json(), &t2.intents)
-    );
-    assert_eq!(t1.intents.len(), 1);
+    assert_eq!((t1.next.to_json(), &t1.made), (t2.next.to_json(), &t2.made));
+    assert_eq!(t1.made.len(), 1);
     // The same for a final refusal and a stop.
     let id = station.ledger.pending_reports()[0].report_id.clone();
     let refused = station.ledger.refuse(id.clone());

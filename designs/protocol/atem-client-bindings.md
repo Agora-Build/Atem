@@ -1075,8 +1075,10 @@ to re-sign. Keep one per device list your Station serves.
 | `stop_reporting(client_id)`, `resume_reporting(client_id)` | the Portal answered `403` to your report client `client_id` (your `station.report` client at Auth): the ledger records the ID and holds every report, none sent, until a resume (one `ReportingStopped` alert; refused `Invalid{malformed}` for an ID that isn't 1 to 128 characters of `[A-Za-z0-9._:-]`); you report again as `client_id`: the stop's own ID clears the stop and keeps every report, another ID drops the reports pending then (below); a ledger not stopped changes nothing, whatever the ID |
 | `resign_alerts()`, `refused_reports()`, `dropped_reports()`, `reporting_stopped()`, `stopped_client_id()` | the native-signed records not yet in force on every host they cover, for every effect they carry (`record_id`s: Astation alerts the owner to re-sign those whose signer was removed); the reports refused for good; the reports a resume under another ID dropped; whether reporting is stopped, and under which report client ID |
 
-Every call that moves the ledger returns `AckTransition{next, intents,
-alerts}` and never changes the handle it was called on. JS: `new
+Every call that moves the ledger returns `AckTransition{next, made,
+alerts}` and never changes the handle it was called on. `made` lists what
+the call made; never send it: send the committed state's
+`pending_reports()`. JS: `new
 AckLedgerHandle(origin, accountId, genesisHash)`,
 `AckLedgerHandle.fromJson(text)`, `toJson()`, `record(recordJson,
 revokedAtMs, coveredHosts, nowMs)`, `ack({accountId, genesisHash, hostId,
@@ -1086,7 +1088,7 @@ hostTrustGen, connectionId}, ackJson, nowMs)`, `tick(nowMs)`,
 `{reportId, report: {type: "revocation_applied" | "revoked", …},
 notBefore}`), `resignAlerts()`, `refusedReports()`, `droppedReports()`,
 `reportingStopped()`, `stoppedClientId()` (a string, or `undefined`); `AckTransition` has the
-getters `next`, `intents` and `alerts` (`{type: "report_refused",
+getters `next`, `made` and `alerts` (`{type: "report_refused",
 reportId}`, `{type: "reporting_stopped", clientId}`, `{type:
 "reports_dropped", clientId, dropped}`);
 `reportAnswer(status)` gives `"confirm"`, `"retry"`, `"refuse"` or
@@ -1152,8 +1154,8 @@ Astation's confirmation**, whose built-in Station takes its report client
 ID from its configuration and always resumes). A `403` stops reporting
 under the report client ID that got it: the ledger records the ID, holds
 every report (none is sent, none is dropped) and goes on counting and
-making reports. Send only `pending_reports()`, never a transition's
-`intents`: while stopped it is empty, and what the calls make is held.
+making reports. `pending_reports()` is empty while stopped; `made` still
+lists what each call made, and those reports are held.
 When the Station reports again (after a restart, say once an operator fixed
 a misconfigured token) it resumes with its report client ID. The ID is
 compared only there, at a resume after a `403` stop: a ledger that isn't
@@ -1169,7 +1171,9 @@ without a stop changes nothing in the ledger.
   naming each), and nothing else changes: every revocation reports on as
   usual under the new ID (a host that applies it later, its final
   `revoked`), and the Portal's answers decide what becomes of them (a
-  refusal is final, with an alert). No revocation is ever silenced.
+  refusal is final, with an alert). No revocation is ever silenced. A
+  final made after such a drop goes without the dropped per-host reports
+  (they are settled unsent), and may be `all_applied`.
 
 **`report_id` and the Portal's idempotency.** A report's id comes from its
 identity only, never from time, order or a counter: `<kind>:` + lowercase
@@ -1223,8 +1227,9 @@ Auth/Portal, for Astation's confirmation**: the agreed design sent it only
 at `applied`; a host that applied the revocation through another record
 first reports this Station's record `duplicate` and is still counted);
 `revoked{all_applied}` goes after every covered host's
-`revocation_applied`, `revoked{deadline_passed, pending_hosts}` 24 hours
-after the revocation.
+`revocation_applied` (but one dropped by a resume under another report
+client ID), `revoked{deadline_passed, pending_hosts}` 24 hours after the
+revocation.
 
 **Its size.** The ledger keeps the `revoke` and `interrupt_running` records
 it tracks (at most 64 covered hosts each), what each host has in force, the

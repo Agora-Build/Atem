@@ -500,7 +500,7 @@ impl AckRun {
     }
 
     fn check_made(&self, t: &LedgerTransition, step: &Value) {
-        let made: Vec<String> = t.intents.iter().map(|i| i.report_id.clone()).collect();
+        let made: Vec<String> = t.made.iter().map(|i| i.report_id.clone()).collect();
         let want: Vec<String> = step["made"]
             .as_array()
             .unwrap()
@@ -607,7 +607,7 @@ impl AckRun {
                 self.commit(t1);
                 let again = AckLedger::from_json(&self.committed).unwrap();
                 let t = self.input(&again, inner).unwrap();
-                assert_eq!(t.intents, vec![], "{}: the replica that lost", self.name());
+                assert_eq!(t.made, vec![], "{}: the replica that lost", self.name());
                 assert_eq!(t.next.to_json(), self.committed, "{}", self.name());
             }
             "advance_ms" => self.now += step["advance_ms"].as_u64().unwrap(),
@@ -661,7 +661,7 @@ impl AckRun {
                     .collect();
                 assert_eq!(json!(alerts), f.get("alerts").cloned().unwrap_or(json!([])));
                 if let Some(t) = t {
-                    assert_eq!(t.intents, vec![], "{}", self.name());
+                    assert_eq!(t.made, vec![], "{}", self.name());
                     self.commit(t);
                 }
             }
@@ -690,7 +690,7 @@ impl AckRun {
                 let t = self.ledger.resume_reporting(id).unwrap();
                 let alerts: Vec<Value> = t.alerts.iter().map(|a| a.to_json()).collect();
                 assert_eq!(json!(alerts), step["alerts"], "{}", self.name());
-                assert_eq!(t.intents, vec![], "{}", self.name());
+                assert_eq!(t.made, vec![], "{}", self.name());
                 self.commit(t);
             }
             "expect_dropped" => {
