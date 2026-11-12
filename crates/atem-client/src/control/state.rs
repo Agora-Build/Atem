@@ -70,25 +70,32 @@
 //!    `revoke`, `interrupt_running`) still applies its effects (a stop
 //!    only ever adds), while a `cover` or `release` is `refused`. A record
 //!    kept pending or refused takes no `record_id`, so a forgery never
-//!    blocks the genuine record. **Bounded** (decision 19 and ruling T4a,
-//!    for Astation's agreement): a principal keeps at most
+//!    blocks the genuine record. **Bounded** (decision 19, rulings T4a and
+//!    T4d, for Astation's agreement): a principal keeps at most
 //!    [`MAX_RECORD_IDS`] counted ids, and the next evicts its oldest,
 //!    never the record that revoked it nor the coverage's cover; the
 //!    principal's evicted floor is the newest `issued_at` evicted. An
-//!    evicted record that comes back grants nothing. A `cover`, `hold` or
-//!    `release` under an id not counted, issued no later than the floor,
-//!    may be one replayed: `feed_seq` isn't signed, so whoever serves the
-//!    host the covering feed (the Station, or a carrier that rewrites its
-//!    pages, such as the `:8080` proxy, which signs no release) could
-//!    re-serve an evicted release at a fresh position and lift a hold in
-//!    force. It is `refused` and kept as evidence ([`Why::PossibleReplay`]);
-//!    a legitimate one is issued after the floor, since a Station's
-//!    `issued_at` only rises. A revoke or an interrupt is never refused
-//!    for it: replayed, one is a `duplicate` (a revocation and its
-//!    interrupts are final); new, it is a stop. A revoked principal's
-//!    cover, hold and release are inert already (rule 7). An evicted
-//!    manager's copy whose signer was removed since comes back `refused`
-//!    as evidence (verified against today's list), and changes nothing.
+//!    evicted record that comes back grants nothing. The floor guards only
+//!    what can grant or lift, a `cover` or a `release`: one under an id
+//!    not counted, issued no later than the floor, may be one replayed
+//!    (`feed_seq` isn't signed, so whoever serves the host the covering
+//!    feed, the Station or a carrier that rewrites its pages such as the
+//!    `:8080` proxy, which signs no release, could re-serve an evicted
+//!    release at a fresh position and lift a hold in force). It is
+//!    `refused` and kept as evidence ([`Why::PossibleReplay`]); a
+//!    legitimate one is issued after the floor, since a Station's
+//!    `issued_at` for a principal's covers and releases only rises. A
+//!    stop never meets the floor: a `hold` applies as any hold (an
+//!    evicted one replayed holds again, which grants nothing), and a
+//!    `revoke` or `interrupt_running` replayed is a `duplicate` (a
+//!    revocation and its interrupts are final). A revoked principal's
+//!    cover and release are inert already (rule 7). The residual: after a
+//!    switch to a Station whose clock lags the floor, its covers and
+//!    releases are refused as possible replays until its `issued_at`
+//!    passes the floor, which fails safe (holds stay, nothing new
+//!    starts). An evicted manager's copy whose signer was removed since
+//!    comes back `refused` as evidence (verified against today's list),
+//!    and changes nothing.
 //! 2. **Verification.** A `Pending` verdict is `pending`; a `Refused` one
 //!    is `refused` and `evidence` (I.5.4: kept as evidence, alerted).
 //! 3. **A revoke is final**, from any feed or from none: a stop counts
@@ -367,10 +374,10 @@ pub enum Why {
     Collision,
     /// Another Station's `cover`, no newer than the coverage's (rule 5).
     NotNewer,
-    /// A `cover`, `hold` or `release` whose `record_id` isn't counted,
-    /// issued no later than the newest record of its principal the bound
-    /// evicted (its evicted floor): possibly an evicted record replayed, so
-    /// refused and kept as evidence (rule 1, ruling T4a).
+    /// A `cover` or `release` whose `record_id` isn't counted, issued no
+    /// later than the newest record of its principal the bound evicted (its
+    /// evicted floor): possibly an evicted record replayed, so refused and
+    /// kept as evidence (rule 1, rulings T4a and T4d; never a stop).
     PossibleReplay,
 }
 
@@ -521,8 +528,8 @@ struct Part {
     /// part.
     records: Vec<Counted>,
     /// The newest `issued_at` among the records the bound evicted: a
-    /// `cover`, `hold` or `release` under an id not counted, issued no
-    /// later, may be one of them replayed (rule 1). `None` until one is
+    /// `cover` or `release` under an id not counted, issued no later, may
+    /// be one of them replayed (rule 1). `None` until one is
     /// evicted; from then on the records stay full.
     evicted_floor: Option<u64>,
     /// A service's control state (the default for a host principal).
@@ -613,9 +620,9 @@ impl Part {
             .map(|c| c.digest)
     }
 
-    /// Whether a `cover`, `hold` or `release` issued at `issued_at`, under
-    /// an id not counted, may be an evicted record replayed: issued no
-    /// later than the newest one evicted.
+    /// Whether a `cover` or `release` issued at `issued_at`, under an id
+    /// not counted, may be an evicted record replayed: issued no later than
+    /// the newest one evicted.
     fn possible_replay(&self, issued_at: u64) -> bool {
         self.evicted_floor.is_some_and(|floor| issued_at <= floor)
     }
@@ -889,19 +896,18 @@ impl ControlState {
                 return Applied::all(action, Refused, true, Some(Why::Refused(reason)));
             }
         }
-        // A cover, hold or release under an id this principal doesn't
-        // count, issued no later than the newest record the bound evicted,
-        // may be an evicted record replayed: `feed_seq` isn't signed, so
-        // whoever serves the feed could re-serve one at a fresh position.
-        // Refused, as evidence (ruling T4a). A legitimate one is issued
-        // after it (a Station's `issued_at` only rises). Never a revoke or
-        // an interrupt: replayed, one is a duplicate (both are final); new,
-        // it is a stop. Nor a revoked principal's: rule 7 makes its cover,
-        // hold and release inert already.
-        let guarded = matches!(
-            action,
-            ControlAction::Cover | ControlAction::Hold | ControlAction::Release
-        );
+        // A cover or release (what can grant or lift) under an id this
+        // principal doesn't count, issued no later than the newest record
+        // the bound evicted, may be an evicted record replayed: `feed_seq`
+        // isn't signed, so whoever serves the feed could re-serve one at a
+        // fresh position. Refused, as evidence (ruling T4a). A legitimate
+        // one is issued after it (a Station's `issued_at` for a principal's
+        // covers and releases only rises). Never a stop (ruling T4d): a
+        // hold applies as any hold, a replayed one only holding again, and
+        // a revoke or interrupt replayed is a duplicate (both are final).
+        // Nor a revoked principal's: rule 7 makes its cover and release
+        // inert already.
+        let guarded = matches!(action, ControlAction::Cover | ControlAction::Release);
         if counted.is_none()
             && guarded
             && kept.is_some_and(|part| {
@@ -4482,15 +4488,17 @@ mod control_state_tests {
             json!(issued(3))
         );
         assert_eq!(ids_of(&state, &service("svc-1")), vec![rid(2)]);
-        // A record the state no longer counts, issued no later than the
-        // newest evicted, is refused as a possible replay: evidence, and
-        // nothing changes (it isn't counted again).
-        let t = state.apply(&fx.svc(3, "svc-2", "svc-2", C::Hold, A), &fx.list, None, 0);
+        // A hold the state no longer counts is verified again and applied
+        // as a hold, whatever the floor (a stop always wins, ruling T4d):
+        // while held, a duplicate, and it counts again (newest).
         assert_eq!(
-            (t.applied.record_result, t.applied.evidence, t.applied.why),
-            (R::Refused, true, Some(Why::PossibleReplay))
+            state.adopt(&fx.svc(3, "svc-2", "svc-2", C::Hold, A), &fx.list, None, 0),
+            dup(&[E::Hold])
         );
-        assert_eq!(t.next, state);
+        assert_eq!(
+            ids_of(&state, &svc2),
+            ids(&mut std::iter::once(1).chain(5..=258).chain(std::iter::once(3)))
+        );
 
         // The revocation's record is pinned too, however old it gets.
         state.adopt(
@@ -4651,13 +4659,12 @@ mod control_state_tests {
         assert_eq!(state.standing(&svc2), standing(None, &[], true, Some(A)));
     }
 
-    /// A hold the state evicted, replayed after a release, is refused as a
-    /// possible replay too, at any position: harmless, since a hold its
-    /// Station means now is issued after every evicted record (a Station's
-    /// `issued_at` only rises) and applies. The old Station's cover and the
-    /// release, replayed, are refused the same way; nothing changes.
+    /// A hold the state evicted, replayed after a release, holds again: no
+    /// floor applies to a hold (ruling T4d), a stop that grants nothing.
+    /// The old Station's cover and the release, replayed under the floor,
+    /// are refused as possible replays; they change nothing.
     #[test]
-    fn an_evicted_hold_replayed_after_a_release_is_refused() {
+    fn an_evicted_hold_replayed_after_a_release_holds_again() {
         let fx = Fx::new();
         let mut state = fx.state();
         let svc2 = service("svc-2");
@@ -4693,9 +4700,7 @@ mod control_state_tests {
         for (rec, pos) in [
             (&stale_cover, at(B, 1)),
             (&release, at(A, 3)),
-            (&hold, at(A, 2)),
-            (&hold, at(A, 9)),
-            (&hold, None),
+            (&release, at(A, 9)),
         ] {
             let t = state.apply(rec, &fx.list, pos, 0);
             assert_eq!(
@@ -4707,11 +4712,16 @@ mod control_state_tests {
             assert!(t.applied.actions.is_empty() && t.touched().is_empty());
             assert_eq!(t.next, state);
         }
-        assert_eq!(
-            state.adopt(&hold, &fx.list, at(A, 2), 0),
-            evidence(all(R::Refused, &[E::Hold]))
-        );
-        assert_eq!(state.standing(&svc2), standing(None, &[], false, Some(A)));
+        // The hold, at its own position, at a fresh one or at none: it
+        // holds again, never refused as a replay.
+        for pos in [at(A, 2), at(A, 9), None] {
+            let t = state.apply(&hold, &fx.list, pos.clone(), 0);
+            assert_eq!(t.applied, held("svc-2"), "{pos:?}");
+        }
+        assert_eq!(state.adopt(&hold, &fx.list, at(A, 2), 0), held("svc-2"));
+        assert_eq!(state.standing(&svc2), standing(None, &[], true, Some(A)));
+        // Counted again: a duplicate now.
+        assert_eq!(state.adopt(&hold, &fx.list, None, 0), dup(&[E::Hold]));
 
         // Where nothing was evicted, the same hold is a duplicate.
         let mut kept = fx.state();
@@ -4727,9 +4737,76 @@ mod control_state_tests {
         assert!(!kept.standing(&svc2).held);
     }
 
+    /// After a switch to a Station whose clock lags the floor, its fresh
+    /// hold, issued below the floor, applies (a stop always wins); its
+    /// cover and release below the floor are refused as possible replays
+    /// until its `issued_at` passes the floor, which fails safe: the hold
+    /// stays and nothing new starts.
+    #[test]
+    fn a_lagging_stations_fresh_hold_below_the_floor_applies() {
+        let fx = Fx::new();
+        let mut state = held_with_its_release_evicted(&fx);
+        let svc2 = service("svc-2");
+        let floor = issued(4);
+        // Released by A first, above the floor.
+        let s2 = |n: u32, action: ControlAction| fx.svc(n, "svc-2", "svc-2", action, A);
+        assert_eq!(
+            state.adopt(&s2(600, C::Release), &fx.list, at(A, 9), 0),
+            released("svc-2")
+        );
+        // Station B, lagging: everything it signs is issued at the floor.
+        let lagging =
+            |n: u32, action: ControlAction| fx.svc_issued(n, "svc-2", action, B, floor - 1);
+        assert_eq!(
+            state.adopt(&lagging(601, C::Hold), &fx.list, at(B, 1), 0),
+            held("svc-2")
+        );
+        for (n, action, pos) in [(602, C::Cover, at(B, 2)), (603, C::Release, at(B, 3))] {
+            let t = state.apply(&lagging(n, action), &fx.list, pos, 0);
+            assert_eq!(
+                (t.applied.record_result, t.applied.evidence, t.applied.why),
+                (R::Refused, true, Some(Why::PossibleReplay)),
+                "{}",
+                action.name()
+            );
+            assert_eq!(t.next, state);
+        }
+        assert_eq!(state.standing(&svc2), standing(None, &[], true, Some(A)));
+        // Once its clock passes the floor (which every eviction raises: read
+        // it), its cover takes coverage and its release lifts the hold.
+        let floor_now = |state: &ControlState| {
+            state.part(&svc2).unwrap()["evicted_floor"]
+                .as_u64()
+                .unwrap()
+        };
+        assert!(floor_now(&state) > floor);
+        assert_eq!(
+            state.adopt(
+                &fx.svc_issued(604, "svc-2", C::Cover, B, floor_now(&state) + 1),
+                &fx.list,
+                at(B, 4),
+                0
+            ),
+            out(
+                R::Applied,
+                &[(E::Cover, R::Applied)],
+                vec![cover_action("svc-2", B)]
+            )
+        );
+        assert_eq!(
+            state.adopt(
+                &fx.svc_issued(605, "svc-2", C::Release, B, floor_now(&state) + 1),
+                &fx.list,
+                at(B, 5),
+                0
+            ),
+            released("svc-2")
+        );
+    }
+
     /// A record issued after the newest evicted record applies as ever,
-    /// one millisecond above the floor included; one issued at the floor is
-    /// a possible replay.
+    /// one millisecond above the floor included; a cover or release issued
+    /// at the floor is a possible replay.
     #[test]
     fn a_fresh_record_above_the_evicted_floor_applies() {
         let fx = Fx::new();

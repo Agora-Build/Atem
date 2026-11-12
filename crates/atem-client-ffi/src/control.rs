@@ -319,9 +319,10 @@ fn applied_info(applied: Applied) -> ControlApplied {
 /// it (a record verified then may not verify against today's list, and
 /// idempotency is by the records kept). Each principal keeps at most 256
 /// counted record ids, oldest evicted first (never its revocation's record
-/// nor the coverage's cover; a cover, hold or release under an evicted
-/// id, issued no later than the newest evicted, is refused as a possible
-/// replay). Every part names its device list (account and genesis).
+/// nor the coverage's cover; a cover or release under an evicted id,
+/// issued no later than the newest evicted, is refused as a possible
+/// replay, never a hold, revoke or interrupt). Every part names its device
+/// list (account and genesis).
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct ControlStateHandle {
     state: ControlState,

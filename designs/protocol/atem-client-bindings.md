@@ -1186,12 +1186,18 @@ agreement**, host-work-v1 §11.1 rule 1 and "The state, per principal").
 signed, so whoever serves a host the covering feed (you, or a carrier
 that rewrites your pages, such as Astation's `:8080` proxy) could
 otherwise re-serve an evicted release at a fresh position and lift a
-hold. A `cover`, `hold` or `release` of a principal that isn't revoked,
-under an id the state no longer counts and issued no later than the
-newest record evicted (the part's `evicted_floor`), is `refused` as a
-possible replay and kept as evidence. So your `issued_at` must only rise
-(your duty below): a record you sign now always applies. Revokes and
-interrupts are never refused for it (replayed, they are duplicates).
+hold. So the floor guards only what can grant or lift: a `cover` or
+`release` of a principal that isn't revoked, under an id the state no
+longer counts and issued no later than the newest record evicted (the
+part's `evicted_floor`), is `refused` as a possible replay and kept as
+evidence. Your `issued_at` for a principal's covers and releases must
+only rise (your duty below): one you sign now always applies. A stop
+never meets the floor: a hold applies as any hold (an evicted one
+replayed holds again, which grants nothing), and revokes and interrupts
+replayed are duplicates. The residual: after a host switches to a
+Station whose clock lags the floor, that Station's covers and releases
+are refused as possible replays until its `issued_at` passes the floor;
+it fails safe (holds stay, nothing new starts).
 Only principals of the device list count records, so a state stays far
 under the 64 MiB that `from_json` and `from_parts` read (a larger one is
 `too_large`). The acknowledgment ledger doesn't prune in this version.
@@ -1218,9 +1224,11 @@ trust model"):
 
 - Covers are ordered by `(issued_at, record_id)`: another Station's cover
   takes coverage only when strictly newer, and a cover never releases a
-  hold. Your records' `issued_at` only rises (a `cover`, `hold` or
-  `release` issued no later than a record a host evicted is refused there
-  as a possible replay). Your covers' `issued_at` only rises: each cover you sign for a
+  hold. Your `issued_at` for a principal's covers and releases only
+  rises (**needs Astation's agreement**: a `cover` or `release` issued no
+  later than a record a host evicted is refused there as a possible
+  replay; holds are never refused for it). Your covers' `issued_at` only
+  rises: each cover you sign for a
   principal is newer than any cover issued for it before, a handed-over
   integration's included (the handover carries the last cover's
   `issued_at`). A cover that isn't newer than the coverage's takes

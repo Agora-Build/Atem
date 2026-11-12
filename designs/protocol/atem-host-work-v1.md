@@ -1048,27 +1048,32 @@ The rules:
    `interrupt_running`) still applies its effects (a stop only ever adds),
    while a `cover` or `release` is `refused`. A record kept pending or
    refused takes no `record_id`. **Bounded** (**Atem's proposal, for
-   Astation's agreement**; plan decision 19, ruling T4a): a host keeps at
-   most 256 counted record ids per principal (`MAX_RECORD_IDS`), and the
-   next evicts the oldest, never the record that revoked the principal nor
-   the coverage's cover; the principal's **evicted floor** is the newest
-   `issued_at` among the records evicted. **An evicted record that comes
-   back grants nothing.** `feed_seq` isn't signed, so whoever serves the
-   host the covering feed's pages (the Station, which holds the key, or a
-   carrier that rewrites them, such as the `:8080` proxy, a native manager
-   that never signs a release, or an impostor on 127.0.0.1:8080) could
-   otherwise re-serve an evicted `release` at a fresh position and lift a
-   hold in force. So a `cover`, `hold` or `release` of a principal that
-   isn't revoked, under a `record_id` it doesn't count and issued no later
-   than its evicted floor, is `refused` as a possible replay
+   Astation's agreement**; plan decision 19, rulings T4a and T4d): a host
+   keeps at most 256 counted record ids per principal (`MAX_RECORD_IDS`),
+   and the next evicts the oldest, never the record that revoked the
+   principal nor the coverage's cover; the principal's **evicted floor**
+   is the newest `issued_at` among the records evicted. **An evicted
+   record that comes back grants nothing.** `feed_seq` isn't signed, so
+   whoever serves the host the covering feed's pages (the Station, which
+   holds the key, or a carrier that rewrites them, such as the `:8080`
+   proxy, a native manager that never signs a release, or an impostor on
+   127.0.0.1:8080) could otherwise re-serve an evicted `release` at a
+   fresh position and lift a hold in force. So the floor guards what can
+   grant or lift, and only that: a `cover` or `release` of a principal
+   that isn't revoked, under a `record_id` it doesn't count and issued no
+   later than its evicted floor, is `refused` as a possible replay
    (`possible_replay`) and kept as evidence, whatever its position. A
-   legitimate one is issued after the floor: a Station's `issued_at` only
-   rises (its duty below); refusing a replayed hold is harmless, since a
-   hold the Station means now is newer and applies. A `revoke` or an
-   `interrupt_running` is never refused for it: replayed, one is a
-   `duplicate` (a revocation and its interrupts are final, the revoking
-   record pinned); new, it is a stop. A revoked principal's cover, hold
-   and release are inert already (rule 7). An evicted manager's copy
+   legitimate one is issued after the floor: a Station's `issued_at` for
+   a principal's covers and releases only rises (its duty below). A stop
+   never meets the floor (a stop always wins): a `hold` applies as any
+   hold, so an evicted hold replayed holds again, which grants nothing;
+   a `revoke` or an `interrupt_running` replayed is a `duplicate` (a
+   revocation and its interrupts are final, the revoking record pinned),
+   and a new one is a stop. A revoked principal's cover and release are
+   inert already (rule 7). **The residual:** after a switch to a Station
+   whose clock lags the floor, its covers and releases are refused as
+   possible replays until its `issued_at` passes the floor. That fails
+   safe: holds stay, and nothing new starts. An evicted manager's copy
    whose signer was removed since comes back `refused` as evidence
    (verified against today's list) and changes nothing.
 2. **Verification** (above): `pending` waits for every effect; `refused` is
@@ -1170,11 +1175,13 @@ ordering can't stop a key holder. The Station's duties:
 - A Station's covers' `issued_at` only rises: each cover it signs for a
   principal is newer, by `(issued_at, record_id)`, than any cover issued
   for that principal before, a handed-over integration's included (the
-  handover carries the last cover's `issued_at`). So does every `hold`
-  and `release` it signs (with the bound of rule 1, for Astation's
-  agreement): one issued no later than a record a host evicted is refused
-  there as a possible replay, so a snapshot's records signed anew are
-  issued now, never with an old `issued_at`.
+  handover carries the last cover's `issued_at`). **Its releases' too
+  (with the bound of rule 1; needs Astation's agreement):** a Station's
+  `issued_at` for a principal's covers and releases only rises, since a
+  cover or release issued no later than a record a host evicted is
+  refused there as a possible replay; a snapshot's covers and releases
+  signed anew are issued now, never with an old `issued_at`. Holds need
+  no such duty: the floor never refuses a stop.
 - A Station re-issues covers only for principals it currently covers.
 - A Station that hands an integration over stops signing for it, and the
   key leaves with it (or the integration is created again as a new
@@ -1213,10 +1220,10 @@ with no coverage, the old Station's cover replayed after a move, an
 body under a counted id: a stop applies, a release or cover is refused,
 and the bound: from an `initial` state whose principal's records are full
 (those not in the file copies of the record `fill` under other ids), an
-evicted release re-served at a fresh position of the covering feed and an
-evicted hold are refused as possible replays while records issued after
-the evicted floor apply, and an evicted revoke replayed is still a
-duplicate), each step with the `standing` of its record's principal after
+evicted release re-served at a fresh position of the covering feed and a
+cover issued before the evicted floor are refused as possible replays
+while a release issued after it applies, an evicted hold replayed holds
+again, and an evicted revoke replayed is still a duplicate), each step with the `standing` of its record's principal after
 it. Each step's position is `{origin, feed_id, feed_seq}`; a state (v2)
 keeps one part per principal, naming its device list, its records the
 `[record_id, digest, issued_at]` triples that counted, oldest first.
