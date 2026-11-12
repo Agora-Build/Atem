@@ -100,3 +100,21 @@ jobs:
             echo "::error::tests were ignored in the debug build"
             exit 1
           fi
+          # The atem binary's debug-only unit tests (`#[cfg(debug_assertions)]`,
+          # so the release run above doesn't even build them), each by its
+          # exact name: the step fails unless every one of them ran and passed.
+          # Find them with
+          #   grep -rn -A2 '#\[cfg(debug_assertions)\]' src | grep -A1 'test\]'
+          units=(runtime::host_bridge::tests::the_drive_hook_plays_host_works_side_through_the_bridge)
+          cargo test --bin atem -- --exact --format pretty "${units[@]}" 2>&1 \
+            | tee debug-unit-tests.log
+          for u in "${units[@]}"; do
+            if ! grep -qxF "test $u ... ok" debug-unit-tests.log; then
+              echo "::error::$u did not run in the debug build"
+              exit 1
+            fi
+          done
+          if ! grep -qE "^test result: ok\. ${#units[@]} passed;" debug-unit-tests.log; then
+            echo "::error::the debug-only unit tests did not all run"
+            exit 1
+          fi

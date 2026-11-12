@@ -4545,10 +4545,11 @@ needs Astation's agreement).
        proves it current, and the host never writes a blind Esc. The owner
        learns of it from the `outcome_unknown` alert (`host.alerts`).
 
-   - **As built.** The chat's half of step 1's turn check is today's Esc
-     rule: chat-v1 shows the session `working` or `waiting`, and its
-     current turn is the one the attempt's prompt began; without chat, or
-     in any other state, the interrupt is dropped and nothing is written.
+   - **(as built; host-internal, no wire change)** The chat's half of
+     step 1's turn check is today's Esc rule: chat-v1 shows the session
+     `working` or `waiting`, and its current turn is the one the attempt's
+     prompt began; without chat, or in any other state, the interrupt is
+     dropped and nothing is written.
      The repeated revocation is a call of its own, which writes nothing.
      While an attempt's write waits for the worker's answer, the interrupt
      runs only that revocation, so one attempt never has two writes in
