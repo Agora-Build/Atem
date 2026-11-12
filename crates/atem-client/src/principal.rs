@@ -131,6 +131,9 @@ pub enum Need {
     /// request (roles change under a live channel, and `manage` is no
     /// permission here).
     HostPolicy,
+    /// `control_records` (delegated host work, II.3.1): a `native` member;
+    /// the records' own signatures carry the authority.
+    ControlRecords,
 }
 
 impl Need {
@@ -161,6 +164,7 @@ impl Need {
             ("session", "approval_seen") => Need::Seen,
             ("session", "revoke_grant") => Need::RevokeGrant,
             ("session", "host_policy_set" | "host_policy_get") => Need::HostPolicy,
+            ("session", "control_records") => Need::ControlRecords,
             ("session", "host_profiles" | "host_launch" | "host_launch_query") => {
                 Need::Op(Op::Launch)
             }
@@ -757,7 +761,7 @@ impl Authority {
         match (&self.scope, need) {
             (_, Need::Control) => control,
             (_, Need::RevokeGrant) => self.client_kind != ClientKind::Browser && control,
-            (_, Need::HostPolicy) => self.client_kind == ClientKind::Native,
+            (_, Need::HostPolicy | Need::ControlRecords) => self.client_kind == ClientKind::Native,
             (None, Need::Seen) => control,
             (Some(scope), Need::Seen) => control && scope.ops.contains(&Op::Approval),
             (None, Need::Op(Op::View | Op::Message)) => true,

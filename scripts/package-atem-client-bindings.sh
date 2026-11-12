@@ -203,6 +203,9 @@ FILES+=("$FRAMING_VECTOR")
 FRAMING_SIZE_VECTOR="atem-client-${VERSION}-host-work-framing-size-v1.json"
 cp designs/protocol/fixtures/host-work/framing-size-v1.json "$OUT/$FRAMING_SIZE_VECTOR"
 FILES+=("$FRAMING_SIZE_VECTOR")
+CONTROL_VECTOR="atem-client-${VERSION}-r9-vectors-host-work-control.json"
+cp designs/protocol/fixtures/r9-vectors-host-work-control.json "$OUT/$CONTROL_VECTOR"
+FILES+=("$CONTROL_VECTOR")
 SUMS="atem-client-${VERSION}-SHA256SUMS.txt"
 (cd "$OUT" && sha256sum "${FILES[@]}" >"$SUMS")
 echo "Packaged into $OUT:"

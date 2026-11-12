@@ -26,10 +26,11 @@ trap 'rm -rf "$WORK"' EXIT
 VECTORS="$ROOT/designs/protocol/fixtures/r9-vectors-pairing.json"
 
 (cd "$DIR" && sha256sum -c "atem-client-${VERSION}-SHA256SUMS.txt")
-# The shared host-work vectors ship beside the packages, each listed in the
+# The shared host-work and r9 vectors ship beside the packages, each listed in the
 # sums (sha256sum -c above checked what is listed, not that it is listed).
-for VECTOR_NAME in requests-v1 prompt-framing-v1 framing-size-v1; do
-  VECTOR_FILE="atem-client-${VERSION}-host-work-${VECTOR_NAME}.json"
+for VECTOR_NAME in host-work-requests-v1 host-work-prompt-framing-v1 host-work-framing-size-v1 \
+  r9-vectors-host-work-control; do
+  VECTOR_FILE="atem-client-${VERSION}-${VECTOR_NAME}.json"
   test -s "$DIR/$VECTOR_FILE" || { echo "$VECTOR_FILE: missing from the package directory" >&2; exit 1; }
   awk -v f="$VECTOR_FILE" '$2 == f {found = 1} END {exit !found}' "$DIR/atem-client-${VERSION}-SHA256SUMS.txt" \
     || { echo "$VECTOR_FILE: not listed in the sums" >&2; exit 1; }

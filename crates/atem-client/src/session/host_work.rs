@@ -10,6 +10,15 @@ pub const LAUNCH_FEATURE: &str = "host.launch";
 pub const WORK_FEATURE: &str = "host.work";
 /// `reply_query`: the reply the agent working on a task submitted.
 pub const REPLY_FEATURE: &str = "host.reply";
+/// Delegated host work (`work_interrupt`, `work_resolve`; delegated
+/// host-work design, plan decision 4). Planned: no host advertises it yet.
+pub const DELEGATED_FEATURE: &str = "host.delegated";
+/// `alert_list`: the host's alerts. Planned: no host advertises it yet.
+pub const ALERTS_FEATURE: &str = "host.alerts";
+/// Host senders (`control_records`, `host_enc_key_get`: the ops that exist
+/// only for them). Planned: no host advertises it yet, so a client never
+/// sends them and a host refuses them ([`crate::session::r9::control_records_op`]).
+pub const SENDERS_FEATURE: &str = "host.senders";
 pub const MAX_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_CONTEXT_BYTES: usize = 128 * 1024;
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;

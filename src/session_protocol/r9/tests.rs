@@ -3043,3 +3043,128 @@ fn the_pairing_copy_is_never_lowered_by_a_running_engine() {
         "the sidecar is level: {side:?}"
     );
 }
+
+/// `control_records` (delegated host-work design II.3.1, plan Task 12) is
+/// the op of `host.senders`, which no host advertises in step 3: an op of
+/// an unadvertised feature is `unsupported_version` (session-v1 §A), and
+/// nothing is applied, answered or fenced.
+mod control_records {
+    use super::*;
+    use atem_client::control::ControlRecord;
+    use atem_client::session::host_work::{ALERTS_FEATURE, DELEGATED_FEATURE, SENDERS_FEATURE};
+    use atem_client::session::r9::control_records_op;
+
+    const ID: &str = "aaaaaaaa-0000-4000-8000-0000000000c1";
+
+    /// A host principal's `interrupt_running`: the right shape, a
+    /// signature that nothing verifies (the host refuses before reading it).
+    fn record(n: u64) -> ControlRecord {
+        let body = json!({
+            "type": "atem-host-work-control", "v": 1,
+            "account_id": ACCOUNT, "genesis_hash": "11".repeat(32),
+            "principal": "host:host-other", "signer": "member:dev-mac",
+            "action": "interrupt_running", "revoke_seq": 7,
+            "record_id": format!("0b9a8c7d-6e5f-4a3b-9c2d-{n:012x}"),
+            "issued_at": 1_793_620_800_000u64,
+            "about": {"by": "owner"},
+        });
+        ControlRecord::parse(
+            json!({"body": body, "sig": atem_client::encoding::b64u(&[7u8; 64])})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap()
+    }
+
+    /// What `handle` got back for a `control_records` the host was handed:
+    /// exactly one message, an error naming the request.
+    fn refusal(rig: &mut Rig, handle: &str) -> (String, Option<String>) {
+        let sent = control_records_op(ID, &[record(1), record(2)]).unwrap();
+        // The client core never sends it to a host that didn't advertise
+        // `host.senders`: the host is handed the record directly, as a
+        // misbehaving or newer client's would arrive.
+        let (att, authority) = match &rig.engine.chans[handle].phase {
+            Phase::Open(a) => (a.attachment.clone(), a.authority.clone()),
+            _ => panic!("{handle} is open"),
+        };
+        let plain = sent.to_string().into_bytes();
+        rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
+        rig.pump();
+        let events = rig.events(handle);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let CEvent::Error(e) = &events[0] else {
+            panic!("an error: {events:?}");
+        };
+        assert_eq!(e.re.as_deref(), Some(ID));
+        (e.code.clone(), e.detail.clone())
+    }
+
+    #[test]
+    fn host_refuses_unadvertised() {
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-bot", bot());
+        for handle in ["ch-phone", "ch-bot"] {
+            for feature in [DELEGATED_FEATURE, ALERTS_FEATURE, SENDERS_FEATURE] {
+                assert!(
+                    !welcome(&mut rig, handle)
+                        .features
+                        .iter()
+                        .any(|f| f == feature),
+                    "{feature}"
+                );
+            }
+        }
+        // A native: the op is the feature's, so it is not supported here.
+        assert_eq!(
+            refusal(&mut rig, "ch-phone"),
+            (
+                "unsupported_version".into(),
+                Some("host.senders is not advertised".into())
+            )
+        );
+        // A service has no right to it either way (a native's op).
+        assert_eq!(refusal(&mut rig, "ch-bot").0, "forbidden");
+        // The channels are as they were: still attached, still served, and
+        // no host-work request, relay message or fence came of it.
+        assert_eq!(rig.engine.status().attachments, 2);
+        assert_eq!(
+            rig.list("ch-phone"),
+            vec![SID.to_string(), SID_B.to_string()]
+        );
+        assert_eq!(rig.list("ch-bot"), vec![SID.to_string()]);
+        assert!(rig.engine.take_host_work().is_empty());
+        assert!(rig.relay.is_empty());
+    }
+
+    /// Hosting on changes nothing: the host-work features are advertised,
+    /// the three delegated ones still are not, and the op is still refused
+    /// the same way.
+    #[test]
+    fn control_records_refused_until_advertised() {
+        let mut rig = Rig::new();
+        rig.engine.enable_host_work(true);
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        let features = welcome(&mut rig, "ch-phone").features;
+        assert!(
+            features.iter().any(|f| f == "host.work"),
+            "hosting is on: {features:?}"
+        );
+        for feature in [DELEGATED_FEATURE, ALERTS_FEATURE, SENDERS_FEATURE] {
+            assert!(!features.iter().any(|f| f == feature), "{feature}");
+        }
+        assert_eq!(
+            refusal(&mut rig, "ch-phone"),
+            (
+                "unsupported_version".into(),
+                Some("host.senders is not advertised".into())
+            )
+        );
+        // Asked again, the same; never a host-work request.
+        assert_eq!(refusal(&mut rig, "ch-phone").0, "unsupported_version");
+        assert!(rig.engine.take_host_work().is_empty());
+    }
+}

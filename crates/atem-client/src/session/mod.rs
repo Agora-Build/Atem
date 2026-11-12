@@ -13,7 +13,9 @@
 //! - [`r9`]: the r9 `hello` (built by the crate around `sig_c`, parsed by the
 //!   host), `welcome`, the r9 session errors and the new session ops of
 //!   §R9.8 (`membership`, `membership_head`, `revoke_grant`,
-//!   `grant_revoked`, `approval_seen`, `seen`);
+//!   `grant_revoked`, `approval_seen`, `seen`) and delegated host work's
+//!   `control_records` and `control_records_result` (feature `host.senders`,
+//!   not advertised yet);
 //! - [`host_policy`]: §R9.8a's relay-only policy (`host_policy_set`,
 //!   `host_policy_get`, `host_policy_result`) and the client's tracker;
 //! - [`framing`]: the prompt framing sender text can't imitate (delegated

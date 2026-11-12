@@ -9,7 +9,7 @@
 //!                    ── finish(hello) ──▶
 //! AwaitWelcome::on_frame ◀── rec 0 ─────── welcome | session error
 //! Attached: list / acquire / submit / receipt_query / approval_seen /
-//!           revoke_grant / membership, and on_frame → events
+//!           revoke_grant / membership / control_records, and on_frame → events
 //! ```
 //!
 //! Sans-I/O like the channel: the caller moves frames, passes the monotonic
@@ -432,6 +432,7 @@ impl AwaitWelcome {
         self.channel.limit_lifetime(now_ms + lifetime);
         let mut attached = Attached {
             host_work: HashMap::new(),
+            control_records: HashMap::new(),
             host_policy: HostPolicyTracker::new(&welcome, false),
             channel: self.channel,
             authorization_deadline: now_ms + lifetime,
@@ -558,6 +559,9 @@ enum Outstanding {
 /// A welcomed attachment: the channel, the `welcome`, and r8's machines.
 pub struct Attached {
     host_work: HashMap<String, crate::session::host_work::Request>,
+    /// `control_records` requests awaiting their results: the request's
+    /// `id` and the `record_id`s it carried, in order.
+    control_records: HashMap<String, Vec<String>>,
     channel: Channel,
     welcome: Welcome,
     host_head: HostHead,
@@ -688,9 +692,15 @@ impl Attached {
         self.seal(&wire::to_value(&env), now_ms)
     }
 
-    /// Any session-family message the app built (terminal-v1, chat-v1).
+    /// Any session-family message the app built (terminal-v1, chat-v1). Host
+    /// work ops and `control_records` are checked first, as their own
+    /// methods check them: against the features the host advertised, with
+    /// their request tracked until the host answers.
     pub fn send(&mut self, message: &Value, now_ms: u64) -> Result<Vec<u8>, ConnectError> {
         let data = &message["data"];
+        if message["type"] == "session" && data["op"] == "control_records" {
+            return self.send_control_records_message(message, now_ms);
+        }
         if message["type"] == "session"
             && matches!(
                 data["op"].as_str(),
@@ -999,6 +1009,58 @@ impl Attached {
         Ok((id, frame))
     }
 
+    /// `control_records{records}`: control records carried to the host on
+    /// the open channel (a native member's op; send `membership` up to the
+    /// head first, [`crate::session::r9::control_records_op`]). Only to a host
+    /// that advertised `host.senders` ("host feature not available"
+    /// otherwise: nothing is sealed). The host answers one
+    /// `control_records_result` with a result per record, which arrives as a
+    /// `session` [`Event::Family`] message once it answers this request, in
+    /// the order sent.
+    pub fn send_control_records(
+        &mut self,
+        records: &[crate::control::ControlRecord],
+        now_ms: u64,
+    ) -> Result<(String, Vec<u8>), ConnectError> {
+        let id = new_id();
+        let message =
+            crate::session::r9::control_records_op(&id, records).map_err(ConnectError::Request)?;
+        let frame = self.send(&message, now_ms)?;
+        Ok((id, frame))
+    }
+
+    /// A `control_records` message, however it was built: read as the host
+    /// reads it, sent only to a host that advertised `host.senders` and
+    /// tracked until its result comes ([`Attached::on_frame`] takes no
+    /// result nobody asked for).
+    fn send_control_records_message(
+        &mut self,
+        message: &Value,
+        now_ms: u64,
+    ) -> Result<Vec<u8>, ConnectError> {
+        let senders = crate::session::host_work::SENDERS_FEATURE;
+        if !self.welcome.features.iter().any(|f| f == senders) {
+            return Err(ConnectError::Request("host feature not available"));
+        }
+        let request =
+            crate::session::r9::ControlRecordsRequest::decode(message.to_string().as_bytes())
+                .map_err(ConnectError::Request)?;
+        if self.control_records.contains_key(&request.id) {
+            return Err(ConnectError::Request("duplicate control records id"));
+        }
+        if self.control_records.len() >= 64 {
+            return Err(ConnectError::Request("too many control records requests"));
+        }
+        let frame = self.seal(message, now_ms)?;
+        let record_ids = request
+            .records
+            .iter()
+            .map(|r| r.record_id().to_owned())
+            .collect();
+        self.control_records.insert(request.id, record_ids);
+        Ok(frame)
+    }
+
     /// Opens one record and runs it through the machines. A failed record
     /// closes the channel (`ConnectError::Channel`).
     pub fn on_frame(&mut self, frame: &[u8], now_ms: u64) -> Result<Vec<Event>, ConnectError> {
@@ -1050,9 +1112,26 @@ impl Attached {
                     request: None,
                 })]);
             }
+            Incoming::ControlRecordsResult(result) => {
+                let bound = self
+                    .control_records
+                    .get(&result.re)
+                    .is_some_and(|record_ids| result.answers(&result.re, record_ids));
+                if !bound {
+                    return Err(ConnectError::Malformed("unbound control records result"));
+                }
+                self.control_records.remove(&result.re);
+                return Ok(vec![Event::Family(FamilyMessage {
+                    family: "session".into(),
+                    data: Some(result.to_json()["data"].clone()),
+                    binding: None,
+                    request: None,
+                })]);
+            }
             Incoming::Error(error) => {
                 if let Some(re) = &error.re {
                     self.host_work.remove(re);
+                    self.control_records.remove(re);
                 }
                 // r8's machines see r8's errors (a lease request's refusal).
                 if let Ok(Envelope::Session(msg)) = wire::decode(&plain) {
