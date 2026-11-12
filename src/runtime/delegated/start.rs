@@ -196,6 +196,12 @@ impl StartView {
         self.live.insert(attempt_id.to_string(), task);
     }
 
+    /// Tests: whether `attempt_id` is registered as live.
+    #[cfg(test)]
+    pub fn is_live(&self, attempt_id: &str) -> bool {
+        self.live.contains_key(attempt_id)
+    }
+
     /// The event a start refused `attempt_id` for, if one did.
     pub fn refused(&self, attempt_id: &str) -> Option<Event> {
         self.refused.get(attempt_id).copied()

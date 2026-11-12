@@ -1,5 +1,6 @@
 //! Opt-in host operations. Work reaches agents only through session-v1 receipts.
 use super::*;
+use crate::runtime::delegated::authority::Caller;
 use crate::runtime::delegated::{Admission, NoFeeds, SenderClass, classify, details};
 use crate::runtime::host_clock::HostClock;
 use crate::runtime::host_work::{
@@ -51,6 +52,8 @@ mod collab_bridge;
 mod collab_launch_bridge;
 #[path = "delegated/dispatch.rs"]
 mod delegated_dispatch;
+#[path = "delegated/requests.rs"]
+mod delegated_requests;
 
 /// The local sender exists only on the broker's internal attachment.
 pub(crate) enum Sender {
@@ -1098,7 +1101,13 @@ impl HostBridge {
                     if old.principal != record.principal || old.digest != record.digest {
                         return Err("request_id_reused".into());
                     }
-                    if !self.work_route_allowed(&old, &a) {
+                    // A delegated task's sender with current authority
+                    // (design I.4.5), else v1's rule.
+                    let allowed = match &old.delegated {
+                        Some(adm) => self.delegated_caller(&a, &old, adm) == Ok(Caller::Sender),
+                        None => self.work_route_allowed(&old, &a),
+                    };
+                    if !allowed {
                         return Err("forbidden".into());
                     }
                     return Ok(ResultBody::Work { work: old.status });
@@ -1128,12 +1137,36 @@ impl HostBridge {
                     .work(task_id)
                     .map_err(|_| "busy")?
                     .ok_or("forbidden")?;
-                if r.principal != principal || !self.work_route_allowed(&r, &a) {
-                    return Err("forbidden".into());
+                match &r.delegated {
+                    // A delegated task (design I.4.5): its sender with
+                    // current authority, no control generation compared and
+                    // no route hiding it; the owner (Decision 15) only reads
+                    // it.
+                    Some(adm) => {
+                        let caller = self
+                            .delegated_caller(&a, &r, adm)
+                            .map_err(|_| "forbidden")?;
+                        if caller == Caller::Owner
+                            && matches!(req, Request::Cancel { .. } | Request::Complete { .. })
+                        {
+                            return Err("forbidden".into());
+                        }
+                    }
+                    None => {
+                        if r.principal != principal || !self.work_route_allowed(&r, &a) {
+                            return Err("forbidden".into());
+                        }
+                    }
                 }
                 if r.status.state == WorkState::OutcomeUnknown {
                     self.reconcile_work(&mut r).map_err(|_| "busy")?;
                     store.save_work(&r).map_err(|_| "busy")?;
+                }
+                // A delegated task's cancel withdraws a live attempt first.
+                if r.delegated.is_some() && matches!(req, Request::Cancel { .. }) {
+                    return Ok(ResultBody::Work {
+                        work: self.delegated_cancel(r, cx)?,
+                    });
                 }
                 match req {
                     // The reply its agent submitted, to the sender that asked
@@ -1279,9 +1312,38 @@ impl HostBridge {
             _ => return Err("invalid_request"),
         };
         if let Some(old) = store.message(message_id).map_err(|_| "busy")? {
-            if old.message.sender != a.name() || old.sender_key != a.key_json() {
-                return Err("forbidden");
-            }
+            // Its delegated tasks (a delegated sender's agent recipients):
+            // their caller rule decides (design I.4.5, Decision 15), and the
+            // owner reads it but never publishes it again. None to look for
+            // on a host that can hold none (`may_hold_delegated`).
+            let delegated: Vec<WorkRecord> = if self.may_hold_delegated() {
+                old.receipt
+                    .recipients
+                    .iter()
+                    .filter(|p| matches!(p.delivery, Delivery::Work { .. }))
+                    .map(|p| store.work(&p.recipient_id).map_err(|_| "busy"))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .filter(|t| t.delegated.is_some())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let caller = if delegated.is_empty() {
+                if old.message.sender != a.name() || old.sender_key != a.key_json() {
+                    return Err("forbidden");
+                }
+                Caller::Sender
+            } else {
+                match self.delegated_message_caller(a, &delegated) {
+                    Some(Caller::Owner) if matches!(req, hw::Request::Publish { .. }) => {
+                        return Err("forbidden");
+                    }
+                    Some(caller) => caller,
+                    None => return Err("forbidden"),
+                }
+            };
             // By the digest recorded at acceptance, which stays when the
             // message's text is dropped (`Store::drop_payloads`).
             if let hw::Request::Publish { message, .. } = req
@@ -1294,12 +1356,14 @@ impl HostBridge {
                 .recipients
                 .iter()
                 .filter(|r| &r.host == req.host())
+                // A delegated task's recipient: its caller rule, above.
+                .filter(|r| !delegated.iter().any(|t| t.task.task_id == r.recipient_id))
             {
                 let accepted = old.receipt.recipients.iter().any(|p| {
                     p.recipient_id == r.recipient_id
                         && !matches!(p.delivery, Delivery::Refused { .. })
                 });
-                if accepted && !self.message_scope(r, a) {
+                if caller == Caller::Sender && accepted && !self.message_scope(r, a) {
                     return Err("forbidden");
                 }
             }
@@ -1335,7 +1399,7 @@ impl HostBridge {
                     .profile(&route.profile_id)
                     .ok_or("forbidden")?;
                 let task = message.task(r).ok_or("invalid_request")?;
-                let record = WorkRecord {
+                let mut record = WorkRecord {
                     delegated: None,
                     attachment_owner: attachment_owner(a),
                     principal: a.name(),
@@ -1369,6 +1433,11 @@ impl HostBridge {
                     let delivery = Delivery::Work {
                         work: (&record.status).into(),
                     };
+                    // A delegated sender's task (Decision 13), mark tasks
+                    // included: its admission record, stored with it in the
+                    // message's transaction (`accept_message`), so it joins
+                    // its sender's order.
+                    record.delegated = self.admission(a, route_id, *route_revision);
                     tasks.push(record);
                     delivery
                 } else {
@@ -1914,7 +1983,10 @@ impl HostBridge {
     /// control state of every principal a task names
     /// (`SessionHost::keep_principals`), so forgetting one is no change. A
     /// halted session journal is a pause of `local`, no change of its
-    /// authority (`local_halted`): its tasks wait for the restart.
+    /// authority (`local_halted`): its tasks wait for the restart. Never a
+    /// delegated task's: design I.3.3's events reach those through the
+    /// start check's conditions (`delegated_dispatch`), and their awaiting
+    /// and unknown tasks are kept (`Store::settle_lost` reads v1 rows only).
     pub(super) fn work_lost(&self, a: &Accepted, now: u64) -> Option<&'static str> {
         if a.authorization_expires_at.is_some_and(|at| now >= at) {
             return Some(AUTHORIZATION_EXPIRED);
@@ -1987,10 +2059,12 @@ fn authority_session(a: &Sender, target: &wire::Target, projects: &ProjectScopes
 #[cfg(test)]
 mod local_tests {
     use super::*;
-    /// The delegated dispatch's tests, beside the rig they share.
+    /// The delegated dispatch's tests and the delegated lifecycle's
+    /// (interaction authority, the event rules), beside the rig they share.
     mod delegated_tests {
         use super::*;
         include!("delegated/dispatch_tests.rs");
+        include!("delegated/lifecycle_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};

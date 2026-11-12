@@ -6,7 +6,11 @@
 //!
 //! - **with a live attempt** is settled from the session host's receipt of
 //!   it (`attempt_receipt`: only host-work's request for that task): still
-//!   `accepted`, it waits for its turn and holds its session; started, the
+//!   `accepted`, it waits for its turn and holds its session, unless an
+//!   event that settles the task applies (a revocation, a removal, a
+//!   narrowing off the target, a route change, a frozen, held or faulted
+//!   device list): then it is withdrawn first and the task takes the
+//!   event's state once the withdrawal is confirmed (I.5.5); started, the
 //!   attempts are over and the task follows that receipt; withdrawn,
 //!   rejected or never admitted, the attempt ends with that proof and the
 //!   task takes the event's state (the start check's, kept with the
@@ -24,14 +28,23 @@
 //!   included, may pass it; the sender's own later tasks there wait behind
 //!   it, so one sender's tasks keep their order.
 //!
-//! Never v1's rules: no sender channel, no `work_lost`. With `host.delegated`
+//! Never v1's rules: no sender channel, no `work_lost`. So the events of
+//! design I.3.3 reach a delegated task only through the start check's
+//! conditions (`may_start`, `Event::outcome`): its sender's grant expiring
+//! and its control generation moving fail nothing; a narrowing fails only
+//! an unstarted task the grant no longer covers, a route change only an
+//! unstarted one; a removal or a revocation cancels an unstarted one
+//! (`sender revoked`). Tasks awaiting their result or of unknown outcome
+//! are kept (`Store::settle_lost` reads v1 rows only). With `host.delegated`
 //! off (the hook removed after tasks were accepted, step 4's Decision 10),
 //! an unstarted task stays `blocked`, `host.delegated is off`, and expires at
 //! its deadline on the delegated clock; a started one follows its receipt.
 use super::*;
 use crate::runtime::delegated::attempts::{Attempt, AttemptEnd, SessionAnswer, attempt_end};
 use crate::runtime::delegated::start::{EXPIRED_BEFORE_SUBMISSION, Event, StartTask, may_start};
-use crate::session_protocol::host::{DETAIL_SESSION_CLOSED, DETAIL_TRUST_CHANGED, Provenance};
+use crate::session_protocol::host::{
+    DETAIL_SESSION_CLOSED, DETAIL_TRUST_CHANGED, Immutable, Provenance, Withdrawal,
+};
 
 /// A task that waits for its first attempt (host-work v1's text).
 const WAITING_FOR_A_READY_AGENT: &str = "waiting for a ready agent";
@@ -68,7 +81,7 @@ impl HostBridge {
             .unwrap()
             .live_attempt(&r.task.task_id)?;
         if let Some(attempt) = live
-            && self.settle_attempt(r, &attempt, now_d)?
+            && self.settle_attempt(r, &attempt, now_d, cx)?
         {
             occupied.insert(sid);
             return Ok(());
@@ -281,7 +294,9 @@ impl HostBridge {
                     (WorkState::Queued, WAITING_FOR_A_READY_AGENT),
                 )
             }
-            _ => self.settle_attempt(r, &attempt, Some(now_d)).map(|_| ()),
+            _ => self
+                .settle_attempt(r, &attempt, Some(now_d), cx)
+                .map(|_| ()),
         }
     }
 
@@ -295,6 +310,7 @@ impl HostBridge {
         r: &mut WorkRecord,
         a: &Attempt,
         now_d: Option<u64>,
+        cx: &mut Cx,
     ) -> anyhow::Result<bool> {
         let receipt = self.host.attempt_receipt(&a.attempt_id, &r.task.task_id);
         // The start check's withdrawal for a hold isn't counted.
@@ -306,6 +322,12 @@ impl HostBridge {
             Some(rc) => attempt_end(SessionAnswer::Receipt(rc.state, rc.detail.as_deref()), held),
         };
         let Some(end) = end else {
+            // `accepted`, and an event that settles the task applies now:
+            // the attempt is withdrawn first, and the task settles from
+            // the withdrawal (design I.5.5, I.5.6).
+            if self.withdraw_for_event(r, a, now_d, cx)? {
+                return Ok(false);
+            }
             // `accepted`: live, waiting for its turn.
             let before = r.status.clone();
             self.reconcile_work(r)?;
@@ -347,6 +369,62 @@ impl HostBridge {
         Ok(false)
     }
 
+    /// The live attempt `a` of `r` waits `accepted` (unstarted, design
+    /// I.3.2): when an event that settles the task applies now (the sender
+    /// revoked or removed, its grant narrowed off the target, its route
+    /// changed, the device list frozen, held or faulted: `may_start`'s, so
+    /// the details are the dispatch's own), the attempt is withdrawn in the
+    /// session host and, once that is confirmed, ended, the task taking the
+    /// event's state (design I.3.3, I.5.5, I.5.6; VII.A test 6). True when
+    /// it did. A withdrawal that found the attempt started leaves it to its
+    /// receipt; one that couldn't be confirmed (the journal halted) leaves
+    /// it as it is: nothing becomes `executing` until the restart, which
+    /// withdraws it. The deadline is left to the start check (and the
+    /// deadline's interrupt intents), and with `host.delegated` off nothing
+    /// is withdrawn here (step 4's Decision 10: a started task follows its
+    /// receipt).
+    fn withdraw_for_event(
+        &mut self,
+        r: &mut WorkRecord,
+        a: &Attempt,
+        now_d: Option<u64>,
+        cx: &mut Cx,
+    ) -> anyhow::Result<bool> {
+        if !self.features.delegated || self.host.journal_halted() {
+            return Ok(false);
+        }
+        let Some(task) = StartTask::of(r) else {
+            return Ok(false);
+        };
+        let checked = may_start(&self.start_view(), &task, now_d);
+        let Err(event) = checked else {
+            return Ok(false);
+        };
+        if !event.outcome().0.terminal() || event == Event::Expired {
+            return Ok(false);
+        }
+        // The request is in the journal (`accepted`), so the withdrawal
+        // finds it by its id: these values go nowhere.
+        let immutable = Immutable {
+            target: r.task.target.clone(),
+            payload_digest: String::new(),
+            provenance: Provenance {
+                task_id: r.task.task_id.clone(),
+                sender: r.principal.clone(),
+            },
+        };
+        let withdrawal = self.host.withdraw(&a.attempt_id, &immutable);
+        let effects = self.host.take_effects();
+        self.exec(effects, cx);
+        let end = match withdrawal {
+            Withdrawal::Started | Withdrawal::Halted => return Ok(false),
+            w => attempt_end(SessionAnswer::Withdrawal(w), false)
+                .unwrap_or(AttemptEnd::Withdrawn { counted: true }),
+        };
+        self.end_attempt(r, a, end, event.outcome())?;
+        Ok(true)
+    }
+
     /// Where a task that may get another attempt goes: the event that stops
     /// it now if one does (a revocation while it waited cancels it, I.6.3),
     /// else back to `queued`.
@@ -364,8 +442,10 @@ impl HostBridge {
     /// Ends attempt `a` of `r` with `end`, the task taking `next`, in one
     /// `BEGIN IMMEDIATE` transaction: the state first, so an event's beats
     /// `too many attempts` (`end_attempt` fails only a task still waiting).
-    /// Never pasted: its terminal pause goes.
-    fn end_attempt(
+    /// A task whose stored state is already terminal (a cancel, an event
+    /// settled it) keeps it: only the attempt ends. Never pasted: its
+    /// terminal pause goes.
+    pub(super) fn end_attempt(
         &mut self,
         r: &mut WorkRecord,
         a: &Attempt,
@@ -378,9 +458,11 @@ impl HostBridge {
             let mut record = store
                 .work(&r.task.task_id)?
                 .ok_or_else(|| anyhow::anyhow!("no task {}", r.task.task_id))?;
-            record.status.state = next.0;
-            record.status.detail = next.1.into();
-            store.save_work(&record)?;
+            if !record.status.state.terminal() {
+                record.status.state = next.0;
+                record.status.detail = next.1.into();
+                store.save_work(&record)?;
+            }
             store.end_attempt(&tx, &r.task.task_id, &a.attempt_id, end)?;
             tx.commit()?;
             *r = store

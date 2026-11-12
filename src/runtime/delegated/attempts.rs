@@ -138,10 +138,9 @@ pub enum SessionAnswer<'a> {
     /// Its receipt: state and detail.
     Receipt(ReceiptState, Option<&'a str>),
     /// `SessionHost::withdraw` (R9.14 item 4).
-    // Answered once withdrawals and interrupt intents run (Tasks 20, 26).
-    #[allow(dead_code)]
     Withdrawal(Withdrawal),
     /// `SessionHost::host_interrupt` (R9.14 item 5).
+    // Answered once interrupt intents run (Task 26).
     #[allow(dead_code)]
     Interrupt(&'a HostInterrupt),
 }

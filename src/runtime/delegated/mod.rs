@@ -7,9 +7,12 @@
 //!
 //! Here so far: who is delegated ([`classify`]: design I.1.3, Decision 13),
 //! the admission record a delegated sender's task gets ([`Admission`],
-//! I.4.1), its attempts ([`attempts`], I.6.4), what the bridge answers the
-//! delegated ops ([`request`]), and §11.6's detail texts ([`details`]).
+//! I.4.1), its attempts ([`attempts`], I.6.4), the start check and the
+//! gates ([`start`], [`gate`], I.4.3, I.5.8), who may query, cancel or
+//! complete it ([`authority`], I.4.5, Decision 15), what the bridge answers
+//! the delegated ops ([`request`]), and §11.6's detail texts ([`details`]).
 pub mod attempts;
+pub mod authority;
 pub mod details;
 pub mod gate;
 pub mod start;
