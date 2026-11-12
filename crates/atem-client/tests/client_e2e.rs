@@ -736,10 +736,9 @@ fn a_contradicting_welcome_is_refused() {
 
 /// The welcome's `verifier` through the connect path (R9.2 "How a verifier
 /// reports itself"; Atem's proposal, for Astation's agreement): a host's
-/// inventory is
-/// read into the attachment's welcome, a host sending none gives `None`,
-/// and a malformed one (or `null`) refuses the welcome: the client never
-/// attaches (`Malformed("verifier")`).
+/// inventory is read into the attachment's welcome, a host sending none
+/// gives `None`, and a malformed one (or `null`) refuses the welcome: the
+/// client never attaches (`Malformed("verifier")`).
 #[test]
 fn a_welcome_carries_the_hosts_verifier() {
     use atem_client::membership::VerifierInventory;

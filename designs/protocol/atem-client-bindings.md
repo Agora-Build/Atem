@@ -600,24 +600,30 @@ sorted by bytes. A strict verifier refuses a chain at an entry of any
 other action, so a signer's gate counts each app's verifier by this.
 `WelcomeInfo.verifier` is the host's inventory when its `welcome` carried
 one. Atem hosts send one in every welcome from the first release that
-carries this change; v0.8.x hosts send none. It is the host's claim about
-itself and never opens the gate alone.
+carries this change; hosts from v0.8.0 to v0.8.5 send none. It is the
+host's claim about itself and never opens the gate alone.
 
 How a signer's gate uses it (**Atem's proposal, for Astation's
-agreement**; session-v1 R9.2 "How the signing gate uses it"):
+agreement**; session-v1 R9.2 "How the signing gate uses it"). It says when
+a verifier is confirmed, and it extends the gate to three scope ops:
 
 - Versions only widen. A version lists every action of the one before it
   and accepts every entry that one accepts, with the same derived state.
-- A signer signs an entry only when every verifier it counts for the
-  account has a confirmed inventory, from its latest welcome, that lists
-  the entry's action, at a version at least the first one that accepts
-  the entry. Today that is version 2 for the five delegated host work
-  actions.
+- A signer signs an entry that some released verifier refuses only when
+  every strict verifier of the account has a confirmed inventory, from
+  its latest welcome, that lists the entry's action, at a version at
+  least the first one that accepts the entry. Today those entries are the
+  five delegated host work actions (version 2), and a service `add` or
+  `set_roles` whose scope carries `launch`, `message` or `notify`
+  (version 1; v0.8.0 and v0.8.1 lack those ops). Every other entry is
+  accepted by every release from v0.8.0 to v0.8.5 and needs no inventory.
 - A verifier is unconfirmed when its latest welcome carries no
   `verifier`, when it is offline, or when it isn't a host and the signer
-  has no report from it. For it the gate signs nothing that some v0.8.x
-  release refuses: none of the five actions, and no service scope with
-  `launch`, `message` or `notify` (v0.8.0 and v0.8.1 lack those ops).
+  has no report from it. It counts as a release that predates the report,
+  so none of those entries is signed while one exists. For the three scope
+  ops this is stricter than host-work-v1 §2's advice to upgrade every
+  verifier before enrolling: a v0.8.2 to v0.8.5 verifier accepts them, but
+  it can't be confirmed until it runs a release that reports.
 - A later welcome with a lower version, or with no `verifier`, makes the
   verifier unconfirmed again.
 - Entries already signed stay signed.

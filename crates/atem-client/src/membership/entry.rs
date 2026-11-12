@@ -278,8 +278,9 @@ action_names! {
 ///
 /// - 1: the eleven actions `genesis` to `k_backup` with the rules of v0.8.2
 ///   to v0.8.5, whose service scopes take ten ops ([`OPS`]). v0.8.0 and
-///   v0.8.1 lack the scope ops `launch`, `message` and `notify`. No v0.8.x
-///   release reports an inventory, so an absent one means any of them.
+///   v0.8.1 lack the scope ops `launch`, `message` and `notify`. No release
+///   from v0.8.0 to v0.8.5 reports an inventory, so an absent one means any
+///   of them.
 /// - 2: adds delegated host work's five (`project_set`, `project_remove`,
 ///   `host_sender_revoke`, `host_sender_readmit`, `host_enc_key`).
 ///

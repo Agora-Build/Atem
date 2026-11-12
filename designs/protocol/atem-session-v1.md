@@ -2009,9 +2009,9 @@ which entries:
     rules of v0.8.2 to v0.8.5, whose service scopes take ten ops: R9.6's
     seven, and `launch`, `message` and `notify` (host-work-v1 §2 "Ops").
     v0.8.0 and v0.8.1 lack the scope ops `launch`, `message` and
-    `notify`. No v0.8.x release reports an inventory, so an absent
-    inventory means any of them: the gate relies on neither the five
-    actions of this section nor those three scope ops for it.
+    `notify`. No release from v0.8.0 to v0.8.5 reports an inventory, so an
+    absent inventory means any of them: the gate relies on neither the
+    five actions of this section nor those three scope ops for it.
   - Version 2 adds the five actions of this section. It is the shared
     core's today.
 - The shared core gives every consumer its own inventory:
@@ -2021,9 +2021,9 @@ which entries:
   action can't be left out of it.)
 - An Atem host reports its own verifier in every r9 `welcome` as
   `verifier` (R9.8), from the first release that carries this change;
-  v0.8.x hosts send none. It is no feature: `features` doesn't change.
-  Released clients ignore the field, because the welcome reader ignores
-  unknown fields. (Atem's display, informative: `atem status` shows the
+  hosts from v0.8.0 to v0.8.5 send none. It is no feature: `features`
+  doesn't change. Released clients ignore the field, because the welcome
+  reader ignores unknown fields. (Atem's display, informative: `atem status` shows the
   runtime's version on its `Device list:` line as `verifier v2`, and
   `atem --version` shows this build's as `device-list verifier v2 (16
   actions)`.)
@@ -2045,20 +2045,29 @@ which entries:
   unconfirmed verifier keeps signing off, and a host whose welcome carries
   no `verifier` is unconfirmed.
 - *How the signing gate uses it* (**Atem's proposal, for Astation's
-  agreement**). This adds to the gate's rules above and changes none.
+  agreement**). This says when a verifier is confirmed, and it extends the
+  gate to three scope ops (below). It removes none of the rules above.
   - Versions only widen. Version N lists every action of version N − 1,
     and it accepts every entry N − 1 accepts, with the same derived state.
     So a chain that verified still verifies the same way.
-  - A signer signs an entry only when every verifier it counts for the
-    account has a confirmed inventory that lists the entry's action, at a
-    `version` at least the first version that accepts the entry. Today an
-    entry of the five actions above needs version 2.
+  - A signer signs an entry that some released verifier refuses only when
+    every strict verifier of the account has a confirmed inventory that
+    lists the entry's action, at a `version` at least the first version
+    that accepts the entry. Today those entries are the five actions above
+    (version 2), and a service `add` or `set_roles` whose scope carries
+    `launch`, `message` or `notify` (version 1). Every other entry is
+    accepted by every release from v0.8.0 to v0.8.5 and needs no
+    inventory.
   - A verifier's confirmed inventory is the one in its latest welcome.
   - A verifier is unconfirmed when its latest welcome carries no
     `verifier`, when it is offline, or when it isn't a host and the signer
-    has no report from it. For an unconfirmed verifier the gate signs
-    nothing that some v0.8.x release refuses: none of the five actions,
-    and no service scope with `launch`, `message` or `notify`.
+    has no report from it. An unconfirmed verifier counts as a release that
+    predates this report, so none of those entries is signed while one
+    exists. This extends the gate beyond the five actions to the three
+    scope ops, and it is stricter than host-work-v1 §2's advice ("upgrade
+    every verifier on the account before enrolling one"): a v0.8.2 to
+    v0.8.5 verifier accepts those ops, but it can't be confirmed until it
+    runs a release that reports.
   - A later welcome with a lower `version`, or with no `verifier`, makes
     the verifier unconfirmed again.
   - Entries already signed stay signed. Removing an obsolete verifier

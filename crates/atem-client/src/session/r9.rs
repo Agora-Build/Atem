@@ -1650,8 +1650,7 @@ mod tests {
 
     /// The welcome's optional `verifier` (R9.2 "How a verifier reports
     /// itself", R9.8; Atem's proposal, for Astation's agreement): read
-    /// strictly when
-    /// present, absent as before.
+    /// strictly when present, absent as before.
     mod verifier {
         use super::*;
         use crate::membership::{VerifierInventory, known_actions};

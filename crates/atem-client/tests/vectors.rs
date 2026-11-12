@@ -5966,10 +5966,10 @@ fn write_control_vectors() {
 // `host_enc_key_get` and its `host_enc_key` answer, and of receipts with and
 // without provenance (`task_id`, `sender`), valid and refused; and the r9
 // welcome's optional `verifier` (R9.2, R9.8; Atem's proposal, for
-// Astation's agreement) with this build's own inventory. Every value
-// comes from the crate's own builders; the valid answer's `enc_key` and
-// `enc_sig` are `r9-vectors-membership-log`'s first `host_enc_key` pair, so
-// its binding verifies against log L.
+// Astation's agreement) with this build's own inventory. Every value comes
+// from the crate's own builders; the valid answer's `enc_key` and `enc_sig`
+// are `r9-vectors-membership-log`'s first `host_enc_key` pair, so its
+// binding verifies against log L.
 
 const WIRE_ID: &str = "c1c2c3c4-0000-4000-8000-000000000001";
 const WIRE_RE: &str = "c1c2c3c4-0000-4000-8000-000000000002";
@@ -6221,10 +6221,9 @@ fn delegated_wire_vectors(book: &Book) -> Value {
 
     // The r9 welcome's optional `verifier` (R9.2 "How a verifier reports
     // itself", R9.8; Atem's proposal, for Astation's agreement): a welcome
-    // without one
-    // (as every host sends today), with this build's, with a newer host's
-    // (names this build doesn't know are read, never judged), the bounds,
-    // and one refused case per rule.
+    // without one (as v0.8.0 to v0.8.5 hosts send it), with this build's,
+    // with a newer host's (names this build doesn't know are read, never
+    // judged), the bounds, and one refused case per rule.
     let welcomes = welcome_cases(&log);
 
     json!({

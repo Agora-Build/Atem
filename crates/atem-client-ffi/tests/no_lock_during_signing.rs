@@ -210,10 +210,9 @@ fn the_channel_signature_holds_no_lock() {
 
 /// `WelcomeInfo.verifier` (session-v1 R9.2 "How a verifier reports
 /// itself"; Atem's proposal, for Astation's agreement): the host's
-/// inventory when its
-/// welcome carried one, `None` when it didn't, and a malformed one refuses
-/// the welcome (`malformed`, detail `verifier`). It shares this file's
-/// native handshake.
+/// inventory when its welcome carried one, `None` when it didn't, and a
+/// malformed one refuses the welcome (`malformed`, detail `verifier`). It
+/// shares this file's native handshake.
 #[test]
 fn the_welcome_info_carries_the_hosts_verifier() {
     use atem_client::membership::VerifierInventory;
