@@ -1416,7 +1416,7 @@ alerts.)
 | `session_id` | the task's target session (`ses-` and 12 characters) |
 | `task_id` | the task: a UUID v4 (a delegated task's id) |
 | `sender` | the delegated sender that enqueued the task: `member:<id>`, `service:<id>` or `host:<id>` (an id of 1-128 bytes of `[A-Za-z0-9._:-]`), as a receipt's provenance names it (session-v1 R9.14). Never `local` or `browser:` |
-| `reason` | why the outcome is unknown, for people: 1-256 bytes, no control or Cf character (`agent exited`, `write interrupted`, `deadline passed; outcome unknown`) |
+| `reason` | why the outcome is unknown, for people: 1-256 bytes, not blank (something besides White_Space), no control or Cf character (`agent exited`, `write interrupted`, `deadline passed; outcome unknown`) |
 | `created_at` | Unix ms on the host's wall clock: when the task became `outcome_unknown`. For people only: it orders nothing |
 | `more` | `true` when alerts follow this page; then the page isn't empty |
 
@@ -1440,7 +1440,10 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
     `alert_id` it read, until `more` is `false`. The cursor stays the
     `alert_id`; the host finds it and lists what follows it in `seq`. A page
     never carries its `after`.
-  - `atem_client::session::alerts::page` is the host's reference.
+  - `atem_client::session::alerts::page` is the host's reference. Its
+    `limit` is the host's own (the request has none) and at least 1: a
+    limit of 0 is refused (`invalid_request`), since a page of no alert
+    with `more` true is a result no reader takes.
 - **An unknown cursor.** An `after` the host has no alert for (the alert
   ended, or never was) is `stale_target`, detail `unknown alert`; the caller
   lists again from the start (**Atem's choice of code, for Astation to
@@ -1498,8 +1501,8 @@ Vectors:
 - `fixtures/host-work/requests-v1.json`: the requests, valid and invalid,
   and the `alerts` results. These are an empty page, a page, every delegated
   sender and the bounds, a later alert with an earlier `created_at` (valid:
-  the order is `seq`'s), and each refusal, `local`, a browser grant and a
-  UUID v5 task among them.
+  the order is `seq`'s), and each refusal, `local`, a browser grant, a
+  UUID v5 task and a blank `reason` among them.
 - `fixtures/r9-vectors-push-hint.json`: the hints, and
   `outcome_unknown_invalid_facts` (a `local` and a browser grant's task,
   refused at open).

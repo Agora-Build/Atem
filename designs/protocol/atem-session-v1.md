@@ -3835,7 +3835,8 @@ it has neither `state` nor `session_id`, `process_gen` or `approval_id`:
   - its session id;
   - its sender: a delegated sender, `member:<id>`, `service:<id>` or
     `host:<id>`, as host-work-v1 §11.3's alert names it;
-  - why the outcome is unknown: 1-256 bytes, no control or Cf character.
+  - why the outcome is unknown: 1-256 bytes, not blank (something besides
+    White_Space), no control or Cf character.
 
   Only a delegated sender's task raises an alert. A task of `local`, a
   browser grant or a service no feed covers keeps v1 (its unknown outcome
