@@ -30,13 +30,9 @@ use atem_client::session::host_work::WorkState;
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 
 /// The counted attempts a task gets (design I.6.4).
-// Used by Task 19's dispatch (it makes, submits and ends attempts).
-#[allow(dead_code)]
 pub const MAX_ATTEMPTS: u32 = 8;
 
 /// One attempt of a task.
-// Used by Task 19's dispatch (it makes, submits and ends attempts).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attempt {
     /// A fresh UUID v4: the session-v1 `request_id` of its prompt.
@@ -50,8 +46,6 @@ pub struct Attempt {
 
 /// How an attempt ended. Every end but `Started` is a proof that it had no
 /// side effect, so the task may get a new attempt.
-// Used by Task 19's dispatch (it makes, submits and ends attempts).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptEnd {
     /// The session host never admitted it (refused before anything was
@@ -69,8 +63,6 @@ pub enum AttemptEnd {
     Reused,
 }
 
-// Used by Task 19's dispatch (it makes, submits and ends attempts).
-#[allow(dead_code)]
 impl AttemptEnd {
     fn as_str(self) -> &'static str {
         match self {
@@ -109,8 +101,6 @@ impl AttemptEnd {
 }
 
 /// Why [`Store::new_attempt`] made none (the error it returns).
-// Used by Task 19's dispatch (it makes, submits and ends attempts).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptRefused {
     /// A v1 task: it has no admission record, so no attempts.
@@ -140,8 +130,6 @@ impl std::fmt::Display for AttemptRefused {
 impl std::error::Error for AttemptRefused {}
 
 /// What the session host answered about an attempt.
-// Used by Task 19's dispatch (it makes, submits and ends attempts).
-#[allow(dead_code)]
 #[derive(Debug)]
 pub enum SessionAnswer<'a> {
     /// `submit_host_work` refused it with this `error` code, recording
@@ -150,8 +138,11 @@ pub enum SessionAnswer<'a> {
     /// Its receipt: state and detail.
     Receipt(ReceiptState, Option<&'a str>),
     /// `SessionHost::withdraw` (R9.14 item 4).
+    // Answered once withdrawals and interrupt intents run (Tasks 20, 26).
+    #[allow(dead_code)]
     Withdrawal(Withdrawal),
     /// `SessionHost::host_interrupt` (R9.14 item 5).
+    #[allow(dead_code)]
     Interrupt(&'a HostInterrupt),
 }
 
@@ -172,8 +163,6 @@ pub enum SessionAnswer<'a> {
 ///   being submitted again. `reused` is `Reused`, `started` `Started`.
 /// - An interrupt that was written, or revoked a lease, passed the turn
 ///   check: the attempt is executing (`Started`).
-// Used by Task 19's dispatch (it makes, submits and ends attempts).
-#[allow(dead_code)]
 pub fn attempt_end(answer: SessionAnswer<'_>, held: bool) -> Option<AttemptEnd> {
     let withdrawn = AttemptEnd::Withdrawn { counted: !held };
     match answer {
@@ -203,8 +192,6 @@ pub fn attempt_end(answer: SessionAnswer<'_>, held: bool) -> Option<AttemptEnd> 
     }
 }
 
-// Used by Task 19's dispatch (it makes, submits and ends attempts).
-#[allow(dead_code)]
 impl Store {
     /// A `BEGIN IMMEDIATE` transaction on the store (design I.5.9): it
     /// holds the write lock from its start, so what it reads stays true

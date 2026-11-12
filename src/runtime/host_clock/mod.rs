@@ -4,10 +4,10 @@
 //! rules to them; `HostClock` runs that state in the runtime.
 //!
 //! `HostClock` lives beside the host-work store (`host_work::Store`, table
-//! `clock`), held by the runtime's host bridge (`Option<HostClock>`). Nothing
-//! outside tests constructs it until the delegated lifecycle does, behind
-//! `host.delegated` (step 4, Task 19): until then the host writes no clock
-//! row, no clock line and no status, as main does.
+//! `clock`), held by the runtime's host bridge (`Option<HostClock>`). The
+//! bridge builds it once the store is open, with `host.delegated` on or while
+//! the store holds a delegated task (step 4's Decision 10): otherwise the
+//! host writes no clock row, no clock line and no status, as main does.
 //!
 //! - **Readings.** The pass observes one a second (`tick`), and a Station's
 //!   `station_time` is observed with one (`station`). In debug builds
@@ -130,12 +130,20 @@ struct Damaged {
 
 impl HostClock {
     /// The clock as `store` recorded it (none: a fresh one; a damaged one:
-    /// see the module doc).
-    // Constructed by the delegated lifecycle behind `host.delegated` (step 4,
-    // Task 19); only tests construct it before.
-    #[allow(dead_code)]
+    /// see the module doc). Built by the host bridge once its store is open,
+    /// with `host.delegated` on or delegated tasks in the store.
     pub fn load(store: &Store) -> Self {
         Self::with_reader(store, Arc::new(system_reading))
+    }
+
+    /// Tests elsewhere in the crate: the clock on `read`'s readings (a
+    /// manual clock) instead of the OS's.
+    #[cfg(test)]
+    pub fn with_readings(
+        store: &Store,
+        read: impl Fn() -> Option<OsReading> + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_reader(store, Arc::new(read))
     }
 
     fn with_reader(store: &Store, read: Reader) -> Self {
@@ -349,10 +357,8 @@ impl HostClock {
         }
     }
 
-    /// `H` and `D` at a reading taken now.
-    // Called by the delegated deadline checks (step 4, Tasks 19–22, 26, 28,
-    // 36).
-    #[allow(dead_code)]
+    /// `H` and `D` at a reading taken now: read once a scheduling pass
+    /// (each call is a full OS reading).
     pub fn now(&self) -> DelegatedNow {
         let r = (self.read)()
             .or_else(|| self.last.clone())
@@ -375,9 +381,6 @@ impl HostClock {
 
     /// The stored record was damaged and the clock hasn't started afresh:
     /// delegated work waits.
-    // Read by the delegated start check and admission (step 4, Tasks 18
-    // and 19).
-    #[allow(dead_code)]
     pub fn damaged(&self) -> bool {
         self.damaged.is_some()
     }

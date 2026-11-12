@@ -2388,6 +2388,8 @@ exact.
 | `blocked` | `revocations not yet checked` | the revocation gate (or, for a host sender, the mailbox gate) is closed |
 | `blocked` | `device list update pending` | the last carriage or fetch stopped at a deferred entry |
 | `blocked` | `waiting for unlock` | a locked cred agent leaves the project scope pending |
+| `blocked` | `journal halted; restart Atem` | (**Atem's addition, for Astation**) the session journal halted with the device list usable (no fault): the task waits until the restart; session-v1 §I's own text |
+| `blocked` | `host.delegated is off` | (**Atem's addition, for Astation**) a task accepted while `host.delegated` was on, not started, after a restart without it: it is never dispatched, and expires at its deadline (on the clock below) |
 | `cancelled` | `sender revoked` | a `revoke` record, an R9 removal, or a host sender's `host_sender_revoke`, `remove_host` or new membership epoch |
 | `failed` | `sender's authorization narrowed` | the current grant (or a host sender's projects) no longer covers the task |
 | `failed` | `route changed` | the route's revision, principals or profile changed |

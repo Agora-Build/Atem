@@ -45,6 +45,8 @@ const TURN_INTERRUPTED: &str = "turn interrupted";
 mod collab_bridge;
 #[path = "collab_launch_bridge.rs"]
 mod collab_launch_bridge;
+#[path = "delegated/dispatch.rs"]
+mod delegated_dispatch;
 
 /// The local sender exists only on the broker's internal attachment.
 pub(crate) enum Sender {
@@ -164,10 +166,16 @@ pub(super) struct State {
     /// live-session limit, a restart): the detail of its local tasks.
     refused: HashMap<String, String>,
     /// The delegated clock (host-work-v1 §11.6), beside the store whose
-    /// `clock` table holds its record. `None` outside tests.
+    /// `clock` table holds its record: built with `host.delegated` on, or
+    /// while the store holds a delegated task (step 4's Decision 10, ruling
+    /// T18a). `None` otherwise, as on main; then, as with a damaged record,
+    /// delegated work waits.
     clock: Option<HostClock>,
     /// When the clock next takes a reading (`clock_pass`).
     clock_due: Instant,
+    /// The store was asked whether it holds a delegated task
+    /// (`ensure_clock`).
+    clock_checked: bool,
 }
 
 impl State {
@@ -197,10 +205,11 @@ impl State {
             recheck_grants: true,
             named: HashSet::new(),
             refused: HashMap::new(),
-            // Task 19 constructs it (`HostClock::load`) when
-            // `host_features().delegated`.
+            // Constructed once the store is open (`ensure_clock`): with
+            // `host.delegated`, or while the store holds a delegated task.
             clock: None,
             clock_due: Instant::now(),
+            clock_checked: false,
         }
     }
 }
@@ -366,6 +375,8 @@ impl HostBridge {
                     self.projects.forget(key);
                 }
                 self.work.scoped = retained;
+                // What the start check reads, as it loaded (Decision 16).
+                self.start_view().config = config.clone();
                 config
             }
             Err(error) => {
@@ -529,6 +540,7 @@ impl HostBridge {
     /// second while the store is open and healthy, hosting on or not, so its
     /// record goes on (`HostClock::tick` writes it when due).
     fn clock_pass(&mut self) {
+        self.ensure_clock();
         let (Some(clock), Some(store)) = (self.work.clock.as_mut(), self.work.store.as_ref())
         else {
             return;
@@ -538,6 +550,78 @@ impl HostBridge {
         }
         self.work.clock_due = Instant::now() + CLOCK_EVERY;
         clock.tick(store);
+    }
+
+    /// The delegated clock, built once the store is open (host-work-v1
+    /// §11.6): with `host.delegated` on, or while the store holds a
+    /// delegated task whatever the hook says now (step 4's Decision 10,
+    /// ruling T18a: such a task still expires at its deadline on it). The
+    /// store is asked once (an open-record index read); a store that can't
+    /// answer gets one.
+    fn ensure_clock(&mut self) {
+        if self.work.clock.is_some() || self.work.error {
+            return;
+        }
+        let Some(store) = self.work.store.as_ref() else {
+            return;
+        };
+        let wanted = if self.features.delegated {
+            true
+        } else if self.work.clock_checked {
+            false
+        } else {
+            self.work.clock_checked = true;
+            store.has_delegated().unwrap_or(true)
+        };
+        if wanted {
+            self.work.clock = Some(HostClock::load(store));
+            self.work.clock_due = Instant::now();
+        }
+    }
+
+    /// The parts of the start view that follow the scheduling pass (the
+    /// device list and `runtime.toml` tell it at commit; both again here):
+    /// the journal's halt, the host's id, the project-scope hashes, and the
+    /// delegated clock's reading, taken once here. `D`, or none without a clock (or with a
+    /// damaged record): delegated work waits then.
+    fn refresh_start_view(&mut self) -> Option<u64> {
+        self.sync_list_view();
+        let now_d = self
+            .work
+            .clock
+            .as_ref()
+            .filter(|c| !c.damaged())
+            .map(|c| c.now().d_ms);
+        let halted = self.host.journal_halted();
+        let host_id = self.host.context().atem_device_id.clone();
+        let scopes = if self.features.delegated {
+            let mut kids = self.r9.scope_project_kids();
+            if let Some(m) = &self.membership {
+                kids.extend(crate::runtime::project_scope::project_kids_of(
+                    m.membership(),
+                    0,
+                ));
+            }
+            crate::runtime::delegated::start::ScopeHashes {
+                hashes: self.projects.known_hashes(),
+                pending: kids
+                    .into_iter()
+                    .filter(|kid| self.projects.pending_for(kid))
+                    .collect(),
+            }
+        } else {
+            Default::default()
+        };
+        let config = self.work.config.clone();
+        let mut view = self.start_view();
+        view.now_d_ms = now_d;
+        view.halted = halted;
+        view.host_id = host_id;
+        view.scopes = scopes;
+        // As `work_config` gave it when it loaded (a pass runs only with a
+        // file that loaded and hosting on).
+        view.config = config;
+        now_d
     }
 
     /// At an orderly stop: the delegated clock's last reading, written.
@@ -1376,6 +1460,8 @@ impl HostBridge {
     /// applies here (`pause_local_tasks` marks local tasks during one).
     fn schedule_work(&mut self, cx: &mut Cx) -> anyhow::Result<()> {
         let now = host_now().wall_ms;
+        // `D`, read once a pass (each read is a full OS reading).
+        let now_d = self.refresh_start_view();
         // Awaiting a result, or of unknown outcome: past the deadline,
         // expired, and past the sender's authorization, failed (their due
         // times, through an index); under a sender's authority, a route or a
@@ -1383,7 +1469,7 @@ impl HostBridge {
         // only when what that depends on changed: `work_inputs`). Either
         // frees an unknown outcome's session queue.
         let store = self.work.store.as_ref().unwrap();
-        store.settle_due(now)?;
+        store.settle_due(now, now_d)?;
         if self.work.recheck_tasks {
             let mut named = HashSet::new();
             store.settle_lost(now, |accepted| {
@@ -1419,8 +1505,17 @@ impl HostBridge {
                 occupied.insert(session.to_string());
             }
         }
+        let mut waits = delegated_dispatch::Waits::default();
         for mut r in tasks {
             if r.status.state.terminal() && r.status.state != WorkState::OutcomeUnknown {
+                continue;
+            }
+            // A delegated sender's task (design I.4) runs under the
+            // `host-work` principal after the start check, on the delegated
+            // clock, never on the sender's channel and never under v1's
+            // rules: nothing below this applies to it.
+            if r.delegated.is_some() {
+                self.schedule_delegated(&mut r, &mut occupied, &mut waits, now_d, cx)?;
                 continue;
             }
             if matches!(
@@ -1458,21 +1553,6 @@ impl HostBridge {
                 continue;
             }
             if r.status.state == WorkState::AwaitingResult {
-                continue;
-            }
-            // A delegated sender's task (design I.4) is dispatched under
-            // host-work after the start check, with its deadline on the
-            // delegated clock (Task 19). Until then its gate stays closed:
-            // it waits `blocked`, `revocations not yet checked`, never on
-            // the sender's channel, and doesn't hold its session (§11.6).
-            if r.delegated.is_some() {
-                if r.status.state != WorkState::Blocked
-                    || r.status.detail != details::REVOCATIONS_NOT_YET_CHECKED
-                {
-                    r.status.state = WorkState::Blocked;
-                    r.status.detail = details::REVOCATIONS_NOT_YET_CHECKED.into();
-                    self.work.store.as_ref().unwrap().save_work(&r)?;
-                }
                 continue;
             }
             if now >= r.task.expires_at {
@@ -1570,53 +1650,8 @@ impl HostBridge {
                 }
                 continue;
             };
-            // Rendered now, from the records, with a tag drawn for this
-            // attempt (delegated host-work design III.2): Atem's lines name
-            // the sender, route and message (a local task's and a delivered
-            // reply's come from the outbox and the reply); the stored prompt
-            // is only the sender's text or reply.
-            let frame = self.collab_frame(&r)?;
-            let tag = framing::Tag::random();
-            let paths: Option<Vec<String>> = paths
-                .iter()
-                .map(|p| p.to_str().map(str::to_string))
-                .collect();
-            let prompt: Result<String, String> = match &paths {
-                None => Err("a screenshot path is not UTF-8".into()),
-                Some(paths) => {
-                    let screenshots: Vec<framing::Screenshot> = r
-                        .task
-                        .attachments
-                        .iter()
-                        .zip(paths)
-                        .map(|(attachment, path)| framing::Screenshot { attachment, path })
-                        .collect();
-                    crate::runtime::collab::task_prompt(&r, frame.as_ref(), &screenshots)
-                        .prompt()
-                        .and_then(|p| p.render(&tag))
-                        .map_err(|e| format!("the prompt could not be rendered: {e}"))
-                }
-            };
-            // Checked at enqueue with the longest lines any frame gets; a
-            // record an earlier build accepted is checked here.
-            let prompt = prompt.and_then(|prompt| {
-                if prompt.len() > wire::MAX_PROMPT_BYTES {
-                    Err(if r.task.attachments.is_empty() {
-                        "the prompt is over 32 KiB once framed".into()
-                    } else {
-                        "attachment paths exceed the prompt bounds".into()
-                    })
-                } else if prompt
-                    .chars()
-                    .any(|c| c.is_control() && c != '\n' && c != '\t')
-                {
-                    Err("the prompt has control characters".into())
-                } else {
-                    Ok(prompt)
-                }
-            });
-            let prompt = match prompt {
-                Ok(prompt) => prompt,
+            let (prompt, tag) = match self.render_task_prompt(&r, &paths)? {
+                Ok(rendered) => rendered,
                 Err(detail) => {
                     r.status.state = WorkState::Failed;
                     r.status.detail = detail;
@@ -1627,43 +1662,9 @@ impl HostBridge {
             let Some((binding, _)) = self.host.binding_for_work(&attachment, &r.task.target) else {
                 continue;
             };
-            // The tag and the terminal pause are kept, durably, before the
-            // prompt can reach the agent: chat-v1 hides the tag from
-            // attachments without `control`, and the session's terminal
-            // frames are held from them until the prompt's turn ends, after a
-            // restart too (`prompt_tags`). A failed write keeps the task
-            // waiting (logged once) and records nothing, so an attempt that
-            // can't be made leaves no tag or pause behind; the next one draws
-            // a fresh tag.
             let sid = r.task.target.session_id.clone();
-            let state = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
-            self.load_pauses(&state, &sid);
-            // The pause is bounded by the host (a day from now on both
-            // clocks), never by the task's deadline: a v1 turn isn't
-            // interrupted at it, and the sender chooses it.
-            let held = self.view_pauses.get(&sid).cloned().unwrap_or_default();
-            let mut pauses = held.clone();
-            pauses.push(crate::runtime::prompt_tags::Pause::new(
-                &r.status.receipt_id,
-                &tag,
-                &host_now(),
-            ));
-            let recorded = crate::runtime::prompt_tags::write_pauses(&state, &sid, &pauses)
-                .map_err(|e| ("waiting to record the prompt's terminal pause", e))
-                .and_then(|()| {
-                    self.prompt_tags.record(&state, &sid, &tag).map_err(|e| {
-                        (
-                            "waiting to record the prompt's framing tag",
-                            std::io::Error::other(e.to_string()),
-                        )
-                    })
-                });
-            if let Err((detail, error)) = recorded {
-                // Even a pause write that failed may have replaced the file
-                // (its directory's sync failing after the rename): the file
-                // goes back to what is held, or is rewritten from memory
-                // at a later pass (`write_pauses`).
-                self.write_pauses(&sid, &held);
+            if let Err((detail, error)) = self.record_prompt_pause(&sid, &r.status.receipt_id, &tag)
+            {
                 if r.status.state != WorkState::Blocked || r.status.detail != detail {
                     eprintln!("atem runtime: {sid}: {detail}: {error}");
                     r.status.state = WorkState::Blocked;
@@ -1672,7 +1673,12 @@ impl HostBridge {
                 }
                 continue;
             }
-            self.view_pauses.insert(sid.clone(), pauses);
+            // The v1 submit, on the sender's own channel: never a delegated
+            // task's (they `continue` above, `schedule_delegated`).
+            debug_assert!(r.delegated.is_none(), "a delegated task on the v1 path");
+            if r.delegated.is_some() {
+                continue;
+            }
             let message = json!({"type":"session", "data": {"v":1,"op":"submit", "id":uuid::Uuid::new_v4().to_string(),
                 "binding":binding, "request_id":r.status.receipt_id, "kind":"prompt", "payload":{"text":prompt}, "acquire":true}});
             r.status.state = WorkState::Submitting;
@@ -1689,14 +1695,7 @@ impl HostBridge {
                 WorkState::Submitted
             } else {
                 // Not admitted, so never pasted: nothing to hold.
-                if let Some(pauses) = self.view_pauses.get_mut(&sid) {
-                    pauses.retain(|p| p.receipt_id != r.status.receipt_id);
-                    let left = pauses.clone();
-                    if left.is_empty() {
-                        self.view_pauses.remove(&sid);
-                    }
-                    self.write_pauses(&sid, &left);
-                }
+                self.drop_prompt_pause(&sid, &r.status.receipt_id);
                 WorkState::OutcomeUnknown
             };
             self.work.store.as_ref().unwrap().save_work(&r)?;
@@ -1704,9 +1703,134 @@ impl HostBridge {
         Ok(())
     }
 
+    /// `r`'s prompt, rendered now from the records with a tag drawn for this
+    /// attempt (delegated host-work design III.2): Atem's lines name the
+    /// sender, route and message (a local task's and a delivered reply's
+    /// come from the outbox and the reply); the stored prompt is only the
+    /// sender's text or reply. `Err(detail)` when it can't be (the task
+    /// fails with it): checked at enqueue with the longest lines any frame
+    /// gets, a record an earlier build accepted is checked here.
+    fn render_task_prompt(
+        &self,
+        r: &WorkRecord,
+        paths: &[PathBuf],
+    ) -> anyhow::Result<Result<(String, framing::Tag), String>> {
+        let frame = self.collab_frame(r)?;
+        let tag = framing::Tag::random();
+        let paths: Option<Vec<String>> = paths
+            .iter()
+            .map(|p| p.to_str().map(str::to_string))
+            .collect();
+        let prompt: Result<String, String> = match &paths {
+            None => Err("a screenshot path is not UTF-8".into()),
+            Some(paths) => {
+                let screenshots: Vec<framing::Screenshot> = r
+                    .task
+                    .attachments
+                    .iter()
+                    .zip(paths)
+                    .map(|(attachment, path)| framing::Screenshot { attachment, path })
+                    .collect();
+                crate::runtime::collab::task_prompt(r, frame.as_ref(), &screenshots)
+                    .prompt()
+                    .and_then(|p| p.render(&tag))
+                    .map_err(|e| format!("the prompt could not be rendered: {e}"))
+            }
+        };
+        Ok(prompt.and_then(|prompt| {
+            if prompt.len() > wire::MAX_PROMPT_BYTES {
+                Err(if r.task.attachments.is_empty() {
+                    "the prompt is over 32 KiB once framed".into()
+                } else {
+                    "attachment paths exceed the prompt bounds".into()
+                })
+            } else if prompt
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t')
+            {
+                Err("the prompt has control characters".into())
+            } else {
+                Ok((prompt, tag))
+            }
+        }))
+    }
+
+    /// The tag and the terminal pause of the prompt `receipt_id` on `sid`,
+    /// kept durably before the prompt can reach the agent: chat-v1 hides the
+    /// tag from attachments without `control`, and the session's terminal
+    /// frames are held from them until the prompt's turn ends, after a
+    /// restart too (`prompt_tags`). A failed write records nothing (the task
+    /// waits with the detail, the error logged once by the caller), so an
+    /// attempt that can't be made leaves no tag or pause behind; the next one
+    /// draws a fresh tag.
+    fn record_prompt_pause(
+        &mut self,
+        sid: &str,
+        receipt_id: &str,
+        tag: &framing::Tag,
+    ) -> Result<(), (&'static str, std::io::Error)> {
+        let state = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
+        self.load_pauses(&state, sid);
+        // The pause is bounded by the host (a day from now on both clocks),
+        // never by the task's deadline: a v1 turn isn't interrupted at it,
+        // and the sender chooses it.
+        let held = self.view_pauses.get(sid).cloned().unwrap_or_default();
+        let mut pauses = held.clone();
+        pauses.push(crate::runtime::prompt_tags::Pause::new(
+            receipt_id,
+            tag,
+            &host_now(),
+        ));
+        let recorded = crate::runtime::prompt_tags::write_pauses(&state, sid, &pauses)
+            .map_err(|e| ("waiting to record the prompt's terminal pause", e))
+            .and_then(|()| {
+                self.prompt_tags.record(&state, sid, tag).map_err(|e| {
+                    (
+                        "waiting to record the prompt's framing tag",
+                        std::io::Error::other(e.to_string()),
+                    )
+                })
+            });
+        if recorded.is_err() {
+            // Even a pause write that failed may have replaced the file (its
+            // directory's sync failing after the rename): the file goes back
+            // to what is held, or is rewritten from memory at a later pass
+            // (`write_pauses`).
+            self.write_pauses(sid, &held);
+            return recorded;
+        }
+        self.view_pauses.insert(sid.to_string(), pauses);
+        Ok(())
+    }
+
+    /// The prompt `receipt_id` was never admitted, so never pasted: its
+    /// terminal pause goes.
+    fn drop_prompt_pause(&mut self, sid: &str, receipt_id: &str) {
+        if let Some(pauses) = self.view_pauses.get_mut(sid) {
+            pauses.retain(|p| p.receipt_id != receipt_id);
+            let left = pauses.clone();
+            if left.is_empty() {
+                self.view_pauses.remove(sid);
+            }
+            self.write_pauses(sid, &left);
+        }
+    }
+
+    /// The receipt of `r`'s prompt: for a delegated task its current
+    /// attempt's, as host-work's request for that task only
+    /// (`attempt_receipt`); else the one under its `receipt_id`.
+    pub(super) fn task_receipt(&self, r: &WorkRecord) -> Option<wire::Receipt> {
+        if r.delegated.is_some() {
+            self.host
+                .attempt_receipt(&r.status.receipt_id, &r.task.task_id)
+        } else {
+            self.host.receipt(&r.status.receipt_id)
+        }
+    }
+
     fn reconcile_work(&self, r: &mut WorkRecord) -> anyhow::Result<()> {
         use crate::session_protocol::wire::ReceiptState;
-        let Some(receipt) = self.host.receipt(&r.status.receipt_id) else {
+        let Some(receipt) = self.task_receipt(r) else {
             // Submitted, and its receipt gone (evicted or lost): what became
             // of it can't be known any more.
             if r.status.state == WorkState::Submitted {
@@ -1753,8 +1877,7 @@ impl HostBridge {
     /// The task's prompt turn ended interrupted (its receipt's journaled
     /// outcome).
     pub(super) fn work_interrupted(&self, r: &WorkRecord) -> bool {
-        self.host
-            .receipt(&r.status.receipt_id)
+        self.task_receipt(r)
             .is_some_and(|receipt| turn_interrupted(&receipt))
     }
 
@@ -1813,17 +1936,7 @@ impl HostBridge {
     /// revision or profile, no longer names the task's principal, or its
     /// profile has another revision or project.
     fn work_route_changed(&self, a: &Accepted) -> bool {
-        let Some(route) = self.work.config.route(&a.route_id) else {
-            return true;
-        };
-        let Some(profile) = self.work.config.profile(&route.profile_id) else {
-            return true;
-        };
-        route.revision != a.route_revision
-            || !route.principals.contains(&a.principal)
-            || profile.id != a.profile_id
-            || profile.revision != a.profile_revision
-            || profile.project != a.project
+        self.work.config.route_changed(a)
     }
 }
 
@@ -1848,6 +1961,11 @@ fn authority_session(a: &Sender, target: &wire::Target, projects: &ProjectScopes
 #[cfg(test)]
 mod local_tests {
     use super::*;
+    /// The delegated dispatch's tests, beside the rig they share.
+    mod delegated_tests {
+        use super::*;
+        include!("delegated/dispatch_tests.rs");
+    }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};
     use crate::runtime::protocol::LaunchEnv;
@@ -2116,9 +2234,9 @@ principals = ["local"]
         });
     }
 
-    /// Nothing constructs the clock outside tests until the delegated
-    /// lifecycle does (step 4, Task 19): without it the passes and an orderly
-    /// stop write no clock row, and the status reports none.
+    /// Without `host.delegated` and without a delegated task in the store
+    /// the bridge builds no delegated clock (as main): the passes and an
+    /// orderly stop write no clock row, and the status reports none.
     #[test]
     fn a_bridge_without_a_host_clock_writes_no_clock_row_and_reports_no_status() {
         local_test(async |root| {
@@ -3163,6 +3281,19 @@ principals = ["local"]
     /// runtime opens a list pinned while it runs; a route `rm` the phone
     /// may use; and the phone's authority, as its channel resolves it.
     fn pin_phone(rig: &mut LocalRig, root: &Path) -> (u64, Authority) {
+        let (log, phone) = pin_phone_log(rig, root);
+        (log.log.head().seq, phone)
+    }
+
+    /// [`pin_phone`], with the list (and its keys) the phone's channel
+    /// verifies.
+    fn pin_phone_log(
+        rig: &mut LocalRig,
+        root: &Path,
+    ) -> (
+        crate::session_protocol::membership::r9log::TestLog,
+        Authority,
+    ) {
         use crate::session_protocol::membership::r9log::{TestLog, host_now as now, secret};
         use crate::session_protocol::membership::{HostPin, MembershipHost};
         use atem_client::channel::Principal;
@@ -3218,7 +3349,7 @@ principals = ["local"]
             &|_| false,
         )
         .unwrap();
-        (log.log.head().seq, phone)
+        (log, phone)
     }
 
     /// The phone's `work_enqueue` of `prompt` through route `rm` to the
@@ -3279,10 +3410,10 @@ principals = ["local"]
     /// sender, its key, the route and revision, the target, the ops and
     /// scope it held, no grant expiry (a native's authority doesn't
     /// expire) and the device list's seq. The reply is `work`, `queued`.
-    /// Without the hook the same sender's task has none. Until dispatch
-    /// under host-work exists (Task 19) the task waits `blocked`,
-    /// `revocations not yet checked` (the gate is closed), never sent on
-    /// the v1 path, and its admission doesn't change.
+    /// Without the hook the same sender's task has none. With no gate open
+    /// (no feeds, no channel of the phone's) the task waits `blocked`,
+    /// `revocations not yet checked`, never sent on the v1 path, and its
+    /// admission doesn't change.
     #[test]
     fn admission_record_freezes_route_target_grant_and_list_seq() {
         use crate::runtime::delegated::{Admission, DelegatedSender, details};

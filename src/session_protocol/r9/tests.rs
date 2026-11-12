@@ -2587,6 +2587,70 @@ fn a_browser_whose_issuer_is_in_a_later_window_is_membership_incomplete() {
     assert_eq!(rig.m.as_ref().unwrap().head(), client_log.head());
 }
 
+/// Design I.5.8 ("Native senders"), VII.A test 20: a native member holds
+/// a caught-up channel while its `hello` carriage left this host holding
+/// the native's own head (the host there already, or brought there), and
+/// only on that open channel, with its own key: a service never counts, a
+/// carriage the window cut short (`more`) doesn't, and a closed channel
+/// stops counting.
+#[test]
+fn a_native_is_caught_up_while_its_channel_carried_the_host_to_its_head() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    let key = |rig: &Rig, id: &str| {
+        rig.log
+            .log
+            .member(id)
+            .unwrap()
+            .member
+            .auth_key
+            .as_bytes()
+            .to_vec()
+    };
+    let phone_key = key(&rig, "dev-phone");
+    assert!(!rig.engine.native_caught_up("member:dev-phone", &phone_key));
+    // Its head is the host's.
+    rig.connect("ph", phone());
+    rig.attached("ph");
+    assert!(rig.engine.native_caught_up("member:dev-phone", &phone_key));
+    assert!(
+        !rig.engine
+            .native_caught_up("member:dev-phone", b"another key")
+    );
+    assert_eq!(
+        rig.engine.caught_up_natives(),
+        vec![("member:dev-phone".to_string(), phone_key.clone())]
+    );
+    // A service is no native, whatever its carriage (one `init` a second).
+    rig.advance(1000);
+    rig.connect("bot", bot());
+    rig.attached("bot");
+    assert!(
+        !rig.engine
+            .native_caught_up("service:svc-bot", &key(&rig, "svc-bot"))
+    );
+    // The channel closes: no longer.
+    rig.envelope_in(&envelope::close("ph", None));
+    assert!(!rig.engine.native_caught_up("member:dev-phone", &phone_key));
+    // A phone 65 entries ahead: its first carriage brings the host 64 of
+    // them (`more`), not to its head; the next one does.
+    for n in 0..65 {
+        rig.log
+            .add_native(&format!("dev-n{n:02}"), &["control", "view"]);
+    }
+    let client_log = rig.log.log.clone();
+    rig.advance(1000);
+    rig.connect_with("ph2", phone(), Some(&client_log));
+    rig.attached("ph2");
+    assert_ne!(rig.m.as_ref().unwrap().head(), client_log.head());
+    assert!(!rig.engine.native_caught_up("member:dev-phone", &phone_key));
+    rig.advance(1000);
+    rig.connect_with("ph3", phone(), Some(&client_log));
+    rig.attached("ph3");
+    assert_eq!(rig.m.as_ref().unwrap().head(), client_log.head());
+    assert!(rig.engine.native_caught_up("member:dev-phone", &phone_key));
+}
+
 /// Re-review N1a: a grant revoked while it isn't live and the wall clock
 /// is behind the high-water mark is kept for the window after the host's
 /// trusted time (`max(wall, high_water)`), not after the rolled-back wall

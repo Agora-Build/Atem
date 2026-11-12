@@ -177,8 +177,7 @@ impl HostBridge {
         }
         let receipt = task.status.receipt_id.as_str();
         if let Some(turn) = self
-            .host
-            .receipt(receipt)
+            .task_receipt(task)
             .and_then(|r| r.result)
             .map(|r| r.turn_id)
         {
@@ -1351,8 +1350,7 @@ impl HostBridge {
                 || turn.is_some_and(|turn| {
                     task.turn_id.as_deref() == Some(turn)
                         || self
-                            .host
-                            .receipt(&task.status.receipt_id)
+                            .task_receipt(&task)
                             .and_then(|r| r.result)
                             .is_some_and(|r| r.turn_id == turn)
                 });
@@ -1362,10 +1360,7 @@ impl HostBridge {
             let starting = matches!(
                 task.status.state,
                 WorkState::Submitting | WorkState::Submitted
-            ) && self
-                .host
-                .receipt(&task.status.receipt_id)
-                .is_some_and(|r| r.result.is_none());
+            ) && self.task_receipt(&task).is_some_and(|r| r.result.is_none());
             if bound || starting {
                 return Ok(task.task.workflow_id);
             }

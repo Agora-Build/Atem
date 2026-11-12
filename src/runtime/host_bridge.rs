@@ -64,6 +64,7 @@
 //! trust (`confirm_approval_rules`; the worker drops the rest, and allows by
 //! none until then), and a rebind or trust change drops them all.
 use super::broker::{BrokerSession, SessionState as BrokerState, WriteOutcome, WriteTag};
+use super::delegated::start::{DelegatedStart, StartView};
 use super::project_scope::{AgentHasher, ProjectHasher, ProjectScopes};
 use super::refusal_log::{self, RefusalLog, Request};
 use super::worker_approvals::Event as ApprovalEvent;
@@ -516,6 +517,18 @@ pub enum Interrupted {
     Refused(HostInterrupt),
 }
 
+/// The device list's publisher into the start view (Decision 16).
+fn list_publisher(
+    view: &Arc<std::sync::Mutex<StartView>>,
+) -> crate::session_protocol::membership::Publisher {
+    let view = view.clone();
+    Box::new(move |state| {
+        view.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .list = Some(state);
+    })
+}
+
 /// Host-work's start check under the drive hook (debug builds): the
 /// verdict the test last gave (`verdict.json`).
 #[cfg(debug_assertions)]
@@ -595,6 +608,11 @@ pub struct HostBridge {
     /// The `host-work` principal's internal attachment (session-v1 R9.14
     /// item 1), only with `host.delegated`: new at every start.
     host_work: Option<String>,
+    /// What host-work's start check reads (design I.4.3; step 4's
+    /// Decision 16): the session host's `StartCheck` (`DelegatedStart`)
+    /// and the delegated dispatch share it. Never locked while calling
+    /// into the session host.
+    start_view: Arc<std::sync::Mutex<StartView>>,
     work: host_work_bridge::State,
     host: SessionHost<FileJournal>,
     dir: std::path::PathBuf,
@@ -771,6 +789,17 @@ impl HostBridge {
             };
         }
         let mut host = Self::build(journal, &identity, epoch, previous, &clock)?;
+        // Host-work's start check (session-v1 R9.14 item 3) whenever a
+        // session host is built: `restart_at` and `rebind` keep it, so every
+        // host-work request of this run is checked against the view (none
+        // installed would withdraw them all). The drive hook (debug builds)
+        // replaces it with its own verdicts once host-work's attachment
+        // exists.
+        let features = super::test_hooks::host_features();
+        let start_view = Arc::new(std::sync::Mutex::new(StartView::new(
+            &identity.atem_device_id,
+        )));
+        host.set_start_check(Box::new(DelegatedStart(start_view.clone())));
         // The principals host-work tasks name keep their control states from
         // the first control write on (the device list's start fences below
         // may be one): a task compares its sender's control generation with
@@ -842,6 +871,13 @@ impl HostBridge {
             }
             _ => (None, None),
         };
+        // The start view is told the list's state at every change
+        // (Decision 16); its deferral is kept on disk with `host.delegated`.
+        let mut membership = membership;
+        if let Some(m) = membership.as_mut() {
+            m.set_persist_deferred(features.delegated);
+            m.set_publisher(list_publisher(&start_view));
+        }
         // r9 "No compatibility": a device list (even one that failed to
         // open) refuses r8 admission.
         host.set_refuse_r8(membership.is_some() || membership_error.is_some());
@@ -874,8 +910,9 @@ impl HostBridge {
         };
         Ok(Self {
             local: None,
-            features: super::test_hooks::host_features(),
+            features,
             host_work: None,
+            start_view,
             work: host_work_bridge::State::open(dir, profile.is_some()),
             projects: ProjectScopes::new(hasher),
             project_unread: HashMap::new(),
@@ -1098,6 +1135,7 @@ impl HostBridge {
             // `atem unpair` removed the device list: this host has none now,
             // and every channel ends.
             self.membership = None;
+            self.sync_list_view();
             self.host_key = None;
             self.host_pub = None;
             self.restart_channels(cx);
@@ -1251,7 +1289,46 @@ impl HostBridge {
             },
             projects: &self.projects,
         };
-        f(&mut self.r9, &mut parts)
+        let out = f(&mut self.r9, &mut parts);
+        // A channel opened or closed: the natives' gates follow it.
+        self.refresh_gates();
+        out
+    }
+
+    /// The start view's caught-up natives (design I.5.8, "Native
+    /// senders"): those holding an open channel whose `hello` carriage
+    /// brought the host up to their own head (`R9Host::native_caught_up`).
+    fn refresh_gates(&mut self) {
+        let natives = self
+            .r9
+            .caught_up_natives()
+            .into_iter()
+            .map(|(principal, _)| principal)
+            .collect();
+        self.start_view().gates.set_caught_up(natives);
+    }
+
+    /// The start view, locked (a poisoned lock is taken as it is: the view
+    /// holds no invariant a panic could break halfway).
+    pub(super) fn start_view(&self) -> std::sync::MutexGuard<'_, StartView> {
+        self.start_view
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The start view's device list follows `self.membership`: a list that
+    /// opened tells it its state at every change (a new one is given the
+    /// publisher here), and none (unpaired, failed, being reopened) leaves
+    /// it without one, so no delegated task starts.
+    fn sync_list_view(&mut self) {
+        match self.membership.as_mut() {
+            Some(m) if m.has_publisher() => {}
+            Some(m) => {
+                m.set_persist_deferred(self.features.delegated);
+                m.set_publisher(list_publisher(&self.start_view));
+            }
+            None => self.start_view().list = None,
+        }
     }
 
     /// The session host's effects of an r9 call; attachments the r9 host
@@ -1443,6 +1520,8 @@ impl HostBridge {
         self.restart_channels(cx);
         let pinned = pinned.map(|(account, pin, _)| (account, pin));
         self.membership = None;
+        // No delegated task starts while the list is reopened.
+        self.sync_list_view();
         self.membership_error = None;
         self.host_key = None;
         self.host_key_error = None;
@@ -1489,6 +1568,7 @@ impl HostBridge {
                         m.pin_of().host_id
                     );
                     self.membership = Some(m);
+                    self.sync_list_view();
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -2847,7 +2927,7 @@ impl HostBridge {
 
     // ── The drive hook (debug builds, `ATEM_TEST_HOST_WORK_DRIVE`) ──
     // The delegated fixtures play host-work's side (session-v1 R9.14)
-    // through these, as its dispatcher (Task 19) and intents (Task 26) will.
+    // through these, as its dispatcher does and its intents (Task 26) will.
 
     /// Host-work's start check answers what the drive hook last said
     /// (`verdict.json`; `go` at each runtime start).

@@ -11,6 +11,8 @@
 //! delegated ops ([`request`]), and §11.6's detail texts ([`details`]).
 pub mod attempts;
 pub mod details;
+pub mod gate;
+pub mod start;
 
 use crate::runtime::test_hooks::HostFeatures;
 use crate::session_protocol::r9::HostWorkError;

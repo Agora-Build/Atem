@@ -412,6 +412,25 @@ impl Config {
     pub fn route(&self, id: &str) -> Option<&Route> {
         self.routes.iter().find(|r| r.id == id)
     }
+
+    /// The route or profile approval a task was accepted under (`a`) is no
+    /// longer this one: the route is gone or has another revision or
+    /// profile, no longer names the task's principal, or its profile has
+    /// another revision or project (host-work v1, and the delegated start
+    /// check's condition 4).
+    pub fn route_changed(&self, a: &Accepted) -> bool {
+        let Some(route) = self.route(&a.route_id) else {
+            return true;
+        };
+        let Some(profile) = self.profile(&route.profile_id) else {
+            return true;
+        };
+        route.revision != a.route_revision
+            || !route.principals.contains(&a.principal)
+            || profile.id != a.profile_id
+            || profile.revision != a.profile_revision
+            || profile.project != a.project
+    }
 }
 
 impl Profile {
@@ -1482,32 +1501,72 @@ impl Store {
     /// time, so a pass reads only what is due. A record that can't be read
     /// (`work_waits` has no deadline for it, so it is due at once) is
     /// settled as such (`fail_unreadable`). Returns how many settled.
-    pub fn settle_due(&self, now: u64) -> Result<usize> {
+    ///
+    /// A delegated task (one with an admission record) compares its deadline
+    /// with the delegated clock instead (`now_d`, §11.6 "Deadline
+    /// comparisons"; without a reading, the wall clock, which `D` never
+    /// trails), and no authorization expiry fails it (design I.2: expiry
+    /// stops new requests only).
+    pub fn settle_due(&self, now: u64, now_d: Option<u64>) -> Result<usize> {
+        let upto = now.max(now_d.unwrap_or(0));
         let mut due = Vec::new();
         {
             let mut q = self.db.prepare(
                 "SELECT id,expires_at,authorization_expires_at FROM work_waits WHERE due_ms<=?1",
             )?;
-            let rows = q.query_map([now], |r| {
+            let rows = q.query_map([upto], |r| {
                 Ok((r.get::<_, String>(0)?, vec![r.get(1)?, r.get(2)?]))
             })?;
             for row in rows {
                 let (id, values) = row?;
-                match waiting(values) {
-                    None => due.push((id, Some(RECORD_UNREADABLE))),
-                    Some((deadline, _)) if now >= deadline => due.push((id, None)),
-                    Some((_, accepted))
-                        if accepted
-                            .authorization_expires_at
-                            .is_some_and(|at| now >= at) =>
-                    {
-                        due.push((id, Some(AUTHORIZATION_EXPIRED)))
+                let Some((deadline, accepted)) = waiting(values) else {
+                    due.push((id, Some(RECORD_UNREADABLE)));
+                    continue;
+                };
+                let authorization = accepted
+                    .authorization_expires_at
+                    .is_some_and(|at| now >= at);
+                if now < deadline && !authorization && now_d.is_none_or(|d| d < deadline) {
+                    continue;
+                }
+                if self.is_delegated(&id)? {
+                    if now_d.unwrap_or(now) >= deadline {
+                        due.push((id, None));
                     }
-                    Some(_) => {}
+                } else if now >= deadline {
+                    due.push((id, None));
+                } else if authorization {
+                    due.push((id, Some(AUTHORIZATION_EXPIRED)));
                 }
             }
         }
         self.settle(due)
+    }
+
+    /// Whether the task `id` is a delegated sender's (it has an admission
+    /// record, design I.4.1): one lookup by its key.
+    pub fn is_delegated(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT json_extract(record,'$.delegated') IS NOT NULL FROM work WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// Whether an open task is a delegated sender's: the store then needs
+    /// the delegated clock, whatever the hook says now (step 4, Decision
+    /// 10). Read through `open_records`, so closed records cost nothing.
+    pub fn has_delegated(&self) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM open_records o CROSS JOIN work w ON w.id=o.id
+            WHERE o.kind='work' AND json_extract(w.record,'$.delegated') IS NOT NULL)",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     /// Before its deadline, a task awaiting its result or of unknown
@@ -1541,7 +1600,11 @@ impl Store {
                     None => due.push((id, Some(RECORD_UNREADABLE))),
                     Some((deadline, _)) if now >= deadline => due.push((id, None)),
                     Some((_, accepted)) => {
-                        if let Some(why) = lost(&accepted) {
+                        // A delegated task has its own rules (design I.3.3:
+                        // awaiting and unknown ones are kept), never v1's.
+                        if let Some(why) = lost(&accepted)
+                            && !self.is_delegated(&id)?
+                        {
                             due.push((id, Some(why)));
                         }
                     }
@@ -1558,7 +1621,7 @@ impl Store {
         now: u64,
         lost: impl FnMut(&Accepted) -> Option<&'static str>,
     ) -> Result<usize> {
-        Ok(self.settle_due(now)? + self.settle_lost(now, lost)?)
+        Ok(self.settle_due(now, None)? + self.settle_lost(now, lost)?)
     }
 
     /// Expires each of `due` (no reason) or fails it with its reason; an
@@ -2309,8 +2372,8 @@ mod tests {
             store.active_tasks().unwrap().is_empty(),
             "none read per pass"
         );
-        assert_eq!(store.settle_due(999).unwrap(), 0);
-        assert_eq!(store.settle_due(1_000).unwrap(), 1);
+        assert_eq!(store.settle_due(999, None).unwrap(), 0);
+        assert_eq!(store.settle_due(1_000, None).unwrap(), 1);
         let expired = store.work(&r.task.task_id).unwrap().unwrap();
         assert_eq!(
             (expired.status.state, expired.status.detail.as_str()),
@@ -2439,7 +2502,7 @@ mod tests {
         assert!(!open(&ids[3]));
         // Awaiting its result: at its deadline.
         assert_eq!(state(&ids[2]), "awaiting_result");
-        assert_eq!(store.settle_due(1_000).unwrap(), 1);
+        assert_eq!(store.settle_due(1_000, None).unwrap(), 1);
         assert_eq!(detail(&ids[2]), unreadable);
         assert_eq!(grant(&ids[2]), "ended");
         // Settled before: closed as it is when its payloads are due (or

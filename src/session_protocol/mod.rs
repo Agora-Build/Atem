@@ -37,7 +37,7 @@ pub mod wire;
 #[cfg(test)]
 mod approval_tests;
 #[cfg(test)]
-mod fake_runtime;
+pub(crate) mod fake_runtime;
 #[cfg(test)]
 mod fixtures;
 #[cfg(test)]

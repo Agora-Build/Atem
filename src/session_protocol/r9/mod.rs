@@ -250,6 +250,10 @@ struct Attached {
     attachment: String,
     authority: Authority,
     grant: Option<atem_client::SignedObject>,
+    /// A native member's `hello` carriage left the host holding the
+    /// native's own head (design I.5.8, "Native senders"): its delegated
+    /// tasks pass the revocation gate while this channel is open.
+    caught_up: bool,
 }
 
 enum Phase {
@@ -769,6 +773,38 @@ impl R9Host {
     }
 
     /// The r9 attachments, with their principals.
+    /// Design I.5.8 ("Native senders"): `principal` (a native member, with
+    /// the auth key `key`, its raw bytes) holds an open channel whose
+    /// `hello` carriage brought this host up to the native's own head: its
+    /// delegated tasks pass the revocation gate while it lasts. (The
+    /// runtime reads them all at once, `caught_up_natives`.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn native_caught_up(&self, principal: &str, key: &[u8]) -> bool {
+        self.chans.values().any(|c| match &c.phase {
+            Phase::Open(a) => {
+                a.caught_up
+                    && a.authority.client_kind == ClientKind::Native
+                    && a.authority.name() == principal
+                    && a.authority.key.as_bytes() == key
+            }
+            _ => false,
+        })
+    }
+
+    /// Every native member [`R9Host::native_caught_up`] holds for, with
+    /// the key of its channel.
+    pub fn caught_up_natives(&self) -> Vec<(String, Vec<u8>)> {
+        self.chans
+            .values()
+            .filter_map(|c| match &c.phase {
+                Phase::Open(a) if a.caught_up && a.authority.client_kind == ClientKind::Native => {
+                    Some((a.authority.name(), a.authority.key.as_bytes().to_vec()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn attachments(&self) -> Vec<(String, String)> {
         self.chans
             .values()
@@ -1460,6 +1496,13 @@ impl R9Host {
             self.reply_and_close(handle, frame, reason::CLOSED);
             return effects;
         }
+        // Design I.5.8 ("Native senders"): a native member whose `hello`
+        // carriage left this host holding its own head (the host was there
+        // already, or the carriage brought it there).
+        let caught_up = authority.client_kind == ClientKind::Native
+            && m.membership()
+                .entry(membership.head.seq)
+                .is_some_and(|e| e.hash() == membership.head.hash);
         // The session host's attachment: one per channel (its own client),
         // speaking for the principal (r8 §H).
         let attachment = new_id();
@@ -1559,6 +1602,7 @@ impl R9Host {
             attachment: attachment.clone(),
             authority,
             grant: hello.grant.clone(),
+            caught_up,
         }));
         self.by_attachment.insert(attachment, handle.to_string());
         effects

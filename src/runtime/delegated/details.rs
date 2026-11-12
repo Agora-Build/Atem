@@ -3,41 +3,33 @@
 //! texts are exact. A test compares them with the table, byte for byte.
 
 /// `blocked`: the sender is held (a `hold` record).
-// Used by Task 19: a held sender's task waits.
-#[allow(dead_code)]
 pub const PAUSED: &str = "paused";
 /// `blocked`: the revocation gate (or, for a host sender, the mailbox gate)
 /// is closed.
 pub const REVOCATIONS_NOT_YET_CHECKED: &str = "revocations not yet checked";
 /// `blocked`: the last carriage or fetch stopped at a deferred entry.
-// Used by Task 19: the start check's deferred entry.
-#[allow(dead_code)]
 pub const DEVICE_LIST_UPDATE_PENDING: &str = "device list update pending";
 /// `blocked`: a locked cred agent leaves the project scope pending.
-// Used by Task 19: the start check's pending project scope.
-#[allow(dead_code)]
 pub const WAITING_FOR_UNLOCK: &str = "waiting for unlock";
+/// `blocked` (Atem's addition, for Astation): the session journal halted
+/// with the device list usable; the session host's own text (session-v1
+/// §I), until the restart.
+pub use crate::session_protocol::host::DETAIL_JOURNAL_HALTED as JOURNAL_HALTED;
+/// `blocked` (Atem's addition, for Astation; step 4's Decision 10): a task
+/// accepted while `host.delegated` was on, not started, after a restart
+/// without it. It is never dispatched and expires at its deadline.
+pub const HOST_DELEGATED_IS_OFF: &str = "host.delegated is off";
 /// `cancelled`: a `revoke` record, an R9 removal, or a host sender's
 /// `host_sender_revoke`, `remove_host` or new membership epoch.
-// Used by Task 20: a removal cancels unstarted tasks.
-#[allow(dead_code)]
 pub const SENDER_REVOKED: &str = "sender revoked";
 /// `failed`: the current grant (or a host sender's projects) no longer
 /// covers the task.
-// Used by Task 20: narrowing fails uncovered unstarted tasks.
-#[allow(dead_code)]
 pub const AUTHORIZATION_NARROWED: &str = "sender's authorization narrowed";
 /// `failed`: the route's revision, principals or profile changed.
-// Used by Task 20: a route change fails unstarted tasks.
-#[allow(dead_code)]
 pub const ROUTE_CHANGED: &str = "route changed";
 /// `failed`: a frozen, faulted or held device list.
-// Used by Task 19: a frozen, held or faulted list.
-#[allow(dead_code)]
 pub const AUTHORITY_CHANGED: &str = "sender's authority changed";
 /// `failed`: 8 attempts.
-// Used by Task 19, through `attempts` (`end_attempt`).
-#[allow(dead_code)]
 pub const TOO_MANY_ATTEMPTS: &str = "too many attempts";
 /// `failed`: a launch still waiting at the spawn boundary at its expiry.
 // Used by Task 28: delegated launches.
@@ -70,11 +62,13 @@ pub use crate::session_protocol::host::DETAIL_WITHDRAWN_BY_HOST as WITHDRAWN_BY_
 
 /// Every text, in the table's order.
 #[cfg(test)]
-pub const ALL: [&str; 16] = [
+pub const ALL: [&str; 18] = [
     PAUSED,
     REVOCATIONS_NOT_YET_CHECKED,
     DEVICE_LIST_UPDATE_PENDING,
     WAITING_FOR_UNLOCK,
+    JOURNAL_HALTED,
+    HOST_DELEGATED_IS_OFF,
     SENDER_REVOKED,
     AUTHORIZATION_NARROWED,
     ROUTE_CHANGED,
@@ -134,6 +128,8 @@ mod tests {
             (blocked, vec![REVOCATIONS_NOT_YET_CHECKED]),
             (blocked, vec![DEVICE_LIST_UPDATE_PENDING]),
             (blocked, vec![WAITING_FOR_UNLOCK]),
+            (blocked, vec![JOURNAL_HALTED]),
+            (blocked, vec![HOST_DELEGATED_IS_OFF]),
             ("`cancelled`", vec![SENDER_REVOKED]),
             (failed, vec![AUTHORIZATION_NARROWED]),
             (failed, vec![ROUTE_CHANGED]),
