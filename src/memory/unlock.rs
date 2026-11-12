@@ -119,6 +119,8 @@ async fn apply_encryption_message<L: AstationLink>(link: &mut L, message: &Astat
         // "…locked; run `atem cred unlock`" is noise here: this is the
         // unlock, and it asks for a missing key once the keys are unlocked.
         Ok(Some(status)) if status.contains(LOCKED) => {}
+        // Handled, nothing new to say (a repeat of what the device already does).
+        Ok(Some(status)) if status.is_empty() => {}
         Ok(Some(status)) => link.print(PrintLevel::Info, &shown(&status)),
         Ok(None) => {}
         Err(error) => link.print(
@@ -1049,6 +1051,48 @@ mod tests {
             self.applied.push(applied.clone());
             Ok(Some(applied))
         }
+    }
+
+    /// A link whose encryption handling answers with `status`.
+    struct Answering {
+        status: &'static str,
+        printed: Vec<String>,
+    }
+
+    impl AstationLink for Answering {
+        async fn send(&mut self, _: AstationMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn recv(&mut self) -> Option<AstationMessage> {
+            None
+        }
+        async fn apply_encryption(&mut self, _: &AstationMessage) -> Result<Option<String>> {
+            Ok(Some(self.status.into()))
+        }
+        fn print(&mut self, _: PrintLevel, text: &str) {
+            self.printed.push(text.into());
+        }
+    }
+
+    /// An encryption message handled with nothing to say (the state it
+    /// brought is what the device already does) shows no line, not a blank one.
+    #[tokio::test]
+    async fn an_encryption_message_with_nothing_to_say_prints_nothing() {
+        let message = AstationMessage::EncryptionMode {
+            account_state: None,
+        };
+        let mut quiet = Answering {
+            status: "",
+            printed: Vec::new(),
+        };
+        apply_encryption_message(&mut quiet, &message).await;
+        assert!(quiet.printed.is_empty(), "{:?}", quiet.printed);
+        let mut news = Answering {
+            status: "Account encryption state updated",
+            printed: Vec::new(),
+        };
+        apply_encryption_message(&mut news, &message).await;
+        assert_eq!(news.printed, ["Account encryption state updated"]);
     }
 
     const K_KID: &str = "0123abcd";

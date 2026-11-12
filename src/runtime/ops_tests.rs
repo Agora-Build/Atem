@@ -948,7 +948,7 @@ fn a_lost_link_fails_the_verification_without_replay() {
         op.printed("Waiting for your Mac").await;
         peer.close();
         let error = op.done().await.unwrap_err();
-        assert_eq!(error, "device verification failed");
+        assert_eq!(error, crate::pair_verify::PAIRED_NOT_VERIFIED);
         assert!(
             op.printed.iter().any(|l| l.contains("connection closed")),
             "{:?}",
@@ -987,7 +987,7 @@ fn a_second_operation_is_refused_while_one_runs() {
         // The first one is unaffected: a refusal of the code ends it.
         op.answer(question, AnswerValue::No).await;
         let error = op.done().await.unwrap_err();
-        assert_eq!(error, "device verification failed");
+        assert_eq!(error, crate::pair_verify::PAIRED_NOT_VERIFIED);
         let abort = peer.next("verifyAbort").await;
         assert_eq!(abort["data"]["reason"], "codes didn't match on atem");
         rt.shutdown().await;
@@ -1153,6 +1153,42 @@ fn pair_replaces_a_record_without_a_binding() {
     first_pairing(Some("astation-other"));
 }
 
+/// Astation's side of a first local pairing up to the granted session: the
+/// authenticated loopback challenge, the pairing code `atem pair` shows, and
+/// the grant. The verification follows on the same connection.
+async fn grant_a_local_pairing(peer: &mut Peer, op: &mut Op) {
+    // Astation challenges; atem answers with a pairing code shown by the CLI.
+    peer.send(&AstationMessage::StatusUpdate {
+        status: "auth_required".into(),
+        data: [
+            ("astation_id", ASTATION),
+            ("challenge", &"a".repeat(64)),
+            ("transport", "lan"),
+            ("protocol", "2"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    });
+    let auth = peer.next("statusUpdate").await;
+    let code = auth["data"]["data"]["pairing_code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    op.printed(&code).await;
+    peer.send(&AstationMessage::StatusUpdate {
+        status: "auth".into(),
+        data: [
+            ("status", "granted"),
+            ("session_id", "session-new"),
+            ("token", "token-new"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    });
+}
+
 fn first_pairing(leftover: Option<&str>) {
     local(async {
         let dir = Rc::new(short_dir());
@@ -1174,36 +1210,7 @@ fn first_pairing(leftover: Option<&str>) {
         let rt = Runtime::start(dir, None, Arc::new(test_agent(&keys))).await;
         let mut op = Op::start(rt.client().await, OpKind::Pair, OpOptions::default()).await;
 
-        // Astation challenges; atem answers with a pairing code shown by the CLI.
-        peer.send(&AstationMessage::StatusUpdate {
-            status: "auth_required".into(),
-            data: [
-                ("astation_id", ASTATION),
-                ("challenge", &"a".repeat(64)),
-                ("transport", "lan"),
-                ("protocol", "2"),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
-        });
-        let auth = peer.next("statusUpdate").await;
-        let code = auth["data"]["data"]["pairing_code"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        op.printed(&code).await;
-        peer.send(&AstationMessage::StatusUpdate {
-            status: "auth".into(),
-            data: [
-                ("status", "granted"),
-                ("session_id", "session-new"),
-                ("token", "token-new"),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
-        });
+        grant_a_local_pairing(&mut peer, &mut op).await;
         // Local pairing: the authenticated loopback challenge named
         // Astation, so no bootstrap hello and no credentials (the
         // token-free design); the verification below establishes trust.
@@ -1248,6 +1255,120 @@ fn first_pairing(leftover: Option<&str>) {
         let refused = peer.hello().await;
         assert_eq!(refused["op"], "error", "{refused}");
         assert_eq!(refused["revision"], 9);
+        rt.shutdown().await;
+    });
+}
+
+/// Where the first printed line containing `needle` is.
+fn line_with(printed: &[String], needle: &str) -> usize {
+    printed
+        .iter()
+        .position(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("no line with {needle:?}: {printed:#?}"))
+}
+
+/// What Astation says when it stops the verification (the real run that
+/// motivated the wording: Astation wasn't signed in).
+const SIGN_IN_FIRST: &str = "Sign in to Agora.Build in Settings > Account to continue.";
+
+/// The output of a verification Astation stopped, for `atem pair` and
+/// `atem pair verify` alike: the encryption status the held message
+/// produced comes first, then the reason as the last printed line, then the
+/// error that says the device is paired but not verified. Nothing lands
+/// between the reason and the error, and no line says the pairing failed.
+fn assert_stopped_verification_output(printed: &[String], error: &str, after: &str) {
+    assert_eq!(error, crate::pair_verify::PAIRED_NOT_VERIFIED);
+    assert!(error.starts_with("Paired, but"), "{error}");
+    assert!(
+        error.contains("'atem pair verify'"),
+        "the next step is in the error: {error}"
+    );
+    let reason = line_with(printed, "Astation stopped device verification");
+    assert!(printed[reason].contains(SIGN_IN_FIRST), "{printed:#?}");
+    assert_eq!(
+        reason,
+        printed.len() - 1,
+        "the reason is the last line: {printed:#?}"
+    );
+    let status = line_with(printed, "Ignored an unsigned encryption mode");
+    assert!(line_with(printed, after) < status, "{printed:#?}");
+    assert!(
+        status < reason,
+        "status before the failure's lines: {printed:#?}"
+    );
+    for line in printed {
+        assert!(!line.contains("device verification failed"), "{line}");
+        assert!(
+            !line.contains("Pairing is saved"),
+            "said once, in the error: {line}"
+        );
+    }
+}
+
+/// `atem pair` whose verification Astation stops: paired, not verified.
+#[test]
+fn a_stopped_verification_ends_atem_pair_with_one_clear_message() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        let profile = dir.path().join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        let (url, mut peer) = Peer::listen().await;
+        std::fs::write(
+            profile.join("config.toml"),
+            format!(
+                "astation_ws = \"{url}\"\nastation_relay_url = \"http://127.0.0.1:1\"\natem_id = \"{ATEM_ID}\"\n"
+            ),
+        )
+        .unwrap();
+        let keys = CredPaths::in_dir(&profile);
+        let rt = Runtime::start(dir, None, Arc::new(test_agent(&keys))).await;
+        let mut op = Op::start(rt.client().await, OpKind::Pair, OpOptions::default()).await;
+        grant_a_local_pairing(&mut peer, &mut op).await;
+        peer.next("verifyCommit").await;
+        // An encryption message during the ceremony is applied after it.
+        peer.send(&AstationMessage::EncryptionMode {
+            account_state: None,
+        });
+        peer.send(&AstationMessage::VerifyAbort {
+            reason: SIGN_IN_FIRST.into(),
+        });
+        let error = op.done().await.unwrap_err();
+        assert_stopped_verification_output(&op.printed, &error, "Paired with Astation.");
+        // The pairing stays saved; the device isn't verified.
+        let src = crate::profile::Sources::in_dir(&rt.profile);
+        assert_eq!(
+            crate::pairing::load(&src)
+                .unwrap()
+                .binding
+                .unwrap()
+                .astation_id,
+            ASTATION
+        );
+        assert!(!verified_as(&rt.keys(), "acct-new"));
+        rt.shutdown().await;
+    });
+}
+
+/// `atem pair verify` on an existing pairing ends with the same message.
+#[test]
+fn a_stopped_verification_ends_atem_pair_verify_with_the_same_message() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        peer.next("verifyCommit").await;
+        peer.send(&AstationMessage::EncryptionMode {
+            account_state: None,
+        });
+        peer.send(&AstationMessage::VerifyAbort {
+            reason: SIGN_IN_FIRST.into(),
+        });
+        let error = op.done().await.unwrap_err();
+        assert_stopped_verification_output(&op.printed, &error, "Verifying this device");
+        assert!(!verified_as(&rt.keys(), "acct-op"));
         rt.shutdown().await;
     });
 }
@@ -1403,14 +1524,28 @@ fn the_cli_side_renders_answers_and_ends_with_done() {
         let (result, abort) = tokio::join!(run, astation);
         assert_eq!(
             result.unwrap_err().to_string(),
-            "device verification failed"
+            crate::pair_verify::PAIRED_NOT_VERIFIED
         );
         assert_eq!(abort["data"]["reason"], "no terminal to compare the code");
         assert_eq!(script.asked, [crate::pair_verify::CODES_QUESTION]);
+        // The reason is one warning line; the next step is in the error that
+        // ends the command, not repeated beside it.
+        let warnings: Vec<_> = script
+            .printed
+            .iter()
+            .filter(|(level, _)| *level == PrintLevel::Warn)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(warnings.len(), 1, "{:?}", script.printed);
         assert!(
-            script.printed.iter().any(
-                |(level, text)| *level == PrintLevel::Warn && text.contains("atem pair verify")
-            ),
+            warnings[0].contains("needs a terminal to compare the safety code"),
+            "{warnings:?}"
+        );
+        assert!(
+            !script
+                .printed
+                .iter()
+                .any(|(_, text)| text.contains("Pairing is saved")),
             "{:?}",
             script.printed
         );
@@ -2188,7 +2323,10 @@ fn the_runtime_is_not_replaced_while_an_operation_runs() {
         assert!(!locator.replaced.exists(), "no replacement recorded");
         // The operation goes on.
         op.answer(question, AnswerValue::No).await;
-        assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        assert_eq!(
+            op.done().await.unwrap_err(),
+            crate::pair_verify::PAIRED_NOT_VERIFIED
+        );
         rt.shutdown().await;
     });
 }
@@ -2218,7 +2356,10 @@ fn a_verify_keys_without_a_genesis_is_refused() {
             abort["data"]["reason"],
             "Atem needs a device list (atem-session r9)"
         );
-        assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        assert_eq!(
+            op.done().await.unwrap_err(),
+            crate::pair_verify::PAIRED_NOT_VERIFIED
+        );
         let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
         assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
         assert!(!pending(&rt.keys()), "no pending pin");
@@ -2392,7 +2533,10 @@ fn a_device_list_for_another_host_key_fails_the_verification() {
                 .contains("host key or trust generation"),
             "{abort}"
         );
-        assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        assert_eq!(
+            op.done().await.unwrap_err(),
+            crate::pair_verify::PAIRED_NOT_VERIFIED
+        );
         let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
         assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
         assert!(!verified_as(&rt.keys(), "acct-op"), "nothing trusted");
@@ -2438,7 +2582,10 @@ fn an_add_host_for_another_generation_fails_the_verification() {
                 .contains("host key or trust generation"),
             "{abort}"
         );
-        assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        assert_eq!(
+            op.done().await.unwrap_err(),
+            crate::pair_verify::PAIRED_NOT_VERIFIED
+        );
         let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
         assert!(!pairing.membership.exists());
         assert!(!verified_as(&rt.keys(), "acct-op"), "nothing trusted");
@@ -2479,7 +2626,10 @@ fn an_unreadable_frozen_genesis_aborts_before_touch_id() {
              directory (~/.config/atem by default)",
         )
         .await;
-        assert_eq!(op.done().await.unwrap_err(), "device verification failed");
+        assert_eq!(
+            op.done().await.unwrap_err(),
+            crate::pair_verify::PAIRED_NOT_VERIFIED
+        );
         assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
         assert!(!pending(&rt.keys()), "no pending pin");
         rt.shutdown().await;
