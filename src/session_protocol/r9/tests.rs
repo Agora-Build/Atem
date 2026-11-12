@@ -3489,9 +3489,14 @@ mod channel_end {
     }
 
     /// A service's channel ends at its expiry (the principal's, wall and
-    /// monotonic): its fence error is the last record, the close `expired`,
-    /// for every attachment of the principal; a browser grant the same;
-    /// the phone stays.
+    /// monotonic): the close is `expired` for every attachment of the
+    /// principal; a browser grant the same; the phone stays. The rig's
+    /// clocks move in lockstep, so the channel's own deadline
+    /// (`mono + (expires_at - wall)`) is reached with the wall expiry and
+    /// its `unauthorized`/`expired` fence record can't be sealed: only
+    /// `close{expired}` goes out. The record is sent only when the wall
+    /// clock passes the expiry before the monotonic deadline (as the shared
+    /// fixture `r9-service-scope-and-expiry` steps it).
     #[test]
     fn a_service_channel_at_its_expiry_closes_expired() {
         let mut rig = Rig::new();
@@ -3627,5 +3632,74 @@ mod channel_end {
         let big = "x".repeat(atem_client::channel::MAX_PLAINTEXT + 1);
         message_for(&mut rig, "ch-phone", &big);
         assert_eq!(closed_with(&rig, "ch-phone").as_deref(), Some("busy"));
+    }
+
+    /// An idle native channel reaches its 24 h (monotonic only) at a pass:
+    /// the pass closes it `expired`, with no record first, and nothing else
+    /// goes.
+    #[test]
+    fn an_idle_native_channel_at_24_hours_closes_expired_at_the_pass() {
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-other", phone());
+        // The first channel's day ends (the second's, a second later, not).
+        rig.advance(DAY - 1000);
+        assert_eq!(closed_with(&rig, "ch-phone").as_deref(), Some("expired"));
+        assert!(!rig.closes.iter().any(|(h, _)| h == "ch-other"));
+        assert_eq!(rig.engine.status().attachments, 1);
+        assert_eq!(rig.list("ch-other").len(), 2);
+    }
+
+    /// When a principal's expiry and a fence that isn't an expiry meet in
+    /// one runtime pass, the first fence to close the attachment decides
+    /// the reason. The pass commits the device list (`membership_pass`)
+    /// before `r9.tick`, so a removal carried in the same pass as the
+    /// expiry closes `closed`; `expired` is noted only by `tick`, right
+    /// before its own fence, so a removal never inherits it.
+    #[test]
+    fn a_removal_in_the_pass_of_an_expiry_closes_closed() {
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-bot", bot());
+        rig.advance(1000);
+        // The bot's hour is over, but no pass ran yet.
+        skip(&mut rig, 3_600_000);
+        let removal = rig.log.remove("svc-bot");
+        let entry = atem_client::SignedObject::parse(removal.to_string().as_bytes()).unwrap();
+        // The phone sealed the carriage in time (its day goes on).
+        let mono = rig.now.host.mono_ms;
+        let (_, frame) = rig
+            .attached("ch-phone")
+            .send_membership(&[entry], mono)
+            .unwrap();
+        rig.send_frame("ch-phone", &frame);
+        assert_eq!(closed_with(&rig, "ch-bot").as_deref(), Some("closed"));
+        // The pass that follows finds the bot gone: no second close.
+        rig.advance(1);
+        assert_eq!(closed_with(&rig, "ch-bot").as_deref(), Some("closed"));
+        assert_eq!(rig.engine.status().attachments, 1);
+    }
+
+    /// `close_reason` is what the inbound record and the welcome seal call:
+    /// every limit is a lifetime end; no other failure is.
+    #[test]
+    fn close_reason_maps_only_the_limits_to_expired() {
+        use atem_client::channel::Limit;
+        for limit in [Limit::Records, Limit::Bytes, Limit::Lifetime] {
+            assert_eq!(close_reason(&ChannelError::Limit(limit)), "expired");
+        }
+        for other in [
+            ChannelError::RecordRejected,
+            ChannelError::Closed,
+            ChannelError::TooLarge,
+            ChannelError::Busy,
+            ChannelError::StaleTarget,
+        ] {
+            assert_eq!(close_reason(&other), "closed", "{other:?}");
+        }
     }
 }

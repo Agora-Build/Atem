@@ -2463,12 +2463,13 @@ impl R9Host {
                 // A limit reached (its lifetime, or its records or bytes,
                 // §R9.7 "Limits") ends the channel `expired`; anything else
                 // Atem can't seal is `busy`.
-                let why = match e {
-                    ChannelError::Limit(_) => reason::EXPIRED,
-                    _ => reason::BUSY,
+                let why = if close_reason(&e) == reason::EXPIRED {
+                    reason::EXPIRED
+                } else {
+                    reason::BUSY
                 };
                 log(&format!(
-                    "a channel can't take a record ({}); closed ({why})",
+                    "a channel can't take a record ({}); closing it with {why}",
                     e.code()
                 ));
                 self.overflow(&handle, why);
