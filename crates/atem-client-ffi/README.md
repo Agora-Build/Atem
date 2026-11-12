@@ -46,7 +46,9 @@ cargo test -p atem-client-ffi                     # Rust: durability, no lock wh
 ```
 
 The conformance suites (`bindings/kotlin`, `bindings/js`, `bindings/swift`)
-run every `r9-vectors-*` file through the generated bindings; the end-to-end
+run every `r9-vectors-*` file and the host-work prompt-framing vectors
+(`prompt-framing-v1.json`, `framing-size-v1.json`) through the generated
+bindings; the end-to-end
 test drives a Kotlin phone and a Node/WASM browser against a test host over
 loopback TCP. Toolchains are passed in by environment (`KOTLINC`, `JNA_JAR`,
 `WASM_BINDGEN`, …; see the script).

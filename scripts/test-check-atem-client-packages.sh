@@ -6,6 +6,7 @@
 # readelf (a wrapper around the real one) shows
 #   - a host-role symbol (`…sign_seen`) early in the dynamic symbol table
 #     (early, so a `| grep -q` under pipefail would have failed open),
+#   - the framing's vectors-only rendering (`…framing_render_for_vectors`),
 #   - no `verify_commit_host_trust_gen` export,
 #   - a 4 KB LOAD alignment.
 #   READELF  the real readelf (default: readelf)
@@ -31,6 +32,7 @@ EOF
 }
 # The injected symbol goes right after the table's header (line 4).
 wrapper inject "awk 'NR == 4 {print \"    52: 0000000000001000   10 FUNC    GLOBAL DEFAULT   12 uniffi_atem_client_ffi_fn_func_sign_seen\"} {print}'" cat
+wrapper injectframing "awk 'NR == 4 {print \"    52: 0000000000001000   10 FUNC    GLOBAL DEFAULT   12 uniffi_atem_client_ffi_fn_func_framing_render_for_vectors\"} {print}'" cat
 wrapper drop "grep -v verify_commit_host_trust_gen" cat
 wrapper align cat "sed 's/0x4000\$/0x1000/'"
 
@@ -47,6 +49,7 @@ expect() { # expect <ok|fail> <readelf> <message>
 }
 expect ok "$REAL" ""
 expect fail "$WORK/inject" "a test-only or host-role symbol is exported"
+expect fail "$WORK/injectframing" "a test-only or host-role symbol is exported"
 expect fail "$WORK/drop" "the UniFFI exports are missing"
 expect fail "$WORK/align" "need 0x4000"
 echo "check-atem-client-packages negative tests: ok"

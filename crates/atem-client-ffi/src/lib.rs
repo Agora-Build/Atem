@@ -22,7 +22,11 @@
 //!   clock;
 //! - [`service`]: service member builders (`add`/`set_roles` action JSON,
 //!   renewal, narrowing) and the `projects` scope hash (§R9.6);
-//! - [`encoding`]: canonical JSON, `enc`, signing inputs and hashes.
+//! - [`encoding`]: canonical JSON, `enc`, signing inputs and hashes;
+//! - [`framing`]: the prompt framing's escaping and marker check, the
+//!   Unicode version pinned for them and a task's preflight size check
+//!   (III.2; the host renders every prompt, a client never does, so
+//!   rendering is exported only for the vectors, feature `test-vectors`).
 //!
 //! Contract for Astation: `designs/protocol/atem-client-bindings.md`.
 // The provider-taking `*_with` helpers are called by the UniFFI and WASM
@@ -41,6 +45,7 @@ mod macros;
 pub mod connection;
 pub mod encoding;
 pub mod error;
+pub mod framing;
 pub mod kit;
 pub mod log;
 pub mod provider;
