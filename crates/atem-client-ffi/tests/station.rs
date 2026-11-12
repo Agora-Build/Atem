@@ -22,9 +22,9 @@ use atem_client_ffi::station::{
     relay_membership_fetch_refused, relay_membership_fetch_result, report_answer,
 };
 use atem_client_ffi::types::{
-    LedgerAlertInfo, LinkAssociationInfo, LogHead, RelayFeedHead, RelayFeedRecord,
-    RelayRefusalCode, RelayToHost, RelayToStation, ReportAnswerKind, ReportIntentInfo,
-    StationReport,
+    ControlAckInfo, ControlEffectKind, ControlEffectResult, ControlResultKind, LedgerAlertInfo,
+    LinkAssociationInfo, LogHead, RelayAckResult, RelayFeedHead, RelayFeedRecord, RelayRefusalCode,
+    RelayToHost, RelayToStation, ReportAnswerKind, ReportIntentInfo, StationReport,
 };
 use serde_json::{Value, json};
 use support::*;
@@ -719,4 +719,321 @@ fn the_three_refusals_and_a_stale_association_refused_without_disclosure() {
     link.host_trust_gen = 1;
     let t = ledger.ack(link, ack, 1_793_620_940_000).unwrap();
     assert_eq!(t.made.len(), 2);
+}
+
+// ------------------------------------------- the Station calls' byte goldens
+
+/// An effect list as the golden file writes it, for the bindings' types.
+fn golden_effects(v: &Value) -> Vec<ControlEffectResult> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|e| ControlEffectResult {
+            effect: match s(&e["effect"]).as_str() {
+                "revocation" => ControlEffectKind::Revocation,
+                "interrupt" => ControlEffectKind::Interrupt,
+                "hold" => ControlEffectKind::Hold,
+                "release" => ControlEffectKind::Release,
+                "cover" => ControlEffectKind::Cover,
+                other => panic!("effect {other}"),
+            },
+            result: match s(&e["result"]).as_str() {
+                "applied" => ControlResultKind::Applied,
+                "duplicate" => ControlResultKind::Duplicate,
+                "pending" => ControlResultKind::Pending,
+                "refused" => ControlResultKind::Refused,
+                other => panic!("result {other}"),
+            },
+        })
+        .collect()
+}
+
+fn golden_effects_json(effects: &[ControlEffectResult]) -> Value {
+    Value::Array(
+        effects
+            .iter()
+            .map(|e| {
+                let effect = match e.effect {
+                    ControlEffectKind::Revocation => "revocation",
+                    ControlEffectKind::Interrupt => "interrupt",
+                    ControlEffectKind::Hold => "hold",
+                    ControlEffectKind::Release => "release",
+                    ControlEffectKind::Cover => "cover",
+                };
+                let result = match e.result {
+                    ControlResultKind::Applied => "applied",
+                    ControlResultKind::Duplicate => "duplicate",
+                    ControlResultKind::Pending => "pending",
+                    ControlResultKind::Refused => "refused",
+                };
+                json!({"effect": effect, "result": result})
+            })
+            .collect(),
+    )
+}
+
+fn golden_ack(f: &Value) -> ControlAckInfo {
+    ControlAckInfo {
+        account_id: s(&f["account_id"]),
+        genesis_hash: s(&f["genesis_hash"]),
+        host_id: s(&f["host_id"]),
+        host_trust_gen: f["host_trust_gen"].as_u64().unwrap(),
+        origin: s(&f["origin"]),
+        feed_id: s(&f["feed_id"]),
+        cursor: f["cursor"].as_u64().unwrap(),
+        results: f["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| match r.get("entry") {
+                Some(entry) => RelayAckResult::Entry {
+                    seq: entry["seq"].as_u64().unwrap(),
+                    entry_hash: s(&entry["entry_hash"]),
+                    applied_seq: r["applied_seq"].as_u64().unwrap(),
+                    effects: golden_effects(&r["effects"]),
+                },
+                None => RelayAckResult::Record {
+                    record_id: s(&r["record_id"]),
+                    effects: golden_effects(&r["effects"]),
+                },
+            })
+            .collect(),
+    }
+}
+
+fn golden_ack_json(ack: &ControlAckInfo) -> Value {
+    json!({
+        "account_id": ack.account_id,
+        "genesis_hash": ack.genesis_hash,
+        "host_id": ack.host_id,
+        "host_trust_gen": ack.host_trust_gen,
+        "origin": ack.origin,
+        "feed_id": ack.feed_id,
+        "cursor": ack.cursor,
+        "results": ack.results.iter().map(|r| match r {
+            RelayAckResult::Record { record_id, effects } =>
+                json!({"record_id": record_id, "effects": golden_effects_json(effects)}),
+            RelayAckResult::Entry { seq, entry_hash, applied_seq, effects } => json!({
+                "entry": {"seq": seq, "entry_hash": entry_hash},
+                "applied_seq": applied_seq,
+                "effects": golden_effects_json(effects),
+            }),
+        }).collect::<Vec<_>>(),
+    })
+}
+
+/// A golden's message as the production exports build it, from its fields.
+fn golden_build(op: &str, f: &Value) -> Result<String, AtemError> {
+    let head = |v: &Value| LogHead {
+        seq: v["seq"].as_u64().unwrap(),
+        hash: s(&v["hash"]),
+    };
+    match op {
+        "control_sync" => relay_control_sync(
+            s(&f["origin"]),
+            f.get("feed_id").map(s),
+            f["after"].as_u64().unwrap(),
+        ),
+        "control_sync_result" => relay_control_sync_result(
+            s(&f["origin"]),
+            s(&f["feed_id"]),
+            f["head"].as_u64().unwrap(),
+            f["station_time"].as_u64().unwrap(),
+            f["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| RelayFeedRecord {
+                    feed_seq: r["feed_seq"].as_u64().unwrap(),
+                    record_json: r["record"].to_string(),
+                })
+                .collect(),
+        ),
+        "heads" => relay_heads(
+            f["feeds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|feed| RelayFeedHead {
+                    origin: s(&feed["origin"]),
+                    feed_id: s(&feed["feed_id"]),
+                    head: feed["head"].as_u64().unwrap(),
+                    station_time: feed["station_time"].as_u64().unwrap(),
+                })
+                .collect(),
+            head(&f["membership"]),
+        ),
+        "control_ack" => relay_control_ack(golden_ack(f)),
+        "membership_fetch" => relay_membership_fetch(f["after"].as_u64().unwrap()),
+        "membership_fetch_result" => relay_membership_fetch_result(
+            head(&f["head"]),
+            f["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(Value::to_string)
+                .collect(),
+        ),
+        "control_sync_refused" => relay_control_sync_refused(RelayRefusalCode::Forbidden),
+        "membership_fetch_refused" => relay_membership_fetch_refused(RelayRefusalCode::Forbidden),
+        "control_ack_refused" => relay_control_ack_refused(RelayRefusalCode::Forbidden),
+        other => panic!("no export for {other}"),
+    }
+}
+
+/// What a decoded message holds, as the golden file's `fields` write it.
+fn golden_describe(direction: &str, wire: &str) -> Result<Value, AtemError> {
+    let head = |h: &LogHead| json!({"seq": h.seq, "hash": h.hash});
+    Ok(match direction {
+        "to_station" => match relay_decode_to_station(wire.to_owned())? {
+            RelayToStation::ControlSync {
+                origin,
+                feed_id,
+                after,
+            } => {
+                let mut f = json!({"origin": origin, "after": after});
+                if let Some(feed_id) = feed_id {
+                    f["feed_id"] = json!(feed_id);
+                }
+                f
+            }
+            RelayToStation::ControlAck { ack } => golden_ack_json(&ack),
+            RelayToStation::MembershipFetch { after } => json!({"after": after}),
+        },
+        "to_host" => match relay_decode_to_host(wire.to_owned())? {
+            RelayToHost::ControlSyncResult {
+                origin,
+                feed_id,
+                head,
+                station_time,
+                records,
+            } => json!({
+                "origin": origin, "feed_id": feed_id, "head": head, "station_time": station_time,
+                "records": records.iter().map(|r| json!({
+                    "feed_seq": r.feed_seq,
+                    "record": serde_json::from_str::<Value>(&r.record_json).unwrap(),
+                })).collect::<Vec<_>>(),
+            }),
+            RelayToHost::Heads { feeds, membership } => json!({
+                "feeds": feeds.iter().map(|f| json!({
+                    "origin": f.origin, "feed_id": f.feed_id, "head": f.head,
+                    "station_time": f.station_time,
+                })).collect::<Vec<_>>(),
+                "membership": head(&membership),
+            }),
+            RelayToHost::MembershipFetchResult { head: h, entries } => json!({
+                "head": head(&h),
+                "entries": entries.iter()
+                    .map(|e| serde_json::from_str::<Value>(e).unwrap())
+                    .collect::<Vec<_>>(),
+            }),
+            RelayToHost::ControlSyncRefused { code }
+            | RelayToHost::MembershipFetchRefused { code }
+            | RelayToHost::ControlAckRefused { code } => match code {
+                RelayRefusalCode::Forbidden => json!({"code": "forbidden"}),
+            },
+        },
+        other => panic!("no reader {other}"),
+    })
+}
+
+/// `r9-vectors-station-calls` through the production exports: every golden
+/// message built byte for byte from its fields, read back to those fields
+/// (each page record judged by `parse_control_record` as the file says), a
+/// golden's decoded value written again to the same bytes, and every invalid
+/// variant refused with its code. A page record the control parser refuses
+/// can't be built: a Station serves only what it validated at intake.
+#[test]
+fn goldens_round_trip_through_the_bindings() {
+    use atem_client_ffi::control::parse_control_record;
+    let file = load("r9-vectors-station-calls");
+    assert_eq!(s(&file["name"]), "r9-vectors-station-calls");
+    let calls = file["calls"].as_array().unwrap();
+    assert!(calls.len() >= 20, "{} goldens", calls.len());
+    for case in calls {
+        let name = s(&case["name"]);
+        let (op, direction, wire) = (s(&case["op"]), s(&case["direction"]), s(&case["wire"]));
+        let fields = &case["fields"];
+        let judged = case.get("judged");
+        // Built byte for byte, unless a page record doesn't parse.
+        let refused = judged.and_then(|j| {
+            j.as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["parses"] == false)
+                .map(|r| s(&r["error"]))
+        });
+        match (golden_build(&op, fields), refused) {
+            (Ok(built), None) => assert_eq!(built, wire, "{name}: built"),
+            (Err(e), Some(want)) => {
+                assert_eq!(code(e), want, "{name}: a record that doesn't parse")
+            }
+            (other, _) => panic!("{name}: {other:?}"),
+        }
+        // Read back to its fields.
+        assert_eq!(
+            golden_describe(&direction, &wire).unwrap(),
+            *fields,
+            "{name}: decoded"
+        );
+        // Each page record, judged as the file says.
+        for (record, verdict) in fields
+            .get("records")
+            .and_then(Value::as_array)
+            .unwrap_or(&Vec::new())
+            .iter()
+            .zip(
+                judged
+                    .map(|j| j.as_array().unwrap().clone())
+                    .unwrap_or_default(),
+            )
+        {
+            match parse_control_record(record["record"].to_string()) {
+                Ok(body) => {
+                    assert_eq!(verdict["parses"], true, "{name}");
+                    assert_eq!(s(&verdict["record_id"]), body.record_id, "{name}");
+                }
+                Err(e) => {
+                    assert_eq!(verdict["parses"], false, "{name}");
+                    assert_eq!(s(&verdict["error"]), code(e), "{name}");
+                }
+            }
+        }
+        // An ack read and written again: the same bytes.
+        if let Ok(RelayToStation::ControlAck { ack }) = relay_decode_to_station(wire.clone()) {
+            assert_eq!(
+                relay_control_ack(ack).unwrap(),
+                wire,
+                "{name}: written again"
+            );
+        }
+        // The other side's reader refuses it.
+        let other = if direction == "to_station" {
+            "to_host"
+        } else {
+            "to_station"
+        };
+        assert_eq!(
+            code(golden_describe(other, &wire).unwrap_err()),
+            "wrong_message",
+            "{name}"
+        );
+    }
+    for case in file["invalid"].as_array().unwrap() {
+        let name = s(&case["name"]);
+        let wire = match case.get("wire") {
+            Some(wire) => s(wire),
+            None => {
+                let fill = &case["wire_fill"];
+                format!(
+                    "{}{}{}",
+                    s(&fill["prefix"]),
+                    s(&fill["fill"]).repeat(fill["count"].as_u64().unwrap() as usize),
+                    s(&fill["suffix"])
+                )
+            }
+        };
+        let error = golden_describe(&s(&case["reader"]), &wire).unwrap_err();
+        assert_eq!(code(error), s(&case["code"]), "{name}");
+    }
 }

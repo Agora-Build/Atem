@@ -1798,6 +1798,488 @@ def check_host_envelope(file, data, report, context):
         case.check(len(reasons) >= 30, f"{len(reasons)} reasons")
 
 
+# ------------------------------------------------ r9-vectors-station-calls
+
+# The Station calls of host-work-v1 §11.4 (design I.5.8): a reader written
+# from the spec's "Every message is read strictly" rules, the grammars and
+# bounds of the wire rules 1 to 9, and the refusals. No code of this
+# repository: the file's every text is read by it, valid and refused.
+RELAY_MAX_BYTES = 262144  # R9.9: every relay message, as sent, before any parse
+RELAY_MAX_ITEMS = 64  # records, results, feeds and entries (wire rule 1)
+RELAY_MAX_DEPTH = 128  # the strict parser's nesting bound
+SAFE_MAX = 2**53 - 1
+RELAY_ID = r"[A-Za-z0-9._:-]{1,128}"
+RELAY_EFFECTS = ["revocation", "interrupt", "hold", "release", "cover"]
+RELAY_RESULTS = ["applied", "duplicate", "pending", "refused"]
+# Wire rule 3 and 4: the effects a record's result names, in this order; a
+# host sender's revoke entry's.
+RECORD_EFFECT_SETS = [["cover"], ["revocation"], ["revocation", "interrupt"], ["hold"], ["release"], ["interrupt"]]
+ENTRY_EFFECT_SETS = [["revocation"], ["revocation", "interrupt"]]
+STATION_TO_HOST_OPS = ["control_sync_result", "heads", "membership_fetch_result", "control_sync_refused", "membership_fetch_refused", "control_ack_refused"]
+HOST_TO_STATION_OPS = ["control_sync", "control_ack", "membership_fetch"]
+
+
+class Refused(Exception):
+    """A reader's refusal, with the code it gives."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+def relay_parse(text):
+    """One strict I-JSON parse: no duplicate key, integers only and at most
+    2^53 - 1, no lone surrogate, nesting within the bound."""
+
+    def safe_int(digits):
+        n = int(digits)
+        if abs(n) > SAFE_MAX:
+            raise NotStrict(f"unsafe integer {digits}")
+        return n
+
+    value = json.loads(
+        text,
+        object_pairs_hook=_no_duplicates,
+        parse_float=_no_float,
+        parse_int=safe_int,
+        parse_constant=_no_constant,
+    )
+
+    def walk(v):
+        if isinstance(v, str):
+            if any(0xD800 <= ord(ch) <= 0xDFFF for ch in v):
+                raise NotStrict("lone surrogate")
+        elif isinstance(v, list):
+            for item in v:
+                walk(item)
+        elif isinstance(v, dict):
+            for key, item in v.items():
+                walk(key)
+                walk(item)
+
+    # Nesting counts containers: the message's own object is the first.
+    def container_depth(v):
+        if isinstance(v, list):
+            return 1 + max((container_depth(i) for i in v), default=0)
+        if isinstance(v, dict):
+            return 1 + max((container_depth(i) for i in v.values()), default=0)
+        return 0
+
+    if container_depth(value) > RELAY_MAX_DEPTH:
+        raise NotStrict("nesting too deep")
+    walk(value)
+    return value
+
+
+def relay_origin_ok(origin):
+    """An origin exact as station_route::normalize_relay writes it: https, or
+    http on a loopback IP literal; a lowercase host; a port only when it
+    isn't the scheme's default; no credentials, path, query or fragment."""
+    if not isinstance(origin, str) or not origin.isascii() or len(origin) > 1024:
+        return False
+    m = re.fullmatch(r"(https|http)://(\[::1\]|[0-9]{1,3}(?:\.[0-9]{1,3}){3}|[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*)(?::([0-9]{1,5}))?", origin)
+    if m is None:
+        return False
+    scheme, host, port = m.groups()
+    if port is not None:
+        if port.startswith("0") or not 1 <= int(port) <= 65535 or int(port) == {"https": 443, "http": 80}[scheme]:
+            return False
+    if scheme == "http":
+        return host == "[::1]" or (re.fullmatch(r"127(?:\.[0-9]{1,3}){3}", host) is not None and all(int(p) <= 255 for p in host.split(".")))
+    return True
+
+
+def _relay_exact(obj, allowed):
+    """An object with only the fields `allowed` names (its absent ones are the caller's)."""
+    if not isinstance(obj, dict):
+        raise Refused("malformed")
+    if any(key not in allowed for key in obj):
+        raise Refused("unknown_field")
+    return obj
+
+
+def _relay_text(obj, key):
+    value = obj.get(key)
+    if not isinstance(value, str):
+        raise Refused("malformed")
+    return value
+
+
+def _relay_uint(obj, key):
+    value = obj.get(key)
+    if type(value) is not int or value < 0:
+        raise Refused("malformed")
+    return value
+
+
+def _relay_array(obj, key, most):
+    items = obj.get(key)
+    if not isinstance(items, list):
+        raise Refused("malformed")
+    if len(items) > most:
+        raise Refused("too_large")
+    return items
+
+
+def _relay_hex32(text):
+    if re.fullmatch(HEX64, text) is None:
+        raise Refused("malformed")
+    return text
+
+
+def _relay_head(value):
+    head = _relay_exact(value, ["seq", "hash"])
+    seq = _relay_uint(head, "seq")
+    _relay_hex32(_relay_text(head, "hash"))
+    if seq < 1:
+        raise Refused("malformed")
+    return head
+
+
+def _relay_origin(text):
+    if not relay_origin_ok(text):
+        raise Refused("malformed")
+
+
+def _relay_uuid4(text):
+    if re.fullmatch(UUID_V4, text) is None:
+        raise Refused("malformed")
+
+
+def _read_control_sync(v):
+    _relay_exact(v, ["type", "op", "origin", "feed_id", "after"])
+    origin = _relay_text(v, "origin")
+    feed = v.get("feed_id") if "feed_id" in v else None
+    if "feed_id" in v and not isinstance(feed, str):
+        raise Refused("malformed")  # an optional field is omitted, never null
+    after = _relay_uint(v, "after")
+    _relay_origin(origin)
+    if feed is not None:
+        _relay_uuid4(feed)
+    elif after != 0:
+        raise Refused("malformed")  # wire rule 2: a cursor belongs to a feed
+
+
+def _read_control_sync_result(v):
+    _relay_exact(v, ["type", "op", "origin", "feed_id", "head", "station_time", "records"])
+    items = _relay_array(v, "records", RELAY_MAX_ITEMS)
+    seqs = []
+    for item in items:
+        _relay_exact(item, ["feed_seq", "record"])
+        if "record" not in item:
+            raise Refused("malformed")  # of any JSON type, but there
+        seqs.append(_relay_uint(item, "feed_seq"))
+    origin, feed = _relay_text(v, "origin"), _relay_text(v, "feed_id")
+    head = _relay_uint(v, "head")
+    _relay_uint(v, "station_time")
+    _relay_origin(origin)
+    _relay_uuid4(feed)
+    previous = 0
+    for seq in seqs:  # wire rule 7: ascending, each in 1..=head
+        if seq <= previous or seq > head:
+            raise Refused("malformed")
+        previous = seq
+
+
+def _read_heads(v):
+    _relay_exact(v, ["type", "op", "feeds", "membership"])
+    feeds = []
+    for item in _relay_array(v, "feeds", RELAY_MAX_ITEMS):
+        _relay_exact(item, ["origin", "feed_id", "head", "station_time"])
+        origin, feed = _relay_text(item, "origin"), _relay_text(item, "feed_id")
+        _relay_uint(item, "head")
+        _relay_uint(item, "station_time")
+        _relay_origin(origin)
+        _relay_uuid4(feed)
+        feeds.append((origin, feed))
+    if "membership" not in v:
+        raise Refused("malformed")
+    _relay_head(v["membership"])
+    if len(set(feeds)) != len(feeds):
+        raise Refused("malformed")  # wire rule 6: an (origin, feed_id) once
+
+
+def _relay_effects(result):
+    items = result.get("effects")
+    if not isinstance(items, list) or not 1 <= len(items) <= 2:
+        raise Refused("malformed")
+    out = []
+    for item in items:
+        _relay_exact(item, ["effect", "result"])
+        effect, outcome = _relay_text(item, "effect"), _relay_text(item, "result")
+        if effect not in RELAY_EFFECTS or outcome not in RELAY_RESULTS:
+            raise Refused("malformed")
+        out.append((effect, outcome))
+    return out
+
+
+def _read_control_ack(v):
+    _relay_exact(v, ["type", "op", "account_id", "genesis_hash", "host_id", "host_trust_gen", "origin", "feed_id", "cursor", "results"])
+    parsed = []
+    for result in _relay_array(v, "results", RELAY_MAX_ITEMS):
+        if not isinstance(result, dict):
+            raise Refused("malformed")
+        has_record, has_entry = "record_id" in result, "entry" in result
+        if has_record == has_entry:
+            raise Refused("malformed")  # wire rule 4: exactly one of two forms
+        if has_record:
+            _relay_exact(result, ["record_id", "effects"])
+            record_id, effects = _relay_text(result, "record_id"), _relay_effects(result)
+            parsed.append(("record", record_id, None, None, effects))
+        else:
+            _relay_exact(result, ["entry", "applied_seq", "effects"])
+            entry = _relay_exact(result["entry"], ["seq", "entry_hash"])
+            seq = _relay_uint(entry, "seq")
+            _relay_hex32(_relay_text(entry, "entry_hash"))
+            parsed.append(("entry", None, seq, _relay_uint(result, "applied_seq"), _relay_effects(result)))
+    account_id = _relay_text(v, "account_id")
+    _relay_hex32(_relay_text(v, "genesis_hash"))
+    host_id = _relay_text(v, "host_id")
+    gen = _relay_uint(v, "host_trust_gen")
+    origin, feed = _relay_text(v, "origin"), _relay_text(v, "feed_id")
+    _relay_uint(v, "cursor")
+    if not 1 <= len(account_id.encode()) <= 128 or re.fullmatch(RELAY_ID, host_id) is None or gen < 1:
+        raise Refused("malformed")
+    _relay_origin(origin)
+    _relay_uuid4(feed)
+    records, entries = set(), set()
+    for kind, record_id, seq, applied_seq, effects in parsed:
+        names = [e for e, _ in effects]
+        if kind == "record":
+            _relay_uuid4(record_id)
+            if names not in RECORD_EFFECT_SETS:
+                raise Refused("malformed")  # wire rule 3
+            fresh = record_id not in records
+            records.add(record_id)
+        else:
+            if seq < 1 or names not in ENTRY_EFFECT_SETS:
+                raise Refused("malformed")
+            # wire rule 5: applied or duplicate only once applied_seq reached seq
+            if any(o in ("applied", "duplicate") for _, o in effects) and applied_seq < seq:
+                raise Refused("malformed")
+            fresh = seq not in entries
+            entries.add(seq)
+        if not fresh:
+            raise Refused("malformed")  # wire rule 6: nothing twice
+
+
+def _read_membership_fetch(v):
+    _relay_exact(v, ["type", "op", "after"])
+    _relay_uint(v, "after")
+
+
+def _read_membership_fetch_result(v):
+    _relay_exact(v, ["type", "op", "head", "entries"])
+    for entry in _relay_array(v, "entries", RELAY_MAX_ITEMS):
+        # A signed object: {body, sig}; its body is the device-list checks' (R9.3).
+        if not isinstance(entry, dict) or not isinstance(entry.get("body"), dict) or not isinstance(entry.get("sig"), str):
+            raise Refused("malformed")
+    if "head" not in v:
+        raise Refused("malformed")
+    _relay_head(v["head"])
+
+
+def _read_refusal(v):
+    _relay_exact(v, ["type", "op", "code"])
+    if _relay_text(v, "code") != "forbidden":
+        raise Refused("malformed")  # exactly `forbidden` in this version
+
+
+RELAY_READERS = {
+    "to_station": {
+        "control_sync": _read_control_sync,
+        "control_ack": _read_control_ack,
+        "membership_fetch": _read_membership_fetch,
+    },
+    "to_host": {
+        "control_sync_result": _read_control_sync_result,
+        "heads": _read_heads,
+        "membership_fetch_result": _read_membership_fetch_result,
+        "control_sync_refused": _read_refusal,
+        "membership_fetch_refused": _read_refusal,
+        "control_ack_refused": _read_refusal,
+    },
+}
+
+
+def read_relay(text, reader):
+    """(message, None) if the reader (`to_station`: a host's calls, `to_host`:
+    a Station's messages) reads `text` as sent, else (None, the code it
+    refuses it with): the size bound before any parse, one strict parse, a
+    relay message of an op this reader reads, then that message's rules."""
+    try:
+        if len(text.encode("utf-8")) > RELAY_MAX_BYTES:
+            raise Refused("too_large")
+        try:
+            value = relay_parse(text)
+        except (NotStrict, ValueError, RecursionError):
+            raise Refused("not_strict")
+        op = value.get("op") if isinstance(value, dict) and value.get("type") == "relay" else None
+        reader_for = RELAY_READERS[reader].get(op) if isinstance(op, str) else None
+        if reader_for is None:
+            raise Refused("wrong_message")
+        reader_for(value)
+        return value, None
+    except Refused as refused:
+        return None, refused.code
+
+
+def compact_ijson(value):
+    """RFC 8785's compact text of a message: keys in UTF-16 order, no
+    whitespace, integers and strings as the check's `jcs`, and `null` where a
+    record is any JSON value."""
+    if value is None:
+        return "null"
+    if isinstance(value, list):
+        return "[" + ",".join(compact_ijson(v) for v in value) + "]"
+    if isinstance(value, dict):
+        keys = sorted(value, key=lambda k: k.encode("utf-16-be"))
+        return "{" + ",".join(_jcs_string(k) + ":" + compact_ijson(value[k]) for k in keys) + "}"
+    return jcs(value)
+
+
+def check_station_calls(file, data, report, context):
+    """The Station calls' goldens (host-work-v1 §11.4). Every valid text is
+    strict I-JSON whose compact form in RFC 8785 key order is the text; this
+    file's own reader (written here from the spec) reads it as its direction
+    says, its fields are the text's and the other direction refuses it; what
+    the text names is the other vectors': a feed of the control vectors'
+    stations, records, device-list entries and heads of log L, effects as each
+    record's action carries them (wire rule 3), each page record's parse
+    verdict as the control vectors list it. Every invalid text is refused by
+    that reader with the code the file says, a bounded text (`wire_fill`) is
+    built here to its size. The builders' exact bytes are the Rust runner's
+    (`station_calls_build_byte_for_byte`) and the binding suites'."""
+    mlog = context["membership_log"]
+    control = context["host_work_control"]
+    with report.case(file, "bound") as case:
+        case.equal(data["max_message_bytes"], RELAY_MAX_BYTES, "R9.9's 262,144 bytes for every relay message")
+        case.equal(sorted(data), ["calls", "invalid", "kind", "max_message_bytes", "name", "note", "requires"], "fields")
+
+    stations = {(s["origin"], s["feed_id"]) for s in control["stations"].values()}
+    records = {compact_ijson(v["record"]): v for v in control["records"]}
+    entries = {e["label"]: e for e in mlog["log"] + mlog["others"]}
+    log_entries = mlog["log"]
+    head = mlog["head"]
+
+    def record_effects(body):
+        action = body["action"]
+        if action == "revoke":
+            return ["revocation", "interrupt"] if body.get("interrupt_running") else ["revocation"]
+        return {"cover": ["cover"], "hold": ["hold"], "release": ["release"], "interrupt_running": ["interrupt"]}[action]
+
+    names = set()
+    ops = {}
+    fetch_after = None
+    for call in data["calls"]:
+        name, op, direction = call["name"], call["op"], call["direction"]
+        with report.case(file, f"call {name}") as case:
+            case.check(name not in names and re.fullmatch(r"[a-z0-9_]+", name) is not None, "a name of its own")
+            names.add(name)
+            wire = call["wire"]
+            case.equal(sorted(k for k in call if k != "judged"), ["direction", "fields", "name", "note", "op", "wire"], "case fields")
+            case.equal(direction, "to_host" if op in STATION_TO_HOST_OPS else "to_station", "its direction")
+            case.check(len(wire.encode()) <= RELAY_MAX_BYTES, "within 262,144 bytes")
+            message, code = read_relay(wire, direction)
+            case.equal(code, None, "read by its side's reader")
+            if message is None:
+                continue
+            ops.setdefault(op, []).append(name)
+            case.equal(message["op"], op, "its op")
+            case.equal(compact_ijson(message), wire, "compact RFC 8785 text of its own parse")
+            case.equal({k: v for k, v in message.items() if k not in ("type", "op")}, call["fields"], "fields are the text's")
+            other = "to_host" if direction == "to_station" else "to_station"
+            case.equal(read_relay(wire, other)[1], "wrong_message", "the other side refuses it")
+            f = call["fields"]
+            if op in ("control_sync", "control_sync_result", "control_ack"):
+                case.check(
+                    (f["origin"], f.get("feed_id")) in stations or (op == "control_sync" and "feed_id" not in f and any(f["origin"] == o for o, _ in stations)),
+                    "a feed of the control vectors' stations",
+                )
+            if op == "control_sync_result":
+                judged = call["judged"]
+                case.equal([j["feed_seq"] for j in judged], [r["feed_seq"] for r in f["records"]], "judged parallel to the records")
+                for r, j in zip(f["records"], judged):
+                    vector = records.get(compact_ijson(r["record"]))
+                    if vector is not None:
+                        parses = "parse_error" not in vector
+                        case.equal(j["parses"], parses, f"record {r['feed_seq']} ({vector['label']}) parses as the control vectors say")
+                        if parses:
+                            case.equal(j["record_id"], vector["record"]["body"]["record_id"], f"record {r['feed_seq']}: its record_id")
+                        else:
+                            case.equal(j["error"], vector["parse_error"], f"record {r['feed_seq']}: its parse error")
+                    else:
+                        case.check(j["parses"] is False and isinstance(j.get("error"), str) and j["error"] != "", f"record {r['feed_seq']}: not a vectors' record, no record")
+            if op == "heads":
+                case.equal(f["membership"], head, "the device list's head: log L's")
+                case.check(all(isinstance(x["head"], int) for x in f["feeds"]), "feeds with heads")
+            if op == "control_ack":
+                case.equal((f["account_id"], f["genesis_hash"]), (mlog["account_id"], mlog["genesis_hash"]), "log L's account and genesis")
+                # A record_id names one record, but the vectors reuse some on
+                # purpose (the conflicting-id records): the effects are those
+                # of a record that carries the id.
+                by_id = {}
+                for v in control["records"]:
+                    if "parse_error" not in v:
+                        by_id.setdefault(v["record"]["body"]["record_id"], []).append(v["record"]["body"])
+                for result in f["results"]:
+                    effects = [e["effect"] for e in result["effects"]]
+                    if "record_id" in result:
+                        bodies = by_id.get(result["record_id"])
+                        if bodies is not None:
+                            case.check(effects in [record_effects(b) for b in bodies], f"{result['record_id'][-4:]}: the effects its {bodies[0]['action']} carries", f"got {effects}")
+                    else:
+                        entry = next((e for e in entries.values() if e["entry_hash"] == result["entry"]["entry_hash"]), None)
+                        case.check(entry is not None, "an entry of the device-list vectors")
+                        if entry is not None:
+                            body = entry["entry"]["body"]
+                            case.equal((body["seq"], body["action"]), (result["entry"]["seq"], "host_sender_revoke"), "its seq and a host sender's revoke")
+                            case.equal(effects, ["revocation", "interrupt"] if body["interrupt_running"] else ["revocation"], "the effects its revoke carries")
+            if op == "membership_fetch":
+                fetch_after = f["after"]
+            if op == "membership_fetch_result":
+                top = f["head"]["seq"]
+                case.equal(f["head"], head, "the Station's head: log L's")
+                case.equal(f["head"]["hash"], log_entries[top - 1]["entry_hash"], "its hash is the head entry's")
+                want = [e["entry"] for e in log_entries[(fetch_after if name == "membership_fetch_result" else top):top]]
+                case.equal(f["entries"], want, "the entries after the host's seq: log L's")
+            if op.endswith("_refused"):
+                case.equal(wire, '{"code":"forbidden","op":"%s","type":"relay"}' % op, "exactly the agreed refusal")
+    with report.case(file, "calls: coverage") as case:
+        case.equal(sorted(ops), sorted(HOST_TO_STATION_OPS + STATION_TO_HOST_OPS), "all six calls and all three refusals")
+        case.check(len(ops["control_ack"]) >= 5 and len(ops["control_sync_result"]) >= 3, "ack and page forms")
+
+    by_op = {}
+    for bad in data["invalid"]:
+        by_op.setdefault(bad["op"], []).append(bad)
+    codes = set()
+    seen = set()
+    for op in HOST_TO_STATION_OPS + STATION_TO_HOST_OPS:
+        with report.case(file, f"invalid {op}") as case:
+            for bad in by_op.get(op, []):
+                name = bad["name"]
+                case.check(name not in seen and name not in names, f"{name}: a name of its own")
+                seen.add(name)
+                if "wire_fill" in bad:
+                    fill = bad["wire_fill"]
+                    wire = fill["prefix"] + fill["fill"] * fill["count"] + fill["suffix"]
+                    case.equal(len(wire.encode()), fill["bytes"], f"{name}: built to its size")
+                    case.check(len(wire.encode()) == RELAY_MAX_BYTES + 1, f"{name}: one byte over the bound")
+                else:
+                    wire = bad["wire"]
+                case.equal(sorted(k for k in bad if k not in ("wire", "wire_fill")), ["code", "name", "op", "reader"], f"{name}: case fields")
+                case.equal(read_relay(wire, bad["reader"])[1], bad["code"], f"{name}: refused {bad['code']}")
+                codes.add(bad["code"])
+            case.check(by_op.get(op), "refused variants")
+    with report.case(file, "invalid: coverage") as case:
+        case.equal(sorted(by_op), sorted(HOST_TO_STATION_OPS + STATION_TO_HOST_OPS), "every call and refusal has refused variants")
+        case.equal(codes, {"too_large", "not_strict", "wrong_message", "unknown_field", "malformed"}, "every refusal code")
+        sized = [b for b in data["invalid"] if "wire_fill" in b]
+        case.equal(len(sized), 1, "one text over the byte bound")
+        counts = {b["name"] for b in data["invalid"] if b["code"] == "too_large"}
+        case.check({"control_sync_result_65_records", "heads_65_feeds", "control_ack_65_results", "membership_fetch_result_65_entries"} <= counts, "65 records, feeds, results and entries")
+
+
 # ---------------------------------------------------------------------- main
 
 # In order: a checker may use what an earlier one recorded in `context`.
@@ -1808,6 +2290,7 @@ CHECKERS = [
     ("r9-vectors-push-hint", check_push_hint),
     ("r9-vectors-delegated-wire", check_delegated_wire),
     ("r9-vectors-host-envelope", check_host_envelope),
+    ("r9-vectors-station-calls", check_station_calls),
 ]
 
 

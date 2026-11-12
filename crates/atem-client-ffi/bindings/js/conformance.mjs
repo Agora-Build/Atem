@@ -833,6 +833,86 @@ check("Station calls: the three refusals exactly and read strictly; a stale-asso
   }
   eq(l.ack({ ...link, hostTrustGen: 1 }, ack, nowMs).made.length, 2);
 });
+// r9-vectors-station-calls (host-work-v1 §11.4): every message of the six
+// Station calls and the three refusals as the builders write it, byte for
+// byte from its fields (an ack is written again from what it decoded to), read
+// back to those fields (each page record judged by parseControlRecord as the
+// file says), refused by the other side's reader, and every invalid text
+// refused with its code. A page record the control parser refuses can't be
+// built: a Station serves only what it validated at intake.
+const calls = load("r9-vectors-station-calls");
+check("Station calls: the byte goldens build exactly, read back to their fields and are refused by the other side; every invalid variant is refused with its code", () => {
+  const camel = (feed) => ({ origin: feed.origin, feedId: feed.feed_id, head: feed.head, stationTime: feed.station_time });
+  const judge = (recordJson) => {
+    try {
+      return { parses: true, record_id: m.parseControlRecord(recordJson).recordId };
+    } catch (e) {
+      return { parses: false, error: e.code };
+    }
+  };
+  eq(calls.max_message_bytes, 262144);
+  eq(calls.calls.length >= 20, true, "goldens");
+  for (const c of calls.calls) {
+    const f = c.fields;
+    const wire = c.wire;
+    const name = c.name;
+    const decode = c.direction === "to_host" ? m.relayDecodeToHost : m.relayDecodeToStation;
+    const other = c.direction === "to_host" ? m.relayDecodeToStation : m.relayDecodeToHost;
+    throwsCode(() => other(wire), "wrong_message");
+    const read = decode(wire);
+    eq(read.type, c.op, `${name} type`);
+    switch (c.op) {
+      case "control_sync":
+        eq(m.relayControlSync(f.origin, f.feed_id, f.after), wire, name);
+        eq([read.origin, read.feedId ?? null, read.after], [f.origin, f.feed_id ?? null, f.after], name);
+        break;
+      case "control_sync_result": {
+        const records = f.records.map((r) => ({ feedSeq: r.feed_seq, recordJson: str(r.record) }));
+        const refused = c.judged.find((j) => !j.parses);
+        const build = () => m.relayControlSyncResult(f.origin, f.feed_id, f.head, f.station_time, records);
+        if (refused === undefined) eq(build(), wire, name);
+        else throwsCode(build, refused.error);
+        eq([read.origin, read.feedId, read.head, read.stationTime], [f.origin, f.feed_id, f.head, f.station_time], name);
+        eq(read.records.length, f.records.length, `${name} records`);
+        read.records.forEach((r, i) => {
+          eq(r.feedSeq, f.records[i].feed_seq, `${name} feed_seq`);
+          same(JSON.parse(r.recordJson), f.records[i].record, `${name} record ${i}`);
+          const { feed_seq: _seq, ...want } = c.judged[i];
+          eq(c.judged[i].feed_seq, r.feedSeq, `${name} judged`);
+          same(judge(r.recordJson), want, `${name} record ${i} judged`);
+        });
+        break;
+      }
+      case "heads":
+        eq(m.relayHeads(f.feeds.map(camel), head(f.membership)), wire, name);
+        same(read.feeds, f.feeds.map(camel), `${name} feeds`);
+        same(read.membership, f.membership, `${name} membership`);
+        break;
+      case "control_ack":
+        eq(m.relayControlAck(read.ack), wire, `${name} written again`);
+        eq([read.ack.hostId, read.ack.hostTrustGen, read.ack.cursor, read.ack.results.length], [f.host_id, f.host_trust_gen, f.cursor, f.results.length], name);
+        break;
+      case "membership_fetch":
+        eq(m.relayMembershipFetch(f.after), wire, name);
+        eq(read.after, f.after, name);
+        break;
+      case "membership_fetch_result":
+        eq(m.relayMembershipFetchResult(head(f.head), f.entries.map(str)), wire, name);
+        same(read.head, f.head, `${name} head`);
+        same(read.entries.map((e) => JSON.parse(e)), f.entries, `${name} entries`);
+        break;
+      default: {
+        const refuse = { control_sync_refused: m.relayControlSyncRefused, membership_fetch_refused: m.relayMembershipFetchRefused, control_ack_refused: m.relayControlAckRefused }[c.op];
+        eq(refuse(f.code), wire, name);
+        eq(read, { type: c.op, code: f.code }, name);
+      }
+    }
+  }
+  for (const bad of calls.invalid) {
+    const wire = bad.wire ?? bad.wire_fill.prefix + bad.wire_fill.fill.repeat(bad.wire_fill.count) + bad.wire_fill.suffix;
+    throwsCode(() => (bad.reader === "to_host" ? m.relayDecodeToHost : m.relayDecodeToStation)(wire), bad.code);
+  }
+});
 check("Station: the Portal's statuses in their classes", () => {
   const want = { 200: "confirm", 401: "retry", 408: "retry", 429: "retry", 500: "retry", 503: "retry", 400: "refuse", 404: "refuse", 409: "refuse", 413: "refuse", 415: "refuse", 204: "refuse", 302: "refuse", 403: "stop_reporting" };
   for (const [status, answer] of Object.entries(want)) eq(m.reportAnswer(Number(status)), answer, status);

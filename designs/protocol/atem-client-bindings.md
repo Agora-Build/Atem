@@ -71,7 +71,8 @@ Every production SDK artifact includes
 `atem-client-<version>-r9-vectors-host-work-control.json`,
 `atem-client-<version>-r9-vectors-push-hint.json`,
 `atem-client-<version>-r9-vectors-delegated-wire.json`,
-`atem-client-<version>-r9-vectors-host-envelope.json` and the five
+`atem-client-<version>-r9-vectors-host-envelope.json`,
+`atem-client-<version>-r9-vectors-station-calls.json` and the five
 `atem-client-<version>-r9-control-ack-*.json` in its SHA-256
 manifest. These are the shared positive/negative request vectors from
 `fixtures/host-work/requests-v1.json`, the prompt framing's vectors from
@@ -84,13 +85,15 @@ from `fixtures/r9-vectors-push-hint.json` (approvals and `outcome_unknown`
 alerts, R9.9), the delegated wire shapes from
 `fixtures/r9-vectors-delegated-wire.json` (session-v1 R9.14), the
 envelopes' and results' vectors from `fixtures/r9-vectors-host-envelope.json`
-(host-work-v1 §11.5; planned, host role) and the Station's acknowledgment
-fixtures `fixtures/r9-control-ack-*.json` (§9, delegated host-work test 48).
+(host-work-v1 §11.5; planned, host role), the Station calls' byte goldens
+from `fixtures/r9-vectors-station-calls.json` (host-work-v1 §11.4, §9) and
+the Station's acknowledgment fixtures `fixtures/r9-control-ack-*.json` (§9,
+delegated host-work test 48).
 The Rust core's tests run all of them; the Swift, Kotlin and WASM
 conformance suites run the framing vectors through the exports of
 [Prompt framing](#prompt-framing-delegated-host-work-design-iii2) (VII.C test
-40), the control records', the push hints' and the envelopes' and results'
-vectors and the acknowledgment fixtures, and
+40), the control records', the push hints', the envelopes' and results' and
+the Station calls' vectors and the acknowledgment fixtures, and
 `scripts/check-atem-client-packages.sh` runs the framing vectors through the
 packaged WASM build. They are fixture data, not a live integration test: the
 host renders every prompt (`session::framing`); a client never does.
@@ -978,7 +981,7 @@ jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (68 checks in JS, 70 in Kotlin and in Swift: the same 68
+- **Conformance** (69 checks in JS, 71 in Kotlin and in Swift: the same 69
   in each language, plus two in Kotlin and Swift, whose provider sees the
   signing request and so the purposes of the five device-list actions and
   of control records; over `designs/protocol/fixtures/r9-vectors-*.json`,
@@ -993,7 +996,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
   (with a CryptoKit `AppKeyProvider`).
 - **Host mail** (planned, host role; four conformance checks per language,
-  of the 68 and 70 above): every entry of `r9-vectors-host-envelope`
+  of the 69 and 71 above): every entry of `r9-vectors-host-envelope`
   extends log L to its hash, the builders reproduce every `built` object
   byte for byte (a fresh seal opens, a builder refuses a plaintext with
   `null`, a dropped reply and a key that isn't the `enc_kid`'s, and seals a
@@ -1004,7 +1007,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   (`JdkKeys`, `CryptoKitKeys`), whose failed open is
   `ProviderError.OpenFailed` (§3): the same verdicts.
 - **Device-list actions** (`tests/host_actions.rs`, Rust; four conformance
-  checks in JS, five in Kotlin and Swift, of the 68 and 70 above): every
+  checks in JS, five in Kotlin and Swift, of the 69 and 71 above): every
   `P*`/`EK*`/`HS*` vector of
   `r9-vectors-membership-log` through the queries (`expect`) and the
   refusals (`reason`), the builders against the vectors' `jcs` and
@@ -1014,7 +1017,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   action through a recording provider under its own purpose and publishing
   it (the verifier takes the entry).
 - **Control records** (`tests/control.rs`, Rust; four conformance checks
-  in JS, five in Kotlin and Swift, of the 68 and 70 above): every record of
+  in JS, five in Kotlin and Swift, of the 69 and 71 above): every record of
   `r9-vectors-host-work-control` parsed (or refused by the parse with its
   code) and verified on each of its chains as `checks` says, the builders
   reproducing it byte for byte (a software store, and the signing input
@@ -1029,8 +1032,8 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   provider asked under `ServiceControl` (no confirmation) for the
   integration's own key and `ControlRecord` (a fresh confirmation of the
   body) for a native manager.
-- **The Station's side** (`tests/station.rs`, Rust; nine conformance
-  checks per language, of the 68 and 70 above): every acknowledgment
+- **The Station's side** (`tests/station.rs`, Rust; ten conformance
+  checks per language, of the 69 and 71 above): every acknowledgment
   fixture (`r9-control-ack-*`, one check each) through `AckLedgerHandle` as
   a Station persists it (each call's next state committed before the
   reports go and adopted after, restarts from the committed state, two
@@ -1044,9 +1047,16 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   3, another direction's message); the three refusals exactly and read
   strictly (unknown codes, fields, nulls, duplicate keys), and an ack
   refused for its stale association with nothing counted or disclosed;
-  and the Portal's statuses in their classes.
+  the Portal's statuses in their classes; and the byte goldens of
+  `r9-vectors-station-calls` (`goldens_round_trip_through_the_bindings`):
+  every message of the six calls and the three refusals built byte for byte
+  from its fields (an ack written again from what it decoded to; a page with
+  a record the control parser refuses is refused by the builder with that
+  parse code), read back to its fields with each page record judged by
+  `parse_control_record` as the file says, refused by the other side's
+  reader as `wrong_message`, and every invalid text refused with its code.
 - **Durable log** (`tests/stored_log.rs`, Rust; two conformance checks per
-  language, of the 68 and 70 above): a partly elapsed wait across a same-boot restart and a reboot,
+  language, of the 69 and 71 above): a partly elapsed wait across a same-boot restart and a reboot,
   the wall clock set back after restore, a wait-ended decision at its chain
   position (with the entry that relies on it), pending, approved and vetoed
   recovery and key-replacement records, a frozen log, corrupted, oversize,
@@ -1243,6 +1253,19 @@ or close an invalid or superseded link.
 | `relay_membership_fetch_result(head, entries)` | the device list's head and the entries after the host's `after` (signed objects' JSON), at most 64: an R9.3 carriage |
 | `relay_control_sync_refused(code)`, `relay_membership_fetch_refused(code)`, `relay_control_ack_refused(code)` | a refusal of that call on this link (`code`: `RelayRefusalCode::Forbidden`, the only one); never send an empty page or an ack instead. `relay_decode_to_host` reads them as `ControlSyncRefused{code}`, `MembershipFetchRefused{code}`, `ControlAckRefused{code}` |
 | `relay_control_sync(origin, feed_id, after)`, `relay_control_ack(ack)`, `relay_membership_fetch(after)`, `relay_decode_to_host(message)` | the host's side, for tests and other hosts |
+
+**Known answers.** `fixtures/r9-vectors-station-calls.json` holds every
+message of the six calls and the three refusals as the exact text these
+builders write (compact, keys in RFC 8785 order), with its decoded fields,
+the control parser's verdict on each page record, and the invalid texts each
+reader refuses with its code (an unknown field, a `null`, a duplicate key,
+an unknown refusal code, a count of 65, a text over 262,144 bytes): a
+Station that writes or reads the same bytes and gives the same codes agrees
+with Atem's host, and `scripts/check-r9-vectors.py` confirms them with a
+reader written from host-work-v1 §11.4. A page whose records the control
+parser refuses is a builder's page with those values put in their slots: a
+Station serves only what it validated at intake, so its builder refuses
+them.
 
 Each builder checks what the reader checks, so what it writes the reader
 accepts; a value out of its grammar is `Invalid{code}` (`too_large`,

@@ -1897,6 +1897,29 @@ bindings' `tests/station.rs` and in the Swift, Kotlin and WASM conformance
 suites through `AckLedgerHandle`; `scripts/check-r9-vectors.py` recomputes
 every `reportId` in them. Every SDK package's checksum manifest lists them.
 
+`fixtures/r9-vectors-station-calls.json` (`kind: "vectors"`, schema in
+`fixtures/schema.md`) holds the messages themselves as exact text, so that
+a custom Station and Astation's `:8080` proxy have known answers: every
+message of the six calls and the three refusals as the shared core's
+builders write it (compact, keys in RFC 8785 order, no whitespace), with its
+decoded fields: `control_sync` with and without `feed_id`,
+`control_sync_result` with records and with records the control parser
+refuses (each record judged on its own, the page standing), `heads`,
+`control_ack` with both result forms, `membership_fetch` and its result, and
+the three refusals; and the invalid variants a reader refuses, each with its
+code (an unknown field, a `null`, a duplicate key, an unknown refusal code,
+a count over 64 and a text over 262,144 bytes among them). They run in
+`crates/atem-client/tests/vectors.rs` (every text built byte for byte from
+its fields, read back to them, refused by the other side's reader, and every
+invalid text refused with its code), in the bindings' `tests/station.rs` and
+in the Swift, Kotlin and WASM conformance suites through the `relay_*`
+exports. `scripts/check-r9-vectors.py` reads every text with a reader
+written from the rules above: strict I-JSON, the compact form in RFC 8785
+key order, each valid message's fields and what it names (feeds of the
+control vectors, device-list entries and heads of log L, the effects each
+record's action carries, wire rule 3), and every invalid text's code. Every
+SDK package's checksum manifest lists the file.
+
 ### 11.5 Envelopes and results (planned)
 
 A **host sender** (`host:<host_id>`, delegated host-work design II.2.1)

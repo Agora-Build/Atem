@@ -1025,6 +1025,107 @@ fun main(args: Array<String>) {
         }
         eq(l.ack(link.copy(hostTrustGen = 1uL), ack, nowMs).made.size, 2)
     }
+    // r9-vectors-station-calls (host-work-v1 §11.4): every message of the six
+    // Station calls and the three refusals as the builders write it, byte for
+    // byte from its fields (an ack is written again from what it decoded to),
+    // read back to those fields (each page record judged by
+    // parseControlRecord as the file says), refused by the other side's
+    // reader, and every invalid text refused with its code. A page record the
+    // control parser refuses can't be built: a Station serves only what it
+    // validated at intake.
+    val stationCalls = load("r9-vectors-station-calls")
+    check("Station calls: the byte goldens build exactly, read back to their fields and are refused by the other side; every invalid variant is refused with its code") {
+        fun head(h: Any?) = LogHead(h["seq"].l().toULong(), h["hash"].s())
+        fun feedHead(f: Any?) = RelayFeedHead(f["origin"].s(), f["feed_id"].s(), f["head"].l().toULong(), f["station_time"].l().toULong())
+        fun judge(recordJson: String): Map<String, Any?> = try {
+            mapOf("parses" to true, "record_id" to parseControlRecord(recordJson).recordId)
+        } catch (e: AtemException) {
+            mapOf("parses" to false, "error" to e.codeOf())
+        }
+        eq(stationCalls["max_message_bytes"].l(), 262144L)
+        eq(stationCalls["calls"].arr().size >= 20, true, "goldens")
+        for (c in stationCalls["calls"].arr()) {
+            val f = c["fields"]
+            val wire = c["wire"].s()
+            val name = c["name"].s()
+            when (val op = c["op"].s()) {
+                "control_sync" -> {
+                    val feed = f.obj()["feed_id"] as String?
+                    val after = f["after"].l().toULong()
+                    eq(relayControlSync(f["origin"].s(), feed, after), wire, name)
+                    throwsCode("wrong_message") { relayDecodeToHost(wire) }
+                    eq(relayDecodeToStation(wire), RelayToStation.ControlSync(f["origin"].s(), feed, after), name)
+                }
+                "control_sync_result" -> {
+                    val items = f["records"].arr()
+                    val records = items.map { RelayFeedRecord(it["feed_seq"].l().toULong(), Json.write(it["record"])) }
+                    val judged = c["judged"].arr()
+                    val refused = judged.firstOrNull { it["parses"] == false }
+                    val build = { relayControlSyncResult(f["origin"].s(), f["feed_id"].s(), f["head"].l().toULong(), f["station_time"].l().toULong(), records) }
+                    if (refused == null) eq(build(), wire, name) else throwsCode(refused["error"].s()) { build() }
+                    throwsCode("wrong_message") { relayDecodeToStation(wire) }
+                    val read = relayDecodeToHost(wire) as RelayToHost.ControlSyncResult
+                    eq(listOf(read.origin, read.feedId, read.head, read.stationTime),
+                        listOf(f["origin"].s(), f["feed_id"].s(), f["head"].l().toULong(), f["station_time"].l().toULong()), name)
+                    eq(read.records.size, items.size, "$name records")
+                    read.records.forEachIndexed { i, r ->
+                        eq(r.feedSeq, items[i]["feed_seq"].l().toULong(), "$name feed_seq")
+                        eq(Json.parse(r.recordJson), items[i]["record"], "$name record $i")
+                        eq(judge(r.recordJson), judged[i].obj().filterKeys { it != "feed_seq" }, "$name record $i judged")
+                    }
+                }
+                "heads" -> {
+                    val feeds = f["feeds"].arr().map(::feedHead)
+                    eq(relayHeads(feeds, head(f["membership"])), wire, name)
+                    throwsCode("wrong_message") { relayDecodeToStation(wire) }
+                    eq(relayDecodeToHost(wire), RelayToHost.Heads(feeds, head(f["membership"])), name)
+                }
+                "control_ack" -> {
+                    throwsCode("wrong_message") { relayDecodeToHost(wire) }
+                    val read = relayDecodeToStation(wire) as RelayToStation.ControlAck
+                    eq(relayControlAck(read.ack), wire, "$name written again")
+                    eq(listOf(read.ack.hostId, read.ack.hostTrustGen, read.ack.cursor, read.ack.results.size),
+                        listOf(f["host_id"].s(), f["host_trust_gen"].l().toULong(), f["cursor"].l().toULong(), f["results"].arr().size), name)
+                }
+                "membership_fetch" -> {
+                    val after = f["after"].l().toULong()
+                    eq(relayMembershipFetch(after), wire, name)
+                    throwsCode("wrong_message") { relayDecodeToHost(wire) }
+                    eq(relayDecodeToStation(wire), RelayToStation.MembershipFetch(after), name)
+                }
+                "membership_fetch_result" -> {
+                    val entries = f["entries"].arr().map { Json.write(it) }
+                    eq(relayMembershipFetchResult(head(f["head"]), entries), wire, name)
+                    throwsCode("wrong_message") { relayDecodeToStation(wire) }
+                    val read = relayDecodeToHost(wire) as RelayToHost.MembershipFetchResult
+                    eq(read.head, head(f["head"]), name)
+                    eq(read.entries.map { Json.parse(it) }, f["entries"].arr(), "$name entries")
+                }
+                else -> {
+                    val built = when (op) {
+                        "control_sync_refused" -> relayControlSyncRefused(RelayRefusalCode.FORBIDDEN)
+                        "membership_fetch_refused" -> relayMembershipFetchRefused(RelayRefusalCode.FORBIDDEN)
+                        else -> relayControlAckRefused(RelayRefusalCode.FORBIDDEN)
+                    }
+                    val want = when (op) {
+                        "control_sync_refused" -> RelayToHost.ControlSyncRefused(RelayRefusalCode.FORBIDDEN)
+                        "membership_fetch_refused" -> RelayToHost.MembershipFetchRefused(RelayRefusalCode.FORBIDDEN)
+                        else -> RelayToHost.ControlAckRefused(RelayRefusalCode.FORBIDDEN)
+                    }
+                    eq(built, wire, name)
+                    throwsCode("wrong_message") { relayDecodeToStation(wire) }
+                    eq(relayDecodeToHost(wire), want, name)
+                }
+            }
+        }
+        for (bad in stationCalls["invalid"].arr()) {
+            val fill = bad.obj()["wire_fill"]
+            val wire = if (fill == null) bad["wire"].s()
+                else fill["prefix"].s() + fill["fill"].s().repeat(fill["count"].l().toInt()) + fill["suffix"].s()
+            if (bad["reader"].s() == "to_host") throwsCode(bad["code"].s()) { relayDecodeToHost(wire) }
+            else throwsCode(bad["code"].s()) { relayDecodeToStation(wire) }
+        }
+    }
     check("Station: the Portal's statuses in their classes") {
         for ((status, want) in listOf(200 to "confirm", 401 to "retry", 408 to "retry", 429 to "retry", 500 to "retry", 503 to "retry",
             400 to "refuse", 404 to "refuse", 409 to "refuse", 413 to "refuse", 415 to "refuse", 204 to "refuse",

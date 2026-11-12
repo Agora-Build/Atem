@@ -1270,6 +1270,129 @@ final class ConformanceTests: XCTestCase {
             link.hostTrustGen = 1
             try eq(try l.ack(link: link, ackJson: ack, nowMs: nowMs).made.count, 2)
         }
+        // r9-vectors-station-calls (host-work-v1 §11.4): every message of the six
+        // Station calls and the three refusals as the builders write it, byte for
+        // byte from its fields (an ack is written again from what it decoded to),
+        // read back to those fields (each page record judged by
+        // parseControlRecord as the file says), refused by the other side's
+        // reader, and every invalid text refused with its code. A page record the
+        // control parser refuses can't be built: a Station serves only what it
+        // validated at intake.
+        let stationCalls = try load("r9-vectors-station-calls")
+        check("Station calls: the byte goldens build exactly, read back to their fields and are refused by the other side; every invalid variant is refused with its code") {
+            func logHead(_ h: Any?) -> LogHead { LogHead(seq: u(o(h)["seq"]), hash: s(o(h)["hash"])) }
+            func judge(_ recordJson: String) throws -> [String: Any] {
+                do {
+                    return ["parses": true, "record_id": try parseControlRecord(recordJson: recordJson).recordId]
+                } catch let e as AtemError {
+                    return ["parses": false, "error": codeOf(e).0]
+                }
+            }
+            try eq(u(stationCalls["max_message_bytes"]), 262144)
+            try eq(a(stationCalls["calls"]).count >= 20, true, "goldens")
+            for c in a(stationCalls["calls"]).map(o) {
+                let f = o(c["fields"])
+                let wire = s(c["wire"])
+                let name = s(c["name"])
+                let op = s(c["op"])
+                switch op {
+                case "control_sync":
+                    let feed = f["feed_id"] as? String
+                    try eq(try relayControlSync(origin: s(f["origin"]), feedId: feed, after: u(f["after"])), wire, name)
+                    try throwsCode("wrong_message") { _ = try relayDecodeToHost(message: wire) }
+                    try eq(try relayDecodeToStation(message: wire), .controlSync(origin: s(f["origin"]), feedId: feed, after: u(f["after"])), name)
+                case "control_sync_result":
+                    let items = a(f["records"]).map(o)
+                    let records = items.map { RelayFeedRecord(feedSeq: u($0["feed_seq"]), recordJson: js($0["record"]!)) }
+                    let judged = a(c["judged"]).map(o)
+                    let build = { try relayControlSyncResult(origin: s(f["origin"]), feedId: s(f["feed_id"]), head: u(f["head"]), stationTime: u(f["station_time"]), records: records) }
+                    if let refused = judged.first(where: { ($0["parses"] as! Bool) == false }) {
+                        try throwsCode(s(refused["error"])) { _ = try build() }
+                    } else {
+                        try eq(try build(), wire, name)
+                    }
+                    try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: wire) }
+                    guard case let .controlSyncResult(origin, feedId, pageHead, stationTime, read) = try relayDecodeToHost(message: wire) else {
+                        throw Failure(description: "\(name): not a page")
+                    }
+                    try eq(origin, s(f["origin"]), name)
+                    try eq(feedId, s(f["feed_id"]), name)
+                    try eq(pageHead, u(f["head"]), name)
+                    try eq(stationTime, u(f["station_time"]), name)
+                    try eq(read.count, items.count, "\(name) records")
+                    for (i, r) in read.enumerated() {
+                        try eq(r.feedSeq, u(items[i]["feed_seq"]), "\(name) feed_seq")
+                        let sent = try JSONSerialization.jsonObject(with: Data(r.recordJson.utf8), options: [.fragmentsAllowed])
+                        try eq(canon(sent), canon(items[i]["record"]!), "\(name) record \(i)")
+                        var want = judged[i]
+                        want["feed_seq"] = nil
+                        try eq(canon(try judge(r.recordJson)), canon(want), "\(name) record \(i) judged")
+                    }
+                case "heads":
+                    let feeds = a(f["feeds"]).map(o).map {
+                        RelayFeedHead(origin: s($0["origin"]), feedId: s($0["feed_id"]), head: u($0["head"]), stationTime: u($0["station_time"]))
+                    }
+                    try eq(try relayHeads(feeds: feeds, membership: logHead(f["membership"])), wire, name)
+                    try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: wire) }
+                    try eq(try relayDecodeToHost(message: wire), .heads(feeds: feeds, membership: logHead(f["membership"])), name)
+                case "control_ack":
+                    try throwsCode("wrong_message") { _ = try relayDecodeToHost(message: wire) }
+                    guard case let .controlAck(ack) = try relayDecodeToStation(message: wire) else {
+                        throw Failure(description: "\(name): not an ack")
+                    }
+                    try eq(try relayControlAck(ack: ack), wire, "\(name) written again")
+                    try eq(ack.hostId, s(f["host_id"]), name)
+                    try eq(ack.hostTrustGen, u(f["host_trust_gen"]), name)
+                    try eq(ack.cursor, u(f["cursor"]), name)
+                    try eq(ack.results.count, a(f["results"]).count, name)
+                case "membership_fetch":
+                    try eq(try relayMembershipFetch(after: u(f["after"])), wire, name)
+                    try throwsCode("wrong_message") { _ = try relayDecodeToHost(message: wire) }
+                    try eq(try relayDecodeToStation(message: wire), .membershipFetch(after: u(f["after"])), name)
+                case "membership_fetch_result":
+                    let entries = a(f["entries"]).map { js($0) }
+                    try eq(try relayMembershipFetchResult(head: logHead(f["head"]), entries: entries), wire, name)
+                    try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: wire) }
+                    guard case let .membershipFetchResult(fetchedHead, fetched) = try relayDecodeToHost(message: wire) else {
+                        throw Failure(description: "\(name): not a fetch result")
+                    }
+                    try eq(fetchedHead, logHead(f["head"]), name)
+                    try eq(try fetched.map { try canonicalJson(json: $0) }, try entries.map { try canonicalJson(json: $0) }, "\(name) entries")
+                default:
+                    let built: String
+                    let want: RelayToHost
+                    switch op {
+                    case "control_sync_refused":
+                        built = try relayControlSyncRefused(code: .forbidden)
+                        want = .controlSyncRefused(code: .forbidden)
+                    case "membership_fetch_refused":
+                        built = try relayMembershipFetchRefused(code: .forbidden)
+                        want = .membershipFetchRefused(code: .forbidden)
+                    default:
+                        built = try relayControlAckRefused(code: .forbidden)
+                        want = .controlAckRefused(code: .forbidden)
+                    }
+                    try eq(built, wire, name)
+                    try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: wire) }
+                    try eq(try relayDecodeToHost(message: wire), want, name)
+                }
+            }
+            for bad in a(stationCalls["invalid"]).map(o) {
+                let wire: String
+                if let fill = bad["wire_fill"] {
+                    let w = o(fill)
+                    wire = s(w["prefix"]) + String(repeating: s(w["fill"]), count: Int(u(w["count"]))) + s(w["suffix"])
+                } else {
+                    wire = s(bad["wire"])
+                }
+                let code = s(bad["code"])
+                if s(bad["reader"]) == "to_host" {
+                    try throwsCode(code) { _ = try relayDecodeToHost(message: wire) }
+                } else {
+                    try throwsCode(code) { _ = try relayDecodeToStation(message: wire) }
+                }
+            }
+        }
         check("Station: the Portal's statuses in their classes") {
             let want: [(UInt16, String)] = [(200, "confirm"), (401, "retry"), (408, "retry"), (429, "retry"), (500, "retry"), (503, "retry"),
                                             (400, "refuse"), (404, "refuse"), (409, "refuse"), (413, "refuse"), (415, "refuse"),
@@ -1886,6 +2009,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 70)
+        XCTAssertEqual(passed, 71)
     }
 }

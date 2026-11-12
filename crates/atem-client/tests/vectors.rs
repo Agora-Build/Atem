@@ -257,6 +257,7 @@ fn every_vectors_file_has_a_runner() {
             "r9-vectors-pairing.json",
             "r9-vectors-push-hint.json",
             "r9-vectors-recovery.json",
+            "r9-vectors-station-calls.json",
         ],
         "a new vectors file needs a runner below"
     );
@@ -6349,6 +6350,1479 @@ fn delegated_wire() {
         run.file.clone(),
         "regenerate with write_delegated_wire_vectors"
     );
+}
+
+// ------------------------------------------- the Station calls' byte goldens
+//
+// `r9-vectors-station-calls` (delegated host-work design I.5.8; host-work-v1
+// §11.4): the six Station calls and the three refusals as the shared core's
+// own builders write them, each as its exact text, with its decoded fields,
+// and the invalid variants a reader refuses, each with its code. Custom
+// Stations and Astation's `:8080` proxy read these as the known answers.
+// `write_station_calls_vectors` (ignored) writes the file from
+// `station_call_vectors`; `station_calls_build_byte_for_byte` checks the
+// builders reproduce every `wire` from its `fields` (and that the file is
+// what the generator makes now), `station_calls_decode_to_their_fields` that
+// the readers give those fields back and judge every page record as the file
+// says, and `station_calls_refuse_the_invalid_variants` that each invalid
+// text is refused with its code. `scripts/check-r9-vectors.py` checks the
+// texts independently: strict I-JSON, the compact form in RFC 8785 key
+// order, and a reader written from the spec for every case.
+
+use atem_client::control::{
+    AckResult, ApplicationResult, CallRefused, ControlAck, ControlSync, ControlSyncResult,
+    EffectKind, EffectResult, EntryRef, FeedEntry, FeedHead, Heads, MembershipFetch,
+    MembershipFetchResult, RefusalCode, RefusedCall, RelayError, ToHost, ToStation,
+};
+
+const STATION_CALLS: &str = "r9-vectors-station-calls";
+
+/// R9.9's bound for every relay message, in bytes as sent.
+const RELAY_MAX_BYTES: usize = 256 * 1024;
+
+/// The file, with its name, kind and requirement checked.
+fn station_calls_file() -> Run {
+    Run::new(STATION_CALLS)
+}
+
+/// A case's text: `wire` as written, or built from its `wire_fill` recipe
+/// (`prefix`, `count` times `fill`, `suffix`).
+fn call_wire(case: &Value) -> String {
+    if let Some(text) = case.get("wire") {
+        return text.as_str().unwrap().to_owned();
+    }
+    let fill = &case["wire_fill"];
+    let count = fill["count"].as_u64().unwrap() as usize;
+    format!(
+        "{}{}{}",
+        s(fill, "prefix"),
+        s(fill, "fill").repeat(count),
+        s(fill, "suffix")
+    )
+}
+
+fn call_head(value: &Value) -> Head {
+    Head {
+        seq: value["seq"].as_u64().unwrap(),
+        hash: Hash32::from_hex(s(value, "hash")).unwrap(),
+    }
+}
+
+fn call_effects(value: &Value) -> Vec<EffectResult> {
+    value
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| EffectResult {
+            effect: EffectKind::from_code(s(e, "effect")).unwrap(),
+            result: ApplicationResult::from_code(s(e, "result")).unwrap(),
+        })
+        .collect()
+}
+
+fn call_ack(f: &Value) -> ControlAck {
+    ControlAck {
+        account_id: s(f, "account_id").into(),
+        genesis_hash: Hash32::from_hex(s(f, "genesis_hash")).unwrap(),
+        host_id: s(f, "host_id").into(),
+        host_trust_gen: f["host_trust_gen"].as_u64().unwrap(),
+        origin: s(f, "origin").into(),
+        feed_id: s(f, "feed_id").into(),
+        cursor: f["cursor"].as_u64().unwrap(),
+        results: f["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| match r.get("entry") {
+                Some(entry) => AckResult::Entry {
+                    entry: EntryRef {
+                        seq: entry["seq"].as_u64().unwrap(),
+                        entry_hash: Hash32::from_hex(s(entry, "entry_hash")).unwrap(),
+                    },
+                    applied_seq: r["applied_seq"].as_u64().unwrap(),
+                    effects: call_effects(&r["effects"]),
+                },
+                None => AckResult::Record {
+                    record_id: s(r, "record_id").into(),
+                    effects: call_effects(&r["effects"]),
+                },
+            })
+            .collect(),
+    }
+}
+
+/// A case's message as the core's builders write it, from its `fields`
+/// alone. A page record the control parser refuses can't be given to
+/// `FeedEntry::new` (a Station serves only what it stored): its slot is
+/// built with a record that parses and the record the case names is put in
+/// its place, as a Station's fault would.
+fn build_call(case: &Value) -> String {
+    let f = &case["fields"];
+    let message = match s(case, "op") {
+        "control_sync" => ControlSync {
+            origin: s(f, "origin").into(),
+            feed_id: f.get("feed_id").map(|v| v.as_str().unwrap().to_owned()),
+            after: f["after"].as_u64().unwrap(),
+        }
+        .to_json(),
+        "control_sync_result" => {
+            let control = load("r9-vectors-host-work-control");
+            let stand_in =
+                ControlRecord::parse(control["records"][0]["record"].to_string().as_bytes())
+                    .unwrap();
+            let records = f["records"].as_array().unwrap();
+            let page = ControlSyncResult {
+                origin: s(f, "origin").into(),
+                feed_id: s(f, "feed_id").into(),
+                head: f["head"].as_u64().unwrap(),
+                station_time: f["station_time"].as_u64().unwrap(),
+                records: records
+                    .iter()
+                    .map(|r| {
+                        let record = ControlRecord::parse(r["record"].to_string().as_bytes())
+                            .unwrap_or_else(|_| stand_in.clone());
+                        FeedEntry::new(r["feed_seq"].as_u64().unwrap(), &record)
+                    })
+                    .collect(),
+            };
+            page.to_json().map(|mut value| {
+                for (slot, r) in records.iter().enumerate() {
+                    if ControlRecord::parse(r["record"].to_string().as_bytes()).is_err() {
+                        value["records"][slot]["record"] = r["record"].clone();
+                    }
+                }
+                value
+            })
+        }
+        "heads" => Heads {
+            feeds: f["feeds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|feed| FeedHead {
+                    origin: s(feed, "origin").into(),
+                    feed_id: s(feed, "feed_id").into(),
+                    head: feed["head"].as_u64().unwrap(),
+                    station_time: feed["station_time"].as_u64().unwrap(),
+                })
+                .collect(),
+            membership: call_head(&f["membership"]),
+        }
+        .to_json(),
+        "control_ack" => call_ack(f).to_json(),
+        "membership_fetch" => MembershipFetch {
+            after: f["after"].as_u64().unwrap(),
+        }
+        .to_json(),
+        "membership_fetch_result" => MembershipFetchResult {
+            head: call_head(&f["head"]),
+            entries: f["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| SignedObject::from_strict(&strict(e)).unwrap())
+                .collect(),
+        }
+        .to_json(),
+        op => {
+            let call = [
+                RefusedCall::ControlSync,
+                RefusedCall::MembershipFetch,
+                RefusedCall::ControlAck,
+            ]
+            .into_iter()
+            .find(|c| c.op() == op)
+            .unwrap_or_else(|| panic!("no builder for {op}"));
+            CallRefused {
+                call,
+                code: RefusalCode::from_code(s(f, "code")).unwrap(),
+            }
+            .to_json()
+        }
+    };
+    message.unwrap().to_string()
+}
+
+fn describe_effects(effects: &[EffectResult]) -> Value {
+    Value::Array(
+        effects
+            .iter()
+            .map(|e| serde_json::json!({"effect": e.effect.code(), "result": e.result.code()}))
+            .collect(),
+    )
+}
+
+/// What a host's call decodes to, as the file's `fields` write it.
+fn describe_to_station(message: &ToStation) -> Value {
+    use serde_json::json;
+    match message {
+        ToStation::ControlSync(sync) => {
+            let mut f = json!({"origin": sync.origin, "after": sync.after});
+            if let Some(feed_id) = &sync.feed_id {
+                f["feed_id"] = json!(feed_id);
+            }
+            f
+        }
+        ToStation::ControlAck(ack) => json!({
+            "account_id": ack.account_id,
+            "genesis_hash": ack.genesis_hash.to_hex(),
+            "host_id": ack.host_id,
+            "host_trust_gen": ack.host_trust_gen,
+            "origin": ack.origin,
+            "feed_id": ack.feed_id,
+            "cursor": ack.cursor,
+            "results": ack.results.iter().map(|r| match r {
+                AckResult::Record { record_id, effects } =>
+                    json!({"record_id": record_id, "effects": describe_effects(effects)}),
+                AckResult::Entry { entry, applied_seq, effects } => json!({
+                    "entry": {"seq": entry.seq, "entry_hash": entry.entry_hash.to_hex()},
+                    "applied_seq": applied_seq,
+                    "effects": describe_effects(effects),
+                }),
+            }).collect::<Vec<_>>(),
+        }),
+        ToStation::MembershipFetch(fetch) => json!({"after": fetch.after}),
+    }
+}
+
+/// What a Station's message decodes to, as the file's `fields` write it.
+fn describe_to_host(message: &ToHost) -> Value {
+    use serde_json::json;
+    match message {
+        ToHost::ControlSyncResult(page) => json!({
+            "origin": page.origin,
+            "feed_id": page.feed_id,
+            "head": page.head,
+            "station_time": page.station_time,
+            "records": page.records.iter()
+                .map(|e| json!({"feed_seq": e.feed_seq, "record": e.raw()}))
+                .collect::<Vec<_>>(),
+        }),
+        ToHost::Heads(heads) => json!({
+            "feeds": heads.feeds.iter().map(|f| json!({
+                "origin": f.origin, "feed_id": f.feed_id, "head": f.head,
+                "station_time": f.station_time,
+            })).collect::<Vec<_>>(),
+            "membership": heads.membership.to_json(),
+        }),
+        ToHost::MembershipFetchResult(result) => json!({
+            "head": result.head.to_json(),
+            "entries": result.entries.iter().map(SignedObject::to_json).collect::<Vec<_>>(),
+        }),
+        ToHost::ControlSyncRefused(code)
+        | ToHost::MembershipFetchRefused(code)
+        | ToHost::ControlAckRefused(code) => json!({"code": code.code()}),
+    }
+}
+
+/// The control parser's verdict on each record of a page, parallel to its
+/// records (`judged` in the file): `parses` with the `record_id`, or not
+/// with the parse's code.
+fn judged_records(page: &ControlSyncResult) -> Value {
+    use serde_json::json;
+    Value::Array(
+        page.records
+            .iter()
+            .map(|entry| match entry.parse_record() {
+                Ok(record) => json!({"feed_seq": entry.feed_seq, "parses": true,
+                    "record_id": record.body().record_id}),
+                Err(e) => json!({"feed_seq": entry.feed_seq, "parses": false, "error": e.code()}),
+            })
+            .collect(),
+    )
+}
+
+/// The reader `direction` names: `to_station` reads a host's calls,
+/// `to_host` a Station's messages.
+fn read_call(direction: &str, bytes: &[u8]) -> Result<(Value, Option<Value>), RelayError> {
+    match direction {
+        "to_station" => ToStation::decode(bytes).map(|m| (describe_to_station(&m), None)),
+        "to_host" => ToHost::decode(bytes).map(|m| {
+            let judged = match &m {
+                ToHost::ControlSyncResult(page) => Some(judged_records(page)),
+                _ => None,
+            };
+            (describe_to_host(&m), judged)
+        }),
+        other => panic!("no reader {other}"),
+    }
+}
+
+/// The message's own type's reader, for an `op` it reads.
+fn read_typed(op: &str, bytes: &[u8]) -> Result<(), RelayError> {
+    match op {
+        "control_sync" => ControlSync::decode(bytes).map(drop),
+        "control_sync_result" => ControlSyncResult::decode(bytes).map(drop),
+        "heads" => Heads::decode(bytes).map(drop),
+        "control_ack" => ControlAck::decode(bytes).map(drop),
+        "membership_fetch" => MembershipFetch::decode(bytes).map(drop),
+        "membership_fetch_result" => MembershipFetchResult::decode(bytes).map(drop),
+        refused => CallRefused::decode(bytes).map(|r| assert_eq!(r.call.op(), refused)),
+    }
+}
+
+const STATION_CALL_OPS: [&str; 9] = [
+    "control_sync",
+    "control_sync_result",
+    "heads",
+    "control_ack",
+    "membership_fetch",
+    "membership_fetch_result",
+    "control_sync_refused",
+    "membership_fetch_refused",
+    "control_ack_refused",
+];
+
+/// Every valid message, byte for byte from its fields.
+#[test]
+fn station_calls_build_byte_for_byte() {
+    let mut run = station_calls_file();
+    assert_eq!(run.get("max_message_bytes"), RELAY_MAX_BYTES);
+    run.get("invalid");
+    let calls = run.get("calls");
+    let mut ops = BTreeSet::new();
+    for case in calls.as_array().unwrap() {
+        let name = s(case, "name");
+        let wire = s(case, "wire");
+        assert_eq!(build_call(case), wire, "{name}");
+        assert!(wire.len() <= RELAY_MAX_BYTES, "{name}: within the bound");
+        ops.insert(s(case, "op").to_owned());
+        run.pass(format!("{name}: built byte for byte"));
+    }
+    assert_eq!(
+        ops,
+        STATION_CALL_OPS.iter().map(|op| op.to_string()).collect(),
+        "every call and every refusal has a golden"
+    );
+    // The fixture is the crate's own output.
+    assert_eq!(
+        station_call_vectors(),
+        run.file.clone(),
+        "regenerate with write_station_calls_vectors"
+    );
+    run.finish();
+}
+
+/// Every valid message, read by its side's reader, gives back its fields
+/// (and the control parser's verdict on each page record); the other side's
+/// reader refuses it as another message.
+#[test]
+fn station_calls_decode_to_their_fields() {
+    let mut run = station_calls_file();
+    run.get("max_message_bytes");
+    run.get("invalid");
+    let calls = run.get("calls");
+    for case in calls.as_array().unwrap() {
+        let name = s(case, "name");
+        let wire = s(case, "wire");
+        let direction = s(case, "direction");
+        let (fields, judged) = read_call(direction, wire.as_bytes()).unwrap();
+        assert_eq!(fields, case["fields"], "{name}: decoded fields");
+        assert_eq!(
+            judged.as_ref(),
+            case.get("judged"),
+            "{name}: judged records"
+        );
+        read_typed(s(case, "op"), wire.as_bytes()).unwrap();
+        // The compact text in key order: parsed and written again, the same.
+        let parsed: Value = serde_json::from_str(wire).unwrap();
+        assert_eq!(parsed.to_string(), wire, "{name}: compact, keys in order");
+        // The other side's reader doesn't read it.
+        let other = match direction {
+            "to_station" => "to_host",
+            _ => "to_station",
+        };
+        assert_eq!(
+            read_call(other, wire.as_bytes()).unwrap_err().code(),
+            "wrong_message",
+            "{name}: read by the other side"
+        );
+        run.pass(format!("{name}: decoded"));
+    }
+    run.finish();
+}
+
+/// Every invalid variant is refused, with its code, by its side's reader and
+/// by the message's own type's.
+#[test]
+fn station_calls_refuse_the_invalid_variants() {
+    let mut run = station_calls_file();
+    run.get("max_message_bytes");
+    run.get("calls");
+    let invalid = run.get("invalid");
+    let mut codes = BTreeSet::new();
+    for case in invalid.as_array().unwrap() {
+        let name = s(case, "name");
+        let wire = call_wire(case);
+        if let Some(fill) = case.get("wire_fill") {
+            assert_eq!(wire.len() as u64, fill["bytes"].as_u64().unwrap(), "{name}");
+        }
+        let code = s(case, "code");
+        let error = read_call(s(case, "reader"), wire.as_bytes()).unwrap_err();
+        assert_eq!(error.code(), code, "{name}");
+        if code != "wrong_message" {
+            let typed = read_typed(s(case, "op"), wire.as_bytes()).unwrap_err();
+            assert_eq!(typed.code(), code, "{name}: the message's own reader");
+        }
+        codes.insert(code.to_owned());
+        run.pass(format!("{name}: refused {code}"));
+    }
+    assert_eq!(
+        codes,
+        [
+            "malformed",
+            "not_strict",
+            "too_large",
+            "unknown_field",
+            "wrong_message"
+        ]
+        .iter()
+        .map(|c| c.to_string())
+        .collect(),
+        "every refusal code the readers give"
+    );
+    run.finish();
+}
+
+/// The golden file's calls and invalid variants as they are written.
+struct CallBook {
+    calls: Vec<Value>,
+    invalid: Vec<Value>,
+    wires: BTreeMap<String, String>,
+}
+
+impl CallBook {
+    /// A message the builders wrote, with its decoded fields.
+    fn valid(
+        &mut self,
+        name: &str,
+        op: &str,
+        direction: &str,
+        note: &str,
+        fields: Value,
+        message: Value,
+    ) {
+        let wire = message.to_string();
+        self.wires.insert(name.to_owned(), wire.clone());
+        self.calls.push(serde_json::json!({
+            "name": name, "op": op, "direction": direction, "note": note,
+            "fields": fields, "wire": wire,
+        }));
+    }
+
+    /// The text of a valid message, parsed, for an invalid variant to change.
+    fn parsed(&self, name: &str) -> Value {
+        serde_json::from_str(&self.wires[name]).unwrap()
+    }
+
+    /// A text a reader refuses, with the code it refuses it with.
+    fn bad(&mut self, name: &str, op: &str, reader: &str, code: &str, wire: impl Into<String>) {
+        self.invalid.push(serde_json::json!({
+            "name": name, "op": op, "reader": reader, "code": code, "wire": wire.into(),
+        }));
+    }
+
+    /// `valid`'s message with `edit` applied, refused.
+    fn bad_edit(&mut self, name: &str, from: &str, code: &str, edit: impl FnOnce(&mut Value)) {
+        let mut message = self.parsed(from);
+        edit(&mut message);
+        let op = message["op"].as_str().unwrap().to_owned();
+        let reader = if ["control_sync", "control_ack", "membership_fetch"].contains(&op.as_str()) {
+            "to_station"
+        } else {
+            "to_host"
+        };
+        self.bad(name, &op, reader, code, message.to_string());
+    }
+}
+
+/// `r9-vectors-station-calls`, as the shared core's builders make it now.
+fn station_call_vectors() -> Value {
+    use serde_json::json;
+    const STATION_TIME: u64 = 1_793_620_940_000;
+    let control = load("r9-vectors-host-work-control");
+    let mlog = load("r9-vectors-membership-log");
+    let station = |name: &str| {
+        let st = &control["stations"][name];
+        (s(st, "origin").to_owned(), s(st, "feed_id").to_owned())
+    };
+    let (origin, feed) = station("A");
+    let (origin_b, feed_b) = station("B");
+    let (_, feed_a2) = station("A2");
+    let account = s(&control, "account_id").to_owned();
+    let genesis = Hash32::from_hex(s(&control, "genesis_hash")).unwrap();
+    let control_record = |label: &str| -> Value {
+        control["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["label"] == label)
+            .unwrap_or_else(|| panic!("no control record {label}"))["record"]
+            .clone()
+    };
+    let record_id = |label: &str| s(&control_record(label)["body"], "record_id").to_owned();
+    let entry = |label: &str| -> Value {
+        mlog["log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(mlog["others"].as_array().unwrap())
+            .find(|e| e["label"] == label)
+            .unwrap_or_else(|| panic!("no entry {label}"))
+            .clone()
+    };
+    let feed_entry = |seq: u64, label: &str| {
+        let record = ControlRecord::parse(control_record(label).to_string().as_bytes()).unwrap();
+        FeedEntry::new(seq, &record)
+    };
+    let log_head = Head {
+        seq: mlog["head"]["seq"].as_u64().unwrap(),
+        hash: Hash32::from_hex(s(&mlog["head"], "hash")).unwrap(),
+    };
+    let mut g = CallBook {
+        calls: Vec::new(),
+        invalid: Vec::new(),
+        wires: BTreeMap::new(),
+    };
+
+    // ------------------------------------------------------- control_sync
+    let sync = |feed_id: Option<&str>, after: u64| {
+        ControlSync {
+            origin: origin.clone(),
+            feed_id: feed_id.map(str::to_owned),
+            after,
+        }
+        .to_json()
+        .unwrap()
+    };
+    g.valid(
+        "control_sync_with_feed_id",
+        "control_sync",
+        "to_station",
+        "the host knows the feed: read it after position 2, the last it read",
+        json!({"origin": origin, "feed_id": feed, "after": 2}),
+        sync(Some(&feed), 2),
+    );
+    g.valid(
+        "control_sync_without_feed_id",
+        "control_sync",
+        "to_station",
+        "the host doesn't know the feed yet: no feed_id, and a cursor belongs to a feed, so after is 0",
+        json!({"origin": origin, "after": 0}),
+        sync(None, 0),
+    );
+    g.valid(
+        "control_sync_at_the_largest_position",
+        "control_sync",
+        "to_station",
+        "after at 2^53 - 1, the largest integer",
+        json!({"origin": origin, "feed_id": feed, "after": 9_007_199_254_740_991u64}),
+        sync(Some(&feed), 9_007_199_254_740_991),
+    );
+
+    // ------------------------------------------------ control_sync_result
+    let page = |feed_id: &str, head: u64, records: Vec<FeedEntry>| {
+        ControlSyncResult {
+            origin: origin.clone(),
+            feed_id: feed_id.to_owned(),
+            head,
+            station_time: STATION_TIME,
+            records,
+        }
+        .to_json()
+        .unwrap()
+    };
+    let wire_record =
+        |seq: u64, label: &str| json!({"feed_seq": seq, "record": control_record(label)});
+    g.valid(
+        "control_sync_result_empty_feed",
+        "control_sync_result",
+        "to_host",
+        "a feed with no record: head 0, no records",
+        json!({"origin": origin, "feed_id": feed_a2, "head": 0, "station_time": STATION_TIME, "records": []}),
+        page(&feed_a2, 0, vec![]),
+    );
+    g.valid(
+        "control_sync_result_with_records",
+        "control_sync_result",
+        "to_host",
+        "three records of the control vectors, ascending, the last at the head",
+        json!({"origin": origin, "feed_id": feed, "head": 3, "station_time": STATION_TIME,
+            "records": [wire_record(1, "S1_cover"), wire_record(2, "S4_revoke"), wire_record(3, "M1_revoke")]}),
+        page(
+            &feed,
+            3,
+            vec![
+                feed_entry(1, "S1_cover"),
+                feed_entry(2, "S4_revoke"),
+                feed_entry(3, "M1_revoke"),
+            ],
+        ),
+    );
+    // A page whose records the control parser judges one at a time: a record
+    // with an unknown field, a string, a null (a record may be any JSON
+    // value) and a gap in the positions. The builder can't write a record it
+    // doesn't parse (a Station serves only what it stored): their slots are
+    // built with a record that parses and the value is put in its place.
+    {
+        let stand_in =
+            ControlRecord::parse(control_record("S1_cover").to_string().as_bytes()).unwrap();
+        let slots: Vec<(u64, Value)> = vec![
+            (4, control_record("S5_revoke_interrupt")),
+            (5, control_record("P4_unknown_field")),
+            (6, json!("not a record")),
+            (7, Value::Null),
+            (9, control_record("S6_interrupt")),
+        ];
+        let entries = slots
+            .iter()
+            .map(
+                |(seq, record)| match ControlRecord::parse(record.to_string().as_bytes()) {
+                    Ok(record) => FeedEntry::new(*seq, &record),
+                    Err(_) => FeedEntry::new(*seq, &stand_in),
+                },
+            )
+            .collect();
+        let mut message = page(&feed, 9, entries);
+        for (slot, (_, record)) in slots.iter().enumerate() {
+            if ControlRecord::parse(record.to_string().as_bytes()).is_err() {
+                message["records"][slot]["record"] = record.clone();
+            }
+        }
+        let fields = json!({"origin": origin, "feed_id": feed, "head": 9, "station_time": STATION_TIME,
+            "records": slots.iter().map(|(seq, record)| json!({"feed_seq": seq, "record": record})).collect::<Vec<_>>()});
+        g.valid(
+            "control_sync_result_with_records_that_do_not_parse",
+            "control_sync_result",
+            "to_host",
+            "a page is read whole and each record judged on its own: one with an unknown field, a string and a null don't parse, and the page, the feed's position and the records after them stand (gaps in the positions are allowed)",
+            fields,
+            message,
+        );
+    }
+    // `judged` on every page: the control parser's verdict on each record.
+    for case in g
+        .calls
+        .iter_mut()
+        .filter(|c| c["op"] == "control_sync_result")
+    {
+        let page = ControlSyncResult::decode(s(case, "wire").as_bytes()).unwrap();
+        case["judged"] = judged_records(&page);
+    }
+
+    // -------------------------------------------------------------- heads
+    let feed_head = |origin: &str, feed_id: &str, head: u64, station_time: u64| FeedHead {
+        origin: origin.to_owned(),
+        feed_id: feed_id.to_owned(),
+        head,
+        station_time,
+    };
+    let feed_json = |origin: &str, feed_id: &str, head: u64, station_time: u64| json!({"origin": origin, "feed_id": feed_id, "head": head, "station_time": station_time});
+    g.valid(
+        "heads_two_stations",
+        "heads",
+        "to_host",
+        "two feeds, each of another Station, and the device list's head (log L's)",
+        json!({"feeds": [feed_json(&origin, &feed, 3, STATION_TIME), feed_json(&origin_b, &feed_b, 12, STATION_TIME - 500)],
+            "membership": log_head.to_json()}),
+        Heads {
+            feeds: vec![
+                feed_head(&origin, &feed, 3, STATION_TIME),
+                feed_head(&origin_b, &feed_b, 12, STATION_TIME - 500),
+            ],
+            membership: log_head,
+        }
+        .to_json()
+        .unwrap(),
+    );
+    g.valid(
+        "heads_without_feeds",
+        "heads",
+        "to_host",
+        "no feed covers a principal with work on this host: only the device list's head",
+        json!({"feeds": [], "membership": log_head.to_json()}),
+        Heads {
+            feeds: vec![],
+            membership: log_head,
+        }
+        .to_json()
+        .unwrap(),
+    );
+    let many = |n: u64| -> Vec<(String, u64)> {
+        (1..=n)
+            .map(|i| (format!("00000000-0000-4000-8000-{i:012x}"), i))
+            .collect()
+    };
+    g.valid(
+        "heads_64_feeds",
+        "heads",
+        "to_host",
+        "the most feeds one heads announces: 64, each once",
+        json!({"feeds": many(64).iter().map(|(f, i)| feed_json(&origin, f, *i, STATION_TIME)).collect::<Vec<_>>(),
+            "membership": log_head.to_json()}),
+        Heads {
+            feeds: many(64).iter().map(|(f, i)| feed_head(&origin, f, *i, STATION_TIME)).collect(),
+            membership: log_head,
+        }
+        .to_json()
+        .unwrap(),
+    );
+
+    // -------------------------------------------------------- control_ack
+    let effects = |codes: &[(&str, &str)]| -> Vec<EffectResult> {
+        codes
+            .iter()
+            .map(|(e, r)| EffectResult {
+                effect: EffectKind::from_code(e).unwrap(),
+                result: ApplicationResult::from_code(r).unwrap(),
+            })
+            .collect()
+    };
+    let effects_json = |codes: &[(&str, &str)]| -> Value {
+        Value::Array(
+            codes
+                .iter()
+                .map(|(e, r)| json!({"effect": e, "result": r}))
+                .collect(),
+        )
+    };
+    let record_result = |id: &str, codes: &[(&str, &str)]| {
+        (
+            AckResult::Record {
+                record_id: id.to_owned(),
+                effects: effects(codes),
+            },
+            json!({"record_id": id, "effects": effects_json(codes)}),
+        )
+    };
+    let entry_result = |label: &str, applied_seq: u64, codes: &[(&str, &str)]| {
+        let e = entry(label);
+        let seq = e["entry"]["body"]["seq"].as_u64().unwrap();
+        let hash = s(&e, "entry_hash").to_owned();
+        (
+            AckResult::Entry {
+                entry: EntryRef {
+                    seq,
+                    entry_hash: Hash32::from_hex(&hash).unwrap(),
+                },
+                applied_seq,
+                effects: effects(codes),
+            },
+            json!({"entry": {"seq": seq, "entry_hash": hash}, "applied_seq": applied_seq,
+                "effects": effects_json(codes)}),
+        )
+    };
+    let ack = |name: &str,
+               note: &str,
+               feed_id: &str,
+               cursor: u64,
+               results: Vec<(AckResult, Value)>,
+               g: &mut CallBook| {
+        let (typed, shown): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+        let message = ControlAck {
+            account_id: account.clone(),
+            genesis_hash: genesis,
+            host_id: "host-b".into(),
+            host_trust_gen: 1,
+            origin: origin.clone(),
+            feed_id: feed_id.to_owned(),
+            cursor,
+            results: typed,
+        }
+        .to_json()
+        .unwrap();
+        g.valid(
+            name,
+            "control_ack",
+            "to_station",
+            note,
+            json!({"account_id": account, "genesis_hash": genesis.to_hex(), "host_id": "host-b",
+                "host_trust_gen": 1, "origin": origin, "feed_id": feed_id, "cursor": cursor,
+                "results": shown}),
+            message,
+        );
+    };
+    ack(
+        "control_ack_cursor_only",
+        "the host read the feed to position 5 and has applied nothing to report: the cursor says only how far it read",
+        &feed,
+        5,
+        vec![],
+        &mut g,
+    );
+    ack(
+        "control_ack_record_results",
+        "results of the reset feed's snapshot, by record_id, each with the effect its record carries: a cover applied, a hold pending, a release refused",
+        &feed_a2,
+        3,
+        vec![
+            record_result(&record_id("A2_cover"), &[("cover", "applied")]),
+            record_result(&record_id("A2_hold"), &[("hold", "pending")]),
+            record_result(&record_id("A2_release"), &[("release", "refused")]),
+        ],
+        &mut g,
+    );
+    ack(
+        "control_ack_revoke_results",
+        "a revoke (its revocation), a revoke with interrupt_running (revocation already in force, interrupt applied) and a later interrupt_running (its interrupt)",
+        &feed,
+        6,
+        vec![
+            record_result(&record_id("S4_revoke"), &[("revocation", "applied")]),
+            record_result(
+                &record_id("S5_revoke_interrupt"),
+                &[("revocation", "duplicate"), ("interrupt", "applied")],
+            ),
+            record_result(&record_id("S6_interrupt"), &[("interrupt", "applied")]),
+        ],
+        &mut g,
+    );
+    ack(
+        "control_ack_entry_result",
+        "the result of a host sender's device-list revoke, by {seq, entry_hash}: applied once applied_seq has reached its seq",
+        &feed,
+        5,
+        vec![entry_result("HS7_revoke", 7, &[("revocation", "applied")])],
+        &mut g,
+    );
+    ack(
+        "control_ack_entry_pending",
+        "the same entry while the host's applied device-list seq is behind it: only pending or refused may be said",
+        &feed,
+        5,
+        vec![entry_result("HS7_revoke", 6, &[("revocation", "pending")])],
+        &mut g,
+    );
+    ack(
+        "control_ack_both_result_forms",
+        "both result forms in one ack: a record's and an entry's (a host sender's revoke that asked for an interrupt: revocation and interrupt)",
+        &feed,
+        5,
+        vec![
+            record_result(
+                &record_id("S5_revoke_interrupt"),
+                &[("revocation", "duplicate"), ("interrupt", "applied")],
+            ),
+            entry_result(
+                "HS12_revoke_interrupt",
+                12,
+                &[("revocation", "applied"), ("interrupt", "applied")],
+            ),
+        ],
+        &mut g,
+    );
+    ack(
+        "control_ack_64_results",
+        "the most results one ack carries: 64, each record once (ids of no vectors record)",
+        &feed,
+        64,
+        many(64)
+            .iter()
+            .map(|(id, _)| {
+                record_result(
+                    &id.replace("00000000-0000-4000-8000", "11111111-1111-4111-8111"),
+                    &[("cover", "applied")],
+                )
+            })
+            .collect(),
+        &mut g,
+    );
+
+    // ------------------------------------------------ the device-list fetch
+    g.valid(
+        "membership_fetch",
+        "membership_fetch",
+        "to_station",
+        "the host holds the device list to seq 2",
+        json!({"after": 2}),
+        MembershipFetch { after: 2 }.to_json().unwrap(),
+    );
+    let labels = ["E3", "E4", "E5", "E6"];
+    let entries: Vec<Value> = labels.iter().map(|l| entry(l)["entry"].clone()).collect();
+    g.valid(
+        "membership_fetch_result",
+        "membership_fetch_result",
+        "to_host",
+        "the entries after seq 2 (log L's E3 to E6, an R9.3 carriage) and the Station's head; no echo of after, no more",
+        json!({"head": log_head.to_json(), "entries": entries}),
+        MembershipFetchResult {
+            head: log_head,
+            entries: entries.iter().map(|e| SignedObject::from_strict(&strict(e)).unwrap()).collect(),
+        }
+        .to_json()
+        .unwrap(),
+    );
+    g.valid(
+        "membership_fetch_result_no_entries",
+        "membership_fetch_result",
+        "to_host",
+        "the host is current: the head and no entries",
+        json!({"head": log_head.to_json(), "entries": []}),
+        MembershipFetchResult {
+            head: log_head,
+            entries: vec![],
+        }
+        .to_json()
+        .unwrap(),
+    );
+
+    // ---------------------------------------------------------- refusals
+    for call in [
+        RefusedCall::ControlSync,
+        RefusedCall::MembershipFetch,
+        RefusedCall::ControlAck,
+    ] {
+        g.valid(
+            call.op(),
+            call.op(),
+            "to_host",
+            "the Station refuses the call on this link (agreed with Astation, 2026-11-11): exactly this, naming nothing",
+            json!({"code": "forbidden"}),
+            CallRefused { call, code: RefusalCode::Forbidden }.to_json().unwrap(),
+        );
+    }
+
+    // ============================================================ invalid
+    let sync_wire = |after: &str| {
+        format!(
+            r#"{{"after":{after},"feed_id":"{feed}","op":"control_sync","origin":"{origin}","type":"relay"}}"#
+        )
+    };
+    g.bad_edit(
+        "control_sync_unknown_field",
+        "control_sync_with_feed_id",
+        "unknown_field",
+        |v| v["mailbox"] = json!(1),
+    );
+    g.bad_edit(
+        "control_sync_feed_id_null",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| v["feed_id"] = Value::Null,
+    );
+    g.bad(
+        "control_sync_duplicate_key",
+        "control_sync",
+        "to_station",
+        "not_strict",
+        format!(
+            r#"{{"after":2,"after":3,"feed_id":"{feed}","op":"control_sync","origin":"{origin}","type":"relay"}}"#
+        ),
+    );
+    g.bad_edit(
+        "control_sync_after_without_a_feed_id",
+        "control_sync_without_feed_id",
+        "malformed",
+        |v| v["after"] = json!(5),
+    );
+    g.bad_edit(
+        "control_sync_origin_with_a_path",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| v["origin"] = json!(format!("{origin}/")),
+    );
+    g.bad_edit(
+        "control_sync_origin_not_lowercase",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| v["origin"] = json!("https://Station-dev.agora.build"),
+    );
+    g.bad_edit(
+        "control_sync_origin_plain_http",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| v["origin"] = json!("http://station-dev.agora.build"),
+    );
+    g.bad_edit(
+        "control_sync_feed_id_not_uuid_v4",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| v["feed_id"] = json!("6f1c2b3a-4d5e-5f60-8a7b-9c0d1e2f3a4b"),
+    );
+    g.bad_edit(
+        "control_sync_feed_id_not_lowercase",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| v["feed_id"] = json!(feed.to_uppercase()),
+    );
+    g.bad(
+        "control_sync_after_a_fraction",
+        "control_sync",
+        "to_station",
+        "not_strict",
+        sync_wire("1.5"),
+    );
+    g.bad(
+        "control_sync_after_an_unsafe_integer",
+        "control_sync",
+        "to_station",
+        "not_strict",
+        sync_wire("9007199254740992"),
+    );
+    g.bad(
+        "control_sync_after_negative",
+        "control_sync",
+        "to_station",
+        "malformed",
+        sync_wire("-1"),
+    );
+    g.bad_edit(
+        "control_sync_after_missing",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| {
+            v.as_object_mut().unwrap().remove("after");
+        },
+    );
+    g.bad_edit(
+        "control_sync_after_as_text",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| v["after"] = json!("2"),
+    );
+    g.bad_edit(
+        "control_sync_not_a_relay_message",
+        "control_sync_with_feed_id",
+        "wrong_message",
+        |v| v["type"] = json!("session"),
+    );
+    let wire = g.wires["control_sync_with_feed_id"].clone();
+    g.bad(
+        "a_call_read_as_a_stations_message",
+        "control_sync",
+        "to_host",
+        "wrong_message",
+        wire,
+    );
+    let wire = g.wires["heads_two_stations"].clone();
+    g.bad(
+        "a_stations_message_read_as_a_call",
+        "heads",
+        "to_station",
+        "wrong_message",
+        wire,
+    );
+    g.bad(
+        "a_json_array",
+        "control_sync",
+        "to_station",
+        "wrong_message",
+        "[]",
+    );
+    g.bad("not_json", "control_sync", "to_station", "not_strict", "{");
+    let push = r#"{"hints":[],"op":"push_hint","type":"relay"}"#;
+    g.bad(
+        "another_relay_message_to_a_station",
+        "control_sync",
+        "to_station",
+        "wrong_message",
+        push,
+    );
+    g.bad(
+        "another_relay_message_to_a_host",
+        "heads",
+        "to_host",
+        "wrong_message",
+        push,
+    );
+
+    // control_sync_result
+    let result_wire = |head: u64, records: &str| {
+        format!(
+            r#"{{"feed_id":"{feed}","head":{head},"op":"control_sync_result","origin":"{origin}","records":{records},"station_time":{STATION_TIME},"type":"relay"}}"#
+        )
+    };
+    // A page of one record that is no record (any JSON value is read), for the
+    // variants of a page's structure to change.
+    let base = "control_sync_result_empty_feed";
+    let one = |v: &mut Value| {
+        v["head"] = json!(1);
+        v["records"] = json!([{"feed_seq": 1, "record": 0}]);
+    };
+    g.bad_edit(
+        "control_sync_result_unknown_field",
+        base,
+        "unknown_field",
+        |v| v["more"] = json!(true),
+    );
+    g.bad_edit(
+        "control_sync_result_item_unknown_field",
+        base,
+        "unknown_field",
+        |v| {
+            one(v);
+            v["records"][0]["extra"] = json!(1)
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_item_without_a_record",
+        base,
+        "malformed",
+        |v| {
+            one(v);
+            v["records"][0].as_object_mut().unwrap().remove("record");
+        },
+    );
+    g.bad_edit("control_sync_result_65_records", base, "too_large", |v| {
+        v["head"] = json!(65);
+        v["records"] = Value::Array(
+            (1..=65)
+                .map(|i| json!({"feed_seq": i, "record": 0}))
+                .collect(),
+        );
+    });
+    g.bad_edit(
+        "control_sync_result_feed_seq_above_the_head",
+        base,
+        "malformed",
+        |v| {
+            one(v);
+            v["records"][0]["feed_seq"] = json!(2)
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_feed_seq_not_ascending",
+        base,
+        "malformed",
+        |v| {
+            v["head"] = json!(2);
+            v["records"] = json!([{"feed_seq": 2, "record": 0}, {"feed_seq": 1, "record": 0}]);
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_feed_seq_twice",
+        base,
+        "malformed",
+        |v| {
+            v["head"] = json!(2);
+            v["records"] = json!([{"feed_seq": 1, "record": 0}, {"feed_seq": 1, "record": 0}]);
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_feed_seq_zero",
+        base,
+        "malformed",
+        |v| {
+            one(v);
+            v["records"][0]["feed_seq"] = json!(0)
+        },
+    );
+    g.bad_edit("control_sync_result_head_as_text", base, "malformed", |v| {
+        v["head"] = json!("0")
+    });
+    g.bad_edit(
+        "control_sync_result_origin_with_a_path",
+        base,
+        "malformed",
+        |v| v["origin"] = json!(format!("{origin}/")),
+    );
+    g.bad_edit(
+        "control_sync_result_feed_id_not_uuid_v4",
+        base,
+        "malformed",
+        |v| v["feed_id"] = json!("not-a-feed"),
+    );
+    g.bad_edit(
+        "control_sync_result_station_time_missing",
+        base,
+        "malformed",
+        |v| {
+            v.as_object_mut().unwrap().remove("station_time");
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_records_not_an_array",
+        base,
+        "malformed",
+        |v| v["records"] = json!({}),
+    );
+    g.bad(
+        "control_sync_result_duplicate_key_inside_a_record",
+        "control_sync_result",
+        "to_host",
+        "not_strict",
+        result_wire(1, r#"[{"feed_seq":1,"record":{"a":1,"a":2}}]"#),
+    );
+    g.bad(
+        "control_sync_result_fraction_inside_a_record",
+        "control_sync_result",
+        "to_host",
+        "not_strict",
+        result_wire(1, r#"[{"feed_seq":1,"record":{"a":1.5}}]"#),
+    );
+    g.bad(
+        "control_sync_result_unsafe_integer_inside_a_record",
+        "control_sync_result",
+        "to_host",
+        "not_strict",
+        result_wire(1, r#"[{"feed_seq":1,"record":{"a":9007199254740992}}]"#),
+    );
+    g.bad(
+        "control_sync_result_lone_surrogate_inside_a_record",
+        "control_sync_result",
+        "to_host",
+        "not_strict",
+        result_wire(1, r#"[{"feed_seq":1,"record":"\ud800"}]"#),
+    );
+    g.bad(
+        "control_sync_result_record_nested_past_the_depth_bound",
+        "control_sync_result",
+        "to_host",
+        "not_strict",
+        result_wire(
+            1,
+            &format!(
+                r#"[{{"feed_seq":1,"record":{}{}}}]"#,
+                "[".repeat(200),
+                "]".repeat(200)
+            ),
+        ),
+    );
+    // Over the bound by one byte: a record that is one long string.
+    {
+        let prefix = format!(
+            r#"{{"feed_id":"{feed}","head":1,"op":"control_sync_result","origin":"{origin}","records":[{{"feed_seq":1,"record":""#
+        );
+        let suffix = format!(r#""}}],"station_time":{STATION_TIME},"type":"relay"}}"#);
+        let bytes = RELAY_MAX_BYTES + 1;
+        g.invalid.push(json!({
+            "name": "control_sync_result_over_262144_bytes",
+            "op": "control_sync_result", "reader": "to_host", "code": "too_large",
+            "wire_fill": {"prefix": prefix, "fill": "x", "count": bytes - prefix.len() - suffix.len(),
+                "suffix": suffix, "bytes": bytes},
+        }));
+    }
+
+    // heads
+    let h = "heads_two_stations";
+    g.bad_edit("heads_unknown_mailbox_field", h, "unknown_field", |v| {
+        v["mailbox"] = json!({"head": 1, "mailbox_id": feed})
+    });
+    g.bad_edit("heads_a_feed_twice", h, "malformed", |v| {
+        v["feeds"][1] = v["feeds"][0].clone()
+    });
+    g.bad_edit("heads_65_feeds", h, "too_large", |v| {
+        v["feeds"] = Value::Array((0..65).map(|_| json!(0)).collect())
+    });
+    g.bad_edit("heads_membership_seq_zero", h, "malformed", |v| {
+        v["membership"]["seq"] = json!(0)
+    });
+    g.bad_edit("heads_membership_hash_not_lowercase", h, "malformed", |v| {
+        v["membership"]["hash"] = json!(log_head.hash.to_hex().to_uppercase())
+    });
+    g.bad_edit("heads_membership_unknown_field", h, "unknown_field", |v| {
+        v["membership"]["extra"] = json!(1)
+    });
+    g.bad_edit("heads_membership_missing", h, "malformed", |v| {
+        v.as_object_mut().unwrap().remove("membership");
+    });
+    g.bad_edit("heads_feeds_missing", h, "malformed", |v| {
+        v.as_object_mut().unwrap().remove("feeds");
+    });
+    g.bad_edit("heads_feed_unknown_field", h, "unknown_field", |v| {
+        v["feeds"][0]["extra"] = json!(1)
+    });
+
+    // control_ack
+    let a = "control_ack_both_result_forms";
+    g.bad_edit("control_ack_unknown_field", a, "unknown_field", |v| {
+        v["extra"] = json!(1)
+    });
+    g.bad_edit("control_ack_65_results", a, "too_large", |v| {
+        v["results"] = Value::Array((0..65).map(|_| json!(0)).collect())
+    });
+    g.bad_edit("control_ack_a_record_twice", a, "malformed", |v| {
+        v["results"] = json!([v["results"][0].clone(), v["results"][0].clone()])
+    });
+    g.bad_edit("control_ack_an_entry_twice", a, "malformed", |v| {
+        v["results"] = json!([v["results"][1].clone(), v["results"][1].clone()])
+    });
+    g.bad_edit("control_ack_effects_out_of_order", a, "malformed", |v| {
+        v["results"][0]["effects"] = json!([
+            {"effect": "interrupt", "result": "applied"},
+            {"effect": "revocation", "result": "duplicate"}
+        ])
+    });
+    g.bad_edit(
+        "control_ack_effects_no_record_carries",
+        a,
+        "malformed",
+        |v| {
+            v["results"][0]["effects"] = json!([
+                {"effect": "cover", "result": "applied"},
+                {"effect": "revocation", "result": "applied"}
+            ])
+        },
+    );
+    g.bad_edit("control_ack_effects_empty", a, "malformed", |v| {
+        v["results"][0]["effects"] = json!([])
+    });
+    g.bad_edit("control_ack_effects_three", a, "malformed", |v| {
+        v["results"][0]["effects"] = json!([
+            {"effect": "revocation", "result": "applied"},
+            {"effect": "interrupt", "result": "applied"},
+            {"effect": "hold", "result": "applied"}
+        ])
+    });
+    g.bad_edit("control_ack_a_result_of_both_forms", a, "malformed", |v| {
+        v["results"][0]["entry"] = v["results"][1]["entry"].clone()
+    });
+    g.bad_edit(
+        "control_ack_a_result_of_neither_form",
+        a,
+        "malformed",
+        |v| {
+            v["results"][0].as_object_mut().unwrap().remove("record_id");
+        },
+    );
+    g.bad_edit("control_ack_an_unknown_result", a, "malformed", |v| {
+        v["results"][0]["effects"][0]["result"] = json!("maybe")
+    });
+    g.bad_edit("control_ack_host_trust_gen_zero", a, "malformed", |v| {
+        v["host_trust_gen"] = json!(0)
+    });
+    g.bad_edit(
+        "control_ack_entry_applied_behind_applied_seq",
+        a,
+        "malformed",
+        |v| v["results"][1]["applied_seq"] = json!(11),
+    );
+    g.bad_edit(
+        "control_ack_genesis_hash_not_lowercase",
+        a,
+        "malformed",
+        |v| v["genesis_hash"] = json!(genesis.to_hex().to_uppercase()),
+    );
+    g.bad_edit("control_ack_cursor_missing", a, "malformed", |v| {
+        v.as_object_mut().unwrap().remove("cursor");
+    });
+    g.bad_edit(
+        "control_ack_result_unknown_field",
+        a,
+        "unknown_field",
+        |v| v["results"][0]["extra"] = json!(1),
+    );
+    g.bad_edit("control_ack_account_id_empty", a, "malformed", |v| {
+        v["account_id"] = json!("")
+    });
+    g.bad_edit("control_ack_feed_id_missing", a, "malformed", |v| {
+        v.as_object_mut().unwrap().remove("feed_id");
+    });
+
+    // membership_fetch
+    let f = "membership_fetch";
+    g.bad_edit("membership_fetch_unknown_field", f, "unknown_field", |v| {
+        v["feed_id"] = json!(feed)
+    });
+    g.bad_edit("membership_fetch_after_null", f, "malformed", |v| {
+        v["after"] = Value::Null
+    });
+    g.bad_edit("membership_fetch_after_missing", f, "malformed", |v| {
+        v.as_object_mut().unwrap().remove("after");
+    });
+
+    // membership_fetch_result
+    let r = "membership_fetch_result_no_entries";
+    g.bad_edit("membership_fetch_result_65_entries", r, "too_large", |v| {
+        v["entries"] = Value::Array((0..65).map(|_| json!(0)).collect())
+    });
+    g.bad_edit(
+        "membership_fetch_result_an_entry_that_is_not_an_object",
+        r,
+        "malformed",
+        |v| v["entries"] = json!([0]),
+    );
+    g.bad_edit(
+        "membership_fetch_result_head_seq_zero",
+        r,
+        "malformed",
+        |v| v["head"]["seq"] = json!(0),
+    );
+    g.bad_edit(
+        "membership_fetch_result_head_hash_not_hex",
+        r,
+        "malformed",
+        |v| v["head"]["hash"] = json!("beb1"),
+    );
+    g.bad_edit(
+        "membership_fetch_result_echoes_after",
+        r,
+        "unknown_field",
+        |v| v["after"] = json!(2),
+    );
+    g.bad_edit(
+        "membership_fetch_result_carries_more",
+        r,
+        "unknown_field",
+        |v| v["more"] = json!(false),
+    );
+    g.bad_edit(
+        "membership_fetch_result_entries_missing",
+        r,
+        "malformed",
+        |v| {
+            v.as_object_mut().unwrap().remove("entries");
+        },
+    );
+
+    // the three refusals
+    for call in [
+        RefusedCall::ControlSync,
+        RefusedCall::MembershipFetch,
+        RefusedCall::ControlAck,
+    ] {
+        let op = call.op();
+        let name = |what: &str| format!("{op}_{what}");
+        g.bad_edit(&name("unknown_code"), op, "malformed", |v| {
+            v["code"] = json!("not_found")
+        });
+        g.bad_edit(&name("code_null"), op, "malformed", |v| {
+            v["code"] = Value::Null
+        });
+        g.bad_edit(&name("code_missing"), op, "malformed", |v| {
+            v.as_object_mut().unwrap().remove("code");
+        });
+        g.bad_edit(&name("code_not_lowercase"), op, "malformed", |v| {
+            v["code"] = json!("Forbidden")
+        });
+        g.bad_edit(&name("names_a_feed"), op, "unknown_field", |v| {
+            v["feed_id"] = json!(feed)
+        });
+        g.bad(
+            &name("duplicate_key"),
+            op,
+            "to_host",
+            "not_strict",
+            format!(r#"{{"code":"forbidden","code":"forbidden","op":"{op}","type":"relay"}}"#),
+        );
+        let wire = g.wires[op].clone();
+        g.bad(
+            &name("read_as_a_call"),
+            op,
+            "to_station",
+            "wrong_message",
+            wire,
+        );
+    }
+
+    json!({
+        "name": STATION_CALLS,
+        "kind": "vectors",
+        "requires": "r9",
+        "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
+        "max_message_bytes": RELAY_MAX_BYTES,
+        "calls": g.calls,
+        "invalid": g.invalid,
+    })
+}
+
+/// Writes `r9-vectors-station-calls` from `station_call_vectors`.
+#[test]
+#[ignore = "writes the Station call goldens"]
+fn write_station_calls_vectors() {
+    let mut text = serde_json::to_string_pretty(&station_call_vectors()).unwrap();
+    text.push('\n');
+    std::fs::write(fixtures_dir().join("r9-vectors-station-calls.json"), text).unwrap();
 }
 
 // ------------------------- delegated host work: envelopes and results (mail)
