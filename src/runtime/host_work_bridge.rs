@@ -1,5 +1,6 @@
 //! Opt-in host operations. Work reaches agents only through session-v1 receipts.
 use super::*;
+use crate::runtime::host_clock::HostClock;
 use crate::runtime::host_work::{
     AUTHORIZATION_EXPIRED, Accepted, Config, LaunchRecord, MessageFrame, Profile, Store,
     WorkRecord,
@@ -15,6 +16,9 @@ use std::sync::atomic::AtomicBool;
 
 /// The longest `paused: <reason>` detail a waiting local task carries.
 const MAX_PAUSE_DETAIL: usize = 240;
+
+/// How often the delegated clock takes a reading (host-work-v1 §11.6).
+const CLOCK_EVERY: Duration = Duration::from_secs(1);
 
 /// How often the payloads of host-work records settled a day past their
 /// deadline are dropped, and collaboration counters whose windows passed
@@ -158,6 +162,11 @@ pub(super) struct State {
     /// Why the runtime refused to start a launch it was handed (the
     /// live-session limit, a restart): the detail of its local tasks.
     refused: HashMap<String, String>,
+    /// The delegated clock (host-work-v1 §11.6), beside the store whose
+    /// `clock` table holds its record. `None` outside tests.
+    clock: Option<HostClock>,
+    /// When the clock next takes a reading (`clock_pass`).
+    clock_due: Instant,
 }
 
 impl State {
@@ -187,6 +196,10 @@ impl State {
             recheck_grants: true,
             named: HashSet::new(),
             refused: HashMap::new(),
+            // Task 19 constructs it (`HostClock::load`) when
+            // `host_features().delegated`.
+            clock: None,
+            clock_due: Instant::now(),
         }
     }
 }
@@ -459,7 +472,39 @@ impl HostBridge {
             )
     }
 
+    /// The delegated clock (host-work-v1 §11.6), when there is one: once a
+    /// second while the store is open and healthy, hosting on or not, so its
+    /// record goes on (`HostClock::tick` writes it when due).
+    fn clock_pass(&mut self) {
+        let (Some(clock), Some(store)) = (self.work.clock.as_mut(), self.work.store.as_ref())
+        else {
+            return;
+        };
+        if self.work.error || Instant::now() < self.work.clock_due {
+            return;
+        }
+        self.work.clock_due = Instant::now() + CLOCK_EVERY;
+        clock.tick(store);
+    }
+
+    /// At an orderly stop: the delegated clock's last reading, written.
+    pub(super) fn work_close(&mut self) {
+        if let (Some(clock), Some(store)) = (self.work.clock.as_mut(), self.work.store.as_ref())
+            && !self.work.error
+        {
+            clock.close(store);
+        }
+    }
+
+    /// The delegated clock's `atem status` line (`HostClock::status_line`):
+    /// while it holds deadlines back, while its record is damaged, and for a
+    /// day after a repair or a lowering.
+    pub fn clock_status(&self) -> Option<String> {
+        self.work.clock.as_ref()?.status_line()
+    }
+
     pub(super) fn work_pass(&mut self, cx: &mut Cx) {
+        self.clock_pass();
         let identity = self.work_host();
         // An unverified host has no identity to keep records under yet.
         if !self.hosting_enabled() || identity.account_id == UNPAIRED {
@@ -605,6 +650,11 @@ impl HostBridge {
                     "atem runtime: agent hosting records of this host's previous identity moved aside to {}",
                     aside.display()
                 );
+                // The clock is the host's, not the identity's: its record
+                // goes on in the new store.
+                if let Some(clock) = self.work.clock.as_mut() {
+                    clock.moved(&store);
+                }
                 self.work.store = Some(store);
                 true
             }
@@ -1943,6 +1993,61 @@ principals = ["local"]
             .build()
             .unwrap();
         tokio::task::LocalSet::new().block_on(&rt, body(dir.path()));
+    }
+
+    fn stored_clock(rig: &LocalRig) -> Option<rusqlite::types::Value> {
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .load_clock()
+            .unwrap()
+    }
+
+    /// The delegated clock (host-work-v1 §11.6), once constructed, lives
+    /// beside the store: the pass reads it once a second and writes its
+    /// record (here its first reading), and an orderly stop writes a last
+    /// reading.
+    #[test]
+    fn the_pass_keeps_the_host_clock_and_an_orderly_stop_writes_it() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let stored = stored_clock;
+            let store = rig.bridge.work.store.as_ref().unwrap();
+            rig.bridge.work.clock = Some(crate::runtime::host_clock::HostClock::load(store));
+            rig.bridge.work.clock_due = Instant::now();
+            one_pass(&mut rig);
+            let first = stored(&rig).expect("written at its first reading");
+            // Within the second, no reading.
+            std::thread::sleep(Duration::from_millis(5));
+            one_pass(&mut rig);
+            assert_eq!(stored(&rig), Some(first.clone()));
+            // An orderly stop takes one and writes it.
+            rig.bridge.close_cleanly();
+            assert_ne!(stored(&rig), Some(first));
+            assert_eq!(rig.bridge.clock_status(), None);
+        });
+    }
+
+    /// Nothing constructs the clock outside tests until the delegated
+    /// lifecycle does (step 4, Task 19): without it the passes and an orderly
+    /// stop write no clock row, and the status reports none.
+    #[test]
+    fn a_bridge_without_a_host_clock_writes_no_clock_row_and_reports_no_status() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            assert!(rig.bridge.work.clock.is_none());
+            rig.bridge.work.clock_due = Instant::now();
+            one_pass(&mut rig);
+            std::thread::sleep(Duration::from_millis(5));
+            rig.bridge.work.clock_due = Instant::now();
+            one_pass(&mut rig);
+            rig.bridge.close_cleanly();
+            assert!(rig.bridge.work.clock.is_none());
+            assert_eq!(stored_clock(&rig), None);
+            assert_eq!(rig.bridge.clock_status(), None);
+        });
     }
 
     #[test]

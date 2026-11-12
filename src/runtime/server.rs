@@ -1415,8 +1415,8 @@ impl Server {
         }
     }
 
-    /// What `status` reports: the link, the attachment, the journal and the
-    /// sessions.
+    /// What `status` reports: the link, the attachment, the journal, the
+    /// sessions, the device list and the delegated clock.
     fn status(&self) -> super::protocol::RuntimeStatus {
         use super::protocol::{RuntimeStatus, Transport};
         use crate::websocket_client::LinkVia;
@@ -1453,6 +1453,7 @@ impl Server {
                 .bridge
                 .as_ref()
                 .and_then(HostBridge::device_list_status),
+            clock: self.bridge.as_ref().and_then(HostBridge::clock_status),
         }
     }
 

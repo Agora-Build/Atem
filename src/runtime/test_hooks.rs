@@ -34,13 +34,21 @@
 //!
 //!   A marker is removed when it is used, and its name appended to
 //!   `<dir>/used`.
-//! - `ATEM_TEST_HOST_CLOCK=<file>` (`<wall_ms> <mono_ms> <boot_id>`): the
-//!   device list's host clock (§R9.5) instead of the system's wall clock,
-//!   `CLOCK_MONOTONIC` and boot id, so a test can simulate a reboot. Or
-//!   `offsets <wall_ms> <mono_ms> <boot_id>`: the system's wall clock and
-//!   `CLOCK_MONOTONIC` plus those offsets (the wall's may be negative), at
-//!   every read, so a test moves the clocks with one write and they go on
-//!   between writes.
+//! - `ATEM_TEST_HOST_CLOCK=<file>` (`<wall_ms> <mono_ms> <boot_id>[ <boot_ms>
+//!   <synced 1|0|-> <machine-hex> <timens_boot_ms>]`): the device list's
+//!   host clock (§R9.5) instead of the system's wall clock, `CLOCK_MONOTONIC`
+//!   and boot id, so a test can simulate a reboot; and the delegated clock's
+//!   readings (host-work-v1 §11.6, `host_clock::HostClock`). The optional
+//!   fields are the delegated clock's own, each defaulting when it and the
+//!   ones after it are left out: its boot-time counter (`mono_ms`), the OS's
+//!   sync report (`1` synchronized, the default; `0` not; `-` no report),
+//!   the machine identity (32 lowercase hex digits; `TEST_MACHINE`) and the
+//!   boot-time namespace offset in ms (0). Or `offsets <wall_ms> <mono_ms>
+//!   <boot_id>[ <boot_ms> …]`: the system's wall clock and `CLOCK_MONOTONIC`
+//!   plus those offsets (the wall's may be negative), and the boot-time
+//!   counter `CLOCK_MONOTONIC` plus `<boot_ms>` (default `<mono_ms>`; it may
+//!   be negative), at every read, so a test moves the clocks with one write
+//!   and they go on between writes; the other optional fields as given.
 //! - `ATEM_TEST_BUILD=<id>`: this process reports `<id>` as its build
 //!   (`cred_agent::build_id`), so a binary test can run a runtime that looks
 //!   like another atem build.
@@ -360,35 +368,29 @@ mod imp {
         }
     }
 
-    pub fn host_clock() -> Option<(u64, u64, String)> {
+    /// `None` when the hook isn't set; `Some(None)` while its file has no
+    /// reading (missing, or not in the hook's format).
+    pub fn host_clock_full() -> Option<Option<super::HookClock>> {
         static CELL: OnceLock<Option<PathBuf>> = OnceLock::new();
         let file = env_path("ATEM_TEST_HOST_CLOCK", &CELL)?;
-        let text = std::fs::read_to_string(file).ok()?;
-        let mut parts = text.split_whitespace();
-        let first = parts.next()?;
-        let (wall, mono) = if first == "offsets" {
-            let wall: i64 = parts.next()?.parse().ok()?;
-            let mono: u64 = parts.next()?.parse().ok()?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_millis() as i64;
-            let mut ts = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            // SAFETY: `ts` is a valid timespec for the call to fill.
-            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-            let real_mono = ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000;
-            (
-                u64::try_from(now.checked_add(wall)?).ok()?,
-                real_mono.checked_add(mono)?,
-            )
-        } else {
-            (first.parse().ok()?, parts.next()?.parse().ok()?)
+        let Ok(text) = std::fs::read_to_string(file) else {
+            return Some(None);
         };
-        let boot = parts.next()?.to_string();
-        Some((wall, mono, boot))
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid timespec for the call to fill.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        let real_mono = ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000;
+        Some(super::parse_host_clock(&text, now, real_mono))
+    }
+
+    pub fn host_clock() -> Option<(u64, u64, String)> {
+        host_clock_full()?.map(|h| (h.wall_ms, h.mono_ms, h.boot_id))
     }
 
     pub fn hold_dispatch() -> Option<bool> {
@@ -651,6 +653,111 @@ pub fn host_clock() -> Option<(u64, u64, String)> {
     return imp::host_clock();
     #[cfg(not(debug_assertions))]
     None
+}
+
+/// The delegated clock's test reading (`ATEM_TEST_HOST_CLOCK`): `None` when
+/// the hook isn't set (always, in release builds), `Some(None)` while its
+/// file has no reading.
+pub fn host_clock_reading() -> Option<Option<crate::runtime::host_clock::os::OsReading>> {
+    #[cfg(debug_assertions)]
+    return imp::host_clock_full().map(|h| h.map(HookClock::reading));
+    #[cfg(not(debug_assertions))]
+    None
+}
+
+/// The machine identity of the hook's readings when its file names none:
+/// one fixed machine, not `os::unknown_machine` (whose boot changes carry
+/// no boot time).
+#[cfg(any(debug_assertions, test))]
+pub(crate) const TEST_MACHINE: [u8; 16] = *b"atem-test-host-1";
+
+/// One reading of `ATEM_TEST_HOST_CLOCK`'s file.
+#[cfg(any(debug_assertions, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HookClock {
+    pub wall_ms: u64,
+    pub mono_ms: u64,
+    pub boot_id: String,
+    /// The delegated clock's boot-time counter, in ms.
+    pub boot_ms: u64,
+    pub synced: crate::runtime::host_clock::os::Synced,
+    pub machine: [u8; 16],
+    pub timens_boot_ms: i64,
+}
+
+#[cfg(any(debug_assertions, test))]
+impl HookClock {
+    /// As the delegated clock reads it.
+    pub fn reading(self) -> crate::runtime::host_clock::os::OsReading {
+        crate::runtime::host_clock::os::OsReading {
+            wall_ms: self.wall_ms,
+            boot_ns: self.boot_ms.saturating_mul(1_000_000),
+            boot_id: self.boot_id,
+            machine: self.machine,
+            timens_boot_ns: self.timens_boot_ms.saturating_mul(1_000_000),
+            synced: self.synced,
+        }
+    }
+}
+
+/// `ATEM_TEST_HOST_CLOCK`'s file (see the module doc), read at the system's
+/// `real_wall_ms` and `real_mono_ms` (`CLOCK_MONOTONIC`). Fields left out at
+/// the end default; anything else that doesn't read is no reading.
+#[cfg(any(debug_assertions, test))]
+pub(crate) fn parse_host_clock(
+    text: &str,
+    real_wall_ms: u64,
+    real_mono_ms: u64,
+) -> Option<HookClock> {
+    use crate::runtime::host_clock::os::Synced;
+    let mut parts = text.split_whitespace();
+    let first = parts.next()?;
+    let offsets = first == "offsets";
+    let (wall_ms, mono_ms) = if offsets {
+        let wall: i64 = parts.next()?.parse().ok()?;
+        let mono: u64 = parts.next()?.parse().ok()?;
+        (
+            u64::try_from(i64::try_from(real_wall_ms).ok()?.checked_add(wall)?).ok()?,
+            real_mono_ms.checked_add(mono)?,
+        )
+    } else {
+        (first.parse().ok()?, parts.next()?.parse().ok()?)
+    };
+    let boot_id = parts.next()?.to_string();
+    let boot_ms = match parts.next() {
+        None => mono_ms,
+        Some(field) if offsets => {
+            let offset: i64 = field.parse().ok()?;
+            u64::try_from((i128::from(real_mono_ms) + i128::from(offset)).max(0)).ok()?
+        }
+        Some(field) => field.parse().ok()?,
+    };
+    let synced = match parts.next() {
+        None | Some("1") => Synced::Yes,
+        Some("0") => Synced::No,
+        Some("-") => Synced::Unknown,
+        Some(_) => return None,
+    };
+    let machine = match parts.next() {
+        None => TEST_MACHINE,
+        Some(hex) => atem_client::encoding::hex_decode_array(hex).ok()?,
+    };
+    let timens_boot_ms = match parts.next() {
+        None => 0,
+        Some(field) => field.parse().ok()?,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(HookClock {
+        wall_ms,
+        mono_ms,
+        boot_id,
+        boot_ms,
+        synced,
+        machine,
+        timens_boot_ms,
+    })
 }
 
 /// The device-list hooks are set (`ATEM_TEST_MEMBERSHIP_FAULTS`).
