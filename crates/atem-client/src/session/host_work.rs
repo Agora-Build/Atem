@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::alerts::{self, Alert};
 use super::wire::{Target, is_digest, is_opaque_id, is_session_id, is_uuid_v4, is_uuid_v5};
 use crate::canonical::MAX_SAFE_INTEGER;
 
@@ -10,8 +11,10 @@ pub const LAUNCH_FEATURE: &str = "host.launch";
 pub const WORK_FEATURE: &str = "host.work";
 /// `reply_query`: the reply the agent working on a task submitted.
 pub const REPLY_FEATURE: &str = "host.reply";
-/// Delegated host work (`work_interrupt`, `work_resolve`; delegated
-/// host-work design, plan decision 4). Planned: no host advertises it yet.
+/// Delegated host work (`work_interrupt`, `work_resolve`, and each
+/// attempt's own `receipt_id`; delegated host-work design I.4.5, I.6.4,
+/// plan decision 4). Planned: no host advertises it yet, so a client never
+/// sends either op and a host refuses them.
 pub const DELEGATED_FEATURE: &str = "host.delegated";
 /// `alert_list`: the host's alerts. Planned: no host advertises it yet.
 pub const ALERTS_FEATURE: &str = "host.alerts";
@@ -265,6 +268,36 @@ pub enum Request {
         task_id: String,
         result: ContextSnapshot,
     },
+    /// Interrupts the task's turn if it is the session's current turn
+    /// (`host.delegated`, I.4.5).
+    #[serde(rename = "work_interrupt")]
+    WorkInterrupt {
+        v: u8,
+        id: String,
+        host: HostTarget,
+        task_id: String,
+    },
+    /// Resolves an `outcome_unknown` task (`host.delegated`, I.4.6).
+    #[serde(rename = "work_resolve")]
+    WorkResolve {
+        v: u8,
+        id: String,
+        host: HostTarget,
+        task_id: String,
+        resolution: Resolution,
+    },
+    /// The host's alerts (`host.alerts`, I.4.6): an unresolved
+    /// `outcome_unknown` task each, oldest first, [`alerts::MAX_PAGE`] at a
+    /// time. `after` is the `alert_id` of the last alert the caller has;
+    /// omitted for the first page.
+    #[serde(rename = "alert_list")]
+    AlertList {
+        v: u8,
+        id: String,
+        host: HostTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+    },
     #[serde(rename = "message_publish")]
     Publish {
         v: u8,
@@ -279,6 +312,37 @@ pub enum Request {
         host: HostTarget,
         message_id: String,
     },
+}
+
+/// How `work_resolve` settles an `outcome_unknown` task: `failed`, with the
+/// detail the task then shows, or `done`, which makes it `completed` with
+/// the result snapshot (`host.delegated`, I.4.6).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Resolution {
+    Failed { detail: String },
+    Done { result: ContextSnapshot },
+}
+
+/// The longest `detail` of a status or a `failed` resolution.
+pub const MAX_DETAIL_BYTES: usize = 1024;
+
+impl Resolution {
+    pub fn valid(&self) -> bool {
+        match self {
+            // Kept exactly as given (the host shows it as the task's
+            // detail; a client never compares it), but never blank, and no
+            // control or Cf character.
+            Self::Failed { detail } => {
+                !detail.trim().is_empty()
+                    && detail.len() <= MAX_DETAIL_BYTES
+                    && !detail
+                        .chars()
+                        .any(|c| c.is_control() || super::framing::is_format(c))
+            }
+            Self::Done { result } => result.valid(),
+        }
+    }
 }
 
 impl Request {
@@ -302,6 +366,9 @@ impl Request {
             | Self::ReplyQuery { id, .. }
             | Self::Cancel { id, .. }
             | Self::Complete { id, .. }
+            | Self::WorkInterrupt { id, .. }
+            | Self::WorkResolve { id, .. }
+            | Self::AlertList { id, .. }
             | Self::Publish { id, .. }
             | Self::MessageQuery { id, .. } => id,
         }
@@ -318,6 +385,9 @@ impl Request {
             | Self::ReplyQuery { host, .. }
             | Self::Cancel { host, .. }
             | Self::Complete { host, .. }
+            | Self::WorkInterrupt { host, .. }
+            | Self::WorkResolve { host, .. }
+            | Self::AlertList { host, .. }
             | Self::Publish { host, .. }
             | Self::MessageQuery { host, .. } => host,
         }
@@ -339,6 +409,10 @@ impl Request {
             super::messages::FEATURE
         } else if matches!(self, Self::ReplyQuery { .. }) {
             REPLY_FEATURE
+        } else if matches!(self, Self::WorkInterrupt { .. } | Self::WorkResolve { .. }) {
+            DELEGATED_FEATURE
+        } else if matches!(self, Self::AlertList { .. }) {
+            ALERTS_FEATURE
         } else {
             WORK_FEATURE
         }
@@ -405,11 +479,18 @@ impl Request {
                 }
                 Self::WorkQuery { task_id, .. }
                 | Self::ReplyQuery { task_id, .. }
-                | Self::Cancel { task_id, .. } => is_uuid_v4(task_id),
+                | Self::Cancel { task_id, .. }
+                | Self::WorkInterrupt { task_id, .. } => is_uuid_v4(task_id),
+                Self::WorkResolve {
+                    task_id,
+                    resolution,
+                    ..
+                } => is_uuid_v4(task_id) && resolution.valid(),
                 Self::Complete {
                     task_id, result, ..
                 } => is_uuid_v4(task_id) && result.valid(),
                 Self::Profiles { .. } => true,
+                Self::AlertList { after, .. } => after.as_deref().is_none_or(is_uuid_v4),
                 Self::Publish { host, message, .. } => {
                     message.valid() && message.recipients.iter().any(|r| &r.host == host)
                 }
@@ -482,19 +563,70 @@ impl WorkState {
 #[serde(deny_unknown_fields)]
 pub struct WorkStatus {
     pub task_id: String,
+    /// The session-v1 `request_id` of the prompt: the current attempt's own
+    /// id behind `host.delegated` (each dispatch is an attempt, I.6.4),
+    /// the one id fixed at enqueue otherwise. Opaque to a client, which
+    /// compares it with nothing.
     pub receipt_id: String,
     pub state: WorkState,
     pub detail: String,
     pub result: Option<ContextSnapshot>,
+    /// Who resolved the task and when, once `work_resolve` (or the host's
+    /// own `atem task resolve`) has; omitted until then, never `null`
+    /// (`host.delegated`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub resolved: Option<Resolved>,
 }
 
 impl WorkStatus {
     pub fn valid(&self) -> bool {
         is_uuid_v4(&self.task_id)
             && is_uuid_v4(&self.receipt_id)
-            && self.detail.len() <= 1024
+            && self.detail.len() <= MAX_DETAIL_BYTES
             && self.result.as_ref().is_none_or(ContextSnapshot::valid)
             && (self.state == WorkState::Completed) == self.result.is_some()
+            // A resolution settles the task for good: `failed`, or
+            // `completed` with the resolver's result.
+            && self.resolved.as_ref().is_none_or(|resolved| {
+                resolved.valid() && matches!(self.state, WorkState::Completed | WorkState::Failed)
+            })
+    }
+}
+
+/// An optional field that is omitted when absent: `null` is no value
+/// (strict I-JSON, "absent fields are omitted").
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// `resolved{by, at}`: the principal that resolved a task and the host's
+/// wall clock then, Unix ms. `by` is `member:<id>` or `service:<id>` (an id
+/// of 1-128 bytes, as a message's sender is): the task's delegated sender or
+/// the owner, or `local` for the host's own command. Only a delegated task
+/// is resolved, so a browser grant, whose tasks keep v1, never
+/// is one; a host sender (`host:`) has no `work_resolve` (design I.4.5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Resolved {
+    pub by: String,
+    pub at: u64,
+}
+
+impl Resolved {
+    pub fn valid(&self) -> bool {
+        (self.by == "local"
+            || ["member:", "service:"]
+                .iter()
+                .any(|prefix| self.by.strip_prefix(prefix).is_some_and(is_opaque_id)))
+            && self.at <= MAX_SAFE_INTEGER
     }
 }
 
@@ -589,6 +721,13 @@ pub enum ResultBody {
     Message {
         message: super::messages::MessageReceipt,
     },
+    /// The host's alerts, oldest first (`host.alerts`, I.4.6): at most
+    /// [`alerts::MAX_PAGE`]; `more` when others follow (and then the page
+    /// isn't empty, so its last alert is the next request's `after`).
+    Alerts {
+        alerts: Vec<Alert>,
+        more: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,6 +779,16 @@ impl Response {
             ResultBody::Work { work } => work.valid(),
             ResultBody::Reply { reply } => reply.as_ref().is_none_or(ResultReply::valid),
             ResultBody::Message { message } => message.valid(),
+            // Every alert is this host's own, in the host's order; a page
+            // that goes on has a last alert to go on from.
+            ResultBody::Alerts { alerts, more } => {
+                alerts.len() <= alerts::MAX_PAGE
+                    && alerts
+                        .iter()
+                        .all(|a| a.valid() && a.host_id == r.host.atem_device_id)
+                    && alerts::in_order(alerts)
+                    && (!*more || !alerts.is_empty())
+            }
         };
         if !valid {
             return Err("invalid host work result");
@@ -692,6 +841,34 @@ impl Response {
                     task_id, result, ..
                 },
             ) => &work.task_id == task_id && work.result.as_ref() == Some(result),
+            // `work_interrupt`: the task's status as it is, `not running`
+            // and unchanged included.
+            (ResultBody::Work { work }, Request::WorkInterrupt { task_id, .. }) => {
+                &work.task_id == task_id
+            }
+            // `work_resolve`: the task as resolved, settled the way it asked.
+            (
+                ResultBody::Work { work },
+                Request::WorkResolve {
+                    task_id,
+                    resolution,
+                    ..
+                },
+            ) => {
+                &work.task_id == task_id
+                    && work.resolved.is_some()
+                    && match resolution {
+                        Resolution::Failed { .. } => work.state == WorkState::Failed,
+                        Resolution::Done { result } => {
+                            work.state == WorkState::Completed
+                                && work.result.as_ref() == Some(result)
+                        }
+                    }
+            }
+            // `alert_list`: a page that never repeats the cursor it follows.
+            (ResultBody::Alerts { alerts, .. }, Request::AlertList { after, .. }) => after
+                .as_ref()
+                .is_none_or(|after| alerts.iter().all(|a| &a.alert_id != after)),
             _ => false,
         }
     }
@@ -721,7 +898,55 @@ mod tests {
             "../../../../designs/protocol/fixtures/host-work/requests-v1.json"
         ))
         .unwrap();
-        for case in fixtures["cases"].as_array().unwrap() {
+        // The delegated ops' vectors are among them (valid and invalid).
+        let cases = fixtures["cases"].as_array().unwrap();
+        for (op, kind) in [
+            ("work_interrupt", None),
+            ("work_resolve", Some("failed")),
+            ("work_resolve", Some("done")),
+        ] {
+            for valid in [true, false] {
+                assert!(
+                    cases.iter().any(|c| {
+                        let data = &c["message"]["data"];
+                        c["valid"] == valid
+                            && data["op"] == op
+                            && kind.is_none_or(|k| data["resolution"]["kind"] == k || !valid)
+                    }),
+                    "{op} {kind:?} valid={valid}"
+                );
+            }
+        }
+        // `alert_list` (`host.alerts`, I.4.6): the first page and a page after
+        // a cursor, and what a host refuses.
+        // A failed resolution's detail: kept as given, never blank, no Cf.
+        for (name, valid) in [
+            ("work_resolve_failed_detail_not_blank", false),
+            ("work_resolve_failed_detail_without_cf", false),
+            ("work_resolve_failed_detail_kept_as_given", true),
+        ] {
+            assert!(
+                cases
+                    .iter()
+                    .any(|c| c["name"] == name && c["valid"] == valid),
+                "{name}"
+            );
+        }
+        for (name, valid) in [
+            ("alert_list_first_page", true),
+            ("alert_list_after", true),
+            ("alert_list_after_must_be_uuid_v4", false),
+            ("alert_list_after_null", false),
+            ("alert_list_unknown_field", false),
+        ] {
+            assert!(
+                cases
+                    .iter()
+                    .any(|c| c["name"] == name && c["valid"] == valid),
+                "{name}"
+            );
+        }
+        for case in cases {
             let raw = case
                 .get("raw")
                 .and_then(Value::as_str)
@@ -755,6 +980,55 @@ mod tests {
             cases
                 .iter()
                 .any(|c| c["result"]["result"]["reply"]["dropped"] == true)
+        );
+        // A `resolved` that is `null` is refused, as the resolvers that
+        // aren't principals.
+        for name in [
+            "work_resolved_null",
+            "work_resolved_by_a_bare_id",
+            "work_resolved_not_by_a_browser_grant",
+        ] {
+            assert!(
+                cases
+                    .iter()
+                    .any(|c| c["name"] == name && c["valid"] == false),
+                "{name}"
+            );
+        }
+        // Alerts results (`alert_list`): a page, the senders an alert may
+        // name, and every strictness rule.
+        for (name, valid) in [
+            ("alerts_empty", true),
+            ("alerts_page", true),
+            ("alerts_senders", true),
+            ("alerts_more_needs_an_alert", false),
+            ("alert_kind_is_outcome_unknown", false),
+            ("alerts_in_order", false),
+            ("alert_is_this_hosts", false),
+            // Only a delegated sender's UUID v4 task.
+            ("alert_sender_not_local", false),
+            ("alert_sender_not_a_browser_grant", false),
+            ("alert_task_id_is_uuid_v4", false),
+            // The host's order, by its sequence number.
+            ("alerts_by_seq_not_time", true),
+            ("alerts_by_seq_even_when_time_ascends", false),
+            ("alert_seq_from_one", false),
+            ("alert_needs_a_seq", false),
+            // No Cf character in a reason.
+            ("alert_reason_without_cf", false),
+        ] {
+            assert!(
+                cases
+                    .iter()
+                    .any(|c| c["name"] == name && c["valid"] == valid),
+                "{name}"
+            );
+        }
+        // Work results too: a task's current attempt and a resolved task.
+        assert!(
+            cases.iter().any(
+                |c| c["valid"] == true && c["result"]["result"]["work"]["resolved"].is_object()
+            )
         );
         for case in cases {
             assert_eq!(
@@ -1092,5 +1366,584 @@ mod tests {
             !context.valid_local(&host),
             "prompt and context share the 32 KiB bound"
         );
+    }
+
+    // ── `work_interrupt` and `work_resolve` (`host.delegated`, I.4.5) ──
+
+    fn work_interrupt() -> Request {
+        Request::WorkInterrupt {
+            v: 1,
+            id: super::super::new_id(),
+            host: reply_host(),
+            task_id: super::super::new_id(),
+        }
+    }
+
+    fn work_resolve(resolution: Resolution) -> Request {
+        Request::WorkResolve {
+            v: 1,
+            id: super::super::new_id(),
+            host: reply_host(),
+            task_id: super::super::new_id(),
+            resolution,
+        }
+    }
+
+    fn done_snapshot() -> ContextSnapshot {
+        ContextSnapshot {
+            kind: ContextKind::Vault,
+            id: "v-notes:entry".into(),
+            version: 3,
+            digest: digest(b"the notes"),
+            text: "the notes".into(),
+        }
+    }
+
+    fn failed(detail: &str) -> Resolution {
+        Resolution::Failed {
+            detail: detail.into(),
+        }
+    }
+
+    fn work_status(task_id: &str, state: WorkState) -> WorkStatus {
+        WorkStatus {
+            task_id: task_id.into(),
+            receipt_id: super::super::new_id(),
+            state,
+            detail: "d".into(),
+            result: None,
+            resolved: None,
+        }
+    }
+
+    fn work_answer(request: &Request, work: WorkStatus) -> Result<Response, &'static str> {
+        let json = result(
+            &super::super::new_id(),
+            request.id(),
+            request.host(),
+            &super::super::new_id(),
+            "channel",
+            ResultBody::Work { work },
+        );
+        Response::from_data(&json["data"])
+    }
+
+    fn task_of(request: &Request) -> String {
+        match request {
+            Request::WorkInterrupt { task_id, .. } | Request::WorkResolve { task_id, .. } => {
+                task_id.clone()
+            }
+            _ => panic!("not a delegated op"),
+        }
+    }
+
+    /// Both ops are `host.delegated`'s, whatever else a request is.
+    #[test]
+    fn feature_is_host_delegated() {
+        assert_eq!(DELEGATED_FEATURE, "host.delegated");
+        for request in [work_interrupt(), work_resolve(failed("agent exited"))] {
+            assert_eq!(request.feature(), DELEGATED_FEATURE);
+            assert!(!request.is_launch());
+        }
+        // The feature of every older op is as it was.
+        let host = reply_host();
+        let task_id = super::super::new_id();
+        let id = super::super::new_id();
+        let work = |op: &str| {
+            Request::from_data(&json!({
+                "v": 1, "id": id, "host": host, "op": op, "task_id": task_id,
+            }))
+            .unwrap()
+        };
+        assert_eq!(work("work_query").feature(), WORK_FEATURE);
+        assert_eq!(work("work_cancel").feature(), WORK_FEATURE);
+        assert_eq!(work("reply_query").feature(), REPLY_FEATURE);
+    }
+
+    /// The two requests have exactly the fields below, and a result that
+    /// answers them is the task's status, `resolved` once it is resolved.
+    #[test]
+    fn work_interrupt_and_resolve_round_trip() {
+        let interrupt = work_interrupt();
+        let data = interrupt.to_json()["data"].clone();
+        assert_eq!(data["op"], "work_interrupt");
+        assert_eq!(
+            data,
+            json!({
+                "v": 1, "id": interrupt.id(), "host": reply_host(),
+                "op": "work_interrupt", "task_id": task_of(&interrupt),
+            })
+        );
+        assert_eq!(Request::from_data(&data), Ok(interrupt.clone()));
+        assert_eq!(
+            Request::decode(interrupt.to_json().to_string().as_bytes()),
+            Ok(interrupt.clone())
+        );
+
+        let resolutions = [
+            (
+                failed("agent exited"),
+                json!({"kind":"failed","detail":"agent exited"}),
+            ),
+            (
+                Resolution::Done {
+                    result: done_snapshot(),
+                },
+                json!({"kind":"done","result":done_snapshot()}),
+            ),
+        ];
+        for (resolution, wire) in resolutions {
+            let resolve = work_resolve(resolution.clone());
+            let data = resolve.to_json()["data"].clone();
+            assert_eq!(data["op"], "work_resolve");
+            assert_eq!(data["resolution"], wire);
+            assert_eq!(Request::from_data(&data), Ok(resolve.clone()));
+            assert_eq!(
+                Request::decode(resolve.to_json().to_string().as_bytes()),
+                Ok(resolve)
+            );
+        }
+
+        // `work_interrupt` is answered by the task's status, whatever it is
+        // (`not running` leaves it unchanged), and by no other task's.
+        let task = task_of(&interrupt);
+        for state in [
+            WorkState::Submitted,
+            WorkState::AwaitingResult,
+            WorkState::Queued,
+        ] {
+            let answer = work_answer(&interrupt, work_status(&task, state)).unwrap();
+            assert!(answer.answers(&interrupt), "{state:?}");
+            // It is the same wire as a query's (no `resolved` unless resolved).
+            let wire = serde_json::to_value(&answer.result).unwrap();
+            assert!(wire["work"].get("resolved").is_none(), "{wire}");
+        }
+        let other = work_answer(
+            &interrupt,
+            work_status(&super::super::new_id(), WorkState::Submitted),
+        )
+        .unwrap();
+        assert!(!other.answers(&interrupt));
+
+        // `work_resolve{done}`: the task is `completed` with that result,
+        // and the resolver and the time are recorded.
+        let resolve = work_resolve(Resolution::Done {
+            result: done_snapshot(),
+        });
+        let task = task_of(&resolve);
+        let resolved = |by: &str| {
+            Some(Resolved {
+                by: by.into(),
+                at: 1_793_620_800_000,
+            })
+        };
+        let mut done = work_status(&task, WorkState::Completed);
+        done.result = Some(done_snapshot());
+        done.resolved = resolved("member:dev-phone");
+        let answer = work_answer(&resolve, done.clone()).unwrap();
+        assert!(answer.answers(&resolve));
+        let wire = serde_json::to_value(&answer.result).unwrap();
+        assert_eq!(
+            wire["work"]["resolved"],
+            json!({"by": "member:dev-phone", "at": 1_793_620_800_000u64})
+        );
+        assert_eq!(
+            serde_json::from_value::<ResultBody>(wire).unwrap(),
+            answer.result
+        );
+        // Not the result it asked for, not resolved, or another task's.
+        let mut other_result = done.clone();
+        other_result.result.as_mut().unwrap().version = 4;
+        assert!(
+            !work_answer(&resolve, other_result)
+                .unwrap()
+                .answers(&resolve)
+        );
+        let mut unresolved = done.clone();
+        unresolved.resolved = None;
+        assert!(!work_answer(&resolve, unresolved).unwrap().answers(&resolve));
+        let mut failed_status = work_status(&task, WorkState::Failed);
+        failed_status.resolved = resolved("local");
+        assert!(
+            !work_answer(&resolve, failed_status)
+                .unwrap()
+                .answers(&resolve)
+        );
+        let mut elsewhere = done;
+        elsewhere.task_id = super::super::new_id();
+        assert!(!work_answer(&resolve, elsewhere).unwrap().answers(&resolve));
+
+        // `work_resolve{failed}`: the task is `failed`, resolved.
+        let resolve = work_resolve(failed("agent exited"));
+        let task = task_of(&resolve);
+        let mut status = work_status(&task, WorkState::Failed);
+        status.detail = "agent exited".into();
+        status.resolved = resolved("service:svc-bot");
+        assert!(
+            work_answer(&resolve, status.clone())
+                .unwrap()
+                .answers(&resolve)
+        );
+        status.state = WorkState::Completed;
+        status.result = Some(done_snapshot());
+        assert!(!work_answer(&resolve, status).unwrap().answers(&resolve));
+        // Neither op is answered by a reply, a launch or a message.
+        let reply = reply_answer(&resolve, None);
+        assert!(!reply.answers(&resolve));
+        assert!(!reply.answers(&interrupt));
+    }
+
+    /// `receipt_id` is the current attempt's id (I.6.4): two statuses of one
+    /// task with other ids are both valid, and each answers the same query.
+    #[test]
+    fn receipt_id_may_change_between_attempts() {
+        let query = Request::from_data(&json!({
+            "v": 1, "id": super::super::new_id(), "host": reply_host(),
+            "op": "work_query", "task_id": "22222222-2222-4222-8222-222222222222",
+        }))
+        .unwrap();
+        let first = work_status("22222222-2222-4222-8222-222222222222", WorkState::Queued);
+        let mut second = first.clone();
+        second.receipt_id = super::super::new_id();
+        assert_ne!(first.receipt_id, second.receipt_id);
+        for work in [first, second] {
+            assert!(work_answer(&query, work).unwrap().answers(&query));
+        }
+        let mut bad = work_status("22222222-2222-4222-8222-222222222222", WorkState::Queued);
+        bad.receipt_id = "not-a-uuid".into();
+        assert!(work_answer(&query, bad).is_err());
+    }
+
+    /// A resolution is `failed{detail}` or `done{result}`, nothing else, and
+    /// every bound of the fields it carries holds.
+    #[test]
+    fn resolution_forms_strict() {
+        let resolve = work_resolve(failed("agent exited"));
+        let base = resolve.to_json()["data"].clone();
+        let with = |resolution: Value| {
+            let mut data = base.clone();
+            data["resolution"] = resolution;
+            Request::from_data(&data)
+        };
+        let snapshot = json!(done_snapshot());
+        // The two valid forms, at their bounds.
+        assert!(with(json!({"kind":"failed","detail":"x"})).is_ok());
+        assert!(with(json!({"kind":"failed","detail":"x".repeat(1024)})).is_ok());
+        assert!(with(json!({"kind":"done","result":snapshot})).is_ok());
+        let mut tabs = snapshot.clone();
+        tabs["text"] = json!("a\tb\nc");
+        tabs["digest"] = json!(digest(b"a\tb\nc"));
+        assert!(with(json!({"kind":"done","result":tabs})).is_ok());
+
+        let mut bad_digest = snapshot.clone();
+        bad_digest["digest"] = json!(digest(b"other"));
+        let mut version_zero = snapshot.clone();
+        version_zero["version"] = json!(0);
+        let mut local_kind = snapshot.clone();
+        local_kind["kind"] = json!("result");
+        let mut extra_field = snapshot.clone();
+        extra_field["extra"] = json!(1);
+        // As `work_complete`'s result: a NUL is refused, nothing else of the
+        // text is (a snapshot's text is the publisher's).
+        let mut nul = snapshot.clone();
+        nul["text"] = json!("a\0b");
+        nul["digest"] = json!(digest("a\0b".as_bytes()));
+        let invalid: Vec<(&str, Value)> = vec![
+            ("no kind", json!({"detail":"x"})),
+            ("unknown kind", json!({"kind":"unknown","detail":"x"})),
+            (
+                "another kind",
+                json!({"kind":"completed","result":snapshot}),
+            ),
+            ("kind is a case off", json!({"kind":"Failed","detail":"x"})),
+            ("failed without detail", json!({"kind":"failed"})),
+            (
+                "failed with a null detail",
+                json!({"kind":"failed","detail":null}),
+            ),
+            (
+                "failed with an empty detail",
+                json!({"kind":"failed","detail":""}),
+            ),
+            (
+                "failed detail too long",
+                json!({"kind":"failed","detail":"x".repeat(1025)}),
+            ),
+            (
+                "failed detail with a control character",
+                json!({"kind":"failed","detail":"bell \u{7}"}),
+            ),
+            (
+                "failed detail with a NUL",
+                json!({"kind":"failed","detail":"a\0b"}),
+            ),
+            (
+                "failed detail is a number",
+                json!({"kind":"failed","detail":1}),
+            ),
+            (
+                "failed with a result",
+                json!({"kind":"failed","detail":"x","result":snapshot}),
+            ),
+            (
+                "failed with an unknown field",
+                json!({"kind":"failed","detail":"x","by":"owner"}),
+            ),
+            ("done without a result", json!({"kind":"done"})),
+            (
+                "done with a null result",
+                json!({"kind":"done","result":null}),
+            ),
+            (
+                "done with a detail",
+                json!({"kind":"done","result":snapshot,"detail":"x"}),
+            ),
+            (
+                "done with an unknown field",
+                json!({"kind":"done","result":snapshot,"extra":1}),
+            ),
+            (
+                "done digest mismatch",
+                json!({"kind":"done","result":bad_digest}),
+            ),
+            (
+                "done version zero",
+                json!({"kind":"done","result":version_zero}),
+            ),
+            (
+                "done with a local-only kind",
+                json!({"kind":"done","result":local_kind}),
+            ),
+            (
+                "done snapshot with an unknown field",
+                json!({"kind":"done","result":extra_field}),
+            ),
+            (
+                "done snapshot with a NUL",
+                json!({"kind":"done","result":nul}),
+            ),
+            ("a string", json!("failed")),
+            ("an array", json!([{"kind":"failed","detail":"x"}])),
+            ("null", Value::Null),
+            ("an empty object", json!({})),
+        ];
+        for (name, resolution) in invalid {
+            assert!(with(resolution).is_err(), "{name}");
+        }
+        // The request's own fields: a resolution, a UUID v4 task id, no more.
+        let mut missing = base.clone();
+        missing.as_object_mut().unwrap().remove("resolution");
+        assert!(Request::from_data(&missing).is_err());
+        let mut no_task = base.clone();
+        no_task.as_object_mut().unwrap().remove("task_id");
+        assert!(Request::from_data(&no_task).is_err());
+        for task_id in ["6ba7b810-9dad-51d1-80b4-00c04fd430c8", "not a uuid"] {
+            let mut bad = base.clone();
+            bad["task_id"] = json!(task_id);
+            assert!(Request::from_data(&bad).is_err(), "{task_id}");
+        }
+        let mut extra = base.clone();
+        extra["extra"] = json!(1);
+        assert!(Request::from_data(&extra).is_err());
+        // The interrupt has no resolution and no other field.
+        let mut interrupt = work_interrupt().to_json()["data"].clone();
+        assert!(Request::from_data(&interrupt).is_ok());
+        interrupt["resolution"] = json!({"kind":"failed","detail":"x"});
+        assert!(Request::from_data(&interrupt).is_err());
+    }
+
+    /// A `failed` resolution's `detail` is kept exactly as given (the client
+    /// doesn't compare it), but it says something: one that is blank after
+    /// trimming white space, or that carries a Cf character (bidi controls,
+    /// zero-width characters: the framing module's rule), is refused.
+    #[test]
+    fn failed_detail_is_not_blank_and_has_no_cf_character() {
+        let data = |detail: &str| {
+            let mut data = work_resolve(failed("x")).to_json()["data"].clone();
+            data["resolution"]["detail"] = json!(detail);
+            data
+        };
+        for good in [
+            "agent exited",
+            "  agent exited ",
+            "the owner checked: nothing ran",
+            "é ü 中文",
+        ] {
+            assert!(Request::from_data(&data(good)).is_ok(), "{good:?}");
+        }
+        for bad in [
+            "",
+            " ",
+            "   ",
+            "\u{3000}",
+            "a\u{200B}b",
+            "\u{202E}detail",
+            "x\u{2066}y",
+            "\u{FEFF}x",
+            "a\nb",
+        ] {
+            assert!(Request::from_data(&data(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    /// `resolved{by, at}` is the resolver and the time, on a settled task
+    /// only; a status without it is as it was.
+    #[test]
+    fn resolved_is_the_resolver_and_the_time_of_a_settled_task() {
+        let task = super::super::new_id();
+        let query = Request::WorkQuery {
+            v: 1,
+            id: super::super::new_id(),
+            host: reply_host(),
+            task_id: task.clone(),
+        };
+        let build = |state: WorkState, resolved: Option<Resolved>| {
+            let mut work = work_status(&task, state);
+            if state == WorkState::Completed {
+                work.result = Some(done_snapshot());
+            }
+            work.resolved = resolved;
+            work_answer(&query, work)
+        };
+        let by = |by: &str, at: u64| Some(Resolved { by: by.into(), at });
+        // The resolver is the task's delegated sender or the owner
+        // (`member:` or `service:` and an id of 1-128 bytes), or the host's
+        // own `local` command. Only a delegated task is resolved, so a
+        // browser grant never is one.
+        let long_id = "x".repeat(128);
+        for who in [
+            "member:dev-phone",
+            "service:svc-bot",
+            "local",
+            "member:x",
+            &format!("member:{long_id}"),
+            &format!("service:{long_id}"),
+            "member:a.b_c:d-e",
+        ] {
+            assert!(build(WorkState::Failed, by(who, 1)).is_ok(), "{who}");
+        }
+        assert!(
+            build(
+                WorkState::Completed,
+                by("member:dev-phone", MAX_SAFE_INTEGER)
+            )
+            .is_ok()
+        );
+        for (why, state, resolved) in [
+            ("no resolver", WorkState::Failed, by("", 1)),
+            (
+                "a resolver with a space",
+                WorkState::Failed,
+                by("member: x", 1),
+            ),
+            ("a bare id", WorkState::Failed, by("x", 1)),
+            ("a prefix and no id", WorkState::Failed, by("member:", 1)),
+            ("an unknown prefix", WorkState::Failed, by("whatever:y", 1)),
+            (
+                "a host sender (it has no work_resolve)",
+                WorkState::Failed,
+                by("host:host-a", 1),
+            ),
+            (
+                "a browser grant (its tasks keep v1 and are never resolved)",
+                WorkState::Failed,
+                by("browser:grant-1", 1),
+            ),
+            (
+                "a prefix of another case",
+                WorkState::Failed,
+                by("Member:x", 1),
+            ),
+            ("local with an id", WorkState::Failed, by("local:x", 1)),
+            (
+                "a prefix with a space",
+                WorkState::Failed,
+                by("service:a b", 1),
+            ),
+            (
+                "an id over 128 bytes",
+                WorkState::Failed,
+                by(&format!("member:{}", "x".repeat(129)), 1),
+            ),
+            (
+                "a resolver over 128 bytes, no prefix",
+                WorkState::Failed,
+                by(&"x".repeat(129), 1),
+            ),
+            (
+                "an unsafe time",
+                WorkState::Failed,
+                by("local", MAX_SAFE_INTEGER + 1),
+            ),
+            ("a queued task", WorkState::Queued, by("local", 1)),
+            ("a running task", WorkState::Submitted, by("local", 1)),
+            (
+                "an unknown outcome",
+                WorkState::OutcomeUnknown,
+                by("local", 1),
+            ),
+            ("an expired task", WorkState::Expired, by("local", 1)),
+        ] {
+            assert!(build(state, resolved).is_err(), "{why}");
+        }
+        // Unknown fields of `resolved`, or one of another type.
+        let good = serde_json::to_value(ResultBody::Work {
+            work: {
+                let mut work = work_status(&task, WorkState::Failed);
+                work.resolved = by("local", 1);
+                work
+            },
+        })
+        .unwrap();
+        for edit in [
+            |v: &mut Value| v["work"]["resolved"]["extra"] = json!(1),
+            |v: &mut Value| v["work"]["resolved"]["at"] = json!("1"),
+            |v: &mut Value| v["work"]["resolved"]["by"] = json!(null),
+            |v: &mut Value| v["work"]["resolved"] = json!("local"),
+            // Absent fields are omitted, never `null`.
+            |v: &mut Value| v["work"]["resolved"] = json!(null),
+        ] {
+            let mut bad = good.clone();
+            edit(&mut bad);
+            assert!(serde_json::from_value::<ResultBody>(bad).is_err());
+        }
+        // Omitted, the status is as before; present, it reads back.
+        let mut omitted = good.clone();
+        omitted["work"].as_object_mut().unwrap().remove("resolved");
+        let ResultBody::Work { work } = serde_json::from_value(omitted).unwrap() else {
+            panic!("work")
+        };
+        assert_eq!(work.resolved, None);
+        assert!(matches!(
+            serde_json::from_value::<ResultBody>(good).unwrap(),
+            ResultBody::Work { work } if work.resolved == by("local", 1)
+        ));
+    }
+
+    /// A status that says `"resolved": null` is no `work` result: the
+    /// host never writes it, and a reader that took it would let an SDK
+    /// drift from "omitted, never null".
+    #[test]
+    fn resolved_null_is_refused() {
+        let task = super::super::new_id();
+        let query = Request::WorkQuery {
+            v: 1,
+            id: super::super::new_id(),
+            host: reply_host(),
+            task_id: task.clone(),
+        };
+        let mut wire = result(
+            &super::super::new_id(),
+            query.id(),
+            query.host(),
+            &super::super::new_id(),
+            "channel",
+            ResultBody::Work {
+                work: work_status(&task, WorkState::Failed),
+            },
+        );
+        assert!(Response::from_data(&wire["data"]).is_ok());
+        wire["data"]["result"]["work"]["resolved"] = json!(null);
+        assert!(Response::from_data(&wire["data"]).is_err());
     }
 }

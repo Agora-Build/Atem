@@ -6,8 +6,10 @@ Recomputes and verifies, with Python's standard library and the
 values `crates/atem-client` computed for the r9 vector files: canonical
 JSON (RFC 8785 for the subset the vectors use: objects, arrays, strings,
 integers, booleans), `enc` (a 4-byte big-endian length before every field),
-hashes, key derivations, and every Ed25519 and P-256 signature (P-256 as
-64-byte r||s, low S required), a host's `enc_sig` included. It doesn't
+hashes, key derivations, every Ed25519 and P-256 signature (P-256 as
+64-byte r||s, low S required), a host's `enc_sig` included, and the push
+hints' sealed parts (RFC 9180 base mode, written here: opened, and sealed
+again from the ephemeral to the same bytes). It doesn't
 derive a verifier's verdicts: `expect` and each `reason` are checked by the
 Rust runner (`crates/atem-client/tests/vectors.rs`) and the binding suites.
 
@@ -29,7 +31,8 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, x25519
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF, HKDFExpand
 
 P256_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
 ED25519_P = 2**255 - 19
@@ -813,6 +816,330 @@ def check_host_work_control(file, data, report, context):
                     )
 
 
+# ------------------------------------------------- r9-vectors-push-hint
+
+# RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305
+# (the suite of R9.9), written from the RFC with the `cryptography` package's
+# primitives: no code of this repository.
+_KEM_SUITE = b"KEM" + (0x0020).to_bytes(2, "big")
+_SUITE = b"HPKE" + (0x0020).to_bytes(2, "big") + (0x0001).to_bytes(2, "big") + (0x0003).to_bytes(2, "big")
+
+
+def _labeled_extract(salt, label, ikm, suite):
+    return hmac.new(salt or bytes(32), b"HPKE-v1" + suite + label + ikm, hashlib.sha256).digest()
+
+
+def _labeled_expand(prk, label, info, length, suite):
+    labeled = length.to_bytes(2, "big") + b"HPKE-v1" + suite + label + info
+    return HKDFExpand(algorithm=hashes.SHA256(), length=length, info=labeled).derive(prk)
+
+
+def hpke_derive_key_pair(ikm):
+    """DeriveKeyPair for X25519: (secret, public)."""
+    prk = _labeled_extract(b"", b"dkp_prk", ikm, _KEM_SUITE)
+    secret = _labeled_expand(prk, b"sk", b"", 32, _KEM_SUITE)
+    return secret, x25519_public(secret)
+
+
+def _hpke_schedule(dh, enc_key, recipient_public, info):
+    kem_context = enc_key + recipient_public
+    eae_prk = _labeled_extract(b"", b"eae_prk", dh, _KEM_SUITE)
+    shared = _labeled_expand(eae_prk, b"shared_secret", kem_context, 32, _KEM_SUITE)
+    psk_id_hash = _labeled_extract(b"", b"psk_id_hash", b"", _SUITE)
+    info_hash = _labeled_extract(b"", b"info_hash", info, _SUITE)
+    context = b"\x00" + psk_id_hash + info_hash
+    secret = _labeled_extract(shared, b"secret", b"", _SUITE)
+    return (
+        _labeled_expand(secret, b"key", context, 32, _SUITE),
+        _labeled_expand(secret, b"base_nonce", context, 12, _SUITE),
+    )
+
+
+def hpke_seal(recipient_public, info, plaintext, ikm_e):
+    """Single-shot seal with the ephemeral DeriveKeyPair(ikm_e): (enc, ct)."""
+    secret_e, enc_key = hpke_derive_key_pair(ikm_e)
+    dh = x25519.X25519PrivateKey.from_private_bytes(secret_e).exchange(
+        x25519.X25519PublicKey.from_public_bytes(recipient_public)
+    )
+    key, nonce = _hpke_schedule(dh, enc_key, recipient_public, info)
+    return enc_key, ChaCha20Poly1305(key).encrypt(nonce, plaintext, b"")
+
+
+def hpke_open(secret, enc_key, ct, info):
+    """Single-shot open; raises InvalidTag when it doesn't open."""
+    recipient_public = x25519_public(secret)
+    dh = x25519.X25519PrivateKey.from_private_bytes(secret).exchange(
+        x25519.X25519PublicKey.from_public_bytes(enc_key)
+    )
+    key, nonce = _hpke_schedule(dh, enc_key, recipient_public, info)
+    return ChaCha20Poly1305(key).decrypt(nonce, ct, b"")
+
+
+PUSH_KEY_FIELDS = ("account_id", "genesis_hash", "host_id", "host_trust_gen")
+
+
+def push_seal_info(body):
+    """The seal `info` (R9.9) of an approval hint, or of an `outcome_unknown`
+    hint (11 fields: the kind in the place of the approval's three)."""
+    head = [
+        "atem-push-seal-v1",
+        body["account_id"],
+        unhex(body["genesis_hash"]),
+        body["host_id"],
+        u64(body["host_trust_gen"]),
+    ]
+    if body.get("kind") == "outcome_unknown":
+        middle = ["outcome_unknown", body["alert_id"]]
+    else:
+        middle = [body["approval_id"], body["session_id"], body["process_gen"]]
+    tail = [u64(body["created_at"]), u64(body["expires_at"]), body["recipient"]["device_id"], body["recipient"]["enc_kid"]]
+    return enc(head + middle + tail)
+
+
+UUID_V4 = r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+
+
+def delegated_task(facts):
+    """Only a delegated sender's task raises an alert (host-work-v1 §11.3):
+    a UUID v4 task of a `member:`, `service:` or `host:` sender (an id of
+    1-128 bytes of [A-Za-z0-9._:-])."""
+    return (
+        re.fullmatch(UUID_V4, facts["task_id"]) is not None
+        and re.fullmatch(r"(member|service|host):[A-Za-z0-9._:-]{1,128}", facts["sender"]) is not None
+    )
+
+
+def check_push_hint(file, data, report, context):
+    """Push hints (R9.9; delegated host-work I.4.6): every hint's body jcs and
+    signing input, the host's signature (by the key the chain names for it),
+    `sealed_hash`, `enc_kid`, the seal `info` from the body's fields, the
+    sealed part opened with RFC 9180 written here and sealed again from the
+    ephemeral to the same `enc` and `ct`; the resolved hint's and the seens'
+    signatures; the ack entries of the `outcome_unknown` hints and their
+    sealed facts. Verdicts and refusals are the Rust runner's and the binding
+    suites' (R9.12)."""
+    keys = context["keys"]
+    mlog = context["membership_log"]
+    entries = {v["label"]: v["entry"]["body"] for v in mlog["log"] + mlog["others"]}
+    replay = Replay([entries[label] for label in LOG_L])
+    host_alg, host_public = test_key_of(keys, "host-a")
+    named = signer_key_in(replay, "host:host-a")
+    with report.case(file, "host key") as case:
+        case.equal((named["alg"], b64u_decode(named["pub"])), (host_alg, host_public), "host-a's host_key in log L")
+        case.equal(data["verifier_now"] > 0, True, "verifier_now")
+
+    secrets = data["recipient_secrets"]
+    with report.case(file, "recipient secrets") as case:
+        for device, secret in secrets.items():
+            case.equal(x25519_public(unhex(secret)), keys.public(device, "enc"), f"{device}'s enc key")
+
+    def check_hint(name, wire, details=None, sealed_expected=True):
+        with report.case(file, name) as case:
+            case.equal(sorted(wire), ["body", "ct", "enc", "sig"] if "enc" in wire else ["body", "sig"], "wire keys")
+            body = wire["body"]
+            text = jcs(body)
+            case.check(len(text.encode()) <= MAX_BODY_BYTES, "body within 4096 bytes")
+            case.equal(body["type"], "atem-push-hint", "type")
+            signing_input = enc(["atem-push-hint-v1", text])
+            if details is not None:
+                case.equal(signing_input.hex(), details["signing_input_hex"], "signing input")
+            case.check(verify(host_alg, host_public, b64u_decode(wire["sig"]), signing_input), "host signature")
+            if "enc" not in wire:
+                return
+            enc_bytes, ct = b64u_decode(wire["enc"]), b64u_decode(wire["ct"])
+            hash_ok = sha256(enc([enc_bytes, ct])).hex() == body["sealed_hash"]
+            if sealed_expected:
+                case.check(hash_ok, "sealed_hash = SHA-256(enc([enc, ct]))")
+            else:
+                case.check(not hash_ok, "sealed_hash names another sealed part")
+            device = body["recipient"]["device_id"]
+            # (A refused case spells it in upper case: the same 8 bytes.)
+            case.equal(enc_kid(keys.public(device, "enc")), body["recipient"]["enc_kid"].lower(), f"{device}'s enc_kid")
+            if details is None or not sealed_expected:
+                return
+            info = push_seal_info(body)
+            case.equal(info.hex(), details["info_hex"], "seal info from the body's fields")
+            case.equal(sha256(enc([enc_bytes, ct])).hex(), details["sealed_hash"], "sealed_hash")
+            case.equal((enc_bytes.hex(), ct.hex()), (details["enc_hex"], details["ct_hex"]), "enc and ct")
+            plain = hpke_open(unhex(secrets[device]), enc_bytes, ct, info)
+            case.equal(plain.decode(), details["plain_jcs"], f"opens for {device} (RFC 9180, ChaCha20-Poly1305)")
+            case.equal(jcs(json.loads(plain, object_pairs_hook=_no_duplicates)), plain.decode(), "the plaintext is canonical")
+            other = "dev-mac" if device == "dev-phone" else "dev-phone"
+            try:
+                hpke_open(unhex(secrets[other]), enc_bytes, ct, info)
+                case.fail(f"{other} opened it")
+            except Exception:
+                case.check(True, f"{other} can't open it")
+            resealed = hpke_seal(keys.public(device, "enc"), info, plain, unhex(details["ikmE_hex"]))
+            case.equal(resealed, (enc_bytes, ct), "sealed again from ikmE: the same enc and ct")
+            if "ikm_label" in details:
+                case.equal(sha256(enc(["atem-r9-test-ikm", details["ikm_label"]])).hex(), details["ikmE_hex"], "ikmE from its label")
+
+    for i, (wire, details) in enumerate(zip(data["open"], data["open_details"])):
+        check_hint(f"open[{i}]", wire, details)
+    for name in ("open_g75", "open_g75001"):
+        check_hint(name, data[name], data[f"{name}_details"])
+    for i, case_ in enumerate(data["invalid"]):
+        # They carry open[0]'s sealed envelope: the same sealed_hash, as the
+        # Rust runner's reasons assume.
+        check_hint(f"invalid[{i}]", case_["hint"])
+    check_hint("resolved", data["resolved"])
+    for name, input_hex in (("seen", data["seen_signing_input_hex"]), ("seen_other_process_gen", data["seen_other_process_gen_details"]["signing_input_hex"])):
+        with report.case(file, name) as case:
+            wire = data[name]
+            signing_input = enc(["atem-seen-v1", jcs(wire["body"])])
+            case.equal(signing_input.hex(), input_hex, "signing input")
+            case.check(verify(host_alg, host_public, b64u_decode(wire["sig"]), signing_input), "host signature")
+
+    # The outcome_unknown hints.
+    hints = data["outcome_unknown"]
+    for i, (wire, details, ack) in enumerate(zip(hints, data["outcome_unknown_details"], data["outcome_unknown_acks"])):
+        check_hint(f"outcome_unknown[{i}]", wire, details)
+        with report.case(file, f"outcome_unknown[{i}] facts") as case:
+            body = wire["body"]
+            case.equal(body["kind"], "outcome_unknown", "kind")
+            case.check("state" not in body and "approval_id" not in body, "no approval state or id in the body")
+            case.check(
+                not any(k in body for k in ("task_id", "session_id", "sender", "reason")),
+                "no sealed fact in the clear",
+            )
+            case.equal(jcs(details["facts"]), details["plain_jcs"], "plain_jcs = jcs of the four facts")
+            case.equal(sorted(details["facts"]), ["reason", "sender", "session_id", "task_id"], "exactly the four facts")
+            facts = details["facts"]
+            case.check(1 <= len(facts["reason"].encode()) <= 256, "reason within 1-256 bytes")
+            case.check(delegated_task(facts), "a delegated sender's (member:, service: or host:) UUID v4 task")
+            case.check(re.fullmatch(r"ses-[a-z2-7]{12}", facts["session_id"]) is not None, "session_id")
+            case.check(re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", body["alert_id"]) is not None, "alert_id is a UUID v4")
+            case.check(0 < body["expires_at"] - body["created_at"] <= 900000, "a window of at most 15 minutes")
+            want = {"kind": "outcome_unknown", "device_id": body["recipient"]["device_id"]}
+            want.update({k: body[k] for k in PUSH_KEY_FIELDS + ("alert_id",)})
+            case.equal(ack, want, "ack entry")
+    with report.case(file, "outcome_unknown alerts") as case:
+        by_alert = {}
+        for wire in hints:
+            by_alert.setdefault(wire["body"]["alert_id"], []).append(wire["body"]["recipient"]["device_id"])
+        case.equal(sorted(map(len, by_alert.values())), [1, 2], "one alert with two recipients, one with one")
+        case.equal(len(data["outcome_unknown_invalid"]) > 0, True, "refused cases")
+    for i, case_ in enumerate(data["outcome_unknown_invalid"]):
+        wire = case_["hint"]
+        # Well-formed and host-signed (their own refusals are the Rust runner's);
+        # every one but bad_sealed carries a sealed part its sealed_hash names or
+        # the first hint's envelope.
+        check_hint(f"outcome_unknown_invalid[{i}]", wire, sealed_expected=(case_["code"] != "bad_sealed"))
+    # Well signed and well sealed, but the sealed facts aren't a delegated
+    # task's: opened here, they are exactly the stated facts, and they break
+    # the rule (the recipient's refusal is the Rust runner's and the suites').
+    for i, case_ in enumerate(data["outcome_unknown_invalid_facts"]):
+        name = f"outcome_unknown_invalid_facts[{i}]"
+        wire = case_["hint"]
+        check_hint(name, wire)
+        with report.case(file, f"{name} facts") as case:
+            body = wire["body"]
+            case.equal(case_["code"], "malformed", "refused at open as malformed")
+            case.equal(body["kind"], "outcome_unknown", "kind")
+            info = push_seal_info(body)
+            case.equal(info.hex(), case_["info_hex"], "seal info from the body's fields")
+            device = case_["device_id"]
+            case.equal(body["recipient"]["device_id"], device, "the recipient")
+            plain = hpke_open(unhex(secrets[device]), b64u_decode(wire["enc"]), b64u_decode(wire["ct"]), info)
+            case.equal(plain.decode(), jcs(case_["facts"]), "opens to exactly the stated facts")
+            case.equal(sorted(case_["facts"]), ["reason", "sender", "session_id", "task_id"], "the four facts")
+            case.check(not delegated_task(case_["facts"]), "not a delegated sender's UUID v4 task")
+
+
+def check_delegated_wire(file, data, report, context):
+    """Delegated host work's session-v1 shapes (R9.14): host_enc_key_get, its
+    host_enc_key answer, and receipts with and without provenance. Each case's
+    verdict is recomputed here from the rules as R9.14 writes them, and the
+    valid answer's enc_sig is verified with host-a's host_key of log L over
+    the enc() input built here."""
+    ID = r"[A-Za-z0-9._:-]{1,128}"
+
+    def whole(case):
+        text = case["raw"] if "raw" in case else json.dumps(case["message"])
+        try:
+            return json.loads(text, object_pairs_hook=_no_duplicates)
+        except Exception:
+            return None
+
+    def session_data(message, keys):
+        if not isinstance(message, dict) or sorted(message) != ["data", "type"] or message["type"] != "session":
+            return None
+        data_ = message["data"]
+        if not isinstance(data_, dict) or (keys is not None and sorted(data_) != sorted(keys)):
+            return None
+        return data_
+
+    def uuid4(v):
+        return isinstance(v, str) and re.fullmatch(UUID_V4, v) is not None
+
+    def b64u_len(v, n):
+        try:
+            return isinstance(v, str) and len(b64u_decode(v)) == n
+        except Exception:
+            return False
+
+    def get_ok(case):
+        data_ = session_data(whole(case), ["v", "op", "id"])
+        return data_ is not None and data_["v"] == 1 and data_["op"] == "host_enc_key_get" and uuid4(data_["id"])
+
+    def key_ok(case):
+        data_ = session_data(whole(case), ["v", "op", "id", "re", "host_id", "host_trust_gen", "enc_key", "enc_sig"])
+        if data_ is None:
+            return False
+        key = data_["enc_key"]
+        gen = data_["host_trust_gen"]
+        return (
+            data_["v"] == 1 and data_["op"] == "host_enc_key" and uuid4(data_["id"]) and uuid4(data_["re"])
+            and isinstance(data_["host_id"], str) and re.fullmatch(ID, data_["host_id"]) is not None
+            and isinstance(gen, int) and not isinstance(gen, bool) and 1 <= gen < 2**53
+            and isinstance(key, dict) and sorted(key) == ["alg", "pub"] and key["alg"] == "x25519"
+            and b64u_len(key["pub"], 32) and b64u_len(data_["enc_sig"], 64)
+        )
+
+    def receipt_ok(case):
+        data_ = session_data(whole(case), None)
+        if data_ is None or data_.get("op") != "receipt" or not uuid4(data_.get("id")):
+            return False
+        has = [k in data_ for k in ("task_id", "sender")]
+        if has == [False, False]:
+            return True
+        if has != [True, True] or data_.get("kind") != "prompt":
+            return False
+        sender = data_["sender"]
+        return (
+            uuid4(data_["task_id"])
+            and isinstance(sender, str)
+            and re.fullmatch(r"(member|service|host):" + ID, sender) is not None
+        )
+
+    for section, rule in (("host_enc_key_get", get_ok), ("host_enc_key", key_ok), ("receipt", receipt_ok)):
+        with report.case(file, section) as case:
+            cases = data[section]
+            case.check(any(c["valid"] for c in cases) and any(not c["valid"] for c in cases), "valid and refused cases")
+            for c in cases:
+                case.equal(rule(c), c["valid"], f"{c['name']}: {'valid' if c['valid'] else 'refused'} by R9.14's rules")
+
+    keys = context["keys"]
+    mlog = context["membership_log"]
+    entries = {v["label"]: v["entry"]["body"] for v in mlog["log"] + mlog["others"]}
+    replay = Replay([entries[label] for label in LOG_L])
+    named = signer_key_in(replay, "host:host-a")
+    binding = data["host_enc_key_binding"]
+    with report.case(file, "host_enc_key binding") as case:
+        case.equal(binding["genesis_hash"], context["genesis_hash"].hex(), "log L's genesis")
+        for c in data["host_enc_key"]:
+            if not c["valid"]:
+                continue
+            d = c["message"]["data"]
+            enc_pub = b64u_decode(d["enc_key"]["pub"])
+            signing_input = enc(["atem-host-enc-key-v1", binding["account_id"], unhex(binding["genesis_hash"]), d["host_id"], u64(d["host_trust_gen"]), enc_pub])
+            case.equal(signing_input.hex(), binding["enc_sig_input_hex"], f"{c['name']}: enc_sig input")
+            case.check(verify(named["alg"], b64u_decode(named["pub"]), b64u_decode(d["enc_sig"]), signing_input), f"{c['name']}: enc_sig by host-a's host_key")
+            same = [e for e in mlog["log"] + mlog["others"] if e["entry"]["body"].get("action") == "host_enc_key" and e["entry"]["body"]["enc_key"]["pub"] == d["enc_key"]["pub"]]
+            case.check(any(e["entry"]["body"]["enc_sig"] == d["enc_sig"] for e in same), f"{c['name']}: the membership log's host_enc_key pair")
+
+
 # ---------------------------------------------------------------------- main
 
 # In order: a checker may use what an earlier one recorded in `context`.
@@ -820,6 +1147,8 @@ CHECKERS = [
     ("r9-vectors-keys", check_keys),
     ("r9-vectors-membership-log", check_membership_log),
     ("r9-vectors-host-work-control", check_host_work_control),
+    ("r9-vectors-push-hint", check_push_hint),
+    ("r9-vectors-delegated-wire", check_delegated_wire),
 ]
 
 

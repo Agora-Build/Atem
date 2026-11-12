@@ -781,6 +781,7 @@ mod tests {
                 digest: host_work::digest(text.as_bytes()),
                 text,
             }),
+            resolved: None,
         };
         let progress = WorkProgress::from(&status);
         assert!(progress.valid());

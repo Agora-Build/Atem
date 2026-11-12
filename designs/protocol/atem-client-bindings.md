@@ -30,6 +30,23 @@ before emitting that event; apps still inspect errors and each result state.
 | `host.reply` | `reply_query` | [Host work](atem-host-work-v1.md#reply) |
 | `host.messages` | `message_publish`, `message_query` | [Host work](atem-host-work-v1.md#5-messages) |
 | `host.attachments` | `attachment_put` | [Host work](atem-host-work-v1.md#6-attachments-and-mark) |
+| `host.delegated` (planned; no host advertises it yet) | `work_interrupt`, `work_resolve` | [Host work §11.2](atem-host-work-v1.md#112-work_interrupt-and-work_resolve) |
+| `host.alerts` (planned; no host advertises it yet) | `alert_list` | [Host work §11.3](atem-host-work-v1.md#113-alert_list-hostalerts) |
+
+The two planned features' results are host-work results too:
+- `alert_list` answers with an `alerts` result kind, and `work_resolve` with
+  a `work` result that carries `resolved`.
+- Released readers reject both, so Atem and Astation enable these features
+  together (host-work-v1 §11.2, "Compatibility").
+
+Planned, advertised by no host yet: `host.senders`'s two session ops,
+`control_records` and `host_enc_key_get`, go through `send_json` the same way
+(session-v1 R9.8, R9.14). The core refuses them without the feature, reads them
+as the host does and tracks each request, and their answers arrive as
+`ClientEvent::Family` with `op` `control_records_result` or `host_enc_key`. A
+`host_enc_key` answer is taken only from the channel's host at its trust
+generation; its `host_id`, `host_trust_gen`, `enc_key.pub` and `enc_sig` are the
+arguments of `host_enc_key_action` (below), which a manager signs.
 
 Persist launch request IDs and immutable message/task identities before sending.
 Recover uncertain results with their query operations; a retry uses a fresh
@@ -441,10 +458,33 @@ A phone receiving a hint (APNs/FCM payload):
 2. `book.offer(hint)` on its `PushHintBook` (`accepted` → show,
    `idempotent` → already shown, `ignored_after_resolved`, or refused
    `duplicate`/`bad_sealed`); a resolved hint replaces the notification;
-3. `hint.open(provider, enc_key_id, device_id)` → `HintContent{tool,
-   summary}` (HPKE open by the provider; refused for another device or
-   `enc_key` before anything is opened). A locked device shows a generic
-   hint instead.
+3. `hint.open(provider, enc_key_id, device_id)` → `HintContent`: an
+   approval hint's `Approval{tool, summary}`, or an `outcome_unknown` hint's
+   `OutcomeUnknown{task_id, session_id, sender, reason}` (HPKE open by the
+   provider; refused for another device or `enc_key` before anything is
+   opened). Facts that aren't a delegated sender's UUID v4 task are refused
+   `malformed` at open (`r9-vectors-push-hint`'s
+   `outcome_unknown_invalid_facts`). A locked device shows a generic hint
+   instead.
+
+`verify_push_hint` takes both kinds of hint (the body's `kind`, which only
+the planned `outcome_unknown` hint of `host.alerts` has, tells them apart;
+session-v1 R9.9, host-work-v1 §11.3). `hint.state()` is `Open`, `Resolved`
+or `OutcomeUnknown{device_id, enc_kid, sealed_hash}`; `hint.approval()` and
+`hint.alert()` (an `AlertRef`: the account, genesis, host, trust generation
+and `alert_id`) each fail `malformed` for the other kind; `book.offer`,
+`ack_json`, `json`, `check_sealed`, `created_at` and `expires_at` serve both.
+An `outcome_unknown` hint has no resolved hint and no seen.
+
+**Binding API change** (for Astation's review). No host sends the new kind
+until `host.alerts` is advertised. What changes:
+- `HintContent` was a record `{tool, summary}`; it is now an enum.
+- `approval()` can now fail.
+- `HintStateInfo` gains the case `OutcomeUnknown`. That breaks every
+  exhaustive Swift `switch` and Kotlin `when` over it, which must handle the
+  new case.
+- In JS, `open()` now returns an object with a `type` tag (`"approval"` or
+  `"outcome_unknown"`), and `state()` has the `outcome_unknown` type.
 
 The relay: `verify_push_hint(…, Relay)`, its book, `push_stages(created_at,
 recipient)`, `push_send_now(…)`, `push_next_due(…)`, `push_guard(expires_at)`
@@ -867,7 +907,7 @@ jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (53 checks in JS, 55 in Kotlin and in Swift: the same 53
+- **Conformance** (55 checks in JS, 57 in Kotlin and in Swift: the same 55
   in each language, plus two in Kotlin and Swift, whose provider sees the
   signing request and so the purposes of the five device-list actions and
   of control records; over `designs/protocol/fixtures/r9-vectors-*.json`,
@@ -882,7 +922,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
   (with a CryptoKit `AppKeyProvider`).
 - **Device-list actions** (`tests/host_actions.rs`, Rust; four conformance
-  checks in JS, five in Kotlin and Swift, of the 49 and 51 above): every
+  checks in JS, five in Kotlin and Swift, of the 55 and 57 above): every
   `P*`/`EK*`/`HS*` vector of
   `r9-vectors-membership-log` through the queries (`expect`) and the
   refusals (`reason`), the builders against the vectors' `jcs` and
@@ -892,7 +932,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   action through a recording provider under its own purpose and publishing
   it (the verifier takes the entry).
 - **Control records** (`tests/control.rs`, Rust; four conformance checks
-  in JS, five in Kotlin and Swift, of the 49 and 51 above): every record of
+  in JS, five in Kotlin and Swift, of the 55 and 57 above): every record of
   `r9-vectors-host-work-control` parsed (or refused by the parse with its
   code) and verified on each of its chains as `checks` says, the builders
   reproducing it byte for byte (a software store, and the signing input

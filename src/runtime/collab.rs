@@ -1039,6 +1039,7 @@ mod tests {
                 state: atem_client::session::host_work::WorkState::Queued,
                 detail: String::new(),
                 result: None,
+                resolved: None,
             },
             task,
             turn_id: None,

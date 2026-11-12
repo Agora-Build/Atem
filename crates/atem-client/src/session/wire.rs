@@ -45,6 +45,12 @@ pub const MAX_SESSION_RULES: usize = 32;
 pub const MAX_IN_FLIGHT: usize = 64;
 /// Names in `welcome.features` (r8).
 pub const MAX_FEATURES: usize = 64;
+/// The host-local principal that submits delegated tasks' prompts
+/// (delegated host-work design I.4.2, session-v1 R9.14): a bare word like
+/// `local`, so no principal a channel admits (`member:`, `service:`,
+/// `browser:`) or a host sender (`host:`) can be it. It uses one internal
+/// attachment and is never welcomed over a link.
+pub const HOST_WORK_PRINCIPAL: &str = "host-work";
 
 // ── Representation helpers (§1) ───────────────────────────────────────────
 
@@ -325,6 +331,33 @@ pub struct Receipt {
         skip_serializing_if = "Option::is_none"
     )]
     pub result: Option<ReceiptResult>,
+    /// Provenance (session-v1 R9.14, planned): on a receipt of the
+    /// [`HOST_WORK_PRINCIPAL`]'s request only, the delegated task it
+    /// attempts (a UUID v4)…
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub task_id: Option<String>,
+    /// …and the sender that asked: `member:<id>`, `service:<id>` or
+    /// `host:<host_id>`. Both or neither, and only on a `prompt` receipt.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sender: Option<String>,
+}
+
+/// A delegated sender as a receipt names it (R9.14): a native member, a
+/// service or a host sender, an id of 1–128 bytes of `[A-Za-z0-9._:-]`.
+/// Never `local`, a browser or the host-work principal: none of them is
+/// delegated (design I.1.3).
+pub fn is_delegated_sender(sender: &str) -> bool {
+    ["member:", "service:", "host:"]
+        .iter()
+        .any(|prefix| sender.strip_prefix(prefix).is_some_and(is_opaque_id))
 }
 
 /// At most this many reply ids in a receipt's `result` (r8 §D).
@@ -881,6 +914,18 @@ impl Receipt {
         uuid(&self.request_id, "request_id")?;
         self.target.validate()?;
         detail(&self.detail)?;
+        match (&self.task_id, &self.sender) {
+            (None, None) => {}
+            (Some(task_id), Some(sender)) => {
+                check(
+                    self.kind == ReceiptKind::Prompt,
+                    "provenance on a receipt other than a prompt",
+                )?;
+                uuid(task_id, "task_id")?;
+                check(is_delegated_sender(sender), "sender")?;
+            }
+            _ => return Err("invalid provenance: task_id and sender go together".into()),
+        }
         if let Some(l) = &self.lease {
             safe(l.lease_epoch, "lease.lease_epoch")?;
             safe(l.ms_left, "lease.ms_left")?;

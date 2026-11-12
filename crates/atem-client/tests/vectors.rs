@@ -40,8 +40,8 @@ use atem_client::membership::{
 use atem_client::principal::{Authority, BrowserGrant, Need, Op, Refusal as PrincipalRefusal};
 use atem_client::provider::sign;
 use atem_client::push::{
-    self, Accepted, Hint, HintBook, HintPlain, HintState, Refusal as PushRefusal, RelayLedger,
-    Seen, Stage, Verdict, Verifier,
+    self, Accepted, AlertHint, AlertKey, AlertPlain, Hint, HintBook, HintPlain, HintState,
+    Refusal as PushRefusal, RelayLedger, Seen, Stage, Verdict, Verifier,
 };
 use atem_client::restore::restore;
 use atem_client::{Error, KeyId, KeyProvider, SignedObject, SoftwareKeys};
@@ -242,6 +242,7 @@ fn every_vectors_file_has_a_runner() {
         [
             "r9-vectors-browser-grant.json",
             "r9-vectors-channel-handshake.json",
+            "r9-vectors-delegated-wire.json",
             "r9-vectors-encoding.json",
             "r9-vectors-host-route.json",
             "r9-vectors-host-work-control.json",
@@ -2229,7 +2230,674 @@ fn push_hint() {
     }
     run.get("verifier_now");
     run.pass("verifier_now: every time rule above ran against it");
+    check_outcome_unknown(&mut run, &book);
     run.finish();
+}
+
+/// The `outcome_unknown` hints of `r9-vectors-push-hint` (delegated host-work
+/// design I.4.6, session-v1 R9.9): the same checks an open approval hint
+/// gets (signing input, host signature, the sealed part from `ikmE`, the
+/// seal `info` from the hint's fields, both verifiers, the recipient and no
+/// other opening it, the host's bytes rebuilt), the ack entries, and the
+/// refusals.
+fn check_outcome_unknown(run: &mut Run, book: &Book) {
+    let host_key = book.signer_public("host-a");
+    let secrets = run.get("recipient_secrets");
+    let now = run.get("verifier_now").as_u64().unwrap();
+    run.get("outcome_unknown_note");
+    let hints = run.get("outcome_unknown");
+    let details = run.get("outcome_unknown_details");
+    let acks = run.get("outcome_unknown_acks");
+    let log = log_l();
+    let hints = hints.as_array().unwrap();
+    assert_eq!(hints.len(), 3);
+    assert_eq!(details.as_array().unwrap().len(), hints.len());
+    assert_eq!(acks.as_array().unwrap().len(), hints.len());
+    let mut ledger = RelayLedger::new();
+    let mut first: Vec<AlertHint> = Vec::new();
+    for (i, ((hint, d), ack)) in hints
+        .iter()
+        .zip(details.as_array().unwrap())
+        .zip(acks.as_array().unwrap())
+        .enumerate()
+    {
+        let name = format!("outcome_unknown[{i}]");
+        let object = SignedObject::from_strict(&strict(hint)).unwrap();
+        assert_eq!(object.label(), SignLabel::PushHint);
+        assert_eq!(object.body()["kind"], "outcome_unknown");
+        assert_eq!(
+            hex(object.signing_input().as_bytes()),
+            s(d, "signing_input_hex")
+        );
+        object.verify(&host_key).unwrap();
+        assert_eq!(
+            sign(
+                &book.provider,
+                &book.signer("host-a"),
+                &object.signing_input()
+            )
+            .unwrap(),
+            object.sig()
+        );
+        run.pass(format!(
+            "{name}: signing input, host signature (reproduced)"
+        ));
+
+        let sealed = object.sealed().unwrap();
+        assert_eq!(hex(&sealed.enc), s(d, "enc_hex"));
+        assert_eq!(hex(&sealed.ct), s(d, "ct_hex"));
+        let device = s(d, "device_id");
+        let recipient = book.public(&format!("{device}/enc"));
+        let kid = enc_kid(&recipient).unwrap();
+        assert_eq!(kid, s(d, "enc_kid"));
+        assert_eq!(kid, s(&object.body()["recipient"], "enc_kid"));
+        let as_sealed = hpke::Sealed {
+            enc: sealed.enc.clone().try_into().unwrap(),
+            ct: sealed.ct.clone(),
+        };
+        assert_eq!(as_sealed.hash().to_hex(), s(d, "sealed_hash"));
+        assert_eq!(as_sealed.hash().to_hex(), s(object.body(), "sealed_hash"));
+        // The ephemeral is derived from a label anyone can recompute.
+        assert_eq!(
+            hex(&Sha256::digest(enc(&[
+                b"atem-r9-test-ikm",
+                s(d, "ikm_label").as_bytes()
+            ]))),
+            s(d, "ikmE_hex")
+        );
+        run.pass(format!("{name}: enc_kid, sealed_hash, ikmE from its label"));
+
+        let info = unhex(s(d, "info_hex"));
+        let secret = unhex32(s(&secrets, device));
+        let plain = hpke::open_with_secret(&secret, &sealed.enc, &sealed.ct, &info, b"").unwrap();
+        assert_eq!(std::str::from_utf8(&plain).unwrap(), s(d, "plain_jcs"));
+        assert_eq!(jcs(&d["facts"]).unwrap(), s(d, "plain_jcs"));
+        assert_eq!(
+            book.provider
+                .hpke_open(
+                    &KeyId::new(format!("{device}/enc")),
+                    &sealed.enc,
+                    &sealed.ct,
+                    &info,
+                    b""
+                )
+                .unwrap(),
+            plain
+        );
+        let resealed = hpke::seal_with_ikm(
+            recipient.as_32().unwrap(),
+            &info,
+            b"",
+            s(d, "plain_jcs").as_bytes(),
+            &unhex32(s(d, "ikmE_hex")),
+        )
+        .unwrap();
+        assert_eq!(resealed, as_sealed);
+        run.pass(format!(
+            "{name}: opens for {device}; seal from ikmE reproduces enc and ct"
+        ));
+
+        // The crate's own host side and recipient side.
+        let verified = AlertHint::verify(&object, &log, now, Verifier::Client).unwrap();
+        verified.check_sealed().unwrap();
+        assert_eq!(
+            hex(&push::alert_seal_info(
+                verified.key(),
+                verified.created_at(),
+                verified.expires_at(),
+                device,
+                &kid
+            )
+            .unwrap()),
+            s(d, "info_hex")
+        );
+        let facts = AlertPlain {
+            task_id: s(&d["facts"], "task_id").into(),
+            session_id: s(&d["facts"], "session_id").into(),
+            sender: s(&d["facts"], "sender").into(),
+            reason: s(&d["facts"], "reason").into(),
+        };
+        let key = |id: &str| KeyId::new(format!("{id}/enc"));
+        assert_eq!(
+            verified.open(&book.provider, &key(device), device).unwrap(),
+            facts
+        );
+        let other = if device == "dev-phone" {
+            "dev-mac"
+        } else {
+            "dev-phone"
+        };
+        assert!(
+            verified.open(&book.provider, &key(other), other).is_err(),
+            "another device can't open it"
+        );
+        assert!(
+            verified.open(&book.provider, &key(other), device).is_err(),
+            "another enc_key can't open it"
+        );
+        let rebuilt = push::alert_hint_with_ikm(
+            &book.provider,
+            &book.signer("host-a"),
+            verified.key(),
+            verified.created_at(),
+            verified.expires_at(),
+            device,
+            &recipient,
+            &facts,
+            &unhex32(s(d, "ikmE_hex")),
+        )
+        .unwrap();
+        assert_eq!(rebuilt, object, "the host's hint, byte for byte");
+        assert_eq!(
+            AlertHint::verify(&object, &log, now, Verifier::Relay).unwrap(),
+            verified
+        );
+        // An approval verifier never takes it.
+        assert!(matches!(
+            Hint::verify(&object, &log, now, Verifier::Client),
+            Err(PushRefusal::Malformed(_))
+        ));
+        run.pass(format!(
+            "{name}: seal info from the hint's fields; verified by client and relay; opened by {device} only; rebuilt byte for byte; no approval verifier takes it"
+        ));
+
+        // Its ack entry, and what the relay does with it.
+        let identity = verified.identity();
+        assert_eq!(identity.to_ack(), *ack, "{name}: ack entry");
+        assert_eq!(push::Identity::from_ack(ack).unwrap(), identity);
+        assert_eq!(
+            push::parse_push_ack(&push::push_ack(std::slice::from_ref(&identity))),
+            std::slice::from_ref(&identity)
+        );
+        assert_eq!(
+            ledger.receive_hint(&object, &log, now),
+            (Verdict::Accepted, Some(identity.clone())),
+            "{name}"
+        );
+        assert_eq!(
+            ledger.receive_hint(&object, &log, now + 200_000),
+            (Verdict::Idempotent, Some(identity)),
+            "{name}: a late resend of the same bytes"
+        );
+        run.pass(format!(
+            "{name}: ack entry; the relay accepts it, then idempotent"
+        ));
+        first.push(verified);
+    }
+    // One alert, two recipients: the hints share the alert's identity but
+    // never each other's.
+    assert_eq!(first[0].key(), first[1].key());
+    assert_ne!(first[0].identity(), first[1].identity());
+    assert_ne!(first[0].key(), first[2].key());
+    run.pass("outcome_unknown: alert A has a hint per recipient, alert B its own identity");
+
+    for (i, case) in run
+        .get("outcome_unknown_invalid")
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        let name = format!("outcome_unknown_invalid[{i}]");
+        let object = SignedObject::from_strict(&strict(&case["hint"])).unwrap();
+        object.verify(&host_key).unwrap();
+        run.pass(format!("{name}: well-formed and host-signed"));
+        let code = s(case, "code");
+        let client = AlertHint::verify(&object, &log, now, Verifier::Client);
+        let relay = AlertHint::verify(&object, &log, now, Verifier::Relay);
+        match code {
+            "malformed" | "binding" | "invalid_times" | "skew" => {
+                for verdict in [&client, &relay] {
+                    assert_eq!(
+                        verdict.as_ref().err().map(PushRefusal::code),
+                        Some(code),
+                        "{name}"
+                    );
+                }
+            }
+            "duplicate" => {
+                let mut book = HintBook::new();
+                assert_eq!(book.offer_alert(first[0].clone()), Ok(Accepted::Accepted));
+                let dup = client.unwrap();
+                assert_eq!(dup.check_sealed(), Ok(()), "a well-sealed envelope");
+                assert_eq!(dup.identity(), first[0].identity());
+                assert_eq!(book.offer_alert(dup), Err(PushRefusal::Duplicate));
+                let mut ledger = RelayLedger::new();
+                ledger.receive_hint(
+                    &SignedObject::from_strict(&strict(&hints[0])).unwrap(),
+                    &log,
+                    now,
+                );
+                assert_eq!(
+                    ledger.receive_hint(&object, &log, now).0,
+                    Verdict::Refused(PushRefusal::Duplicate)
+                );
+            }
+            "bad_sealed" => {
+                let swapped = client.unwrap();
+                assert_eq!(swapped.check_sealed(), Err(PushRefusal::BadSealed));
+                assert_eq!(
+                    HintBook::new().offer_alert(swapped.clone()),
+                    Err(PushRefusal::BadSealed)
+                );
+                assert!(
+                    swapped
+                        .open(&book.provider, &KeyId::new("dev-phone/enc"), "dev-phone")
+                        .is_err()
+                );
+                assert_eq!(
+                    RelayLedger::new().receive_hint(&object, &log, now).0,
+                    Verdict::Refused(PushRefusal::BadSealed)
+                );
+            }
+            other => panic!("{name}: an unexpected code {other}"),
+        }
+        run.pass(format!("{name}: refused {code}, {}", s(case, "reason")));
+    }
+    // Hints whose sealed facts aren't a delegated task's: both verifiers
+    // take them, the relay keeps them, the sealed part is the one named,
+    // and the recipient refuses each at open. A host never builds one.
+    let secrets = run.get("recipient_secrets");
+    for (i, case) in run
+        .get("outcome_unknown_invalid_facts")
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        let name = format!("outcome_unknown_invalid_facts[{i}]");
+        assert_eq!(s(case, "code"), "malformed");
+        let object = SignedObject::from_strict(&strict(&case["hint"])).unwrap();
+        object.verify(&host_key).unwrap();
+        let client = AlertHint::verify(&object, &log, now, Verifier::Client).unwrap();
+        assert_eq!(
+            AlertHint::verify(&object, &log, now, Verifier::Relay).unwrap(),
+            client
+        );
+        client.check_sealed().unwrap();
+        assert_eq!(
+            RelayLedger::new().receive_hint(&object, &log, now).0,
+            Verdict::Accepted,
+            "{name}: the relay never opens it"
+        );
+        let device = s(case, "device_id");
+        let sealed = object.sealed().unwrap();
+        let plain = hpke::open_with_secret(
+            &unhex32(s(&secrets, device)),
+            &sealed.enc,
+            &sealed.ct,
+            &unhex(s(case, "info_hex")),
+            b"",
+        )
+        .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&plain).unwrap(),
+            jcs(&case["facts"]).unwrap(),
+            "{name}: only the facts are wrong"
+        );
+        assert!(
+            matches!(
+                client.open(&book.provider, &KeyId::new(format!("{device}/enc")), device),
+                Err(Error::Malformed(_))
+            ),
+            "{name}: refused at open"
+        );
+        let facts = AlertPlain {
+            task_id: s(&case["facts"], "task_id").into(),
+            session_id: s(&case["facts"], "session_id").into(),
+            sender: s(&case["facts"], "sender").into(),
+            reason: s(&case["facts"], "reason").into(),
+        };
+        assert!(
+            push::alert_hint_with_ikm(
+                &book.provider,
+                &book.signer("host-a"),
+                client.key(),
+                client.created_at(),
+                client.expires_at(),
+                device,
+                &book.public(&format!("{device}/enc")),
+                &facts,
+                &[7u8; 32],
+            )
+            .is_err(),
+            "{name}: a host never builds it"
+        );
+        run.pass(format!(
+            "{name}: verified, kept by the relay, refused at open: {}",
+            s(case, "reason")
+        ));
+    }
+    // The key type is the one the builder makes.
+    let _: &AlertKey = first[0].key();
+}
+
+/// The `outcome_unknown` entries of `r9-vectors-push-hint` (kept apart from
+/// the file's other fields, whose bytes never move): hints for two alerts,
+/// their `details`, ack entries and refused cases. Every value comes from the
+/// crate's own builders with ephemerals derived from labels
+/// (`ikmE = SHA-256(enc(["atem-r9-test-ikm", label]))`).
+fn outcome_unknown_vectors(book: &Book) -> BTreeMap<&'static str, Value> {
+    use serde_json::json;
+    let log = log_l();
+    let now = load("r9-vectors-push-hint")["verifier_now"]
+        .as_u64()
+        .unwrap();
+    let host = book.signer("host-a");
+    let ikm = |label: &str| -> [u8; 32] {
+        Sha256::digest(enc(&[b"atem-r9-test-ikm", label.as_bytes()])).into()
+    };
+    let created_at = now + 1_000;
+    // Alert A: the common case, a service's task; alert B: the bounds (a
+    // host sender with a 128-byte id, a 256-byte reason). Only a delegated
+    // sender's UUID v4 task raises an alert: the hints whose
+    // sealed facts name another are `outcome_unknown_invalid_facts`.
+    struct Alert {
+        name: &'static str,
+        alert_id: &'static str,
+        created_at: u64,
+        expires_at: u64,
+        facts: Value,
+    }
+    let alerts = [
+        Alert {
+            name: "A",
+            alert_id: "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+            created_at,
+            expires_at: created_at + 600_000,
+            facts: json!({
+                "task_id": "c4d9e8f7-1a2b-4c3d-8e5f-6a7b8c9d0e1f",
+                "session_id": "ses-aaaaaaaaaaaa",
+                "sender": "service:svc-discord",
+                "reason": "agent exited",
+            }),
+        },
+        Alert {
+            name: "B",
+            alert_id: "7b3c8d02-4e5f-4a79-b2da-1e9f708b3c45",
+            created_at: created_at + 1_000,
+            expires_at: created_at + 1_000 + 900_000,
+            facts: json!({
+                "task_id": "0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0",
+                "session_id": "ses-bbbbbbbbbbbb",
+                "sender": format!("host:{}", "h".repeat(128)),
+                "reason": format!("write interrupted: {}", "x".repeat(256 - 19)),
+            }),
+        },
+    ];
+    assert_eq!(alerts[1].facts["reason"].as_str().unwrap().len(), 256);
+    let plain_of = |facts: &Value| AlertPlain {
+        task_id: s(facts, "task_id").into(),
+        session_id: s(facts, "session_id").into(),
+        sender: s(facts, "sender").into(),
+        reason: s(facts, "reason").into(),
+    };
+    let key_of = |a: &Alert| AlertKey::new(&log, "host-a", 1, a.alert_id);
+    let build = |a: &Alert, device: &str, label: &str| {
+        push::alert_hint_with_ikm(
+            &book.provider,
+            &host,
+            &key_of(a),
+            a.created_at,
+            a.expires_at,
+            device,
+            &book.public(&format!("{device}/enc")),
+            &plain_of(&a.facts),
+            &ikm(label),
+        )
+        .unwrap()
+    };
+    let mut hints = Vec::new();
+    let mut details = Vec::new();
+    let mut acks = Vec::new();
+    for (a, device) in [
+        (&alerts[0], "dev-phone"),
+        (&alerts[0], "dev-mac"),
+        (&alerts[1], "dev-phone"),
+    ] {
+        let label = format!("alert-{}-{device}", a.name);
+        let object = build(a, device, &label);
+        let recipient = book.public(&format!("{device}/enc"));
+        let kid = enc_kid(&recipient).unwrap();
+        let sealed = object.sealed().unwrap();
+        let sealed_hash = hpke::Sealed {
+            enc: sealed.enc.clone().try_into().unwrap(),
+            ct: sealed.ct.clone(),
+        }
+        .hash()
+        .to_hex();
+        let info =
+            push::alert_seal_info(&key_of(a), a.created_at, a.expires_at, device, &kid).unwrap();
+        hints.push(object.to_json());
+        details.push(json!({
+            "alert": a.name,
+            "ct_hex": hex(&sealed.ct),
+            "device_id": device,
+            "enc_hex": hex(&sealed.enc),
+            "enc_kid": kid,
+            "facts": a.facts,
+            "ikmE_hex": hex(&ikm(&label)),
+            "ikm_label": label,
+            "info_hex": hex(&info),
+            "plain_jcs": jcs(&a.facts).unwrap(),
+            "sealed_hash": sealed_hash,
+            "signing_input_hex": hex(object.signing_input().as_bytes()),
+        }));
+        acks.push(
+            push::Identity::Alert {
+                key: key_of(a),
+                device_id: device.into(),
+            }
+            .to_ack(),
+        );
+    }
+
+    // The refused cases: re-signed bodies carrying the first hint's sealed
+    // envelope (so only their stated reason refuses them), as the approval
+    // file's `invalid` do.
+    let first = SignedObject::from_strict(&strict(&hints[0])).unwrap();
+    let envelope = first.sealed().unwrap().clone();
+    let resigned = |edit: &dyn Fn(&mut Value)| {
+        let mut body = first.body().clone();
+        edit(&mut body);
+        SignedObject::sign(&book.provider, &host, body)
+            .unwrap()
+            .with_sealed(envelope.clone())
+            .to_json()
+    };
+    let mut invalid = Vec::new();
+    let mut case = |hint: Value, code: &str, reason: &str| {
+        invalid.push(json!({"code": code, "hint": hint, "reason": reason}));
+    };
+    case(
+        resigned(&|b| b["task_id"] = json!(s(&alerts[0].facts, "task_id"))),
+        "malformed",
+        "the task id beside the identity: only the sealed part names the task, session, sender and reason",
+    );
+    case(
+        resigned(&|b| b["kind"] = json!("expired")),
+        "malformed",
+        "kind `expired`: the one kind is `outcome_unknown`",
+    );
+    case(
+        resigned(&|b| b["state"] = json!("open")),
+        "malformed",
+        "an approval's `state` beside the kind",
+    );
+    case(
+        resigned(&|b| {
+            b.as_object_mut().unwrap().remove("alert_id");
+            b["approval_id"] = json!(alerts[0].alert_id);
+        }),
+        "malformed",
+        "an approval's `approval_id` where the alert's `alert_id` belongs",
+    );
+    case(
+        resigned(&|b| {
+            b["recipient"]["enc_kid"] = json!(s(&b["recipient"], "enc_kid").to_uppercase())
+        }),
+        "malformed",
+        "recipient.enc_kid in upper case",
+    );
+    case(
+        resigned(&|b| b["host_trust_gen"] = json!(2)),
+        "binding",
+        "host_trust_gen 2: not the host's newest add_host generation",
+    );
+    case(
+        resigned(&|b| b["expires_at"] = json!(alerts[0].created_at)),
+        "invalid_times",
+        "expires_at <= created_at",
+    );
+    case(
+        resigned(&|b| b["expires_at"] = json!(alerts[0].created_at + 900_001)),
+        "invalid_times",
+        "a window of 900001 ms: over 15 minutes",
+    );
+    case(
+        resigned(&|b| {
+            b["created_at"] = json!(now + 600_000);
+            b["expires_at"] = json!(now + 1_200_000);
+        }),
+        "skew",
+        "created_at 600000 ms after the verifier's clock (verifier now = verifier_now): refused by a client (over 300 s) and by the relay (over 120 s)",
+    );
+    let again = build(&alerts[0], "dev-phone", "alert-A-dev-phone-again");
+    assert_ne!(again, first);
+    case(
+        again.to_json(),
+        "duplicate",
+        "the identity of outcome_unknown[0] with other bytes (another ephemeral): the first stays",
+    );
+    let mut swapped = first.to_json();
+    swapped["ct"] = hints[1]["ct"].clone();
+    case(
+        swapped,
+        "bad_sealed",
+        "outcome_unknown[0]'s body and signature with outcome_unknown[1]'s ct: not the sealed part sealed_hash names",
+    );
+
+    // Hints a host never builds: well signed and well sealed, but their
+    // sealed facts aren't a delegated sender's UUID v4 task.
+    // The relay can't tell (it never opens them); the recipient refuses each
+    // at open (`malformed`). Sealed here from the raw facts, since the
+    // crate's builder refuses them.
+    let mut invalid_facts = Vec::new();
+    for (alert_id, facts, why) in [
+        (
+            "8c4d9e13-5f60-4b8a-93eb-2f0a819c4d56",
+            json!({
+                "task_id": "6ba7b810-9dad-51d1-80b4-00c04fd430c8",
+                "session_id": "ses-bbbbbbbbbbbb",
+                "sender": "local",
+                "reason": format!("write interrupted: {}", "x".repeat(256 - 19)),
+            }),
+            "a local selector's UUID v5 task, sender `local`: local tasks keep v1 (their unknown outcomes expire) and raise no alert",
+        ),
+        (
+            "9d5eaf24-6071-4c9b-a4fc-3a1b920d5e67",
+            json!({
+                "task_id": "1e2f3a4b-5c6d-4e7f-8091-a2b3c4d5e6f7",
+                "session_id": "ses-aaaaaaaaaaaa",
+                "sender": "browser:grant-1",
+                "reason": "agent exited",
+            }),
+            "a browser grant's task: browser grants keep v1 and raise no alert",
+        ),
+    ] {
+        let device = "dev-phone";
+        let template = Alert {
+            name: "invalid",
+            alert_id,
+            created_at,
+            expires_at: created_at + 600_000,
+            facts: alerts[0].facts.clone(),
+        };
+        let valid = build(&template, device, "unused");
+        let recipient = book.public(&format!("{device}/enc"));
+        let kid = enc_kid(&recipient).unwrap();
+        let info = push::alert_seal_info(
+            &key_of(&template),
+            template.created_at,
+            template.expires_at,
+            device,
+            &kid,
+        )
+        .unwrap();
+        let label = format!("alert-{alert_id}-{device}-facts");
+        let sealed = hpke::seal_with_ikm(
+            recipient.as_32().unwrap(),
+            &info,
+            b"",
+            jcs(&facts).unwrap().as_bytes(),
+            &ikm(&label),
+        )
+        .unwrap();
+        let mut body = valid.body().clone();
+        body["sealed_hash"] = json!(sealed.hash().to_hex());
+        let hint = SignedObject::sign(&book.provider, &host, body)
+            .unwrap()
+            .with_sealed(atem_client::signed::SealedPart {
+                enc: sealed.enc.to_vec(),
+                ct: sealed.ct.clone(),
+            });
+        invalid_facts.push(json!({
+            "code": "malformed",
+            "device_id": device,
+            "facts": facts,
+            "hint": hint.to_json(),
+            "ikm_label": label,
+            "info_hex": hex(&info),
+            "reason": why,
+        }));
+    }
+
+    BTreeMap::from([
+        ("outcome_unknown", Value::Array(hints)),
+        ("outcome_unknown_acks", Value::Array(acks)),
+        ("outcome_unknown_details", Value::Array(details)),
+        ("outcome_unknown_invalid", Value::Array(invalid)),
+        ("outcome_unknown_invalid_facts", Value::Array(invalid_facts)),
+        (
+            "outcome_unknown_note",
+            json!(
+                "Hints of kind outcome_unknown (delegated host-work I.4.6): the body's type is atem-push-hint and its label atem-push-hint-v1 like an approval hint's, told apart by `kind` (no `state`, no session_id, process_gen or approval_id; `alert_id` instead). The task, session, sender and reason are only in the sealed part, jcs of {reason, sender, session_id, task_id}. info = enc([\"atem-push-seal-v1\", account_id, genesis_hash, host_id, u64(host_trust_gen), \"outcome_unknown\", alert_id, u64(created_at), u64(expires_at), device_id, enc_kid]) (11 fields; an approval's has 12). ikmE_hex = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Entries 0 and 1 are one alert for two recipients; entry 2 is another alert at the bounds. Only a delegated sender's (member:, service: or host:) UUID v4 task raises an alert. outcome_unknown_acks are the push_ack entries, one per hint. Each outcome_unknown_invalid carries the first hint's sealed envelope (except bad_sealed's, which is the point) so only its code refuses it; the runner checks the code with both verifiers. Each outcome_unknown_invalid_facts is well signed and well sealed (both verifiers take it, and its sealed_hash names its sealed part), but its sealed facts aren't a delegated task's: the recipient refuses it at open (malformed)."
+            ),
+        ),
+    ])
+}
+
+/// Adds the `outcome_unknown` entries to `r9-vectors-push-hint`: text
+/// insertion between `open_g75_details` and `recipient_secrets`, so every
+/// other byte of the file stays (it isn't serde's own pretty form: the
+/// refused hints keep `enc` before `ct`). A file that already has them is
+/// rewritten from the old fields.
+#[test]
+#[ignore = "writes the outcome_unknown push hint vectors"]
+fn write_outcome_unknown_vectors() {
+    let path = fixtures_dir().join("r9-vectors-push-hint.json");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    let anchor = "  \"recipient_secrets\": {\n";
+    if let Some(start) = text.find("  \"outcome_unknown\": [") {
+        let end = text.find(anchor).unwrap();
+        text.replace_range(start..end, "");
+    }
+    let fields = outcome_unknown_vectors(&Book::load());
+    let pretty = serde_json::to_string_pretty(&serde_json::Map::from_iter(
+        fields.iter().map(|(k, v)| ((*k).to_owned(), v.clone())),
+    ))
+    .unwrap();
+    let lines: Vec<&str> = pretty.lines().collect();
+    let mut block = lines[1..lines.len() - 1].join("\n");
+    block.push_str(",\n");
+    let at = text.find(anchor).unwrap();
+    text.insert_str(at, &block);
+    // Valid JSON, the new fields as built, the old ones untouched.
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    for (key, value) in &fields {
+        assert_eq!(parsed[key], *value, "{key}");
+    }
+    std::fs::write(path, text).unwrap();
 }
 
 /// `r9-vectors-pairing`: every valid `verifyCommit` gives its
@@ -5278,4 +5946,395 @@ fn write_control_vectors() {
         text,
     )
     .unwrap();
+}
+
+// ------------------------------------------------- the delegated wire shapes
+//
+// `r9-vectors-delegated-wire` (session-v1 R9.14, planned): the shapes of
+// `host_enc_key_get` and its `host_enc_key` answer, and of receipts with and
+// without provenance (`task_id`, `sender`), valid and refused. Every value
+// comes from the crate's own builders; the valid answer's `enc_key` and
+// `enc_sig` are `r9-vectors-membership-log`'s first `host_enc_key` pair, so
+// its binding verifies against log L.
+
+const WIRE_ID: &str = "c1c2c3c4-0000-4000-8000-000000000001";
+const WIRE_RE: &str = "c1c2c3c4-0000-4000-8000-000000000002";
+
+fn delegated_wire_vectors(book: &Book) -> Value {
+    use atem_client::membership::{host_enc_sig_input, sign_host_enc_key};
+    use atem_client::session::r9::{HostEncKey, host_enc_key_get};
+    use atem_client::session::wire::{
+        Envelope, Op, Receipt, ReceiptKind, ReceiptState, SessionMessage, Target,
+    };
+    use serde_json::json;
+    let log = log_l();
+    let case = |name: &str, valid: bool, message: Value| json!({"name": name, "valid": valid, "message": message});
+
+    // host_enc_key_get: exactly v, op and a UUID v4 id.
+    let get = host_enc_key_get(WIRE_ID);
+    let edit = |f: &dyn Fn(&mut Value)| {
+        let mut m = get.clone();
+        f(&mut m);
+        m
+    };
+    let mut gets = vec![case("host_enc_key_get", true, get.clone())];
+    for (name, m) in [
+        (
+            "host_enc_key_get_unknown_field",
+            edit(&|m| m["data"]["extra"] = json!(1)),
+        ),
+        (
+            "host_enc_key_get_version",
+            edit(&|m| m["data"]["v"] = json!(2)),
+        ),
+        (
+            "host_enc_key_get_id_is_uuid_v4",
+            edit(&|m| m["data"]["id"] = json!("6ba7b810-9dad-51d1-80b4-00c04fd430c8")),
+        ),
+        (
+            "host_enc_key_get_id_not_null",
+            edit(&|m| m["data"]["id"] = Value::Null),
+        ),
+        (
+            "host_enc_key_get_needs_an_id",
+            edit(&|m| {
+                m["data"].as_object_mut().unwrap().remove("id");
+            }),
+        ),
+        (
+            "host_enc_key_get_is_a_session_message",
+            edit(&|m| m["type"] = json!("terminal")),
+        ),
+    ] {
+        gets.push(case(name, false, m));
+    }
+    gets.push(json!({
+        "name": "host_enc_key_get_duplicate_key",
+        "valid": false,
+        "raw": format!(r#"{{"type":"session","data":{{"v":1,"op":"host_enc_key_get","id":"{WIRE_ID}","id":"{WIRE_RE}"}}}}"#),
+    }));
+
+    // host_enc_key: the host-a key of log L, bound by host-a's host_key.
+    let enc_pub: [u8; 32] = b64u_decode("VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA")
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let genesis = log.genesis_hash();
+    let enc_sig = sign_host_enc_key(
+        &book.provider,
+        &book.signer("host-a"),
+        log.account_id(),
+        &genesis,
+        "host-a",
+        1,
+        &enc_pub,
+    )
+    .unwrap();
+    let answer = HostEncKey {
+        id: WIRE_RE.into(),
+        re: WIRE_ID.into(),
+        host_id: "host-a".into(),
+        host_trust_gen: 1,
+        enc_key: PublicKey::new(Alg::X25519, &enc_pub).unwrap(),
+        enc_sig: enc_sig.clone(),
+    }
+    .to_json();
+    let edit = |f: &dyn Fn(&mut Value)| {
+        let mut m = answer.clone();
+        f(&mut m);
+        m
+    };
+    let mut keys = vec![case("host_enc_key", true, answer.clone())];
+    for (name, m) in [
+        (
+            "host_enc_key_unknown_field",
+            edit(&|m| m["data"]["extra"] = json!(1)),
+        ),
+        (
+            "host_enc_key_needs_re",
+            edit(&|m| {
+                m["data"].as_object_mut().unwrap().remove("re");
+            }),
+        ),
+        (
+            "host_enc_key_re_not_null",
+            edit(&|m| m["data"]["re"] = Value::Null),
+        ),
+        (
+            "host_enc_key_host_id_grammar",
+            edit(&|m| m["data"]["host_id"] = json!("host a")),
+        ),
+        (
+            "host_enc_key_host_trust_gen_from_one",
+            edit(&|m| m["data"]["host_trust_gen"] = json!(0)),
+        ),
+        (
+            "host_enc_key_is_x25519",
+            edit(&|m| m["data"]["enc_key"]["alg"] = json!("ed25519")),
+        ),
+        (
+            "host_enc_key_32_bytes",
+            edit(&|m| m["data"]["enc_key"]["pub"] = json!(b64u(&enc_pub[..31]))),
+        ),
+        (
+            "host_enc_key_key_object",
+            edit(&|m| m["data"]["enc_key"]["extra"] = json!(1)),
+        ),
+        (
+            "host_enc_key_sig_64_bytes",
+            edit(&|m| m["data"]["enc_sig"] = json!(b64u(&enc_sig[..63]))),
+        ),
+        (
+            "host_enc_key_sig_base64url",
+            edit(&|m| m["data"]["enc_sig"] = json!("not base64url!")),
+        ),
+    ] {
+        keys.push(case(name, false, m));
+    }
+
+    // Receipts: provenance on a prompt receipt only, both or neither.
+    let target = Target {
+        account_id: "acct-test-1".into(),
+        atem_device_id: "host-a".into(),
+        host_trust_gen: 1,
+        session_id: "ses-aaaaaaaaaaaa".into(),
+        process_gen: "22222222-2222-4222-8222-222222222222".into(),
+    };
+    let receipt = |kind, state, task_id: Option<&str>, sender: Option<&str>| {
+        atem_client::session::wire::to_value(&Envelope::Session(SessionMessage {
+            id: WIRE_ID.into(),
+            re: None,
+            op: Op::Receipt(Receipt {
+                request_id: "44444444-4444-4444-8444-000000000001".into(),
+                target: target.clone(),
+                kind,
+                state,
+                detail: None,
+                updated_at: 1_793_620_800_000,
+                lease: None,
+                result: None,
+                task_id: task_id.map(str::to_owned),
+                sender: sender.map(str::to_owned),
+            }),
+        }))
+    };
+    const TASK: &str = "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+    let with = |sender: &str| {
+        receipt(
+            ReceiptKind::Prompt,
+            ReceiptState::Executing,
+            Some(TASK),
+            Some(sender),
+        )
+    };
+    let edit = |f: &dyn Fn(&mut Value)| {
+        let mut m = with("service:svc-1");
+        f(&mut m);
+        m
+    };
+    let mut receipts = vec![
+        case(
+            "receipt_without_provenance",
+            true,
+            receipt(ReceiptKind::Prompt, ReceiptState::Accepted, None, None),
+        ),
+        case(
+            "receipt_of_a_stop_without_provenance",
+            true,
+            receipt(ReceiptKind::Stop, ReceiptState::Completed, None, None),
+        ),
+        case("receipt_provenance_service", true, with("service:svc-1")),
+        case("receipt_provenance_member", true, with("member:dev-phone")),
+        case("receipt_provenance_host", true, with("host:host-b")),
+        case(
+            "receipt_provenance_128_byte_id",
+            true,
+            with(&format!("service:{}", "s".repeat(128))),
+        ),
+    ];
+    for (name, m) in [
+        (
+            "receipt_provenance_needs_sender",
+            edit(&|m| {
+                m["data"].as_object_mut().unwrap().remove("sender");
+            }),
+        ),
+        (
+            "receipt_provenance_needs_task_id",
+            edit(&|m| {
+                m["data"].as_object_mut().unwrap().remove("task_id");
+            }),
+        ),
+        (
+            "receipt_provenance_sender_not_null",
+            edit(&|m| m["data"]["sender"] = Value::Null),
+        ),
+        (
+            "receipt_provenance_task_id_not_null",
+            edit(&|m| m["data"]["task_id"] = Value::Null),
+        ),
+        (
+            "receipt_provenance_task_id_is_uuid_v4",
+            edit(&|m| m["data"]["task_id"] = json!("6ba7b810-9dad-51d1-80b4-00c04fd430c8")),
+        ),
+        (
+            "receipt_provenance_sender_not_local",
+            edit(&|m| m["data"]["sender"] = json!("local")),
+        ),
+        (
+            "receipt_provenance_sender_not_a_browser_grant",
+            edit(&|m| m["data"]["sender"] = json!("browser:g-1")),
+        ),
+        (
+            "receipt_provenance_sender_not_host_work",
+            edit(&|m| m["data"]["sender"] = json!("host-work")),
+        ),
+        (
+            "receipt_provenance_sender_has_an_id",
+            edit(&|m| m["data"]["sender"] = json!("service:")),
+        ),
+        (
+            "receipt_provenance_sender_id_at_most_128_bytes",
+            edit(&|m| m["data"]["sender"] = json!(format!("service:{}", "s".repeat(129)))),
+        ),
+        (
+            "receipt_provenance_only_on_a_prompt",
+            edit(&|m| m["data"]["kind"] = json!("interrupt")),
+        ),
+    ] {
+        receipts.push(case(name, false, m));
+    }
+
+    json!({
+        "name": "r9-vectors-delegated-wire",
+        "kind": "vectors",
+        "requires": "r9",
+        "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4 and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without. Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
+        "host_enc_key_binding": {
+            "account_id": log.account_id(),
+            "genesis_hash": genesis.to_hex(),
+            "host_id": "host-a",
+            "host_trust_gen": 1,
+            "enc_sig_input_hex": hex(host_enc_sig_input(log.account_id(), &genesis, "host-a", 1, &enc_pub).as_bytes()),
+        },
+        "host_enc_key_get": gets,
+        "host_enc_key": keys,
+        "receipt": receipts,
+    })
+}
+
+#[test]
+#[ignore = "writes the delegated wire shape vectors"]
+fn write_delegated_wire_vectors() {
+    let value = delegated_wire_vectors(&Book::load());
+    let mut text = serde_json::to_string_pretty(&value).unwrap();
+    text.push('\n');
+    std::fs::write(fixtures_dir().join("r9-vectors-delegated-wire.json"), text).unwrap();
+}
+
+/// `r9-vectors-delegated-wire`: each case read as the shared core reads it
+/// (valid or refused as a whole), the valid ones written back byte for
+/// byte, and the answer's binding verified against log L.
+#[test]
+fn delegated_wire() {
+    use atem_client::membership::{host_enc_sig_input, verify_host_enc_sig};
+    use atem_client::session::r9::{HostEncKeyGet, Incoming, host_enc_key_get};
+    use atem_client::session::wire::{self as swire, Envelope};
+    let mut run = Run::new("r9-vectors-delegated-wire");
+    let book = Book::load();
+    let bytes = |case: &Value| -> Vec<u8> {
+        match case.get("raw") {
+            Some(raw) => raw.as_str().unwrap().as_bytes().to_vec(),
+            None => case["message"].to_string().into_bytes(),
+        }
+    };
+    for case in run.get("host_enc_key_get").as_array().unwrap() {
+        let name = s(case, "name");
+        let read = HostEncKeyGet::decode(&bytes(case));
+        assert_eq!(read.is_ok(), case["valid"] == true, "{name}");
+        if let Ok(read) = read {
+            assert_eq!(host_enc_key_get(&read.id), case["message"], "{name}");
+        }
+        run.pass(format!(
+            "{name}: {}",
+            if case["valid"] == true {
+                "read"
+            } else {
+                "refused"
+            }
+        ));
+    }
+    let binding = run.get("host_enc_key_binding");
+    let log = log_l();
+    assert_eq!(s(&binding, "account_id"), log.account_id());
+    assert_eq!(s(&binding, "genesis_hash"), log.genesis_hash().to_hex());
+    for case in run.get("host_enc_key").as_array().unwrap() {
+        let name = s(case, "name");
+        let read = match Incoming::parse(&bytes(case)) {
+            Ok(Incoming::HostEncKey(answer)) => Some(answer),
+            _ => None,
+        };
+        assert_eq!(read.is_some(), case["valid"] == true, "{name}");
+        if let Some(answer) = read {
+            assert_eq!(answer.to_json(), case["message"], "{name}");
+            let enc_pub = answer.enc_key.as_32().unwrap();
+            assert_eq!(
+                hex(host_enc_sig_input(
+                    log.account_id(),
+                    &log.genesis_hash(),
+                    &answer.host_id,
+                    answer.host_trust_gen,
+                    enc_pub
+                )
+                .as_bytes()),
+                s(&binding, "enc_sig_input_hex"),
+                "{name}"
+            );
+            verify_host_enc_sig(
+                &book.signer_public("host-a"),
+                log.account_id(),
+                &log.genesis_hash(),
+                &answer.host_id,
+                answer.host_trust_gen,
+                enc_pub,
+                &answer.enc_sig,
+            )
+            .unwrap();
+            assert!(answer.action(false, 1).is_ok(), "{name}: drafts the entry");
+        }
+        run.pass(format!(
+            "{name}: {}",
+            if case["valid"] == true {
+                "read, binding verified"
+            } else {
+                "refused"
+            }
+        ));
+    }
+    for case in run.get("receipt").as_array().unwrap() {
+        let name = s(case, "name");
+        let read = swire::decode(&bytes(case));
+        assert_eq!(read.is_ok(), case["valid"] == true, "{name}");
+        if let Ok(Envelope::Session(message)) = read {
+            assert_eq!(
+                swire::to_value(&Envelope::Session(message)),
+                case["message"],
+                "{name}"
+            );
+        }
+        run.pass(format!(
+            "{name}: {}",
+            if case["valid"] == true {
+                "read and written back"
+            } else {
+                "refused"
+            }
+        ));
+    }
+    // The fixture is the crate's own output.
+    assert_eq!(
+        delegated_wire_vectors(&book),
+        run.file.clone(),
+        "regenerate with write_delegated_wire_vectors"
+    );
 }

@@ -258,6 +258,525 @@
     "sealed_hash": "21dc3fb00e9322acc5b9c1373f50a0cff7a97d267c0d9ad84c0af2495130bd3c",
     "signing_input_hex": "000000116174656d2d707573682d68696e742d7631000002157b226163636f756e745f6964223a22616363742d746573742d31222c22617070726f76616c5f6964223a2236633164336535662d373038312d343239332d613462352d633664376538663930613132222c22637265617465645f6174223a313739333236343030353030302c22657870697265735f6174223a313739333236343038303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a312c2270726f636573735f67656e223a2232323232323232322d323232322d343232322d383232322d323232323232323232323232222c22726563697069656e74223a7b226465766963655f6964223a226465762d70686f6e65222c22656e635f6b6964223a2230376236396533656531386431363935227d2c227365616c65645f68617368223a2232316463336662303065393332326163633562396331333733663530613063666637613937643236376330643961643834633061663234393531333062643363222c2273657373696f6e5f6964223a227365732d616161616161616161616161222c227374617465223a226f70656e222c2274797065223a226174656d2d707573682d68696e74222c2276223a317d"
   },
+  "outcome_unknown": [
+    {
+      "body": {
+        "account_id": "acct-test-1",
+        "alert_id": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+        "created_at": 1793264006000,
+        "expires_at": 1793264606000,
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-a",
+        "host_trust_gen": 1,
+        "kind": "outcome_unknown",
+        "recipient": {
+          "device_id": "dev-phone",
+          "enc_kid": "07b69e3ee18d1695"
+        },
+        "sealed_hash": "905ef3318844a2b7e2407813cd1f1dffa1080c2d0d21623b1796c9ea928dc591",
+        "type": "atem-push-hint",
+        "v": 1
+      },
+      "ct": "pMYqkzqTUqsJllscwrLR59yhY-XXQnCfuUJUKE6-waNU_QVmodlsfof5Fh914sJ-0lksZkonMTf4gWvdX2fACjF74fbBlvD5yNvCQ0_by3vtAry0Dn7r9qwLlBG9omGFnAuWLdLH9zzIHWd0EWFISGnmMIgC1y_A5Pz0U0XuukbosZYUkjbDcduhy58nwpfmiBwrJGwlCM4l",
+      "enc": "b-Btf0wG_NkTAFkinFSXwvODpfveI3773drcwpYD3iw",
+      "sig": "dr8zQSGiPE_lhqb5wUSP7dPceY1Ct8rdHfgBbcRNlBfNofiFAHM5fkw2KXOtyP_crKc0O1HSB2mV2uNZ70H7AA"
+    },
+    {
+      "body": {
+        "account_id": "acct-test-1",
+        "alert_id": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+        "created_at": 1793264006000,
+        "expires_at": 1793264606000,
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-a",
+        "host_trust_gen": 1,
+        "kind": "outcome_unknown",
+        "recipient": {
+          "device_id": "dev-mac",
+          "enc_kid": "742c1f83d7133047"
+        },
+        "sealed_hash": "1d6ef1cfbb1c1b3a1bf31dc8b0c44fc64ed29bf95039343ca7c47204eb051b90",
+        "type": "atem-push-hint",
+        "v": 1
+      },
+      "ct": "pHO8zLcaCj7FtiAthnNwFNxj3W9JMvaiKKrX1ePHKotYRiwQzZompUvC62hMBxyKYTfEK8v0n_BuAtK5tkTDR5HWTMkNbVwn-UdZvU_bcI9W-SqBmgvD_u7eAaWQdPD9nAZkzKAp_kadlrkzIdn6-n-Y89ncF185wo5IqE8OI_oMLUkPNOE4wZLRH2PJR4y_QKoKRbgHz0Wj",
+      "enc": "LkKqg1TJPN858N-an1CrRl5vaTNPq44xiK8Lr8eIOX4",
+      "sig": "Ln6E9cd8ES-Fx8T45zs6_3PP-kzDluxEDMQBVFdO-Qq_JtxBWhIceQaENzz4A6f2BLF53u_x8d6XIEPHEHJYAA"
+    },
+    {
+      "body": {
+        "account_id": "acct-test-1",
+        "alert_id": "7b3c8d02-4e5f-4a79-b2da-1e9f708b3c45",
+        "created_at": 1793264007000,
+        "expires_at": 1793264907000,
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-a",
+        "host_trust_gen": 1,
+        "kind": "outcome_unknown",
+        "recipient": {
+          "device_id": "dev-phone",
+          "enc_kid": "07b69e3ee18d1695"
+        },
+        "sealed_hash": "bc794e8b90c66e1a1626f5c248881c3bce8ee5d2da18ea71af199b9afab50420",
+        "type": "atem-push-hint",
+        "v": 1
+      },
+      "ct": "0YsdO06bUOH6Seyu0yWuvG-Bk8fDjPOE1oDalctLe-tHBlq-zkrOtF1ZbC_G_LrAr3VU-eJuaX4WmHCEpS8TOucO5xAeKxa_HTwCJZMNdOOvW4LgPvXf5w0W3VnYTqxNrU0zs8tcrHvtxh2fe9Q3GIYn4B3aiEmQo6t_lbGfx3bDhAefWUd7OOTnW7v2BAFJVA6_f0Zfz8-78fx5QSvZwaOhcpgS1FgaIgp8m-pY9Dj07tyMndd2F_2frPan6vdY7ycQ1P6fapk2Y1SL4c0NGL0a1EThNe7ZeX3i8W6C31_VcHzu3izryjiSDNiNXQuZRmn2J3Oz_PzBo2wWSQZsEVrgc39Fc2UsZ0NPBGlVinuUJPfJPMREblKjXjCNK0Ry5-TVAz98D6YXLJ1AcZS1tMHwNC6M_bncPu86_deE0ImjTJtpFE1BdARVEJKknhpnj-EGYURMQXDg3YIFWhlRvuQpk-wE0G7lfo_2toKnZ1HEUOOxhRBbsxtcHBAzqhA1wsQZBkL-7MgQx6bzaknuWmFRIBXueRrsjCbRwerpPyoCxcUdpxjusg8GN9vsreNc6MyzkC6AExmmn0zydO8lHxUigstWPDUkNKLXpapWyYzydo6QJU1QGi4PlXBcnvGrhiHQe5-k-KIeM4EWlTNz8q53GmpIxG34GoArn6gS0A",
+      "enc": "Ag8XPaikgpUCtppFLJh7ADu0RS9sTNlo05LaAv9pLS4",
+      "sig": "VQSLmJHD2xeVkikyQvLrCQTY-fKs7CYR82fZIqyKDlZH1AxBAoceoA6brsIJgzmLXKe-QwpC2_iCr6AF4tOVAQ"
+    }
+  ],
+  "outcome_unknown_acks": [
+    {
+      "account_id": "acct-test-1",
+      "alert_id": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+      "device_id": "dev-phone",
+      "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "kind": "outcome_unknown"
+    },
+    {
+      "account_id": "acct-test-1",
+      "alert_id": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+      "device_id": "dev-mac",
+      "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "kind": "outcome_unknown"
+    },
+    {
+      "account_id": "acct-test-1",
+      "alert_id": "7b3c8d02-4e5f-4a79-b2da-1e9f708b3c45",
+      "device_id": "dev-phone",
+      "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "kind": "outcome_unknown"
+    }
+  ],
+  "outcome_unknown_details": [
+    {
+      "alert": "A",
+      "ct_hex": "a4c62a933a9352ab09965b1cc2b2d1e7dca163e5d742709fb94254284ebec1a354fd0566a1d96c7e87f9161f75e2c27ed2592c664a273137f8816bdd5f67c00a317be1f6c196f0f9c8dbc2434fdbcb7bed02bcb40e7eebf6ac0b9411bda261859c0b962dd2c7f73cc81d67741161484869e6308802d72fc0e4fcf45345eeba46e8b196149236c371dba1cb9f27c297e6881c2b246c2508ce25",
+      "device_id": "dev-phone",
+      "enc_hex": "6fe06d7f4c06fcd9130059229c5497c2f383a5fbde237efbdddadcc29603de2c",
+      "enc_kid": "07b69e3ee18d1695",
+      "facts": {
+        "reason": "agent exited",
+        "sender": "service:svc-discord",
+        "session_id": "ses-aaaaaaaaaaaa",
+        "task_id": "c4d9e8f7-1a2b-4c3d-8e5f-6a7b8c9d0e1f"
+      },
+      "ikmE_hex": "17cdf8e67cb1276ee5690406ed5af82a58b1ccc5e8dd65e88aac4aa626887461",
+      "ikm_label": "alert-A-dev-phone",
+      "info_hex": "000000116174656d2d707573682d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d610000000800000000000000010000000f6f7574636f6d655f756e6b6e6f776e0000002435653261376339312d336234642d346636382d613163392d30643865366637613262333400000008000001a186dd337000000008000001a186e65b30000000096465762d70686f6e650000001030376236396533656531386431363935",
+      "plain_jcs": "{\"reason\":\"agent exited\",\"sender\":\"service:svc-discord\",\"session_id\":\"ses-aaaaaaaaaaaa\",\"task_id\":\"c4d9e8f7-1a2b-4c3d-8e5f-6a7b8c9d0e1f\"}",
+      "sealed_hash": "905ef3318844a2b7e2407813cd1f1dffa1080c2d0d21623b1796c9ea928dc591",
+      "signing_input_hex": "000000116174656d2d707573682d68696e742d7631000001c77b226163636f756e745f6964223a22616363742d746573742d31222c22616c6572745f6964223a2235653261376339312d336234642d346636382d613163392d306438653666376132623334222c22637265617465645f6174223a313739333236343030363030302c22657870697265735f6174223a313739333236343630363030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a312c226b696e64223a226f7574636f6d655f756e6b6e6f776e222c22726563697069656e74223a7b226465766963655f6964223a226465762d70686f6e65222c22656e635f6b6964223a2230376236396533656531386431363935227d2c227365616c65645f68617368223a2239303565663333313838343461326237653234303738313363643166316466666131303830633264306432313632336231373936633965613932386463353931222c2274797065223a226174656d2d707573682d68696e74222c2276223a317d"
+    },
+    {
+      "alert": "A",
+      "ct_hex": "a473bcccb71a0a3ec5b6202d86737014dc63dd6f4932f6a228aad7d5e3c72a8b58462c10cd9a26a54bc2eb684c071c8a6137c42bcbf49ff06e02d2b9b644c34791d64cc90d6d5c27f94759bd4fdb708f56f92a819a0bc3feeede01a59074f0fd9c0664cca029fe469d96b93321d9fafa7f98f3d9dc175f39c28e48a84f0e23fa0c2d490f34e138c192d11f63c9478cbf40aa0a45b807cf45a3",
+      "device_id": "dev-mac",
+      "enc_hex": "2e42aa8354c93cdf39f0df9a9f50ab465e6f69334fab8e3188af0bafc788397e",
+      "enc_kid": "742c1f83d7133047",
+      "facts": {
+        "reason": "agent exited",
+        "sender": "service:svc-discord",
+        "session_id": "ses-aaaaaaaaaaaa",
+        "task_id": "c4d9e8f7-1a2b-4c3d-8e5f-6a7b8c9d0e1f"
+      },
+      "ikmE_hex": "894ebd2fab11edd535ecdee9d5818fb7eada0d3fece2c0d681e325ada4b4719f",
+      "ikm_label": "alert-A-dev-mac",
+      "info_hex": "000000116174656d2d707573682d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d610000000800000000000000010000000f6f7574636f6d655f756e6b6e6f776e0000002435653261376339312d336234642d346636382d613163392d30643865366637613262333400000008000001a186dd337000000008000001a186e65b30000000076465762d6d61630000001037343263316638336437313333303437",
+      "plain_jcs": "{\"reason\":\"agent exited\",\"sender\":\"service:svc-discord\",\"session_id\":\"ses-aaaaaaaaaaaa\",\"task_id\":\"c4d9e8f7-1a2b-4c3d-8e5f-6a7b8c9d0e1f\"}",
+      "sealed_hash": "1d6ef1cfbb1c1b3a1bf31dc8b0c44fc64ed29bf95039343ca7c47204eb051b90",
+      "signing_input_hex": "000000116174656d2d707573682d68696e742d7631000001c57b226163636f756e745f6964223a22616363742d746573742d31222c22616c6572745f6964223a2235653261376339312d336234642d346636382d613163392d306438653666376132623334222c22637265617465645f6174223a313739333236343030363030302c22657870697265735f6174223a313739333236343630363030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a312c226b696e64223a226f7574636f6d655f756e6b6e6f776e222c22726563697069656e74223a7b226465766963655f6964223a226465762d6d6163222c22656e635f6b6964223a2237343263316638336437313333303437227d2c227365616c65645f68617368223a2231643665663163666262316331623361316266333164633862306334346663363465643239626639353033393334336361376334373230346562303531623930222c2274797065223a226174656d2d707573682d68696e74222c2276223a317d"
+    },
+    {
+      "alert": "B",
+      "ct_hex": "d18b1d3b4e9b50e1fa49ecaed325aebc6f8193c7c38cf384d680da95cb4b7beb47065abece4aceb45d596c2fc6fcbac0af7554f9e26e697e16987084a52f133ae70ee7101e2b16bf1d3c0225930d74e3af5b82e03ef5dfe70d16dd59d84eac4dad4d33b3cb5cac7bedc61d9f7bd437188627e01dda884990a3ab7f95b19fc776c384079f59477b38e4e75bbbf6040149540ebf7f465fcfcfbbf1fc79412bd9c1a3a1729812d4581a220a7c9bea58f438f4eedc8c9dd77617fd9facf6a7eaf758ef2710d4fe9f6a993663548be1cd0d18bd1ad444e135eed9797de2f16e82df5fd5707ceede2cebca38920cd88d5d0b994669f62773b3fcfcc1a36c1649066c115ae0737f4573652c67434f0469558a7b9424f7c93cc4446e52a35e308d2b4472e7e4d5033f7c0fa6172c9d407194b5b4c1f0342e8cfdb9dc3eef3afdd784d089a34c9b69144d417404551092a49e1a678fe10661444c4170e0dd82055a1951bee42993ec04d06ee57e8ff6b682a76751c450e3b185105bb31b5c1c1033aa1035c2c4190642feecc810c7a6f36a49ee5a61512015ee791aec8c26d1c1eae93f2a02c5c51da718eeb20f0637dbecade35ce8ccb3902e801319a69f4cf274ef251f152282cb563c352434a2d7a5aa56c98cf2768e90254d501a2e0f95705c9ef1ab8621d07b9fa4f8a21e338116953373f2ae771a6a48c46df81a802b9fa812d0",
+      "device_id": "dev-phone",
+      "enc_hex": "020f173da8a4829502b69a452c987b003bb4452f6c4cd968d392da02ff692d2e",
+      "enc_kid": "07b69e3ee18d1695",
+      "facts": {
+        "reason": "write interrupted: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "sender": "host:hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+        "session_id": "ses-bbbbbbbbbbbb",
+        "task_id": "0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0"
+      },
+      "ikmE_hex": "3fd90ad671ec001e89ad8034f62eaec79af198b302f3a4faddad1545eccd3bc0",
+      "ikm_label": "alert-B-dev-phone",
+      "info_hex": "000000116174656d2d707573682d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d610000000800000000000000010000000f6f7574636f6d655f756e6b6e6f776e0000002437623363386430322d346535662d346137392d623264612d31653966373038623363343500000008000001a186dd375800000008000001a186eaf2f8000000096465762d70686f6e650000001030376236396533656531386431363935",
+      "plain_jcs": "{\"reason\":\"write interrupted: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"sender\":\"host:hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh\",\"session_id\":\"ses-bbbbbbbbbbbb\",\"task_id\":\"0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0\"}",
+      "sealed_hash": "bc794e8b90c66e1a1626f5c248881c3bce8ee5d2da18ea71af199b9afab50420",
+      "signing_input_hex": "000000116174656d2d707573682d68696e742d7631000001c77b226163636f756e745f6964223a22616363742d746573742d31222c22616c6572745f6964223a2237623363386430322d346535662d346137392d623264612d316539663730386233633435222c22637265617465645f6174223a313739333236343030373030302c22657870697265735f6174223a313739333236343930373030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a312c226b696e64223a226f7574636f6d655f756e6b6e6f776e222c22726563697069656e74223a7b226465766963655f6964223a226465762d70686f6e65222c22656e635f6b6964223a2230376236396533656531386431363935227d2c227365616c65645f68617368223a2262633739346538623930633636653161313632366635633234383838316333626365386565356432646131386561373161663139396239616661623530343230222c2274797065223a226174656d2d707573682d68696e74222c2276223a317d"
+    }
+  ],
+  "outcome_unknown_invalid": [
+    {
+      "code": "malformed",
+      "hint": {
+        "body": {
+          "account_id": "acct-test-1",
+          "alert_id": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+          "created_at": 1793264006000,
+          "expires_at": 1793264606000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "kind": "outcome_unknown",
+          "recipient": {
+            "device_id": "dev-phone",
+            "enc_kid": "07b69e3ee18d1695"
+          },
+          "sealed_hash": "905ef3318844a2b7e2407813cd1f1dffa1080c2d0d21623b1796c9ea928dc591",
+          "task_id": "c4d9e8f7-1a2b-4c3d-8e5f-6a7b8c9d0e1f",
+          "type": "atem-push-hint",
+          "v": 1
+        },
+        "ct": "pMYqkzqTUqsJllscwrLR59yhY-XXQnCfuUJUKE6-waNU_QVmodlsfof5Fh914sJ-0lksZkonMTf4gWvdX2fACjF74fbBlvD5yNvCQ0_by3vtAry0Dn7r9qwLlBG9omGFnAuWLdLH9zzIHWd0EWFISGnmMIgC1y_A5Pz0U0XuukbosZYUkjbDcduhy58nwpfmiBwrJGwlCM4l",
+        "enc": "b-Btf0wG_NkTAFkinFSXwvODpfveI3773drcwpYD3iw",
+        "sig": "HuyI0zBiWqTSVImz94mJ5ilEWoU2foT1weyZdlolwtp1CFX8SEKDK54COS0CuGX31D_x3VqQ0EvPC-odiFhxBw"
+      },
+      "reason": "the task id beside the identity: only the sealed part names the task, session, sender and reason"
+    },
+    {
+      "code": "malformed",
+      "hint": {
+        "body": {
+          "account_id": "acct-test-1",
+          "alert_id": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+          "created_at": 1793264006000,
+          "expires_at": 1793264606000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "kind": "expired",
+          "recipient": {
+            "device_id": "dev-phone",
+            "enc_kid": "07b69e3ee18d1695"
+          },
+          "sealed_hash": "905ef3318844a2b7e2407813cd1f1dffa1080c2d0d21623b1796c9ea928dc591",
+          "type": "atem-push-hint",
+          "v": 1
+        },
+        "ct": "pMYqkzqTUqsJllscwrLR59yhY-XXQnCfuUJUKE6-waNU_QVmodlsfof5Fh914sJ-0lksZkonMTf4gWvdX2fACjF74fbBlvD5yNvCQ0_by3vtAry0Dn7r9qwLlBG9omGFnAuWLdLH9zzIHWd0EWFISGnmMIgC1y_A5Pz0U0XuukbosZYUkjbDcduhy58nwpfmiBwrJGwlCM4l",
+        "enc": "b-Btf0wG_NkTAFkinFSXwvODpfveI3773drcwpYD3iw",
+        "sig": "MkhakJKUijUJRCQguWMCJjKfT4aTKjki5oqGVEzDbYCpcKz-LPrvAvSXkwnQxI9g7O6WscLKvw6smXH0OaJeAw"
+      },
+      "reason": "kind `expired`: the one kind is `outcome_unknown`"
+    },
+    {
+      "code": "malformed",
+      "hint": {
+        "body": {
+          "account_id": "acct-test-1",
+          "alert_id": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+          "created_at": 1793264006000,
+          "expires_at": 1793264606000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "kind": "outcome_unknown",
+          "recipient": {
+            "device_id": "dev-phone",
+            "enc_kid": "07b69e3ee18d1695"
+          },
+          "sealed_hash": "905ef3318844a2b7e2407813cd1f1dffa1080c2d0d21623b1796c9ea928dc591",
+          "state": "open",
+          "type": "atem-push-hint",
+          "v": 1
+        },
+        "ct": "pMYqkzqTUqsJllscwrLR59yhY-XXQnCfuUJUKE6-waNU_QVmodlsfof5Fh914sJ-0lksZkonMTf4gWvdX2fACjF74fbBlvD5yNvCQ0_by3vtAry0Dn7r9qwLlBG9omGFnAuWLdLH9zzIHWd0EWFISGnmMIgC1y_A5Pz0U0XuukbosZYUkjbDcduhy58nwpfmiBwrJGwlCM4l",
+        "enc": "b-Btf0wG_NkTAFkinFSXwvODpfveI3773drcwpYD3iw",
+        "sig": "D6ZQNqzLbgf3xhkdXNBIIk7Tbo_sIYbweuWm6EUm-UYRQ10gENxEN8Q4Pql95znv6i8KKqNCCIn0KjGQyHVRDg"
+      },
+      "reason": "an approval's `state` beside the kind"
+    },
+    {
+      "code": "malformed",
+      "hint": {
+        "body": {
+          "account_id": "acct-test-1",
+          "approval_id": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+          "created_at": 1793264006000,
+          "expires_at": 1793264606000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "kind": "outcome_unknown",
+          "recipient": {
+            "device_id": "dev-phone",
+            "enc_kid": "07b69e3ee18d1695"
+          },
+          "sealed_hash": "905ef3318844a2b7e2407813cd1f1dffa1080c2d0d21623b1796c9ea928dc591",
+          "type": "atem-push-hint",
+          "v": 1
+        },
+        "ct": "pMYqkzqTUqsJllscwrLR59yhY-XXQnCfuUJUKE6-waNU_QVmodlsfof5Fh914sJ-0lksZkonMTf4gWvdX2fACjF74fbBlvD5yNvCQ0_by3vtAry0Dn7r9qwLlBG9omGFnAuWLdLH9zzIHWd0EWFISGnmMIgC1y_A5Pz0U0XuukbosZYUkjbDcduhy58nwpfmiBwrJGwlCM4l",
+        "enc": "b-Btf0wG_NkTAFkinFSXwvODpfveI3773drcwpYD3iw",
+        "sig": "io1vEHCZseUDeti3sKCvtmVlJYuS6Y-QkEIRjy4B4ywLecL2eDSog4eTk5iMEtGKWUDIdmMDO2AGJvLBzpwVAw"
+      },
+      "reason": "an approval's `approval_id` where the alert's `alert_id` belongs"
+    },
+    {
+      "code": "malformed",
+      "hint": {
+        "body": {
+          "account_id": "acct-test-1",
+          "alert_id": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+          "created_at": 1793264006000,
+          "expires_at": 1793264606000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "kind": "outcome_unknown",
+          "recipient": {
+            "device_id": "dev-phone",
+            "enc_kid": "07B69E3EE18D1695"
+          },
+          "sealed_hash": "905ef3318844a2b7e2407813cd1f1dffa1080c2d0d21623b1796c9ea928dc591",
+          "type": "atem-push-hint",
+          "v": 1
+        },
+        "ct": "pMYqkzqTUqsJllscwrLR59yhY-XXQnCfuUJUKE6-waNU_QVmodlsfof5Fh914sJ-0lksZkonMTf4gWvdX2fACjF74fbBlvD5yNvCQ0_by3vtAry0Dn7r9qwLlBG9omGFnAuWLdLH9zzIHWd0EWFISGnmMIgC1y_A5Pz0U0XuukbosZYUkjbDcduhy58nwpfmiBwrJGwlCM4l",
+        "enc": "b-Btf0wG_NkTAFkinFSXwvODpfveI3773drcwpYD3iw",
+        "sig": "jjtQaweSEZIywuS-Pdv0gQWjQ7gfZ-TZSaJW-QDoOZbW2W8EoJTQvhCtxTidsIt8pEh4gsKLN6gm79wkrasdCQ"
+      },
+      "reason": "recipient.enc_kid in upper case"
+    },
+    {
+      "code": "binding",
+      "hint": {
+        "body": {
+          "account_id": "acct-test-1",
+          "alert_id": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+          "created_at": 1793264006000,
+          "expires_at": 1793264606000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 2,
+          "kind": "outcome_unknown",
+          "recipient": {
+            "device_id": "dev-phone",
+            "enc_kid": "07b69e3ee18d1695"
+          },
+          "sealed_hash": "905ef3318844a2b7e2407813cd1f1dffa1080c2d0d21623b1796c9ea928dc591",
+          "type": "atem-push-hint",
+          "v": 1
+        },
+        "ct": "pMYqkzqTUqsJllscwrLR59yhY-XXQnCfuUJUKE6-waNU_QVmodlsfof5Fh914sJ-0lksZkonMTf4gWvdX2fACjF74fbBlvD5yNvCQ0_by3vtAry0Dn7r9qwLlBG9omGFnAuWLdLH9zzIHWd0EWFISGnmMIgC1y_A5Pz0U0XuukbosZYUkjbDcduhy58nwpfmiBwrJGwlCM4l",
+        "enc": "b-Btf0wG_NkTAFkinFSXwvODpfveI3773drcwpYD3iw",
+        "sig": "3PGhIjy8B5iKV7xKRTWMAMUNNDS1GC6f9iagldc1NS02G-FmKaF2ATqk6AktYovIeFt0S3PyUQxyCeh8b4LoDQ"
+      },
+      "reason": "host_trust_gen 2: not the host's newest add_host generation"
+    },
+    {
+      "code": "invalid_times",
+      "hint": {
+        "body": {
+          "account_id": "acct-test-1",
+          "alert_id": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+          "created_at": 1793264006000,
+          "expires_at": 1793264006000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "kind": "outcome_unknown",
+          "recipient": {
+            "device_id": "dev-phone",
+            "enc_kid": "07b69e3ee18d1695"
+          },
+          "sealed_hash": "905ef3318844a2b7e2407813cd1f1dffa1080c2d0d21623b1796c9ea928dc591",
+          "type": "atem-push-hint",
+          "v": 1
+        },
+        "ct": "pMYqkzqTUqsJllscwrLR59yhY-XXQnCfuUJUKE6-waNU_QVmodlsfof5Fh914sJ-0lksZkonMTf4gWvdX2fACjF74fbBlvD5yNvCQ0_by3vtAry0Dn7r9qwLlBG9omGFnAuWLdLH9zzIHWd0EWFISGnmMIgC1y_A5Pz0U0XuukbosZYUkjbDcduhy58nwpfmiBwrJGwlCM4l",
+        "enc": "b-Btf0wG_NkTAFkinFSXwvODpfveI3773drcwpYD3iw",
+        "sig": "pm9qvS5yzKFqv6JEvqEMhoMVPRQI8cQiUarTGiob60i5EilOjakPmHi0qkjrYapnqq0FKPkWKZULmgcaAgMrDw"
+      },
+      "reason": "expires_at <= created_at"
+    },
+    {
+      "code": "invalid_times",
+      "hint": {
+        "body": {
+          "account_id": "acct-test-1",
+          "alert_id": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+          "created_at": 1793264006000,
+          "expires_at": 1793264906001,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "kind": "outcome_unknown",
+          "recipient": {
+            "device_id": "dev-phone",
+            "enc_kid": "07b69e3ee18d1695"
+          },
+          "sealed_hash": "905ef3318844a2b7e2407813cd1f1dffa1080c2d0d21623b1796c9ea928dc591",
+          "type": "atem-push-hint",
+          "v": 1
+        },
+        "ct": "pMYqkzqTUqsJllscwrLR59yhY-XXQnCfuUJUKE6-waNU_QVmodlsfof5Fh914sJ-0lksZkonMTf4gWvdX2fACjF74fbBlvD5yNvCQ0_by3vtAry0Dn7r9qwLlBG9omGFnAuWLdLH9zzIHWd0EWFISGnmMIgC1y_A5Pz0U0XuukbosZYUkjbDcduhy58nwpfmiBwrJGwlCM4l",
+        "enc": "b-Btf0wG_NkTAFkinFSXwvODpfveI3773drcwpYD3iw",
+        "sig": "CnxrqFVgG_Lz0qcG2u-PkqnTVYdPGWemuKkTglRWy5rYzMgKlWIkIN9Yo82kAGQLMzm9voLiNAa1c9875ZPwDA"
+      },
+      "reason": "a window of 900001 ms: over 15 minutes"
+    },
+    {
+      "code": "skew",
+      "hint": {
+        "body": {
+          "account_id": "acct-test-1",
+          "alert_id": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+          "created_at": 1793264605000,
+          "expires_at": 1793265205000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "kind": "outcome_unknown",
+          "recipient": {
+            "device_id": "dev-phone",
+            "enc_kid": "07b69e3ee18d1695"
+          },
+          "sealed_hash": "905ef3318844a2b7e2407813cd1f1dffa1080c2d0d21623b1796c9ea928dc591",
+          "type": "atem-push-hint",
+          "v": 1
+        },
+        "ct": "pMYqkzqTUqsJllscwrLR59yhY-XXQnCfuUJUKE6-waNU_QVmodlsfof5Fh914sJ-0lksZkonMTf4gWvdX2fACjF74fbBlvD5yNvCQ0_by3vtAry0Dn7r9qwLlBG9omGFnAuWLdLH9zzIHWd0EWFISGnmMIgC1y_A5Pz0U0XuukbosZYUkjbDcduhy58nwpfmiBwrJGwlCM4l",
+        "enc": "b-Btf0wG_NkTAFkinFSXwvODpfveI3773drcwpYD3iw",
+        "sig": "HNhlthRctpgIEKDJnKWrGcovYffHy54r_XtnTcVnwlrXNhivX3udXbnZ7Gbrb3J-6y5Z5o_HN4XAdYXHDrrKBg"
+      },
+      "reason": "created_at 600000 ms after the verifier's clock (verifier now = verifier_now): refused by a client (over 300 s) and by the relay (over 120 s)"
+    },
+    {
+      "code": "duplicate",
+      "hint": {
+        "body": {
+          "account_id": "acct-test-1",
+          "alert_id": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+          "created_at": 1793264006000,
+          "expires_at": 1793264606000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "kind": "outcome_unknown",
+          "recipient": {
+            "device_id": "dev-phone",
+            "enc_kid": "07b69e3ee18d1695"
+          },
+          "sealed_hash": "9a9c69d27d487e34352254e22c7df98732f655788c4eeb48a0ca3060c9a1d34a",
+          "type": "atem-push-hint",
+          "v": 1
+        },
+        "ct": "aAPv75HxL-2Hn8bixL7BWQDtB6IRERuG4Xc4tEO_toHgF3gy37XQoHMA6a73MaoEFNzLD5_NQ1A4M8gVcmRwYW-QEzuz8Ic-B46hgry5i18W0iTEQ8-GtZ6irJERIUadXg7mCbMOduruoASMPQZJ3wU5djKiq1SgyPCvJJscsd0f-KWmtwlkSzViocbL3PQ9Bt0907Aadb2S",
+        "enc": "kavGprf5iH4WnmGR58yXwucLjNvr09u8A04tnNZveTM",
+        "sig": "3OPYh1f2_-ffc-Vda8YMqJ7QVJuT1In2_cX6hTKuZEShh_r_4RLtzlOEULL4MGAKo3D0qNgrY0PoLT3SyiuvCQ"
+      },
+      "reason": "the identity of outcome_unknown[0] with other bytes (another ephemeral): the first stays"
+    },
+    {
+      "code": "bad_sealed",
+      "hint": {
+        "body": {
+          "account_id": "acct-test-1",
+          "alert_id": "5e2a7c91-3b4d-4f68-a1c9-0d8e6f7a2b34",
+          "created_at": 1793264006000,
+          "expires_at": 1793264606000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "kind": "outcome_unknown",
+          "recipient": {
+            "device_id": "dev-phone",
+            "enc_kid": "07b69e3ee18d1695"
+          },
+          "sealed_hash": "905ef3318844a2b7e2407813cd1f1dffa1080c2d0d21623b1796c9ea928dc591",
+          "type": "atem-push-hint",
+          "v": 1
+        },
+        "ct": "pHO8zLcaCj7FtiAthnNwFNxj3W9JMvaiKKrX1ePHKotYRiwQzZompUvC62hMBxyKYTfEK8v0n_BuAtK5tkTDR5HWTMkNbVwn-UdZvU_bcI9W-SqBmgvD_u7eAaWQdPD9nAZkzKAp_kadlrkzIdn6-n-Y89ncF185wo5IqE8OI_oMLUkPNOE4wZLRH2PJR4y_QKoKRbgHz0Wj",
+        "enc": "b-Btf0wG_NkTAFkinFSXwvODpfveI3773drcwpYD3iw",
+        "sig": "dr8zQSGiPE_lhqb5wUSP7dPceY1Ct8rdHfgBbcRNlBfNofiFAHM5fkw2KXOtyP_crKc0O1HSB2mV2uNZ70H7AA"
+      },
+      "reason": "outcome_unknown[0]'s body and signature with outcome_unknown[1]'s ct: not the sealed part sealed_hash names"
+    }
+  ],
+  "outcome_unknown_invalid_facts": [
+    {
+      "code": "malformed",
+      "device_id": "dev-phone",
+      "facts": {
+        "reason": "write interrupted: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "sender": "local",
+        "session_id": "ses-bbbbbbbbbbbb",
+        "task_id": "6ba7b810-9dad-51d1-80b4-00c04fd430c8"
+      },
+      "hint": {
+        "body": {
+          "account_id": "acct-test-1",
+          "alert_id": "8c4d9e13-5f60-4b8a-93eb-2f0a819c4d56",
+          "created_at": 1793264006000,
+          "expires_at": 1793264606000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "kind": "outcome_unknown",
+          "recipient": {
+            "device_id": "dev-phone",
+            "enc_kid": "07b69e3ee18d1695"
+          },
+          "sealed_hash": "78a83c25c4bba4a847c56dfbe06c605b1df522a28baf5756370acc449765fa9b",
+          "type": "atem-push-hint",
+          "v": 1
+        },
+        "ct": "xBedXIEuONGAPI-VBCsCz7H9d-UzVHV8jTKSexFcFcHZgmFesU4D9yCBvFWciLK_YLJZDnvedfZXhEMtTwWcKO_8SL7MyoiZD3uJXTEX2q0e_BtFBi_W8tBNgitwH3gR_r-M1cerPQVQFFsXj_BhzRe56sv7mxmKhB9LhdYKSnAsDDZTBT62ARP-vp3UiDU0lf_8Ni7-nESNJNPVZSCKGPMVNv_4sVIOxqS5T2TNgx_eWOwo5HnSDVmLleHhK147MfMeccYg5eWYyT0WizBLsNPyeL4RJnw6yNURV-z3aDpaMEHbHPPaRDU7XtXw0gu61O6W2pFAiup3SnndrbapWkr7TJ2IGRCTozepnPFmB2QogRTxRz208PxndfVG3VULAy7RMTj-Ha8Gbz5Pw0yJ8pwBSmEJ9mOAkBIrmKjsfCai-D8Xcyyapiw7Gqi9B6giax7NkulsNZNip6mUUJXVHbpNbEdGscSRp-AiawU5Gh9mN1akylNislxn4HzCHpY",
+        "enc": "vNSbmZv345MUatQwhLL7IMHcLMIgIT3M6eVaWqHftAs",
+        "sig": "oqSWNnjZDy0Scupz3OgMLZUDNupBjam9pXwInih_9R5Aslq-08kAbFjbdZKOvIJ2T9P82dSuzNMm96tPmhG4Bg"
+      },
+      "ikm_label": "alert-8c4d9e13-5f60-4b8a-93eb-2f0a819c4d56-dev-phone-facts",
+      "info_hex": "000000116174656d2d707573682d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d610000000800000000000000010000000f6f7574636f6d655f756e6b6e6f776e0000002438633464396531332d356636302d346238612d393365622d32663061383139633464353600000008000001a186dd337000000008000001a186e65b30000000096465762d70686f6e650000001030376236396533656531386431363935",
+      "reason": "a local selector's UUID v5 task, sender `local`: local tasks keep v1 (their unknown outcomes expire) and raise no alert"
+    },
+    {
+      "code": "malformed",
+      "device_id": "dev-phone",
+      "facts": {
+        "reason": "agent exited",
+        "sender": "browser:grant-1",
+        "session_id": "ses-aaaaaaaaaaaa",
+        "task_id": "1e2f3a4b-5c6d-4e7f-8091-a2b3c4d5e6f7"
+      },
+      "hint": {
+        "body": {
+          "account_id": "acct-test-1",
+          "alert_id": "9d5eaf24-6071-4c9b-a4fc-3a1b920d5e67",
+          "created_at": 1793264006000,
+          "expires_at": 1793264606000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "kind": "outcome_unknown",
+          "recipient": {
+            "device_id": "dev-phone",
+            "enc_kid": "07b69e3ee18d1695"
+          },
+          "sealed_hash": "77c4727684803b52ea25cf7698dac9c11531ffeba30adea930f079b40b54e94d",
+          "type": "atem-push-hint",
+          "v": 1
+        },
+        "ct": "Fehf2AeSmH7Ncu8h05vVsQ_0uoywA2x_e1SPL80NaA4vWqiXpFNL6u7MwePg6S5LTduCEgkFuZkKLFKfc4qt9mmjgYVUeXBMLJj3PhgLKDn4N88lMwdoz7rJa6a-HayVE2pKPRPejEO0nwKLc8QUYKypoIvWGNYmNuGlmC4eXPv1m2kOr5AyQiQSB2O-fEIpaO2pkoI",
+        "enc": "2Xy2UUxbRZPqZH9Axf9IZ19r8HPgoXAOs2Xmd6XU1Dk",
+        "sig": "iuYKVizvkxjHre1SpTm3ms5UrW0wSCbS4_h5NG0u-2duSt9nUv1mazaPM-Darkh7sd9pFOJixcVLWFfM1YWFBw"
+      },
+      "ikm_label": "alert-9d5eaf24-6071-4c9b-a4fc-3a1b920d5e67-dev-phone-facts",
+      "info_hex": "000000116174656d2d707573682d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d610000000800000000000000010000000f6f7574636f6d655f756e6b6e6f776e0000002439643565616632342d363037312d346339622d613466632d33613162393230643565363700000008000001a186dd337000000008000001a186e65b30000000096465762d70686f6e650000001030376236396533656531386431363935",
+      "reason": "a browser grant's task: browser grants keep v1 and raise no alert"
+    }
+  ],
+  "outcome_unknown_note": "Hints of kind outcome_unknown (delegated host-work I.4.6): the body's type is atem-push-hint and its label atem-push-hint-v1 like an approval hint's, told apart by `kind` (no `state`, no session_id, process_gen or approval_id; `alert_id` instead). The task, session, sender and reason are only in the sealed part, jcs of {reason, sender, session_id, task_id}. info = enc([\"atem-push-seal-v1\", account_id, genesis_hash, host_id, u64(host_trust_gen), \"outcome_unknown\", alert_id, u64(created_at), u64(expires_at), device_id, enc_kid]) (11 fields; an approval's has 12). ikmE_hex = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Entries 0 and 1 are one alert for two recipients; entry 2 is another alert at the bounds. Only a delegated sender's (member:, service: or host:) UUID v4 task raises an alert. outcome_unknown_acks are the push_ack entries, one per hint. Each outcome_unknown_invalid carries the first hint's sealed envelope (except bad_sealed's, which is the point) so only its code refuses it; the runner checks the code with both verifiers. Each outcome_unknown_invalid_facts is well signed and well sealed (both verifiers take it, and its sealed_hash names its sealed part), but its sealed facts aren't a delegated task's: the recipient refuses it at open (malformed).",
   "recipient_secrets": {
     "dev-mac": "bfa0664fde3222947767b3a54bc886cee232dc7a498dfdb7006862df10f6bd55",
     "dev-phone": "e813b00518eedc5f85e1b036f168917ef9dc935806a410c2f73e624dbf0e0c1b"

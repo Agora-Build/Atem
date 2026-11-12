@@ -26,15 +26,23 @@ trap 'rm -rf "$WORK"' EXIT
 VECTORS="$ROOT/designs/protocol/fixtures/r9-vectors-pairing.json"
 
 (cd "$DIR" && sha256sum -c "atem-client-${VERSION}-SHA256SUMS.txt")
-# The shared host-work and r9 vectors ship beside the packages, each listed in the
-# sums (sha256sum -c above checked what is listed, not that it is listed).
-for VECTOR_NAME in host-work-requests-v1 host-work-prompt-framing-v1 host-work-framing-size-v1 \
-  r9-vectors-host-work-control; do
-  VECTOR_FILE="atem-client-${VERSION}-${VECTOR_NAME}.json"
-  test -s "$DIR/$VECTOR_FILE" || { echo "$VECTOR_FILE: missing from the package directory" >&2; exit 1; }
-  awk -v f="$VECTOR_FILE" '$2 == f {found = 1} END {exit !found}' "$DIR/atem-client-${VERSION}-SHA256SUMS.txt" \
-    || { echo "$VECTOR_FILE: not listed in the sums" >&2; exit 1; }
+# The shared vectors ship beside the bindings, each listed in the sums and
+# the same bytes as the repository's.
+for vector in \
+  host-work/requests-v1.json:host-work-requests-v1.json \
+  host-work/prompt-framing-v1.json:host-work-prompt-framing-v1.json \
+  host-work/framing-size-v1.json:host-work-framing-size-v1.json \
+  r9-vectors-host-work-control.json:r9-vectors-host-work-control.json \
+  r9-vectors-push-hint.json:r9-vectors-push-hint.json \
+  r9-vectors-delegated-wire.json:r9-vectors-delegated-wire.json; do
+  source="$ROOT/designs/protocol/fixtures/${vector%%:*}"
+  shipped="atem-client-${VERSION}-${vector#*:}"
+  grep -q "  $shipped\$" "$DIR/atem-client-${VERSION}-SHA256SUMS.txt" ||
+    { echo "vectors: $shipped is not in the SHA256SUMS" >&2; exit 1; }
+  cmp -s "$source" "$DIR/$shipped" ||
+    { echo "vectors: $shipped differs from ${vector%%:*}" >&2; exit 1; }
 done
+echo "vectors: 6 files shipped, listed and unchanged"
 FRAMING_VECTORS="$DIR/atem-client-${VERSION}-host-work-prompt-framing-v1.json"
 FRAMING_SIZE_VECTORS="$DIR/atem-client-${VERSION}-host-work-framing-size-v1.json"
 python3 - "$DIR/atem-client-${VERSION}-SOURCE.json" "${EXPECT_COMMIT:-}" <<'EOF'

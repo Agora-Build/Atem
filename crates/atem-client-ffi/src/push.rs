@@ -6,23 +6,40 @@
 //! `enc_key` (only then is the content shown). The relay: `verify_push_hint
 //! (…, Relay)`, its book, and the schedule (`push_stages`, `push_send_now`,
 //! `push_next_due`), all from the signed `created_at`.
+//!
+//! One entry point for both kinds of hint: an approval's (`state()` `Open` or
+//! `Resolved`, `approval()`) and an `outcome_unknown` hint's (delegated host
+//! work, I.4.6: `state()` `OutcomeUnknown`, `alert()`), told apart by the
+//! body's `kind`; `open` returns each kind's own sealed content.
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use atem_client::principal::{BrowserGrant, Op};
 use atem_client::provider::{KeyId, KeyProvider};
 use atem_client::push::{
-    self, Accepted, ApprovalKey, DeviceClass, Hint, HintBook, HintState, Identity, RecipientInfo,
-    Seen, Stage, Verifier,
+    self, Accepted, AlertHint, AlertKey, ApprovalKey, DeviceClass, Hint, HintBook, HintState,
+    Identity, RecipientInfo, Seen, Stage, Verifier,
 };
 
 use crate::encoding::{canonical, canonical_lossy, hash_of, safe_int, signed, strict};
 use crate::error::{AtemError, Result};
 use crate::log::{MembershipLog, object_json};
 use crate::types::{
-    ApprovalRef, BrowserGrantInfo, DeviceKind, HintContent, HintOffer, HintStateInfo,
+    AlertRef, ApprovalRef, BrowserGrantInfo, DeviceKind, HintContent, HintOffer, HintStateInfo,
     PublicKeyData, PushRecipient, PushStage, PushStageDue, PushVerifier, SeenInfo,
 };
+
+impl From<&AlertKey> for AlertRef {
+    fn from(k: &AlertKey) -> Self {
+        AlertRef {
+            account_id: k.account_id.clone(),
+            genesis_hash: k.genesis_hash.clone(),
+            host_id: k.host_id.clone(),
+            host_trust_gen: k.host_trust_gen,
+            alert_id: k.alert_id.clone(),
+        }
+    }
+}
 
 impl From<&ApprovalKey> for ApprovalRef {
     fn from(k: &ApprovalKey) -> Self {
@@ -85,10 +102,16 @@ fn ack_json(identity: &Identity) -> String {
     canonical_lossy(&identity.to_ack())
 }
 
-/// A verified push hint (only `verify_push_hint` makes one).
+/// A verified push hint (only `verify_push_hint` makes one): an approval's
+/// or an `outcome_unknown` hint.
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct PushHint {
-    hint: Hint,
+    hint: Verified,
+}
+
+enum Verified {
+    Approval(Hint),
+    Alert(AlertHint),
 }
 
 impl PushHint {
@@ -98,12 +121,24 @@ impl PushHint {
         enc_key_id: &str,
         device_id: &str,
     ) -> Result<HintContent> {
-        let plain = self
-            .hint
-            .open(provider, &KeyId::new(enc_key_id), device_id)?;
-        Ok(HintContent {
-            tool: plain.tool,
-            summary: plain.summary,
+        let key = KeyId::new(enc_key_id);
+        Ok(match &self.hint {
+            Verified::Approval(hint) => {
+                let plain = hint.open(provider, &key, device_id)?;
+                HintContent::Approval {
+                    tool: plain.tool,
+                    summary: plain.summary,
+                }
+            }
+            Verified::Alert(hint) => {
+                let plain = hint.open(provider, &key, device_id)?;
+                HintContent::OutcomeUnknown {
+                    task_id: plain.task_id,
+                    session_id: plain.session_id,
+                    sender: plain.sender,
+                    reason: plain.reason,
+                }
+            }
         })
     }
 }
@@ -124,67 +159,112 @@ pub fn verify_push_hint(
         PushVerifier::Client => Verifier::Client,
         PushVerifier::Relay => Verifier::Relay,
     };
-    let hint = Hint::verify(&object, &log.lock(), now_ms, verifier)?;
+    // An `outcome_unknown` hint carries a `kind`, which no approval hint has.
+    let hint = if object.body().get("kind").is_some() {
+        Verified::Alert(AlertHint::verify(&object, &log.lock(), now_ms, verifier)?)
+    } else {
+        Verified::Approval(Hint::verify(&object, &log.lock(), now_ms, verifier)?)
+    };
     Ok(Arc::new(PushHint { hint }))
 }
 
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 impl PushHint {
-    pub fn approval(&self) -> ApprovalRef {
-        self.hint.key().into()
+    /// The approval an approval hint is about (an `outcome_unknown` hint is
+    /// about none: `alert()`).
+    pub fn approval(&self) -> Result<ApprovalRef> {
+        match &self.hint {
+            Verified::Approval(hint) => Ok(hint.key().into()),
+            Verified::Alert(_) => Err(AtemError::malformed(
+                "an outcome_unknown hint names no approval",
+            )),
+        }
+    }
+
+    /// The alert an `outcome_unknown` hint is about (an approval hint is
+    /// about none: `approval()`).
+    pub fn alert(&self) -> Result<AlertRef> {
+        match &self.hint {
+            Verified::Alert(hint) => Ok(hint.key().into()),
+            Verified::Approval(_) => Err(AtemError::malformed("an approval hint names no alert")),
+        }
     }
 
     pub fn state(&self) -> HintStateInfo {
-        match self.hint.state() {
-            HintState::Open {
-                device_id,
-                enc_kid,
-                sealed_hash,
-            } => HintStateInfo::Open {
-                device_id: device_id.clone(),
-                enc_kid: enc_kid.clone(),
-                sealed_hash: sealed_hash.to_hex(),
+        match &self.hint {
+            Verified::Approval(hint) => match hint.state() {
+                HintState::Open {
+                    device_id,
+                    enc_kid,
+                    sealed_hash,
+                } => HintStateInfo::Open {
+                    device_id: device_id.clone(),
+                    enc_kid: enc_kid.clone(),
+                    sealed_hash: sealed_hash.to_hex(),
+                },
+                HintState::Resolved {
+                    reason,
+                    resolved_at,
+                } => HintStateInfo::Resolved {
+                    reason: reason.clone(),
+                    resolved_at: *resolved_at,
+                },
             },
-            HintState::Resolved {
-                reason,
-                resolved_at,
-            } => HintStateInfo::Resolved {
-                reason: reason.clone(),
-                resolved_at: *resolved_at,
+            Verified::Alert(hint) => HintStateInfo::OutcomeUnknown {
+                device_id: hint.device_id().to_owned(),
+                enc_kid: hint.enc_kid().to_owned(),
+                sealed_hash: hint.sealed_hash().to_hex(),
             },
         }
     }
 
     pub fn created_at(&self) -> u64 {
-        self.hint.created_at()
+        match &self.hint {
+            Verified::Approval(hint) => hint.created_at(),
+            Verified::Alert(hint) => hint.created_at(),
+        }
     }
 
     pub fn expires_at(&self) -> u64 {
-        self.hint.expires_at()
+        match &self.hint {
+            Verified::Approval(hint) => hint.expires_at(),
+            Verified::Alert(hint) => hint.expires_at(),
+        }
     }
 
     /// The hint's `push_ack` entry (canonical JSON).
     pub fn ack_json(&self) -> String {
-        ack_json(&self.hint.identity())
+        ack_json(&match &self.hint {
+            Verified::Approval(hint) => hint.identity(),
+            Verified::Alert(hint) => hint.identity(),
+        })
     }
 
     /// The hint in canonical JSON (what to forward or store).
     pub fn json(&self) -> String {
-        object_json(self.hint.object())
+        object_json(match &self.hint {
+            Verified::Approval(hint) => hint.object(),
+            Verified::Alert(hint) => hint.object(),
+        })
     }
 
     /// The sealed part is the one `sealed_hash` names (none on a resolved).
     pub fn check_sealed(&self) -> Result<()> {
-        Ok(self.hint.check_sealed()?)
+        match &self.hint {
+            Verified::Approval(hint) => hint.check_sealed()?,
+            Verified::Alert(hint) => hint.check_sealed()?,
+        }
+        Ok(())
     }
 }
 
 #[cfg(feature = "uniffi")]
 #[uniffi::export]
 impl PushHint {
-    /// Opens the sealed tool and summary with this device's `enc_key`
-    /// (`enc_key_id` in the provider): refused for another device or
-    /// another key before anything is opened.
+    /// Opens the sealed content with this device's `enc_key` (`enc_key_id`
+    /// in the provider): an approval hint's tool and summary, an
+    /// `outcome_unknown` hint's task, session, sender and reason. Refused for
+    /// another device or another key before anything is opened.
     pub fn open(
         &self,
         provider: Arc<dyn crate::provider::AppKeyProvider>,
@@ -224,7 +304,11 @@ impl PushHintBook {
     /// refused `duplicate` (the first stays); a new open must carry its
     /// sealed part (`bad_sealed`).
     pub fn offer(&self, hint: Arc<PushHint>) -> Result<HintOffer> {
-        Ok(match self.lock().offer(hint.hint.clone())? {
+        let offered = match &hint.hint {
+            Verified::Approval(hint) => self.lock().offer(hint.clone())?,
+            Verified::Alert(hint) => self.lock().offer_alert(hint.clone())?,
+        };
+        Ok(match offered {
             Accepted::Accepted => HintOffer::Accepted,
             Accepted::Idempotent => HintOffer::Idempotent,
             Accepted::IgnoredAfterResolved => HintOffer::IgnoredAfterResolved,
