@@ -1740,8 +1740,14 @@ pub fn verify_push_hint(
 
 #[wasm_bindgen]
 impl PushHint {
+    /// The approval an approval hint is about (an `outcome_unknown` hint
+    /// names none: `alert()`).
     pub fn approval(&self) -> JsResult<JsValue> {
-        to_js(&self.0.approval())
+        ok(self.0.approval())
+    }
+    /// The alert an `outcome_unknown` hint is about.
+    pub fn alert(&self) -> JsResult<JsValue> {
+        ok(self.0.alert())
     }
     pub fn state(&self) -> JsResult<JsValue> {
         to_js(&self.0.state())

@@ -210,8 +210,9 @@ dependencies (`p256`, `ed25519-dalek`, `x25519-dalek`, `hkdf`,
 with an independent implementation (Python `cryptography`:
 `python3 -I scripts/check-r9-vectors.py designs/protocol/fixtures`, which
 recomputes and verifies the cryptographic values of `r9-vectors-keys`,
-`r9-vectors-membership-log` and `r9-vectors-host-work-control` today, one
-checker per file, and exits
+`r9-vectors-membership-log`, `r9-vectors-host-work-control`,
+`r9-vectors-push-hint` and `r9-vectors-delegated-wire` today, one checker
+per file, and exits
 non-zero on a mismatch; it derives no verdict: `expect` and the refusal
 reasons are checked by `crates/atem-client/tests/vectors.rs` and the
 binding conformance suites). Test keys:
@@ -232,7 +233,8 @@ and `negative`/`invalid` cases must be refused for the stated reason.
 | `r9-vectors-browser-grant` | a signed QR grant, its hash, the browser's `th3`/`sig_c`, and two invalid grants |
 | `r9-vectors-pairing` | `verifyCommit` with `host_trust_gen` (§R9.2): valid and invalid messages as exact bytes, the `add_host` generation checks, and when a verification attempt is void |
 | `r9-envelope-vectors` | the channel envelope (R9.7a): the three event shapes, valid and invalid handles and reasons, envelopes Atem refuses, and every bound (the largest legal record and its exact serialized sizes) |
-| `r9-vectors-push-hint` | two sealed, signed open hints (HPKE inputs including `ikmE`), a resolved hint, a host-signed seen, a seen from another `process_gen`, two hints at the 15 s guard (`open_g75`, `open_g75001`), and four refused hints |
+| `r9-vectors-push-hint` | two sealed, signed open hints (HPKE inputs including `ikmE`), a resolved hint, a host-signed seen, a seen from another `process_gen`, two hints at the 15 s guard (`open_g75`, `open_g75001`), and four refused hints; planned (`host.alerts`), `outcome_unknown` hints (`outcome_unknown`: one alert for two recipients and one at the bounds, a host sender's task; `outcome_unknown_details`, `outcome_unknown_acks`), the refused ones (`outcome_unknown_invalid`, each with its `code`) and `outcome_unknown_invalid_facts`: hints both verifiers take whose sealed facts aren't a delegated sender's UUID v4 task (a local selector's UUID v5 task, a browser grant's), refused `malformed` at open |
+| `r9-vectors-delegated-wire` | planned (session-v1 R9.14): `host_enc_key_get`, its `host_enc_key` answer (the valid one's `enc_key`/`enc_sig` is `r9-vectors-membership-log`'s first `host_enc_key` pair; `host_enc_key_binding` gives the `enc_sig` input) and receipts with and without provenance (`task_id`, `sender`), each case `valid` or refused as a whole, as a `message` or as exact `raw` text |
 
 `kind: "scenario"` — `{name, requires, kind, side, log, note, setup,
 steps}`. `log` names the vectors file whose entry labels the scenario

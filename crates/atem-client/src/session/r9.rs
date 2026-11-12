@@ -843,6 +843,167 @@ pub fn control_records_result(id: &str, re: &str, results: &[RecordResult]) -> V
     .to_json()
 }
 
+/// `host_enc_key_get{}` (C→H, feature [`SENDERS_FEATURE`]; delegated
+/// host-work design II.4.1, session-v1 R9.14): a native manager asks the
+/// host for the encryption key it vouches for, to draft the `host_enc_key`
+/// device-list entry. The host answers one [`HostEncKey`]. Only native
+/// members holding `manage` at the host's head get it (the channel admits
+/// no service or browser; `manage` is checked when the host handles it).
+/// Nothing here advertises the op.
+///
+/// [`SENDERS_FEATURE`]: crate::session::host_work::SENDERS_FEATURE
+pub fn host_enc_key_get(id: &str) -> Value {
+    session(json!({"v": 1, "op": "host_enc_key_get", "id": id}))
+}
+
+/// A `host_enc_key_get` as the host reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostEncKeyGet {
+    pub id: String,
+}
+
+impl HostEncKeyGet {
+    /// Reads a received plaintext, strictly (I-JSON, no duplicate keys):
+    /// exactly `{"type":"session","data":{"v":1,"op":"host_enc_key_get",
+    /// "id":<UUID v4>}}`. `Err` is a short reason, fit for the error's
+    /// `detail`.
+    pub fn decode(plain: &[u8]) -> Result<Self, &'static str> {
+        const SHAPE: &str = "not a host_enc_key_get message";
+        let root = StrictValue::parse(plain, MAX_PLAINTEXT).map_err(|_| "not strict JSON")?;
+        let value = root.value();
+        let data = value
+            .as_object()
+            .filter(|o| o.len() == 2 && value["type"] == "session")
+            .and_then(|_| value["data"].as_object())
+            .filter(|d| {
+                d.len() == 3
+                    && d.get("v").and_then(Value::as_u64) == Some(1)
+                    && d.get("op").and_then(Value::as_str) == Some("host_enc_key_get")
+            })
+            .ok_or(SHAPE)?;
+        let id = data
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| is_uuid_v4(id))
+            .ok_or(SHAPE)?;
+        Ok(HostEncKeyGet { id: id.to_owned() })
+    }
+}
+
+/// `host_enc_key{re, host_id, host_trust_gen, enc_key, enc_sig}` (H→C): the
+/// answer to one `host_enc_key_get`. The host's X25519 key for its current
+/// trust generation and the host's `enc_sig` over it, by its `host_key`
+/// (the newest `add_host`'s), in the `host_enc_key` entry's own forms: what
+/// a manager needs to draft the entry ([`HostEncKey::action`]). The binding
+/// verifies on its own, so the channel needs no trust: the device-list
+/// verifier checks it against the chain (`bad_enc_sig`,
+/// `host_trust_gen_not_current`), and `check_change` says first when the
+/// key was set before (`enc_key_reused`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostEncKey {
+    pub id: String,
+    /// The `id` of the `host_enc_key_get` it answers.
+    pub re: String,
+    /// The host's `atem_device_id` (its `host_id` in the device list).
+    pub host_id: String,
+    pub host_trust_gen: u64,
+    /// X25519.
+    pub enc_key: crate::keys::PublicKey,
+    /// 64 bytes: Ed25519 by the host's `host_key` over
+    /// [`crate::membership::host_enc_sig_input`].
+    pub enc_sig: Vec<u8>,
+}
+
+impl HostEncKey {
+    /// Reads a `host_enc_key`'s `data`: exactly its fields, UUID v4 ids, an
+    /// id-grammar `host_id`, a generation of 1 or more, an X25519 key and a
+    /// 64-byte signature.
+    pub fn from_data(data: &Value) -> Result<Self, &'static str> {
+        let o = data.as_object().ok_or("data")?;
+        if o.get("op").and_then(Value::as_str) != Some("host_enc_key") {
+            return Err("op");
+        }
+        if o.get("v").and_then(Value::as_u64) != Some(1) {
+            return Err("v");
+        }
+        // `v`, `op`, `id`, `re`, `host_id`, `host_trust_gen`, `enc_key`,
+        // `enc_sig`.
+        if o.len() != 8 {
+            return Err("fields");
+        }
+        let uuid = |k: &'static str| -> Result<String, &'static str> {
+            o.get(k)
+                .and_then(Value::as_str)
+                .filter(|s| is_uuid_v4(s))
+                .map(str::to_owned)
+                .ok_or(k)
+        };
+        let host_id = o
+            .get("host_id")
+            .and_then(Value::as_str)
+            .filter(|id| crate::membership::entry::id_ok(id))
+            .ok_or("host_id")?
+            .to_owned();
+        let host_trust_gen = o
+            .get("host_trust_gen")
+            .and_then(Value::as_u64)
+            .filter(|g| (1..=crate::canonical::MAX_SAFE_INTEGER).contains(g))
+            .ok_or("host_trust_gen")?;
+        let enc_key = o
+            .get("enc_key")
+            .and_then(|k| crate::keys::PublicKey::from_json_as(k, crate::keys::Alg::X25519).ok())
+            .ok_or("enc_key")?;
+        let enc_sig = o
+            .get("enc_sig")
+            .and_then(Value::as_str)
+            .and_then(|s| crate::encoding::b64u_decode_array::<64>(s).ok())
+            .ok_or("enc_sig")?
+            .to_vec();
+        Ok(HostEncKey {
+            id: uuid("id")?,
+            re: uuid("re")?,
+            host_id,
+            host_trust_gen,
+            enc_key,
+            enc_sig,
+        })
+    }
+
+    /// The wire message.
+    pub fn to_json(&self) -> Value {
+        session(
+            json!({"v": 1, "op": "host_enc_key", "id": self.id, "re": self.re,
+            "host_id": self.host_id, "host_trust_gen": self.host_trust_gen,
+            "enc_key": self.enc_key.to_json(), "enc_sig": b64u(&self.enc_sig)}),
+        )
+    }
+
+    /// Whether this answers the request `request_id` on a channel to
+    /// `host_id` at `host_trust_gen` (the welcome's `atem_device_id` and
+    /// `host_trust_gen`): a key of another host or generation is no answer.
+    pub fn answers(&self, request_id: &str, host_id: &str, host_trust_gen: u64) -> bool {
+        self.re == request_id && self.host_id == host_id && self.host_trust_gen == host_trust_gen
+    }
+
+    /// The `host_enc_key` action a manager drafts from it
+    /// ([`crate::membership::host_enc_key`]); `retire_previous` after a
+    /// suspected compromise, `signed_at` the time it signs.
+    pub fn action(
+        &self,
+        retire_previous: bool,
+        signed_at: u64,
+    ) -> Result<crate::membership::Action, crate::membership::Invalid> {
+        crate::membership::host_enc_key(
+            &self.host_id,
+            self.host_trust_gen,
+            &self.enc_key,
+            &self.enc_sig,
+            retire_previous,
+            signed_at,
+        )
+    }
+}
+
 /// A session-family message a client received, r9's own ops read here; the
 /// rest goes to r8's decoder ([`crate::session::wire::decode`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -866,6 +1027,8 @@ pub enum Incoming {
     HostPolicyChanged(Box<crate::session::host_policy::HostPolicyChanged>),
     /// A `control_records_result` (H→C).
     ControlRecordsResult(ControlRecordsResult),
+    /// A `host_enc_key` (H→C), the answer to `host_enc_key_get`.
+    HostEncKey(Box<HostEncKey>),
     /// Any other message (r8's session ops, terminal-v1, chat-v1).
     Other,
 }
@@ -914,6 +1077,7 @@ impl Incoming {
             "control_records_result" => {
                 Incoming::ControlRecordsResult(ControlRecordsResult::from_data(data)?)
             }
+            "host_enc_key" => Incoming::HostEncKey(Box::new(HostEncKey::from_data(data)?)),
             _ => Incoming::Other,
         })
     }
@@ -1309,6 +1473,157 @@ mod tests {
                         .collect::<Vec<_>>(),
                 })).collect::<Vec<_>>()).unwrap()
             });
+        }
+    }
+
+    /// `host_enc_key_get` and its answer (delegated host-work design II.4.1:
+    /// the manager gets `{enc_pub, enc_sig}` from the host over its channel).
+    mod host_enc_key_get {
+        use super::*;
+        use crate::keys::{Alg, PublicKey};
+
+        const ID: &str = "aaaaaaaa-0000-4000-8000-0000000000e1";
+        const REPLY: &str = "aaaaaaaa-0000-4000-8000-0000000000e2";
+
+        fn bytes(message: &Value) -> Vec<u8> {
+            message.to_string().into_bytes()
+        }
+
+        fn answer() -> HostEncKey {
+            HostEncKey {
+                id: REPLY.into(),
+                re: ID.into(),
+                host_id: "host-a".into(),
+                host_trust_gen: 2,
+                enc_key: PublicKey::new(Alg::X25519, &[9u8; 32]).unwrap(),
+                enc_sig: vec![7u8; 64],
+            }
+        }
+
+        fn parse_answer(data: &Value) -> Result<HostEncKey, &'static str> {
+            match Incoming::parse(&bytes(&json!({"type": "session", "data": data})))? {
+                Incoming::HostEncKey(answer) => Ok(*answer),
+                other => panic!("not a host_enc_key: {other:?}"),
+            }
+        }
+
+        /// The request and its answer, as built, sent and read on each end.
+        #[test]
+        fn host_enc_key_get_round_trip() {
+            // C→H: exactly `v`, `op` and `id`.
+            let request = host_enc_key_get(ID);
+            assert_eq!(request["type"], "session");
+            assert_eq!(
+                request["data"],
+                json!({"v": 1, "op": "host_enc_key_get", "id": ID})
+            );
+            assert_eq!(
+                HostEncKeyGet::decode(&bytes(&request)),
+                Ok(HostEncKeyGet { id: ID.into() })
+            );
+            // H→C: what a manager needs to draft the `host_enc_key` entry,
+            // in the entry's own forms (`enc_key{alg, pub}`, `enc_sig`).
+            let sent = answer().to_json();
+            assert_eq!(sent["type"], "session");
+            assert_eq!(
+                sent["data"],
+                json!({"v": 1, "op": "host_enc_key", "id": REPLY, "re": ID,
+                    "host_id": "host-a", "host_trust_gen": 2,
+                    "enc_key": {"alg": "x25519", "pub": b64u(&[9u8; 32])},
+                    "enc_sig": b64u(&[7u8; 64])})
+            );
+            let Ok(Incoming::HostEncKey(read)) = Incoming::parse(&bytes(&sent)) else {
+                panic!("a host_enc_key");
+            };
+            assert_eq!(*read, answer());
+            // It answers the request it names, from the host the channel
+            // reaches, at that host's trust generation.
+            assert!(read.answers(ID, "host-a", 2));
+            assert!(!read.answers(REPLY, "host-a", 2));
+            assert!(!read.answers(ID, "host-b", 2));
+            assert!(!read.answers(ID, "host-a", 1));
+            // It drafts the entry the manager signs (the binding is the
+            // verifier's to check against the chain).
+            assert_eq!(
+                read.action(false, 1_793_620_800_000),
+                Ok(crate::membership::Action::HostEncKey {
+                    host_id: "host-a".into(),
+                    host_trust_gen: 2,
+                    enc_key: PublicKey::new(Alg::X25519, &[9u8; 32]).unwrap(),
+                    enc_sig: vec![7u8; 64],
+                    retire_previous: false,
+                })
+            );
+        }
+
+        /// The host reads the request strictly: exactly its fields, a UUID v4
+        /// id, strict JSON, as every r9 session op.
+        #[test]
+        fn the_request_is_read_strictly() {
+            let good = host_enc_key_get(ID);
+            let refused = |f: &dyn Fn(&mut Value)| {
+                let mut m = good.clone();
+                f(&mut m);
+                assert!(HostEncKeyGet::decode(&bytes(&m)).is_err(), "{m}");
+            };
+            refused(&|m| m["data"]["extra"] = json!(1));
+            refused(&|m| m["data"]["v"] = json!(2));
+            refused(&|m| m["data"]["op"] = json!("host_enc_key"));
+            refused(&|m| m["data"]["id"] = json!("not-a-uuid"));
+            refused(&|m| m["data"]["id"] = json!(null));
+            refused(&|m| {
+                m["data"].as_object_mut().unwrap().remove("id");
+            });
+            refused(&|m| m["type"] = json!("terminal"));
+            refused(&|m| m["extra"] = json!(1));
+            let dup = format!(
+                r#"{{"type":"session","data":{{"v":1,"op":"host_enc_key_get","id":"{ID}","id":"{REPLY}"}}}}"#
+            );
+            assert!(HostEncKeyGet::decode(dup.as_bytes()).is_err());
+            assert!(HostEncKeyGet::decode(b"{").is_err());
+        }
+
+        /// The answer is read as strictly: every field, no more, `null`
+        /// nowhere, an X25519 key and a 64-byte signature, a generation of 1
+        /// or more.
+        #[test]
+        fn the_answer_is_read_strictly() {
+            let good = answer().to_json()["data"].clone();
+            assert!(parse_answer(&good).is_ok());
+            let refused = |f: &dyn Fn(&mut Value)| {
+                let mut d = good.clone();
+                f(&mut d);
+                assert!(parse_answer(&d).is_err(), "{d}");
+            };
+            refused(&|d| d["extra"] = json!(1));
+            refused(&|d| d["v"] = json!(2));
+            for field in [
+                "id",
+                "re",
+                "host_id",
+                "host_trust_gen",
+                "enc_key",
+                "enc_sig",
+            ] {
+                refused(&|d| {
+                    d.as_object_mut().unwrap().remove(field);
+                });
+                refused(&|d| d[field] = json!(null));
+            }
+            refused(&|d| d["re"] = json!("not-a-uuid"));
+            refused(&|d| d["id"] = json!("not-a-uuid"));
+            refused(&|d| d["host_id"] = json!(""));
+            refused(&|d| d["host_id"] = json!("host a"));
+            refused(&|d| d["host_id"] = json!("h".repeat(129)));
+            refused(&|d| d["host_trust_gen"] = json!(0));
+            refused(&|d| d["host_trust_gen"] = json!("2"));
+            refused(&|d| d["enc_key"]["alg"] = json!("ed25519"));
+            refused(&|d| d["enc_key"]["pub"] = json!(b64u(&[9u8; 31])));
+            refused(&|d| d["enc_key"]["extra"] = json!(1));
+            refused(&|d| d["enc_key"] = json!(b64u(&[9u8; 32])));
+            refused(&|d| d["enc_sig"] = json!(b64u(&[7u8; 63])));
+            refused(&|d| d["enc_sig"] = json!(b64u(&[7u8; 65])));
+            refused(&|d| d["enc_sig"] = json!("not base64url!"));
         }
     }
 

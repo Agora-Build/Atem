@@ -93,12 +93,18 @@ pub struct HostCore {
     /// A misbehaving host for client tests: rewrites the result it sends
     /// for a `control_records` message.
     pub control_records_override: Option<fn(&mut atem_client::session::r9::ControlRecordsResult)>,
+    /// A misbehaving host for client tests: rewrites its `host_enc_key`
+    /// answer.
+    pub host_enc_key_override: Option<fn(&mut atem_client::session::r9::HostEncKey)>,
     /// The host policy (§R9.8a), in memory: (relay_only, revision) and the
     /// recorded changes (request_id, principal, relay_only, expected
     /// revision, committed revision).
     pub policy: (bool, u64),
     policy_requests: Vec<(String, String, bool, u64, u64)>,
 }
+
+/// The X25519 key the stand-in host vouches for (`host_enc_key_get`).
+pub const HOST_ENC_PUB: [u8; 32] = [0x5a; 32];
 
 fn uuid(n: u64) -> String {
     format!("aaaaaaaa-0000-4000-8000-{n:012x}")
@@ -135,6 +141,7 @@ impl HostCore {
             refusals: Vec::new(),
             welcome_override: None,
             control_records_override: None,
+            host_enc_key_override: None,
             policy: (false, 0),
             policy_requests: Vec::new(),
         }
@@ -803,6 +810,43 @@ impl HostConn {
                     }
                     return vec![result.to_json().to_string().into_bytes()];
                 }
+                Some("host_enc_key_get") => {
+                    // A stand-in for the real host: a manager gets this
+                    // host's encryption key for its trust generation, with
+                    // the host's `enc_sig` by its `host_channel_key`.
+                    use atem_client::membership::sign_host_enc_key;
+                    use atem_client::session::r9::{HostEncKey, HostEncKeyGet};
+                    if HostEncKeyGet::decode(plain).is_err() {
+                        return vec![error(code::INVALID_REQUEST, None)];
+                    }
+                    if !core.holds_manage(&authority) {
+                        return vec![error(code::FORBIDDEN, None)];
+                    }
+                    let enc_pub = HOST_ENC_PUB;
+                    let enc_sig = sign_host_enc_key(
+                        &core.keys,
+                        &core.host_key,
+                        core.log.account_id(),
+                        &core.log.genesis_hash(),
+                        &core.host_id,
+                        core.trust_gen,
+                        &enc_pub,
+                    )
+                    .unwrap();
+                    let mut answer = HostEncKey {
+                        id: uuid(0x9005),
+                        re: id.clone(),
+                        host_id: core.host_id.clone(),
+                        host_trust_gen: core.trust_gen,
+                        enc_key: atem_client::PublicKey::new(atem_client::Alg::X25519, &enc_pub)
+                            .unwrap(),
+                        enc_sig,
+                    };
+                    if let Some(rewrite) = core.host_enc_key_override {
+                        rewrite(&mut answer);
+                    }
+                    return vec![answer.to_json().to_string().into_bytes()];
+                }
                 Some("approval_seen") => {
                     let approval_id = data["approval_id"].as_str().unwrap_or_default();
                     let target = &data["binding"]["target"];
@@ -929,6 +973,8 @@ impl HostConn {
                         updated_at: core.now.wall_ms,
                         lease,
                         result: None,
+                        task_id: None,
+                        sender: None,
                     };
                     let accepted = reply(WireOp::Receipt(receipt.clone()));
                     receipt.state = ReceiptState::Completed;

@@ -1,0 +1,748 @@
+{
+  "host_enc_key": [
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA",
+          "extra": 1,
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_unknown_field",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_needs_re",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": null,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_re_not_null",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA",
+          "host_id": "host a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_host_id_grammar",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA",
+          "host_id": "host-a",
+          "host_trust_gen": 0,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_host_trust_gen_from_one",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "ed25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_is_x25519",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9mg"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_32_bytes",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "extra": 1,
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZAA",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_key_object",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "Mem84afE8_OA6az9Iho-bq3Xuq1V-ku25fmfFqnBxzOf6r0QHm6MXItX1Peec5MX7P9NEIHMDn1flBOT2ifZ",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_sig_64_bytes",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "enc_key": {
+            "alg": "x25519",
+            "pub": "VmHgPdR1YmbgM0OShrmG5X-fQKiFf8UbteuY4GN9miA"
+          },
+          "enc_sig": "not base64url!",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000002",
+          "op": "host_enc_key",
+          "re": "c1c2c3c4-0000-4000-8000-000000000001",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_sig_base64url",
+      "valid": false
+    }
+  ],
+  "host_enc_key_binding": {
+    "account_id": "acct-test-1",
+    "enc_sig_input_hex": "000000146174656d2d686f73742d656e632d6b65792d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d61000000080000000000000001000000205661e03dd4756266e033439286b986e57f9f40a8857fc51bb5eb98e0637d9a20",
+    "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+    "host_id": "host-a",
+    "host_trust_gen": 1
+  },
+  "host_enc_key_get": [
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "host_enc_key_get",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_get",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "extra": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "host_enc_key_get",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_get_unknown_field",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "host_enc_key_get",
+          "v": 2
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_get_version",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "6ba7b810-9dad-51d1-80b4-00c04fd430c8",
+          "op": "host_enc_key_get",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_get_id_is_uuid_v4",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": null,
+          "op": "host_enc_key_get",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_get_id_not_null",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "op": "host_enc_key_get",
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "host_enc_key_get_needs_an_id",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "host_enc_key_get",
+          "v": 1
+        },
+        "type": "terminal"
+      },
+      "name": "host_enc_key_get_is_a_session_message",
+      "valid": false
+    },
+    {
+      "name": "host_enc_key_get_duplicate_key",
+      "raw": "{\"type\":\"session\",\"data\":{\"v\":1,\"op\":\"host_enc_key_get\",\"id\":\"c1c2c3c4-0000-4000-8000-000000000001\",\"id\":\"c1c2c3c4-0000-4000-8000-000000000002\"}}",
+      "valid": false
+    }
+  ],
+  "kind": "vectors",
+  "name": "r9-vectors-delegated-wire",
+  "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4 and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without. Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
+  "receipt": [
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "state": "accepted",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_without_provenance",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "stop",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "state": "completed",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_of_a_stop_without_provenance",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "service:svc-1",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_service",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "member:dev-phone",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_member",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "host:host-b",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_host",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "service:ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_128_byte_id",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_needs_sender",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "service:svc-1",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_needs_task_id",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": null,
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_sender_not_null",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "service:svc-1",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": null,
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_task_id_not_null",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "service:svc-1",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "6ba7b810-9dad-51d1-80b4-00c04fd430c8",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_task_id_is_uuid_v4",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "local",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_sender_not_local",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "browser:g-1",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_sender_not_a_browser_grant",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "host-work",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_sender_not_host_work",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "service:",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_sender_has_an_id",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "prompt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "service:sssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_sender_id_at_most_128_bytes",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "kind": "interrupt",
+          "op": "receipt",
+          "request_id": "44444444-4444-4444-8444-000000000001",
+          "sender": "service:svc-1",
+          "state": "executing",
+          "target": {
+            "account_id": "acct-test-1",
+            "atem_device_id": "host-a",
+            "host_trust_gen": 1,
+            "process_gen": "22222222-2222-4222-8222-222222222222",
+            "session_id": "ses-aaaaaaaaaaaa"
+          },
+          "task_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "updated_at": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "receipt_provenance_only_on_a_prompt",
+      "valid": false
+    }
+  ],
+  "requires": "r9"
+}

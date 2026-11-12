@@ -865,6 +865,7 @@ impl HostBridge {
                         state: WorkState::Queued,
                         detail: "waiting for a ready agent".into(),
                         result: None,
+                        resolved: None,
                     },
                     turn_id: None,
                 };
@@ -945,6 +946,13 @@ impl HostBridge {
                 store.save_work(&r).map_err(|_| "busy")?;
                 Ok(ResultBody::Work { work: r.status })
             }
+            // `host.delegated`'s and `host.alerts`' ops: the channel refuses
+            // them while the host doesn't advertise the feature (none does
+            // yet, step 3), so none gets here; one that did would be refused,
+            // never half-served.
+            Request::WorkInterrupt { .. }
+            | Request::WorkResolve { .. }
+            | Request::AlertList { .. } => Err("busy"),
             Request::Publish { .. }
             | Request::MessageQuery { .. }
             | Request::AttachmentPut { .. } => unreachable!(),
@@ -1123,6 +1131,7 @@ impl HostBridge {
                         state: WorkState::Queued,
                         detail: "waiting for a ready agent".into(),
                         result: None,
+                        resolved: None,
                     },
                     turn_id: None,
                 };
@@ -2293,6 +2302,7 @@ principals = ["local"]
                 state,
                 detail: String::new(),
                 result: None,
+                resolved: None,
             },
             task,
             turn_id: None,
@@ -2814,6 +2824,7 @@ principals = ["local"]
                     state: WorkState::Completed,
                     detail: String::new(),
                     result: None,
+                    resolved: None,
                 },
                 task,
                 turn_id: None,
@@ -2852,6 +2863,57 @@ principals = ["local"]
             idle(&mut rig, 300).await;
             assert_eq!(prompt(&rig, &ids[0]), "", "settled and past the retention");
             assert!(!prompt(&rig, &ids[1]).is_empty(), "still in its turn");
+        });
+    }
+
+    /// The delegated ops of step 3 never reach the bridge (the channel
+    /// refuses an op of a feature the host doesn't advertise). One that did
+    /// is refused `busy`, never half-served: `work_interrupt`,
+    /// `work_resolve` and `alert_list`.
+    #[test]
+    fn delegated_ops_that_reach_the_bridge_are_busy() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let local = rig.bridge.local_attachment().to_string();
+            let host = rig.bridge.work_host();
+            let id = || uuid::Uuid::new_v4().to_string();
+            let requests = [
+                hw::Request::WorkInterrupt {
+                    v: 1,
+                    id: id(),
+                    host: host.clone(),
+                    task_id: id(),
+                },
+                hw::Request::WorkResolve {
+                    v: 1,
+                    id: id(),
+                    host: host.clone(),
+                    task_id: id(),
+                    resolution: hw::Resolution::Failed {
+                        detail: "agent exited".into(),
+                    },
+                },
+                hw::Request::AlertList {
+                    v: 1,
+                    id: id(),
+                    host: host.clone(),
+                    after: None,
+                },
+            ];
+            for request in &requests {
+                assert_eq!(
+                    rig.bridge.work_request(
+                        &local,
+                        request,
+                        &mut Cx {
+                            client: &rig.app.astation_client,
+                            sessions: &mut rig.sessions,
+                        },
+                    ),
+                    Err("busy"),
+                    "{request:?}"
+                );
+            }
         });
     }
 
@@ -4122,6 +4184,7 @@ launch = "on_message"
                     state: WorkState::AwaitingResult,
                     detail: "agent submission receipt reconciled; task completion requires an explicit result".into(),
                     result: None,
+                    resolved: None,
                 },
                 task,
                 turn_id: Some("turn-0".into()),
@@ -4899,6 +4962,7 @@ launch = "on_message"
                             state: WorkState::Queued,
                             detail: String::new(),
                             result: None,
+                            resolved: None,
                         },
                         turn_id: None,
                         authorization_expires_at: None,
@@ -4984,6 +5048,8 @@ principals = ["browser:b"]
             updated_at: 1,
             lease: None,
             result: None,
+            task_id: None,
+            sender: None,
         };
         use wire::{ReceiptKind, ReceiptState};
         assert!(turn_interrupted(&receipt(

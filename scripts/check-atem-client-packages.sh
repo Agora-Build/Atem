@@ -3,13 +3,15 @@
 #
 # Checks what scripts/package-atem-client-bindings.sh put in <dir>, the way
 # Astation should after downloading it (designs/protocol/atem-client-bindings.md
-# §7): the SHA-256 sums, the source pin, the shared host-work vectors listed in
-# the sums (requests, prompt framing, framing size), no test-only or host-role
-# export in the shipped bindings (the framing's vectors-only rendering
-# included), and each package used once: the Node build of the WASM package
-# runs the packaged framing vectors (escaping, Unicode version, the preflight
-# size check) and, with the JVM jar (through JNA), reads the r9 pairing
-# vectors' verifyCommit messages with the shared parser. The Android zip:
+# §7): the SHA-256 sums, the source pin, the shared vectors listed in the sums
+# and unchanged (host-work requests, prompt framing, framing size; r9 control,
+# push-hint and delegated-wire vectors; the acknowledgment fixtures), no
+# test-only or host-role export in the shipped bindings (the framing's
+# vectors-only rendering included), and each package used once: the Node
+# build of the WASM package runs the packaged framing vectors (escaping,
+# Unicode version, the preflight size check) and, with the JVM jar (through
+# JNA), reads the r9 pairing vectors' verifyCommit messages with the shared
+# parser. The Android zip:
 # each ABI's ELF class, machine, 16 KB LOAD alignment and exports (READELF,
 # default readelf).
 #   EXPECT_COMMIT  the full SHA the packages must pin (with a clean tree)
@@ -26,15 +28,29 @@ trap 'rm -rf "$WORK"' EXIT
 VECTORS="$ROOT/designs/protocol/fixtures/r9-vectors-pairing.json"
 
 (cd "$DIR" && sha256sum -c "atem-client-${VERSION}-SHA256SUMS.txt")
-# The shared host-work and r9 vectors ship beside the packages, each listed in the
-# sums (sha256sum -c above checked what is listed, not that it is listed).
-for VECTOR_NAME in host-work-requests-v1 host-work-prompt-framing-v1 host-work-framing-size-v1 \
-  r9-vectors-host-work-control; do
-  VECTOR_FILE="atem-client-${VERSION}-${VECTOR_NAME}.json"
-  test -s "$DIR/$VECTOR_FILE" || { echo "$VECTOR_FILE: missing from the package directory" >&2; exit 1; }
-  awk -v f="$VECTOR_FILE" '$2 == f {found = 1} END {exit !found}' "$DIR/atem-client-${VERSION}-SHA256SUMS.txt" \
-    || { echo "$VECTOR_FILE: not listed in the sums" >&2; exit 1; }
+# The shared vectors and the Station's acknowledgment fixtures (test 48)
+# ship beside the bindings, each listed in the sums and the same bytes as the
+# repository's.
+SHIPPED_VECTORS=(
+  host-work/requests-v1.json:host-work-requests-v1.json
+  host-work/prompt-framing-v1.json:host-work-prompt-framing-v1.json
+  host-work/framing-size-v1.json:host-work-framing-size-v1.json
+  r9-vectors-host-work-control.json:r9-vectors-host-work-control.json
+  r9-vectors-push-hint.json:r9-vectors-push-hint.json
+  r9-vectors-delegated-wire.json:r9-vectors-delegated-wire.json
+)
+for fixture in "$ROOT"/designs/protocol/fixtures/r9-control-ack-*.json; do
+  SHIPPED_VECTORS+=("$(basename "$fixture"):$(basename "$fixture")")
 done
+for vector in "${SHIPPED_VECTORS[@]}"; do
+  source="$ROOT/designs/protocol/fixtures/${vector%%:*}"
+  shipped="atem-client-${VERSION}-${vector#*:}"
+  grep -q "  $shipped\$" "$DIR/atem-client-${VERSION}-SHA256SUMS.txt" ||
+    { echo "vectors: $shipped is not in the SHA256SUMS" >&2; exit 1; }
+  cmp -s "$source" "$DIR/$shipped" ||
+    { echo "vectors: $shipped differs from ${vector%%:*}" >&2; exit 1; }
+done
+echo "vectors: ${#SHIPPED_VECTORS[@]} files shipped, listed and unchanged"
 FRAMING_VECTORS="$DIR/atem-client-${VERSION}-host-work-prompt-framing-v1.json"
 FRAMING_SIZE_VECTORS="$DIR/atem-client-${VERSION}-host-work-framing-size-v1.json"
 python3 - "$DIR/atem-client-${VERSION}-SOURCE.json" "${EXPECT_COMMIT:-}" <<'EOF'

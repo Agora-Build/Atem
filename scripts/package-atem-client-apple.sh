@@ -91,9 +91,13 @@ for fixture in designs/protocol/fixtures/r9-control-ack-*.json; do
   ACK_FIXTURES+=("atem-client-${VERSION}-$(basename "$fixture")")
   cp "$fixture" "$OUT/${ACK_FIXTURES[${#ACK_FIXTURES[@]}-1]}"
 done
+PUSH_VECTOR="atem-client-${VERSION}-r9-vectors-push-hint.json"
+cp designs/protocol/fixtures/r9-vectors-push-hint.json "$OUT/$PUSH_VECTOR"
+WIRE_VECTOR="atem-client-${VERSION}-r9-vectors-delegated-wire.json"
+cp designs/protocol/fixtures/r9-vectors-delegated-wire.json "$OUT/$WIRE_VECTOR"
 ./scripts/atem-client-source-pin.sh "$OUT/$PIN" apple-swiftpm "default (uniffi)" \
   "xcodebuild=$(xcodebuild -version | tr '\n' ' ' | sed 's/ *$//')" \
   "swift=$(swift --version 2>&1 | sed -n 1p)"
-(cd "$OUT" && shasum -a 256 "$ZIP" "atem-client-${VERSION}-atem_client_ffiFFI.h" "$PIN" "$VECTOR" "$WORK_VECTOR" "$FRAMING_VECTOR" "$FRAMING_SIZE_VECTOR" "$CONTROL_VECTOR" "${ACK_FIXTURES[@]}" > "atem-client-${VERSION}-SHA256SUMS.txt")
+(cd "$OUT" && shasum -a 256 "$ZIP" "atem-client-${VERSION}-atem_client_ffiFFI.h" "$PIN" "$VECTOR" "$WORK_VECTOR" "$FRAMING_VECTOR" "$FRAMING_SIZE_VECTOR" "$CONTROL_VECTOR" "$PUSH_VECTOR" "$WIRE_VECTOR" "${ACK_FIXTURES[@]}" > "atem-client-${VERSION}-SHA256SUMS.txt")
 echo "Packaged into $OUT:"
 ls -l "$OUT"

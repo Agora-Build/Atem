@@ -22,6 +22,16 @@
 //!   [`RelayLedger`] is a reference relay over a shared store (the real
 //!   relay is Astation's: its HTTP shapes and storage are its own).
 //!
+//! A second kind of hint, **`outcome_unknown`** (delegated host-work design
+//! I.4.6, feature `host.alerts`), tells the owner's devices that a task's
+//! outcome is unknown: [`alert_hint`] builds one per recipient (the task,
+//! session, sender and reason sealed to its `enc_key`), [`AlertHint::verify`]
+//! reads it as strictly as an open approval hint, [`AlertHint::open`] opens
+//! it; [`HintBook`], [`Outbox`] and [`RelayLedger`] carry it like an open
+//! hint, under its own identity ([`AlertKey`], [`Identity::Alert`]). It is a
+//! body of the same `type`, told apart by a `kind` field no approval hint
+//! has; no host sends it while `host.alerts` is unadvertised.
+//!
 //! Identity of a hint or seen: `(account_id, genesis_hash, host_id,
 //! host_trust_gen, session_id, process_gen, approval_id)`, plus `state` and
 //! `recipient.device_id` for a hint and `device_id` for a seen; every match,
@@ -40,6 +50,8 @@ use crate::hpke::{self, Sealed};
 use crate::keys::{PublicKey, enc_kid};
 use crate::membership::{MemberKind, MemberStatus, Membership, Role};
 use crate::provider::{KeyId, KeyProvider};
+use crate::session::alerts;
+use crate::session::wire::is_uuid_v4;
 use crate::signed::SealedPart;
 
 /// `expires_at − created_at` is at most 15 minutes.
@@ -65,6 +77,8 @@ pub const RESEND_MS: u64 = 10_000;
 /// The sealed summary and tool bounds (§1, r8's approval bounds).
 pub const MAX_TOOL_BYTES: usize = 128;
 pub const MAX_SUMMARY_BYTES: usize = 512;
+/// The `kind` of the `outcome_unknown` hint (and of its ack entry).
+pub const ALERT_KIND: &str = "outcome_unknown";
 
 // -------------------------------------------------------------- identity
 
@@ -137,6 +151,68 @@ impl ApprovalKey {
     }
 }
 
+/// The alert an `outcome_unknown` hint is about: the host's alert id
+/// within the host's account, genesis and trust generation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AlertKey {
+    pub account_id: String,
+    /// Lowercase hex (a public value: ordered for maps).
+    pub genesis_hash: String,
+    pub host_id: String,
+    pub host_trust_gen: u64,
+    /// The alert's UUID v4 (`alert_list`'s `alert_id`).
+    pub alert_id: String,
+}
+
+impl AlertKey {
+    /// The alert `alert_id` of host `host_id` (at `host_trust_gen`) of the
+    /// account `log` names.
+    pub fn new(log: &Membership, host_id: &str, host_trust_gen: u64, alert_id: &str) -> Self {
+        AlertKey {
+            account_id: log.account_id().into(),
+            genesis_hash: log.genesis_hash().to_hex(),
+            host_id: host_id.into(),
+            host_trust_gen,
+            alert_id: alert_id.into(),
+        }
+    }
+
+    fn fields(&self, out: &mut Map<String, Value>) {
+        out.insert("account_id".into(), json!(self.account_id));
+        out.insert("genesis_hash".into(), json!(self.genesis_hash));
+        out.insert("host_id".into(), json!(self.host_id));
+        out.insert("host_trust_gen".into(), json!(self.host_trust_gen));
+        out.insert("alert_id".into(), json!(self.alert_id));
+    }
+
+    fn read(o: &Map<String, Value>) -> Result<AlertKey> {
+        let s = |k: &'static str| -> Result<String> {
+            o.get(k)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .ok_or(Error::Malformed(k))
+        };
+        Ok(AlertKey {
+            account_id: s("account_id")?,
+            genesis_hash: Hash32::from_hex(&s("genesis_hash")?)?.to_hex(),
+            host_id: s("host_id")?,
+            host_trust_gen: o
+                .get("host_trust_gen")
+                .and_then(Value::as_u64)
+                .filter(|g| *g >= 1)
+                .ok_or(Error::Malformed("host_trust_gen"))?,
+            alert_id: s("alert_id").and_then(|id| {
+                if is_uuid_v4(&id) {
+                    Ok(id)
+                } else {
+                    Err(Error::Malformed("alert_id"))
+                }
+            })?,
+        })
+    }
+}
+
 /// The full identity (`push_ack` entries name it).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Identity {
@@ -152,14 +228,21 @@ pub enum Identity {
         key: ApprovalKey,
         device_id: String,
     },
+    /// An `outcome_unknown` hint for one recipient.
+    Alert {
+        key: AlertKey,
+        device_id: String,
+    },
 }
 
 impl Identity {
-    pub fn key(&self) -> &ApprovalKey {
+    /// The approval an identity is about; none for an alert's.
+    pub fn key(&self) -> Option<&ApprovalKey> {
         match self {
             Identity::Open { key, .. }
             | Identity::Resolved { key }
-            | Identity::Seen { key, .. } => key,
+            | Identity::Seen { key, .. } => Some(key),
+            Identity::Alert { .. } => None,
         }
     }
 
@@ -183,6 +266,11 @@ impl Identity {
                 key.fields(&mut o);
                 o.insert("device_id".into(), json!(device_id));
             }
+            Identity::Alert { key, device_id } => {
+                o.insert("kind".into(), json!(ALERT_KIND));
+                key.fields(&mut o);
+                o.insert("device_id".into(), json!(device_id));
+            }
         }
         Value::Object(o)
     }
@@ -190,13 +278,23 @@ impl Identity {
     /// A `push_ack` entry as received (exact fields).
     pub fn from_ack(value: &Value) -> Result<Identity> {
         let o = value.as_object().ok_or(Error::Malformed("ack"))?;
-        let key = ApprovalKey::read(o)?;
         let device = || -> Result<String> {
             o.get("device_id")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .ok_or(Error::Malformed("device_id"))
         };
+        // An alert's ack: `kind`, its five identity fields and the device.
+        if o.get("kind").and_then(Value::as_str) == Some(ALERT_KIND) {
+            if o.len() != 7 {
+                return Err(Error::Malformed("unknown field in an ack"));
+            }
+            return Ok(Identity::Alert {
+                key: AlertKey::read(o)?,
+                device_id: device()?,
+            });
+        }
+        let key = ApprovalKey::read(o)?;
         let (identity, n) = match (
             o.get("kind").and_then(Value::as_str),
             o.get("state").and_then(Value::as_str),
@@ -613,18 +711,91 @@ fn check_host_signed(
     key: &ApprovalKey,
     log: &Membership,
 ) -> std::result::Result<(), (Refusal, bool)> {
-    let host = log.host(&key.host_id).ok_or((Refusal::Binding, false))?;
+    check_binding(
+        object,
+        (
+            &key.account_id,
+            &key.genesis_hash,
+            &key.host_id,
+            key.host_trust_gen,
+        ),
+        log,
+    )
+}
+
+/// The host's signature, then the binding of `(account, genesis, host,
+/// trust generation)` to the verifier's log.
+fn check_binding(
+    object: &SignedObject,
+    (account_id, genesis_hash, host_id, host_trust_gen): (&str, &str, &str, u64),
+    log: &Membership,
+) -> std::result::Result<(), (Refusal, bool)> {
+    let host = log.host(host_id).ok_or((Refusal::Binding, false))?;
     // The signature first: a tampered field fails here whatever it says.
     object
         .verify(&host.host_key)
         .map_err(|_| (Refusal::BadSignature, false))?;
-    if key.account_id != log.account_id()
-        || key.genesis_hash != log.genesis_hash().to_hex()
-        || key.host_trust_gen != host.host_trust_gen
+    if account_id != log.account_id()
+        || genesis_hash != log.genesis_hash().to_hex()
+        || host_trust_gen != host.host_trust_gen
     {
         return Err((Refusal::Binding, true));
     }
     Ok(())
+}
+
+/// `expires_at > created_at` and ≤ 15 min, the verifier's skew rule (`open`:
+/// the relay's bound applies to opens, not to a resolved hint), staleness.
+fn check_times(
+    created_at: u64,
+    expires_at: u64,
+    now_ms: u64,
+    verifier: Verifier,
+    open: bool,
+) -> std::result::Result<(), Refusal> {
+    if expires_at <= created_at || expires_at - created_at > MAX_HINT_LIFETIME_MS {
+        return Err(Refusal::InvalidTimes);
+    }
+    match verifier {
+        Verifier::Client if created_at > now_ms.saturating_add(CLIENT_SKEW_MS) => {
+            return Err(Refusal::Skew);
+        }
+        Verifier::Relay if open && created_at.abs_diff(now_ms) > RELAY_SKEW_MS => {
+            return Err(Refusal::Skew);
+        }
+        _ => {}
+    }
+    if expires_at.saturating_add(CLIENT_SKEW_MS) <= now_ms {
+        return Err(Refusal::Stale);
+    }
+    Ok(())
+}
+
+/// An open hint's `recipient` and `sealed_hash`: exactly `{device_id,
+/// enc_kid}` (16 lower-case hex) and a hash.
+fn open_recipient(
+    o: &Map<String, Value>,
+) -> std::result::Result<(String, String, Hash32), Refusal> {
+    let r = o
+        .get("recipient")
+        .and_then(Value::as_object)
+        .filter(|r| r.len() == 2)
+        .ok_or(Refusal::Malformed("recipient"))?;
+    let device_id = r
+        .get("device_id")
+        .and_then(Value::as_str)
+        .ok_or(Refusal::Malformed("recipient.device_id"))?;
+    let enc_kid = r
+        .get("enc_kid")
+        .and_then(Value::as_str)
+        .filter(|k| k.len() == 16 && k.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        .ok_or(Refusal::Malformed("recipient.enc_kid"))?;
+    let sealed_hash = o
+        .get("sealed_hash")
+        .and_then(Value::as_str)
+        .and_then(|h| Hash32::from_hex(h).ok())
+        .ok_or(Refusal::Malformed("sealed_hash"))?;
+    Ok((device_id.to_owned(), enc_kid.to_owned(), sealed_hash))
 }
 
 /// A refusal, and the identity when the signature had verified (boxed:
@@ -708,30 +879,11 @@ impl Hint {
         let created_at = u64_of(o, "created_at").map_err(unidentified)?;
         let expires_at = u64_of(o, "expires_at").map_err(unidentified)?;
         let state = if state == Some("open") {
-            let r = o
-                .get("recipient")
-                .and_then(Value::as_object)
-                .filter(|r| r.len() == 2)
-                .ok_or(unidentified(Refusal::Malformed("recipient")))?;
-            let device_id = r
-                .get("device_id")
-                .and_then(Value::as_str)
-                .ok_or(unidentified(Refusal::Malformed("recipient.device_id")))?;
-            let enc_kid = r
-                .get("enc_kid")
-                .and_then(Value::as_str)
-                .filter(|k| {
-                    k.len() == 16 && k.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-                })
-                .ok_or(unidentified(Refusal::Malformed("recipient.enc_kid")))?;
+            let (device_id, enc_kid, sealed_hash) = open_recipient(o).map_err(unidentified)?;
             HintState::Open {
-                device_id: device_id.to_owned(),
-                enc_kid: enc_kid.to_owned(),
-                sealed_hash: o
-                    .get("sealed_hash")
-                    .and_then(Value::as_str)
-                    .and_then(|h| Hash32::from_hex(h).ok())
-                    .ok_or(unidentified(Refusal::Malformed("sealed_hash")))?,
+                device_id,
+                enc_kid,
+                sealed_hash,
             }
         } else {
             HintState::Resolved {
@@ -746,22 +898,8 @@ impl Hint {
         check_host_signed(object, &key, log)
             .map_err(|(r, signed)| (r, signed.then(|| Box::new(identity_of(&key, &state)))))?;
         let identified = |r: Refusal| (r, Some(Box::new(identity_of(&key, &state))));
-        if expires_at <= created_at || expires_at - created_at > MAX_HINT_LIFETIME_MS {
-            return Err(identified(Refusal::InvalidTimes));
-        }
         let open = matches!(state, HintState::Open { .. });
-        match verifier {
-            Verifier::Client if created_at > now_ms.saturating_add(CLIENT_SKEW_MS) => {
-                return Err(identified(Refusal::Skew));
-            }
-            Verifier::Relay if open && created_at.abs_diff(now_ms) > RELAY_SKEW_MS => {
-                return Err(identified(Refusal::Skew));
-            }
-            _ => {}
-        }
-        if expires_at.saturating_add(CLIENT_SKEW_MS) <= now_ms {
-            return Err(identified(Refusal::Stale));
-        }
+        check_times(created_at, expires_at, now_ms, verifier, open).map_err(identified)?;
         Ok(Hint {
             object: object.clone(),
             key,
@@ -902,6 +1040,394 @@ impl Seen {
     }
 }
 
+// ------------------------------------------- the outcome_unknown hint
+
+/// The sealed plaintext of an `outcome_unknown` hint:
+/// `jcs({"reason":…, "sender":…, "session_id":…, "task_id":…})`. Every field
+/// is bounded as `alert_list`'s alert is ([`alerts::valid_task_id`],
+/// [`alerts::valid_sender`], [`alerts::valid_reason`], a session id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertPlain {
+    pub task_id: String,
+    pub session_id: String,
+    pub sender: String,
+    pub reason: String,
+}
+
+impl AlertPlain {
+    fn check(&self) -> Result<()> {
+        if self.reason.len() > alerts::MAX_REASON_BYTES {
+            return Err(Error::TooLarge);
+        }
+        if !alerts::valid_task_id(&self.task_id) {
+            return Err(Error::Malformed("task_id"));
+        }
+        if !crate::session::wire::is_session_id(&self.session_id) {
+            return Err(Error::Malformed("session_id"));
+        }
+        if !alerts::valid_sender(&self.sender) {
+            return Err(Error::Malformed("sender"));
+        }
+        if !alerts::valid_reason(&self.reason) {
+            return Err(Error::Malformed("reason"));
+        }
+        Ok(())
+    }
+
+    fn bytes(&self) -> Result<Zeroizing<Vec<u8>>> {
+        self.check()?;
+        Ok(Zeroizing::new(
+            jcs(&json!({
+                "reason": self.reason,
+                "sender": self.sender,
+                "session_id": self.session_id,
+                "task_id": self.task_id,
+            }))?
+            .into_bytes(),
+        ))
+    }
+
+    /// Exactly the canonical four fields (anything else refused).
+    fn parse(plain: &[u8]) -> Result<AlertPlain> {
+        let value =
+            crate::canonical::parse_strict(plain, 4096, crate::canonical::Numbers::IntegersOnly)?;
+        let o = value.as_object().ok_or(Error::Malformed("plaintext"))?;
+        if o.len() != 4 {
+            return Err(Error::Malformed("plaintext fields"));
+        }
+        let field = |k: &'static str| -> Result<String> {
+            o.get(k)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or(Error::Malformed(k))
+        };
+        let parsed = AlertPlain {
+            task_id: field("task_id")?,
+            session_id: field("session_id")?,
+            sender: field("sender")?,
+            reason: field("reason")?,
+        };
+        if *parsed.bytes()? != plain {
+            return Err(Error::Malformed("plaintext not canonical"));
+        }
+        Ok(parsed)
+    }
+}
+
+/// `info = enc(["atem-push-seal-v1", account_id, genesis_hash, host_id,
+/// u64(host_trust_gen), "outcome_unknown", alert_id, u64(created_at),
+/// u64(expires_at), device_id, enc_kid])`: the approval seal's label with
+/// 11 fields (an approval's has 12) and the kind in the place of its
+/// `approval_id`, so neither kind's seal opens as the other's.
+pub fn alert_seal_info(
+    key: &AlertKey,
+    created_at: u64,
+    expires_at: u64,
+    device_id: &str,
+    enc_kid: &str,
+) -> Result<Vec<u8>> {
+    let genesis = Hash32::from_hex(&key.genesis_hash)?;
+    Ok(enc(&[
+        domain::PUSH_SEAL.as_bytes(),
+        key.account_id.as_bytes(),
+        genesis.as_bytes(),
+        key.host_id.as_bytes(),
+        &u64_field(key.host_trust_gen),
+        ALERT_KIND.as_bytes(),
+        key.alert_id.as_bytes(),
+        &u64_field(created_at),
+        &u64_field(expires_at),
+        device_id.as_bytes(),
+        enc_kid.as_bytes(),
+    ]))
+}
+
+fn alert_body(
+    key: &AlertKey,
+    created_at: u64,
+    expires_at: u64,
+    device_id: &str,
+    kid: &str,
+    sealed: &Sealed,
+) -> Value {
+    let mut o = Map::new();
+    o.insert("type".into(), json!("atem-push-hint"));
+    o.insert("v".into(), json!(1));
+    o.insert("kind".into(), json!(ALERT_KIND));
+    key.fields(&mut o);
+    o.insert("created_at".into(), json!(created_at));
+    o.insert("expires_at".into(), json!(expires_at));
+    o.insert(
+        "recipient".into(),
+        json!({"device_id": device_id, "enc_kid": kid}),
+    );
+    o.insert("sealed_hash".into(), json!(sealed.hash().to_hex()));
+    Value::Object(o)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_alert(
+    provider: &dyn KeyProvider,
+    host_key: &KeyId,
+    key: &AlertKey,
+    created_at: u64,
+    expires_at: u64,
+    device_id: &str,
+    kid: &str,
+    sealed: Sealed,
+) -> Result<SignedObject> {
+    let body = alert_body(key, created_at, expires_at, device_id, kid, &sealed);
+    Ok(
+        SignedObject::sign(provider, host_key, body)?.with_sealed(SealedPart {
+            enc: sealed.enc.to_vec(),
+            ct: sealed.ct,
+        }),
+    )
+}
+
+/// The host signs one `outcome_unknown` hint for `device_id`, the task,
+/// session, sender and reason sealed to its `enc_key` (with
+/// `host_channel_key` behind `provider`). Like an open approval hint it
+/// lives at most 15 minutes (`expires_at − created_at`).
+#[allow(clippy::too_many_arguments)]
+pub fn alert_hint(
+    provider: &dyn KeyProvider,
+    host_key: &KeyId,
+    key: &AlertKey,
+    created_at: u64,
+    expires_at: u64,
+    device_id: &str,
+    enc_key: &PublicKey,
+    plain: &AlertPlain,
+) -> Result<SignedObject> {
+    if !is_uuid_v4(&key.alert_id) {
+        return Err(Error::Malformed("alert_id"));
+    }
+    let kid = enc_kid(enc_key)?;
+    let info = alert_seal_info(key, created_at, expires_at, device_id, &kid)?;
+    let recipient = enc_key.as_32().ok_or(Error::BadKey)?;
+    let sealed = hpke::seal(recipient, &info, b"", &plain.bytes()?)?;
+    sign_alert(
+        provider, host_key, key, created_at, expires_at, device_id, &kid, sealed,
+    )
+}
+
+/// `alert_hint` with the HPKE ephemeral `DeriveKeyPair(ikm_e)` (known-answer
+/// vectors only).
+#[cfg(feature = "test-vectors")]
+#[allow(clippy::too_many_arguments)]
+pub fn alert_hint_with_ikm(
+    provider: &dyn KeyProvider,
+    host_key: &KeyId,
+    key: &AlertKey,
+    created_at: u64,
+    expires_at: u64,
+    device_id: &str,
+    enc_key: &PublicKey,
+    plain: &AlertPlain,
+    ikm_e: &[u8; 32],
+) -> Result<SignedObject> {
+    if !is_uuid_v4(&key.alert_id) {
+        return Err(Error::Malformed("alert_id"));
+    }
+    let kid = enc_kid(enc_key)?;
+    let info = alert_seal_info(key, created_at, expires_at, device_id, &kid)?;
+    let recipient = enc_key.as_32().ok_or(Error::BadKey)?;
+    let sealed = hpke::seal_with_ikm(recipient, &info, b"", &plain.bytes()?, ikm_e)?;
+    sign_alert(
+        provider, host_key, key, created_at, expires_at, device_id, &kid, sealed,
+    )
+}
+
+/// The hints of one alert: one per recipient of `log` ([`recipients`]),
+/// every native member with `control` at its head.
+pub fn alert_hints(
+    provider: &dyn KeyProvider,
+    host_key: &KeyId,
+    log: &Membership,
+    key: &AlertKey,
+    created_at: u64,
+    expires_at: u64,
+    plain: &AlertPlain,
+) -> Result<Vec<SignedObject>> {
+    recipients(log)
+        .iter()
+        .map(|(device, enc_key)| {
+            alert_hint(
+                provider, host_key, key, created_at, expires_at, device, enc_key, plain,
+            )
+        })
+        .collect()
+}
+
+/// A verified `outcome_unknown` hint. Its fields are private: only
+/// [`AlertHint::verify`] makes one, so a hint can only be opened (its
+/// decryption `info` built from its fields) after its signature verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlertHint {
+    object: SignedObject,
+    key: AlertKey,
+    created_at: u64,
+    expires_at: u64,
+    device_id: String,
+    enc_kid: String,
+    sealed_hash: Hash32,
+}
+
+const ALERT_FIELDS: [&str; 12] = [
+    "type",
+    "v",
+    "kind",
+    "account_id",
+    "genesis_hash",
+    "host_id",
+    "host_trust_gen",
+    "alert_id",
+    "created_at",
+    "expires_at",
+    "recipient",
+    "sealed_hash",
+];
+
+impl AlertHint {
+    pub fn object(&self) -> &SignedObject {
+        &self.object
+    }
+    pub fn key(&self) -> &AlertKey {
+        &self.key
+    }
+    pub fn created_at(&self) -> u64 {
+        self.created_at
+    }
+    pub fn expires_at(&self) -> u64 {
+        self.expires_at
+    }
+    /// The recipient device.
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+    pub fn enc_kid(&self) -> &str {
+        &self.enc_kid
+    }
+    pub fn sealed_hash(&self) -> &Hash32 {
+        &self.sealed_hash
+    }
+
+    /// §R9.9 verification, as for an open approval hint and in the same
+    /// order: exact fields, signature by the host's newest key, binding,
+    /// `expires_at > created_at` and ≤ 15 min, skew (the verifier's rule),
+    /// staleness; the sealed part is checked by [`HintBook::offer_alert`]
+    /// after the duplicate check, and by [`AlertHint::open`].
+    pub fn verify(
+        object: &SignedObject,
+        log: &Membership,
+        now_ms: u64,
+        verifier: Verifier,
+    ) -> std::result::Result<AlertHint, Refusal> {
+        Self::verify_reporting(object, log, now_ms, verifier).map_err(|(r, _)| r)
+    }
+
+    /// [`AlertHint::verify`], also naming the hint's identity in a refusal
+    /// once its signature verified (binding, times, skew, staleness).
+    pub fn verify_reporting(
+        object: &SignedObject,
+        log: &Membership,
+        now_ms: u64,
+        verifier: Verifier,
+    ) -> std::result::Result<AlertHint, Reported> {
+        let unidentified = |r: Refusal| (r, None);
+        if object.body_type() != "atem-push-hint" {
+            return Err(unidentified(Refusal::Malformed("type")));
+        }
+        let o = object
+            .body()
+            .as_object()
+            .ok_or(unidentified(Refusal::Malformed("body")))?;
+        if o.get("kind").and_then(Value::as_str) != Some(ALERT_KIND) {
+            return Err(unidentified(Refusal::Malformed("kind")));
+        }
+        if o.len() != ALERT_FIELDS.len() || !o.keys().all(|k| ALERT_FIELDS.contains(&k.as_str())) {
+            return Err(unidentified(Refusal::Malformed("fields")));
+        }
+        let key = AlertKey::read(o).map_err(|_| unidentified(Refusal::Malformed("identity")))?;
+        let created_at = u64_of(o, "created_at").map_err(unidentified)?;
+        let expires_at = u64_of(o, "expires_at").map_err(unidentified)?;
+        let (device_id, enc_kid, sealed_hash) = open_recipient(o).map_err(unidentified)?;
+        let identity = Identity::Alert {
+            key: key.clone(),
+            device_id: device_id.clone(),
+        };
+        check_binding(
+            object,
+            (
+                &key.account_id,
+                &key.genesis_hash,
+                &key.host_id,
+                key.host_trust_gen,
+            ),
+            log,
+        )
+        .map_err(|(r, signed)| (r, signed.then(|| Box::new(identity.clone()))))?;
+        check_times(created_at, expires_at, now_ms, verifier, true)
+            .map_err(|r| (r, Some(Box::new(identity.clone()))))?;
+        Ok(AlertHint {
+            object: object.clone(),
+            key,
+            created_at,
+            expires_at,
+            device_id,
+            enc_kid,
+            sealed_hash,
+        })
+    }
+
+    /// The hint carries its sealed part, the one `sealed_hash` names.
+    pub fn check_sealed(&self) -> std::result::Result<(), Refusal> {
+        match self.object.sealed() {
+            Some(sealed) if Hash32::of_enc(&[&sealed.enc, &sealed.ct]) == self.sealed_hash => {
+                Ok(())
+            }
+            _ => Err(Refusal::BadSealed),
+        }
+    }
+
+    pub fn identity(&self) -> Identity {
+        Identity::Alert {
+            key: self.key.clone(),
+            device_id: self.device_id.clone(),
+        }
+    }
+
+    /// The recipient opens its sealed part with its `enc_key` behind
+    /// `provider` (`enc_key_id`), as `device_id`. A hint for another device
+    /// or another `enc_key` (its `enc_kid`) is refused before opening.
+    pub fn open(
+        &self,
+        provider: &dyn KeyProvider,
+        enc_key_id: &KeyId,
+        device_id: &str,
+    ) -> Result<AlertPlain> {
+        if self.device_id != device_id {
+            return Err(Error::Malformed("not this device's hint"));
+        }
+        let ours = enc_kid(&provider.public_key(enc_key_id)?)?;
+        if !crate::encoding::ct_eq(ours.as_bytes(), self.enc_kid.as_bytes()) {
+            return Err(Error::Malformed("not this enc_key's hint"));
+        }
+        self.check_sealed().map_err(|_| Error::OpenFailed)?;
+        let sealed = self.object.sealed().ok_or(Error::OpenFailed)?;
+        let info = alert_seal_info(
+            &self.key,
+            self.created_at,
+            self.expires_at,
+            device_id,
+            &self.enc_kid,
+        )?;
+        let plain = provider.hpke_open(enc_key_id, &sealed.enc, &sealed.ct, &info, b"")?;
+        AlertPlain::parse(&plain)
+    }
+}
+
 // ------------------------------------------------------------- the book
 
 /// What happened to a hint offered to a [`HintBook`].
@@ -921,6 +1447,9 @@ pub enum Accepted {
 pub struct HintBook {
     hints: BTreeMap<Identity, Hint>,
     resolved: BTreeSet<ApprovalKey>,
+    /// The accepted `outcome_unknown` hints (an alert has no resolved hint
+    /// and no seen: it ends with its task).
+    alerts: BTreeMap<Identity, AlertHint>,
 }
 
 impl HintBook {
@@ -960,6 +1489,28 @@ impl HintBook {
         self.hints.values().find(|h| h.object == *object)
     }
 
+    /// Offers a verified `outcome_unknown` hint: the same identity with
+    /// other bytes is [`Refusal::Duplicate`] (the first stays); a new one
+    /// must carry its sealed part ([`AlertHint::check_sealed`]).
+    pub fn offer_alert(&mut self, hint: AlertHint) -> std::result::Result<Accepted, Refusal> {
+        let identity = hint.identity();
+        if let Some(stored) = self.alerts.get(&identity) {
+            return if stored.object == hint.object {
+                Ok(Accepted::Idempotent)
+            } else {
+                Err(Refusal::Duplicate)
+            };
+        }
+        hint.check_sealed()?;
+        self.alerts.insert(identity, hint);
+        Ok(Accepted::Accepted)
+    }
+
+    /// The accepted `outcome_unknown` hint with exactly these bytes, if any.
+    pub fn stored_alert(&self, object: &SignedObject) -> Option<&AlertHint> {
+        self.alerts.values().find(|h| h.object == *object)
+    }
+
     pub fn is_resolved(&self, key: &ApprovalKey) -> bool {
         self.resolved.contains(key)
     }
@@ -983,6 +1534,8 @@ impl HintBook {
             .collect();
         self.hints.retain(|_, h| !expired.contains(&h.key));
         self.resolved.retain(|k| !expired.contains(k));
+        self.alerts
+            .retain(|_, h| h.expires_at + CLIENT_SKEW_MS > now_ms);
     }
 }
 
@@ -1153,6 +1706,19 @@ struct ApprovalState {
     replaced: bool,
 }
 
+/// One alert's push state at the relay: the same schedule as an open hint's
+/// ([`stages`], [`send_now`]) from the signed `created_at`, with nothing to
+/// cancel it (an alert has no seen and no resolved hint).
+#[derive(Debug, Clone, Default)]
+struct AlertState {
+    created_at: u64,
+    expires_at: u64,
+    /// Recipient → when its hint was accepted (relay clock).
+    recipients: BTreeMap<String, u64>,
+    /// (device, stage) sent once, across replicas.
+    sent: BTreeSet<(String, Stage)>,
+}
+
 /// A reference relay over its durable store (a value the caller persists
 /// and shares between replicas; "set-if-absent" is a map insert here).
 /// Every send is decided by [`stages`]/[`send_now`] from the signed
@@ -1161,6 +1727,8 @@ struct ApprovalState {
 pub struct RelayLedger {
     book: HintBook,
     approvals: BTreeMap<ApprovalKey, ApprovalState>,
+    /// The `outcome_unknown` hints' alerts.
+    alerts: BTreeMap<AlertKey, AlertState>,
     /// Seens with no open yet, by identity, with their arrival order.
     pending: BTreeMap<Identity, (u64, Seen)>,
     applied_seens: BTreeSet<Identity>,
@@ -1183,6 +1751,14 @@ impl RelayLedger {
         // A resend of bytes already accepted (a lost ack, a reconnect) is
         // idempotent whenever it arrives: the skew bound applies at first
         // receipt only. The bytes are the verified ones.
+        if let Some(stored) = self.book.stored_alert(object) {
+            return (Verdict::Idempotent, Some(stored.identity()));
+        }
+        // An `outcome_unknown` hint carries a `kind`, which no approval hint
+        // has: it is verified as its own kind, strictly.
+        if object.body().get("kind").is_some() {
+            return self.receive_alert(object, log, now);
+        }
         if let Some(stored) = self.book.stored(object) {
             let identity = stored.identity();
             let verdict = match stored.state {
@@ -1221,7 +1797,9 @@ impl RelayLedger {
                         .pending
                         .iter()
                         .filter(|(id, (_, s))| {
-                            *id.key() == key && s.device_id == device_id && s.in_window(created_at)
+                            id.key() == Some(&key)
+                                && s.device_id == device_id
+                                && s.in_window(created_at)
                         })
                         .map(|(id, _)| id.clone())
                         .collect();
@@ -1235,6 +1813,41 @@ impl RelayLedger {
             }
         }
         (verdict, Some(identity))
+    }
+
+    /// An `outcome_unknown` hint arrives: verified as the relay does
+    /// ([`Verifier::Relay`]), offered to the book (identical bytes
+    /// idempotent, other bytes under its identity refused, a missing or
+    /// mismatched sealed part refused) and scheduled for its recipient.
+    fn receive_alert(
+        &mut self,
+        object: &SignedObject,
+        log: &Membership,
+        now: u64,
+    ) -> (Verdict, Option<Identity>) {
+        let hint = match AlertHint::verify_reporting(object, log, now, Verifier::Relay) {
+            Ok(h) => h,
+            Err((r, identity)) => return (Verdict::Refused(r), identity.map(|i| *i)),
+        };
+        let identity = hint.identity();
+        let (key, created_at, expires_at) = (hint.key.clone(), hint.created_at, hint.expires_at);
+        let device_id = hint.device_id.clone();
+        match self.book.offer_alert(hint) {
+            Err(r) => (Verdict::Refused(r), Some(identity)),
+            Ok(Accepted::Accepted) => {
+                self.alerts
+                    .entry(key)
+                    .or_insert(AlertState {
+                        created_at,
+                        expires_at,
+                        ..Default::default()
+                    })
+                    .recipients
+                    .insert(device_id, now);
+                (Verdict::Accepted, Some(identity))
+            }
+            Ok(_) => (Verdict::Idempotent, Some(identity)),
+        }
     }
 
     /// A seen arrives (`push_seen`).
@@ -1278,7 +1891,10 @@ impl RelayLedger {
                     let account: Vec<(u64, Identity)> = self
                         .pending
                         .iter()
-                        .filter(|(id, _)| id.key().account_id == seen.key.account_id)
+                        .filter(|(id, _)| {
+                            id.key()
+                                .is_some_and(|k| k.account_id == seen.key.account_id)
+                        })
                         .map(|(id, (o, _))| (*o, id.clone()))
                         .collect();
                     if account.len() > MAX_PENDING_SEENS
@@ -1338,11 +1954,42 @@ impl RelayLedger {
                 }
             }
         }
+        for (key, a) in &mut self.alerts {
+            for (d, accepted_at) in &a.recipients {
+                for (stage, due) in stages(a.created_at, device(d)) {
+                    if !stage.is_provider_push() || a.sent.contains(&(d.clone(), stage)) {
+                        continue;
+                    }
+                    if send_now(stage, due, now, a.expires_at, false, false) {
+                        a.sent.insert((d.clone(), stage));
+                        pushes.push(Push {
+                            device_id: d.clone(),
+                            kind: stage.kind(),
+                            due_at: due.max(*accepted_at),
+                            collapse_id: key.alert_id.clone(),
+                        });
+                    }
+                }
+            }
+        }
         pushes
     }
 
     /// The earliest time [`RelayLedger::due`] may return something.
     pub fn next_wake(&self, now: u64, device: &dyn Fn(&str) -> RecipientInfo) -> Option<u64> {
+        let alerts = self.alerts.values().flat_map(|a| {
+            a.recipients.keys().filter_map(move |d| {
+                stages(a.created_at, device(d))
+                    .into_iter()
+                    .filter(|(s, due)| {
+                        s.is_provider_push()
+                            && !a.sent.contains(&(d.clone(), *s))
+                            && *due < guard(a.expires_at)
+                    })
+                    .map(|(_, due)| due.max(now))
+                    .min()
+            })
+        });
         self.approvals
             .values()
             .filter(|a| !a.resolved)
@@ -1366,6 +2013,7 @@ impl RelayLedger {
                         .min()
                 })
             })
+            .chain(alerts)
             .min()
     }
 }
@@ -1537,6 +2185,25 @@ impl Outbox {
         push_hint_message(&hints.iter().map(|h| h.object.clone()).collect::<Vec<_>>())
     }
 
+    /// Queues `outcome_unknown` hints, resent like any hint until their
+    /// identity is acknowledged or `expires_at + 300 s` passes (no resolved
+    /// hint follows an alert); returns the `push_hint` message to send now.
+    pub fn send_alert_hints(&mut self, hints: &[AlertHint], now: u64) -> Value {
+        for h in hints {
+            self.order += 1;
+            self.pending.insert(
+                h.identity(),
+                Pending {
+                    object: h.object.clone(),
+                    next_at: now + RESEND_MS,
+                    live_until: h.expires_at + CLIENT_SKEW_MS,
+                    order: self.order,
+                },
+            );
+        }
+        push_hint_message(&hints.iter().map(|h| h.object.clone()).collect::<Vec<_>>())
+    }
+
     /// Queues a seen; returns the `push_seen` message to send now.
     pub fn send_seen(&mut self, seen: &Seen, expires_at: u64, now: u64) -> Value {
         self.order += 1;
@@ -1558,7 +2225,7 @@ impl Outbox {
         for ack in acks {
             self.pending.remove(ack);
             if let Identity::Resolved { key } = ack {
-                self.pending.retain(|id, _| id.key() != key);
+                self.pending.retain(|id, _| id.key() != Some(key));
             }
         }
     }

@@ -30,6 +30,23 @@ before emitting that event; apps still inspect errors and each result state.
 | `host.reply` | `reply_query` | [Host work](atem-host-work-v1.md#reply) |
 | `host.messages` | `message_publish`, `message_query` | [Host work](atem-host-work-v1.md#5-messages) |
 | `host.attachments` | `attachment_put` | [Host work](atem-host-work-v1.md#6-attachments-and-mark) |
+| `host.delegated` (planned; no host advertises it yet) | `work_interrupt`, `work_resolve` | [Host work §11.2](atem-host-work-v1.md#112-work_interrupt-and-work_resolve) |
+| `host.alerts` (planned; no host advertises it yet) | `alert_list` | [Host work §11.3](atem-host-work-v1.md#113-alert_list-hostalerts) |
+
+The two planned features' results are host-work results too:
+- `alert_list` answers with an `alerts` result kind, and `work_resolve` with
+  a `work` result that carries `resolved`.
+- Released readers reject both, so Atem and Astation enable these features
+  together (host-work-v1 §11.2, "Compatibility").
+
+Planned, advertised by no host yet: `host.senders`'s two session ops,
+`control_records` and `host_enc_key_get`, go through `send_json` the same way
+(session-v1 R9.8, R9.14). The core refuses them without the feature, reads them
+as the host does and tracks each request, and their answers arrive as
+`ClientEvent::Family` with `op` `control_records_result` or `host_enc_key`. A
+`host_enc_key` answer is taken only from the channel's host at its trust
+generation; its `host_id`, `host_trust_gen`, `enc_key.pub` and `enc_sig` are the
+arguments of `host_enc_key_action` (below), which a manager signs.
 
 Persist launch request IDs and immutable message/task identities before sending.
 Recover uncertain results with their query operations; a retry uses a fresh
@@ -51,7 +68,9 @@ Every production SDK artifact includes
 `atem-client-<version>-host-work-requests-v1.json`,
 `atem-client-<version>-host-work-prompt-framing-v1.json`,
 `atem-client-<version>-host-work-framing-size-v1.json`,
-`atem-client-<version>-r9-vectors-host-work-control.json` and the five
+`atem-client-<version>-r9-vectors-host-work-control.json`,
+`atem-client-<version>-r9-vectors-push-hint.json`,
+`atem-client-<version>-r9-vectors-delegated-wire.json` and the five
 `atem-client-<version>-r9-control-ack-*.json` in its SHA-256
 manifest. These are the shared positive/negative request vectors from
 `fixtures/host-work/requests-v1.json`, the prompt framing's vectors from
@@ -59,12 +78,16 @@ manifest. These are the shared positive/negative request vectors from
 and the size check; delegated host-work design III.2), the preflight size
 cases from `fixtures/host-work/framing-size-v1.json` (each with its complete
 inputs and the expected checked length), the control records' vectors from
-`fixtures/r9-vectors-host-work-control.json` (§9) and the Station's
-acknowledgment fixtures `fixtures/r9-control-ack-*.json` (§9, delegated
-host-work test 48). The Rust core's tests run all of them; the Swift, Kotlin
-and WASM conformance suites run the framing vectors through the exports of
-[Prompt framing](#prompt-framing-delegated-host-work-design-iii2) (VII.C test
-40), the control records' vectors and the acknowledgment fixtures, and
+`fixtures/r9-vectors-host-work-control.json` (§9), the push hints' vectors
+from `fixtures/r9-vectors-push-hint.json` (approvals and `outcome_unknown`
+alerts, R9.9), the delegated wire shapes from
+`fixtures/r9-vectors-delegated-wire.json` (session-v1 R9.14) and the
+Station's acknowledgment fixtures `fixtures/r9-control-ack-*.json` (§9,
+delegated host-work test 48). The Rust core's tests run all of them; the
+Swift, Kotlin and WASM conformance suites run the framing vectors through
+the exports of [Prompt framing](#prompt-framing-delegated-host-work-design-iii2)
+(VII.C test 40), the control records' and the push hints' vectors and the
+acknowledgment fixtures, and
 `scripts/check-atem-client-packages.sh` runs the framing vectors through the
 packaged WASM build. They are fixture data, not a live integration test: the
 host renders every prompt (`session::framing`); a client never does.
@@ -444,10 +467,33 @@ A phone receiving a hint (APNs/FCM payload):
 2. `book.offer(hint)` on its `PushHintBook` (`accepted` → show,
    `idempotent` → already shown, `ignored_after_resolved`, or refused
    `duplicate`/`bad_sealed`); a resolved hint replaces the notification;
-3. `hint.open(provider, enc_key_id, device_id)` → `HintContent{tool,
-   summary}` (HPKE open by the provider; refused for another device or
-   `enc_key` before anything is opened). A locked device shows a generic
-   hint instead.
+3. `hint.open(provider, enc_key_id, device_id)` → `HintContent`: an
+   approval hint's `Approval{tool, summary}`, or an `outcome_unknown` hint's
+   `OutcomeUnknown{task_id, session_id, sender, reason}` (HPKE open by the
+   provider; refused for another device or `enc_key` before anything is
+   opened). Facts that aren't a delegated sender's UUID v4 task are refused
+   `malformed` at open (`r9-vectors-push-hint`'s
+   `outcome_unknown_invalid_facts`). A locked device shows a generic hint
+   instead.
+
+`verify_push_hint` takes both kinds of hint (the body's `kind`, which only
+the planned `outcome_unknown` hint of `host.alerts` has, tells them apart;
+session-v1 R9.9, host-work-v1 §11.3). `hint.state()` is `Open`, `Resolved`
+or `OutcomeUnknown{device_id, enc_kid, sealed_hash}`; `hint.approval()` and
+`hint.alert()` (an `AlertRef`: the account, genesis, host, trust generation
+and `alert_id`) each fail `malformed` for the other kind; `book.offer`,
+`ack_json`, `json`, `check_sealed`, `created_at` and `expires_at` serve both.
+An `outcome_unknown` hint has no resolved hint and no seen.
+
+**Binding API change** (for Astation's review). No host sends the new kind
+until `host.alerts` is advertised. What changes:
+- `HintContent` was a record `{tool, summary}`; it is now an enum.
+- `approval()` can now fail.
+- `HintStateInfo` gains the case `OutcomeUnknown`. That breaks every
+  exhaustive Swift `switch` and Kotlin `when` over it, which must handle the
+  new case.
+- In JS, `open()` now returns an object with a `type` tag (`"approval"` or
+  `"outcome_unknown"`), and `state()` has the `outcome_unknown` type.
 
 The relay: `verify_push_hint(…, Relay)`, its book, `push_stages(created_at,
 recipient)`, `push_send_now(…)`, `push_next_due(…)`, `push_guard(expires_at)`
@@ -868,7 +914,8 @@ pin naming another commit (for instance a merge commit) or `tree_dirty:
 true` means the download is not the build you asked for: don't use it.
 `EXPECT_COMMIT=<sha> scripts/check-atem-client-packages.sh <version> <dir>`
 is what CI runs on the Linux packages (sums, the pin's commit and clean
-tree, the three host-work vectors listed in the sums, no test-only or
+tree, every shipped vectors file and acknowledgment fixture listed in the
+sums and the same bytes as the repository's, no test-only or
 host-role export (the framing's vectors-only rendering included), the
 packaged framing vectors through the Node build, and one call through the JVM
 jar); it can be run on a download the same way.
@@ -880,7 +927,7 @@ jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (62 checks in JS, 64 in Kotlin and in Swift: the same 62
+- **Conformance** (64 checks in JS, 66 in Kotlin and in Swift: the same 64
   in each language, plus two in Kotlin and Swift, whose provider sees the
   signing request and so the purposes of the five device-list actions and
   of control records; over `designs/protocol/fixtures/r9-vectors-*.json`,
@@ -895,7 +942,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
   (with a CryptoKit `AppKeyProvider`).
 - **Device-list actions** (`tests/host_actions.rs`, Rust; four conformance
-  checks in JS, five in Kotlin and Swift, of the 62 and 64 above): every
+  checks in JS, five in Kotlin and Swift, of the 64 and 66 above): every
   `P*`/`EK*`/`HS*` vector of
   `r9-vectors-membership-log` through the queries (`expect`) and the
   refusals (`reason`), the builders against the vectors' `jcs` and
@@ -905,7 +952,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   action through a recording provider under its own purpose and publishing
   it (the verifier takes the entry).
 - **Control records** (`tests/control.rs`, Rust; four conformance checks
-  in JS, five in Kotlin and Swift, of the 62 and 64 above): every record of
+  in JS, five in Kotlin and Swift, of the 64 and 66 above): every record of
   `r9-vectors-host-work-control` parsed (or refused by the parse with its
   code) and verified on each of its chains as `checks` says, the builders
   reproducing it byte for byte (a software store, and the signing input
@@ -921,7 +968,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   integration's own key and `ControlRecord` (a fresh confirmation of the
   body) for a native manager.
 - **The Station's side** (`tests/station.rs`, Rust; nine conformance
-  checks per language, of the 62 and 64 above): every acknowledgment
+  checks per language, of the 64 and 66 above): every acknowledgment
   fixture (`r9-control-ack-*`, one check each) through `AckLedgerHandle` as
   a Station persists it (each call's next state committed before the
   reports go and adopted after, restarts from the committed state, two
@@ -937,7 +984,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   refused for its stale association with nothing counted or disclosed;
   and the Portal's statuses in their classes.
 - **Durable log** (`tests/stored_log.rs`, Rust; two conformance checks per
-  language, of the 62 and 64 above): a partly elapsed wait across a same-boot restart and a reboot,
+  language, of the 64 and 66 above): a partly elapsed wait across a same-boot restart and a reboot,
   the wall clock set back after restore, a wait-ended decision at its chain
   position (with the entry that relies on it), pending, approved and vetoed
   recovery and key-replacement records, a frozen log, corrupted, oversize,

@@ -1938,6 +1938,7 @@ mod tests {
                 state: WorkState::Queued,
                 detail: String::new(),
                 result: None,
+                resolved: None,
             },
             turn_id: None,
         }
