@@ -1,11 +1,13 @@
-// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) run
-// through the Kotlin binding (UniFFI + JNA), the same checks as the WASM
-// (bindings/js/conformance.mjs) and Swift runs. Usage:
+// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) and the
+// host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
+// framing-size-v1.json) run through the Kotlin binding (UniFFI + JNA), the
+// same checks as the WASM (bindings/js/conformance.mjs) and Swift runs. Usage:
 //   java -Djna.library.path=<dir of libatem_client_ffi.so> -cp … \
 //     atem.bindings.test.ConformanceKt <fixtures dir>
 package atem.bindings.test
 
 import java.io.File
+import java.security.MessageDigest
 import java.util.Base64
 import uniffi.atem_client_ffi.*
 
@@ -66,6 +68,18 @@ private fun throwsCode(code: String, f: () -> Unit) {
 private fun b64u(s: String): ByteArray = Base64.getUrlDecoder().decode(s)
 
 private fun utf8(s: String) = s.toByteArray(Charsets.UTF_8)
+
+private const val CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+// A tag's 60 bits as written (XXXX-XXXX-XXXX, Crockford base32).
+private fun tagBitsOf(tag: String): ULong =
+    tag.filter { it != '-' }.fold(0uL) { bits, c ->
+        val i = CROCKFORD.indexOf(c)
+        require(i >= 0) { "not a tag character: $c" }
+        (bits shl 5) or i.toULong()
+    }
+
+private fun sha256Hex(text: String): String = hex(MessageDigest.getInstance("SHA-256").digest(utf8(text)))
 
 fun main(args: Array<String>) {
     val dir = File(args[0])
@@ -936,6 +950,131 @@ fun main(args: Array<String>) {
                 throw AssertionError("${c["case"].s()} was accepted")
             } catch (e: AtemException.Invalid) {
             }
+        }
+    }
+
+    // ------------------------------------------------------------- framing
+    // The prompt framing (delegated host-work design III.2) over
+    // designs/protocol/fixtures/host-work/: the escaping and the marker
+    // check, the Unicode version they are pinned to, the preflight size check
+    // and (a test-vectors build only) the rendering, byte for byte.
+    fun loadWork(name: String) = Json.parse(File(File(dir, "host-work"), "$name.json").readText())
+    val framing = loadWork("prompt-framing-v1")
+    val framingSize = loadWork("framing-size-v1")
+    fun snapshot(kind: String, id: String, version: Long, text: String): Map<String, Any?> =
+        linkedMapOf("kind" to kind, "id" to id, "version" to version, "digest" to sha256Hex(text), "text" to text)
+    // framingCheckedLen of a text, an optional mark (a host-work MarkTask
+    // object) and snapshots (host-work ContextSnapshot objects): the complete
+    // inputs.
+    fun checkedLen(text: String, mark: Any?, context: List<Any?>): Long =
+        framingCheckedLen(text, mark?.let { Json.write(it) }, Json.write(context)).toLong()
+
+    check("framing: Unicode version, escape cases, marker check (III.2)") {
+        eq(framingUnicodeVersion(), framing["unicode_version"].s(), "Unicode version")
+        eq(framing["unicode_version"].s(), "18.0.0")
+        val cases = framing["escape"].arr()
+        eq(cases.size, 57)
+        for (c in cases) {
+            val name = c["name"].s()
+            val r = framingEscape(c["text"].s())
+            eq(r.escaped, c["escaped"].s(), name)
+            eq(r.barsAdded.toLong(), c["bars_added"].l(), name)
+            // The marker check on each line (after the bars it already starts
+            // with) agrees with where the escaping put its bars.
+            val folding = c["text"].s()
+                .split('\n', '\r', '\u000B', '\u000C', '\u0085', '\u2028', '\u2029')
+                .count { framingFoldsToMarker(it.trimStart('|')) }
+            eq(folding.toLong(), c["bars_added"].l(), "$name: lines that fold")
+        }
+        for (line in listOf("[atem]", "  [ATEM x", "[\u0410\u0422\u0415\u041c]", "[a\ufe0ftem]")) eq(framingFoldsToMarker(line), true, line)
+        for (line in listOf("", "x[atem]", "[ atem]", "|[atem]", "[atom]")) eq(framingFoldsToMarker(line), false, line)
+    }
+    check("framing: rendered prompts byte for byte, tags from their bits (vectors only)") {
+        val tag = framing["tag"].s()
+        val bits = tagBitsOf(tag)
+        val prompts = framing["prompts"].arr()
+        eq(prompts.size, 9)
+        for (p in prompts) {
+            val name = p["name"].s()
+            val rendered = framingRenderForVectors(Json.write(p["input"]), bits)
+            eq(rendered, p["rendered"].s(), name)
+            eq(utf8(rendered).size.toLong(), p["bytes"].l(), "$name: bytes")
+        }
+        // Every tag of the vectors renders the prompt with that tag, on Atem's
+        // own lines only (the sender's text is not touched, even where it
+        // holds the vectors' tag).
+        val first = prompts[0]
+        val old = "[atem $tag] "
+        for (t in framing["tags"].arr()) {
+            val fresh = "[atem ${t["tag"].s()}] "
+            val expected = first["rendered"].s().split('\n').joinToString("\n") { line ->
+                if (line.startsWith(old)) fresh + line.removePrefix(old) else line
+            }
+            eq(framingRenderForVectors(Json.write(first["input"]), t["bits"].s().toULong(16)), expected, t["bits"].s())
+        }
+        // What the core refuses, and what is no input, is refused: a snapshot
+        // whose text doesn't match its digest is never rendered.
+        val input = prompts[2]["input"].obj()
+        framingRenderForVectors(Json.write(input), 1uL)
+        val firstContext = LinkedHashMap(input["context"].arr()[0].obj())
+        firstContext["text"] = "not what the digest says"
+        val tampered = LinkedHashMap(input)
+        tampered["context"] = listOf(firstContext)
+        throwsCode("malformed") { framingRenderForVectors(Json.write(tampered), 1uL) }
+        val headless = LinkedHashMap(input)
+        headless.remove("header")
+        throwsCode("malformed") { framingRenderForVectors(Json.write(headless), 1uL) }
+    }
+    check("framing: the size section (typical, worst, worst with a mark, at the bound)") {
+        val size = framing["size"]
+        fun vault(id: String, version: Long, n: Int) = snapshot("vault", id, version, "c".repeat(n))
+        // A typical task: 5,120 bytes of context, a 1,024-byte prompt.
+        eq(checkedLen("t".repeat(1024), null, listOf(vault("api-contract", 3L, 5120))) - 1024 - 5120, size["typical"]["checked_atem_bytes"].l(), "typical")
+        // The worst: eight 1,000-byte contexts with 128-byte ids and 16-digit
+        // versions, a 1,000-byte prompt.
+        val worst = (0 until 8).map { i -> snapshot("memory", "$i" + "m".repeat(127), 9007199254740991L, "c".repeat(1000)) }
+        val text = "t".repeat(1000)
+        eq(checkedLen(text, null, worst) - 1000 - 8 * 1000, size["worst"]["checked_atem_bytes"].l(), "worst")
+        // The same with a mark (the vectors' own, with a 128-byte mark id).
+        val withMark = framing["prompts"].arr().first { it["input"].obj().containsKey("mark") }
+        val mark = LinkedHashMap(withMark["input"]["mark"].obj())
+        mark["mark_id"] = "k".repeat(128)
+        eq(checkedLen(text, mark, worst), size["worst_mark"]["checked_bytes"].l(), "worst with a mark")
+        // At the bound: one byte more is over it.
+        val n = size["at_bound"]["context_bytes"].l().toInt()
+        fun at(k: Int) = checkedLen("x", null, listOf(snapshot("vault", "c", 1L, "y".repeat(k))))
+        val bound = framingSize["max_prompt_bytes"].l()
+        eq(at(n), size["at_bound"]["checked_len"].l(), "at the bound")
+        eq(at(n), bound, "exactly the bound")
+        eq(at(n + 1), bound + 1, "one byte over")
+    }
+    check("framing: every framing-size-v1 case with its complete inputs") {
+        eq(framingSize["max_prompt_bytes"].l(), 32768L)
+        eq(framingSize["attachment_reserve"].l(), 4096L)
+        val cases = framingSize["cases"].arr()
+        if (cases.size < 10) throw AssertionError("only ${cases.size} cases")
+        for (c in cases) eq(checkedLen(c["text"].s(), c["mark"], c["context"].arr()), c["checked_len"].l(), c["name"].s())
+        // What the preflight takes is exactly the host-work shapes: anything
+        // else is refused, never read loosely.
+        val okContext = Json.write(listOf(snapshot("vault", "a", 1L, "x")))
+        framingCheckedLen("t", null, "[]")
+        framingCheckedLen("t", null, okContext)
+        val dup = okContext.replace("\"id\":\"a\"", "\"id\":\"a\",\"id\":\"b\"")
+        val float = okContext.replace("\"version\":1", "\"version\":1.5")
+        if (dup == okContext || float == okContext) throw AssertionError("the refusal inputs changed nothing")
+        throwsCode("not_strict_json") { framingCheckedLen("t", null, "[") }
+        throwsCode("not_strict_json") { framingCheckedLen("t", null, dup) }
+        throwsCode("not_strict_json") { framingCheckedLen("t", null, float) }
+        for (context in listOf(
+            "{}",
+            "null",
+            """[{"kind":"vault","id":"a","version":1,"digest":"d"}]""",
+            """[{"kind":"notes","id":"a","version":1,"digest":"d","text":"x"}]""",
+        )) {
+            throwsCode("malformed") { framingCheckedLen("t", null, context) }
+        }
+        for (mark in listOf("null", "{}", "[]", """{"mark_id":"m"}""")) {
+            throwsCode("malformed") { framingCheckedLen("t", mark, "[]") }
         }
     }
 

@@ -7,6 +7,7 @@ use atem_client::connect::ConnectError;
 use atem_client::membership::Invalid;
 use atem_client::membership::publish::PublishError;
 use atem_client::restore::RestoreError;
+use atem_client::session::framing::FramingError;
 
 use crate::types::NextStep;
 
@@ -238,6 +239,15 @@ impl From<atem_client::control::ControlError> for AtemError {
             code: e.code().into(),
             detail: e.to_string(),
         }
+    }
+}
+
+/// What the framing refuses to render (a line of Atem's that isn't one
+/// line, a snapshot that doesn't match its digest, a prompt that doesn't
+/// read back) is input that isn't what it must be: `Invalid` `malformed`.
+impl From<FramingError> for AtemError {
+    fn from(e: FramingError) -> Self {
+        AtemError::malformed(&e.to_string())
     }
 }
 

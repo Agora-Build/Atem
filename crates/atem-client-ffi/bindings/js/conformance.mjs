@@ -1,11 +1,12 @@
-// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) run
-// through the WASM binding under Node. Usage:
+// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) and the
+// host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
+// framing-size-v1.json) run through the WASM binding under Node. Usage:
 //   node conformance.mjs <wasm-bindgen nodejs pkg dir> <fixtures dir>
 // The same checks run through Kotlin (bindings/kotlin/Conformance.kt) and
 // Swift (bindings/swift/Tests/…/ConformanceTests.swift).
 import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { join, resolve } from "node:path";
 
 const [pkgDir, fixturesDir] = process.argv.slice(2).map((p) => resolve(p));
@@ -764,6 +765,119 @@ check("verifyCommit host_trust_gen (r9-vectors-pairing)", () => {
     }
     if (!refused) throw new Error(`${c.case} was accepted`);
   }
+});
+
+// ----------------------------------------------------------------- framing
+// The prompt framing (delegated host-work design III.2) over
+// designs/protocol/fixtures/host-work/: the escaping and the marker check,
+// the Unicode version they are pinned to, the preflight size check and (a
+// test-vectors build only) the rendering, byte for byte.
+const loadWork = (name) => JSON.parse(readFileSync(join(fixturesDir, "host-work", `${name}.json`), "utf8"));
+const framing = loadWork("prompt-framing-v1");
+const framingSize = loadWork("framing-size-v1");
+const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+// A tag's 60 bits as written (XXXX-XXXX-XXXX, Crockford base32): a BigInt,
+// which is what the binding takes (60 bits don't fit a JS number).
+const tagBitsOf = (tag) =>
+  [...tag.replaceAll("-", "")].reduce((bits, c) => {
+    const i = CROCKFORD.indexOf(c);
+    if (i < 0) throw new Error(`not a tag character: ${c}`);
+    return (bits << 5n) | BigInt(i);
+  }, 0n);
+const sha256Hex = (text) => createHash("sha256").update(text, "utf8").digest("hex");
+const snapshot = (kind, id, version, text) => ({ kind, id, version, digest: sha256Hex(text), text });
+// framingCheckedLen of a text, an optional mark (a host-work MarkTask object)
+// and snapshots (host-work ContextSnapshot objects): the complete inputs.
+const checkedLen = (text, mark, context) => m.framingCheckedLen(text, mark === undefined ? undefined : str(mark), str(context));
+const LINE_BREAK = /[\n\r\v\f\u0085\u2028\u2029]/;
+check("framing: Unicode version, escape cases, marker check (III.2)", () => {
+  eq(m.framingUnicodeVersion(), framing.unicode_version, "Unicode version");
+  eq(framing.unicode_version, "18.0.0");
+  eq(framing.escape.length, 57);
+  for (const c of framing.escape) {
+    const r = m.framingEscape(c.text);
+    eq(r.escaped, c.escaped, c.name);
+    eq(r.barsAdded, c.bars_added, c.name);
+    // The marker check on each line (after the bars it already starts with)
+    // agrees with where the escaping put its bars.
+    const folding = c.text.split(LINE_BREAK).filter((line) => m.framingFoldsToMarker(line.replace(/^\|+/, ""))).length;
+    eq(folding, c.bars_added, `${c.name}: lines that fold`);
+  }
+  for (const line of ["[atem]", "  [ATEM x", "[\u0410\u0422\u0415\u041c]", "[a\ufe0ftem]"]) eq(m.framingFoldsToMarker(line), true, line);
+  for (const line of ["", "x[atem]", "[ atem]", "|[atem]", "[atom]"]) eq(m.framingFoldsToMarker(line), false, line);
+});
+check("framing: rendered prompts byte for byte, tags from their bits (vectors only)", () => {
+  const bits = tagBitsOf(framing.tag);
+  eq(framing.prompts.length, 9);
+  for (const p of framing.prompts) {
+    const rendered = m.framingRenderForVectors(str(p.input), bits);
+    eq(rendered, p.rendered, p.name);
+    eq(Buffer.byteLength(rendered, "utf8"), p.bytes, `${p.name}: bytes`);
+  }
+  // Every tag of the vectors renders the prompt with that tag, on Atem's own
+  // lines only (the sender's text is not touched, even where it holds the
+  // vectors' tag).
+  const first = framing.prompts[0];
+  const old = `[atem ${framing.tag}] `;
+  for (const t of framing.tags) {
+    const fresh = `[atem ${t.tag}] `;
+    const expected = first.rendered
+      .split("\n")
+      .map((line) => (line.startsWith(old) ? fresh + line.slice(old.length) : line))
+      .join("\n");
+    eq(m.framingRenderForVectors(str(first.input), BigInt(`0x${t.bits}`)), expected, t.bits);
+  }
+  // What the core refuses, and what is no input, is refused: a snapshot whose
+  // text doesn't match its digest is never rendered.
+  const input = JSON.parse(str(framing.prompts[2].input));
+  m.framingRenderForVectors(str(input), 1n);
+  const tampered = JSON.parse(str(input));
+  tampered.context[0].text = "not what the digest says";
+  throwsCode(() => m.framingRenderForVectors(str(tampered), 1n), "malformed");
+  const headless = JSON.parse(str(input));
+  delete headless.header;
+  throwsCode(() => m.framingRenderForVectors(str(headless), 1n), "malformed");
+});
+check("framing: the size section (typical, worst, worst with a mark, at the bound)", () => {
+  const size = framing.size;
+  const vault = (id, version, n) => snapshot("vault", id, version, "c".repeat(n));
+  // A typical task: 5,120 bytes of context, a 1,024-byte prompt.
+  eq(checkedLen("t".repeat(1024), undefined, [vault("api-contract", 3, 5120)]) - 1024 - 5120, size.typical.checked_atem_bytes, "typical");
+  // The worst: eight 1,000-byte contexts with 128-byte ids and 16-digit
+  // versions, a 1,000-byte prompt.
+  const worst = Array.from({ length: 8 }, (_, i) => snapshot("memory", `${i}${"m".repeat(127)}`, 9007199254740991, "c".repeat(1000)));
+  const text = "t".repeat(1000);
+  eq(checkedLen(text, undefined, worst) - 1000 - 8 * 1000, size.worst.checked_atem_bytes, "worst");
+  // The same with a mark (the vectors' own, with a 128-byte mark id).
+  const mark = { ...framing.prompts.find((p) => p.input.mark !== undefined).input.mark, mark_id: "k".repeat(128) };
+  eq(checkedLen(text, mark, worst), size.worst_mark.checked_bytes, "worst with a mark");
+  // At the bound: one byte more is over it.
+  const n = size.at_bound.context_bytes;
+  const at = (k) => checkedLen("x", undefined, [snapshot("vault", "c", 1, "y".repeat(k))]);
+  eq(at(n), size.at_bound.checked_len, "at the bound");
+  eq(at(n), framingSize.max_prompt_bytes, "exactly the bound");
+  eq(at(n + 1), framingSize.max_prompt_bytes + 1, "one byte over");
+});
+check("framing: every framing-size-v1 case with its complete inputs", () => {
+  eq(framingSize.max_prompt_bytes, 32768);
+  eq(framingSize.attachment_reserve, 4096);
+  if (framingSize.cases.length < 10) throw new Error(`only ${framingSize.cases.length} cases`);
+  for (const c of framingSize.cases) eq(checkedLen(c.text, c.mark, c.context), c.checked_len, c.name);
+  // What the preflight takes is exactly the host-work shapes: anything else
+  // is refused, never read loosely.
+  const okContext = str([snapshot("vault", "a", 1, "x")]);
+  eq(m.framingCheckedLen("t", undefined, "[]") > 0, true);
+  eq(m.framingCheckedLen("t", undefined, okContext) > 0, true);
+  const dup = okContext.replace('"id":"a"', '"id":"a","id":"b"');
+  const float = okContext.replace('"version":1', '"version":1.5');
+  if (dup === okContext || float === okContext) throw new Error("the refusal inputs changed nothing");
+  throwsCode(() => m.framingCheckedLen("t", undefined, "["), "not_strict_json");
+  throwsCode(() => m.framingCheckedLen("t", undefined, dup), "not_strict_json");
+  throwsCode(() => m.framingCheckedLen("t", undefined, float), "not_strict_json");
+  for (const context of ["{}", "null", '[{"kind":"vault","id":"a","version":1,"digest":"d"}]', '[{"kind":"notes","id":"a","version":1,"digest":"d","text":"x"}]']) {
+    throwsCode(() => m.framingCheckedLen("t", undefined, context), "malformed");
+  }
+  for (const mark of ["null", "{}", "[]", '{"mark_id":"m"}']) throwsCode(() => m.framingCheckedLen("t", mark, "[]"), "malformed");
 });
 
 console.log(`wasm conformance: ${passed} passed, ${failures.length} failed`);

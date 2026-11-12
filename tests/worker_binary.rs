@@ -247,6 +247,15 @@ impl Broker {
         }
     }
 
+    /// Messages until the agent's output shows `text`, which may have come
+    /// with what was read already: the worker reports a write's result and
+    /// the agent's output it caused in either order.
+    fn shows(&mut self, text: &str) {
+        if !self.output.contains(text) {
+            self.until(|_, out| out.contains(text));
+        }
+    }
+
     fn write(&mut self, seq: u64, bytes: &[u8], epoch: u64) {
         self.send(json!({"op": "write", "seq": seq, "bytes": STANDARD.encode(bytes), "input_epoch": epoch}));
     }
@@ -327,7 +336,7 @@ fn a_worker_owns_its_agent_survives_the_broker_and_is_adopted_by_a_new_one() {
     let written = broker.result(2);
     assert_eq!(written["ok"], true, "{written}");
     assert_eq!(written["bytes_written"], 4);
-    broker.until(|_, out| out.contains("got:new"));
+    broker.shows("got:new");
     assert!(!broker.output.contains("old"), "{:?}", broker.output);
 
     // The broker goes away: the worker and its agent keep running.
@@ -587,9 +596,7 @@ impl Approving {
     /// Waits until the agent's output shows `text` (it may have come with
     /// what was read already).
     fn screen_shows(&mut self, text: &str) {
-        if !self.broker.output.contains(text) {
-            self.broker.until(|_, out| out.contains(text));
-        }
+        self.broker.shows(text);
     }
 
     /// A paste as the broker sends Claude's (it releases nothing).

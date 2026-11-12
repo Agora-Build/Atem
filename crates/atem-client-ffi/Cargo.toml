@@ -31,7 +31,8 @@ software-keys = ["atem-client/software-keys"]
 # Host-role functions (sign_seen, admit_carrier): for the conformance and
 # host-side tests; never in an app build.
 host = []
-# Deterministic HPKE re-seals and raw primitive verification, for the
+# Deterministic HPKE re-seals, raw primitive verification and the prompt
+# framing's vectors-only render (`framing_render_for_vectors`), for the
 # known-answer vectors only. Never in the packaged app artifacts.
 test-vectors = ["atem-client/test-vectors", "software-keys"]
 

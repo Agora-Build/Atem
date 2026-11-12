@@ -29,7 +29,11 @@
 //! - [`control`]: control records of delegated host work (build, parse,
 //!   verify) and the reference control state with its per-effect results,
 //!   production exports for Station builders;
-//! - [`encoding`]: canonical JSON, `enc`, signing inputs and hashes.
+//! - [`encoding`]: canonical JSON, `enc`, signing inputs and hashes;
+//! - [`framing`]: the prompt framing's escaping and marker check, the
+//!   Unicode version pinned for them and a task's preflight size check
+//!   (III.2; the host renders every prompt, a client never does, so
+//!   rendering is exported only for the vectors, feature `test-vectors`).
 //!
 //! Contract for Astation: `designs/protocol/atem-client-bindings.md`.
 // The provider-taking `*_with` helpers are called by the UniFFI and WASM
@@ -49,6 +53,7 @@ pub mod connection;
 pub mod control;
 pub mod encoding;
 pub mod error;
+pub mod framing;
 pub mod host_actions;
 pub mod kit;
 pub mod log;
