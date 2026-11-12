@@ -1367,10 +1367,13 @@ fn a_refused_chat_request_never_names_a_file() {
 
 /// The host clock (`ATEM_TEST_HOST_CLOCK`, debug builds): the real wall and
 /// monotonic clocks plus offsets the test moves, this boot, rewritten every
-/// 20 ms (atomically).
+/// 20 ms and by `jump` (atomically, one write at a time).
 struct MovingClock {
     path: PathBuf,
     offsets: std::sync::Arc<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64)>,
+    /// Writes the file now. Each write reads the offsets under one lock, so
+    /// none with offsets older than the last `jump`'s can land after it.
+    write: std::sync::Arc<dyn Fn() + Send + Sync>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     writer: Option<std::thread::JoinHandle<()>>,
 }
@@ -1386,9 +1389,11 @@ impl MovingClock {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
         let boot = boot.trim().to_string();
-        let write = {
+        let one_at_a_time = std::sync::Mutex::new(());
+        let write: std::sync::Arc<dyn Fn() + Send + Sync> = {
             let (path, offsets) = (path.clone(), offsets.clone());
-            move || {
+            std::sync::Arc::new(move || {
+                let _one = one_at_a_time.lock().unwrap();
                 let mut ts = libc::timespec {
                     tv_sec: 0,
                     tv_nsec: 0,
@@ -1401,30 +1406,36 @@ impl MovingClock {
                 let tmp = path.with_extension("tmp");
                 std::fs::write(&tmp, format!("{wall} {mono} {boot}")).unwrap();
                 std::fs::rename(&tmp, &path).unwrap();
-            }
+            })
         };
         write();
-        let s = stop.clone();
+        let (s, w) = (stop.clone(), write.clone());
         let writer = std::thread::spawn(move || {
             while !s.load(Ordering::SeqCst) {
-                write();
+                w();
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
         MovingClock {
             path,
             offsets,
+            write,
             stop,
             writer: Some(writer),
         }
     }
 
     /// Moves the host's wall and monotonic clocks `wall_ms` and `mono_ms`
-    /// ahead of the real ones.
+    /// ahead of the real ones: in the file before it returns (then a host
+    /// pass, 100 ms, on them), so whatever the test does next happens on the
+    /// moved clocks. (Left to the writer thread, a write late under load let
+    /// the host admit the next viewer on the old monotonic clock, its
+    /// channel's 24 h lifetime then over as soon as the jump landed.)
     fn jump(&self, wall_ms: u64, mono_ms: u64) {
         use std::sync::atomic::Ordering;
         self.offsets.0.store(wall_ms, Ordering::SeqCst);
         self.offsets.1.store(mono_ms, Ordering::SeqCst);
+        (self.write)();
         std::thread::sleep(Duration::from_millis(100));
     }
 }
