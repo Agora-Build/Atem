@@ -460,6 +460,28 @@ check("device-list actions: verifyHostEncSig binds every field of a host's enc_s
   }
 });
 
+// -------------------------------------------- the verifier's own inventory
+// r9-vectors-delegated-wire's `verifier`: what this binding's verifier
+// reports about itself (session-v1 R9.2 "How a verifier reports itself";
+// Atem's proposal, for Astation's agreement, Decision 23): version 2, the
+// sixteen actions, sorted by bytes, each once; every action the
+// membership-log vectors sign is one of them.
+const wireShapes = load("r9-vectors-delegated-wire");
+check("verifier inventory: version and known actions (R9.2)", () => {
+  const ours = m.verifierInventory();
+  same(ours, wireShapes.verifier, "this binding's verifier");
+  eq(ours.version, 2);
+  eq(ours.actions.length, 16);
+  const bytes = (s) => Buffer.from(s, "utf8");
+  for (let i = 1; i < ours.actions.length; i++) {
+    if (Buffer.compare(bytes(ours.actions[i - 1]), bytes(ours.actions[i])) >= 0) throw new Error(`not sorted at ${ours.actions[i]}`);
+  }
+  for (const v of [...mlog.log, ...mlog.others]) {
+    if (!ours.actions.includes(v.entry.body.action)) throw new Error(`${v.label}: ${v.entry.body.action} isn't listed`);
+  }
+  for (const a of FIVE) if (!ours.actions.includes(a)) throw new Error(`${a} isn't listed`);
+});
+
 // ---------------------------------- delegated host work: control records
 // r9-vectors-host-work-control: every record parses and verifies on each of
 // its chains as `checks` says (or its parse refuses it, `parse_error`); the

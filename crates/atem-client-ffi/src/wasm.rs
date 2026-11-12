@@ -319,6 +319,15 @@ pub fn ed25519_public_to_x25519(raw: Vec<u8>) -> JsResult<Vec<u8>> {
     )?))
 }
 
+// ------------------------------------------------------- the verifier
+
+/// This binding's device-list verifier: `{version, actions}` (session-v1
+/// R9.2 "How a verifier reports itself"; Atem's proposal, Decision 23).
+#[wasm_bindgen(js_name = verifierInventory)]
+pub fn verifier_inventory() -> JsResult<JsValue> {
+    to_js(&crate::log::verifier_inventory())
+}
+
 // ------------------------------------------------------------ framing
 
 #[wasm_bindgen(js_name = framingUnicodeVersion)]

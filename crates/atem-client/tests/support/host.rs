@@ -650,6 +650,7 @@ impl HostConn {
                 .map(PendingRecovery::of)
                 .collect(),
             channel_id: channel.channel_id().to_owned(),
+            verifier: None,
         };
         let mut welcome = welcome;
         if let Some(rewrite) = core.welcome_override {

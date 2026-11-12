@@ -1986,7 +1986,47 @@ hosts, Station replicas, native controllers and other SDK consumers),
 starting with an enumerated test account; an unknown, offline or
 unconfirmed verifier keeps signing off, removing an obsolete verifier is
 an explicit manager action, and no feature flag alone is proof
-(delegated host work II.2.2 "The signing gate", I.8). Each is signed by a native manager, like every
+(delegated host work II.2.2 "The signing gate", I.8).
+
+*How a verifier reports itself* (**Atem's proposal, for Astation's
+agreement**; Decision 23). A verifier describes itself with an inventory
+`{version, actions}`, so a signer's gate can tell which verifiers know
+which actions:
+
+- `actions`: the actions the verifier accepts, 1 to 64 names, sorted by
+  bytes, each once. A name is 1–32 bytes of `[a-z0-9_]`, the first a
+  letter.
+- `version`: an integer from 1 to 2^32 − 1 naming that action set and the
+  rules the verifier applies to it. Any change to either is a new version.
+  Version 1 is the eleven actions v0.8.x released (`genesis` to
+  `k_backup`, the rules above; those releases report nothing). Version 2
+  adds the five actions of this section, and it is the shared core's today.
+- The shared core gives every consumer its own inventory:
+  `atem_client::membership::VERIFIER_VERSION` and `known_actions()`, and
+  `verifier_inventory()` in the bindings. `known_actions()` is built from
+  an exhaustive match over the core's actions, so a new action can't be
+  left out of it.
+- An Atem host reports its own verifier in the r9 `welcome` as `verifier`
+  (R9.8). Today's hosts send none; a later change starts sending it.
+  Released clients ignore the field, because the welcome reader ignores
+  unknown fields.
+- A reader takes the field strictly. It is either absent (never `null`),
+  or exactly `version` and `actions` as above. Anything else refuses the
+  whole welcome. A name the reader doesn't know is no refusal, because a
+  newer verifier knows more.
+- What it proves: the channel authenticates the welcome, so the relay can
+  neither forge nor strip it. It is the host's own claim about its own
+  verifier at that welcome. It says nothing about native controllers,
+  Station replicas or other SDK consumers, nor about the host after a later
+  update. The signer's gate keeps its rules: an unknown, offline or
+  unconfirmed verifier keeps signing off, and a host whose welcome carries
+  no `verifier` is unconfirmed.
+- Vectors: `r9-vectors-delegated-wire`. Its `verifier` is this release's
+  own (version 2). Its `welcome` cases cover a welcome with a `verifier`,
+  one without, a newer host's naming an action this release doesn't know,
+  the bounds, and one refused case per rule.
+
+Each of the five is signed by a native manager, like every
 entry but `recovery_add` (the recovery key signing one is
 `recovery_signer_action`), with a fresh confirmation bound to the exact
 body (R9.6 rule 4). Every rule below is judged at `seq-1`, on the state
@@ -3554,7 +3594,7 @@ replaced key, also for a proof at an ancestor head; `relay_replies`:
 | op | dir | fields |
 |---|---|---|
 | `hello` | C→H (the `finish` plaintext) | `revision: 9` (required), `proof{principal, sig}` (`sig` = `sig_c`, b64u), `membership{head{seq,hash}, entries, more?}`, `grant?` (signed grant, browser only); no `resume` |
-| `welcome` | H→C (first record) | r8 fields (`revision: 9`, `features`) plus `principal` (string), `client_kind` (`native`/`service`/`browser`), `permissions`, `scope?` (service/browser: `{ops, sessions?, projects?}`), `head{seq,hash}` (after the carriage), `pending_recovery` (always present, possibly empty: `[{entry_hash, seq, action, subject, effective_at}]`, R9.5), `channel_id`, `authorization_ms_left` |
+| `welcome` | H→C (first record) | r8 fields (`revision: 9`, `features`) plus `principal` (string), `client_kind` (`native`/`service`/`browser`), `permissions`, `scope?` (service/browser: `{ops, sessions?, projects?}`), `head{seq,hash}` (after the carriage), `pending_recovery` (always present, possibly empty: `[{entry_hash, seq, action, subject, effective_at}]`, R9.5), `channel_id`, `authorization_ms_left`, `verifier?` (`{version, actions}`, the host verifier's inventory, read strictly, absent rather than `null`; R9.2 "How a verifier reports itself"; **Atem's proposal, for Astation's agreement**; Decision 23) |
 | `membership` | C→H | `entries` (R9.3) → `membership_head{re, head}` |
 | `membership_head` | H→C | `head`, `pending_recovery` (event when Atem's head moves or a pending entry changes state; reply with `re`) |
 | `revoke_grant` | C→H | `grant_id` → `grant_revoked{re}` (issuer or a member with `control`) |

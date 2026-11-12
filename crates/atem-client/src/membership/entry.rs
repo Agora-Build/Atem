@@ -235,28 +235,77 @@ pub enum Action {
     },
 }
 
-impl Action {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Action::Genesis { .. } => "genesis",
-            Action::Add { .. } => "add",
-            Action::Remove { .. } => "remove",
-            Action::SetRoles { .. } => "set_roles",
-            Action::AddHost { .. } => "add_host",
-            Action::RemoveHost { .. } => "remove_host",
-            Action::RecoveryAdd { .. } => "recovery_add",
-            Action::SetRecoveryKey { .. } => "set_recovery_key",
-            Action::RecoveryApprove { .. } => "recovery_approve",
-            Action::RecoveryVeto { .. } => "recovery_veto",
-            Action::KBackup(_) => "k_backup",
-            Action::ProjectSet { .. } => "project_set",
-            Action::ProjectRemove { .. } => "project_remove",
-            Action::HostSenderRevoke { .. } => "host_sender_revoke",
-            Action::HostSenderReadmit { .. } => "host_sender_readmit",
-            Action::HostEncKey { .. } => "host_enc_key",
+/// One table for [`Action::name`] and [`known_actions`]: the match is
+/// exhaustive, so a new variant fails to compile until it has its row here,
+/// and that row lists it. Rows go in byte order of the name
+/// (`known_actions_are_sorted_and_unique` checks it).
+macro_rules! action_names {
+    ($($variant:pat => $name:literal,)*) => {
+        impl Action {
+            /// The `action` field's value.
+            pub fn name(&self) -> &'static str {
+                match self {
+                    $($variant => $name,)*
+                }
+            }
         }
-    }
 
+        const KNOWN_ACTIONS: &[&str] = &[$($name),*];
+    };
+}
+
+action_names! {
+    Action::Add { .. } => "add",
+    Action::AddHost { .. } => "add_host",
+    Action::Genesis { .. } => "genesis",
+    Action::HostEncKey { .. } => "host_enc_key",
+    Action::HostSenderReadmit { .. } => "host_sender_readmit",
+    Action::HostSenderRevoke { .. } => "host_sender_revoke",
+    Action::KBackup(_) => "k_backup",
+    Action::ProjectRemove { .. } => "project_remove",
+    Action::ProjectSet { .. } => "project_set",
+    Action::RecoveryAdd { .. } => "recovery_add",
+    Action::RecoveryApprove { .. } => "recovery_approve",
+    Action::RecoveryVeto { .. } => "recovery_veto",
+    Action::Remove { .. } => "remove",
+    Action::RemoveHost { .. } => "remove_host",
+    Action::SetRecoveryKey { .. } => "set_recovery_key",
+    Action::SetRoles { .. } => "set_roles",
+}
+
+/// The version of this verifier's action set (R9.2 "How a verifier reports
+/// itself"): 1 is the set v0.8.x released (`genesis` to `k_backup`, never
+/// reported: those releases predate the report), 2 adds delegated host
+/// work's five (`project_set`, `project_remove`, `host_sender_revoke`,
+/// `host_sender_readmit`, `host_enc_key`). Every change to
+/// [`known_actions`], or to what this verifier accepts in one of them, is a
+/// new version (`verifier_version_pins_its_action_set` pins the set).
+pub const VERIFIER_VERSION: u32 = 2;
+
+/// A verifier reports at most this many actions.
+pub const MAX_VERIFIER_ACTIONS: usize = 64;
+
+/// The actions this build's verifier knows, sorted by bytes, each once:
+/// every `action` [`Entry::parse`] reads (an entry of any other is
+/// `malformed`, and a strict verifier stops the chain there, R9.2 "the
+/// signing gate").
+pub fn known_actions() -> &'static [&'static str] {
+    KNOWN_ACTIONS
+}
+
+/// The grammar of an action name in a verifier's report: 1–32 bytes of
+/// `[a-z0-9_]`, the first a letter. Every name of [`known_actions`] has it;
+/// a reader takes any name that does (a newer verifier knows more).
+pub fn action_name_ok(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=32).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
+}
+
+impl Action {
     /// A `recovery_add` or a `kit: "lost"` `set_recovery_key`: the entries
     /// that wait 24 h and take approve and veto (§R9.5).
     pub fn is_pending_type(&self) -> bool {
@@ -952,5 +1001,124 @@ mod tests {
         assert_eq!(parse(at_two), Err(Invalid::BadGenesis));
         b["signer"] = json!("dev-y");
         assert_eq!(parse(b), Err(Invalid::BadGenesis));
+    }
+
+    /// The verifier's inventory and its parser agree: every listed action
+    /// gets past the action check (whatever its fields then say), and a name
+    /// not listed is an unknown action. `Action::name` is the exhaustive
+    /// match the list is built from, so a variant can't be missing; the
+    /// parser's own table of names is what this pins to it.
+    #[test]
+    fn every_action_is_listed_in_known_actions() {
+        let unknown = Err(Invalid::Malformed("unknown action"));
+        assert!(!known_actions().is_empty());
+        for name in known_actions() {
+            assert_ne!(
+                parse(body(json!({"action": name}))).map(|_| ()),
+                unknown,
+                "{name} is listed but the parser doesn't know it"
+            );
+        }
+        for name in ["", "Add", "add-host", "project_rename", "host_sender_pause"] {
+            assert!(!known_actions().contains(&name), "{name}");
+            assert_eq!(
+                parse(body(json!({"action": name}))).map(|_| ()),
+                unknown,
+                "{name}"
+            );
+        }
+        // The variants a test can build without keys: their names are the
+        // listed ones.
+        let h = Hash32([1; 32]);
+        for action in [
+            Action::Remove {
+                device_id: "d".into(),
+            },
+            Action::RemoveHost {
+                host_id: "h".into(),
+            },
+            Action::RecoveryApprove { target: h },
+            Action::RecoveryVeto { target: h },
+            Action::ProjectRemove { name: "p".into() },
+            Action::HostSenderRevoke {
+                host_id: "h".into(),
+                interrupt_running: false,
+            },
+            Action::HostSenderReadmit {
+                host_id: "h".into(),
+            },
+        ] {
+            assert!(known_actions().contains(&action.name()), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn known_actions_are_sorted_and_unique() {
+        let known = known_actions();
+        assert!(!known.is_empty() && known.len() <= MAX_VERIFIER_ACTIONS);
+        for pair in known.windows(2) {
+            assert!(
+                pair[0].as_bytes() < pair[1].as_bytes(),
+                "{} before {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        for name in known {
+            assert!(action_name_ok(name), "{name}");
+        }
+    }
+
+    /// A verifier's version names its action set. Version 1 is what v0.8.x
+    /// released (never reported: those releases predate the field); 2 adds
+    /// delegated host work's five. A change to the set is a new version,
+    /// pinned here.
+    #[test]
+    fn verifier_version_pins_its_action_set() {
+        const V1: [&str; 11] = [
+            "add",
+            "add_host",
+            "genesis",
+            "k_backup",
+            "recovery_add",
+            "recovery_approve",
+            "recovery_veto",
+            "remove",
+            "remove_host",
+            "set_recovery_key",
+            "set_roles",
+        ];
+        const V2: [&str; 16] = [
+            "add",
+            "add_host",
+            "genesis",
+            "host_enc_key",
+            "host_sender_readmit",
+            "host_sender_revoke",
+            "k_backup",
+            "project_remove",
+            "project_set",
+            "recovery_add",
+            "recovery_approve",
+            "recovery_veto",
+            "remove",
+            "remove_host",
+            "set_recovery_key",
+            "set_roles",
+        ];
+        assert_eq!(VERIFIER_VERSION, 2);
+        assert_eq!(known_actions(), V2);
+        let added: Vec<&str> = V2.iter().copied().filter(|a| !V1.contains(a)).collect();
+        assert_eq!(
+            added,
+            [
+                "host_enc_key",
+                "host_sender_readmit",
+                "host_sender_revoke",
+                "project_remove",
+                "project_set"
+            ]
+        );
+        assert!(V1.iter().all(|a| V2.contains(a)));
     }
 }

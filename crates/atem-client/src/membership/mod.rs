@@ -66,8 +66,8 @@ pub use capacity::{
 };
 pub use draft::{check_body, draft_on, sign_entry, sign_entry_cosigned};
 pub use entry::{
-    Action, Entry, HostRecord, KBackupRecord, KitMode, Member, MemberKind, RECOVERY_SIGNER, Role,
-    RolesChange, Scope,
+    Action, Entry, HostRecord, KBackupRecord, KitMode, MAX_VERIFIER_ACTIONS, Member, MemberKind,
+    RECOVERY_SIGNER, Role, RolesChange, Scope, VERIFIER_VERSION, action_name_ok, known_actions,
 };
 pub use host_enc_key::{
     EncKey, HostEncKeys, PreviousEncKey, host_enc_key, host_enc_sig_input, sign_host_enc_key,
@@ -84,6 +84,71 @@ pub use service::{
     service_set_roles,
 };
 pub use wait::{HostNow, RECOVERY_WAIT_MS, WaitClock};
+
+/// What a verifier reports about itself (R9.2 "How a verifier reports
+/// itself", the r9 `welcome`'s `verifier`, R9.8): its version and the
+/// actions it knows. Atem's proposal, for Astation's agreement (Decision
+/// 23). A signer reads it as a claim of the verifier that sent it, over the
+/// channel that authenticated it; it never opens the signing gate alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifierInventory {
+    /// From 1; [`VERIFIER_VERSION`] for this build.
+    pub version: u32,
+    /// 1 to [`MAX_VERIFIER_ACTIONS`] names, sorted by bytes, each once,
+    /// each [`action_name_ok`]; names this build doesn't know are kept.
+    pub actions: Vec<String>,
+}
+
+impl VerifierInventory {
+    /// This build's: [`VERIFIER_VERSION`] and [`known_actions`].
+    pub fn ours() -> VerifierInventory {
+        VerifierInventory {
+            version: VERIFIER_VERSION,
+            actions: known_actions().iter().map(|a| a.to_string()).collect(),
+        }
+    }
+
+    /// `{"version": …, "actions": […]}`.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"version": self.version, "actions": self.actions})
+    }
+
+    /// Reads a report strictly: exactly `version` (an integer from 1 to
+    /// 2^32 − 1) and `actions` (as above); anything else is `Err`. An action
+    /// this build doesn't know is no error.
+    pub fn from_json(value: &serde_json::Value) -> Result<VerifierInventory, &'static str> {
+        const WHAT: &str = "verifier";
+        let o = value.as_object().ok_or(WHAT)?;
+        if o.len() != 2 {
+            return Err(WHAT);
+        }
+        let version = o
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| *v >= 1)
+            .ok_or(WHAT)?;
+        let actions = o
+            .get("actions")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(WHAT)?
+            .iter()
+            .map(|a| {
+                a.as_str()
+                    .filter(|a| action_name_ok(a))
+                    .map(str::to_owned)
+                    .ok_or(WHAT)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let sorted_once = actions
+            .windows(2)
+            .all(|pair| pair[0].as_bytes() < pair[1].as_bytes());
+        if actions.is_empty() || actions.len() > MAX_VERIFIER_ACTIONS || !sorted_once {
+            return Err(WHAT);
+        }
+        Ok(VerifierInventory { version, actions })
+    }
+}
 
 /// Log limits (§R9.2). [`Membership::capacity`] reports a log's use of them.
 pub const MAX_ENTRIES: u64 = 1024;

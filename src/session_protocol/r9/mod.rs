@@ -1496,6 +1496,7 @@ impl R9Host {
                 .map(PendingRecovery::of)
                 .collect(),
             channel_id: channel.channel_id().to_owned(),
+            verifier: None,
         };
         let frame = match channel.seal(&welcome.to_bytes(), mono) {
             Ok(frame) => frame,

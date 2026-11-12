@@ -24,7 +24,7 @@ use crate::error::{AtemError, Result};
 use crate::types::{
     CapacityInfo, CapacityLevelKind, CarriageResult, CarriageStop, ChangeRefusalInfo, FreezeInfo,
     HeadRelationKind, HostClock, HostInfo, KBackupInfo, LogHead, MemberInfo, MemberStatusKind,
-    MembershipEffect, PendingRecoveryInfo,
+    MembershipEffect, PendingRecoveryInfo, VerifierInventory,
 };
 
 /// Largest durable snapshot `MembershipLog::from_stored` reads: the host's
@@ -330,6 +330,17 @@ impl MembershipLog {
 
 fn member_action(member: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"action": "add", "member": member})
+}
+
+/// This binding's device-list verifier (session-v1 R9.2 "How a verifier
+/// reports itself"; Atem's proposal, for Astation's agreement, Decision
+/// 23): its version and the actions `MembershipLog` accepts. A strict
+/// verifier refuses a chain at an entry of any other action, so a signer
+/// counts this app's verifier among the account's before it signs a newer
+/// action.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn verifier_inventory() -> VerifierInventory {
+    (&atem_client::membership::VerifierInventory::ours()).into()
 }
 
 #[cfg_attr(feature = "uniffi", uniffi::export)]

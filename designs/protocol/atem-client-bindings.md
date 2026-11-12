@@ -330,6 +330,8 @@ Effects and timers:
 - **`WelcomeInfo`**: `authorization_ms_left` bounds the channel (the
   binding enforces it); show `pending_recovery`; `fetch_to(log)` → fetch
   up to that head and `extend` the log (never adopt it unverified).
+  `verifier` is the host verifier's inventory, absent when the host sent
+  none (Atem's proposal; see "The verifier's inventory" below).
 - **`ClientEvent::Outgoing{frame}`**: send it now (a chat resync `open`).
 - **`ClientEvent::MembershipHead{head, pending_recovery}`**: as `fetch_to`.
 - **`ClientEvent::Fenced{code, detail}`**: the attachment is over
@@ -587,6 +589,18 @@ by itself is the builder's `bad_project`, `malformed` or `wrong_alg` too),
 key, `verify_host_enc_sig` on every `enc_sig` whose binding fields parse,
 and (Kotlin and Swift, whose providers see the request) the signing
 purposes.
+
+**The verifier's inventory** (**Atem's proposal, for Astation's
+agreement**; Decision 23; session-v1 R9.2 "How a verifier reports
+itself"). `verifier_inventory()` returns `VerifierInventory{version,
+actions}` (JS `verifierInventory()`: `{version, actions}`). It describes
+this binding's own verifier: version 2, the sixteen actions
+`MembershipLog` accepts, sorted by bytes. A strict verifier refuses a chain
+at an entry of any other action, so a signer's gate counts each app's
+verifier by this. `WelcomeInfo.verifier` is the host's inventory when its
+`welcome` carried one; today's hosts send none. It is the host's claim
+about itself and never opens the gate alone. All three suites check
+`verifier_inventory()` against `r9-vectors-delegated-wire`'s `verifier`.
 
 ### Control records (delegated host work; planned)
 
