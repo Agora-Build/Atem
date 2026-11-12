@@ -163,7 +163,7 @@ pub(super) struct State {
     /// live-session limit, a restart): the detail of its local tasks.
     refused: HashMap<String, String>,
     /// The delegated clock (host-work-v1 §11.6), beside the store whose
-    /// `clock` table holds its record: loaded with the store's first pass.
+    /// `clock` table holds its record. `None` outside tests.
     clock: Option<HostClock>,
     /// When the clock next takes a reading (`clock_pass`).
     clock_due: Instant,
@@ -196,6 +196,8 @@ impl State {
             recheck_grants: true,
             named: HashSet::new(),
             refused: HashMap::new(),
+            // Task 19 constructs it (`HostClock::load`) when
+            // `host_features().delegated`.
             clock: None,
             clock_due: Instant::now(),
         }
@@ -470,21 +472,19 @@ impl HostBridge {
             )
     }
 
-    /// The delegated clock (host-work-v1 §11.6), once a second while the
-    /// store is open and healthy, hosting on or not, so its record goes on
-    /// (`HostClock::tick` writes it when due).
+    /// The delegated clock (host-work-v1 §11.6), when there is one: once a
+    /// second while the store is open and healthy, hosting on or not, so its
+    /// record goes on (`HostClock::tick` writes it when due).
     fn clock_pass(&mut self) {
-        let Some(store) = self.work.store.as_ref() else {
+        let (Some(clock), Some(store)) = (self.work.clock.as_mut(), self.work.store.as_ref())
+        else {
             return;
         };
         if self.work.error || Instant::now() < self.work.clock_due {
             return;
         }
         self.work.clock_due = Instant::now() + CLOCK_EVERY;
-        self.work
-            .clock
-            .get_or_insert_with(|| HostClock::load(store))
-            .tick(store);
+        clock.tick(store);
     }
 
     /// At an orderly stop: the delegated clock's last reading, written.
@@ -499,7 +499,7 @@ impl HostBridge {
     /// The delegated clock's `atem status` line, while it holds deadlines
     /// back (`HostClock::status_line`).
     pub fn clock_status(&self) -> Option<String> {
-        self.work.clock.as_ref()?.status_line().map(str::to_string)
+        self.work.clock.as_ref()?.status_line()
     }
 
     pub(super) fn work_pass(&mut self, cx: &mut Cx) {
@@ -1994,22 +1994,27 @@ principals = ["local"]
         tokio::task::LocalSet::new().block_on(&rt, body(dir.path()));
     }
 
-    /// The delegated clock (host-work-v1 §11.6) lives beside the store: the
-    /// pass reads it once a second and writes its record (here its first
-    /// reading), and an orderly stop writes a last reading.
+    fn stored_clock(rig: &LocalRig) -> Option<rusqlite::types::Value> {
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .load_clock()
+            .unwrap()
+    }
+
+    /// The delegated clock (host-work-v1 §11.6), once constructed, lives
+    /// beside the store: the pass reads it once a second and writes its
+    /// record (here its first reading), and an orderly stop writes a last
+    /// reading.
     #[test]
     fn the_pass_keeps_the_host_clock_and_an_orderly_stop_writes_it() {
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
-            let stored = |rig: &LocalRig| {
-                rig.bridge
-                    .work
-                    .store
-                    .as_ref()
-                    .unwrap()
-                    .load_clock()
-                    .unwrap()
-            };
+            let stored = stored_clock;
+            let store = rig.bridge.work.store.as_ref().unwrap();
+            rig.bridge.work.clock = Some(crate::runtime::host_clock::HostClock::load(store));
             rig.bridge.work.clock_due = Instant::now();
             one_pass(&mut rig);
             let first = stored(&rig).expect("written at its first reading");
@@ -2020,6 +2025,26 @@ principals = ["local"]
             // An orderly stop takes one and writes it.
             rig.bridge.close_cleanly();
             assert_ne!(stored(&rig), Some(first));
+            assert_eq!(rig.bridge.clock_status(), None);
+        });
+    }
+
+    /// Nothing constructs the clock outside tests until the delegated
+    /// lifecycle does (step 4, Task 19): without it the passes and an orderly
+    /// stop write no clock row, and the status reports none.
+    #[test]
+    fn a_bridge_without_a_host_clock_writes_no_clock_row_and_reports_no_status() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            assert!(rig.bridge.work.clock.is_none());
+            rig.bridge.work.clock_due = Instant::now();
+            one_pass(&mut rig);
+            std::thread::sleep(Duration::from_millis(5));
+            rig.bridge.work.clock_due = Instant::now();
+            one_pass(&mut rig);
+            rig.bridge.close_cleanly();
+            assert!(rig.bridge.work.clock.is_none());
+            assert_eq!(stored_clock(&rig), None);
             assert_eq!(rig.bridge.clock_status(), None);
         });
     }
@@ -4359,10 +4384,8 @@ launch = "on_message"
     fn a_pass_where_nothing_changed_does_the_same_work_beside_thousands_of_awaiting_tasks() {
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
-            // The payload pass (once a minute) is not this pass, nor is the
-            // delegated clock's (once a second; its record once a minute).
+            // The payload pass (once a minute) is not this pass.
             rig.bridge.work.cleanup = Instant::now() + Duration::from_secs(3600);
-            rig.bridge.work.clock_due = Instant::now() + Duration::from_secs(3600);
             count_store_steps(&rig);
             add_awaiting(&rig, 500, 4096);
             drain(&mut rig);
@@ -4394,7 +4417,6 @@ launch = "on_message"
             local_test(async |root| {
                 let mut rig = LocalRig::new(root).await;
                 rig.bridge.work.cleanup = Instant::now() + Duration::from_secs(3600);
-                rig.bridge.work.clock_due = Instant::now() + Duration::from_secs(3600);
                 count_store_steps(&rig);
                 add_awaiting(&rig, 4096, prompt);
                 drain(&mut rig);

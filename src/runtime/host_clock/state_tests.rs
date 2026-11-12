@@ -1495,8 +1495,17 @@ fn state_json_round_trips() {
             machine: M2,
             boot_id: "boot-b".to_string(),
         }],
+        last_change: Some(Change {
+            kind: ChangeKind::Repaired,
+            old: (1_800_000_120_000, Some(1_800_000_000_100)),
+            new: (1_800_000_000_000, None),
+            at_ms: 1_800_000_000_000,
+        }),
     };
     let text = state.to_json();
+    assert!(text.contains(
+        r#""last_change":{"kind":"repaired","old":[1800000120000,1800000000100],"new":[1800000000000,null],"at_ms":1800000000000}"#
+    ));
     assert_eq!(ClockState::from_json(&text).expect("reads back"), state);
     assert!(text.contains(&format!("\"machine\":\"{}\"", "11".repeat(16))));
     assert!(text.contains(&format!(
@@ -1513,6 +1522,12 @@ fn state_json_round_trips() {
     assert!(ClockState::from_json(&text.replace(&"11".repeat(16), &"1".repeat(31))).is_err());
     assert!(ClockState::from_json(&text.replace(&"11".repeat(16), &"AB".repeat(16))).is_err());
     assert!(ClockState::from_json("{}").is_err());
+    // The change too: no unknown field, a known kind, two values each.
+    assert!(ClockState::from_json(&text.replace("\"at_ms\"", "\"extra\":1,\"at_ms\"")).is_err());
+    assert!(ClockState::from_json(&text.replace("\"repaired\"", "\"moved\"")).is_err());
+    assert!(
+        ClockState::from_json(&text.replace("[1800000000000,null]", "[1800000000000]")).is_err()
+    );
 }
 
 #[test]

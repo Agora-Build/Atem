@@ -38,6 +38,11 @@
 //!   above the floor it raises it, below it the floor follows it down at
 //!   500 ppm.
 //! - **Deadlines** compare with `D = max(H, the floor's prediction)`.
+//! - **The latest repair or lowering** is kept with the record
+//!   (`last_change`, with `D` just after it), for `atem status`.
+//! - **A damaged record** (`HostClock`) starts afresh at a synchronized
+//!   reading, or at a `station_time` within the cap of the reading
+//!   (`station_afresh`, step 4 ruling T11a).
 //!
 //! The fallbacks of the OS readings (ruling T9b): a boot id the OS can't give
 //! (`os::UNKNOWN_BOOT_PREFIX`, one per process) and a machine with no id
@@ -61,6 +66,8 @@ pub const CAP_MS: u64 = 600_000;
 pub const WENT_BACK_MS: u64 = 600_000;
 /// An owner alert's least spacing, on `H`.
 pub const ALERT_EVERY_MS: u64 = 3_600_000;
+/// How long `atem status` shows the latest repair or lowering, on `D`.
+pub const CHANGE_SHOWN_MS: u64 = 86_400_000;
 
 /// At a boot's first synchronized reading, `wall_hw` or the floor more than
 /// this ahead of the wall clock is lowered to it.
@@ -248,6 +255,31 @@ pub struct ClockState {
     /// the oldest one: a late-direction lowering, at most once per eviction,
     /// needing a shared profile and clock-setting privilege.
     spent_boots: Vec<Boot>,
+    /// The latest repair or lowering (§11.6: `runtime.log` keeps every one,
+    /// `atem status` shows it): a new one replaces it.
+    last_change: Option<Change>,
+}
+
+/// A repair or a lowering, as `atem status` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Change {
+    pub kind: ChangeKind,
+    /// `(wall_hw, floor)` before and after, in ms (as the event's).
+    pub old: (u64, Option<u64>),
+    pub new: (u64, Option<u64>),
+    /// `D` just after it, in ms: `atem status` shows it for a day of `D`
+    /// from then (`CHANGE_SHOWN_MS`).
+    pub at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    /// A jump undone (rule 3).
+    Repaired,
+    /// The once-per-boot lowering at a boot's first synchronized reading.
+    Lowered,
 }
 
 /// A boot of a machine.
@@ -419,6 +451,51 @@ impl ClockState {
         }
     }
 
+    /// A `station_time` while a damaged record waits (step 4 ruling T11a),
+    /// read at `r` (also observed first, on the waiting state): within the
+    /// cap of the reading itself (`w` + 10 minutes) it starts the clock
+    /// afresh, `H` = `max(w, station_time)` and the floor taken from it, with
+    /// no mark (no lowering is armed: the Station's time bounds it); beyond
+    /// it, nothing is taken and the hourly "Station clock ahead of this host"
+    /// alert for `origin` is due as for any `station_time`.
+    pub fn station_afresh(&self, origin: &str, station_time_ms: u64, r: &OsReading) -> StationStep {
+        let Step {
+            mut next,
+            mut events,
+        } = self.observe(r);
+        let w = ns(r.wall_ms);
+        let cap = w + ns(CAP_MS);
+        let st = ns(station_time_ms);
+        if st > cap {
+            let h_ms = next.h_ms(r);
+            if alert_due(next.last_ahead_alert_ms.get(origin).copied(), h_ms) {
+                events.push(ClockEvent::StationAhead {
+                    origin: origin.to_string(),
+                    station_time_ms,
+                    cap_ms: to_ms(cap),
+                });
+                next.note_ahead_alert(origin, h_ms);
+            }
+            return StationStep {
+                next,
+                within_cap: false,
+                events,
+            };
+        }
+        let fresh = ClockState {
+            record: Some(Stamp::at(w.max(st), r)),
+            floor: Some(Stamp::at(st, r)),
+            anchor: None,
+            mark: false,
+            ..next
+        };
+        StationStep {
+            next: fresh,
+            within_cap: true,
+            events,
+        }
+    }
+
     /// `H` at `r`.
     pub fn h_ms(&self, r: &OsReading) -> u64 {
         to_ms(self.h_ns(r))
@@ -431,6 +508,10 @@ impl ClockState {
     }
 
     /// The record carries the mark: no synchronized reading yet in its boot.
+    pub fn last_change(&self) -> Option<&Change> {
+        self.last_change.as_ref()
+    }
+
     pub fn mark(&self) -> bool {
         self.mark
     }
@@ -544,9 +625,27 @@ impl ClockState {
         }
         self.record = Some(Stamp::at(record, r));
         self.anchor = None;
-        events.push(ClockEvent::Repaired {
-            old: (to_ms(w.max(p)), old_floor.map(to_ms)),
-            new: (to_ms(record), new_floor.map(to_ms)),
+        let (old, new) = (
+            (to_ms(w.max(p)), old_floor.map(to_ms)),
+            (to_ms(record), new_floor.map(to_ms)),
+        );
+        self.note_change(ChangeKind::Repaired, old, new, r);
+        events.push(ClockEvent::Repaired { old, new });
+    }
+
+    /// The latest repair or lowering, with `D` just after it.
+    fn note_change(
+        &mut self,
+        kind: ChangeKind,
+        old: (u64, Option<u64>),
+        new: (u64, Option<u64>),
+        r: &OsReading,
+    ) {
+        self.last_change = Some(Change {
+            kind,
+            old,
+            new,
+            at_ms: self.deadline_ms(r),
         });
     }
 
@@ -644,10 +743,12 @@ impl ClockState {
         {
             self.floor = Some(Stamp::at(f, r));
         }
-        events.push(ClockEvent::LoweredAtSync {
-            old: (to_ms(record), floor.map(to_ms)),
-            new: (to_ms(new_record), new_floor.map(to_ms)),
-        });
+        let (old, new) = (
+            (to_ms(record), floor.map(to_ms)),
+            (to_ms(new_record), new_floor.map(to_ms)),
+        );
+        self.note_change(ChangeKind::Lowered, old, new, r);
+        events.push(ClockEvent::LoweredAtSync { old, new });
     }
 
     /// A wall clock more than 10 minutes below `H`: the alert, at most one an

@@ -4,7 +4,11 @@
 //! rules to them; `HostClock` runs that state in the runtime.
 //!
 //! `HostClock` lives beside the host-work store (`host_work::Store`, table
-//! `clock`), owned by the runtime's host bridge:
+//! `clock`), held by the runtime's host bridge (`Option<HostClock>`). Nothing
+//! outside tests constructs it until the delegated lifecycle does, behind
+//! `host.delegated` (step 4, Task 19): until then the host writes no clock
+//! row, no clock line and no status, as main does.
+//!
 //! - **Readings.** The pass observes one a second (`tick`), and a Station's
 //!   `station_time` is observed with one (`station`). In debug builds
 //!   `ATEM_TEST_HOST_CLOCK` replaces the OS's readings (`test_hooks`); release
@@ -20,13 +24,21 @@
 //!   line with the old and new values, and so does each owner alert (step 4
 //!   Decision 12: "host clock went back", "Station clock ahead of this
 //!   host"); the follow-down, anchors and guards write none. `atem status`
-//!   gets `status_line` while the clock holds deadlines back.
+//!   gets `status_line`: §11.6's text while the clock holds deadlines back,
+//!   and the latest repair or lowering with its values for a day of `D`
+//!   (ruling T11c), the two side by side when both apply.
 //! - **A damaged record** (one that isn't a clock state) is never taken for
 //!   a fresh one, which would lose the record and re-arm the lowering: it is
 //!   kept aside (`clock_aside`), one `runtime.log` line and the status say so,
 //!   delegated work waits (`damaged`), and nothing is written over it until
-//!   the OS reports its wall clock synchronized; the clock then starts afresh
-//!   from that reading, as a profile's first synchronized reading would.
+//!   the first of (ruling T11a): a reading the OS reports synchronized (the
+//!   clock starts afresh from it, as a profile's first synchronized reading
+//!   would), or a Station's `station_time` within the cap of the reading
+//!   (`H` = `max(reading, station_time)`, the floor taken from it, no
+//!   lowering armed). Delegated work comes only from senders a Station's
+//!   feed covers, so a working delegated host gets one; the 10-minute cap
+//!   bounds a forged one, as for any floor. One beyond the cap keeps it
+//!   waiting, with the origin's "Station clock ahead" alert.
 
 // Its macOS confirmation reader and the Linux composition's parts are read
 // by tests only.
@@ -35,7 +47,7 @@ pub mod os;
 pub mod state;
 
 use self::os::{OsReading, Synced};
-use self::state::{ClockEvent, ClockState, StationStep, Step};
+use self::state::{Change, ChangeKind, ClockEvent, ClockState, StationStep, Step};
 use crate::runtime::host_work::Store;
 use rusqlite::types::Value;
 use std::sync::Arc;
@@ -57,8 +69,7 @@ pub const AHEAD_WAITING: &str = "host clock ahead of its record; waiting for a s
 /// `H` with no mark.
 pub const WENT_BACK: &str = "host clock went back";
 /// A damaged record: kept aside, delegated work waits.
-pub const DAMAGED: &str =
-    "host clock record damaged and kept aside; delegated work waits for a synchronized clock";
+pub const DAMAGED: &str = "host clock record damaged and kept aside; delegated work waits for a synchronized clock or a Station time";
 
 /// The delegated clock now: `H` and `D` (§11.6), in ms since the epoch.
 // Read by the delegated deadline checks (step 4, Tasks 19–22, 26, 28, 36).
@@ -104,6 +115,9 @@ struct Damaged {
 impl HostClock {
     /// The clock as `store` recorded it (none: a fresh one; a damaged one:
     /// see the module doc).
+    // Constructed by the delegated lifecycle behind `host.delegated` (step 4,
+    // Task 19); only tests construct it before.
+    #[allow(dead_code)]
     pub fn load(store: &Store) -> Self {
         Self::with_reader(store, Arc::new(system_reading))
     }
@@ -138,7 +152,7 @@ impl HostClock {
                 .map_err(|e| log(format!("its damaged record couldn't be kept aside ({e:#})")))
                 .is_ok();
         log(format!(
-            "its record in {} can't be read ({why}); {}, and delegated work waits for a synchronized clock",
+            "its record in {} can't be read ({why}); {}, and delegated work waits for a synchronized clock or a Station time within the cap",
             store.state.join("host-work.sqlite").display(),
             if aside {
                 "kept aside (table clock_aside)"
@@ -196,26 +210,41 @@ impl HostClock {
     /// A Station's `station_time` from `origin`'s heads, observed with a
     /// reading: taken into the floor up to `H` + 10 minutes. Written before
     /// it counts, whatever the cap said (the reading's effects are in it):
-    /// false when beyond the cap (the origin's gate closes), when the write
-    /// failed, and while the record is damaged.
+    /// false when beyond the cap (the origin's gate closes) and when the
+    /// write failed. While the record is damaged, one within the cap of the
+    /// reading starts the clock afresh from it (`ClockState::station_afresh`)
+    /// and counts once written; one beyond keeps it waiting (false).
     // Called on a Station's heads (step 4, Task 33).
     #[allow(dead_code)]
     pub fn station(&mut self, origin: &str, station_time_ms: u64, store: &Store) -> bool {
         let Some(r) = (self.read)() else {
             return false;
         };
+        let aside = self.damaged.as_ref().map(|d| d.aside);
         let StationStep {
             next,
             within_cap,
             events,
-        } = self.state.station(origin, station_time_ms, &r);
+        } = match aside {
+            Some(true) => self.state.station_afresh(origin, station_time_ms, &r),
+            _ => self.state.station(origin, station_time_ms, &r),
+        };
         self.state = next;
         log_events(&events);
         self.last = Some(r.clone());
-        if self.damaged.is_some() {
-            return false;
+        match aside {
+            None => self.persist(store, &r) && within_cap,
+            Some(true) if within_cap => {
+                self.damaged = None;
+                log(format!(
+                    "starts afresh at the Station time {} from {origin} (the wall clock read {}); its damaged record stays kept aside",
+                    utc(station_time_ms),
+                    utc(r.wall_ms)
+                ));
+                self.persist(store, &r)
+            }
+            Some(_) => false,
         }
-        self.persist(store, &r) && within_cap
     }
 
     /// `H` and `D` at a reading taken now.
@@ -232,11 +261,12 @@ impl HostClock {
         }
     }
 
-    /// The `atem status` line while the clock holds deadlines back (§11.6's
-    /// texts), as of the latest reading.
-    pub fn status_line(&self) -> Option<&'static str> {
+    /// The `atem status` line, as of the latest reading: §11.6's text while
+    /// the clock holds deadlines back, and the latest repair or lowering
+    /// within a day of `D` (see `status_text`).
+    pub fn status_line(&self) -> Option<String> {
         if self.damaged.is_some() {
-            return Some(DAMAGED);
+            return Some(DAMAGED.to_string());
         }
         status_text(&self.state, self.last.as_ref()?, cfg!(target_os = "macos"))
     }
@@ -307,12 +337,27 @@ impl HostClock {
     }
 }
 
-/// The status line for `state` at reading `r` (see `status_line`): with the
-/// mark and no synchronized reading, `D` more than 10 minutes ahead of the
-/// wall clock is held back until the lowering, and the line names the fix
-/// (`macos`: waiting for its report); without the mark, `H` that far ahead is
-/// the went-back alert's state.
-fn status_text(state: &ClockState, r: &OsReading, macos: bool) -> Option<&'static str> {
+/// The status line for `state` at reading `r` (see `status_line`): what
+/// holds deadlines back (`held_back`), then, after `; `, the latest repair or
+/// lowering while `D` is less than a day past it (§11.6: `atem status` shows
+/// it; ruling T11c).
+fn status_text(state: &ClockState, r: &OsReading, macos: bool) -> Option<String> {
+    let change = state
+        .last_change()
+        .filter(|c| state.deadline_ms(r).saturating_sub(c.at_ms) < state::CHANGE_SHOWN_MS)
+        .map(change_text);
+    match (held_back(state, r, macos), change) {
+        (Some(held), Some(change)) => Some(format!("{held}; {change}")),
+        (Some(held), None) => Some(held.to_string()),
+        (None, change) => change,
+    }
+}
+
+/// With the mark and no synchronized reading, `D` more than 10 minutes ahead
+/// of the wall clock is held back until the lowering, and the text names the
+/// fix (`macos`: waiting for its report); without the mark, `H` that far
+/// ahead is the went-back alert's state.
+fn held_back(state: &ClockState, r: &OsReading, macos: bool) -> Option<&'static str> {
     let ahead = |v: u64| v > r.wall_ms.saturating_add(AHEAD_MS);
     if state.mark() && r.synced != Synced::Yes && ahead(state.deadline_ms(r)) {
         return Some(if macos {
@@ -324,18 +369,33 @@ fn status_text(state: &ClockState, r: &OsReading, macos: bool) -> Option<&'stati
     ahead(state.h_ms(r)).then_some(WENT_BACK)
 }
 
+/// A repair or lowering as `atem status` shows it, with its values.
+fn change_text(change: &Change) -> String {
+    let what = match change.kind {
+        ChangeKind::Repaired => "repaired a forward jump undone",
+        ChangeKind::Lowered => "lowered to the wall clock at a boot's first synchronized reading",
+    };
+    format!(
+        "host clock {what} at {}: {}",
+        utc(change.at_ms),
+        values(&change.old, &change.new)
+    )
+}
+
+/// `wall_hw <old> -> <new>[, floor <old> -> <new>]`.
+fn values(old: &(u64, Option<u64>), new: &(u64, Option<u64>)) -> String {
+    let floor = |v: Option<u64>| v.map_or_else(|| "none".to_string(), utc);
+    let mut text = format!("wall_hw {} -> {}", utc(old.0), utc(new.0));
+    if old.1.is_some() || new.1.is_some() {
+        text.push_str(&format!(", floor {} -> {}", floor(old.1), floor(new.1)));
+    }
+    text
+}
+
 /// The `runtime.log` line of an event: repairs and lowerings with the old
 /// and new values (§11.6), the owner alerts (Decision 12); none for the
 /// rest.
 fn log_line(event: &ClockEvent) -> Option<String> {
-    let values = |old: &(u64, Option<u64>), new: &(u64, Option<u64>)| {
-        let floor = |v: Option<u64>| v.map_or_else(|| "none".to_string(), utc);
-        let mut text = format!("wall_hw {} -> {}", utc(old.0), utc(new.0));
-        if old.1.is_some() || new.1.is_some() {
-            text.push_str(&format!(", floor {} -> {}", floor(old.1), floor(new.1)));
-        }
-        text
-    };
     match event {
         ClockEvent::Repaired { old, new } => Some(format!(
             "repaired a forward jump undone: {}",

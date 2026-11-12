@@ -12,6 +12,7 @@ use std::sync::Mutex;
 const SEC: u64 = 1_000;
 const MIN: u64 = 60 * SEC;
 const HOUR: u64 = 60 * MIN;
+const DAY: u64 = 24 * HOUR;
 /// The true time when a test starts (2027-01-15), in ms.
 const T: u64 = 1_800_000_000_000;
 const M: [u8; 16] = [0x11; 16];
@@ -303,28 +304,41 @@ fn status_names_the_fix_when_deadlines_are_held_back() {
     } else {
         ENABLE
     };
-    assert_eq!(clock.status_line(), Some(here));
+    assert_eq!(clock.status_line().as_deref(), Some(here));
     let r = clock.last.clone().unwrap();
-    assert_eq!(status_text(&clock.state, &r, false), Some(ENABLE));
-    assert_eq!(status_text(&clock.state, &r, true), Some(WAITING));
+    assert_eq!(
+        status_text(&clock.state, &r, false).as_deref(),
+        Some(ENABLE)
+    );
+    assert_eq!(
+        status_text(&clock.state, &r, true).as_deref(),
+        Some(WAITING)
+    );
     // So does a reading with no report at all.
     os.pass(SEC);
     os.set_wall(os.wall(), Synced::Unknown);
     clock.tick(&store);
-    assert_eq!(clock.status_line(), Some(here));
+    assert_eq!(clock.status_line().as_deref(), Some(here));
 
-    // The first synchronized reading lowers it: nothing held back.
+    // The first synchronized reading lowers it: nothing held back, and the
+    // lowering is shown.
     os.pass(SEC);
     os.set_wall(os.wall(), Synced::Yes);
     assert!(clock.tick(&store).iter().any(lowered));
-    assert_eq!(clock.status_line(), None);
+    let line = clock.status_line().unwrap();
+    assert!(line.starts_with("host clock lowered"), "{line}");
 
     // With the mark gone, a wall clock more than 10 minutes below `H` is the
-    // went-back alert's state: it holds deadlines back too.
+    // went-back alert's state: it holds deadlines back too, shown beside the
+    // lowering.
     os.pass(SEC);
     os.set_wall(os.wall() - 30 * MIN, Synced::Yes);
     clock.tick(&store);
-    assert_eq!(clock.status_line(), Some(WENT_BACK));
+    let line = clock.status_line().unwrap();
+    assert!(
+        line.starts_with(&format!("{WENT_BACK}; host clock lowered")),
+        "{line}"
+    );
     assert_eq!(WENT_BACK, "host clock went back");
 
     // A reboot whose record is less than 10 minutes ahead holds nothing
@@ -337,6 +351,81 @@ fn status_names_the_fix_when_deadlines_are_held_back() {
     clock.tick(&store);
     assert!(clock.state.mark());
     assert_eq!(clock.status_line(), None);
+}
+
+#[test]
+fn a_repair_shows_in_status_with_its_values_for_a_day() {
+    let (_dir, store) = open_store();
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::Yes);
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    clock.tick(&store);
+    os.pass(SEC);
+    os.set_wall(os.wall() + 2 * MIN, Synced::No);
+    clock.tick(&store);
+    os.pass(SEC);
+    os.set_wall(os.wall() - 2 * MIN, Synced::No);
+    let events = clock.tick(&store);
+    let [ClockEvent::Repaired { old, new }] = events[..] else {
+        panic!("{events:?}");
+    };
+    let line = clock.status_line().unwrap();
+    assert!(line.starts_with("host clock repaired"), "{line}");
+    assert!(
+        line.contains(&utc(old.0)) && line.contains(&utc(new.0)),
+        "{line}"
+    );
+    // Kept with the record: a restart shows it too.
+    assert_eq!(stored(&store), clock.state);
+    let restarted = HostClock::with_reader(&store, os.reader());
+    assert_eq!(restarted.status_line(), Some(line.clone()));
+    // Shown for 24 hours on `D`, then gone.
+    os.pass(DAY - MIN);
+    clock.tick(&store);
+    assert_eq!(clock.status_line(), Some(line));
+    os.pass(MIN);
+    clock.tick(&store);
+    assert_eq!(clock.status_line(), None);
+}
+
+#[test]
+fn a_lowering_across_a_reboot_shows_in_status_for_a_day() {
+    let (_dir, store) = open_store();
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::Yes);
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    clock.tick(&store);
+    os.reboot("boot-b", T - HOUR, 20 * SEC, Synced::Yes);
+    let events = clock.tick(&store);
+    let Some(ClockEvent::LoweredAtSync { old, new }) = events.iter().find(|e| lowered(e)) else {
+        panic!("{events:?}");
+    };
+    let line = clock.status_line().unwrap();
+    assert!(line.starts_with("host clock lowered"), "{line}");
+    assert!(
+        line.contains(&utc(old.0)) && line.contains(&utc(new.0)),
+        "{line}"
+    );
+    assert_eq!(stored(&store), clock.state);
+    os.pass(DAY - MIN);
+    clock.tick(&store);
+    assert_eq!(clock.status_line(), Some(line));
+    os.pass(MIN);
+    clock.tick(&store);
+    assert_eq!(clock.status_line(), None);
+}
+
+#[test]
+fn the_follow_down_shows_nothing_in_status() {
+    let (_dir, store) = open_store();
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::Yes);
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    clock.tick(&store);
+    for back in [10 * SEC, 5 * MIN] {
+        os.pass(SEC);
+        os.set_wall(os.wall() - back, Synced::Yes);
+        assert!(clock.tick(&store).is_empty());
+        assert_eq!(clock.status_line(), None);
+    }
+    assert_eq!(clock.state.last_change(), None);
 }
 
 #[test]
@@ -516,22 +605,21 @@ fn a_damaged_host_clock_record_is_kept_aside_and_never_fresh() {
     logged();
     let mut clock = HostClock::with_reader(&store, os.reader());
     assert!(clock.damaged());
-    assert_eq!(clock.status_line(), Some(DAMAGED));
+    assert_eq!(clock.status_line().as_deref(), Some(DAMAGED));
     let lines = logged();
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("kept aside"), "{}", lines[0]);
     assert!(lines[0].contains("host-work.sqlite"), "{}", lines[0]);
     assert_eq!(aside(&store), vec![torn.clone()]);
 
-    // Unsynchronized readings: nothing is written over it, the status stays,
-    // and a Station time is never within the cap (no gate opens on it).
+    // Unsynchronized readings: nothing is written over it, and the status
+    // stays.
     clock.tick(&store);
     os.pass(2 * MIN);
     clock.tick(&store);
-    assert!(!clock.station(ORIGIN, os.wall(), &store));
     clock.close(&store);
     assert_eq!(store.load_clock().unwrap(), Some(torn.clone()));
-    assert_eq!(clock.status_line(), Some(DAMAGED));
+    assert_eq!(clock.status_line().as_deref(), Some(DAMAGED));
 
     // A restart reads it damaged again, and keeps no second copy.
     let mut clock = HostClock::with_reader(&store, os.reader());
@@ -614,4 +702,99 @@ fn a_station_time_is_written_before_it_counts() {
             .any(|l| l.contains("Station clock ahead of this host")),
         "{lines:?}"
     );
+}
+
+/// A clock whose stored record is torn, read with `os`.
+fn damaged_clock(os: &Os) -> (tempfile::TempDir, Store, HostClock, Value) {
+    let (dir, store) = open_store();
+    let torn = Value::Text(r#"{"record":"#.into());
+    store
+        .db
+        .execute("INSERT INTO clock(id,state) VALUES(1,?1)", [&torn])
+        .unwrap();
+    let clock = HostClock::with_reader(&store, os.reader());
+    assert!(clock.damaged());
+    logged();
+    (dir, store, clock, torn)
+}
+
+#[test]
+fn a_damaged_record_starts_afresh_at_a_station_time_within_the_cap() {
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::No);
+    let (_dir, store, mut clock, torn) = damaged_clock(&os);
+    os.pass(SEC);
+    let st = os.wall() + 5 * MIN;
+    // `H` := max(reading, station_time), the floor taken from it, written.
+    assert!(clock.station(ORIGIN, st, &store));
+    assert!(!clock.damaged());
+    assert_eq!(clock.now(), DelegatedNow { h_ms: st, d_ms: st });
+    assert_eq!(stored(&store), clock.state);
+    // No once-per-boot lowering is armed by it: the Station time bounds it.
+    assert!(!clock.state.mark());
+    assert_eq!(clock.status_line(), None);
+    let lines = logged();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("afresh") && lines[0].contains(&utc(st)) && lines[0].contains(ORIGIN),
+        "{}",
+        lines[0]
+    );
+    assert_eq!(aside(&store), vec![torn]);
+}
+
+#[test]
+fn a_station_time_past_the_cap_keeps_a_damaged_record_waiting_and_alerts_hourly() {
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::No);
+    let (_dir, store, mut clock, torn) = damaged_clock(&os);
+    let alerts = |lines: Vec<String>| {
+        lines
+            .iter()
+            .filter(|l| l.contains("Station clock ahead of this host"))
+            .count()
+    };
+    for (after, alerted) in [(SEC, 1), (MIN, 0), (HOUR, 1)] {
+        os.pass(after);
+        assert!(!clock.station(ORIGIN, os.wall() + 11 * MIN, &store));
+        assert!(clock.damaged());
+        assert_eq!(alerts(logged()), alerted);
+    }
+    assert_eq!(store.load_clock().unwrap(), Some(torn));
+    assert_eq!(clock.status_line().as_deref(), Some(DAMAGED));
+}
+
+#[test]
+fn a_synchronized_reading_still_starts_a_damaged_record_afresh() {
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::No);
+    let (_dir, store, mut clock, _torn) = damaged_clock(&os);
+    os.pass(SEC);
+    os.set_wall(os.wall(), Synced::Yes);
+    clock.tick(&store);
+    assert!(!clock.damaged());
+    assert_eq!(clock.now().h_ms, os.wall());
+    assert_eq!(stored(&store), clock.state);
+}
+
+#[test]
+fn a_station_time_below_the_reading_starts_a_damaged_record_at_the_reading() {
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::No);
+    let (_dir, store, mut clock, _torn) = damaged_clock(&os);
+    os.pass(SEC);
+    assert!(clock.station(ORIGIN, os.wall() - 3 * MIN, &store));
+    assert!(!clock.damaged());
+    assert_eq!(
+        clock.now(),
+        DelegatedNow {
+            h_ms: os.wall(),
+            d_ms: os.wall()
+        }
+    );
+    assert_eq!(stored(&store), clock.state);
+    // The record is the reading's: a wall clock then set back a minute is
+    // followed down from it, not from the Station's time.
+    let start = os.wall();
+    os.pass(SEC);
+    os.set_wall(os.wall() - MIN, Synced::No);
+    clock.tick(&store);
+    let h = clock.now().h_ms;
+    assert!((start + SEC - 1..=start + SEC).contains(&h), "{h}");
 }
