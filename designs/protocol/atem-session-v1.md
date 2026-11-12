@@ -3439,7 +3439,8 @@ task is taken or reported. **Planned (delegated host work; changed for
 host senders, needs Astation's agreement):** a routed link also carries the
 Station calls of host-work-v1 §11.4 (`control_sync`,
 `control_sync_result`, `heads`, `control_ack`, `membership_fetch`,
-`membership_fetch_result`) and, in stage 3, the mailbox calls (delegated
+`membership_fetch_result`, and the refusals `control_sync_refused`,
+`membership_fetch_refused`, `control_ack_refused`) and, in stage 3, the mailbox calls (delegated
 host-work design II.4.3), because unattended hosts are where delegated and
 host-sender work runs. The Station takes the calling host from the route
 the host proved (its verified root, host and connection binding), never

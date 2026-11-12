@@ -818,7 +818,7 @@ build and the JVM jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (57 checks in JS, 59 in Kotlin and in Swift: the same 57
+- **Conformance** (58 checks in JS, 60 in Kotlin and in Swift: the same 58
   in each language, plus two in Kotlin and Swift, whose provider sees the
   signing request and so the purposes of the five device-list actions and
   of control records; over
@@ -854,8 +854,8 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   provider asked under `ServiceControl` (no confirmation) for the
   integration's own key and `ControlRecord` (a fresh confirmation of the
   body) for a native manager.
-- **The Station's side** (`tests/station.rs`, Rust; eight conformance
-  checks per language, of the 57 and 59 above): every acknowledgment
+- **The Station's side** (`tests/station.rs`, Rust; nine conformance
+  checks per language, of the 58 and 60 above): every acknowledgment
   fixture (`r9-control-ack-*`, one check each) through `AckLedgerHandle` as
   a Station persists it (each call's next state committed before the
   reports go and adopted after, restarts from the committed state, two
@@ -866,10 +866,12 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   and written back, feed pages, heads and device-list fetches round-tripping,
   the builders refusing what the readers refuse (a record the control
   parser refuses, a position above the head, a `mailbox` head before stage
-  3, another direction's message); and the Portal's statuses in their
-  classes.
+  3, another direction's message); the three refusals exactly and read
+  strictly (unknown codes, fields, nulls, duplicate keys), and an ack
+  refused for its stale association with nothing counted or disclosed;
+  and the Portal's statuses in their classes.
 - **Durable log** (`tests/stored_log.rs`, Rust; two conformance checks per
-  language, of the 57 above): a partly elapsed wait across a same-boot restart and a reboot,
+  language, of the 58 above): a partly elapsed wait across a same-boot restart and a reboot,
   the wall clock set back after restore, a wait-ended decision at its chain
   position (with the entry that relies on it), pending, approved and vetoed
   recovery and key-replacement records, a frozen log, corrupted, oversize,
@@ -1036,9 +1038,27 @@ answer `control_sync`, `heads` and `membership_fetch` only for the account
 of the calling link's verified association: `heads` names only that
 account's feeds, `control_sync` serves only them, `membership_fetch` only
 its device list, and a request naming another account's feed is refused
-(`forbidden`; **Atem's proposal, for Astation's and Auth/Portal's
-agreement**; **the refusal's wire form is open (for Astation)**: §11.4 has
-no message that carries it).
+with `relay_control_sync_refused` or `relay_membership_fetch_refused`
+(**Atem's proposal, for Astation's and Auth/Portal's agreement**; the
+refusal wire **agreed with Astation on 2026-11-11**, #120 comment
+6810116314).
+
+**Refusals.** A Station refuses a host's call on the link with exactly
+`{"type":"relay","op":"control_sync_refused","code":"forbidden"}`,
+`{"type":"relay","op":"membership_fetch_refused","code":"forbidden"}` or
+`{"type":"relay","op":"control_ack_refused","code":"forbidden"}`: `code` is
+exactly `forbidden` in this version, and nothing else is carried (no
+account, feed, host, cursor, principal, integration or record), so a
+refusal never discloses another account. `control_ack_refused` is also the
+reply to an ack `ack` refuses for its association on the link
+(`not_the_link`, `other_account`, `other_station`); no other refusal of an
+ack gets a reply. A refusal is an authorization failure on that link,
+never an empty successful page or an application acknowledgment: it
+advances no cursor, membership head, clock floor or ledger evidence, opens
+no gate, carries no request id and must not complete or correlate a
+request. The host keeps that link's synchronization gates closed while it
+repairs the association and resynchronizes; the transport may still fence
+or close an invalid or superseded link.
 
 | call | what it does |
 |---|---|
@@ -1046,6 +1066,7 @@ no message that carries it).
 | `relay_control_sync_result(origin, feed_id, head, station_time, records)` | the page after the host's `after`: at most 64 `RelayFeedRecord{feed_seq, record_json}`, ascending, each `feed_seq` in `1..=head`, 256 KiB in all. Each record goes through the control parser first: one it refuses is `Invalid{code}` with its parse code, and the page isn't written. Serve only records you validated at intake and stored |
 | `relay_heads(feeds, membership)` | each covering feed's `RelayFeedHead{origin, feed_id, head, station_time}` (at most 64, a feed once) and the device list's `LogHead`. Send it on every (re)connection, every 30 seconds and at once when a record is stored |
 | `relay_membership_fetch_result(head, entries)` | the device list's head and the entries after the host's `after` (signed objects' JSON), at most 64: an R9.3 carriage |
+| `relay_control_sync_refused(code)`, `relay_membership_fetch_refused(code)`, `relay_control_ack_refused(code)` | a refusal of that call on this link (`code`: `RelayRefusalCode::Forbidden`, the only one); never send an empty page or an ack instead. `relay_decode_to_host` reads them as `ControlSyncRefused{code}`, `MembershipFetchRefused{code}`, `ControlAckRefused{code}` |
 | `relay_control_sync(origin, feed_id, after)`, `relay_control_ack(ack)`, `relay_membership_fetch(after)`, `relay_decode_to_host(message)` | the host's side, for tests and other hosts |
 
 Each builder checks what the reader checks, so what it writes the reader
@@ -1060,7 +1081,9 @@ costs only itself, never the page. JS: `relayDecodeToStation(message)`,
 `relayControlAck({accountId, genesisHash, hostId, hostTrustGen, origin, feedId, cursor, results})`
 (each result `{type: "record", recordId, effects}` or `{type: "entry", seq,
 entryHash, appliedSeq, effects}`, each effect `{effect, result}`),
-`relayMembershipFetch(after)`, `relayMembershipFetchResult({seq, hash}, entries)`;
+`relayMembershipFetch(after)`, `relayMembershipFetchResult({seq, hash}, entries)`,
+`relayControlSyncRefused("forbidden")`, `relayMembershipFetchRefused("forbidden")`,
+`relayControlAckRefused("forbidden")` (read back as `{type: "control_sync_refused", code: "forbidden"}` and so on);
 an object with a key outside these is refused (`malformed`).
 
 ### The acknowledgment ledger
@@ -1076,7 +1099,7 @@ to re-sign. Keep one per device list your Station serves.
 | `AckLedgerHandle::new(origin, account_id, genesis_hash)`, `from_json(state_json)`, `to_json()` | an empty ledger (`origin` exact, as hosts compare it: `https://` and a lowercase host, a port only when not the default, no path; `http://` on a loopback address for development; else `Invalid{malformed}`); the stored one (`Stored{code}`: `too_large` over 64 MiB, `malformed`, `unsupported_version`, `stored_invalid`, also for a `pending` list not in the order the reports were made: it would stall a principal); its durable state, canonical JSON (`"v": 1`) |
 | `origin()`, `account_id()`, `genesis_hash()` | the Station and the device list the ledger is for (`genesis_hash` in lowercase hex): check them against the device list a stored state is loaded for |
 | `record(record_json, revoked_at_ms, covered_hosts, now_ms)` | a record you stored in your feed, before you serve it. Your own `revoke` (signed with the integration's service key) starts the revocation: `revoked_at_ms` is when the Portal revoked the integration (the deadline's start, but the ledger keeps `min(revoked_at_ms, the record's issued_at + 1 hour)`, so the deadline is at most `issued_at` plus 25 hours, where a host stops resending the revoke's result: **Atem's proposal, for Astation's agreement**, host-work-v1 §11.4), `covered_hosts` the hosts its grant covered. For any other record `covered_hosts` are the hosts its re-sign alert waits for. Refused (`Invalid{code}`): `other_account`, `other_station`, `record_id_reused` (another body under a `record_id` the ledger tracks), `malformed`, or the record's parse code |
-| `ack(link, ack_json, now_ms)` | a host's `control_ack` as received, on the link whose verified association is `link` (`LinkAssociationInfo{account_id, genesis_hash, host_id, host_trust_gen, connection_id}`). Refused whole, nothing counted: `incomplete_link`, `not_the_link` (the ack's account, root, host or trust generation isn't the link's), `other_account`, `other_station`, `not_the_record` (a result whose effects aren't the record's), or the reader's code |
+| `ack(link, ack_json, now_ms)` | a host's `control_ack` as received, on the link whose verified association is `link` (`LinkAssociationInfo{account_id, genesis_hash, host_id, host_trust_gen, connection_id}`). Refused whole, nothing counted: `incomplete_link`, `not_the_link` (the ack's account, root, host or trust generation isn't the link's), `other_account`, `other_station`, `not_the_record` (a result whose effects aren't the record's), or the reader's code. Answer `not_the_link`, `other_account` and `other_station` with `relay_control_ack_refused` on the link; the others get no reply |
 | `tick(now_ms)` | your timer: a revocation 24 hours past its start (`record`'s `min(revoked_at_ms, issued_at + 1 hour)`) gets its `revoked{deadline_passed}` report |
 | `pending_reports()` | what to send now, in order: `ReportIntentInfo{report_id, report, not_before}`, `report` being `RevocationApplied{integration_id, host, record_id}` or `Revoked{integration_id, outcome, pending_hosts}` |
 | `report_answer(status)` | the class of the Portal's HTTP status: `Confirm`, `Retry`, `Refuse`, `StopReporting` (below) |
@@ -1180,8 +1203,8 @@ without a stop changes nothing in the ledger.
 - **The stop's own ID** clears the stop: every held report goes, in order.
 - **Another ID than the stop's** is another Station at Auth (a removed
   Station registered again, with new integrations); Auth/Portal's rule is
-  "start fresh, drop the old pending reports". **Atem's reading, for
-  Auth/Portal to confirm:** the reports pending at that moment are dropped
+  "start fresh, drop the old pending reports", read as follows (**agreed with Auth/Portal (2026-11-11, #148 comment 6803727308)**):
+  the reports pending at that moment are dropped
   (settled unsent, kept in `dropped_reports()`, a `ReportsDropped` alert
   naming each), and nothing else changes: every revocation reports on as
   usual under the new ID (a host that applies it later, its final
@@ -1205,6 +1228,22 @@ recorded answer and counts nothing again, and a repeated id with another
 body with `409 report_id_reused` (the first stands). A revocation has one
 `revoked` and one `revocation_applied` per host, so neither the record a
 `revocation_applied` names nor a `revoked`'s outcome is part of the id.
+
+**The Portal's report rules** (Auth/Portal's Phase B, the revised set;
+the Portal's `platform.md` "Station Builders" contract is authoritative and
+points here for the `reportId` derivation): the per-host body is
+`{integrationId, state: "revocation_applied", reportId, host, recordId}`
+and the final body `{integrationId, state: "revoked", reportId, outcome,
+pendingHosts}`; `reportId` is 1 to 128 characters of `[A-Za-z0-9._:-]`,
+opaque to the Portal; `host` and every `pendingHosts` entry follow the
+device-list id grammar, and `recordId` is a lowercase UUID v4;
+`pendingHosts` holds at most 100 distinct entries (the ledger's bound is
+64, `MAX_HOSTS`); a body is at most 16 KiB; `revocation_applied` needs the
+integration in `revoking` or `revoked`, else `409 invalid_state`; the same
+host under another `reportId` gets `200` and is not counted again, and a
+second final under another `reportId` gets `409`. Report order, a final
+at once for an own revoke past its deadline or with no covered host, the
+24-hour clock and the 403 stop and resume are agreed with Auth/Portal (2026-11-11, #148 comment 6803727308).
 
 **The Portal's answers** (Auth/Portal's classes; `report_answer`):
 

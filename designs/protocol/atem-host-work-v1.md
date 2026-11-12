@@ -1175,6 +1175,7 @@ Each is `{"type":"relay","op":…}` on Atem's one link, like `push_hint`
 | `control_ack` | host → Station | `account_id`, `genesis_hash`, `host_id`, `host_trust_gen` (the host's claim, below), `origin`, `feed_id`, `cursor` (the host's scan cursor in that feed), `results` |
 | `membership_fetch` | host → Station | `after`: the head `seq` the host holds (design I.5.8, "the host fetches the device list itself"; R9.3 allows it, and it gets no more trust than any carrier) |
 | `membership_fetch_result` | Station → host | `head: {seq, hash}` and `entries`: the signed entries after `after`, an R9.3 carriage |
+| `control_sync_refused`, `membership_fetch_refused`, `control_ack_refused` | Station → host | `code`, exactly `forbidden`: the Station refused that call on this link ("Refusals" below) |
 
 ```json
 {"type":"relay","op":"control_sync","origin":"https://station-dev.agora.build",
@@ -1285,10 +1286,39 @@ that account's feeds, `control_sync` serves only them and
 another account's feed (an `origin` and `feed_id` that aren't its account's
 feed at this Station) is refused, `forbidden`, and nothing of another
 account is served: no principal, `integration_id`, `about.by`, record id or
-revocation time of another account reaches the link. **The refusal's wire
-form is open (for Astation)**: no message above carries a refusal for
-`control_sync` or `membership_fetch`, so a Station can't send `forbidden` as
-written, and Atem proposes no form.
+revocation time of another account reaches the link. The refusal is
+`control_sync_refused` or `membership_fetch_refused` ("Refusals" below).
+
+**Refusals** (**agreed with Astation on 2026-11-11**, #120 comment
+6810116314; they follow `host_route_refused`'s naming). A Station refuses a
+host's call on the link with exactly one of:
+
+```json
+{"type":"relay","op":"control_sync_refused","code":"forbidden"}
+{"type":"relay","op":"membership_fetch_refused","code":"forbidden"}
+{"type":"relay","op":"control_ack_refused","code":"forbidden"}
+```
+
+- `code` is exactly `forbidden` in this version. There are no optional
+  fields, no nulls, and no account, feed, host, cursor, principal,
+  integration or record identifier: a refusal never echoes another
+  account's existence, head, cursor, principal, integration or record
+  metadata. Read strictly like every relay message: an unknown field, an
+  unknown code, a null or a duplicate key refuses the message.
+- `control_sync_refused` and `membership_fetch_refused` answer a call for
+  another account's feed or device list (above). `control_ack_refused` is
+  also the reply to an ack whose claimed association differs from the
+  link's (below): the reference ledger's `AckRefusal::reply` gives it for
+  `not_the_link`, `other_account` and `other_station`, and no other refusal
+  of an ack gets a reply.
+- A refusal is an authorization failure on that link, never an empty
+  successful page or an application acknowledgment. It advances no cursor,
+  membership head, clock floor or ledger evidence and opens no gate. It
+  carries no request id and must not complete or correlate a request.
+- The host keeps that link's synchronization gates closed while it repairs
+  the association and resynchronizes. The transport may still fence or
+  close an invalid or superseded link; a refusal creates no authority for
+  it.
 
 A native token alone never fetches or acknowledges another host's feeds,
 results or mailbox, and Astation proxies no credentials to an arbitrary
@@ -1297,7 +1327,8 @@ Station. A `control_ack`'s `account_id`, `genesis_hash`, `host_id` and
 one that isn't its link's: **an ack's authenticated association is the
 complete account, root, host, trust generation and connection
 association**. The Station refuses an ack whose claim differs from it,
-and counts the ack for the link's host, never the claim's. The connection
+answering `control_ack_refused` ("Refusals" above) and counting nothing,
+and counts an ack only for the link's host, never the claim's. The connection
 is the Station's to fence at its transport: an ack from a connection of
 the host that isn't its current authenticated connection is refused there
 (**Atem's proposal, for Astation's agreement**: the reference ledger
@@ -1355,7 +1386,8 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
   Station's ledger settles a revocation at its deadline, 24 hours after the
   revocation's start. The host knows no time of the revocation but the
   service's own `revoke`'s `issued_at`, and the ledger's `revoked_at_ms` is
-  the Station's word, so (**Atem's proposal, for Astation's agreement**) the
+  the Station's word, so (**Atem's proposal, for Astation's agreement**;
+  agreed with Auth/Portal (2026-11-11, #148 comment 6803727308)) the
   ledger takes the start as `min(revoked_at_ms, issued_at + 1 hour)`: a
   Station that records its own revoke more than an hour after its
   `issued_at` gets its deadline at `issued_at` plus 25 hours, never later,
@@ -1378,7 +1410,7 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
   native-signed record until every effect it carries is in force on every
   host it covers.
 
-#### Reports (for Auth/Portal review)
+#### Reports (agreed with Auth/Portal, 2026-11-11)
 
 The Station reports a revocation's progress to the Portal (`POST
 /api/v1/stations/reports`; the HTTP body is Auth/Portal's, `platform.md`:
@@ -1394,7 +1426,7 @@ appended earlier counts for its hosts, and they are reported once the
 Station's own revoke is recorded, naming the native record. An own revoke
 whose grant covered no host is final at once, as `revoked{all_applied,
 pending_hosts: []}` with no per-host report: nothing could apply it, so the
-revocation is complete (**Atem's choice, for Auth/Portal to confirm**).
+revocation is complete (**agreed with Auth/Portal (2026-11-11, #148 comment 6803727308)**).
 
 - **`revocation_applied{host, record_id}`**: once per covered host and
   revoked integration, at that host's first `applied` **or `duplicate`**
@@ -1417,19 +1449,18 @@ revocation is complete (**Atem's choice, for Auth/Portal to confirm**).
   is persisted, so a restart never moves the deadline. An ack or a record
   is counted after any deadline its time has passed, so the outcome
   depends on time, never on when the Station looked; an own revoke recorded
-  after its own deadline is final at once (**Atem's choice, for Auth/Portal
-  to confirm**): `all_applied` when every covered host already has the
+  after its own deadline is final at once (**agreed with Auth/Portal (2026-11-11, #148 comment 6803727308)**): `all_applied` when
+  every covered host already has the
   revocation in force (through a native revoke), else `deadline_passed`.
 - **Order.** Reports of one principal go to the Portal in the order they
   were made, one at a time: a report is sent only once every report of
   the same principal made before it is settled (done, final or dropped),
   so a per-host report made after its revocation's `revoked` is delivered
-  after it (**Atem's rule, for Auth/Portal to confirm**). As a consequence
+  after it (**agreed with Auth/Portal (2026-11-11, #148 comment 6803727308)**). As a consequence
   a `revoked` report is delivered only after the per-host reports made
   before it, so the Portal never sees `all_applied` ahead of a covered
   host's `revocation_applied`, nor `deadline_passed` ahead of those made
-  before the deadline (the second is **Atem's choice, for Auth/Portal to
-  confirm**). The one exception is a per-host report dropped by a resume
+  before the deadline (the second too: **agreed with Auth/Portal (2026-11-11, #148 comment 6803727308)**). The one exception is a per-host report dropped by a resume
   under another report client ID (below): it is settled unsent, so the
   final goes without it.
 
@@ -1452,6 +1483,27 @@ for account `acct-test-1`, the genesis of `r9-vectors-membership-log`,
 `revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca`
 for host `host-b`, and
 `revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1`.
+
+**The Portal's report rules** (Auth/Portal's Phase B, the revised set; the
+Portal's `platform.md` "Station Builders" contract is authoritative, and
+links the bindings' "For Station builders" for the `reportId`
+derivation):
+
+- The per-host body is `{integrationId, state: "revocation_applied",
+  reportId, host, recordId}`; the final body is `{integrationId, state:
+  "revoked", reportId, outcome, pendingHosts}`.
+- `reportId` is 1 to 128 characters of `[A-Za-z0-9._:-]`, opaque to the
+  Portal (it never recomputes it).
+- `host` and every entry of `pendingHosts` follow the device-list id
+  grammar (1 to 128 characters of `[A-Za-z0-9._:-]`); `recordId` is a
+  lowercase UUID v4.
+- `pendingHosts` holds at most 100 distinct entries (Atem's bound is 64,
+  `MAX_HOSTS`, so the ledger never exceeds it).
+- A body is at most 16 KiB.
+- `revocation_applied` needs the integration in `revoking` or `revoked`;
+  otherwise it is `409 invalid_state`.
+- The same host under another `reportId` gets `200` and is not counted
+  again; a second final under another `reportId` gets `409`.
 
 **The Portal's answers** (Auth/Portal's classes):
 
@@ -1492,8 +1544,8 @@ client changes without a stop changes nothing in its ledgers.
   order (agreed with Auth/Portal).
 - **Another ID than the stop's** is another Station at Auth (a removed
   Station registered again, with new integrations), and Auth/Portal's rule
-  is "start fresh, drop the old pending reports". **Atem's reading, for
-  Auth/Portal to confirm:** the reports pending at that moment are dropped,
+  is "start fresh, drop the old pending reports", read as follows
+  (**agreed with Auth/Portal (2026-11-11, #148 comment 6803727308)**): the reports pending at that moment are dropped,
   done unsent, each named in an operator alert and kept in the ledger
   (`dropped_reports`); nothing else changes, so every revocation reports on
   as usual under the new ID (a host that applies it later, its final
