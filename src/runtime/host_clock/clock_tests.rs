@@ -1037,3 +1037,97 @@ fn a_failed_write_is_logged_once_retried_and_counts_no_station_time() {
     assert_eq!(stored(&store), clock.state);
     assert!(clock.station(ORIGIN, os.wall() + 5 * MIN, &store));
 }
+
+/// PR 4 re-review N3: of two retired stores, the numerically newest
+/// (`retired-10` over `retired-9`, whatever the directory's order) is the
+/// one whose record a new store takes.
+#[test]
+fn the_newest_retired_store_wins() {
+    // Two records, each a clock's in a store of its own.
+    let kept: Vec<ClockState> = [T, T + HOUR]
+        .into_iter()
+        .map(|wall| {
+            let (_dir, store) = open_store();
+            let os = Os::new(wall, 100 * SEC, "boot-a", Synced::Yes);
+            let mut clock = HostClock::with_reader(&store, os.reader());
+            clock.tick(&store);
+            stored(&store)
+        })
+        .collect();
+    assert_ne!(kept[0], kept[1]);
+    let dir = tempfile::tempdir().unwrap();
+    for (at, state) in [(9, &kept[0]), (10, &kept[1])] {
+        let store = Store::open(dir.path()).unwrap();
+        store.save_clock(state).unwrap();
+        store.retire(at).unwrap();
+    }
+    let new = Store::open(dir.path()).unwrap();
+    let os = Os::new(T + 2 * HOUR, 100 * SEC, "boot-a", Synced::Yes);
+    let clock = HostClock::with_reader(&new, os.reader());
+    assert!(!clock.damaged());
+    assert_eq!(clock.state, kept[1], "retired-10 is the newest");
+    assert_eq!(stored(&new), kept[1]);
+}
+
+/// PR 4 re-review N1, N3: a newest retired store that can't be read keeps
+/// the clock damaged (fail closed: it may hold the record), and its line
+/// names that file, not the new store; a readable older one isn't taken
+/// in its place.
+#[test]
+fn an_unreadable_retired_store_keeps_the_clock_damaged_and_names_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = Store::open(dir.path()).unwrap();
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::Yes);
+    let mut clock = HostClock::with_reader(&old, os.reader());
+    clock.tick(&old);
+    old.retire(9).unwrap();
+    std::fs::write(
+        dir.path().join("host-work.sqlite.retired-10"),
+        b"not a database at all, not even close to one",
+    )
+    .unwrap();
+    let new = Store::open(dir.path()).unwrap();
+    logged();
+    let clock = HostClock::with_reader(&new, os.reader());
+    assert!(clock.damaged());
+    assert_eq!(clock.status_line().as_deref(), Some(DAMAGED_UNKEPT));
+    let lines = logged();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("host-work.sqlite.retired-10"),
+        "{}",
+        lines[0]
+    );
+    assert!(!lines[0].contains("sqlite.retired-9"), "{}", lines[0]);
+    assert_eq!(new.load_clock().unwrap(), None, "nothing written over it");
+}
+
+/// PR 4 re-review N2: while a damaged record isn't kept aside, a Station
+/// time within the cap is no start and leaves nothing behind: `D` stays the
+/// reading's, and once the record is kept and a synchronized reading starts
+/// the clock afresh, the floor holds none of it.
+#[test]
+fn a_damaged_record_not_kept_aside_takes_no_station_time() {
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::No);
+    let (_dir, store) = open_store();
+    store.put_clock(&Value::Text("{".into())).unwrap();
+    store
+        .db
+        .execute_batch("CREATE TABLE clock_aside (at_ms INTEGER NOT NULL, state)")
+        .unwrap();
+    fail_writes(&store, "clock_aside", true);
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    assert_eq!(clock.status_line().as_deref(), Some(DAMAGED_UNKEPT));
+    os.pass(SEC);
+    let w = os.wall();
+    assert!(!clock.station(ORIGIN, w + 9 * MIN, &store));
+    assert_eq!(clock.now().d_ms, w, "the Station time is not in D");
+    fail_writes(&store, "clock_aside", false);
+    os.pass(SEC);
+    os.set_wall(os.wall(), Synced::Yes);
+    clock.tick(&store);
+    assert!(!clock.damaged());
+    let now = clock.now();
+    assert_eq!(now.d_ms, os.wall(), "nothing of it was kept");
+    assert_eq!(stored(&store), clock.state);
+}

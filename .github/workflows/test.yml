@@ -48,8 +48,10 @@ jobs:
       # `ntp_gettime_reports_a_state` the state ntp_gettime reports, and the
       # ignored `real_os_report_macos` one JSON line of what `os::read()` sees
       # (src/runtime/host_clock/os.rs). The same build: nothing is rebuilt.
+      # It runs even when the test step failed, so the readings still reach
+      # the log (PR 4 re-review N4).
       - name: Print the macOS clock readings
-        if: runner.os == 'macOS'
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
         shell: bash
         run: |
           set -o pipefail

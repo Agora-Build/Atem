@@ -1142,22 +1142,26 @@ impl Store {
             .collect();
         retired.sort_by(|a, b| b.0.cmp(&a.0));
         for (_, path) in retired {
-            let db = Connection::open_with_flags(
-                &path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )?;
-            let has_table: bool = db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='clock')",
-                [],
-                |r| r.get(0),
-            )?;
-            if !has_table {
-                continue;
-            }
-            let value = db
-                .query_row("SELECT state FROM clock WHERE id=1", [], |r| r.get(0))
-                .optional()?;
+            // An error names the retired file (PR 4 re-review N1).
+            let read = || -> Result<Option<rusqlite::types::Value>> {
+                let db = Connection::open_with_flags(
+                    &path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?;
+                let has_table: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='clock')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if !has_table {
+                    return Ok(None);
+                }
+                Ok(db
+                    .query_row("SELECT state FROM clock WHERE id=1", [], |r| r.get(0))
+                    .optional()?)
+            };
+            let value = read().with_context(|| path.display().to_string())?;
             if let Some(value) = value {
                 return Ok(Some((value, path)));
             }

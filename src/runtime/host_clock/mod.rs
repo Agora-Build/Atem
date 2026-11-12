@@ -166,12 +166,17 @@ impl HostClock {
     /// review M2). A damaged one is kept as damage (`keep`).
     fn read_record(&mut self, store: &Store) {
         let db = store.state.join("host-work.sqlite");
-        let found = store.load_clock().and_then(|row| match row {
-            Some(value) => Ok(Some((value, None))),
-            None => Ok(store
-                .retired_clock()?
-                .map(|(value, path)| (value, Some(path)))),
-        });
+        // An error names the file that failed: this store's, or a retired
+        // one's (PR 4 re-review N1).
+        let found = store
+            .load_clock()
+            .map_err(|e| e.context(db.display().to_string()))
+            .and_then(|row| match row {
+                Some(value) => Ok(Some((value, None))),
+                None => Ok(store
+                    .retired_clock()?
+                    .map(|(value, path)| (value, Some(path)))),
+            });
         let retry = self.damaged.is_some();
         match found {
             Ok(None) => {
@@ -226,8 +231,7 @@ impl HostClock {
                         aside: false,
                     });
                     log(format!(
-                        "its record in {} can't be read ({e:#}); read again at every reading, and delegated work waits",
-                        db.display()
+                        "its record can't be read ({e:#}); read again at every reading, and delegated work waits (moving that file aside lets the clock start afresh)"
                     ));
                 }
             }
@@ -331,6 +335,16 @@ impl HostClock {
             return false;
         };
         let aside = self.damaged.as_ref().map(|d| d.aside);
+        if aside == Some(false) {
+            // Damaged and not kept aside yet: the reading counts as any
+            // reading, the Station time not at all, so nothing of it is
+            // written later either (PR 4 re-review N2).
+            let Step { next, events } = self.state.observe(&r);
+            self.state = next;
+            log_events(&events);
+            self.last = Some(r);
+            return false;
+        }
         let StationStep {
             next,
             within_cap,
