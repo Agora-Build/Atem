@@ -963,7 +963,15 @@ def derive_bound(case, sequence):
     ids gone (initial + counted) - final, and a cover or release of a
     principal not revoked, its id not counted then and issued no later than
     the floor then, must be `refused` as evidence with `why`
-    `possible_replay`, and only those."""
+    `possible_replay`, and only those.
+
+    Its limits: the pins are static (the initial and final states'
+    revocation and cover records, not the ones in force at each step,
+    which only matters were a pin to change during an eviction), and it
+    takes each step's result as written: which records verification
+    refuses or keeps pending, and that a frozen list or a failed
+    verification comes before the floor, are outside it (the Rust runner
+    and the suites check those)."""
     initial = sequence.get("initial", {}).get("principals", {})
     final = sequence["state"]["principals"]
     ids, issued, floor, revoked, pins, evicted = {}, {}, {}, {}, {}, {}
@@ -1016,7 +1024,9 @@ def derive_bound(case, sequence):
     for principal, want in sorted(ids.items()):
         part = final.get(principal, {})
         got = [r[0] for r in part.get("records", [])]
-        case.equal(got, want, f"{principal}: the final records, oldest first, as the steps count and evict them")
+        # This equality is what asserts each eviction took the oldest id not
+        # pinned: `want` was built by evicting exactly those.
+        case.equal(got, want, f"{principal}: the final records, oldest first, as the steps count and evict (oldest unpinned first)")
         case.equal(part.get("evicted_floor"), floor[principal], f"{principal}: evicted_floor, the newest issued_at evicted")
         begin = [r[0] for r in initial.get(principal, {}).get("records", [])]
         added = [
@@ -1029,9 +1039,6 @@ def derive_bound(case, sequence):
         # An id evicted and counted again is in the final records.
         gone = set(evicted[principal]) - set(got)
         case.equal(sorted(set(begin + added) - set(got)), sorted(gone), f"{principal}: the ids gone are (initial + counted) - final")
-        if evicted[principal]:
-            back = len(evicted[principal]) - len(gone)
-            case.check(True, f"{principal}: {len(evicted[principal])} evicted, each the oldest not pinned then ({back} counted again)")
 
 
 # ------------------------------------------------ r9-control-ack-* fixtures

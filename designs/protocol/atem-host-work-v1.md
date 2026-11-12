@@ -1282,7 +1282,8 @@ file has, the `fill` record's body under it, each part's device list, its
 evicted floor only with full records, one feed per origin in `order`, each
 step's position against the stations, and the last step's `standing`
 against the state), checks each `why` is a code of its result's kind,
-present exactly when it should be, and derives the bound from the steps
+present exactly when it should be (the exact code among codes of one kind
+is pinned by the Rust runner and the suites), and derives the bound from the steps
 alone: the ids each step counts and the oldest unpinned ones evicted past
 256, the final records in order, `evicted_floor` as the newest `issued_at`
 evicted, and every possible replay (an unrevoked principal's cover or

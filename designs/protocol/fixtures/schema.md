@@ -221,7 +221,9 @@ floor, the final order and every possible replay, from the steps alone);
 the other files' `expect` and refusal reasons are checked by
 `crates/atem-client/tests/vectors.rs` and the binding conformance suites).
 (**For Astation**, amended for step 4: the Station calls' checker, the
-control vectors' bound derivation and their parts and `why` checks.)
+control vectors' bound derivation, their parts checks, and that each
+`why` is a code of its kind present exactly when due; the exact code is
+pinned by the Rust runner and the suites.)
 Test keys:
 secret = SHA-256(enc(["atem-r9-test-key", label])) (`r9-vectors-keys`).
 Hex fields end in `_hex`; wire objects use base64url without padding.

@@ -379,8 +379,11 @@ impl ControlStateHandle {
     /// it, or it isn't exactly `to_json()`'s form). Nothing is loaded then.
     /// `account_mismatch` or `genesis_mismatch` means the stored state is
     /// another device list's (a re-pair, to this account or another): delete
-    /// it and start with `new`. On any other error keep the work it guards
-    /// stopped and never start again from an empty state.
+    /// it and start with `new`. Start with `new` only when your own pairing
+    /// changed; otherwise treat a mismatch as damage and keep the work
+    /// stopped (a well-formed but damaged header reads like another list's).
+    /// On any other error keep the work it guards stopped and never start
+    /// again from an empty state.
     #[cfg_attr(feature = "uniffi", uniffi::constructor)]
     pub fn from_json(log: Arc<MembershipLog>, state_json: String) -> Result<Arc<Self>> {
         if state_json.len() > MAX_CONTROL_STATE_JSON {

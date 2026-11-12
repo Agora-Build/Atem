@@ -2779,7 +2779,7 @@ pub fn seal_result_with_ikm(
 /// Host role: the receiver's checks 1 to 6 (`open_envelope`): `{type:
 /// "open", plainJson, sender}`, `{type: "pending", hostId, hostTrustGen}`,
 /// `{type: "refused", reason, evidence}`, `{type: "refused_authenticated",
-/// objectId, reason, sender: {hostId, hostTrustGen}}` or `{type:
+/// objectId, reason, senderHost: {hostId, hostTrustGen}}` or `{type:
 /// "unavailable", code, detail}`.
 #[cfg(all(feature = "software-keys", feature = "host"))]
 #[wasm_bindgen(js_name = openEnvelope)]
