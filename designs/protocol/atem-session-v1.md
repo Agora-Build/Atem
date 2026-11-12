@@ -4176,7 +4176,12 @@ host-work-v1 §11.4 (the size bound before any parse, the strict parse, the
 fields and grammars, the wire rules) and whose refusal codes it derives:
 every other `expect` and each refusal's `reason` are checked by the Rust
 runner (`crates/atem-client/tests/vectors.rs`) and the binding conformance
-suites, which run the host-envelope and Station-calls checks too. Scenarios
+suites, which run the host-envelope and Station-calls checks too. Of
+`r9-vectors-host-work-control` it also derives the bound from the steps
+alone (the evicted ids, the floor, the final order and every possible
+replay) and checks each step's `why`. (**For Astation**, amended for step
+4: this paragraph's Station-calls checker and the control vectors' bound
+and `why` checks.) Scenarios
 (`kind: "scenario"`): chain (`valid-suffix`, `rollback`,
 `removed-signer-conflict`, `current-manager-conflict`, `unknown-carrier`,
 `honest-concurrent-appends`, `relay-cas-failure`, `signature-retry`,

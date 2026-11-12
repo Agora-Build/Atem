@@ -994,6 +994,17 @@ record! {
         /// verification, or it reuses a `record_id` of the same principal
         /// with another body (a stop still applies then; see `effects`).
         pub evidence: bool,
+        /// Why it is `pending` or `refused`, or kept as evidence: set
+        /// exactly then (a colliding record is `collision`, whatever its
+        /// result), `None` (JS `null`) for a record that counted without
+        /// question. The verifier's reason (`principal_unknown`,
+        /// `signer_unknown`, `revoke_not_in_list`; `wrong_account`,
+        /// `bad_signature`, `key_mismatch`, `signer_not_allowed`,
+        /// `removed_manager`, `host_key_signed`, `not_a_service`,
+        /// `not_a_revoke`), or the state's: `list_frozen`, `not_revoked`,
+        /// `revoke_not_applied`, `order`, `after_revoke`, `collision`,
+        /// `not_newer`, `possible_replay` (host-work-v1 §11.1).
+        pub why: Option<String>,
     }
 }
 
@@ -1008,7 +1019,8 @@ record! {
         pub revoked: Option<String>,
         /// The revocations whose interrupt a record put in force, as
         /// `ControlHostAction::Interrupt` names them (a service's revoking
-        /// `record_id`, a host principal's `revoke_seq` in decimal), sorted.
+        /// `record_id`, a host principal's `revoke_seq` in decimal), sorted
+        /// as text (`"10"` before `"9"`).
         pub interrupted: Vec<String>,
         /// A hold is in force.
         pub held: bool,

@@ -704,6 +704,12 @@ def check_membership_log(file, data, report, context):
 LOG_L = ["E1", "E2", "E3", "E4", "E5", "E6"]
 # The most counted record ids a principal's part keeps (ControlState, decision 19).
 MAX_RECORD_IDS = 256
+# The control vectors' records by label, for the sequence checks.
+CONTROL_BY_LABEL = {}
+
+
+def by_label_of(label):
+    return CONTROL_BY_LABEL[label]
 
 
 def signer_key_in(replay, signer):
@@ -808,6 +814,9 @@ def check_host_work_control(file, data, report, context):
             if "parse_error" in vector:
                 case.check(True, f"refused at parse ({vector['parse_error']}; not derived here)")
 
+    CONTROL_BY_LABEL.clear()
+    CONTROL_BY_LABEL.update(by_label)
+
     def check_state(case, state, fill, what):
         """A state (v2: one part per principal): its account, each part's
         device list (the file's account and genesis), its records (one to
@@ -894,6 +903,135 @@ def check_host_work_control(file, data, report, context):
             last = sequence["steps"][-1]
             principal = by_label[last["record"]]["record"]["body"]["principal"]
             case.equal(last["standing"], standing_of(sequence["state"], principal), "the last step's standing is the state's")
+            check_why(case, sequence)
+            derive_bound(case, sequence)
+
+
+# Applied::why's codes (host-work-v1 §11.1), by what they explain.
+WHY_PENDING = {"principal_unknown", "signer_unknown", "revoke_not_in_list", "list_frozen", "not_revoked", "revoke_not_applied"}
+WHY_VERIFIER_REFUSED = {
+    "wrong_account", "bad_signature", "key_mismatch", "signer_not_allowed",
+    "removed_manager", "host_key_signed", "not_a_service", "not_a_revoke",
+}
+WHY_STATE_REFUSED = {"order", "after_revoke", "not_newer"}
+WHY_EVIDENCE = WHY_VERIFIER_REFUSED | {"collision", "possible_replay"}
+WHY_CODES = WHY_PENDING | WHY_VERIFIER_REFUSED | WHY_STATE_REFUSED | {"collision", "possible_replay"}
+
+
+def check_why(case, sequence):
+    """Each step's `expect.why`: one of the codes, present exactly when the
+    record is pending or refused or kept as evidence, and of the kind its
+    result says (pending: a wait; refused as evidence: the verifier's
+    reason, a collision or a possible replay; refused otherwise: order,
+    after a revoke, not newer, or a list of another account; counted as
+    evidence: a collision)."""
+    bad = []
+    for i, step in enumerate(sequence["steps"], 1):
+        expect = step["expect"]
+        result, evidence, why = expect["result"], expect["evidence"], expect.get("why")
+        explains = result in ("pending", "refused") or evidence
+        if (why is not None) != explains or (why is not None and why not in WHY_CODES):
+            bad.append(i)
+        elif result == "pending" and why not in WHY_PENDING:
+            bad.append(i)
+        elif result == "refused" and evidence and why not in WHY_EVIDENCE:
+            bad.append(i)
+        elif result == "refused" and not evidence and why not in WHY_STATE_REFUSED | {"wrong_account"}:
+            bad.append(i)
+        elif result in ("applied", "duplicate") and evidence and why != "collision":
+            bad.append(i)
+    case.check(
+        not bad,
+        "every step's why: a code of its kind, present exactly when pending, refused or evidence"
+        + (f" (not: steps {bad})" if bad else ""),
+    )
+
+
+def pins_of(part):
+    """The record ids a part never evicts: its revocation's, its cover's."""
+    return {part.get("revoked_by"), part.get("coverage", {}).get("cover", {}).get("record_id")} - {None}
+
+
+def derive_bound(case, sequence):
+    """The bound, derived from the file alone (no state machine): per
+    principal, the counted ids start as `initial`'s and gain each step's id
+    that counted (`applied` or `duplicate`, not evidence) and wasn't counted
+    yet, in step order; past MAX_RECORD_IDS the oldest id that isn't pinned
+    (the revocation's record, the coverage's cover, at the start or the
+    end) is evicted and raises the evicted floor to its issued_at. The final
+    records (in order) and `evicted_floor` must be what that gives, the
+    ids gone (initial + counted) - final, and a cover or release of a
+    principal not revoked, its id not counted then and issued no later than
+    the floor then, must be `refused` as evidence with `why`
+    `possible_replay`, and only those."""
+    initial = sequence.get("initial", {}).get("principals", {})
+    final = sequence["state"]["principals"]
+    ids, issued, floor, revoked, pins, evicted = {}, {}, {}, {}, {}, {}
+
+    def start(principal):
+        part = initial.get(principal, {})
+        ids[principal] = [r[0] for r in part.get("records", [])]
+        for r in part.get("records", []):
+            issued[(principal, r[0])] = r[2]
+        floor[principal] = part.get("evicted_floor")
+        revoked[principal] = "revoked_by" in part
+        pins[principal] = pins_of(part) | pins_of(final.get(principal, {}))
+        evicted[principal] = []
+
+    for principal in set(initial) | set(final):
+        start(principal)
+    wrong = []
+    for i, step in enumerate(sequence["steps"], 1):
+        body = by_label_of(step["record"])["record"]["body"]
+        principal, rid, expect = body["principal"], body["record_id"], step["expect"]
+        if principal not in ids:
+            start(principal)
+        guarded = (
+            body["action"] in ("cover", "release")
+            and not revoked[principal]
+            and rid not in ids[principal]
+            and floor[principal] is not None
+            and body["issued_at"] <= floor[principal]
+        )
+        replay = expect.get("why") == "possible_replay"
+        if guarded != replay or (guarded and (expect["result"], expect["evidence"]) != ("refused", True)):
+            wrong.append(i)
+        counted = expect["result"] in ("applied", "duplicate") and not expect["evidence"]
+        if counted and body["action"] == "revoke":
+            revoked[principal] = True
+        if counted and rid not in ids[principal]:
+            ids[principal].append(rid)
+            issued[(principal, rid)] = body["issued_at"]
+            if len(ids[principal]) > MAX_RECORD_IDS:
+                victim = next(x for x in ids[principal] if x not in pins[principal])
+                ids[principal].remove(victim)
+                evicted[principal].append(victim)
+                at = issued[(principal, victim)]
+                floor[principal] = at if floor[principal] is None else max(floor[principal], at)
+    case.check(
+        not wrong,
+        "each guarded step (an unrevoked principal's cover or release, its id not counted, issued no later than the floor) "
+        "is refused as evidence with why possible_replay, and only those" + (f" (not: steps {wrong})" if wrong else ""),
+    )
+    for principal, want in sorted(ids.items()):
+        part = final.get(principal, {})
+        got = [r[0] for r in part.get("records", [])]
+        case.equal(got, want, f"{principal}: the final records, oldest first, as the steps count and evict them")
+        case.equal(part.get("evicted_floor"), floor[principal], f"{principal}: evicted_floor, the newest issued_at evicted")
+        begin = [r[0] for r in initial.get(principal, {}).get("records", [])]
+        added = [
+            by_label_of(st["record"])["record"]["body"]["record_id"]
+            for st in sequence["steps"]
+            if by_label_of(st["record"])["record"]["body"]["principal"] == principal
+            and st["expect"]["result"] in ("applied", "duplicate")
+            and not st["expect"]["evidence"]
+        ]
+        # An id evicted and counted again is in the final records.
+        gone = set(evicted[principal]) - set(got)
+        case.equal(sorted(set(begin + added) - set(got)), sorted(gone), f"{principal}: the ids gone are (initial + counted) - final")
+        if evicted[principal]:
+            back = len(evicted[principal]) - len(gone)
+            case.check(True, f"{principal}: {len(evicted[principal])} evicted, each the oldest not pinned then ({back} counted again)")
 
 
 # ------------------------------------------------ r9-control-ack-* fixtures

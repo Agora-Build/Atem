@@ -716,11 +716,16 @@ fun main(args: Array<String>) {
         is ControlHostAction.Interrupt -> mapOf("type" to "interrupt", "principal" to a.principal, "revocation" to a.revocation)
         is ControlHostAction.Cover -> mapOf("type" to "cover", "principal" to a.principal, "origin" to a.origin, "feed_id" to a.feedId)
     }
-    fun controlAppliedOf(a: ControlApplied): Map<String, Any?> = mapOf(
-        "result" to a.result.name.lowercase(),
-        "effects" to a.effects.map { mapOf("effect" to it.effect.name.lowercase(), "result" to it.result.name.lowercase()) },
-        "actions" to a.actions.map(::controlActionOf),
-        "evidence" to a.evidence)
+    fun controlAppliedOf(a: ControlApplied): Map<String, Any?> {
+        val m = linkedMapOf<String, Any?>(
+            "result" to a.result.name.lowercase(),
+            "effects" to a.effects.map { mapOf("effect" to it.effect.name.lowercase(), "result" to it.result.name.lowercase()) },
+            "actions" to a.actions.map(::controlActionOf),
+            "evidence" to a.evidence)
+        // Why it is pending, refused or evidence: present exactly then.
+        a.why?.let { m["why"] = it }
+        return m
+    }
     fun ctlPos(p: Any?): ControlFeedPos? =
         p?.let { ControlFeedPos(it["origin"].s(), it["feed_id"].s(), it["feed_seq"].l().toULong()) }
     fun controlStandingOf(s: ControlStanding): Map<String, Any?> {
@@ -1131,8 +1136,24 @@ fun main(args: Array<String>) {
                     throwsCode("wrong_message") { relayDecodeToHost(wire) }
                     val read = relayDecodeToStation(wire) as RelayToStation.ControlAck
                     eq(relayControlAck(read.ack), wire, "$name written again")
-                    eq(listOf(read.ack.hostId, read.ack.hostTrustGen, read.ack.cursor, read.ack.results.size),
-                        listOf(f["host_id"].s(), f["host_trust_gen"].l().toULong(), f["cursor"].l().toULong(), f["results"].arr().size), name)
+                    // What it decoded to, field by field, against the golden's fields
+                    // (a mapping wrong both ways round wouldn't show in the re-encoding).
+                    fun effectsOf(e: List<ControlEffectResult>) =
+                        e.map { mapOf("effect" to it.effect.name.lowercase(), "result" to it.result.name.lowercase()) }
+                    val ack = read.ack
+                    val decoded = mapOf(
+                        "account_id" to ack.accountId, "cursor" to ack.cursor.toLong(), "feed_id" to ack.feedId,
+                        "genesis_hash" to ack.genesisHash, "host_id" to ack.hostId,
+                        "host_trust_gen" to ack.hostTrustGen.toLong(), "origin" to ack.origin,
+                        "results" to ack.results.map { r ->
+                            when (r) {
+                                is RelayAckResult.Record -> mapOf("effects" to effectsOf(r.effects), "record_id" to r.recordId)
+                                is RelayAckResult.Entry -> mapOf(
+                                    "applied_seq" to r.appliedSeq.toLong(), "effects" to effectsOf(r.effects),
+                                    "entry" to mapOf("entry_hash" to r.entryHash, "seq" to r.seq.toLong()))
+                            }
+                        })
+                    eq(decoded, f.obj(), "$name decoded")
                 }
                 "membership_fetch" -> {
                     val after = f["after"].l().toULong()
@@ -1258,7 +1279,7 @@ fun main(args: Array<String>) {
         is EnvelopeVerdictInfo.Pending -> mapOf("verdict" to "pending", "host_id" to got.hostId, "host_trust_gen" to got.hostTrustGen.toLong()) to null
         is EnvelopeVerdictInfo.Refused -> mapOf("verdict" to "refused", "reason" to got.reason, "evidence" to got.evidence) to null
         is EnvelopeVerdictInfo.RefusedAuthenticated ->
-            mapOf("verdict" to "refused_authenticated", "object_id" to got.objectId, "reason" to got.reason, "sender" to mailSender(got.sender)) to null
+            mapOf("verdict" to "refused_authenticated", "object_id" to got.objectId, "reason" to got.reason, "sender" to mailSender(got.senderHost)) to null
         is EnvelopeVerdictInfo.Unavailable -> mapOf("verdict" to "unavailable", "code" to got.code, "detail" to got.detail) to null
     }
     fun resultVerdict(got: ResultVerdictInfo): Pair<Map<String, Any?>, String?> = when (got) {
@@ -1267,7 +1288,7 @@ fun main(args: Array<String>) {
         is ResultVerdictInfo.Pending -> mapOf("verdict" to "pending", "host_id" to got.hostId, "host_trust_gen" to got.hostTrustGen.toLong()) to null
         is ResultVerdictInfo.Refused -> mapOf("verdict" to "refused", "reason" to got.reason, "evidence" to got.evidence) to null
         is ResultVerdictInfo.RefusedAuthenticated ->
-            mapOf("verdict" to "refused_authenticated", "object_id" to got.objectId, "reason" to got.reason, "sender" to mailSender(got.sender)) to null
+            mapOf("verdict" to "refused_authenticated", "object_id" to got.objectId, "reason" to got.reason, "sender" to mailSender(got.senderHost)) to null
         is ResultVerdictInfo.Unavailable -> mapOf("verdict" to "unavailable", "code" to got.code, "detail" to got.detail) to null
     }
     check("host mail: the entries extend log L to their hashes") {

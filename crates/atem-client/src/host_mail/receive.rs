@@ -262,8 +262,9 @@ pub struct Recipient {
     /// sender's head.
     pub keys: Vec<(KeyId, [u8; 8])>,
     /// Every `enc_kid` this host made at its current trust generation, from
-    /// its own record, never from its device list, with the kids of
-    /// [`keys`](Self::keys) added. Every `host_enc_key` entry for this host
+    /// its own record, never from its device list; a kid in
+    /// [`keys`](Self::keys) counts as made, listed here or not. Every
+    /// `host_enc_key` entry for this host
     /// carries this host's own `enc_sig`, so no other kid can ever be one it
     /// accepts: mail sealed to one is refused `enc_key_not_accepted` even when
     /// signed beyond this head, with no wait. A kid here but not in

@@ -1084,8 +1084,8 @@ The rules:
    (`possible_replay`) and kept as evidence, whatever its position. A
    cover or release applies when it was issued after every evicted record
    of that principal, which a Station meets for every record it signed
-   itself when its `issued_at` for the principal only rises (its duty
-   below). A stop
+   itself when each cover or release it signs for the principal is issued
+   after every record it signed for it before (its duty below). A stop
    never meets the floor (a stop always wins): a `hold` applies as any
    hold, so an evicted hold replayed holds again, which grants nothing;
    a `revoke` or an `interrupt_running` replayed is a `duplicate` (a
@@ -1208,11 +1208,11 @@ ordering can't stop a key holder. The Station's duties:
 - A Station's covers' `issued_at` only rises: each cover it signs for a
   principal is newer, by `(issued_at, record_id)`, than any cover issued
   for that principal before, a handed-over integration's included (the
-  handover carries the last cover's `issued_at`). **Its releases' too
-  (with the bound of rule 1; needs Astation's agreement; **for Astation**,
-  amended for step 4):** each cover
-  or release a Station signs for a principal is issued after every
-  record it signed for that principal before, its holds included, since
+  handover carries the last cover's `issued_at`). **Its releases' too**
+  (with the bound of rule 1; **needs Astation's agreement**; **for
+  Astation**, amended for step 4): each cover or release a Station signs
+  for a principal is issued after every record it signed for that
+  principal before, its holds included, since
   a cover or release issued no later than a record a host evicted is
   refused there as a possible replay; a snapshot's covers and releases
   signed anew are issued now, never with an old `issued_at`, and a
@@ -1259,13 +1259,18 @@ and the bound: from an `initial` state whose principal's records are full
 evicted release re-served at a fresh position of the covering feed and a
 cover issued before the evicted floor are refused as possible replays
 while a release issued after it applies, an evicted hold replayed holds
-again, and an evicted revoke replayed is still a duplicate), each step with the `standing` of its record's principal after
+again, and an evicted revoke replayed is still a duplicate), each step
+with the `standing` of its record's principal after
 it. Each step's position is `{origin, feed_id, feed_seq}`; a state (v2)
 keeps one part per principal, naming its device list, its records the
-`[record_id, digest, issued_at]` triples that counted, oldest first
-(**for Astation**, amended for step 4: every sequence's `state` is v2,
-each step carries its `standing`, and two sequences and three records are
-new in the file; its steps' other fields are as they were).
+`[record_id, digest, issued_at]` triples that counted, oldest first. Each
+step's `expect.why` is `Applied::why`'s code, present exactly when the
+record is pending or refused or kept as evidence (the bindings'
+`ControlApplied.why`). (**For Astation**, amended for step 4: every
+sequence's `state` is v2, each step carries its `standing` and `why`, two
+sequences and three records are new in the file, and the checker's checks
+of parts, `why` and the bound below are new; its steps' other fields are as
+they were.)
 They run in `crates/atem-client/tests/vectors.rs`, in the bindings'
 `tests/control.rs` and in the Swift, Kotlin and WASM conformance suites;
 `scripts/check-r9-vectors.py` recomputes their cryptographic values
@@ -1276,7 +1281,13 @@ file has, the `fill` record's body under it, each part's device list, its
 256-id bound with its revocation's and cover's records among them, an
 evicted floor only with full records, one feed per origin in `order`, each
 step's position against the stations, and the last step's `standing`
-against the state) and derives no verdict.
+against the state), checks each `why` is a code of its result's kind,
+present exactly when it should be, and derives the bound from the steps
+alone: the ids each step counts and the oldest unpinned ones evicted past
+256, the final records in order, `evicted_floor` as the newest `issued_at`
+evicted, and every possible replay (an unrevoked principal's cover or
+release, its id not counted, issued no later than the floor then) refused
+as evidence with `why` `possible_replay`. It derives no other verdict.
 Every SDK package's checksum manifest lists the file.
 
 ### 11.2 `work_interrupt` and `work_resolve`
@@ -2034,6 +2045,7 @@ bindings' `tests/station.rs` and in the Swift, Kotlin and WASM conformance
 suites through `AckLedgerHandle`; `scripts/check-r9-vectors.py` recomputes
 every `reportId` in them. Every SDK package's checksum manifest lists them.
 
+(**For Astation's acceptance**, new in step 4.)
 `fixtures/r9-vectors-station-calls.json` (`kind: "vectors"`, schema in
 `fixtures/schema.md`) holds the messages themselves as exact text, so that
 a custom Station and Astation's `:8080` proxy have known answers: every
@@ -2188,15 +2200,16 @@ names its reason; the reasons are stable and snake_case.
    `enc_kid` names one of the keys it accepts now (`enc_key_not_accepted`;
    "The recipient's keys" below). The key part waits when
    `signed_at_head.seq` is beyond this host's head (Pending, below): this
-   host's own new `host_enc_key` may be among the entries it lacks. Only a
-   key this host made waits (**for Astation**, amended for step 4): a key id
-   it never made is refused `enc_key_not_accepted` beyond its head too,
-   after the checks that settle at any head, step 5's times and, for a
-   claimed pair this list holds, step 4's check. **Agreed with Astation
-   (2026-11-11, #120 comment 6810116314).** The current trust generation is the host's own, from its
-   pairing (`pairing/trust_gen`), never one read from its device list, which
-   may lag behind its own new `add_host` after `atem pair verify` (every
-   mail to its new generation would then be refused for good).
+   host's own new `host_enc_key` may be among the entries it lacks.
+   **Agreed with Astation (2026-11-11, #120 comment 6810116314).** The
+   current trust generation is the host's own, from its pairing
+   (`pairing/trust_gen`), never one read from its device list, which may
+   lag behind its own new `add_host` after `atem pair verify` (every mail
+   to its new generation would then be refused for good). Only a key this
+   host made waits (**for Astation**, amended for step 4): a key id it
+   never made is refused `enc_key_not_accepted` beyond its head too, after
+   the checks that settle at any head, step 5's times and, for a claimed
+   pair this list holds, step 4's check.
 3. **The sender.** For a result: the host, at the generation, the outbox row
    went to (`not_the_recipient`). Then, when `signed_at_head.seq` is not
    beyond this host's head, this list settles it, in this order: a host no
@@ -2378,7 +2391,8 @@ Mail to any other key it made is refused `enc_key_not_accepted` once this
 host's head is at or beyond the head the object names. **For Astation**
 (amended for step 4): the host also passes the id of every key it made in
 its current trust generation (`generated`), from its own record, never
-from its device list, with the id of every key it accepts added. It writes
+from its device list; a key it accepts counts as made, listed there or
+not. It writes
 each id to that record durably before `host_enc_key_get` hands the key
 out, and keeps it for the generation; a lost record is rebuilt from the
 private keys it still holds for that generation (design II.4.1). Every

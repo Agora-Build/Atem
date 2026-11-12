@@ -176,12 +176,16 @@ fn applied_json(a: &ControlApplied) -> Value {
         .iter()
         .map(|e| json!({"effect": effect_code(e.effect), "result": result_code(e.result)}))
         .collect();
-    json!({
+    let mut v = json!({
         "result": result_code(a.result),
         "effects": effects,
         "actions": actions,
         "evidence": a.evidence,
-    })
+    });
+    if let Some(why) = &a.why {
+        v["why"] = why.as_str().into();
+    }
+    v
 }
 
 fn verdict_json(chain: &[String], check: &ControlCheckInfo) -> Value {
@@ -591,11 +595,41 @@ fn the_state_loads_from_its_parts_only_as_written() {
             )],
             "too_large",
         ),
-        // A part whose device list can't be read might be this list's.
+        // A part whose device list can't be read might be this list's:
+        // its genesis not hex, not a string or missing, its account not a
+        // string or missing.
         (
             vec![with(
                 "host:host-a",
                 &host.replace(&genesis_hash().to_hex(), "zz"),
+            )],
+            "stored_invalid",
+        ),
+        (
+            vec![with(
+                "host:host-a",
+                &host.replace(&format!("\"{}\"", genesis_hash().to_hex()), "7"),
+            )],
+            "stored_invalid",
+        ),
+        (
+            vec![with(
+                "host:host-a",
+                &host.replace(
+                    &format!(",\"genesis_hash\":\"{}\"", genesis_hash().to_hex()),
+                    "",
+                ),
+            )],
+            "stored_invalid",
+        ),
+        (
+            vec![with("host:host-a", &host.replace("\"acct-test-1\"", "7"))],
+            "stored_invalid",
+        ),
+        (
+            vec![with(
+                "host:host-a",
+                &host.replace("\"account_id\":\"acct-test-1\",", ""),
             )],
             "stored_invalid",
         ),
@@ -668,7 +702,7 @@ fn the_state_loads_only_as_written_for_its_own_list() {
         f(&mut state);
         atem_client::canonical::jcs(&state).unwrap()
     };
-    let cases: [(String, &str); 10] = [
+    let cases: [(String, &str); 15] = [
         ("[".into(), "malformed"),
         ("[]".into(), "malformed"),
         (
@@ -686,6 +720,19 @@ fn the_state_loads_only_as_written_for_its_own_list() {
             edit(&|s| s["genesis_hash"] = "00".repeat(32).into()),
             "genesis_mismatch",
         ),
+        // A header the state can't read names no list: malformed, never
+        // another list's (as `MembershipLog::from_stored` answers).
+        (
+            edit(&|s| drop(s.as_object_mut().unwrap().remove("genesis_hash"))),
+            "malformed",
+        ),
+        (edit(&|s| s["genesis_hash"] = "zz".into()), "malformed"),
+        (edit(&|s| s["genesis_hash"] = 7.into()), "malformed"),
+        (
+            edit(&|s| drop(s.as_object_mut().unwrap().remove("account_id"))),
+            "malformed",
+        ),
+        (edit(&|s| s["account_id"] = 7.into()), "malformed"),
         // The state's own rules: an interrupt without its revocation.
         (
             edit(&|s| {

@@ -922,7 +922,10 @@ final class ConformanceTests: XCTestCase {
         }
         func controlAppliedOf(_ applied: ControlApplied) -> [String: Any] {
             let effects: [[String: Any]] = applied.effects.map { ["effect": effectCode($0.effect), "result": resultCode($0.result)] }
-            return ["result": resultCode(applied.result), "effects": effects, "actions": applied.actions.map(controlActionOf), "evidence": applied.evidence]
+            var out: [String: Any] = ["result": resultCode(applied.result), "effects": effects, "actions": applied.actions.map(controlActionOf), "evidence": applied.evidence]
+            // Why it is pending, refused or evidence: present exactly then.
+            if let why = applied.why { out["why"] = why }
+            return out
         }
         func ctlPos(_ v: Any?) -> ControlFeedPos? {
             guard let p = v as? [String: Any] else { return nil }
@@ -1394,10 +1397,25 @@ final class ConformanceTests: XCTestCase {
                         throw Failure(description: "\(name): not an ack")
                     }
                     try eq(try relayControlAck(ack: ack), wire, "\(name) written again")
-                    try eq(ack.hostId, s(f["host_id"]), name)
-                    try eq(ack.hostTrustGen, u(f["host_trust_gen"]), name)
-                    try eq(ack.cursor, u(f["cursor"]), name)
-                    try eq(ack.results.count, a(f["results"]).count, name)
+                    // What it decoded to, field by field, against the golden's fields
+                    // (a mapping wrong both ways round wouldn't show in the re-encoding).
+                    func effectsOf(_ e: [ControlEffectResult]) -> [[String: Any]] {
+                        e.map { ["effect": effectCode($0.effect), "result": resultCode($0.result)] }
+                    }
+                    let results: [[String: Any]] = ack.results.map { r in
+                        switch r {
+                        case let .record(recordId, effects):
+                            return ["effects": effectsOf(effects), "record_id": recordId]
+                        case let .entry(seq, entryHash, appliedSeq, effects):
+                            return ["applied_seq": appliedSeq, "effects": effectsOf(effects), "entry": ["entry_hash": entryHash, "seq": seq] as [String: Any]]
+                        }
+                    }
+                    let decoded: [String: Any] = [
+                        "account_id": ack.accountId, "cursor": ack.cursor, "feed_id": ack.feedId,
+                        "genesis_hash": ack.genesisHash, "host_id": ack.hostId,
+                        "host_trust_gen": ack.hostTrustGen, "origin": ack.origin, "results": results,
+                    ]
+                    try eq(canon(decoded), canon(f), "\(name) decoded")
                 case "membership_fetch":
                     try eq(try relayMembershipFetch(after: u(f["after"])), wire, name)
                     try throwsCode("wrong_message") { _ = try relayDecodeToHost(message: wire) }

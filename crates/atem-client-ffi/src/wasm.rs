@@ -993,7 +993,7 @@ impl ControlStateHandle {
     /// Applies a record to this state (`pos`: `{origin, feedId, feedSeq}`,
     /// or `null`/`undefined` over a channel) and returns a
     /// `ControlTransition`: `applied` (`{result, effects: [{effect,
-    /// result}], actions: [{type, principal, …}], evidence}`) and `next`,
+    /// result}], actions: [{type, principal, …}], evidence, why}`) and `next`,
     /// the state after it, and `touched`, the principals whose part it
     /// changed. This handle doesn't change: use `next` once your
     /// transaction storing `next.toJson()` (or the touched parts)
@@ -1103,7 +1103,8 @@ pub struct ControlTransition {
 
 #[wasm_bindgen]
 impl ControlTransition {
-    /// What the record did: `{result, effects, actions, evidence}`.
+    /// What the record did: `{result, effects, actions, evidence, why}`
+    /// (`why` `null` when the record counted without question).
     #[wasm_bindgen(getter)]
     pub fn applied(&self) -> JsValue {
         self.applied.clone()

@@ -4914,6 +4914,21 @@ impl<'a> ControlGen<'a> {
                 .next;
             step["standing"] = standing_json(&state.standing(&rec.principal().name()));
         }
+        // Each step's `why`, from the hand-written list: exactly the steps
+        // pending, refused or kept as evidence have one.
+        for (i, step) in steps.iter_mut().enumerate() {
+            let why = CONTROL_WHY
+                .iter()
+                .find(|(q, n, _)| *q == label && *n == i + 1)
+                .map(|(_, _, why)| *why);
+            let expect = &step["expect"];
+            let explains =
+                matches!(s(expect, "result"), "pending" | "refused") || expect["evidence"] == true;
+            assert_eq!(why.is_some(), explains, "{label} step {}: why", i + 1);
+            if let Some(why) = why {
+                step["expect"]["why"] = why.into();
+            }
+        }
         let mut v = serde_json::json!({"label": label, "note": note, "steps": steps, "state": state.to_json()});
         if let Some((initial, fill)) = initial {
             v["initial"] = initial.to_json();
@@ -4972,6 +4987,62 @@ impl<'a> ControlGen<'a> {
         state
     }
 }
+
+/// Why each step of a control sequence is pending or refused, or kept as
+/// evidence (`Applied::why`, host-work-v1 §11.1), by sequence and step
+/// (from 1): written out by hand, as `expect` is. A step not listed has
+/// none; the generator checks the list against each step's `expect`.
+const CONTROL_WHY: &[(&str, usize, &str)] = &[
+    ("Q1_service_on_one_feed", 10, "after_revoke"),
+    ("Q2_removed_manager_then_resigned", 1, "removed_manager"),
+    ("Q2_removed_manager_then_resigned", 3, "removed_manager"),
+    ("Q3_pending_signer", 1, "signer_unknown"),
+    ("Q3_pending_signer", 2, "signer_unknown"),
+    ("Q4_cover_from_another_station", 3, "not_newer"),
+    ("Q4_cover_from_another_station", 4, "order"),
+    ("Q4_cover_from_another_station", 7, "order"),
+    ("Q5_feed_reset", 5, "order"),
+    ("Q6_feed_reset_on_a_new_host", 4, "order"),
+    ("Q7_host_interrupt", 1, "revoke_not_in_list"),
+    ("Q7_host_interrupt", 2, "revoke_not_applied"),
+    ("Q7_host_interrupt", 6, "not_a_revoke"),
+    ("Q7_host_interrupt", 7, "host_key_signed"),
+    ("Q8_refused_and_kept_as_evidence", 2, "collision"),
+    ("Q8_refused_and_kept_as_evidence", 3, "bad_signature"),
+    ("Q8_refused_and_kept_as_evidence", 4, "wrong_account"),
+    ("Q8_refused_and_kept_as_evidence", 5, "key_mismatch"),
+    ("Q8_refused_and_kept_as_evidence", 6, "signer_not_allowed"),
+    ("Q8_refused_and_kept_as_evidence", 7, "not_a_service"),
+    ("Q8_refused_and_kept_as_evidence", 8, "principal_unknown"),
+    (
+        "Q10_hold_from_a_station_that_lost_the_takeover",
+        2,
+        "not_newer",
+    ),
+    ("Q10_hold_from_a_station_that_lost_the_takeover", 4, "order"),
+    ("Q11_reset_cover_not_newer", 4, "order"),
+    ("Q12_service_interrupt_waits", 1, "not_revoked"),
+    ("Q13_out_of_order_in_one_feed", 5, "order"),
+    ("Q14_hold_with_no_coverage", 2, "order"),
+    ("Q15_old_cover_replayed_after_a_move", 5, "order"),
+    ("Q16_issued_at_tie", 2, "not_newer"),
+    ("Q18_colliding_record_ids", 4, "collision"),
+    ("Q18_colliding_record_ids", 5, "collision"),
+    ("Q18_colliding_record_ids", 6, "collision"),
+    ("Q18_colliding_record_ids", 7, "collision"),
+    ("Q18_colliding_record_ids", 8, "collision"),
+    (
+        "Q19_evicted_records_replayed_are_refused",
+        3,
+        "possible_replay",
+    ),
+    (
+        "Q19_evicted_records_replayed_are_refused",
+        6,
+        "possible_replay",
+    ),
+    ("Q20_evicted_revoke_still_duplicate", 5, "after_revoke"),
+];
 
 /// What a principal has in force as the vectors write it
 /// (`ControlState::standing`): `held`, `interrupted` (sorted), and
@@ -5855,7 +5926,7 @@ fn control_vectors(book: &Book) -> Value {
         "name": "r9-vectors-host-work-control",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part names its device list, account_id and genesis_hash, and its `records` are the [record_id, digest, issued_at] triples that counted, oldest first; `order` holds one feed per Station origin). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover, and raises the part's `evicted_floor` to the newest issued_at evicted; a cover or release of a principal not revoked, under an id not counted and issued no later than the floor, is refused as a possible replay and kept as evidence; a hold, revoke or interrupt never is (decision 19, rulings T4a and T4d, for Astation's agreement).",
+        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part names its device list, account_id and genesis_hash, and its `records` are the [record_id, digest, issued_at] triples that counted, oldest first; `order` holds one feed per Station origin). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). Its `expect.why` is Applied::why's code (host-work-v1 §11.1: the verifier's pending or refusal reason, or list_frozen, not_revoked, revoke_not_applied, order, after_revoke, collision, not_newer, possible_replay), present exactly when the record is pending or refused or kept as evidence. A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover, and raises the part's `evicted_floor` to the newest issued_at evicted; a cover or release of a principal not revoked, under an id not counted and issued no later than the floor, is refused as a possible replay and kept as evidence; a hold, revoke or interrupt never is (decision 19, rulings T4a and T4d, for Astation's agreement).",
         "account_id": "acct-test-1",
         "genesis_hash": genesis_hash().to_hex(),
         "stations": {
@@ -5900,7 +5971,11 @@ fn applied_of(a: &ControlApplied) -> Value {
         .iter()
         .map(|e| (e.effect.code(), e.result.code()))
         .collect();
-    applied(a.record_result.code(), &effects, actions, a.evidence)
+    let mut v = applied(a.record_result.code(), &effects, actions, a.evidence);
+    if let Some(why) = a.why {
+        v["why"] = why.code().into();
+    }
+    v
 }
 
 /// A verdict as the vectors write it.

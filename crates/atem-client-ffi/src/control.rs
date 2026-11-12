@@ -297,6 +297,7 @@ fn applied_info(applied: Applied) -> ControlApplied {
             })
             .collect(),
         evidence: applied.evidence,
+        why: applied.why.map(|why| why.code().to_owned()),
     }
 }
 
@@ -319,11 +320,11 @@ fn applied_info(applied: Applied) -> ControlApplied {
 /// `from_json` or `control_state_from_parts` at start; never re-apply records to rebuild
 /// it (a record verified then may not verify against today's list, and
 /// idempotency is by the records kept). Each principal keeps at most 256
-/// counted record ids, oldest evicted first (never its revocation's record
-/// nor the coverage's cover; a cover or release under an evicted id,
-/// issued no later than the newest evicted, is refused as a possible
-/// replay, never a hold, revoke or interrupt). Every part names its device
-/// list (account and genesis).
+/// counted record ids, oldest evicted first, and a cover or release of a
+/// principal that isn't revoked, under an id no longer counted and issued
+/// no later than the newest evicted, is refused as a possible replay: the
+/// rules are host-work-v1 §11.1 rule 1's. Every part names its device list
+/// (account and genesis).
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct ControlStateHandle {
     state: ControlState,
@@ -370,15 +371,16 @@ impl ControlStateHandle {
 
     /// A state `to_json()` wrote, for `log`'s device list. `Stored{code}`:
     /// `too_large` (over 64 MiB), `malformed` (not strict JSON, not an
-    /// object, no `v`), `unsupported_version` (a `v` other than 2: 1 is the
-    /// format before parts per principal),
-    /// `account_mismatch`, `genesis_mismatch` (another device list's state),
-    /// `stored_invalid` (the state's own rules refuse it, or it isn't
-    /// exactly `to_json()`'s form). Nothing is loaded then. A
-    /// `genesis_mismatch` after a re-pair (the stored state is the old
-    /// device list's) means the new list starts with `new`; on any other
-    /// error keep the work it guards stopped and never start again from an
-    /// empty state.
+    /// object, no `v`, an `account_id` or `genesis_hash` missing or not
+    /// readable: such a header names no list), `unsupported_version` (a
+    /// `v` other than 2: 1 is the format before parts per principal),
+    /// `account_mismatch`, `genesis_mismatch` (a well-formed header naming
+    /// another device list), `stored_invalid` (the state's own rules refuse
+    /// it, or it isn't exactly `to_json()`'s form). Nothing is loaded then.
+    /// `account_mismatch` or `genesis_mismatch` means the stored state is
+    /// another device list's (a re-pair, to this account or another): delete
+    /// it and start with `new`. On any other error keep the work it guards
+    /// stopped and never start again from an empty state.
     #[cfg_attr(feature = "uniffi", uniffi::constructor)]
     pub fn from_json(log: Arc<MembershipLog>, state_json: String) -> Result<Arc<Self>> {
         if state_json.len() > MAX_CONTROL_STATE_JSON {
@@ -407,22 +409,32 @@ impl ControlStateHandle {
             }
         }
         {
+            // Only a well-formed header naming another list is that list's
+            // mismatch; one that can't be read names no list (fail closed).
             let list = log.lock();
-            if object.get("account_id").and_then(Value::as_str) != Some(list.account_id()) {
-                return Err(AtemError::stored(
-                    "account_mismatch",
-                    "the state is of another account",
-                ));
+            match object.get("account_id").and_then(Value::as_str) {
+                None => return Err(AtemError::stored("malformed", "account_id")),
+                Some(account) if account != list.account_id() => {
+                    return Err(AtemError::stored(
+                        "account_mismatch",
+                        "the state is of another account",
+                    ));
+                }
+                Some(_) => {}
             }
-            let genesis = object
+            match object
                 .get("genesis_hash")
                 .and_then(Value::as_str)
-                .and_then(|h| Hash32::from_hex(h).ok());
-            if genesis != Some(list.genesis_hash()) {
-                return Err(AtemError::stored(
-                    "genesis_mismatch",
-                    "the state is of another device list",
-                ));
+                .and_then(|h| Hash32::from_hex(h).ok())
+            {
+                None => return Err(AtemError::stored("malformed", "genesis_hash")),
+                Some(genesis) if genesis != list.genesis_hash() => {
+                    return Err(AtemError::stored(
+                        "genesis_mismatch",
+                        "the state is of another device list",
+                    ));
+                }
+                Some(_) => {}
             }
         }
         let state = ControlState::from_json(&value)
@@ -547,9 +559,11 @@ pub struct ControlLoadedParts {
 /// leftovers: at a live re-pair, delete the old list's rows in the
 /// transaction that adopts `new`). `Stored{code}`: `too_large` (over 64
 /// MiB in all), `malformed` (a part that isn't strict JSON),
-/// `stored_invalid` (a principal given twice, a name that is no principal,
-/// a part whose device list can't be read, one of this list its rules
-/// refuse, or not exactly `part()`'s form). Nothing is loaded then; keep
+/// `stored_invalid` (a principal given twice; a part whose device list
+/// can't be read; a part of this list whose name is no principal, that its
+/// rules refuse, or that isn't exactly `part()`'s form: store each
+/// `part_json` byte for byte). A part of another list is reported in
+/// `foreign` whatever its name. Nothing is loaded then; keep
 /// the work it guards stopped and never start again from an empty state.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn control_state_from_parts(

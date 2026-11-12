@@ -567,6 +567,12 @@ check("control records: the builders reproduce every record; a body the parse re
   throwsCode(() => m.controlRecordSigningInput({ ...controlBodyOf(ctl.records[0].record.body), feed_id: "x" }), "malformed");
 });
 const controlActionOut = ({ feedId, ...rest }) => (feedId === undefined ? rest : { ...rest, feed_id: feedId });
+// An applied object as the vectors write it: `why` only when there is one.
+const controlAppliedOut = ({ why, actions, ...rest }) => ({
+  ...rest,
+  actions: actions.map(controlActionOut),
+  ...(why === null || why === undefined ? {} : { why }),
+});
 const ctlPos = (pos) => (pos === undefined ? null : { origin: pos.origin, feedId: pos.feed_id, feedSeq: pos.feed_seq });
 // A standing as the vectors write it: `revoked` and `coverage` only when there are.
 const controlStandingOf = ({ revoked, interrupted, held, coverage }) => ({
@@ -583,7 +589,7 @@ check("control records: every sequence's per-effect results, standing and state 
       const principal = ctlByLabel[step.record].record.body.principal;
       const t = state.apply(str(ctlByLabel[step.record].record), logAfter(step.chain), ctlPos(step.pos), step.host_applied_seq);
       const got = t.applied;
-      same({ ...got, actions: got.actions.map(controlActionOut) }, step.expect, `${q.label} step ${i + 1}`);
+      same(controlAppliedOut(got), step.expect, `${q.label} step ${i + 1}`);
       same(controlStandingOf(t.next.standing(principal)), step.standing, `${q.label} step ${i + 1} standing`);
       const changed = state.part(principal) !== t.next.part(principal);
       same(t.touched, changed ? [principal] : [], `${q.label} step ${i + 1} touched`);
@@ -598,6 +604,10 @@ check("control records: every sequence's per-effect results, standing and state 
   const text = m.canonicalJson(str(ctl.sequences[0].state));
   throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace('"acct-test-1"', '"acct-other"')), "account_mismatch");
   throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace('"v":2', '"v":1')), "unsupported_version");
+  // A header the state can't read names no list: malformed, never another
+  // list's (whose code would let a host start empty).
+  throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace(/"genesis_hash":"[0-9a-f]+",/, "")), "malformed");
+  throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace('"account_id":"acct-test-1",', '"account_id":7,')), "malformed");
   throwsCode(() => m.ControlStateHandle.fromJson(logL(), "["), "malformed");
 });
 check("control records: a state's parts per principal load in any order, only as written", () => {
@@ -936,7 +946,26 @@ check("Station calls: the byte goldens build exactly, read back to their fields 
         break;
       case "control_ack":
         eq(m.relayControlAck(read.ack), wire, `${name} written again`);
-        eq([read.ack.hostId, read.ack.hostTrustGen, read.ack.cursor, read.ack.results.length], [f.host_id, f.host_trust_gen, f.cursor, f.results.length], name);
+        // What it decoded to, field by field, against the golden's fields (a
+        // mapping wrong both ways round wouldn't show in the re-encoding).
+        same(
+          {
+            account_id: read.ack.accountId,
+            cursor: read.ack.cursor,
+            feed_id: read.ack.feedId,
+            genesis_hash: read.ack.genesisHash,
+            host_id: read.ack.hostId,
+            host_trust_gen: read.ack.hostTrustGen,
+            origin: read.ack.origin,
+            results: read.ack.results.map((r) =>
+              r.type === "entry"
+                ? { applied_seq: r.appliedSeq, effects: r.effects, entry: { entry_hash: r.entryHash, seq: r.seq } }
+                : { effects: r.effects, record_id: r.recordId },
+            ),
+          },
+          f,
+          `${name} decoded`,
+        );
         break;
       case "membership_fetch":
         eq(m.relayMembershipFetch(f.after), wire, name);
@@ -1026,12 +1055,12 @@ const mailRecipient = (r) => ({
 const mailOutbox = (o) => ({ recipient: mailHost(o.recipient), messageId: o.message_id, cancelCompleteIds: o.cancel_complete_ids, taskIds: o.task_ids });
 // A verdict as `expect` writes it; an open's plaintext against the object's.
 const mailExpect = (c, got) => {
-  const { type, plainJson, hostId, hostTrustGen, objectId, ...rest } = got;
+  const { type, plainJson, hostId, hostTrustGen, objectId, senderHost, ...rest } = got;
   const v = { verdict: type, ...rest };
   if (hostId !== undefined) Object.assign(v, { host_id: hostId, host_trust_gen: hostTrustGen });
   if (objectId !== undefined) v.object_id = objectId;
-  // An authenticated refusal's sender is a host record: {hostId, hostTrustGen}.
-  if (typeof rest.sender === "object") v.sender = { host_id: rest.sender.hostId, host_trust_gen: rest.sender.hostTrustGen };
+  // An authenticated refusal's sender host is a record: {hostId, hostTrustGen}.
+  if (senderHost !== undefined) v.sender = { host_id: senderHost.hostId, host_trust_gen: senderHost.hostTrustGen };
   same(v, c.expect, c.label);
   const sealed = mailObject[c.object].sealed;
   if (plainJson === undefined) return;

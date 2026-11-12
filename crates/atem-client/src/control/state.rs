@@ -500,7 +500,8 @@ pub struct Standing {
     /// [`HostAction::Interrupt`] names them: a service's revoking
     /// `record_id`, a host principal's `revoke_seq` in decimal (a revoke
     /// entry that carried `interrupt_running: true` interrupted with the
-    /// entry, which is the device list's).
+    /// entry, which is the device list's). Sorted as text: `"10"` before
+    /// `"9"`.
     pub interrupted: BTreeSet<String>,
     /// A hold is in force (I.5.5 step 4).
     pub held: bool,
@@ -1491,7 +1492,10 @@ impl ServiceControl {
                 Some(Covering {
                     origin: origin(&c["origin"], what)?,
                     feed_id: feed_id(&c["feed_id"], what)?,
-                    since: c["since"].as_u64().ok_or(Error::Malformed(what))?,
+                    since: c["since"]
+                        .as_u64()
+                        .filter(|at| *at <= MAX_SAFE_INTEGER)
+                        .ok_or(Error::Malformed(what))?,
                     cover: CoverKey {
                         issued_at: cover["issued_at"]
                             .as_u64()
@@ -1522,7 +1526,9 @@ impl ServiceControl {
                 };
                 let entry = (
                     feed_id(&json!(id), what)?,
-                    at.as_u64().ok_or(Error::Malformed(what))?,
+                    at.as_u64()
+                        .filter(|at| *at <= MAX_SAFE_INTEGER)
+                        .ok_or(Error::Malformed(what))?,
                 );
                 order.insert(origin(&json!(at_origin), what)?, entry);
             }
@@ -3421,6 +3427,30 @@ mod control_state_tests {
             ("null", Box::new(|j| j["principals"] = Value::Null)),
             ("empty account", Box::new(|j| j["account_id"] = json!(""))),
             (
+                "account not a string",
+                Box::new(|j| j["account_id"] = json!(7)),
+            ),
+            (
+                "no account",
+                Box::new(|j| {
+                    j.as_object_mut().unwrap().remove("account_id");
+                }),
+            ),
+            (
+                "genesis not hex",
+                Box::new(|j| j["genesis_hash"] = json!("zz")),
+            ),
+            (
+                "genesis not a string",
+                Box::new(|j| j["genesis_hash"] = json!(7)),
+            ),
+            (
+                "no genesis",
+                Box::new(|j| {
+                    j.as_object_mut().unwrap().remove("genesis_hash");
+                }),
+            ),
+            (
                 "uppercase hash",
                 Box::new(|j| {
                     j["genesis_hash"] = json!(j["genesis_hash"].as_str().unwrap().to_uppercase())
@@ -3628,6 +3658,18 @@ mod control_state_tests {
                 Box::new(move |j| j["principals"][svc1]["order"][A.0][A.1] = json!("2")),
             ),
             (
+                "order position unsafe",
+                Box::new(move |j| {
+                    j["principals"][svc1]["order"][A.0][A.1] = json!(MAX_SAFE_INTEGER + 1)
+                }),
+            ),
+            (
+                "coverage since unsafe",
+                Box::new(move |j| {
+                    j["principals"][svc1]["coverage"]["since"] = json!(MAX_SAFE_INTEGER + 1)
+                }),
+            ),
+            (
                 "order empty",
                 Box::new(move |j| j["principals"][svc1]["order"] = json!({})),
             ),
@@ -3655,7 +3697,15 @@ mod control_state_tests {
         for (what, edit) in edits {
             let mut bad = good.clone();
             edit(&mut bad);
-            assert!(ControlState::from_json(&bad).is_err(), "{what}");
+            // A part naming another list in a whole state is that list's
+            // mismatch; anything else, a header the state can't read
+            // included, is malformed (it names no list).
+            let got = ControlState::from_json(&bad);
+            if what.starts_with("a part of another") {
+                assert!(matches!(got, Err(Error::GenesisMismatch)), "{what}");
+            } else {
+                assert!(matches!(got, Err(Error::Malformed(_))), "{what}");
+            }
         }
         assert_eq!(ControlState::from_json(&good).unwrap(), state);
     }
@@ -5149,6 +5199,20 @@ mod control_state_tests {
             (
                 "genesis not hex",
                 damaged(&|j| j["genesis_hash"] = json!("zz")),
+            ),
+            (
+                "genesis not a string",
+                damaged(&|j| j["genesis_hash"] = json!(7)),
+            ),
+            (
+                "no genesis",
+                damaged(&|j| {
+                    j.as_object_mut().unwrap().remove("genesis_hash");
+                }),
+            ),
+            (
+                "account not a string",
+                damaged(&|j| j["account_id"] = json!(7)),
             ),
             (
                 "no account",

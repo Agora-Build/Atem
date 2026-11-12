@@ -109,7 +109,8 @@ record! {
         /// Every `enc_kid` (16 hex) this host made at that generation, from
         /// its own record (each id written durably before the key was handed
         /// out; a lost record rebuilt from the private keys it still holds),
-        /// never from its device list, with the ids of `keys` added. A key id
+        /// never from its device list; a key in `keys` counts as made,
+        /// listed here or not. A key id
         /// in neither `keys` nor `generated` is refused `enc_key_not_accepted`
         /// for good, even when the object is signed beyond this host's head;
         /// one here but not in `keys` waits there.
@@ -150,13 +151,16 @@ data_enum! {
         Refused { reason: String, evidence: String },
         /// Refused after the signature verified and the sealed part matched:
         /// the host reports it to the sender (a status naming `object_id`,
-        /// `refused: invalid_request`), and it claims `(sender.host_id,
-        /// object_id)`; `sender.host_trust_gen` says which `add_host` key
-        /// verified the copy.
+        /// `refused: invalid_request`), and it claims `(sender_host.host_id,
+        /// object_id)`; `sender_host.host_trust_gen` says which `add_host`
+        /// key verified the copy.
         RefusedAuthenticated {
             object_id: String,
             reason: String,
-            sender: MailHostData,
+            /// The authenticated sender host (named `sender_host`, not
+            /// `sender`: `Open`'s and `Accepted`'s `sender` is a principal
+            /// string, and one field name has one type).
+            sender_host: MailHostData,
         },
         /// A local failure (the key provider): nothing is decided; retry.
         Unavailable { code: String, detail: String },
@@ -186,7 +190,10 @@ data_enum! {
         RefusedAuthenticated {
             object_id: String,
             reason: String,
-            sender: MailHostData,
+            /// The authenticated sender host (named `sender_host`, not
+            /// `sender`: `Open`'s and `Accepted`'s `sender` is a principal
+            /// string, and one field name has one type).
+            sender_host: MailHostData,
         },
         /// As `EnvelopeVerdictInfo::Unavailable`.
         Unavailable { code: String, detail: String },
@@ -326,7 +333,7 @@ impl From<EnvelopeVerdict> for EnvelopeVerdictInfo {
             } => EnvelopeVerdictInfo::RefusedAuthenticated {
                 object_id,
                 reason: reason.into(),
-                sender: sender.into(),
+                sender_host: sender.into(),
             },
             EnvelopeVerdict::Unavailable { error } => EnvelopeVerdictInfo::Unavailable {
                 code: error.code().into(),
@@ -374,7 +381,7 @@ impl From<ResultVerdict> for ResultVerdictInfo {
             } => ResultVerdictInfo::RefusedAuthenticated {
                 object_id,
                 reason: reason.into(),
-                sender: sender.into(),
+                sender_host: sender.into(),
             },
             ResultVerdict::Unavailable { error } => ResultVerdictInfo::Unavailable {
                 code: error.code().into(),
@@ -699,7 +706,7 @@ mod tests {
             EnvelopeVerdictInfo::RefusedAuthenticated {
                 object_id: "id".into(),
                 reason: "expired".into(),
-                sender: want.clone(),
+                sender_host: want.clone(),
             }
         );
         assert_eq!(
@@ -711,7 +718,7 @@ mod tests {
             ResultVerdictInfo::RefusedAuthenticated {
                 object_id: "id".into(),
                 reason: "expired".into(),
-                sender: want,
+                sender_host: want,
             }
         );
     }

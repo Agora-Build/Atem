@@ -50,7 +50,7 @@ comment 6810116314), and confirmed #148's refusal wire (2026-11-12, #148 comment
 report items (2026-11-11, #148 comment 6803727308) and #147's items 1 to 3 (2026-11-12, #147 comment
 6813332550). The agreed items are marked in host-work-v1 §11, session-v1 R9.2, R9.3, R9.7b, R9.8, R9.9 and
 R9.14 and in the bindings contract. Still open, or step 4 acceptance: the runtime's enforcement of the feed store
-and the host's gates and cursors, byte-level goldens for the relay messages (proposed in step 4's PR 2,
+and the host's gates and cursors, byte-level goldens for the relay messages (proposed in step 4,
 `r9-vectors-station-calls.json`, for Astation's acceptance), the clock provider's tests,
 `no_match`'s wire form and the status of a selector-resolved (UUID v5) task. The design text below changes only in
 these marks and the amendments that follow.
@@ -62,6 +62,13 @@ the host's own `enc_sig`; so the host records every key id it makes durably, bef
 a refusal of a verified copy (steps 5 and 6) names its sender, `(host_id, host_trust_gen)`: the claim on its `id` is
 `(sender.host_id, id)`, as before, and `host_trust_gen` says which `add_host` key verified the copy. Each changed
 passage (in II.4.1 and II.4.2) is marked "Amended for step 4, for Astation's review".
+
+**Refined in the contract for step 4 (proposed, for Astation's agreement).** host-work-v1 §11.1 rule 1's bound (at most
+256 counted record ids per principal, oldest first, and the evicted floor) refines I.5.4's collision row and I.5.5 step
+1 for evicted ids: an evicted id is no longer known, so another body under it is no collision, and an evicted record
+that comes back is verified and applied as a new one (an evicted hold replayed holds again; an evicted cover or release
+issued no later than the floor is refused as a possible replay). The design text below is unchanged; the contract
+states the refinement.
 
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256
@@ -1762,7 +1769,8 @@ is locked can still open its mail. The host makes it at pairing and at `atem pai
 missing. `atem unpair` deletes it, as it deletes `host_channel_key` (R9.3). **Amended for step 4, for Astation's
 review.** The host records the `enc_kid` of every key it makes durably, before `host_enc_key_get` returns the key, and
 keeps the record for that trust generation. It passes the record to II.4.2's receiver (`generated`, host-work-v1
-§11.5), with the kid of every key it accepts added. A lost record is rebuilt from the private keys the host still holds for that generation; mail sealed to
+§11.5); a key it accepts counts as made, listed there or not. A lost record is rebuilt from the private keys the host
+still holds for that generation; mail sealed to
 a key whose private part is gone couldn't be opened anyway. Mail sealed to a key whose id the record lacks, and signed
 beyond the host's head, is refused for good. In (a) and (b) the host vouches for its key with `enc_sig`: Ed25519 by
 `host_key` over `enc(["atem-host-enc-key-v1", account_id, genesis_hash, host_id, u64(host_trust_gen), enc_pub])`. The
