@@ -601,6 +601,10 @@ verifier by this. `WelcomeInfo.verifier` is the host's inventory when its
 `welcome` carried one; today's hosts send none. It is the host's claim
 about itself and never opens the gate alone. All three suites check
 `verifier_inventory()` against `r9-vectors-delegated-wire`'s `verifier`.
+The end-to-end test (`check-atem-client-bindings.sh e2e`) checks
+`WelcomeInfo.verifier`. The Kotlin phone and the Node browser read a test
+host's report, and the Node bot gets `null` from a host that sends none. A
+malformed report refuses the welcome (`Invalid{malformed, verifier}`).
 
 ### Control records (delegated host work; planned)
 

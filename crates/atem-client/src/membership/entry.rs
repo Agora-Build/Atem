@@ -279,7 +279,14 @@ action_names! {
 /// work's five (`project_set`, `project_remove`, `host_sender_revoke`,
 /// `host_sender_readmit`, `host_enc_key`). Every change to
 /// [`known_actions`], or to what this verifier accepts in one of them, is a
-/// new version (`verifier_version_pins_its_action_set` pins the set).
+/// new version. `verifier_version_pins_its_action_set` pins the set; the
+/// rules have no such guard, so the vectors are the check: a change in the
+/// verdict a device-list vector gives for an entry of a known action
+/// (accepted where it was refused, refused where it was accepted, another
+/// refusal reason, or another state derived from it) in
+/// `r9-vectors-membership-log` or its kin (`r9-vectors-recovery`, the
+/// `r9-chain-*` fixtures) needs a new version. A new vector that pins an
+/// unchanged rule doesn't.
 pub const VERIFIER_VERSION: u32 = 2;
 
 /// A verifier reports at most this many actions.

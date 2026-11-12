@@ -1700,7 +1700,7 @@ mod tests {
         #[test]
         fn welcome_reads_an_optional_verifier() {
             let ours = VerifierInventory::ours();
-            assert_eq!(ours.actions, known_actions());
+            assert_eq!(ours.actions(), known_actions());
             let data = data_with(json!({"version": 2, "actions": known_actions()}));
             let w = read(&data).unwrap();
             assert_eq!(w.verifier(), Some(&ours));
@@ -1712,7 +1712,7 @@ mod tests {
             let w = read(&newer).unwrap();
             let v = w.verifier().unwrap();
             assert_eq!(
-                (v.version, v.actions.as_slice()),
+                (v.version(), v.actions()),
                 (3, &["add".to_owned(), "zz_later_action".to_owned()][..])
             );
 
@@ -1723,7 +1723,7 @@ mod tests {
                     .unwrap()
                     .verifier()
                     .unwrap()
-                    .actions
+                    .actions()
                     .len(),
                 64
             );

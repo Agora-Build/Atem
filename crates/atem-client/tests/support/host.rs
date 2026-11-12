@@ -90,6 +90,9 @@ pub struct HostCore {
     pub refusals: Vec<SessionError>,
     /// A misbehaving host for client tests: rewrites the welcome it sends.
     pub welcome_override: Option<fn(&mut Welcome)>,
+    /// A misbehaving host for client tests: rewrites the welcome's JSON
+    /// (after `welcome_override`), for what `Welcome` itself can't hold.
+    pub welcome_json_override: Option<fn(&mut Value)>,
     /// A misbehaving host for client tests: rewrites the result it sends
     /// for a `control_records` message.
     pub control_records_override: Option<fn(&mut atem_client::session::r9::ControlRecordsResult)>,
@@ -140,6 +143,7 @@ impl HostCore {
             next_conn: 0,
             refusals: Vec::new(),
             welcome_override: None,
+            welcome_json_override: None,
             control_records_override: None,
             host_enc_key_override: None,
             policy: (false, 0),
@@ -656,7 +660,11 @@ impl HostConn {
         if let Some(rewrite) = core.welcome_override {
             rewrite(&mut welcome);
         }
-        let frame = channel.seal(&welcome.to_bytes(), mono).unwrap();
+        let mut sent = welcome.to_json();
+        if let Some(rewrite) = core.welcome_json_override {
+            rewrite(&mut sent);
+        }
+        let frame = channel.seal(sent.to_string().as_bytes(), mono).unwrap();
         core.attachments.insert(
             self.id,
             Attachment {

@@ -734,6 +734,48 @@ fn a_contradicting_welcome_is_refused() {
     assert_eq!(attached.fetch_to(&device.log), Some(world.v.head("E6")));
 }
 
+/// The welcome's `verifier` through the connect path (R9.2 "How a verifier
+/// reports itself"; Atem's proposal, Decision 23): a host's inventory is
+/// read into the attachment's welcome, a host sending none gives `None`,
+/// and a malformed one (or `null`) refuses the welcome: the client never
+/// attaches (`Malformed("verifier")`).
+#[test]
+fn a_welcome_carries_the_hosts_verifier() {
+    use atem_client::membership::VerifierInventory;
+    let world = World::new(&L);
+    let phone = Device::native(&world, "dev-phone", world.log(&L));
+
+    world.core.lock().unwrap().welcome_override =
+        Some(|w| w.verifier = Some(VerifierInventory::ours()));
+    let mut wire = world.tcp();
+    let attached = phone.connect(&mut wire).unwrap();
+    assert_eq!(
+        attached.welcome().verifier(),
+        Some(&VerifierInventory::ours())
+    );
+
+    world.core.lock().unwrap().welcome_override = None;
+    let mut wire = world.tcp();
+    let attached = phone.connect(&mut wire).unwrap();
+    assert_eq!(attached.welcome().verifier(), None);
+
+    type Rewrite = fn(&mut Value);
+    let malformed: [Rewrite; 3] = [
+        |w| w["data"]["verifier"] = json!({"version": 2, "actions": ["remove", "add"]}),
+        |w| w["data"]["verifier"] = Value::Null,
+        |w| w["data"]["verifier"] = json!({"version": 2, "actions": ["add"], "rules": "x"}),
+    ];
+    for rewrite in malformed {
+        world.core.lock().unwrap().welcome_json_override = Some(rewrite);
+        let mut wire = world.tcp();
+        assert_eq!(
+            phone.connect(&mut wire).err(),
+            Some(ConnectError::Malformed("verifier"))
+        );
+    }
+    world.core.lock().unwrap().welcome_json_override = None;
+}
+
 // ------------------------------------------------------------------ push
 
 /// The relay end of the host's link: runs the reference ledger, answers

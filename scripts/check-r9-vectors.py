@@ -1301,7 +1301,10 @@ def check_delegated_wire(file, data, report, context):
             or not isinstance(data_.get("permissions"), list) or not all(p in ("view", "control") for p in data_["permissions"])
             or not isinstance(data_.get("features"), list) or not all(isinstance(f, str) for f in data_["features"])
             or not isinstance(data_.get("pending_recovery"), list)
-            or not isinstance(head, dict) or not nat(head.get("seq")) or not isinstance(head.get("hash"), str)
+            # Head::from_json: exactly seq (from 1) and hash (64 lowercase hex).
+            or not isinstance(head, dict) or sorted(head) != ["hash", "seq"]
+            or not nat(head["seq"]) or head["seq"] < 1
+            or not isinstance(head["hash"], str) or re.fullmatch(r"[0-9a-f]{64}", head["hash"]) is None
         ):
             return False
         return "verifier" not in data_ or verifier_ok(data_["verifier"])

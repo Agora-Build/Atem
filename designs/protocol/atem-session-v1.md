@@ -1998,6 +1998,12 @@ which actions:
   letter.
 - `version`: an integer from 1 to 2^32 − 1 naming that action set and the
   rules the verifier applies to it. Any change to either is a new version.
+  For the rules, the device-list vectors are the measure: a change in the
+  verdict that `r9-vectors-membership-log` or its kin (`r9-vectors-recovery`,
+  the `r9-chain-*` fixtures) give an entry of a known action needs a new
+  version. That covers an entry accepted where it was refused, refused
+  where it was accepted, another refusal reason, or another state derived
+  from it. A new vector that pins an unchanged rule needs none.
   Version 1 is the eleven actions v0.8.x released (`genesis` to
   `k_backup`, the rules above; those releases report nothing). Version 2
   adds the five actions of this section, and it is the shared core's today.

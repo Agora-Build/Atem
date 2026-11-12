@@ -290,8 +290,8 @@ record! {
 impl From<&atem_client::membership::VerifierInventory> for VerifierInventory {
     fn from(v: &atem_client::membership::VerifierInventory) -> Self {
         VerifierInventory {
-            version: v.version,
-            actions: v.actions.clone(),
+            version: v.version(),
+            actions: v.actions().to_vec(),
         }
     }
 }

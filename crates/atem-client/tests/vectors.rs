@@ -6286,9 +6286,10 @@ fn welcome_cases(log: &Membership) -> Vec<Value> {
         w.to_json()
     };
     let ours = VerifierInventory::ours();
-    let inventory =
-        |version: u32, actions: Vec<String>| Some(VerifierInventory { version, actions });
-    let mut newer: Vec<String> = ours.actions.clone();
+    let inventory = |version: u32, actions: Vec<String>| {
+        Some(VerifierInventory::new(version, actions).expect("a valid inventory"))
+    };
+    let mut newer: Vec<String> = ours.actions().to_vec();
     newer.push("later_action".into());
     newer.sort();
     let names = |n: usize| (0..n).map(|i| format!("action_{i:02}")).collect::<Vec<_>>();
@@ -6535,7 +6536,7 @@ fn delegated_wire() {
     // This build's verifier, pinned (version 2: R9.2's sixteen actions).
     let ours = atem_client::membership::VerifierInventory::ours();
     assert_eq!(run.get("verifier"), ours.to_json());
-    assert_eq!(ours.version, atem_client::membership::VERIFIER_VERSION);
+    assert_eq!(ours.version(), atem_client::membership::VERIFIER_VERSION);
     run.pass("verifier: this build's version and actions");
     for case in run.get("welcome").as_array().unwrap() {
         let name = s(case, "name");
