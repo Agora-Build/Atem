@@ -598,7 +598,8 @@ this binding's own verifier: version 2, the sixteen actions
 `MembershipLog` accepts, sorted by bytes. A strict verifier refuses a chain
 at an entry of any other action, so a signer's gate counts each app's
 verifier by this. `WelcomeInfo.verifier` is the host's inventory when its
-`welcome` carried one; today's hosts send none. It is the host's claim
+`welcome` carried one. Atem hosts after v0.8.5 send one in every welcome,
+and v0.8.x hosts send none. It is the host's claim
 about itself and never opens the gate alone. All three suites check
 `verifier_inventory()` against `r9-vectors-delegated-wire`'s `verifier`.
 The end-to-end test (`check-atem-client-bindings.sh e2e`) checks

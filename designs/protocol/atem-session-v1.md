@@ -2012,10 +2012,13 @@ which actions:
   `verifier_inventory()` in the bindings. `known_actions()` is built from
   an exhaustive match over the core's actions, so a new action can't be
   left out of it.
-- An Atem host reports its own verifier in the r9 `welcome` as `verifier`
-  (R9.8). Today's hosts send none; a later change starts sending it.
-  Released clients ignore the field, because the welcome reader ignores
-  unknown fields.
+- An Atem host reports its own verifier in every r9 `welcome` as
+  `verifier` (R9.8). Hosts from the build after v0.8.5 send it; v0.8.x
+  hosts send none. It is no feature: `features` doesn't change. Released
+  clients ignore the field, because the welcome reader ignores unknown
+  fields. `atem status` shows the runtime's version on its `Device list:`
+  line (`verifier v2`), and `atem --version` shows this build's
+  (`device-list verifier v2 (16 actions)`).
 - A reader takes the field strictly. It is either absent (never `null`),
   or exactly `version` and `actions` as above. Anything else refuses the
   whole welcome. A name the reader doesn't know is no refusal, because a
