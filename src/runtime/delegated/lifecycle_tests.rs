@@ -1,15 +1,16 @@
 // Interaction authority and the event rules of delegated tasks (design
 // I.2, I.3, I.4.5; host-work-v1 §11.6; step 4's Decisions 13 and 15), in
 // the bridge: the rig's host with a pinned device list, the phone (a native
-// member holding `control`) and a bot (a service on this host the tests
-// treat as covered by a feed of the host's own Station, as PR 10's feeds
-// will make it), the fake agent, and the delegated clock on a manual OS.
+// member holding `control`) and a bot (a service on this host, classified
+// on a control view whose feed of the host's own Station covers it, as PR
+// 10's feeds will), the fake agent, and the delegated clock on a manual OS.
 // Included beside the dispatch's tests (`dispatch_tests.rs`), whose helpers
 // and imports it shares.
 
 use crate::runtime::delegated::gate::Gates;
-use crate::runtime::delegated::{Admission, DelegatedSender, FeedRef};
+use crate::runtime::delegated::{ControlView, FeedRef};
 use crate::runtime::host_work::AUTHORIZATION_EXPIRED;
+use crate::runtime::project_scope::{CredAgentHasher, ProjectScopes, TableAgent};
 use atem_client::canonical::StrictValue;
 use atem_client::membership::ServiceScope;
 
@@ -17,6 +18,16 @@ const BOT: &str = "service:svc-bot";
 /// A session a bot's scope may name besides the rig's (never launched).
 const OTHER_SESSION: &str = "ses-zzzzzzzzzzzz";
 const HOUR: u64 = 3_600_000;
+/// The kid of the bot's `projects` entries, and the rig's launch project's
+/// hash under it (`h1.<kid>.<hash>`, R9.6), as the test cred agent makes it.
+const KID: &str = "0a0b0c0d";
+const PROJECT: &str =
+    "h1.0a0b0c0d.1111111111111111111111111111111111111111111111111111111111111111";
+/// Another project under that kid.
+const OTHER_PROJECT: &str =
+    "h1.0a0b0c0d.2222222222222222222222222222222222222222222222222222222222222222";
+/// The rig's launch project key.
+const RIG_PROJECT: &str = "local:project";
 
 /// The phone, the bot, the Mac (a native member holding `control`: an
 /// owner), a viewer (`view` only), and the list behind them.
@@ -34,6 +45,25 @@ fn resolve(log: &TestLog, principal: atem_client::channel::Principal) -> Authori
     Authority::resolve(&log.log, &principal, None, "host", 1, &now(), &|_| false).unwrap()
 }
 
+/// A control view whose feed (of the host's own Station) covers the bot.
+struct CoversBot;
+
+impl ControlView for CoversBot {
+    fn standing(&self, principal: &str) -> SenderStanding {
+        SenderStanding {
+            coverage: (principal == BOT).then(bot_feed),
+            ..SenderStanding::default()
+        }
+    }
+}
+
+/// How the bot's grant is scoped: the rig's session and [`OTHER_SESSION`],
+/// or these `projects` entries.
+enum BotScope<'a> {
+    Sessions,
+    Projects(&'a [&'a str]),
+}
+
 /// The rig as a delegated host (`host.delegated` on, the delegated clock on
 /// `os`, the host's own Station's gate open): its list the Mac, this host,
 /// the phone, a viewer and the bot (scoped to the rig's session and
@@ -41,21 +71,75 @@ fn resolve(log: &TestLog, principal: atem_client::channel::Principal) -> Authori
 /// expiring at `bot_expiry`), routes `rm` (the phone) and `rs` (the bot),
 /// and the bot covered by a feed of the host's own Station.
 fn with_bot(rig: &mut LocalRig, root: &Path, os: &ManualOs, bot_expiry: u64) -> Senders {
+    delegated_host(rig, root, os, bot_expiry, BotScope::Sessions)
+}
+
+/// [`with_bot`], the bot's grant scoped to `projects` entries instead, and
+/// the rig's project hashed by `agent` (a test cred agent that makes
+/// [`PROJECT`] under [`KID`]); once both the session's and the profile's
+/// hashes are known (what an enqueue compares).
+async fn with_project_bot(
+    rig: &mut LocalRig,
+    root: &Path,
+    os: &ManualOs,
+    bot_expiry: u64,
+    projects: &[&str],
+    agent: &Arc<TableAgent>,
+) -> Senders {
+    agent
+        .table
+        .lock()
+        .unwrap()
+        .insert((RIG_PROJECT.into(), KID.into()), PROJECT.into());
+    rig.bridge.projects = ProjectScopes::new(Arc::new(CredAgentHasher {
+        agent: agent.clone(),
+        astation_id: "astation-test".into(),
+    }));
+    let profile = rig.bridge.work.config.profile("p").unwrap().scope_key();
+    rig.bridge
+        .projects
+        .session(rig.sid.as_str(), Some(RIG_PROJECT.into()));
+    rig.bridge
+        .projects
+        .session(&profile, Some(RIG_PROJECT.into()));
+    let s = delegated_host(rig, root, os, bot_expiry, BotScope::Projects(projects));
+    rig.until(|r| {
+        r.bridge.projects.matches(r.sid.as_str(), PROJECT) == Some(true)
+            && r.bridge.projects.matches(&profile, PROJECT) == Some(true)
+    })
+    .await;
+    s
+}
+
+fn delegated_host(
+    rig: &mut LocalRig,
+    root: &Path,
+    os: &ManualOs,
+    bot_expiry: u64,
+    scope: BotScope<'_>,
+) -> Senders {
     use crate::session_protocol::membership::r9log::secret;
     use crate::session_protocol::membership::{HostPin, MembershipHost};
     use atem_client::channel::Principal;
     rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
+    rig.bridge.work.controls = Some(Box::new(CoversBot));
     let mut log = TestLog::genesis("acct", &secret("delegated astation"));
     log.add_host("host", 1, &secret("delegated host"));
     log.add_native("dev-phone", &["control", "view"]);
     log.add_native("dev-viewer", &["view"]);
-    log.add_service(
-        "svc-bot",
-        &["host"],
-        Some(&[rig.sid.as_str(), OTHER_SESSION]),
-        &["message", "notify", "prompt", "stop", "view"],
-        bot_expiry,
-    );
+    let ops = ["message", "notify", "prompt", "stop", "view"];
+    match scope {
+        BotScope::Sessions => log.add_service(
+            "svc-bot",
+            &["host"],
+            Some(&[rig.sid.as_str(), OTHER_SESSION]),
+            &ops,
+            bot_expiry,
+        ),
+        BotScope::Projects(projects) => {
+            log.add_service_projects("svc-bot", &["host"], Some(projects), None, &ops, bot_expiry)
+        }
+    };
     let pairing = crate::profile::Sources::in_dir(&root.join("profile"))
         .paths
         .pairing;
@@ -243,9 +327,8 @@ fn reply_text(reply: Result<ResultBody, HostWorkError>) -> String {
 }
 
 /// The bot enqueues `prompt` through route `rs`, its deadline
-/// `expires_at`: the task's id. Its admission is what `classify` gives a
-/// bot a feed covers (PR 10's feeds; this version's host covers none, so
-/// the enqueue alone would leave it v1), written before any pass.
+/// `expires_at`: the task's id. A feed covers it (`CoversBot`), so the task
+/// is delegated, its admission frozen by the bridge.
 fn bot_task(rig: &mut LocalRig, s: &Senders, prompt: &str, expires_at: u64) -> String {
     let mut req = phone_enqueue(rig, prompt);
     if let hw::Request::Enqueue { route_id, task, .. } = &mut req {
@@ -254,25 +337,10 @@ fn bot_task(rig: &mut LocalRig, s: &Senders, prompt: &str, expires_at: u64) -> S
     }
     ask_req(rig, &s.bot, &req).unwrap();
     let id = enqueued(&req);
-    let mut record = stored_record(rig, &id);
-    assert_eq!(record.delegated, None, "no feed covers it in this version");
-    record.delegated = Some(Admission::freeze(
-        &s.bot,
-        DelegatedSender::Service {
-            device_id: "svc-bot".into(),
-            feed: bot_feed(),
-        },
-        "rs",
-        1,
-        s.log.log.head().seq,
-    ));
-    rig.bridge
-        .work
-        .store
-        .as_ref()
-        .unwrap()
-        .save_work(&record)
-        .unwrap();
+    let admission = stored_record(rig, &id)
+        .delegated
+        .expect("a covered bot's task");
+    assert_eq!(admission.principal, BOT);
     id
 }
 
@@ -398,6 +466,17 @@ fn expiry_neither_fails_nor_stops_accepted_tasks() {
         let s = with_bot(&mut rig, root, &os, start + HOUR);
         let first = bot_task(&mut rig, &s, "EXPIRY_FIRST", start + 3 * HOUR);
         run(&mut rig, &first, "EXPIRY_FIRST").await;
+        // Its authorization recorded as already past on the wall clock too
+        // (v1's arm would fail it, by the wall clock, at once).
+        let mut record = stored_record(&rig, &first);
+        record.authorization_expires_at = Some(start - 1);
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .save_work(&record)
+            .unwrap();
         rig.bridge.start_view().gates = Gates::closed_until_feeds();
         let second = bot_task(&mut rig, &s, "EXPIRY_SECOND", start + 3 * HOUR);
         blocked(&mut rig, &second, details::REVOCATIONS_NOT_YET_CHECKED).await;
@@ -568,6 +647,9 @@ fn narrowing_fails_only_uncovered_unstarted_tasks() {
         run(&mut rig, &first, "NARROW_FIRST").await;
         rig.bridge.start_view().gates = Gates::closed_until_feeds();
         let second = bot_task(&mut rig, &s, "NARROW_SECOND", start + HOUR);
+        let bot = s.bot.clone();
+        let (message, message_task) = message_from(&rig, BOT, "rs", "NARROW_MESSAGE", None);
+        ask_req(&mut rig, &bot, &message).unwrap();
         let phone = s.phone.clone();
         let phones = phone_task(&mut rig, &phone, "NARROW_PHONE", start + HOUR);
         blocked(&mut rig, &second, details::REVOCATIONS_NOT_YET_CHECKED).await;
@@ -591,11 +673,14 @@ fn narrowing_fails_only_uncovered_unstarted_tasks() {
                 details::REVOCATIONS_NOT_YET_CHECKED.into()
             )
         );
-        let bot = s.bot.clone();
         assert_eq!(
             status(ask(&mut rig, &bot, Q::Query(&first))).state,
             WorkState::AwaitingResult
         );
+        assert!(matches!(
+            ask(&mut rig, &bot, Q::Message(&message)),
+            Ok(ResultBody::Message { .. })
+        ));
         // The session left out.
         let out = s
             .log
@@ -607,10 +692,33 @@ fn narrowing_fails_only_uncovered_unstarted_tasks() {
         assert_eq!(settled(&rig, &second).1, details::AUTHORIZATION_NARROWED);
         assert_eq!(settled(&rig, &first).0, WorkState::AwaitingResult);
         assert_eq!(ask(&mut rig, &bot, Q::Query(&first)), forbidden());
+        assert_eq!(settled(&rig, &message_task), outcome(Event::Narrowed));
+        assert_eq!(ask(&mut rig, &bot, Q::Message(&message)), forbidden());
         let mac = s.mac.clone();
         assert_eq!(
             status(ask(&mut rig, &mac, Q::Query(&first))).state,
             WorkState::AwaitingResult
+        );
+        assert!(matches!(
+            ask(&mut rig, &mac, Q::Message(&message)),
+            Ok(ResultBody::Message { .. })
+        ));
+        // A message's tasks decide all or nothing: one on a session the
+        // grant still covers and one off it, and the message isn't the
+        // bot's to read.
+        let mut covered = stored_record(&rig, &message_task);
+        covered.task.target.session_id = OTHER_SESSION.into();
+        let left_out = stored_record(&rig, &message_task);
+        let as_bot = Sender::Remote(Box::new(bot.clone()));
+        assert_eq!(
+            rig.bridge
+                .delegated_message_caller(&as_bot, std::slice::from_ref(&covered)),
+            Some(Caller::Sender)
+        );
+        assert_eq!(
+            rig.bridge
+                .delegated_message_caller(&as_bot, &[covered, left_out]),
+            None
         );
         assert_eq!(settled(&rig, &phones).0, WorkState::Blocked);
         rig.bridge.start_view().gates.open_own_station(ORIGIN);
@@ -903,21 +1011,34 @@ fn owner_reads_any_delegated_task_not_v1_ones() {
         let task = bot_task(&mut rig, &s, "OWNER_DELEGATED", start + HOUR);
         run(&mut rig, &task, "OWNER_DELEGATED").await;
         reply(&mut rig, &task, "OWNER_REPLY", &[]).unwrap();
-        // The bot's v1 task (no feed covers it): no admission.
-        let mut req = phone_enqueue(&rig, "OWNER_V1");
-        if let hw::Request::Enqueue { route_id, .. } = &mut req {
-            *route_id = "rs".into();
-        }
         let (bot, phone, mac, viewer) = (
             s.bot.clone(),
             s.phone.clone(),
             s.mac.clone(),
             s.viewer.clone(),
         );
+        // The bot's message, delegated too.
+        let (message, _) = message_from(&rig, BOT, "rs", "OWNER_MESSAGE", None);
+        ask_req(&mut rig, &bot, &message).unwrap();
+        // The bot's v1 task and message (the hook off): no admission.
+        rig.bridge.features = HostFeatures::default();
+        let mut req = phone_enqueue(&rig, "OWNER_V1");
+        if let hw::Request::Enqueue { route_id, .. } = &mut req {
+            *route_id = "rs".into();
+        }
         ask_req(&mut rig, &bot, &req).unwrap();
+        let (v1_message, v1_message_task) = message_from(&rig, BOT, "rs", "OWNER_V1_MESSAGE", None);
+        ask_req(&mut rig, &bot, &v1_message).unwrap();
+        rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
         let v1 = enqueued(&req);
         assert_eq!(stored_record(&rig, &v1).delegated, None);
+        assert_eq!(stored_record(&rig, &v1_message_task).delegated, None);
         for owner in [&phone, &mac] {
+            assert!(matches!(
+                ask(&mut rig, owner, Q::Message(&message)),
+                Ok(ResultBody::Message { .. })
+            ));
+            assert_eq!(ask(&mut rig, owner, Q::Message(&v1_message)), forbidden());
             assert_eq!(
                 status(ask(&mut rig, owner, Q::Query(&task))).state,
                 WorkState::AwaitingResult
@@ -932,8 +1053,14 @@ fn owner_reads_any_delegated_task_not_v1_ones() {
             assert_eq!(ask(&mut rig, owner, Q::Reply(&v1)), forbidden());
         }
         assert_eq!(ask(&mut rig, &viewer, Q::Query(&task)), forbidden());
-        // Its sender reads both, as before.
+        // Its sender reads them all, as before.
         assert_eq!(status(ask(&mut rig, &bot, Q::Query(&v1))).task_id, v1);
+        for m in [&message, &v1_message] {
+            assert!(matches!(
+                ask(&mut rig, &bot, Q::Message(m)),
+                Ok(ResultBody::Message { .. })
+            ));
+        }
         assert_eq!(
             status(ask(&mut rig, &bot, Q::Complete(&task, "done"))).state,
             WorkState::Completed
@@ -996,13 +1123,26 @@ fn phone_message(
     text: &str,
     mark: Option<atem_client::session::mark::MarkTask>,
 ) -> (hw::Request, String) {
+    message_from(rig, PHONE, "rm", text, mark)
+}
+
+/// `sender`'s `message_publish` with an agent recipient on this host
+/// through `route`, its text `text` (and `mark` when given): its request and
+/// the recipient's task id.
+fn message_from(
+    rig: &LocalRig,
+    sender: &str,
+    route: &str,
+    text: &str,
+    mark: Option<atem_client::session::mark::MarkTask>,
+) -> (hw::Request, String) {
     let mut message = rig.message();
-    message.sender = PHONE.into();
+    message.sender = sender.into();
     message.from_session = None;
     message.text = text.into();
     message.mark = mark;
     if let Destination::Agent { route_id, .. } = &mut message.recipients[0].destination {
-        *route_id = "rm".into();
+        *route_id = route.into();
     }
     let task = message.recipients[0].recipient_id.clone();
     let req = hw::Request::Publish {
@@ -1031,11 +1171,23 @@ fn message_tasks_of_delegated_senders_are_delegated() {
         let (phone, _) = delegated(&mut rig, root, &os, false);
         let earlier = phone_task(&mut rig, &phone, "MESSAGE_EARLIER", start + HOUR);
         blocked(&mut rig, &earlier, details::REVOCATIONS_NOT_YET_CHECKED).await;
-        let (publish, task) = phone_message(&rig, "MESSAGE_TASK", None);
-        assert!(matches!(
-            as_phone(&mut rig, &phone, &publish),
-            Ok(ResultBody::Message { .. })
-        ));
+        let (mut publish, task) = phone_message(&rig, "MESSAGE_TASK", None);
+        // A notice to the route's project too (a stored recipient).
+        if let hw::Request::Publish { message, .. } = &mut publish {
+            message.recipients.push(Recipient {
+                recipient_id: uuid::Uuid::new_v4().to_string(),
+                host: rig.bridge.work_host(),
+                destination: Destination::Project {
+                    route_id: "rm".into(),
+                    route_revision: 1,
+                },
+            });
+        }
+        let Ok(ResultBody::Message { message: receipt }) = as_phone(&mut rig, &phone, &publish)
+        else {
+            panic!("a message result");
+        };
+        assert!(matches!(receipt.recipients[1].delivery, Delivery::Stored));
         let admission = stored_record(&rig, &task)
             .delegated
             .expect("a delegated sender's message task");
@@ -1097,8 +1249,8 @@ fn message_tasks_of_delegated_senders_are_delegated() {
         let attempt = stored_record(&rig, &task).status.receipt_id;
         let receipt = rig.bridge.host.attempt_receipt(&attempt, &task).unwrap();
         assert_eq!(receipt.sender.as_deref(), Some(PHONE));
-        // A route change hides the delegated message from its sender, not
-        // the v1 one.
+        // A route change hides the v1 message from its sender, not the
+        // delegated one (its notice included: judged by its tasks' rule).
         rig.bridge
             .work
             .config
@@ -1257,6 +1409,214 @@ fn end_attempt_keeps_a_terminal_stored_state() {
         assert_eq!(
             attempts(&rig, &task),
             [(a.attempt_id.clone(), Some("not_admitted".into()), true)]
+        );
+    });
+}
+
+/// Task 20 review m1, design I.5.6: the withdrawal's own write fails (the
+/// journal halts in it), so it can't be confirmed: the cancel is `busy`, the
+/// task and its live attempt are as they were, and the request is on the
+/// refusal list, so the restart rejects it.
+#[test]
+fn a_cancel_whose_withdrawal_halts_the_journal_is_busy() {
+    use crate::session_protocol::journal::Journal as _;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, true);
+        phone_task(&mut rig, &phone, "WITHDRAWAL_RUNNING", start + HOUR);
+        rig.until(|r| input(r).contains("WITHDRAWAL_RUNNING")).await;
+        let waiting = phone_task(&mut rig, &phone, "WITHDRAWAL_WAITING", start + HOUR);
+        blocked(
+            &mut rig,
+            &waiting,
+            "waiting for an earlier task on this session",
+        )
+        .await;
+        let attempt = attempt_behind_the_turn(&mut rig, &waiting, "WITHDRAWAL_WAITING");
+        let before = settled(&rig, &waiting);
+        assert!(!rig.bridge.host.journal_halted());
+        // The next journal write, the withdrawal's `rejected`, fails.
+        rig.bridge.host.journal_mut().fail_append_of(1, false);
+        assert_eq!(ask(&mut rig, &phone, Q::Cancel(&waiting)), busy());
+        assert!(rig.bridge.host.journal_halted());
+        assert_eq!(settled(&rig, &waiting), before);
+        assert_ne!(before.0, WorkState::Cancelled);
+        assert_eq!(attempts(&rig, &waiting), [(attempt.clone(), None, true)]);
+        let listed = rig.bridge.host.journal().refusals().unwrap();
+        assert!(listed.iter().any(|r| r.request_id == attempt), "{listed:?}");
+    });
+}
+
+// ── A `projects`-scoped bot (Task 20 review I1) ──
+
+/// The cred agent can no longer make the bot's project hashes: they are
+/// dropped and the agent is locked, so they aren't made again. This is
+/// what the host has once the last service naming the kid expired (its
+/// kid unused, `ProjectScopes::pass`) with the agent locked; simulated, as
+/// that pass reads the real wall clock.
+fn hashes_gone(rig: &mut LocalRig, agent: &TableAgent) {
+    *agent.unlocked.lock().unwrap() = false;
+    rig.bridge
+        .projects
+        .pass(&std::collections::BTreeSet::new(), Instant::now());
+    passes(rig, 3);
+    assert_eq!(rig.bridge.projects.matches(rig.sid.as_str(), PROJECT), None);
+}
+
+/// VII.A test 2 with a `projects`-scoped bot (Task 20 review I1, face b):
+/// its grant expires with a task queued, and the hashes of its project go
+/// with the agent locked. The task matched the project at admission (its
+/// entry frozen there), so it runs before its deadline: never `waiting for
+/// unlock`.
+#[test]
+fn a_projects_scoped_grant_expiring_with_a_task_queued_still_runs() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let agent = TableAgent::new(true);
+        let s = with_project_bot(&mut rig, root, &os, start + HOUR, &[PROJECT], &agent).await;
+        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        let task = bot_task(&mut rig, &s, "PROJECTS_EXPIRY", start + 3 * HOUR);
+        assert_eq!(
+            stored_record(&rig, &task)
+                .delegated
+                .unwrap()
+                .projects_matched,
+            [PROJECT]
+        );
+        blocked(&mut rig, &task, details::REVOCATIONS_NOT_YET_CHECKED).await;
+        os.pass(HOUR + 1_000);
+        hashes_gone(&mut rig, &agent);
+        assert!(rig.bridge.start_view().scopes.pending.contains(KID));
+        rig.bridge.start_view().gates.open_own_station(ORIGIN);
+        run(&mut rig, &task, "PROJECTS_EXPIRY").await;
+        assert_eq!(input(&rig).matches("PROJECTS_EXPIRY").count(), 1);
+    });
+}
+
+/// Task 20 review I1, face a: the bot's task awaits its result, and its
+/// session stops (its hashes leave with it). The task stays readable and
+/// completable by the bot: its project matched at admission, and no
+/// narrowing happened.
+#[test]
+fn a_projects_scoped_awaiting_task_stays_readable_after_its_session_stops() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let agent = TableAgent::new(true);
+        let s = with_project_bot(&mut rig, root, &os, start + 3 * HOUR, &[PROJECT], &agent).await;
+        let task = bot_task(&mut rig, &s, "PROJECTS_STOPPED", start + HOUR);
+        run(&mut rig, &task, "PROJECTS_STOPPED").await;
+        reply(&mut rig, &task, "PROJECTS_REPLY", &[]).unwrap();
+        // The session stops.
+        let session = rig.sessions.remove(&rig.sid).unwrap();
+        let _ = session.stop();
+        passes(&mut rig, 3);
+        assert_eq!(rig.bridge.projects.matches(rig.sid.as_str(), PROJECT), None);
+        let bot = s.bot.clone();
+        assert_eq!(
+            status(ask(&mut rig, &bot, Q::Query(&task))).state,
+            WorkState::AwaitingResult
+        );
+        assert_eq!(
+            reply_text(ask(&mut rig, &bot, Q::Reply(&task))),
+            "PROJECTS_REPLY"
+        );
+        assert_eq!(
+            status(ask(&mut rig, &bot, Q::Complete(&task, "done"))).state,
+            WorkState::Completed
+        );
+    });
+}
+
+/// VII.A test 2 with a `projects`-scoped bot, the agent locked (Task 20
+/// review I1, question 6): after the expiry the bot reads nothing; a
+/// renewal (the same entries, a later expiry) makes its task and reply
+/// readable at once, though no hash can be made.
+#[test]
+fn a_projects_scoped_renewal_while_the_agent_is_locked_restores_reads() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let agent = TableAgent::new(true);
+        let mut s = with_project_bot(&mut rig, root, &os, start + HOUR, &[PROJECT], &agent).await;
+        let task = bot_task(&mut rig, &s, "PROJECTS_RENEWED", start + 3 * HOUR);
+        run(&mut rig, &task, "PROJECTS_RENEWED").await;
+        reply(&mut rig, &task, "PROJECTS_RENEWED_REPLY", &[]).unwrap();
+        os.pass(HOUR + 1_000);
+        hashes_gone(&mut rig, &agent);
+        let bot = s.bot.clone();
+        assert_eq!(ask(&mut rig, &bot, Q::Query(&task)), forbidden());
+        let renewal = s.log.renew_service("svc-bot", start + 4 * HOUR);
+        carry(&mut rig, &s.log, renewal);
+        passes(&mut rig, 3);
+        assert_eq!(rig.bridge.projects.matches(rig.sid.as_str(), PROJECT), None);
+        assert_eq!(
+            status(ask(&mut rig, &bot, Q::Query(&task))).state,
+            WorkState::AwaitingResult
+        );
+        assert_eq!(
+            reply_text(ask(&mut rig, &bot, Q::Reply(&task))),
+            "PROJECTS_RENEWED_REPLY"
+        );
+        assert_eq!(
+            status(ask(&mut rig, &bot, Q::Complete(&task, "done"))).state,
+            WorkState::Completed
+        );
+    });
+}
+
+/// Design I.3.3 ("Narrowing") with a `projects`-scoped bot: a narrowing
+/// that drops the task's project (another entry under the same kid stays)
+/// is no longer the bot's grant covering it: its task awaiting a result is
+/// `forbidden` to it, the owner reads it, and its unstarted task fails
+/// `sender's authorization narrowed`. The frozen entry never covers more
+/// than the grant does.
+#[test]
+fn a_narrowing_that_drops_the_project_is_forbidden() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let agent = TableAgent::new(true);
+        let mut s = with_project_bot(
+            &mut rig,
+            root,
+            &os,
+            start + 3 * HOUR,
+            &[PROJECT, OTHER_PROJECT],
+            &agent,
+        )
+        .await;
+        let first = bot_task(&mut rig, &s, "PROJECTS_FIRST", start + HOUR);
+        run(&mut rig, &first, "PROJECTS_FIRST").await;
+        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        let second = bot_task(&mut rig, &s, "PROJECTS_SECOND", start + HOUR);
+        blocked(&mut rig, &second, details::REVOCATIONS_NOT_YET_CHECKED).await;
+        let out = s.log.narrow_service(
+            "svc-bot",
+            &ServiceScope::new(["host"])
+                .projects(Some([OTHER_PROJECT]))
+                .ops(["message", "notify", "prompt", "stop"]),
+            None,
+        );
+        carry(&mut rig, &s.log, out);
+        rig.until(|r| settled(r, &second).0 == WorkState::Failed)
+            .await;
+        assert_eq!(settled(&rig, &second), outcome(Event::Narrowed));
+        assert_eq!(settled(&rig, &first).0, WorkState::AwaitingResult);
+        let (bot, mac) = (s.bot.clone(), s.mac.clone());
+        for q in [Q::Query(&first), Q::Reply(&first), Q::Complete(&first, "x")] {
+            assert_eq!(ask(&mut rig, &bot, q), forbidden());
+        }
+        assert_eq!(
+            status(ask(&mut rig, &mac, Q::Query(&first))).state,
+            WorkState::AwaitingResult
         );
     });
 }

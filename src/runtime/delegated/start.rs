@@ -289,14 +289,17 @@ pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> R
         return Err(Event::Narrowed);
     }
     let session = &task.target.session_id;
+    // An entry the task's project matched at admission decides without a
+    // hash (Task 20 review I1); the hashes only for a kid it didn't see.
+    let live = |entry: &str| view.scopes.matches(session, entry);
     let scope_pending = !authority.session_in_scope(&view.host_id, session, &|entry| {
-        view.scopes.matches(session, entry)
+        adm.project_matches(entry, &live)
     });
     if scope_pending {
         // In scope if every comparison still pending matched: waiting for
         // unlock, never narrowed; out of it whatever they say: narrowed.
         let pending_in = authority.session_in_scope(&view.host_id, session, &|entry| {
-            view.scopes.matches(session, entry).or(Some(true))
+            adm.project_matches(entry, &live).or(Some(true))
         });
         if !pending_in {
             return Err(Event::Narrowed);

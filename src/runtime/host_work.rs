@@ -2407,6 +2407,7 @@ mod tests {
             scope_at_admission: serde_json::Value::Null,
             grant_expires_at: None,
             device_list_seq: 3,
+            projects_matched: vec![],
         });
         store
             .db

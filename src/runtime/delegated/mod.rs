@@ -120,6 +120,15 @@ pub struct Admission {
     pub grant_expires_at: Option<u64>,
     /// The device list's head `seq` at admission.
     pub device_list_seq: u64,
+    /// A service's `projects` scope entries the task's launch project
+    /// matched at admission, sorted (`h1.<kid>.<hash>`; Task 20 review I1):
+    /// a current grant covers the task's project when one of its entries
+    /// equals one of these, with no hash from the cred agent, whatever
+    /// became of the session ([`Admission::project_matches`]). Empty
+    /// without a `projects` scope, and in records written before it was
+    /// kept: the live comparison is the rule then.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects_matched: Vec<String>,
 }
 
 impl Admission {
@@ -165,7 +174,40 @@ impl Admission {
             scope_at_admission,
             grant_expires_at: authority.expires_at,
             device_list_seq,
+            projects_matched: Vec::new(),
         }
+    }
+
+    /// Whether the task's session is in the current grant's `projects`
+    /// entry `entry` (Task 20 review I1): yes when it equals an entry the
+    /// task's project matched at admission; no when another of those has
+    /// its kid (the project's hash under that kid is the frozen one); else,
+    /// for a kid the admission didn't see, the live comparison (`live`:
+    /// none while it can't be made). Without frozen entries, `live` alone,
+    /// as before they were kept.
+    pub fn project_matches(
+        &self,
+        entry: &str,
+        live: &dyn Fn(&str) -> Option<bool>,
+    ) -> Option<bool> {
+        use crate::runtime::project_scope::kid_of;
+        if self.projects_matched.iter().any(|m| m == entry) {
+            return Some(true);
+        }
+        let kid = kid_of(entry);
+        if kid.is_some() && self.projects_matched.iter().any(|m| kid_of(m) == kid) {
+            return Some(false);
+        }
+        live(entry)
+    }
+
+    /// With the `projects` scope entries the task's project matched at
+    /// admission (sorted, once each).
+    pub fn with_projects(mut self, mut matched: Vec<String>) -> Admission {
+        matched.sort();
+        matched.dedup();
+        self.projects_matched = matched;
+        self
     }
 }
 
@@ -478,6 +520,7 @@ mod tests {
                 scope_at_admission: serde_json::Value::Null,
                 grant_expires_at: None,
                 device_list_seq: head,
+                projects_matched: vec![],
             }
         );
 

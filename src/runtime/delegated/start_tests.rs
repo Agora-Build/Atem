@@ -325,6 +325,54 @@ fn only_holds_gates_and_deferrals_let_the_session_go() {
     }
 }
 
+/// Task 20 review I1: a bot's task whose project matched an entry at
+/// admission (frozen there) is judged by that entry: no hash (the kid
+/// pending after its hashes went, or the session's project gone) starts
+/// it; a grant re-scoped to another project under that kid narrows it,
+/// never pending; under a kid the admission didn't see, the live comparison
+/// decides (pending waits, a known hash starts it).
+#[test]
+fn frozen_project_entries_decide_without_a_hash() {
+    use atem_client::membership::ServiceScope;
+    const THIRD: &str =
+        "h1.0b0b0b0b.3333333333333333333333333333333333333333333333333333333333333333";
+    let rescoped = |entry: &'static str| {
+        log_with(move |log| {
+            log.set_service(
+                "svc-bot",
+                &ServiceScope::new([HOST])
+                    .projects(Some([entry]))
+                    .ops(["notify", "prompt"]),
+                host_now().wall_ms + 3_600_000,
+            );
+        })
+    };
+    let log = log_with(|_| {});
+    let mut bot = task(&log, BOT, LATER);
+    bot.admission = bot.admission.clone().with_projects(vec![PROJECT.into()]);
+    let mut v = view(&log);
+    v.scopes.hashes.clear();
+    v.scopes.pending.insert(KID.into());
+    assert_eq!(may_start(&v, &bot, Some(0)), Ok(()));
+    v.scopes.pending.clear();
+    assert_eq!(may_start(&v, &bot, Some(0)), Ok(()));
+    let other = rescoped(OTHER);
+    let mut o = view(&other);
+    o.scopes.hashes.clear();
+    o.scopes.pending.insert(KID.into());
+    assert_eq!(may_start(&o, &bot, Some(0)), Err(Event::Narrowed));
+    let third = rescoped(THIRD);
+    let mut t = view(&third);
+    t.scopes.hashes.clear();
+    t.scopes.pending.insert("0b0b0b0b".into());
+    assert_eq!(may_start(&t, &bot, Some(0)), Err(Event::ScopePending));
+    t.scopes.pending.clear();
+    t.scopes
+        .hashes
+        .insert((S1.into(), "0b0b0b0b".into()), THIRD.into());
+    assert_eq!(may_start(&t, &bot, Some(0)), Ok(()));
+}
+
 // ── At the start (the session host's `accepted` → `executing` step) ──
 
 fn rid(n: u64) -> String {

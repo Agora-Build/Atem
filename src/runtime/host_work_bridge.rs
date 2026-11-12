@@ -186,6 +186,10 @@ pub(super) struct State {
     /// When the next reading of `D` is due outside the scheduling pass
     /// (`take_reading`).
     read_due: Instant,
+    /// Tests: the control view senders are classified on in place of
+    /// `NoFeeds` (a feed covering a service, as PR 10's will).
+    #[cfg(test)]
+    controls: Option<Box<dyn crate::runtime::delegated::ControlView + Send + Sync>>,
 }
 
 impl State {
@@ -221,6 +225,8 @@ impl State {
             clock_due: Instant::now(),
             clock_checked: false,
             read_due: Instant::now(),
+            #[cfg(test)]
+            controls: None,
         }
     }
 }
@@ -445,29 +451,51 @@ impl HostBridge {
     /// `host.delegated` on; until the host syncs feeds (PR 10) no service
     /// is covered (`NoFeeds`).
     pub(super) fn sender_class(&self, principal: &str) -> SenderClass {
-        match self.open_list() {
-            Some(list) => classify(principal, list, &NoFeeds, self.features),
-            None => SenderClass::V1,
+        let Some(list) = self.open_list() else {
+            return SenderClass::V1;
+        };
+        // Tests: a control view covering a service, as PR 10's feeds will.
+        #[cfg(test)]
+        if let Some(controls) = &self.work.controls {
+            return classify(principal, list, controls.as_ref(), self.features);
         }
+        classify(principal, list, &NoFeeds, self.features)
     }
 
     /// The admission record of a task `a` enqueues through `route_id` at
-    /// `route_revision` (design I.4.1): only a delegated sender's
-    /// ([`HostBridge::sender_class`]); none for `local` and every v1
-    /// sender.
-    fn admission(&self, a: &Sender, route_id: &str, route_revision: u64) -> Option<Admission> {
+    /// `route_revision` to `session` (design I.4.1): only a delegated
+    /// sender's ([`HostBridge::sender_class`]); none for `local` and every
+    /// v1 sender. With a `projects` scope, the entries the session's launch
+    /// project matched (what `work_allowed` compared) are frozen with it
+    /// (Task 20 review I1).
+    fn admission(
+        &self,
+        a: &Sender,
+        route_id: &str,
+        route_revision: u64,
+        session: &str,
+    ) -> Option<Admission> {
         let authority = a.remote()?;
         let SenderClass::Delegated(sender) = self.sender_class(&authority.name()) else {
             return None;
         };
         let seq = self.open_list()?.head().seq;
-        Some(Admission::freeze(
-            authority,
-            sender,
-            route_id,
-            route_revision,
-            seq,
-        ))
+        let matched = authority
+            .scope
+            .as_ref()
+            .and_then(|scope| scope.projects.as_ref())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| self.projects.matches(session, entry) == Some(true))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some(
+            Admission::freeze(authority, sender, route_id, route_revision, seq)
+                .with_projects(matched),
+        )
     }
 
     fn work_host(&self) -> HostTarget {
@@ -1122,7 +1150,8 @@ impl HostBridge {
                 }
                 // A delegated sender's task: its admission record, stored
                 // with it before the reply (design I.4.1).
-                record.delegated = self.admission(&a, route_id, *route_revision);
+                record.delegated =
+                    self.admission(&a, route_id, *route_revision, &task.target.session_id);
                 store.enqueue(&record).map_err(|_| "busy")?;
                 self.host.keep_principal(&record.principal);
                 Ok(ResultBody::Work {
@@ -1330,20 +1359,19 @@ impl HostBridge {
             } else {
                 Vec::new()
             };
-            let caller = if delegated.is_empty() {
+            if delegated.is_empty() {
                 if old.message.sender != a.name() || old.sender_key != a.key_json() {
                     return Err("forbidden");
                 }
-                Caller::Sender
             } else {
                 match self.delegated_message_caller(a, &delegated) {
                     Some(Caller::Owner) if matches!(req, hw::Request::Publish { .. }) => {
                         return Err("forbidden");
                     }
-                    Some(caller) => caller,
+                    Some(_) => {}
                     None => return Err("forbidden"),
                 }
-            };
+            }
             // By the digest recorded at acceptance, which stays when the
             // message's text is dropped (`Store::drop_payloads`).
             if let hw::Request::Publish { message, .. } = req
@@ -1351,19 +1379,20 @@ impl HostBridge {
             {
                 return Err("request_id_reused");
             }
+            // A delegated sender's message is judged wholly by its tasks'
+            // rule (above), its notices too: a route change hides nothing
+            // from its sender (design I.4.5). A v1 message: v1's scope rule.
             for r in old
                 .message
                 .recipients
                 .iter()
-                .filter(|r| &r.host == req.host())
-                // A delegated task's recipient: its caller rule, above.
-                .filter(|r| !delegated.iter().any(|t| t.task.task_id == r.recipient_id))
+                .filter(|r| delegated.is_empty() && &r.host == req.host())
             {
                 let accepted = old.receipt.recipients.iter().any(|p| {
                     p.recipient_id == r.recipient_id
                         && !matches!(p.delivery, Delivery::Refused { .. })
                 });
-                if caller == Caller::Sender && accepted && !self.message_scope(r, a) {
+                if accepted && !self.message_scope(r, a) {
                     return Err("forbidden");
                 }
             }
@@ -1437,7 +1466,12 @@ impl HostBridge {
                     // included: its admission record, stored with it in the
                     // message's transaction (`accept_message`), so it joins
                     // its sender's order.
-                    record.delegated = self.admission(a, route_id, *route_revision);
+                    record.delegated = self.admission(
+                        a,
+                        route_id,
+                        *route_revision,
+                        &record.task.target.session_id,
+                    );
                     tasks.push(record);
                     delivery
                 } else {
@@ -3554,6 +3588,7 @@ principals = ["local"]
                 scope_at_admission: Value::Null,
                 grant_expires_at: None,
                 device_list_seq: seq,
+                projects_matched: vec![],
             };
             assert_eq!(record.delegated.as_ref(), Some(&admission));
             let hw::Request::Enqueue { task, .. } = &req else {

@@ -7,7 +7,9 @@
 //!   the host's device list: still a member under that key (a new key is a
 //!   new member, R9.2), no `revoke` record, its grant unexpired, `notify`
 //!   and `prompt` in that grant, and the grant still covering the task's
-//!   target (design I.3.3: "readable within the new grant"). A changed
+//!   target (design I.3.3: "readable within the new grant"; a `projects`
+//!   entry the task's project matched at admission covers it with no hash,
+//!   `Admission::project_matches`). A changed
 //!   `control_gen` doesn't forbid anything (a renewal, any `set_roles`),
 //!   and neither does a route change (I.4.5).
 //! - **The owner** ([`Caller::Owner`]): a native member holding `control`
@@ -139,9 +141,12 @@ fn sender_authority(
             _ => Refused::NotCovered,
         },
     )?;
+    // A `projects` entry the task's project matched at admission covers it
+    // without a hash (I1): the live comparison only for a kid it didn't see.
+    let projects = |entry: &str| task.project_matches(entry, at.projects);
     if !grant.allows(Need::Op(Op::Notify))
         || !grant.allows(Need::Op(Op::Prompt))
-        || !grant.session_in_scope(at.host_id, session_id, at.projects)
+        || !grant.session_in_scope(at.host_id, session_id, &projects)
     {
         return Err(Refused::NotCovered);
     }
@@ -451,5 +456,73 @@ mod tests {
             },
         );
         assert_eq!(s2, Err(Refused::NotCovered));
+    }
+
+    /// Task 20 review I1: the `projects` entries the task's project matched
+    /// at admission cover it with no hash (its session gone, the cred agent
+    /// locked or its hashes dropped); a narrowing to another project under
+    /// that kid doesn't, whatever a live comparison says; only under a kid
+    /// the admission didn't see does the live comparison decide. An
+    /// admission without frozen entries keeps the live rule.
+    #[test]
+    fn frozen_project_entries_cover_without_a_hash() {
+        use atem_client::membership::ServiceScope;
+        const PA: &str =
+            "h1.0a0b0c0d.1111111111111111111111111111111111111111111111111111111111111111";
+        const PB: &str =
+            "h1.0a0b0c0d.2222222222222222222222222222222222222222222222222222222222222222";
+        const PC: &str =
+            "h1.0b0b0b0b.3333333333333333333333333333333333333333333333333333333333333333";
+        let mut log = log(later());
+        log.add_service_projects(
+            "svc-proj",
+            &[HOST],
+            Some(&[PA, PB]),
+            None,
+            &["notify", "prompt", "view"],
+            later(),
+        );
+        let frozen = admitted(&log, "service:svc-proj").with_projects(vec![PA.into()]);
+        let live = admitted(&log, "service:svc-proj");
+        assert!(live.projects_matched.is_empty());
+        let none = SenderStanding::default();
+        let at = |log: &TestLog, task: &Admission, projects: &dyn Fn(&str) -> Option<bool>| {
+            interaction(
+                "service:svc-proj",
+                &key(log, "svc-proj"),
+                task,
+                S1,
+                &Grounds {
+                    list: &log.log,
+                    standing: &none,
+                    host_id: HOST,
+                    now_ms: 0,
+                    projects,
+                },
+            )
+        };
+        assert_eq!(at(&log, &frozen, &|_| None), Ok(Caller::Sender));
+        assert_eq!(at(&log, &frozen, &|_| Some(false)), Ok(Caller::Sender));
+        assert_eq!(at(&log, &live, &|_| None), Err(Refused::NotCovered));
+        assert_eq!(at(&log, &live, &|e| Some(e == PA)), Ok(Caller::Sender));
+        // Narrowed to the other project under that kid.
+        log.narrow_service(
+            "svc-proj",
+            &ServiceScope::new([HOST])
+                .projects(Some([PB]))
+                .ops(["notify", "prompt"]),
+            None,
+        );
+        assert_eq!(at(&log, &frozen, &|_| Some(true)), Err(Refused::NotCovered));
+        // Scoped under a kid the admission didn't see: the live comparison.
+        log.set_service(
+            "svc-proj",
+            &ServiceScope::new([HOST])
+                .projects(Some([PC]))
+                .ops(["notify", "prompt"]),
+            later(),
+        );
+        assert_eq!(at(&log, &frozen, &|e| Some(e == PC)), Ok(Caller::Sender));
+        assert_eq!(at(&log, &frozen, &|_| None), Err(Refused::NotCovered));
     }
 }
