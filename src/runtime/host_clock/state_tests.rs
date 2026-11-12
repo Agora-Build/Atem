@@ -152,11 +152,17 @@ fn check(
             "only a new boot not yet spent sets the mark"
         );
     }
-    // A boot's first synchronized reading with the mark spends its lowering.
-    if r.synced == Synced::Yes && (old.mark || (new_boot && !spent)) {
+    // A boot's first synchronized reading with the mark spends its lowering;
+    // in a boot already spent, a carried mark spends and lowers nothing.
+    if r.synced == Synced::Yes && !spent && (old.mark || new_boot) {
         assert_eq!(new.spent_boots.last(), Some(&Boot::of(r)));
     }
+    if spent {
+        assert_eq!(new.spent_boots, old.spent_boots);
+    }
     assert!(new.spent_boots.len() <= MAX_SPENT_BOOTS);
+    let distinct: HashSet<&Boot> = new.spent_boots.iter().collect();
+    assert_eq!(distinct.len(), new.spent_boots.len(), "a boot spent twice");
     if was_lowered {
         assert_eq!(
             r.synced,
@@ -164,6 +170,7 @@ fn check(
             "a lowering needs a synchronized reading"
         );
         assert!(old.mark || new_boot, "a lowering needs the mark");
+        assert!(!spent, "a lowering in a boot already spent");
         assert!(
             track.lowered.insert(r.boot_id.clone()),
             "a second lowering in boot {}",
@@ -1885,4 +1892,60 @@ fn a_profile_back_on_a_machine_gets_no_second_lowering_in_its_boot() {
             "boot-3", "boot-4", "boot-5", "boot-6", "boot-7", "boot-8", "boot-9", "boot-10"
         ]
     );
+}
+
+#[test]
+fn a_mark_carried_from_another_boot_gives_no_second_lowering_in_a_spent_boot() {
+    // Re-review probe: A's boot spends its lowering; the profile visits B,
+    // whose boot sets the mark but never gets a synchronized reading; back on
+    // A, the mark it carries lowers nothing.
+    let mut host = Host::new(Synced::No);
+    host.wall_off = 2 * HOUR;
+    host.observe();
+    host.advance(MIN);
+    host.wall_off = 0;
+    host.synced = Synced::Yes;
+    assert_eq!(count(&host.observe(), lowered), 1, "A's own lowering");
+    host.run(HOUR, MIN);
+    let a = Boot::of(&host.reading());
+    assert_eq!(host.state.spent_boots, vec![a.clone()]);
+    // B: one unsynchronized reading, its clock two hours ahead.
+    let a_start = T0 - 30 * SEC;
+    let b_start = T0 - 5 * DAY;
+    host.synced = Synced::No;
+    host.machine = M2;
+    host.boot_id = "b-boot".to_string();
+    host.counter = host.truth - b_start;
+    host.wall_off = 2 * HOUR;
+    host.observe();
+    assert!(host.state.mark(), "B's boot sets the mark");
+    // Back on A, synchronized, its clock on time: no second lowering in A's
+    // boot, the alert instead, and A not spent twice.
+    host.advance(MIN);
+    host.machine = M1;
+    host.boot_id = "boot-0".to_string();
+    host.counter = host.truth - a_start;
+    host.wall_off = 0;
+    host.synced = Synced::Yes;
+    let events = host.observe();
+    assert_eq!(guard(&events), Some(GuardWhy::OtherMachine));
+    assert_eq!(count(&events, lowered), 0);
+    assert_eq!(count(&events, went_back), 1);
+    assert!(!host.state.mark());
+    assert_eq!(host.state.spent_boots, vec![a.clone()]);
+    host.run(HOUR, MIN);
+    assert_eq!(host.seen(lowered), 1);
+    // B's own boot still has its lowering, at its first synchronized reading.
+    host.synced = Synced::No;
+    host.machine = M2;
+    host.boot_id = "b-boot".to_string();
+    host.counter = host.truth - b_start;
+    host.wall_off = -2 * HOUR;
+    host.observe();
+    assert!(host.state.mark());
+    host.advance(MIN);
+    host.synced = Synced::Yes;
+    assert_eq!(count(&host.observe(), lowered), 1, "B's own lowering");
+    let b = Boot::of(&host.reading());
+    assert_eq!(host.state.spent_boots, vec![a, b]);
 }

@@ -29,7 +29,11 @@
 //!   either is more than 10 minutes ahead of the wall clock, are lowered to
 //!   it, once. A boot whose first synchronized reading has passed is
 //!   remembered (`spent_boots`), so a profile that comes back to it gets no
-//!   second lowering in that boot.
+//!   second lowering in that boot, even with a mark carried from another
+//!   machine's boot. Only the latest eight boots are remembered: a profile
+//!   that circulates among more than eight re-arms the oldest one (a
+//!   late-direction lowering, at most once per eviction, needing a shared
+//!   profile and clock-setting privilege).
 //! - **The floor** (`station`): a `station_time` up to `H` + 10 minutes;
 //!   above the floor it raises it, below it the floor follows it down at
 //!   500 ppm.
@@ -66,7 +70,10 @@ const LOWER_AHEAD_MS: u64 = 600_000;
 const BEFORE_BOOT_SLACK_MS: u64 = 60_000;
 /// The origins whose last "Station clock ahead" alert is kept.
 const MAX_ORIGINS: usize = 16;
-/// The boots whose once-per-boot lowering is remembered as spent.
+/// The boots whose once-per-boot lowering is remembered as spent. A profile
+/// that circulates among more than eight boots re-arms the oldest one: a
+/// late-direction lowering, at most once per eviction, needing a shared
+/// profile and clock-setting privilege.
 const MAX_SPENT_BOOTS: usize = 8;
 
 /// Values on the host's clock are kept in ns since the epoch (`i128`); a
@@ -233,14 +240,18 @@ pub struct ClockState {
     /// `H` at the last "Station clock ahead of this host", per origin.
     last_ahead_alert_ms: BTreeMap<String, u64>,
     /// The boots whose first synchronized reading has passed with the mark,
-    /// newest last, at most `MAX_SPENT_BOOTS`: a boot change into one of them
-    /// sets no mark, so the lowering stays once per boot when a profile
-    /// moves between machines and back.
+    /// newest last, each once, at most `MAX_SPENT_BOOTS`: a boot change into
+    /// one of them sets no mark, and a mark carried into one (set on another
+    /// machine's boot the profile left unsynchronized) lowers nothing, so the
+    /// lowering stays once per boot when a profile moves between machines and
+    /// back. A profile that circulates among more than eight boots re-arms
+    /// the oldest one: a late-direction lowering, at most once per eviction,
+    /// needing a shared profile and clock-setting privilege.
     spent_boots: Vec<Boot>,
 }
 
 /// A boot of a machine.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Boot {
     #[serde(with = "machine_hex")]
@@ -604,6 +615,12 @@ impl ClockState {
             return;
         }
         self.mark = false;
+        // A mark carried into a boot whose lowering is spent (set on another
+        // machine's boot the profile left before a synchronized reading there)
+        // lowers nothing.
+        if self.spent_boots.contains(&Boot::of(r)) {
+            return;
+        }
         // This boot's lowering is spent, whether or not it lowers anything.
         self.spent_boots.push(Boot::of(r));
         if self.spent_boots.len() > MAX_SPENT_BOOTS {
