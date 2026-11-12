@@ -702,6 +702,8 @@ def check_membership_log(file, data, report, context):
 # ------------------------------------------- r9-vectors-host-work-control
 
 LOG_L = ["E1", "E2", "E3", "E4", "E5", "E6"]
+# The most counted record ids a principal's part keeps (ControlState, decision 19).
+MAX_RECORD_IDS = 256
 
 
 def signer_key_in(replay, signer):
@@ -806,6 +808,57 @@ def check_host_work_control(file, data, report, context):
             if "parse_error" in vector:
                 case.check(True, f"refused at parse ({vector['parse_error']}; not derived here)")
 
+    def check_state(case, state, fill, what):
+        """A state (v2: one part per principal): its account, each part's
+        records (one to 256 [record_id, digest] pairs, each id once, the
+        revocation's record and the coverage's cover among them), and each
+        digest: the SHA-256 of a record body of that principal with that id,
+        or, for an id no record of the file has, of the record `fill`'s
+        body under that id."""
+        case.equal(state["v"], 2, f"{what}: v 2")
+        case.equal((state["account_id"], state["genesis_hash"]), (data["account_id"], data["genesis_hash"]), f"{what}: the account")
+        for principal, part in state["principals"].items():
+            records = part["records"]
+            ids = [record_id for record_id, _ in records]
+            case.check(1 <= len(records) <= MAX_RECORD_IDS and len(set(ids)) == len(ids), f"{what} {principal}: 1 to {MAX_RECORD_IDS} record ids, each once")
+            for pin in [part.get("revoked_by"), part.get("coverage", {}).get("cover", {}).get("record_id")]:
+                case.check(pin is None or pin in ids, f"{what} {principal}: its revocation's and cover's records kept")
+            copies, wrong = 0, []
+            for record_id, digest in records:
+                texts = jcs_by_record_id.get((principal, record_id), set())
+                if texts:
+                    case.check(
+                        digest in {sha256(t.encode()).hex() for t in texts},
+                        f"{what} {principal} {record_id[-4:]}: the SHA-256 of a record body of that principal with that id",
+                    )
+                    continue
+                body = dict(by_label[fill]["record"]["body"]) if fill in by_label else {}
+                body["record_id"] = record_id
+                copies += 1
+                if body.get("principal") != principal or sha256(jcs(body).encode()).hex() != digest:
+                    wrong.append(record_id)
+            if copies:
+                case.check(
+                    not wrong,
+                    f"{what} {principal}: {copies} ids no record of the file has, each the SHA-256 of {fill}'s body under that id"
+                    + (f" (not: {', '.join(wrong)})" if wrong else ""),
+                )
+
+    def standing_of(state, principal):
+        """What the state's part of `principal` has in force, as a step's
+        `standing` writes it."""
+        part = state["principals"].get(principal, {})
+        if principal.startswith("host:"):
+            interrupted = sorted(str(seq) for seq in part.get("interrupted", []))
+        else:
+            interrupted = [part["revoked_by"]] if part.get("interrupted") else []
+        out = {"held": part.get("held", False), "interrupted": interrupted}
+        if "revoked_by" in part:
+            out["revoked"] = part["revoked_by"]
+        if "coverage" in part:
+            out["coverage"] = {"origin": part["coverage"]["origin"], "feed_id": part["coverage"]["feed_id"]}
+        return out
+
     for sequence in data["sequences"]:
         with report.case(file, sequence["label"]) as case:
             for step in sequence["steps"]:
@@ -814,15 +867,23 @@ def check_host_work_control(file, data, report, context):
                     pos = step["pos"]
                     case.equal(sorted(pos), ["feed_id", "feed_seq", "origin"], "a position {origin, feed_id, feed_seq}")
                     case.check((pos["origin"], pos["feed_id"]) in stations, "a position in a station's feed")
-            state = sequence["state"]
-            case.equal((state["account_id"], state["genesis_hash"]), (data["account_id"], data["genesis_hash"]), "the state's account")
-            for principal, digests in state["records"].items():
-                for record_id, digest in digests.items():
-                    texts = jcs_by_record_id.get((principal, record_id), set())
-                    case.check(
-                        digest in {sha256(t.encode()).hex() for t in texts},
-                        f"{principal} {record_id[-4:]}: the SHA-256 of a record body of that principal with that id",
-                    )
+                standing = step["standing"]
+                case.check(
+                    {"held", "interrupted"} <= set(standing) <= {"held", "interrupted", "revoked", "coverage"},
+                    "a standing {held, interrupted, revoked?, coverage?}",
+                )
+            fill = sequence.get("fill")
+            if "initial" in sequence:
+                case.check(fill in by_label, f"fill {fill} is a record of the file")
+                check_state(case, sequence["initial"], fill, "initial")
+                full = [len(part["records"]) for part in sequence["initial"]["principals"].values()]
+                case.check(MAX_RECORD_IDS in full, "initial: a principal's records full")
+            else:
+                case.check(fill is None, "no fill without an initial state")
+            check_state(case, sequence["state"], fill, "state")
+            last = sequence["steps"][-1]
+            principal = by_label[last["record"]]["record"]["body"]["principal"]
+            case.equal(last["standing"], standing_of(sequence["state"], principal), "the last step's standing is the state's")
 
 
 # ------------------------------------------------ r9-control-ack-* fixtures

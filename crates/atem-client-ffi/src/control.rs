@@ -22,12 +22,15 @@
 //!   valid, pending or refused, with its reason).
 //! - **Apply** them: `ControlStateHandle` is the reference control state of
 //!   one device list (`ControlState`): `apply` gives each record's
-//!   per-effect results and the host actions, and the next state as a new
-//!   handle; the handle applied on never changes. Persist the next state's
-//!   `to_json()` in the same transaction as your own state, use the next
-//!   handle once that transaction committed (keep the old one if it
-//!   failed: applying the record again gives the same results), and load
-//!   the state with `from_json` at start.
+//!   per-effect results and the host actions, the next state as a new
+//!   handle and the principals whose part it changed (`touched`); the
+//!   handle applied on never changes. Persist the next state (whole,
+//!   `to_json()`, or the touched principals' `part`s) in the same
+//!   transaction as your own state, use the next handle once that
+//!   transaction committed (keep the old one if it failed: applying the
+//!   record again gives the same results), and load the state with
+//!   `from_json` or `from_parts` at start. `standing` is what is in force
+//!   for one principal.
 //!
 //! Errors: a record its parse refuses is `Invalid{code}` (`malformed`,
 //! `unknown_field`, `field_not_allowed`, `not_for_host_principal`,
@@ -50,17 +53,20 @@ use crate::encoding::{canonical, canonical_lossy, safe_int};
 use crate::error::{AtemError, Result};
 use crate::log::{MembershipLog, object_json};
 use crate::types::{
-    ControlApplied, ControlCheckInfo, ControlEffectKind, ControlEffectResult, ControlFeedPos,
-    ControlHostAction, ControlRecordBody, ControlResultKind, PublicKeyData,
+    ControlApplied, ControlCheckInfo, ControlCoverage, ControlEffectKind, ControlEffectResult,
+    ControlFeedPos, ControlHostAction, ControlRecordBody, ControlResultKind, ControlStanding,
+    ControlStatePart, PublicKeyData,
 };
 
 /// Largest control state `ControlStateHandle::from_json` reads, checked
-/// before parsing. The state keeps one entry per record that counted (about
-/// 110 bytes each), so this holds some 600,000 records.
+/// before parsing (and the most `from_parts` reads, its parts in all). A
+/// principal's part keeps at most 256 counted record ids (about 110 bytes
+/// each, `MAX_RECORD_IDS`), and only principals of the device list count
+/// records (at most 1,024 entries), so a state stays well under this.
 pub const MAX_CONTROL_STATE_JSON: usize = 64 << 20;
 
-/// The control state's format (`"v"`).
-const STATE_VERSION: u64 = 1;
+/// The control state's format (`"v"`): 2, one part per principal.
+const STATE_VERSION: u64 = 2;
 
 impl ControlRecordBody {
     /// The body object, every given field in it, read by the hosts' own
@@ -301,14 +307,18 @@ fn applied_info(applied: Applied) -> ControlApplied {
 /// next state as a new handle (`ControlTransition`); the handle it was
 /// called on stays as it was, so it is safe to share across threads.
 ///
-/// **Persistence.** In one transaction, store `next.to_json()` with what
-/// you do with the results (your cursor, acknowledgments, alerts). Once it
-/// committed, use `next` from then on; if it failed, keep the handle you
-/// applied on and apply the record again: the same results and actions
-/// come back, so no effect is lost. Load the state with `from_json` at
-/// start; never re-apply records to rebuild it (a record verified then may
-/// not verify against today's list, and idempotency is by the records
-/// kept).
+/// **Persistence.** In one transaction, store the next state with what you
+/// do with the results (your cursor, acknowledgments, alerts): whole
+/// (`next.to_json()`), or one row per principal, writing the `part` of
+/// each principal the transition `touched` (no other part changed). Once
+/// it committed, use `next` from then on; if it failed, keep the handle
+/// you applied on and apply the record again: the same results and
+/// actions come back, so no effect is lost. Load the state with
+/// `from_json` or `from_parts` at start; never re-apply records to rebuild
+/// it (a record verified then may not verify against today's list, and
+/// idempotency is by the records kept). Each principal keeps at most 256
+/// counted record ids, oldest evicted first (never its revocation's record
+/// nor the coverage's cover).
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct ControlStateHandle {
     state: ControlState,
@@ -333,11 +343,14 @@ impl std::fmt::Debug for ControlStateHandle {
 pub struct ControlTransition {
     /// What the record did, and what the host does with it.
     pub applied: ControlApplied,
-    /// The state after the record. Store `next.to_json()` in the
-    /// transaction that acts on `applied`, and use `next` once it
-    /// committed. Until then, and if it fails, the handle `apply` was
-    /// called on is the current state: it didn't change.
+    /// The state after the record. Store `next.to_json()` (or the parts
+    /// of `touched`) in the transaction that acts on `applied`, and use
+    /// `next` once it committed. Until then, and if it fails, the handle
+    /// `apply` was called on is the current state: it didn't change.
     pub next: Arc<ControlStateHandle>,
+    /// The principals whose part `next` changed: the record's principal,
+    /// or none. Write exactly these `next.part(…)`s.
+    pub touched: Vec<String>,
 }
 
 #[cfg_attr(feature = "uniffi", uniffi::export)]
@@ -352,7 +365,8 @@ impl ControlStateHandle {
 
     /// A state `to_json()` wrote, for `log`'s device list. `Stored{code}`:
     /// `too_large` (over 64 MiB), `malformed` (not strict JSON, not an
-    /// object, no `v`), `unsupported_version` (a `v` other than 1),
+    /// object, no `v`), `unsupported_version` (a `v` other than 2: 1 is the
+    /// format before parts per principal),
     /// `account_mismatch`, `genesis_mismatch` (another device list's state),
     /// `stored_invalid` (the state's own rules refuse it, or it isn't
     /// exactly `to_json()`'s form). Nothing is loaded then. A
@@ -422,11 +436,102 @@ impl ControlStateHandle {
         Ok(Self::wrap(state))
     }
 
-    /// The durable state: canonical JSON (`"v": 1`). Store the next
-    /// state's after every `apply`, in the same transaction as what you do
-    /// with the result.
+    /// The state of `log`'s device list made of `parts` (each principal's
+    /// `part`, in any order), read as `from_json` reads a whole state.
+    /// `Stored{code}`: `too_large` (over 64 MiB in all), `malformed` (a
+    /// part that isn't strict JSON), `stored_invalid` (a principal given
+    /// twice, a name that is no principal, a part its rules refuse or not
+    /// exactly `part()`'s form). Nothing is loaded then; keep the work it
+    /// guards stopped. A store of another device list's parts (a re-pair)
+    /// starts with `new` instead: parts carry no account.
+    #[cfg_attr(feature = "uniffi", uniffi::constructor)]
+    pub fn from_parts(log: Arc<MembershipLog>, parts: Vec<ControlStatePart>) -> Result<Arc<Self>> {
+        let total: usize = parts
+            .iter()
+            .map(|p| p.principal.len() + p.part_json.len())
+            .sum();
+        if total > MAX_CONTROL_STATE_JSON {
+            return Err(AtemError::stored(
+                "too_large",
+                format!(
+                    "a control state's parts are at most {MAX_CONTROL_STATE_JSON} bytes in all"
+                ),
+            ));
+        }
+        let mut values = Vec::with_capacity(parts.len());
+        for part in parts {
+            let value = parse_strict(
+                part.part_json.as_bytes(),
+                MAX_CONTROL_STATE_JSON,
+                Numbers::IntegersOnly,
+            )
+            .map_err(|e| {
+                AtemError::stored(
+                    "malformed",
+                    format!("{}'s part: not strict JSON: {e:?}", part.principal),
+                )
+            })?;
+            values.push((part.principal, value));
+        }
+        let state = ControlState::from_parts(&log.lock(), values.iter().cloned())
+            .map_err(|e| AtemError::stored("stored_invalid", e.to_string()))?;
+        // Exactly the export: another spelling of a part is refused.
+        for (principal, value) in &values {
+            let exact = match (
+                state.part(principal).map(|p| canonical(&p)),
+                canonical(value),
+            ) {
+                (Some(Ok(ours)), Ok(theirs)) => ours == theirs,
+                _ => false,
+            };
+            if !exact {
+                return Err(AtemError::stored(
+                    "stored_invalid",
+                    format!("{principal}'s part isn't exactly part()'s form"),
+                ));
+            }
+        }
+        Ok(Self::wrap(state))
+    }
+
+    /// The durable state: canonical JSON (`"v": 2`, one part per
+    /// principal). Store the next state's after every `apply` (or its
+    /// touched parts), in the same transaction as what you do with the
+    /// result.
     pub fn to_json(&self) -> String {
         canonical_lossy(&self.state.to_json())
+    }
+
+    /// Every principal the state has a part for (one a record counted for),
+    /// sorted.
+    pub fn principals(&self) -> Vec<String> {
+        self.state.principals()
+    }
+
+    /// `principal`'s part (`service:<id>`, `host:<host_id>`), canonical
+    /// JSON, or `None` when the state has none: what a store keeping one
+    /// row per principal writes for each principal a transition `touched`.
+    pub fn part(&self, principal: String) -> Option<String> {
+        self.state
+            .part(&principal)
+            .map(|part| canonical_lossy(&part))
+    }
+
+    /// What is in force for `principal` (`service:<id>`, `host:<host_id>`):
+    /// its revocation, the revocations whose interrupt is in force, the
+    /// hold and the covering feed. A principal the state holds nothing for
+    /// (or a name that is none) has nothing in force.
+    pub fn standing(&self, principal: String) -> ControlStanding {
+        let standing = self.state.standing(&principal);
+        ControlStanding {
+            revoked: standing.revoked,
+            interrupted: standing.interrupted.into_iter().collect(),
+            held: standing.held,
+            coverage: standing.coverage.map(|c| ControlCoverage {
+                origin: c.origin,
+                feed_id: c.feed_id,
+            }),
+        }
     }
 
     /// Verifies `record_json` against `log` (the device list at the head
@@ -464,6 +569,7 @@ impl ControlStateHandle {
         };
         let transition = self.state.apply(&rec, &log.lock(), pos, host_applied_seq);
         Ok(ControlTransition {
+            touched: transition.touched(),
             applied: applied_info(transition.applied),
             next: Self::wrap(transition.next),
         })

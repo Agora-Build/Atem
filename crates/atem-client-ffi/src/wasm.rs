@@ -968,18 +968,62 @@ impl ControlStateHandle {
             crate::control::ControlStateHandle::from_json(log.0.clone(), state_json),
         )?))
     }
+    /// A state made of its parts, for `log`'s device list
+    /// (`ControlStateHandle::from_parts`): `parts` is an array of
+    /// `{principal, partJson}`, in any order.
+    #[wasm_bindgen(js_name = fromParts)]
+    pub fn from_parts(log: &MembershipLog, parts: JsValue) -> JsResult<ControlStateHandle> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct P {
+            principal: String,
+            part_json: String,
+        }
+        let parts = items::<P>(
+            &parts,
+            &["principal", "partJson"],
+            "parts [{principal, partJson}]",
+        )?
+        .into_iter()
+        .map(|p| crate::types::ControlStatePart {
+            principal: p.principal,
+            part_json: p.part_json,
+        })
+        .collect();
+        Ok(ControlStateHandle(err(
+            crate::control::ControlStateHandle::from_parts(log.0.clone(), parts),
+        )?))
+    }
     /// The durable state (canonical JSON): store the next state's after
     /// every `apply`.
     #[wasm_bindgen(js_name = toJson)]
     pub fn to_json(&self) -> String {
         self.0.to_json()
     }
+    /// Every principal the state has a part for, sorted.
+    pub fn principals(&self) -> Vec<String> {
+        self.0.principals()
+    }
+    /// `principal`'s part (canonical JSON), or `undefined`: what a store
+    /// keeping one row per principal writes for each principal a
+    /// transition `touched`.
+    pub fn part(&self, principal: String) -> Option<String> {
+        self.0.part(principal)
+    }
+    /// What is in force for `principal`: `{revoked, interrupted, held,
+    /// coverage}` (`revoked` and `coverage`, `{origin, feedId}`, `null`
+    /// when there are none).
+    pub fn standing(&self, principal: String) -> JsResult<JsValue> {
+        to_js(&self.0.standing(principal))
+    }
     /// Applies a record to this state (`pos`: `{origin, feedId, feedSeq}`,
     /// or `null`/`undefined` over a channel) and returns a
     /// `ControlTransition`: `applied` (`{result, effects: [{effect,
     /// result}], actions: [{type, principal, …}], evidence}`) and `next`,
-    /// the state after it. This handle doesn't change: use `next` once
-    /// your transaction storing `next.toJson()` committed.
+    /// the state after it, and `touched`, the principals whose part it
+    /// changed. This handle doesn't change: use `next` once your
+    /// transaction storing `next.toJson()` (or the touched parts)
+    /// committed.
     pub fn apply(
         &self,
         record_json: String,
@@ -1012,6 +1056,7 @@ impl ControlStateHandle {
         Ok(ControlTransition {
             applied: to_js(&transition.applied)?,
             next: transition.next,
+            touched: transition.touched,
         })
     }
 }
@@ -1021,6 +1066,7 @@ impl ControlStateHandle {
 pub struct ControlTransition {
     applied: JsValue,
     next: Arc<crate::control::ControlStateHandle>,
+    touched: Vec<String>,
 }
 
 #[wasm_bindgen]
@@ -1036,6 +1082,11 @@ impl ControlTransition {
     #[wasm_bindgen(getter)]
     pub fn next(&self) -> ControlStateHandle {
         ControlStateHandle(self.next.clone())
+    }
+    /// The principals whose part `next` changed: the record's, or none.
+    #[wasm_bindgen(getter)]
+    pub fn touched(&self) -> Vec<String> {
+        self.touched.clone()
     }
 }
 

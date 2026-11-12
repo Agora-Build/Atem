@@ -981,7 +981,7 @@ jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (69 checks in JS, 71 in Kotlin and in Swift: the same 69
+- **Conformance** (70 checks in JS, 72 in Kotlin and in Swift: the same 70
   in each language, plus two in Kotlin and Swift, whose provider sees the
   signing request and so the purposes of the five device-list actions and
   of control records; over `designs/protocol/fixtures/r9-vectors-*.json`,
@@ -996,7 +996,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
   (with a CryptoKit `AppKeyProvider`).
 - **Host mail** (planned, host role; four conformance checks per language,
-  of the 69 and 71 above): every entry of `r9-vectors-host-envelope`
+  of the 70 and 72 above): every entry of `r9-vectors-host-envelope`
   extends log L to its hash, the builders reproduce every `built` object
   byte for byte (a fresh seal opens, a builder refuses a plaintext with
   `null`, a dropped reply and a key that isn't the `enc_kid`'s, and seals a
@@ -1007,7 +1007,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   (`JdkKeys`, `CryptoKitKeys`), whose failed open is
   `ProviderError.OpenFailed` (§3): the same verdicts.
 - **Device-list actions** (`tests/host_actions.rs`, Rust; four conformance
-  checks in JS, five in Kotlin and Swift, of the 69 and 71 above): every
+  checks in JS, five in Kotlin and Swift, of the 70 and 72 above): every
   `P*`/`EK*`/`HS*` vector of
   `r9-vectors-membership-log` through the queries (`expect`) and the
   refusals (`reason`), the builders against the vectors' `jcs` and
@@ -1016,16 +1016,21 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   be a key, a generation or an algorithm), and a manager signing each
   action through a recording provider under its own purpose and publishing
   it (the verifier takes the entry).
-- **Control records** (`tests/control.rs`, Rust; four conformance checks
-  in JS, five in Kotlin and Swift, of the 69 and 71 above): every record of
+- **Control records** (`tests/control.rs`, Rust; five conformance checks
+  in JS, six in Kotlin and Swift, of the 70 and 72 above): every record of
   `r9-vectors-host-work-control` parsed (or refused by the parse with its
   code) and verified on each of its chains as `checks` says, the builders
   reproducing it byte for byte (a software store, and the signing input
   plus the vector's signature; a body the parse refuses is refused, nothing
-  signed), every sequence through a `ControlStateHandle` with each step's
-  per-effect results and the state it leaves (each step applied to the
-  next state the step before returned), the state loading only for its
-  own device list and exactly as written, a failed commit losing no effect
+  signed), every sequence through a `ControlStateHandle` (from its
+  `initial` state when it has one) with each step's per-effect results,
+  the `standing` of its record's principal and the parts it `touched`
+  (exactly the parts that changed), and the state it leaves (each step
+  applied to the next state the step before returned), the state loading
+  only for its own device list and exactly as written, whole and from its
+  parts per principal (in any order; a principal given twice, a part that
+  isn't strict JSON or not of its principal's kind refused), a failed
+  commit losing no effect
   (the handle `apply` was called on unchanged, the record applied again
   giving the same results and actions, and a duplicate once the next
   state is adopted), and (Kotlin and Swift) the
@@ -1033,7 +1038,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   integration's own key and `ControlRecord` (a fresh confirmation of the
   body) for a native manager.
 - **The Station's side** (`tests/station.rs`, Rust; ten conformance
-  checks per language, of the 69 and 71 above): every acknowledgment
+  checks per language, of the 70 and 72 above): every acknowledgment
   fixture (`r9-control-ack-*`, one check each) through `AckLedgerHandle` as
   a Station persists it (each call's next state committed before the
   reports go and adopted after, restarts from the committed state, two
@@ -1056,7 +1061,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   `parse_control_record` as the file says, refused by the other side's
   reader as `wrong_message`, and every invalid text refused with its code.
 - **Durable log** (`tests/stored_log.rs`, Rust; two conformance checks per
-  language, of the 69 and 71 above): a partly elapsed wait across a same-boot restart and a reboot,
+  language, of the 70 and 72 above): a partly elapsed wait across a same-boot restart and a reboot,
   the wall clock set back after restore, a wait-ended decision at its chain
   position (with the entry that relies on it), pending, approved and vetoed
   recovery and key-replacement records, a frozen log, corrupted, oversize,
@@ -1108,7 +1113,9 @@ acknowledgments").
 | `control_record_signing_input(body)`, then `control_record_with_signature(body, signer_key, signature)` (all three; JS `controlRecordSigningInput(body)`, `controlRecordWithSignature(body, signerAlg, signerRaw, signature)`) | the same in two steps, for a key that signs elsewhere (a KMS, an HSM, WebCrypto): the bytes to sign, `enc(["atem-host-work-control-v1", jcs(body)])`, then the record. The signature (P-256 64-byte `r‖s`, either S, normalized to low S; Ed25519) is verified under `signer_key` before the record is returned (`bad_signature`; an X25519 key is `wrong_alg`) |
 | `parse_control_record(record_json)` | the body, field by field (strict JSON, at most 16 KiB, exactly the body's fields); no signature check |
 | `verify_control_record(log, record_json)` | against a verified `MembershipLog`: `Valid{signer, key_seq, head}` (`signer` `service:<id>` for the principal's own key, from the entry at `key_seq`; `member:<id>` for a current native manager), `Pending{reason}` (`principal_unknown`, `signer_unknown`, `revoke_not_in_list`: verify again after the list advances) or `Refused{reason}` (`wrong_account`, `bad_signature`, `key_mismatch`, `signer_not_allowed`, `removed_manager`, `host_key_signed`, `not_a_service`, `not_a_revoke`: keep it as evidence). A record the parse refuses is `Invalid{code}` |
-| `ControlStateHandle::new(log)`, `from_json(log, state_json)`, `to_json()`, `apply(record_json, log, pos, host_applied_seq)` | the reference control state of one device list, as a host keeps it. A handle never changes: `apply` verifies the record against `log` (the device list at the head of this transaction) and returns `ControlTransition{applied, next}`, `applied` being `ControlApplied{result, effects, actions, evidence}` and `next` the state after the record, a new handle. `pos` is `ControlFeedPos{origin, feed_id, feed_seq}`, where the record was read; a record whose body names another `origin` or `feed_id` counts as read at no position (its hold still applies, its cover and release don't) |
+| `ControlStateHandle::new(log)`, `from_json(log, state_json)`, `to_json()`, `apply(record_json, log, pos, host_applied_seq)` | the reference control state of one device list, as a host keeps it. A handle never changes: `apply` verifies the record against `log` (the device list at the head of this transaction) and returns `ControlTransition{applied, next, touched}`, `applied` being `ControlApplied{result, effects, actions, evidence}`, `next` the state after the record, a new handle, and `touched` the principals whose part it changed (the record's, or none). `pos` is `ControlFeedPos{origin, feed_id, feed_seq}`, where the record was read; a record whose body names another `origin` or `feed_id` counts as read at no position (its hold still applies, its cover and release don't) |
+| `principals()`, `part(principal)`, `from_parts(log, parts)` | the state one part per principal, for a store that keeps a row per principal: `part` is a principal's canonical JSON (`None` when the state has none), `from_parts` loads `ControlStatePart{principal, part_json}`s in any order, read as strictly as `from_json`. Write the parts a transition `touched`; no other part changed |
+| `standing(principal)` | what is in force for `service:<id>` or `host:<host_id>`: `ControlStanding{revoked, interrupted, held, coverage}`: the revoking record's `record_id` (never for a host principal, whose revocation is a device-list entry), the revocations whose interrupt a record put in force (a service's revoking `record_id`, a host principal's `revoke_seq` in decimal), the hold, and `ControlCoverage{origin, feed_id}`, the covering feed. A principal the state holds nothing for has nothing in force |
 
 JS takes a body as a plain object with `ControlRecordBody`'s fields in
 camelCase (`accountId`, `genesisHash`, `origin`, `feedId`, `principal`,
@@ -1116,8 +1123,12 @@ camelCase (`accountId`, `genesisHash`, `origin`, `feedId`, `principal`,
 `recordId`, `issuedAt`, `integrationId`, `by`), absent ones omitted, `null`
 or `undefined`; any other key is refused (`malformed`), never dropped.
 `apply`'s `pos` is `{origin, feedId, feedSeq}` or `null`, and it returns a
-`ControlTransition` with the getters `applied` (a plain object) and `next`
-(a `ControlStateHandle`). Only bots and tests get
+`ControlTransition` with the getters `applied` (a plain object), `next`
+(a `ControlStateHandle`) and `touched` (an array of principals). JS's
+`fromParts(log, parts)` takes `[{principal, partJson}]` (any other key is
+refused), `part` returns `undefined` for a principal with none, and
+`standing` a plain object whose `revoked` and `coverage` (`{origin,
+feedId}`) are `null` when there are none. Only bots and tests get
 `buildControlRecord(store, keyId, body)` (feature `software-keys`).
 
 **The body** (`atem-host-work-control`, host-work-v1 §11.1). A service's
@@ -1142,27 +1153,37 @@ synchronized clock: it orders covers (below).
 2. If you keep a control state (to predict what hosts report, or to know
    what a reset's snapshot must re-issue), `apply` the record at its
    position (`{origin, feed_id, feed_seq}` in your own feed) and store the
-   transition's `next.to_json()` in the same transaction as the feed row.
+   transition's `next.to_json()` (or `next.part(p)` for each principal it
+   `touched`, one row per principal) in the same transaction as the feed
+   row.
    Use `next` from then on only once that transaction committed. If it
    fails, keep the handle you applied on: `apply` didn't change it, and
    applying the record again gives the same results and actions, so no
    effect is lost. Never rebuild a state by re-applying stored records: a
    record that verified then may not verify against today's list, and
    idempotency is by the records the state keeps.
-3. At start, load it with `from_json(log, state_json)`, the log being the
-   same account's and genesis's. A state that doesn't load is
-   `Stored{code}` (`too_large`, `malformed`, `unsupported_version`,
-   `account_mismatch`, `genesis_mismatch`, `stored_invalid`).
-   `genesis_mismatch` after a re-pair means the stored state is the old
-   device list's: the new list starts with `new`. On any other code stop
-   the work it guards and never start again from an empty state.
+3. At start, load it with `from_json(log, state_json)` (or
+   `from_parts(log, parts)`), the log being the same account's and
+   genesis's. A state that doesn't load is `Stored{code}` (`too_large`,
+   `malformed`, `unsupported_version`, `account_mismatch`,
+   `genesis_mismatch`, `stored_invalid`). `genesis_mismatch` after a
+   re-pair means the stored state is the old device list's: the new list
+   starts with `new`. Parts carry no account: a store of parts belongs to
+   one device list, and a re-pair clears it and starts with `new`. On any
+   other code stop the work it guards and never start again from an empty
+   state. A `v` 1 state, the format before parts per principal, is
+   `unsupported_version`: this version reads `v` 2 only.
 
-**Its size.** The state keeps every record that counted (about 110 bytes
-each) and is read whole: `from_json` takes at most 64 MiB, some 600,000
-records, and refuses a larger one `too_large`. Pruning records that can no
-longer come again is planned (neither this state nor the acknowledgment
-ledger prunes in this version); until then a long-lived Station sizes its
-state against that bound.
+**Its size.** Each principal keeps at most 256 counted record ids (about
+110 bytes each, `MAX_RECORD_IDS`), the next evicting its oldest but never
+its revocation's record or the coverage's cover (**Atem's proposal, for
+Astation's agreement**, host-work-v1 §11.1 rule 1: an evicted record
+coming back is applied as a new one, and the only changes it can make
+are a replayed hold holding again and a release its own Station serves
+again at a later position of the covering feed). Only principals of the
+device list count records, so a state stays far under the 64 MiB that
+`from_json` and `from_parts` read (a larger one is `too_large`). The
+acknowledgment ledger doesn't prune in this version.
 
 **Reading results.** `apply` gives the record's `result` and one result per
 effect it carries (`revocation`, `interrupt`, `hold`, `release`, `cover`).
@@ -1170,9 +1191,9 @@ Read `effects`, not only `result`: a revoke that adds `interrupt_running:
 true` to one already applied is `applied` for its interrupt and
 `duplicate` for its revocation. For the revocation, `duplicate` means
 "already in force on this host" and counts as done (decision 8).
-`pending` waits (apply the record again once the device list or
-host-work's applied `seq` advanced); `refused` never applies from this
-record; `evidence` means keep the record and alert: it failed
+`pending` waits (apply the record again once the device list,
+host-work's applied `seq` or the principal's revocation advanced);
+`refused` never applies from this record; `evidence` means keep the record and alert: it failed
 verification, or it reuses a `record_id` of the same principal with
 another body (a stop, `hold`, `revoke` or `interrupt_running`, still
 applies its effects then; a `cover` or `release` is refused). Record ids

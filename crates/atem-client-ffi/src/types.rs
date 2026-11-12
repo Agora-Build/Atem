@@ -998,6 +998,46 @@ record! {
 }
 
 record! {
+    /// What a control state has in force for one principal
+    /// (`ControlStateHandle::standing`; I.5.5). A principal the state holds
+    /// nothing for has nothing in force.
+    pub struct ControlStanding {
+        /// A service's revocation: the `record_id` of the revoke that
+        /// revoked it. Always `None` for a host principal, whose
+        /// revocation is a device-list entry.
+        pub revoked: Option<String>,
+        /// The revocations whose interrupt a record put in force, as
+        /// `ControlHostAction::Interrupt` names them (a service's revoking
+        /// `record_id`, a host principal's `revoke_seq` in decimal), sorted.
+        pub interrupted: Vec<String>,
+        /// A hold is in force.
+        pub held: bool,
+        /// The covering feed: its future tasks are delegated, under that
+        /// origin's gate. `None`: not covered.
+        pub coverage: Option<ControlCoverage>,
+    }
+}
+
+record! {
+    /// A covering feed: its Station's exact origin and current `feed_id`.
+    pub struct ControlCoverage {
+        pub origin: String,
+        pub feed_id: String,
+    }
+}
+
+record! {
+    /// One principal's part of a control state, as `ControlStateHandle::part`
+    /// writes it (canonical JSON), for a store that keeps one row per
+    /// principal (`ControlStateHandle::from_parts`).
+    pub struct ControlStatePart {
+        /// `service:<id>` or `host:<host_id>`.
+        pub principal: String,
+        pub part_json: String,
+    }
+}
+
+record! {
     /// Where a record was read: its feed's Station `origin` and `feed_id`,
     /// and its position (`feed_seq`). None over a channel. A record counts
     /// as read at its own feed's position only when its body names the

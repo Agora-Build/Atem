@@ -3,9 +3,10 @@
 //! `designs/protocol/fixtures/r9-vectors-host-work-control.json` parses and
 //! verifies as the vector says, the builders (a provider, or a signing
 //! input and a signature) reproduce it, every sequence runs through
-//! `ControlStateHandle` with the vector's per-effect results and state, the
-//! state persists and loads only for its own device list, and the signing
-//! purposes follow the record's signer.
+//! `ControlStateHandle` with the vector's per-effect results, standing and
+//! state, the state persists (whole, or one part per principal) and loads
+//! only for its own device list, and the signing purposes follow the
+//! record's signer.
 #![cfg(feature = "uniffi")]
 
 #[path = "../../atem-client/tests/support/mod.rs"]
@@ -25,7 +26,8 @@ use atem_client_ffi::log::MembershipLog;
 use atem_client_ffi::provider::{AppKeyProvider, ProviderError};
 use atem_client_ffi::types::{
     ControlApplied, ControlCheckInfo, ControlEffectKind, ControlFeedPos, ControlHostAction,
-    ControlRecordBody, ControlResultKind, HostClock, PublicKeyData, SignRequest, SigningPurpose,
+    ControlRecordBody, ControlResultKind, ControlStanding, ControlStatePart, HostClock,
+    PublicKeyData, SignRequest, SigningPurpose,
 };
 use serde_json::{Value, json};
 use support::*;
@@ -405,32 +407,68 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Every sequence through the handle: each step's results, the state as
-/// the vector writes it, and the state reloaded.
+/// What a principal has in force, as the vectors write it.
+fn standing_json(standing: &ControlStanding) -> Value {
+    let mut v = json!({"held": standing.held, "interrupted": standing.interrupted});
+    if let Some(by) = &standing.revoked {
+        v["revoked"] = by.as_str().into();
+    }
+    if let Some(c) = &standing.coverage {
+        v["coverage"] = json!({"origin": c.origin, "feed_id": c.feed_id});
+    }
+    v
+}
+
+/// Every principal's part of `state`, as a host stores them.
+fn parts_of(state: &ControlStateHandle) -> Vec<ControlStatePart> {
+    state
+        .principals()
+        .into_iter()
+        .map(|principal| ControlStatePart {
+            part_json: state.part(principal.clone()).unwrap(),
+            principal,
+        })
+        .collect()
+}
+
+/// Every sequence through the handle, from its `initial` state when it has
+/// one: each step's results and the standing of its record's principal,
+/// the parts it touched (exactly the parts that changed), the state as the
+/// vector writes it, and the state reloaded whole and from its parts.
 #[test]
 fn the_sequences_through_the_state_handle() {
     let v = Vectors::load();
     let file = control();
-    let records: std::collections::BTreeMap<String, String> = file["records"]
+    let records: std::collections::BTreeMap<String, (String, String)> = file["records"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|r| (s(&r["label"]), r["record"].to_string()))
+        .map(|r| {
+            let principal = s(&r["record"]["body"]["principal"]);
+            (s(&r["label"]), (r["record"].to_string(), principal))
+        })
         .collect();
     let l = log_after(&v, &[]);
     for q in file["sequences"].as_array().unwrap() {
         let label = q["label"].as_str().unwrap();
-        let mut state = ControlStateHandle::new(l.clone());
+        let mut state = match q.get("initial") {
+            Some(initial) => {
+                let text = atem_client::canonical::jcs(initial).unwrap();
+                ControlStateHandle::from_json(l.clone(), text).unwrap()
+            }
+            None => ControlStateHandle::new(l.clone()),
+        };
         for (i, step) in q["steps"].as_array().unwrap().iter().enumerate() {
             let pos = step.get("pos").map(|p| ControlFeedPos {
                 origin: s(&p["origin"]),
                 feed_id: s(&p["feed_id"]),
                 feed_seq: p["feed_seq"].as_u64().unwrap(),
             });
+            let (record, principal) = &records[step["record"].as_str().unwrap()];
             let before = state.to_json();
             let got = state
                 .apply(
-                    records[step["record"].as_str().unwrap()].clone(),
+                    record.clone(),
                     log_after(&v, &chain_of(step)),
                     pos,
                     step["host_applied_seq"].as_u64().unwrap(),
@@ -442,6 +480,15 @@ fn the_sequences_through_the_state_handle() {
                 "{label} step {}",
                 i + 1
             );
+            assert_eq!(
+                standing_json(&got.next.standing(principal.clone())),
+                step["standing"],
+                "{label} step {}",
+                i + 1
+            );
+            let changed = state.part(principal.clone()) != got.next.part(principal.clone());
+            let touched: Vec<String> = changed.then(|| principal.clone()).into_iter().collect();
+            assert_eq!(got.touched, touched, "{label} step {}", i + 1);
             // The handle applied on is unchanged; the next one goes on.
             assert_eq!(state.to_json(), before, "{label} step {}", i + 1);
             state = got.next;
@@ -450,6 +497,96 @@ fn the_sequences_through_the_state_handle() {
         assert_eq!(state.to_json(), text, "{label}");
         let back = ControlStateHandle::from_json(l.clone(), text.clone()).unwrap();
         assert_eq!(back.to_json(), text, "{label}");
+        let parts = parts_of(&state);
+        for part in &parts {
+            let want = &q["state"]["principals"][&part.principal];
+            assert_eq!(part.part_json, atem_client::canonical::jcs(want).unwrap());
+        }
+        let back = ControlStateHandle::from_parts(l.clone(), parts).unwrap();
+        assert_eq!(back.to_json(), text, "{label}: from its parts");
+    }
+}
+
+/// A state loads from its parts, one per principal in any order, exactly
+/// as written: a principal given twice, a part that isn't strict JSON, out
+/// of its kind's form or not exactly as `part` writes it, or parts larger
+/// in all than a whole state may be, are refused.
+#[test]
+fn the_state_loads_from_its_parts_only_as_written() {
+    let v = Vectors::load();
+    let file = control();
+    let l = log_after(&v, &[]);
+    // Q17 holds a service's part and a host principal's.
+    let q = file["sequences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|q| q["label"] == "Q17_record_ids_per_principal")
+        .unwrap();
+    let state =
+        ControlStateHandle::from_json(l.clone(), atem_client::canonical::jcs(&q["state"]).unwrap())
+            .unwrap();
+    let parts = parts_of(&state);
+    assert_eq!(
+        parts
+            .iter()
+            .map(|p| p.principal.as_str())
+            .collect::<Vec<_>>(),
+        ["host:host-a", "service:svc-discord"]
+    );
+    let reversed: Vec<_> = parts.iter().rev().cloned().collect();
+    assert_eq!(
+        ControlStateHandle::from_parts(l.clone(), reversed)
+            .unwrap()
+            .to_json(),
+        state.to_json()
+    );
+    assert_eq!(
+        ControlStateHandle::from_parts(l.clone(), Vec::new())
+            .unwrap()
+            .to_json(),
+        ControlStateHandle::new(l.clone()).to_json()
+    );
+    assert_eq!(state.part("service:svc-other".into()), None);
+    let stored = |e: AtemError| match e {
+        AtemError::Stored { code, .. } => code,
+        other => panic!("{other:?}"),
+    };
+    let load = |parts: Vec<ControlStatePart>| {
+        ControlStateHandle::from_parts(l.clone(), parts)
+            .map(|_| ())
+            .map_err(stored)
+    };
+    let with = |principal: &str, part_json: &str| ControlStatePart {
+        principal: principal.into(),
+        part_json: part_json.into(),
+    };
+    let host = parts[0].part_json.clone();
+    let svc = parts[1].part_json.clone();
+    let cases: Vec<(Vec<ControlStatePart>, &str)> = vec![
+        (vec![parts[1].clone(), parts[1].clone()], "stored_invalid"),
+        (vec![with("service:svc-discord", "{")], "malformed"),
+        (vec![with("service:svc-discord", &host)], "stored_invalid"),
+        (vec![with("host:host-a", &svc)], "stored_invalid"),
+        (vec![with("svc-discord", &svc)], "stored_invalid"),
+        (vec![with("member:dev-mac", &host)], "stored_invalid"),
+        (
+            vec![with(
+                "service:svc-discord",
+                &svc.replace("\"held\":false", "\"held\":0"),
+            )],
+            "stored_invalid",
+        ),
+        (
+            vec![with(
+                "host:host-a",
+                &" ".repeat(atem_client_ffi::control::MAX_CONTROL_STATE_JSON + 1),
+            )],
+            "too_large",
+        ),
+    ];
+    for (parts, want) in cases {
+        assert_eq!(load(parts.clone()), Err(want.to_owned()), "{parts:?}");
     }
 }
 
@@ -473,14 +610,16 @@ fn the_state_loads_only_as_written_for_its_own_list() {
         f(&mut state);
         atem_client::canonical::jcs(&state).unwrap()
     };
-    let cases: [(String, &str); 8] = [
+    let cases: [(String, &str); 10] = [
         ("[".into(), "malformed"),
         ("[]".into(), "malformed"),
         (
             edit(&|s| drop(s.as_object_mut().unwrap().remove("v"))),
             "malformed",
         ),
-        (edit(&|s| s["v"] = 2.into()), "unsupported_version"),
+        // The format before parts per principal.
+        (edit(&|s| s["v"] = 1.into()), "unsupported_version"),
+        (edit(&|s| s["v"] = 3.into()), "unsupported_version"),
         (
             edit(&|s| s["account_id"] = "acct-other".into()),
             "account_mismatch",
@@ -492,7 +631,7 @@ fn the_state_loads_only_as_written_for_its_own_list() {
         // The state's own rules: an interrupt without its revocation.
         (
             edit(&|s| {
-                s["services"]["svc-discord"]
+                s["principals"]["service:svc-discord"]
                     .as_object_mut()
                     .unwrap()
                     .remove("revoked_by");
@@ -501,7 +640,22 @@ fn the_state_loads_only_as_written_for_its_own_list() {
         ),
         // Host seqs out of their strict order.
         (
-            edit(&|s| s["hosts"]["host-a"] = json!({"interrupted": [7, 7]})),
+            edit(&|s| {
+                s["principals"]["host:host-a"] = json!({
+                    "interrupted": [7, 7],
+                    "records": [["00000000-0000-4000-8000-000000000001", "11".repeat(32)]],
+                })
+            }),
+            "stored_invalid",
+        ),
+        // More record ids than a principal keeps.
+        (
+            edit(&|s| {
+                let ids: Vec<Value> = (0..=atem_client::control::MAX_RECORD_IDS)
+                    .map(|n| json!([format!("00000000-0000-4000-8000-{n:012x}"), "11".repeat(32)]))
+                    .collect();
+                s["principals"]["host:host-a"] = json!({"records": ids});
+            }),
             "stored_invalid",
         ),
     ];

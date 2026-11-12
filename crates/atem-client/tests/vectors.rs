@@ -25,7 +25,7 @@ use atem_client::channel::{
 use atem_client::control::{
     Applied as ControlApplied, ControlAbout, ControlAction, ControlBody, ControlCheck,
     ControlError, ControlFeed, ControlPrincipal, ControlRecord, ControlSigner, ControlState,
-    FeedPos, HostAction, Transition, VerifiedSigner, build_control, principal_key_of,
+    FeedPos, HostAction, MAX_RECORD_IDS, Standing, VerifiedSigner, build_control, principal_key_of,
     verify_control,
 };
 use atem_client::domain::{SignLabel, SigningInput};
@@ -4882,20 +4882,109 @@ impl<'a> ControlGen<'a> {
     /// A sequence: its steps applied to a new state of L, and the state
     /// they leave (`ControlState::to_json`, the form a host persists).
     fn sequence(&self, label: &str, note: &str, steps: Vec<Value>) -> Value {
-        let mut state = ControlState::new(&self.ctx.chain(&[]));
-        for step in &steps {
+        self.sequence_on(label, note, None, steps)
+    }
+
+    /// A sequence from `initial` (a new state of L when `None`), each step
+    /// with `standing`: its record principal's after the step
+    /// (`ControlState::standing`). `initial` is written with `fill`, the
+    /// record whose body, under other record ids, its records of
+    /// svc-discord that aren't the file's are.
+    fn sequence_on(
+        &self,
+        label: &str,
+        note: &str,
+        initial: Option<(&ControlState, &str)>,
+        mut steps: Vec<Value>,
+    ) -> Value {
+        let mut state = initial.map_or_else(
+            || ControlState::new(&self.ctx.chain(&[])),
+            |(initial, _)| initial.clone(),
+        );
+        for step in &mut steps {
             let chain = chain_labels(step);
+            let rec = self.record(s(step, "record"));
             state = state
                 .apply(
-                    &self.record(s(step, "record")),
+                    &rec,
                     &self.ctx.chain(&chain),
                     feed_pos(step),
                     step["host_applied_seq"].as_u64().unwrap(),
                 )
                 .next;
+            step["standing"] = standing_json(&state.standing(&rec.principal().name()));
         }
-        serde_json::json!({"label": label, "note": note, "steps": steps, "state": state.to_json()})
+        let mut v = serde_json::json!({"label": label, "note": note, "steps": steps, "state": state.to_json()});
+        if let Some((initial, fill)) = initial {
+            v["initial"] = initial.to_json();
+            v["fill"] = fill.into();
+        }
+        v
     }
+
+    /// A state of L after the file's records `first` (each read at its
+    /// position, every one counting), then `count` copies of the record
+    /// `fill`'s body under the record ids `control_rid(0x1000 + i)`, signed
+    /// by `signed_with` and read at no position, each counting: the start
+    /// of an eviction sequence, svc-discord's records full.
+    fn filled(
+        &self,
+        first: &[(&str, Option<(Feed, u64)>)],
+        fill: &str,
+        signed_with: &str,
+        count: u64,
+    ) -> ControlState {
+        let l = self.ctx.chain(&[]);
+        let counts = |state: &ControlState, rec: &ControlRecord, pos: Option<FeedPos>| {
+            let t = state.apply(rec, &l, pos, 6);
+            assert!(
+                matches!(
+                    t.applied.record_result,
+                    ApplicationResult::Applied | ApplicationResult::Duplicate
+                ),
+                "{} counts",
+                rec.record_id()
+            );
+            t.next
+        };
+        let mut state = ControlState::new(&l);
+        for (label, pos) in first {
+            let pos = pos.map(|(feed, feed_seq)| FeedPos {
+                origin: feed.0.into(),
+                feed_id: feed.1.into(),
+                feed_seq,
+            });
+            state = counts(&state, &self.record(label), pos);
+        }
+        let template = self.record(fill).body().clone();
+        for i in 0..count {
+            let mut body = template.clone();
+            body.record_id = control_rid(0x1000 + i);
+            let object =
+                build_control(&self.book.provider, &self.book.signer(signed_with), &body).unwrap();
+            state = counts(&state, &ControlRecord::from_signed(object).unwrap(), None);
+        }
+        let ids = state.part(SVC).unwrap()["records"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert_eq!(ids, MAX_RECORD_IDS, "svc-discord's records full");
+        state
+    }
+}
+
+/// What a principal has in force as the vectors write it
+/// (`ControlState::standing`): `held`, `interrupted` (sorted), and
+/// `revoked`, `coverage` `{origin, feed_id}` when there are.
+fn standing_json(standing: &Standing) -> Value {
+    let mut v = serde_json::json!({"held": standing.held, "interrupted": standing.interrupted});
+    if let Some(by) = &standing.revoked {
+        v["revoked"] = by.as_str().into();
+    }
+    if let Some(c) = &standing.coverage {
+        v["coverage"] = serde_json::json!({"origin": c.origin, "feed_id": c.feed_id});
+    }
+    v
 }
 
 /// A step's feed position.
@@ -5689,6 +5778,43 @@ fn control_vectors(book: &Book) -> Value {
                 step("S1_cover", a(1), applied("duplicate", &[("cover", "duplicate")], none.clone(), false)),
             ],
         ),
+        g.sequence_on(
+            "Q19_evicted_hold_holds_again",
+            "a principal keeps at most 256 counted record ids, oldest first, never evicting the coverage's cover (decision 19, for Astation's agreement): from svc-discord covered, held and full (S1_cover, S2_hold, then 254 copies of S2_hold), S3_release lifts the hold and evicts S2_hold, which replayed holds again (a stop its key holder could sign anew); S3_release, still counted, is a duplicate that lifts nothing; a later release does",
+            Some((
+                &g.filled(&[("S1_cover", a(1)), ("S2_hold", a(2))], "S2_hold", "svc-discord", 254),
+                "S2_hold",
+            )),
+            vec![
+                step("S3_release", a(3), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+                step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("S3_release", a(3), applied("duplicate", &[("release", "duplicate")], none.clone(), false)),
+                step("S11_release", a(4), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence_on(
+            "Q20_evicted_revoke_still_duplicate",
+            "the record that revoked a principal is never evicted; another revoke evicted and replayed is verified again and is still a duplicate: from svc-discord revoked and full (S4_revoke, M1_revoke, then 254 copies of S4_revoke), S5_revoke_interrupt adds the interrupt and evicts M1_revoke, which comes back a duplicate, as S4_revoke (pinned) and a later interrupt do",
+            Some((
+                &g.filled(&[("S4_revoke", a(4)), ("M1_revoke", a(5))], "S4_revoke", "svc-discord", 254),
+                "S4_revoke",
+            )),
+            vec![
+                step(
+                    "S5_revoke_interrupt",
+                    a(6),
+                    applied(
+                        "applied",
+                        &[("revocation", "duplicate"), ("interrupt", "applied")],
+                        vec![act_interrupt(SVC, &control_rid(4))],
+                        false,
+                    ),
+                ),
+                step("M1_revoke", a(7), applied("duplicate", &[("revocation", "duplicate")], none.clone(), false)),
+                step("S4_revoke", a(4), applied("duplicate", &[("revocation", "duplicate")], none.clone(), false)),
+                step("M2_interrupt", a(8), applied("duplicate", &[("interrupt", "duplicate")], none.clone(), false)),
+            ],
+        ),
     ];
 
     let svc_key = book.signer_public("svc-discord");
@@ -5696,7 +5822,7 @@ fn control_vectors(book: &Book) -> Value {
         "name": "r9-vectors-host-work-control",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (the records that counted kept by principal, then record_id). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused).",
+        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part's `records` the [record_id, digest] pairs that counted, oldest first). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover (decision 19, for Astation's agreement).",
         "account_id": "acct-test-1",
         "genesis_hash": genesis_hash().to_hex(),
         "stations": {
@@ -5912,24 +6038,49 @@ fn host_work_control() {
         sequences, made["sequences"],
         "sequences: as control_vectors makes them"
     );
+    let mut evicting = 0;
     for q in sequences.as_array().unwrap() {
         let label = s(q, "label");
-        let mut state = ControlState::new(&l);
+        // From `initial` (read as a host reads its stored state), else new.
+        let mut state = match q.get("initial") {
+            Some(initial) => {
+                let state = ControlState::from_json(&strict(initial).into_value()).unwrap();
+                assert_eq!(state.to_json(), *initial, "{label}: initial");
+                let full = initial["principals"][SVC]["records"].as_array().unwrap();
+                assert_eq!(full.len(), MAX_RECORD_IDS, "{label}: svc-discord full");
+                assert!(q["fill"].is_string(), "{label}: fill");
+                evicting += 1;
+                state
+            }
+            None => ControlState::new(&l),
+        };
         for (i, step) in q["steps"].as_array().unwrap().iter().enumerate() {
             let chain = chain_labels(step);
-            let Transition { applied, next } = state.apply(
-                &by_label[s(step, "record")],
+            let rec = &by_label[s(step, "record")];
+            let principal = rec.principal().name();
+            let t = state.apply(
+                rec,
                 &ctx.chain(&chain),
                 feed_pos(step),
                 step["host_applied_seq"].as_u64().unwrap(),
             );
             assert_eq!(
-                applied_of(&applied),
+                applied_of(&t.applied),
                 step["expect"],
                 "{label} step {}",
                 i + 1
             );
-            state = next;
+            assert_eq!(
+                standing_json(&t.next.standing(&principal)),
+                step["standing"],
+                "{label} step {}: standing",
+                i + 1
+            );
+            // Touched: the record's principal exactly when its part changed.
+            let changed = state.part(&principal) != t.next.part(&principal);
+            let touched = if changed { vec![principal] } else { vec![] };
+            assert_eq!(t.touched(), touched, "{label} step {}: touched", i + 1);
+            state = t.next;
         }
         assert_eq!(state.to_json(), q["state"], "{label}: state");
         let text = jcs(&q["state"]).unwrap();
@@ -5940,10 +6091,30 @@ fn host_work_control() {
             text,
             "{label}: to_json(from_json) is the same text"
         );
+        // Split into its parts and recombined, the same state.
+        let parts: Vec<(String, Value)> = state
+            .principals()
+            .into_iter()
+            .map(|p| {
+                let part = state.part(&p).unwrap();
+                assert_eq!(part, q["state"]["principals"][&p], "{label}: {p}'s part");
+                (p, part)
+            })
+            .collect();
+        assert_eq!(
+            parts.len(),
+            q["state"]["principals"].as_object().unwrap().len()
+        );
+        assert_eq!(
+            ControlState::from_parts(&l, parts).unwrap(),
+            state,
+            "{label}: from_parts"
+        );
         run.pass(format!(
-            "{label}: every step's results, the state and its round trip"
+            "{label}: every step's results, standing and touched, the state, its round trip and its parts"
         ));
     }
+    assert_eq!(evicting, 2, "the two eviction sequences");
     run.finish();
 }
 

@@ -703,7 +703,9 @@ impl ControlRecordsRequest {
 /// One record's result in a `control_records_result`: the record's, and
 /// each effect it carries with its own (I.5.8, "results and counts are per
 /// effect"). The words are [`ApplicationResult::code`] and
-/// [`EffectKind::code`].
+/// [`EffectKind::code`]; the record's `result` follows from its `effects`
+/// by host-work-v1 §11.1's rule ([`ApplicationResult::of_effects`]), and a
+/// result that doesn't is malformed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordResult {
     pub record_id: String,
@@ -758,6 +760,10 @@ impl RecordResult {
             }
             effects.push(EffectResult { effect, result });
         }
+        // The record's result follows from its effects' (§11.1).
+        if result != ApplicationResult::of_effects(&effects) {
+            return Err("result");
+        }
         Ok(RecordResult {
             record_id,
             result,
@@ -778,7 +784,8 @@ pub struct ControlRecordsResult {
 
 impl ControlRecordsResult {
     /// Reads a `control_records_result`'s `data`: exactly its fields, the
-    /// words of the vocabulary, UUID v4 ids, and one to 64 results.
+    /// words of the vocabulary, UUID v4 ids, and one to 64 results, each
+    /// record's `result` the one its `effects` give.
     pub fn from_data(data: &Value) -> Result<Self, &'static str> {
         let o = data.as_object().ok_or("data")?;
         if o.get("op").and_then(Value::as_str) != Some("control_records_result") {
@@ -1397,6 +1404,56 @@ mod tests {
             match Incoming::parse(&bytes(&json!({"type": "session", "data": data})))? {
                 Incoming::ControlRecordsResult(r) => Ok(r),
                 other => panic!("not a result: {other:?}"),
+            }
+        }
+
+        /// A record's `result` follows from its effects by §11.1's rule:
+        /// `applied` when any effect is, `duplicate` when every effect is,
+        /// else `pending` when any is, else `refused`. One that says
+        /// otherwise is a malformed result, whatever its words.
+        #[test]
+        fn control_records_result_refuses_a_record_result_inconsistent_with_its_effects() {
+            use ApplicationResult::{Applied, Duplicate, Pending, Refused};
+            use EffectKind::{Interrupt, Revocation};
+            let sent = records(1);
+            let good = control_records_result(RE, ID, &results_for(&sent))["data"].clone();
+            let cases: [(&[(EffectKind, ApplicationResult)], ApplicationResult); 9] = [
+                (&[(Interrupt, Applied)], Applied),
+                (&[(Interrupt, Duplicate)], Duplicate),
+                (&[(Interrupt, Pending)], Pending),
+                (&[(Interrupt, Refused)], Refused),
+                (&[(Revocation, Duplicate), (Interrupt, Applied)], Applied),
+                (&[(Revocation, Refused), (Interrupt, Applied)], Applied),
+                (
+                    &[(Revocation, Duplicate), (Interrupt, Duplicate)],
+                    Duplicate,
+                ),
+                (&[(Revocation, Duplicate), (Interrupt, Pending)], Pending),
+                (&[(Revocation, Refused), (Interrupt, Duplicate)], Refused),
+            ];
+            for (effects, want) in cases {
+                let wire: Vec<Value> = effects
+                    .iter()
+                    .map(|(e, r)| json!({"effect": e.code(), "result": r.code()}))
+                    .collect();
+                for result in [Applied, Duplicate, Pending, Refused] {
+                    let mut d = good.clone();
+                    d["results"][0]["effects"] = json!(wire);
+                    d["results"][0]["result"] = json!(result.code());
+                    let got = parse_result(&d);
+                    if result == want {
+                        let r = got.unwrap_or_else(|e| panic!("{d}: {e}"));
+                        assert_eq!(r.results[0].result, want);
+                    } else {
+                        assert!(got.is_err(), "{} beside {wire:?}", result.code());
+                    }
+                }
+            }
+            // The rule is the state's own.
+            for (effects, want) in cases {
+                let effects: Vec<EffectResult> =
+                    effects.iter().map(|&(e, r)| effect(e, r)).collect();
+                assert_eq!(ApplicationResult::of_effects(&effects), want);
             }
         }
 

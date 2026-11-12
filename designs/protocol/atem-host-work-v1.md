@@ -1019,7 +1019,10 @@ record, a re-signed copy, a revoke of a revoked principal, an interrupt for
 a revocation already interrupted), `pending` (not in force yet, and it can
 be later), `refused` (not in force, and never from this record). The
 record's `result` is `applied` when any effect is, `duplicate` when every
-effect is, else `pending` when any effect is, else `refused`. **Consumers
+effect is, else `pending` when any effect is, else `refused`
+(`ApplicationResult::of_effects`; a `control_records_result` whose record
+`result` doesn't follow from its `effects` this way is malformed, and the
+client core refuses it). **Consumers
 read `effects`, not only `result`**: a revoke that adds `interrupt_running:
 true` to one already applied is `applied` for its interrupt and `duplicate`
 for its revocation. For the revocation, `duplicate` means "already in force
@@ -1044,7 +1047,22 @@ The rules:
    and alerted, and the first body keeps the id; a stop (`hold`, `revoke`,
    `interrupt_running`) still applies its effects (a stop only ever adds),
    while a `cover` or `release` is `refused`. A record kept pending or
-   refused takes no `record_id`.
+   refused takes no `record_id`. **Bounded** (**Atem's proposal, for
+   Astation's agreement**; plan decision 19): a host keeps at most 256
+   counted record ids per principal (`MAX_RECORD_IDS`), and the next
+   evicts the oldest, never the record that revoked the principal nor the
+   coverage's cover. An evicted record that comes back is verified and
+   applied as a new one. A revoke stays a `duplicate` (the revocation is
+   in force, and so is its interrupt once applied) and a cover is no newer
+   than the coverage's, so it changes the state in two ways only: a
+   replayed `hold` holds again, a stop (whoever can replay it holds the
+   principal's key, which signs holds anyway), and a `release` its own
+   Station serves again at a later position of the covering feed lifts a
+   hold (only that feed's Station can place it there, and it could sign a
+   new release anyway). Its result may differ from `duplicate`
+   (`refused` for another Station's older cover, or for a manager's copy
+   whose signer was removed since), and another body under its id is no
+   longer a collision.
 2. **Verification** (above): `pending` waits for every effect; `refused` is
    evidence. A list of another account or genesis applies nothing.
 3. **A revoke is final**, from any feed or from none.
@@ -1081,6 +1099,29 @@ The rules:
    is a `duplicate` by its `record_id` and holds nothing again.
 7. **After a revoke**, `cover`, `hold` and `release` change nothing: a
    `duplicate` when they ask for what is recorded, else `refused`.
+
+**The state, per principal** (planned with the feeds; for Astation's
+agreement with the bound above). A host's control state is one part per
+principal (`ControlState::part`, `from_parts`; the bindings'
+`ControlStateHandle::{principals, part, from_parts}`), and a record changes
+at most its own principal's: the transition names it (`touched`), and the
+host writes only that part in the record's transaction (one row per
+principal), never the whole state. A part keeps its records that counted
+oldest first, `[record_id, digest]` pairs, with what is in force for the
+principal; the whole state (`to_json`, `"v": 2`) is the parts by principal
+with the device list's account and genesis, which a host's parts take
+from its device list. `standing(principal)` is what is in force: its
+revocation (the revoking record's `record_id`; a host principal's
+revocation is a device-list entry, never here), the revocations whose
+interrupt a record put in force (a service's revoking `record_id`, a host
+principal's `revoke_seq` in decimal), the hold, and the covering feed
+`{origin, feed_id}`. Each application also says why a record is `pending`
+(the verifier's reason, or `list_frozen`, `not_revoked`: a service's
+interrupt before its revocation, `revoke_not_applied`: a host principal's
+before host-work applied its revoke) or `refused` (the verifier's reason,
+or `order`, `after_revoke`, `not_newer`), or kept as evidence
+(`collision`): `Applied.why`, the host's for its pending store, evidence
+and alerts.
 
 **Resets** (**Atem's proposal, for Astation's and Auth/Portal's
 agreement**: design I.5.2's snapshot re-issues "the latest revoke, hold or
@@ -1145,17 +1186,25 @@ hold from a Station whose cover wasn't newer and after a reset whose cover
 isn't newer (applied, its release refused), a service's interrupt waiting
 for its revocation, holds and releases out of order in one feed, a hold
 with no coverage, the old Station's cover replayed after a move, an
-`issued_at` tie broken by `record_id`, record ids per principal, and
-another body under a counted id: a stop applies, a release or cover is
-refused). Each step's position is `{origin, feed_id, feed_seq}`; a state
-keeps the records that counted by principal, then `record_id`.
+`issued_at` tie broken by `record_id`, record ids per principal, another
+body under a counted id: a stop applies, a release or cover is refused,
+and the bound: from an `initial` state whose principal's records are full
+(those not in the file copies of the record `fill` under other ids), an
+evicted hold replayed after a release holds again and an evicted revoke
+replayed is still a duplicate), each step with the `standing` of its
+record's principal after it. Each step's position is `{origin, feed_id,
+feed_seq}`; a state (v2) keeps one part per principal, its records the
+`[record_id, digest]` pairs that counted, oldest first.
 They run in `crates/atem-client/tests/vectors.rs`, in the bindings'
 `tests/control.rs` and in the Swift, Kotlin and WASM conformance suites;
 `scripts/check-r9-vectors.py` recomputes their cryptographic values
 (`jcs`, signing inputs, every signature by the key its chain names, the
 `r9Svc` values, the record digests a state keeps, each a body of that
-principal with that `record_id`, and each step's position against the
-stations) and derives no verdict.
+principal with that `record_id` or, for an id no record of the file has,
+the `fill` record's body under it, each part's 256-id bound and its
+revocation's and cover's records among them, each step's position against
+the stations, and the last step's `standing` against the state) and
+derives no verdict.
 Every SDK package's checksum manifest lists the file.
 
 ### 11.2 `work_interrupt` and `work_resolve`

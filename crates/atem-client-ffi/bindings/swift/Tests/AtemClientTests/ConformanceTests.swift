@@ -786,10 +786,12 @@ final class ConformanceTests: XCTestCase {
         // each of its chains as `checks` says (or its parse refuses it,
         // `parse_error`); the builders reproduce it byte for byte (a software
         // store, or the signing input and a signature); every sequence runs
-        // through a ControlStateHandle with each step's per-effect results and
-        // the state it leaves (a handle never changes, so a failed commit
-        // loses no effect); and a provider is asked under the purpose the
-        // record's signer gives.
+        // through a ControlStateHandle (from its `initial` state when it has
+        // one) with each step's per-effect results, the standing of its
+        // record's principal and the parts it touched, and the state it
+        // leaves, whole and in parts per principal (a handle never changes,
+        // so a failed commit loses no effect); and a provider is asked under
+        // the purpose the record's signer gives.
         let ctl = try load("r9-vectors-host-work-control")
         let ctlRecords = a(ctl["records"]).map(o)
         var ctlByLabel: [String: [String: Any]] = [:]
@@ -926,25 +928,61 @@ final class ConformanceTests: XCTestCase {
             guard let p = v as? [String: Any] else { return nil }
             return ControlFeedPos(origin: s(p["origin"]), feedId: s(p["feed_id"]), feedSeq: u(p["feed_seq"]))
         }
-        check("control records: every sequence's per-effect results and its state through ControlStateHandle") {
+        // A standing as the vectors write it: `revoked` and `coverage` only when there are.
+        func controlStandingOf(_ standing: ControlStanding) -> [String: Any] {
+            var out: [String: Any] = ["held": standing.held, "interrupted": standing.interrupted]
+            if let revoked = standing.revoked { out["revoked"] = revoked }
+            if let coverage = standing.coverage { out["coverage"] = ["origin": coverage.origin, "feed_id": coverage.feedId] }
+            return out
+        }
+        func controlPartsOf(_ state: ControlStateHandle) -> [ControlStatePart] {
+            state.principals().map { ControlStatePart(principal: $0, partJson: state.part(principal: $0)!) }
+        }
+        check("control records: every sequence's per-effect results, standing and state through ControlStateHandle") {
             for q in a(ctl["sequences"]).map(o) {
                 let label = s(q["label"])
                 var state = ControlStateHandle(log: try logL())
+                if let initial = q["initial"] {
+                    state = try ControlStateHandle.fromJson(log: try logL(), stateJson: try canonicalJson(json: js(initial)))
+                }
                 for (i, step) in a(q["steps"]).map(o).enumerated() {
-                    let record = js(ctlByLabel[s(step["record"])]!["record"]!)
+                    let r = ctlByLabel[s(step["record"])]!
+                    let principal = s(o(o(r["record"])["body"])["principal"])
+                    let record = js(r["record"]!)
                     let t = try state.apply(recordJson: record, log: try logAfter(a(step["chain"]).map(s)), pos: ctlPos(step["pos"]), hostAppliedSeq: u(step["host_applied_seq"]))
                     try eq(canon(controlAppliedOf(t.applied)), canon(o(step["expect"])), "\(label) step \(i + 1)")
+                    try eq(canon(controlStandingOf(t.next.standing(principal: principal))), canon(o(step["standing"])), "\(label) step \(i + 1) standing")
+                    let changed = state.part(principal: principal) != t.next.part(principal: principal)
+                    try eq(t.touched, changed ? [principal] : [], "\(label) step \(i + 1) touched")
                     state = t.next
                 }
                 let text = try canonicalJson(json: js(q["state"]!))
                 try eq(state.toJson(), text, label)
                 try eq(try ControlStateHandle.fromJson(log: try logL(), stateJson: text).toJson(), text, label)
+                try eq(try ControlStateHandle.fromParts(log: try logL(), parts: controlPartsOf(state)).toJson(), text, "\(label) from its parts")
             }
             // Only its own device list's state, exactly as written.
             let text = try canonicalJson(json: js(o(a(ctl["sequences"])[0])["state"]!))
             try throwsCode("account_mismatch") { _ = try ControlStateHandle.fromJson(log: try logL(), stateJson: text.replacingOccurrences(of: "\"acct-test-1\"", with: "\"acct-other\"")) }
-            try throwsCode("unsupported_version") { _ = try ControlStateHandle.fromJson(log: try logL(), stateJson: text.replacingOccurrences(of: "\"v\":1", with: "\"v\":2")) }
+            try throwsCode("unsupported_version") { _ = try ControlStateHandle.fromJson(log: try logL(), stateJson: text.replacingOccurrences(of: "\"v\":2", with: "\"v\":1")) }
             try throwsCode("malformed") { _ = try ControlStateHandle.fromJson(log: try logL(), stateJson: "[") }
+        }
+        check("control records: a state's parts per principal load in any order, only as written") {
+            let q = a(ctl["sequences"]).map(o).first { s($0["label"]) == "Q17_record_ids_per_principal" }!
+            let state = try ControlStateHandle.fromJson(log: try logL(), stateJson: try canonicalJson(json: js(q["state"]!)))
+            let parts = controlPartsOf(state)
+            try eq(parts.map { $0.principal }, ["host:host-a", "service:svc-discord"])
+            for part in parts {
+                try eq(part.partJson, try canonicalJson(json: js(o(o(q["state"])["principals"])[part.principal]!)), part.principal)
+            }
+            try eq(try ControlStateHandle.fromParts(log: try logL(), parts: parts.reversed()).toJson(), state.toJson(), "any order")
+            try eq(try ControlStateHandle.fromParts(log: try logL(), parts: []).toJson(), ControlStateHandle(log: try logL()).toJson(), "none")
+            try eq(state.part(principal: "service:svc-other"), nil)
+            try eq(canon(controlStandingOf(state.standing(principal: "member:dev-mac"))), canon(["held": false, "interrupted": [String]()] as [String: Any]))
+            try throwsCode("stored_invalid") { _ = try ControlStateHandle.fromParts(log: try logL(), parts: [parts[1], parts[1]]) }
+            try throwsCode("malformed") { _ = try ControlStateHandle.fromParts(log: try logL(), parts: [ControlStatePart(principal: "service:svc-discord", partJson: "{")]) }
+            try throwsCode("stored_invalid") { _ = try ControlStateHandle.fromParts(log: try logL(), parts: [ControlStatePart(principal: "service:svc-discord", partJson: parts[0].partJson)]) }
+            try throwsCode("stored_invalid") { _ = try ControlStateHandle.fromParts(log: try logL(), parts: [ControlStatePart(principal: "svc-discord", partJson: parts[1].partJson)]) }
         }
         check("control records: a failed commit loses no effect (apply leaves its handle as it was)") {
             let state = ControlStateHandle(log: try logL())

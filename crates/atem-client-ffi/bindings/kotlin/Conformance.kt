@@ -604,10 +604,12 @@ fun main(args: Array<String>) {
     // of its chains as `checks` says (or its parse refuses it,
     // `parse_error`); the builders reproduce it byte for byte (a software
     // store, or the signing input and a signature); every sequence runs
-    // through a ControlStateHandle with each step's per-effect results and
-    // the state it leaves (a handle never changes, so a failed commit loses
-    // no effect); and a provider is asked under the purpose the record's
-    // signer gives.
+    // through a ControlStateHandle (from its `initial` state when it has
+    // one) with each step's per-effect results, the standing of its
+    // record's principal and the parts it touched, and the state it leaves,
+    // whole and in parts per principal (a handle never changes, so a failed
+    // commit loses no effect); and a provider is asked under the purpose
+    // the record's signer gives.
     val ctl = load("r9-vectors-host-work-control")
     val ctlRecords = ctl["records"].arr()
     val ctlByLabel = ctlRecords.associateBy { it["label"].s() }
@@ -721,25 +723,56 @@ fun main(args: Array<String>) {
         "evidence" to a.evidence)
     fun ctlPos(p: Any?): ControlFeedPos? =
         p?.let { ControlFeedPos(it["origin"].s(), it["feed_id"].s(), it["feed_seq"].l().toULong()) }
-    check("control records: every sequence's per-effect results and its state through ControlStateHandle") {
+    fun controlStandingOf(s: ControlStanding): Map<String, Any?> {
+        val m = linkedMapOf<String, Any?>("held" to s.held, "interrupted" to s.interrupted)
+        s.revoked?.let { m["revoked"] = it }
+        s.coverage?.let { m["coverage"] = mapOf("origin" to it.origin, "feed_id" to it.feedId) }
+        return m
+    }
+    fun controlPartsOf(state: ControlStateHandle): List<ControlStatePart> =
+        state.principals().map { ControlStatePart(it, state.part(it)!!) }
+    check("control records: every sequence's per-effect results, standing and state through ControlStateHandle") {
         for (q in ctl["sequences"].arr()) {
             val label = q["label"].s()
-            var state = ControlStateHandle(logL())
+            val initial = q.obj()["initial"]
+            var state = if (initial == null) ControlStateHandle(logL())
+                else ControlStateHandle.fromJson(logL(), canonicalJson(Json.write(initial)))
             q["steps"].arr().forEachIndexed { i, step ->
-                val record = Json.write(ctlByLabel.getValue(step["record"].s())["record"])
+                val r = ctlByLabel.getValue(step["record"].s())
+                val principal = r["record"]["body"]["principal"].s()
+                val record = Json.write(r["record"])
                 val t = state.apply(record, logAfter(strs(step["chain"])), ctlPos(step.obj()["pos"]), step["host_applied_seq"].l().toULong())
                 eq(controlAppliedOf(t.applied), step["expect"].obj(), "$label step ${i + 1}")
+                eq(controlStandingOf(t.next.standing(principal)), step["standing"].obj(), "$label step ${i + 1} standing")
+                val changed = state.part(principal) != t.next.part(principal)
+                eq(t.touched, if (changed) listOf(principal) else emptyList(), "$label step ${i + 1} touched")
                 state = t.next
             }
             val text = canonicalJson(Json.write(q["state"]))
             eq(state.toJson(), text, label)
             eq(ControlStateHandle.fromJson(logL(), text).toJson(), text, label)
+            eq(ControlStateHandle.fromParts(logL(), controlPartsOf(state)).toJson(), text, "$label from its parts")
         }
         // Only its own device list's state, exactly as written.
         val text = canonicalJson(Json.write(ctl["sequences"][0]["state"]))
         throwsCode("account_mismatch") { ControlStateHandle.fromJson(logL(), text.replace("\"acct-test-1\"", "\"acct-other\"")) }
-        throwsCode("unsupported_version") { ControlStateHandle.fromJson(logL(), text.replace("\"v\":1", "\"v\":2")) }
+        throwsCode("unsupported_version") { ControlStateHandle.fromJson(logL(), text.replace("\"v\":2", "\"v\":1")) }
         throwsCode("malformed") { ControlStateHandle.fromJson(logL(), "[") }
+    }
+    check("control records: a state's parts per principal load in any order, only as written") {
+        val q = ctl["sequences"].arr().first { it["label"].s() == "Q17_record_ids_per_principal" }
+        val state = ControlStateHandle.fromJson(logL(), canonicalJson(Json.write(q["state"])))
+        val parts = controlPartsOf(state)
+        eq(parts.map { it.principal }, listOf("host:host-a", "service:svc-discord"))
+        for (part in parts) eq(part.partJson, canonicalJson(Json.write(q["state"]["principals"][part.principal])), part.principal)
+        eq(ControlStateHandle.fromParts(logL(), parts.reversed()).toJson(), state.toJson(), "any order")
+        eq(ControlStateHandle.fromParts(logL(), emptyList()).toJson(), ControlStateHandle(logL()).toJson(), "none")
+        eq(state.part("service:svc-other"), null)
+        eq(controlStandingOf(state.standing("member:dev-mac")), mapOf("held" to false, "interrupted" to emptyList<String>()))
+        throwsCode("stored_invalid") { ControlStateHandle.fromParts(logL(), listOf(parts[1], parts[1])) }
+        throwsCode("malformed") { ControlStateHandle.fromParts(logL(), listOf(ControlStatePart("service:svc-discord", "{"))) }
+        throwsCode("stored_invalid") { ControlStateHandle.fromParts(logL(), listOf(ControlStatePart("service:svc-discord", parts[0].partJson))) }
+        throwsCode("stored_invalid") { ControlStateHandle.fromParts(logL(), listOf(ControlStatePart("svc-discord", parts[1].partJson))) }
     }
     check("control records: a failed commit loses no effect (apply leaves its handle as it was)") {
         val state = ControlStateHandle(logL())

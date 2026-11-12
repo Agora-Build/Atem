@@ -465,9 +465,11 @@ check("device-list actions: verifyHostEncSig binds every field of a host's enc_s
 // its chains as `checks` says (or its parse refuses it, `parse_error`); the
 // builders reproduce it byte for byte (a software store, or the signing
 // input and a signature: a Station's KMS or WebCrypto); every sequence runs
-// through a ControlStateHandle with each step's per-effect results and the
-// state it leaves, which loads again only for its own device list; and a
-// handle never changes, so a failed commit loses no effect.
+// through a ControlStateHandle (from its `initial` state when it has one)
+// with each step's per-effect results, the standing of its record's
+// principal and the parts it touched, and the state it leaves, which loads
+// again, whole or from its parts per principal, only for its own device
+// list; and a handle never changes, so a failed commit loses no effect.
 const ctl = load("r9-vectors-host-work-control");
 const ctlByLabel = Object.fromEntries(ctl.records.map((r) => [r.label, r]));
 const CONTROL_FIELDS = ["type", "v", "account_id", "genesis_hash", "origin", "feed_id", "principal", "principal_key", "signer", "action", "interrupt_running", "revoke_seq", "record_id", "issued_at", "about"];
@@ -566,24 +568,54 @@ check("control records: the builders reproduce every record; a body the parse re
 });
 const controlActionOut = ({ feedId, ...rest }) => (feedId === undefined ? rest : { ...rest, feed_id: feedId });
 const ctlPos = (pos) => (pos === undefined ? null : { origin: pos.origin, feedId: pos.feed_id, feedSeq: pos.feed_seq });
-check("control records: every sequence's per-effect results and its state through ControlStateHandle", () => {
+// A standing as the vectors write it: `revoked` and `coverage` only when there are.
+const controlStandingOf = ({ revoked, interrupted, held, coverage }) => ({
+  held,
+  interrupted,
+  ...(revoked === null ? {} : { revoked }),
+  ...(coverage === null ? {} : { coverage: { origin: coverage.origin, feed_id: coverage.feedId } }),
+});
+const controlPartsOf = (state) => state.principals().map((principal) => ({ principal, partJson: state.part(principal) }));
+check("control records: every sequence's per-effect results, standing and state through ControlStateHandle", () => {
   for (const q of ctl.sequences) {
-    let state = new m.ControlStateHandle(logL());
+    let state = q.initial === undefined ? new m.ControlStateHandle(logL()) : m.ControlStateHandle.fromJson(logL(), m.canonicalJson(str(q.initial)));
     q.steps.forEach((step, i) => {
+      const principal = ctlByLabel[step.record].record.body.principal;
       const t = state.apply(str(ctlByLabel[step.record].record), logAfter(step.chain), ctlPos(step.pos), step.host_applied_seq);
       const got = t.applied;
       same({ ...got, actions: got.actions.map(controlActionOut) }, step.expect, `${q.label} step ${i + 1}`);
+      same(controlStandingOf(t.next.standing(principal)), step.standing, `${q.label} step ${i + 1} standing`);
+      const changed = state.part(principal) !== t.next.part(principal);
+      same(t.touched, changed ? [principal] : [], `${q.label} step ${i + 1} touched`);
       state = t.next;
     });
     const text = m.canonicalJson(str(q.state));
     eq(state.toJson(), text, q.label);
     eq(m.ControlStateHandle.fromJson(logL(), text).toJson(), text, q.label);
+    eq(m.ControlStateHandle.fromParts(logL(), controlPartsOf(state)).toJson(), text, `${q.label} from its parts`);
   }
   // Only its own device list's state, exactly as written.
   const text = m.canonicalJson(str(ctl.sequences[0].state));
   throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace('"acct-test-1"', '"acct-other"')), "account_mismatch");
-  throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace('"v":1', '"v":2')), "unsupported_version");
+  throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace('"v":2', '"v":1')), "unsupported_version");
   throwsCode(() => m.ControlStateHandle.fromJson(logL(), "["), "malformed");
+});
+check("control records: a state's parts per principal load in any order, only as written", () => {
+  const q = ctl.sequences.find((x) => x.label === "Q17_record_ids_per_principal");
+  const state = m.ControlStateHandle.fromJson(logL(), m.canonicalJson(str(q.state)));
+  const parts = controlPartsOf(state);
+  same(parts.map((p) => p.principal), ["host:host-a", "service:svc-discord"]);
+  for (const part of parts) eq(part.partJson, m.canonicalJson(str(q.state.principals[part.principal])), part.principal);
+  eq(m.ControlStateHandle.fromParts(logL(), [...parts].reverse()).toJson(), state.toJson(), "any order");
+  eq(m.ControlStateHandle.fromParts(logL(), []).toJson(), new m.ControlStateHandle(logL()).toJson(), "none");
+  eq(state.part("service:svc-other"), undefined);
+  same(controlStandingOf(state.standing("member:dev-mac")), { held: false, interrupted: [] });
+  throwsCode(() => m.ControlStateHandle.fromParts(logL(), [parts[1], parts[1]]), "stored_invalid");
+  throwsCode(() => m.ControlStateHandle.fromParts(logL(), [{ principal: "service:svc-discord", partJson: "{" }]), "malformed");
+  throwsCode(() => m.ControlStateHandle.fromParts(logL(), [{ principal: "service:svc-discord", partJson: parts[0].partJson }]), "stored_invalid");
+  throwsCode(() => m.ControlStateHandle.fromParts(logL(), [{ principal: "svc-discord", partJson: parts[1].partJson }]), "stored_invalid");
+  // A part names exactly its two fields.
+  throwsCode(() => m.ControlStateHandle.fromParts(logL(), [{ ...parts[1], part_json: parts[1].partJson }]), "malformed");
 });
 check("control records: a failed commit loses no effect (apply leaves its handle as it was)", () => {
   const state = new m.ControlStateHandle(logL());
