@@ -100,3 +100,27 @@ jobs:
             echo "::error::tests were ignored in the debug build"
             exit 1
           fi
+
+      # The delegated clock's time-namespace guard against a real namespace
+      # (host-work-v1 §11.6 "one boot", Decision 17): the ignored test
+      # `timens_offset_is_seen_in_a_time_namespace` checks that the reading
+      # reports the boot-time offset `unshare --time --boottime=86400` gives
+      # its children and that the clock state's guard sees it. A new time
+      # namespace needs privilege, so the bin's test binary (a debug build,
+      # located from cargo's JSON output) runs under sudo, forked into it. A
+      # run that finds no such test fails: zero tests passed is no pass.
+      - name: Run the time-namespace clock test (unshare --time)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --bin atem --no-run --message-format=json > "$RUNNER_TEMP/atem-test-build.json"
+          BIN=$(python3 -I scripts/clock-real-os.py find-bin "$RUNNER_TEMP/atem-test-build.json")
+          echo "test binary: $BIN"
+          TEST=runtime::host_clock::os::tests::timens_offset_is_seen_in_a_time_namespace
+          sudo unshare --time --boottime=86400 --fork "$BIN" --exact "$TEST" --ignored --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/timens-test.log"
+          if ! grep -qE '^test result: ok\. 1 passed; 0 failed;' "$RUNNER_TEMP/timens-test.log"; then
+            echo "::error::the time-namespace test did not run and pass"
+            exit 1
+          fi

@@ -1,0 +1,123 @@
+name: clock-real-os
+
+# MANUAL ONLY (workflow_dispatch; never on push or pull request): the
+# measurements host-work-v1 §11.6 "Clocks" (design I.6.5) asks for, taken on
+# real runners from Atem's own readings. The ignored tests
+# `real_os_report_linux` / `real_os_report_macos` (src/runtime/host_clock/os.rs)
+# print what `os::read()` sees, and scripts/clock-real-os.py drives them around
+# a `sudo date` step of the runner's wall clock. The runner is discarded after
+# the job, and an `if: always()` step puts the clock back first.
+#
+# Each job uploads one JSON artifact (the step summary shows its headline):
+#   linux-step-window: does a forward step set STA_UNSYNC at once (rule 4), and
+#     how long until it clears (the "step window")?
+#   macos-sync-report: what does ntp_gettime report before and after a step and
+#     after `sntp -sS` (does it follow `timed`), and does mach_continuous_time
+#     count from boot (kern.boottime)?
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clock-real-os-${{ github.ref }}
+  # Never cancel a run with the clock stepped.
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-step-window:
+    name: Linux step window (STA_UNSYNC after a forward step)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the bin's tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --bin atem --no-run --message-format=json > "$RUNNER_TEMP/build.json"
+          BIN=$(python3 -I scripts/clock-real-os.py find-bin "$RUNNER_TEMP/build.json")
+          echo "ATEM_TEST_BIN=$BIN" >> "$GITHUB_ENV"
+
+      - name: Read once (no step yet)
+        shell: bash
+        run: python3 -I scripts/clock-real-os.py read --bin "$ATEM_TEST_BIN"
+
+      # Steps the clock forward 2 minutes (sudo date), reads at once, polls
+      # every 100 ms until STA_UNSYNC clears or 15 minutes pass ("never
+      # cleared" is a result, not a failure), steps back, writes the JSON.
+      - name: Measure the step window
+        shell: bash
+        run: |
+          python3 -I scripts/clock-real-os.py linux-step-window \
+            --bin "$ATEM_TEST_BIN" \
+            --out "$RUNNER_TEMP/clock-real-os/linux-step-window.json" \
+            --ref "$RUNNER_TEMP/clock-real-os/ref.json"
+
+      - name: Put the clock back (always)
+        if: always()
+        shell: bash
+        run: python3 -I scripts/clock-real-os.py restore --ref "$RUNNER_TEMP/clock-real-os/ref.json"
+
+      - name: Upload the measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clock-real-os-linux-step-window
+          path: ${{ runner.temp }}/clock-real-os/linux-step-window.json
+          if-no-files-found: error
+
+  macos-sync-report:
+    name: macOS sync report (ntp_gettime, mach_continuous_time)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the bin's tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --bin atem --no-run --message-format=json > "$RUNNER_TEMP/build.json"
+          BIN=$(python3 -I scripts/clock-real-os.py find-bin "$RUNNER_TEMP/build.json")
+          echo "ATEM_TEST_BIN=$BIN" >> "$GITHUB_ENV"
+
+      - name: Read once (no step yet)
+        shell: bash
+        run: python3 -I scripts/clock-real-os.py read --bin "$ATEM_TEST_BIN"
+
+      # Reads ntp_gettime before and after a one-minute `sudo date` step and
+      # for 30 s after it (timed alone), runs `sudo sntp -sS time.apple.com`,
+      # polls every second for 5 minutes, steps back, writes the JSON.
+      - name: Report ntp_gettime around a step and a resync
+        shell: bash
+        run: |
+          python3 -I scripts/clock-real-os.py macos-sync-report \
+            --bin "$ATEM_TEST_BIN" \
+            --out "$RUNNER_TEMP/clock-real-os/macos-sync-report.json" \
+            --ref "$RUNNER_TEMP/clock-real-os/ref.json"
+
+      - name: Put the clock back (always)
+        if: always()
+        shell: bash
+        run: python3 -I scripts/clock-real-os.py restore --ref "$RUNNER_TEMP/clock-real-os/ref.json"
+
+      - name: Upload the measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clock-real-os-macos-sync-report
+          path: ${{ runner.temp }}/clock-real-os/macos-sync-report.json
+          if-no-files-found: error

@@ -788,9 +788,10 @@ mod tests {
         assert_ne!(sync_report(), Synced::Unknown);
     }
 
+    /// `kern.boottime` in ns since the epoch (macOS moves it with a wall-clock
+    /// step), or `None` when it can't be read.
     #[cfg(target_os = "macos")]
-    #[test]
-    fn continuous_time_counts_from_boot() {
+    fn kern_boottime_ns() -> Option<i128> {
         let mut tv = libc::timeval {
             tv_sec: 0,
             tv_usec: 0,
@@ -806,8 +807,13 @@ mod tests {
                 0,
             )
         };
-        assert_eq!(rc, 0, "kern.boottime");
-        let booted_at = i128::from(tv.tv_sec) * i128::from(SEC) + i128::from(tv.tv_usec) * 1_000;
+        (rc == 0).then(|| i128::from(tv.tv_sec) * i128::from(SEC) + i128::from(tv.tv_usec) * 1_000)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn continuous_time_counts_from_boot() {
+        let booted_at = kern_boottime_ns().expect("kern.boottime");
         let counter = i128::from(continuous_ns());
         let wall = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -869,5 +875,184 @@ mod tests {
             // Until the real-OS check confirms `ntp_gettime` as timed's report.
             assert_eq!(first.synced, Synced::Unknown);
         }
+    }
+
+    // The real OS, on demand. These are `#[ignore]`d: CI runs them by name
+    // (`test.yml`'s time-namespace step, `clock-real-os.yml` through
+    // `scripts/clock-real-os.py`), so the numbers it records come from this
+    // module's own readings and no ordinary run touches them.
+
+    /// The Linux time-namespace check, run by `test.yml` as
+    /// `sudo unshare --time --boottime=86400 --fork <test binary> --exact
+    /// runtime::host_clock::os::tests::timens_offset_is_seen_in_a_time_namespace
+    /// --ignored`: the reading reports the namespace's boot-time offset, the
+    /// counter includes it, and the clock state's guard (Decision 17) sees it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "runs under `unshare --time --boottime=86400 --fork` (test.yml)"]
+    fn timens_offset_is_seen_in_a_time_namespace() {
+        use crate::runtime::host_clock::state::{ClockEvent, ClockState, GuardWhy};
+
+        /// `--boottime=86400`: a day, exactly.
+        const OFFSET_NS: i64 = 86_400 * SEC as i64;
+        let guarded =
+            |events: &[ClockEvent]| events.iter().any(|e| matches!(e, ClockEvent::Guarded(_)));
+
+        let (monotonic, boottime) = timens_offsets();
+        assert_eq!(
+            boottime, OFFSET_NS,
+            "boottime offset {boottime} ns (monotonic {monotonic} ns): run this test as \
+             `unshare --time --boottime=86400 --fork <test binary> --exact <its path> --ignored`"
+        );
+
+        // The reading reports it (about 86,400,000 ms), and the boot-time
+        // counter includes it: `CLOCK_BOOTTIME` is the host's plus the
+        // offset, and the counter follows it to within what the kernel's
+        // slewing and a VM's clocks allow, orders of magnitude below a day.
+        let r = read();
+        assert_eq!(r.timens_boot_ns, OFFSET_NS);
+        assert_eq!(r.timens_boot_ns / 1_000_000, 86_400_000);
+        let counter = i128::from(r.boot_ns);
+        let boottime_now = i128::from(clock_ns(libc::CLOCK_BOOTTIME));
+        let uptime = boottime_now - i128::from(OFFSET_NS);
+        assert!(
+            uptime > 0,
+            "CLOCK_BOOTTIME {boottime_now} ns is below the offset"
+        );
+        assert!(
+            (boottime_now - counter).abs() < 5 * i128::from(SEC) + uptime / 500,
+            "the counter {counter} ns doesn't follow CLOCK_BOOTTIME {boottime_now} ns"
+        );
+        eprintln!(
+            "timens: offset {boottime} ns, counter {counter} ns, host uptime {uptime} ns, {:?}",
+            r.synced
+        );
+
+        // The guard: a record this boot made outside the namespace (no
+        // offset) and one from another boot are both predating it, and no
+        // boot time crosses either.
+        let outside = OsReading {
+            boot_ns: r.boot_ns - OFFSET_NS as u64,
+            timens_boot_ns: 0,
+            ..r.clone()
+        };
+        let first = ClockState::default().observe(&outside);
+        assert!(!guarded(&first.events), "a first reading guards nothing");
+        let step = first.next.observe(&r);
+        assert!(
+            step.events
+                .contains(&ClockEvent::Guarded(GuardWhy::NamespaceChanged)),
+            "the offset changed within a boot: {:?}",
+            step.events
+        );
+        assert!(
+            step.next
+                .to_json()
+                .contains(&format!("\"timens_boot_ns\":{OFFSET_NS}")),
+            "the record keeps the offset it counted with"
+        );
+        let other_boot = OsReading {
+            boot_id: "00000000-0000-4000-8000-00000000cafe".into(),
+            boot_ns: 3_600 * SEC,
+            wall_ms: r.wall_ms - 3_600_000,
+            timens_boot_ns: 0,
+            ..r.clone()
+        };
+        let step = ClockState::default().observe(&other_boot).next.observe(&r);
+        assert!(
+            step.events
+                .contains(&ClockEvent::Guarded(GuardWhy::TimeNamespace)),
+            "another boot, read in a namespace: {:?}",
+            step.events
+        );
+        // Read again in the namespace: the same boot, nothing guarded.
+        let again = step.next.observe(&read());
+        assert!(!guarded(&again.events), "{:?}", again.events);
+    }
+
+    /// What a report test's JSON line starts with: `scripts/clock-real-os.py`
+    /// takes the line that does.
+    const REPORT_PREFIX: &str = "ATEM_CLOCK_REPORT ";
+
+    fn synced_name(synced: Synced) -> &'static str {
+        match synced {
+            Synced::Yes => "yes",
+            Synced::No => "no",
+            Synced::Unknown => "unknown",
+        }
+    }
+
+    /// Test-only: this host's readings as one JSON line, for
+    /// `clock-real-os.yml`'s step-window job: the wall clock, the raw counter
+    /// (`CLOCK_MONOTONIC_RAW`), the boot-time counter, the boot id, the
+    /// namespace offset, `Synced` and `adjtimex`'s status bits.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "prints one JSON line of this host's readings (clock-real-os.yml)"]
+    fn real_os_report_linux() {
+        let raw_ns = LinuxClocks.raw_ns();
+        let status = adjtimex_status();
+        let r = read();
+        let line = serde_json::json!({
+            "os": "linux",
+            "wall_ms": r.wall_ms,
+            "raw_ns": raw_ns,
+            "boot_ns": r.boot_ns,
+            "boot_id": r.boot_id,
+            "timens_boot_ns": r.timens_boot_ns,
+            "synced": synced_name(r.synced),
+            "adjtimex_status": status,
+            "adjtimex_status_hex": status.map(|s| format!("{s:#06x}")),
+            "sta_unsync": status.map(|s| s & STA_UNSYNC != 0),
+        });
+        println!("{REPORT_PREFIX}{line}");
+    }
+
+    /// Test-only: this host's readings as one JSON line, for
+    /// `clock-real-os.yml`'s macOS job: the wall clock, the counter
+    /// (`mach_continuous_time` in ns) beside `kern.boottime` (does it count
+    /// from boot, and does the boot time move with a step), `Synced` and
+    /// `ntp_gettime` as xnu answers it (the call's return value, `errno` when
+    /// it failed, the state in the structure and `macos_ntp_state`'s verdict).
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "prints one JSON line of this host's readings (clock-real-os.yml)"]
+    fn real_os_report_macos() {
+        let ntp = ntp_gettime_symbol().map(|ntp_gettime| {
+            // SAFETY: an all-zero `ntptimeval` is a valid value.
+            let mut ntv: libc::ntptimeval = unsafe { std::mem::zeroed() };
+            ntv.time_state = -1;
+            // SAFETY: `ntv` is a valid ntptimeval for the call to fill.
+            let rc = unsafe { ntp_gettime(&mut ntv) };
+            let errno = (rc == -1)
+                .then(|| std::io::Error::last_os_error().raw_os_error())
+                .flatten();
+            serde_json::json!({
+                "return": rc,
+                "errno": errno,
+                "time_state": ntv.time_state,
+                "maxerror": ntv.maxerror,
+                "esterror": ntv.esterror,
+            })
+        });
+        let counter = i128::from(continuous_ns());
+        let booted_at = kern_boottime_ns();
+        let r = read();
+        let wall_ns = i128::from(r.wall_ms) * 1_000_000;
+        let since_boot = booted_at.map(|b| wall_ns - b);
+        let line = serde_json::json!({
+            "os": "macos",
+            "wall_ms": r.wall_ms,
+            "raw_ns": counter,
+            "boot_ns": r.boot_ns,
+            "boot_id": r.boot_id,
+            "synced": synced_name(r.synced),
+            "ntp_gettime": ntp,
+            "ntp_state": macos_ntp_state(),
+            "kern_boottime_ns": booted_at.map(|b| b as i64),
+            "since_boot_ns": since_boot.map(|s| s as i64),
+            "counter_gap_ns": since_boot.map(|s| (s - counter) as i64),
+        });
+        println!("{REPORT_PREFIX}{line}");
     }
 }
