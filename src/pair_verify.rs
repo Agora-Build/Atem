@@ -440,9 +440,16 @@ pub(crate) async fn request_key_after_verification(
     }
 }
 
-/// `atem pair` after the pairing was saved, and `atem pair verify`: a failed verification is shown
-/// in full here, then reported as a short error so the exit status is
-/// nonzero.
+/// What `atem pair` and `atem pair verify` end with when the verification
+/// failed. True for both: `atem pair` saved the pairing before it verified,
+/// and `atem pair verify` only runs on a pairing that exists. The reason is
+/// the warning line printed just before it.
+pub(crate) const PAIRED_NOT_VERIFIED: &str = "Paired, but this device isn't verified yet. Fix the problem above, then run 'atem pair verify'.";
+
+/// `atem pair` after the pairing was saved, and `atem pair verify`: a failed
+/// verification shows its reason (one warning line), then ends the command
+/// with `PAIRED_NOT_VERIFIED`, so the exit status is nonzero and the last
+/// line says what is and isn't done. The pairing stays saved either way.
 pub(crate) fn verification_result(
     verification: Result<()>,
     mut warn: impl FnMut(&str),
@@ -451,8 +458,7 @@ pub(crate) fn verification_result(
         Ok(()) => Ok(()),
         Err(error) => {
             warn(&format!("\u{26a0}\u{fe0f}  {error}"));
-            warn("Pairing is saved. Run 'atem pair verify' to verify this device.");
-            Err(anyhow!("device verification failed"))
+            Err(anyhow!(PAIRED_NOT_VERIFIED))
         }
     }
 }
@@ -785,6 +791,9 @@ mod tests {
         assert!(warning.contains("atem cred unlock"), "{warning}");
     }
 
+    /// `atem pair` (the pairing was just saved) and `atem pair verify` (it
+    /// already existed) both end here: one warning line with the reason, then
+    /// an error that says the pairing stands and the device isn't verified.
     #[test]
     fn pair_fails_after_a_failed_verification() {
         assert!(verification_result(Ok(()), |_| panic!("nothing to warn about")).is_ok());
@@ -793,8 +802,21 @@ mod tests {
             warned.push(line.to_string())
         })
         .unwrap_err();
-        assert!(warned[0].contains("codes didn't match"), "{warned:?}");
-        assert_eq!(error.to_string(), "device verification failed");
+        assert_eq!(
+            warned,
+            ["\u{26a0}\u{fe0f}  codes didn't match".to_string()],
+            "the reason once, and nothing else"
+        );
+        assert_eq!(error.to_string(), PAIRED_NOT_VERIFIED);
+        assert_eq!(
+            error.to_string(),
+            "Paired, but this device isn't verified yet. Fix the problem above, then run 'atem pair verify'."
+        );
+        // The last line must not read as if pairing failed.
+        assert!(
+            !error.to_string().contains("verification failed"),
+            "{error}"
+        );
     }
 
     /// Astation's certificate for a verification whose pairing was removed

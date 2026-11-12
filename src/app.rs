@@ -660,7 +660,10 @@ impl App {
         };
         match self.astation_client.handle_encryption_message(&message).await {
             Ok(Some(status)) => {
-                self.status_message = Some(status);
+                // Empty: handled, nothing to say; the status stays as it was.
+                if !status.is_empty() {
+                    self.status_message = Some(status);
+                }
                 return;
             }
             Ok(None) => {}

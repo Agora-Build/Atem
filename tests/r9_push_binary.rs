@@ -18,10 +18,9 @@ use serde_json::{Value, json};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use support::astation::{FakeAstation, write_verified_pairing};
+use support::host_clock::HostClock;
 use support::r9::{Out, Router, client_ms, write_pin};
 use support::r9log::{self, MAC, TestLog, auth, enc, secret};
 use support::{Sandbox, within};
@@ -32,71 +31,6 @@ const HOST: &str = "host-push";
 /// a slow runner (the Intel macOS CI one takes ~340 s for ~45 s of tests) needs
 /// the slack, and a hung test still ends.
 const WAIT: Duration = Duration::from_secs(60);
-
-/// The device list's host clock (`ATEM_TEST_HOST_CLOCK`): the real wall
-/// clock plus an offset the test moves, the real monotonic clock and boot
-/// id, rewritten every 20 ms (atomically).
-struct HostClock {
-    path: PathBuf,
-    offset: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-}
-
-fn real_mono_ms() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `ts` is a valid timespec for the call to fill.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
-}
-
-impl HostClock {
-    fn start(dir: &Path) -> HostClock {
-        let path = dir.join("host-clock");
-        let offset = Arc::new(AtomicU64::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-            .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "boot".into());
-        let write = {
-            let path = path.clone();
-            let offset = offset.clone();
-            move || {
-                let wall = r9log::host_now().wall_ms + offset.load(Ordering::SeqCst);
-                let tmp = path.with_extension("tmp");
-                std::fs::write(&tmp, format!("{wall} {} {boot}", real_mono_ms())).unwrap();
-                std::fs::rename(&tmp, &path).unwrap();
-            }
-        };
-        write();
-        let s = stop.clone();
-        std::thread::spawn(move || {
-            while !s.load(Ordering::SeqCst) {
-                write();
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        });
-        HostClock { path, offset, stop }
-    }
-
-    /// Moves the host's wall clock `ms` ahead of the real one.
-    fn jump(&self, ms: u64) {
-        self.offset.store(ms, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    fn wall(&self) -> u64 {
-        r9log::host_now().wall_ms + self.offset.load(Ordering::SeqCst)
-    }
-}
-
-impl Drop for HostClock {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-    }
-}
 
 struct Rig {
     sandbox: Sandbox,
@@ -142,7 +76,7 @@ impl Rig {
             )
             .unwrap();
         }
-        let clock = host_clock.then(|| HostClock::start(sandbox.dir.path()));
+        let clock = host_clock.then(|| HostClock::start(sandbox.dir.path(), "host-clock"));
         let mut rig = Rig {
             sandbox,
             astation: FakeAstation::start(),
@@ -166,10 +100,9 @@ impl Rig {
             .env("ASTATION_WS", &self.astation.url)
             .env("ASTATION_RELAY_URL", "http://127.0.0.1:1");
         if let Some(clock) = &self.clock {
-            // The host clock is a file a thread rewrites every 20 ms; on a
-            // loaded machine it lags, and the per-link one-init-a-second
-            // limit (checked by the engine tests) could refuse an init the
-            // test spaced 1.1 s apart: off here, as in the fixture runner.
+            // The per-link one-init-a-second limit (checked by the engine
+            // tests) could refuse an init the test spaced 1.1 s apart on a
+            // loaded machine: off here, as in the fixture runner.
             command
                 .env("ATEM_TEST_HOST_CLOCK", &clock.path)
                 .env("ATEM_TEST_NO_INIT_LIMIT", "1");
@@ -686,7 +619,7 @@ fn a_late_approval_within_15_s_of_expiry_is_suppressed() {
     rig.clock
         .as_ref()
         .unwrap()
-        .jump(to - r9log::host_now().wall_ms);
+        .set_wall((to - r9log::host_now().wall_ms) as i64);
     assert_eq!(
         relay(&mut router, Duration::from_secs(12)),
         None,
@@ -812,7 +745,7 @@ fn after_a_suspend_an_approval_still_gets_its_hints() {
     let (sid, fake) = rig.agent();
     let mut router = Router::new(&rig.astation);
     let clock = rig.clock.as_ref().unwrap();
-    clock.jump(700_000);
+    clock.set_wall(700_000);
     let before = clock.wall();
     let (_m, _p, _ap, first, request) = approval(&rig, &mut router, &sid, &fake);
     let after = clock.wall();
@@ -876,7 +809,7 @@ fn after_a_suspend_displayed_times_follow_the_wall_clock() {
     let created = sessions["sessions"][0]["created_at"].clone();
     within(&created, started - 120_000, after, "created_at");
 
-    clock.jump(3_600_000);
+    clock.set_wall(3_600_000);
     next_init();
     let before = clock.wall();
     let mut p = Dev::connect(&mut router, "phone", "relay", &rig.log, &phone());
