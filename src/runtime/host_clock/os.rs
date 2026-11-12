@@ -214,15 +214,19 @@ fn continuous_ns() -> u64 {
 
 // The boot id (Decision 18).
 
+/// The prefix of the boot id made when the OS gives none.
+pub(crate) const UNKNOWN_BOOT_PREFIX: &str = "unknown-";
+
 /// This boot's id: Linux `/proc/sys/kernel/random/boot_id`, macOS
 /// `kern.bootsessionuuid` (which a wall-clock step doesn't change, unlike
 /// the `kern.boottime` R9.5's waits key on). Unreadable: an id made once per
-/// process, so the clock state takes each process for a boot of its own.
+/// process (`UNKNOWN_BOOT_PREFIX` and a UUID), which the clock state takes
+/// for an unknown boot: no boot time crosses it, and it sets no mark.
 pub fn boot_session_id() -> String {
     static UNKNOWN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     os_boot_id().unwrap_or_else(|| {
         UNKNOWN
-            .get_or_init(|| format!("unknown-{}", uuid::Uuid::new_v4()))
+            .get_or_init(|| format!("{UNKNOWN_BOOT_PREFIX}{}", uuid::Uuid::new_v4()))
             .clone()
     })
 }
@@ -276,6 +280,13 @@ const MACHINE_LABEL: &str = "atem-host-clock-machine-v1";
 /// readable gets the hash of the empty id.
 pub fn machine_identity() -> [u8; 16] {
     machine_identity_of(machine_id().unwrap_or_default().as_bytes())
+}
+
+/// The identity of a machine with no id readable (the empty id's hash),
+/// which the clock state takes for an unknown machine: no boot time crosses
+/// a boot change on it.
+pub(crate) fn unknown_machine() -> [u8; 16] {
+    machine_identity_of(b"")
 }
 
 fn machine_identity_of(id: &[u8]) -> [u8; 16] {
