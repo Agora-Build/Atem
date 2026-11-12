@@ -620,6 +620,9 @@
         <p style="font-size:14px; margin-top:8px">Marked <span class="chip proposed">proposed</span>: designs the
           decisions asked for but nobody has agreed yet, such as the exact R9 form of Revoke and Readmit, and the
           disabled-account binding. Every owner choice is now decided (choice 19 was withdrawn).</p>
+        <p style="font-size:14px; margin-top:8px">Update, 2026-11-12: step 3's contracts (PRs #145 to #150) are merged
+          and dormant, agreed with Astation and Auth/Portal. Two figures carry their amendments: the Station's
+          refusals in figure 3b and the same-Station note in figure 1.</p>
       </div>
     </div>
 
@@ -688,7 +691,7 @@ flowchart TB
     RELAY["<b>Relay</b><br/>routes r9 channels<br/>it can't read"]
     FEED["<b>Control feed</b><br/>records signed with a service key<br/>or by a native manager"]
     DL["<b>Device-list copy</b>"]
-    MBOX["<b>Mailbox</b><br/>sealed envelopes · ≤ 24 h"]
+    MBOX["<b>Mailbox</b><br/>sealed envelopes · ≤ 24 h<br/>both hosts on this Station"]
   end
   subgraph HOSTS["Atem hosts · one outbound relay link each"]
     subgraph HA["Host A"]
@@ -810,7 +813,7 @@ flowchart TB
               <tr><td>Station ↔ host (channels)</td><td>Session-v1, chat, approvals and host-work ops from Astation, the phone, or an integration as <code>service:svc-…</code>. The Mac and the phone reach the relay with an <code>astation.remote</code> token for the selected Station</td><td><span class="prot"><span class="ln ch"></span><span><code>atem-ch1</code>, end to end; the device's key checked against the device list</span></span></td></tr>
               <tr><td>Device list → host</td><td>Members, services, hosts and their keys, project grants, host-sender revoke and readmit</td><td><span class="prot"><span class="ln signed"></span><span>entries signed by native managers</span></span></td></tr>
               <tr><td>Control feed → host</td><td>Integration stops (cover, revoke, hold, release, interrupt); a native interrupt for a revoked host sender</td><td><span class="prot"><span class="ln signed"></span><span>integration stops: signed with the integration's service key; a host sender's interrupt: signed by a native manager</span></span></td></tr>
-              <tr><td>Host ↔ mailbox ↔ host</td><td>Requests, cancel, complete; status and results back</td><td><span class="prot"><span class="ln sealed"></span><span>signed with <code>host_key</code>, sealed to <code>host_enc_key</code></span></span></td></tr>
+              <tr><td>Host ↔ mailbox ↔ host</td><td>Requests, cancel, complete; status and results back. In this version both hosts use the same Station <span class="chip decided">decided</span> (owner decision, 2026-11-10); sending across Stations is an open question (IX.4)</td><td><span class="prot"><span class="ln sealed"></span><span>signed with <code>host_key</code>, sealed to <code>host_enc_key</code></span></span></td></tr>
               <tr><td>Runtime ↔ agents</td><td><code>atem message send</code>, replies, framed prompts</td><td><span class="prot"><span class="ln local"></span><span>same-user socket, tied to the agent's session</span></span></td></tr>
             </tbody>
           </table>
@@ -1032,6 +1035,7 @@ sequenceDiagram
   S->>B: Head announcement
   B->>S: control_sync after its cursor
   S-->>B: The signed revoke record
+  Note over B,S: For another account's feed, or from a link whose association is stale, the Station answers control_sync_refused instead of the record (membership_fetch_refused and control_ack_refused likewise), with code forbidden. It advances no cursor, head or evidence, opens no gate and names nothing of another account. Agreed with Astation 2026-11-11/12 (PR 148)
   B->>B: Verify with the service key in the device list, apply it with the cursor in one transaction
   Note over B,G: Unstarted tasks cancelled as sender revoked. Attempts not yet executing are withdrawn.
   alt interrupt_running is true
@@ -1465,7 +1469,7 @@ flowchart TB
     <footer>
       <p><strong>Source.</strong>
         <code>proposals/delegated-host-work/delegated-host-work-and-host-senders.md</code>, revision 5, with the
-        owner's decisions of 2026-11-07 in its Appendix A (they win wherever the two differ). Drawn 2026-11-07. Diagrams render with Mermaid 11 in the browser; if one doesn't render, its source
+        owner's decisions of 2026-11-07 in its Appendix A (they win wherever the two differ). Drawn 2026-11-07, amended 2026-11-12 for step 3's agreements (figures 1 and 3b). Diagrams render with Mermaid 11 in the browser; if one doesn't render, its source
         text is shown in place.</p>
     </footer>
 
