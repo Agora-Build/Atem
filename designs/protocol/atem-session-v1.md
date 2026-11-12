@@ -1573,10 +1573,10 @@ authority it was accepted under only while that principal keeps `control`.
      `withdrawn by the host` for the `host-work` principal's withdrawal
      (R9.14 items 4 and 6);
   2. the previous run did **not** end with a clean close → `rejected`,
-     `detail:"authorization history unknown"`, for every principal,
-     whatever the journal holds (a fence on disk or not: a failed write
-     may have left it, so what reached the disk never changes the
-     outcome);
+     `detail:"authorization history unknown"`, for every principal but
+     `host-work` (R9.14 item 6, below), whatever the journal holds (a
+     fence on disk or not: a failed write may have left it, so what
+     reached the disk never changes the outcome);
   3. after a clean close: host trust changed → `host trust changed` (§6);
      `control_gen` below its principal's durable one → `control revoked`;
      the rest is dispatched only once its principal's control is
@@ -1590,9 +1590,10 @@ authority it was accepted under only while that principal keeps `control`.
   `executing` work is unaffected: reconciled, else `outcome_unknown`
   (§6). The `host-work` principal's requests follow R9.14 item 6 instead
   of steps 2 and 3: every other recovered `accepted` one is `rejected`,
-  `withdrawn at recovery`, and its `executing` prompts are reconciled from
-  the adopted worker's chat. If a resolution can't be persisted, the host starts with remote
-  sessions disabled (`welcome.host_error`) and dispatches nothing.
+  `withdrawn at recovery`, and its `executing` prompts are reconciled
+  from the adopted worker's chat. If a resolution can't be persisted, the
+  host starts with remote sessions disabled (`welcome.host_error`) and
+  dispatches nothing.
   Requests already `rejected` in the journal keep their detail; the
   in-memory rejections of a failed revocation write (above) were never
   persisted, so the same requests come back `rejected` with step 2's
@@ -4324,11 +4325,11 @@ that fills in the design is marked. Astation agreed R9.14 (2026-11-11, #120
 comment 6810116314), except the two questions still marked open (item 1's
 UI question, item 8's request for a new key) and what step 4 added since,
 each marked where it is: item 1's leases (no prompt that doesn't acquire,
-the lease kept while a request is open, none after a restart) and item 3's
-fail-closed rules (Atem's choices, for Astation to confirm); item 4's
-refusal-list rules (with §I.2's), item 5's delivery after a restart and
-item 6's reconciliation of `executing` prompts (changed agreed meaning,
-needs Astation's agreement).
+none after a restart) and item 3's fail-closed rules (Atem's choices, for
+Astation to confirm); item 1's lease kept while a request is open, item
+4's refusal-list rules (with §I.2's), item 5's delivery after a restart
+and item 6's reconciliation of `executing` prompts (changed agreed
+meaning, needs Astation's agreement).
 
 1. **The `host-work` principal.** Its name is `host-work`
    (`atem_client::session::wire::HOST_WORK_PRINCIPAL`), a bare word like
@@ -4361,13 +4362,16 @@ needs Astation's agreement).
      this revision adds no field for it.)
    - **Leases, as built** (**Atem's choice, for Astation to confirm**). A
      prompt it submits without `acquire: true`, or with `takeover`, is
-     `invalid_request`, and nothing is recorded. It keeps the lease while
-     any request of its on that session is open (`accepted` or
-     `executing`), not only for one turn, and releases it at the first
-     pass after the last one settled. After a restart a turn still running
-     and rebound (item 6) holds no lease: leases aren't persisted and
-     host-work doesn't acquire again, so a native may acquire it without a
-     takeover.
+     `invalid_request`, and nothing is recorded. After a restart a turn
+     still running and rebound (item 6) holds no lease: leases aren't
+     persisted and host-work doesn't acquire again, so a native may
+     acquire it without a takeover.
+   - **How long it holds the lease, as built** (**changed agreed
+     meaning, needs Astation's agreement**: the agreed text above says it
+     holds the lease "for that turn"). It keeps the lease while any
+     request of its on that session is open (`accepted` or `executing`),
+     not only for one turn, and releases it at the first pass after the
+     last one settled.
    - **Approvals.** The runtime answers no approval through this
      attachment. A delegated turn's approval cards go, as today, to the
      attachments with `control` (§G; design I.4.2).
@@ -4540,10 +4544,11 @@ needs Astation's agreement).
        it, and the interrupt is delivered once more. Until that chat
        arrives (at most 60 s, item 6) the turn check refuses, no turn
        state yet, and the intent stays pending. In every other case the
-       start's reconciliation settles the attempt `outcome_unknown` (item
-       6) and no Esc is written: the turn may still run, but nothing
-       proves it current, and the host never writes a blind Esc. The owner
-       learns of it from the `outcome_unknown` alert (`host.alerts`).
+       start's reconciliation settles the attempt (item 6: `completed`
+       when its turn ended with a known outcome, else `outcome_unknown`)
+       and no Esc is written: a turn that may still run is not proven
+       current, and the host never writes a blind Esc. The owner learns of
+       an `outcome_unknown` attempt from its alert (`host.alerts`).
 
    - **(as built; host-internal, no wire change)** The chat's half of
      step 1's turn check is today's Esc rule: chat-v1 shows the session
@@ -4571,9 +4576,9 @@ needs Astation's agreement).
    This proves no side effect, and host-work queues the task again for a
    new attempt once the revocation gate opens (design I.6.2, I.6.3). Its
    `executing` requests are reconciled as §6 says (worker adoption, else
-   `outcome_unknown`, `agent exited`). The order (the refusal list first,
-   as §I.7 rules for every principal) is **Atem's choice, agreed with Astation
-   (2026-11-11, #120 comment 6810116314)**.
+   `outcome_unknown`, `agent exited`), as built below. The order (the
+   refusal list first, as §I.7 rules for every principal) is **Atem's
+   choice, agreed with Astation (2026-11-11, #120 comment 6810116314)**.
 
    **The reconciliation, as built (changed agreed meaning, needs
    Astation's agreement):**
@@ -4605,10 +4610,11 @@ needs Astation's agreement).
      (`outcome_unknown`, `outcome could not be established`, as v1's
      reconciliation has always written it).
    - **Corrupt journals.** A record a journal can read but whose rules it
-     breaks (a provenance off a `host-work` prompt, a turn result off a
-     `completed` prompt, a turn started anywhere but an `executing`
-     `host-work` prompt, or twice) ends that session's log there, as an
-     invalid transition always has, instead of disabling remote sessions.
+     breaks (a provenance on anything but a `host-work` prompt, a turn
+     result on anything but a `completed` prompt, a turn started anywhere
+     but on an `executing` `host-work` prompt, or twice) ends that
+     session's log there, as an invalid transition always has, instead of
+     disabling remote sessions.
      This changes what any host does with such a corrupt journal.
    - **Downgrades.** An older build can't read `turn_started`: it ends
      that session's log at the record, losing the later records of every

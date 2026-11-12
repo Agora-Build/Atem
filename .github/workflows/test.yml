@@ -101,11 +101,31 @@ jobs:
             exit 1
           fi
           # The atem binary's debug-only unit tests (`#[cfg(debug_assertions)]`,
-          # so the release run above doesn't even build them), each by its
-          # exact name: the step fails unless every one of them ran and passed.
-          # Find them with
-          #   grep -rn -A2 '#\[cfg(debug_assertions)\]' src | grep -A1 'test\]'
+          # so the release run above doesn't even build them, or ignored in
+          # release with `cfg_attr(not(debug_assertions), ignore)`), each by
+          # its exact name: the step fails unless every one of them ran and
+          # passed.
           units=(runtime::host_bridge::tests::the_drive_hook_plays_host_works_side_through_the_bridge)
+          # Every such test in src is in the list: a test fn whose attributes
+          # (the lines above it, doc comments included) say either form.
+          # Gate tests one by one: a test in a debug-only module isn't seen.
+          found=$(find src -name '*.rs' -print0 | xargs -0 awk '
+            /^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/ {
+              if ((attrs ~ /cfg\([[:space:]]*debug_assertions[[:space:]]*\)/ ||
+                   attrs ~ /cfg_attr\([[:space:]]*not\([[:space:]]*debug_assertions[[:space:]]*\)[[:space:]]*,[[:space:]]*ignore/) &&
+                  attrs ~ /#\[(tokio::)?test[]( ]/) {
+                sub(/^.*fn[[:space:]]+/, ""); sub(/[^A-Za-z0-9_].*$/, ""); print
+              }
+              attrs = ""; next
+            }
+            /^[[:space:]]*$/ || /[;{}][[:space:]]*$/ { attrs = ""; next }
+            { attrs = attrs " " $0 }')
+          for n in $found; do
+            if [[ " ${units[*]} " != *"::$n "* ]]; then
+              echo "::error::$n is a debug-only unit test; add it to this step's units"
+              exit 1
+            fi
+          done
           cargo test --bin atem -- --exact --format pretty "${units[@]}" 2>&1 \
             | tee debug-unit-tests.log
           for u in "${units[@]}"; do

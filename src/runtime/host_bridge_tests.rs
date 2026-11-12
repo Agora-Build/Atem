@@ -105,10 +105,25 @@ fn local<F: std::future::Future>(body: F) -> F::Output {
     tokio::task::LocalSet::new().block_on(&runtime, body)
 }
 
+/// An executable script `dir/name`. A test may call this again for a
+/// script an earlier session's agent is still exec'ing: writing that file
+/// in place fails with "Text file busy" (or truncates it under the exec).
+/// So an unchanged script is left alone, and a new one is written to a
+/// temp file in the same directory and renamed over the name: a new inode,
+/// while a running exec keeps the old one.
 fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let text = format!("#!/bin/sh\n{body}\n");
+    let unchanged = std::fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o777 == 0o755)
+        && std::fs::read(&path).is_ok_and(|b| b == text.as_bytes());
+    if !unchanged {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".{name}.tmp-{}-{n}", std::process::id()));
+        std::fs::write(&tmp, &text).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+    }
     path
 }
 
