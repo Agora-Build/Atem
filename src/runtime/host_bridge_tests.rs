@@ -297,6 +297,25 @@ impl Peer {
         lease["binding"]["lease_epoch"].as_u64().unwrap()
     }
 
+    /// The lease with its whole 15 s ahead, for a step that needs it now: a
+    /// repeat `acquire` returns the current lease unchanged, deadline
+    /// included, so it is renewed; one that ended meanwhile is acquired
+    /// again. (Held across several turns, a lease ran out on a slow runner.)
+    async fn fresh_lease(&mut self, sid: &str, process_gen: &str) -> u64 {
+        loop {
+            let epoch = self.acquire(sid, process_gen).await;
+            let id = self.request(
+                "renew",
+                json!({"binding": self.binding(sid, process_gen, Some(epoch))}),
+            );
+            let renewed = self.reply(&id).await;
+            if renewed["op"] == "lease" {
+                return epoch;
+            }
+            assert_eq!(renewed["code"], "stale_lease", "{renewed}");
+        }
+    }
+
     fn terminal(&self, op: &str, sid: &str, process_gen: &str, fields: Value, lease: Option<u64>) {
         let mut data = json!({"v": 1, "op": op, "terminal_id": sid, "generation": process_gen,
                               "binding": self.binding(sid, process_gen, lease)});
@@ -2970,8 +2989,9 @@ fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approva
 
         // A remote prompt: pasted through the worker, accepted once the
         // hook and the rollout both named it, its reply, its completion.
-        let lease = peer.acquire(&sid, &pg).await;
-        let send = |peer: &mut Peer, rid: &str, text: &str| {
+        // Each step that needs the lease renews it first: one 15 s lease
+        // doesn't last these turns on a slow runner.
+        let send = |peer: &mut Peer, lease: u64, rid: &str, text: &str| {
             peer.chat(
                 "submit",
                 "conv-1",
@@ -2991,7 +3011,8 @@ fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approva
         };
         let r2 = uuid::Uuid::new_v4().to_string();
         let from = peer.seen.len();
-        send(peer, &r2, "remote two");
+        let lease = peer.fresh_lease(&sid, &pg).await;
+        send(peer, lease, &r2, "remote two");
         let at_accepted = peer.wait_from(from, accepted(r2.clone())).await;
         agent_event(&fake, "prompt turn-2 remote two").await;
         // The prompt's own message carries the request id (the hook and
@@ -3020,9 +3041,11 @@ fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approva
         // An interrupt while a turn runs: Esc, completed at the turn's end.
         let r3 = uuid::Uuid::new_v4().to_string();
         let from = peer.seen.len();
-        send(peer, &r3, "remote three");
+        let lease = peer.fresh_lease(&sid, &pg).await;
+        send(peer, lease, &r3, "remote three");
         peer.wait_from(from, accepted(r3.clone())).await;
         activity_until(peer, &sid, "working").await;
+        let lease = peer.fresh_lease(&sid, &pg).await;
         let interrupt = uuid::Uuid::new_v4().to_string();
         let id = peer.request(
             "submit",
@@ -3057,7 +3080,8 @@ fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approva
         // chat; the turn goes on and completes.
         let r4 = uuid::Uuid::new_v4().to_string();
         let from = peer.seen.len();
-        send(peer, &r4, "remote four");
+        let lease = peer.fresh_lease(&sid, &pg).await;
+        send(peer, lease, &r4, "remote four");
         peer.wait_from(from, accepted(r4.clone())).await;
         // `accepted` is the receipt's durable acceptance: the paste may not
         // have reached the agent yet. The tool call asks for permission
@@ -3098,7 +3122,7 @@ fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approva
 
         // An interrupt Codex ignores: no turn end within 10 s, unknown.
         std::fs::write(fake.join("deaf"), "").unwrap();
-        let lease = peer.acquire(&sid, &pg).await;
+        let lease = peer.fresh_lease(&sid, &pg).await;
         let r5 = uuid::Uuid::new_v4().to_string();
         let from = peer.seen.len();
         peer.chat(
@@ -3111,6 +3135,7 @@ fn codex_chat_first_prompt_local_then_remote_prompts_an_interrupt_and_an_approva
         agent_event(&fake, "prompt turn-5 remote five").await;
         let peer = &mut rt.peer;
         activity_until(peer, &sid, "working").await;
+        let lease = peer.fresh_lease(&sid, &pg).await;
         let interrupt = uuid::Uuid::new_v4().to_string();
         let id = peer.request(
             "submit",
