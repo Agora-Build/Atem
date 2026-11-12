@@ -28,7 +28,11 @@
 //!   `enc_sig` check and the log's queries over the state they derive;
 //! - `host_mail` (feature `host`; planned, host role only): envelopes and
 //!   results between hosts, sealed and judged by the receiver's checks;
-//! - [`encoding`]: canonical JSON, `enc`, signing inputs and hashes.
+//! - [`encoding`]: canonical JSON, `enc`, signing inputs and hashes;
+//! - [`framing`]: the prompt framing's escaping and marker check, the
+//!   Unicode version pinned for them and a task's preflight size check
+//!   (III.2; the host renders every prompt, a client never does, so
+//!   rendering is exported only for the vectors, feature `test-vectors`).
 //!
 //! Contract for Astation: `designs/protocol/atem-client-bindings.md`.
 // The provider-taking `*_with` helpers are called by the UniFFI and WASM
@@ -47,6 +51,7 @@ mod macros;
 pub mod connection;
 pub mod encoding;
 pub mod error;
+pub mod framing;
 pub mod host_actions;
 #[cfg(feature = "host")]
 pub mod host_mail;

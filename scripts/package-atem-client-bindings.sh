@@ -25,9 +25,10 @@
 #           README.txt. Each library's ELF class, machine and LOAD alignment
 #           are checked before it is packaged.
 #
-# Next to them: atem-client-<version>-SOURCE.json (commit, crate versions,
-# features, toolchains; scripts/atem-client-source-pin.sh) and
-# atem-client-<version>-SHA256SUMS.txt over every file. Archives are
+# Next to them: the shared host-work vectors (atem-client-<version>-host-work-
+# {requests,prompt-framing,framing-size}-v1.json), atem-client-<version>-SOURCE.json
+# (commit, crate versions, features, toolchains; scripts/atem-client-source-pin.sh)
+# and atem-client-<version>-SHA256SUMS.txt over every file. Archives are
 # deterministic (sorted, mtime 0, numeric owner 0, gzip -n).
 # The Apple package is scripts/package-atem-client-apple.sh (macOS). This
 # script needs GNU tar and coreutils (Linux; CI runs it on ubuntu-latest).
@@ -153,7 +154,7 @@ if want android; then
     grep -Eq "^ *Machine: +$MACHINE\$" <<<"$HDR" \
       || { echo "android $ABI: not $MACHINE" >&2; echo "$HDR" >&2; exit 1; }
     SYMS=$("$READELF" --dyn-syms -W "$SO")
-    if grep -qiE 'sign_seen|admit_carrier|software_?key' <<<"$SYMS"; then
+    if grep -qiE 'sign_seen|admit_carrier|software_?key|framing_render_for_vectors' <<<"$SYMS"; then
       echo "android $ABI: a test-only or host-role symbol is exported" >&2
       exit 1
     fi
@@ -199,6 +200,9 @@ FILES+=("$WORK_VECTOR")
 FRAMING_VECTOR="atem-client-${VERSION}-host-work-prompt-framing-v1.json"
 cp designs/protocol/fixtures/host-work/prompt-framing-v1.json "$OUT/$FRAMING_VECTOR"
 FILES+=("$FRAMING_VECTOR")
+FRAMING_SIZE_VECTOR="atem-client-${VERSION}-host-work-framing-size-v1.json"
+cp designs/protocol/fixtures/host-work/framing-size-v1.json "$OUT/$FRAMING_SIZE_VECTOR"
+FILES+=("$FRAMING_SIZE_VECTOR")
 # Envelopes and results between hosts (host-work-v1 §11.5; planned).
 MAIL_VECTOR="atem-client-${VERSION}-r9-vectors-host-envelope.json"
 cp designs/protocol/fixtures/r9-vectors-host-envelope.json "$OUT/$MAIL_VECTOR"

@@ -283,7 +283,10 @@ Details: agent collaboration, section 17.
   as confusable with Latin.
 - **Vectors.** `fixtures/host-work/prompt-framing-v1.json`: tags, escaping
   cases (III.2's folding cases), rendered prompts and the size check, run by
-  `atem-client`'s tests.
+  `atem-client`'s tests; `fixtures/host-work/framing-size-v1.json`: the
+  size-preflight cases for `framing_checked_len` (complete inputs and the
+  expected checked length), run by the Rust tests and the Swift, Kotlin and
+  JS conformance suites.
 
 The rendered prompt is at most 32,768 bytes (28,672 with attachments, which
 leaves room for the screenshot lines the host adds); the prompt and each
