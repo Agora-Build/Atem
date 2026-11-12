@@ -694,6 +694,10 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
+/// Shown when a signed account state or key grant changed this device's
+/// encryption mode or key id and needed no migration.
+pub const ENCRYPTION_STATE_UPDATED: &str = "Account encryption state updated";
+
 /// Status of an encryption message held for later; internal, not shown.
 pub const HOLDING_ENCRYPTION: &str = "Holding an encryption message until Astation's identity is known";
 
@@ -2120,7 +2124,9 @@ impl AstationClient {
     }
 
     /// Persist encryption mode/key messages before application code handles
-    /// ordinary Astation traffic. Returns a user-facing status when handled.
+    /// ordinary Astation traffic. Returns a user-facing status when handled:
+    /// `None` is "not an encryption message", the empty string is "handled,
+    /// nothing to say" (callers show no line for it).
     pub async fn handle_encryption_message(
         &mut self,
         message: &AstationMessage,
@@ -2152,6 +2158,17 @@ impl AstationClient {
         };
         let paths = self.profile_sources()?.paths.cred;
         let agent = self.cred_agent();
+        // What the device does before this message, to say only what changed:
+        // its mode and key id for a state, the key id it holds for a grant.
+        let mode_before = matches!(message, AstationMessage::EncryptionMode { .. })
+            .then(|| Self::signed_mode_and_kid(&paths, &astation_id));
+        let held_before = match message {
+            AstationMessage::KeyGrant { .. } => {
+                let (agent, astation_id) = (agent.clone(), astation_id.clone());
+                blocking(move || Ok(agent.held_kid(&astation_id).ok().flatten())).await?
+            }
+            _ => None,
+        };
         let applied = match message {
             AstationMessage::EncryptionMode { account_state } => {
                 capture.apply(|| apply_account_state(&paths, &astation_id, account_state.as_ref()))?
@@ -2213,10 +2230,40 @@ impl AstationClient {
                 if needs_key().await? {
                     return request_key().await;
                 }
-                self.finish_encryption_migration(&astation_id, state.kid).await
+                let changed = mode_before
+                    .is_some_and(|before| Self::signed_mode_and_kid(&paths, &astation_id) != before);
+                let migrated = self.finish_encryption_migration(&astation_id, state.kid).await?;
+                Ok(Some(migrated.unwrap_or_else(|| Self::state_status(changed))))
             }
-            Applied::KeyInstalled(kid) => self.finish_encryption_migration(&astation_id, Some(kid)).await,
+            Applied::KeyInstalled(kid) => {
+                let changed = held_before.as_deref() != Some(kid.as_str());
+                let migrated = self.finish_encryption_migration(&astation_id, Some(kid)).await?;
+                Ok(Some(migrated.unwrap_or_else(|| Self::state_status(changed))))
+            }
         }
+    }
+
+    /// The mode and key id of the newest signed account state governing
+    /// `astation_id` (`effective_state`); the defaults (`off`, no key) before
+    /// a verified device has one, as `account_mode` treats an unverified one.
+    /// Unreadable trust state reads as the defaults too: it only decides
+    /// whether a status line is shown.
+    fn signed_mode_and_kid(
+        paths: &crate::paths::CredPaths,
+        astation_id: &str,
+    ) -> (crate::memory::crypto::EncryptionMode, Option<String>) {
+        crate::memory::trust::TrustStore::load_from(&paths.trust)
+            .ok()
+            .and_then(|trust| crate::memory::verification::effective_state(&trust, astation_id).ok().flatten())
+            .and_then(|(_, state)| state)
+            .map(|state| (state.mode, state.kid))
+            .unwrap_or_default()
+    }
+
+    /// What a state that needed no migration says: the line only when this
+    /// device's mode or key id changed, else nothing (an empty status).
+    fn state_status(changed: bool) -> String {
+        if changed { ENCRYPTION_STATE_UPDATED.into() } else { String::new() }
     }
 
     /// The migration's signed completion goes out only under the captured
@@ -2255,6 +2302,7 @@ impl AstationClient {
         let mut statuses = Vec::new();
         for message in std::mem::take(&mut self.held_encryption) {
             match self.handle_encryption_message(&message).await {
+                Ok(Some(status)) if status.is_empty() => {}
                 Ok(Some(status)) => statuses.push(status),
                 Ok(None) => {}
                 // Older than the state the verification just delivered: stale, not news.
@@ -2277,7 +2325,8 @@ impl AstationClient {
 
     /// Runs this device's part of a migration and reports it, one at a
     /// time: the runtime's link skips one an operation is running (that
-    /// operation reports it); an operation waits for the link's.
+    /// operation reports it); an operation waits for the link's. `None`: no
+    /// migration was pending, so there was nothing to run or report.
     async fn finish_encryption_migration(&self, astation_id: &str, kid: Option<String>) -> Result<Option<String>> {
         self.check_capture()?;
         let _one = if self.is_op_view {
@@ -2302,7 +2351,7 @@ impl AstationClient {
             self.send_message_flushed(AstationMessage::EncryptionMigrationComplete { mode: target.to_string(), kid, completion }).await?;
             return Ok(Some(format!("Encryption migration complete; requesting {target}")));
         }
-        Ok(Some("Account encryption state updated".into()))
+        Ok(None)
     }
 
     /// Non-blocking: returns a message if one is already queued, None otherwise.
@@ -3099,6 +3148,106 @@ mod tests {
         assert_eq!(status, HOLDING_ENCRYPTION);
         assert!(unbound.apply_held_encryption().await.is_empty());
         assert_eq!(unbound.take_held_encryption().len(), 1);
+    }
+
+    /// A client of the verified, unlocked `device` (its profile bound to the
+    /// pairing), as the runtime's link is after `atem pair`.
+    fn client_of(
+        device: &crate::memory::fake_astation::UnlockedDevice,
+        dir: &std::path::Path,
+    ) -> AstationClient {
+        let capture = crate::pairing::tests::bound_profile(dir, crate::memory::fake_astation::ASTATION_ID);
+        let mut client = AstationClient::new()
+            .with_profile(capture.sources().clone())
+            .with_agent(device.agent.clone());
+        client.connected_astation_id = Some(crate::memory::fake_astation::ASTATION_ID.into());
+        client.set_capture_for_test(capture);
+        client
+    }
+
+    /// Astation's signed `encryptionMode`.
+    fn signed_mode(
+        device: &crate::memory::fake_astation::UnlockedDevice,
+        mode: crate::memory::crypto::EncryptionMode,
+        kid: Option<&str>,
+        epoch: u64,
+    ) -> AstationMessage {
+        let state = crate::memory::statements::AccountState {
+            account: crate::memory::fake_astation::ACCOUNT.into(),
+            sign_gen: 1,
+            mode,
+            kid: kid.map(str::to_string),
+            epoch,
+        };
+        AstationMessage::EncryptionMode {
+            account_state: Some(device.server.astation.sign(&state.encode())),
+        }
+    }
+
+    /// "Account encryption state updated" only says something when a signed
+    /// state changed this device's mode or key id: a newer epoch of what it
+    /// already does is handled with no line (an empty status, never `None`,
+    /// which means "not an encryption message").
+    #[tokio::test]
+    async fn a_signed_state_is_reported_only_when_the_mode_or_key_id_changed() {
+        use crate::memory::crypto::EncryptionMode::{Off, On};
+        let _profile = crate::test_profile::temp();
+        let dir = tempfile::tempdir().unwrap();
+        let mut device = crate::memory::fake_astation::UnlockedDevice::new(dir.path());
+        // Epoch 2: on with a key held.
+        device.set_key(On, "0123abcd", [7; 32]);
+        let mut client = client_of(&device, dir.path());
+
+        // The same mode and key id at a newer epoch: nothing to say.
+        let same = signed_mode(&device, On, Some("0123abcd"), 3);
+        assert_eq!(client.handle_encryption_message(&same).await.unwrap(), Some(String::new()));
+        // The same message again is a repeat the state already holds.
+        assert_eq!(
+            client.handle_encryption_message(&same).await.unwrap(),
+            Some("Account encryption state unchanged".to_string())
+        );
+        // Held and applied later: no status lines either.
+        client.hold_encryption(signed_mode(&device, On, Some("0123abcd"), 4));
+        assert!(client.apply_held_encryption().await.is_empty());
+
+        // The mode changed: reported, held and applied later as well.
+        client.hold_encryption(signed_mode(&device, Off, None, 5));
+        assert_eq!(client.apply_held_encryption().await, [ENCRYPTION_STATE_UPDATED.to_string()]);
+        // Off at a newer epoch: nothing changed.
+        let off = signed_mode(&device, Off, None, 6);
+        assert_eq!(client.handle_encryption_message(&off).await.unwrap(), Some(String::new()));
+    }
+
+    /// A first signed `off` for a device with no state says nothing: it
+    /// already behaves that way.
+    #[tokio::test]
+    async fn a_first_signed_off_state_is_not_reported() {
+        let _profile = crate::test_profile::temp();
+        let dir = tempfile::tempdir().unwrap();
+        let device = crate::memory::fake_astation::UnlockedDevice::new(dir.path());
+        let mut client = client_of(&device, dir.path());
+        let off = signed_mode(&device, crate::memory::crypto::EncryptionMode::Off, None, 5);
+        assert_eq!(client.handle_encryption_message(&off).await.unwrap(), Some(String::new()));
+    }
+
+    /// A key grant is reported only when it brings a key id the device didn't
+    /// hold.
+    #[tokio::test]
+    async fn a_key_grant_is_reported_only_when_it_brings_a_new_key_id() {
+        use crate::memory::crypto::EncryptionMode::On;
+        let _profile = crate::test_profile::temp();
+        let dir = tempfile::tempdir().unwrap();
+        let mut device = crate::memory::fake_astation::UnlockedDevice::new(dir.path());
+        // On, naming a key this device doesn't hold yet.
+        device.state(On, Some("0123abcd"));
+        let mut client = client_of(&device, dir.path());
+        let grant = || AstationMessage::KeyGrant { grant: Some(device.grant("0123abcd", [7; 32])) };
+        assert_eq!(
+            client.handle_encryption_message(&grant()).await.unwrap(),
+            Some(ENCRYPTION_STATE_UPDATED.to_string())
+        );
+        // The same key again: held already.
+        assert_eq!(client.handle_encryption_message(&grant()).await.unwrap(), Some(String::new()));
     }
 
     #[test]

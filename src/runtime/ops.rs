@@ -425,6 +425,19 @@ async fn settle_encryption<U: OpUi>(view: &mut AstationClient, ui: &U) {
     }
 }
 
+/// The end of `atem pair` and `atem pair verify` after the ceremony:
+/// applies the encryption messages held meanwhile and shows what they did,
+/// and only then the verdict (`verification_result`), so no status line
+/// lands between a failure's lines and the error that ends them.
+async fn conclude_verification<U: OpUi>(
+    view: &mut AstationClient,
+    ui: &U,
+    verification: Result<()>,
+) -> Result<()> {
+    settle_encryption(view, ui).await;
+    crate::pair_verify::verification_result(verification, |line| ui.print(PrintLevel::Warn, line))
+}
+
 // ── atem pair verify ──
 
 async fn pair_verify<U: OpUi>(
@@ -465,12 +478,9 @@ async fn pair_verify<U: OpUi>(
         PrintLevel::Info,
         &format!("Verifying this device with Astation {astation_id}..."),
     );
-    let verified = crate::pair_verify::verification_result(
-        verify_device(&mut view, &astation_id, &src.paths.cred, env.agent()?, ui).await,
-        |line| ui.print(PrintLevel::Warn, line),
-    );
-    settle_encryption(&mut view, ui).await;
-    verified
+    let verification =
+        verify_device(&mut view, &astation_id, &src.paths.cred, env.agent()?, ui).await;
+    conclude_verification(&mut view, ui, verification).await
 }
 
 /// `verifyAbort` reason when this host's record of frozen device lists
@@ -899,12 +909,9 @@ async fn pair<U: OpUi>(
     }
     // A failed verification is shown, then makes the result a failure; the
     // pairing stays saved.
-    let verified = crate::pair_verify::verification_result(
-        verify_device(&mut view, &astation_id, &src.paths.cred, env.agent()?, ui).await,
-        |line| ui.print(PrintLevel::Warn, line),
-    );
-    settle_encryption(&mut view, ui).await;
-    verified
+    let verification =
+        verify_device(&mut view, &astation_id, &src.paths.cred, env.agent()?, ui).await;
+    conclude_verification(&mut view, ui, verification).await
 }
 
 /// How long a first pairing waits for Astation's introduction (the relay's
