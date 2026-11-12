@@ -21,13 +21,15 @@
 //! - **The anchor** (rules 1–4 of "Automatic repair"): an unsynchronized
 //!   reading more than 60 s above the prediction copies the record and the
 //!   floor as they stood; a later reading within 60 s of the anchor's record
-//!   prediction lowers both (never raises them, never below the reading, the
-//!   anchor's predictions or the Station raise kept with it); the OS's sync
-//!   at a reading outside the band drops it.
+//!   prediction lowers both to it (never raises them, never below the
+//!   reading, the anchor's predictions or the Station raise kept with it);
+//!   the OS's sync at a reading outside the band drops it.
 //! - **The mark** (`lower_at_sync`): from a new boot until the first reading
 //!   the OS reports synchronized, at which `wall_hw` and the floor, when
 //!   either is more than 10 minutes ahead of the wall clock, are lowered to
-//!   it, once.
+//!   it, once. A boot whose first synchronized reading has passed is
+//!   remembered (`spent_boots`), so a profile that comes back to it gets no
+//!   second lowering in that boot.
 //! - **The floor** (`station`): a `station_time` up to `H` + 10 minutes;
 //!   above the floor it raises it, below it the floor follows it down at
 //!   500 ppm.
@@ -64,6 +66,8 @@ const LOWER_AHEAD_MS: u64 = 600_000;
 const BEFORE_BOOT_SLACK_MS: u64 = 60_000;
 /// The origins whose last "Station clock ahead" alert is kept.
 const MAX_ORIGINS: usize = 16;
+/// The boots whose once-per-boot lowering is remembered as spent.
+const MAX_SPENT_BOOTS: usize = 8;
 
 /// Values on the host's clock are kept in ns since the epoch (`i128`); a
 /// stamp stores the millisecond and puts the rest into its boot time.
@@ -129,8 +133,15 @@ impl Stamp {
         ns(self.value_ms)
     }
 
-    /// The boot time from the stamp to `r`, within its boot (never negative:
-    /// a counter read a hair lower counts as no time).
+    /// The boot time from the stamp to `r`, within its boot, never negative:
+    /// a counter read a hair lower (the composed Linux counter can step back
+    /// by under a microsecond between reads) counts as no time. So does a
+    /// counter that ran backwards under an unchanged boot id, which no boot
+    /// change is taken for: readings stay compared within the boot, from a
+    /// counter that started again. That needs a boot id that outlives its
+    /// counter (a VM restored from a memory snapshot older than the profile,
+    /// or a sandbox with a fixed `boot_id`), outside §11.6's model; a guard
+    /// for it is left to PR 4's review.
     fn since(&self, r: &OsReading) -> i128 {
         (i128::from(r.boot_ns) - i128::from(self.boot_ns)).max(0)
     }
@@ -221,6 +232,29 @@ pub struct ClockState {
     last_went_back_alert_ms: Option<u64>,
     /// `H` at the last "Station clock ahead of this host", per origin.
     last_ahead_alert_ms: BTreeMap<String, u64>,
+    /// The boots whose first synchronized reading has passed with the mark,
+    /// newest last, at most `MAX_SPENT_BOOTS`: a boot change into one of them
+    /// sets no mark, so the lowering stays once per boot when a profile
+    /// moves between machines and back.
+    spent_boots: Vec<Boot>,
+}
+
+/// A boot of a machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Boot {
+    #[serde(with = "machine_hex")]
+    machine: [u8; 16],
+    boot_id: String,
+}
+
+impl Boot {
+    fn of(r: &OsReading) -> Boot {
+        Boot {
+            machine: r.machine,
+            boot_id: r.boot_id.clone(),
+        }
+    }
 }
 
 /// What a reading or a `station_time` did, for `runtime.log`, `atem status`
@@ -241,8 +275,9 @@ pub enum ClockEvent {
     },
     AnchorArmed,
     AnchorDropped,
-    /// A jump undone: `(wall_hw, floor)` as they predicted at the reading,
-    /// and after.
+    /// A jump undone: `(wall_hw, floor)` as they read at the reading (`H`'s
+    /// value, `max(w, wall_hw's prediction)`, and the floor's prediction),
+    /// and after. Never higher after: a repair only lowers.
     Repaired {
         old: (u64, Option<u64>),
         new: (u64, Option<u64>),
@@ -476,7 +511,12 @@ impl ClockState {
         events: &mut Vec<ClockEvent>,
     ) {
         let w = ns(r.wall_ms);
-        let record = updated.min(w.max(a));
+        // Lowered to `max(w, a)`, never raised: with the anchor at or below
+        // the prediction that is the record, this reading's follow-down
+        // included (never below `a`); with it above (the record walked below
+        // the anchor's trajectory), there is nothing to lower and the update
+        // stands.
+        let record = if a <= p { w.max(a) } else { updated };
         let old_floor = self.floor.as_ref().map(|f| predict(f, Crossing::Same, r));
         let new_floor = old_floor.map(|now| {
             let target = [anchor.floor.as_ref(), anchor.station.as_ref()]
@@ -494,7 +534,7 @@ impl ClockState {
         self.record = Some(Stamp::at(record, r));
         self.anchor = None;
         events.push(ClockEvent::Repaired {
-            old: (to_ms(p), old_floor.map(to_ms)),
+            old: (to_ms(w.max(p)), old_floor.map(to_ms)),
             new: (to_ms(record), new_floor.map(to_ms)),
         });
     }
@@ -527,8 +567,10 @@ impl ClockState {
             events.push(ClockEvent::AnchorDropped);
         }
         // The mark goes with a boot Atem can tell is new: the first reading
-        // ever, or another boot id, both the OS's. A changed namespace in the
-        // same boot, or an id the OS couldn't give, leaves it as it was.
+        // ever, or another boot id, both the OS's, whose first synchronized
+        // reading hasn't passed with the mark already (a profile back on a
+        // machine it left). A changed namespace in the same boot, or an id
+        // the OS couldn't give, leaves it as it was.
         let new_boot = match from {
             None => true,
             Some((record, _)) => {
@@ -537,7 +579,7 @@ impl ClockState {
                     && !unknown_boot(&r.boot_id)
             }
         };
-        if new_boot {
+        if new_boot && !self.spent_boots.contains(&Boot::of(r)) {
             self.mark = true;
         }
     }
@@ -562,6 +604,11 @@ impl ClockState {
             return;
         }
         self.mark = false;
+        // This boot's lowering is spent, whether or not it lowers anything.
+        self.spent_boots.push(Boot::of(r));
+        if self.spent_boots.len() > MAX_SPENT_BOOTS {
+            self.spent_boots.remove(0);
+        }
         let w = ns(r.wall_ms);
         let record = self
             .record

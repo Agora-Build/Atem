@@ -140,14 +140,23 @@ fn check(
         None => true,
         Some(o) => o.boot_id != r.boot_id && !unknown_boot(&o.boot_id) && !unknown_boot(&r.boot_id),
     };
+    let spent = old.spent_boots.contains(&Boot::of(r));
     if r.synced == Synced::Yes {
         assert!(!new.mark, "a synchronized reading clears the mark");
-    } else if new_boot {
+    } else if new_boot && !spent {
         assert!(new.mark, "a new boot sets the mark");
     }
     if new.mark && !old.mark {
-        assert!(new_boot, "only a new boot sets the mark");
+        assert!(
+            new_boot && !spent,
+            "only a new boot not yet spent sets the mark"
+        );
     }
+    // A boot's first synchronized reading with the mark spends its lowering.
+    if r.synced == Synced::Yes && (old.mark || (new_boot && !spent)) {
+        assert_eq!(new.spent_boots.last(), Some(&Boot::of(r)));
+    }
+    assert!(new.spent_boots.len() <= MAX_SPENT_BOOTS);
     if was_lowered {
         assert_eq!(
             r.synced,
@@ -231,10 +240,14 @@ fn check(
                 let oa = old.anchor.as_ref().expect("a repair needs an anchor");
                 let a = predict(&oa.record, Crossing::Same, r);
                 if !was_lowered {
-                    // Lowered, never raised; never below the anchor's record
-                    // prediction or the reading.
-                    assert!(now <= a.max(w));
-                    assert!(now >= (p - rho(since)).min(a.max(w)));
+                    if a <= p {
+                        // Lowered to max(w, a): never below the anchor's
+                        // record prediction or the reading.
+                        assert_eq!(now, a.max(w), "a repair lands on max(w, a)");
+                    } else {
+                        // Nothing to lower: the update stands.
+                        assert!(now >= (p - rho(since)).max(w) && now <= p.max(w));
+                    }
                 }
                 if let (Some(before), Some(after)) = (floor_before, floor_now) {
                     let copies = [oa.floor.as_ref(), oa.station.as_ref()]
@@ -252,10 +265,15 @@ fn check(
                     assert_eq!(
                         event,
                         &ClockEvent::Repaired {
-                            old: (to_ms(p), floor_before.map(to_ms)),
+                            old: (to_ms(w.max(p)), floor_before.map(to_ms)),
                             new: (to_ms(now), floor_now.map(to_ms)),
                         }
                     );
+                    // It reads as what happened: nothing rises.
+                    let ClockEvent::Repaired { old, new } = event else {
+                        unreachable!()
+                    };
+                    assert!(new.0 <= old.0 && new.1 <= old.1);
                 }
             } else if !was_lowered {
                 assert_eq!(floor_now, floor_before, "a reading never moves the floor");
@@ -1466,10 +1484,18 @@ fn state_json_round_trips() {
         mark: true,
         last_went_back_alert_ms: Some(1_800_000_000_000),
         last_ahead_alert_ms: [(ORIGIN.to_string(), 1_800_000_000_001)].into(),
+        spent_boots: vec![Boot {
+            machine: M2,
+            boot_id: "boot-b".to_string(),
+        }],
     };
     let text = state.to_json();
     assert_eq!(ClockState::from_json(&text).expect("reads back"), state);
     assert!(text.contains(&format!("\"machine\":\"{}\"", "11".repeat(16))));
+    assert!(text.contains(&format!(
+        "\"spent_boots\":[{{\"machine\":\"{}\",\"boot_id\":\"boot-b\"}}]",
+        "22".repeat(16)
+    )));
     let fresh = ClockState::default();
     assert_eq!(
         ClockState::from_json(&fresh.to_json()).expect("reads back"),
@@ -1715,4 +1741,148 @@ fn first_reading_ever_records_the_wall_clock_and_marks_the_boot() {
     let mut host = Host::new(Synced::Yes);
     host.observe();
     assert!(!host.state.mark());
+}
+
+/// A host whose record, after a 61 s jump the anchor took and a clock set 2
+/// hours back, was followed down a minute at a time until it is less than one
+/// minute's follow-down (30 ms) above the anchor's record prediction.
+fn walked_to_the_anchor() -> Host {
+    let mut host = settled_host(5);
+    host.synced = Synced::No;
+    host.advance(MIN);
+    host.wall_off += 61 * SEC;
+    assert_eq!(count(&host.observe(), armed), 1);
+    host.advance(MIN);
+    host.wall_off = -2 * HOUR;
+    host.observe();
+    while host.record() - host.anchor().expect("pending") >= 30 * MS {
+        host.advance(MIN);
+        host.observe();
+    }
+    assert!(host.record() > host.anchor().expect("pending"));
+    host.advance(MIN);
+    let (p, a) = (host.h(), host.anchor().expect("pending"));
+    assert!(
+        p - follow_down(MIN) < a && a <= p,
+        "the case: p − ρΔ < a ≤ p"
+    );
+    host
+}
+
+#[test]
+fn a_repair_never_lands_below_the_anchor_prediction_after_a_follow_down() {
+    // Review probe P1: a 61 s jump, the runtime stopped two days in the same
+    // boot, then the clock set to a − 30 s. That reading's follow-down (86.4 s)
+    // alone would end 25.4 s below a; the repair lands on max(w, a).
+    let mut host = settled_host(10);
+    host.synced = Synced::No;
+    host.advance(MIN);
+    host.wall_off += 61 * SEC;
+    assert_eq!(count(&host.observe(), armed), 1);
+    host.advance(2 * DAY);
+    let a = host.anchor().expect("pending");
+    host.set_wall(a - 30 * SEC);
+    assert_eq!(count(&host.observe(), repaired), 1);
+    assert_eq!(host.record(), a);
+
+    // Random jumps and gaps whose follow-down passes the anchor.
+    for seed in 0..40 {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut host = settled_host(5);
+        host.synced = unsynced(&mut rng);
+        host.advance(MIN);
+        let jump = rng.gen_range(61..=600) * SEC;
+        host.wall_off += jump;
+        assert_eq!(count(&host.observe(), armed), 1);
+        host.advance(jump * 2_000 + rng.gen_range(0..=86_400) * SEC);
+        let a = host.anchor().expect("pending");
+        let off = rng.gen_range(-60_000..=60_000) * MS;
+        host.set_wall(a + off);
+        assert_eq!(count(&host.observe(), repaired), 1);
+        assert_eq!(host.record(), (a + off).max(a));
+    }
+
+    // At a reading a minute: undone below the anchor, it lands on it.
+    let mut host = walked_to_the_anchor();
+    let a = host.anchor().expect("pending");
+    host.set_wall(a - 30 * SEC);
+    assert_eq!(count(&host.observe(), repaired), 1);
+    assert_eq!(host.record(), a);
+
+    // Undone above the record's prediction: the record takes the reading, and
+    // the event reads no rise (review Minor 3).
+    let mut host = walked_to_the_anchor();
+    let p = host.h();
+    host.set_wall(p + 10 * SEC);
+    let events = host.observe();
+    let w = ns(host.reading().wall_ms);
+    assert_eq!(host.record(), w);
+    assert_eq!(
+        events.iter().find(|e| repaired(e)),
+        Some(&ClockEvent::Repaired {
+            old: (to_ms(w), None),
+            new: (to_ms(w), None),
+        })
+    );
+}
+
+#[test]
+fn a_profile_back_on_a_machine_gets_no_second_lowering_in_its_boot() {
+    // Review probe P2: a profile shared by machines A and B (one runtime at a
+    // time) moved A -> B -> A -> B. B's clock runs two hours behind; its one
+    // kernel boot gets one lowering, at its first synchronized reading.
+    let mut host = Host::new(Synced::Yes);
+    host.observe();
+    host.run(HOUR, MIN);
+    let a_start = T0 - 30 * SEC;
+    let b_start = T0 - 5 * DAY;
+    for round in 0..3 {
+        host.synced = Synced::No;
+        host.machine = M2;
+        host.boot_id = "b-boot".to_string();
+        host.counter = host.truth - b_start;
+        host.wall_off = -2 * HOUR;
+        let events = host.observe();
+        assert_eq!(guard(&events), Some(GuardWhy::OtherMachine));
+        assert_eq!(host.state.mark(), round == 0, "round {round}");
+        host.advance(MIN);
+        host.synced = Synced::Yes;
+        assert_eq!(count(&host.observe(), lowered), usize::from(round == 0));
+        host.run(HOUR, MIN);
+        // Back on A, whose boot's first synchronized reading passed at its
+        // first reading.
+        host.synced = Synced::No;
+        host.machine = M1;
+        host.boot_id = "boot-0".to_string();
+        host.counter = host.truth - a_start;
+        host.wall_off = 0;
+        host.observe();
+        assert!(!host.state.mark());
+        host.advance(MIN);
+        host.synced = Synced::Yes;
+        host.run(HOUR, MIN);
+    }
+    assert_eq!(host.seen(lowered), 1);
+    assert!(
+        host.seen(went_back) >= 2,
+        "B's clock behind: the alert instead"
+    );
+
+    // The list keeps the latest eight boots.
+    for _ in 0..10 {
+        host.reboot(MIN, 30 * SEC);
+        host.observe();
+    }
+    let kept: Vec<&str> = host
+        .state
+        .spent_boots
+        .iter()
+        .map(|b| b.boot_id.as_str())
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            "boot-3", "boot-4", "boot-5", "boot-6", "boot-7", "boot-8", "boot-9", "boot-10"
+        ]
+    );
 }
