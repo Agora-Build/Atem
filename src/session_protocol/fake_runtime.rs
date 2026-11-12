@@ -64,6 +64,9 @@ pub struct Pty {
     pub pushes: Vec<Value>,
     /// Session rules the runtime was asked to revoke, in order.
     pub rule_revokes: Vec<String>,
+    /// Interrupts written on the host's own authority (R9.14 item 5): the
+    /// request ids of their attempts, in order.
+    pub host_interrupts: Vec<String>,
 }
 
 impl Default for Pty {
@@ -83,6 +86,7 @@ impl Default for Pty {
             approvals_released: 0,
             pushes: Vec::new(),
             rule_revokes: Vec::new(),
+            host_interrupts: Vec::new(),
         }
     }
 }
@@ -706,6 +710,9 @@ impl<J: Journal> FakeRuntime<J> {
                     }
                 }
                 Effect::ApprovalReleased { .. } => self.pty.approvals_released += 1,
+                Effect::HostInterrupt { request_id, .. } => {
+                    self.pty.host_interrupts.push(request_id)
+                }
                 Effect::PushApproval { request } => {
                     self.pty
                         .pushes

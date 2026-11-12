@@ -108,7 +108,12 @@
 //! another submitter is left alone. A
 //! `request_id` recorded under another submitter, where either is the
 //! `host-work` principal, is `request_id_reused` even with every immutable
-//! value equal (R9.14 items 3, 4, 7).
+//! value equal (R9.14 items 3, 4, 7). Host-work interrupts its executing
+//! attempt's turn with the host's own authority (`host_interrupt`, item 5):
+//! the turn check first, then the input epoch and the revocation of
+//! another controller's lease (`revoked`), then the write; receipt-less,
+//! like local input. While the intent stays pending only the revocation
+//! repeats (`host_revoke`).
 
 use super::canonical::{self, MAX_SAFE_INTEGER};
 pub use super::journal::Provenance;
@@ -369,6 +374,14 @@ pub enum Effect {
         approval_id: String,
         reason: ApprovalCloseReason,
     },
+    /// Write the interrupt key to the session on the host's own authority
+    /// (session-v1 R9.14 item 5; `host_interrupt`): the input epoch already
+    /// moved. It is no submission and has no receipt; the runtime reports
+    /// what became of the write to host-work.
+    HostInterrupt {
+        session_id: String,
+        request_id: String,
+    },
     /// A chat-v1 reply to the conversation that submitted (or was refused).
     /// The runtime's chat stream renders it with its own `generation` and
     /// `sequence` head.
@@ -529,6 +542,32 @@ pub enum Withdrawal {
     Started,
     /// A write the withdrawal needed failed: the journal halted, and
     /// nothing becomes `executing` until the restart, which settles it.
+    Halted,
+}
+
+/// What an interrupt with host authority did (session-v1 R9.14 item 5;
+/// design I.5.7): `host_interrupt`, and `host_revoke` on the later passes
+/// of a pending intent. Only `Written` and `Revoked` changed anything.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostInterrupt {
+    /// The turn check passed: the input epoch moved, a lease another
+    /// controller held was revoked (`lease_changed{reason: "revoked"}`),
+    /// and the write (`Effect::HostInterrupt`) is the last effect.
+    Written(Vec<Effect>),
+    /// `host_revoke`'s: the turn check passed and a lease another
+    /// controller held was revoked (its end moved the input epoch); nothing
+    /// written. Empty when nobody else held it.
+    Revoked(Vec<Effect>),
+    /// The session's current turn isn't the attempt's: a request of another
+    /// submitter, another session's, or one whose session no longer runs
+    /// its process. Nothing done.
+    NotCurrentTurn,
+    /// The attempt isn't executing: queued (`accepted`), settled, or not in
+    /// the journal (never admitted, or settled and evicted). Nothing done:
+    /// one not yet started is host-work's to withdraw (I.5.7).
+    NotExecuting,
+    /// The journal halted (r8 §I): nothing done; the restart settles the
+    /// attempt.
     Halted,
 }
 
@@ -1567,6 +1606,90 @@ impl<J: Journal> SessionHost<J> {
             origin: Origin::Local,
         });
         self.take()
+    }
+
+    /// Interrupts the turn of host-work's attempt `request_id` on
+    /// `session_id` with the host's own authority (session-v1 R9.14 item 5,
+    /// design I.5.7), as local input does (§5) and in this order: the turn
+    /// check (`host_interrupt_blocked`; refused, nothing is done), then the
+    /// input epoch and the revocation of a lease another controller holds
+    /// (`revoked`, never `local_input`: attachments see a revocation; the
+    /// host-work principal's own lease stays), then the write
+    /// (`Effect::HostInterrupt`, last). No submission: no receipt, nothing
+    /// journaled, nothing on the refusal list; the attempt's own prompt
+    /// receipt completes with its turn (`interrupted`, §6).
+    pub fn host_interrupt(&mut self, session_id: &str, request_id: &str) -> HostInterrupt {
+        if let Some(blocked) = self.host_interrupt_blocked(session_id, request_id) {
+            return blocked;
+        }
+        if let Some(s) = self.sessions.get_mut(session_id) {
+            s.input_epoch += 1;
+        }
+        self.revoke_other_lease(session_id);
+        self.out.push(Effect::HostInterrupt {
+            session_id: session_id.to_string(),
+            request_id: request_id.to_string(),
+        });
+        HostInterrupt::Written(self.take())
+    }
+
+    /// Item 5's later passes while an intent is pending, once its interrupt
+    /// was delivered: the same turn check, then only the revocation of a
+    /// lease another controller holds (so a takeover during the turn can't
+    /// defeat the owner's choice); nothing written. `Revoked`, empty when
+    /// nobody else holds the lease.
+    pub fn host_revoke(&mut self, session_id: &str, request_id: &str) -> HostInterrupt {
+        if let Some(blocked) = self.host_interrupt_blocked(session_id, request_id) {
+            return blocked;
+        }
+        self.revoke_other_lease(session_id);
+        HostInterrupt::Revoked(self.take())
+    }
+
+    /// The session host's half of item 5's turn check: why
+    /// `host_interrupt` (or `host_revoke`) would do nothing now, if it
+    /// would. Prompts run one at a time per session, so an attempt that is
+    /// `executing` is its session's current turn here (the runtime also
+    /// checks the chat's turn before asking). A halted journal first.
+    pub fn host_interrupt_blocked(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Option<HostInterrupt> {
+        if self.journal_halted {
+            return Some(HostInterrupt::Halted);
+        }
+        let Some(e) = self.receipts.get(request_id) else {
+            return Some(HostInterrupt::NotExecuting);
+        };
+        let s = &e.stored;
+        if !is_host_work(&s.principal)
+            || s.kind != ReceiptKind::Prompt
+            || s.target.session_id != session_id
+        {
+            return Some(HostInterrupt::NotCurrentTurn);
+        }
+        if s.state != ReceiptState::Executing {
+            return Some(HostInterrupt::NotExecuting);
+        }
+        let runs = self.sessions.get(session_id).is_some_and(|x| {
+            x.state == SessionState::Running && x.spec.process_gen == s.target.process_gen
+        });
+        (!runs).then_some(HostInterrupt::NotCurrentTurn)
+    }
+
+    /// Ends a lease of `session_id` held by anyone but the `host-work`
+    /// principal, reason `revoked` (its end moves the input epoch first, so
+    /// the holder's queued bytes are dropped at the write boundary).
+    fn revoke_other_lease(&mut self, session_id: &str) {
+        let other = self
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.lease.as_ref())
+            .is_some_and(|l| !is_host_work(&l.principal));
+        if other {
+            self.end_lease(session_id, LeaseChangeReason::Revoked, None);
+        }
     }
 
     /// Called by the PTY writer right before writing a queued remote chunk,

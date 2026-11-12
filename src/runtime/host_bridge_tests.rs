@@ -2597,28 +2597,25 @@ fn input_to_codex_releases_its_waiting_hooks_first() {
     });
 }
 
-#[tokio::test]
-async fn adoption_tells_the_worker_which_approvals_the_broker_knows() {
+/// Codex running the fake approval agent (`FAKE_DIR` = `fake`) in a worker
+/// in this process: its input releases a waiting approval hook first.
+async fn approval_codex(dir: &Path, fake: &Path) -> crate::runtime::broker::BrokerSession {
     use crate::runtime::adopt::SpawnRequest;
-    use crate::runtime::worker_approvals::Event;
-    let _sweep = HookSweep;
-    let dir = short_dir();
-    let fake = dir.path().join("fake");
     let launcher = Launcher::InProcess(InProcess {
-        state: dir.path().join("state"),
-        socket_dir: dir.path().join("ws"),
-        chat_root: dir.path().join("chat"),
+        state: dir.join("state"),
+        socket_dir: dir.join("ws"),
+        chat_root: dir.join("chat"),
     });
     let request = SpawnRequest {
         session_id: crate::session::SessionId::new(),
         process_gen: uuid::Uuid::new_v4().to_string(),
         provider: crate::session::Provider::Codex,
         args: vec![],
-        cwd: dir.path().to_path_buf(),
+        cwd: dir.to_path_buf(),
         rows: 24,
         cols: 80,
     };
-    let hook = crate::chat::codex::hook_command(&dir.path().join("chat/approval-hook.sh"));
+    let hook = crate::chat::codex::hook_command(&dir.join("chat/approval-hook.sh"));
     let env = LaunchEnv(vec![
         ("PATH".into(), "/usr/bin:/bin".into()),
         (
@@ -2629,8 +2626,16 @@ async fn adoption_tells_the_worker_which_approvals_the_broker_knows() {
         ("FAKE_CODEX_HOOK".into(), hook),
     ]);
     let (handle, created_at_ms) = launcher.spawn(request.clone(), env).await.unwrap();
-    let mut session =
-        crate::runtime::broker::BrokerSession::launched(handle, &request, created_at_ms);
+    crate::runtime::broker::BrokerSession::launched(handle, &request, created_at_ms)
+}
+
+#[tokio::test]
+async fn adoption_tells_the_worker_which_approvals_the_broker_knows() {
+    use crate::runtime::worker_approvals::Event;
+    let _sweep = HookSweep;
+    let dir = short_dir();
+    let fake = dir.path().join("fake");
+    let mut session = approval_codex(dir.path(), &fake).await;
     agent_event(&fake, "started").await;
     ask(
         &fake,
@@ -4796,4 +4801,344 @@ fn host_work_renews_every_5s_while_its_turn_runs_and_releases_at_the_end() {
         bridge.host().receipt(&rid).unwrap().state,
         ReceiptState::Completed
     );
+}
+
+// ── Interrupt with host authority (session-v1 R9.14 item 5) ──
+
+/// Host-work's attempt on `id`'s session: the session registered with the
+/// host (offering chat-v1, as Codex with Atem's hooks on does), the attempt
+/// submitted and started. Its prompt isn't pasted here (the dispatch is
+/// left undone): `show_turn` shows its turn. Its request id.
+fn host_work_attempt(
+    bridge: &mut super::HostBridge,
+    id: &crate::session::SessionId,
+    cx: &mut super::Cx<'_>,
+) -> String {
+    use crate::session_protocol::host::{Provenance, StartVerdict};
+    use crate::session_protocol::wire::ReceiptState;
+    cx.sessions.get_mut(id).unwrap().chat_offered = true;
+    bridge.register(id, cx);
+    let att = bridge
+        .host_work_attachment()
+        .expect("with host.delegated")
+        .to_string();
+    let ctx = bridge.host().context().clone();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let data = json!({"v": 1, "op": "submit", "id": uuid::Uuid::new_v4().to_string(),
+        "binding": {"target": {"account_id": ctx.account_id, "atem_device_id": ctx.atem_device_id,
+            "host_trust_gen": ctx.host_trust_gen, "session_id": id.to_string(),
+            "process_gen": cx.sessions[id].process_gen}, "attachment_gen": att},
+        "request_id": request_id, "kind": "prompt", "payload": {"text": "run the tests"},
+        "acquire": true});
+    bridge.host.set_start_check(Box::new(StartVerdict::Go));
+    let _undone = bridge.host.submit_host_work(
+        &att,
+        data,
+        Provenance {
+            task_id: uuid::Uuid::new_v4().to_string(),
+            sender: "member:phone-1".into(),
+        },
+    );
+    assert_eq!(
+        bridge.host().receipt(&request_id).unwrap().state,
+        ReceiptState::Executing
+    );
+    request_id
+}
+
+/// The chat of a session whose current turn host-work's attempt
+/// `request_id` began and still runs (its prompt accepted: the hook and
+/// the log agree; the agent working): what the turn check reads. The fake
+/// agents keep no chat of their own.
+fn show_turn(session: &mut crate::runtime::broker::BrokerSession, request_id: &str) {
+    use crate::chat::adapter::{AgentEvent, LogItem};
+    use crate::chat::session::{ChatSession, State};
+    let generation = session.process_gen.clone();
+    let mut chat = ChatSession::new(generation.clone(), 0);
+    chat.on_event(
+        AgentEvent::SessionStarted {
+            session_id: "fake-session".into(),
+            log_path: PathBuf::new(),
+            source: "startup".into(),
+            same_log: false,
+        },
+        1,
+        0,
+    );
+    let text = chat
+        .submit(request_id, &generation, "run the tests", 0, false)
+        .unwrap();
+    chat.mark_pasted(request_id, Instant::now(), 2);
+    chat.on_event(
+        AgentEvent::PromptSubmitted {
+            text: text.clone(),
+            turn_id: None,
+            at_ms: Some(3),
+        },
+        3,
+        0,
+    );
+    chat.on_log(
+        LogItem::UserMessage {
+            id: "user-1".into(),
+            turn_id: "turn-1".into(),
+            text,
+            created_at_ms: 3,
+        },
+        3,
+        0,
+    );
+    assert_eq!(chat.current_request_id(), Some(request_id));
+    assert_eq!(chat.status().state, State::Working);
+    session.chat = chat;
+    session.chat_v1 = true;
+}
+
+/// Pumps `id`'s worker until it answered a write, hands the answers to the
+/// bridge, and returns what host-work was told since the last call.
+async fn answered(
+    bridge: &mut super::HostBridge,
+    id: &crate::session::SessionId,
+    cx: &mut super::Cx<'_>,
+) -> Vec<(String, super::InterruptReport)> {
+    let results = tokio::time::timeout(WAIT, async {
+        loop {
+            let session = cx.sessions.get_mut(id).unwrap();
+            session.pump();
+            let results = session.take_results();
+            if !results.is_empty() {
+                return results;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the worker answers the write");
+    for result in results {
+        bridge.write_result(id.as_str(), result, cx);
+    }
+    bridge.host_interrupt_reports()
+}
+
+/// The sequence number of `request_id`'s host interrupt write still waiting
+/// for the worker's answer.
+fn pending_interrupt(bridge: &super::HostBridge, sid: &str, request_id: &str) -> Option<u64> {
+    bridge.pending.iter().find_map(|((s, seq), p)| {
+        matches!(p, super::Pending::HostInterrupt(r) if s == sid && r == request_id).then_some(*seq)
+    })
+}
+
+/// The worker's answer to a host interrupt's write, as host-work hears it.
+#[test]
+fn interrupt_reports_follow_the_write_outcome() {
+    use super::super::broker::WriteOutcome;
+    use super::InterruptReport;
+    let outcome = |ok, dropped, no_effect, consumed| WriteOutcome {
+        seq: 0,
+        ok,
+        dropped,
+        no_effect,
+        consumed,
+        error: None,
+    };
+    let cases = [
+        ((true, false, false, false), InterruptReport::Ok),
+        // The worker's `consumed` answer also says nothing was written.
+        ((false, false, true, true), InterruptReport::Consumed),
+        ((false, true, false, false), InterruptReport::Dropped),
+        ((false, false, true, false), InterruptReport::NoEffect),
+        (
+            (false, false, false, false),
+            InterruptReport::ErrorAfterQueue,
+        ),
+    ];
+    for ((ok, dropped, no_effect, consumed), want) in cases {
+        assert_eq!(
+            super::interrupt_report(&outcome(ok, dropped, no_effect, consumed)),
+            want
+        );
+    }
+}
+
+/// Codex with an approval hook waiting: the Esc only hands the approval to
+/// Codex's own dialog, and the worker consumes it (`CONSUME_INPUT`):
+/// reported `Consumed`, once, and nothing reached the agent. Written again
+/// on later passes, it reaches the agent once the worker's consume window
+/// passed, reported `Ok`. Then only the revocation repeats: nothing more is
+/// written.
+#[tokio::test]
+async fn a_consumed_write_is_reported_for_a_retry() {
+    use super::InterruptReport;
+    use crate::runtime::worker_approvals::Event;
+    use crate::session_protocol::host::HostInterrupt;
+    use crate::session_protocol::wire::ReceiptState;
+    let _sweep = HookSweep;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let fake = dir.path().join("fake");
+    let mut session = approval_codex(dir.path(), &fake).await;
+    agent_event(&fake, "started").await;
+    ask(
+        &fake,
+        1,
+        json!({"tool_name": "shell", "tool_input": {"command": "ls"}}),
+    );
+    tokio::time::timeout(WAIT, async {
+        loop {
+            session.pump();
+            let events = session.take_approvals();
+            if events.iter().any(|e| matches!(e, Event::Request { .. })) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("no approval request");
+    let mut app = idle_app();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    let id = session.id.clone();
+    let sid = id.to_string();
+    let mut sessions = std::collections::BTreeMap::from([(id.clone(), session)]);
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    let rid = host_work_attempt(&mut bridge, &id, &mut cx);
+    show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+
+    assert!(matches!(
+        bridge.host_interrupt(&sid, &rid, &mut cx),
+        HostInterrupt::Written(_)
+    ));
+    assert_eq!(
+        answered(&mut bridge, &id, &mut cx).await,
+        [(rid.clone(), InterruptReport::Consumed)]
+    );
+    assert_eq!(bridge.host_interrupt_reports(), [], "reported once");
+    // The hook got "no decision" (Codex's own dialog asks); the Esc itself
+    // never reached the agent.
+    agent_event(&fake, "answer 1 none").await;
+    assert_eq!(std::fs::read(fake.join("input")).unwrap_or_default(), b"");
+
+    // The retry, as a later pass makes it while the intent is pending.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+        assert!(matches!(
+            bridge.host_interrupt(&sid, &rid, &mut cx),
+            HostInterrupt::Written(_)
+        ));
+        match answered(&mut bridge, &id, &mut cx).await.as_slice() {
+            [(r, InterruptReport::Ok)] if *r == rid => break,
+            // Within the worker's consume window.
+            [(r, InterruptReport::Consumed)] if *r == rid && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    agent_input(&fake, b"\x1b").await;
+    // Delivered: later passes repeat only the revocation (nobody else
+    // holds the lease here), and nothing more is written.
+    show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+    assert_eq!(
+        bridge.host_revoke(&sid, &rid, &mut cx),
+        HostInterrupt::Revoked(Vec::new())
+    );
+    assert_eq!(pending_interrupt(&bridge, &sid, &rid), None);
+    // No receipt of its own: the attempt's prompt still runs its turn.
+    assert_eq!(
+        bridge.host().receipt(&rid).unwrap().state,
+        ReceiptState::Executing
+    );
+    let _ = cx.sessions.get_mut(&id).unwrap().stop();
+}
+
+/// The chat must show the attempt's turn running first (today's Esc rule):
+/// until then nothing is written. A writer error after the write was
+/// queued (the Esc may have reached the terminal) is reported
+/// `ErrorAfterQueue` once: the same answer again, or the worker's own for
+/// that write, reports nothing. A write the session's end leaves
+/// unanswered is reported `NoEffect` (nothing left to interrupt), once.
+#[tokio::test]
+async fn an_error_after_queueing_is_reported_once() {
+    use super::super::broker::{SessionState as BrokerState, WriteOutcome};
+    use super::InterruptReport;
+    use crate::session_protocol::host::HostInterrupt;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let session = broker_session(dir.path()).await;
+    let mut app = idle_app();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    let id = session.id.clone();
+    let sid = id.to_string();
+    let mut sessions = std::collections::BTreeMap::from([(id.clone(), session)]);
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    let rid = host_work_attempt(&mut bridge, &id, &mut cx);
+    // Its prompt not taken yet: the chat shows no turn of it.
+    let epoch = bridge.host().input_epoch(&sid);
+    assert_eq!(
+        bridge.host_interrupt(&sid, &rid, &mut cx),
+        HostInterrupt::NotCurrentTurn
+    );
+    assert_eq!(bridge.host().input_epoch(&sid), epoch);
+    assert_eq!(pending_interrupt(&bridge, &sid, &rid), None);
+
+    show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+    assert!(matches!(
+        bridge.host_interrupt(&sid, &rid, &mut cx),
+        HostInterrupt::Written(_)
+    ));
+    let seq = pending_interrupt(&bridge, &sid, &rid).expect("waits for the worker's answer");
+    let failed = WriteOutcome {
+        seq,
+        ok: false,
+        dropped: false,
+        no_effect: false,
+        consumed: false,
+        error: Some("Input/output error".into()),
+    };
+    bridge.write_result(&sid, failed.clone(), &mut cx);
+    assert_eq!(
+        bridge.host_interrupt_reports(),
+        [(rid.clone(), InterruptReport::ErrorAfterQueue)]
+    );
+    assert_eq!(bridge.host_interrupt_reports(), []);
+    bridge.write_result(&sid, failed, &mut cx);
+    assert_eq!(answered(&mut bridge, &id, &mut cx).await, [], "never twice");
+
+    // Written again; the session ends before the worker's answer is read.
+    show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+    assert!(matches!(
+        bridge.host_interrupt(&sid, &rid, &mut cx),
+        HostInterrupt::Written(_)
+    ));
+    assert!(pending_interrupt(&bridge, &sid, &rid).is_some());
+    let session = cx.sessions.get_mut(&id).unwrap();
+    session.stop().unwrap();
+    tokio::time::timeout(WAIT, async {
+        while session.state == BrokerState::Running {
+            session.pump();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the agent exits");
+    bridge.sync_state(&id, &mut cx);
+    assert_eq!(
+        bridge.host_interrupt_reports(),
+        [(rid.clone(), InterruptReport::NoEffect)]
+    );
+    bridge.worker_reports(&mut cx);
+    assert_eq!(bridge.host_interrupt_reports(), []);
 }

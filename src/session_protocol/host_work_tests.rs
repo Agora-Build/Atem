@@ -4,7 +4,9 @@
 //! does (items 1, 2); its requests start only after the start check, in
 //! the step that makes them `executing`, and it may withdraw them (items 3,
 //! 4); a `request_id` recorded under another submitter is
-//! `request_id_reused` when either is the host-work principal (item 7).
+//! `request_id_reused` when either is the host-work principal (item 7); it
+//! interrupts its attempt's turn with the host's own authority, the turn
+//! check first, receipt-less (item 5).
 
 use super::canonical;
 use super::fake_runtime::{AUTHORIZATION_MS, FailFsync, FakeRuntime};
@@ -1429,4 +1431,342 @@ fn past_the_bound_in_memory_a_full_list_halts_the_journal() {
     assert_eq!(rt.host.start_error(), None);
     assert!(!rt.host.journal_halted());
     assert!(rt.host.receipt(&rid(next)).is_none());
+}
+
+// ── Interrupt with host authority (session-v1 R9.14 item 5) ──
+
+/// A session-v1 `acquire` of `client` (attachment `att`) on S1.
+fn acquire<J: Journal + FailFsync>(
+    rt: &mut FakeRuntime<J>,
+    client: &str,
+    att: &str,
+    takeover: bool,
+) {
+    rt.send(
+        client,
+        &json!({"type": "session", "data": {"v": 1, "op": "acquire", "id": id(),
+            "binding": {"target": target(), "attachment_gen": att}, "takeover": takeover}}),
+    );
+    assert_eq!(rt.host.lease_holder(S1), Some(att));
+}
+
+/// `client` (attachment `att`) releases its lease on S1.
+fn release<J: Journal + FailFsync>(rt: &mut FakeRuntime<J>, client: &str, att: &str) {
+    let epoch = rt.host.lease_epoch(S1).unwrap();
+    rt.send(
+        client,
+        &json!({"type": "session", "data": {"v": 1, "op": "release", "id": id(),
+            "binding": {"target": target(), "attachment_gen": att, "lease_epoch": epoch}}}),
+    );
+    assert_eq!(rt.host.lease_holder(S1), None);
+}
+
+/// The effects of an interrupt that passed the turn check.
+fn written(outcome: HostInterrupt) -> Vec<Effect> {
+    match outcome {
+        HostInterrupt::Written(fx) => fx,
+        other => panic!("not written: {other:?}"),
+    }
+}
+
+/// The effects of a repeated revocation that passed the turn check.
+fn revoked(outcome: HostInterrupt) -> Vec<Effect> {
+    match outcome {
+        HostInterrupt::Revoked(fx) => fx,
+        other => panic!("not revoked: {other:?}"),
+    }
+}
+
+/// The `lease_changed` reasons among `fx`, per attachment, in order.
+fn lease_reasons(fx: &[Effect]) -> Vec<(String, wire::LeaseChangeReason)> {
+    fx.iter()
+        .filter_map(|e| match e {
+            Effect::Send {
+                attachment,
+                message: wire::Envelope::Session(m),
+            } => match &m.op {
+                wire::Op::LeaseChanged { reason, .. } => Some((attachment.clone(), *reason)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Where among `fx` the interrupt's write is.
+fn write_at(fx: &[Effect], request_id: &str) -> Option<usize> {
+    fx.iter().position(|e| {
+        matches!(e, Effect::HostInterrupt { session_id, request_id: r }
+            if session_id == S1 && r == request_id)
+    })
+}
+
+fn interrupted() -> DispatchReport {
+    DispatchReport::Completed {
+        detail: Some(DETAIL_TURN_INTERRUPTED.into()),
+        turn_id: Some("turn-1".into()),
+        user_message_id: Some("turn-1-u".into()),
+    }
+}
+
+/// The turn check comes first: an attempt that isn't the session's current
+/// turn (queued behind another, settled, never admitted, named with another
+/// session) or a request that isn't host-work's attempt gets nothing: no
+/// epoch bump, no revocation of the controller of that other turn, nothing
+/// written. A halted journal: nothing at all.
+#[test]
+fn host_interrupt_checks_the_turn_first() {
+    let mut rt = setup();
+    host_work(&mut rt, HW);
+    // c1's turn runs; host-work's attempt waits behind it (one prompt at a
+    // time), and c1 holds the lease again.
+    client_prompt(&mut rt, "c1", C1, 1);
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Executing
+    );
+    release(&mut rt, "c1", C1);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 2), provenance(TASK, SENDER));
+    assert_eq!(
+        rt.host.receipt(&rid(2)).unwrap().state,
+        ReceiptState::Accepted
+    );
+    release_host_work(&mut rt, HW);
+    acquire(&mut rt, "c1", C1, false);
+    got(&mut rt, "c1");
+    got(&mut rt, "v");
+    let epoch = rt.host.input_epoch(S1).unwrap();
+    for (session_id, request_id, want) in [
+        (S1, rid(2), HostInterrupt::NotExecuting),
+        (S1, rid(1), HostInterrupt::NotCurrentTurn),
+        (S1, rid(9), HostInterrupt::NotExecuting),
+        ("ses-bbbbbbbbbbbb", rid(2), HostInterrupt::NotCurrentTurn),
+    ] {
+        assert_eq!(
+            rt.host.host_interrupt(session_id, &request_id),
+            want,
+            "{session_id} {request_id}"
+        );
+        assert_eq!(rt.host.input_epoch(S1), Some(epoch));
+        assert_eq!(rt.host.lease_holder(S1), Some(C1));
+        assert!(got(&mut rt, "c1").is_empty());
+        assert!(rt.host.take_effects().is_empty());
+    }
+    assert!(rt.pty.host_interrupts.is_empty());
+
+    // c1's turn ends: the attempt starts, and is the current turn now.
+    let fx = rt.host.dispatch_report(&rid(1), done());
+    rt.apply(fx);
+    assert_eq!(
+        rt.host.receipt(&rid(2)).unwrap().state,
+        ReceiptState::Executing
+    );
+    let fx = written(rt.host.host_interrupt(S1, &rid(2)));
+    rt.apply(fx);
+    assert_eq!(rt.pty.host_interrupts, [rid(2)]);
+    // Its turn ended: settled, nothing more.
+    let fx = rt.host.dispatch_report(&rid(2), interrupted());
+    rt.apply(fx);
+    let epoch = rt.host.input_epoch(S1).unwrap();
+    assert_eq!(
+        rt.host.host_interrupt(S1, &rid(2)),
+        HostInterrupt::NotExecuting
+    );
+    assert_eq!(rt.host.input_epoch(S1), Some(epoch));
+
+    // A halted journal: nothing at all, the attempt's turn running or not.
+    submit_host_work(&mut rt, HW, prompt_data(HW, 3), provenance(TASK2, SENDER));
+    assert_eq!(
+        rt.host.receipt(&rid(3)).unwrap().state,
+        ReceiptState::Executing
+    );
+    rt.host.journal_mut().fail_next_refusal();
+    assert_eq!(withdraw(&mut rt, 8), Withdrawal::Halted);
+    got(&mut rt, "c1");
+    let epoch = rt.host.input_epoch(S1).unwrap();
+    assert_eq!(rt.host.host_interrupt(S1, &rid(3)), HostInterrupt::Halted);
+    assert_eq!(rt.host.host_revoke(S1, &rid(3)), HostInterrupt::Halted);
+    assert_eq!(rt.host.input_epoch(S1), Some(epoch));
+    assert_eq!(rt.host.lease_holder(S1), Some(HW));
+    assert!(rt.host.take_effects().is_empty());
+    assert_eq!(rt.pty.host_interrupts, [rid(2)]);
+}
+
+/// The attempt's turn: the input epoch moves, and a lease another
+/// controller holds is revoked (`lease_changed{reason: "revoked"}`, never
+/// `local_input`), so its queued bytes are dropped at the write boundary,
+/// all before the write, which comes last. Host-work's own lease is no
+/// other controller's: it stays, and the epoch still moves.
+#[test]
+fn host_interrupt_bumps_the_epoch_and_revokes_another_lease_with_revoked() {
+    let mut rt = setup();
+    host_work(&mut rt, HW);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    assert_eq!(rt.host.lease_holder(S1), Some(HW));
+    let epoch = rt.host.input_epoch(S1).unwrap();
+    let fx = written(rt.host.host_interrupt(S1, &rid(1)));
+    assert!(rt.host.input_epoch(S1).unwrap() > epoch);
+    assert_eq!(rt.host.lease_holder(S1), Some(HW));
+    assert_eq!(lease_reasons(&fx), []);
+    assert_eq!(write_at(&fx, &rid(1)), Some(fx.len() - 1), "{fx:#?}");
+    rt.apply(fx);
+
+    // A native takes the lease over mid-turn; its bytes queue under its
+    // input epoch.
+    acquire(&mut rt, "c1", C1, true);
+    got(&mut rt, "c1");
+    got(&mut rt, "v");
+    let theirs = rt.host.input_epoch(S1).unwrap();
+    let now = rt.now();
+    assert!(rt.host.admit_write(S1, theirs, now));
+    let fx = written(rt.host.host_interrupt(S1, &rid(1)));
+    let at = write_at(&fx, &rid(1)).expect("written");
+    assert_eq!(at, fx.len() - 1, "the write comes last: {fx:#?}");
+    let reasons = lease_reasons(&fx[..at]);
+    assert!(
+        reasons.contains(&(C1.to_string(), wire::LeaseChangeReason::Revoked)),
+        "{reasons:?}"
+    );
+    assert!(
+        reasons
+            .iter()
+            .all(|(_, r)| *r == wire::LeaseChangeReason::Revoked),
+        "{reasons:?}"
+    );
+    assert!(rt.host.input_epoch(S1).unwrap() > theirs);
+    assert!(
+        !rt.host.admit_write(S1, theirs, now),
+        "its bytes are dropped"
+    );
+    assert_eq!(rt.host.lease_holder(S1), None);
+    rt.apply(fx);
+    for client in ["c1", "v"] {
+        let changed: Vec<Value> = got(&mut rt, client)
+            .into_iter()
+            .filter(|m| m["op"] == "lease_changed")
+            .collect();
+        assert_eq!(changed.len(), 1, "{client}: {changed:#?}");
+        assert_eq!(changed[0]["reason"], "revoked");
+        assert_eq!(changed[0]["controller"], Value::Null);
+    }
+    assert_eq!(rt.pty.host_interrupts, [rid(1), rid(1)]);
+    // Still the attempt's turn: its receipt is untouched.
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Executing
+    );
+}
+
+/// No submission: nothing goes in the journal (no record of any kind) or
+/// on the refusal list, nobody gets a receipt, and the attempt's own prompt
+/// receipt completes `interrupted` with its turn, as an Esc's does.
+#[test]
+fn host_interrupt_has_no_receipt_and_the_prompt_completes_interrupted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    host_work(&mut rt, HW);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Executing
+    );
+    for client in [HOST_WORK_PRINCIPAL, "c1", "v"] {
+        got(&mut rt, client);
+    }
+    let log = std::fs::read(log_path(dir.path())).unwrap();
+    let records = rt.host.journal().load().unwrap().len();
+
+    let fx = written(rt.host.host_interrupt(S1, &rid(1)));
+    rt.apply(fx);
+    let fx = revoked(rt.host.host_revoke(S1, &rid(1)));
+    rt.apply(fx);
+    assert_eq!(std::fs::read(log_path(dir.path())).unwrap(), log);
+    assert_eq!(rt.host.journal().load().unwrap().len(), records);
+    assert!(rt.host.journal().refusals().unwrap().is_empty());
+    for client in [HOST_WORK_PRINCIPAL, "c1", "v"] {
+        let msgs = got(&mut rt, client);
+        assert!(receipts(&msgs).is_empty(), "{client}: {msgs:#?}");
+    }
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Executing
+    );
+
+    // The turn ends interrupted: the prompt's receipt says so.
+    let fx = rt.host.dispatch_report(&rid(1), interrupted());
+    rt.apply(fx);
+    let r = rt.host.receipt(&rid(1)).unwrap();
+    assert_eq!(r.state, ReceiptState::Completed);
+    assert_eq!(r.detail.as_deref(), Some(DETAIL_TURN_INTERRUPTED));
+    assert_eq!(r.task_id.as_deref(), Some(TASK));
+    assert_eq!(
+        logged(&log_path(dir.path()), &rid(1)),
+        ["accepted", "executing", "completed: interrupted"]
+    );
+    let mine = receipts(&got(&mut rt, HOST_WORK_PRINCIPAL));
+    assert_eq!(states(&mine), ["completed"], "{mine:#?}");
+    assert_eq!(mine[0]["request_id"], rid(1));
+    assert!(rt.host.journal().refusals().unwrap().is_empty());
+}
+
+/// While the intent is pending, later passes repeat only the revocation
+/// (`host_revoke`): a native that takes the lease over after the interrupt
+/// loses it again on each request, and nothing more is written. Nobody
+/// else holding it, nothing changes; once the turn ended, a native keeps
+/// the lease it takes.
+#[test]
+fn a_takeover_after_the_interrupt_is_revoked_again_on_request() {
+    let mut rt = setup();
+    host_work(&mut rt, HW);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    let fx = written(rt.host.host_interrupt(S1, &rid(1)));
+    rt.apply(fx);
+    assert_eq!(rt.pty.host_interrupts, [rid(1)]);
+
+    // A takeover, then a plain acquire of the free lease: each is revoked
+    // again on request.
+    for takeover in [true, false] {
+        acquire(&mut rt, "c1", C1, takeover);
+        got(&mut rt, "c1");
+        let theirs = rt.host.input_epoch(S1).unwrap();
+        let fx = revoked(rt.host.host_revoke(S1, &rid(1)));
+        assert_eq!(
+            lease_reasons(&fx)
+                .into_iter()
+                .filter(|(att, _)| att == C1)
+                .collect::<Vec<_>>(),
+            [(C1.to_string(), wire::LeaseChangeReason::Revoked)]
+        );
+        assert_eq!(write_at(&fx, &rid(1)), None, "nothing written");
+        rt.apply(fx);
+        assert_eq!(rt.host.lease_holder(S1), None);
+        assert!(rt.host.input_epoch(S1).unwrap() > theirs);
+        let now = rt.now();
+        assert!(!rt.host.admit_write(S1, theirs, now));
+        let changed: Vec<Value> = got(&mut rt, "c1")
+            .into_iter()
+            .filter(|m| m["op"] == "lease_changed")
+            .collect();
+        assert_eq!(changed.len(), 1, "{changed:#?}");
+        assert_eq!(changed[0]["reason"], "revoked");
+    }
+    // Nobody else holds it: nothing to revoke, nothing moves.
+    let epoch = rt.host.input_epoch(S1).unwrap();
+    assert_eq!(revoked(rt.host.host_revoke(S1, &rid(1))), []);
+    assert_eq!(rt.host.input_epoch(S1), Some(epoch));
+    assert_eq!(
+        rt.pty.host_interrupts,
+        [rid(1)],
+        "only the revocation repeats"
+    );
+
+    // The turn ended: a native keeps the lease it takes now.
+    let fx = rt.host.dispatch_report(&rid(1), interrupted());
+    rt.apply(fx);
+    acquire(&mut rt, "c1", C1, false);
+    assert_eq!(
+        rt.host.host_revoke(S1, &rid(1)),
+        HostInterrupt::NotExecuting
+    );
+    assert_eq!(rt.host.lease_holder(S1), Some(C1));
 }
