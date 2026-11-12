@@ -1143,6 +1143,26 @@ impl HostBridge {
             && (!self.r9.owns(attachment) || self.r9.sees_approvals(attachment))
     }
 
+    /// A session the runtime just added (launched or adopted), before any
+    /// pass registered it: its launch project is read now from its worker's
+    /// record, written before the worker's `hello`, so a message sent right
+    /// after a launch resolves to it (local routes match on the project); a
+    /// pass would learn it only after requests handled in between.
+    pub fn session_added(&mut self, sid: &SessionId) {
+        if let Some(state) = self.dir.parent()
+            && let Ok(record) =
+                super::worker::read_record(&super::worker::record_path(state, sid.as_str()))
+        {
+            self.projects.session(sid.as_str(), record.project_key);
+        }
+    }
+
+    /// A session the runtime removed: its launch project goes with it, also
+    /// when no pass registered it.
+    pub fn session_removed(&mut self, sid: &SessionId) {
+        self.projects.forget(sid.as_str());
+    }
+
     /// The keyed hashes of the sessions' launch projects (never waiting
     /// for the cred agent): once a session's become known, its descriptor
     /// goes out again, so attachments whose `projects` scope now holds it
@@ -2558,8 +2578,8 @@ impl HostBridge {
     fn register(&mut self, id: &SessionId, cx: &mut Cx) {
         let sid = id.to_string();
         // Its launch project, as recorded at launch (§R9.6): the worker
-        // keeps it in its record (read at the next passes until it is
-        // there).
+        // keeps it in its record (read when the session was added, and at
+        // the next passes until it is there).
         self.project_unread.insert(sid.clone(), Instant::now());
         let session = &cx.sessions[id];
         let (rows, cols) = session.size();
