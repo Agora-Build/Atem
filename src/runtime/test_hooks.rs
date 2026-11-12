@@ -36,7 +36,11 @@
 //!   `<dir>/used`.
 //! - `ATEM_TEST_HOST_CLOCK=<file>` (`<wall_ms> <mono_ms> <boot_id>`): the
 //!   device list's host clock (§R9.5) instead of the system's wall clock,
-//!   `CLOCK_MONOTONIC` and boot id, so a test can simulate a reboot.
+//!   `CLOCK_MONOTONIC` and boot id, so a test can simulate a reboot. Or
+//!   `offsets <wall_ms> <mono_ms> <boot_id>`: the system's wall clock and
+//!   `CLOCK_MONOTONIC` plus those offsets (the wall's may be negative), at
+//!   every read, so a test moves the clocks with one write and they go on
+//!   between writes.
 //! - `ATEM_TEST_BUILD=<id>`: this process reports `<id>` as its build
 //!   (`cred_agent::build_id`), so a binary test can run a runtime that looks
 //!   like another atem build.
@@ -341,8 +345,28 @@ mod imp {
         let file = env_path("ATEM_TEST_HOST_CLOCK", &CELL)?;
         let text = std::fs::read_to_string(file).ok()?;
         let mut parts = text.split_whitespace();
-        let wall = parts.next()?.parse().ok()?;
-        let mono = parts.next()?.parse().ok()?;
+        let first = parts.next()?;
+        let (wall, mono) = if first == "offsets" {
+            let wall: i64 = parts.next()?.parse().ok()?;
+            let mono: u64 = parts.next()?.parse().ok()?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_millis() as i64;
+            let mut ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: `ts` is a valid timespec for the call to fill.
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+            let real_mono = ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000;
+            (
+                u64::try_from(now.checked_add(wall)?).ok()?,
+                real_mono.checked_add(mono)?,
+            )
+        } else {
+            (first.parse().ok()?, parts.next()?.parse().ok()?)
+        };
         let boot = parts.next()?.to_string();
         Some((wall, mono, boot))
     }

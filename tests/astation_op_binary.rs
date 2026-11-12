@@ -131,6 +131,13 @@ fn pair_verify_runs_through_the_auto_started_runtime() {
     assert_eq!(abort["reason"], "codes didn't match on atem");
     assert!(!cli.exits(), "a refused code fails the command");
     let written = cli.written();
-    assert!(written.contains("device verification failed"), "{written}");
+    // Paired already: the last line says so, with the next step, instead of
+    // reading as if pairing failed.
+    assert!(
+        written.contains("Paired, but this device isn't verified yet."),
+        "{written}"
+    );
+    assert!(written.contains("run 'atem pair verify'"), "{written}");
+    assert!(!written.contains("device verification failed"), "{written}");
     assert!(sandbox.runtime_pid().is_some(), "the runtime ran it");
 }
