@@ -7,7 +7,7 @@
 //! <state>/journal.lock          flock held for the journal's life (one writer)
 //! <state>/floors                0600, lease-epoch floors of every session
 //! <state>/principals            0600, each principal's control state (r8 §H)
-//! <state>/refused               0600, the refusal list (r8 §I.2)
+//! <state>/refused               0600, the refusal list (r8 §I.2; withdrawals, R9.14 item 4)
 //! <state>/clean_close           0600, `{"runtime_epoch": n}` after an orderly stop (r8 §H)
 //! <state>/receipts/             0700
 //! <state>/receipts/<sid>.log    0600, append-only, one per session with live receipts
@@ -186,6 +186,10 @@ enum Disk {
         payload_digest: String,
         detail: String,
         updated_at: u64,
+        /// Session-v1 R9.14 item 2: only a `host-work` prompt's entry has
+        /// it, so every other record is written as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance: Option<Provenance>,
     },
     Transition {
         seq: u64,
@@ -240,6 +244,7 @@ impl Disk {
                 payload_digest,
                 detail,
                 updated_at,
+                provenance,
             } => Disk::Rejected {
                 seq,
                 request_id,
@@ -248,6 +253,7 @@ impl Disk {
                 payload_digest,
                 detail,
                 updated_at,
+                provenance,
             },
             Record::Transition {
                 request_id,
@@ -311,6 +317,7 @@ impl Disk {
                 payload_digest,
                 detail,
                 updated_at,
+                provenance,
             } => (
                 seq,
                 Record::Rejected {
@@ -320,6 +327,7 @@ impl Disk {
                     payload_digest,
                     detail,
                     updated_at,
+                    provenance,
                 },
             ),
             Disk::Transition {

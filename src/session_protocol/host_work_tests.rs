@@ -1,16 +1,24 @@
-//! The `host-work` principal (session-v1 R9.14, items 1 and 2): its
-//! internal attachment is never fenced, its prompts carry their provenance
-//! (`task_id`, `sender`) on every receipt and across restarts, and no other
-//! receipt does.
+//! The `host-work` principal (session-v1 R9.14): its internal attachment
+//! is never fenced, its prompts carry their provenance (`task_id`,
+//! `sender`) on every receipt and across restarts, and no other receipt
+//! does (items 1, 2); its requests start only after the start check, in
+//! the step that makes them `executing`, and it may withdraw them (items 3,
+//! 4); a `request_id` recorded under another submitter is
+//! `request_id_reused` when either is the host-work principal (item 7).
 
-use super::fake_runtime::{AUTHORIZATION_MS, FakeRuntime};
+use super::canonical;
+use super::fake_runtime::{AUTHORIZATION_MS, FailFsync, FakeRuntime};
 use super::file_journal::FileJournal;
 use super::fixtures::{HostEvent, HostUnderTest};
 use super::host::*;
 use super::journal::{Journal, MemJournal, Record};
-use super::wire::{self, ClientKind, HOST_WORK_PRINCIPAL, Permission, ReceiptKind, ReceiptState};
+use super::wire::{
+    self, ClientKind, HOST_WORK_PRINCIPAL, Permission, ReceiptKind, ReceiptState, Target,
+};
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 const S1: &str = "ses-aaaaaaaaaaaa";
 const P1: &str = "22222222-2222-4222-8222-222222222222";
@@ -61,8 +69,18 @@ fn target() -> Value {
 
 /// The runtime's internal attachment of the `host-work` principal, made
 /// as the runtime makes it: connected with `view` and `control`, welcomed
-/// through the internal path (never an r8 `hello`).
+/// through the internal path (never an r8 `hello`), with a start check
+/// that lets every request start (R9.14 item 3: without one, none does).
 fn host_work<J: Journal + super::fake_runtime::FailFsync>(rt: &mut FakeRuntime<J>, att: &str) {
+    connect_host_work(rt, att);
+    rt.host.set_start_check(Box::new(StartVerdict::Go));
+}
+
+/// The internal attachment alone: no start check installed.
+fn connect_host_work<J: Journal + super::fake_runtime::FailFsync>(
+    rt: &mut FakeRuntime<J>,
+    att: &str,
+) {
     rt.connect_only(
         HOST_WORK_PRINCIPAL,
         att,
@@ -453,4 +471,748 @@ fn provenance_survives_a_restart() {
         assert_eq!((r.task_id, r.sender), want(n), "{n} in a new process");
         assert_eq!(r.kind, ReceiptKind::Prompt);
     }
+}
+
+// ── The start check, withdrawal, and `request_id_reused` across submitters
+//    (session-v1 R9.14 items 3, 4 and 7) ──
+
+const V: &str = "77777777-7777-4777-8777-777777777777";
+const C2: &str = "88888888-8888-4888-8888-888888888888";
+const GEN3: &str = "aaaaaaaa-9999-4999-8999-999999999999";
+
+/// What a start check was asked: the request, its session and process,
+/// and its provenance.
+type Asked = (String, String, String, Provenance);
+
+/// A start check whose verdict the test sets; it records what it was
+/// asked.
+#[derive(Clone)]
+struct Verdicts(Arc<Mutex<(StartVerdict, Vec<Asked>)>>);
+
+impl Verdicts {
+    fn new(verdict: StartVerdict) -> Self {
+        Self(Arc::new(Mutex::new((verdict, Vec::new()))))
+    }
+
+    fn set(&self, verdict: StartVerdict) {
+        self.0.lock().unwrap().0 = verdict;
+    }
+
+    fn asked(&self) -> Vec<Asked> {
+        self.0.lock().unwrap().1.clone()
+    }
+}
+
+impl StartCheck for Verdicts {
+    fn check(&self, req: &StartRequest<'_>) -> StartVerdict {
+        let mut state = self.0.lock().unwrap();
+        state.1.push((
+            req.request_id.to_string(),
+            req.session_id.to_string(),
+            req.process_gen.to_string(),
+            req.provenance.clone(),
+        ));
+        state.0
+    }
+}
+
+fn asked(n: u64) -> Asked {
+    (
+        rid(n),
+        S1.to_string(),
+        P1.to_string(),
+        provenance(TASK, SENDER),
+    )
+}
+
+fn states(receipts: &[Value]) -> Vec<String> {
+    receipts
+        .iter()
+        .map(|r| r["state"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Whether the host ever asked the runtime to perform `request_id`.
+fn dispatched<J: Journal>(rt: &FakeRuntime<J>, request_id: &str) -> bool {
+    rt.effects
+        .iter()
+        .any(|e| matches!(e, Effect::Dispatch { request_id: r, .. } if r == request_id))
+}
+
+fn log_path(dir: &Path) -> PathBuf {
+    dir.join(format!("state/receipts/{S1}.log"))
+}
+
+/// What `request_id`'s records on disk say, in order: `accepted`, then
+/// each transition's state (with its detail, if any).
+fn logged(log: &Path, request_id: &str) -> Vec<String> {
+    let log = std::fs::read_to_string(log).unwrap_or_default();
+    log.lines()
+        .map(|line| line.splitn(3, ' ').nth(2).unwrap())
+        .map(|json| serde_json::from_str::<Value>(json).unwrap())
+        .filter(|r| r["request_id"] == request_id)
+        .map(|r| match r["t"].as_str().unwrap() {
+            "transition" => format!(
+                "{}{}",
+                r["state"].as_str().unwrap(),
+                r["detail"]
+                    .as_str()
+                    .map(|d| format!(": {d}"))
+                    .unwrap_or_default()
+            ),
+            t => t.to_string(),
+        })
+        .collect()
+}
+
+/// The immutable values (§6) of `prompt_data(_, n)`'s request, with the
+/// attempt's provenance, as host-work keeps them for a withdrawal.
+fn immutable() -> Immutable {
+    Immutable {
+        target: serde_json::from_value::<Target>(target()).unwrap(),
+        payload_digest: canonical::payload_digest(&json!({"text": "run the tests"})).unwrap(),
+        provenance: provenance(TASK, SENDER),
+    }
+}
+
+/// `client` (attachment `att`) submits a prompt that acquires the lease,
+/// as `prompt_data` writes it, on the plain session path.
+fn client_prompt<J: Journal + FailFsync>(rt: &mut FakeRuntime<J>, client: &str, att: &str, n: u64) {
+    rt.send(
+        client,
+        &json!({"type": "session", "data": prompt_data(att, n)}),
+    );
+}
+
+/// The lease holder (the host-work attachment, here) releases it, as the
+/// runtime does at its next pass once the turn ended.
+fn release_host_work<J: Journal + FailFsync>(rt: &mut FakeRuntime<J>, att: &str) {
+    let now = rt.now();
+    rt.host.release(att, S1, now).unwrap();
+    let fx = rt.host.take_effects();
+    rt.apply(fx);
+}
+
+fn restart<J: Journal + FailFsync>(rt: &mut FakeRuntime<J>, runtime_gen: &str, runtime_epoch: u64) {
+    let now = rt.now();
+    rt.event(
+        &HostEvent::RestartRuntime {
+            runtime_gen: runtime_gen.into(),
+            runtime_epoch,
+        },
+        now,
+    )
+    .unwrap();
+}
+
+fn withdraw<J: Journal + FailFsync>(rt: &mut FakeRuntime<J>, n: u64) -> Withdrawal {
+    let w = rt.host.withdraw(&rid(n), &immutable());
+    let fx = rt.host.take_effects();
+    rt.apply(fx);
+    w
+}
+
+/// A new process over the journal in `dir` (after compacting every log):
+/// what the disk says.
+fn reopened(dir: &Path) -> SessionHost<FileJournal> {
+    let mut journal = FileJournal::open(&dir.join("state")).unwrap();
+    journal.compact_all().unwrap();
+    drop(journal);
+    let journal = FileJournal::open(&dir.join("state")).unwrap();
+    let ctx = HostContext {
+        account_id: "account-a".into(),
+        atem_device_id: "host-a".into(),
+        host_trust_gen: 1,
+        runtime_gen: GEN3.into(),
+        runtime_epoch: 20,
+    };
+    SessionHost::new(ctx, HostConfig::default(), journal, random_ids()).unwrap()
+}
+
+#[test]
+fn start_check_withdraw_rejects_withdrawn_by_the_host_before_any_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    connect_host_work(&mut rt, HW);
+    let check = Verdicts::new(StartVerdict::Withdraw);
+    rt.host.set_start_check(Box::new(check.clone()));
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+
+    // Accepted (with the lease it acquired, §F), then rejected at its
+    // start: never executing.
+    let mine = receipts(&got(&mut rt, HOST_WORK_PRINCIPAL));
+    assert_eq!(states(&mine), ["accepted", "rejected"], "{mine:#?}");
+    assert_eq!(DETAIL_WITHDRAWN_BY_HOST, "withdrawn by the host");
+    assert_eq!(mine[1]["detail"], DETAIL_WITHDRAWN_BY_HOST);
+    for r in &mine {
+        assert_eq!(r["task_id"], TASK, "{r}");
+        assert_eq!(r["sender"], SENDER, "{r}");
+        decodes(r);
+    }
+    assert_eq!(check.asked(), vec![asked(1)]);
+    // Before any effect: nothing dispatched, nothing written to the agent.
+    assert!(!dispatched(&rt, &rid(1)));
+    assert_eq!(rt.pty.dispatch_attempts, 0);
+    assert!(
+        !rt.effects
+            .iter()
+            .any(|e| matches!(e, Effect::PtyWrite { .. }))
+    );
+    // Durable: accepted, then rejected with the detail; never executing.
+    assert_eq!(
+        logged(&log_path(dir.path()), &rid(1)),
+        ["accepted", "rejected: withdrawn by the host"]
+    );
+
+    // Another principal's work never asks it: c1's prompt runs.
+    release_host_work(&mut rt, HW);
+    client_prompt(&mut rt, "c1", C1, 2);
+    assert_eq!(
+        rt.host.receipt(&rid(2)).unwrap().state,
+        ReceiptState::Executing
+    );
+    assert!(dispatched(&rt, &rid(2)));
+    assert_eq!(check.asked().len(), 1);
+}
+
+/// Each request a check was asked about, with its records on disk then.
+type Seen = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
+/// A start check that reads the journal on disk when it is asked, so the
+/// test sees where in the step it runs.
+struct ReadsTheLog {
+    log: PathBuf,
+    verdicts: Verdicts,
+    seen: Seen,
+}
+
+impl StartCheck for ReadsTheLog {
+    fn check(&self, req: &StartRequest<'_>) -> StartVerdict {
+        let on_disk = logged(&self.log, req.request_id);
+        self.seen
+            .lock()
+            .unwrap()
+            .push((req.request_id.to_string(), on_disk));
+        self.verdicts.check(req)
+    }
+}
+
+#[test]
+fn start_check_runs_in_the_same_step_as_executing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    connect_host_work(&mut rt, HW);
+    let verdicts = Verdicts::new(StartVerdict::Go);
+    let seen = Seen::default();
+    rt.host.set_start_check(Box::new(ReadsTheLog {
+        log: log_path(dir.path()),
+        verdicts: verdicts.clone(),
+        seen: seen.clone(),
+    }));
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Executing
+    );
+
+    // Admitted behind that turn while the check would refuse it: it isn't
+    // asked at admission, only at its start.
+    verdicts.set(StartVerdict::Withdraw);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 2), provenance(TASK, SENDER));
+    assert_eq!(
+        rt.host.receipt(&rid(2)).unwrap().state,
+        ReceiptState::Accepted
+    );
+    assert_eq!(verdicts.asked(), vec![asked(1)]);
+    verdicts.set(StartVerdict::Go);
+
+    // The turn ends. In that one step the check is asked while the request
+    // is `accepted` on disk and not yet `executing`; then it is `executing`
+    // and dispatched, in the effects of the same call.
+    let fx = rt.host.dispatch_report(&rid(1), done());
+    assert!(
+        fx.iter()
+            .any(|e| matches!(e, Effect::Dispatch { request_id, .. } if *request_id == rid(2))),
+        "{fx:#?}"
+    );
+    rt.apply(fx);
+    assert_eq!(verdicts.asked(), vec![asked(1), asked(2)]);
+    assert_eq!(
+        seen.lock().unwrap().last().unwrap(),
+        &(rid(2), vec!["accepted".to_string()])
+    );
+    assert_eq!(
+        logged(&log_path(dir.path()), &rid(2)),
+        ["accepted", "executing"]
+    );
+
+    // Refused at the same point: rejected in that step, never executing.
+    submit_host_work(&mut rt, HW, prompt_data(HW, 3), provenance(TASK, SENDER));
+    verdicts.set(StartVerdict::Withdraw);
+    let fx = rt.host.dispatch_report(&rid(2), done());
+    assert!(
+        !fx.iter()
+            .any(|e| matches!(e, Effect::Dispatch { request_id, .. } if *request_id == rid(3))),
+        "{fx:#?}"
+    );
+    rt.apply(fx);
+    assert_eq!(
+        seen.lock().unwrap().last().unwrap(),
+        &(rid(3), vec!["accepted".to_string()])
+    );
+    assert_eq!(
+        logged(&log_path(dir.path()), &rid(3)),
+        ["accepted", "rejected: withdrawn by the host"]
+    );
+    assert!(!dispatched(&rt, &rid(3)));
+}
+
+/// What the runtime's views hold (Decision 16): updated at the moment what
+/// they show commits, read by the start check when it is asked.
+#[derive(Default)]
+struct Views {
+    frozen: bool,
+}
+
+struct ListCheck {
+    views: Arc<Mutex<Views>>,
+    /// Each request asked about, with whether the list was frozen then.
+    saw: Arc<Mutex<Vec<(String, bool)>>>,
+}
+
+impl StartCheck for ListCheck {
+    fn check(&self, req: &StartRequest<'_>) -> StartVerdict {
+        let frozen = self.views.lock().unwrap().frozen;
+        self.saw
+            .lock()
+            .unwrap()
+            .push((req.request_id.to_string(), frozen));
+        if frozen {
+            StartVerdict::Withdraw
+        } else {
+            StartVerdict::Go
+        }
+    }
+}
+
+#[test]
+fn a_freeze_committed_in_the_same_call_chain_is_seen_by_the_start_check() {
+    let mut rt = setup();
+    connect_host_work(&mut rt, HW);
+    let views = Arc::new(Mutex::new(Views::default()));
+    let saw = Arc::new(Mutex::new(Vec::new()));
+    rt.host.set_start_check(Box::new(ListCheck {
+        views: views.clone(),
+        saw: saw.clone(),
+    }));
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    submit_host_work(&mut rt, HW, prompt_data(HW, 2), provenance(TASK, SENDER));
+    assert_eq!(
+        rt.host.receipt(&rid(2)).unwrap().state,
+        ReceiptState::Accepted
+    );
+
+    // One call chain, with no pass of host-work's in it: a device-list
+    // freeze commits (R9.4), updating the views at once and fencing every
+    // remote principal as `MembershipHost`'s freeze does; then the turn
+    // holding the session ends, and the attempt waiting `accepted` starts.
+    let commit_freeze_then_end_turn = |rt: &mut FakeRuntime| {
+        views.lock().unwrap().frozen = true;
+        for p in rt.host.remote_principals() {
+            let fx = rt.host.fence_principal(&p, 0);
+            rt.apply(fx);
+        }
+        let fx = rt.host.dispatch_report(&rid(1), done());
+        rt.apply(fx);
+    };
+    commit_freeze_then_end_turn(&mut rt);
+
+    // The check saw the freeze (condition 2a): withdrawn, never dispatched.
+    assert_eq!(*saw.lock().unwrap(), vec![(rid(1), false), (rid(2), true)]);
+    let r = rt.host.receipt(&rid(2)).unwrap();
+    assert_eq!(r.state, ReceiptState::Rejected);
+    assert_eq!(r.detail.as_deref(), Some(DETAIL_WITHDRAWN_BY_HOST));
+    assert!(!dispatched(&rt, &rid(2)));
+    // The check stopped it, not a fence: the host-work principal keeps
+    // `control` at generation 1, the remote one was fenced.
+    assert_eq!(rt.host.control_gen(HOST_WORK_PRINCIPAL), 1);
+    assert!(rt.host.control_gen("c1") > 1);
+}
+
+#[test]
+fn no_start_check_installed_withdraws() {
+    let mut rt = setup();
+    connect_host_work(&mut rt, HW);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    let mine = receipts(&got(&mut rt, HOST_WORK_PRINCIPAL));
+    assert_eq!(states(&mine), ["accepted", "rejected"], "{mine:#?}");
+    assert_eq!(mine[1]["detail"], DETAIL_WITHDRAWN_BY_HOST);
+    assert!(!dispatched(&rt, &rid(1)));
+    assert_eq!(rt.pty.dispatch_attempts, 0);
+
+    // Every other principal's work runs as before, with no check at all.
+    release_host_work(&mut rt, HW);
+    client_prompt(&mut rt, "c1", C1, 2);
+    assert_eq!(
+        rt.host.receipt(&rid(2)).unwrap().state,
+        ReceiptState::Executing
+    );
+    assert!(dispatched(&rt, &rid(2)));
+}
+
+#[test]
+fn withdraw_accepted_rejects_durably() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    host_work(&mut rt, HW);
+    rt.host.hold_dispatch(true);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Accepted
+    );
+    got(&mut rt, HOST_WORK_PRINCIPAL);
+
+    assert_eq!(withdraw(&mut rt, 1), Withdrawal::Rejected);
+    // Durable before it returned, and reported to its submitter.
+    assert_eq!(
+        logged(&log_path(dir.path()), &rid(1)),
+        ["accepted", "rejected: withdrawn by the host"]
+    );
+    let mine = receipts(&got(&mut rt, HOST_WORK_PRINCIPAL));
+    assert_eq!(states(&mine), ["rejected"], "{mine:#?}");
+    assert_eq!(mine[0]["detail"], DETAIL_WITHDRAWN_BY_HOST);
+    assert_eq!(mine[0]["task_id"], TASK);
+    decodes(&mine[0]);
+
+    // It never runs: the queue goes on past it.
+    rt.host.hold_dispatch(false);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 2), provenance(TASK2, SENDER));
+    assert_eq!(
+        rt.host.receipt(&rid(2)).unwrap().state,
+        ReceiptState::Executing
+    );
+    assert!(!dispatched(&rt, &rid(1)));
+
+    // Withdrawn again: still `Rejected`, nothing written.
+    let before = rt.host.journal().load().unwrap().len();
+    assert_eq!(withdraw(&mut rt, 1), Withdrawal::Rejected);
+    assert_eq!(rt.host.journal().load().unwrap().len(), before);
+
+    // What the disk says, in a new process.
+    drop(rt);
+    let host = reopened(dir.path());
+    let r = host.receipt(&rid(1)).unwrap();
+    assert_eq!(r.state, ReceiptState::Rejected);
+    assert_eq!(r.detail.as_deref(), Some(DETAIL_WITHDRAWN_BY_HOST));
+    assert_eq!(
+        (r.task_id.as_deref(), r.sender.as_deref()),
+        (Some(TASK), Some(SENDER))
+    );
+}
+
+#[test]
+fn withdraw_absent_lists_it_and_a_late_submit_gets_the_rejected_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    host_work(&mut rt, HW);
+
+    assert_eq!(withdraw(&mut rt, 1), Withdrawal::Listed);
+    // On the refusal list: its immutable values, the detail and the
+    // attempt's provenance. Nothing in the journal's log.
+    let listed = rt.host.journal().refusals().unwrap();
+    assert_eq!(listed.len(), 1, "{listed:#?}");
+    let entry = &listed[0];
+    let imm = immutable();
+    assert_eq!(entry.request_id, rid(1));
+    assert_eq!(entry.target, imm.target);
+    assert_eq!(entry.kind, ReceiptKind::Prompt);
+    assert_eq!(entry.payload_digest, imm.payload_digest);
+    assert_eq!(entry.detail.as_deref(), Some(DETAIL_WITHDRAWN_BY_HOST));
+    assert_eq!(entry.provenance, Some(provenance(TASK, SENDER)));
+    assert!(rt.host.receipt(&rid(1)).is_none());
+    assert!(logged(&log_path(dir.path()), &rid(1)).is_empty());
+    // Withdrawn again: still listed, once.
+    assert_eq!(withdraw(&mut rt, 1), Withdrawal::Listed);
+    assert_eq!(rt.host.journal().refusals().unwrap().len(), 1);
+
+    // A late submit of it gets that rejected receipt instead of running:
+    // no lease, nothing dispatched, nothing recorded.
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    let mine = receipts(&got(&mut rt, HOST_WORK_PRINCIPAL));
+    assert_eq!(states(&mine), ["rejected"], "{mine:#?}");
+    assert_eq!(mine[0]["detail"], DETAIL_WITHDRAWN_BY_HOST);
+    assert_eq!(mine[0]["task_id"], TASK);
+    assert_eq!(mine[0]["sender"], SENDER);
+    assert!(mine[0].get("lease").is_none(), "{}", mine[0]);
+    decodes(&mine[0]);
+    assert_eq!(rt.host.lease_holder(S1), None);
+    assert!(!dispatched(&rt, &rid(1)));
+    assert!(logged(&log_path(dir.path()), &rid(1)).is_empty());
+    // With another payload: `request_id_reused`.
+    let mut other = prompt_data(HW, 1);
+    other["payload"]["text"] = json!("something else");
+    submit_host_work(&mut rt, HW, other, provenance(TASK, SENDER));
+    assert_eq!(
+        error_code(&got(&mut rt, HOST_WORK_PRINCIPAL)),
+        "request_id_reused"
+    );
+    // From another submitter, every value equal: `request_id_reused`
+    // (item 7), and no lease.
+    got(&mut rt, "c1");
+    client_prompt(&mut rt, "c1", C1, 1);
+    assert_eq!(error_code(&got(&mut rt, "c1")), "request_id_reused");
+    assert_eq!(rt.host.lease_holder(S1), None);
+
+    // A restart records it, with the same detail and provenance.
+    restart(&mut rt, GEN2, 8);
+    let r = rt.host.receipt(&rid(1)).unwrap();
+    assert_eq!(r.state, ReceiptState::Rejected);
+    assert_eq!(r.detail.as_deref(), Some(DETAIL_WITHDRAWN_BY_HOST));
+    assert_eq!(
+        (r.task_id.as_deref(), r.sender.as_deref()),
+        (Some(TASK), Some(SENDER))
+    );
+    assert!(rt.host.journal().refusals().unwrap().is_empty());
+    // A late submit after it: the recorded receipt.
+    host_work(&mut rt, HW2);
+    submit_host_work(&mut rt, HW2, prompt_data(HW2, 1), provenance(TASK, SENDER));
+    let mine = receipts(&got(&mut rt, HOST_WORK_PRINCIPAL));
+    assert_eq!(states(&mine), ["rejected"], "{mine:#?}");
+    assert_eq!(mine[0]["detail"], DETAIL_WITHDRAWN_BY_HOST);
+    assert!(!dispatched(&rt, &rid(1)));
+}
+
+#[test]
+fn withdraw_executing_reports_started() {
+    let mut rt = setup();
+    host_work(&mut rt, HW);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Executing
+    );
+    got(&mut rt, HOST_WORK_PRINCIPAL);
+    let before = rt.host.journal().records().len();
+    assert_eq!(withdraw(&mut rt, 1), Withdrawal::Started);
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Executing
+    );
+    assert_eq!(rt.host.journal().records().len(), before);
+    assert!(got(&mut rt, HOST_WORK_PRINCIPAL).is_empty());
+    // Past `executing`, the same.
+    let fx = rt.host.dispatch_report(&rid(1), done());
+    rt.apply(fx);
+    assert_eq!(withdraw(&mut rt, 1), Withdrawal::Started);
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Completed
+    );
+}
+
+#[test]
+fn a_failed_withdrawal_write_halts_the_journal() {
+    // Still `accepted`, and its rejection can't be written.
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    host_work(&mut rt, HW);
+    rt.host.hold_dispatch(true);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    got(&mut rt, HOST_WORK_PRINCIPAL);
+    rt.host.journal_mut().fail_next_fsync();
+    assert_eq!(withdraw(&mut rt, 1), Withdrawal::Halted);
+    assert!(rt.host.journal_halted());
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Accepted
+    );
+    // Nothing becomes `executing` until the restart, and nothing is
+    // admitted.
+    rt.host.hold_dispatch(false);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 2), provenance(TASK, SENDER));
+    assert_eq!(error_code(&got(&mut rt, HOST_WORK_PRINCIPAL)), "busy");
+    assert!(!dispatched(&rt, &rid(1)));
+    // The restart settles it: rejected, withdrawn by the host.
+    restart(&mut rt, GEN2, 8);
+    let r = rt.host.receipt(&rid(1)).unwrap();
+    assert_eq!(r.state, ReceiptState::Rejected);
+    assert_eq!(r.detail.as_deref(), Some(DETAIL_WITHDRAWN_BY_HOST));
+    assert_eq!(r.task_id.as_deref(), Some(TASK));
+    assert!(!dispatched(&rt, &rid(1)));
+
+    // Not in the journal yet, and the refusal list can't be written.
+    let mut rt = setup();
+    host_work(&mut rt, HW);
+    rt.host.journal_mut().fail_next_refusal();
+    assert_eq!(withdraw(&mut rt, 3), Withdrawal::Halted);
+    assert!(rt.host.journal_halted());
+    submit_host_work(&mut rt, HW, prompt_data(HW, 3), provenance(TASK, SENDER));
+    assert_eq!(error_code(&got(&mut rt, HOST_WORK_PRINCIPAL)), "busy");
+    assert!(rt.host.receipt(&rid(3)).is_none());
+    assert!(!dispatched(&rt, &rid(3)));
+}
+
+#[test]
+fn request_id_recorded_under_another_submitter_is_reused_both_ways() {
+    let mut rt = setup();
+    host_work(&mut rt, HW);
+    // Recorded under c1, a remote native: the host-work principal's submit
+    // with every immutable value equal is `request_id_reused`, and changes
+    // nothing.
+    client_prompt(&mut rt, "c1", C1, 1);
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Executing
+    );
+    got(&mut rt, "c1");
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    let msgs = got(&mut rt, HOST_WORK_PRINCIPAL);
+    assert_eq!(error_code(&msgs), "request_id_reused");
+    assert!(receipts(&msgs).is_empty(), "{msgs:#?}");
+    let r = rt.host.receipt(&rid(1)).unwrap();
+    assert_eq!((r.state, r.task_id), (ReceiptState::Executing, None));
+    assert_eq!(rt.host.lease_holder(S1), Some(C1));
+    // c1's turn ends and it releases the lease.
+    let fx = rt.host.dispatch_report(&rid(1), done());
+    rt.apply(fx);
+    let epoch = rt.host.lease_epoch(S1).unwrap();
+    rt.send(
+        "c1",
+        &json!({"type": "session", "data": {"v": 1, "op": "release", "id": id(),
+            "binding": {"target": target(), "attachment_gen": C1, "lease_epoch": epoch}}}),
+    );
+    assert_eq!(rt.host.lease_holder(S1), None);
+
+    // Recorded under the host-work principal: c1's submit with every value
+    // equal is `request_id_reused`, not its receipt; a viewer's too.
+    submit_host_work(&mut rt, HW, prompt_data(HW, 2), provenance(TASK, SENDER));
+    assert_eq!(
+        rt.host.receipt(&rid(2)).unwrap().state,
+        ReceiptState::Executing
+    );
+    got(&mut rt, "c1");
+    client_prompt(&mut rt, "c1", C1, 2);
+    let msgs = got(&mut rt, "c1");
+    assert_eq!(error_code(&msgs), "request_id_reused");
+    assert!(receipts(&msgs).is_empty(), "{msgs:#?}");
+    got(&mut rt, "v");
+    client_prompt(&mut rt, "v", V, 2);
+    assert_eq!(error_code(&got(&mut rt, "v")), "request_id_reused");
+    assert_eq!(rt.host.lease_holder(S1), Some(HW));
+
+    // Between other principals nothing changes (§6): a viewer's duplicate
+    // of c1's request gets its receipt.
+    client_prompt(&mut rt, "v", V, 1);
+    let mine = receipts(&got(&mut rt, "v"));
+    assert_eq!(states(&mine), ["completed"], "{mine:#?}");
+    assert_eq!(mine[0]["request_id"], rid(1));
+}
+
+#[test]
+fn refusal_entries_keep_their_detail_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    host_work(&mut rt, HW);
+    // A withdrawal of a request not in the journal, then c1's admission
+    // write fails (§I.2): two entries, one with the withdrawal's detail.
+    assert_eq!(withdraw(&mut rt, 1), Withdrawal::Listed);
+    got(&mut rt, "c1");
+    rt.host.journal_mut().fail_next_fsync();
+    client_prompt(&mut rt, "c1", C1, 2);
+    let msgs = got(&mut rt, "c1");
+    assert_eq!(error_code(&msgs), "busy");
+    assert!(rt.host.journal_halted());
+    let listed = rt.host.journal().refusals().unwrap();
+    let details: Vec<(String, Option<String>)> = listed
+        .iter()
+        .map(|r| (r.request_id.clone(), r.detail.clone()))
+        .collect();
+    assert_eq!(
+        details,
+        [
+            (rid(1), Some(DETAIL_WITHDRAWN_BY_HOST.to_string())),
+            (rid(2), None)
+        ]
+    );
+    // On disk, a failed admission write's entry is written as before:
+    // neither a detail nor a provenance.
+    let file = std::fs::read_to_string(dir.path().join("state/refused")).unwrap();
+    assert_eq!(file.matches("\"detail\"").count(), 1, "{file}");
+    assert_eq!(file.matches("\"provenance\"").count(), 1, "{file}");
+
+    // The restart resolves each with its own detail.
+    restart(&mut rt, GEN2, 8);
+    let want = |host: &SessionHost<FileJournal>| {
+        let r = host.receipt(&rid(1)).unwrap();
+        assert_eq!(r.state, ReceiptState::Rejected);
+        assert_eq!(r.detail.as_deref(), Some(DETAIL_WITHDRAWN_BY_HOST));
+        assert_eq!(
+            (r.task_id.as_deref(), r.sender.as_deref()),
+            (Some(TASK), Some(SENDER))
+        );
+        let r = host.receipt(&rid(2)).unwrap();
+        assert_eq!(r.state, ReceiptState::Rejected);
+        assert_eq!(r.detail.as_deref(), Some("acceptance not confirmed"));
+        assert_eq!((r.task_id, r.sender), (None, None));
+    };
+    want(&rt.host);
+    assert!(rt.host.journal().refusals().unwrap().is_empty());
+    // Each submitter's late submit: its own recorded receipt; the other
+    // one's is `request_id_reused`.
+    host_work(&mut rt, HW2);
+    submit_host_work(&mut rt, HW2, prompt_data(HW2, 1), provenance(TASK, SENDER));
+    let mine = receipts(&got(&mut rt, HOST_WORK_PRINCIPAL));
+    assert_eq!(states(&mine), ["rejected"], "{mine:#?}");
+    assert_eq!(mine[0]["detail"], DETAIL_WITHDRAWN_BY_HOST);
+    decodes(&mine[0]);
+    rt.attach("c1", C2).unwrap();
+    client_prompt(&mut rt, "c1", C2, 1);
+    assert_eq!(error_code(&got(&mut rt, "c1")), "request_id_reused");
+    client_prompt(&mut rt, "c1", C2, 2);
+    let theirs = receipts(&got(&mut rt, "c1"));
+    assert_eq!(states(&theirs), ["rejected"], "{theirs:#?}");
+    assert_eq!(theirs[0]["detail"], "acceptance not confirmed");
+
+    // In a new process, after compaction: the same.
+    drop(rt);
+    want(&reopened(dir.path()));
+}
+
+/// Task 13's review (M2): a `host-work` submit whose admission write fails
+/// keeps its provenance on the refusal list, and the receipt the restart
+/// resolves carries it.
+#[test]
+fn a_refused_host_work_admission_keeps_its_provenance_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    host_work(&mut rt, HW);
+    rt.host.journal_mut().fail_next_fsync();
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    assert_eq!(error_code(&got(&mut rt, HOST_WORK_PRINCIPAL)), "busy");
+    let listed = rt.host.journal().refusals().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].provenance, Some(provenance(TASK, SENDER)));
+    assert_eq!(listed[0].detail, None);
+
+    restart(&mut rt, GEN2, 8);
+    let want = |host: &SessionHost<FileJournal>| {
+        let r = host.receipt(&rid(1)).unwrap();
+        assert_eq!(r.state, ReceiptState::Rejected);
+        assert_eq!(r.detail.as_deref(), Some("acceptance not confirmed"));
+        assert_eq!(
+            (r.task_id.as_deref(), r.sender.as_deref()),
+            (Some(TASK), Some(SENDER))
+        );
+        decodes(
+            &wire::to_value(&wire::Envelope::Session(wire::SessionMessage {
+                id: id(),
+                re: None,
+                op: wire::Op::Receipt(r),
+            }))["data"],
+        );
+    };
+    want(&rt.host);
+    drop(rt);
+    want(&reopened(dir.path()));
 }

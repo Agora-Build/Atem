@@ -4706,6 +4706,10 @@ fn host_work_renews_every_5s_while_its_turn_runs_and_releases_at_the_end() {
         "request_id": rid, "kind": "prompt", "payload": {"text": "run the tests"},
         "acquire": true});
     bridge.host.advance(clock.now());
+    // The start check host-work installs (R9.14 item 3; none withdraws).
+    bridge
+        .host
+        .set_start_check(Box::new(crate::session_protocol::host::StartVerdict::Go));
     let _ = bridge.host.submit_host_work(
         &att,
         data,

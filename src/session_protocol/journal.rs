@@ -9,9 +9,11 @@
 //!
 //! Apart from the appended log, a journal keeps two small records, each
 //! replaced atomically and never counted as an append: the refusal list
-//! (requests answered `busy` because their admission write failed, §I.2)
-//! and the clean-close record (`{"runtime_epoch": n}`, written at an
-//! orderly shutdown with a healthy journal, §H).
+//! (requests answered `busy` because their admission write failed, §I.2,
+//! and `host-work` requests withdrawn before they were journaled,
+//! session-v1 R9.14 item 4) and the clean-close record
+//! (`{"runtime_epoch": n}`, written at an orderly shutdown with a healthy
+//! journal, §H).
 //!
 //! `MemJournal` keeps everything in memory and can fail the n-th next append
 //! (`fail_fsync_of`; with `undo_fails` the failed record is kept, the worst
@@ -54,7 +56,9 @@ pub enum Record {
     },
     /// — → `rejected`: a request on the refusal list whose `accepted` record
     /// never reached the disk, resolved at restart with its immutable values
-    /// (§I.3). Nothing was accepted.
+    /// (§I.3) and the detail its entry records (session-v1 R9.14 item 4).
+    /// Nothing was accepted. `provenance` only for a `host-work` prompt's
+    /// entry (R9.14 item 2).
     Rejected {
         request_id: String,
         target: Target,
@@ -62,6 +66,7 @@ pub enum Record {
         payload_digest: String,
         detail: String,
         updated_at: u64,
+        provenance: Option<Provenance>,
     },
     /// The receipt left the retention window and is forgotten.
     Evicted { request_id: String },
@@ -117,8 +122,10 @@ impl Provenance {
     }
 }
 
-/// A request refused `busy` because its admission write failed (§I.2): its
-/// immutable values, never its payload.
+/// An entry of the refusal list: a request refused `busy` because its
+/// admission write failed (§I.2), or a `host-work` request withdrawn before
+/// it was journaled (session-v1 R9.14 item 4). Its immutable values, never
+/// its payload. The restart records it `rejected` with `detail`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Refusal {
@@ -127,6 +134,40 @@ pub struct Refusal {
     pub kind: ReceiptKind,
     pub payload_digest: String,
     pub updated_at: u64,
+    /// The `rejected` receipt's detail: `withdrawn by the host` for a
+    /// withdrawal; none for a failed admission write (`acceptance not
+    /// confirmed`, §I.3), whose entry is written as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// A `host-work` prompt's provenance (R9.14 item 2), so the receipt
+    /// a late submit or the restart gives carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
+}
+
+/// The submitter of a request recorded straight as `rejected` (§I.3):
+/// nothing was accepted, so none is recorded, but a provenance names the
+/// `host-work` principal, the only one that has one (R9.14 item 2); empty
+/// otherwise.
+pub fn refused_principal(provenance: Option<&Provenance>) -> String {
+    match provenance {
+        Some(_) => super::wire::HOST_WORK_PRINCIPAL.to_string(),
+        None => String::new(),
+    }
+}
+
+/// R9.14 item 2: a provenance is valid and on a prompt only.
+fn check_provenance(
+    provenance: Option<&Provenance>,
+    kind: ReceiptKind,
+    request_id: &str,
+) -> Result<(), JournalError> {
+    if provenance.is_some_and(|p| kind != ReceiptKind::Prompt || !p.valid()) {
+        return Err(JournalError(format!(
+            "invalid provenance on {kind:?} {request_id}"
+        )));
+    }
+    Ok(())
 }
 
 /// Durable receipt storage.
@@ -414,15 +455,7 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                 if out.receipts.contains_key(&request_id) {
                     return Err(JournalError(format!("request {request_id} admitted twice")));
                 }
-                // R9.14 item 2: a valid task and sender, on a prompt only.
-                if provenance
-                    .as_ref()
-                    .is_some_and(|p| kind != ReceiptKind::Prompt || !p.valid())
-                {
-                    return Err(JournalError(format!(
-                        "invalid provenance on {kind:?} {request_id}"
-                    )));
-                }
+                check_provenance(provenance.as_ref(), kind, &request_id)?;
                 let stored = Stored {
                     request_id: request_id.clone(),
                     target,
@@ -447,10 +480,12 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                 payload_digest,
                 detail,
                 updated_at,
+                provenance,
             } => {
                 if out.receipts.contains_key(&request_id) {
                     return Err(JournalError(format!("request {request_id} recorded twice")));
                 }
+                check_provenance(provenance.as_ref(), kind, &request_id)?;
                 let stored = Stored {
                     request_id: request_id.clone(),
                     target,
@@ -462,9 +497,9 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                     updated_at,
                     result: None,
                     order: i as u64,
-                    principal: String::new(),
+                    principal: refused_principal(provenance.as_ref()),
                     control_gen: 0,
-                    provenance: None,
+                    provenance,
                 };
                 out.receipts.insert(request_id, stored);
             }
@@ -629,6 +664,8 @@ mod tests {
             kind: ReceiptKind::Prompt,
             payload_digest: "0".repeat(64),
             updated_at: 1,
+            detail: None,
+            provenance: None,
         };
         j.record_refusal(refusal.clone()).unwrap();
         assert!(j.write_clean_close(7).is_err(), "never after a failure");
@@ -665,6 +702,7 @@ mod tests {
             payload_digest: "0".repeat(64),
             detail: "acceptance not confirmed".into(),
             updated_at: 3,
+            provenance: None,
         };
         let r = replay(vec![rejected.clone()]).unwrap();
         assert_eq!(r.receipts["b"].state, ReceiptState::Rejected);

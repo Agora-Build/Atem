@@ -301,6 +301,8 @@ fn the_refusal_list_survives_a_crash_around_its_rename() {
         kind: ReceiptKind::Prompt,
         payload_digest: "0".repeat(64),
         updated_at: 1,
+        detail: None,
+        provenance: None,
     };
     j.record_refusal(refusal(1)).unwrap();
     std::fs::write(state.join("refused.tmp"), b"half a file").unwrap();
