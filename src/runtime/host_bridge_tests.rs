@@ -1481,8 +1481,13 @@ fn a_stop_submission_completes_when_the_agent_exits() {
 
 /// A session the broker started, in a worker in this process.
 async fn broker_session(dir: &Path) -> crate::runtime::broker::BrokerSession {
+    session_running(dir, &echo_agent(dir)).await
+}
+
+/// A Codex session the broker started running `agent`, in a worker in
+/// this process.
+async fn session_running(dir: &Path, agent: &Path) -> crate::runtime::broker::BrokerSession {
     use crate::runtime::adopt::SpawnRequest;
-    let agent = echo_agent(dir);
     let launcher = Launcher::InProcess(InProcess {
         state: dir.join("state"),
         socket_dir: dir.join("ws"),
@@ -4968,9 +4973,8 @@ fn interrupt_reports_follow_the_write_outcome() {
 /// written.
 #[tokio::test]
 async fn a_consumed_write_is_reported_for_a_retry() {
-    use super::InterruptReport;
+    use super::{InterruptReport, Interrupted};
     use crate::runtime::worker_approvals::Event;
-    use crate::session_protocol::host::HostInterrupt;
     use crate::session_protocol::wire::ReceiptState;
     let _sweep = HookSweep;
     let _profile = crate::test_profile::temp();
@@ -5010,10 +5014,10 @@ async fn a_consumed_write_is_reported_for_a_retry() {
     let rid = host_work_attempt(&mut bridge, &id, &mut cx);
     show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
 
-    assert!(matches!(
+    assert_eq!(
         bridge.host_interrupt(&sid, &rid, &mut cx),
-        HostInterrupt::Written(_)
-    ));
+        Interrupted::Written
+    );
     assert_eq!(
         answered(&mut bridge, &id, &mut cx).await,
         [(rid.clone(), InterruptReport::Consumed)]
@@ -5028,10 +5032,10 @@ async fn a_consumed_write_is_reported_for_a_retry() {
     let deadline = Instant::now() + WAIT;
     loop {
         show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
-        assert!(matches!(
+        assert_eq!(
             bridge.host_interrupt(&sid, &rid, &mut cx),
-            HostInterrupt::Written(_)
-        ));
+            Interrupted::Written
+        );
         match answered(&mut bridge, &id, &mut cx).await.as_slice() {
             [(r, InterruptReport::Ok)] if *r == rid => break,
             // Within the worker's consume window.
@@ -5046,10 +5050,10 @@ async fn a_consumed_write_is_reported_for_a_retry() {
     // holds the lease here), and nothing more is written.
     show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
     assert_eq!(
-        bridge.host_revoke(&sid, &rid, &mut cx),
-        HostInterrupt::Revoked(Vec::new())
+        bridge.host_interrupt_revoke_lease(&sid, &rid, &mut cx),
+        Interrupted::Revoked
     );
-    assert_eq!(pending_interrupt(&bridge, &sid, &rid), None);
+    assert!(!bridge.host_interrupt_outstanding(&sid, &rid));
     // No receipt of its own: the attempt's prompt still runs its turn.
     assert_eq!(
         bridge.host().receipt(&rid).unwrap().state,
@@ -5067,7 +5071,7 @@ async fn a_consumed_write_is_reported_for_a_retry() {
 #[tokio::test]
 async fn an_error_after_queueing_is_reported_once() {
     use super::super::broker::{SessionState as BrokerState, WriteOutcome};
-    use super::InterruptReport;
+    use super::{InterruptReport, Interrupted};
     use crate::session_protocol::host::HostInterrupt;
     let _profile = crate::test_profile::temp();
     let dir = short_dir();
@@ -5089,16 +5093,16 @@ async fn an_error_after_queueing_is_reported_once() {
     let epoch = bridge.host().input_epoch(&sid);
     assert_eq!(
         bridge.host_interrupt(&sid, &rid, &mut cx),
-        HostInterrupt::NotCurrentTurn
+        Interrupted::Refused(HostInterrupt::NotCurrentTurn)
     );
     assert_eq!(bridge.host().input_epoch(&sid), epoch);
-    assert_eq!(pending_interrupt(&bridge, &sid, &rid), None);
+    assert!(!bridge.host_interrupt_outstanding(&sid, &rid));
 
     show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
-    assert!(matches!(
+    assert_eq!(
         bridge.host_interrupt(&sid, &rid, &mut cx),
-        HostInterrupt::Written(_)
-    ));
+        Interrupted::Written
+    );
     let seq = pending_interrupt(&bridge, &sid, &rid).expect("waits for the worker's answer");
     let failed = WriteOutcome {
         seq,
@@ -5119,11 +5123,11 @@ async fn an_error_after_queueing_is_reported_once() {
 
     // Written again; the session ends before the worker's answer is read.
     show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
-    assert!(matches!(
+    assert_eq!(
         bridge.host_interrupt(&sid, &rid, &mut cx),
-        HostInterrupt::Written(_)
-    ));
-    assert!(pending_interrupt(&bridge, &sid, &rid).is_some());
+        Interrupted::Written
+    );
+    assert!(bridge.host_interrupt_outstanding(&sid, &rid));
     let session = cx.sessions.get_mut(&id).unwrap();
     session.stop().unwrap();
     tokio::time::timeout(WAIT, async {
@@ -5141,4 +5145,352 @@ async fn an_error_after_queueing_is_reported_once() {
     );
     bridge.worker_reports(&mut cx);
     assert_eq!(bridge.host_interrupt_reports(), []);
+}
+
+/// A native member's attachment (`view`, `control`) on the bridge's host,
+/// welcomed as r9 admission welcomes one (it is on no link: what is sent
+/// to it goes nowhere).
+fn native(bridge: &mut super::HostBridge) -> String {
+    use crate::session_protocol::host::Attach;
+    use crate::session_protocol::wire::{ClientKind, Permission};
+    let att = uuid::Uuid::new_v4().to_string();
+    bridge
+        .host
+        .connect(Attach {
+            client: "c1".into(),
+            principal: "c1".into(),
+            attachment_gen: att.clone(),
+            permissions: vec![Permission::View, Permission::Control],
+            client_kind: ClientKind::Native,
+            authorization_ms: 24 * 60 * 60 * 1000,
+        })
+        .unwrap();
+    let now = bridge.clock.now();
+    bridge.host.welcome_r9(&att, now).unwrap();
+    let _ = bridge.host.take_effects();
+    att
+}
+
+/// `att`'s binding to `id`'s session, with its lease epoch if any.
+fn native_binding(
+    bridge: &super::HostBridge,
+    att: &str,
+    id: &crate::session::SessionId,
+    cx: &super::Cx<'_>,
+    lease: Option<u64>,
+) -> Value {
+    let ctx = bridge.host().context();
+    let mut binding = json!({"target": {"account_id": ctx.account_id,
+        "atem_device_id": ctx.atem_device_id, "host_trust_gen": ctx.host_trust_gen,
+        "session_id": id.to_string(), "process_gen": cx.sessions[id].process_gen},
+        "attachment_gen": att});
+    if let Some(epoch) = lease {
+        binding["lease_epoch"] = epoch.into();
+    }
+    binding
+}
+
+/// `att` sends `message`; the bridge performs what it causes. Its effects.
+fn from_native(
+    bridge: &mut super::HostBridge,
+    att: &str,
+    cx: &mut super::Cx<'_>,
+    message: Value,
+) -> Vec<crate::session_protocol::host::Effect> {
+    let now = bridge.clock.now();
+    let effects = bridge
+        .host
+        .receive(att, message.to_string().as_bytes(), now);
+    bridge.exec(effects.clone(), cx);
+    effects
+}
+
+/// The native `att` takes `id`'s lease over, and the pass syncs the
+/// workers' epochs as every pass does. Its lease epoch.
+fn take_over(
+    bridge: &mut super::HostBridge,
+    att: &str,
+    id: &crate::session::SessionId,
+    cx: &mut super::Cx<'_>,
+) -> u64 {
+    let binding = native_binding(bridge, att, id, cx, None);
+    from_native(
+        bridge,
+        att,
+        cx,
+        json!({"type": "session", "data": {"v": 1, "op": "acquire",
+            "id": uuid::Uuid::new_v4().to_string(), "binding": binding, "takeover": true}}),
+    );
+    assert_eq!(bridge.host().lease_holder(id.as_str()), Some(att));
+    bridge.sync_all(cx);
+    bridge.host().lease_epoch(id.as_str()).unwrap()
+}
+
+/// The native `att`, holding `id`'s lease at `lease`, subscribes and types
+/// `chunks` chunks of 8 KiB, which the bridge hands to the worker.
+fn native_types(
+    bridge: &mut super::HostBridge,
+    att: &str,
+    id: &crate::session::SessionId,
+    cx: &mut super::Cx<'_>,
+    lease: u64,
+    chunks: u64,
+) {
+    use crate::session_protocol::host::Effect;
+    let (sid, pg) = (id.to_string(), cx.sessions[id].process_gen.clone());
+    let binding = native_binding(bridge, att, id, cx, None);
+    let effects = from_native(
+        bridge,
+        att,
+        cx,
+        json!({"type": "terminal", "data": {"v": 1, "op": "subscribe",
+            "terminal_id": sid, "generation": pg, "binding": binding}}),
+    );
+    let stream = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::StreamOpened { stream_id, .. } => Some(stream_id.clone()),
+            _ => None,
+        })
+        .expect("subscribed");
+    let binding = native_binding(bridge, att, id, cx, Some(lease));
+    let chunk = STANDARD.encode([b'r'; 8 * 1024]);
+    for sequence in 0..chunks {
+        from_native(
+            bridge,
+            att,
+            cx,
+            json!({"type": "terminal", "data": {"v": 1, "op": "input",
+                "terminal_id": sid, "generation": pg, "binding": binding,
+                "stream_id": stream, "sequence": sequence, "bytes": chunk}}),
+        );
+    }
+    assert_eq!(bridge.per[&sid].remote.len() as u64, chunks, "admitted");
+    bridge.drain_remote(cx);
+    assert!(bridge.per[&sid].remote.is_empty(), "handed to the worker");
+}
+
+/// The input epochs a refusal must leave alone: the host's, the one the
+/// bridge last synced the worker to (`per.host_epoch`), and the worker's
+/// (as the session holds it).
+fn epochs(
+    bridge: &super::HostBridge,
+    id: &crate::session::SessionId,
+    cx: &super::Cx<'_>,
+) -> (Option<u64>, u64, u64) {
+    (
+        bridge.host().input_epoch(id.as_str()),
+        bridge.per[id.as_str()].host_epoch,
+        cx.sessions[id].input_epoch(),
+    )
+}
+
+/// The chat's half refuses before anything moves: with no turn shown
+/// running (no turn state) or another one shown, another holder's lease,
+/// the host's input epoch and the worker's stay, and nothing is written.
+/// With the attempt's turn shown, the interrupt revokes that lease and the
+/// worker's epoch rises.
+#[tokio::test]
+async fn a_chat_refusal_leaves_another_holders_lease_and_the_workers_epoch() {
+    use super::Interrupted;
+    use crate::session_protocol::host::HostInterrupt;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let session = broker_session(dir.path()).await;
+    let mut app = idle_app();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    let id = session.id.clone();
+    let sid = id.to_string();
+    let mut sessions = std::collections::BTreeMap::from([(id.clone(), session)]);
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    let rid = host_work_attempt(&mut bridge, &id, &mut cx);
+    let c1 = native(&mut bridge);
+    take_over(&mut bridge, &c1, &id, &mut cx);
+    let before = epochs(&bridge, &id, &cx);
+    let other = uuid::Uuid::new_v4().to_string();
+    for shown in [None, Some(other.as_str())] {
+        if let Some(other) = shown {
+            show_turn(cx.sessions.get_mut(&id).unwrap(), other);
+        }
+        assert_eq!(
+            bridge.host_interrupt(&sid, &rid, &mut cx),
+            Interrupted::Refused(HostInterrupt::NotCurrentTurn),
+            "{shown:?}"
+        );
+        assert_eq!(
+            bridge.host_interrupt_revoke_lease(&sid, &rid, &mut cx),
+            Interrupted::Refused(HostInterrupt::NotCurrentTurn),
+            "{shown:?}"
+        );
+        assert_eq!(bridge.host().lease_holder(&sid), Some(c1.as_str()));
+        assert_eq!(epochs(&bridge, &id, &cx), before, "{shown:?}");
+        assert!(!bridge.host_interrupt_outstanding(&sid, &rid));
+    }
+
+    show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+    assert_eq!(
+        bridge.host_interrupt(&sid, &rid, &mut cx),
+        Interrupted::Written
+    );
+    assert_eq!(bridge.host().lease_holder(&sid), None);
+    let after = epochs(&bridge, &id, &cx);
+    assert!(
+        after.0 > before.0 && after.1 > before.1,
+        "{before:?} {after:?}"
+    );
+    assert!(
+        after.2 > before.2,
+        "the worker's epoch: {before:?} {after:?}"
+    );
+    let _ = cx.sessions.get_mut(&id).unwrap().stop();
+}
+
+/// While a write for the attempt is outstanding, `host_interrupt` runs
+/// only the revoke-only step: no second Esc, still the one write waiting
+/// for its answer. Once that came (one report), it writes again.
+#[tokio::test]
+async fn an_outstanding_write_is_never_written_twice() {
+    use super::{InterruptReport, Interrupted};
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let session = broker_session(dir.path()).await;
+    let mut app = idle_app();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    let id = session.id.clone();
+    let sid = id.to_string();
+    let mut sessions = std::collections::BTreeMap::from([(id.clone(), session)]);
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    let rid = host_work_attempt(&mut bridge, &id, &mut cx);
+    show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+    let writes = |bridge: &super::HostBridge| {
+        bridge
+            .pending
+            .values()
+            .filter(|p| matches!(p, super::Pending::HostInterrupt(r) if *r == rid))
+            .count()
+    };
+
+    assert!(!bridge.host_interrupt_outstanding(&sid, &rid));
+    assert_eq!(
+        bridge.host_interrupt(&sid, &rid, &mut cx),
+        Interrupted::Written
+    );
+    assert!(bridge.host_interrupt_outstanding(&sid, &rid));
+    let seq = pending_interrupt(&bridge, &sid, &rid).unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            bridge.host_interrupt(&sid, &rid, &mut cx),
+            Interrupted::Revoked
+        );
+        assert_eq!(writes(&bridge), 1);
+        assert_eq!(pending_interrupt(&bridge, &sid, &rid), Some(seq));
+    }
+    assert_eq!(
+        answered(&mut bridge, &id, &mut cx).await,
+        [(rid.clone(), InterruptReport::Ok)]
+    );
+    assert!(!bridge.host_interrupt_outstanding(&sid, &rid));
+    // The worker's chat batches replace the shown turn: shown again.
+    show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+    assert_eq!(
+        bridge.host_interrupt(&sid, &rid, &mut cx),
+        Interrupted::Written
+    );
+    assert_eq!(writes(&bridge), 1);
+    assert_ne!(pending_interrupt(&bridge, &sid, &rid), Some(seq));
+    let _ = cx.sessions.get_mut(&id).unwrap().stop();
+}
+
+/// A native's bytes already handed to the worker are dropped there once
+/// its lease ends: by the interrupt on one session, by the revoke-only call
+/// on another. Behind an agent that reads nothing yet, the worker answers
+/// `dropped` for the chunks still queued; the interrupt's Esc, written
+/// under the new epoch, lands once the agent reads.
+#[tokio::test]
+async fn a_natives_bytes_at_the_worker_are_dropped_after_the_interrupt() {
+    use super::super::broker::WriteOutcome;
+    use super::{InterruptReport, Interrupted};
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let mut sessions = std::collections::BTreeMap::new();
+    let mut ids = Vec::new();
+    for name in ["sleepy-1", "sleepy-2"] {
+        // Raw, no echo: reads nothing for 3 s, so writes queue.
+        let agent = script(
+            dir.path(),
+            name,
+            "stty raw -echo\nprintf 'SLEEPING\\r\\n'\nsleep 3\nexec cat",
+        );
+        let session = session_running(dir.path(), &agent).await;
+        ids.push(session.id.clone());
+        sessions.insert(session.id.clone(), session);
+    }
+    let mut app = idle_app();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    let c1 = native(&mut bridge);
+    let mut rids = Vec::new();
+    for id in &ids {
+        let rid = host_work_attempt(&mut bridge, id, &mut cx);
+        show_turn(cx.sessions.get_mut(id).unwrap(), &rid);
+        let lease = take_over(&mut bridge, &c1, id, &mut cx);
+        native_types(&mut bridge, &c1, id, &mut cx, lease, 24);
+        rids.push(rid);
+    }
+    assert_eq!(
+        bridge.host_interrupt(ids[0].as_str(), &rids[0], &mut cx),
+        Interrupted::Written
+    );
+    assert_eq!(
+        bridge.host_interrupt_revoke_lease(ids[1].as_str(), &rids[1], &mut cx),
+        Interrupted::Revoked
+    );
+    for id in &ids {
+        assert_eq!(bridge.host().lease_holder(id.as_str()), None);
+    }
+
+    // Every write is answered once the agents read.
+    for (id, writes) in [(&ids[0], 25), (&ids[1], 24)] {
+        let mut results: Vec<WriteOutcome> = Vec::new();
+        tokio::time::timeout(WAIT, async {
+            while results.len() < writes {
+                let session = cx.sessions.get_mut(id).unwrap();
+                session.pump();
+                results.extend(session.take_results());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("unanswered writes of {id}"));
+        let dropped = results.iter().filter(|r| r.dropped).count();
+        assert!(dropped > 0, "nothing queued was dropped: {results:?}");
+        for result in results {
+            bridge.write_result(id.as_str(), result, &mut cx);
+        }
+    }
+    assert_eq!(
+        bridge.host_interrupt_reports(),
+        [(rids[0].clone(), InterruptReport::Ok)]
+    );
+    for id in &ids {
+        let _ = cx.sessions.get_mut(id).unwrap().stop();
+    }
 }

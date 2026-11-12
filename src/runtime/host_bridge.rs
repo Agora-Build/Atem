@@ -469,12 +469,30 @@ pub enum InterruptReport {
     Consumed,
     /// Dropped at the worker's write boundary (a newer input epoch).
     Dropped,
-    /// Nothing to interrupt by the time the write landed: refused before
-    /// it was queued, or the session's process ended first.
+    /// Nothing written: refused before it was queued, or it never reached
+    /// the worker. Or unanswered: the process ended; nothing is left to
+    /// interrupt, whatever was written.
     NoEffect,
     /// A writer error after queueing: it may have reached the terminal, so
     /// it counts as delivered (no blind second Esc; item 5's 10 s rule).
     ErrorAfterQueue,
+}
+
+/// What `HostBridge::host_interrupt` (or `host_interrupt_revoke_lease`)
+/// did. Everything it caused is already performed: nothing to carry out.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Interrupted {
+    /// The input epoch moved, another controller's lease was revoked, and
+    /// the interrupt key was written: its outcome comes in
+    /// `host_interrupt_reports`.
+    Written,
+    /// Only another controller's lease was revoked (if any): the revoke-only
+    /// call, or `host_interrupt` while a write of the attempt is
+    /// outstanding. Nothing written.
+    Revoked,
+    /// Refused before anything moved: `NotCurrentTurn`, `NotExecuting` or
+    /// `Halted` (never `Written` or `Revoked`).
+    Refused(HostInterrupt),
 }
 
 /// The broker's view of one session the host knows.
@@ -571,7 +589,9 @@ pub struct HostBridge {
     interrupts: HashMap<String, Vec<String>>,
     pending: HashMap<(String, u64), Pending>,
     /// What became of interrupts written with host authority, for
-    /// host-work (`host_interrupt_reports`): request id → report.
+    /// host-work (`host_interrupt_reports`): (the attempt's request id,
+    /// report), in the order the answers came (a session's in its write
+    /// order).
     interrupt_reports: Vec<(String, InterruptReport)>,
     /// terminal-v1 messages in order (frames, acks, errors) waiting for the
     /// bounded terminal queue.
@@ -2602,25 +2622,41 @@ impl HostBridge {
     // then only the tests do.
 
     /// Interrupts the turn of host-work's attempt `request_id` on `sid`
-    /// with the host's own authority, in one step and this order: the turn
-    /// check (the session host's: the attempt is the session's executing
-    /// prompt; then the chat's, `runs_turn_of`), the input epoch and the
-    /// revocation of another controller's lease (`revoked`), and the
-    /// interrupt key, written as local input is (under the worker's new
-    /// epoch, no lease deadline). The effects are performed here; `Written`
-    /// lists them for the record (never perform them again). Receipt-less:
-    /// the attempt's prompt receipt completes `interrupted` with its turn.
-    /// The write's outcome comes once in `host_interrupt_reports`.
+    /// with the host's own authority (`SessionHost::host_interrupt`, given
+    /// the chat's half of the turn check, `running_request`), in one step:
+    /// the turn check, the input epoch and the revocation of another
+    /// controller's lease (`revoked`), and the interrupt key, written as
+    /// local input is (under the worker's new epoch, no lease deadline).
+    /// Everything is performed here. Receipt-less: the attempt's prompt
+    /// receipt completes `interrupted` with its turn. The write's outcome
+    /// comes once in `host_interrupt_reports`; while it is outstanding,
+    /// this runs only the revoke-only step (`Revoked`), so one attempt never
+    /// has two writes in flight. Run it after the pass's `advance`.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn host_interrupt(&mut self, sid: &str, request_id: &str, cx: &mut Cx) -> HostInterrupt {
-        if let Some(blocked) = self.host_turn_blocked(sid, request_id, cx) {
-            return blocked;
+    fn host_interrupt(&mut self, sid: &str, request_id: &str, cx: &mut Cx) -> Interrupted {
+        if self.host_interrupt_outstanding(sid, request_id) {
+            return self.host_interrupt_revoke_lease(sid, request_id, cx);
         }
-        let outcome = self.host.host_interrupt(sid, request_id);
-        if let HostInterrupt::Written(effects) = &outcome {
-            self.exec(effects.clone(), cx);
+        let running = running_request(cx, sid);
+        match self
+            .host
+            .host_interrupt(sid, request_id, running.as_deref())
+        {
+            HostInterrupt::Written(effects) => {
+                self.exec(effects, cx);
+                Interrupted::Written
+            }
+            refused => Interrupted::Refused(refused),
         }
-        outcome
+    }
+
+    /// A host interrupt write for `request_id` on `sid` waits for the
+    /// worker's answer (its report hasn't come).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn host_interrupt_outstanding(&self, sid: &str, request_id: &str) -> bool {
+        self.pending.iter().any(|((s, _), p)| {
+            s == sid && matches!(p, Pending::HostInterrupt(r) if r == request_id)
+        })
     }
 
     /// Item 5's later passes once the interrupt was delivered: the same
@@ -2628,32 +2664,24 @@ impl HostBridge {
     /// worker's epoch raised, so its queued bytes are dropped); nothing
     /// written. Performed here, as `host_interrupt`.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn host_revoke(&mut self, sid: &str, request_id: &str, cx: &mut Cx) -> HostInterrupt {
-        if let Some(blocked) = self.host_turn_blocked(sid, request_id, cx) {
-            return blocked;
+    fn host_interrupt_revoke_lease(
+        &mut self,
+        sid: &str,
+        request_id: &str,
+        cx: &mut Cx,
+    ) -> Interrupted {
+        let running = running_request(cx, sid);
+        match self
+            .host
+            .host_interrupt_revoke_lease(sid, request_id, running.as_deref())
+        {
+            HostInterrupt::Revoked(effects) => {
+                self.exec(effects, cx);
+                self.sync_epoch(sid, cx);
+                Interrupted::Revoked
+            }
+            refused => Interrupted::Refused(refused),
         }
-        let outcome = self.host.host_revoke(sid, request_id);
-        if let HostInterrupt::Revoked(effects) = &outcome {
-            self.exec(effects.clone(), cx);
-            self.sync_epoch(sid, cx);
-        }
-        outcome
-    }
-
-    /// Item 5's turn check, before anything moves: the session host's
-    /// (`host_interrupt_blocked`), then the chat's. A session without chat
-    /// has no turn state, and one whose chat doesn't show the attempt's
-    /// turn running (its prompt not taken yet, another turn, the turn
-    /// ended, Codex before its first prompt) gets no blind Esc: both are
-    /// `NotCurrentTurn` (its current turn can't be shown to be the
-    /// attempt's).
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn host_turn_blocked(&self, sid: &str, request_id: &str, cx: &mut Cx) -> Option<HostInterrupt> {
-        if let Some(blocked) = self.host.host_interrupt_blocked(sid, request_id) {
-            return Some(blocked);
-        }
-        let runs = session_of(cx, sid).is_some_and(|s| s.is_live() && runs_turn_of(s, request_id));
-        (!runs).then_some(HostInterrupt::NotCurrentTurn)
     }
 
     /// What became of the interrupts written with host authority since the
@@ -4563,11 +4591,19 @@ fn turn_known_to_run(s: &BrokerSession) -> bool {
         )
 }
 
-/// The chat's half of R9.14 item 5's turn check: the prompt `request_id`
-/// began the chat's current turn, and that turn is known to run.
+/// The chat's half of R9.14 item 5's turn check, for the session host: the
+/// request whose turn `sid`'s chat shows running under today's Esc rule
+/// (`turn_known_to_run`). None for a session that isn't live, has no turn
+/// state (no chat: no blind Esc), shows no turn running (its prompt not
+/// taken yet, the turn ended, Codex before its first prompt) or one typed
+/// at the terminal.
 #[cfg_attr(not(test), allow(dead_code))]
-fn runs_turn_of(s: &BrokerSession, request_id: &str) -> bool {
-    turn_known_to_run(s) && s.chat.current_request_id() == Some(request_id)
+fn running_request(cx: &mut Cx, sid: &str) -> Option<String> {
+    let s = session_of(cx, sid).filter(|s| s.is_live())?;
+    turn_known_to_run(s)
+        .then(|| s.chat.current_request_id())
+        .flatten()
+        .map(str::to_string)
 }
 
 /// §6: what a failed host write proves (`None`: it was written).
