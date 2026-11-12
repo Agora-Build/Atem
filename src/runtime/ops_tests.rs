@@ -1719,20 +1719,28 @@ fn relay_only_waits_for_the_operation_on_the_local_link() {
 /// The status after relay only dropped a local link.
 const RELAY_ONLY_RECONNECT: &str = "Astation allows only the relay; reconnecting through it";
 
-/// Runs passes (each prompt) until the Astation link is dropped, within `limit`.
+/// Runs passes until the Astation link is dropped, within `limit`.
 async fn pass_until_dropped(app: &mut App, limit: Duration) {
     let started = Instant::now();
     while app.astation_connected {
         assert!(started.elapsed() < limit, "the link was not dropped");
-        let pass = Instant::now();
-        app.process_astation_messages().await;
-        assert!(
-            pass.elapsed() < Duration::from_secs(1),
-            "the pass never waits"
-        );
+        pass(app).await;
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(app.relay_only_drop.is_none());
+}
+
+/// One pass. It never waits for the result: the tests whose writer holds
+/// it check that passes return with the link kept, which a pass waiting for
+/// the write (or for the 5 s) couldn't. No time bound on the pass itself: it
+/// reads the profile's files (the first pass derives the machine key five
+/// times for the pairing record, each an `ioreg` run on macOS), which took
+/// over 1 s on a loaded runner. `WAIT` only turns a pass that awaits
+/// something into a failure instead of a hang.
+async fn pass(app: &mut App) {
+    tokio::time::timeout(WAIT, app.process_astation_messages())
+        .await
+        .expect("the pass never waits");
 }
 
 /// The pass returns at once while the writer holds the result and keeps the
@@ -1748,12 +1756,7 @@ fn relay_only_drop_waits_for_the_result_without_holding_the_pass() {
         let paused = app.astation_client.pause_writer_for_test();
         commit(&mut app, &profile, true, true);
         for _ in 0..10 {
-            let pass = Instant::now();
-            app.process_astation_messages().await;
-            assert!(
-                pass.elapsed() < Duration::from_secs(1),
-                "the pass never waits"
-            );
+            pass(&mut app).await;
             assert!(app.astation_connected, "the result isn't written yet");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1795,7 +1798,24 @@ fn relay_only_gives_up_on_the_result_after_5_s() {
             commit(&mut app, &profile, true, written);
             app.close_op_route();
             let ended = Instant::now();
-            pass_until_dropped(&mut app, Duration::from_secs(8)).await;
+            // The first pass sets the drop due 5 s on and returns at once
+            // (it never waits for the result) with the link kept...
+            pass(&mut app).await;
+            let due_by = Instant::now() + Duration::from_secs(5);
+            assert!(app.astation_connected, "written {written}");
+            assert!(app.relay_only_drop.is_some(), "written {written}");
+            // ...and the first pass to begin after that drops it, however
+            // long the passes take.
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                let began = Instant::now();
+                pass(&mut app).await;
+                if !app.astation_connected {
+                    break;
+                }
+                assert!(began < due_by, "kept past the 5 s: written {written}");
+            }
+            assert!(app.relay_only_drop.is_none());
             assert!(
                 ended.elapsed() >= Duration::from_secs(5),
                 "written {written}"
