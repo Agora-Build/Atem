@@ -1236,8 +1236,10 @@ fun main(args: Array<String>) {
         b["account_id"].s(), b["genesis_hash"].s(), mailHost(b["sender"]), mailHost(b["recipient"]),
         b["recipient"]["enc_kid"].s(), b["id"].s(), b["created_at"].l().toULong(), b["expires_at"].l().toULong(),
         LogHead(b["signed_at_head"]["seq"].l().toULong(), b["signed_at_head"]["hash"].s()))
+    // The keys it accepts, and every key it made (`generated`), by their key ids.
     fun mailRecipient(r: Any?) = MailRecipientData(
-        r["host_id"].s(), r["host_trust_gen"].l().toULong(), r["keys"].arr().map { MailKeyData(it.s(), encKid(encKey(it.s()))) })
+        r["host_id"].s(), r["host_trust_gen"].l().toULong(), r["keys"].arr().map { MailKeyData(it.s(), encKid(encKey(it.s()))) },
+        r["generated"].arr().map { encKid(encKey(it.s())) })
     fun mailOutbox(o: Any?) = MailOutboxData(
         mailHost(o["recipient"]), o["message_id"].s(), o["cancel_complete_ids"].arr().map { it.s() }, o["task_ids"].arr().map { it.s() })
     fun sha256(text: String) = hex(java.security.MessageDigest.getInstance("SHA-256").digest(utf8(text)))
@@ -1250,11 +1252,13 @@ fun main(args: Array<String>) {
         if (sealed.obj().containsKey("plaintext")) eq(plain, sealed["plaintext"], label)
         else eq(listOf(utf8(plain).size.toLong(), sha256(plain)), listOf(sealed["plaintext_bytes"], sealed["plaintext_sha256"]), label)
     }
+    fun mailSender(h: MailHostData) = mapOf("host_id" to h.hostId, "host_trust_gen" to h.hostTrustGen.toLong())
     fun envelopeVerdict(got: EnvelopeVerdictInfo): Pair<Map<String, Any?>, String?> = when (got) {
         is EnvelopeVerdictInfo.Open -> mapOf("verdict" to "open", "sender" to got.sender) to got.plainJson
         is EnvelopeVerdictInfo.Pending -> mapOf("verdict" to "pending", "host_id" to got.hostId, "host_trust_gen" to got.hostTrustGen.toLong()) to null
         is EnvelopeVerdictInfo.Refused -> mapOf("verdict" to "refused", "reason" to got.reason, "evidence" to got.evidence) to null
-        is EnvelopeVerdictInfo.RefusedAuthenticated -> mapOf("verdict" to "refused_authenticated", "object_id" to got.objectId, "reason" to got.reason) to null
+        is EnvelopeVerdictInfo.RefusedAuthenticated ->
+            mapOf("verdict" to "refused_authenticated", "object_id" to got.objectId, "reason" to got.reason, "sender" to mailSender(got.sender)) to null
         is EnvelopeVerdictInfo.Unavailable -> mapOf("verdict" to "unavailable", "code" to got.code, "detail" to got.detail) to null
     }
     fun resultVerdict(got: ResultVerdictInfo): Pair<Map<String, Any?>, String?> = when (got) {
@@ -1262,7 +1266,8 @@ fun main(args: Array<String>) {
         is ResultVerdictInfo.NotDelivered -> mapOf("verdict" to "not_delivered", "sender" to got.sender, "reason" to got.reason) to got.plainJson
         is ResultVerdictInfo.Pending -> mapOf("verdict" to "pending", "host_id" to got.hostId, "host_trust_gen" to got.hostTrustGen.toLong()) to null
         is ResultVerdictInfo.Refused -> mapOf("verdict" to "refused", "reason" to got.reason, "evidence" to got.evidence) to null
-        is ResultVerdictInfo.RefusedAuthenticated -> mapOf("verdict" to "refused_authenticated", "object_id" to got.objectId, "reason" to got.reason) to null
+        is ResultVerdictInfo.RefusedAuthenticated ->
+            mapOf("verdict" to "refused_authenticated", "object_id" to got.objectId, "reason" to got.reason, "sender" to mailSender(got.sender)) to null
         is ResultVerdictInfo.Unavailable -> mapOf("verdict" to "unavailable", "code" to got.code, "detail" to got.detail) to null
     }
     check("host mail: the entries extend log L to their hashes") {
@@ -1288,7 +1293,7 @@ fun main(args: Array<String>) {
         }
         check(built >= 20) { "$built built" }
         val b = listOf("M7_add_host_b", "M8_enc_a", "M9_enc_b", "M10_add_host_evil")
-        val toB = MailRecipientData("host-b", 1uL, listOf(MailKeyData("host-b-enc-1", encKid(encKey("host-b-enc-1")))))
+        val toB = MailRecipientData("host-b", 1uL, listOf(MailKeyData("host-b-enc-1", encKid(encKey("host-b-enc-1")))), listOf(encKid(encKey("host-b-enc-1"))))
         val req = mailObject.getValue("request")
         val plain = req["sealed"]["plaintext"].s()
         val fresh = sealEnvelope(store, "host-a", mailFields(req["object"]["body"]), plain, encKey("host-b-enc-1"))
@@ -1299,7 +1304,7 @@ fun main(args: Array<String>) {
         eq((openEnvelope(canonical, mailList(b), toB, store, mailNow) as EnvelopeVerdictInfo.Open).plainJson, canonicalJson(loose["sealed"]["plaintext"].s()))
         val status = mailObject.getValue("status")
         val freshResult = sealResult(store, "host-b", mailFields(status["object"]["body"]), status["sealed"]["plaintext"].s(), encKey("host-a-enc-1"))
-        val toA = MailRecipientData("host-a", 1uL, listOf(MailKeyData("host-a-enc-1", encKid(encKey("host-a-enc-1")))))
+        val toA = MailRecipientData("host-a", 1uL, listOf(MailKeyData("host-a-enc-1", encKid(encKey("host-a-enc-1")))), listOf(encKid(encKey("host-a-enc-1"))))
         val row = mailOutbox(mail["checks"].arr().first { it["label"] == "status_accepted" }["outbox"])
         check(acceptResult(freshResult, mailList(b), toA, row, store, mailNow) is ResultVerdictInfo.Accepted) { "a fresh result is accepted" }
         val nul = mailObject.getValue("plaintext_null")

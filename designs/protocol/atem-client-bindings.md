@@ -627,7 +627,7 @@ The bindings carry them so the Swift, Kotlin and WASM suites run
 |---|---|
 | `seal_envelope(provider, host_key_id, fields, plain_json, recipient_enc)`, `seal_result(…)` | the object's wire JSON (canonical): `plain_json` (one plaintext shape, read by the receiver's own strict parse: no `null`, exactly its fields; its canonical form is what is sealed; within its bound) sealed to the recipient host's X25519 encryption key, whose `enc_kid` must be `fields.enc_kid` (`malformed` otherwise), and the body signed with the Ed25519 `host_key_id` (purpose `HostSigning`). `fields` is `MailFieldsData{account_id, genesis_hash, sender, recipient, enc_kid, id, created_at, expires_at, signed_at_head}`, its `sender` and `recipient` each a `MailHostData{host_id, host_trust_gen}` |
 | `seal_envelope_with_ikm(…, ikm_e)`, `seal_result_with_ikm(…, ikm_e)` | the same with the ephemeral `DeriveKeyPair(ikm_e)`: the vectors' objects byte for byte (feature `test-vectors`) |
-| `open_envelope(object_json, log, me, provider, now_ms)` | the receiver's checks 1 to 6 against its device list: `EnvelopeVerdictInfo` `Open{plain_json, sender}`, `Pending{host_id, host_trust_gen}`, `Refused{reason, evidence}`, `RefusedAuthenticated{object_id, reason}` or `Unavailable{code, detail}`. `Pending` may also mean the object is sealed to a key this host hasn't applied yet (signed at a head beyond its own): judge it again after each device-list advance and each change of `me.keys`. `Refused` (any refusal before the copy is shown to be the sender's, signed and intact: steps 1 to 4, for example a bad signature or a sealed part its `sealed_hash` doesn't name) claims no id and is never reported; the ids `Open` and `RefusedAuthenticated` claim are the authenticated sender's, `(sender.host_id, id)`. `me` is `MailRecipientData{host_id, host_trust_gen, keys}`: the host's own trust generation from its pairing (never one read from its device list) and the keys it accepts now (`MailKeyData{key_id, enc_kid}`) |
+| `open_envelope(object_json, log, me, provider, now_ms)` | the receiver's checks 1 to 6 against its device list: `EnvelopeVerdictInfo` `Open{plain_json, sender}`, `Pending{host_id, host_trust_gen}`, `Refused{reason, evidence}`, `RefusedAuthenticated{object_id, reason, sender}` or `Unavailable{code, detail}`. `Pending` may also mean the object is sealed to a key this host made but hasn't applied yet (signed at a head beyond its own): judge it again after each device-list advance and each change of `me.keys`. `Refused` (any refusal before the copy is shown to be the sender's, signed and intact: steps 1 to 4, for example a bad signature or a sealed part its `sealed_hash` doesn't name) claims no id and is never reported; the ids `Open` and `RefusedAuthenticated` claim are the authenticated sender's, `(sender.host_id, id)`, and `RefusedAuthenticated.sender` is that sender, a `MailHostData{host_id, host_trust_gen}` (the generation whose `add_host` key verified the copy). `me` is `MailRecipientData{host_id, host_trust_gen, keys, generated}`: the host's own trust generation from its pairing (never one read from its device list), the keys it accepts now (`MailKeyData{key_id, enc_kid}`) and the `enc_kid` (16 hex) of every key it made in that generation, from its own records (a key id in neither is refused `enc_key_not_accepted` even beyond its head; one only in `generated` waits there) |
 | `accept_result(object_json, log, me, outbox, provider, now_ms)` | the sending host's check of a result against its row `MailOutboxData{recipient, message_id, cancel_complete_ids, task_ids}`: `ResultVerdictInfo` `Accepted`, `NotDelivered{plain_json, sender, reason}` (a revoked or removed sender's result, kept as data), and the same `Pending`, `Refused`, `RefusedAuthenticated`, `Unavailable` |
 
 The verdict functions throw only for bytes that don't parse as a signed
@@ -641,7 +641,10 @@ those bytes too, under the SHA-256 of the bytes as fetched (host-work-v1
 §11.5). Anything about a signed object's content is a verdict. JS: `sealEnvelope`, `sealResult`,
 `sealEnvelopeWithIkm`, `sealResultWithIkm`, `openEnvelope`, `acceptResult`
 with a `SoftwareKeyStore` (builds with `software-keys` and `host`), the
-fields and records as camelCase objects, the verdicts as `{type, …}`.
+fields and records as camelCase objects (the receiver `{hostId,
+hostTrustGen, keys: [{keyId, encKid}], generated: [encKid]}`), the verdicts
+as `{type, …}` (an authenticated refusal's `sender` as `{hostId,
+hostTrustGen}`).
 
 ### Encoding helpers
 
@@ -1001,10 +1004,11 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   byte for byte (a fresh seal opens, a builder refuses a plaintext with
   `null`, a dropped reply and a key that isn't the `enc_kid`'s, and seals a
   plaintext's canonical form only), and every check's verdict and reason
-  through `open_envelope` and `accept_result`, with the plaintext an open
-  gives (the largest by its length and SHA-256). Kotlin and Swift also open
-  the request and the re-signed copy through their own platform providers
-  (`JdkKeys`, `CryptoKitKeys`), whose failed open is
+  through `open_envelope` and `accept_result` (with each receiver's
+  `generated` key ids and each authenticated refusal's `sender`), with the
+  plaintext an open gives (the largest by its length and SHA-256). Kotlin
+  and Swift also open the request and the re-signed copy through their own
+  platform providers (`JdkKeys`, `CryptoKitKeys`), whose failed open is
   `ProviderError.OpenFailed` (§3): the same verdicts.
 - **Device-list actions** (`tests/host_actions.rs`, Rust; four conformance
   checks in JS, five in Kotlin and Swift, of the 70 and 72 above): every

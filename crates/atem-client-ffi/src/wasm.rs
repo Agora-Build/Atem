@@ -2626,7 +2626,7 @@ fn mail_fields(v: JsValue) -> JsResult<crate::host_mail::MailFieldsData> {
     })
 }
 
-/// `{hostId, hostTrustGen, keys: [{keyId, encKid}]}`.
+/// `{hostId, hostTrustGen, keys: [{keyId, encKid}], generated: [encKid]}`.
 #[cfg(all(feature = "software-keys", feature = "host"))]
 fn mail_recipient(v: JsValue) -> JsResult<crate::host_mail::MailRecipientData> {
     #[derive(Deserialize)]
@@ -2641,10 +2641,16 @@ fn mail_recipient(v: JsValue) -> JsResult<crate::host_mail::MailRecipientData> {
         host_id: String,
         host_trust_gen: f64,
         keys: Vec<K>,
+        generated: Vec<String>,
     }
-    mail_keys_only(&v, &["hostId", "hostTrustGen", "keys"], "recipient")?;
-    let r: R = serde_wasm_bindgen::from_value(v)
-        .map_err(|_| bad("recipient {hostId, hostTrustGen, keys: [{keyId, encKid}]}"))?;
+    mail_keys_only(
+        &v,
+        &["hostId", "hostTrustGen", "keys", "generated"],
+        "recipient",
+    )?;
+    let r: R = serde_wasm_bindgen::from_value(v).map_err(|_| {
+        bad("recipient {hostId, hostTrustGen, keys: [{keyId, encKid}], generated: [encKid]}")
+    })?;
     Ok(crate::host_mail::MailRecipientData {
         host_id: r.host_id,
         host_trust_gen: ms(r.host_trust_gen)?,
@@ -2656,6 +2662,7 @@ fn mail_recipient(v: JsValue) -> JsResult<crate::host_mail::MailRecipientData> {
                 enc_kid: k.enc_kid,
             })
             .collect(),
+        generated: r.generated,
     })
 }
 
@@ -2771,7 +2778,8 @@ pub fn seal_result_with_ikm(
 /// Host role: the receiver's checks 1 to 6 (`open_envelope`): `{type:
 /// "open", plainJson, sender}`, `{type: "pending", hostId, hostTrustGen}`,
 /// `{type: "refused", reason, evidence}`, `{type: "refused_authenticated",
-/// objectId, reason}` or `{type: "unavailable", code, detail}`.
+/// objectId, reason, sender: {hostId, hostTrustGen}}` or `{type:
+/// "unavailable", code, detail}`.
 #[cfg(all(feature = "software-keys", feature = "host"))]
 #[wasm_bindgen(js_name = openEnvelope)]
 pub fn open_envelope(

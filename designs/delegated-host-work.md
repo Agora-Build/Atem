@@ -41,6 +41,13 @@ I.13, VII.A test 18 and IX.1 item 6). The exact rules are host-work-v1 §11.6, "
 I.6.5 also carries a note for the owner (2026-11-11): on Linux, Atem measures boot time with a raw composition of
 kernel clocks instead of the `CLOCK_BOOTTIME` the decision names, so that the OS's slewing can't move `H`.
 
+**Amended for step 4, for Astation's review (host mail).** Two changes to II.4.2's receiver, built in the shared core
+(host-work-v1 §11.5). Only a key the host made waits: mail sealed to a key id the host never made in its current trust
+generation is refused at once, even when signed beyond its head, since every `host_enc_key` entry for the host carries
+the host's own `enc_sig`. And a refusal of a verified copy (steps 5 and 6) names its sender, the `(host_id,
+host_trust_gen)` whose key verified it, which the claim on its `id` is keyed by. Each changed passage in II.4.2 is
+marked "Amended for step 4, for Astation's review".
+
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256
 `cc180912cd8d3afc11c20f77a3ebc4e8a81989ede1327afc90df52d09c39eb83`), changed only by this status block, Appendix B, the link to
@@ -1808,7 +1815,12 @@ with the sealed part beside it.
    is beyond this host's head, a key it doesn't accept waits (below): its own new `host_enc_key` may be among the
    entries it lacks. A key the host generated and handed out but whose `host_enc_key` its own list hasn't applied yet
    should be accepted too: a sender whose list already has the entry seals to it, and the mail then opens at once
-   instead of waiting.
+   instead of waiting. **Amended for step 4, for Astation's review.** Only a key the host made waits. The host keeps
+   the id of every key it made in its current trust generation, recorded before it hands the key out. Every
+   `host_enc_key` entry for the host carries the host's own `enc_sig`, so no entry it lacks can make any other key one
+   it accepts. Mail sealed to a key id the host never made is refused even when `signed_at_head.seq` is beyond its head,
+   and never waits. There the refusal comes after the checks that settle at any head (step 3's, below), step 5's times
+   and, when this host's list holds the claimed `(host_id, host_trust_gen)`, step 4's check of the copy.
 3. The sender is a current host at its applied head whose newest `add_host` has exactly `sender.host_trust_gen`.
    **Owner decision 2026-11-07:** its `host_id` is `authorized(g)` at this host's head (II.3.1), `signed_at_head.seq`
    is at least g, and this host's entry at `signed_at_head.seq` has `signed_at_head.hash`. **Amended after
@@ -1833,7 +1845,8 @@ with the sealed part beside it.
   it waits, below), and there step 3 also refuses a claimed generation the list doesn't hold, or whose `add_host` comes
   after `signed_at_head.seq`: the list the sender signed at is the one this host holds. Two are refused at any head,
   since `add_host` generations strictly rise: a generation below the sender's newest, and an envelope from a removed
-  host at the generation it last held (after step 5's times when the head is beyond this host's). These refusals claim
+  host at the generation it last held (after step 5's times when the head is beyond this host's). **Amended for step 4,
+  for Astation's review.** A third is refused at any head: a key id this host never made (step 2). These refusals claim
   no `id` (Duplicates, below): the sender's own copy, sent again, is still judged.
 - **Amended after agreement, 2026-11-10 (for Astation).** **Step 3 for a `signed_at_head.seq` beyond this host's head**
   (it read: "for a `sender.host_trust_gen`, or a `signed_at_head.seq`, beyond this host's head"): the host may not have
@@ -1843,7 +1856,8 @@ with the sealed part beside it.
   result), it then verifies the copy as step 4 does, its signature with that `add_host`'s `host_key` and its sealed part
   against the signed `sealed_hash`, and refuses an object that fails, since that pair has one key forever (so neither
   junk nor a variant of the sender's own object takes its slots); otherwise (a sender it doesn't know, or a generation
-  above its newest) the signature can't be checked yet. One that passes stays pending, isn't marked done, and is judged
+  above its newest) the signature can't be checked yet. **Amended for step 4, for Astation's review.** Then one sealed
+  to a key id this host never made is refused (step 2). One that passes stays pending, isn't marked done, and is judged
   again after each device-list advance and each change of the keys it accepts, until it expires. At most 64 objects stay
   pending per claimed `(host_id, host_trust_gen)` and 256 in all; more are dropped undecided (it read: "more are refused
   and kept as evidence"): an overflow is no verdict, records nothing, claims no `id` and isn't marked done, so the
@@ -1851,7 +1865,9 @@ with the sealed part beside it.
   can't stop its other work. **New rule.**
 - **Steps 5 and 6, once step 4 passed:** the sender is authenticated, so the refusal is reported back to it as a
   status naming the object's `id`, `refused` with `invalid_request` (II.4.4); its outbox doesn't stay `sent` until
-  expiry.
+  expiry. **Amended for step 4, for Astation's review.** The refusal names that sender, the `(host_id,
+  host_trust_gen)` whose `add_host` key verified the copy: the claim on the `id` (Duplicates, below) is that sender's,
+  never the host whose object another host re-signed.
 - **Step 7:** a recorded decision (`refused`), reported back (II.4.4).
 - **Duplicates.** **Amended after agreement, 2026-11-10 (for Astation)** (it read: "The same `id` with the same
   `sealed_hash` is a duplicate: acknowledged, nothing changes. The same `id` with other bytes is refused and kept as

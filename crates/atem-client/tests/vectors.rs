@@ -8237,6 +8237,16 @@ const MAIL_B2: MailHost = MailHost("host-b", 2);
 const MAIL_EVIL: MailHost = MailHost("host-evil", 1);
 
 impl MailHost {
+    /// Every host encryption key it made at its generation (r9-vectors-keys
+    /// names): host-a and host-b made both of theirs at generation 1.
+    fn generated(self) -> &'static [&'static str] {
+        match (self.0, self.1) {
+            ("host-a", 1) => &["host-a-enc-1", "host-a-enc-2"],
+            ("host-b", 1) => &["host-b-enc-1", "host-b-enc-2"],
+            _ => &[],
+        }
+    }
+
     fn host_ref(self) -> HostRef {
         HostRef {
             host_id: self.0.into(),
@@ -8549,7 +8559,8 @@ impl<'a> MailVectors<'a> {
 
     /// A check of `object`: the verdict `expect` of `open_envelope` (no
     /// `outbox`) or `accept_result`, on L + `chain`, by the receiver
-    /// `(host, its keys)`, at `now`.
+    /// `(host, its keys)`, which made every key [`MailHost::generated`]
+    /// names, at `now`.
     #[allow(clippy::too_many_arguments)]
     fn check(
         &mut self,
@@ -8558,6 +8569,26 @@ impl<'a> MailVectors<'a> {
         object: &str,
         chain: &[&str],
         receiver: (MailHost, &[&str]),
+        now: u64,
+        outbox: Option<Value>,
+        expect: Value,
+    ) {
+        let generated = receiver.0.generated();
+        self.check_made(
+            label, note, object, chain, receiver, generated, now, outbox, expect,
+        );
+    }
+
+    /// [`Self::check`] by a receiver that made only the keys `generated`.
+    #[allow(clippy::too_many_arguments)]
+    fn check_made(
+        &mut self,
+        label: &str,
+        note: &str,
+        object: &str,
+        chain: &[&str],
+        receiver: (MailHost, &[&str]),
+        generated: &[&str],
         now: u64,
         outbox: Option<Value>,
         expect: Value,
@@ -8573,6 +8604,7 @@ impl<'a> MailVectors<'a> {
                 "host_id": receiver.0.0,
                 "host_trust_gen": receiver.0.1,
                 "keys": receiver.1,
+                "generated": generated,
             },
             "now": now,
             "expect": expect,
@@ -8591,11 +8623,18 @@ impl<'a> MailVectors<'a> {
         })
     }
 
+    /// Refused after step 4: the claim is the body's sender's, whose key
+    /// verified the copy.
     fn refused_authenticated(&self, object: &str, reason: &str) -> Value {
+        let body = self.objects[object].body();
         serde_json::json!({
             "verdict": "refused_authenticated",
-            "object_id": s(self.objects[object].body(), "id"),
+            "object_id": s(body, "id"),
             "reason": reason,
+            "sender": {
+                "host_id": s(&body["sender"], "host_id"),
+                "host_trust_gen": body["sender"]["host_trust_gen"],
+            },
         })
     }
 }
@@ -9072,6 +9111,13 @@ fn host_envelope_vectors(book: &Book) -> Value {
         MAIL_B1,
         |_| {},
     );
+    g.resign(
+        "cancel_to_new_key_bad_signature",
+        "cancel_to_new_key's body signed by host-b's key: host-a's at generation 1 is known, so the signature is checked before the key",
+        "cancel_to_new_key",
+        MAIL_B1,
+        |_| {},
+    );
     let to_a = enc_kid(&g.enc_pub("host-a-enc-1")).unwrap();
     g.edit(
         "redirected_edited",
@@ -9184,6 +9230,20 @@ fn host_envelope_vectors(book: &Book) -> Value {
         f,
         MailPlain::Result(status()),
         "host-a-enc-1",
+    );
+    let f = g.fields(
+        "status_to_new_key",
+        MAIL_B1,
+        MAIL_A1,
+        "host-a-enc-2",
+        &on_b(&["M11_rotate_a"]),
+    );
+    g.seal(
+        "status_to_new_key",
+        "host-b's receipt for the request, sealed to host-a's new key host-a-enc-2, signed at the head of B + M11_rotate_a (seq 11), where host-b's list has the rotation",
+        f,
+        MailPlain::Result(status()),
+        "host-a-enc-2",
     );
     let f = ba(&g, "dropped_reply");
     let text = jcs(&serde_json::json!({
@@ -9453,7 +9513,52 @@ fn host_envelope_vectors(book: &Book) -> Value {
         "cancel_to_new_key",
         &b,
         mail_pending(MAIL_A1),
-        "sealed to a key host-b handed out but hasn't applied (its host_enc_key is beyond its head): it waits",
+        "sealed to a key host-b made and handed out but hasn't applied (its host_enc_key is beyond its head; the key is in generated): it waits",
+    );
+    let e = g.refused("cancel_to_new_key_bad_signature", "bad_signature");
+    at(
+        &mut g,
+        "new_key_head_ahead_bad_signature",
+        "cancel_to_new_key_bad_signature",
+        &b,
+        e,
+        "the same key, from a known generation: the signature is checked before waiting",
+    );
+    let e = g.refused("cancel_to_new_key", "enc_key_not_accepted");
+    g.check_made(
+        "never_generated_key_head_ahead",
+        "sealed to a key host-b never made (not in generated): refused even beyond its head, with no wait, since no entry it lacks can make that key one it accepts",
+        "cancel_to_new_key",
+        &b,
+        to_b,
+        &["host-b-enc-1"],
+        MAIL_NOW,
+        None,
+        e,
+    );
+    let e = g.refused("cancel_to_new_key_bad_signature", "bad_signature");
+    g.check_made(
+        "never_generated_key_head_ahead_bad_signature",
+        "the same, from a known generation: the signature is checked before the key",
+        "cancel_to_new_key_bad_signature",
+        &b,
+        to_b,
+        &["host-b-enc-1"],
+        MAIL_NOW,
+        None,
+        e,
+    );
+    let e = g.refused("cancel_to_new_key", "expired");
+    g.check_made(
+        "never_generated_key_head_ahead_times_first",
+        "the same at its expires_at: the body's times come before the key",
+        "cancel_to_new_key",
+        &b,
+        to_b,
+        &["host-b-enc-1"],
+        MAIL_EXPIRES,
+        None,
+        e,
     );
     g.check(
         "new_key_opens",
@@ -9721,6 +9826,38 @@ fn host_envelope_vectors(book: &Book) -> Value {
         e,
     );
     g.check(
+        "result_new_key_head_ahead_pending",
+        "a result sealed to a key host-a made and handed out but hasn't applied: it waits",
+        "status_to_new_key",
+        &b,
+        to_a,
+        MAIL_NOW,
+        Some(outbox(&request_id)),
+        mail_pending(MAIL_B1),
+    );
+    g.check(
+        "result_new_key_accepted",
+        "once host-a applies the rotation and lists the key, it is accepted",
+        "status_to_new_key",
+        &on_b(&["M11_rotate_a"]),
+        (MAIL_A1, &["host-a-enc-2", "host-a-enc-1"]),
+        MAIL_NOW,
+        Some(outbox(&request_id)),
+        accepted.clone(),
+    );
+    let e = g.refused("status_to_new_key", "enc_key_not_accepted");
+    g.check_made(
+        "result_never_generated_key_head_ahead",
+        "a result sealed to a key host-a never made: refused even beyond its head",
+        "status_to_new_key",
+        &b,
+        to_a,
+        &["host-a-enc-1"],
+        MAIL_NOW,
+        Some(outbox(&request_id)),
+        e,
+    );
+    g.check(
         "removed_result_head_ahead_pending",
         "a removed host's result signed beyond the receiver's head waits (its signature checked first), to be kept as data",
         "status_head_ahead",
@@ -9794,7 +9931,7 @@ fn host_envelope_vectors(book: &Book) -> Value {
         "name": "r9-vectors-host-envelope",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Envelopes and results between hosts (delegated host-work II.4.2, II.4.4; host-work-v1 §11.5). Each object is {body, sig, enc, ct}: the body signed by the sender's host_key (Ed25519) over enc([\"atem-envelope-v1\" or \"atem-result-v1\", jcs(body)]); the plaintext sealed with RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, to the recipient's host encryption key, info = enc([\"atem-envelope-seal-v1\" or \"atem-result-seal-v1\", account_id, genesis_hash (32 bytes), sender.host_id, u64(sender.host_trust_gen), recipient.host_id, u64(recipient.host_trust_gen), enc_kid, id, u64(created_at), u64(expires_at)]); sealed_hash = SHA-256(enc([enc, ct])). The sender's ephemeral is DeriveKeyPair(ikmE), ikmE = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Device lists: log L of r9-vectors-membership-log followed by `chain`, labels of `entries` (signed by dev-mac); the objects are signed at B = L + M7..M10 (head 10) unless their signed_at_head says otherwise. Objects: `signed_with` names the r9-vectors-keys host key whose signature `sig` is; `built` objects are what seal_envelope / seal_result make from the body's fields, `sealed.plaintext` and ikmE; `sealed` gives the seal's inputs and outputs (`plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB); `sealed_from` names the object whose sealed part it carries, `edited_from` the object it is after a change made after signing. Checks: `call` (open_envelope, or accept_result with `outbox`, the sending host's row) on L + `chain`, by `receiver` (its host_id, current host_trust_gen and the keys it accepts, r9-vectors-keys names), at `now`; `expect` is the verdict: open or accepted (with `sender`; the plaintext is the object's), not_delivered (with `sender` and the return grant's detail as `reason`), pending (the claimed host_id and host_trust_gen), refused (before the copy is shown to be the sender's, signed and intact (step 4): `reason` and `evidence` = SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent; it claims no id) or refused_authenticated (after it: the object's id and `reason`; it claims the id for its authenticated sender, (sender.host_id, id)).",
+        "note": "Envelopes and results between hosts (delegated host-work II.4.2, II.4.4; host-work-v1 §11.5). Each object is {body, sig, enc, ct}: the body signed by the sender's host_key (Ed25519) over enc([\"atem-envelope-v1\" or \"atem-result-v1\", jcs(body)]); the plaintext sealed with RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, to the recipient's host encryption key, info = enc([\"atem-envelope-seal-v1\" or \"atem-result-seal-v1\", account_id, genesis_hash (32 bytes), sender.host_id, u64(sender.host_trust_gen), recipient.host_id, u64(recipient.host_trust_gen), enc_kid, id, u64(created_at), u64(expires_at)]); sealed_hash = SHA-256(enc([enc, ct])). The sender's ephemeral is DeriveKeyPair(ikmE), ikmE = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Device lists: log L of r9-vectors-membership-log followed by `chain`, labels of `entries` (signed by dev-mac); the objects are signed at B = L + M7..M10 (head 10) unless their signed_at_head says otherwise. Objects: `signed_with` names the r9-vectors-keys host key whose signature `sig` is; `built` objects are what seal_envelope / seal_result make from the body's fields, `sealed.plaintext` and ikmE; `sealed` gives the seal's inputs and outputs (`plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB); `sealed_from` names the object whose sealed part it carries, `edited_from` the object it is after a change made after signing. Checks: `call` (open_envelope, or accept_result with `outbox`, the sending host's row) on L + `chain`, by `receiver` (its host_id, current host_trust_gen, the keys it accepts and every key it made at that generation, `generated`; r9-vectors-keys names), at `now`; `expect` is the verdict: open or accepted (with `sender`; the plaintext is the object's), not_delivered (with `sender` and the return grant's detail as `reason`), pending (the claimed host_id and host_trust_gen), refused (before the copy is shown to be the sender's, signed and intact (step 4): `reason` and `evidence` = SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent; it claims no id) or refused_authenticated (after it: the object's id, `reason` and `sender`, the {host_id, host_trust_gen} whose key verified it; it claims the id for that sender, (sender.host_id, id)). A key in neither `keys` nor `generated` is refused enc_key_not_accepted even beyond the receiver's head, after the checks that settle at any head, the times and a known generation's signature; one in `generated` only waits there.",
         "account_id": "acct-test-1",
         "genesis_hash": g.genesis.to_hex(),
         "now": MAIL_NOW,
@@ -9822,8 +9959,17 @@ fn mail_verdict(verdict: EnvelopeVerdict) -> (Value, Option<Vec<u8>>) {
             serde_json::json!({"verdict": "refused", "reason": reason, "evidence": evidence.to_hex()}),
             None,
         ),
-        EnvelopeVerdict::RefusedAuthenticated { object_id, reason } => (
-            serde_json::json!({"verdict": "refused_authenticated", "object_id": object_id, "reason": reason}),
+        EnvelopeVerdict::RefusedAuthenticated {
+            object_id,
+            reason,
+            sender,
+        } => (
+            serde_json::json!({
+                "verdict": "refused_authenticated",
+                "object_id": object_id,
+                "reason": reason,
+                "sender": {"host_id": sender.host_id, "host_trust_gen": sender.host_trust_gen},
+            }),
             None,
         ),
         EnvelopeVerdict::Unavailable { error } => panic!("unavailable: {error}"),
@@ -9855,9 +10001,15 @@ fn mail_result_verdict(verdict: ResultVerdict) -> (Value, Option<Vec<u8>>) {
         ResultVerdict::Refused { reason, evidence } => {
             mail_verdict(EnvelopeVerdict::Refused { reason, evidence })
         }
-        ResultVerdict::RefusedAuthenticated { object_id, reason } => {
-            mail_verdict(EnvelopeVerdict::RefusedAuthenticated { object_id, reason })
-        }
+        ResultVerdict::RefusedAuthenticated {
+            object_id,
+            reason,
+            sender,
+        } => mail_verdict(EnvelopeVerdict::RefusedAuthenticated {
+            object_id,
+            reason,
+            sender,
+        }),
         ResultVerdict::Unavailable { error } => panic!("unavailable: {error}"),
     }
 }
@@ -10017,22 +10169,25 @@ fn host_envelope() {
         let label = s(c, "label");
         let list = g.list(&chain_labels(c));
         let receiver = &c["receiver"];
-        let me = MailRecipient {
-            host_id: s(receiver, "host_id").into(),
-            host_trust_gen: receiver["host_trust_gen"].as_u64().unwrap(),
-            keys: receiver["keys"]
+        let kid = |name: &str| {
+            atem_client::keys::enc_kid_bytes(&book.public(&format!("{name}/enc"))).unwrap()
+        };
+        let names = |field: &str| -> Vec<&str> {
+            receiver[field]
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|k| {
-                    let name = k.as_str().unwrap();
-                    let key = book.public(&format!("{name}/enc"));
-                    (
-                        KeyId::new(format!("{name}/enc")),
-                        atem_client::keys::enc_kid_bytes(&key).unwrap(),
-                    )
-                })
+                .map(|k| k.as_str().unwrap())
+                .collect()
+        };
+        let me = MailRecipient {
+            host_id: s(receiver, "host_id").into(),
+            host_trust_gen: receiver["host_trust_gen"].as_u64().unwrap(),
+            keys: names("keys")
+                .into_iter()
+                .map(|name| (KeyId::new(format!("{name}/enc")), kid(name)))
                 .collect(),
+            generated: names("generated").into_iter().map(kid).collect(),
         };
         let object_label = s(c, "object");
         let object = SignedObject::from_strict(&strict(&objects[object_label]["object"])).unwrap();

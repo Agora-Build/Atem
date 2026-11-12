@@ -1017,7 +1017,12 @@ const mailFields = (b) => ({
   expiresAt: b.expires_at,
   signedAtHead: { seq: b.signed_at_head.seq, hash: b.signed_at_head.hash },
 });
-const mailRecipient = (r) => ({ ...mailHost(r), keys: r.keys.map((name) => ({ keyId: name, encKid: m.encKid(encRaw(name)) })) });
+// The keys it accepts, and every key it made (`generated`), by their key ids.
+const mailRecipient = (r) => ({
+  ...mailHost(r),
+  keys: r.keys.map((name) => ({ keyId: name, encKid: m.encKid(encRaw(name)) })),
+  generated: r.generated.map((name) => m.encKid(encRaw(name))),
+});
 const mailOutbox = (o) => ({ recipient: mailHost(o.recipient), messageId: o.message_id, cancelCompleteIds: o.cancel_complete_ids, taskIds: o.task_ids });
 // A verdict as `expect` writes it; an open's plaintext against the object's.
 const mailExpect = (c, got) => {
@@ -1025,6 +1030,8 @@ const mailExpect = (c, got) => {
   const v = { verdict: type, ...rest };
   if (hostId !== undefined) Object.assign(v, { host_id: hostId, host_trust_gen: hostTrustGen });
   if (objectId !== undefined) v.object_id = objectId;
+  // An authenticated refusal's sender is a host record: {hostId, hostTrustGen}.
+  if (typeof rest.sender === "object") v.sender = { host_id: rest.sender.hostId, host_trust_gen: rest.sender.hostTrustGen };
   same(v, c.expect, c.label);
   const sealed = mailObject[c.object].sealed;
   if (plainJson === undefined) return;
@@ -1048,7 +1055,7 @@ check("host mail: the builders reproduce every built object; a fresh seal opens;
   }
   if (built < 20) throw new Error(`${built} built`);
   const B = ["M7_add_host_b", "M8_enc_a", "M9_enc_b", "M10_add_host_evil"];
-  const toB = mailRecipient({ host_id: "host-b", host_trust_gen: 1, keys: ["host-b-enc-1"] });
+  const toB = mailRecipient({ host_id: "host-b", host_trust_gen: 1, keys: ["host-b-enc-1"], generated: ["host-b-enc-1"] });
   const req = mailObject.request;
   const fresh = m.sealEnvelope(store, "host-a", mailFields(req.object.body), req.sealed.plaintext, encRaw("host-b-enc-1"));
   eq(m.openEnvelope(fresh, mailList(B), toB, store, mail.now), { type: "open", plainJson: req.sealed.plaintext, sender: "host:host-a" });
@@ -1058,7 +1065,7 @@ check("host mail: the builders reproduce every built object; a fresh seal opens;
   eq(m.openEnvelope(canonical, mailList(B), toB, store, mail.now).plainJson, m.canonicalJson(loose.sealed.plaintext));
   const status = mailObject.status;
   const freshResult = m.sealResult(store, "host-b", mailFields(status.object.body), status.sealed.plaintext, encRaw("host-a-enc-1"));
-  const toA = mailRecipient({ host_id: "host-a", host_trust_gen: 1, keys: ["host-a-enc-1"] });
+  const toA = mailRecipient({ host_id: "host-a", host_trust_gen: 1, keys: ["host-a-enc-1"], generated: ["host-a-enc-1"] });
   const row = mailOutbox(mail.checks.find((c) => c.label === "status_accepted").outbox);
   eq(m.acceptResult(freshResult, mailList(B), toA, row, store, mail.now).type, "accepted");
   throwsCode(() => m.sealEnvelope(store, "host-a", mailFields(mailObject.plaintext_null.object.body), mailObject.plaintext_null.sealed.plaintext, encRaw("host-b-enc-1")), "null_value");

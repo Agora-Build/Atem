@@ -2149,7 +2149,11 @@ names its reason; the reasons are stable and snake_case.
    `enc_kid` names one of the keys it accepts now (`enc_key_not_accepted`;
    "The recipient's keys" below). The key part waits when
    `signed_at_head.seq` is beyond this host's head (Pending, below): this
-   host's own new `host_enc_key` may be among the entries it lacks. **For
+   host's own new `host_enc_key` may be among the entries it lacks. Only a
+   key this host made waits (**for Astation**, amended for step 4): a key id
+   it never made is refused `enc_key_not_accepted` beyond its head too,
+   after the checks that settle at any head, step 5's times and, for a
+   claimed pair this list holds, step 4's check. **For
    Astation.** The current trust generation is the host's own, from its
    pairing (`pairing/trust_gen`), never one read from its device list, which
    may lag behind its own new `add_host` after `atem pair verify` (every
@@ -2208,8 +2212,13 @@ storage and its receipts are the host's.
   generation it last held (`removed_sender`, after the body's times when the
   head is beyond this host's): no entry this host lacks can bring that
   generation back. A removed host's result at that generation still waits,
-  to be kept as data. **Within this host's list** (`signed_at_head.seq` at
-  or below its head), a generation the list doesn't hold there is refused
+  to be kept as data. A key id this host never made (**for Astation**,
+  amended for step 4) is settled at any head too, `enc_key_not_accepted`:
+  every `host_enc_key` entry for this host carries this host's own
+  `enc_sig`, so no entry it lacks can make that key one it accepts. It comes
+  last, after the body's times and the check of the copy below. **Within
+  this host's list** (`signed_at_head.seq` at or below its head), a
+  generation the list doesn't hold there is refused
   `generation_ahead`, and a key it doesn't accept `enc_key_not_accepted`,
   never pending: the list the sender signed at is the one this host holds. A
   pending object is judged again after each device-list advance and each
@@ -2234,8 +2243,8 @@ storage and its receipts are the host's.
 |---|---|---|
 | `Open{plain, sender}` | checks 1 to 6 passed; `sender` is `host:<host_id>` | step 7 |
 | `Pending{host_id, host_trust_gen}` | above | keeps it, not done; judges it again |
-| `Refused{reason, evidence}` | before the copy is shown to be the sender's: steps 1 to 4 (step 2's key part only at a head this host holds), and step 5 on an object signed beyond this host's head | marks it done under `evidence = SHA-256(enc([jcs(body), sig, enc, ct]))` (`enc` and `ct` empty when absent); claims no id; tells nobody |
-| `RefusedAuthenticated{object_id, reason}` | steps 5 and 6, once step 4 showed the copy to be the sender's, intact | marks it done; it claims the object's id; reports it to the sender as `{"kind":"status","object_id":<id>,"refused":"invalid_request"}`, whatever the reason (for a result, nothing is reported back) |
+| `Refused{reason, evidence}` | before the copy is shown to be the sender's: steps 1 to 4 (step 2's key part at a head this host holds, or for a key id this host never made), and step 5 on an object signed beyond this host's head | marks it done under `evidence = SHA-256(enc([jcs(body), sig, enc, ct]))` (`enc` and `ct` empty when absent); claims no id; tells nobody |
+| `RefusedAuthenticated{object_id, reason, sender}` | steps 5 and 6, once step 4 showed the copy to be the sender's, intact; `sender` is `{host_id, host_trust_gen}`, the host whose `add_host` key verified it (**for Astation**, amended for step 4) | marks it done; it claims the object's id for `sender`; reports it to the sender as `{"kind":"status","object_id":<id>,"refused":"invalid_request"}`, whatever the reason (for a result, nothing is reported back) |
 | `Unavailable{error}` | a local failure: the key provider failed (the key missing, or not the one its kid names) | decides nothing; judges it again later |
 
 A seal that doesn't open under the key is `open_failed`, the sender's
@@ -2247,7 +2256,9 @@ it is `ProviderError.OpenFailed` from `hpke_open` (atem-client-bindings.md
 "Duplicates"). A claim is the authenticated sender's: `(sender.host_id,
 id)`, the key of the Station's puts (design II.4.3). Only a copy whose signature
 verified and whose sealed part its `sealed_hash` names (step 4) claims that
-pair: its verdict is Open, RefusedAuthenticated, Accepted or NotDelivered. A
+pair: its verdict is Open, RefusedAuthenticated, Accepted or NotDelivered,
+and each names that sender (RefusedAuthenticated as `sender{host_id,
+host_trust_gen}`, the others as `host:<host_id>`). A
 later object from that sender with that `id` and the same `sealed_hash` (the
 body's field, so the sender may re-sign the same sealed part at a newer
 head) is a duplicate, acknowledged with the first verdict; one with another
@@ -2319,8 +2330,14 @@ applied yet: a sender whose list already has the entry seals to it, and the
 mail then opens at once, instead of waiting until this host's list reaches
 the head the sender signed at (Pending). A host judges a pending object
 again after each device-list advance and each change of the keys it accepts.
-Mail to any other key is refused `enc_key_not_accepted` once this host's
-head is at or beyond the head the object names.
+Mail to any other key it made is refused `enc_key_not_accepted` once this
+host's head is at or beyond the head the object names. **For Astation**
+(amended for step 4): the host also passes the id of every key it made in
+its current trust generation (`generated`), from its own records, each
+recorded before it hands the key out, never from its device list. Every
+`host_enc_key` entry for a host carries the host's own `enc_sig`, so no
+other key id can ever become one it accepts: mail sealed to one is refused
+`enc_key_not_accepted` at any head and never waits.
 
 **Open items, for Astation.** Both wait for cross-host `select`
 (collaboration §5): the wire form of `no_match` in a status (a selector of

@@ -1514,10 +1514,12 @@ final class ConformanceTests: XCTestCase {
                 encKid: s(o(b["recipient"])["enc_kid"]), id: s(b["id"]), createdAt: u(b["created_at"]), expiresAt: u(b["expires_at"]),
                 signedAtHead: LogHead(seq: u(head["seq"]), hash: s(head["hash"])))
         }
+        // The keys it accepts, and every key it made (`generated`), by their key ids.
         func mailRecipient(_ r: Any?) throws -> MailRecipientData {
             let x = o(r)
             let keyRefs = try a(x["keys"]).map { MailKeyData(keyId: s($0), encKid: try encKid(encKey: encKey(s($0)))) }
-            return MailRecipientData(hostId: s(x["host_id"]), hostTrustGen: u(x["host_trust_gen"]), keys: keyRefs)
+            let generated = try a(x["generated"]).map { try encKid(encKey: encKey(s($0))) }
+            return MailRecipientData(hostId: s(x["host_id"]), hostTrustGen: u(x["host_trust_gen"]), keys: keyRefs, generated: generated)
         }
         func mailOutbox(_ v: Any?) -> MailOutboxData {
             let x = o(v)
@@ -1537,12 +1539,14 @@ final class ConformanceTests: XCTestCase {
                 try eq(sha256Hex(plain), s(sealed["plaintext_sha256"]), label)
             }
         }
+        func mailSender(_ h: MailHostData) -> [String: Any] { ["host_id": h.hostId, "host_trust_gen": h.hostTrustGen] }
         func envelopeVerdict(_ got: EnvelopeVerdictInfo) -> ([String: Any], String?) {
             switch got {
             case let .open(plainJson, sender): return (["verdict": "open", "sender": sender], plainJson)
             case let .pending(hostId, hostTrustGen): return (["verdict": "pending", "host_id": hostId, "host_trust_gen": hostTrustGen], nil)
             case let .refused(reason, evidence): return (["verdict": "refused", "reason": reason, "evidence": evidence], nil)
-            case let .refusedAuthenticated(objectId, reason): return (["verdict": "refused_authenticated", "object_id": objectId, "reason": reason], nil)
+            case let .refusedAuthenticated(objectId, reason, sender):
+                return (["verdict": "refused_authenticated", "object_id": objectId, "reason": reason, "sender": mailSender(sender)], nil)
             case let .unavailable(code, detail): return (["verdict": "unavailable", "code": code, "detail": detail], nil)
             }
         }
@@ -1552,7 +1556,8 @@ final class ConformanceTests: XCTestCase {
             case let .notDelivered(plainJson, sender, reason): return (["verdict": "not_delivered", "sender": sender, "reason": reason], plainJson)
             case let .pending(hostId, hostTrustGen): return (["verdict": "pending", "host_id": hostId, "host_trust_gen": hostTrustGen], nil)
             case let .refused(reason, evidence): return (["verdict": "refused", "reason": reason, "evidence": evidence], nil)
-            case let .refusedAuthenticated(objectId, reason): return (["verdict": "refused_authenticated", "object_id": objectId, "reason": reason], nil)
+            case let .refusedAuthenticated(objectId, reason, sender):
+                return (["verdict": "refused_authenticated", "object_id": objectId, "reason": reason, "sender": mailSender(sender)], nil)
             case let .unavailable(code, detail): return (["verdict": "unavailable", "code": code, "detail": detail], nil)
             }
         }
@@ -1584,7 +1589,9 @@ final class ConformanceTests: XCTestCase {
             }
             if built < 20 { throw Failure(description: "\(built) built") }
             let b = ["M7_add_host_b", "M8_enc_a", "M9_enc_b", "M10_add_host_evil"]
-            let toB = MailRecipientData(hostId: "host-b", hostTrustGen: 1, keys: [MailKeyData(keyId: "host-b-enc-1", encKid: try encKid(encKey: encKey("host-b-enc-1")))])
+            let toB = MailRecipientData(
+                hostId: "host-b", hostTrustGen: 1, keys: [MailKeyData(keyId: "host-b-enc-1", encKid: try encKid(encKey: encKey("host-b-enc-1")))],
+                generated: [try encKid(encKey: encKey("host-b-enc-1"))])
             let req = mailObject["request"]!
             let reqPlain = s(o(req["sealed"])["plaintext"])
             let fresh = try sealEnvelope(provider: store, hostKeyId: "host-a", fields: mailFields(o(req["object"])["body"]), plainJson: reqPlain, recipientEnc: encKey("host-b-enc-1"))
@@ -1599,7 +1606,9 @@ final class ConformanceTests: XCTestCase {
             try eq(openedJson, try canonicalJson(json: loosePlain))
             let status = mailObject["status"]!
             let freshResult = try sealResult(provider: store, hostKeyId: "host-b", fields: mailFields(o(status["object"])["body"]), plainJson: s(o(status["sealed"])["plaintext"]), recipientEnc: encKey("host-a-enc-1"))
-            let toA = MailRecipientData(hostId: "host-a", hostTrustGen: 1, keys: [MailKeyData(keyId: "host-a-enc-1", encKid: try encKid(encKey: encKey("host-a-enc-1")))])
+            let toA = MailRecipientData(
+                hostId: "host-a", hostTrustGen: 1, keys: [MailKeyData(keyId: "host-a-enc-1", encKid: try encKid(encKey: encKey("host-a-enc-1")))],
+                generated: [try encKid(encKey: encKey("host-a-enc-1"))])
             let row = mailOutbox(mailChecks.first { s($0["label"]) == "status_accepted" }!["outbox"])
             guard case .accepted(_, _) = try acceptResult(objectJson: freshResult, log: try mailList(b), me: toA, outbox: row, provider: store, nowMs: mailNow) else {
                 throw Failure(description: "a fresh result isn't accepted")

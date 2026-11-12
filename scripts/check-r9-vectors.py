@@ -1606,9 +1606,11 @@ class MailList:
                 self.senders[body["host_id"]] = ("authorized", seq)
 
 
-def mail_verdict(wire, call, hosts, receiver_keys, receiver, now, outbox):
+def mail_verdict(wire, call, hosts, receiver_keys, generated, receiver, now, outbox):
     """The receiver's verdict on a mailbox object (II.4.2 checks 1 to 6, and
-    for a result II.4.4's), from the spec: (verdict, opened plaintext)."""
+    for a result II.4.4's), from the spec: (verdict, opened plaintext).
+    `receiver_keys` maps each kid it accepts to its secret; `generated` is
+    every kid it made at its generation."""
     body = wire.get("body")
     envelope = call == "open_envelope"
 
@@ -1616,7 +1618,14 @@ def mail_verdict(wire, call, hosts, receiver_keys, receiver, now, outbox):
         return {"verdict": "refused", "reason": reason, "evidence": mail_evidence(wire)}, None
 
     def authenticated(reason):
-        return {"verdict": "refused_authenticated", "object_id": body["id"], "reason": reason}, None
+        # The claim is the sender's whose newest add_host key verified the
+        # copy: (host_id, that add_host's generation).
+        return {
+            "verdict": "refused_authenticated",
+            "object_id": body["id"],
+            "reason": reason,
+            "sender": {"host_id": sid, "host_trust_gen": newest},
+        }, None
 
     # 1. Strict parse and pin.
     if not mail_well_formed(wire):
@@ -1631,8 +1640,8 @@ def mail_verdict(wire, call, hosts, receiver_keys, receiver, now, outbox):
         return refused("not_for_this_host")
     if recipient["host_trust_gen"] != receiver["host_trust_gen"]:
         return refused("recipient_generation_not_current")
-    # The key part waits when the head is beyond this host's: its own new
-    # host_enc_key may be in the entries it lacks.
+    # The key part waits when the head is beyond this host's and the key is
+    # one it made: its own new host_enc_key may be in the entries it lacks.
     head = body["signed_at_head"]
     ahead = head["seq"] > hosts.head
     secret = receiver_keys.get(recipient["enc_kid"])
@@ -1658,6 +1667,10 @@ def mail_verdict(wire, call, hosts, receiver_keys, receiver, now, outbox):
             return refused("bad_signature")
         if key is not None and sha256(enc([b64u_decode(wire["enc"]), b64u_decode(wire["ct"])])).hex() != body["sealed_hash"]:
             return refused("sealed_hash_mismatch")
+        # Every host_enc_key entry for this host carries its own enc_sig, so
+        # a key it never made can never become one it accepts: no wait.
+        if secret is None and recipient["enc_kid"] not in generated:
+            return refused("enc_key_not_accepted")
         return {"verdict": "pending", "host_id": sid, "host_trust_gen": sgen}, None
 
     removed = sid not in hosts.current
@@ -1752,9 +1765,10 @@ def check_host_envelope(file, data, report, context):
     nobody over a body changed after signing), `info` from the body's fields,
     `sealed_hash`, the open with the recipient key, the plaintext and its
     bounds, the seal again from ikmE to the same enc and ct, and the object's
-    size on the wire. Each check: the verdict and reason recomputed from the
-    bytes, the device list (L + chain) and the receiver, written here from
-    the spec, and the plaintext an open gives."""
+    size on the wire. Each check: the verdict and reason (and an
+    authenticated refusal's sender) recomputed from the bytes, the device
+    list (L + chain) and the receiver (the keys it accepts and every key it
+    made), written here from the spec, and the plaintext an open gives."""
     keys = context["keys"]
     mlog = context["membership_log"]
     log_l = mlog["log"]
@@ -1857,8 +1871,9 @@ def check_host_envelope(file, data, report, context):
             hosts = MailList(account_id, genesis, chain_of(check["chain"]))
             receiver = check["receiver"]
             receiver_keys = {enc_kid(keys.public(name, "enc")): unhex(keys.keys[name]["enc"]["secret_hex"]) for name in receiver["keys"]}
+            generated = {enc_kid(keys.public(name, "enc")) for name in receiver["generated"]}
             wire = objects[check["object"]]["object"]
-            got, plain = mail_verdict(wire, check["call"], hosts, receiver_keys, receiver, check["now"], check.get("outbox"))
+            got, plain = mail_verdict(wire, check["call"], hosts, receiver_keys, generated, receiver, check["now"], check.get("outbox"))
             case.equal(got, check["expect"], f"{check['call']} on L + {len(check['chain'])}: {got['verdict']} {got.get('reason', '')}")
             if plain is not None:
                 case.equal(plain, plaintexts.get(check["object"]), "the plaintext the object sealed")
