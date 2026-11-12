@@ -1659,7 +1659,9 @@ fn the_link_leaves_a_migration_to_the_operation_running_one() {
         link.connect_raw(&url).await.unwrap();
         link.pin_astation_for_test(ASTATION);
         // An operation (or another finish) is running one.
-        let running = crate::websocket_client::MIGRATION.lock().await;
+        let running = crate::websocket_client::migration_lock(&crate::paths::ProfilePaths::in_dir(&profile).cred)
+            .lock_owned()
+            .await;
         let status = link.finish_pending_migration(ASTATION).await.unwrap();
         assert_eq!(
             status.as_deref(),
