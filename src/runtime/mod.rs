@@ -10,6 +10,7 @@ pub mod collab;
 pub mod collab_context;
 pub mod commands;
 pub mod host_bridge;
+pub mod host_clock;
 pub mod host_work;
 mod host_attachments;
 pub mod op_client;
