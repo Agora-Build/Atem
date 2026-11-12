@@ -1,4 +1,46 @@
 {
+  "at_the_bound": [
+    {
+      "accepts": {
+        "head": 1,
+        "records": 1,
+        "records_parse": [
+          false
+        ]
+      },
+      "direction": "to_host",
+      "name": "control_sync_result_at_262144_bytes",
+      "note": "exactly the bound: a page of one record that is a string of 'x' (not a record: it doesn't parse, the page standing); the one byte longer text is control_sync_result_over_262144_bytes",
+      "op": "control_sync_result",
+      "wire_fill": {
+        "bytes": 262144,
+        "count": 261932,
+        "fill": "x",
+        "prefix": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":\"",
+        "suffix": "\"}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      }
+    },
+    {
+      "accepts": {
+        "entries": 1,
+        "head": {
+          "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 6
+        }
+      },
+      "direction": "to_host",
+      "name": "membership_fetch_result_at_262144_bytes",
+      "note": "exactly the bound, the same bound as every other relay message (no 512 KiB exemption: only stage 3's mailbox calls get that): one entry of log L (E4) whose signature is padded with 'A', so it is read as a message but its signature would not verify; the one byte longer text is membership_fetch_result_over_262144_bytes",
+      "op": "membership_fetch_result",
+      "wire_fill": {
+        "bytes": 262144,
+        "count": 261308,
+        "fill": "A",
+        "prefix": "{\"entries\":[{\"body\":{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"p256\",\"pub\":\"BD8UXpprH3CBh945lGGLF4Yko4Z5KbKYeHXByOecSEuLXtZm-AR4BMDHLbp_hfBUC63FDri68xBldtBzjuXzabs\"},\"device_id\":\"dev-ipad\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"TRl4_gy_dBKDDLNsUlk-Qsei_CJeOJrqlQpcayyR_08\"},\"kind\":\"native\",\"roles\":[\"control\",\"manage\",\"view\"]},\"prev_hash\":\"c342f9fa13c5a0707efe755a2d16f8a6089dfa8afaf16fde1858772c71c878a0\",\"seq\":4,\"signed_at\":1792400003000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1},\"sig\":\"fzspVSv3gm_mY7PRN2NwfB9xWKAIyw6DEhxExE31vCsUExx018VAhrYQaFO9a0YxfHTHTwxkgiPrXsvHmamlmQ",
+        "suffix": "\"}],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"membership_fetch_result\",\"type\":\"relay\"}"
+      }
+    }
+  ],
   "calls": [
     {
       "direction": "to_station",
@@ -248,6 +290,7 @@
         ],
         "station_time": 1793620940000
       },
+      "hand_assembled": true,
       "judged": [
         {
           "feed_seq": 4,
@@ -2009,6 +2052,45 @@
       }
     },
     {
+      "code": "too_large",
+      "name": "control_sync_result_300000_bytes",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire_fill": {
+        "bytes": 300000,
+        "count": 299788,
+        "fill": "x",
+        "prefix": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":\"",
+        "suffix": "\"}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      }
+    },
+    {
+      "code": "too_large",
+      "name": "membership_fetch_result_over_262144_bytes",
+      "op": "membership_fetch_result",
+      "reader": "to_host",
+      "wire_fill": {
+        "bytes": 262145,
+        "count": 261309,
+        "fill": "A",
+        "prefix": "{\"entries\":[{\"body\":{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"p256\",\"pub\":\"BD8UXpprH3CBh945lGGLF4Yko4Z5KbKYeHXByOecSEuLXtZm-AR4BMDHLbp_hfBUC63FDri68xBldtBzjuXzabs\"},\"device_id\":\"dev-ipad\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"TRl4_gy_dBKDDLNsUlk-Qsei_CJeOJrqlQpcayyR_08\"},\"kind\":\"native\",\"roles\":[\"control\",\"manage\",\"view\"]},\"prev_hash\":\"c342f9fa13c5a0707efe755a2d16f8a6089dfa8afaf16fde1858772c71c878a0\",\"seq\":4,\"signed_at\":1792400003000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1},\"sig\":\"fzspVSv3gm_mY7PRN2NwfB9xWKAIyw6DEhxExE31vCsUExx018VAhrYQaFO9a0YxfHTHTwxkgiPrXsvHmamlmQ",
+        "suffix": "\"}],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"membership_fetch_result\",\"type\":\"relay\"}"
+      }
+    },
+    {
+      "code": "too_large",
+      "name": "membership_fetch_result_300000_bytes",
+      "op": "membership_fetch_result",
+      "reader": "to_host",
+      "wire_fill": {
+        "bytes": 300000,
+        "count": 299164,
+        "fill": "A",
+        "prefix": "{\"entries\":[{\"body\":{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"p256\",\"pub\":\"BD8UXpprH3CBh945lGGLF4Yko4Z5KbKYeHXByOecSEuLXtZm-AR4BMDHLbp_hfBUC63FDri68xBldtBzjuXzabs\"},\"device_id\":\"dev-ipad\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"TRl4_gy_dBKDDLNsUlk-Qsei_CJeOJrqlQpcayyR_08\"},\"kind\":\"native\",\"roles\":[\"control\",\"manage\",\"view\"]},\"prev_hash\":\"c342f9fa13c5a0707efe755a2d16f8a6089dfa8afaf16fde1858772c71c878a0\",\"seq\":4,\"signed_at\":1792400003000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1},\"sig\":\"fzspVSv3gm_mY7PRN2NwfB9xWKAIyw6DEhxExE31vCsUExx018VAhrYQaFO9a0YxfHTHTwxkgiPrXsvHmamlmQ",
+        "suffix": "\"}],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"membership_fetch_result\",\"type\":\"relay\"}"
+      }
+    },
+    {
       "code": "unknown_field",
       "name": "heads_unknown_mailbox_field",
       "op": "heads",
@@ -2418,6 +2500,6 @@
   "kind": "vectors",
   "max_message_bytes": 262144,
   "name": "r9-vectors-station-calls",
-  "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
+  "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", for Astation's agreement). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
   "requires": "r9"
 }

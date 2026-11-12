@@ -1259,13 +1259,17 @@ message of the six calls and the three refusals as the exact text these
 builders write (compact, keys in RFC 8785 order), with its decoded fields,
 the control parser's verdict on each page record, and the invalid texts each
 reader refuses with its code (an unknown field, a `null`, a duplicate key,
-an unknown refusal code, a count of 65, a text over 262,144 bytes): a
-Station that writes or reads the same bytes and gives the same codes agrees
-with Atem's host, and `scripts/check-r9-vectors.py` confirms them with a
+an unknown refusal code, a count of 65) and the byte bound for each call
+that can carry a large page (a text of exactly 262,144 bytes read, one of
+262,145 and one of 300,000 refused, for `control_sync_result` and
+`membership_fetch_result` alike): a Station that writes or reads the same
+bytes and gives the same codes agrees with Atem's host, and `scripts/check-r9-vectors.py` confirms them with a
 reader written from host-work-v1 §11.4. A page whose records the control
-parser refuses is a builder's page with those values put in their slots: a
-Station serves only what it validated at intake, so its builder refuses
-them.
+parser refuses is a builder's page with those values put in their slots
+(`hand_assembled: true` in its case): a Station serves only what it
+validated at intake, so its builder refuses them, and a `null` or a string
+record kept as evidence with the page standing is Atem's reading of "any
+JSON type", for Astation's agreement.
 
 Each builder checks what the reader checks, so what it writes the reader
 accepts; a value out of its grammar is `Invalid{code}` (`too_large`,

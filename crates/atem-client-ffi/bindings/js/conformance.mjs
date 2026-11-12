@@ -869,6 +869,7 @@ check("Station calls: the byte goldens build exactly, read back to their fields 
       case "control_sync_result": {
         const records = f.records.map((r) => ({ feedSeq: r.feed_seq, recordJson: str(r.record) }));
         const refused = c.judged.find((j) => !j.parses);
+        eq(refused !== undefined, c.hand_assembled === true, `${name} hand_assembled`);
         const build = () => m.relayControlSyncResult(f.origin, f.feed_id, f.head, f.station_time, records);
         if (refused === undefined) eq(build(), wire, name);
         else throwsCode(build, refused.error);
@@ -908,9 +909,26 @@ check("Station calls: the byte goldens build exactly, read back to their fields 
       }
     }
   }
+  const textOf = (c) => c.wire ?? c.wire_fill.prefix + c.wire_fill.fill.repeat(c.wire_fill.count) + c.wire_fill.suffix;
+  // Exactly the bound is read, the same bound for every call that can carry a
+  // large page; `accepts` is what it gives back.
+  for (const c of calls.at_the_bound) {
+    const wire = textOf(c);
+    eq(Buffer.byteLength(wire), 262144, `${c.name} bytes`);
+    const read = m.relayDecodeToHost(wire);
+    eq(read.type, c.op, c.name);
+    same(read.head, c.accepts.head, `${c.name} head`);
+    if (c.op === "control_sync_result") {
+      eq(read.head, c.accepts.head, `${c.name} head`);
+      eq(read.records.length, c.accepts.records, `${c.name} records`);
+      eq(read.records.map((r) => judge(r.recordJson).parses), c.accepts.records_parse, `${c.name} parse`);
+    } else {
+      eq(read.entries.length, c.accepts.entries, `${c.name} entries`);
+    }
+    throwsCode(() => m.relayDecodeToStation(wire), "wrong_message");
+  }
   for (const bad of calls.invalid) {
-    const wire = bad.wire ?? bad.wire_fill.prefix + bad.wire_fill.fill.repeat(bad.wire_fill.count) + bad.wire_fill.suffix;
-    throwsCode(() => (bad.reader === "to_host" ? m.relayDecodeToHost : m.relayDecodeToStation)(wire), bad.code);
+    throwsCode(() => (bad.reader === "to_host" ? m.relayDecodeToHost : m.relayDecodeToStation)(textOf(bad)), bad.code);
   }
 });
 check("Station: the Portal's statuses in their classes", () => {

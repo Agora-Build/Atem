@@ -1306,6 +1306,8 @@ final class ConformanceTests: XCTestCase {
                     let records = items.map { RelayFeedRecord(feedSeq: u($0["feed_seq"]), recordJson: js($0["record"]!)) }
                     let judged = a(c["judged"]).map(o)
                     let build = { try relayControlSyncResult(origin: s(f["origin"]), feedId: s(f["feed_id"]), head: u(f["head"]), stationTime: u(f["station_time"]), records: records) }
+                    let handAssembled = (c["hand_assembled"] as? Bool) ?? false
+                    try eq(judged.contains(where: { ($0["parses"] as! Bool) == false }), handAssembled, "\(name) hand_assembled")
                     if let refused = judged.first(where: { ($0["parses"] as! Bool) == false }) {
                         try throwsCode(s(refused["error"])) { _ = try build() }
                     } else {
@@ -1377,14 +1379,37 @@ final class ConformanceTests: XCTestCase {
                     try eq(try relayDecodeToHost(message: wire), want, name)
                 }
             }
-            for bad in a(stationCalls["invalid"]).map(o) {
-                let wire: String
-                if let fill = bad["wire_fill"] {
+            func textOf(_ c: [String: Any]) -> String {
+                if let fill = c["wire_fill"] {
                     let w = o(fill)
-                    wire = s(w["prefix"]) + String(repeating: s(w["fill"]), count: Int(u(w["count"]))) + s(w["suffix"])
-                } else {
-                    wire = s(bad["wire"])
+                    return s(w["prefix"]) + String(repeating: s(w["fill"]), count: Int(u(w["count"]))) + s(w["suffix"])
                 }
+                return s(c["wire"])
+            }
+            // Exactly the bound is read, the same bound for every call that can carry
+            // a large page; `accepts` is what it gives back.
+            for c in a(stationCalls["at_the_bound"]).map(o) {
+                let wire = textOf(c)
+                let accepts = o(c["accepts"])
+                let name = s(c["name"])
+                try eq(wire.utf8.count, 262144, "\(name) bytes")
+                switch try relayDecodeToHost(message: wire) {
+                case let .controlSyncResult(_, _, pageHead, _, records):
+                    try eq(pageHead, u(accepts["head"]), "\(name) head")
+                    try eq(records.count, Int(u(accepts["records"])), "\(name) records")
+                    for (r, want) in zip(records, a(accepts["records_parse"])) {
+                        try eq(try judge(r.recordJson)["parses"] as! Bool, want as! Bool, "\(name) parse")
+                    }
+                case let .membershipFetchResult(fetchedHead, fetched):
+                    try eq(fetchedHead, logHead(accepts["head"]), "\(name) head")
+                    try eq(fetched.count, Int(u(accepts["entries"])), "\(name) entries")
+                default:
+                    throw Failure(description: "\(name): not a page or a fetch result")
+                }
+                try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: wire) }
+            }
+            for bad in a(stationCalls["invalid"]).map(o) {
+                let wire = textOf(bad)
                 let code = s(bad["code"])
                 if s(bad["reader"]) == "to_host" {
                     try throwsCode(code) { _ = try relayDecodeToHost(message: wire) }

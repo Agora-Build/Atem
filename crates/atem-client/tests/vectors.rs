@@ -6485,14 +6485,24 @@ fn build_call(case: &Value) -> String {
                     })
                     .collect(),
             };
-            page.to_json().map(|mut value| {
+            let mut unparsed = false;
+            let built = page.to_json().map(|mut value| {
                 for (slot, r) in records.iter().enumerate() {
                     if ControlRecord::parse(r["record"].to_string().as_bytes()).is_err() {
                         value["records"][slot]["record"] = r["record"].clone();
+                        unparsed = true;
                     }
                 }
                 value
-            })
+            });
+            // Such a page is marked in its case, and only such a page.
+            assert_eq!(
+                case.get("hand_assembled") == Some(&serde_json::json!(true)),
+                unparsed,
+                "{}: hand_assembled",
+                s(case, "name")
+            );
+            built
         }
         "heads" => Heads {
             feeds: f["feeds"]
@@ -6679,6 +6689,16 @@ fn station_calls_build_byte_for_byte() {
     let mut run = station_calls_file();
     assert_eq!(run.get("max_message_bytes"), RELAY_MAX_BYTES);
     run.get("invalid");
+    for case in run.get("at_the_bound").as_array().unwrap() {
+        let name = s(case, "name");
+        assert_eq!(
+            call_wire(case).len(),
+            RELAY_MAX_BYTES,
+            "{name}: exactly the bound"
+        );
+        assert_eq!(case["wire_fill"]["bytes"], RELAY_MAX_BYTES, "{name}");
+        run.pass(format!("{name}: exactly 262,144 bytes"));
+    }
     let calls = run.get("calls");
     let mut ops = BTreeSet::new();
     for case in calls.as_array().unwrap() {
@@ -6711,6 +6731,49 @@ fn station_calls_decode_to_their_fields() {
     let mut run = station_calls_file();
     run.get("max_message_bytes");
     run.get("invalid");
+    // A text of exactly the bound is read (the same bound for every call
+    // that can carry a large page), and gives back what `accepts` says.
+    for case in run.get("at_the_bound").as_array().unwrap() {
+        let name = s(case, "name");
+        let wire = call_wire(case);
+        assert_eq!(wire.len(), RELAY_MAX_BYTES, "{name}");
+        let (fields, judged) = read_call(s(case, "direction"), wire.as_bytes()).unwrap();
+        let accepts = &case["accepts"];
+        assert_eq!(fields["head"], accepts["head"], "{name}: head");
+        let held = fields.get("records").or_else(|| fields.get("entries"));
+        let key = if fields.get("records").is_some() {
+            "records"
+        } else {
+            "entries"
+        };
+        assert_eq!(
+            held.unwrap().as_array().unwrap().len() as u64,
+            accepts[key].as_u64().unwrap(),
+            "{name}: {key}"
+        );
+        let parses = judged.map(|j| {
+            Value::Array(
+                j.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v["parses"].clone())
+                    .collect(),
+            )
+        });
+        assert_eq!(
+            parses.as_ref(),
+            accepts.get("records_parse"),
+            "{name}: records"
+        );
+        read_typed(s(case, "op"), wire.as_bytes()).unwrap();
+        let other = read_call("to_station", wire.as_bytes()).unwrap_err();
+        assert_eq!(
+            other.code(),
+            "wrong_message",
+            "{name}: read by the other side"
+        );
+        run.pass(format!("{name}: read"));
+    }
     let calls = run.get("calls");
     for case in calls.as_array().unwrap() {
         let name = s(case, "name");
@@ -6749,13 +6812,16 @@ fn station_calls_refuse_the_invalid_variants() {
     let mut run = station_calls_file();
     run.get("max_message_bytes");
     run.get("calls");
+    run.get("at_the_bound");
     let invalid = run.get("invalid");
     let mut codes = BTreeSet::new();
+    let mut sized = BTreeSet::new();
     for case in invalid.as_array().unwrap() {
         let name = s(case, "name");
         let wire = call_wire(case);
         if let Some(fill) = case.get("wire_fill") {
             assert_eq!(wire.len() as u64, fill["bytes"].as_u64().unwrap(), "{name}");
+            sized.insert((s(case, "op").to_owned(), wire.len()));
         }
         let code = s(case, "code");
         let error = read_call(s(case, "reader"), wire.as_bytes()).unwrap_err();
@@ -6767,6 +6833,17 @@ fn station_calls_refuse_the_invalid_variants() {
         codes.insert(code.to_owned());
         run.pass(format!("{name}: refused {code}"));
     }
+    // The byte bound is refused one byte over and well over, for each call
+    // that can carry a large page: `membership_fetch_result` included (no
+    // 512 KiB exemption outside stage 3's mailbox calls).
+    assert_eq!(
+        sized,
+        ["control_sync_result", "membership_fetch_result"]
+            .iter()
+            .flat_map(|op| [RELAY_MAX_BYTES + 1, 300_000].map(|n| (op.to_string(), n)))
+            .collect(),
+        "the byte bound's texts"
+    );
     assert_eq!(
         codes,
         [
@@ -7000,6 +7077,11 @@ fn station_call_vectors() -> Value {
             message,
         );
     }
+    // The page built with records put in their slots is marked in its case.
+    g.calls
+        .iter_mut()
+        .find(|c| c["name"] == "control_sync_result_with_records_that_do_not_parse")
+        .unwrap()["hand_assembled"] = json!(true);
     // `judged` on every page: the control parser's verdict on each record.
     for case in g
         .calls
@@ -7578,20 +7660,79 @@ fn station_call_vectors() -> Value {
             ),
         ),
     );
-    // Over the bound by one byte: a record that is one long string.
-    {
-        let prefix = format!(
+    // The byte bound (R9.9: 262,144 bytes as sent, before any parse) for each
+    // call that can carry a large page: a page's record (any JSON value, here
+    // one long string) and a fetch result's entry (here a signed object of
+    // log L whose signature is padded). A text at the bound is read, one byte
+    // over (and well over, 300,000) is `too_large`; the pair share a prefix and
+    // a suffix and differ in the fill by one. The other calls are bounded by
+    // their counts and grammars well below it.
+    let at_bound = {
+        let page_prefix = format!(
             r#"{{"feed_id":"{feed}","head":1,"op":"control_sync_result","origin":"{origin}","records":[{{"feed_seq":1,"record":""#
         );
-        let suffix = format!(r#""}}],"station_time":{STATION_TIME},"type":"relay"}}"#);
-        let bytes = RELAY_MAX_BYTES + 1;
-        g.invalid.push(json!({
-            "name": "control_sync_result_over_262144_bytes",
-            "op": "control_sync_result", "reader": "to_host", "code": "too_large",
-            "wire_fill": {"prefix": prefix, "fill": "x", "count": bytes - prefix.len() - suffix.len(),
-                "suffix": suffix, "bytes": bytes},
-        }));
-    }
+        let page_suffix = format!(r#""}}],"station_time":{STATION_TIME},"type":"relay"}}"#);
+        let fetch_entry = |label: &str| {
+            let e = entry(label)["entry"].clone();
+            let prefix = format!(
+                r#"{{"entries":[{{"body":{},"sig":"{}"#,
+                e["body"],
+                s(&e, "sig")
+            );
+            (prefix, s(&e, "sig").len())
+        };
+        let fetch_suffix = format!(
+            r#""}}],"head":{{"hash":"{}","seq":{}}},"op":"membership_fetch_result","type":"relay"}}"#,
+            log_head.hash.to_hex(),
+            log_head.seq
+        );
+        let recipe = |prefix: &str, fill: &str, suffix: &str, bytes: usize| {
+            json!({"prefix": prefix, "fill": fill, "count": bytes - prefix.len() - suffix.len(),
+                "suffix": suffix, "bytes": bytes})
+        };
+        // The first entry of log L whose padded signature is still base64url
+        // at the bound (a length of 1 mod 4 can't be).
+        let (label, fetch_prefix) = ["E3", "E4", "E5", "E6"]
+            .into_iter()
+            .map(|label| (label, fetch_entry(label)))
+            .find(|(_, (prefix, sig_len))| {
+                (sig_len + RELAY_MAX_BYTES - prefix.len() - fetch_suffix.len()) % 4 != 1
+            })
+            .map(|(label, (prefix, _))| (label, prefix))
+            .unwrap();
+        let fetch_at_bound = recipe(&fetch_prefix, "A", &fetch_suffix, RELAY_MAX_BYTES);
+        for (op, prefix, fill, suffix) in [
+            ("control_sync_result", &page_prefix, "x", &page_suffix),
+            ("membership_fetch_result", &fetch_prefix, "A", &fetch_suffix),
+        ] {
+            for (what, bytes) in [
+                ("over_262144_bytes", RELAY_MAX_BYTES + 1),
+                ("300000_bytes", 300_000),
+            ] {
+                g.invalid.push(json!({
+                    "name": format!("{op}_{what}"),
+                    "op": op, "reader": "to_host", "code": "too_large",
+                    "wire_fill": recipe(prefix, fill, suffix, bytes),
+                }));
+            }
+        }
+        json!([
+            {
+                "name": "control_sync_result_at_262144_bytes",
+                "op": "control_sync_result", "direction": "to_host",
+                "note": "exactly the bound: a page of one record that is a string of 'x' (not a record: it doesn't parse, the page standing); the one byte longer text is control_sync_result_over_262144_bytes",
+                "wire_fill": recipe(&page_prefix, "x", &page_suffix, RELAY_MAX_BYTES),
+                "accepts": {"head": 1, "records": 1, "records_parse": [false]},
+            },
+            {
+                "name": "membership_fetch_result_at_262144_bytes",
+                "op": "membership_fetch_result", "direction": "to_host",
+                "note": format!("exactly the bound, the same bound as every other relay message (no 512 KiB exemption: only stage 3's mailbox calls get that): one entry of log L ({label}) whose signature is padded with 'A', so it is read as a message but its signature would not verify; the one byte longer text is membership_fetch_result_over_262144_bytes"),
+                "wire_fill": fetch_at_bound,
+                "accepts": {"head": log_head.to_json(), "entries": 1},
+            },
+        ])
+    };
 
     // heads
     let h = "heads_two_stations";
@@ -7809,9 +7950,10 @@ fn station_call_vectors() -> Value {
         "name": STATION_CALLS,
         "kind": "vectors",
         "requires": "r9",
-        "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
+        "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", for Astation's agreement). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
         "max_message_bytes": RELAY_MAX_BYTES,
         "calls": g.calls,
+        "at_the_bound": at_bound,
         "invalid": g.invalid,
     })
 }

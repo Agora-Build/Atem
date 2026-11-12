@@ -937,6 +937,23 @@ fn golden_describe(direction: &str, wire: &str) -> Result<Value, AtemError> {
     })
 }
 
+/// A case's text: `wire` as written, or built from its `wire_fill` recipe
+/// (`prefix`, `count` times `fill`, `suffix`).
+fn golden_wire(case: &Value) -> String {
+    match case.get("wire") {
+        Some(wire) => s(wire),
+        None => {
+            let fill = &case["wire_fill"];
+            format!(
+                "{}{}{}",
+                s(&fill["prefix"]),
+                s(&fill["fill"]).repeat(fill["count"].as_u64().unwrap() as usize),
+                s(&fill["suffix"])
+            )
+        }
+    }
+}
+
 /// `r9-vectors-station-calls` through the production exports: every golden
 /// message built byte for byte from its fields, read back to those fields
 /// (each page record judged by `parse_control_record` as the file says), a
@@ -963,6 +980,13 @@ fn goldens_round_trip_through_the_bindings() {
                 .find(|r| r["parses"] == false)
                 .map(|r| s(&r["error"]))
         });
+        // Only a page with a record the parser refuses is marked as hand
+        // assembled, and a builder refuses exactly that one.
+        assert_eq!(
+            case.get("hand_assembled") == Some(&json!(true)),
+            refused.is_some(),
+            "{name}: hand_assembled"
+        );
         match (golden_build(&op, fields), refused) {
             (Ok(built), None) => assert_eq!(built, wire, "{name}: built"),
             (Err(e), Some(want)) => {
@@ -1019,20 +1043,37 @@ fn goldens_round_trip_through_the_bindings() {
             "{name}"
         );
     }
+    // Exactly the bound is read, by the same reader for every call that can
+    // carry a large page; `accepts` is what it gives back.
+    for case in file["at_the_bound"].as_array().unwrap() {
+        let name = s(&case["name"]);
+        let wire = golden_wire(case);
+        assert_eq!(wire.len(), 262_144, "{name}");
+        let fields = golden_describe(&s(&case["direction"]), &wire).unwrap();
+        let accepts = &case["accepts"];
+        assert_eq!(fields["head"], accepts["head"], "{name}");
+        match s(&case["op"]).as_str() {
+            "control_sync_result" => {
+                let records = fields["records"].as_array().unwrap();
+                assert_eq!(records.len() as u64, accepts["records"].as_u64().unwrap());
+                let parse = accepts["records_parse"].as_array().unwrap();
+                for (r, want) in records.iter().zip(parse) {
+                    let parses = parse_control_record(r["record"].to_string()).is_ok();
+                    assert_eq!(json!(parses), *want, "{name}");
+                }
+            }
+            _ => assert_eq!(
+                fields["entries"].as_array().unwrap().len() as u64,
+                accepts["entries"].as_u64().unwrap(),
+                "{name}"
+            ),
+        }
+        let other = golden_describe("to_station", &wire).unwrap_err();
+        assert_eq!(code(other), "wrong_message", "{name}");
+    }
     for case in file["invalid"].as_array().unwrap() {
         let name = s(&case["name"]);
-        let wire = match case.get("wire") {
-            Some(wire) => s(wire),
-            None => {
-                let fill = &case["wire_fill"];
-                format!(
-                    "{}{}{}",
-                    s(&fill["prefix"]),
-                    s(&fill["fill"]).repeat(fill["count"].as_u64().unwrap() as usize),
-                    s(&fill["suffix"])
-                )
-            }
-        };
+        let wire = golden_wire(case);
         let error = golden_describe(&s(&case["reader"]), &wire).unwrap_err();
         assert_eq!(code(error), s(&case["code"]), "{name}");
     }

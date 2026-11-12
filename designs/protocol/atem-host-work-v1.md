@@ -1904,11 +1904,18 @@ message of the six calls and the three refusals as the shared core's
 builders write it (compact, keys in RFC 8785 order, no whitespace), with its
 decoded fields: `control_sync` with and without `feed_id`,
 `control_sync_result` with records and with records the control parser
-refuses (each record judged on its own, the page standing), `heads`,
+refuses (each record judged on its own, the page standing; that page is
+marked `hand_assembled`, since a Station never serves such a record and its
+builder refuses them; a `null` or a string record kept as evidence is
+**Atem's reading of "any JSON type", for Astation's agreement**), `heads`,
 `control_ack` with both result forms, `membership_fetch` and its result, and
 the three refusals; and the invalid variants a reader refuses, each with its
-code (an unknown field, a `null`, a duplicate key, an unknown refusal code,
-a count over 64 and a text over 262,144 bytes among them). They run in
+code (an unknown field, a `null`, a duplicate key, an unknown refusal code
+and a count over 64 among them). The 256 KiB bound is pinned for each call
+that can carry a large page, `control_sync_result` and
+`membership_fetch_result`: a text of exactly 262,144 bytes is read, and one
+of 262,145 and one of 300,000 bytes are `too_large` (no 512 KiB exemption
+for `membership_fetch_result`; only stage 3's mailbox calls get it). They run in
 `crates/atem-client/tests/vectors.rs` (every text built byte for byte from
 its fields, read back to them, refused by the other side's reader, and every
 invalid text refused with its code), in the bindings' `tests/station.rs` and

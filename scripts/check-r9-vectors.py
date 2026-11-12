@@ -2148,13 +2148,20 @@ def check_station_calls(file, data, report, context):
     record's action carries them (wire rule 3), each page record's parse
     verdict as the control vectors list it. Every invalid text is refused by
     that reader with the code the file says, a bounded text (`wire_fill`) is
-    built here to its size. The builders' exact bytes are the Rust runner's
-    (`station_calls_build_byte_for_byte`) and the binding suites'."""
+    built here to its size: exactly the bound (`at_the_bound`) is read, one
+    byte over and 300,000 bytes are `too_large`, for each call that can carry
+    a large page (a page's record, a fetch result's entry), so a reader that
+    allowed more for either (the 512 KiB of stage 3's mailbox calls is no
+    exemption for `membership_fetch_result`) fails. A record that is not a
+    JSON object is `malformed` to the signed-object parse (R9.1: a signed
+    object is an object), derived here. The builders' exact bytes are the
+    Rust runner's (`station_calls_build_byte_for_byte`) and the binding
+    suites'."""
     mlog = context["membership_log"]
     control = context["host_work_control"]
     with report.case(file, "bound") as case:
         case.equal(data["max_message_bytes"], RELAY_MAX_BYTES, "R9.9's 262,144 bytes for every relay message")
-        case.equal(sorted(data), ["calls", "invalid", "kind", "max_message_bytes", "name", "note", "requires"], "fields")
+        case.equal(sorted(data), ["at_the_bound", "calls", "invalid", "kind", "max_message_bytes", "name", "note", "requires"], "fields")
 
     stations = {(s["origin"], s["feed_id"]) for s in control["stations"].values()}
     records = {compact_ijson(v["record"]): v for v in control["records"]}
@@ -2177,7 +2184,14 @@ def check_station_calls(file, data, report, context):
             case.check(name not in names and re.fullmatch(r"[a-z0-9_]+", name) is not None, "a name of its own")
             names.add(name)
             wire = call["wire"]
-            case.equal(sorted(k for k in call if k != "judged"), ["direction", "fields", "name", "note", "op", "wire"], "case fields")
+            case.equal(sorted(k for k in call if k not in ("judged", "hand_assembled")), ["direction", "fields", "name", "note", "op", "wire"], "case fields")
+            # A page with a record the parser refuses is a builder's page with
+            # the records put in their slots, and says so (exactly then).
+            case.equal(
+                call.get("hand_assembled", False),
+                op == "control_sync_result" and any(not j["parses"] for j in call["judged"]),
+                "hand_assembled exactly when a page record doesn't parse",
+            )
             case.equal(direction, "to_host" if op in STATION_TO_HOST_OPS else "to_station", "its direction")
             case.check(len(wire.encode()) <= RELAY_MAX_BYTES, "within 262,144 bytes")
             message, code = read_relay(wire, direction)
@@ -2208,6 +2222,9 @@ def check_station_calls(file, data, report, context):
                             case.equal(j["record_id"], vector["record"]["body"]["record_id"], f"record {r['feed_seq']}: its record_id")
                         else:
                             case.equal(j["error"], vector["parse_error"], f"record {r['feed_seq']}: its parse error")
+                    elif not isinstance(r["record"], dict):
+                        # Not a JSON object: the signed-object parse refuses it as malformed.
+                        case.equal({k: v for k, v in j.items() if k != "feed_seq"}, {"parses": False, "error": "malformed"}, f"record {r['feed_seq']}: not an object, malformed")
                     else:
                         case.check(j["parses"] is False and isinstance(j.get("error"), str) and j["error"] != "", f"record {r['feed_seq']}: not a vectors' record, no record")
             if op == "heads":
@@ -2249,6 +2266,37 @@ def check_station_calls(file, data, report, context):
         case.equal(sorted(ops), sorted(HOST_TO_STATION_OPS + STATION_TO_HOST_OPS), "all six calls and all three refusals")
         case.check(len(ops["control_ack"]) >= 5 and len(ops["control_sync_result"]) >= 3, "ack and page forms")
 
+    # Exactly the bound is read: the reader that refuses it is a byte too
+    # strict, and the one that allows more than the bound for a fetch result
+    # is refused by the invalid texts below.
+    seen_bound = set()
+    with report.case(file, "at the bound") as case:
+        log_bodies = [e["entry"]["body"] for e in log_entries]
+        for bound in data["at_the_bound"]:
+            name = bound["name"]
+            case.equal(sorted(bound), ["accepts", "direction", "name", "note", "op", "wire_fill"], f"{name}: case fields")
+            fill = bound["wire_fill"]
+            wire = fill["prefix"] + fill["fill"] * fill["count"] + fill["suffix"]
+            case.equal((len(wire.encode()), fill["bytes"]), (RELAY_MAX_BYTES, RELAY_MAX_BYTES), f"{name}: built to exactly 262,144 bytes")
+            case.check(name not in names, f"{name}: a name of its own")
+            message, code = read_relay(wire, bound["direction"])
+            case.equal(code, None, f"{name}: read")
+            if message is not None:
+                accepts = bound["accepts"]
+                if bound["op"] == "control_sync_result":
+                    case.equal((message["head"], len(message["records"])), (accepts["head"], accepts["records"]), f"{name}: head and records")
+                    # Not a JSON object: not a record (the page stands).
+                    case.equal([isinstance(r["record"], dict) for r in message["records"]], accepts["records_parse"], f"{name}: which records can parse")
+                else:
+                    case.equal((message["head"], len(message["entries"])), (accepts["head"], accepts["entries"]), f"{name}: head and entries")
+                    case.equal(message["head"], head, f"{name}: log L's head")
+                    entry = message["entries"][0]
+                    case.check(entry["body"] in log_bodies, f"{name}: the entry's body is log L's")
+                    case.check(any(entry["sig"].startswith(e["entry"]["sig"]) for e in log_entries), f"{name}: its signature is log L's, padded")
+                case.equal(read_relay(wire, "to_station")[1], "wrong_message", f"{name}: the other side refuses it")
+            seen_bound.add(bound["op"])
+        case.equal(seen_bound, {"control_sync_result", "membership_fetch_result"}, "a text at the bound for each call that can carry a large page")
+
     by_op = {}
     for bad in data["invalid"]:
         by_op.setdefault(bad["op"], []).append(bad)
@@ -2264,7 +2312,7 @@ def check_station_calls(file, data, report, context):
                     fill = bad["wire_fill"]
                     wire = fill["prefix"] + fill["fill"] * fill["count"] + fill["suffix"]
                     case.equal(len(wire.encode()), fill["bytes"], f"{name}: built to its size")
-                    case.check(len(wire.encode()) == RELAY_MAX_BYTES + 1, f"{name}: one byte over the bound")
+                    case.check(fill["bytes"] in (RELAY_MAX_BYTES + 1, 300000), f"{name}: one byte over the bound, or 300,000 bytes")
                 else:
                     wire = bad["wire"]
                 case.equal(sorted(k for k in bad if k not in ("wire", "wire_fill")), ["code", "name", "op", "reader"], f"{name}: case fields")
@@ -2274,8 +2322,13 @@ def check_station_calls(file, data, report, context):
     with report.case(file, "invalid: coverage") as case:
         case.equal(sorted(by_op), sorted(HOST_TO_STATION_OPS + STATION_TO_HOST_OPS), "every call and refusal has refused variants")
         case.equal(codes, {"too_large", "not_strict", "wrong_message", "unknown_field", "malformed"}, "every refusal code")
-        sized = [b for b in data["invalid"] if "wire_fill" in b]
-        case.equal(len(sized), 1, "one text over the byte bound")
+        sized = {(b["op"], b["wire_fill"]["bytes"]) for b in data["invalid"] if "wire_fill" in b}
+        case.equal(
+            sized,
+            {(op, n) for op in ("control_sync_result", "membership_fetch_result") for n in (RELAY_MAX_BYTES + 1, 300000)},
+            "the byte bound refused one byte over and at 300,000, for a page and a fetch result",
+        )
+        case.equal(sum("wire_fill" in b for b in data["invalid"]), 4, "four texts over the byte bound")
         counts = {b["name"] for b in data["invalid"] if b["code"] == "too_large"}
         case.check({"control_sync_result_65_records", "heads_65_feeds", "control_ack_65_results", "membership_fetch_result_65_entries"} <= counts, "65 records, feeds, results and entries")
 

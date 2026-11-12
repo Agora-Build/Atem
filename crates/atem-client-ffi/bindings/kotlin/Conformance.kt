@@ -1061,6 +1061,7 @@ fun main(args: Array<String>) {
                     val records = items.map { RelayFeedRecord(it["feed_seq"].l().toULong(), Json.write(it["record"])) }
                     val judged = c["judged"].arr()
                     val refused = judged.firstOrNull { it["parses"] == false }
+                    eq(refused != null, c.obj()["hand_assembled"] == true, "$name hand_assembled")
                     val build = { relayControlSyncResult(f["origin"].s(), f["feed_id"].s(), f["head"].l().toULong(), f["station_time"].l().toULong(), records) }
                     if (refused == null) eq(build(), wire, name) else throwsCode(refused["error"].s()) { build() }
                     throwsCode("wrong_message") { relayDecodeToStation(wire) }
@@ -1118,10 +1119,33 @@ fun main(args: Array<String>) {
                 }
             }
         }
-        for (bad in stationCalls["invalid"].arr()) {
-            val fill = bad.obj()["wire_fill"]
-            val wire = if (fill == null) bad["wire"].s()
+        fun textOf(c: Any?): String {
+            val fill = c.obj()["wire_fill"]
+            return if (fill == null) c["wire"].s()
                 else fill["prefix"].s() + fill["fill"].s().repeat(fill["count"].l().toInt()) + fill["suffix"].s()
+        }
+        // Exactly the bound is read, the same bound for every call that can carry
+        // a large page; `accepts` is what it gives back.
+        for (c in stationCalls["at_the_bound"].arr()) {
+            val wire = textOf(c)
+            val accepts = c["accepts"]
+            eq(wire.toByteArray(Charsets.UTF_8).size, 262144, "${c["name"]} bytes")
+            when (val read = relayDecodeToHost(wire)) {
+                is RelayToHost.ControlSyncResult -> {
+                    eq(read.head, accepts["head"].l().toULong(), "${c["name"]} head")
+                    eq(read.records.size, accepts["records"].l().toInt(), "${c["name"]} records")
+                    eq(read.records.map { judge(it.recordJson)["parses"] }, accepts["records_parse"].arr(), "${c["name"]} parse")
+                }
+                is RelayToHost.MembershipFetchResult -> {
+                    eq(read.head, head(accepts["head"]), "${c["name"]} head")
+                    eq(read.entries.size, accepts["entries"].l().toInt(), "${c["name"]} entries")
+                }
+                else -> throw AssertionError("${c["name"]}: not a page or a fetch result")
+            }
+            throwsCode("wrong_message") { relayDecodeToStation(wire) }
+        }
+        for (bad in stationCalls["invalid"].arr()) {
+            val wire = textOf(bad)
             if (bad["reader"].s() == "to_host") throwsCode(bad["code"].s()) { relayDecodeToHost(wire) }
             else throwsCode(bad["code"].s()) { relayDecodeToStation(wire) }
         }
