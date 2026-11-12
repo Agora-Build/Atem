@@ -491,7 +491,8 @@ and `alert_id`) each fail `malformed` for the other kind; `book.offer`,
 `ack_json`, `json`, `check_sealed`, `created_at` and `expires_at` serve both.
 An `outcome_unknown` hint has no resolved hint and no seen.
 
-**Binding API change** (for Astation's review). No host sends the new kind
+**Binding API change** (reviewed by Astation with #149's contract sign-off,
+2026-11-11, #120 comment 6810116314). No host sends the new kind
 until `host.alerts` is advertised. What changes:
 - `HintContent` was a record `{tool, summary}`; it is now an enum.
 - `approval()` can now fail.
@@ -730,8 +731,8 @@ trait AppKeyProvider (Swift protocol / Kotlin interface):
 errors: ProviderError.Cancelled{reason} | UnknownKey | OpenFailed | Failed{reason}
 ```
 
-- **`ProviderError.OpenFailed`** (planned, for host mail; **for Astation's
-  agreement**: a new error case its providers can construct, a source
+- **`ProviderError.OpenFailed`** (planned, for host mail; **agreed with Astation (2026-11-11, #120 comment
+  6810116314)**: a new error case its providers can construct, a source
   change for an app that switches over `ProviderError` exhaustively). From
   `hpke_open` only, when the seal doesn't open under the key: the AEAD
   refuses the ciphertext (CryptoKit's authentication failure, the JDK's
@@ -1230,8 +1231,8 @@ are per principal: one principal's record never blocks another's with the
 same id. `actions` is what the host does in the same transaction
 (`Revoke`, `Interrupt`, `Hold`, `Release`, `Cover`).
 
-**The Station's duties** (**Atem's proposal, for Astation's and
-Auth/Portal's agreement**; host-work-v1 §11.1, "Resets" and "Stations: the
+**The Station's duties** (**Atem's proposal, agreed with Astation (2026-11-11,
+#120 comment 6810116314) and Auth/Portal (2026-11-12, #147 comment 6813332550)**; host-work-v1 §11.1, "Resets" and "Stations: the
 trust model"):
 
 - Covers are ordered by `(issued_at, record_id)`: another Station's cover
@@ -1280,9 +1281,9 @@ of the calling link's verified association: `heads` names only that
 account's feeds, `control_sync` serves only them, `membership_fetch` only
 its device list, and a request naming another account's feed is refused
 with `relay_control_sync_refused` or `relay_membership_fetch_refused`
-(**Atem's proposal, for Astation's and Auth/Portal's agreement**; the
-refusal wire **agreed with Astation on 2026-11-11**, #120 comment
-6810116314).
+(**Atem's proposal, for Auth/Portal's agreement**; it and the refusal wire are
+**agreed with Astation on 2026-11-11**, #120 comment 6810116314, and the
+refusal wire was confirmed on 2026-11-12, #148 comment 6812769009).
 
 **Refusals.** A Station refuses a host's call on the link with exactly
 `{"type":"relay","op":"control_sync_refused","code":"forbidden"}`,
@@ -1356,7 +1357,7 @@ to re-sign. Keep one per device list your Station serves.
 |---|---|
 | `AckLedgerHandle::new(origin, account_id, genesis_hash)`, `from_json(state_json)`, `to_json()` | an empty ledger (`origin` exact, as hosts compare it: `https://` and a lowercase host, a port only when not the default, no path; `http://` on a loopback address for development; else `Invalid{malformed}`); the stored one (`Stored{code}`: `too_large` over 64 MiB, `malformed`, `unsupported_version`, `stored_invalid`, also for a `pending` list not in the order the reports were made: it would stall a principal); its durable state, canonical JSON (`"v": 1`) |
 | `origin()`, `account_id()`, `genesis_hash()` | the Station and the device list the ledger is for (`genesis_hash` in lowercase hex): check them against the device list a stored state is loaded for |
-| `record(record_json, revoked_at_ms, covered_hosts, now_ms)` | a record you stored in your feed, before you serve it. Your own `revoke` (signed with the integration's service key) starts the revocation: `revoked_at_ms` is when the Portal revoked the integration (the deadline's start, but the ledger keeps `min(revoked_at_ms, the record's issued_at + 1 hour)`, so the deadline is at most `issued_at` plus 25 hours, where a host stops resending the revoke's result: **Atem's proposal, for Astation's agreement**, host-work-v1 §11.4), `covered_hosts` the hosts its grant covered. For any other record `covered_hosts` are the hosts its re-sign alert waits for. Refused (`Invalid{code}`): `other_account`, `other_station`, `record_id_reused` (another body under a `record_id` the ledger tracks), `malformed`, or the record's parse code |
+| `record(record_json, revoked_at_ms, covered_hosts, now_ms)` | a record you stored in your feed, before you serve it. Your own `revoke` (signed with the integration's service key) starts the revocation: `revoked_at_ms` is when the Portal revoked the integration (the deadline's start, but the ledger keeps `min(revoked_at_ms, the record's issued_at + 1 hour)`, so the deadline is at most `issued_at` plus 25 hours, where a host stops resending the revoke's result: **Atem's proposal, agreed with Astation (2026-11-11, #120 comment 6810116314)**, host-work-v1 §11.4), `covered_hosts` the hosts its grant covered. For any other record `covered_hosts` are the hosts its re-sign alert waits for. Refused (`Invalid{code}`): `other_account`, `other_station`, `record_id_reused` (another body under a `record_id` the ledger tracks), `malformed`, or the record's parse code |
 | `ack(link, ack_json, now_ms)` | a host's `control_ack` as received, on the link whose verified association is `link` (`LinkAssociationInfo{account_id, genesis_hash, host_id, host_trust_gen, connection_id}`). Refused whole, nothing counted: `incomplete_link`, `not_the_link` (the ack's account, root, host or trust generation isn't the link's), `other_account`, `other_station`, `not_the_record` (a result whose effects aren't the record's), or the reader's code. Answer `not_the_link`, `other_account` and `other_station` with `relay_control_ack_refused` on the link; the others get no reply |
 | `tick(now_ms)` | your timer: a revocation 24 hours past its start (`record`'s `min(revoked_at_ms, issued_at + 1 hour)`) gets its `revoked{deadline_passed}` report |
 | `pending_reports()` | what to send now, in order: `ReportIntentInfo{report_id, report, not_before}`, `report` being `RevocationApplied{integration_id, host, record_id}` or `Revoked{integration_id, outcome, pending_hosts}` |
@@ -1445,8 +1446,8 @@ it can't tell a superseded connection from the current one.
    stopped for that device list and never start again from an empty
    ledger: it would lose the deadlines and the per-host counts.
 
-**The 403 stop and its resume** (agreed with Auth/Portal; **for
-Astation's confirmation**, whose built-in Station takes its report client
+**The 403 stop and its resume** (agreed with Auth/Portal; **agreed with Astation (2026-11-11, #120 comment
+6810116314)**, whose built-in Station takes its report client
 ID from its configuration and always resumes). A `403` stops reporting
 under the report client ID that got it: the ledger records the ID, holds
 every report (none is sent, none is dropped) and goes on counting and
@@ -1535,7 +1536,7 @@ revocation, and the interrupt for it); the cursor, `pending` and `refused`
 never count. `revocation_applied` goes once per host and revoked
 integration, at the host's first `applied` or `duplicate` for the
 revocation, naming that record (**changed agreed meaning, agreed by
-Auth/Portal, for Astation's confirmation**: the agreed design sent it only
+Auth/Portal, and by Astation (2026-11-11, #120 comment 6810116314)**: the agreed design sent it only
 at `applied`; a host that applied the revocation through another record
 first reports this Station's record `duplicate` and is still counted);
 `revoked{all_applied}` goes after every covered host's

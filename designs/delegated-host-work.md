@@ -18,7 +18,8 @@ pause's bound the host's own (a day on both clocks, never the sender's deadline)
 to its session (III.2, "Who sees the live tag"; VI). The implementation, its vectors
 (`designs/protocol/fixtures/host-work/prompt-framing-v1.json`) and this text land together; nothing else changed.
 
-**Amended after agreement, 2026-11-10 (host mail; for Astation's review).** Step 3 builds the envelope and result
+**Amended after agreement, 2026-11-10 (host mail; agreed with Astation,
+2026-11-11, #120 comment 6810116314).** Step 3 builds the envelope and result
 objects (II.4.2, II.4.4; their contract is host-work-v1 §11.5), and three of II.4.2's receiver rules are written as
 built: the claimed generation's `add_host` comes at or before `signed_at_head.seq` (with the matching sender rule); only
 a `signed_at_head` beyond this host's head waits, so a generation this host's list doesn't hold at a head it holds is
@@ -41,6 +42,18 @@ I.13, VII.A test 18 and IX.1 item 6). The exact rules are host-work-v1 §11.6, "
 I.6.5 also carries a note for the owner (2026-11-11): on Linux, Atem measures boot time with a raw composition of
 kernel clocks instead of the `CLOCK_BOOTTIME` the decision names, so that the OS's slewing can't move `H`.
 
+**Step 3 contract agreements, 2026-11-11/12.** Step 3 of the order of work (PRs #145 to #150: the
+framing in the bindings, the five device-list actions, control records, Station calls and the acknowledgment
+ledger, the Part I wire, host senders' envelopes and results) merged on 2026-11-12. Astation reviewed all six
+contracts and signed them off, agreeing to the requested items other than those left open below (2026-11-11, #120
+comment 6810116314), and confirmed #148's refusal wire (2026-11-12, #148 comment 6812769009 and #120 comment 6812778769). Auth/Portal agreed #148's five
+report items (2026-11-11, #148 comment 6803727308) and #147's items 1 to 3 (2026-11-12, #147 comment
+6813332550). The agreed items are marked in host-work-v1 §11, session-v1 R9.2, R9.3, R9.7b, R9.8, R9.9 and
+R9.14 and in the bindings contract. Still open, or step 4 acceptance: the runtime's enforcement of the feed store
+and the host's gates and cursors, byte-level goldens for the relay messages, the clock provider's tests,
+`no_match`'s wire form and the status of a selector-resolved (UUID v5) task. The design text below changes only in
+these marks.
+
 **Amended for step 4, for Astation's review (host mail).** Two changes to II.4.2's receiver, built in the shared core
 (host-work-v1 §11.5). Only a key the host made waits: mail sealed to a key id the host never made in its current trust
 generation is refused at once, even when signed beyond its head, since every `host_enc_key` entry for the host carries
@@ -54,10 +67,11 @@ passage (in II.4.1 and II.4.2) is marked "Amended for step 4, for Astation's rev
 `cc180912cd8d3afc11c20f77a3ebc4e8a81989ede1327afc90df52d09c39eb83`), changed only by this status block, Appendix B, the link to
 the diagram, the two Astation file references in XI (written so they are not read as paths in this repository), and
 one update marked "updated after agreement" in III.4 (the phone's login is live on dev, Auth #19), and the framing,
-host-mail and clock amendments above. The diagram is
+host-mail and clock amendments above, and the marks of step 3's agreements. The diagram is
 `delegated-host-work-flows.html` (frozen `flows.html`, SHA-256
 `587a4c74ca9c2645dd3a2c79908813da573451479c0a0a846896fd3ff909cf6a`), changed only in the phone's login in figures 1
-and 2, marked the same way. Citations of [agent-collaboration.md](agent-collaboration.md) and its section numbers
+and 2, marked the same way, and, after step 3's agreements, in figure 1 (both hosts use the same Station) and
+figure 3b (the Station's refusals), marked in the figure. Citations of [agent-collaboration.md](agent-collaboration.md) and its section numbers
 (`collaboration §n`) refer to that file at `3e60fcc`, PR #124's head when the text was agreed. That file, the stage-1
 collaboration design, is in this repository (merged in #124): it has been edited since `3e60fcc` but its section
 numbers are the same, and its stage 2 and 3 passages are now pointers to this file. Appendix B quotes the cited
@@ -1816,7 +1830,7 @@ with the sealed part beside it.
 1. Strict parse (R9.1); `type` and `v`; `account_id` and `genesis_hash` are its pin.
 2. The recipient is itself, at its current trust generation, and `enc_kid` names its current `enc_key` (or, for 24 h
    after a routine `host_enc_key` rotation, its previous one; never after a rotation with `retire_previous`, II.3.1).
-   **Amended after agreement, 2026-11-10 (for Astation).** The current trust generation is the host's own, from its
+   **Amended after agreement, 2026-11-10 (agreed with Astation, 2026-11-11, #120 comment 6810116314).** The current trust generation is the host's own, from its
    pairing, never one read from its device list, which may lag behind its own new `add_host`. When `signed_at_head.seq`
    is beyond this host's head, a key it doesn't accept waits (below): its own new `host_enc_key` may be among the
    entries it lacks. A key the host generated and handed out but whose `host_enc_key` its own list hasn't applied yet
@@ -1831,31 +1845,30 @@ with the sealed part beside it.
 3. The sender is a current host at its applied head whose newest `add_host` has exactly `sender.host_trust_gen`.
    **Owner decision 2026-11-07:** its `host_id` is `authorized(g)` at this host's head (II.3.1), `signed_at_head.seq`
    is at least g, and this host's entry at `signed_at_head.seq` has `signed_at_head.hash`. **Amended after
-   agreement, 2026-11-10 (for Astation).** The claimed generation's `add_host` is at or before `signed_at_head.seq`:
+   agreement, 2026-11-10 (agreed with Astation, 2026-11-11, #120 comment 6810116314).** The claimed generation's `add_host` is at or before `signed_at_head.seq`:
    a host signs only once its own device list shows its `add_host` at exactly its `host_trust_gen`.
-4. The signature, with that `add_host`'s `host_key`. **Amended after agreement, 2026-11-10 (for Astation).** And
+4. The signature, with that `add_host`'s `host_key`. **Amended after agreement, 2026-11-10 (agreed with Astation, 2026-11-11, #120 comment 6810116314).** And
    `sealed_hash` names `enc` and `ct` (it was the first part of step 6): the signature never covered a sealed part its
    `sealed_hash` doesn't name, so such a copy isn't the sender's, and every later verdict is about the sender's own,
    intact copy.
 5. The times: `expires_at` after `created_at` and at most 24 h later, not passed, and `created_at` at most 60 s ahead
    of its clock at first acceptance (host-work-v1 §5). The clock is I.6.5's.
 6. Open, then strict parse of the plaintext, whose ids, times and sender equal the body's. **Amended after agreement,
-   2026-11-10 (for Astation):** its `sealed_hash` check is step 4's now.
+   2026-11-10 (agreed with Astation, 2026-11-11, #120 comment 6810116314):** its `sealed_hash` check is step 4's now.
 7. Then the host-work checks of a message: route, project, ops, target and no attachments (II.2; host-work-v1 §5
    "Publish"), committed in one transaction with the mailbox cursor.
 
 **Outcomes.**
 - **Steps 1, 2 and 4, and step 3 for a sender this host doesn't know, has removed or holds `revoked`, or whose
   `signed_at_head` is before its generation or names another hash:** the object is refused and its hash kept as
-  evidence; the host marks it done in the mailbox. Nothing reaches an agent. **Amended after agreement, 2026-11-10 (for
-  Astation).** Step 2's key part and step 3 refuse these only at a `signed_at_head` this host's list holds (one beyond
+  evidence; the host marks it done in the mailbox. Nothing reaches an agent. **Amended after agreement, 2026-11-10 (agreed with Astation, 2026-11-11, #120 comment 6810116314).** Step 2's key part and step 3 refuse these only at a `signed_at_head` this host's list holds (one beyond
   it waits, below), and there step 3 also refuses a claimed generation the list doesn't hold, or whose `add_host` comes
   after `signed_at_head.seq`: the list the sender signed at is the one this host holds. Two are refused at any head,
   since `add_host` generations strictly rise: a generation below the sender's newest, and an envelope from a removed
   host at the generation it last held (after step 5's times when the head is beyond this host's). **Amended for step 4,
   for Astation's review.** A third is refused at any head: a key id this host never made (step 2). These refusals claim
   no `id` (Duplicates, below): the sender's own copy, sent again, is still judged.
-- **Amended after agreement, 2026-11-10 (for Astation).** **Step 3 for a `signed_at_head.seq` beyond this host's head**
+- **Amended after agreement, 2026-11-10 (agreed with Astation, 2026-11-11, #120 comment 6810116314).** **Step 3 for a `signed_at_head.seq` beyond this host's head**
   (it read: "for a `sender.host_trust_gen`, or a `signed_at_head.seq`, beyond this host's head"): the host may not have
   the sender's new `add_host`, or its readmit, or its own new `host_enc_key`, the key the object is sealed to, yet. Step
   5's time checks run first, on the body's times; an object that fails them is refused. When this host already holds the
@@ -1876,7 +1889,7 @@ with the sealed part beside it.
   The claim on the `id` is `(sender.host_id, id)` (Duplicates, below), never the host's whose object another host
   re-signed; `host_trust_gen` only says which `add_host` key verified the copy.
 - **Step 7:** a recorded decision (`refused`), reported back (II.4.4).
-- **Duplicates.** **Amended after agreement, 2026-11-10 (for Astation)** (it read: "The same `id` with the same
+- **Duplicates.** **Amended after agreement, 2026-11-10 (agreed with Astation, 2026-11-11, #120 comment 6810116314)** (it read: "The same `id` with the same
   `sealed_hash` is a duplicate: acknowledged, nothing changes. The same `id` with other bytes is refused and kept as
   evidence"). A claim on an `id` is the authenticated sender's, `(sender.host_id, id)`, the key of the Station's
   puts (II.4.3), and only an object whose signature verified and whose sealed part its `sealed_hash` names claims it (an

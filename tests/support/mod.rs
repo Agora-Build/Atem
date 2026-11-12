@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod astation;
+pub mod host_clock;
 pub mod profile;
 pub mod r9;
 pub mod r9log;

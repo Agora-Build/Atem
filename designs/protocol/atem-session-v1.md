@@ -1963,7 +1963,9 @@ limits when a commit moves a limit into nearly full or full, and one
 when a list opens already there.
 
 **Host senders and projects** (planned: signed only once every strict
-verifier of an account knows these actions, the signing gate). Delegated
+verifier of an account knows these actions, the signing gate; the five
+actions' rules below and the exhaustive enum additions are agreed with
+Astation, 2026-11-11, #120 comment 6810116314, and the gate stays closed). Delegated
 host work ([delegated-host-work.md](../delegated-host-work.md)
 II.2.2, II.3.1, II.4.1) adds the five actions `project_set`,
 `project_remove`, `host_sender_revoke`, `host_sender_readmit` and
@@ -2443,7 +2445,8 @@ beside host principals' records, is refused whole: the host answers
 takes with `control_records_result{re, results}`, one result per record,
 in the order sent (R9.8).
 
-- **Carriage order** (**Atem's proposal, for Astation's agreement**: it
+- **Carriage order** (**Atem's proposal, agreed with Astation (2026-11-11,
+  #120 comment 6810116314)**: it
   narrows delegated host-work I.5.4's "pending until the list holds it" for
   a native the list holds without `manage`). A carrier sends `membership`
   up to its own head first, then `control_records`: each record is
@@ -2460,7 +2463,8 @@ in the order sent (R9.8).
   feed's records are verified only after the host fetched the device list
   up to the head the Station announced (delegated host-work I.5.8).
 - **A record the parser refuses** fails the whole message
-  `invalid_request` (**Atem's choice, for Astation to confirm**): nothing
+  `invalid_request` (**Atem's choice, agreed with Astation (2026-11-11, #120
+  comment 6810116314)**): nothing
   of it is applied, and runtime.log gets one refusal line. In a Station
   feed, by contrast, a record that doesn't parse is refused on its own and
   kept as evidence.
@@ -2469,7 +2473,8 @@ in the order sent (R9.8).
   member may send the op (a service or a browser gets `forbidden`), and a
   host that doesn't advertise `host.senders` refuses it
   `unsupported_version` (detail `host.senders is not advertised`; **Atem's
-  choice of code, for Astation to confirm**), with no effect.
+  choice of code, agreed with Astation (2026-11-11, #120 comment
+  6810116314)**), with no effect.
 
 **Bounds against rejected traffic:** ≤ 65 signature checks per carriage;
 r7.1's one `hello` per second per transport; `evidence` keeps a count
@@ -3452,7 +3457,8 @@ R9.9), nothing else: r8 session-family messages are dropped unanswered, no Astat
 operation (pair, pair verify, cred unlock/projects, the token refresh)
 runs on it, no `credentialSync` or encryption message is applied, no mark
 task is taken or reported. **Planned (delegated host work; changed for
-host senders, needs Astation's agreement):** a routed link also carries the
+host senders; the Station calls are agreed with Astation (2026-11-11, #120
+comment 6810116314), the stage-3 mailbox calls wait for stage 3):** a routed link also carries the
 Station calls of host-work-v1 §11.4 (`control_sync`,
 `control_sync_result`, `heads`, `control_ack`, `membership_fetch`,
 `membership_fetch_result`, and the refusals `control_sync_refused`,
@@ -3570,7 +3576,8 @@ replaced key, also for a proof at an ancestor head; `relay_replies`:
   `host.policy`.
 - An r9 session op of a feature the host doesn't advertise is refused
   `unsupported_version` with no effect (as §A refuses an op of a feature
-  it doesn't list; **Atem's choice of code, for Astation to confirm**):
+  it doesn't list; **Atem's choice of code, agreed with Astation (2026-11-11,
+  #120 comment 6810116314)**):
   today `control_records` and `host_enc_key_get`, whose feature
   `host.senders` no host advertises (detail `host.senders is not
   advertised`). The host-work ops of a feature it doesn't list are
@@ -3808,8 +3815,7 @@ Open envelope (signed by `host_channel_key`):
   session or process never matches.
 
 **`outcome_unknown` hint** (planned: part of feature `host.alerts`, which no
-host advertises yet; delegated host-work I.4.6, host-work-v1 §11.3; **new
-body, for Astation to confirm**). When a task's outcome becomes unknown, the
+host advertises yet; delegated host-work I.4.6, host-work-v1 §11.3; **new body, agreed with Astation (2026-11-11, #120 comment 6810116314)**). When a task's outcome becomes unknown, the
 host signs one hint per recipient, as for an open approval hint, to tell the
 owner's devices that a person is needed. It is a second body of the same
 `type`, signed under the same label (`atem-push-hint-v1`) by
@@ -3845,7 +3851,8 @@ it has neither `state` nor `session_id`, `process_gen` or `approval_id`:
   `service:` sender passes, since only the host knows whether a feed covers
   it. The body names the alert, never the task: nothing the owner reads is
   in the clear. No new label: it is the push hint's own, and the seal's.
-  **Atem's choices, for Astation to confirm:** the sealed facts (the
+  **Atem's choices, agreed with Astation (2026-11-11, #120 comment
+  6810116314):** the sealed facts (the
   design's "the host, session, task and sender, and why": the host is the
   body's `host_id`), their bounds, the `kind` discriminator, and an
   `alert_id` (the host's own UUID v4, the `alert_id` of `alert_list`) as
@@ -3876,7 +3883,8 @@ it has neither `state` nor `session_id`, `process_gen` or `approval_id`:
   (collapse id / FCM tag = `alert_id`), as an approval's do on its
   `approval_id`. So the hints of one alert to one device replace each other,
   and two alerts never do. The crate's reference relay schedules by it
-  (`RelayLedger`). **Atem's choice, for Astation to confirm.**
+  (`RelayLedger`). **Atem's choice, agreed with Astation (2026-11-11, #120
+  comment 6810116314).**
 
 **Verification** (relay and clients; `now` is the verifier's clock):
 signature by the newest `add_host` key of `host_id` in its verified log;
@@ -4300,8 +4308,9 @@ principal exists, no receipt carries `task_id` or `sender`, and
 `host_enc_key_get` is refused (below). The host builds it in step 4 of the
 design's order of work. The shared core already has the wire: the
 principal's name, the receipt fields and their reader, and the op and its
-answer. Each choice that fills in the design is marked for Astation's
-agreement.
+answer. Each choice that fills in the design is marked. Astation agreed R9.14
+(2026-11-11, #120 comment 6810116314), except the two questions still marked
+open (item 1's UI question, item 8's request for a new key).
 
 1. **The `host-work` principal.** Its name is `host-work`
    (`atem_client::session::wire::HOST_WORK_PRINCIPAL`), a bare word like
@@ -4350,8 +4359,8 @@ agreement.
      `null`. `sender` is never `local`, a `browser:` principal or
      `host-work` itself: none of them is a delegated sender (design I.1.3).
      A reader refuses a receipt that breaks these rules, as it refuses any
-     malformed receipt. These rules are **Atem's choice, for Astation to
-     confirm**: the design says only that the receipt gains `task_id` and
+     malformed receipt. These rules are **Atem's choice, agreed with Astation (2026-11-11, #120
+     comment 6810116314)**: the design says only that the receipt gains `task_id` and
      `sender`, "present only on the host-work principal's receipts".
    - **Admission metadata, like §H's principal.** They are recorded with
      `accepted`, never change after it, and are in neither the payload
@@ -4397,8 +4406,8 @@ agreement.
      by the host`. A late submit of it then gets that `rejected` receipt
      instead of running, and a restart resolves it with the same detail
      (§I.3 gives `acceptance not confirmed` only to the refusals of a
-     failed admission write). **Atem's choice, for Astation to confirm**:
-     the design says the late submit gets "the recorded `rejected`
+     failed admission write). **Atem's choice, agreed with Astation (2026-11-11, #120 comment
+     6810116314)**: the design says the late submit gets "the recorded `rejected`
      receipt", not which detail it keeps;
    - **already `executing`:** the withdrawal fails, and the task is
      running.
@@ -4426,9 +4435,11 @@ agreement.
      another task's turn loses nothing. The design lists the epoch bump
      and the lease revocation first, then "in the same pass, the session
      host drops the interrupt if the current turn isn't the task's". This
-     reading is **Atem's choice, for Astation to confirm**.
+     reading is **Atem's choice, agreed with Astation (2026-11-11, #120
+     comment 6810116314)**.
    - **No receipt.** It is no submission: like local input, it has no
-     receipt of its own (**Atem's reading**; the design says "as local
+     receipt of its own (**Atem's reading, agreed with Astation (2026-11-11, #120 comment
+     6810116314)**; the design says "as local
      input does", not whether it has one). The attempt's prompt receipt
      completes with the turn's outcome (`interrupted`, §6).
    - **Pending until done.** An intent stays pending until the turn was
@@ -4479,8 +4490,8 @@ agreement.
    new attempt once the revocation gate opens (design I.6.2, I.6.3). Its
    `executing` requests are reconciled as §6 says (worker adoption, else
    `outcome_unknown`, `agent exited`). The order (the refusal list first,
-   as §I.7 rules for every principal) is **Atem's choice, for Astation to
-   confirm**.
+   as §I.7 rules for every principal) is **Atem's choice, agreed with Astation
+   (2026-11-11, #120 comment 6810116314)**.
 
 7. **`request_id_reused` across submitters.** A `submit` whose
    `request_id` is recorded under another submitter, where the recorded
@@ -4491,8 +4502,8 @@ agreement.
    an attempt (design I.6.4). Between any other principals §6 and §H are
    unchanged: a duplicate needs only `view`. Attempt ids are fresh UUID v4s
    from a CSPRNG, so a collision means a client reused an id it learned.
-   Applying the rule in both directions is **Atem's choice, for Astation
-   to confirm**: the design names only the host-work principal's own
+   Applying the rule in both directions is **Atem's choice, agreed with
+   Astation (2026-11-11, #120 comment 6810116314)**: the design names only the host-work principal's own
    submits, and the reverse keeps a client's submit from returning a
    host-work attempt's receipt.
 
@@ -4529,8 +4540,8 @@ agreement.
        `add_host`'s `host_key`) over `enc(["atem-host-enc-key-v1",
        account_id, genesis_hash, host_id, u64(host_trust_gen),
        enc_pub])`. These are the entry's own forms, so the manager copies
-       them into the entry (`HostEncKey::action`). The shape is **Atem's
-       choice, for Astation to confirm**: the design says the manager gets
+       them into the entry (`HostEncKey::action`). The shape is **Atem's choice, agreed with Astation (2026-11-11, #120
+       comment 6810116314)**: the design says the manager gets
        `{enc_pub, enc_sig}`. This answer carries `enc_key` as the entry's
        `{alg, pub}` object, and names `host_id` and `host_trust_gen` so it
        can be bound to the channel (below).
@@ -4538,8 +4549,8 @@ agreement.
        head. The host checks `manage` each time it handles a request, as
        for the host policy (R9.8a); a native without it gets `forbidden`.
        The channel refuses services and browsers `forbidden` before
-       decoding. **Atem's choice, for Astation to confirm**: the design
-       says "a session op for native members", and only a manager signs
+       decoding. **Atem's choice, agreed with Astation (2026-11-11, #120 comment
+       6810116314)**: the design says "a session op for native members", and only a manager signs
        the entry the answer is for.
      - **Read-only.** The host makes, rotates and records nothing for
        the request. It answers with the key it holds, whether or not the
@@ -4547,12 +4558,13 @@ agreement.
        and not made, or unreadable) answers `busy`, detail `host
        encryption key unavailable`. A held device list answers `busy`,
        detail `device list not reconciled`, as for the host policy. Both
-       details are **Atem's choice, for Astation to confirm**.
+       details are **Atem's choice, agreed with Astation (2026-11-11, #120
+       comment 6810116314)**.
      - **The client** takes an answer only for a request it sent on that
        channel, from the channel's host (`atem_device_id`) at its trust
        generation. Anything else is a malformed host message (`unbound
-       host enc key`), and the channel closes (**Atem's choice, for
-       Astation to confirm**). `Attached::
+       host enc key`), and the channel closes (**Atem's choice, agreed with Astation (2026-11-11,
+       #120 comment 6810116314)**). `Attached::
        send_host_enc_key_get` sends the request, and the generic `send`
        checks a hand-built one the same way: the feature, the host's own
        reading, a fresh id, at most 64 waiting. The answer arrives as a

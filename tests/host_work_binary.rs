@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use support::astation::{ASTATION, FakeAstation, write_encryption_mode, write_verified_pairing};
+use support::host_clock::HostClock;
 use support::r9::{Out, Router, client_ms, write_pin};
 use support::r9log::{self, MAC, TestLog, auth, secret};
 use support::{Sandbox, within};
@@ -1365,92 +1366,6 @@ fn a_refused_chat_request_never_names_a_file() {
     );
 }
 
-/// The host clock (`ATEM_TEST_HOST_CLOCK`, debug builds): the real wall and
-/// monotonic clocks plus offsets the test moves, this boot, rewritten every
-/// 20 ms and by `jump` (atomically, one write at a time).
-struct MovingClock {
-    path: PathBuf,
-    offsets: std::sync::Arc<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64)>,
-    /// Writes the file now. Each write reads the offsets under one lock, so
-    /// none with offsets older than the last `jump`'s can land after it.
-    write: std::sync::Arc<dyn Fn() + Send + Sync>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    writer: Option<std::thread::JoinHandle<()>>,
-}
-
-impl MovingClock {
-    fn start(dir: &Path) -> MovingClock {
-        use std::sync::atomic::Ordering;
-        let path = dir.join("moving-clock");
-        let offsets = std::sync::Arc::new((
-            std::sync::atomic::AtomicU64::new(0),
-            std::sync::atomic::AtomicU64::new(0),
-        ));
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
-        let boot = boot.trim().to_string();
-        let one_at_a_time = std::sync::Mutex::new(());
-        let write: std::sync::Arc<dyn Fn() + Send + Sync> = {
-            let (path, offsets) = (path.clone(), offsets.clone());
-            std::sync::Arc::new(move || {
-                let _one = one_at_a_time.lock().unwrap();
-                let mut ts = libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                };
-                // SAFETY: `ts` is a valid timespec for the call to fill.
-                unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-                let mono = ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000;
-                let wall = r9log::host_now().wall_ms + offsets.0.load(Ordering::SeqCst);
-                let mono = mono + offsets.1.load(Ordering::SeqCst);
-                let tmp = path.with_extension("tmp");
-                std::fs::write(&tmp, format!("{wall} {mono} {boot}")).unwrap();
-                std::fs::rename(&tmp, &path).unwrap();
-            })
-        };
-        write();
-        let (s, w) = (stop.clone(), write.clone());
-        let writer = std::thread::spawn(move || {
-            while !s.load(Ordering::SeqCst) {
-                w();
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        });
-        MovingClock {
-            path,
-            offsets,
-            write,
-            stop,
-            writer: Some(writer),
-        }
-    }
-
-    /// Moves the host's wall and monotonic clocks `wall_ms` and `mono_ms`
-    /// ahead of the real ones: in the file before it returns (then a host
-    /// pass, 100 ms, on them), so whatever the test does next happens on the
-    /// moved clocks. (Left to the writer thread, a write late under load let
-    /// the host admit the next viewer on the old monotonic clock, its
-    /// channel's 24 h lifetime then over as soon as the jump landed.)
-    fn jump(&self, wall_ms: u64, mono_ms: u64) {
-        use std::sync::atomic::Ordering;
-        self.offsets.0.store(wall_ms, Ordering::SeqCst);
-        self.offsets.1.store(mono_ms, Ordering::SeqCst);
-        (self.write)();
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-impl Drop for MovingClock {
-    /// Stops the writer and waits for it, before the sandbox it writes in
-    /// goes (the clock is declared after the rig, so it drops first).
-    fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(writer) = self.writer.take() {
-            let _ = writer.join();
-        }
-    }
-}
-
 /// The pause's bound is the host's own: a day from the dispatch on the
 /// wall clock and on the monotonic clock both (final security review C1).
 /// A wall clock set a day forward doesn't end it (the monotonic day hasn't
@@ -1464,7 +1379,7 @@ impl Drop for MovingClock {
 fn a_pause_ends_a_day_after_its_dispatch_on_both_clocks() {
     const DAY: u64 = 86_400_000;
     let mut rig = Rig::prepared("claude", |_| {});
-    let clock = MovingClock::start(rig.sandbox.dir.path());
+    let clock = HostClock::start(rig.sandbox.dir.path(), "moving-clock");
     rig.clock = Some(clock.path.clone());
     rig.start();
     private(&rig.fake.join("echo"), "");
@@ -1501,7 +1416,7 @@ fn a_pause_ends_a_day_after_its_dispatch_on_both_clocks() {
 
     // The wall clock a day ahead (and the task's deadline long past): a new
     // view-only subscription still gets nothing.
-    clock.jump(DAY + 120_000, 60_000);
+    clock.set(DAY as i64 + 120_000, 60_000);
     let mut viewer = watch(&mut r);
     let held = viewer_frames(&mut viewer, &mut r, &sid, &pg, Duration::from_millis(2_000));
     assert!(
@@ -1512,7 +1427,7 @@ fn a_pause_ends_a_day_after_its_dispatch_on_both_clocks() {
     drop(viewer);
 
     // The monotonic day too: frames again, the turn still running.
-    clock.jump(DAY + 180_000, DAY + 120_000);
+    clock.set(DAY as i64 + 180_000, DAY + 120_000);
     let mut viewer = watch(&mut r);
     let after = first_frames(&mut viewer, &mut r, &sid, &pg, "no frame after the day");
     assert!(frames_in(&after)[0]["reset"] == true, "{after:?}");

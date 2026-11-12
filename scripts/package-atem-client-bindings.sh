@@ -154,7 +154,10 @@ if want android; then
     grep -Eq "^ *Machine: +$MACHINE\$" <<<"$HDR" \
       || { echo "android $ABI: not $MACHINE" >&2; echo "$HDR" >&2; exit 1; }
     SYMS=$("$READELF" --dyn-syms -W "$SO")
-    if grep -qiE 'sign_seen|admit_carrier|software_?key|framing_render_for_vectors' <<<"$SYMS"; then
+    # Never in an Android build, as check-atem-client-packages.sh checks too:
+    # test-only exports and the `host` role's (sign_seen, admit_carrier, the
+    # host-mail functions and their MailFieldsData record).
+    if grep -qiE 'sign_seen|admit_carrier|software_?key|framing_render_for_vectors|seal_envelope|open_envelope|seal_result|accept_result|mail_?fields_?data' <<<"$SYMS"; then
       echo "android $ABI: a test-only or host-role symbol is exported" >&2
       exit 1
     fi

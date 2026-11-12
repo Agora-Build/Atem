@@ -843,14 +843,28 @@ three features, defined in `atem_client::session::host_work`
 **No host advertises them in this version**, and a host refuses each of
 their ops as it refuses any op of a feature it doesn't list: a session op
 (`control_records`, `host_enc_key_get`) is `unsupported_version` with no
-effect (session-v1 R9.8; **Atem's choice of code, for Astation to
-confirm**), and a host-work request (`work_interrupt`, `work_resolve`,
+effect (session-v1 R9.8; **Atem's choice of code, agreed with Astation (2026-11-11, #120
+comment 6810116314)**), and a host-work request (`work_interrupt`, `work_resolve`,
 `alert_list`) is `busy` (§7, §11.2, §11.3). Clients check
 `welcome.features` first; the client core
 refuses to send `control_records` or `host_enc_key_get` to a host that
 doesn't list `host.senders` (`host feature not available`). The lifecycle
 these ops serve (§11.6) and session-v1's side of it (R9.14) are planned
 with them.
+
+**Contract status (2026-11-12).** Step 3 of the design's order of work
+(PRs #145 to #150, the shared-core contracts behind this section) merged on
+2026-11-12. Astation reviewed all six contracts and signed them off
+(2026-11-11, #120 comment 6810116314; the §11.4 refusal wire again at the
+implementation, 2026-11-12, #148 comment 6812769009 and #120 comment
+6812778769). Auth/Portal agreed #148's five report items (2026-11-11, #148
+comment 6803727308) and #147's items 1 to 3 (2026-11-12, #147 comment
+6813332550). Each item they agreed to is marked **agreed** below, and a
+marker that still reads "for Astation to confirm" is one the review didn't
+name. Open, or step 4 acceptance: the runtime's enforcement (the feed store,
+the host's gates and cursors), byte-level goldens for the relay messages,
+the clock provider's tests, `no_match`'s wire form and the status of a
+selector-resolved (UUID v5) task. The agreement activates nothing.
 
 ### 11.1 Control records
 
@@ -951,7 +965,7 @@ alerted, the scan cursor moves past it):
 | `wrong_account` | `account_id` or `genesis_hash` isn't the list's |
 | `bad_signature` | the signature doesn't verify under the named signer's key |
 | `key_mismatch` | `principal_key` names no key the service ever had |
-| `signer_not_allowed` | a manager's `cover`, `hold` or `release`; a `member:` signer that isn't a native manager (a native without `manage`, a service, a cancelled `recovery_add`). A native the list holds without `manage` is refused even when a promotion beyond the host's head would make it a manager (**Atem's proposal, for Astation's agreement**: it narrows design I.5.4's "pending until the list holds it" to signers the list doesn't hold yet, and adds this re-delivery case beside `removed_manager`). Delivering the same record again once the host's list holds the promotion is enough: a refused record takes no `record_id`, so it is verified again |
+| `signer_not_allowed` | a manager's `cover`, `hold` or `release`; a `member:` signer that isn't a native manager (a native without `manage`, a service, a cancelled `recovery_add`). A native the list holds without `manage` is refused even when a promotion beyond the host's head would make it a manager (**Atem's proposal, agreed with Astation (2026-11-11, #120 comment 6810116314)**: it narrows design I.5.4's "pending until the list holds it" to signers the list doesn't hold yet, and adds this re-delivery case beside `removed_manager`). Delivering the same record again once the host's list holds the promotion is enough: a refused record takes no `record_id`, so it is verified again |
 | `removed_manager` | its native signer was a manager and was removed or lost `manage` before the host applied it (its signature verifies under that signer's old key): the strict rule of I.5.4; Astation signs it again with a current manager (the same stop, a new `record_id`) |
 | `host_key_signed` | a host principal's record naming the host as its signer |
 | `not_a_service` | `service:<id>` names a native member |
@@ -970,7 +984,8 @@ frozen (R9.4) or the host is held after a write fault (R9.3).
 
 - **Feeds.** A Station keeps one control feed per account it serves (per
   Station and account: its own `feed_id`, and each host's cursor in it;
-  **Atem's proposal, for Astation's and Auth/Portal's agreement**, §11.4
+  **Atem's proposal, agreed with Astation (2026-11-11, #120 comment
+  6810116314), for Auth/Portal's agreement**, §11.4
   "One feed per account"). An account's feed carries every record of the
   principals of that account the Station covers, native managers' records
   included (Astation submits them, the Station appends them), and host
@@ -984,13 +999,15 @@ frozen (R9.4) or the host is held after a write fault (R9.3).
   Station's feed: a message holding one, alone or beside host principals'
   records, is refused whole, `invalid_request`, and the host applies
   nothing of it. Sent by native members only, after `membership` up to
-  the carrier's head (**Atem's proposal, for Astation's agreement**: a
+  the carrier's head (**Atem's proposal, agreed with Astation
+  (2026-11-11, #120 comment 6810116314)**: a
   record signed by a native the host's list holds without `manage` is
   refused, `signer_not_allowed`, and delivering the same record again
   after the `membership` that brings the host to the promotion is
   enough). A record the parser refuses fails the whole message
   `invalid_request`: nothing applied, one refusal line in runtime.log
-  (**Atem's choice, for Astation to confirm**; in a feed, by contrast, a
+  (**Atem's choice, agreed with Astation (2026-11-11, #120 comment
+  6810116314)**; in a feed, by contrast, a
   record that doesn't parse is refused on its own and kept as evidence). A
   carrier gets no authority from carrying.
 
@@ -1032,8 +1049,9 @@ a host's first `applied` or `duplicate` for the revocation).
 
 The rules:
 
-1. **Idempotent by principal and `record_id`** (**Atem's proposal, for
-   Astation's and Auth/Portal's agreement**; it amends design I.5.4's "the
+1. **Idempotent by principal and `record_id`** (**Atem's proposal,
+   agreed with Astation (2026-11-11, #120 comment 6810116314) and
+   Auth/Portal (2026-11-12, #147 comment 6813332550)**; it amends design I.5.4's "the
    first one counts" for stops). A record that counted (`applied` or
    `duplicate`) is kept, under its principal, with the SHA-256 of its
    body's `jcs`; the same body again is `duplicate` for every effect,
@@ -1089,8 +1107,8 @@ The rules:
    intents are durable then), and is a `duplicate` when the
    revoke entry itself carried `interrupt_running: true`.
 5. **Coverage** is per Station (origin), ordered by `(issued_at,
-   record_id)` (**Atem's proposal, for Astation's and Auth/Portal's
-   agreement**). A `cover` read at its own feed's position (the position's
+   record_id)` (**Atem's proposal, agreed with Astation (2026-11-11, #120 comment
+   6810116314) and Auth/Portal (2026-11-12, #147 comment 6813332550)**). A `cover` read at its own feed's position (the position's
    origin and `feed_id` are the body's) starts it.
    Another Station's cover takes it over only when strictly newer than the
    newest cover taken from the covering Station; an older or equal one is
@@ -1099,8 +1117,8 @@ The rules:
    feed after a reset) moves the coverage's ordering to that feed. **A
    cover never releases**: a hold survives every coverage change.
 6. **A stop always wins: a hold applies from any feed; only a release
-   follows feed order** (**Atem's proposal, for Astation's and
-   Auth/Portal's agreement**; it amends design I.5.5 step 4, "the last in
+   follows feed order** (**Atem's proposal, agreed with Astation (2026-11-11, #120 comment
+   6810116314) and Auth/Portal (2026-11-12, #147 comment 6813332550)**; it amends design I.5.5 step 4, "the last in
    feed order wins", to hold for releases only). A verified `hold` applies
    wherever it was read: in or out of order, from a feed that covers the
    principal or not, or with no coverage at all (`duplicate` while a hold
@@ -1161,8 +1179,8 @@ or `order`, `after_revoke`, `not_newer`, `possible_replay`), or kept as
 evidence (`collision`, `possible_replay`): `Applied.why`, the host's for its
 pending store, evidence and alerts.
 
-**Resets** (**Atem's proposal, for Astation's and Auth/Portal's
-agreement**: design I.5.2's snapshot re-issues "the latest revoke, hold or
+**Resets** (**Atem's proposal, agreed with Astation (2026-11-11, #120
+comment 6810116314) and Auth/Portal (2026-11-12, #147 comment 6813332550)**: design I.5.2's snapshot re-issues "the latest revoke, hold or
 release and interrupt state" and names no cover). A reset's snapshot is
 taken from the Station's current effective state (the Portal's Station
 feed), never from a restored backup's view. It re-issues, for each
@@ -1177,8 +1195,8 @@ leaves the coverage on the old feed: its holds, revokes and interrupts
 still apply, so no stop is lost, but its releases are refused until a
 newer cover arrives.
 
-**Stations: the trust model** (**Atem's proposal, for Astation's and
-Auth/Portal's agreement**). The principal's own key may sign every action,
+**Stations: the trust model** (**Atem's proposal, agreed with Astation
+(2026-11-11, #120 comment 6810116314) and Auth/Portal (2026-11-12, #147 comment 6813332550)**). The principal's own key may sign every action,
 so whoever holds it controls coverage and can always sign a newer cover;
 ordering can't stop a key holder. The Station's duties:
 
@@ -1274,7 +1292,7 @@ they serialize back to the same JSON.
 |---|---|
 | `task_id` | a UUID v4 |
 | `resolution.kind` | `failed` or `done`, exactly its fields |
-| `failed.detail` | 1–1024 bytes, not blank (something besides White_Space), no control character and no Cf character (bidi controls, zero-width characters; the framing module's General_Category Cf, `framing::is_format`): the detail the task then shows. **Atem's choice, for Astation to confirm**: the design says only `failed{detail}`, so a multi-line, blank or Cf-carrying reason is `invalid_request` |
+| `failed.detail` | 1–1024 bytes, not blank (something besides White_Space), no control character and no Cf character (bidi controls, zero-width characters; the framing module's General_Category Cf, `framing::is_format`): the detail the task then shows. **Atem's choice, agreed with Astation (2026-11-11, #120 comment 6810116314)**: the design says only `failed{detail}`, so a multi-line, blank or Cf-carrying reason is `invalid_request` |
 | `done.result` | a context snapshot, with `work_complete`'s checks and no more (a `result` kind is local only; **Atem's choice, for Astation to confirm**) |
 
 **Authority.** Both are directed-work requests: the channel checks `notify`
@@ -1319,8 +1337,8 @@ not name is `forbidden`, as for `work_query`.
     `work_resolve` in this version (design I.4.5).
   `resolved` is omitted before the task is resolved, never `null` (a
   reader refuses `null`), and appears on `failed` and `completed` statuses
-  only. Its shape is **Atem's choice, for Astation to confirm**: the design
-  says only that "the resolver and the time are recorded".
+  only. Its shape is **Atem's choice, agreed with Astation (2026-11-11, #120
+  comment 6810116314)**: the design says only that "the resolver and the time are recorded".
 - `receipt_id` is the id of the task's current attempt (design I.6.4): a
   new dispatch after an attempt proven side-effect-free has a new one. It is
   opaque to a client, which compares it with nothing; a client that
@@ -1341,7 +1359,8 @@ host refuses both with `busy`, detail `host.delegated is not advertised`,
 after the channel's `notify` check and before decoding: the code a host-work
 request the host can't take has (§1, §7), unlike `control_records`, which is
 a session op (§11, `unsupported_version`). Nothing is queued or recorded
-(**Atem's choice of code, for Astation to confirm**).
+(**Atem's choice of code, agreed with Astation (2026-11-11, #120
+comment 6810116314)**).
 
 **Compatibility: enable `host.delegated` together.** `WorkStatus` denies
 unknown fields, so every reader released before `resolved` existed (Atem's
@@ -1369,7 +1388,8 @@ done**, each a `work_resolve` (§11.2) by the owner.
   and a host sender (`host:`). A task of `local`, a browser grant or a
   service no feed covers keeps v1: its `outcome_unknown` expires at
   `expires_at`, and it raises no alert and no hint. **Atem's reading of
-  the design, for Astation to confirm:** design I.4.6's rules sit under
+  the design, agreed with Astation (2026-11-11, #120 comment
+  6810116314):** design I.4.6's rules sit under
   "tasks that Atem owns", and I.1.3 keeps them on v1.
 - So every alert can be answered with Mark failed or Mark done.
 
@@ -1420,7 +1440,8 @@ alerts.)
 | `created_at` | Unix ms on the host's wall clock: when the task became `outcome_unknown`. For people only: it orders nothing |
 | `more` | `true` when alerts follow this page; then the page isn't empty |
 
-Every field is **Atem's choice, for Astation to confirm**: the design says
+Every field is **Atem's choice, agreed with Astation (2026-11-11, #120
+comment 6810116314)**: the design says
 only that the alert "names the host, session, task and sender, and why the
 outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
 `detail` may be 1,024 bytes).
@@ -1431,8 +1452,10 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
     numbers (alerts end).
   - Never by `created_at`. A wall clock set back gives a later alert an
     earlier `created_at`, and a client following `after` would otherwise
-    miss it (**Atem's choice, for Astation to confirm**).
-  - At most **64** alerts per result (**Atem's choice**). A host holds at
+    miss it (**Atem's choice, agreed with Astation (2026-11-11, #120
+    comment 6810116314)**).
+  - At most **64** alerts per result (**Atem's choice, agreed with
+    Astation (2026-11-11, #120 comment 6810116314)**). A host holds at
     most 256 unresolved outcomes (design I.4.6), so a full list is four
     pages. An alert is typically about 450 bytes, at most about 750, and
     about 1 KB with escaping.
@@ -1488,7 +1511,8 @@ refuses `alert_list` with `busy`, detail `host.alerts is not advertised`,
 after the channel's authority check (a service, a browser and a native member
 without `control` learn `forbidden`) and before decoding: the code every
 host-work request the host can't take has (§1, §7). Nothing is read, queued
-or recorded (**Atem's choice of code, for Astation to confirm**, as for
+or recorded (**Atem's choice of code, agreed with Astation (2026-11-11, #120
+comment 6810116314)**, as for
 §11.2). The hint is never sent either.
 
 **Compatibility: enable `host.alerts` together.** An older reader of
@@ -1560,8 +1584,9 @@ a count over its bound refused before any item is read; the grammars of the
 signed objects (an `origin` exact as `station_route::normalize_relay`
 writes it, `feed_id` and `record_id` UUID v4, ids of 1 to 128 characters of
 `[A-Za-z0-9._:-]`, lowercase hex hashes). A builder checks what the reader
-checks. The wire rules below are **Atem's proposal, for Astation's
-agreement** (the design names the messages, not these rules):
+checks. The wire rules below are **Atem's proposal, agreed with Astation
+(2026-11-11, #120 comment 6810116314)** (the design names the messages,
+not these rules):
 
 1. At most 64 records in a `control_sync_result`, 64 results in a
    `control_ack`, 64 feeds in a `heads` and 64 entries in a
@@ -1610,8 +1635,8 @@ parsed, serialized again (not the bytes received): it stays verifiable,
 because a signature covers `jcs(body)`, never the bytes a Station sent. **A page that isn't strict
 I-JSON as a whole** (a duplicate key, a fraction, an unsafe integer, a lone
 surrogate or nesting past the parser's depth, anywhere in it, inside a
-record too) **is a Station fault** (**Atem's proposal, for Astation's
-agreement**): the host refuses the page, keeps its cursor, keeps the gate
+record too) **is a Station fault** (**Atem's proposal, agreed with Astation (2026-11-11,
+#120 comment 6810116314)**): the host refuses the page, keeps its cursor, keeps the gate
 for that origin closed (fail closed) and raises an owner alert ("Station
 sent a page that isn't strict JSON"), rate-limited to one an hour per
 origin as I.5.4's alerts are. **The Station's duty:** validate every record
@@ -1635,8 +1660,8 @@ calling"):
   the host's `host_channel_key` at its device list's head, carried through
   the proxy.
 
-**One feed per account** (**Atem's proposal, for Astation's and
-Auth/Portal's agreement**; the design's "each Station's control feed"
+**One feed per account** (**Atem's proposal, agreed with Astation
+(2026-11-11, #120 comment 6810116314), for Auth/Portal's agreement**; the design's "each Station's control feed"
 doesn't say whose records a link may read). The Station keeps one control
 feed per (Station, account), with its own `feed_id` and, on each host, its
 own cursor. `control_sync`, `heads` and `membership_fetch` answer only for
@@ -1650,7 +1675,8 @@ revocation time of another account reaches the link. The refusal is
 `control_sync_refused` or `membership_fetch_refused` ("Refusals" below).
 
 **Refusals** (**agreed with Astation on 2026-11-11**, #120 comment
-6810116314; they follow `host_route_refused`'s naming). A Station refuses a
+6810116314, and confirmed against the implementation on 2026-11-12, #148
+comment 6812769009 and #120 comment 6812778769; they follow `host_route_refused`'s naming). A Station refuses a
 host's call on the link with exactly one of:
 
 ```json
@@ -1691,8 +1717,8 @@ answering `control_ack_refused` ("Refusals" above) and counting nothing,
 and counts an ack only for the link's host, never the claim's. The connection
 is the Station's to fence at its transport: an ack from a connection of
 the host that isn't its current authenticated connection is refused there
-(**Atem's proposal, for Astation's agreement**: the reference ledger
-compares the four claims and requires a connection, but no message names a
+(**Atem's proposal, agreed with Astation (2026-11-11, #120 comment
+6810116314)**: the reference ledger compares the four claims and requires a connection, but no message names a
 connection, so it can't tell a superseded connection from the current
 one).
 
@@ -1701,7 +1727,8 @@ relay connection. On `:8080`, Astation proxies these calls and the heads to
 the Station unchanged (records are signed; Astation is a native manager),
 the host's device-list fetch included. With neither path the gate stays
 closed. These calls and the heads also run on a routed link (session-v1
-R9.7b; **changed for host senders, needs Astation's agreement**: today a
+R9.7b; **changed for host senders, agreed with Astation (2026-11-11, #120
+comment 6810116314)**: today a
 routed link carries only channel envelopes and push relay messages).
 
 #### Heads, resets and the gate
@@ -1737,8 +1764,8 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
   `applied`, `duplicate`, `pending`, `refused`). Only `applied` and
   `duplicate` say an effect is in force on that host; the Station counts
   nothing from the cursor, `pending` or `refused`.
-- **When a host acknowledges** (**Atem's proposal, for Astation's
-  agreement**; the design leaves it open). After each page's transaction
+- **When a host acknowledges** (**Atem's proposal, agreed with Astation
+  (2026-11-11, #120 comment 6810116314)**; the design leaves it open). After each page's transaction
   committed, the results of that page's records, with the new cursor. Since
   `control_ack` has no answer, the host sends the in-force results
   (`applied` or `duplicate`) of its `revoke` and `interrupt_running`
@@ -1746,8 +1773,8 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
   Station's ledger settles a revocation at its deadline, 24 hours after the
   revocation's start. The host knows no time of the revocation but the
   service's own `revoke`'s `issued_at`, and the ledger's `revoked_at_ms` is
-  the Station's word, so (**Atem's proposal, for Astation's agreement**;
-  agreed with Auth/Portal (2026-11-11, #148 comment 6803727308)) the
+  the Station's word, so (**Atem's proposal**, agreed with Astation (2026-11-11, #120 comment
+  6810116314) and with Auth/Portal (2026-11-11, #148 comment 6803727308)) the
   ledger takes the start as `min(revoked_at_ms, issued_at + 1 hour)`: a
   Station that records its own revoke more than an hour after its
   `issued_at` gets its deadline at `issued_at` plus 25 hours, never later,
@@ -1791,8 +1818,8 @@ revocation is complete (**agreed with Auth/Portal (2026-11-11, #148 comment 6803
 - **`revocation_applied{host, record_id}`**: once per covered host and
   revoked integration, at that host's first `applied` **or `duplicate`**
   for the revocation's effect, naming the record whose result said so
-  (**changed agreed meaning, agreed by Auth/Portal, for Astation's
-  confirmation**: design I.5.8 and IV row 7 send it only at `applied`. A
+  (**changed agreed meaning, agreed by Auth/Portal, and by Astation
+  (2026-11-11, #120 comment 6810116314)**: design I.5.8 and IV row 7 send it only at `applied`. A
   host that applied the revocation through another record first, a native
   revoke in another Station's feed it syncs, reports this Station's record
   `duplicate`; it counts toward `all_applied`, so it must also reach the
@@ -1884,7 +1911,7 @@ A network error or a timeout has no status; a client library's "no
 response" sentinel (such as `0`) is a network error, not a status.
 
 **The 403 stop and its resume** (**changed agreed meaning, agreed with
-Auth/Portal, for Astation's confirmation**: Auth/Portal's first answer made
+Auth/Portal, and with Astation (2026-11-11, #120 comment 6810116314)**: Auth/Portal's first answer made
 a `403` final for every report). A `403` is the Portal refusing the
 Station's report client (its `station.report` client at Auth), so the
 Station stops reporting on every ledger it keeps, in one transaction, with
@@ -1918,9 +1945,10 @@ The built-in Station takes its report client ID from its configuration and
 always resumes.
 
 **The Station's duties** (**Atem's proposal, for Astation's and
-Auth/Portal's agreement**):
+Auth/Portal's agreement**, except the two marked agreed with Astation):
 
-- **Persist before any HTTP.** A transition's next state and its report
+- **Persist before any HTTP** (**agreed with Astation (2026-11-11, #120
+  comment 6810116314)**). A transition's next state and its report
   intents are stored in one transaction before any report is sent, and the
   Station acts on the next state only once that committed. A crash before
   the commit loses nothing: the host acknowledges again and the same
@@ -1934,7 +1962,8 @@ Auth/Portal's agreement**):
   same reports byte for byte, but an ack processed at another time may pass
   a deadline. A replica whose compare-and-swap failed starts again from the
   new state.
-- **Record ids are unique per Station**: a fresh UUID v4 per record (a
+- **Record ids are unique per Station** (**agreed with Astation (2026-11-11,
+  #120 comment 6810116314)**): a fresh UUID v4 per record (a
   re-signed record included). The reference ledger refuses another body
   under a `record_id` it tracks, but a `cover`, `hold` or `release` id it
   doesn't track can't be checked against a later revoke. So the Station
@@ -2156,8 +2185,8 @@ names its reason; the reasons are stable and snake_case.
    key this host made waits (**for Astation**, amended for step 4): a key id
    it never made is refused `enc_key_not_accepted` beyond its head too,
    after the checks that settle at any head, step 5's times and, for a
-   claimed pair this list holds, step 4's check. **For
-   Astation.** The current trust generation is the host's own, from its
+   claimed pair this list holds, step 4's check. **Agreed with Astation
+   (2026-11-11, #120 comment 6810116314).** The current trust generation is the host's own, from its
    pairing (`pairing/trust_gen`), never one read from its device list, which
    may lag behind its own new `add_host` after `atem pair verify` (every
    mail to its new generation would then be refused for good).
@@ -2177,7 +2206,8 @@ names its reason; the reasons are stable and snake_case.
    of the sender's newest `add_host` (`bad_signature`), and `sealed_hash`
    names `enc` and `ct` (`sealed_hash_mismatch`): the signature never
    covered a sealed part its `sealed_hash` doesn't name, so such a copy
-   isn't the sender's. **For Astation** (the design's step 6 checked
+   isn't the sender's. **Agreed with Astation
+   (2026-11-11, #120 comment 6810116314)** (the design's step 6 checked
    `sealed_hash` after the times): every verdict after this step is about
    the sender's own, intact copy.
 5. **The times.** `expires_at` after `created_at` (`bad_times`) and at most
@@ -2196,8 +2226,9 @@ Step 7, the §5 checks of a message (route, project, ops, target), its
 storage and its receipts are the host's.
 
 - **The claimed generation's `add_host` is at or before
-  `signed_at_head.seq`** (step 3; **for Astation**). The matching sender
-  rule, **also for Astation**: a host signs an envelope or a result only
+  `signed_at_head.seq`** (step 3; **agreed with Astation (2026-11-11, #120 comment
+  6810116314)**). The matching sender rule, **also agreed with
+  Astation**: a host signs an envelope or a result only
   once its own device list shows its `add_host` at exactly its
   `host_trust_gen` (and itself `authorized`), and names that list's head as
   `signed_at_head`.
@@ -2206,8 +2237,8 @@ storage and its receipts are the host's.
   sender's standing nor the key settles it: entries this host hasn't seen
   may add the sender (unknown here), add it again at a newer generation
   (removed), readmit it (revoked), bring its newer generation, or bring this
-  host's own new `host_enc_key`, the key the object is sealed to (**for
-  Astation**), and no sender can know the hash of an entry that doesn't
+  host's own new `host_enc_key`, the key the object is sealed to (**agreed with Astation (2026-11-11, #120
+  comment 6810116314)**), and no sender can know the hash of an entry that doesn't
   exist. Step 5 runs first, on the body's times, and a failure is refused.
   Two claims are settled at any head, because `add_host` generations
   strictly rise: a generation below the sender's newest
@@ -2227,7 +2258,7 @@ storage and its receipts are the host's.
   pending object is judged again after each device-list advance and each
   change of the keys this host accepts, until it expires (the design's
   limits: 64 per claimed pair, 256 in all; pending objects don't hold the
-  gate). **For Astation:** an object that arrives over either limit is no
+  gate). **Agreed with Astation:** an object that arrives over either limit is no
   verdict: it is dropped undecided, with no refusal and no evidence record,
   it claims no id and isn't marked done, so the sender's resend is judged
   anew.
@@ -2255,7 +2286,8 @@ doing, whichever provider holds the key: through the bindings' key provider
 it is `ProviderError.OpenFailed` from `hpke_open` (atem-client-bindings.md
 §3).
 
-**Which copies claim an id** (**for Astation**; design II.4.2,
+**Which copies claim an id** (**agreed with Astation (2026-11-11, #120
+comment 6810116314)**; design II.4.2,
 "Duplicates"). A claim is the authenticated sender's: `(sender.host_id,
 id)`, the key of the Station's puts (design II.4.3). Only a copy whose signature
 verified and whose sealed part its `sealed_hash` names (step 4) claims that
@@ -2348,7 +2380,11 @@ other key id can ever become one it accepts: mail sealed to one is refused
 `enc_key_not_accepted` at any head and never waits. So a key whose id the
 record lacks has its mail refused for good.
 
-**Open items, for Astation.** Both wait for cross-host `select`
+**Open items** (left open by Astation's review, 2026-11-11, #120 comment
+6810116314: it signed off the objects above without them, they don't prevent
+merging these gated primitives, and each must be specified and covered by
+shared vectors before cross-host selector or mailbox execution is
+activated). Both wait for cross-host `select`
 (collaboration §5): the wire form of `no_match` in a status (a selector of
 the request that matched nothing here), and a status for a task a selector
 resolved (its UUID v5 id).
@@ -2524,6 +2560,13 @@ Every deadline check of the delegated lifecycle uses one clock (design
 I.6.5, as amended by the **owner's decision of 2026-11-10**). It is
 Atem-internal: no field or message changes, and Astation's `station_time`
 stays as the design gives it.
+
+**Agreed with Astation (2026-11-11, #120 comment 6810116314)** as a
+specification: the Linux raw boot-time counter, the raw macOS counter,
+same-boot comparisons and the bounded follow-down after a boot's first
+synchronized reading. That is not validation of an implemented clock
+provider: moved profiles, machine identity, Linux time namespaces, the OS's
+actual sync flags, suspend, reboot and repairs still need step 4 tests.
 
 - **Boot time.** Atem measures elapsed time on a raw counter that keeps
   counting while the machine sleeps, and that nothing slews or steps:
