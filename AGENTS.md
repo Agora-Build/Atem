@@ -34,7 +34,7 @@ cargo test -p atem-core -p atem-core-ffi # Token library + C ABI tests (workspac
 cargo build --release && cargo test --release --bin atem perf_ -- --ignored --nocapture --test-threads=1 # Encrypted-path performance (src/memory/perf_tests.rs; prints numbers to compare with the budgets in designs/e2e-encryption.md "Performance"; perf_2c waits for a quiet host)
 ./scripts/check-atem-core-ffi.sh         # Build libatem_core_ffi.a, drive it from C (and Swift on macOS)
 cargo test -p atem-client -p atem-client-ffi # r9 client core + bindings: vectors, r9 client/relay fixtures, channel and end-to-end tests
-python3 -I scripts/check-r9-vectors.py designs/protocol/fixtures # independent check of the r9 vectors (Python `cryptography` only; keys, membership log and control records today)
+python3 -I scripts/check-r9-vectors.py designs/protocol/fixtures # independent check of the r9 vectors (Python `cryptography` only; keys, membership log, control records, push hints, the delegated wire and host envelopes today)
 ./scripts/check-atem-client-bindings.sh [kotlin] [wasm] [swift] [e2e] # binding conformance over the r9 vectors and the host-work framing vectors (toolchains from env: KOTLINC, JNA_JAR, WASM_BINDGEN)
 ./scripts/package-atem-client-bindings.sh <ver> <out> [wasm] [kotlin] [android] # binding packages + SHA256SUMS + SOURCE.json (android: ANDROID_NDK_HOME); check-atem-client-packages.sh checks them; Apple: package-atem-client-apple.sh
 cargo test --test runtime_fixtures_binary r9_fixtures -- --nocapture # r9 host scenarios against the real runtime (ATEM_FIXTURE=<name>[,…], ATEM_R9_PARALLEL)

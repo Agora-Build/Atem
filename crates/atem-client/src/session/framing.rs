@@ -118,7 +118,8 @@ pub const TAG_LEN: usize = 14;
 /// (host-work v1: 28,672 bytes with attachments).
 pub const ATTACHMENT_RESERVE: usize = 4096;
 /// The longest sender principal: `service:` (or `browser:`) and a 128-byte
-/// id. Local senders (`local`, with their session) are shorter.
+/// id. A host sender (`host:`, delegated host work II.2.1) and local
+/// senders (`local`, with their session) are shorter.
 pub const MAX_SENDER_BYTES: usize = "service:".len() + MAX_OPAQUE_ID_BYTES;
 
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";

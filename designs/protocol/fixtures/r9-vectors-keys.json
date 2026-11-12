@@ -130,6 +130,13 @@
       },
       "note": "host-b's host encryption key (label \"host-b host_enc_key 1\")"
     },
+    "host-b-enc-2": {
+      "enc": {
+        "pub_hex": "eae49be083c18abf0345066248c65d57f1cc0188859b1d3c359da5d20eeec143",
+        "secret_hex": "e8b594bff6d56a6fe1717692e7b40951625e5efe55b30a9ee87c3995ef6e5d9b"
+      },
+      "note": "host-b's second host encryption key (label \"host-b host_enc_key 2\"): the host-envelope vectors' rotation of host-b"
+    },
     "host-b-gen-2": {
       "host_key": {
         "alg": "ed25519",

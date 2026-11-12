@@ -48,6 +48,11 @@ pub enum ProviderError {
     Cancelled { reason: String },
     /// No key by that id.
     UnknownKey,
+    /// `hpke_open` only: the seal doesn't open under this key (the AEAD
+    /// refuses the ciphertext, or `enc` isn't a valid X25519 public key).
+    /// The sender's doing, not the provider's: the core judges the object
+    /// (planned, for host mail; a new case for Astation's providers).
+    OpenFailed,
     /// Any other platform failure.
     Failed { reason: String },
 }
@@ -57,6 +62,7 @@ impl std::fmt::Display for ProviderError {
         match self {
             ProviderError::Cancelled { reason } => write!(f, "cancelled: {reason}"),
             ProviderError::UnknownKey => f.write_str("unknown key"),
+            ProviderError::OpenFailed => f.write_str("the seal doesn't open under this key"),
             ProviderError::Failed { reason } => write!(f, "failed: {reason}"),
         }
     }
@@ -88,7 +94,11 @@ pub trait AppKeyProvider: Send + Sync {
 
     /// RFC 9180 base-mode open with an X25519 key: DHKEM(X25519,
     /// HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305 (CryptoKit `HPKE`,
-    /// Tink).
+    /// Tink). A seal that doesn't open under the key (the AEAD refuses it,
+    /// or `enc` isn't a valid X25519 public key) fails with
+    /// [`ProviderError::OpenFailed`]: the core then judges the object, as it
+    /// does its own seal that doesn't open; any other failure is the
+    /// provider's, and decides nothing.
     fn hpke_open(
         &self,
         key_id: String,
@@ -169,9 +179,13 @@ pub fn describe(input: &SigningInput) -> (SigningPurpose, Option<String>) {
         SignLabel::ChannelClient => (SigningPurpose::Channel, None),
         // A host's `enc_sig` signs fields, not a body (II.4.1).
         SignLabel::ChannelHost | SignLabel::HostEncKey => (SigningPurpose::HostSigning, None),
-        SignLabel::PushHint | SignLabel::Seen | SignLabel::HostRoute => {
-            (SigningPurpose::HostSigning, body())
-        }
+        // Signed bodies the host makes with its `host_key`: an envelope and
+        // a result between hosts (II.4.2, II.4.4) too.
+        SignLabel::PushHint
+        | SignLabel::Seen
+        | SignLabel::HostRoute
+        | SignLabel::Envelope
+        | SignLabel::Result => (SigningPurpose::HostSigning, body()),
         SignLabel::BrowserGrant => (SigningPurpose::BrowserGrant, body()),
         // A control record (delegated host-work I.5.3), by its signer.
         SignLabel::HostWorkControl => {
@@ -247,6 +261,7 @@ pub fn sign_request(key: &KeyId, input: &SigningInput) -> SignRequest {
 fn provider_error(e: ProviderError) -> atem_client::Error {
     match e {
         ProviderError::UnknownKey => atem_client::Error::UnknownKey,
+        ProviderError::OpenFailed => atem_client::Error::OpenFailed,
         other => atem_client::Error::Provider(other.to_string()),
     }
 }
@@ -444,6 +459,10 @@ impl AppKeyProvider for SoftwareKeyStore {
             SignLabel::HostRoute,
             SignLabel::HostEncKey,
             SignLabel::HostWorkControl,
+            // A host's mail (delegated host work II.4.2, II.4.4; host role,
+            // planned): the conformance suites seal through this store.
+            SignLabel::Envelope,
+            SignLabel::Result,
         ]
         .into_iter()
         .find(|l| l.as_str().as_bytes() == label)
@@ -492,8 +511,14 @@ impl AppKeyProvider for SoftwareKeyStore {
     ) -> Result<Vec<u8>, ProviderError> {
         KeyProvider::hpke_open(self, &KeyId(key_id), &enc, &ct, &info, &aad)
             .map(|p| p.to_vec())
-            .map_err(|e| ProviderError::Failed {
-                reason: e.to_string(),
+            .map_err(|e| match e {
+                // The seal doesn't open under this key: an AEAD refusal or
+                // an `enc` that isn't a key (`open_with_secret`). Anything
+                // else is the store's own.
+                atem_client::Error::OpenFailed => ProviderError::OpenFailed,
+                other => ProviderError::Failed {
+                    reason: other.to_string(),
+                },
             })
     }
 }
@@ -659,5 +684,77 @@ mod tests {
             trailing.input.extend_from_slice(extra);
             assert!(AppKeyProvider::sign(&*store, trailing).is_err());
         }
+        // A host's mail is signed through the store too (host role).
+        for label in [SignLabel::Envelope, SignLabel::Result] {
+            let request = sign_request(&KeyId::new("k"), &SigningInput::new(label, b"{}"));
+            assert_eq!(request.purpose, SigningPurpose::HostSigning);
+            assert_eq!(AppKeyProvider::sign(&*store, request).unwrap().len(), 64);
+        }
+    }
+
+    /// A seal that doesn't open under the key is `ProviderError::OpenFailed`
+    /// from a platform provider (`AppKeyProvider::hpke_open`) and the core's
+    /// `OpenFailed` through it, so the core judges the object; a key the
+    /// provider doesn't have stays the provider's failure.
+    #[cfg(all(feature = "software-keys", feature = "uniffi"))]
+    #[test]
+    fn a_seal_that_does_not_open_is_open_failed_through_the_platform() {
+        let store = SoftwareKeyStore::new();
+        store.insert_x25519("enc".into(), vec![9u8; 32]).unwrap();
+        let public = KeyProvider::public_key(&*store, &KeyId::new("enc")).unwrap();
+        let sealed =
+            atem_client::hpke::seal(public.as_32().unwrap(), b"info", b"", b"plain").unwrap();
+        let platform = Platform(store.clone().provider());
+        let enc_key = KeyId::new("enc");
+        let open =
+            |info: &[u8], ct: &[u8]| platform.hpke_open(&enc_key, &sealed.enc, ct, info, b"");
+        assert_eq!(&open(b"info", &sealed.ct).unwrap()[..], b"plain");
+        assert_eq!(
+            open(b"other info", &sealed.ct),
+            Err(atem_client::Error::OpenFailed)
+        );
+        let mut flipped = sealed.ct.clone();
+        flipped[0] ^= 1;
+        assert_eq!(open(b"info", &flipped), Err(atem_client::Error::OpenFailed));
+        // The store itself, as a foreign provider: the typed case, for an
+        // AEAD refusal and for an `enc` that isn't a key.
+        let foreign = |enc: &[u8], ct: &[u8], info: &[u8]| {
+            AppKeyProvider::hpke_open(
+                &*store,
+                "enc".into(),
+                enc.to_vec(),
+                ct.to_vec(),
+                info.to_vec(),
+                vec![],
+            )
+        };
+        assert_eq!(
+            foreign(&sealed.enc, &flipped, b"info"),
+            Err(ProviderError::OpenFailed)
+        );
+        assert_eq!(
+            foreign(&[1u8; 31], &sealed.ct, b"info"),
+            Err(ProviderError::OpenFailed)
+        );
+        assert!(matches!(
+            AppKeyProvider::hpke_open(
+                &*store,
+                "gone".into(),
+                sealed.enc.to_vec(),
+                sealed.ct.clone(),
+                b"info".to_vec(),
+                vec![]
+            ),
+            Err(ProviderError::Failed { .. } | ProviderError::UnknownKey)
+        ));
+        let missing =
+            platform.hpke_open(&KeyId::new("gone"), &sealed.enc, &sealed.ct, b"info", b"");
+        assert!(
+            matches!(
+                missing,
+                Err(atem_client::Error::Provider(_) | atem_client::Error::UnknownKey)
+            ),
+            "{missing:?}"
+        );
     }
 }

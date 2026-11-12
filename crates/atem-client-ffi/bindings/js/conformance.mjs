@@ -839,6 +839,109 @@ check("Station: the Portal's statuses in their classes", () => {
   throwsCode(() => m.reportAnswer(200.5), "malformed");
 });
 
+// ------------------------------- delegated host work: envelopes and results
+// r9-vectors-host-envelope (host-work-v1 §11.5; planned, host role, feature
+// `host`): the device lists (log L and the file's `entries`), the builders
+// reproducing every `built` object byte for byte, and every check's verdict
+// through openEnvelope or acceptResult, with the plaintext an open gives.
+const mail = load("r9-vectors-host-envelope");
+const mailEntry = Object.fromEntries(mail.entries.map((e) => [e.label, e]));
+const mailObject = Object.fromEntries(mail.objects.map((o) => [o.label, o]));
+const mailList = (chain) => {
+  const log = logL();
+  eq(log.extend(chain.map((label) => str(mailEntry[label].entry)), NOW).stop, null, `chain ${chain}`);
+  return log;
+};
+// Every host key under its r9-vectors-keys name, and every host encryption key.
+const mailStore = () => {
+  const store = new m.SoftwareKeyStore();
+  for (const [name, k] of Object.entries(keys)) {
+    if (k.host_key) store.insertEd25519(name, unhex(k.host_key.secret_hex));
+    if (name.startsWith("host-") && k.enc) store.insertX25519(name, unhex(k.enc.secret_hex));
+  }
+  return store;
+};
+const encRaw = (name) => unhex(keys[name].enc.pub_hex);
+const mailHost = (h) => ({ hostId: h.host_id, hostTrustGen: h.host_trust_gen });
+const mailFields = (b) => ({
+  accountId: b.account_id,
+  genesisHash: b.genesis_hash,
+  sender: mailHost(b.sender),
+  recipient: mailHost(b.recipient),
+  encKid: b.recipient.enc_kid,
+  id: b.id,
+  createdAt: b.created_at,
+  expiresAt: b.expires_at,
+  signedAtHead: { seq: b.signed_at_head.seq, hash: b.signed_at_head.hash },
+});
+const mailRecipient = (r) => ({ ...mailHost(r), keys: r.keys.map((name) => ({ keyId: name, encKid: m.encKid(encRaw(name)) })) });
+const mailOutbox = (o) => ({ recipient: mailHost(o.recipient), messageId: o.message_id, cancelCompleteIds: o.cancel_complete_ids, taskIds: o.task_ids });
+// A verdict as `expect` writes it; an open's plaintext against the object's.
+const mailExpect = (c, got) => {
+  const { type, plainJson, hostId, hostTrustGen, objectId, ...rest } = got;
+  const v = { verdict: type, ...rest };
+  if (hostId !== undefined) Object.assign(v, { host_id: hostId, host_trust_gen: hostTrustGen });
+  if (objectId !== undefined) v.object_id = objectId;
+  same(v, c.expect, c.label);
+  const sealed = mailObject[c.object].sealed;
+  if (plainJson === undefined) return;
+  if (sealed.plaintext !== undefined) eq(plainJson, sealed.plaintext, c.label);
+  else eq([Buffer.byteLength(plainJson), createHash("sha256").update(plainJson).digest("hex")], [sealed.plaintext_bytes, sealed.plaintext_sha256], c.label);
+};
+check("host mail: the entries extend log L to their hashes", () => {
+  for (const e of mail.entries) {
+    const r = mailList(e.chain).extend([str(e.entry)], NOW);
+    eq(r.stop, null, e.label);
+    eq(r.head.hash, e.entry_hash, e.label);
+  }
+});
+check("host mail: the builders reproduce every built object; a fresh seal opens; what no builder seals is refused", () => {
+  const store = mailStore();
+  let built = 0;
+  for (const o of mail.objects.filter((x) => x.built && x.sealed.plaintext !== undefined)) {
+    const seal = o.kind === "envelope" ? m.sealEnvelopeWithIkm : m.sealResultWithIkm;
+    eq(seal(store, o.signed_with, mailFields(o.object.body), o.sealed.plaintext, encRaw(o.sealed.to), unhex(o.sealed.ikmE_hex)), m.canonicalJson(str(o.object)), o.label);
+    built++;
+  }
+  if (built < 20) throw new Error(`${built} built`);
+  const B = ["M7_add_host_b", "M8_enc_a", "M9_enc_b", "M10_add_host_evil"];
+  const toB = mailRecipient({ host_id: "host-b", host_trust_gen: 1, keys: ["host-b-enc-1"] });
+  const req = mailObject.request;
+  const fresh = m.sealEnvelope(store, "host-a", mailFields(req.object.body), req.sealed.plaintext, encRaw("host-b-enc-1"));
+  eq(m.openEnvelope(fresh, mailList(B), toB, store, mail.now), { type: "open", plainJson: req.sealed.plaintext, sender: "host:host-a" });
+  // The builder seals a plaintext's canonical form only.
+  const loose = mailObject.plaintext_not_canonical;
+  const canonical = m.sealEnvelope(store, "host-a", mailFields(loose.object.body), loose.sealed.plaintext, encRaw("host-b-enc-1"));
+  eq(m.openEnvelope(canonical, mailList(B), toB, store, mail.now).plainJson, m.canonicalJson(loose.sealed.plaintext));
+  const status = mailObject.status;
+  const freshResult = m.sealResult(store, "host-b", mailFields(status.object.body), status.sealed.plaintext, encRaw("host-a-enc-1"));
+  const toA = mailRecipient({ host_id: "host-a", host_trust_gen: 1, keys: ["host-a-enc-1"] });
+  const row = mailOutbox(mail.checks.find((c) => c.label === "status_accepted").outbox);
+  eq(m.acceptResult(freshResult, mailList(B), toA, row, store, mail.now).type, "accepted");
+  throwsCode(() => m.sealEnvelope(store, "host-a", mailFields(mailObject.plaintext_null.object.body), mailObject.plaintext_null.sealed.plaintext, encRaw("host-b-enc-1")), "null_value");
+  throwsCode(() => m.sealResult(store, "host-b", mailFields(mailObject.dropped_reply.object.body), mailObject.dropped_reply.sealed.plaintext, encRaw("host-a-enc-1")), "malformed");
+  // The enc_kid names the key sealed to.
+  throwsCode(() => m.sealEnvelope(store, "host-a", mailFields(req.object.body), req.sealed.plaintext, encRaw("host-a-enc-1")), "malformed");
+});
+check("host mail: every envelope check's verdict (openEnvelope)", () => {
+  const store = mailStore();
+  let n = 0;
+  for (const c of mail.checks.filter((x) => x.call === "open_envelope")) {
+    mailExpect(c, m.openEnvelope(str(mailObject[c.object].object), mailList(c.chain), mailRecipient(c.receiver), store, c.now));
+    n++;
+  }
+  if (n < 44) throw new Error(`${n} checks`);
+});
+check("host mail: every result check's verdict (acceptResult)", () => {
+  const store = mailStore();
+  let n = 0;
+  for (const c of mail.checks.filter((x) => x.call === "accept_result")) {
+    mailExpect(c, m.acceptResult(str(mailObject[c.object].object), mailList(c.chain), mailRecipient(c.receiver), mailOutbox(c.outbox), store, c.now));
+    n++;
+  }
+  if (n < 9) throw new Error(`${n} checks`);
+});
+
 // ---------------------------------------------------------------- recovery
 const kit1 = () => m.RecoveryKit.read(unhex(rec.R_hex), rec.kit.account_id, rec.kit.genesis_hash, unhex(rec.kit.kit_tag_hex));
 check("kit 1: tag, recovery key, X25519 key", () => {

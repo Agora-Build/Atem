@@ -5,15 +5,14 @@
 # Astation should after downloading it (designs/protocol/atem-client-bindings.md
 # §7): the SHA-256 sums, the source pin, the shared vectors listed in the sums
 # and unchanged (host-work requests, prompt framing, framing size; r9 control,
-# push-hint and delegated-wire vectors; the acknowledgment fixtures), no
-# test-only or host-role export in the shipped bindings (the framing's
-# vectors-only rendering included), and each package used once: the Node
-# build of the WASM package runs the packaged framing vectors (escaping,
-# Unicode version, the preflight size check) and, with the JVM jar (through
-# JNA), reads the r9 pairing vectors' verifyCommit messages with the shared
-# parser. The Android zip:
-# each ABI's ELF class, machine, 16 KB LOAD alignment and exports (READELF,
-# default readelf).
+# push-hint, delegated-wire and host-envelope vectors; the acknowledgment
+# fixtures), no test-only or host-role export in the shipped bindings (the
+# framing's vectors-only rendering and host mail included), and each package
+# used once: the Node build of the WASM package runs the packaged framing
+# vectors (escaping, Unicode version, the preflight size check) and, with the
+# JVM jar (through JNA), reads the r9 pairing vectors' verifyCommit messages
+# with the shared parser. The Android zip: each ABI's ELF class, machine,
+# 16 KB LOAD alignment and exports (READELF, default readelf).
 #   EXPECT_COMMIT  the full SHA the packages must pin (with a clean tree)
 #   NODE  node (default: node on PATH)
 #   JAVA, JAVAC  java and javac (default: on PATH), and JNA_JAR: the jar check
@@ -28,9 +27,10 @@ trap 'rm -rf "$WORK"' EXIT
 VECTORS="$ROOT/designs/protocol/fixtures/r9-vectors-pairing.json"
 
 (cd "$DIR" && sha256sum -c "atem-client-${VERSION}-SHA256SUMS.txt")
-# The shared vectors and the Station's acknowledgment fixtures (test 48)
-# ship beside the bindings, each listed in the sums and the same bytes as the
-# repository's.
+# The shared host-work and r9 vectors and the Station's acknowledgment
+# fixtures (test 48) ship beside the packages, each listed in the sums
+# (sha256sum -c above checked what is listed, not that it is listed) and the
+# same bytes as the repository's.
 SHIPPED_VECTORS=(
   host-work/requests-v1.json:host-work-requests-v1.json
   host-work/prompt-framing-v1.json:host-work-prompt-framing-v1.json
@@ -38,6 +38,7 @@ SHIPPED_VECTORS=(
   r9-vectors-host-work-control.json:r9-vectors-host-work-control.json
   r9-vectors-push-hint.json:r9-vectors-push-hint.json
   r9-vectors-delegated-wire.json:r9-vectors-delegated-wire.json
+  r9-vectors-host-envelope.json:r9-vectors-host-envelope.json
 )
 for fixture in "$ROOT"/designs/protocol/fixtures/r9-control-ack-*.json; do
   SHIPPED_VECTORS+=("$(basename "$fixture"):$(basename "$fixture")")
@@ -45,8 +46,9 @@ done
 for vector in "${SHIPPED_VECTORS[@]}"; do
   source="$ROOT/designs/protocol/fixtures/${vector%%:*}"
   shipped="atem-client-${VERSION}-${vector#*:}"
-  grep -q "  $shipped\$" "$DIR/atem-client-${VERSION}-SHA256SUMS.txt" ||
-    { echo "vectors: $shipped is not in the SHA256SUMS" >&2; exit 1; }
+  test -s "$DIR/$shipped" || { echo "$shipped: missing from the package directory" >&2; exit 1; }
+  awk -v f="$shipped" '$2 == f {found = 1} END {exit !found}' "$DIR/atem-client-${VERSION}-SHA256SUMS.txt" \
+    || { echo "$shipped: not listed in the sums" >&2; exit 1; }
   cmp -s "$source" "$DIR/$shipped" ||
     { echo "vectors: $shipped differs from ${vector%%:*}" >&2; exit 1; }
 done
@@ -68,7 +70,7 @@ assert pin["toolchain"].get("rustc"), pin
 print("source pin:", pin["commit"], "dirty" if pin["tree_dirty"] else "clean")
 EOF
 # No test-only or host-role export ships.
-FORBIDDEN='SoftwareKeyStore|signSeen|sign_seen|admitCarrier|admit_carrier|AdmissionInfo|framingRenderForVectors|framing_render_for_vectors'
+FORBIDDEN='SoftwareKeyStore|signSeen|sign_seen|admitCarrier|admit_carrier|AdmissionInfo|framingRenderForVectors|framing_render_for_vectors|sealEnvelope|seal_envelope|openEnvelope|open_envelope|sealResult|seal_result|acceptResult|accept_result|MailFieldsData'
 
 WASM="$DIR/atem-client-${VERSION}-wasm.tar.gz"
 if [ -f "$WASM" ]; then
@@ -188,7 +190,7 @@ if [ -f "$ANDROID" ]; then
     [ "$ALIGNS" = 0x4000 ] || { echo "android $ABI: LOAD alignment '$ALIGNS', need 0x4000" >&2; exit 1; }
     SYMS=$("$READELF" --dyn-syms -W "$SO")
     [ -n "$SYMS" ] || { echo "android $ABI: no dynamic symbols read" >&2; exit 1; }
-    if grep -qiE 'sign_seen|admit_carrier|software_?key|framing_render_for_vectors' <<<"$SYMS"; then
+    if grep -qiE 'sign_seen|admit_carrier|software_?key|framing_render_for_vectors|seal_envelope|open_envelope|seal_result|accept_result' <<<"$SYMS"; then
       echo "android $ABI: a test-only or host-role symbol is exported" >&2
       exit 1
     fi

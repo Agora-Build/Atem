@@ -56,8 +56,23 @@ final class CryptoKitKeys: AppKeyProvider, @unchecked Sendable {
     func hpkeOpen(keyId: String, enc: Data, ct: Data, info: Data, aad: Data) throws -> Data {
         guard case .x25519(let k) = try key(keyId) else { throw ProviderError.Failed(reason: "not X25519") }
         guard #available(macOS 14.0, iOS 17.0, *) else { throw ProviderError.Failed(reason: "HPKE needs macOS 14 / iOS 17") }
-        var recipient = try HPKE.Recipient(privateKey: k, ciphersuite: .Curve25519_SHA256_ChachaPoly, info: info, encapsulatedKey: enc)
-        return try recipient.open(ct, authenticating: aad)
+        // A seal that doesn't open under this key is the typed OpenFailed,
+        // which the core judges: the recipient context refuses the
+        // encapsulated key (the key and suite are this provider's own, so
+        // what it refuses is the sender's `enc`), or the AEAD's
+        // authentication fails. Any other error is this provider's own
+        // failure.
+        var recipient: HPKE.Recipient
+        do {
+            recipient = try HPKE.Recipient(privateKey: k, ciphersuite: .Curve25519_SHA256_ChachaPoly, info: info, encapsulatedKey: enc)
+        } catch {
+            throw ProviderError.OpenFailed
+        }
+        do {
+            return try recipient.open(ct, authenticating: aad)
+        } catch CryptoKitError.authenticationFailure {
+            throw ProviderError.OpenFailed
+        }
     }
 }
 #endif
