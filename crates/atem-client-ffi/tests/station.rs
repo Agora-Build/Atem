@@ -16,13 +16,15 @@ use std::sync::Arc;
 
 use atem_client_ffi::AtemError;
 use atem_client_ffi::station::{
-    AckLedgerHandle, AckTransition, relay_control_ack, relay_control_sync,
-    relay_control_sync_result, relay_decode_to_host, relay_decode_to_station, relay_heads,
-    relay_membership_fetch, relay_membership_fetch_result, report_answer,
+    AckLedgerHandle, AckTransition, relay_control_ack, relay_control_ack_refused,
+    relay_control_sync, relay_control_sync_refused, relay_control_sync_result,
+    relay_decode_to_host, relay_decode_to_station, relay_heads, relay_membership_fetch,
+    relay_membership_fetch_refused, relay_membership_fetch_result, report_answer,
 };
 use atem_client_ffi::types::{
-    LedgerAlertInfo, LinkAssociationInfo, LogHead, RelayFeedHead, RelayFeedRecord, RelayToHost,
-    RelayToStation, ReportAnswerKind, ReportIntentInfo, StationReport,
+    LedgerAlertInfo, LinkAssociationInfo, LogHead, RelayFeedHead, RelayFeedRecord,
+    RelayRefusalCode, RelayToHost, RelayToStation, ReportAnswerKind, ReportIntentInfo,
+    StationReport,
 };
 use serde_json::{Value, json};
 use support::*;
@@ -621,4 +623,100 @@ fn the_portals_statuses_fall_in_their_classes() {
     ] {
         assert_eq!(report_answer(status), want, "{status}");
     }
+}
+
+/// The Station's refusals (agreed with Astation, 2026-11-11): the three
+/// replies exactly, read back strictly as the host's typed refusals; and
+/// an ack refused for its stale association, answered
+/// `control_ack_refused`, with nothing counted, kept or disclosed.
+#[test]
+fn the_three_refusals_and_a_stale_association_refused_without_disclosure() {
+    use RelayRefusalCode::Forbidden;
+    let replies = [
+        (
+            relay_control_sync_refused(Forbidden).unwrap(),
+            "control_sync_refused",
+            RelayToHost::ControlSyncRefused { code: Forbidden },
+        ),
+        (
+            relay_membership_fetch_refused(Forbidden).unwrap(),
+            "membership_fetch_refused",
+            RelayToHost::MembershipFetchRefused { code: Forbidden },
+        ),
+        (
+            relay_control_ack_refused(Forbidden).unwrap(),
+            "control_ack_refused",
+            RelayToHost::ControlAckRefused { code: Forbidden },
+        ),
+    ];
+    for (message, op, want) in replies {
+        let v: Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(v, json!({"type": "relay", "op": op, "code": "forbidden"}));
+        assert_eq!(relay_decode_to_host(message.clone()).unwrap(), want);
+        assert_eq!(
+            code(relay_decode_to_station(message).unwrap_err()),
+            "wrong_message"
+        );
+        for (fields, want) in [
+            (r#""code":"not_found""#, "malformed"),
+            (r#""code":null"#, "malformed"),
+            (r#""code":"forbidden","feed_id":"x""#, "unknown_field"),
+            (r#""code":"forbidden","code":"forbidden""#, "not_strict"),
+        ] {
+            let bad = format!(r#"{{"type":"relay","op":"{op}",{fields}}}"#);
+            assert_eq!(code(relay_decode_to_host(bad).unwrap_err()), want);
+        }
+    }
+
+    // A stale association: the link was verified at trust generation 2,
+    // the ack claims 1.
+    let file = load("r9-control-ack-deadline");
+    let st = &file["setup"]["station"];
+    let ledger = AckLedgerHandle::new(
+        s(&st["origin"]),
+        s(&st["account_id"]),
+        s(&st["genesis_hash"]),
+    )
+    .unwrap();
+    let s4 = records()["S4_revoke"].to_string();
+    let ledger = ledger
+        .record(
+            s4,
+            1_793_620_903_000,
+            vec!["host-b".into()],
+            1_793_620_940_000,
+        )
+        .unwrap()
+        .next;
+    let before = ledger.to_json();
+    let ack = file["steps"][1]["control_ack"].to_string();
+    let mut link = LinkAssociationInfo {
+        account_id: s(&st["account_id"]),
+        genesis_hash: s(&st["genesis_hash"]),
+        host_id: "host-b".into(),
+        host_trust_gen: 2,
+        connection_id: "relay-1:host-b".into(),
+    };
+    let e = ledger
+        .ack(link.clone(), ack.clone(), 1_793_620_940_000)
+        .unwrap_err();
+    assert_eq!(code(e), "not_the_link");
+    // Nothing counted or kept: the same state, nothing to send.
+    assert_eq!(ledger.to_json(), before);
+    assert!(ledger.pending_reports().is_empty());
+    // The reply names nothing of the ack, the link or the ledger.
+    let reply = relay_control_ack_refused(Forbidden).unwrap();
+    for secret in [
+        s(&st["account_id"]),
+        s(&st["genesis_hash"]),
+        s(&st["origin"]),
+        "host-b".to_owned(),
+        "00000000-0000-4000-8000-000000000004".to_owned(),
+    ] {
+        assert!(!reply.contains(&secret), "{secret}");
+    }
+    // Once the link's association is the ack's, it counts.
+    link.host_trust_gen = 1;
+    let t = ledger.ack(link, ack, 1_793_620_940_000).unwrap();
+    assert_eq!(t.made.len(), 2);
 }

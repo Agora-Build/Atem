@@ -1098,6 +1098,50 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: "{\"type\":\"relay\",\"op\":\"push_hint\",\"hints\":[]}") }
             try throwsCode("not_strict") { _ = try relayDecodeToStation(message: "{") }
         }
+        check("Station calls: the three refusals exactly and read strictly; a stale-association ack refused without disclosure or ledger advance") {
+            let refusals: [((RelayRefusalCode) throws -> String, String, RelayToHost)] = [
+                ({ try relayControlSyncRefused(code: $0) }, "control_sync_refused", .controlSyncRefused(code: .forbidden)),
+                ({ try relayMembershipFetchRefused(code: $0) }, "membership_fetch_refused", .membershipFetchRefused(code: .forbidden)),
+                ({ try relayControlAckRefused(code: $0) }, "control_ack_refused", .controlAckRefused(code: .forbidden)),
+            ]
+            for (build, op, want) in refusals {
+                let msg = try build(.forbidden)
+                try eq(try canonicalJson(json: msg), try canonicalJson(json: js(["type": "relay", "op": op, "code": "forbidden"])), op)
+                try eq(try relayDecodeToHost(message: msg), want, op)
+                try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: msg) }
+                let bad: [(String, String)] = [
+                    ("\"code\":\"not_found\"", "malformed"),
+                    ("\"code\":null", "malformed"),
+                    ("\"code\":\"forbidden\",\"feed_id\":\"x\"", "unknown_field"),
+                    ("\"code\":\"forbidden\",\"code\":\"forbidden\"", "not_strict"),
+                ]
+                for (fields, code) in bad {
+                    try throwsCode(code) { _ = try relayDecodeToHost(message: "{\"type\":\"relay\",\"op\":\"\(op)\",\(fields)}") }
+                }
+            }
+            // A stale association: the link was verified at trust generation 2, the ack claims 1.
+            let f = try load("r9-control-ack-deadline")
+            let setup = o(f["setup"])
+            let st = o(setup["station"])
+            let nowMs: UInt64 = 1_793_620_940_000
+            let l = try AckLedgerHandle(origin: s(st["origin"]), accountId: s(st["account_id"]), genesisHash: s(st["genesis_hash"]))
+                .record(recordJson: ctlRecord("S4_revoke"), revokedAtMs: 1_793_620_903_000, coveredHosts: ["host-b"], nowMs: nowMs).next
+            let before = l.toJson()
+            let ack = js(o(a(f["steps"])[1])["control_ack"]!)
+            var link = linkOf(o(setup["links"])["host-b"])
+            link.hostTrustGen = 2
+            try throwsCode("not_the_link") { _ = try l.ack(link: link, ackJson: ack, nowMs: nowMs) }
+            try eq(l.toJson(), before)
+            try eq(l.pendingReports(), [ReportIntentInfo]())
+            let reply = try relayControlAckRefused(code: .forbidden)
+            let secrets = [s(st["account_id"]), s(st["genesis_hash"]), s(st["origin"]), "host-b",
+                           s(o(o(ctlByLabel["S4_revoke"]!["record"])["body"])["record_id"])]
+            for secret in secrets where reply.contains(secret) {
+                throw Failure(description: "the refusal names \(secret)")
+            }
+            link.hostTrustGen = 1
+            try eq(try l.ack(link: link, ackJson: ack, nowMs: nowMs).made.count, 2)
+        }
         check("Station: the Portal's statuses in their classes") {
             let want: [(UInt16, String)] = [(200, "confirm"), (401, "retry"), (408, "retry"), (429, "retry"), (500, "retry"), (503, "retry"),
                                             (400, "refuse"), (404, "refuse"), (409, "refuse"), (413, "refuse"), (415, "refuse"),
@@ -1308,6 +1352,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 59)
+        XCTAssertEqual(passed, 60)
     }
 }

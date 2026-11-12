@@ -1215,6 +1215,38 @@ pub fn relay_control_ack(ack: JsValue) -> JsResult<String> {
     ))
 }
 
+fn refusal_code(code: &str) -> JsResult<crate::types::RelayRefusalCode> {
+    match code {
+        "forbidden" => Ok(crate::types::RelayRefusalCode::Forbidden),
+        _ => Err(bad("a refusal's code is \"forbidden\"")),
+    }
+}
+
+/// `control_sync_refused{code}` (`relay_control_sync_refused`; `code` is
+/// `"forbidden"`).
+#[wasm_bindgen(js_name = relayControlSyncRefused)]
+pub fn relay_control_sync_refused(code: String) -> JsResult<String> {
+    err(crate::station::relay_control_sync_refused(refusal_code(
+        &code,
+    )?))
+}
+
+/// `membership_fetch_refused{code}` (`relay_membership_fetch_refused`).
+#[wasm_bindgen(js_name = relayMembershipFetchRefused)]
+pub fn relay_membership_fetch_refused(code: String) -> JsResult<String> {
+    err(crate::station::relay_membership_fetch_refused(
+        refusal_code(&code)?,
+    ))
+}
+
+/// `control_ack_refused{code}` (`relay_control_ack_refused`).
+#[wasm_bindgen(js_name = relayControlAckRefused)]
+pub fn relay_control_ack_refused(code: String) -> JsResult<String> {
+    err(crate::station::relay_control_ack_refused(refusal_code(
+        &code,
+    )?))
+}
+
 /// `membership_fetch{after}` (`relay_membership_fetch`).
 #[wasm_bindgen(js_name = relayMembershipFetch)]
 pub fn relay_membership_fetch(after: f64) -> JsResult<String> {

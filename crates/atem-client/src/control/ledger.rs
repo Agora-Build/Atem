@@ -142,7 +142,7 @@ use crate::session::wire::is_uuid_v4;
 use crate::station_route::normalize_relay;
 
 use super::record::{ControlAction, ControlPrincipal, ControlRecord, ControlSigner};
-use super::relay::{AckResult, ControlAck, RelayError};
+use super::relay::{AckResult, CallRefused, ControlAck, RefusalCode, RefusedCall, RelayError};
 use super::state::{ApplicationResult, EffectKind};
 
 /// How long after a revocation the Station reports it `deadline_passed`:
@@ -529,6 +529,29 @@ pub enum AckRefusal {
 }
 
 impl AckRefusal {
+    /// The reply the Station sends the host on the link for this refusal:
+    /// `control_ack_refused{forbidden}` when the ack is refused for its
+    /// association on this link (its claimed account, root, host or trust
+    /// generation isn't the link's, the link is another device list's, or
+    /// the ack is about another Station's feed; agreed with Astation,
+    /// 2026-11-11). None for a refusal that is no authorization failure on
+    /// the link (the Station's own incomplete association, a malformed ack,
+    /// a result whose effects aren't its record's): the Station logs and
+    /// alerts, and tells the host nothing. Either way nothing is counted.
+    pub fn reply(&self) -> Option<CallRefused> {
+        match self {
+            AckRefusal::NotTheLink | AckRefusal::OtherAccount | AckRefusal::OtherStation => {
+                Some(CallRefused {
+                    call: RefusedCall::ControlAck,
+                    code: RefusalCode::Forbidden,
+                })
+            }
+            AckRefusal::IncompleteLink | AckRefusal::Malformed(_) | AckRefusal::NotTheRecord(_) => {
+                None
+            }
+        }
+    }
+
     pub fn code(&self) -> &'static str {
         match self {
             AckRefusal::IncompleteLink => "incomplete_link",
@@ -1806,7 +1829,9 @@ mod ack_ledger_tests {
         ControlAbout, ControlAction, ControlBody, ControlFeed, ControlPrincipal, ControlSigner,
         build_control,
     };
-    use crate::control::relay::{AckResult, ControlAck, EntryRef, RelayError};
+    use crate::control::relay::{
+        AckResult, CallRefused, ControlAck, EntryRef, RefusalCode, RefusedCall, RelayError,
+    };
     use crate::control::state::{ApplicationResult, EffectKind, EffectResult};
     use crate::membership::entry::id_ok;
     use crate::provider::KeyId;
@@ -2911,6 +2936,88 @@ mod ack_ledger_tests {
     }
 
     // ---------------------------------------------------------- refusals
+
+    /// An ack the Station refuses for its association (stale: another
+    /// trust generation or host than the link verified; another account or
+    /// root; another Station's feed) is answered `control_ack_refused`
+    /// (agreed with Astation, 2026-11-11): it names nothing, and the ledger
+    /// neither counts nor reports anything (no cursor, no evidence). A
+    /// refusal that is no authorization failure on the link (the Station's
+    /// own incomplete association, a malformed ack, a record's effects) has
+    /// no reply.
+    #[test]
+    fn an_ack_refused_for_its_association_is_answered_control_ack_refused() {
+        let (mut l, s) = revoked_ledger();
+        let applied = || vec![res(&s, &[(E::Revocation, R::Applied)])];
+        l.ack_by("a", applied(), T0);
+        let before = l.clone();
+        let reply = CallRefused {
+            call: RefusedCall::ControlAck,
+            code: RefusalCode::Forbidden,
+        };
+
+        // A stale association: the link was verified at trust generation 2,
+        // the ack claims 1.
+        let mut stale = link("b");
+        stale.host_trust_gen = 2;
+        let e = l.ack(&stale, &ack("b", applied()), T0).unwrap_err();
+        assert_eq!(e, AckRefusal::NotTheLink);
+        assert_eq!(e.reply(), Some(reply));
+        // Another account's link and claim.
+        let mut other = link("b");
+        other.account_id = "acct-other".into();
+        let mut a = ack("b", applied());
+        a.account_id = "acct-other".into();
+        let e = l.ack(&other, &a, T0).unwrap_err();
+        assert_eq!(
+            (e.clone(), e.reply()),
+            (AckRefusal::OtherAccount, Some(reply))
+        );
+        // Another Station's feed.
+        let mut a = ack("b", applied());
+        a.origin = "https://station-b.example.com".into();
+        let e = l.ack(&link("b"), &a, T0).unwrap_err();
+        assert_eq!(
+            (e.clone(), e.reply()),
+            (AckRefusal::OtherStation, Some(reply))
+        );
+        // No reply where the link is not at fault.
+        let mut incomplete = link("b");
+        incomplete.connection_id = String::new();
+        assert_eq!(
+            l.ack(&incomplete, &ack("b", applied()), T0)
+                .unwrap_err()
+                .reply(),
+            None
+        );
+        for e in [
+            AckRefusal::Malformed(RelayError::TooLarge),
+            AckRefusal::NotTheRecord(rid(1)),
+        ] {
+            assert_eq!(e.reply(), None);
+        }
+        // Nothing counted, made or kept: host-b has nothing in force.
+        assert_eq!(l, before);
+        assert_eq!(l.pending_reports(), before.pending_reports());
+        assert!(!l.to_json().to_string().contains("\"host\":\"b\""));
+        // The reply discloses nothing of the ack or the ledger.
+        let wire = reply.to_json().unwrap();
+        assert_eq!(
+            wire,
+            json!({"type": "relay", "op": "control_ack_refused", "code": "forbidden"})
+        );
+        let wire = wire.to_string();
+        for secret in [
+            ACCOUNT,
+            FEED,
+            ORIGIN,
+            INTEGRATION,
+            &rid(1),
+            &genesis().to_hex(),
+        ] {
+            assert!(!wire.contains(secret), "{secret}");
+        }
+    }
 
     #[test]
     fn ack_from_another_association_refused() {

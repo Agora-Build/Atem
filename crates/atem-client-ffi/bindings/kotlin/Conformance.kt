@@ -976,6 +976,41 @@ fun main(args: Array<String>) {
         throwsCode("wrong_message") { relayDecodeToStation("{\"type\":\"relay\",\"op\":\"push_hint\",\"hints\":[]}") }
         throwsCode("not_strict") { relayDecodeToStation("{") }
     }
+    check("Station calls: the three refusals exactly and read strictly; a stale-association ack refused without disclosure or ledger advance") {
+        val refusals: List<Triple<(RelayRefusalCode) -> String, String, RelayToHost>> = listOf(
+            Triple({ c -> relayControlSyncRefused(c) }, "control_sync_refused", RelayToHost.ControlSyncRefused(RelayRefusalCode.FORBIDDEN)),
+            Triple({ c -> relayMembershipFetchRefused(c) }, "membership_fetch_refused", RelayToHost.MembershipFetchRefused(RelayRefusalCode.FORBIDDEN)),
+            Triple({ c -> relayControlAckRefused(c) }, "control_ack_refused", RelayToHost.ControlAckRefused(RelayRefusalCode.FORBIDDEN)))
+        for ((build, op, want) in refusals) {
+            val msg = build(RelayRefusalCode.FORBIDDEN)
+            eq(canonicalJson(msg), canon(mapOf("type" to "relay", "op" to op, "code" to "forbidden")), op)
+            eq(relayDecodeToHost(msg), want, op)
+            throwsCode("wrong_message") { relayDecodeToStation(msg) }
+            for ((fields, code) in listOf("\"code\":\"not_found\"" to "malformed", "\"code\":null" to "malformed",
+                "\"code\":\"forbidden\",\"feed_id\":\"x\"" to "unknown_field",
+                "\"code\":\"forbidden\",\"code\":\"forbidden\"" to "not_strict")) {
+                throwsCode(code) { relayDecodeToHost("{\"type\":\"relay\",\"op\":\"$op\",$fields}") }
+            }
+        }
+        // A stale association: the link was verified at trust generation 2, the ack claims 1.
+        val f = load("r9-control-ack-deadline")
+        val st = f["setup"]["station"]
+        val nowMs = 1793620940000uL
+        val l = AckLedgerHandle(st["origin"].s(), st["account_id"].s(), st["genesis_hash"].s())
+            .record(ctlRecord("S4_revoke"), 1793620903000uL, listOf("host-b"), nowMs).next
+        val before = l.toJson()
+        val ack = Json.write(f["steps"][1]["control_ack"])
+        val link = linkOf(f["setup"]["links"]["host-b"]).copy(hostTrustGen = 2uL)
+        throwsCode("not_the_link") { l.ack(link, ack, nowMs) }
+        eq(l.toJson(), before)
+        eq(l.pendingReports(), emptyList<ReportIntentInfo>())
+        val reply = relayControlAckRefused(RelayRefusalCode.FORBIDDEN)
+        for (secret in listOf(st["account_id"].s(), st["genesis_hash"].s(), st["origin"].s(), "host-b",
+            ctlByLabel.getValue("S4_revoke")["record"]["body"]["record_id"].s())) {
+            if (reply.contains(secret)) throw AssertionError("the refusal names $secret")
+        }
+        eq(l.ack(link.copy(hostTrustGen = 1uL), ack, nowMs).made.size, 2)
+    }
     check("Station: the Portal's statuses in their classes") {
         for ((status, want) in listOf(200 to "confirm", 401 to "retry", 408 to "retry", 429 to "retry", 500 to "retry", 503 to "retry",
             400 to "refuse", 404 to "refuse", 409 to "refuse", 413 to "refuse", 415 to "refuse", 204 to "refuse",

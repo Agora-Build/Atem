@@ -36,10 +36,10 @@ use std::sync::Arc;
 
 use atem_client::canonical::{Numbers, parse_strict};
 use atem_client::control::{
-    AckLedger, AckResult, ApplicationResult, ControlAck, ControlRecord, ControlSync,
+    AckLedger, AckResult, ApplicationResult, CallRefused, ControlAck, ControlRecord, ControlSync,
     ControlSyncResult, EffectKind, EffectResult, EntryRef, FeedEntry, FeedHead, Heads, LedgerAlert,
-    LedgerTransition, LinkAssociation, MembershipFetch, MembershipFetchResult, Report,
-    ReportAnswer, ReportIntent, ToHost, ToStation,
+    LedgerTransition, LinkAssociation, MembershipFetch, MembershipFetchResult, RefusalCode,
+    RefusedCall, Report, ReportAnswer, ReportIntent, ToHost, ToStation,
 };
 use serde_json::Value;
 
@@ -49,9 +49,22 @@ use crate::error::{AtemError, Result};
 use crate::log::{object_json, objects_of};
 use crate::types::{
     ControlAckInfo, ControlEffectKind, ControlEffectResult, ControlResultKind, LedgerAlertInfo,
-    LinkAssociationInfo, LogHead, RelayAckResult, RelayFeedHead, RelayFeedRecord, RelayToHost,
-    RelayToStation, ReportAnswerKind, ReportIntentInfo, StationReport,
+    LinkAssociationInfo, LogHead, RelayAckResult, RelayFeedHead, RelayFeedRecord, RelayRefusalCode,
+    RelayToHost, RelayToStation, ReportAnswerKind, ReportIntentInfo, StationReport,
 };
+
+fn refusal_code(code: RefusalCode) -> RelayRefusalCode {
+    match code {
+        RefusalCode::Forbidden => RelayRefusalCode::Forbidden,
+    }
+}
+
+fn refused(call: RefusedCall, code: RelayRefusalCode) -> Result<String> {
+    let code = match code {
+        RelayRefusalCode::Forbidden => RefusalCode::Forbidden,
+    };
+    Ok(wire(CallRefused { call, code }.to_json()?))
+}
 
 /// Largest ledger state `AckLedgerHandle::from_json` reads, checked before
 /// parsing.
@@ -321,6 +334,15 @@ pub fn relay_decode_to_host(message: String) -> Result<RelayToHost> {
             head: result.head.into(),
             entries: result.entries.iter().map(object_json).collect(),
         },
+        ToHost::ControlSyncRefused(code) => RelayToHost::ControlSyncRefused {
+            code: refusal_code(code),
+        },
+        ToHost::MembershipFetchRefused(code) => RelayToHost::MembershipFetchRefused {
+            code: refusal_code(code),
+        },
+        ToHost::ControlAckRefused(code) => RelayToHost::ControlAckRefused {
+            code: refusal_code(code),
+        },
     })
 }
 
@@ -402,6 +424,31 @@ pub fn relay_membership_fetch_result(head: LogHead, entries: Vec<String>) -> Res
         entries: objects_of(&entries)?,
     };
     Ok(wire(result.to_json()?))
+}
+
+/// `control_sync_refused{code}` (Station → host): this link may not read
+/// the feed it asked for (another account's). Agreed with Astation,
+/// 2026-11-11: exactly `{"type":"relay","op":"control_sync_refused",
+/// "code":"forbidden"}`, naming nothing. Never send an empty page instead.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn relay_control_sync_refused(code: RelayRefusalCode) -> Result<String> {
+    refused(RefusedCall::ControlSync, code)
+}
+
+/// `membership_fetch_refused{code}` (Station → host): this link may not
+/// fetch that device list.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn relay_membership_fetch_refused(code: RelayRefusalCode) -> Result<String> {
+    refused(RefusedCall::MembershipFetch, code)
+}
+
+/// `control_ack_refused{code}` (Station → host): the reply to an ack
+/// `AckLedgerHandle::ack` refuses for its association on this link
+/// (`not_the_link`, `other_account`, `other_station`); no other refusal of
+/// an ack gets a reply. Nothing is counted either way.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn relay_control_ack_refused(code: RelayRefusalCode) -> Result<String> {
+    refused(RefusedCall::ControlAck, code)
 }
 
 /// The class of the Portal's HTTP `status` for a report (Auth/Portal's): a

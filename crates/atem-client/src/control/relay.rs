@@ -15,6 +15,7 @@
 //! | `control_ack` | host → Station | `account_id`, `genesis_hash`, `host_id`, `host_trust_gen`, `origin`, `feed_id`, `cursor`, `results` |
 //! | `membership_fetch` | host → Station | `after` |
 //! | `membership_fetch_result` | Station → host | `head`, `entries` |
+//! | `control_sync_refused`, `membership_fetch_refused`, `control_ack_refused` | Station → host | `code` (`forbidden`) |
 //!
 //! A `mailbox` field joins `heads` in stage 3 (II.5); until then it is an
 //! unknown field and refused.
@@ -63,6 +64,21 @@
 //! closed (fail closed) and raises a rate-limited alert; this layer only
 //! says which refusal it is.
 //!
+//! **Refusals** (agreed with Astation, 2026-11-11, Atem #120 comment
+//! 6810116314). A Station refuses a host's call on this link with
+//! `{"type":"relay","op":"<call>_refused","code":"forbidden"}`
+//! ([`CallRefused`]; `code` is exactly `forbidden` in this version, and
+//! nothing else is carried: no account, feed, host, cursor, principal,
+//! integration or record): a `control_sync` or `membership_fetch` for
+//! another account, and a `control_ack` whose claimed association isn't the
+//! link's ([`super::ledger::AckRefusal::reply`]). A refusal is an
+//! authorization failure on that link, never an empty successful page or an
+//! application acknowledgment: it advances no cursor, membership head, clock
+//! floor or ledger evidence and opens no gate. It carries no request id and
+//! never completes or correlates a request. The host keeps that link's
+//! synchronization gates closed while it repairs the association and
+//! resynchronizes; the transport may still fence or close the link.
+//!
 //! **Clocks** (I.6.5). `station_time` is the Station's unsigned word: here
 //! it is only a safe integer. The host's cap on it and its clock floor are
 //! the host's.
@@ -108,6 +124,9 @@ pub mod op {
     pub const CONTROL_ACK: &str = "control_ack";
     pub const MEMBERSHIP_FETCH: &str = "membership_fetch";
     pub const MEMBERSHIP_FETCH_RESULT: &str = "membership_fetch_result";
+    pub const CONTROL_SYNC_REFUSED: &str = "control_sync_refused";
+    pub const MEMBERSHIP_FETCH_REFUSED: &str = "membership_fetch_refused";
+    pub const CONTROL_ACK_REFUSED: &str = "control_ack_refused";
 }
 
 /// Why a relay message is refused. `code()` is a stable name.
@@ -973,6 +992,110 @@ impl MembershipFetchResult {
     }
 }
 
+// ------------------------------------------------------------- refusals
+
+/// Why a Station refused a host's call: exactly `forbidden` in this
+/// version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalCode {
+    /// The call isn't authorized on this link: another account's feed or
+    /// device list, or an ack whose claimed association isn't the link's.
+    Forbidden,
+}
+
+impl RefusalCode {
+    /// The wire name.
+    pub fn code(self) -> &'static str {
+        match self {
+            RefusalCode::Forbidden => "forbidden",
+        }
+    }
+
+    /// From the wire name, exactly.
+    pub fn from_code(code: &str) -> Option<Self> {
+        (code == "forbidden").then_some(RefusalCode::Forbidden)
+    }
+}
+
+/// The host's call a refusal answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedCall {
+    ControlSync,
+    MembershipFetch,
+    ControlAck,
+}
+
+impl RefusedCall {
+    /// The refusal's `op`: `<call>_refused`.
+    pub fn op(self) -> &'static str {
+        match self {
+            RefusedCall::ControlSync => op::CONTROL_SYNC_REFUSED,
+            RefusedCall::MembershipFetch => op::MEMBERSHIP_FETCH_REFUSED,
+            RefusedCall::ControlAck => op::CONTROL_ACK_REFUSED,
+        }
+    }
+
+    fn of_op(op: &str) -> Option<Self> {
+        [
+            RefusedCall::ControlSync,
+            RefusedCall::MembershipFetch,
+            RefusedCall::ControlAck,
+        ]
+        .into_iter()
+        .find(|call| call.op() == op)
+    }
+}
+
+/// A Station's refusal of a host's call on this link:
+/// `{"type":"relay","op":"<call>_refused","code":"forbidden"}` (Station →
+/// host; agreed with Astation, 2026-11-11). Exactly those fields: it names
+/// no account, feed, host, cursor, principal, integration or record. An
+/// authorization failure on the link, never a page or an acknowledgment:
+/// the host advances nothing on it (cursor, membership head, clock floor,
+/// evidence), opens no gate, completes and correlates no request, and keeps
+/// the link's synchronization gates closed while it repairs the
+/// association and resynchronizes (the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallRefused {
+    pub call: RefusedCall,
+    pub code: RefusalCode,
+}
+
+impl CallRefused {
+    /// The wire message.
+    pub fn to_json(&self) -> Result<Value> {
+        let mut m = message(self.call.op());
+        m.insert("code".into(), json!(self.code.code()));
+        finish(m)
+    }
+
+    /// Reads received bytes, strictly: one of the three refusals.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let root = parse(bytes)?;
+        let root = root.value();
+        let call = op_of(root)
+            .and_then(RefusedCall::of_op)
+            .ok_or(RelayError::WrongMessage)?;
+        Self::read(root, call)
+    }
+
+    fn read(root: &Value, call: RefusedCall) -> Result<Self> {
+        let f = Fields::message(root, call.op(), &["type", "op", "code"])?;
+        let code = RefusalCode::from_code(f.text("code")?).ok_or(RelayError::Malformed("code"))?;
+        Ok(CallRefused { call, code })
+    }
+}
+
+impl From<CallRefused> for ToHost {
+    fn from(refused: CallRefused) -> Self {
+        match refused.call {
+            RefusedCall::ControlSync => ToHost::ControlSyncRefused(refused.code),
+            RefusedCall::MembershipFetch => ToHost::MembershipFetchRefused(refused.code),
+            RefusedCall::ControlAck => ToHost::ControlAckRefused(refused.code),
+        }
+    }
+}
+
 // ------------------------------------------------------------- dispatch
 
 /// A message a Station reads from a host. A relay message of any other op,
@@ -1008,6 +1131,12 @@ pub enum ToHost {
     ControlSyncResult(ControlSyncResult),
     Heads(Heads),
     MembershipFetchResult(MembershipFetchResult),
+    /// The Station refused this link's `control_sync` ([`CallRefused`]).
+    ControlSyncRefused(RefusalCode),
+    /// The Station refused this link's `membership_fetch`.
+    MembershipFetchRefused(RefusalCode),
+    /// The Station refused this link's `control_ack`.
+    ControlAckRefused(RefusalCode),
 }
 
 impl ToHost {
@@ -1024,7 +1153,11 @@ impl ToHost {
             Some(op::MEMBERSHIP_FETCH_RESULT) => {
                 MembershipFetchResult::read(root).map(ToHost::MembershipFetchResult)
             }
-            _ => Err(RelayError::WrongMessage),
+            Some(op) => match RefusedCall::of_op(op) {
+                Some(call) => CallRefused::read(root, call).map(ToHost::from),
+                None => Err(RelayError::WrongMessage),
+            },
+            None => Err(RelayError::WrongMessage),
         }
     }
 }
@@ -2247,5 +2380,127 @@ mod tests {
             "/after",
             json!("1")
         ))));
+    }
+
+    // ----------------------------------------------------------- refusals
+
+    fn refusal_of(call: RefusedCall) -> ToHost {
+        match call {
+            RefusedCall::ControlSync => ToHost::ControlSyncRefused(RefusalCode::Forbidden),
+            RefusedCall::MembershipFetch => ToHost::MembershipFetchRefused(RefusalCode::Forbidden),
+            RefusedCall::ControlAck => ToHost::ControlAckRefused(RefusalCode::Forbidden),
+        }
+    }
+
+    const REFUSALS: [(RefusedCall, &str); 3] = [
+        (RefusedCall::ControlSync, "control_sync_refused"),
+        (RefusedCall::MembershipFetch, "membership_fetch_refused"),
+        (RefusedCall::ControlAck, "control_ack_refused"),
+    ];
+
+    /// The three refusals (agreed with Astation, 2026-11-11): exactly
+    /// `{"type":"relay","op":"<call>_refused","code":"forbidden"}`, read
+    /// back as the host's typed refusal, never a page or an ack.
+    #[test]
+    fn the_three_refusals_round_trip_exactly() {
+        for (call, op) in REFUSALS {
+            let refused = CallRefused {
+                call,
+                code: RefusalCode::Forbidden,
+            };
+            let wire = refused.to_json().unwrap();
+            assert_eq!(
+                wire,
+                json!({"type": "relay", "op": op, "code": "forbidden"})
+            );
+            // Nothing but its op and code: no account, feed, host, cursor,
+            // principal, integration or record.
+            assert_eq!(wire.as_object().unwrap().len(), 3);
+            let bytes = wire.to_string();
+            assert_eq!(CallRefused::decode(bytes.as_bytes()).unwrap(), refused);
+            assert_eq!(ToHost::decode(bytes.as_bytes()).unwrap(), refusal_of(call));
+            // A host's reader takes it; a Station's never does.
+            assert_eq!(
+                ToStation::decode(bytes.as_bytes()).unwrap_err(),
+                RelayError::WrongMessage
+            );
+            assert_eq!(call.op(), op);
+            assert_eq!(
+                RefusalCode::from_code("forbidden"),
+                Some(RefusalCode::Forbidden)
+            );
+        }
+        // Another relay message is not a refusal.
+        let page = json!({"type": "relay", "op": "heads", "feeds": [],
+            "membership": {"seq": 1, "hash": "00".repeat(32)}});
+        assert_eq!(
+            CallRefused::decode(page.to_string().as_bytes()).unwrap_err(),
+            RelayError::WrongMessage
+        );
+    }
+
+    #[test]
+    fn refusals_are_read_strictly() {
+        for (_, op) in REFUSALS {
+            let ok = format!(r#"{{"type":"relay","op":"{op}","code":"forbidden"}}"#);
+            assert!(ToHost::decode(ok.as_bytes()).is_ok());
+            let cases = [
+                // Unknown codes, spelt otherwise or of another type.
+                (
+                    r#""code":"not_found""#.to_owned(),
+                    RelayError::Malformed("code"),
+                ),
+                (
+                    r#""code":"Forbidden""#.to_owned(),
+                    RelayError::Malformed("code"),
+                ),
+                (r#""code":1"#.to_owned(), RelayError::Malformed("code")),
+                (r#""code":null"#.to_owned(), RelayError::Malformed("code")),
+                // No code.
+                (r#""x":"forbidden""#.to_owned(), RelayError::UnknownField),
+                // A field beside the code: nothing is ever named.
+                (
+                    r#""code":"forbidden","feed_id":"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b""#
+                        .to_owned(),
+                    RelayError::UnknownField,
+                ),
+                (
+                    r#""code":"forbidden","account_id":"acct-test-1""#.to_owned(),
+                    RelayError::UnknownField,
+                ),
+                (
+                    r#""code":"forbidden","detail":null"#.to_owned(),
+                    RelayError::UnknownField,
+                ),
+                // A duplicate key: the parse refuses the message whole.
+                (
+                    r#""code":"forbidden","code":"forbidden""#.to_owned(),
+                    RelayError::NotStrict,
+                ),
+            ];
+            for (fields, want) in cases {
+                let bytes = format!(r#"{{"type":"relay","op":"{op}",{fields}}}"#);
+                assert_eq!(
+                    ToHost::decode(bytes.as_bytes()).unwrap_err(),
+                    want,
+                    "{bytes}"
+                );
+                assert_eq!(CallRefused::decode(bytes.as_bytes()).unwrap_err(), want);
+            }
+            let missing = format!(r#"{{"type":"relay","op":"{op}"}}"#);
+            assert_eq!(
+                ToHost::decode(missing.as_bytes()).unwrap_err(),
+                RelayError::Malformed("code")
+            );
+        }
+        // Bounded like every relay message.
+        let big = format!(
+            r#"{{"type":"relay","op":"control_ack_refused","code":"forbidden","pad":"{}"}}"#,
+            "x".repeat(MAX_RELAY_MESSAGE_BYTES)
+        );
+        assert_eq!(
+            ToHost::decode(big.as_bytes()).unwrap_err(),
+            RelayError::TooLarge
+        );
     }
 }

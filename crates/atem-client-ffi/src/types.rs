@@ -1159,8 +1159,22 @@ data_enum! {
     }
 }
 
+unit_enum! {
+    /// Why a Station refused a host's call on the link (`code`): exactly
+    /// `forbidden` in this version.
+    pub enum RelayRefusalCode {
+        /// Not authorized on this link: another account's feed or device
+        /// list, or an ack whose claimed association isn't the link's.
+        Forbidden,
+    }
+}
+
 data_enum! {
     /// A Station's message to a host, as `relay_decode_to_host` reads it.
+    /// A refusal is an authorization failure on the link, never a page or
+    /// an acknowledgment: advance nothing on it, open no gate, complete or
+    /// correlate no request, and keep the link's synchronization gates
+    /// closed while the association is repaired and resynchronized.
     pub enum RelayToHost {
         ControlSyncResult {
             origin: String,
@@ -1177,5 +1191,12 @@ data_enum! {
             head: LogHead,
             entries: Vec<String>,
         },
+        /// `control_sync_refused`: the Station refused this link's
+        /// `control_sync`.
+        ControlSyncRefused { code: RelayRefusalCode },
+        /// `membership_fetch_refused`.
+        MembershipFetchRefused { code: RelayRefusalCode },
+        /// `control_ack_refused`.
+        ControlAckRefused { code: RelayRefusalCode },
     }
 }

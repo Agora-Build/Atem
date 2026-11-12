@@ -795,6 +795,43 @@ check("Station calls: fixture acks read and write back; pages, heads and fetches
   throwsCode(() => m.relayDecodeToStation(str({ type: "relay", op: "push_hint", hints: [] })), "wrong_message");
   throwsCode(() => m.relayDecodeToStation("{"), "not_strict");
 });
+check("Station calls: the three refusals exactly and read strictly; a stale-association ack refused without disclosure or ledger advance", () => {
+  const refusals = [
+    [m.relayControlSyncRefused, "control_sync_refused"],
+    [m.relayMembershipFetchRefused, "membership_fetch_refused"],
+    [m.relayControlAckRefused, "control_ack_refused"],
+  ];
+  for (const [build, op] of refusals) {
+    const msg = build("forbidden");
+    eq(canon(JSON.parse(msg)), canon({ type: "relay", op, code: "forbidden" }), op);
+    eq(m.relayDecodeToHost(msg), { type: op, code: "forbidden" }, op);
+    throwsCode(() => m.relayDecodeToStation(msg), "wrong_message");
+    throwsCode(() => build("not_found"), "malformed");
+    const bad = [
+      ['"code":"not_found"', "malformed"],
+      ['"code":null', "malformed"],
+      ['"code":"forbidden","feed_id":"x"', "unknown_field"],
+      ['"code":"forbidden","code":"forbidden"', "not_strict"],
+    ];
+    for (const [fields, code] of bad) throwsCode(() => m.relayDecodeToHost(`{"type":"relay","op":"${op}",${fields}}`), code);
+  }
+  // A stale association: the link was verified at trust generation 2, the ack claims 1.
+  const f = load("r9-control-ack-deadline");
+  const st = f.setup.station;
+  const nowMs = 1793620940000;
+  const l = new m.AckLedgerHandle(st.origin, st.account_id, st.genesis_hash).record(ctlRecord("S4_revoke"), 1793620903000, ["host-b"], nowMs).next;
+  const before = l.toJson();
+  const ack = str(f.steps[1].control_ack);
+  const link = { ...linkOf(f.setup.links["host-b"]), hostTrustGen: 2 };
+  throwsCode(() => l.ack(link, ack, nowMs), "not_the_link");
+  eq(l.toJson(), before);
+  eq(l.pendingReports(), []);
+  const reply = m.relayControlAckRefused("forbidden");
+  for (const secret of [st.account_id, st.genesis_hash, st.origin, "host-b", ctlByLabel.S4_revoke.record.body.record_id]) {
+    if (reply.includes(secret)) throw new Error(`the refusal names ${secret}`);
+  }
+  eq(l.ack({ ...link, hostTrustGen: 1 }, ack, nowMs).made.length, 2);
+});
 check("Station: the Portal's statuses in their classes", () => {
   const want = { 200: "confirm", 401: "retry", 408: "retry", 429: "retry", 500: "retry", 503: "retry", 400: "refuse", 404: "refuse", 409: "refuse", 413: "refuse", 415: "refuse", 204: "refuse", 302: "refuse", 403: "stop_reporting" };
   for (const [status, answer] of Object.entries(want)) eq(m.reportAnswer(Number(status)), answer, status);
