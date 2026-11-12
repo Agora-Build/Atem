@@ -190,7 +190,7 @@ if [ -f "$ANDROID" ]; then
     [ "$ALIGNS" = 0x4000 ] || { echo "android $ABI: LOAD alignment '$ALIGNS', need 0x4000" >&2; exit 1; }
     SYMS=$("$READELF" --dyn-syms -W "$SO")
     [ -n "$SYMS" ] || { echo "android $ABI: no dynamic symbols read" >&2; exit 1; }
-    if grep -qiE 'sign_seen|admit_carrier|software_?key|framing_render_for_vectors|seal_envelope|open_envelope|seal_result|accept_result' <<<"$SYMS"; then
+    if grep -qiE 'sign_seen|admit_carrier|software_?key|framing_render_for_vectors|seal_envelope|open_envelope|seal_result|accept_result|mail_?fields_?data' <<<"$SYMS"; then
       echo "android $ABI: a test-only or host-role symbol is exported" >&2
       exit 1
     fi
