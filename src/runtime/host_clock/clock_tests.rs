@@ -91,7 +91,12 @@ fn stored(store: &Store) -> ClockState {
     }
 }
 
+/// The copies kept aside (none while the table doesn't exist: it is made
+/// with the first copy).
 fn aside(store: &Store) -> Vec<Value> {
+    if !table_exists(store, "clock_aside") {
+        return Vec::new();
+    }
     let mut q = store
         .db
         .prepare("SELECT state FROM clock_aside ORDER BY rowid")
@@ -100,6 +105,32 @@ fn aside(store: &Store) -> Vec<Value> {
         .unwrap()
         .map(Result::unwrap)
         .collect()
+}
+
+fn table_exists(store: &Store, name: &str) -> bool {
+    store
+        .db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            [name],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// Writes to `table` fail until `fail_writes(.., false)`.
+fn fail_writes(store: &Store, table: &str, on: bool) {
+    let sql = if on {
+        format!(
+            "CREATE TRIGGER fail_{table}_insert BEFORE INSERT ON {table}
+                BEGIN SELECT RAISE(ABORT, 'injected write fault'); END;
+            CREATE TRIGGER fail_{table}_update BEFORE UPDATE ON {table}
+                BEGIN SELECT RAISE(ABORT, 'injected write fault'); END;"
+        )
+    } else {
+        format!("DROP TRIGGER fail_{table}_insert; DROP TRIGGER fail_{table}_update;")
+    };
+    store.db.execute_batch(&sql).unwrap();
 }
 
 /// The `runtime.log` lines written on this thread since the last call.
@@ -724,10 +755,17 @@ fn a_damaged_record_starts_afresh_at_a_station_time_within_the_cap() {
     let (_dir, store, mut clock, torn) = damaged_clock(&os);
     os.pass(SEC);
     let st = os.wall() + 5 * MIN;
-    // `H` := max(reading, station_time), the floor taken from it, written.
+    // `H` is the reading's own (§11.6: `H` never includes `station_time`),
+    // the floor the Station time: `D` = max(w, st). Written.
     assert!(clock.station(ORIGIN, st, &store));
     assert!(!clock.damaged());
-    assert_eq!(clock.now(), DelegatedNow { h_ms: st, d_ms: st });
+    assert_eq!(
+        clock.now(),
+        DelegatedNow {
+            h_ms: os.wall(),
+            d_ms: st
+        }
+    );
     assert_eq!(stored(&store), clock.state);
     // No once-per-boot lowering is armed by it: the Station time bounds it.
     assert!(!clock.state.mark());
@@ -797,4 +835,205 @@ fn a_station_time_below_the_reading_starts_a_damaged_record_at_the_reading() {
     clock.tick(&store);
     let h = clock.now().h_ms;
     assert!((start + SEC - 1..=start + SEC).contains(&h), "{h}");
+}
+
+/// The review's trace (PR 4, I1): after a damaged record starts at a Station
+/// time, the cap is the reading's `w` + 10 minutes, not that time's: a head
+/// at the old `H` + 10 minutes − 1 s isn't taken, one at `w` + 10 minutes − 1
+/// s is.
+#[test]
+fn a_station_start_keeps_the_station_time_out_of_h_and_the_cap() {
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::No);
+    let (_dir, store, mut clock, _torn) = damaged_clock(&os);
+    os.pass(SEC);
+    let w = os.wall();
+    assert!(clock.station(ORIGIN, w + 5 * MIN, &store));
+    assert!(!clock.station(ORIGIN, w + 5 * MIN + 10 * MIN - SEC, &store));
+    assert_eq!(
+        clock.now(),
+        DelegatedNow {
+            h_ms: w,
+            d_ms: w + 5 * MIN
+        }
+    );
+    assert!(clock.station(ORIGIN, w + 10 * MIN - SEC, &store));
+    assert_eq!(
+        clock.now(),
+        DelegatedNow {
+            h_ms: w,
+            d_ms: w + 599 * SEC
+        }
+    );
+}
+
+/// PR 4 is inert on main (T11b): a store gains only the `clock` table;
+/// `clock_aside` is made with the first copy kept aside.
+#[test]
+fn the_store_makes_clock_aside_only_to_keep_a_copy() {
+    let (_dir, store) = open_store();
+    assert!(table_exists(&store, "clock"));
+    assert!(!table_exists(&store, "clock_aside"));
+    assert_eq!(aside(&store), Vec::<Value>::new());
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::No);
+    let (_dir, store, _clock, torn) = damaged_clock(&os);
+    assert!(table_exists(&store, "clock_aside"));
+    assert_eq!(aside(&store), vec![torn]);
+}
+
+/// The retire's crash window (PR 4, M2): the old store is moved aside before
+/// the clock writes into the new one. A new store with no row takes the
+/// newest retired store's record, read only, and writes it at once, a
+/// damaged one as damaged (kept aside in the new store too).
+#[test]
+fn a_new_store_without_a_row_takes_the_retired_stores_record() {
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::Yes);
+    // Healthy.
+    let dir = tempfile::tempdir().unwrap();
+    let old = Store::open(dir.path()).unwrap();
+    let mut clock = HostClock::with_reader(&old, os.reader());
+    clock.tick(&old);
+    let kept = stored(&old);
+    old.retire(T).unwrap();
+    let new = Store::open(dir.path()).unwrap();
+    assert_eq!(new.load_clock().unwrap(), None);
+    logged();
+    let clock = HostClock::with_reader(&new, os.reader());
+    assert!(!clock.damaged());
+    assert_eq!(clock.state, kept);
+    assert_eq!(stored(&new), kept);
+    let lines = logged();
+    assert!(lines.iter().any(|l| l.contains("retired-")), "{lines:?}");
+    // Damaged: carried as damage.
+    let dir = tempfile::tempdir().unwrap();
+    let old = Store::open(dir.path()).unwrap();
+    let torn = Value::Text("{".into());
+    old.put_clock(&torn).unwrap();
+    old.retire(T).unwrap();
+    let new = Store::open(dir.path()).unwrap();
+    let clock = HostClock::with_reader(&new, os.reader());
+    assert!(clock.damaged());
+    assert_eq!(clock.status_line().as_deref(), Some(DAMAGED));
+    assert_eq!(new.load_clock().unwrap(), Some(torn.clone()));
+    assert_eq!(aside(&new), vec![torn]);
+    // Retired stores with no record, or from before the `clock` table: a
+    // fresh clock.
+    let dir = tempfile::tempdir().unwrap();
+    let old = Store::open(dir.path()).unwrap();
+    old.retire(T).unwrap();
+    let older = Store::open(dir.path()).unwrap();
+    older.db.execute_batch("DROP TABLE clock").unwrap();
+    older.retire(T + 1).unwrap();
+    let new = Store::open(dir.path()).unwrap();
+    let clock = HostClock::with_reader(&new, os.reader());
+    assert!(!clock.damaged());
+    assert_eq!(new.load_clock().unwrap(), None);
+}
+
+/// A carry into a new store that fails (PR 4, M2) is tried again at each
+/// reading; until it is written and kept aside the status says so, and
+/// nothing starts the clock afresh.
+#[test]
+fn a_failed_carry_is_retried_at_each_reading() {
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::No);
+    let (_dir, _store, mut clock, torn) = damaged_clock(&os);
+    let (_new_dir, new) = open_store();
+    fail_writes(&new, "clock", true);
+    clock.moved(&new);
+    assert_eq!(clock.status_line().as_deref(), Some(DAMAGED_UNKEPT));
+    for synced in [Synced::No, Synced::Yes] {
+        os.pass(SEC);
+        os.set_wall(os.wall(), synced);
+        clock.tick(&new);
+        assert!(clock.damaged());
+        assert_eq!(new.load_clock().unwrap(), None);
+    }
+    assert!(!clock.station(ORIGIN, os.wall(), &new));
+    fail_writes(&new, "clock", false);
+    os.pass(SEC);
+    os.set_wall(os.wall(), Synced::No);
+    clock.tick(&new);
+    assert_eq!(new.load_clock().unwrap(), Some(torn.clone()));
+    assert_eq!(aside(&new), vec![torn]);
+    assert_eq!(clock.status_line().as_deref(), Some(DAMAGED));
+}
+
+/// A damaged record that couldn't be kept aside (PR 4, M3) says so, starts
+/// nothing afresh, and is tried again at each reading: the copy, and a store
+/// that couldn't be read at all.
+#[test]
+fn a_damaged_record_not_kept_aside_retries_at_each_reading() {
+    // The copy fails.
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::No);
+    let (_dir, store) = open_store();
+    let torn = Value::Text("{".into());
+    store.put_clock(&torn).unwrap();
+    store
+        .db
+        .execute_batch("CREATE TABLE clock_aside (at_ms INTEGER NOT NULL, state)")
+        .unwrap();
+    fail_writes(&store, "clock_aside", true);
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    assert!(clock.damaged());
+    assert_eq!(clock.status_line().as_deref(), Some(DAMAGED_UNKEPT));
+    os.pass(SEC);
+    os.set_wall(os.wall(), Synced::Yes);
+    clock.tick(&store);
+    assert!(clock.damaged(), "no synchronized reading starts it unkept");
+    assert!(!clock.station(ORIGIN, os.wall(), &store));
+    fail_writes(&store, "clock_aside", false);
+    os.pass(SEC);
+    os.set_wall(os.wall(), Synced::No);
+    clock.tick(&store);
+    assert_eq!(aside(&store), vec![torn.clone()]);
+    assert_eq!(clock.status_line().as_deref(), Some(DAMAGED));
+    assert_eq!(store.load_clock().unwrap(), Some(torn.clone()));
+
+    // The store can't be read (here: a `clock` table of another shape).
+    let (_dir, store) = open_store();
+    store
+        .db
+        .execute_batch("DROP TABLE clock; CREATE TABLE clock (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    assert!(clock.damaged());
+    assert_eq!(clock.status_line().as_deref(), Some(DAMAGED_UNKEPT));
+    // Readable again, with a damaged record: kept aside then.
+    store
+        .db
+        .execute_batch("DROP TABLE clock; CREATE TABLE clock (id INTEGER PRIMARY KEY, state TEXT)")
+        .unwrap();
+    store.put_clock(&torn).unwrap();
+    os.pass(SEC);
+    clock.tick(&store);
+    assert_eq!(aside(&store), vec![torn]);
+    assert_eq!(clock.status_line().as_deref(), Some(DAMAGED));
+}
+
+/// A write that fails (PR 4, M4; the Task 33 gate's input): one log line
+/// however many readings retry it, no `station_time` counts until it is
+/// written, and the next reading after the fault writes.
+#[test]
+fn a_failed_write_is_logged_once_retried_and_counts_no_station_time() {
+    let (_dir, store) = open_store();
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::Yes);
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    clock.tick(&store);
+    let written = stored(&store);
+    logged();
+    fail_writes(&store, "clock", true);
+    os.pass(SEC);
+    assert!(!clock.station(ORIGIN, os.wall() + 5 * MIN, &store));
+    for _ in 0..3 {
+        os.pass(SEC);
+        clock.tick(&store);
+    }
+    let lines = logged();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("couldn't be written"), "{}", lines[0]);
+    assert_eq!(stored(&store), written);
+    fail_writes(&store, "clock", false);
+    os.pass(SEC);
+    clock.tick(&store);
+    assert_eq!(stored(&store), clock.state);
+    assert!(clock.station(ORIGIN, os.wall() + 5 * MIN, &store));
 }

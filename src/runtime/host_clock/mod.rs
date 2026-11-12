@@ -31,14 +31,21 @@
 //!   a fresh one, which would lose the record and re-arm the lowering: it is
 //!   kept aside (`clock_aside`), one `runtime.log` line and the status say so,
 //!   delegated work waits (`damaged`), and nothing is written over it until
-//!   the first of (ruling T11a): a reading the OS reports synchronized (the
-//!   clock starts afresh from it, as a profile's first synchronized reading
-//!   would), or a Station's `station_time` within the cap of the reading
-//!   (`H` = `max(reading, station_time)`, the floor taken from it, no
-//!   lowering armed). Delegated work comes only from senders a Station's
-//!   feed covers, so a working delegated host gets one; the 10-minute cap
-//!   bounds a forged one, as for any floor. One beyond the cap keeps it
-//!   waiting, with the origin's "Station clock ahead" alert.
+//!   the first of (ruling T11a, as amended): a reading the OS reports
+//!   synchronized (the clock starts afresh from it, as a profile's first
+//!   synchronized reading would), or a Station's `station_time` within the
+//!   cap of the reading, `w` + 10 minutes (`H` stays the reading's own, since
+//!   `H` never includes `station_time` (§11.6); the floor is the Station
+//!   time, so `D` = `max(w, station_time)`; no lowering armed). Delegated work
+//!   comes only from senders a Station's feed covers, so a working delegated
+//!   host gets one; the cap bounds a forged one, as for any floor. One beyond
+//!   the cap keeps it waiting, with the origin's "Station clock ahead" alert.
+//!   A record that couldn't be read or kept aside says so in the status and
+//!   is tried again at every reading, and starts nothing afresh until kept.
+//! - **A new store without a record** (a crash between a retire for a new
+//!   host identity and the clock's first write in the new store) takes the
+//!   newest retired store's, read only, and writes it (a damaged one as
+//!   damage).
 
 // Its macOS confirmation reader and the Linux composition's parts are read
 // by tests only.
@@ -68,6 +75,10 @@ pub const AHEAD_WAITING: &str = "host clock ahead of its record; waiting for a s
 /// §11.6's owner alert, while the wall clock is more than 10 minutes below
 /// `H` with no mark.
 pub const WENT_BACK: &str = "host clock went back";
+/// A damaged record not kept aside yet (the copy, the store's read or a
+/// carry into a new store failed): tried again at every reading.
+pub const DAMAGED_UNKEPT: &str =
+    "host clock record damaged and not kept aside yet; delegated work waits while Atem tries again";
 /// A damaged record: kept aside, delegated work waits.
 pub const DAMAGED: &str = "host clock record damaged and kept aside; delegated work waits for a synchronized clock or a Station time";
 
@@ -106,9 +117,14 @@ pub struct HostClock {
 
 /// A stored record that isn't a clock state.
 struct Damaged {
-    /// As stored (`None`: the store couldn't be read).
+    /// As stored (`None`: it couldn't be read; read again at every reading).
     value: Option<Value>,
-    /// Kept aside: a synchronized reading may start afresh over it.
+    /// The current store's row holds it (a value carried from a retired
+    /// store, or into a new one, isn't there until written).
+    written: bool,
+    /// Kept aside in the current store: a synchronized reading or a Station
+    /// time may start afresh over it. Until then the copy is tried again at
+    /// every reading.
     aside: bool,
 }
 
@@ -132,35 +148,120 @@ impl HostClock {
             unsaved: false,
             damaged: None,
         };
-        match store.load_clock() {
-            Ok(None) => {}
-            Ok(Some(Value::Text(text))) => match ClockState::from_json(&text) {
-                Ok(state) => clock.state = state,
-                Err(e) => clock.damage(store, Some(Value::Text(text)), &e.to_string()),
-            },
-            Ok(Some(value)) => clock.damage(store, Some(value), "not text"),
-            Err(e) => clock.damage(store, None, &format!("{e:#}")),
-        }
+        clock.read_record(store);
         clock
     }
 
-    fn damage(&mut self, store: &Store, value: Option<Value>, why: &str) {
-        let at_ms = self.last.as_ref().map_or(0, |r| r.wall_ms);
-        let aside = value.is_some()
-            && store
-                .keep_clock_aside(at_ms)
-                .map_err(|e| log(format!("its damaged record couldn't be kept aside ({e:#})")))
-                .is_ok();
-        log(format!(
-            "its record in {} can't be read ({why}); {}, and delegated work waits for a synchronized clock or a Station time within the cap",
-            store.state.join("host-work.sqlite").display(),
-            if aside {
-                "kept aside (table clock_aside)"
-            } else {
-                "not kept aside, so nothing is written over it"
+    /// Reads the record, at load and again at every reading while one
+    /// couldn't be read: the store's row, else the newest retired store's
+    /// (`Store::retired_clock`), carried into this store at once (PR 4
+    /// review M2). A damaged one is kept as damage (`keep`).
+    fn read_record(&mut self, store: &Store) {
+        let db = store.state.join("host-work.sqlite");
+        let found = store.load_clock().and_then(|row| match row {
+            Some(value) => Ok(Some((value, None))),
+            None => Ok(store
+                .retired_clock()?
+                .map(|(value, path)| (value, Some(path)))),
+        });
+        let retry = self.damaged.is_some();
+        match found {
+            Ok(None) => {
+                if self.damaged.take().is_some() {
+                    log("its record reads as none now; it starts afresh".into());
+                }
+            }
+            Ok(Some((value, from))) => match parse(&value) {
+                Ok(state) => {
+                    self.damaged = None;
+                    self.state = state;
+                    if let Some(path) = &from {
+                        log(format!(
+                            "its record carried from {} into {} (a store moved aside before the record was written to the new one)",
+                            path.display(),
+                            db.display()
+                        ));
+                        match self.last.clone() {
+                            Some(r) => {
+                                self.persist(store, &r);
+                            }
+                            None => self.unsaved = true,
+                        }
+                    } else if retry {
+                        log("its record reads again".into());
+                    }
+                }
+                Err(why) => {
+                    self.damaged = Some(Damaged {
+                        value: Some(value),
+                        written: from.is_none(),
+                        aside: false,
+                    });
+                    let kept = self.keep(store);
+                    let source = from.as_deref().unwrap_or(&db);
+                    log(format!(
+                        "its record in {} can't be read ({why}); {}, and delegated work waits for a synchronized clock or a Station time within the cap",
+                        source.display(),
+                        if kept {
+                            "kept aside (table clock_aside)"
+                        } else {
+                            "not kept aside yet (tried again at every reading), so nothing is written over it"
+                        },
+                    ));
+                }
             },
-        ));
-        self.damaged = Some(Damaged { value, aside });
+            Err(e) => {
+                if !retry {
+                    self.damaged = Some(Damaged {
+                        value: None,
+                        written: false,
+                        aside: false,
+                    });
+                    log(format!(
+                        "its record in {} can't be read ({e:#}); read again at every reading, and delegated work waits",
+                        db.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    /// A damaged value written into the store's row (when carried) and kept
+    /// aside; whether it is kept now.
+    fn keep(&mut self, store: &Store) -> bool {
+        let at_ms = self.last.as_ref().map_or(0, |r| r.wall_ms);
+        let Some(d) = self.damaged.as_mut() else {
+            return false;
+        };
+        let Some(value) = d.value.as_ref() else {
+            return false;
+        };
+        if !d.written {
+            if store.put_clock(value).is_err() {
+                return false;
+            }
+            d.written = true;
+        }
+        if !d.aside {
+            if store.keep_clock_aside(at_ms).is_err() {
+                return false;
+            }
+            d.aside = true;
+        }
+        true
+    }
+
+    /// While a damaged record isn't kept aside: its copy, or its read, again.
+    fn retry_damaged(&mut self, store: &Store) {
+        match &self.damaged {
+            Some(d) if !d.aside && d.value.is_some() => {
+                if self.keep(store) {
+                    log("its damaged record is kept aside now (table clock_aside)".into());
+                }
+            }
+            Some(d) if !d.aside => self.read_record(store),
+            _ => {}
+        }
     }
 
     /// One reading (once a second on the pass): §11.6's rules, the record
@@ -179,6 +280,7 @@ impl HostClock {
         let Some(r) = (self.read)() else {
             return Vec::new();
         };
+        self.retry_damaged(store);
         let mark = self.state.mark();
         let Step { next, events } = self.state.observe(&r);
         self.state = next;
@@ -265,8 +367,8 @@ impl HostClock {
     /// the clock holds deadlines back, and the latest repair or lowering
     /// within a day of `D` (see `status_text`).
     pub fn status_line(&self) -> Option<String> {
-        if self.damaged.is_some() {
-            return Some(DAMAGED.to_string());
+        if let Some(d) = &self.damaged {
+            return Some(if d.aside { DAMAGED } else { DAMAGED_UNKEPT }.to_string());
         }
         status_text(&self.state, self.last.as_ref()?, cfg!(target_os = "macos"))
     }
@@ -282,25 +384,24 @@ impl HostClock {
 
     /// The store was moved aside for a new host identity and `store` opened
     /// in its place: the clock is the host's, so its record goes on in the
-    /// new store at once (a damaged one as it was, so it stays damaged).
+    /// new store at once (a damaged one as it was, so it stays damaged). A
+    /// carry that fails is tried again at every reading (a healthy record's
+    /// write as any failed write; a damaged one's copy by `retry_damaged`),
+    /// and a crash before it is covered by `read_record`'s retired store.
     pub fn moved(&mut self, store: &Store) {
         self.saved = None;
-        match &self.damaged {
-            None => {
-                if let Some(r) = self.last.clone() {
+        match self.damaged.as_mut() {
+            None => match self.last.clone() {
+                Some(r) => {
                     self.persist(store, &r);
                 }
-            }
+                None => self.unsaved = true,
+            },
             Some(d) => {
-                let value = d.value.clone().unwrap_or(Value::Null);
-                let at_ms = self.last.as_ref().map_or(0, |r| r.wall_ms);
-                let kept = store
-                    .put_clock(&value)
-                    .and_then(|()| store.keep_clock_aside(at_ms));
-                if let Err(e) = kept {
-                    log(format!(
-                        "its damaged record couldn't be carried into the new store ({e:#})"
-                    ));
+                d.written = false;
+                d.aside = false;
+                if d.value.is_some() && !self.keep(store) {
+                    log("its damaged record couldn't be carried into the new store yet; tried again at every reading".into());
                 }
             }
         }
@@ -334,6 +435,14 @@ impl HostClock {
                 false
             }
         }
+    }
+}
+
+/// A stored value as a clock state, or why it isn't one.
+fn parse(value: &Value) -> Result<ClockState, String> {
+    match value {
+        Value::Text(text) => ClockState::from_json(text).map_err(|e| e.to_string()),
+        _ => Err("not text".into()),
     }
 }
 

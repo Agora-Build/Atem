@@ -153,9 +153,12 @@ impl Stamp {
     /// counter that ran backwards under an unchanged boot id, which no boot
     /// change is taken for: readings stay compared within the boot, from a
     /// counter that started again. That needs a boot id that outlives its
-    /// counter (a VM restored from a memory snapshot older than the profile,
-    /// or a sandbox with a fixed `boot_id`), outside §11.6's model; a guard
-    /// for it is left to PR 4's review.
+    /// counter (a VM restored from a memory snapshot older than a newer,
+    /// persistent profile, or a sandbox with a fixed `boot_id`). Accepted for
+    /// step 4 (PR 4 review, D4): it is late only, the same class as §11.6's
+    /// uncounted downtime (the record re-stamps at the next update; the
+    /// floor's and the anchor's predictions wait until the counter passes
+    /// their stamps).
     fn since(&self, r: &OsReading) -> i128 {
         (i128::from(r.boot_ns) - i128::from(self.boot_ns)).max(0)
     }
@@ -454,8 +457,10 @@ impl ClockState {
     /// A `station_time` while a damaged record waits (step 4 ruling T11a),
     /// read at `r` (also observed first, on the waiting state): within the
     /// cap of the reading itself (`w` + 10 minutes) it starts the clock
-    /// afresh, `H` = `max(w, station_time)` and the floor taken from it, with
-    /// no mark (no lowering is armed: the Station's time bounds it); beyond
+    /// afresh: `H` stays the reading's own (`H` never includes
+    /// `station_time`, §11.6, so the next cap is `w` + 10 minutes too), the
+    /// floor is the Station time (`D` = `max(w, station_time)`), and no mark
+    /// (no lowering is armed: the Station's time bounds it); beyond
     /// it, nothing is taken and the hourly "Station clock ahead of this host"
     /// alert for `origin` is due as for any `station_time`.
     pub fn station_afresh(&self, origin: &str, station_time_ms: u64, r: &OsReading) -> StationStep {
@@ -483,7 +488,7 @@ impl ClockState {
             };
         }
         let fresh = ClockState {
-            record: Some(Stamp::at(w.max(st), r)),
+            record: Some(Stamp::at(w, r)),
             floor: Some(Stamp::at(st, r)),
             anchor: None,
             mark: false,
@@ -507,11 +512,12 @@ impl ClockState {
         to_ms(self.deadline_ns(r))
     }
 
-    /// The record carries the mark: no synchronized reading yet in its boot.
+    /// The latest repair or lowering, for `atem status`.
     pub fn last_change(&self) -> Option<&Change> {
         self.last_change.as_ref()
     }
 
+    /// The record carries the mark: no synchronized reading yet in its boot.
     pub fn mark(&self) -> bool {
         self.mark
     }

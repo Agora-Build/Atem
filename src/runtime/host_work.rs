@@ -1022,8 +1022,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS closed_records (
                 kind TEXT NOT NULL, id TEXT NOT NULL, at_ms INTEGER NOT NULL,
                 PRIMARY KEY(kind,id)) WITHOUT ROWID;
-            CREATE TABLE IF NOT EXISTS clock (id INTEGER PRIMARY KEY CHECK (id = 1), state TEXT);
-            CREATE TABLE IF NOT EXISTS clock_aside (at_ms INTEGER NOT NULL, state);")?;
+            CREATE TABLE IF NOT EXISTS clock (id INTEGER PRIMARY KEY CHECK (id = 1), state TEXT);")?;
         track_open_records(&db)?;
         track_waits(&db)?;
         std::fs::File::open(state)?.sync_all()?;
@@ -1073,9 +1072,12 @@ impl Store {
 
     /// Keeps the clock's stored record aside (`clock_aside`, found at
     /// `at_ms`), as it is, never read again: once, while it is the latest
-    /// copy, and only the latest `CLOCK_ASIDE_KEPT` copies.
+    /// copy, and only the latest `CLOCK_ASIDE_KEPT` copies. The table is made
+    /// with the first copy, so a store whose clock never kept one has only
+    /// `clock`.
     pub fn keep_clock_aside(&self, at_ms: u64) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS clock_aside (at_ms INTEGER NOT NULL, state)")?;
         tx.execute(
             "INSERT INTO clock_aside(at_ms,state) SELECT ?1,c.state FROM clock c
             WHERE c.id=1 AND NOT EXISTS(SELECT 1 FROM clock_aside a
@@ -1089,6 +1091,47 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// The clock's record of the newest retired store that has one
+    /// (`retire`), and that store's path, read only: the record is the
+    /// host's, not the identity's, so a new store that has none yet (a crash
+    /// between the retire and the clock's first write there) takes it.
+    pub fn retired_clock(&self) -> Result<Option<(rusqlite::types::Value, PathBuf)>> {
+        let mut retired: Vec<(u64, PathBuf)> = std::fs::read_dir(&self.state)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name().into_string().ok()?;
+                let at_ms = name
+                    .strip_prefix("host-work.sqlite.retired-")?
+                    .parse()
+                    .ok()?;
+                Some((at_ms, entry.path()))
+            })
+            .collect();
+        retired.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, path) in retired {
+            let db = Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            let has_table: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='clock')",
+                [],
+                |r| r.get(0),
+            )?;
+            if !has_table {
+                continue;
+            }
+            let value = db
+                .query_row("SELECT state FROM clock WHERE id=1", [], |r| r.get(0))
+                .optional()?;
+            if let Some(value) = value {
+                return Ok(Some((value, path)));
+            }
+        }
+        Ok(None)
     }
 
     /// The host these records belong to; none before the first `bind`.

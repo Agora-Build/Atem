@@ -496,8 +496,9 @@ impl HostBridge {
         }
     }
 
-    /// The delegated clock's `atem status` line, while it holds deadlines
-    /// back (`HostClock::status_line`).
+    /// The delegated clock's `atem status` line (`HostClock::status_line`):
+    /// while it holds deadlines back, while its record is damaged, and for a
+    /// day after a repair or a lowering.
     pub fn clock_status(&self) -> Option<String> {
         self.work.clock.as_ref()?.status_line()
     }

@@ -78,8 +78,9 @@ pub struct StatusReport {
     pub local_agents: Line,
     /// The runtime's r9 device list, when it has one (`Device list:`).
     pub device_list: Option<Line>,
-    /// The runtime's delegated clock, while it holds deadlines back
-    /// (`Clock:`, host-work-v1 §11.6).
+    /// The runtime's delegated clock (`Clock:`, host-work-v1 §11.6): while
+    /// it holds deadlines back, while its record is damaged, and for a day
+    /// after a repair or a lowering.
     pub clock: Option<Line>,
     /// Printed after the block (e.g. the reset steps for broken key files).
     pub notes: Vec<String>,
