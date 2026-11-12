@@ -832,7 +832,7 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | OpenFailed | Failed{reaso
 | `Restore{code, detail}` | `kit_tag_mismatch`, `genesis_mismatch`, `membership_invalid`, `no_host_reachable`, `log_behind_host`, `kit_not_current`, `no_backup`, `backup_hash_mismatch`, `backup_invalid` |
 | `Publish{code, detail}` | `outstanding` (also: another publisher or writer of this device holds a prepared body), `not_on_head`, `nothing_prepared`, `sign` |
 | `Push{code, detail}` | `malformed`, `binding`, `bad_signature`, `invalid_times`, `skew`, `stale`, `bad_sealed`, `duplicate` |
-| `Stored{code, detail}` | a stored snapshot didn't load. `MembershipLog::from_stored`: `too_large` (over 16 MiB), `malformed` (not strict JSON, not an object, no `v`, no `account_id`/`genesis_hash`), `unsupported_version` (a `v` other than 1), `account_mismatch`, `genesis_mismatch` (the snapshot's are not the caller's anchors), `stored_invalid` (the shared verifier refused it, or it isn't exactly `stored_json()`'s form); a malformed anchor argument is `Invalid`. `ControlStateHandle::from_json` (§9): `too_large` (over 64 MiB), `malformed` (not strict JSON, not an object, no `v`), `unsupported_version` (a `v` other than 1), `account_mismatch`, `genesis_mismatch` (the state is another device list's), `stored_invalid` (the state's own rules refuse it, or it isn't exactly `to_json()`'s form) |
+| `Stored{code, detail}` | a stored snapshot didn't load. `MembershipLog::from_stored`: `too_large` (over 16 MiB), `malformed` (not strict JSON, not an object, no `v`, no `account_id`/`genesis_hash`), `unsupported_version` (a `v` other than 1), `account_mismatch`, `genesis_mismatch` (the snapshot's are not the caller's anchors), `stored_invalid` (the shared verifier refused it, or it isn't exactly `stored_json()`'s form); a malformed anchor argument is `Invalid`. `ControlStateHandle::from_json` (§9): `too_large` (over 64 MiB), `malformed` (not strict JSON, not an object, no `v`), `unsupported_version` (a `v` other than 2: **for Astation**, amended for step 4), `account_mismatch`, `genesis_mismatch` (the state is another device list's), `stored_invalid` (the state's own rules refuse it, or it isn't exactly `to_json()`'s form) |
 | `State{detail}` | `state` (a call out of order: `already started`, `not waiting for accept`, `no signature pending`, …; or the object changed while the provider was signing) |
 
 `detail` is for logs and may change; branch on the variant and `code`.
@@ -1249,7 +1249,7 @@ trust model"):
   takes coverage only when strictly newer, and a cover never releases a
   hold. Each cover or release you sign for a principal is issued after
   every record you signed for it before, your holds included (**needs
-  Astation's agreement**: a `cover` or `release` issued no later than a
+  Astation's agreement**, **for Astation**, amended for step 4: a `cover` or `release` issued no later than a
   record a host evicted is refused there as a possible replay; holds are
   never refused for it), and a handover carries the newest `issued_at`
   of any record signed for the principal. Your covers' `issued_at` only

@@ -1209,7 +1209,8 @@ ordering can't stop a key holder. The Station's duties:
   principal is newer, by `(issued_at, record_id)`, than any cover issued
   for that principal before, a handed-over integration's included (the
   handover carries the last cover's `issued_at`). **Its releases' too
-  (with the bound of rule 1; needs Astation's agreement):** each cover
+  (with the bound of rule 1; needs Astation's agreement; **for Astation**,
+  amended for step 4):** each cover
   or release a Station signs for a principal is issued after every
   record it signed for that principal before, its holds included, since
   a cover or release issued no later than a record a host evicted is

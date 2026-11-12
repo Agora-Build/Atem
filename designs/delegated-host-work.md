@@ -50,9 +50,10 @@ comment 6810116314), and confirmed #148's refusal wire (2026-11-12, #148 comment
 report items (2026-11-11, #148 comment 6803727308) and #147's items 1 to 3 (2026-11-12, #147 comment
 6813332550). The agreed items are marked in host-work-v1 §11, session-v1 R9.2, R9.3, R9.7b, R9.8, R9.9 and
 R9.14 and in the bindings contract. Still open, or step 4 acceptance: the runtime's enforcement of the feed store
-and the host's gates and cursors, byte-level goldens for the relay messages, the clock provider's tests,
+and the host's gates and cursors, byte-level goldens for the relay messages (proposed in step 4's PR 2,
+`r9-vectors-station-calls.json`, for Astation's acceptance), the clock provider's tests,
 `no_match`'s wire form and the status of a selector-resolved (UUID v5) task. The design text below changes only in
-these marks.
+these marks and the amendments that follow.
 
 **Amended for step 4, for Astation's review (host mail).** Two changes to II.4.2's receiver, built in the shared core
 (host-work-v1 §11.5). Only a key the host made waits: mail sealed to a key id the host never made in its current trust
