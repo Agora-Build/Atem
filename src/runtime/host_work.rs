@@ -554,6 +554,12 @@ pub struct WorkRecord {
     /// lines come from the outbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<MessageFrame>,
+    /// A delegated sender's task (design I.1.3, I.4.1): what it was
+    /// admitted under, frozen before the enqueue was answered. None for a
+    /// v1 task (`local`, a browser grant, a service no feed covers, every
+    /// sender while `host.delegated` is off), whose record is as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated: Option<crate::runtime::delegated::Admission>,
 }
 
 /// What a message's task renders around its text: the message's id and
@@ -1022,7 +1028,13 @@ impl Store {
             CREATE TABLE IF NOT EXISTS closed_records (
                 kind TEXT NOT NULL, id TEXT NOT NULL, at_ms INTEGER NOT NULL,
                 PRIMARY KEY(kind,id)) WITHOUT ROWID;
-            CREATE TABLE IF NOT EXISTS clock (id INTEGER PRIMARY KEY CHECK (id = 1), state TEXT);")?;
+            CREATE TABLE IF NOT EXISTS clock (id INTEGER PRIMARY KEY CHECK (id = 1), state TEXT);
+            CREATE TABLE IF NOT EXISTS attempts (
+                task_id TEXT NOT NULL, attempt_id TEXT PRIMARY KEY, n INTEGER NOT NULL,
+                \"end\" TEXT, counted INTEGER NOT NULL, created_ms INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS attempts_live ON attempts(task_id)
+                WHERE \"end\" IS NULL;")?;
         track_open_records(&db)?;
         track_waits(&db)?;
         std::fs::File::open(state)?.sync_all()?;
@@ -1994,6 +2006,7 @@ mod tests {
     fn task() -> WorkRecord {
         let task_id = uuid::Uuid::new_v4().to_string();
         WorkRecord {
+            delegated: None,
             principal: "member:phone".into(),
             attachment_owner: String::new(),
             control_gen: 1,

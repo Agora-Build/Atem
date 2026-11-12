@@ -566,6 +566,7 @@ impl HostBridge {
                 return Ok(false);
             }
             store.enqueue(&WorkRecord {
+                delegated: None,
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
                 control_gen: grant.origin.control_gen,
@@ -1522,6 +1523,7 @@ impl HostBridge {
             };
             let task = local_task(message, &r.task_id, target);
             let record = WorkRecord {
+                delegated: None,
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
                 control_gen: self.host.control_gen("local"),

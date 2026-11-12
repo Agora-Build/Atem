@@ -6,19 +6,22 @@
 //! 4's Decision 10); a release build never does.
 //!
 //! Here so far: who is delegated ([`classify`]: design I.1.3, Decision 13),
-//! what the bridge answers the delegated ops ([`request`]), and §11.6's
-//! detail texts ([`details`]).
-// Used by the lifecycle as later tasks build it (admission records,
-// dispatch, the feeds); until then only the tests and `request` use them.
-#![cfg_attr(not(test), allow(dead_code))]
+//! the admission record a delegated sender's task gets ([`Admission`],
+//! I.4.1), its attempts ([`attempts`], I.6.4), what the bridge answers the
+//! delegated ops ([`request`]), and §11.6's detail texts ([`details`]).
+pub mod attempts;
 pub mod details;
 
 use crate::runtime::test_hooks::HostFeatures;
 use crate::session_protocol::r9::HostWorkError;
 use atem_client::membership::entry::MemberKind;
 use atem_client::membership::{MemberStatus, Membership};
+use atem_client::principal::{Authority, Need, Op, op_names};
+use atem_client::session::host_work::digest;
 use atem_client::session::host_work::{ALERTS_FEATURE, DELEGATED_FEATURE, Request, ResultBody};
 use atem_client::session::wire::is_delegated_sender;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 /// The detail of a `host.delegated` op the host advertises but doesn't
 /// serve yet (`busy`, host-work-v1 §7: a request it can't take now). Not a
@@ -29,7 +32,7 @@ pub const ALERTS_NOT_SERVED: &str = "host.alerts is not served yet";
 
 /// The Station feed that covers a service (design I.5.2): the Station's
 /// origin and the feed's id.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeedRef {
     pub origin: String,
     pub feed_id: String,
@@ -37,7 +40,8 @@ pub struct FeedRef {
 
 /// A sender whose every stop the host learns from signed data (design
 /// I.1.3), so its tasks run while it is offline.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DelegatedSender {
     /// A native member (`member:<id>`): its stops come from the device list.
     Native { device_id: String },
@@ -80,12 +84,96 @@ impl ControlView for NoFeeds {
     }
 }
 
+/// A delegated sender's task's admission record (design I.4.1): what its
+/// execution depends on, stored with the task before the enqueue is
+/// answered and never changed. The task's own fields hold the rest of
+/// I.4.1's record: `task_id`, `workflow_id`, the deadline, the target
+/// triple with `session_id` and `process_gen`, the inputs and their
+/// digest, the profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Admission {
+    /// `member:<id>` or `service:<id>`.
+    pub principal: String,
+    /// Hex SHA-256 of the principal's `auth_key` (its raw bytes), as
+    /// `r9_svc` is computed.
+    pub principal_key: String,
+    pub sender: DelegatedSender,
+    /// The feed whose control records apply to it: a covered service's.
+    /// None for a native member, whose gate is the host's own Station's
+    /// (design I.5.8), not a feed of its own.
+    pub feed: Option<FeedRef>,
+    pub route_id: String,
+    pub route_revision: u64,
+    /// The ops it held (`notify` and `prompt` among them), sorted: a
+    /// service's grant's, every op for a native member holding `control`.
+    pub ops_at_admission: Vec<String>,
+    /// A service's grant scope (`ops`, `hosts`, and `sessions` and
+    /// `projects` when it has them); null for a native member (roles, no
+    /// scope).
+    pub scope_at_admission: Value,
+    /// A service's grant expiry; none for a native member.
+    pub grant_expires_at: Option<u64>,
+    /// The device list's head `seq` at admission.
+    pub device_list_seq: u64,
+}
+
+impl Admission {
+    /// The record of a task `authority` enqueued through `route_id` at
+    /// `route_revision`, its sender classified `sender` ([`classify`]) on
+    /// the device list whose head is `device_list_seq`.
+    pub fn freeze(
+        authority: &Authority,
+        sender: DelegatedSender,
+        route_id: &str,
+        route_revision: u64,
+        device_list_seq: u64,
+    ) -> Admission {
+        let feed = match &sender {
+            DelegatedSender::Service { feed, .. } => Some(feed.clone()),
+            DelegatedSender::Native { .. } => None,
+        };
+        let ops = Op::ALL
+            .into_iter()
+            .filter(|op| authority.allows(Need::Op(*op)))
+            .collect();
+        let scope_at_admission = authority.scope.as_ref().map_or(Value::Null, |scope| {
+            let mut out = json!({"ops": op_names(&scope.ops)});
+            for (key, list) in [
+                ("hosts", &scope.hosts),
+                ("sessions", &scope.sessions),
+                ("projects", &scope.projects),
+            ] {
+                if let Some(list) = list {
+                    out[key] = json!(list);
+                }
+            }
+            out
+        });
+        Admission {
+            principal: authority.name(),
+            principal_key: digest(authority.key.as_bytes()),
+            sender,
+            feed,
+            route_id: route_id.to_owned(),
+            route_revision,
+            ops_at_admission: op_names(&ops).into_iter().map(String::from).collect(),
+            scope_at_admission,
+            grant_expires_at: authority.expires_at,
+            device_list_seq,
+        }
+    }
+}
+
 /// Who is delegated (design I.1.3, step 4's Decision 13), with
 /// `host.delegated` on: a native member in effect on the host's pinned
 /// device list (`list`), and a service in effect there that a feed this
 /// host syncs covers (`controls`). Everyone else keeps v1: browser grants,
 /// services no feed covers, `local`, host senders (`host.senders` is never
 /// on in step 4) and anything that isn't a principal of the list.
+///
+/// The caller passes the host's device list only while it is open and
+/// serving (pinned, not held, frozen or faulted): otherwise a native member
+/// is v1, never delegated (`HostBridge::sender_class`).
 pub fn classify(
     principal: &str,
     list: &Membership,
@@ -342,6 +430,73 @@ mod tests {
                 "{principal:?}"
             );
         }
+    }
+
+    /// Design I.4.1: what a delegated sender held at admission, frozen:
+    /// its principal and key fingerprint (hex SHA-256 of its `auth_key`, as
+    /// `r9_svc` is computed), its kind and feed, the route, the ops it
+    /// held, its scope, its grant's expiry and the device list's head.
+    #[test]
+    fn admission_freezes_what_the_sender_held() {
+        use atem_client::channel::Principal;
+        use atem_client::membership::service_key_fingerprint;
+        use atem_client::principal::{Authority, Op, op_names};
+        let log = list();
+        let now = host_now();
+        let resolve = |principal: Principal| {
+            Authority::resolve(&log.log, &principal, None, HOST, 1, &now, &|_| false).unwrap()
+        };
+        let head = log.log.head().seq;
+
+        let phone = resolve(Principal::Native {
+            device_id: "dev-phone".into(),
+        });
+        let SenderClass::Delegated(sender) = classify(&phone.name(), &log.log, &NoFeeds, on())
+        else {
+            panic!("a native member is delegated");
+        };
+        let a = Admission::freeze(&phone, sender.clone(), "r", 3, head);
+        assert_eq!(
+            a,
+            Admission {
+                principal: "member:dev-phone".into(),
+                principal_key: service_key_fingerprint(&phone.key).unwrap(),
+                sender,
+                feed: None,
+                route_id: "r".into(),
+                route_revision: 3,
+                // A native member holding `control` holds every op.
+                ops_at_admission: op_names(&Op::ALL.into_iter().collect())
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                scope_at_admission: serde_json::Value::Null,
+                grant_expires_at: None,
+                device_list_seq: head,
+            }
+        );
+
+        let bot = resolve(Principal::Service {
+            device_id: "svc-bot".into(),
+        });
+        let covers = Covers(vec!["service:svc-bot"]);
+        let SenderClass::Delegated(sender) = classify(&bot.name(), &log.log, &covers, on()) else {
+            panic!("a covered service is delegated");
+        };
+        let a = Admission::freeze(&bot, sender, "r", 1, head);
+        assert_eq!(a.principal, "service:svc-bot");
+        assert_eq!(a.principal_key, service_key_fingerprint(&bot.key).unwrap());
+        assert_eq!(a.feed, Some(feed()));
+        assert_eq!(a.ops_at_admission, ["notify", "prompt", "view"]);
+        assert_eq!(
+            a.scope_at_admission,
+            serde_json::json!({"ops": ["notify", "prompt", "view"], "hosts": [HOST]})
+        );
+        assert_eq!(a.grant_expires_at, bot.expires_at);
+        assert!(a.grant_expires_at.is_some());
+        // Stored with the task, and read back the same.
+        let text = serde_json::to_string(&a).unwrap();
+        assert_eq!(serde_json::from_str::<Admission>(&text).unwrap(), a);
     }
 
     /// With the hook off the delegated ops that reach the bridge are

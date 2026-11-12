@@ -1,5 +1,6 @@
 //! Opt-in host operations. Work reaches agents only through session-v1 receipts.
 use super::*;
+use crate::runtime::delegated::{Admission, NoFeeds, SenderClass, classify, details};
 use crate::runtime::host_clock::HostClock;
 use crate::runtime::host_work::{
     AUTHORIZATION_EXPIRED, Accepted, Config, LaunchRecord, MessageFrame, Profile, Store,
@@ -398,6 +399,53 @@ impl HostBridge {
             .enable_host_work(self.hosting_enabled() && self.work.store.is_some());
     }
 
+    /// The host's device list while it is open and serving (pinned, opened,
+    /// with its channel key; not held, frozen or faulted): the only list a
+    /// sender is classified on (design I.1.3).
+    fn open_list(&self) -> Option<&atem_client::membership::Membership> {
+        match (&self.membership, &self.membership_error, &self.host_key) {
+            (Some(m), None, Some(_))
+                if !m.unpaired()
+                    && !m.is_frozen()
+                    && m.held().is_none()
+                    && m.faulted().is_none() =>
+            {
+                Some(m.membership())
+            }
+            _ => None,
+        }
+    }
+
+    /// Who `principal` is to this host's tasks (Decision 13): delegated
+    /// only on an open list ([`HostBridge::open_list`]) with
+    /// `host.delegated` on; until the host syncs feeds (PR 10) no service
+    /// is covered (`NoFeeds`).
+    pub(super) fn sender_class(&self, principal: &str) -> SenderClass {
+        match self.open_list() {
+            Some(list) => classify(principal, list, &NoFeeds, self.features),
+            None => SenderClass::V1,
+        }
+    }
+
+    /// The admission record of a task `a` enqueues through `route_id` at
+    /// `route_revision` (design I.4.1): only a delegated sender's
+    /// ([`HostBridge::sender_class`]); none for `local` and every v1
+    /// sender.
+    fn admission(&self, a: &Sender, route_id: &str, route_revision: u64) -> Option<Admission> {
+        let authority = a.remote()?;
+        let SenderClass::Delegated(sender) = self.sender_class(&authority.name()) else {
+            return None;
+        };
+        let seq = self.open_list()?.head().seq;
+        Some(Admission::freeze(
+            authority,
+            sender,
+            route_id,
+            route_revision,
+            seq,
+        ))
+    }
+
     fn work_host(&self) -> HostTarget {
         let ctx = self.host.context();
         HostTarget {
@@ -731,11 +779,23 @@ impl HostBridge {
         req: &hw::Request,
         cx: &mut Cx,
     ) -> Result<ResultBody, HostWorkError> {
-        use hw::Request;
         if req.host() != &self.work_host() {
             return Err("stale_target".into());
         }
         let a = self.work_authority(attachment).ok_or("unauthorized")?;
+        self.work_request_as(attachment, req, a, cx)
+    }
+
+    /// [`HostBridge::work_request`] from `a`, the current authority of the
+    /// request's `attachment`, once the request names this host.
+    fn work_request_as(
+        &mut self,
+        attachment: &str,
+        req: &hw::Request,
+        a: Sender,
+        cx: &mut Cx,
+    ) -> Result<ResultBody, HostWorkError> {
+        use hw::Request;
         let principal = a.name();
         let wall = host_now().wall_ms;
         if let Request::AttachmentPut {
@@ -901,7 +961,8 @@ impl HostBridge {
                     &serde_json::to_vec(&(req.host(), route_id, route_revision, task))
                         .map_err(|_| "invalid_request")?,
                 );
-                let record = WorkRecord {
+                let mut record = WorkRecord {
+                    delegated: None,
                     attachment_owner: attachment_owner(&a),
                     principal,
                     control_gen: self.host.control_gen(&a.name()),
@@ -941,6 +1002,9 @@ impl HostBridge {
                 {
                     return Err("invalid_request".into());
                 }
+                // A delegated sender's task: its admission record, stored
+                // with it before the reply (design I.4.1).
+                record.delegated = self.admission(&a, route_id, *route_revision);
                 store.enqueue(&record).map_err(|_| "busy")?;
                 self.host.keep_principal(&record.principal);
                 Ok(ResultBody::Work {
@@ -1163,6 +1227,7 @@ impl HostBridge {
                     .ok_or("forbidden")?;
                 let task = message.task(r).ok_or("invalid_request")?;
                 let record = WorkRecord {
+                    delegated: None,
                     attachment_owner: attachment_owner(a),
                     principal: a.name(),
                     control_gen: self.host.control_gen(&a.name()),
@@ -1393,6 +1458,21 @@ impl HostBridge {
                 continue;
             }
             if r.status.state == WorkState::AwaitingResult {
+                continue;
+            }
+            // A delegated sender's task (design I.4) is dispatched under
+            // host-work after the start check, with its deadline on the
+            // delegated clock (Task 19). Until then its gate stays closed:
+            // it waits `blocked`, `revocations not yet checked`, never on
+            // the sender's channel, and doesn't hold its session (§11.6).
+            if r.delegated.is_some() {
+                if r.status.state != WorkState::Blocked
+                    || r.status.detail != details::REVOCATIONS_NOT_YET_CHECKED
+                {
+                    r.status.state = WorkState::Blocked;
+                    r.status.detail = details::REVOCATIONS_NOT_YET_CHECKED.into();
+                    self.work.store.as_ref().unwrap().save_work(&r)?;
+                }
                 continue;
             }
             if now >= r.task.expires_at {
@@ -2398,6 +2478,7 @@ principals = ["local"]
         let mut task = message.task(&message.recipients[0]).unwrap();
         task.expires_at = expires_at;
         let record = WorkRecord {
+            delegated: None,
             principal: principal.into(),
             attachment_owner: String::new(),
             control_gen,
@@ -2920,6 +3001,7 @@ principals = ["local"]
             let mut task = message.task(&message.recipients[0]).unwrap();
             task.expires_at = old;
             let record = WorkRecord {
+                delegated: None,
                 principal: "member:owner".into(),
                 attachment_owner: String::new(),
                 control_gen: 0,
@@ -3073,6 +3155,274 @@ principals = ["local"]
             other.host_trust_gen += 1;
             let [stale, ..] = delegated_requests(&other);
             assert_eq!(ask(&mut rig, &stale), Err("stale_target".into()));
+        });
+    }
+
+    /// The rig's host with a pinned device list (`acct`, this host at
+    /// trust generation 1, a phone holding `control`), opened as the
+    /// runtime opens a list pinned while it runs; a route `rm` the phone
+    /// may use; and the phone's authority, as its channel resolves it.
+    fn pin_phone(rig: &mut LocalRig, root: &Path) -> (u64, Authority) {
+        use crate::session_protocol::membership::r9log::{TestLog, host_now as now, secret};
+        use crate::session_protocol::membership::{HostPin, MembershipHost};
+        use atem_client::channel::Principal;
+        let mut log = TestLog::genesis("acct", &secret("delegated astation"));
+        log.add_host("host", 1, &secret("delegated host"));
+        log.add_native("dev-phone", &["control", "view"]);
+        let pairing = crate::profile::Sources::in_dir(&root.join("profile"))
+            .paths
+            .pairing;
+        let pin = HostPin {
+            host_id: "host".into(),
+            host_trust_gen: 1,
+        };
+        MembershipHost::pin(
+            &pairing,
+            &rig.bridge.dir,
+            &pin,
+            &log.log,
+            &secret("delegated host"),
+        )
+        .unwrap();
+        rig.bridge.pairing = Some(pairing);
+        rig.bridge.reopen_list_if_changed(&mut Cx {
+            client: &rig.app.astation_client,
+            sessions: &mut rig.sessions,
+        });
+        // Nothing else of the pairing takes part in these tests.
+        rig.bridge.pairing = None;
+        assert!(rig.bridge.membership.is_some() && rig.bridge.host_key.is_some());
+        rig.bridge
+            .work
+            .config
+            .routes
+            .push(crate::runtime::host_work::Route {
+                id: "rm".into(),
+                revision: 1,
+                profile_id: "p".into(),
+                principals: vec!["member:dev-phone".into()],
+                labels: vec![],
+                launch: Default::default(),
+                results: false,
+                auto_report: Default::default(),
+            });
+        let phone = Authority::resolve(
+            &log.log,
+            &Principal::Native {
+                device_id: "dev-phone".into(),
+            },
+            None,
+            "host",
+            1,
+            &now(),
+            &|_| false,
+        )
+        .unwrap();
+        (log.log.head().seq, phone)
+    }
+
+    /// The phone's `work_enqueue` of `prompt` through route `rm` to the
+    /// rig's session.
+    fn phone_enqueue(rig: &LocalRig, prompt: &str) -> hw::Request {
+        let host = rig.bridge.work_host();
+        hw::Request::Enqueue {
+            v: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            host: host.clone(),
+            route_id: "rm".into(),
+            route_revision: 1,
+            task: hw::WorkTask {
+                task_id: uuid::Uuid::new_v4().to_string(),
+                workflow_id: uuid::Uuid::new_v4().to_string(),
+                target: wire::Target {
+                    account_id: host.account_id,
+                    atem_device_id: host.atem_device_id,
+                    host_trust_gen: host.host_trust_gen,
+                    session_id: rig.sid.to_string(),
+                    process_gen: rig.sessions[&rig.sid].process_gen.clone(),
+                },
+                expires_at: host_now().wall_ms + 60_000,
+                prompt: prompt.into(),
+                context: vec![],
+                attachments: vec![],
+            },
+        }
+    }
+
+    /// The phone's request, as its channel hands it to the bridge.
+    fn as_phone(
+        rig: &mut LocalRig,
+        phone: &Authority,
+        req: &hw::Request,
+    ) -> Result<ResultBody, HostWorkError> {
+        rig.bridge.work_request_as(
+            "att-phone",
+            req,
+            Sender::Remote(Box::new(phone.clone())),
+            &mut Cx {
+                client: &rig.app.astation_client,
+                sessions: &mut rig.sessions,
+            },
+        )
+    }
+
+    fn enqueued(req: &hw::Request) -> String {
+        match req {
+            hw::Request::Enqueue { task, .. } => task.task_id.clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Design I.4.1, Decision 13: a native member's `work_enqueue` with
+    /// `host.delegated` on stores its admission record with the task,
+    /// durable before the reply (another connection reads it then): the
+    /// sender, its key, the route and revision, the target, the ops and
+    /// scope it held, no grant expiry (a native's authority doesn't
+    /// expire) and the device list's seq. The reply is `work`, `queued`.
+    /// Without the hook the same sender's task has none. Until dispatch
+    /// under host-work exists (Task 19) the task waits `blocked`,
+    /// `revocations not yet checked` (the gate is closed), never sent on
+    /// the v1 path, and its admission doesn't change.
+    #[test]
+    fn admission_record_freezes_route_target_grant_and_list_seq() {
+        use crate::runtime::delegated::{Admission, DelegatedSender, details};
+        use crate::runtime::test_hooks::HostFeatures;
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let (seq, phone) = pin_phone(&mut rig, root);
+
+            let v1 = phone_enqueue(&rig, "V1_TASK_PROMPT");
+            as_phone(&mut rig, &phone, &v1).unwrap();
+            assert_eq!(stored_record(&rig, &enqueued(&v1)).delegated, None);
+
+            rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
+            let req = phone_enqueue(&rig, "DELEGATED_TASK_PROMPT");
+            let task_id = enqueued(&req);
+            let reply = as_phone(&mut rig, &phone, &req).unwrap();
+            let db = rusqlite::Connection::open(root.join("runtime/host-work.sqlite")).unwrap();
+            let text: String = db
+                .query_row("SELECT record FROM work WHERE id=?1", [&task_id], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let record: WorkRecord = serde_json::from_str(&text).unwrap();
+            let admission = Admission {
+                principal: "member:dev-phone".into(),
+                principal_key: atem_client::membership::service_key_fingerprint(&phone.key)
+                    .unwrap(),
+                sender: DelegatedSender::Native {
+                    device_id: "dev-phone".into(),
+                },
+                feed: None,
+                route_id: "rm".into(),
+                route_revision: 1,
+                ops_at_admission: atem_client::principal::op_names(&Op::ALL.into_iter().collect())
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                scope_at_admission: Value::Null,
+                grant_expires_at: None,
+                device_list_seq: seq,
+            };
+            assert_eq!(record.delegated.as_ref(), Some(&admission));
+            let hw::Request::Enqueue { task, .. } = &req else {
+                unreachable!()
+            };
+            assert_eq!(record.task.target, task.target);
+            assert_eq!((record.route_id.as_str(), record.route_revision), ("rm", 1));
+            let ResultBody::Work { work } = reply else {
+                panic!("a work result: {reply:?}");
+            };
+            assert_eq!(work.state, WorkState::Queued);
+            assert_eq!(work.detail, "waiting for a ready agent");
+            assert_eq!(work, record.status);
+
+            // A retry is the recorded task, its admission as it was.
+            let mut retry = req.clone();
+            if let hw::Request::Enqueue { id, .. } = &mut retry {
+                *id = uuid::Uuid::new_v4().to_string();
+            }
+            assert!(as_phone(&mut rig, &phone, &retry).is_ok());
+            rig.until(|r| {
+                stored_record(r, &task_id).status.detail == details::REVOCATIONS_NOT_YET_CHECKED
+            })
+            .await;
+            idle(&mut rig, 300).await;
+            let after = stored_record(&rig, &task_id);
+            assert_eq!(after.status.state, WorkState::Blocked);
+            assert_eq!(after.delegated.as_ref(), Some(&admission));
+            assert!(
+                !std::fs::read_to_string(rig.fake.join("input"))
+                    .unwrap_or_default()
+                    .contains("DELEGATED_TASK_PROMPT")
+            );
+        });
+    }
+
+    /// Design I.6.4: behind `host.delegated` a task's `receipt_id` is its
+    /// current attempt's id: the id fixed at enqueue until its first
+    /// attempt, then the latest attempt's, ended or not. A v1 task has no
+    /// attempts.
+    #[test]
+    fn work_query_shows_the_current_attempt_id() {
+        use crate::runtime::delegated::attempts::AttemptEnd;
+        use crate::runtime::test_hooks::HostFeatures;
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let (_, phone) = pin_phone(&mut rig, root);
+            let v1 = phone_enqueue(&rig, "V1_TASK_PROMPT");
+            as_phone(&mut rig, &phone, &v1).unwrap();
+            rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
+            let req = phone_enqueue(&rig, "DELEGATED_TASK_PROMPT");
+            let task_id = enqueued(&req);
+            let ResultBody::Work { work } = as_phone(&mut rig, &phone, &req).unwrap() else {
+                panic!("a work result");
+            };
+            let host = rig.bridge.work_host();
+            let query = |rig: &mut LocalRig, task_id: &str| {
+                let req = hw::Request::WorkQuery {
+                    v: 1,
+                    id: uuid::Uuid::new_v4().to_string(),
+                    host: host.clone(),
+                    task_id: task_id.into(),
+                };
+                match as_phone(rig, &phone, &req).unwrap() {
+                    ResultBody::Work { work } => work,
+                    other => panic!("a work result: {other:?}"),
+                }
+            };
+            assert_eq!(query(&mut rig, &task_id).receipt_id, work.receipt_id);
+            let attempt = |rig: &LocalRig| {
+                let store = rig.bridge.work.store.as_ref().unwrap();
+                let tx = store.immediate().unwrap();
+                let a = store.new_attempt(&tx, &task_id).unwrap();
+                tx.commit().unwrap();
+                a
+            };
+            let first = attempt(&rig);
+            let seen = query(&mut rig, &task_id);
+            assert_eq!(seen.receipt_id, first.attempt_id);
+            assert_eq!(seen.state, WorkState::Queued);
+            {
+                let store = rig.bridge.work.store.as_ref().unwrap();
+                let tx = store.immediate().unwrap();
+                store
+                    .end_attempt(&tx, &task_id, &first.attempt_id, AttemptEnd::NotAdmitted)
+                    .unwrap();
+                tx.commit().unwrap();
+            }
+            assert_eq!(query(&mut rig, &task_id).receipt_id, first.attempt_id);
+            let second = attempt(&rig);
+            assert_ne!(second.attempt_id, first.attempt_id);
+            assert_eq!(query(&mut rig, &task_id).receipt_id, second.attempt_id);
+            // The v1 task keeps the one id fixed at its enqueue.
+            let v1_id = enqueued(&v1);
+            let before = query(&mut rig, &v1_id).receipt_id;
+            let store = rig.bridge.work.store.as_ref().unwrap();
+            let tx = store.immediate().unwrap();
+            assert!(store.new_attempt(&tx, &v1_id).is_err());
+            drop(tx);
+            assert_eq!(query(&mut rig, &v1_id).receipt_id, before);
         });
     }
 
@@ -4328,6 +4678,7 @@ launch = "on_message"
             task.expires_at = host_now().wall_ms + 3_600_000;
             task.prompt = "x".repeat(prompt);
             let record = WorkRecord {
+                delegated: None,
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
                 control_gen,
@@ -5091,6 +5442,7 @@ launch = "on_message"
                 store.bind(&host).unwrap();
                 store
                     .enqueue(&WorkRecord {
+                        delegated: None,
                         principal: "browser:b".into(),
                         attachment_owner: String::new(),
                         control_gen: 2,
