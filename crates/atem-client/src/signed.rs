@@ -372,7 +372,7 @@ impl SignedObject {
 }
 
 /// The checks every signed body gets; returns its label and `jcs`.
-fn check_body(body: &Value) -> Result<(SignLabel, String)> {
+pub(crate) fn check_body(body: &Value) -> Result<(SignLabel, String)> {
     if !body.is_object() {
         return Err(Error::Malformed("body must be an object"));
     }

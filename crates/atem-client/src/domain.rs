@@ -28,6 +28,9 @@ pub enum SignLabel {
     /// host-work design II.4.1): Ed25519 by its `host_key` over
     /// [`SigningInput::fields`], not over a body.
     HostEncKey,
+    /// `atem-host-work-control` bodies: control records (delegated
+    /// host-work design I.5.3).
+    HostWorkControl,
     /// `atem-envelope` bodies (delegated host-work design II.4.2): a host
     /// sender's request, cancel or complete, signed by its `host_key`.
     Envelope,
@@ -48,6 +51,7 @@ impl SignLabel {
             SignLabel::ChannelClient => "atem-ch1-client-sig-v1",
             SignLabel::HostRoute => "atem-host-route-v1",
             SignLabel::HostEncKey => "atem-host-enc-key-v1",
+            SignLabel::HostWorkControl => "atem-host-work-control-v1",
             SignLabel::Envelope => "atem-envelope-v1",
             SignLabel::Result => "atem-result-v1",
         }
@@ -62,6 +66,7 @@ impl SignLabel {
             "atem-push-hint" => Some(SignLabel::PushHint),
             "atem-seen" => Some(SignLabel::Seen),
             "atem-host-route" => Some(SignLabel::HostRoute),
+            "atem-host-work-control" => Some(SignLabel::HostWorkControl),
             "atem-envelope" => Some(SignLabel::Envelope),
             "atem-result" => Some(SignLabel::Result),
             _ => None,
@@ -136,7 +141,7 @@ mod tests {
 
     /// Every label, in one list. The match fails to compile until a new
     /// label is listed here too, so the distinctness test covers it.
-    const LABELS: [SignLabel; 11] = [
+    const LABELS: [SignLabel; 12] = [
         SignLabel::MembershipEntry,
         SignLabel::RecoveryCosign,
         SignLabel::BrowserGrant,
@@ -146,6 +151,7 @@ mod tests {
         SignLabel::ChannelClient,
         SignLabel::HostRoute,
         SignLabel::HostEncKey,
+        SignLabel::HostWorkControl,
         SignLabel::Envelope,
         SignLabel::Result,
     ];
@@ -161,8 +167,9 @@ mod tests {
             SignLabel::ChannelClient => 6,
             SignLabel::HostRoute => 7,
             SignLabel::HostEncKey => 8,
-            SignLabel::Envelope => 9,
-            SignLabel::Result => 10,
+            SignLabel::HostWorkControl => 9,
+            SignLabel::Envelope => 10,
+            SignLabel::Result => 11,
         }
     }
 

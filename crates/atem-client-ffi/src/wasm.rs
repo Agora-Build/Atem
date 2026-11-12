@@ -23,8 +23,8 @@ use wasm_bindgen::prelude::*;
 
 use crate::error::AtemError;
 use crate::types::{
-    ApprovalChoice, ClientIdentity, DeviceKind, HostClock, KeyAlg, PrincipalKind, PublicKeyData,
-    PushRecipient, PushStage, PushVerifier, SignLabelKind,
+    ApprovalChoice, ClientIdentity, ControlFeedPos, ControlRecordBody, DeviceKind, HostClock,
+    KeyAlg, PrincipalKind, PublicKeyData, PushRecipient, PushStage, PushVerifier, SignLabelKind,
 };
 
 type JsResult<T> = Result<T, JsValue>;
@@ -155,6 +155,7 @@ fn label(name: &str) -> JsResult<SignLabelKind> {
         "seen" => SignLabelKind::Seen,
         "channel_host" => SignLabelKind::ChannelHost,
         "channel_client" => SignLabelKind::ChannelClient,
+        "host_work_control" => SignLabelKind::HostWorkControl,
         _ => return Err(bad("unknown label")),
     })
 }
@@ -798,6 +799,244 @@ pub fn project_hash(account_key: JsValue, project_key: String) -> JsResult<Strin
         crate::types::AccountKey { kid: k.kid, k: k.k },
         project_key,
     ))
+}
+
+// --------------------------------------- control records (Station builders)
+
+/// A control record's body as JS passes it: `ControlRecordBody`'s fields
+/// in camelCase, absent ones omitted, `undefined` or `null`; no other field.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct JsControlBody {
+    account_id: String,
+    genesis_hash: String,
+    #[serde(default)]
+    origin: Option<String>,
+    #[serde(default)]
+    feed_id: Option<String>,
+    principal: String,
+    #[serde(default)]
+    principal_key: Option<String>,
+    signer: String,
+    action: String,
+    #[serde(default)]
+    interrupt_running: Option<bool>,
+    #[serde(default)]
+    revoke_seq: Option<f64>,
+    record_id: String,
+    issued_at: f64,
+    #[serde(default)]
+    integration_id: Option<String>,
+    by: String,
+}
+
+/// `v` is a plain object with no key outside `fields` (serde-wasm-bindgen
+/// reads only the fields a struct names, so `deny_unknown_fields` alone
+/// would let a misspelled one through unread).
+fn only_fields(v: &JsValue, fields: &[&str], what: &str) -> JsResult<()> {
+    use wasm_bindgen::JsCast;
+    let object = v
+        .dyn_ref::<js_sys::Object>()
+        .ok_or_else(|| bad(&format!("{what} is an object")))?;
+    for key in js_sys::Object::keys(object).iter() {
+        let key = key.as_string().unwrap_or_default();
+        if !fields.contains(&key.as_str()) {
+            return Err(bad(&format!("{what}: unknown field {key}")));
+        }
+    }
+    Ok(())
+}
+
+fn control_body(v: JsValue) -> JsResult<ControlRecordBody> {
+    only_fields(
+        &v,
+        &[
+            "accountId",
+            "genesisHash",
+            "origin",
+            "feedId",
+            "principal",
+            "principalKey",
+            "signer",
+            "action",
+            "interruptRunning",
+            "revokeSeq",
+            "recordId",
+            "issuedAt",
+            "integrationId",
+            "by",
+        ],
+        "a control record body",
+    )?;
+    let b: JsControlBody = serde_wasm_bindgen::from_value(v).map_err(|e| {
+        bad(&format!(
+            "a control record body {{accountId, genesisHash, origin?, feedId?, principal, principalKey?, signer, action, interruptRunning?, revokeSeq?, recordId, issuedAt, integrationId?, by}}: {e}"
+        ))
+    })?;
+    Ok(ControlRecordBody {
+        account_id: b.account_id,
+        genesis_hash: b.genesis_hash,
+        origin: b.origin,
+        feed_id: b.feed_id,
+        principal: b.principal,
+        principal_key: b.principal_key,
+        signer: b.signer,
+        action: b.action,
+        interrupt_running: b.interrupt_running,
+        revoke_seq: b.revoke_seq.map(ms).transpose()?,
+        record_id: b.record_id,
+        issued_at: ms(b.issued_at)?,
+        integration_id: b.integration_id,
+        by: b.by,
+    })
+}
+
+/// A record's body, field by field (`parse_control_record`).
+#[wasm_bindgen(js_name = parseControlRecord)]
+pub fn parse_control_record(record_json: String) -> JsResult<JsValue> {
+    ok(crate::control::parse_control_record(record_json))
+}
+
+/// The verdict on a record against `log` (`verify_control_record`):
+/// `{type: "valid", signer, keySeq, head}`, `{type: "pending", reason}` or
+/// `{type: "refused", reason}`.
+#[wasm_bindgen(js_name = verifyControlRecord)]
+pub fn verify_control_record(log: &MembershipLog, record_json: String) -> JsResult<JsValue> {
+    ok(crate::control::verify_control_record(
+        log.0.clone(),
+        record_json,
+    ))
+}
+
+/// The bytes a key signs for `body` (`control_record_signing_input`): a
+/// Station's key in WebCrypto or a KMS signs them, then
+/// `controlRecordWithSignature` makes the record.
+#[wasm_bindgen(js_name = controlRecordSigningInput)]
+pub fn control_record_signing_input(body: JsValue) -> JsResult<Vec<u8>> {
+    err(crate::control::control_record_signing_input(control_body(
+        body,
+    )?))
+}
+
+/// The record of `body` with `signature` by the key `signerAlg`/`signerRaw`
+/// (`control_record_with_signature`; verified before it is returned).
+#[wasm_bindgen(js_name = controlRecordWithSignature)]
+pub fn control_record_with_signature(
+    body: JsValue,
+    signer_alg: &str,
+    signer_raw: Vec<u8>,
+    signature: Vec<u8>,
+) -> JsResult<String> {
+    err(crate::control::control_record_with_signature(
+        control_body(body)?,
+        key(signer_alg, signer_raw)?,
+        signature,
+    ))
+}
+
+/// A record signed with a key of a software store (bots and tests; a
+/// Station keeps its keys in its own key store and uses
+/// `controlRecordSigningInput`).
+#[cfg(feature = "software-keys")]
+#[wasm_bindgen(js_name = buildControlRecord)]
+pub fn build_control_record(
+    store: &SoftwareKeyStore,
+    key_id: String,
+    body: JsValue,
+) -> JsResult<String> {
+    err(crate::control::build_control_record_with(
+        &*store.0,
+        &key_id,
+        &control_body(body)?,
+    ))
+}
+
+/// The reference control state of one device list (`ControlStateHandle`).
+#[wasm_bindgen]
+pub struct ControlStateHandle(Arc<crate::control::ControlStateHandle>);
+
+#[wasm_bindgen]
+impl ControlStateHandle {
+    #[wasm_bindgen(constructor)]
+    pub fn new(log: &MembershipLog) -> ControlStateHandle {
+        ControlStateHandle(crate::control::ControlStateHandle::new(log.0.clone()))
+    }
+    /// A state `toJson()` wrote, for `log`'s device list.
+    #[wasm_bindgen(js_name = fromJson)]
+    pub fn from_json(log: &MembershipLog, state_json: String) -> JsResult<ControlStateHandle> {
+        Ok(ControlStateHandle(err(
+            crate::control::ControlStateHandle::from_json(log.0.clone(), state_json),
+        )?))
+    }
+    /// The durable state (canonical JSON): store the next state's after
+    /// every `apply`.
+    #[wasm_bindgen(js_name = toJson)]
+    pub fn to_json(&self) -> String {
+        self.0.to_json()
+    }
+    /// Applies a record to this state (`pos`: `{origin, feedId, feedSeq}`,
+    /// or `null`/`undefined` over a channel) and returns a
+    /// `ControlTransition`: `applied` (`{result, effects: [{effect,
+    /// result}], actions: [{type, principal, …}], evidence}`) and `next`,
+    /// the state after it. This handle doesn't change: use `next` once
+    /// your transaction storing `next.toJson()` committed.
+    pub fn apply(
+        &self,
+        record_json: String,
+        log: &MembershipLog,
+        pos: JsValue,
+        host_applied_seq: f64,
+    ) -> JsResult<ControlTransition> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct P {
+            origin: String,
+            feed_id: String,
+            feed_seq: f64,
+        }
+        let pos = if pos.is_null() || pos.is_undefined() {
+            None
+        } else {
+            only_fields(&pos, &["origin", "feedId", "feedSeq"], "pos")?;
+            let p: P = serde_wasm_bindgen::from_value(pos)
+                .map_err(|_| bad("pos {origin, feedId, feedSeq}, or null"))?;
+            Some(ControlFeedPos {
+                origin: p.origin,
+                feed_id: p.feed_id,
+                feed_seq: ms(p.feed_seq)?,
+            })
+        };
+        let transition = err(self
+            .0
+            .apply(record_json, log.0.clone(), pos, ms(host_applied_seq)?))?;
+        Ok(ControlTransition {
+            applied: to_js(&transition.applied)?,
+            next: transition.next,
+        })
+    }
+}
+
+/// What `ControlStateHandle.apply` gives (`crate::control::ControlTransition`).
+#[wasm_bindgen]
+pub struct ControlTransition {
+    applied: JsValue,
+    next: Arc<crate::control::ControlStateHandle>,
+}
+
+#[wasm_bindgen]
+impl ControlTransition {
+    /// What the record did: `{result, effects, actions, evidence}`.
+    #[wasm_bindgen(getter)]
+    pub fn applied(&self) -> JsValue {
+        self.applied.clone()
+    }
+    /// The state after the record: use it once the transaction storing
+    /// `next.toJson()` committed (until then the handle applied on is the
+    /// current state).
+    #[wasm_bindgen(getter)]
+    pub fn next(&self) -> ControlStateHandle {
+        ControlStateHandle(self.next.clone())
+    }
 }
 
 // ------------------------------------------------------- kit and backup

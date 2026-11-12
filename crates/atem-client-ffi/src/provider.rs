@@ -161,6 +161,7 @@ impl From<SignLabelKind> for SignLabel {
             SignLabelKind::Seen => SignLabel::Seen,
             SignLabelKind::ChannelHost => SignLabel::ChannelHost,
             SignLabelKind::ChannelClient => SignLabel::ChannelClient,
+            SignLabelKind::HostWorkControl => SignLabel::HostWorkControl,
         }
     }
 }
@@ -186,6 +187,11 @@ pub fn describe(input: &SigningInput) -> (SigningPurpose, Option<String>) {
         | SignLabel::Envelope
         | SignLabel::Result => (SigningPurpose::HostSigning, body()),
         SignLabel::BrowserGrant => (SigningPurpose::BrowserGrant, body()),
+        // A control record (delegated host-work I.5.3), by its signer.
+        SignLabel::HostWorkControl => {
+            let body = body();
+            (control_purpose(body.as_deref()), body)
+        }
         SignLabel::RecoveryCosign => (SigningPurpose::Kit, body()),
         SignLabel::MembershipEntry => {
             let body = body();
@@ -216,6 +222,25 @@ pub fn describe(input: &SigningInput) -> (SigningPurpose, Option<String>) {
             };
             (purpose, body)
         }
+    }
+}
+
+/// A control record's purpose, by the signer its body names: the
+/// principal's own service key (`signer` equal to a `service:` `principal`,
+/// a Station signing for an integration it hosts) is `ServiceControl`, with
+/// no owner confirmation; anything else, a native manager's `member:`
+/// signature above all, is `ControlRecord`, with a fresh confirmation of the
+/// body. A body that can't be read asks for the confirmation.
+fn control_purpose(body: Option<&str>) -> SigningPurpose {
+    let value = body.and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok());
+    let own_service_key = value.is_some_and(|v| {
+        let principal = v["principal"].as_str();
+        principal.is_some_and(|p| p.starts_with("service:")) && v["signer"].as_str() == principal
+    });
+    if own_service_key {
+        SigningPurpose::ServiceControl
+    } else {
+        SigningPurpose::ControlRecord
     }
 }
 
@@ -431,6 +456,9 @@ impl AppKeyProvider for SoftwareKeyStore {
             SignLabel::Seen,
             SignLabel::ChannelHost,
             SignLabel::ChannelClient,
+            SignLabel::HostRoute,
+            SignLabel::HostEncKey,
+            SignLabel::HostWorkControl,
             // A host's mail (delegated host work II.4.2, II.4.4; host role,
             // planned): the conformance suites seal through this store.
             SignLabel::Envelope,
@@ -441,8 +469,14 @@ impl AppKeyProvider for SoftwareKeyStore {
         .ok_or(ProviderError::Failed {
             reason: "unknown label".into(),
         })?;
-        let payload = fields.get(1).copied().unwrap_or_default();
-        let input = SigningInput::new(label, payload);
+        // One payload after the label, or a host's `enc_sig` fields (II.4.1).
+        let payload = &fields[1..];
+        if payload.len() != 1 && label != SignLabel::HostEncKey {
+            return Err(ProviderError::Failed {
+                reason: "not a signing input".into(),
+            });
+        }
+        let input = SigningInput::fields(label, payload);
         if input.as_bytes() != request.input.as_slice() {
             return Err(ProviderError::Failed {
                 reason: "not a signing input".into(),
@@ -551,6 +585,8 @@ mod tests {
             (SignLabel::PushHint, SigningPurpose::HostSigning),
             (SignLabel::Seen, SigningPurpose::HostSigning),
             (SignLabel::ChannelHost, SigningPurpose::HostSigning),
+            // A control record whose body can't be read asks the owner.
+            (SignLabel::HostWorkControl, SigningPurpose::ControlRecord),
         ] {
             let request = sign_request(&KeyId::new("k"), &SigningInput::new(label, b"{}"));
             assert_eq!(request.purpose, purpose, "{label:?}");
@@ -558,6 +594,56 @@ mod tests {
                 request.fresh_confirmation,
                 purpose != SigningPurpose::HostSigning
             );
+        }
+    }
+
+    /// A control record's purpose follows its signer (I.5.4): a native
+    /// manager's needs a fresh confirmation of the body; a Station signing
+    /// with the integration's own service key needs none.
+    #[test]
+    fn a_control_record_names_its_signer() {
+        let control = |principal: &str, signer: &str| {
+            let body = format!(
+                r#"{{"action":"revoke","principal":"{principal}","signer":"{signer}","type":"atem-host-work-control"}}"#
+            );
+            sign_request(
+                &KeyId::new("k"),
+                &SigningInput::new(SignLabel::HostWorkControl, body.as_bytes()),
+            )
+        };
+        for (principal, signer, purpose) in [
+            (
+                "service:svc-1",
+                "member:dev-mac",
+                SigningPurpose::ControlRecord,
+            ),
+            (
+                "host:host-a",
+                "member:dev-mac",
+                SigningPurpose::ControlRecord,
+            ),
+            (
+                "service:svc-1",
+                "service:svc-1",
+                SigningPurpose::ServiceControl,
+            ),
+            // A host's own key signs no record: never without the owner.
+            ("host:host-a", "host:host-a", SigningPurpose::ControlRecord),
+            (
+                "service:svc-1",
+                "service:svc-2",
+                SigningPurpose::ControlRecord,
+            ),
+        ] {
+            let request = control(principal, signer);
+            assert_eq!(request.purpose, purpose, "{principal} by {signer}");
+            assert_eq!(
+                request.fresh_confirmation,
+                purpose == SigningPurpose::ControlRecord,
+                "{principal} by {signer}"
+            );
+            assert_eq!(request.label, "atem-host-work-control-v1");
+            assert!(request.body_json.unwrap().contains(signer));
         }
     }
 
@@ -579,6 +665,25 @@ mod tests {
         let mut unlabelled = good;
         unlabelled.input = atem_client::encoding::enc(&[b"not-a-label", b"{}"]);
         assert!(AppKeyProvider::sign(&*store, unlabelled).is_err());
+        // Every label the core signs with: a control record, a host route,
+        // and a host's enc_sig over several fields.
+        for input in [
+            SigningInput::new(SignLabel::HostWorkControl, b"{}"),
+            SigningInput::new(SignLabel::HostRoute, b"{}"),
+            SigningInput::fields(SignLabel::HostEncKey, &[b"acct", &[7u8; 32], b"host-a"]),
+        ] {
+            let request = sign_request(&KeyId::new("k"), &input);
+            let sig = AppKeyProvider::sign(&*store, request).unwrap();
+            let public = KeyProvider::public_key(&*store, &KeyId::new("k")).unwrap();
+            public.verify(&input, &sig).unwrap();
+        }
+        // Bytes after a valid input, or a second field beside a body, are no
+        // signing input.
+        for extra in [&[0u8, 0, 0][..], &[0, 0, 0, 0]] {
+            let mut trailing = sign_request(&KeyId::new("k"), &entry_input("remove"));
+            trailing.input.extend_from_slice(extra);
+            assert!(AppKeyProvider::sign(&*store, trailing).is_err());
+        }
         // A host's mail is signed through the store too (host role).
         for label in [SignLabel::Envelope, SignLabel::Result] {
             let request = sign_request(&KeyId::new("k"), &SigningInput::new(label, b"{}"));

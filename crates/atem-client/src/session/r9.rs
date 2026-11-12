@@ -19,8 +19,10 @@ use crate::SignedObject;
 use crate::canonical::{StrictValue, jcs};
 use crate::channel::carriage::Carriage;
 use crate::channel::{ClientProof, MAX_PLAINTEXT, Principal};
+use crate::control::{ApplicationResult, ControlRecord, EffectKind, EffectResult};
 use crate::encoding::{b64u, b64u_decode};
 use crate::membership::Head;
+use crate::session::wire::is_uuid_v4;
 
 /// The revision an r9 `hello` must carry and `welcome` echoes.
 pub const REVISION: u64 = 9;
@@ -576,6 +578,271 @@ pub fn seen(id: &str, re: &str) -> Value {
     session(json!({"v": 1, "op": "seen", "id": id, "re": re}))
 }
 
+/// The most records one `control_records` message carries.
+pub const MAX_CONTROL_RECORDS: usize = 64;
+/// The most bytes one `control_records` message is: its plaintext, as sealed.
+pub const MAX_CONTROL_RECORDS_BYTES: usize = 256 * 1024;
+/// Why a `control_records` message holding a service's record is refused.
+const NOT_A_HOST_RECORD: &str = "not a host principal's record";
+
+/// `control_records{records}` (C→H, feature [`SENDERS_FEATURE`]): control
+/// records carried to the host on an open channel, the signed objects as
+/// they are. It is for native members, as `membership` is for entries, and
+/// the host answers one [`ControlRecordsResult`]. It carries **host
+/// principals' records only** (`host:<host_id>`, a native manager's
+/// `interrupt_running`): a service's record travels only in its Station's
+/// feed, and a message holding one is refused whole.
+///
+/// **Carriage order.** A carrier sends `membership` up to its head before
+/// `control_records` on a channel: a record is verified against the device
+/// list the host has applied. One whose principal or native signer isn't
+/// in that list yet waits (`pending`, `principal_unknown` or
+/// `signer_unknown`), but one signed by a native the list holds without
+/// `manage`, a promotion the host hasn't applied yet included, is refused
+/// (`signer_not_allowed`), not held for the entry to come; delivering the
+/// same record again after `membership` brought the host to the promotion
+/// is enough (a refused record takes no `record_id`).
+///
+/// **A carrier gets no authority from carrying** ("trust the signature, not
+/// the sender", account-trust §3.5): the host verifies each record against
+/// its own device list and applies it as I.5.5 says, whoever sent it. A
+/// message is one to 64 records and at most 256 KiB: [`MAX_CONTROL_RECORDS`]
+/// and [`MAX_CONTROL_RECORDS_BYTES`]. Nothing here advertises the op: a
+/// client never sends it to a host that didn't list the feature, and a host
+/// that didn't refuses it.
+///
+/// `Err` for what the host would refuse: none, too many, a service's
+/// record, over the size.
+///
+/// [`SENDERS_FEATURE`]: crate::session::host_work::SENDERS_FEATURE
+pub fn control_records_op(id: &str, records: &[ControlRecord]) -> Result<Value, &'static str> {
+    if records.is_empty() {
+        return Err("no records");
+    }
+    if records.len() > MAX_CONTROL_RECORDS {
+        return Err("too many records");
+    }
+    if !records.iter().all(|r| r.principal().is_host()) {
+        return Err(NOT_A_HOST_RECORD);
+    }
+    let message = session(json!({"v": 1, "op": "control_records", "id": id,
+        "records": records.iter().map(|r| r.object().to_json()).collect::<Vec<_>>()}));
+    if message.to_string().len() > MAX_CONTROL_RECORDS_BYTES {
+        return Err("message too large");
+    }
+    Ok(message)
+}
+
+/// A `control_records` message as the host reads it: the records, parsed
+/// (structure only; verifying and applying them is the host's, I.5.4 and
+/// I.5.5), in the order sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlRecordsRequest {
+    pub id: String,
+    pub records: Vec<ControlRecord>,
+}
+
+impl ControlRecordsRequest {
+    /// Reads a received plaintext, strictly (I-JSON, no duplicate keys,
+    /// integers only): exactly `{"type":"session","data":{"v":1,"op":
+    /// "control_records","id":<UUID v4>,"records":[…]}}`, one to 64 records
+    /// of at most 256 KiB in all. Each record must parse as a control
+    /// record of a host principal (`host:<host_id>`); one that doesn't, or a
+    /// service's record, spoils the message, and nothing is read partly.
+    /// `Err` is a short reason, fit for the error's `detail`.
+    pub fn decode(plain: &[u8]) -> Result<Self, &'static str> {
+        let root = StrictValue::parse(plain, MAX_CONTROL_RECORDS_BYTES).map_err(|e| match e {
+            crate::canonical::StrictError::TooLarge => "message too large",
+            _ => "not strict JSON",
+        })?;
+        const SHAPE: &str = "not a control_records message";
+        let shape = |ok: bool| if ok { Ok(()) } else { Err(SHAPE) };
+        let value = root.value();
+        shape(value.as_object().is_some_and(|o| o.len() == 2) && value["type"] == "session")?;
+        let data = value["data"].as_object().ok_or(SHAPE)?;
+        shape(
+            data.len() == 4
+                && data.get("v").and_then(Value::as_u64) == Some(1)
+                && data.get("op").and_then(Value::as_str) == Some("control_records"),
+        )?;
+        let id = data
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| is_uuid_v4(id))
+            .ok_or(SHAPE)?
+            .to_owned();
+        let items = root
+            .get("data")
+            .and_then(|d| d.get("records"))
+            .and_then(|r| r.items())
+            .ok_or(SHAPE)?;
+        if items.is_empty() {
+            return Err("no records");
+        }
+        if items.len() > MAX_CONTROL_RECORDS {
+            return Err("too many records");
+        }
+        let records = items
+            .iter()
+            .map(|item| {
+                let record = SignedObject::from_strict(item)
+                    .ok()
+                    .and_then(|object| ControlRecord::from_signed(object).ok())
+                    .ok_or("not a control record")?;
+                if record.principal().is_host() {
+                    Ok(record)
+                } else {
+                    Err(NOT_A_HOST_RECORD)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ControlRecordsRequest { id, records })
+    }
+}
+
+/// One record's result in a `control_records_result`: the record's, and
+/// each effect it carries with its own (I.5.8, "results and counts are per
+/// effect"). The words are [`ApplicationResult::code`] and
+/// [`EffectKind::code`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordResult {
+    pub record_id: String,
+    pub result: ApplicationResult,
+    /// Every effect the record carries, once each.
+    pub effects: Vec<EffectResult>,
+}
+
+impl RecordResult {
+    fn to_json(&self) -> Value {
+        json!({"record_id": self.record_id, "result": self.result.code(),
+            "effects": self.effects.iter().map(|e| json!({
+                "effect": e.effect.code(), "result": e.result.code()})).collect::<Vec<_>>()})
+    }
+
+    fn from_json(value: &Value) -> Result<Self, &'static str> {
+        let o = value
+            .as_object()
+            .filter(|o| o.len() == 3)
+            .ok_or("results")?;
+        let record_id = o
+            .get("record_id")
+            .and_then(Value::as_str)
+            .filter(|id| is_uuid_v4(id))
+            .ok_or("record_id")?
+            .to_owned();
+        let result = o
+            .get("result")
+            .and_then(Value::as_str)
+            .and_then(ApplicationResult::from_code)
+            .ok_or("result")?;
+        let mut effects: Vec<EffectResult> = Vec::new();
+        for item in o
+            .get("effects")
+            .and_then(Value::as_array)
+            .filter(|a| !a.is_empty())
+            .ok_or("effects")?
+        {
+            let e = item.as_object().filter(|e| e.len() == 2).ok_or("effects")?;
+            let effect = e
+                .get("effect")
+                .and_then(Value::as_str)
+                .and_then(EffectKind::from_code)
+                .ok_or("effects")?;
+            let result = e
+                .get("result")
+                .and_then(Value::as_str)
+                .and_then(ApplicationResult::from_code)
+                .ok_or("effects")?;
+            if effects.iter().any(|seen| seen.effect == effect) {
+                return Err("effects");
+            }
+            effects.push(EffectResult { effect, result });
+        }
+        Ok(RecordResult {
+            record_id,
+            result,
+            effects,
+        })
+    }
+}
+
+/// `control_records_result{re, results}` (H→C): the answer to one
+/// `control_records`, one result per record, in the order sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlRecordsResult {
+    pub id: String,
+    /// The `id` of the `control_records` it answers.
+    pub re: String,
+    pub results: Vec<RecordResult>,
+}
+
+impl ControlRecordsResult {
+    /// Reads a `control_records_result`'s `data`: exactly its fields, the
+    /// words of the vocabulary, UUID v4 ids, and one to 64 results.
+    pub fn from_data(data: &Value) -> Result<Self, &'static str> {
+        let o = data.as_object().ok_or("data")?;
+        if o.get("op").and_then(Value::as_str) != Some("control_records_result") {
+            return Err("op");
+        }
+        if o.get("v").and_then(Value::as_u64) != Some(1) {
+            return Err("v");
+        }
+        if o.len() != 5 {
+            return Err("fields");
+        }
+        let uuid = |k: &'static str| -> Result<String, &'static str> {
+            o.get(k)
+                .and_then(Value::as_str)
+                .filter(|s| is_uuid_v4(s))
+                .map(str::to_owned)
+                .ok_or(k)
+        };
+        let results = o
+            .get("results")
+            .and_then(Value::as_array)
+            .filter(|a| (1..=MAX_CONTROL_RECORDS).contains(&a.len()))
+            .ok_or("results")?
+            .iter()
+            .map(RecordResult::from_json)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ControlRecordsResult {
+            id: uuid("id")?,
+            re: uuid("re")?,
+            results,
+        })
+    }
+
+    /// The wire message.
+    pub fn to_json(&self) -> Value {
+        session(
+            json!({"v": 1, "op": "control_records_result", "id": self.id, "re": self.re,
+            "results": self.results.iter().map(RecordResult::to_json).collect::<Vec<_>>()}),
+        )
+    }
+
+    /// Whether this answers the request `request_id` that carried
+    /// `record_ids`: its `re`, and one result per record, in order.
+    pub fn answers(&self, request_id: &str, record_ids: &[String]) -> bool {
+        self.re == request_id
+            && self.results.len() == record_ids.len()
+            && self
+                .results
+                .iter()
+                .zip(record_ids)
+                .all(|(result, id)| &result.record_id == id)
+    }
+}
+
+/// `control_records_result{re, results}` (H→C).
+pub fn control_records_result(id: &str, re: &str, results: &[RecordResult]) -> Value {
+    ControlRecordsResult {
+        id: id.into(),
+        re: re.into(),
+        results: results.to_vec(),
+    }
+    .to_json()
+}
+
 /// A session-family message a client received, r9's own ops read here; the
 /// rest goes to r8's decoder ([`crate::session::wire::decode`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -597,6 +864,8 @@ pub enum Incoming {
     HostPolicyResult(Box<crate::session::host_policy::HostPolicyResult>),
     HostWorkResult(Box<crate::session::host_work::Response>),
     HostPolicyChanged(Box<crate::session::host_policy::HostPolicyChanged>),
+    /// A `control_records_result` (H→C).
+    ControlRecordsResult(ControlRecordsResult),
     /// Any other message (r8's session ops, terminal-v1, chat-v1).
     Other,
 }
@@ -642,6 +911,9 @@ impl Incoming {
             "host_policy_changed" => Incoming::HostPolicyChanged(Box::new(
                 crate::session::host_policy::HostPolicyChanged::from_data(data)?,
             )),
+            "control_records_result" => {
+                Incoming::ControlRecordsResult(ControlRecordsResult::from_data(data)?)
+            }
             _ => Incoming::Other,
         })
     }
@@ -650,6 +922,395 @@ impl Incoming {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `control_records` and its result (delegated host-work design II.3.1,
+    /// plan Task 12).
+    mod control_records {
+        use super::*;
+
+        const ID: &str = "aaaaaaaa-0000-4000-8000-0000000000c1";
+        const RE: &str = "aaaaaaaa-0000-4000-8000-0000000000c2";
+
+        /// A host principal's `interrupt_running`, number `n` (the record id
+        /// varies; the signature is of the right shape, which the parse
+        /// never verifies).
+        fn record(n: u64) -> ControlRecord {
+            let body = json!({
+                "type": "atem-host-work-control", "v": 1,
+                "account_id": "acct-test-1", "genesis_hash": "11".repeat(32),
+                "principal": "host:host-a", "signer": "member:dev-mac",
+                "action": "interrupt_running", "revoke_seq": 7,
+                "record_id": format!("0b9a8c7d-6e5f-4a3b-9c2d-{n:012x}"),
+                "issued_at": 1_793_620_800_000u64,
+                "about": {"by": "owner"},
+            });
+            ControlRecord::parse(
+                json!({"body": body, "sig": b64u(&[7u8; 64])})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap()
+        }
+
+        fn records(count: u64) -> Vec<ControlRecord> {
+            (1..=count).map(record).collect()
+        }
+
+        /// A service's record (a native manager's revoke of `service:svc-1`),
+        /// number `n`: well formed, but its place is its Station's feed.
+        fn service_record(n: u64) -> ControlRecord {
+            let body = json!({
+                "type": "atem-host-work-control", "v": 1,
+                "account_id": "acct-test-1", "genesis_hash": "11".repeat(32),
+                "origin": "https://station-dev.agora.build",
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "principal": "service:svc-1", "principal_key": "22".repeat(32),
+                "signer": "member:dev-mac",
+                "action": "revoke", "interrupt_running": true,
+                "record_id": format!("0b9a8c7d-6e5f-4a3b-9c2d-{n:012x}"),
+                "issued_at": 1_793_620_800_000u64,
+                "about": {"integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0", "by": "owner"},
+            });
+            ControlRecord::parse(
+                json!({"body": body, "sig": b64u(&[7u8; 64])})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .unwrap()
+        }
+
+        fn ids(records: &[ControlRecord]) -> Vec<String> {
+            records.iter().map(|r| r.record_id().to_owned()).collect()
+        }
+
+        fn effect(effect: EffectKind, result: ApplicationResult) -> EffectResult {
+            EffectResult { effect, result }
+        }
+
+        fn results_for(records: &[ControlRecord]) -> Vec<RecordResult> {
+            records
+                .iter()
+                .enumerate()
+                .map(|(i, r)| match i % 3 {
+                    0 => RecordResult {
+                        record_id: r.record_id().to_owned(),
+                        result: ApplicationResult::Applied,
+                        effects: vec![effect(EffectKind::Interrupt, ApplicationResult::Applied)],
+                    },
+                    1 => RecordResult {
+                        record_id: r.record_id().to_owned(),
+                        result: ApplicationResult::Pending,
+                        effects: vec![
+                            effect(EffectKind::Revocation, ApplicationResult::Duplicate),
+                            effect(EffectKind::Interrupt, ApplicationResult::Pending),
+                        ],
+                    },
+                    _ => RecordResult {
+                        record_id: r.record_id().to_owned(),
+                        result: ApplicationResult::Refused,
+                        effects: vec![effect(EffectKind::Interrupt, ApplicationResult::Refused)],
+                    },
+                })
+                .collect()
+        }
+
+        fn bytes(message: &Value) -> Vec<u8> {
+            message.to_string().into_bytes()
+        }
+
+        /// The message, as sent and as the host reads it.
+        #[test]
+        fn control_records_round_trip() {
+            let sent = records(3);
+            let message = control_records_op(ID, &sent).unwrap();
+            assert_eq!(message["type"], "session");
+            let data = &message["data"];
+            assert_eq!(data["v"], 1);
+            assert_eq!(data["op"], "control_records");
+            assert_eq!(data["id"], ID);
+            assert_eq!(data.as_object().unwrap().len(), 4);
+            for (wire, record) in data["records"].as_array().unwrap().iter().zip(&sent) {
+                assert_eq!(wire, &record.object().to_json(), "the signed object as is");
+            }
+            // The host reads exactly what was sent, in order.
+            let plain = bytes(&message);
+            assert!(plain.len() <= MAX_CONTROL_RECORDS_BYTES);
+            let read = ControlRecordsRequest::decode(&plain).unwrap();
+            assert_eq!(read.id, ID);
+            assert_eq!(read.records, sent);
+            // The client classifies its own op as nothing it reads.
+            assert_eq!(Incoming::parse(&plain), Ok(Incoming::Other));
+
+            // The result: one per record, per-effect results; written and
+            // read again, bound to the request.
+            let results = results_for(&sent);
+            let reply = control_records_result(RE, ID, &results);
+            assert_eq!(reply["type"], "session");
+            assert_eq!(reply["data"]["op"], "control_records_result");
+            assert_eq!(reply["data"]["v"], 1);
+            assert_eq!(reply["data"]["id"], RE);
+            assert_eq!(reply["data"]["re"], ID);
+            assert_eq!(
+                reply["data"]["results"][1],
+                json!({
+                    "record_id": sent[1].record_id(),
+                    "result": "pending",
+                    "effects": [
+                        {"effect": "revocation", "result": "duplicate"},
+                        {"effect": "interrupt", "result": "pending"},
+                    ],
+                })
+            );
+            let Ok(Incoming::ControlRecordsResult(got)) = Incoming::parse(&bytes(&reply)) else {
+                panic!("a control_records_result");
+            };
+            assert_eq!(got.id, RE);
+            assert_eq!(got.re, ID);
+            assert_eq!(got.results, results);
+            assert!(got.answers(ID, &ids(&sent)));
+            assert_eq!(got.to_json(), reply);
+            // Not another request, not the same records in another order,
+            // not fewer or more.
+            assert!(!got.answers(RE, &ids(&sent)));
+            let mut swapped = ids(&sent);
+            swapped.swap(0, 1);
+            assert!(!got.answers(ID, &swapped));
+            assert!(!got.answers(ID, &ids(&sent)[..2]));
+            let mut more = ids(&sent);
+            more.push(record(9).record_id().to_owned());
+            assert!(!got.answers(ID, &more));
+        }
+
+        /// At most 64 records, and at least one: 65 are refused by the
+        /// builder and by the host's reading, and an empty message too.
+        #[test]
+        fn sixty_five_records_refused() {
+            let all = records(65);
+            let ok = control_records_op(ID, &all[..64]).unwrap();
+            assert_eq!(
+                ControlRecordsRequest::decode(&bytes(&ok))
+                    .unwrap()
+                    .records
+                    .len(),
+                64
+            );
+            assert_eq!(
+                control_records_op(ID, &all).unwrap_err(),
+                "too many records"
+            );
+            // A message built by hand with 65.
+            let mut over = ok.clone();
+            over["data"]["records"]
+                .as_array_mut()
+                .unwrap()
+                .push(all[64].object().to_json());
+            assert_eq!(
+                ControlRecordsRequest::decode(&bytes(&over)).unwrap_err(),
+                "too many records"
+            );
+            // None is no message.
+            assert_eq!(control_records_op(ID, &[]).unwrap_err(), "no records");
+            let mut none = ok;
+            none["data"]["records"] = json!([]);
+            assert_eq!(
+                ControlRecordsRequest::decode(&bytes(&none)).unwrap_err(),
+                "no records"
+            );
+        }
+
+        /// The message is at most 256 KiB as sealed (its plaintext): the
+        /// limit itself passes, one byte more is refused, whatever the
+        /// count.
+        #[test]
+        fn over_256_kib_refused() {
+            let message = control_records_op(ID, &records(2)).unwrap();
+            let mut plain = bytes(&message);
+            plain.resize(MAX_CONTROL_RECORDS_BYTES, b' ');
+            assert_eq!(
+                ControlRecordsRequest::decode(&plain).unwrap().records.len(),
+                2
+            );
+            plain.push(b' ');
+            assert_eq!(
+                ControlRecordsRequest::decode(&plain).unwrap_err(),
+                "message too large"
+            );
+        }
+
+        /// What else the host refuses: not strict JSON, another shape, a
+        /// record that isn't a control record. Nothing is read partly.
+        #[test]
+        fn control_records_decode_is_strict() {
+            let good = control_records_op(ID, &records(2)).unwrap();
+            assert!(ControlRecordsRequest::decode(&bytes(&good)).is_ok());
+            let refused = |message: &Value, why: &str| {
+                assert_eq!(
+                    ControlRecordsRequest::decode(&bytes(message)).unwrap_err(),
+                    why,
+                    "{message}"
+                );
+            };
+            let edit = |f: &dyn Fn(&mut Value)| {
+                let mut m = good.clone();
+                f(&mut m);
+                m
+            };
+            let shape = "not a control_records message";
+            refused(&edit(&|m| m["data"]["v"] = json!(2)), shape);
+            refused(&edit(&|m| m["data"]["op"] = json!("membership")), shape);
+            refused(&edit(&|m| m["data"]["id"] = json!("not-a-uuid")), shape);
+            refused(&edit(&|m| m["data"]["extra"] = json!(1)), shape);
+            refused(&edit(&|m| m["extra"] = json!(1)), shape);
+            refused(&edit(&|m| m["type"] = json!("terminal")), shape);
+            refused(&edit(&|m| m["data"]["records"] = json!({})), shape);
+            refused(
+                &edit(&|m| {
+                    m["data"].as_object_mut().unwrap().remove("records");
+                }),
+                shape,
+            );
+            // One that isn't a control record spoils the message.
+            let bad = "not a control record";
+            refused(&edit(&|m| m["data"]["records"][1] = json!("x")), bad);
+            refused(
+                &edit(&|m| m["data"]["records"][1]["body"]["action"] = json!("pause")),
+                bad,
+            );
+            refused(&edit(&|m| m["data"]["records"][1]["extra"] = json!(1)), bad);
+            // A device-list entry is no control record.
+            refused(
+                &edit(&|m| {
+                    m["data"]["records"][1]["body"]["type"] = json!("atem-membership-entry");
+                }),
+                bad,
+            );
+            // Not strict JSON: a duplicate key, a fraction, garbage.
+            let text = String::from_utf8(bytes(&good)).unwrap();
+            let dup = text.replacen("\"v\":1", "\"v\":1,\"v\":1", 1);
+            assert_eq!(
+                ControlRecordsRequest::decode(dup.as_bytes()).unwrap_err(),
+                "not strict JSON"
+            );
+            let frac = text.replacen("\"revoke_seq\":7", "\"revoke_seq\":7.5", 1);
+            assert_eq!(
+                ControlRecordsRequest::decode(frac.as_bytes()).unwrap_err(),
+                "not strict JSON"
+            );
+            assert_eq!(
+                ControlRecordsRequest::decode(b"{").unwrap_err(),
+                "not strict JSON"
+            );
+        }
+
+        /// Host principals' records only: a service's record travels in its
+        /// Station's feed, never on a channel. The builder refuses one, and
+        /// the host's reading refuses the whole message (nothing of it is
+        /// applied), alone or beside host principals' records.
+        #[test]
+        fn a_service_record_is_refused_whole() {
+            let why = "not a host principal's record";
+            assert_eq!(
+                control_records_op(ID, &[service_record(1)]).unwrap_err(),
+                why
+            );
+            let mixed = [record(1), service_record(2), record(3)];
+            assert_eq!(control_records_op(ID, &mixed).unwrap_err(), why);
+            // Built by hand: refused whole when read.
+            let mut message = control_records_op(ID, &records(3)).unwrap();
+            message["data"]["records"][1] = service_record(2).object().to_json();
+            assert_eq!(
+                ControlRecordsRequest::decode(&bytes(&message)).unwrap_err(),
+                why
+            );
+            message["data"]["records"] = json!([service_record(1).object().to_json()]);
+            assert_eq!(
+                ControlRecordsRequest::decode(&bytes(&message)).unwrap_err(),
+                why
+            );
+        }
+
+        fn parse_result(data: &Value) -> Result<ControlRecordsResult, &'static str> {
+            match Incoming::parse(&bytes(&json!({"type": "session", "data": data})))? {
+                Incoming::ControlRecordsResult(r) => Ok(r),
+                other => panic!("not a result: {other:?}"),
+            }
+        }
+
+        /// The result's words are the four results and the five effects,
+        /// exact; a result is exactly the fields of the form.
+        #[test]
+        fn result_vocabulary_strict() {
+            let sent = records(2);
+            let good = control_records_result(RE, ID, &results_for(&sent))["data"].clone();
+            assert!(parse_result(&good).is_ok());
+            // Every result word on every effect word is read.
+            for result in ["applied", "duplicate", "pending", "refused"] {
+                for kind in ["revocation", "interrupt", "hold", "release", "cover"] {
+                    let mut d = good.clone();
+                    d["results"][0]["result"] = json!(result);
+                    d["results"][0]["effects"] = json!([{"effect": kind, "result": result}]);
+                    let r = parse_result(&d).unwrap();
+                    assert_eq!(r.results[0].result.code(), result);
+                    assert_eq!(r.results[0].effects[0].effect.code(), kind);
+                }
+            }
+            // Anything else is refused: other words, case, types.
+            let refused = |f: &dyn Fn(&mut Value)| {
+                let mut d = good.clone();
+                f(&mut d);
+                assert!(parse_result(&d).is_err(), "{d}");
+            };
+            for word in ["done", "Applied", "APPLIED", "ok", "failed", "", "applied "] {
+                refused(&|d| d["results"][0]["result"] = json!(word));
+                refused(&|d| d["results"][0]["effects"][0]["result"] = json!(word));
+            }
+            for word in ["stop", "Interrupt", "revoke", "pause", "", "interrupt "] {
+                refused(&|d| d["results"][0]["effects"][0]["effect"] = json!(word));
+            }
+            refused(&|d| d["results"][0]["result"] = json!(1));
+            refused(&|d| d["results"][0]["result"] = json!(null));
+            refused(&|d| d["results"][0]["effects"][0]["effect"] = json!(null));
+            // The form: every field, no more, the right types.
+            refused(&|d| d["v"] = json!(2));
+            refused(&|d| d["extra"] = json!(1));
+            refused(&|d| {
+                d.as_object_mut().unwrap().remove("re");
+            });
+            refused(&|d| d["re"] = json!("not-a-uuid"));
+            refused(&|d| d["id"] = json!("not-a-uuid"));
+            refused(&|d| d["results"][0]["extra"] = json!(1));
+            refused(&|d| d["results"][0]["effects"][0]["extra"] = json!(1));
+            refused(&|d| {
+                d["results"][0].as_object_mut().unwrap().remove("effects");
+            });
+            refused(&|d| {
+                d["results"][0].as_object_mut().unwrap().remove("record_id");
+            });
+            refused(&|d| d["results"][0]["record_id"] = json!("not-a-uuid"));
+            refused(&|d| d["results"][0]["effects"] = json!([]));
+            // An effect appears once.
+            refused(&|d| {
+                d["results"][0]["effects"] = json!([
+                    {"effect": "interrupt", "result": "applied"},
+                    {"effect": "interrupt", "result": "duplicate"},
+                ]);
+            });
+            refused(&|d| d["results"] = json!([]));
+            refused(&|d| d["results"] = json!({}));
+            // At most one per record of a message of 64.
+            let many = results_for(&records(65));
+            refused(&|d| {
+                d["results"] = serde_json::to_value(
+                many.iter().map(|r| json!({
+                    "record_id": r.record_id,
+                    "result": r.result.code(),
+                    "effects": r.effects.iter()
+                        .map(|e| json!({"effect": e.effect.code(), "result": e.result.code()}))
+                        .collect::<Vec<_>>(),
+                })).collect::<Vec<_>>()).unwrap()
+            });
+        }
+    }
 
     /// r8 §F: a `lease_held` names the holder; the client keeps it (a
     /// confirmed takeover sends it back as `expected_controller`), and the

@@ -26,21 +26,24 @@ trap 'rm -rf "$WORK"' EXIT
 VECTORS="$ROOT/designs/protocol/fixtures/r9-vectors-pairing.json"
 
 (cd "$DIR" && sha256sum -c "atem-client-${VERSION}-SHA256SUMS.txt")
-# The shared vectors ship beside the bindings, each listed in the sums and
-# the same bytes as the repository's.
+# The shared host-work and r9 vectors ship beside the packages, each listed in
+# the sums (sha256sum -c above checked what is listed, not that it is listed)
+# and the same bytes as the repository's.
 for vector in \
   host-work/requests-v1.json:host-work-requests-v1.json \
   host-work/prompt-framing-v1.json:host-work-prompt-framing-v1.json \
   host-work/framing-size-v1.json:host-work-framing-size-v1.json \
+  r9-vectors-host-work-control.json:r9-vectors-host-work-control.json \
   r9-vectors-host-envelope.json:r9-vectors-host-envelope.json; do
   source="$ROOT/designs/protocol/fixtures/${vector%%:*}"
   shipped="atem-client-${VERSION}-${vector#*:}"
-  grep -q "  $shipped\$" "$DIR/atem-client-${VERSION}-SHA256SUMS.txt" ||
-    { echo "vectors: $shipped is not in the SHA256SUMS" >&2; exit 1; }
+  test -s "$DIR/$shipped" || { echo "$shipped: missing from the package directory" >&2; exit 1; }
+  awk -v f="$shipped" '$2 == f {found = 1} END {exit !found}' "$DIR/atem-client-${VERSION}-SHA256SUMS.txt" \
+    || { echo "$shipped: not listed in the sums" >&2; exit 1; }
   cmp -s "$source" "$DIR/$shipped" ||
     { echo "vectors: $shipped differs from ${vector%%:*}" >&2; exit 1; }
 done
-echo "vectors: 4 files shipped, listed and unchanged"
+echo "vectors: 5 files shipped, listed and unchanged"
 FRAMING_VECTORS="$DIR/atem-client-${VERSION}-host-work-prompt-framing-v1.json"
 FRAMING_SIZE_VECTORS="$DIR/atem-client-${VERSION}-host-work-framing-size-v1.json"
 python3 - "$DIR/atem-client-${VERSION}-SOURCE.json" "${EXPECT_COMMIT:-}" <<'EOF'

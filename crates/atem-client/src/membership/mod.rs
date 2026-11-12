@@ -960,6 +960,73 @@ impl Membership {
             .collect()
     }
 
+    /// Every `auth_key` `device_id` had in this log, with the `seq` of the
+    /// entry that gave it (its `genesis`, `add`, or a `recovery_add` in
+    /// effect here), whatever happened since: removed, demoted, a service's
+    /// grant expired. A key's `alg` is the one pinned there (§R9.1), so a
+    /// signature is checked under it (delegated host-work design I.5.4:
+    /// "the principal's own key, as recorded in the account's device-list
+    /// history").
+    ///
+    /// Today this is at most one key: ids are never reused (`add` and
+    /// `recovery_add` refuse a known id, `device_id_reused`), and no entry
+    /// changes a member's key (`set_roles` changes roles or a service's
+    /// scope and expiry only). A `recovery_add` still pending here, or
+    /// cancelled, gave no key: its member holds nothing.
+    pub fn keys_ever(&self, device_id: &str) -> Vec<(u64, PublicKey)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match &entry.action {
+                Action::Genesis { member, .. } | Action::Add { member }
+                    if member.device_id == device_id =>
+                {
+                    Some((entry.seq, member.auth_key.clone()))
+                }
+                Action::RecoveryAdd { member }
+                    if member.device_id == device_id && self.took_effect(entry) =>
+                {
+                    Some((entry.seq, member.auth_key.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `device_id`'s `auth_key` if it is a current native manager: a
+    /// `native` member in effect holding `manage` at this head (delegated
+    /// host-work design I.5.4, "Removed managers"), under its pinned `alg`.
+    pub fn current_manager_key(&self, device_id: &str) -> Option<PublicKey> {
+        self.member(device_id)
+            .filter(|state| state.status == MemberStatus::Active && state.member.is_manager())
+            .map(|state| state.member.auth_key.clone())
+    }
+
+    /// Whether `device_id` held `manage` at some point of this log: it
+    /// entered as a manager (a `recovery_add` only once it took effect), or
+    /// a `set_roles` gave it `manage`. With [`Self::current_manager_key`]
+    /// `None`, it was removed or lost `manage` since.
+    pub(crate) fn was_manager(&self, device_id: &str) -> bool {
+        self.entries.iter().any(|entry| match &entry.action {
+            Action::Genesis { member, .. } | Action::Add { member } => {
+                member.device_id == device_id && member.is_manager()
+            }
+            Action::RecoveryAdd { member } => {
+                member.device_id == device_id && member.is_manager() && self.took_effect(entry)
+            }
+            Action::SetRoles {
+                device_id: target,
+                change: RolesChange::Native(roles),
+            } => target == device_id && roles.contains(&Role::Manage),
+            _ => false,
+        })
+    }
+
+    /// A pending-type entry whose wait ended in effect here (§R9.5).
+    fn took_effect(&self, entry: &Entry) -> bool {
+        self.record(&entry.hash())
+            .is_some_and(|record| record.state() == RecoveryState::Active)
+    }
+
     /// A current host's newest key (`add_host`).
     pub fn host(&self, host_id: &str) -> Option<&HostRecord> {
         self.derived

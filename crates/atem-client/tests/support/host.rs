@@ -90,6 +90,9 @@ pub struct HostCore {
     pub refusals: Vec<SessionError>,
     /// A misbehaving host for client tests: rewrites the welcome it sends.
     pub welcome_override: Option<fn(&mut Welcome)>,
+    /// A misbehaving host for client tests: rewrites the result it sends
+    /// for a `control_records` message.
+    pub control_records_override: Option<fn(&mut atem_client::session::r9::ControlRecordsResult)>,
     /// The host policy (§R9.8a), in memory: (relay_only, revision) and the
     /// recorded changes (request_id, principal, relay_only, expected
     /// revision, committed revision).
@@ -131,6 +134,7 @@ impl HostCore {
             next_conn: 0,
             refusals: Vec::new(),
             welcome_override: None,
+            control_records_override: None,
             policy: (false, 0),
             policy_requests: Vec::new(),
         }
@@ -767,6 +771,37 @@ impl HostConn {
                             .to_string()
                             .into_bytes(),
                     ];
+                }
+                Some("control_records") => {
+                    // A stand-in for the real host (this carries the op, it
+                    // applies nothing): every record is kept pending.
+                    use atem_client::control::{ApplicationResult, EffectKind, EffectResult};
+                    use atem_client::session::r9::{
+                        ControlRecordsRequest, ControlRecordsResult, RecordResult,
+                    };
+                    let Ok(request) = ControlRecordsRequest::decode(plain) else {
+                        return vec![error(code::INVALID_REQUEST, None)];
+                    };
+                    let mut result = ControlRecordsResult {
+                        id: uuid(0x9004),
+                        re: id.clone(),
+                        results: request
+                            .records
+                            .iter()
+                            .map(|r| RecordResult {
+                                record_id: r.record_id().to_owned(),
+                                result: ApplicationResult::Pending,
+                                effects: vec![EffectResult {
+                                    effect: EffectKind::Interrupt,
+                                    result: ApplicationResult::Pending,
+                                }],
+                            })
+                            .collect(),
+                    };
+                    if let Some(rewrite) = core.control_records_override {
+                        rewrite(&mut result);
+                    }
+                    return vec![result.to_json().to_string().into_bytes()];
                 }
                 Some("approval_seen") => {
                     let approval_id = data["approval_id"].as_str().unwrap_or_default();

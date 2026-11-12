@@ -781,6 +781,215 @@ final class ConformanceTests: XCTestCase {
             #endif
         }
 
+        // ---------------------------- delegated host work: control records
+        // r9-vectors-host-work-control: every record parses and verifies on
+        // each of its chains as `checks` says (or its parse refuses it,
+        // `parse_error`); the builders reproduce it byte for byte (a software
+        // store, or the signing input and a signature); every sequence runs
+        // through a ControlStateHandle with each step's per-effect results and
+        // the state it leaves (a handle never changes, so a failed commit
+        // loses no effect); and a provider is asked under the purpose the
+        // record's signer gives.
+        let ctl = try load("r9-vectors-host-work-control")
+        let ctlRecords = a(ctl["records"]).map(o)
+        var ctlByLabel: [String: [String: Any]] = [:]
+        for r in ctlRecords { ctlByLabel[s(r["label"])] = r }
+        let controlFields: Set<String> = ["type", "v", "account_id", "genesis_hash", "origin", "feed_id", "principal", "principal_key",
+                                          "signer", "action", "interrupt_running", "revoke_seq", "record_id", "issued_at", "about"]
+        // The typed body of a record's body JSON (nil: a field the body doesn't have).
+        func controlBodyOf(_ b: [String: Any]) -> ControlRecordBody? {
+            if !Set(b.keys).isSubset(of: controlFields) { return nil }
+            let about = o(b["about"])
+            return ControlRecordBody(
+                accountId: s(b["account_id"]), genesisHash: s(b["genesis_hash"]),
+                origin: b["origin"] as? String, feedId: b["feed_id"] as? String,
+                principal: s(b["principal"]), principalKey: b["principal_key"] as? String,
+                signer: s(b["signer"]), action: s(b["action"]),
+                interruptRunning: b["interrupt_running"] as? Bool,
+                revokeSeq: (b["revoke_seq"] as? NSNumber)?.uint64Value,
+                recordId: s(b["record_id"]), issuedAt: u(b["issued_at"]),
+                integrationId: about["integration_id"] as? String, by: s(about["by"]))
+        }
+        // A test key by name: a member's auth key, or a host's host_key.
+        func testKeyOf(_ name: String) -> (KeyAlg, Data, Data) {
+            let entry = o(keys[name])
+            let k = o(entry["auth"] ?? entry["host_key"])
+            let alg: KeyAlg = s(k["alg"]) == "p256" ? .p256 : .ed25519
+            return (alg, unhex(s(k["pub_hex"])), unhex(s(k["secret_hex"])))
+        }
+        func verdictOf(_ chain: Any, _ got: ControlCheckInfo) -> [String: Any] {
+            switch got {
+            case let .valid(signer, keySeq, _):
+                var v: [String: Any] = ["chain": chain, "verdict": "valid", "signer": signer]
+                if let seq = keySeq { v["key_seq"] = seq }
+                return v
+            case let .pending(reason):
+                return ["chain": chain, "verdict": "pending", "reason": reason]
+            case let .refused(reason):
+                return ["chain": chain, "verdict": "refused", "reason": reason]
+            }
+        }
+        check("control records: every record parses and verifies on its chains as the vectors say") {
+            var verdicts = 0
+            let svc = o(o(o(ctl["services"])["svc-discord"])["auth_key"])
+            for r in ctlRecords {
+                let label = s(r["label"])
+                let json = js(r["record"]!)
+                if let parseError = r["parse_error"] as? String {
+                    try throwsCode(parseError) { _ = try parseControlRecord(recordJson: json) }
+                    try throwsCode(parseError) { _ = try verifyControlRecord(log: try logL(), recordJson: json) }
+                    continue
+                }
+                try eq(try parseControlRecord(recordJson: json), controlBodyOf(o(o(r["record"])["body"])), "\(label) body")
+                let info = try signedObjectInfo(json: json)
+                try eq(info.bodyJcs, s(r["jcs"]), label)
+                try eq(hex(info.signingInput), s(r["signing_input_hex"]), label)
+                try eq(hex(signingInput(label: .hostWorkControl, payload: utf8(s(r["jcs"])))), s(r["signing_input_hex"]), label)
+                let checks = a(r["checks"]).map(o)
+                if let r9 = r["r9_svc"] as? String {
+                    try eq(try serviceKeyFingerprint(authKey: PublicKeyData(alg: .ed25519, raw: b64u(s(svc["pub"])))), r9, label)
+                    let principalKey = s(o(o(r["record"])["body"])["principal_key"])
+                    try eq(principalKey == r9, (checks[0]["reason"] as? String) != "key_mismatch", "\(label) principal_key")
+                }
+                for c in checks {
+                    let chain = a(c["chain"]).map(s)
+                    let log = try logAfter(chain)
+                    let got = try verifyControlRecord(log: log, recordJson: json)
+                    try eq(canon(verdictOf(a(c["chain"]), got)), canon(c), "\(label) on \(chain)")
+                    if case let .valid(_, _, head) = got { try eq(head, log.head(), label) }
+                    verdicts += 1
+                }
+            }
+            if verdicts < 52 { throw Failure(description: "\(verdicts) verdicts") }
+        }
+        check("control records: the builders reproduce every record; a body the parse refuses is refused") {
+            var built = 0
+            for r in ctlRecords {
+                let label = s(r["label"])
+                guard let body = controlBodyOf(o(o(r["record"])["body"])) else {
+                    try eq(r["parse_error"] as? String, "unknown_field", label)
+                    continue
+                }
+                let (alg, pub, secret) = testKeyOf(s(r["signed_with"]))
+                let store = SoftwareKeyStore()
+                if alg == .p256 { try store.insertP256(keyId: "k", secret: secret) } else { try store.insertEd25519(keyId: "k", seed: secret) }
+                if let parseError = r["parse_error"] as? String {
+                    try throwsCode(parseError) { _ = try buildControlRecord(provider: store.provider(), keyId: "k", body: body) }
+                    try throwsCode(parseError) { _ = try controlRecordSigningInput(body: body) }
+                    continue
+                }
+                try eq(hex(try controlRecordSigningInput(body: body)), s(r["signing_input_hex"]), label)
+                let sig = b64u(s(o(r["record"])["sig"]))
+                let signer = PublicKeyData(alg: alg, raw: pub)
+                if (a(r["checks"]).map(o)[0]["reason"] as? String) == "bad_signature" {
+                    try throwsCode("bad_signature") { _ = try controlRecordWithSignature(body: body, signerKey: signer, signature: sig) }
+                    continue
+                }
+                let canonical = try canonicalJson(json: js(r["record"]!))
+                try eq(try controlRecordWithSignature(body: body, signerKey: signer, signature: sig), canonical, label)
+                try eq(try buildControlRecord(provider: store.provider(), keyId: "k", body: body), canonical, label)
+                built += 1
+            }
+            if built < 44 { throw Failure(description: "\(built) built") }
+        }
+        func controlActionOf(_ action: ControlHostAction) -> [String: Any] {
+            switch action {
+            case let .revoke(principal): return ["type": "revoke", "principal": principal]
+            case let .hold(principal): return ["type": "hold", "principal": principal]
+            case let .release(principal): return ["type": "release", "principal": principal]
+            case let .interrupt(principal, revocation): return ["type": "interrupt", "principal": principal, "revocation": revocation]
+            case let .cover(principal, origin, feedId): return ["type": "cover", "principal": principal, "origin": origin, "feed_id": feedId]
+            }
+        }
+        func resultCode(_ r: ControlResultKind) -> String {
+            switch r {
+            case .applied: return "applied"
+            case .duplicate: return "duplicate"
+            case .pending: return "pending"
+            case .refused: return "refused"
+            }
+        }
+        func effectCode(_ e: ControlEffectKind) -> String {
+            switch e {
+            case .revocation: return "revocation"
+            case .interrupt: return "interrupt"
+            case .hold: return "hold"
+            case .release: return "release"
+            case .cover: return "cover"
+            }
+        }
+        func controlAppliedOf(_ applied: ControlApplied) -> [String: Any] {
+            let effects: [[String: Any]] = applied.effects.map { ["effect": effectCode($0.effect), "result": resultCode($0.result)] }
+            return ["result": resultCode(applied.result), "effects": effects, "actions": applied.actions.map(controlActionOf), "evidence": applied.evidence]
+        }
+        func ctlPos(_ v: Any?) -> ControlFeedPos? {
+            guard let p = v as? [String: Any] else { return nil }
+            return ControlFeedPos(origin: s(p["origin"]), feedId: s(p["feed_id"]), feedSeq: u(p["feed_seq"]))
+        }
+        check("control records: every sequence's per-effect results and its state through ControlStateHandle") {
+            for q in a(ctl["sequences"]).map(o) {
+                let label = s(q["label"])
+                var state = ControlStateHandle(log: try logL())
+                for (i, step) in a(q["steps"]).map(o).enumerated() {
+                    let record = js(ctlByLabel[s(step["record"])]!["record"]!)
+                    let t = try state.apply(recordJson: record, log: try logAfter(a(step["chain"]).map(s)), pos: ctlPos(step["pos"]), hostAppliedSeq: u(step["host_applied_seq"]))
+                    try eq(canon(controlAppliedOf(t.applied)), canon(o(step["expect"])), "\(label) step \(i + 1)")
+                    state = t.next
+                }
+                let text = try canonicalJson(json: js(q["state"]!))
+                try eq(state.toJson(), text, label)
+                try eq(try ControlStateHandle.fromJson(log: try logL(), stateJson: text).toJson(), text, label)
+            }
+            // Only its own device list's state, exactly as written.
+            let text = try canonicalJson(json: js(o(a(ctl["sequences"])[0])["state"]!))
+            try throwsCode("account_mismatch") { _ = try ControlStateHandle.fromJson(log: try logL(), stateJson: text.replacingOccurrences(of: "\"acct-test-1\"", with: "\"acct-other\"")) }
+            try throwsCode("unsupported_version") { _ = try ControlStateHandle.fromJson(log: try logL(), stateJson: text.replacingOccurrences(of: "\"v\":1", with: "\"v\":2")) }
+            try throwsCode("malformed") { _ = try ControlStateHandle.fromJson(log: try logL(), stateJson: "[") }
+        }
+        check("control records: a failed commit loses no effect (apply leaves its handle as it was)") {
+            let state = ControlStateHandle(log: try logL())
+            let before = state.toJson()
+            let record = js(ctlByLabel["S5_revoke_interrupt"]!["record"]!)
+            let station = o(o(ctl["stations"])["A"])
+            let pos = ControlFeedPos(origin: s(station["origin"]), feedId: s(station["feed_id"]), feedSeq: 1)
+            let first = try state.apply(recordJson: record, log: try logL(), pos: pos, hostAppliedSeq: 6)
+            try eq(first.applied.actions.count, 2)
+            // The caller's transaction failed: apply again to the handle it kept.
+            try eq(state.toJson(), before)
+            let again = try state.apply(recordJson: record, log: try logL(), pos: pos, hostAppliedSeq: 6)
+            try eq(canon(controlAppliedOf(again.applied)), canon(controlAppliedOf(first.applied)), "the same results and actions")
+            try eq(again.next.toJson(), first.next.toJson())
+            // Committed: the next state goes on, and the record is a duplicate.
+            let after = try again.next.apply(recordJson: record, log: try logL(), pos: pos, hostAppliedSeq: 6)
+            try eq(resultCode(after.applied.result), "duplicate")
+        }
+        check("control records: a Station's service key signs with no confirmation, a native manager's asks a fresh one") {
+            #if canImport(CryptoKit)
+            let station = CryptoKitKeys()
+            try station.addEd25519("svc-discord/auth", seed: unhex(s(key("svc-discord", "auth")["secret_hex"])))
+            try station.addP256("dev-mac/auth", secret: unhex(s(key("dev-mac", "auth")["secret_hex"])))
+            let cases: [(String, String, SigningPurpose)] = [
+                ("S1_cover", "svc-discord/auth", .serviceControl),
+                ("S4_revoke", "svc-discord/auth", .serviceControl),
+                ("M1_revoke", "dev-mac/auth", .controlRecord),
+                ("H1_interrupt_7", "dev-mac/auth", .controlRecord),
+            ]
+            for (label, keyId, purpose) in cases {
+                let r = ctlByLabel[label]!
+                let made = try buildControlRecord(provider: station, keyId: keyId, body: controlBodyOf(o(o(r["record"])["body"]))!)
+                guard let sent = station.requests.last else { throw Failure(description: "\(label): no signing request") }
+                try eq(sent.purpose, purpose, label)
+                try eq(sent.freshConfirmation, purpose == .controlRecord, label)
+                try eq(sent.bodyJson, s(r["jcs"]), label)
+                try eq(sent.label, "atem-host-work-control-v1", label)
+                // CryptoKit's signatures are randomized: the record verifies as the vector's.
+                let last = a(r["checks"]).map(o).last!
+                let got = try verifyControlRecord(log: try logAfter(a(last["chain"]).map(s)), recordJson: made)
+                try eq(canon(verdictOf(a(last["chain"]), got)), canon(last), label)
+            }
+            #endif
+        }
+
         // ------------------------------- delegated host work: envelopes and results
         // r9-vectors-host-envelope (host-work-v1 §11.5; planned, host role, feature
         // `host`): the device lists (log L and the file's `entries`), the builders
@@ -1312,6 +1521,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 54)
+        XCTAssertEqual(passed, 59)
     }
 }

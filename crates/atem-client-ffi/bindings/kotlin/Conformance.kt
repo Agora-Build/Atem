@@ -599,6 +599,188 @@ fun main(args: Array<String>) {
         eq(keysOf.previous, null)
     }
 
+    // ---------------------------- delegated host work: control records
+    // r9-vectors-host-work-control: every record parses and verifies on each
+    // of its chains as `checks` says (or its parse refuses it,
+    // `parse_error`); the builders reproduce it byte for byte (a software
+    // store, or the signing input and a signature); every sequence runs
+    // through a ControlStateHandle with each step's per-effect results and
+    // the state it leaves (a handle never changes, so a failed commit loses
+    // no effect); and a provider is asked under the purpose the record's
+    // signer gives.
+    val ctl = load("r9-vectors-host-work-control")
+    val ctlRecords = ctl["records"].arr()
+    val ctlByLabel = ctlRecords.associateBy { it["label"].s() }
+    val controlFields = setOf("type", "v", "account_id", "genesis_hash", "origin", "feed_id", "principal", "principal_key",
+        "signer", "action", "interrupt_running", "revoke_seq", "record_id", "issued_at", "about")
+    // The typed body of a record's body JSON (null: a field the body doesn't have).
+    fun controlBodyOf(b: Any?): ControlRecordBody? {
+        val o = b.obj()
+        if (!controlFields.containsAll(o.keys)) return null
+        return ControlRecordBody(
+            accountId = o["account_id"].s(),
+            genesisHash = o["genesis_hash"].s(),
+            origin = o["origin"] as String?,
+            feedId = o["feed_id"] as String?,
+            principal = o["principal"].s(),
+            principalKey = o["principal_key"] as String?,
+            signer = o["signer"].s(),
+            action = o["action"].s(),
+            interruptRunning = o["interrupt_running"] as Boolean?,
+            revokeSeq = (o["revoke_seq"] as Long?)?.toULong(),
+            recordId = o["record_id"].s(),
+            issuedAt = o["issued_at"].l().toULong(),
+            integrationId = o["about"].obj()["integration_id"] as String?,
+            by = o["about"]["by"].s())
+    }
+    // A test key by name: a member's auth key, or a host's host_key.
+    fun testKeyOf(name: String): Triple<KeyAlg, ByteArray, ByteArray> {
+        val k = keys[name].obj()["auth"] ?: keys[name]["host_key"]
+        val alg = if (k["alg"].s() == "p256") KeyAlg.P256 else KeyAlg.ED25519
+        return Triple(alg, unhex(k["pub_hex"].s()), unhex(k["secret_hex"].s()))
+    }
+    fun verdictOf(chain: Any?, got: ControlCheckInfo): Map<String, Any?> = when (got) {
+        is ControlCheckInfo.Valid -> linkedMapOf<String, Any?>("chain" to chain, "verdict" to "valid", "signer" to got.signer)
+            .also { v -> got.keySeq?.let { v["key_seq"] = it.toLong() } }
+        is ControlCheckInfo.Pending -> mapOf("chain" to chain, "verdict" to "pending", "reason" to got.reason)
+        is ControlCheckInfo.Refused -> mapOf("chain" to chain, "verdict" to "refused", "reason" to got.reason)
+    }
+    check("control records: every record parses and verifies on its chains as the vectors say") {
+        var verdicts = 0
+        val svc = ctl["services"]["svc-discord"]["auth_key"]
+        for (r in ctlRecords) {
+            val label = r["label"].s()
+            val json = Json.write(r["record"])
+            val parseError = r.obj()["parse_error"]
+            if (parseError != null) {
+                throwsCode(parseError.s()) { parseControlRecord(json) }
+                throwsCode(parseError.s()) { verifyControlRecord(logL(), json) }
+                continue
+            }
+            eq(parseControlRecord(json), controlBodyOf(r["record"]["body"]), "$label body")
+            val info = signedObjectInfo(json)
+            eq(info.bodyJcs, r["jcs"], label)
+            eq(hex(info.signingInput), r["signing_input_hex"], label)
+            eq(hex(signingInput(SignLabelKind.HOST_WORK_CONTROL, utf8(r["jcs"].s()))), r["signing_input_hex"], label)
+            if (r.obj().containsKey("r9_svc")) {
+                eq(serviceKeyFingerprint(PublicKeyData(KeyAlg.ED25519, b64u(svc["pub"].s()))), r["r9_svc"], label)
+                eq(r["record"]["body"]["principal_key"] == r["r9_svc"], r["checks"][0]["reason"] != "key_mismatch", "$label principal_key")
+            }
+            for (c in r["checks"].arr()) {
+                val log = logAfter(strs(c["chain"]))
+                val got = verifyControlRecord(log, json)
+                eq(verdictOf(c["chain"], got), c.obj(), "$label on ${c["chain"]}")
+                if (got is ControlCheckInfo.Valid) eq(got.head, log.head(), label)
+                verdicts++
+            }
+        }
+        check(verdicts >= 52) { "$verdicts verdicts" }
+    }
+    check("control records: the builders reproduce every record; a body the parse refuses is refused") {
+        var built = 0
+        for (r in ctlRecords) {
+            val label = r["label"].s()
+            val body = controlBodyOf(r["record"]["body"])
+            if (body == null) {
+                eq(r["parse_error"], "unknown_field", label)
+                continue
+            }
+            val (alg, pub, secret) = testKeyOf(r["signed_with"].s())
+            val store = SoftwareKeyStore()
+            if (alg == KeyAlg.P256) store.insertP256("k", secret) else store.insertEd25519("k", secret)
+            val parseError = r.obj()["parse_error"]
+            if (parseError != null) {
+                throwsCode(parseError.s()) { buildControlRecord(store.provider(), "k", body) }
+                throwsCode(parseError.s()) { controlRecordSigningInput(body) }
+                continue
+            }
+            eq(hex(controlRecordSigningInput(body)), r["signing_input_hex"], label)
+            val sig = b64u(r["record"]["sig"].s())
+            if (r["checks"][0]["reason"] == "bad_signature") {
+                throwsCode("bad_signature") { controlRecordWithSignature(body, PublicKeyData(alg, pub), sig) }
+                continue
+            }
+            val canonical = canonicalJson(Json.write(r["record"]))
+            eq(controlRecordWithSignature(body, PublicKeyData(alg, pub), sig), canonical, label)
+            eq(buildControlRecord(store.provider(), "k", body), canonical, label)
+            built++
+        }
+        check(built >= 44) { "$built built" }
+    }
+    fun controlActionOf(a: ControlHostAction): Map<String, Any?> = when (a) {
+        is ControlHostAction.Revoke -> mapOf("type" to "revoke", "principal" to a.principal)
+        is ControlHostAction.Hold -> mapOf("type" to "hold", "principal" to a.principal)
+        is ControlHostAction.Release -> mapOf("type" to "release", "principal" to a.principal)
+        is ControlHostAction.Interrupt -> mapOf("type" to "interrupt", "principal" to a.principal, "revocation" to a.revocation)
+        is ControlHostAction.Cover -> mapOf("type" to "cover", "principal" to a.principal, "origin" to a.origin, "feed_id" to a.feedId)
+    }
+    fun controlAppliedOf(a: ControlApplied): Map<String, Any?> = mapOf(
+        "result" to a.result.name.lowercase(),
+        "effects" to a.effects.map { mapOf("effect" to it.effect.name.lowercase(), "result" to it.result.name.lowercase()) },
+        "actions" to a.actions.map(::controlActionOf),
+        "evidence" to a.evidence)
+    fun ctlPos(p: Any?): ControlFeedPos? =
+        p?.let { ControlFeedPos(it["origin"].s(), it["feed_id"].s(), it["feed_seq"].l().toULong()) }
+    check("control records: every sequence's per-effect results and its state through ControlStateHandle") {
+        for (q in ctl["sequences"].arr()) {
+            val label = q["label"].s()
+            var state = ControlStateHandle(logL())
+            q["steps"].arr().forEachIndexed { i, step ->
+                val record = Json.write(ctlByLabel.getValue(step["record"].s())["record"])
+                val t = state.apply(record, logAfter(strs(step["chain"])), ctlPos(step.obj()["pos"]), step["host_applied_seq"].l().toULong())
+                eq(controlAppliedOf(t.applied), step["expect"].obj(), "$label step ${i + 1}")
+                state = t.next
+            }
+            val text = canonicalJson(Json.write(q["state"]))
+            eq(state.toJson(), text, label)
+            eq(ControlStateHandle.fromJson(logL(), text).toJson(), text, label)
+        }
+        // Only its own device list's state, exactly as written.
+        val text = canonicalJson(Json.write(ctl["sequences"][0]["state"]))
+        throwsCode("account_mismatch") { ControlStateHandle.fromJson(logL(), text.replace("\"acct-test-1\"", "\"acct-other\"")) }
+        throwsCode("unsupported_version") { ControlStateHandle.fromJson(logL(), text.replace("\"v\":1", "\"v\":2")) }
+        throwsCode("malformed") { ControlStateHandle.fromJson(logL(), "[") }
+    }
+    check("control records: a failed commit loses no effect (apply leaves its handle as it was)") {
+        val state = ControlStateHandle(logL())
+        val before = state.toJson()
+        val record = Json.write(ctlByLabel.getValue("S5_revoke_interrupt")["record"])
+        val a = ctl["stations"]["A"]
+        val pos = ControlFeedPos(a["origin"].s(), a["feed_id"].s(), 1uL)
+        val first = state.apply(record, logL(), pos, 6uL)
+        eq(first.applied.actions.size, 2)
+        // The caller's transaction failed: apply again to the handle it kept.
+        eq(state.toJson(), before)
+        val again = state.apply(record, logL(), pos, 6uL)
+        eq(again.applied, first.applied, "the same results and actions")
+        eq(again.next.toJson(), first.next.toJson())
+        // Committed: the next state goes on, and the record is a duplicate.
+        eq(again.next.apply(record, logL(), pos, 6uL).applied.result, ControlResultKind.DUPLICATE)
+    }
+    check("control records: a Station's service key signs with no confirmation, a native manager's asks a fresh one") {
+        val station = JdkKeys()
+        val svc = keys["svc-discord"]["auth"]
+        station.addEd25519("svc-discord/auth", unhex(svc["secret_hex"].s()), unhex(svc["pub_hex"].s()))
+        val mac = keys["dev-mac"]["auth"]
+        station.addP256("dev-mac/auth", unhex(mac["secret_hex"].s()), unhex(mac["pub_hex"].s()))
+        for ((label, keyId, purpose) in listOf(
+            Triple("S1_cover", "svc-discord/auth", SigningPurpose.SERVICE_CONTROL),
+            Triple("S4_revoke", "svc-discord/auth", SigningPurpose.SERVICE_CONTROL),
+            Triple("M1_revoke", "dev-mac/auth", SigningPurpose.CONTROL_RECORD),
+            Triple("H1_interrupt_7", "dev-mac/auth", SigningPurpose.CONTROL_RECORD))) {
+            val r = ctlByLabel.getValue(label)
+            val made = buildControlRecord(station, keyId, controlBodyOf(r["record"]["body"])!!)
+            val sent = station.requests.last()
+            eq(sent.purpose, purpose, label)
+            eq(sent.freshConfirmation, purpose == SigningPurpose.CONTROL_RECORD, label)
+            eq(sent.bodyJson, r["jcs"], label)
+            eq(sent.label, "atem-host-work-control-v1", label)
+            // The JDK's P-256 signatures are randomized: the record verifies as the vector's.
+            val last = r["checks"].arr().last()
+            eq(verdictOf(last["chain"], verifyControlRecord(logAfter(strs(last["chain"])), made)), last.obj(), label)
+        }
+    }
+
     // ------------------------------- delegated host work: envelopes and results
     // r9-vectors-host-envelope (host-work-v1 §11.5; planned, host role, feature
     // `host`): the device lists (log L and the file's `entries`), the builders
