@@ -7,7 +7,8 @@ name: clock-real-os
 #     the default branch;
 #   - the label `clock-real-os` on a pull request (pull_request, `labeled`):
 #     it runs from the PR branch, which is how it runs before the file is on
-#     main. Any other label, and any other PR event, skips every job. It
+#     main. Any other label skips every job, and so does a pull request from
+#     a fork; no other PR event starts the workflow (`types: [labeled]`). It
 #     measures the PR's head commit, not GitHub's merge of it.
 #
 # The measurements host-work-v1 §11.6 "Clocks" (design I.6.5) asks for, taken
@@ -34,7 +35,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: clock-real-os-${{ github.ref }}
+  # The label (or the dispatch) is in the group: a run another label started
+  # (every job skipped) waits in a group of its own and can never take a
+  # pending real run's place, which one group per ref allowed.
+  group: clock-real-os-${{ github.ref }}-${{ github.event.label.name || github.event_name }}
   # Never cancel a run with the clock stepped.
   cancel-in-progress: false
 
@@ -44,7 +48,10 @@ env:
 jobs:
   linux-step-window:
     name: Linux step window (STA_UNSYNC after a forward step)
-    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'clock-real-os'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.label.name == 'clock-real-os' &&
+      github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -96,7 +103,10 @@ jobs:
 
   macos-sync-report:
     name: macOS sync report (ntp_gettime, mach_continuous_time)
-    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'clock-real-os'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.label.name == 'clock-real-os' &&
+      github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: macos-15
     timeout-minutes: 45
     steps:

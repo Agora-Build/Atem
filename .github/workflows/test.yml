@@ -41,6 +41,29 @@ jobs:
         if: runner.os != 'Linux'
         run: cargo test --release --target ${{ matrix.target }} --no-fail-fast
 
+      # macOS: the delegated clock's readings, printed (the run above captures
+      # test output, so only pass or fail reaches the log). Read only:
+      # `continuous_time_counts_from_boot` prints the gap between
+      # mach_continuous_time and now − kern.boottime,
+      # `ntp_gettime_reports_a_state` the state ntp_gettime reports, and the
+      # ignored `real_os_report_macos` one JSON line of what `os::read()` sees
+      # (src/runtime/host_clock/os.rs). The same build: nothing is rebuilt.
+      - name: Print the macOS clock readings
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --release --target ${{ matrix.target }} --bin atem -- \
+            --exact --nocapture --include-ignored \
+            runtime::host_clock::os::tests::continuous_time_counts_from_boot \
+            runtime::host_clock::os::tests::ntp_gettime_reports_a_state \
+            runtime::host_clock::os::tests::real_os_report_macos \
+            2>&1 | tee clock-readings.log
+          if ! grep -qE '^test result: ok\. 3 passed; 0 failed;' clock-readings.log; then
+            echo "::error::the macOS clock readings did not all run"
+            exit 1
+          fi
+
       # Linux: the cred agent locks its memory only when RLIMIT_MEMLOCK is
       # unlimited or at least 512 MiB (runners default to 8 MiB), so raise it
       # for this shell and everything it starts, then run the tests with the
