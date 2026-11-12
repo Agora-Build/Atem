@@ -1,12 +1,22 @@
 name: clock-real-os
 
-# MANUAL ONLY (workflow_dispatch; never on push or pull request): the
-# measurements host-work-v1 §11.6 "Clocks" (design I.6.5) asks for, taken on
-# real runners from Atem's own readings. The ignored tests
+# MANUAL ONLY: it never runs on push, and on a pull request only when a person
+# adds the label `clock-real-os` (below). Two ways to start it:
+#   - workflow_dispatch ("Run workflow", `gh workflow run clock-real-os.yml
+#     --ref <branch>`): GitHub offers this only for a workflow file that is on
+#     the default branch;
+#   - the label `clock-real-os` on a pull request (pull_request, `labeled`):
+#     it runs from the PR branch, which is how it runs before the file is on
+#     main. Any other label, and any other PR event, skips every job. It
+#     measures the PR's head commit, not GitHub's merge of it.
+#
+# The measurements host-work-v1 §11.6 "Clocks" (design I.6.5) asks for, taken
+# on real runners from Atem's own readings. The ignored tests
 # `real_os_report_linux` / `real_os_report_macos` (src/runtime/host_clock/os.rs)
 # print what `os::read()` sees, and scripts/clock-real-os.py drives them around
-# a `sudo date` step of the runner's wall clock. The runner is discarded after
-# the job, and an `if: always()` step puts the clock back first.
+# a `sudo date` step of the runner's wall clock. The script steps a clock only
+# on a GitHub-hosted runner. The runner is discarded after the job, and an
+# `if: always()` step puts the clock back first.
 #
 # Each job uploads one JSON artifact (the step summary shows its headline):
 #   linux-step-window: does a forward step set STA_UNSYNC at once (rule 4), and
@@ -17,6 +27,8 @@ name: clock-real-os
 
 on:
   workflow_dispatch:
+  pull_request:
+    types: [labeled]
 
 permissions:
   contents: read
@@ -32,10 +44,15 @@ env:
 jobs:
   linux-step-window:
     name: Linux step window (STA_UNSYNC after a forward step)
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'clock-real-os'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The PR's head commit (never GitHub's synthetic merge), or the
+          # dispatched ref.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -56,6 +73,7 @@ jobs:
       # every 100 ms until STA_UNSYNC clears or 15 minutes pass ("never
       # cleared" is a result, not a failure), steps back, writes the JSON.
       - name: Measure the step window
+        timeout-minutes: 25
         shell: bash
         run: |
           python3 -I scripts/clock-real-os.py linux-step-window \
@@ -78,10 +96,13 @@ jobs:
 
   macos-sync-report:
     name: macOS sync report (ntp_gettime, mach_continuous_time)
-    runs-on: macos-latest
-    timeout-minutes: 30
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'clock-real-os'
+    runs-on: macos-15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -102,6 +123,7 @@ jobs:
       # for 30 s after it (timed alone), runs `sudo sntp -sS time.apple.com`,
       # polls every second for 5 minutes, steps back, writes the JSON.
       - name: Report ntp_gettime around a step and a resync
+        timeout-minutes: 15
         shell: bash
         run: |
           python3 -I scripts/clock-real-os.py macos-sync-report \

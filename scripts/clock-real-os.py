@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Real-OS clock checks on CI runners (delegated lifecycle, host-work-v1 §11.6).
 
-Used by `.github/workflows/test.yml` (find-bin) and the manual
-`.github/workflows/clock-real-os.yml` (the rest). Every reading comes from
+Used by the manual `.github/workflows/clock-real-os.yml` (`test.yml`'s
+time-namespace step finds its binary with `jq` and doesn't depend on this
+script). Every reading comes from
 Atem's own code: the ignored tests `real_os_report_linux` and
 `real_os_report_macos` in `src/runtime/host_clock/os.rs` print one JSON line
 (prefixed `ATEM_CLOCK_REPORT `) of what `os::read()` sees, and this script
@@ -28,9 +29,10 @@ only calls them and keeps their lines.
       an `if: always()` step, so a crashed or cancelled run never leaves the
       runner's clock stepped.
 
-The wall clock is stepped only on GitHub Actions (or under --dry-run, which
-runs everything but `sudo date` and `sntp`): never run this on a machine
-whose clock matters.
+The wall clock is stepped only on a GitHub-hosted runner (GITHUB_ACTIONS=true
+and RUNNER_ENVIRONMENT=github-hosted), or not at all under --dry-run, which runs
+everything but anything with `sudo` (`date`, `sntp`, `systemsetup`): never run
+this on a machine whose clock matters.
 """
 
 import argparse
@@ -96,62 +98,130 @@ def report(bin_path, timeout=30):
 # Running things, best effort.
 
 
-def sh(cmd, timeout=30):
+def sh(cmd, timeout=30, limit=2000):
     shown = " ".join(cmd)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as e:
         return {"cmd": shown, "error": str(e)}
-    return {"cmd": shown, "rc": p.returncode, "out": (p.stdout + p.stderr).strip()[-2000:]}
+    return {"cmd": shown, "rc": p.returncode, "out": (p.stdout + p.stderr).strip()[-limit:]}
 
 
-def context():
+# What the runner is, for reading the numbers (the spec names the image).
+RUNNER_ENV = ["ImageOS", "ImageVersion", "RUNNER_OS", "RUNNER_ARCH", "RUNNER_ENVIRONMENT"]
+
+
+def runner_env():
+    return {name: os.environ.get(name) for name in RUNNER_ENV}
+
+
+def context(dry_run):
+    """Which time-sync daemon and configuration the runner has. Nothing here
+    changes anything; under --dry-run nothing with `sudo` runs either."""
     if platform.system() == "Linux":
         cmds = [
-            ["uname", "-a"],
-            ["sh", "-c", "grep PRETTY_NAME /etc/os-release"],
-            ["timedatectl", "show"],
-            ["systemctl", "is-active", "systemd-timesyncd", "chrony", "chronyd"],
-            ["chronyc", "tracking"],
+            (["uname", "-a"], 2000),
+            (["sh", "-c", "grep PRETTY_NAME /etc/os-release"], 2000),
+            (["timedatectl", "show"], 2000),
+            (["systemctl", "is-active", "systemd-timesyncd", "chrony", "chronyd"], 2000),
+            (["chronyc", "tracking"], 2000),
+            # Whether chrony steps (makestep) and clears STA_UNSYNC (rtcsync).
+            (["sh", "-c", "grep -rEH '^(makestep|rtcsync|refclock|pool|server|driftfile)' /etc/chrony* 2>&1"], 6000),
+            (["sh", "-c", "grep -rEH '^[^#]*(NTP|FallbackNTP)' /etc/systemd/timesyncd.conf /etc/systemd/timesyncd.conf.d 2>&1"], 2000),
         ]
     else:
         cmds = [
-            ["sw_vers"],
-            ["uname", "-a"],
-            ["sysctl", "kern.boottime", "kern.bootsessionuuid"],
-            ["pgrep", "-lf", "timed"],
-            ["sudo", "-n", "systemsetup", "-getusingnetworktime"],
-            ["sudo", "-n", "systemsetup", "-getnetworktimeserver"],
+            (["sw_vers"], 2000),
+            (["uname", "-a"], 2000),
+            (["sysctl", "kern.boottime", "kern.bootsessionuuid"], 2000),
+            (["pgrep", "-lf", "timed"], 2000),
+            (["sudo", "-n", "systemsetup", "-getusingnetworktime"], 2000),
+            (["sudo", "-n", "systemsetup", "-getnetworktimeserver"], 2000),
         ]
-    return [sh(c) for c in cmds]
+    out = []
+    for cmd, limit in cmds:
+        if dry_run and cmd[0] == "sudo":
+            out.append({"cmd": " ".join(cmd), "skipped": "dry run"})
+        else:
+            out.append(sh(cmd, limit=limit))
+    return out
 
 
 # Stepping the wall clock, and putting it back.
 
 
+class StepRefused(RuntimeError):
+    pass
+
+
+def check_may_step(dry_run):
+    """The only places that run `sudo` to change a clock call this first: a
+    GitHub-hosted runner, never `act`, a self-hosted runner or a dev machine
+    (an exported variable alone isn't enough)."""
+    if dry_run:
+        return
+    if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
+        raise StepRefused(
+            "refusing to change this machine's clock: not a GitHub-hosted runner "
+            "(GITHUB_ACTIONS=true and RUNNER_ENVIRONMENT=github-hosted); use --dry-run"
+        )
+
+
+def refuse_unless_allowed(dry_run):
+    """A driver stops before doing anything on a machine it may not step."""
+    try:
+        check_may_step(dry_run)
+    except StepRefused as e:
+        die(str(e))
+
+
+def privileged(cmd, dry_run, timeout=30):
+    """Run a `sudo` command that changes the clock: guarded, and not at all
+    under --dry-run."""
+    shown = " ".join(cmd)
+    if dry_run:
+        print(f"dry run, would run: {shown}")
+        return {"cmd": shown, "dry_run": True}
+    check_may_step(False)
+    return sh(cmd, timeout=timeout)
+
+
 def set_wall(epoch, dry_run):
-    """Set the wall clock to `epoch` (Unix seconds): only on GitHub Actions."""
+    """Set the wall clock to `epoch` (Unix seconds)."""
     if platform.system() == "Linux":
         cmd = ["sudo", "-n", "date", "-u", "-s", f"@{epoch:.6f}"]
     else:
         # BSD date: [[[mm]dd]HH]MM[[cc]yy][.ss], whole seconds.
         cmd = ["sudo", "-n", "date", "-u", time.strftime("%m%d%H%M%Y.%S", time.gmtime(round(epoch)))]
-    shown = " ".join(cmd)
-    if dry_run:
-        print(f"dry run, would run: {shown}")
-        return {"cmd": shown, "dry_run": True}
-    if os.environ.get("GITHUB_ACTIONS") != "true":
-        die("refusing to step this machine's clock outside GitHub Actions (use --dry-run)")
-    result = sh(cmd)
-    if result.get("rc") != 0:
+    result = privileged(cmd, dry_run)
+    if not dry_run and result.get("rc") != 0:
         raise RuntimeError(f"the clock step failed: {result}")
     return result
 
 
+def ref_clock():
+    """A counter the time-sync daemon can't slew (CLOCK_MONOTONIC, which
+    `time.monotonic()` reads on Linux, is slewed by NTP: a daemon slewing the
+    wall clock back would move it too). CLOCK_MONOTONIC_RAW where it exists
+    (Linux, macOS), else `time.monotonic()`."""
+    raw = getattr(time, "CLOCK_MONOTONIC_RAW", None)
+    if raw is not None:
+        return "monotonic_raw", time.clock_gettime(raw)
+    return "monotonic", time.monotonic()
+
+
+def raw_now():
+    """Seconds on the unslewed counter: every elapsed time and deadline here,
+    so a daemon slewing the wall clock (and CLOCK_MONOTONIC with it) can't
+    stretch them."""
+    return ref_clock()[1]
+
+
 def write_ref(path):
-    """Where the wall clock should be, from now on: the monotonic clock
+    """Where the wall clock should be, from now on: an unslewed counter
     (which no step moves) says how far it has run since."""
-    ref = {"wall": time.time(), "mono": time.monotonic(), "utc": utc_now()}
+    name, counter = ref_clock()
+    ref = {"wall": time.time(), "counter": counter, "clock": name, "utc": utc_now()}
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as f:
         json.dump(ref, f)
@@ -159,7 +229,10 @@ def write_ref(path):
 
 
 def expected_wall(ref):
-    return ref["wall"] + (time.monotonic() - ref["mono"])
+    name, counter = ref_clock()
+    if name != ref["clock"]:
+        raise RuntimeError(f"the reference counted with {ref['clock']}, this process has {name}")
+    return ref["wall"] + (counter - ref["counter"])
 
 
 def restore(ref_path, dry_run):
@@ -239,9 +312,21 @@ def find_bin(args):
 # linux-step-window.
 
 
+def transition(r, stepped):
+    """A change of the adjtimex status word, with the wall clock and the
+    counter at it (a daemon stepping the wall clock shows in `wall_ms`)."""
+    return {
+        "after_s": ns_to_s(r["boot_ns"] - stepped["boot_ns"]),
+        "adjtimex_status_hex": r.get("adjtimex_status_hex"),
+        "wall_ms": r["wall_ms"],
+        "boot_ns": r["boot_ns"],
+    }
+
+
 def linux_step_window(args):
     if platform.system() != "Linux":
         die("this job measures the Linux kernel's STA_UNSYNC")
+    refuse_unless_allowed(args.dry_run)
     out = {
         "job": "linux-step-window",
         "started_utc": utc_now(),
@@ -250,16 +335,17 @@ def linux_step_window(args):
             "poll_ms": args.poll_ms,
             "timeout_s": args.timeout_s,
             "dry_run": args.dry_run,
+            "runner": runner_env(),
         },
     }
     failed = False
     write_ref(args.ref)
     try:
-        out["context"] = context()
+        out["context"] = context(args.dry_run)
         before = out["before"] = report(args.bin)
-        mono_step = time.monotonic()
+        mono_step = raw_now()
         out["step_command"] = set_wall(time.time() + args.step_seconds, args.dry_run)
-        mono_stepped = time.monotonic()
+        mono_stepped = raw_now()
         # At once: rule 4 expects a step to set STA_UNSYNC.
         stepped = out["after_step"] = report(args.bin)
         out["step_command_s"] = mono_stepped - mono_step
@@ -268,10 +354,11 @@ def linux_step_window(args):
         latest = stepped
         polls = poll_errors = consecutive_errors = 0
         status = stepped.get("adjtimex_status")
-        transitions = [{"after_s": 0.0, "adjtimex_status_hex": stepped.get("adjtimex_status_hex")}]
+        transitions = [transition(stepped, stepped)]
+        disagreements = 0
         deadline = mono_stepped + args.timeout_s
         mono_cleared = mono_stepped if cleared else None
-        while not cleared and time.monotonic() < deadline:
+        while not cleared and raw_now() < deadline:
             time.sleep(args.poll_ms / 1000)
             try:
                 r = report(args.bin)
@@ -287,12 +374,10 @@ def linux_step_window(args):
             latest = r
             if r.get("adjtimex_status") != status:
                 status = r.get("adjtimex_status")
-                transitions.append({
-                    "after_s": ns_to_s(r["boot_ns"] - stepped["boot_ns"]),
-                    "adjtimex_status_hex": r.get("adjtimex_status_hex"),
-                })
+                transitions.append(transition(r, stepped))
+            disagreements += r.get("status_agrees") is False
             if r["synced"] == "yes":
-                cleared, mono_cleared = True, time.monotonic()
+                cleared, mono_cleared = True, raw_now()
         out["context_after"] = [
             sh(["timedatectl", "show", "-p", "NTP", "-p", "NTPSynchronized"]),
             sh(["chronyc", "tracking"]),
@@ -304,13 +389,16 @@ def linux_step_window(args):
             "cleared": cleared,
             # By the product's own raw counter (a step doesn't move it), from
             # the reading just after the step to the first one that reads
-            # synchronized; the driver's monotonic clock agrees to a poll.
+            # synchronized; the driver's own unslewed counter agrees to a poll.
             "window_s": ns_to_s(latest["boot_ns"] - stepped["boot_ns"]) if cleared else None,
-            "window_s_monotonic": mono_cleared - mono_stepped if cleared else None,
-            "waited_s": time.monotonic() - mono_stepped,
+            "window_s_raw": mono_cleared - mono_stepped if cleared else None,
+            "waited_s": raw_now() - mono_stepped,
             "timed_out": not cleared,
             "polls": polls,
             "poll_errors": poll_errors,
+            # Readings whose adjtimex status word (a second call) and `synced`
+            # (the reading's own) disagreed on STA_UNSYNC: they are two calls.
+            "status_disagreements": disagreements,
             "transitions": transitions,
         }
     except Exception as e:  # noqa: BLE001 - recorded, then the job fails
@@ -319,7 +407,7 @@ def linux_step_window(args):
     finally:
         try:
             out["restore"] = restore(args.ref, args.dry_run)
-        except Exception as e:  # noqa: BLE001
+        except BaseException as e:  # noqa: BLE001 - the artifact is written whatever happens
             failed = True
             out["restore"] = {"error": f"{type(e).__name__}: {e}"}
         try:
@@ -367,6 +455,7 @@ def mac_row(t, phase, r):
 def macos_sync_report(args):
     if platform.system() != "Darwin":
         die("this job reads macOS's ntp_gettime")
+    refuse_unless_allowed(args.dry_run)
     out = {
         "job": "macos-sync-report",
         "started_utc": utc_now(),
@@ -375,22 +464,23 @@ def macos_sync_report(args):
             "pre_sync_s": args.pre_sync_s,
             "duration_s": args.duration_s,
             "dry_run": args.dry_run,
+            "runner": runner_env(),
         },
         "columns": MAC_COLUMNS,
     }
     rows = out["rows"] = []
     failed = False
-    t0 = time.monotonic()
+    t0 = raw_now()
     write_ref(args.ref)
 
     def sample(phase):
         r = report(args.bin)
-        rows.append(mac_row(time.monotonic() - t0, phase, r))
+        rows.append(mac_row(raw_now() - t0, phase, r))
         return r
 
     def poll(phase, seconds):
-        end = time.monotonic() + seconds
-        while time.monotonic() < end:
+        end = raw_now() + seconds
+        while raw_now() < end:
             time.sleep(args.poll_s)
             try:
                 sample(phase)
@@ -398,17 +488,13 @@ def macos_sync_report(args):
                 note_poll_error(out, e)
 
     try:
-        out["context"] = context()
+        out["context"] = context(args.dry_run)
         before = out["before"] = sample("before")
         out["step_command"] = set_wall(time.time() + args.step_seconds, args.dry_run)
         stepped = out["after_step"] = sample("step")
         # `timed` alone, before anything asks for a resync.
         poll("pre_sync", args.pre_sync_s)
-        if args.dry_run:
-            print("dry run, would run: sudo -n sntp -sS time.apple.com")
-            out["sntp"] = {"dry_run": True}
-        else:
-            out["sntp"] = sh(["sudo", "-n", "sntp", "-sS", "time.apple.com"], timeout=120)
+        out["sntp"] = privileged(["sudo", "-n", "sntp", "-sS", "time.apple.com"], args.dry_run, timeout=120)
         synced = out["after_sntp"] = sample("sntp")
         poll("post_sync", args.duration_s)
 
@@ -440,7 +526,7 @@ def macos_sync_report(args):
     finally:
         try:
             out["restore"] = restore(args.ref, args.dry_run)
-        except Exception as e:  # noqa: BLE001
+        except BaseException as e:  # noqa: BLE001 - the artifact is written whatever happens
             failed = True
             out["restore"] = {"error": f"{type(e).__name__}: {e}"}
         out["finished_utc"] = utc_now()
@@ -472,7 +558,10 @@ def read_command(args):
 
 
 def restore_command(args):
-    result = restore(args.ref, args.dry_run)
+    try:
+        result = restore(args.ref, args.dry_run)
+    except StepRefused as e:
+        die(str(e))
     print(json.dumps(result, sort_keys=True))
 
 

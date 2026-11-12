@@ -986,13 +986,25 @@ mod tests {
     /// `clock-real-os.yml`'s step-window job: the wall clock, the raw counter
     /// (`CLOCK_MONOTONIC_RAW`), the boot-time counter, the boot id, the
     /// namespace offset, `Synced` and `adjtimex`'s status bits.
+    ///
+    /// `wall_ms`, `boot_ns`, `boot_id`, `timens_boot_ns`, `synced` and
+    /// `sta_unsync` come from one `read()`: `sta_unsync` is that reading's own
+    /// `Synced` (`Yes` is STA_UNSYNC clear, `No` set). `raw_ns` and the
+    /// `adjtimex` status word are separate calls beside it, not atomic with
+    /// it, so the word's STA_UNSYNC bit can differ from `sta_unsync` by a
+    /// flip in between: `status_agrees` says whether it does not.
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "prints one JSON line of this host's readings (clock-real-os.yml)"]
     fn real_os_report_linux() {
         let raw_ns = LinuxClocks.raw_ns();
-        let status = adjtimex_status();
         let r = read();
+        let status = adjtimex_status();
+        let sta_unsync = match r.synced {
+            Synced::Yes => Some(false),
+            Synced::No => Some(true),
+            Synced::Unknown => None,
+        };
         let line = serde_json::json!({
             "os": "linux",
             "wall_ms": r.wall_ms,
@@ -1001,9 +1013,10 @@ mod tests {
             "boot_id": r.boot_id,
             "timens_boot_ns": r.timens_boot_ns,
             "synced": synced_name(r.synced),
+            "sta_unsync": sta_unsync,
             "adjtimex_status": status,
             "adjtimex_status_hex": status.map(|s| format!("{s:#06x}")),
-            "sta_unsync": status.map(|s| s & STA_UNSYNC != 0),
+            "status_agrees": status.map(|s| s & STA_UNSYNC != 0) == sta_unsync,
         });
         println!("{REPORT_PREFIX}{line}");
     }
@@ -1014,6 +1027,12 @@ mod tests {
     /// from boot, and does the boot time move with a step), `Synced` and
     /// `ntp_gettime` as xnu answers it (the call's return value, `errno` when
     /// it failed, the state in the structure and `macos_ntp_state`'s verdict).
+    ///
+    /// The calls are not atomic: `ntp_gettime`'s structure, `continuous_ns`,
+    /// `kern.boottime`, `read()` and `macos_ntp_state()` are separate calls,
+    /// microseconds apart (`wall_ms`, `boot_ns`, `boot_id` and `synced` are
+    /// one `read()`'s), so a state that changes in between can differ across
+    /// the fields.
     #[cfg(target_os = "macos")]
     #[test]
     #[ignore = "prints one JSON line of this host's readings (clock-real-os.yml)"]

@@ -106,16 +106,24 @@ jobs:
       # `timens_offset_is_seen_in_a_time_namespace` checks that the reading
       # reports the boot-time offset `unshare --time --boottime=86400` gives
       # its children and that the clock state's guard sees it. A new time
-      # namespace needs privilege, so the bin's test binary (a debug build,
-      # located from cargo's JSON output) runs under sudo, forked into it. A
-      # run that finds no such test fails: zero tests passed is no pass.
+      # namespace needs privilege, so the bin's unit-test binary runs under
+      # sudo, forked into it. It is the release test binary the earlier step
+      # built (the same cargo flags, so `--no-run` only reports it); cargo's
+      # JSON output names it. Fails when no binary is found, the test fails or
+      # no test ran: zero tests passed is no pass.
       - name: Run the time-namespace clock test (unshare --time)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --bin atem --no-run --message-format=json > "$RUNNER_TEMP/atem-test-build.json"
-          BIN=$(python3 -I scripts/clock-real-os.py find-bin "$RUNNER_TEMP/atem-test-build.json")
+          cargo test --release --target ${{ matrix.target }} --bin atem --no-run --message-format=json \
+            > "$RUNNER_TEMP/atem-test-build.json"
+          BIN=$(jq -rs '[.[] | select(.reason == "compiler-artifact" and .target.name == "atem"
+                                      and (.target.kind | index("bin")) and .profile.test and .executable)
+                         | .executable] | unique
+                        | if length == 1 then .[0] else error("expected one atem test binary, found \(length)") end' \
+            "$RUNNER_TEMP/atem-test-build.json")
+          test -x "$BIN"
           echo "test binary: $BIN"
           TEST=runtime::host_clock::os::tests::timens_offset_is_seen_in_a_time_namespace
           sudo unshare --time --boottime=86400 --fork "$BIN" --exact "$TEST" --ignored --nocapture \
