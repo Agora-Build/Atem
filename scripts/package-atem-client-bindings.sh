@@ -206,6 +206,14 @@ FILES+=("$FRAMING_SIZE_VECTOR")
 CONTROL_VECTOR="atem-client-${VERSION}-r9-vectors-host-work-control.json"
 cp designs/protocol/fixtures/r9-vectors-host-work-control.json "$OUT/$CONTROL_VECTOR"
 FILES+=("$CONTROL_VECTOR")
+# The push hints (approvals and outcome_unknown alerts, R9.9) and the
+# delegated wire shapes (R9.14): apps and relays verify these strictly.
+PUSH_VECTOR="atem-client-${VERSION}-r9-vectors-push-hint.json"
+cp designs/protocol/fixtures/r9-vectors-push-hint.json "$OUT/$PUSH_VECTOR"
+FILES+=("$PUSH_VECTOR")
+WIRE_VECTOR="atem-client-${VERSION}-r9-vectors-delegated-wire.json"
+cp designs/protocol/fixtures/r9-vectors-delegated-wire.json "$OUT/$WIRE_VECTOR"
+FILES+=("$WIRE_VECTOR")
 # Envelopes and results between hosts (host-work-v1 §11.5; planned).
 MAIL_VECTOR="atem-client-${VERSION}-r9-vectors-host-envelope.json"
 cp designs/protocol/fixtures/r9-vectors-host-envelope.json "$OUT/$MAIL_VECTOR"

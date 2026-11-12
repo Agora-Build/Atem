@@ -71,13 +71,14 @@ R9.6 gains three ops for service `scope.ops` and browser grant `ops`:
 | Op | Requests | Control op |
 |---|---|---|
 | `launch` | `host_profiles`, `host_launch`, `host_launch_query` | yes |
-| `notify` | `work_enqueue`, `work_query`, `reply_query`, `work_cancel`, `work_complete` | yes |
+| `notify` | `work_enqueue`, `work_query`, `reply_query`, `work_cancel`, `work_complete`, `work_interrupt`, `work_resolve` (the last two: `host.delegated`, §11.2) | yes |
 | `message` | `message_publish`, `message_query`, `attachment_put` | no |
 
 A native member needs the `control` role for the `launch` and `notify`
 requests; the `message` requests are open to every native member. The channel
 checks the op before decoding (`forbidden`). Existing grants don't gain these
-ops. Membership verifiers older than these ops reject signed entries that
+ops. `alert_list` (§11.3) is no op: it answers native members holding
+`control` and nobody else. Membership verifiers older than these ops reject signed entries that
 carry them: upgrade every verifier on the account before enrolling one.
 
 ### Host checks
@@ -336,9 +337,11 @@ capacity limit or on a storage failure). The reply follows the durable
 | `outcome_unknown` | the submission is uncertain, or its receipt is gone (detail `receipt no longer available`); never resubmitted; `expired` at `expires_at` |
 
 `receipt_id` (UUID v4, fixed at enqueue) is the session-v1 `request_id` of the
-prompt. `detail` is display text of at most 1024 bytes; clients don't parse
+prompt; behind `host.delegated` it is the current attempt's own id (§11.2).
+`detail` is display text of at most 1024 bytes; clients don't parse
 it. `result` is a context snapshot exactly when the state is `completed`, else
-`null`.
+`null`. A resolved task's status also carries `resolved` (§11.2); it is
+omitted otherwise.
 
 ### Dispatch
 
@@ -763,10 +766,10 @@ request's `id`:
 |---|---|
 | `forbidden` | a missing op or local consent, out of scope, an unknown id or another principal's, a sender mismatch |
 | `unauthorized` | the caller's authority is no longer current |
-| `stale_target` | the host triple doesn't match |
+| `stale_target` | the host triple doesn't match; an `alert_list` cursor the host has no alert for (§11.3) |
 | `invalid_request` | decoding, a field rule, an expiry, an upload gap, bad PNG bytes |
-| `request_id_reused` | the same id with other content |
-| `busy` | hosting off, too many queued requests, a capacity limit or storage failure, the live-session limit, cancel or complete in the wrong state |
+| `request_id_reused` | the same id with other content; another result for a task already `completed`, another resolution for a task already resolved (§11.2) |
+| `busy` | hosting off, too many queued requests, a capacity limit or storage failure, the live-session limit, cancel or complete in the wrong state, an op of a feature the host doesn't list (§11.2, §11.3) |
 
 After a lost reply, query (`host_launch_query`, `work_query`, `reply_query`,
 `message_query`) or resend the same content with a fresh `id`. Never mint a
@@ -819,8 +822,9 @@ dropped.
   host-to-host sender.
 - **Not implemented:** resolving an `outcome_unknown` task by hand (a reply
   its agent submits moves it to `awaiting_result`; otherwise it expires at
-  `expires_at`), and deleting or archiving the host's records (every record is
-  kept; only payloads go, §9).
+  `expires_at`; planned behind `host.delegated`: §11.2, §11.6), and deleting
+  or archiving the host's records (every record is kept; only payloads go,
+  §9).
 
 ## 11. Delegated work (planned; `host.delegated`, `host.alerts`, `host.senders`; not advertised)
 
@@ -832,17 +836,21 @@ three features, defined in `atem_client::session::host_work`
 
 | Feature | Ops |
 |---|---|
-| `host.delegated` | `work_interrupt`, `work_resolve` (Part I; written in a later section) |
-| `host.alerts` | `alert_list` (Part I; written in a later section) |
-| `host.senders` | `control_records` (session-v1 R9.3, R9.8; §11.1), `host_enc_key_get` (written later) |
+| `host.delegated` | `work_interrupt`, `work_resolve` (§11.2) |
+| `host.alerts` | `alert_list` (§11.3), and the push hint of kind `outcome_unknown` (session-v1 R9.9) |
+| `host.senders` | `control_records` (session-v1 R9.3, R9.8; §11.1), `host_enc_key_get` (session-v1 R9.8, R9.14) |
 
 **No host advertises them in this version**, and a host refuses each of
 their ops as it refuses any op of a feature it doesn't list: a session op
-(`control_records`) is `unsupported_version` with no effect (session-v1
-R9.8; **Atem's choice of code, for Astation to confirm**). Clients check
+(`control_records`, `host_enc_key_get`) is `unsupported_version` with no
+effect (session-v1 R9.8; **Atem's choice of code, for Astation to
+confirm**), and a host-work request (`work_interrupt`, `work_resolve`,
+`alert_list`) is `busy` (§7, §11.2, §11.3). Clients check
 `welcome.features` first; the client core
-refuses to send `control_records` to a host that doesn't list
-`host.senders` (`host feature not available`).
+refuses to send `control_records` or `host_enc_key_get` to a host that
+doesn't list `host.senders` (`host feature not available`). The lifecycle
+these ops serve (§11.6) and session-v1's side of it (R9.14) are planned
+with them.
 
 ### 11.1 Control records
 
@@ -1147,6 +1155,254 @@ They run in `crates/atem-client/tests/vectors.rs`, in the bindings'
 principal with that `record_id`, and each step's position against the
 stations) and derives no verdict.
 Every SDK package's checksum manifest lists the file.
+
+### 11.2 `work_interrupt` and `work_resolve`
+
+Two directed-work requests of `host.delegated` (design I.4.5, I.4.6), in
+§1's form: `v: 1`, a fresh `id`, the `host`, exactly these fields, and
+they serialize back to the same JSON.
+
+```json
+{"v":1,"id":"…","host":{…},"op":"work_interrupt","task_id":"<UUID v4>"}
+{"v":1,"id":"…","host":{…},"op":"work_resolve","task_id":"<UUID v4>",
+ "resolution":{"kind":"failed","detail":"agent exited"}}
+{"v":1,"id":"…","host":{…},"op":"work_resolve","task_id":"<UUID v4>",
+ "resolution":{"kind":"done","result":{"kind":"vault","id":"…","version":1,"text":"…","digest":"…"}}}
+```
+
+| Field | Rule |
+|---|---|
+| `task_id` | a UUID v4 |
+| `resolution.kind` | `failed` or `done`, exactly its fields |
+| `failed.detail` | 1–1024 bytes, not blank (something besides White_Space), no control character and no Cf character (bidi controls, zero-width characters; the framing module's General_Category Cf, `framing::is_format`): the detail the task then shows. **Atem's choice, for Astation to confirm**: the design says only `failed{detail}`, so a multi-line, blank or Cf-carrying reason is `invalid_request` |
+| `done.result` | a context snapshot, with `work_complete`'s checks and no more (a `result` kind is local only; **Atem's choice, for Astation to confirm**) |
+
+**Authority.** Both are directed-work requests: the channel checks `notify`
+before decoding (`forbidden`; a native member needs `control`), as for every
+op of §2. The host then checks, each time, that the caller is the task's
+sender (the principal and key that enqueued it) with current authority, or
+the owner (a native member holding `control` at the head); for
+`work_interrupt` the sender also holds `interrupt`. A task the caller may
+not name is `forbidden`, as for `work_query`.
+
+**Results** are `work` results (§4 "Status").
+
+- `work_interrupt` interrupts the task's turn when it is the session's
+  current turn. Its result is the task's status as it stood when the
+  interrupt was accepted, before the interrupt is written: the turn's end
+  shows in later queries. Otherwise nothing happens: the result is the
+  task's status as it is, with `detail` `not running`. That detail replaces
+  the task's own in that one result only, and isn't stored.
+- `work_resolve` settles an `outcome_unknown` task of a **delegated
+  sender** (§11.6); a task in any other state, unless it was resolved, is
+  `forbidden`, and so is a task of a sender that isn't delegated (`local`,
+  a browser grant, a service no feed covers): its `outcome_unknown` keeps
+  v1 and expires at `expires_at` (§11.3). `failed` makes it `failed` with
+  the given `detail`; `done` makes it `completed` with that `result`.
+- **The same resolution** is the same canonical `resolution` (for `done`,
+  the whole snapshot, `digest` included), whoever asks and whatever the
+  exchange `id`. It returns the recorded status, which keeps the first
+  resolver's `resolved{by, at}`, as a repeated `work_complete` keeps its
+  result. Another resolution of a resolved task is `request_id_reused`.
+- **`failed.detail` is kept exactly as given:** the host stores and shows
+  it byte for byte, leading and trailing spaces included, and a client
+  never compares it with what it sent (a mismatch would close the
+  channel for no gain).
+- A task resolved by either path has `resolved`: `{"by":…,"at":<ms>}`, the
+  resolver and the host's wall clock then. `by` is `member:<id>` or
+  `service:<id>` (the id is 1–128 bytes of `[A-Za-z0-9._:-]`, as a
+  message's sender is): the task's sender or the owner. Or it is the
+  literal `local`, for the host's own command (`atem task resolve`).
+  - A browser grant is never one: its tasks keep v1, and only a
+    delegated task is resolved.
+  - A host sender (`host:<id>`) is none either, since it gets no
+    `work_resolve` in this version (design I.4.5).
+  `resolved` is omitted before the task is resolved, never `null` (a
+  reader refuses `null`), and appears on `failed` and `completed` statuses
+  only. Its shape is **Atem's choice, for Astation to confirm**: the design
+  says only that "the resolver and the time are recorded".
+- `receipt_id` is the id of the task's current attempt (design I.6.4): a
+  new dispatch after an attempt proven side-effect-free has a new one. It is
+  opaque to a client, which compares it with nothing; a client that
+  needs a task's identity uses `task_id`.
+- **A message's progress** (`message_query`'s per-recipient `work`,
+  `WorkProgress`, §5) carries the same per-attempt `receipt_id` and no
+  `resolved`. A resolved task shows there only as its state and `detail`;
+  `work_query` gives the resolver.
+
+**Client core.** `Attached::send` refuses both unless `welcome.features`
+lists `host.delegated` (`host feature not available`). A result answers
+`work_interrupt` when it is that task's status; it answers `work_resolve`
+when it is that task's status, `resolved`, and settled the way the request
+asked (`failed`; or `completed` with exactly its `result`).
+
+**Not advertised yet.** No host lists `host.delegated` in this version. A
+host refuses both with `busy`, detail `host.delegated is not advertised`,
+after the channel's `notify` check and before decoding: the code a host-work
+request the host can't take has (§1, §7), unlike `control_records`, which is
+a session op (§11, `unsupported_version`). Nothing is queued or recorded
+(**Atem's choice of code, for Astation to confirm**).
+
+**Compatibility: enable `host.delegated` together.** `WorkStatus` denies
+unknown fields, so every reader released before `resolved` existed (Atem's
+own earlier clients and every SDK built from them) rejects a `work` result
+that carries it as a malformed result and drops the channel. A host
+therefore writes `resolved` only behind `host.delegated`, and Atem and
+Astation enable `host.delegated` together, once every reader that can query
+a task knows `resolved`. `receipt_id` and `failed.detail` change nothing for
+an old reader: the first is still a UUID v4, the second a status `detail` of
+at most 1024 bytes.
+
+Vectors: `fixtures/host-work/requests-v1.json` (the requests, valid and
+invalid, a blank and a Cf-carrying `failed.detail` among the refused, and
+`work` results with `resolved`: each kind of resolver, a bare, unknown or
+browser one, and `null`).
+
+### 11.3 `alert_list` (`host.alerts`)
+
+An unknown outcome needs a person (design I.4.6, owner decision): when a
+**delegated sender's** task becomes `outcome_unknown` the host records an
+**alert**, and the owner's devices show it with **Mark failed** and **Mark
+done**, each a `work_resolve` (§11.2) by the owner.
+- Only delegated senders' tasks raise one (§11.6): a native member
+  (`member:`), a service its Station's control feed covers (`service:`)
+  and a host sender (`host:`). A task of `local`, a browser grant or a
+  service no feed covers keeps v1: its `outcome_unknown` expires at
+  `expires_at`, and it raises no alert and no hint. **Atem's reading of
+  the design, for Astation to confirm:** design I.4.6's rules sit under
+  "tasks that Atem owns", and I.1.3 keeps them on v1.
+- So every alert can be answered with Mark failed or Mark done.
+
+This section is the alert's wire: a query, and the push hint that tells the
+owner's devices (session-v1 R9.9, "`outcome_unknown` hint"). Both belong to
+feature `host.alerts`.
+
+```json
+{"v":1,"id":"…","host":{…},"op":"alert_list"}
+{"v":1,"id":"…","host":{…},"op":"alert_list","after":"<alert_id>"}
+```
+
+In §1's form: `v: 1`, a fresh `id`, the `host`, exactly these fields (`after`
+omitted for the first page, never `null`), and the request serializes back to
+the same JSON. `after` is a UUID v4, the `alert_id` of the last alert the
+caller has.
+
+**Authority.** `alert_list` answers **native members holding `control`** at
+the host's head, the members that get approval hints (design I.4.6, "New
+rule"). A service never does, whatever its ops, and nor does a browser or a
+native member without `control`: `forbidden`, from the channel, before
+decoding. It is not a `notify` request: the op a service would need doesn't
+exist. (**Atem's choice of shape, for Astation to confirm**: the design says
+"native members with `control`", and a request of its own, checked like
+`control_records`, keeps a service with `notify` from reading the owner's
+alerts.)
+
+**Result.** An `alerts` result (§7's envelope):
+
+```json
+{"kind":"alerts","alerts":[
+  {"alert_id":"<UUID v4>","seq":17,"kind":"outcome_unknown","host_id":"<atem_device_id>",
+   "session_id":"ses-…","task_id":"<UUID v4>","sender":"service:svc-1",
+   "reason":"agent exited","created_at":1793264006000}],
+ "more":false}
+```
+
+| Field | Rule |
+|---|---|
+| `alert_id` | a UUID v4 the host chose, kept with the alert |
+| `seq` | the host's sequence number of the alert: from 1, rising by at least one with every alert the host creates, never reused, kept with the alert. The list's order |
+| `kind` | `outcome_unknown`, the one kind; a reader refuses any other |
+| `host_id` | the host's own `atem_device_id`, the `host` of the result; another host's is refused |
+| `session_id` | the task's target session (`ses-` and 12 characters) |
+| `task_id` | the task: a UUID v4 (a delegated task's id) |
+| `sender` | the delegated sender that enqueued the task: `member:<id>`, `service:<id>` or `host:<id>` (an id of 1-128 bytes of `[A-Za-z0-9._:-]`), as a receipt's provenance names it (session-v1 R9.14). Never `local` or `browser:` |
+| `reason` | why the outcome is unknown, for people: 1-256 bytes, no control or Cf character (`agent exited`, `write interrupted`, `deadline passed; outcome unknown`) |
+| `created_at` | Unix ms on the host's wall clock: when the task became `outcome_unknown`. For people only: it orders nothing |
+| `more` | `true` when alerts follow this page; then the page isn't empty |
+
+Every field is **Atem's choice, for Astation to confirm**: the design says
+only that the alert "names the host, session, task and sender, and why the
+outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
+`detail` may be 1,024 bytes).
+
+- **Order and pages.**
+  - Alerts are listed in the order the host created them: strictly
+    ascending by `seq`, so no alert repeats within a page. `seq` may skip
+    numbers (alerts end).
+  - Never by `created_at`. A wall clock set back gives a later alert an
+    earlier `created_at`, and a client following `after` would otherwise
+    miss it (**Atem's choice, for Astation to confirm**).
+  - At most **64** alerts per result (**Atem's choice**). A host holds at
+    most 256 unresolved outcomes (design I.4.6), so a full list is four
+    pages. An alert is typically about 450 bytes, at most about 750, and
+    about 1 KB with escaping.
+  - A caller asks for the next page with `after` equal to the last
+    `alert_id` it read, until `more` is `false`. The cursor stays the
+    `alert_id`; the host finds it and lists what follows it in `seq`. A page
+    never carries its `after`.
+  - `atem_client::session::alerts::page` is the host's reference.
+- **An unknown cursor.** An `after` the host has no alert for (the alert
+  ended, or never was) is `stale_target`, detail `unknown alert`; the caller
+  lists again from the start (**Atem's choice of code, for Astation to
+  confirm**: the host triple is what §7's `stale_target` usually names, but a
+  cursor that no longer points at anything is a stale target too).
+- **What is listed.** Exactly the delegated tasks that are
+  `outcome_unknown` and unresolved, one alert each. An alert ends when its
+  task is resolved (`work_resolve`, or the host's command) or a reply
+  moves it to `awaiting_result` (design I.4.6, "Ending"); an ended alert is
+  no longer listed. No other ending exists in this store: a delegated
+  task's `outcome_unknown` never expires (§11.6, "Unknown outcomes"), and a
+  new host identity moves the whole store aside, alerts included (design
+  I.3.3). A task reaches `outcome_unknown` once, so an alert is never raised
+  twice for one. The host keeps an alert for every unresolved outcome; at 32
+  unresolved on a host the `reason` of a new alert says so (for example
+  `agent exited; 32 outcomes unresolved on this host`) within the 256 bytes
+  (design I.4.6 says only that "the alert says so"). At 64 unresolved from one
+  sender the host refuses that sender's new tasks (`busy`, detail `too many
+  unresolved outcomes`), and at 256 on the host every sender's new remote
+  tasks, until the owner resolves some (design I.4.6, "Capacity").
+- **Reminders.** The daily reminder while any stay unresolved is Astation's,
+  from this list; the host sends none.
+- **What it doesn't do.** The query changes nothing and records nothing. It is
+  read-only: a repeat gives the current list.
+
+**The push hint.** The host signs an `outcome_unknown` hint per recipient
+when an alert is raised: a body of `atem-push-hint` with a `kind`, the task,
+session, sender and reason sealed to the recipient's `enc_key`. Session-v1
+R9.9 specifies it; the shared vectors are `r9-vectors-push-hint`
+(`outcome_unknown*`).
+
+**Client core.** `Attached::send` refuses `alert_list` unless
+`welcome.features` lists `host.alerts` (`host feature not available`),
+decodes it with the host's rules and tracks it until the host answers. A
+result answers `alert_list` when it is an `alerts` result for that exchange's
+host and none of its alerts is the request's `after`; it is read as strictly
+as every result: the alert's fields, this host's `host_id`, the order, 64 at
+most.
+
+**Not advertised yet.** No host lists `host.alerts` in this version. A host
+refuses `alert_list` with `busy`, detail `host.alerts is not advertised`,
+after the channel's authority check (a service, a browser and a native member
+without `control` learn `forbidden`) and before decoding: the code every
+host-work request the host can't take has (§1, §7). Nothing is read, queued
+or recorded (**Atem's choice of code, for Astation to confirm**, as for
+§11.2). The hint is never sent either.
+
+**Compatibility: enable `host.alerts` together.** An older reader of
+push hints refuses the new `kind` (`malformed`), and an older reader of a
+`host_work_result` refuses the `alerts` kind. A host therefore sends the hint
+and answers the query only behind `host.alerts`, which Atem and Astation
+enable together, once the relay and every client verify the new hint body.
+
+Vectors:
+- `fixtures/host-work/requests-v1.json`: the requests, valid and invalid,
+  and the `alerts` results. These are an empty page, a page, every delegated
+  sender and the bounds, a later alert with an earlier `created_at` (valid:
+  the order is `seq`'s), and each refusal, `local`, a browser grant and a
+  UUID v5 task among them.
+- `fixtures/r9-vectors-push-hint.json`: the hints, and
+  `outcome_unknown_invalid_facts` (a `local` and a browser grant's task,
+  refused at open).
 
 ### 11.5 Envelopes and results (planned)
 
@@ -1455,3 +1711,621 @@ stage-3 item, written with Astation. Each call carries one object and is
 bounded at 512 KiB (owner decision 2026-11-07, choice 13); R9.9's rule that
 Atem drops a larger relay message unread exempts them (design II.4.2, a
 contract change that needs agreement).
+
+### 11.6 Delegated lifecycle (planned)
+
+Behind `host.delegated`, a task from a **delegated sender** has a lifecycle
+the host owns (design I.1 to I.6): it runs while the sender is offline,
+under the host-local `host-work` principal (session-v1 R9.14), and only
+signed data stops it. The delegated senders are a service its Station's
+control feed covers, a native member, and a host sender (`host:<host_id>`,
+on hosts that list `host.senders`). Browser grants, services no feed
+covers and `local` keep this document's v1 lifecycle (design I.1.3).
+Nothing here runs in this version. The host builds it in step 4 of the
+design's order of work, with the session-v1 revision of R9.14. What a
+client reads changes only where marked: the per-attempt `receipt_id` and
+`resolved` (§11.2), the alerts (§11.3), the receipts' `task_id` and
+`sender` (session-v1 R9.14) and the `detail` texts below. The rest is
+behaviour behind the feature, and `atem status` and `runtime.log` text.
+
+#### The start check
+
+A delegated task gets an **attempt** (below) when all of these hold, in one
+host-work transaction (design I.4.3):
+
+1. It is `queued`, no earlier task of its session holds it, and its
+   deadline hasn't passed (on the clock below).
+2. Its sender has no `revoke` record, isn't removed from the device list,
+   isn't held, and no device-list update is deferred on this host. A host
+   sender's `host_id` is `authorized` at the generation recorded at
+   admission, isn't removed, and its membership epoch is the one recorded
+   at admission; otherwise the task is `cancelled`, `sender revoked`.
+   - 2a. The device list isn't frozen, held or faulted, and the session
+     journal isn't halted. A frozen, faulted or held list fails the task
+     `sender's authority changed`. A halted journal alone leaves it
+     `blocked` until the restart.
+3. The current grant still covers the target, `notify` and `prompt` (a
+   lapsed grant is judged as it stood when it lapsed). For a host sender,
+   its project still lists it and this host, with `notify` and `prompt`.
+4. The route still exists at the recorded revision, with the sender among
+   its principals.
+5. The revocation gate for the sender's feed is open (for a host sender,
+   the mailbox gate too).
+6. The session is live, with chat, `ready`, no draft, no lease held, no
+   approval open, and its attachments verified.
+
+The sender's channel and online status are not conditions.
+
+- **At the start.** The same check runs again when the attempt's
+  request becomes `executing`, in the same serialized step (conditions 2,
+  2a, 3, 4 and 5, against the committed device list, `runtime.toml` and
+  the control state; session-v1 R9.14, item 3). A refusal there is the
+  receipt's `rejected` (`withdrawn by the host`), and the task takes the
+  event's state: `cancelled`, `failed`, or `blocked` for a hold.
+- **Waiting doesn't hold the session.** A task `blocked` for `paused`,
+  `revocations not yet checked` or `device list update pending` doesn't
+  hold its session's queue, so later tasks of other senders, local ones
+  included, may pass it. One sender's tasks keep their order.
+- **Deferred entries.** While the host's last carriage or relay fetch
+  stopped at a deferred device-list entry, every unstarted delegated
+  remote task waits (`blocked`, `device list update pending`), for at
+  most the 24 h recovery wait (session-v1 R9.5). Running turns go on, and
+  local tasks run.
+- **Locked credentials.** A locked cred agent leaves a project scope
+  pending (session-v1 R9.6): the task is `blocked`, `waiting for unlock`,
+  never failed as narrowed.
+- **Launches.** A delegated sender's launch is checked at the spawn
+  boundary against conditions 2, 2a, 3 (with `launch`), 4 and 5, before
+  the worker is spawned (design I.4.3, "Launches"). A reason that can
+  clear (a hold, the gate closed, a deferred entry) makes it wait while
+  its expiry holds, then `failed`, `expired before the spawn`. A reason
+  that can't clear ends it `failed` at once with the event's detail, and
+  never `outcome_unknown`. A receipt-database fault, a halted journal and
+  hosting switched off still fence it as §4 says.
+
+#### Attempts and `receipt_id`
+
+- **An attempt** is one dispatch of a task: a fresh UUID v4, committed in
+  the attempt's row before the submit, and the session-v1 `request_id` of
+  its prompt. The `host-work` principal submits it. Each attempt renders
+  the prompt anew with a fresh framing tag, drawn after the attempt's
+  input is fixed. A resent submit returns the recorded receipt, so an
+  attempt never runs twice.
+- **One live attempt.** At most one attempt of a task is live at a time.
+  A new one is made only once the previous one is proven side-effect-free:
+  never admitted (no receipt in the recovered journal), withdrawn, or
+  `rejected`. An attempt that reached `executing`, `completed` or
+  `outcome_unknown` ends the task's attempts for good.
+- **The limit.** At most **8** attempts per task, then `failed`, `too
+  many attempts`. Attempts a hold withdrew don't count. Nor does an
+  attempt the session host answered `request_id_reused` (an id recorded
+  under another submitter, session-v1 R9.14 item 7): it was never
+  admitted, and the host takes a fresh id. The deadline bounds them
+  anyway.
+- **`receipt_id`** in a `work` result is the current attempt's id (§11.2),
+  so it changes when a new attempt starts. A client compares it with
+  nothing; a task's identity is its `task_id`.
+- **Restart.** Recovered `accepted` attempts are `rejected`, `withdrawn
+  at recovery`, before anything is dispatched (session-v1 R9.14 item 6).
+  Their tasks go back to `queued` for a new attempt once the revocation
+  gate opens, after pending interrupt intents are carried out, every
+  task is reconciled with its latest attempt's receipt and route changes
+  are applied (design I.6.2, I.6.3).
+
+#### Unknown outcomes
+
+- `outcome_unknown` is final for execution: such a task is never
+  submitted again. Nothing ever treats it as success. To try again, the
+  sender enqueues a new task.
+- It no longer becomes `expired` at the deadline. There it stops holding
+  its session, and its `detail` becomes `deadline passed; outcome
+  unknown`. It stays `outcome_unknown` until `work_resolve` (§11.2) or the
+  host's own command (below) resolves it, which records the resolver and
+  the time (`resolved`).
+- A reply its agent submits proves the turn ran: the task moves to
+  `awaiting_result` and still needs `work_complete`. A reply that arrives
+  after a `failed` resolution is stored, and the task stays `failed`.
+- Each one raises an alert (§11.3); the alert ends when the task is
+  resolved, or a reply moves it to `awaiting_result`.
+
+#### Capacity
+
+- An unresolved task drops its prompt and context a day after its
+  deadline, with the uploads it named, and stops being an open record
+  (§9). It stays `outcome_unknown`, with its alert.
+- At **32** unresolved on a host, a new alert's `reason` says so (§11.3).
+- At **64** unresolved from one sender, the host refuses that sender's
+  requests that would make a new task (`work_enqueue`, and
+  `message_publish` with an agent recipient): `busy`, detail `too many
+  unresolved outcomes`. A host sender's request envelopes count the same
+  way (design II.9). Their refusal travels back as the envelope's status
+  object, whose form is the envelopes' (design II.4.4, specified with
+  host senders).
+- At **256** unresolved on the host, it refuses such requests from every
+  remote sender, host senders included, with the same code and detail,
+  until the owner resolves some. Local tasks are never refused for
+  unresolved outcomes. Which requests count, and the one detail for both
+  limits, are **Atem's choice, for Astation to confirm**: the design says
+  "new tasks" and "new remote tasks", and names the 64's detail only.
+
+#### Details
+
+`detail` stays display text that clients don't parse; these texts are
+exact.
+
+| State | `detail` | When |
+|---|---|---|
+| `blocked` | `paused` | the sender is held (a `hold` record) |
+| `blocked` | `revocations not yet checked` | the revocation gate (or, for a host sender, the mailbox gate) is closed |
+| `blocked` | `device list update pending` | the last carriage or fetch stopped at a deferred entry |
+| `blocked` | `waiting for unlock` | a locked cred agent leaves the project scope pending |
+| `cancelled` | `sender revoked` | a `revoke` record, an R9 removal, or a host sender's `host_sender_revoke`, `remove_host` or new membership epoch |
+| `failed` | `sender's authorization narrowed` | the current grant (or a host sender's projects) no longer covers the task |
+| `failed` | `route changed` | the route's revision, principals or profile changed |
+| `failed` | `sender's authority changed` | a frozen, faulted or held device list |
+| `failed` | `too many attempts` | 8 attempts |
+| `failed` | `expired before the spawn` | a launch still waiting at the spawn boundary at its expiry |
+| `awaiting_result` | `interrupted at deadline` | a running turn interrupted at the task's deadline (then `expired` as today) |
+| `outcome_unknown` | `deadline passed; outcome unknown` | its deadline passed unresolved |
+| (a `work_interrupt` result) | `not running` | the task's turn isn't the session's current turn (§11.2) |
+| (an error) | `too many unresolved outcomes` | `busy`, the 64 or 256 limit |
+| (a receipt) | `withdrawn by the host`, `withdrawn at recovery` | session-v1 R9.14 items 3, 4 and 6; the task's state follows the event |
+
+#### Clocks
+
+Every deadline check of the delegated lifecycle uses one clock (design
+I.6.5, as amended by the **owner's decision of 2026-11-10**). It is
+Atem-internal: no field or message changes, and Astation's `station_time`
+stays as the design gives it.
+
+- **Boot time.** Atem measures elapsed time on a raw counter that keeps
+  counting while the machine sleeps, and that nothing slews or steps:
+  - **macOS:** `mach_continuous_time`.
+  - **Linux:** `CLOCK_MONOTONIC_RAW + (CLOCK_BOOTTIME − CLOCK_MONOTONIC)`
+    (**Atem's fill-in** of how boot time is measured on Linux):
+    - `CLOCK_BOOTTIME` counts suspend, but the kernel slews it with the
+      wall clock;
+    - `CLOCK_MONOTONIC_RAW` is never slewed, but stops in suspend;
+    - their difference `CLOCK_BOOTTIME − CLOCK_MONOTONIC` is the kernel's
+      suspended time. It is measured at each resume (by a nonstop
+      clocksource or the RTC) and never slewed.
+  - **The read must be consistent.** The difference is read before and
+    after `CLOCK_MONOTONIC_RAW`, so a resume between the reads never
+    yields a reading off by one suspend.
+    - **A tolerance of 1 ms.** The difference is itself two reads, so it
+      moves by their own span on every read: nanoseconds, more if the
+      thread is preempted. Two differences more than 1 ms apart mean a
+      resume fell between the reads (it moves the difference by the
+      suspended time), or the thread was preempted that long; either way
+      the whole read is retried. A resume that moved it by less leaves an
+      error under 1 ms.
+    - **At most 3 retries.** If they run out (a machine suspending and
+      resuming again and again), Atem takes the last `CLOCK_MONOTONIC_RAW`
+      plus the difference read after it. The suspended time only grows,
+      so that sum lies, within the reads' own span, between the counter's
+      values at the `CLOCK_MONOTONIC_RAW` read and at the end of the read:
+      a reading of the counter during the read, never off by a suspend
+      outside it.
+  - **Not the monotonic clocks.** `CLOCK_MONOTONIC` and
+    `mach_absolute_time` stop during suspend, so a laptop's sleep would
+    look like a forward jump that never comes back.
+  - **Within one boot only.** Boot time counts only within the boot it was
+    read in (its `boot_id`).
+  - **Leases keep `CLOCK_MONOTONIC`** (session-v1 §3's lease deadlines).
+- **The host's own time `H`.** The host keeps the `wall_hw` record: a
+  value, the `boot_id` and the boot time it was recorded at. Its
+  **prediction** at boot time `b` of the same boot is `wall_hw + (b −
+  the recorded boot time)`.
+  - In the same boot, `H = max(wall clock, the prediction)`.
+  - After a reboot, `H = max(wall clock, wall_hw + this boot's boot time so
+    far)` until a new record (one boot, below, with its two assumptions).
+  - `H` never includes `station_time`.
+- **One boot** (**Atem's fill-in**). Every boot-time difference is taken
+  within one `boot_id` only: a prediction, an update's `Δ`, the floor's
+  elapsed time, and an anchor's predictions.
+  - A record or floor from an earlier boot was made before this boot
+    began. So it predicts its value plus this boot's boot time so far (the
+    counter's reading, which starts at boot): a lower bound, which leaves
+    uncounted only the time from the record to this boot (the downtime, and
+    any time before the shutdown that no runtime recorded).
+  - **Its two assumptions:** the record predates this boot, and the
+    counter starts at this boot. Two setups break them, and either can
+    push `H` ahead of the true time at the first reading, so tasks expire
+    early:
+    - **A store opened on another node with the same identity:** a
+      container's profile volume rescheduled to another node with a stable
+      hostname, or an image that carries one `/etc/machine-id` to every
+      node. The record may have been written after this node booted, and
+      the first reading adds this node's whole uptime.
+    - **A Linux time namespace with a boot-time offset** (a CRIU restore,
+      `unshare --time --boottime`): the counter reads this boot's boot time
+      plus the offset, so a positive one adds itself to the prediction (a
+      negative one leaves that much more uncounted, as the downtime is).
+    - **Guarded in step 4.** Step 4 detects both (for example by a boot id
+      or a machine id recorded with `wall_hw`, and the namespace's offsets
+      in `/proc/self/timens_offsets`; how it tells nodes apart that share
+      one `/etc/machine-id` is step 4's) and then adds no boot time across
+      the reboot: the record and the floor predict their bare values, so
+      the first reading records `max(w, wall_hw)`.
+    - **macOS:** Apple documents `mach_continuous_time` as counting from
+      an arbitrary point. That it starts at boot is to be confirmed in step
+      4; if it doesn't, macOS adds no boot time across a reboot either.
+  - `Δ` across a reboot is 0.
+  - No anchor carries over a reboot.
+  - The **first reading of a boot** is no jump and makes no anchor: it
+    follows the rule across a reboot (below).
+  - A runtime restarted within the same boot is the same boot: its first
+    reading is compared as any other.
+- **The record's update** (**Atem's fill-in** of the design's "the
+  highest wall-clock reading"). The host updates the record at least once
+  a minute and at shutdown. Take the reading `w`, the prediction `p`, and
+  `Δ`, the boot time since the previous update in this boot. The new value
+  is `w` when `w ≥ p`, and `max(w, p − ρ·Δ)` when `w < p`: the
+  **follow-down**.
+
+  The new value is stamped with the current `boot_id` and boot time. A
+  clock set back, all at once or in small steps, pulls the prediction down
+  by no more than the follow-down. Recording the highest raw reading
+  instead would let a set-back reading that is still above the stored
+  value replace a higher prediction.
+  - **The follow-down rate `ρ` is 500 ppm:** 0.5 ms a second, 30 ms a
+    minute, 43.2 s a day.
+    - It is NTP's frequency tolerance (RFC 5905, `MAXFREQ`).
+    - It is also the bound the Linux kernel puts on the frequency
+      correction its NTP discipline applies (`MAXFREQ` in the kernel's
+      `include/linux/timex.h`, "max frequency error", 500 000 ns a second).
+  - **It applies at every update,** on both systems, whatever the OS
+    reports. The OS's sync report serves only rule 4 below and the mark
+    after a reboot.
+  - **Why it is needed.**
+    - On both systems the counter is raw. The wall clock the OS
+      disciplines drifts from it by the oscillator's error and by the OS's
+      slewing.
+    - Without the follow-down, a record that never comes down keeps every
+      such lead:
+      - the lead builds over the whole uptime;
+      - it carries into the next boot whenever the reboot is shorter than
+        the lead;
+      - past 10 minutes it raises a false "host clock went back" alert
+        every hour on a healthy host.
+
+      At 23 ppm that is a minute a month; at 20 ppm, 10 minutes takes
+      about a year.
+  - **What it bounds, and its price.** Any fall of the wall clock against
+    the raw counter, stepped or slewed, by the OS, a time source it follows
+    or anyone who can set the clock, is followed down at most 500 ppm:
+    43.2 s a day.
+    - A fall faster than that leaves the wall clock below `H`, and past 10
+      minutes the owner is alerted.
+    - So, once the boot's first synchronized reading has passed, someone
+      who can move the clock back walks the record down by at most 43.2 s
+      a day, on both systems. That reading itself can lower the record to
+      a wall clock however far behind: the rule across a reboot trusts the
+      OS's sync report once per boot (Linux, and macOS once its report is
+      confirmed; "The bounds that remain").
+  - **A healthy host, worked through.**
+    - **A Mac** whose counter runs 20 ppm fast against `timed`'s wall
+      clock (about 52 s a month): each minute the prediction gains 1.2 ms
+      on the wall clock, and the follow-down allows 30 ms. So every update
+      brings the record back onto the wall clock. The lead stays within
+      1.2 ms, never builds over the uptime, and never raises the alert.
+    - **A synchronized Linux host** is the same case: the raw counter's
+      oscillator error is brought back at each update while it is under
+      500 ppm. A leap second's 1 s, stepped or slewed, comes down in about
+      33 minutes.
+    - In both cases deadlines fall at most that lead early, never late.
+  - **The counter's assumptions** (stated for the owner):
+    - **The oscillator's error is under 500 ppm,** the range the kernel's
+      frequency discipline corrects (`ADJ_FREQUENCY` is clamped to
+      `MAXFREQ`). A host whose time-sync daemon has to use tick
+      adjustments (`ADJ_TICK`; some mis-calibrated VMs) builds an early
+      lead at the excess, and past 10 minutes a false alert.
+    - **Each resume can add about 1 s of early lead** where the RTC
+      measures the suspended time (its 1 s granularity, plus its drift
+      while suspended). The lead is followed down the same way.
+    - **Anchors age at the counter's rate.** An anchor's prediction drifts
+      from true time by the counter's error times the anchor's age. So a
+      jump undone more than `60 s / error` after it was made (about 7
+      days at 100 ppm) can miss the band: no repair, early only. The
+      follow-down still brings the record down.
+  - **What the follow-down doesn't clear quickly.** Say a clock booted an
+    hour ahead.
+    - **If the OS's first sync steps it back,** that sync is normally the
+      boot's first synchronized reading, where the rule across a reboot
+      (below) lowers the lead at once.
+    - **A step back after that reading** isn't taken within the boot. The
+      owner's decision lowers the record to a synchronized wall clock only
+      at a boot's first synchronized reading. The record is followed down
+      at 500 ppm (an hour in about 83 days), with the alert raised
+      meanwhile, and the next boot's first synchronized reading lowers it
+      at once.
+    - **macOS, until its report is confirmed:** only the follow-down
+      clears it, or a reboot whose downtime exceeds the remaining lead
+      (one boot, above).
+- **The clock floor** is the latest `station_time` the host has seen,
+  with the boot time it was seen at.
+  - It takes a `station_time` only up to `H` plus 10 minutes. One further
+    ahead closes the gate for that origin and raises an owner alert
+    ("Station clock ahead of this host", at most one an hour). The gate
+    reopens when a head within the cap arrives.
+  - A `station_time` below the floor's prediction lowers the floor by at
+    most 500 ppm of the boot time since the floor last changed, as the
+    record's follow-down does. So the counter's rate error builds no lead
+    on the floor either.
+    - This uses the Station's time, which is not one of the repair's
+      inputs, so it is no part of the repair.
+    - It can only bring the floor toward the Station's time, and the floor
+      lowers no deadline comparison below `H`.
+  - Only this follow-down, the repair and the rule across a reboot (below)
+    lower the floor.
+- **Deadline comparisons** use `max(H, floor + boot time elapsed since
+  the floor was set)`, the floor's boot time counting within one boot
+  only. After a restart or a reboot, the floor (plus this boot's boot time
+  so far, after a reboot) is the lower bound until the next sync. The
+  envelope times of host senders use the same clock.
+- **A clock that goes back.** A wall clock more than 10 minutes below `H`
+  raises an owner alert ("host clock went back", at most one an hour).
+  Nothing is revived: every comparison keeps using `H`.
+- **Automatic repair** (owner decision 2026-11-10). It replaces the
+  design's "owner's reset", a local command left unnamed.
+  - There is no command and no network time. Keeping the clock right is the
+    OS's job, and HTTP `Date` headers are no time service.
+  - A clock that jumped forward and was corrected would otherwise expire
+    tasks early for good, so Atem repairs `wall_hw` and the floor itself.
+  - The decision's inputs are the boot time and the OS's own sync report,
+    and every rule below uses only those.
+  - The rules are **Atem's fill-in** of the owner's "comes back to the
+    trajectory the boot time predicts from before the jump (within 60 s)".
+  - **A jump undone within one boot.**
+    1. **A forward jump** is a reading more than 60 s above the
+       prediction of a record of the same boot. The first reading of a
+       boot never is one (one boot, above).
+       - If the OS reports its clock synchronized with that reading,
+         the jump is the OS's own step. No anchor is made, and a pending
+         one is dropped (rule 4).
+       - Otherwise, if no anchor is pending, Atem keeps the **anchor**
+         before the record takes the reading: a copy of the `wall_hw`
+         record and a copy of the floor, as they stood (each a value, a
+         `boot_id` and a boot time).
+       - The copies never change, so the anchor's two predictions (each
+         value plus the boot time since its own boot time, in this boot)
+         never decrease.
+    2. **While an anchor is pending:**
+       - the record goes on as above: it takes the jumped readings, and
+         comes down only by the follow-down;
+       - a `station_time` that raises the floor is kept with the anchor as
+         well: of the raises since the anchor was taken, the one with the
+         highest prediction, with its boot time;
+       - a further jump keeps the first anchor.
+    3. **The jump is undone** when a later reading `w`, in the anchor's
+       boot, is within 60 s of the anchor's record prediction (above or
+       below it). Then both values are lowered, never raised, and stamped
+       now:
+       - `wall_hw` to `max(w, the anchor's record prediction)`;
+       - the floor to `max(w, the anchor's floor prediction, the
+         prediction of the Station raise kept with it)`.
+
+       The anchor is dropped. Keeping the Station raise means a repair
+       never undoes the Station's own lead. A raise that only the jumped
+       `H`'s wider cap let in stays too: it can only make deadlines early.
+    4. **The OS's sync ends an anchor.** At a reading outside the
+       anchor's band, a report from the OS that its clock is synchronized
+       drops the anchor: the OS has made the jumped trajectory its
+       synchronized time, and the jump stands.
+       - **Why the report can be trusted here:** a step clears the Linux
+         kernel's synchronized state until the time-sync daemon next
+         reports, so a synchronized report after a jump is the OS's report
+         on the new time (to be checked in step 4).
+       - **Dropping an anchor only gives up a repair:** `H` stays as high
+         as the record is. So no lateness can come of this rule, even if
+         that check fails.
+       - **Nothing else ends an anchor** in its boot. A reading more than
+         60 s below its record prediction is a clock set back: the alert,
+         and no repair. A reboot drops the anchor (one boot, above).
+  - **The invariants**, measured on the boot-time counter, within one
+    boot:
+    - the record's prediction decreases only at a repair, by the rule
+      across a reboot (once, at the boot's first synchronized reading), or
+      at an update by the follow-down, by at most 500 ppm of the boot time
+      since the previous update;
+    - the anchor's two predictions never decrease, nor does the Station
+      raise kept with it;
+    - a repair never sets `wall_hw` below the anchor's record prediction,
+      the floor below the higher of the anchor's floor prediction and the
+      Station raise kept with it, or either below the reading;
+    - no comparison crosses a reboot.
+
+    So, against the boot-time counter, a forward move and back ends
+    neither `wall_hw` nor the floor below where each stood before the
+    move, apart from the follow-down and the once-per-boot lowering across
+    a reboot (to a wall clock the OS reports synchronized). Against true
+    time, add only the counter's own rate error. Nothing settled is
+    revived.
+  - **The small-steps-back attack, worked through.** Suppose the true
+    time is `T`, the record's prediction is on it, and the boot's first
+    synchronized reading has passed (before it, see "The bounds that
+    remain").
+    1. The attacker sets the clock back 50 s a minute, for 30 minutes.
+       Each update lowers the prediction by at most 30 ms (the
+       follow-down), 0.9 s in all. No reading is ahead of it, so no anchor
+       is made. Past 10 minutes, "host clock went back" fires.
+    2. The attacker sets the clock to `T`: no jump (it is 0.9 s above the
+       prediction, well within 60 s), so the record takes the reading and
+       is back on `T`.
+    3. It sets the clock to `T` + 2 min: a jump. If the OS reports its
+       clock unsynchronized, as a manual step makes it, the jump is
+       anchored at the record's trajectory, and `wall_hw` rises to
+       `T` + 2 min.
+    4. Back to `T`: within 60 s of the anchor, so the jump is undone,
+       and `wall_hw` returns to the anchor's trajectory: on `T`, or at most
+       0.9 s below it had step 2 been skipped. Back to `T` − 25 min
+       instead: more than 60 s below the anchor, so there is no repair,
+       and `wall_hw` stays near `T` + 2 min, coming down at 500 ppm.
+
+    Either way nothing ends more than the follow-down below `T`. If the
+    OS reports the jump in step 3 synchronized, it makes no anchor or
+    loses it (rule 4), and `wall_hw` stays near `T` + 2 min, coming down
+    at 500 ppm: early, never below `T`.
+  - **An OS forward step, then a set-back or a down-slew, worked
+    through.** A Linux host booted three hours slow (no RTC), so the
+    record is on the slow trajectory `S`.
+    1. The time-sync daemon's first sync steps the clock forward three
+       hours. The kernel marks the clock unsynchronized at the step (as
+       rule 4 expects), so Atem's next reading is a jump and arms an
+       anchor on `S`.
+    2. The daemon's next report clears the mark. At Atem's next reading
+       (still on the true time `T`, outside the anchor's band, and
+       synchronized) the anchor is dropped, and the record stays on `T`.
+    3. Later someone sets the clock back toward `S`, or a bad time source
+       makes the daemon slew it down through `S`'s band. No anchor exists,
+       so nothing is repaired. On the raw counter both are a fall of the
+       wall clock: the record comes down by at most 500 ppm, and the alert
+       fires once the wall clock is 10 minutes below `H`. The same holds
+       on a Mac.
+
+    Under the earlier text the stale anchor stayed armed for the boot.
+    The set-back would have lowered `wall_hw` and the floor to `S`,
+    three hours below `T`, and later jumps in that boot could no longer
+    be repaired.
+  - **A reboot, worked through.** A Mac (sync report not yet confirmed)
+    shuts down at `X` with `wall_hw` = `X`, stays off three days, and
+    boots.
+    1. Its first reading, `X` + 3 days, is the boot's first reading: no
+       jump and no anchor. The record becomes `max(X + 3 days, X + this
+       boot's boot time so far)` = `X` + 3 days, in the new boot.
+    2. Later someone steps the clock back to `X` + 30 s. No anchor
+       exists, so nothing is repaired. The follow-down lowers the record by
+       at most 500 ppm, and the alert fires past 10 minutes. `H` stays
+       within 43.2 s a day of the true time, plus the counter's own rate
+       error.
+
+    Compared across the reboot, the first reading would have been a jump.
+    It would have armed an anchor at `X` for the whole boot, and the step
+    back would have "repaired" `wall_hw` and the floor to `X` + 30 s: three
+    days, plus the uptime, below the true time.
+
+    A clock set forward while the machine was off shows up only as the
+    boot's first reading, so it is never repaired in that boot as a jump.
+    Deadlines are early. On Linux, once the OS has corrected the clock, the
+    boot's first synchronized reading lowers a lead of more than 10 minutes
+    at once, by the rule across a reboot. Otherwise the follow-down clears
+    it.
+  - **The bounds that remain,** for the owner:
+    - **On Linux, the step window.** An anchor armed by the OS's own
+      forward step stays armed until Atem's first reading after the
+      time-sync daemon next reports synchronized (to be measured in step
+      4), and for the rest of the boot if it never does. A set-back into
+      its band before then lowers `wall_hw` to the old trajectory, below
+      the true time by up to the step's size.
+    - **On macOS, until its sync report is confirmed:**
+      - Rule 4 never applies, so an anchor armed by `timed`'s own forward
+        step on a clock slow by more than 60 s lasts the boot.
+      - A later set-back, or a down-slew into its band, lowers `wall_hw`
+        to the old trajectory, up to the step's size below the true time.
+      - Later jumps in that boot aren't repaired: `H` stays ahead of the
+        wall clock, coming down at 500 ppm. A reboot doesn't clear it
+        either, unless its downtime exceeds the remaining lead: macOS has
+        no lowering across a reboot before confirmation.
+      - A Mac's clock keeps time while it's off, so such steps are rare,
+        and exploiting one needs someone able to set the clock or to
+        steer its time source.
+      - The floor is lowered no further than its own pre-step value and
+        the Station's raises, so with a Station it stays a lower bound.
+    - **A jump the OS reports as synchronized** is never repaired in its
+      boot. `H` stays ahead (deadlines early) and comes down by the
+      follow-down, and at a later boot's first synchronized reading by the
+      rule across a reboot (on macOS, once the report is confirmed).
+    - **The downtime isn't counted (the late direction).** A wall clock
+      that is behind the true time at a boot's first reading is taken as
+      it is, short by up to the time from the last record to this boot,
+      with no "host clock went back" alert. That time is the downtime,
+      plus any time before the shutdown that no runtime recorded (hosting
+      off, a crash). The clock may have been set back while the machine
+      was off, set back after boot but before Atem's runtime first reads,
+      or restored stale with no attacker at all (fake-hwclock on a machine
+      without an RTC). The record's lower bound, `wall_hw` plus this boot's
+      boot time so far, counts everything but that time. This bound holds
+      until the boot's first synchronized reading, which can lower `H`
+      further (next item). Remote starts still wait for the Station's
+      sync, whose head would hit the cap.
+    - **The once-per-boot lowering trusts the OS's sync report (the late
+      direction).** This is the price of the owner's decision of
+      2026-11-10, whose input is the OS's own sync report, trusted here
+      once per boot. At a boot's first synchronized reading, when
+      `wall_hw` or the floor is more than 10 minutes ahead of the wall
+      clock, the rule across a reboot lowers both to whatever wall clock
+      the OS then reports as synchronized, however far behind the true
+      time it is, with a `runtime.log` line and no owner alert. Anyone who
+      can set the clock can usually also clear the unsynchronized flag (on
+      Linux the same privilege sets `adjtimex`'s status), and on a host
+      with no time-sync daemon (or chrony without `rtcsync`) that can
+      happen at any time in the boot. A time source the daemon follows
+      that is wrong at boot does the same.
+      So the walk-back of at most 43.2 s a day holds only after that
+      reading, and the downtime bound above only until it. On macOS this
+      applies once its report is confirmed. Remote starts still wait for
+      the Station's sync, whose head would hit the cap.
+    - **The counter's assumptions** above (the oscillator under 500 ppm,
+      about 1 s a resume, anchors ageing), and the two assumptions of the
+      rule across a reboot (one boot, above: a store moved to another node
+      or a time namespace's offset can make deadlines early; guarded in
+      step 4).
+  - **Across a reboot.** Boot time doesn't cross a reboot (one boot,
+    above).
+    - The boot's first reading records `max(w, wall_hw + this boot's boot
+      time so far)` with the new `boot_id`. This assumes the record
+      predates this boot and the counter starts at it (one boot, above:
+      a store moved to another node and a time namespace's offset break
+      that; guarded in step 4). When that reading is also the first
+      synchronized one, the record and the lowering below are one
+      evaluation, before any deadline is compared.
+    - The record carries a **mark** from the reboot until the first reading
+      at which the OS reports its clock synchronized in the new boot. At
+      that reading, if `wall_hw` or the floor is more than 10 minutes ahead
+      of the wall clock, Atem lowers both to the current wall clock.
+    - Then the mark goes, and for the rest of the boot only the rules above
+      apply. The mark is **Atem's fill-in**: it fixes when the rule applies.
+      It is stored with the record, so the lowering and the mark's removal
+      are one write.
+    - **Linux:** `adjtimex`'s status without `STA_UNSYNC`, which
+      systemd-timesyncd clears once synchronized, and chrony too when
+      `rtcsync` is set (as distributions usually ship it; without it chrony
+      leaves the flag set). In a container it reports the host kernel's
+      state, which is the right answer.
+    - **macOS:** the candidate is `ntp_gettime()` returning `TIME_OK`
+      rather than `TIME_ERROR`, to be confirmed against `timed`'s behaviour
+      in step 4. Until it is, macOS doesn't lower them across a reboot.
+  - **Otherwise** Atem stays on the safe side: tasks may expire early, and
+    `atem status` says why and names the fix. Where the flag never clears
+    (no time-sync daemon runs, or chrony runs without `rtcsync`), it says
+    `host clock ahead of its record; enable time synchronization (chrony
+    with rtcsync, or systemd-timesyncd)`.
+    On macOS before confirmation, it says `host clock ahead of its
+    record; waiting for a synchronized clock`.
+  - **What doesn't change.**
+    - No repair, and no lowering across a reboot, sets either value below
+      the current wall clock.
+    - Nothing already settled is revived: tasks already `expired`,
+      envelopes already refused as expired, `outcome_unknown` tasks
+      already past their deadline.
+    - The device list's recovery waits (session-v1 R9.5) keep their own
+      clocks.
+    - Every repair, and every lowering across a reboot, writes one
+      `runtime.log` line with the old and new values, and `atem status`
+      shows it. The follow-down is no repair: it writes no line.
+
+#### On the host
+
+- `atem status` shows the number of unresolved outcomes, and the clock
+  state above when it holds deadlines back.
+- `atem task list --unknown` lists the unresolved outcomes: the task,
+  session, sender, reason and when.
+- `atem task resolve <task_id> failed|done` resolves one as the owner, on
+  the host. Its `resolved.by` is `local` (§11.2), and it works for a
+  revoked sender's task. Like `work_resolve`, it resolves only a delegated
+  task: a task of `local`, a browser grant or a service no feed covers
+  keeps v1, and its unknown outcome expires.
+
+Both commands are built in step 4, with the lifecycle. Their output, and
+how `done` takes its result snapshot and `failed` its detail, are
+step 4's.

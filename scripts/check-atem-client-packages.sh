@@ -34,6 +34,8 @@ for vector in \
   host-work/prompt-framing-v1.json:host-work-prompt-framing-v1.json \
   host-work/framing-size-v1.json:host-work-framing-size-v1.json \
   r9-vectors-host-work-control.json:r9-vectors-host-work-control.json \
+  r9-vectors-push-hint.json:r9-vectors-push-hint.json \
+  r9-vectors-delegated-wire.json:r9-vectors-delegated-wire.json \
   r9-vectors-host-envelope.json:r9-vectors-host-envelope.json; do
   source="$ROOT/designs/protocol/fixtures/${vector%%:*}"
   shipped="atem-client-${VERSION}-${vector#*:}"
@@ -43,7 +45,7 @@ for vector in \
   cmp -s "$source" "$DIR/$shipped" ||
     { echo "vectors: $shipped differs from ${vector%%:*}" >&2; exit 1; }
 done
-echo "vectors: 5 files shipped, listed and unchanged"
+echo "vectors: 7 files shipped, listed and unchanged"
 FRAMING_VECTORS="$DIR/atem-client-${VERSION}-host-work-prompt-framing-v1.json"
 FRAMING_SIZE_VECTORS="$DIR/atem-client-${VERSION}-host-work-framing-size-v1.json"
 python3 - "$DIR/atem-client-${VERSION}-SOURCE.json" "${EXPECT_COMMIT:-}" <<'EOF'

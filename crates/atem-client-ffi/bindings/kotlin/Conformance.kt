@@ -1031,10 +1031,77 @@ fun main(args: Array<String>) {
             val keysJdk = JdkKeys()
             keysJdk.addX25519("enc", unhex(push["recipient_secrets"][device].s()), unhex(keys[device]["enc"]["pub_hex"].s()))
             val plain = Json.parse(d["plain_jcs"].s())
-            eq(hint.open(keysJdk, "enc", device), HintContent(plain["tool"].s(), plain["summary"].s()))
+            eq(hint.open(keysJdk, "enc", device), HintContent.Approval(plain["tool"].s(), plain["summary"].s()))
+            val other = if (device == "dev-phone") "dev-mac" else "dev-phone"
+            throwsCode("malformed") { hint.open(keysJdk, "enc", other) }
+            throwsCode("malformed") { hint.alert() }
+        }
+    }
+    check("outcome_unknown hints verify and open for their device only") {
+        push["outcome_unknown"].arr().forEachIndexed { i, h ->
+            val d = push["outcome_unknown_details"][i]
+            val hint = verifyPushHint(Json.write(h), logL(), nowP, PushVerifier.CLIENT)
+            eq(hint.state(), HintStateInfo.OutcomeUnknown(d["device_id"].s(), d["enc_kid"].s(), d["sealed_hash"].s()))
+            eq(hex(signedObjectInfo(Json.write(h)).signingInput), d["signing_input_hex"])
+            hint.checkSealed()
+            eq(hint.createdAt(), h["body"]["created_at"].l().toULong())
+            eq(hint.expiresAt(), h["body"]["expires_at"].l().toULong())
+            val b = h["body"]
+            eq(hint.alert(), AlertRef(b["account_id"].s(), b["genesis_hash"].s(), b["host_id"].s(), b["host_trust_gen"].l().toULong(), b["alert_id"].s()))
+            throwsCode("malformed") { hint.approval() }
+            eq(Json.parse(hint.ackJson()), push["outcome_unknown_acks"][i])
+            val device = d["device_id"].s()
+            val keysJdk = JdkKeys()
+            keysJdk.addX25519("enc", unhex(push["recipient_secrets"][device].s()), unhex(keys[device]["enc"]["pub_hex"].s()))
+            val f = d["facts"]
+            eq(hint.open(keysJdk, "enc", device), HintContent.OutcomeUnknown(f["task_id"].s(), f["session_id"].s(), f["sender"].s(), f["reason"].s()))
             val other = if (device == "dev-phone") "dev-mac" else "dev-phone"
             throwsCode("malformed") { hint.open(keysJdk, "enc", other) }
         }
+    }
+    check("outcome_unknown hints: refusals, dedup and acks") {
+        for (c in push["outcome_unknown_invalid"].arr()) {
+            val code = c["code"].s()
+            if (code in listOf("malformed", "binding", "invalid_times", "skew")) {
+                for (verifier in listOf(PushVerifier.CLIENT, PushVerifier.RELAY)) {
+                    throwsCode(code) { verifyPushHint(Json.write(c["hint"]), logL(), nowP, verifier) }
+                }
+            }
+        }
+        fun verified(h: Any?) = verifyPushHint(Json.write(h), logL(), nowP, PushVerifier.CLIENT)
+        val book = PushHintBook()
+        eq(book.offer(verified(push["outcome_unknown"][0])), HintOffer.ACCEPTED)
+        eq(book.offer(verified(push["outcome_unknown"][0])), HintOffer.IDEMPOTENT)
+        eq(book.offer(verified(push["outcome_unknown"][1])), HintOffer.ACCEPTED)
+        val cases = push["outcome_unknown_invalid"].arr()
+        val duplicate = cases.first { it["code"].s() == "duplicate" }
+        throwsCode("duplicate") { book.offer(verified(duplicate["hint"])) }
+        // A swapped sealed part verifies (its body and signature are the
+        // host's) and is refused where the sealed part counts.
+        val swapped = verified(cases.first { it["code"].s() == "bad_sealed" }["hint"])
+        throwsCode("bad_sealed") { swapped.checkSealed() }
+        throwsCode("bad_sealed") { PushHintBook().offer(swapped) }
+        val keysJdk = JdkKeys()
+        keysJdk.addX25519("enc", unhex(push["recipient_secrets"]["dev-phone"].s()), unhex(keys["dev-phone"]["enc"]["pub_hex"].s()))
+        throwsCode("open_failed") { swapped.open(keysJdk, "enc", "dev-phone") }
+        // Well signed and well sealed, but the sealed facts aren't a
+        // delegated sender's UUID v4 task: verified and kept, refused at open.
+        for (c in push["outcome_unknown_invalid_facts"].arr()) {
+            for (verifier in listOf(PushVerifier.CLIENT, PushVerifier.RELAY)) {
+                verifyPushHint(Json.write(c["hint"]), logL(), nowP, verifier)
+            }
+            val hint = verified(c["hint"])
+            hint.checkSealed()
+            val device = c["device_id"].s()
+            val keysFor = JdkKeys()
+            keysFor.addX25519("enc", unhex(push["recipient_secrets"][device].s()), unhex(keys[device]["enc"]["pub_hex"].s()))
+            throwsCode(c["code"].s()) { hint.open(keysFor, "enc", device) }
+        }
+        // The ack entries, and an approval hint is no alert.
+        val acks = push["outcome_unknown"].arr().map { verified(it).ackJson() }
+        eq(parsePushAck(pushAckMessage(acks)), acks)
+        eq(acks.map { Json.parse(it) }, push["outcome_unknown_acks"].arr())
+        throwsCode("malformed") { verified(push["open"][0]).alert() }
     }
     check("resolved and seen") {
         val r = verifyPushHint(Json.write(push["resolved"]), logL(), nowP, PushVerifier.CLIENT)

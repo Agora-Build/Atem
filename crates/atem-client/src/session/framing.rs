@@ -242,13 +242,17 @@ pub struct Folded {
     pub capital_skeleton: String,
 }
 
+/// Whether `c` is of General_Category Cf (format characters: bidi controls,
+/// zero-width characters), as the pinned Unicode data says. The folding
+/// drops them; host-work text shown to people refuses them (a failed
+/// resolution's `detail`, an alert's `reason`).
+pub fn is_format(c: char) -> bool {
+    c.general_category() == GeneralCategory::Format
+}
+
 /// Folds one line (see the module's notes).
 pub fn fold(line: &str) -> Folded {
-    let nfkc: String = line
-        .chars()
-        .filter(|c| c.general_category() != GeneralCategory::Format)
-        .nfkc()
-        .collect();
+    let nfkc: String = line.chars().filter(|c| !is_format(*c)).nfkc().collect();
     let lower = lowercase(&nfkc);
     Folded {
         skeleton: skeleton(&lower),

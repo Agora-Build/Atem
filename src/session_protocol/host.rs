@@ -4280,6 +4280,10 @@ fn to_receipt(s: &Stored, with_result: bool) -> Receipt {
         updated_at: s.updated_at,
         lease: None,
         result,
+        // Delegated host work (session-v1 R9.14): only the `host-work`
+        // principal's receipts carry them, and it doesn't exist yet.
+        task_id: None,
+        sender: None,
     }
 }
 

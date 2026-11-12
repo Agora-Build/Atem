@@ -180,7 +180,7 @@ private fun run(args: Array<String>) {
         if (state is HintStateInfo.Open && state.deviceId == "dev-phone") opened = hint
     }
     val mine = opened ?: fail("no hint for dev-phone")
-    val content = mine.open(provider, "dev-phone/enc", "dev-phone")
+    val content = mine.open(provider, "dev-phone/enc", "dev-phone") as HintContent.Approval
     println("HINT dev-phone ${content.tool} ${content.summary}")
 
     // The card was shown in a focused window to an active user: seen.
