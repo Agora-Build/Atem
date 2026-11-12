@@ -23,7 +23,7 @@ unzip -q "$OUT/${PREFIX}-apple-swiftpm.zip" -d "$WORK"
 SWIFT="$WORK/AtemClient/Sources/AtemClient/atem_client_ffi.swift"
 grep -q 'public func stationRouteOffer' "$SWIFT"
 grep -q 'public func stationRouteVerifyAccepted' "$SWIFT"
-if grep -qE 'SoftwareKeyStore|signSeen|admitCarrier|AdmissionInfo' "$SWIFT"; then
+if grep -qE 'SoftwareKeyStore|signSeen|admitCarrier|AdmissionInfo|framingRenderForVectors' "$SWIFT"; then
   echo "a test-only or host-role export is in the package" >&2
   exit 1
 fi

@@ -3679,6 +3679,68 @@ launch = "on_message"
         });
     }
 
+    /// A session the runtime adds (`Server::insert_session` calls
+    /// `session_added`) is its route's candidate at once: before, its launch
+    /// project was learned at the next pass only, so a message handled in
+    /// between resolved to no session (`no_match`) and was never delivered.
+    #[test]
+    fn a_session_added_since_the_last_pass_is_a_candidate_at_once() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let launcher = Launcher::InProcess(InProcess {
+                state: root.join("runtime"),
+                socket_dir: root.join("ws"),
+                chat_root: root.join("chat"),
+            });
+            let request = SpawnRequest {
+                session_id: SessionId::new(),
+                process_gen: uuid::Uuid::new_v4().to_string(),
+                provider: crate::session::Provider::Claude,
+                args: vec![],
+                cwd: root.join("project"),
+                rows: 24,
+                cols: 80,
+            };
+            let fake = root.join("fake-added");
+            std::fs::create_dir_all(&fake).unwrap();
+            let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/approvals/fake-agent.py");
+            let (handle, created) = launcher
+                .spawn(
+                    request.clone(),
+                    LaunchEnv(vec![
+                        ("PATH".into(), "/usr/bin:/bin".into()),
+                        ("HOME".into(), root.display().to_string()),
+                        ("CLAUDE_CLI_BIN".into(), bin.display().to_string()),
+                        ("FAKE_DIR".into(), fake.display().to_string()),
+                    ]),
+                )
+                .await
+                .unwrap();
+            let sid = request.session_id.clone();
+            rig.sessions.insert(
+                sid.clone(),
+                BrokerSession::launched(handle, &request, created),
+            );
+            let found = |rig: &LocalRig| {
+                rig.bridge
+                    .collab_candidates(&rig.sessions)
+                    .iter()
+                    .any(|c| c.session_id == sid.as_str())
+            };
+            // No pass since: its launch project isn't known yet.
+            assert!(!found(&rig));
+            rig.bridge.session_added(&sid);
+            assert_eq!(
+                rig.bridge.projects.key_of(sid.as_str()),
+                Some("local:project")
+            );
+            assert!(found(&rig), "a session the runtime added is no candidate");
+            rig.bridge.session_removed(&sid);
+            assert!(rig.bridge.projects.key_of(sid.as_str()).is_none());
+        });
+    }
+
     /// Spec section 5: messages share a pending launch, including one that
     /// just started and whose project isn't known yet (no second session in
     /// that window), and a later one reaches the session by its project.

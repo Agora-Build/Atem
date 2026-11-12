@@ -1,7 +1,9 @@
-// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) run
-// through the Swift binding, the same checks as the Kotlin
-// (bindings/kotlin/Conformance.kt) and WASM (bindings/js/conformance.mjs)
-// runs. ATEM_FIXTURES names the fixtures directory.
+// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) and the
+// host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
+// framing-size-v1.json) run through the Swift binding, the same checks as the
+// Kotlin (bindings/kotlin/Conformance.kt) and WASM
+// (bindings/js/conformance.mjs) runs. ATEM_FIXTURES names the fixtures
+// directory.
 import CryptoKit
 import Foundation
 import XCTest
@@ -32,6 +34,62 @@ private func b64uString(_ d: Data) -> String {
 
 private func utf8(_ s: String) -> Data { Data(s.utf8) }
 
+private func sha256Hex(_ text: String) -> String { hex(Data(SHA256.hash(data: Data(text.utf8)))) }
+
+// A tag's 60 bits as written (XXXX-XXXX-XXXX, Crockford base32).
+private func tagBitsOf(_ tag: String) -> UInt64 {
+    let crockford = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+    return tag.filter { $0 != "-" }.reduce(UInt64(0)) { bits, c in (bits << 5) | UInt64(crockford.firstIndex(of: c)!) }
+}
+
+// The lines of a text (a line ends at LF, CR, VT, FF, NEL, U+2028 or U+2029,
+// taken per scalar: Swift's own Character view joins CR LF) without the `|`s
+// each starts with: what the marker check is given, as the escaping does.
+private func linesWithoutLeadingBars(_ text: String) -> [String] {
+    var lines: [String] = []
+    var current = String.UnicodeScalarView()
+    var leading = true
+    for c in text.unicodeScalars {
+        switch c.value {
+        case 0x0A, 0x0D, 0x0B, 0x0C, 0x85, 0x2028, 0x2029:
+            lines.append(String(current))
+            current = String.UnicodeScalarView()
+            leading = true
+        case 0x7C where leading:
+            break
+        default:
+            leading = false
+            current.append(c)
+        }
+    }
+    lines.append(String(current))
+    return lines
+}
+
+// `rendered` with `old` swapped for `fresh` at the start of every line (a
+// line ends at "\n" only), byte for byte: Swift's String equality is
+// canonical equivalence, so what is compared is UTF-8.
+private func retagged(_ rendered: String, from old: String, to fresh: String) -> [UInt8] {
+    let bytes = Array(rendered.utf8)
+    let oldBytes = Array(old.utf8)
+    let freshBytes = Array(fresh.utf8)
+    var out: [UInt8] = []
+    var atLineStart = true
+    var i = 0
+    while i < bytes.count {
+        if atLineStart && bytes[i...].starts(with: oldBytes) {
+            out.append(contentsOf: freshBytes)
+            i += oldBytes.count
+            atLineStart = false
+        } else {
+            out.append(bytes[i])
+            atLineStart = bytes[i] == 0x0A
+            i += 1
+        }
+    }
+    return out
+}
+
 private func o(_ v: Any?) -> [String: Any] { v as! [String: Any] }
 private func a(_ v: Any?) -> [Any] { v as! [Any] }
 private func s(_ v: Any?) -> String { v as! String }
@@ -47,6 +105,76 @@ private func canon(_ v: Any) -> String {
 
 private struct Failure: Error, CustomStringConvertible {
     let description: String
+}
+
+// How the vector files are decoded. Apple's JSONSerialization builds each
+// string value through NSString, which takes a U+FEFF that starts the value
+// for a byte order mark and drops it: a vector text such as
+// "\u{FEFF}[atem] byte order mark" would reach the binding without its first
+// scalar (the binding itself keeps it: UniFFI lowers and lifts strings as
+// plain UTF-8). So every U+FEFF in a file (the bytes EF BB BF, or a \uFEFF
+// escape) is swapped for U+E000 before parsing, a private-use scalar the
+// vector files never contain (a file that does is refused), and swapped back
+// in the decoded strings and keys by Swift's own String, which keeps it. A
+// file without a U+FEFF is parsed as it is.
+private func decodeVectors(_ data: Data) throws -> Any {
+    let bytes = [UInt8](data)
+    var swapped: [UInt8] = []
+    swapped.reserveCapacity(bytes.count)
+    var found = false
+    var i = 0
+    while i < bytes.count {
+        let b = bytes[i]
+        if b == 0xEF, i + 2 < bytes.count, bytes[i + 1] == 0xBB, bytes[i + 2] == 0xBF {
+            swapped += [0xEE, 0x80, 0x80]
+            found = true
+            i += 3
+        } else if b == 0xEE, i + 2 < bytes.count, bytes[i + 1] == 0x80, bytes[i + 2] == 0x80 {
+            throw Failure(description: "a vector file holds U+E000, the stand-in for U+FEFF")
+        } else if b == 0x5C, i + 1 < bytes.count {
+            // A backslash and the byte it escapes (an escaped backslash is no
+            // start of an escape); \uFEFF in either case.
+            if bytes[i + 1] == 0x75, i + 5 < bytes.count,
+               (bytes[i + 2] | 0x20) == 0x66, (bytes[i + 3] | 0x20) == 0x65,
+               (bytes[i + 4] | 0x20) == 0x66, (bytes[i + 5] | 0x20) == 0x66 {
+                swapped += [0xEE, 0x80, 0x80]
+                found = true
+                i += 6
+            } else {
+                swapped += [b, bytes[i + 1]]
+                i += 2
+            }
+        } else {
+            swapped.append(b)
+            i += 1
+        }
+    }
+    let parsed = try JSONSerialization.jsonObject(with: Data(swapped))
+    return found ? restoringBOM(parsed) : parsed
+}
+
+private func restoringBOM(_ v: Any) -> Any {
+    switch v {
+    case let text as String:
+        return restoringBOM(inString: text)
+    case let object as [String: Any]:
+        var out: [String: Any] = [:]
+        for (key, value) in object { out[restoringBOM(inString: key)] = restoringBOM(value) }
+        return out
+    case let array as [Any]:
+        return array.map { restoringBOM($0) }
+    default:
+        return v
+    }
+}
+
+private func restoringBOM(inString text: String) -> String {
+    let standIn: Unicode.Scalar = "\u{E000}"
+    let bom: Unicode.Scalar = "\u{FEFF}"
+    guard text.unicodeScalars.contains(standIn) else { return text }
+    var scalars = String.UnicodeScalarView()
+    for c in text.unicodeScalars { scalars.append(c == standIn ? bom : c) }
+    return String(scalars)
 }
 
 private func eq<T: Equatable>(_ a: T, _ b: T, _ what: String = "") throws {
@@ -97,7 +225,7 @@ final class ConformanceTests: XCTestCase {
         let dir = URL(fileURLWithPath: ProcessInfo.processInfo.environment["ATEM_FIXTURES"]
             ?? "../../../designs/protocol/fixtures")
         func load(_ name: String) throws -> [String: Any] {
-            o(try JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("\(name).json"))))
+            o(try decodeVectors(Data(contentsOf: dir.appendingPathComponent("\(name).json"))))
         }
         let enc = try load("r9-vectors-encoding")
         let keys = o(try load("r9-vectors-keys")["keys"])
@@ -370,7 +498,7 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("wrong_alg") { _ = try serviceAddAction(deviceId: "svc-x", authKey: PublicKeyData(alg: .x25519, raw: unhex(s(key("dev-phone", "enc")["pub_hex"]))), scope: ServiceScopeInfo(hosts: ["host-a"], projects: nil, sessions: nil, ops: []), expiresAt: at, signedAt: at) }
         }
         // r9_svc vectors: atem-client's own file (crates/atem-client/vectors).
-        let svcFp = o(try JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("../../../crates/atem-client/vectors/r9-svc-fingerprint.json"))))
+        let svcFp = o(try decodeVectors(Data(contentsOf: dir.appendingPathComponent("../../../crates/atem-client/vectors/r9-svc-fingerprint.json"))))
         check("service key fingerprint r9_svc (atem-client vectors)") {
             func alg(_ name: String) -> KeyAlg { name == "p256" ? .p256 : (name == "ed25519" ? .ed25519 : .x25519) }
             for c in a(svcFp["valid"]).map(o) {
@@ -1140,9 +1268,155 @@ final class ConformanceTests: XCTestCase {
             }
         }
 
+        // ------------------------------------------------------------ framing
+        // The prompt framing (delegated host-work design III.2) over
+        // designs/protocol/fixtures/host-work/: the escaping and the marker
+        // check, the Unicode version they are pinned to, the preflight size
+        // check and (a test-vectors build only) the rendering, byte for byte.
+        // Strings are compared as UTF-8: Swift's == is canonical equivalence.
+        func loadWork(_ name: String) throws -> [String: Any] {
+            o(try decodeVectors(Data(contentsOf: dir.appendingPathComponent("host-work").appendingPathComponent("\(name).json"))))
+        }
+        let framing = try loadWork("prompt-framing-v1")
+        let framingSize = try loadWork("framing-size-v1")
+        let framingPrompts = a(framing["prompts"]).map(o)
+        func snapshot(_ kind: String, _ id: String, _ version: UInt64, _ text: String) -> [String: Any] {
+            ["kind": kind, "id": id, "version": NSNumber(value: version), "digest": sha256Hex(text), "text": text]
+        }
+        // framingCheckedLen of a text, an optional mark (a host-work MarkTask
+        // object) and snapshots (host-work ContextSnapshot objects): the
+        // complete inputs.
+        func checkedLen(_ text: String, _ mark: [String: Any]?, _ context: [[String: Any]]) throws -> UInt64 {
+            try framingCheckedLen(text: text, markJson: mark.map { js($0) }, contextJson: js(context))
+        }
+
+        check("framing: Unicode version, escape cases, marker check (III.2)") {
+            try eq(framingUnicodeVersion(), s(framing["unicode_version"]), "Unicode version")
+            try eq(s(framing["unicode_version"]), "18.0.0")
+            let cases = a(framing["escape"]).map(o)
+            try eq(cases.count, 57)
+            // The decoding kept the vectors' U+FEFF (see decodeVectors).
+            try eq(cases.contains { s($0["text"]).unicodeScalars.first?.value == 0xFEFF }, true, "a text starting with U+FEFF reached the check")
+            for c in cases {
+                let name = s(c["name"])
+                let r = framingEscape(text: s(c["text"]))
+                try eq(Array(r.escaped.utf8), Array(s(c["escaped"]).utf8), name)
+                try eq(UInt64(r.barsAdded), u(c["bars_added"]), name)
+                // The marker check on each line (after the bars it already
+                // starts with) agrees with where the escaping put its bars.
+                let folding = linesWithoutLeadingBars(s(c["text"])).filter { framingFoldsToMarker(line: $0) }.count
+                try eq(UInt64(folding), u(c["bars_added"]), "\(name): lines that fold")
+            }
+            for line in ["[atem]", "  [ATEM x", "[\u{410}\u{422}\u{415}\u{41c}]", "[a\u{fe0f}tem]"] {
+                try eq(framingFoldsToMarker(line: line), true, line)
+            }
+            for line in ["", "x[atem]", "[ atem]", "|[atem]", "[atom]"] {
+                try eq(framingFoldsToMarker(line: line), false, line)
+            }
+        }
+        check("framing: rendered prompts byte for byte, tags from their bits (vectors only)") {
+            let tag = s(framing["tag"])
+            let bits = tagBitsOf(tag)
+            try eq(framingPrompts.count, 9)
+            for p in framingPrompts {
+                let name = s(p["name"])
+                let rendered = try framingRenderForVectors(inputJson: js(p["input"]!), tagBits: bits)
+                try eq(Array(rendered.utf8), Array(s(p["rendered"]).utf8), name)
+                try eq(UInt64(rendered.utf8.count), u(p["bytes"]), "\(name): bytes")
+            }
+            // Every tag of the vectors renders the prompt with that tag, on
+            // Atem's own lines only (the sender's text is not touched, even
+            // where it holds the vectors' tag).
+            let first = framingPrompts[0]
+            let old = "[atem \(tag)] "
+            for t in a(framing["tags"]).map(o) {
+                let fresh = "[atem \(s(t["tag"]))] "
+                let expected = retagged(s(first["rendered"]), from: old, to: fresh)
+                let tagBits = UInt64(s(t["bits"]), radix: 16)!
+                let got = try framingRenderForVectors(inputJson: js(first["input"]!), tagBits: tagBits)
+                try eq(Array(got.utf8), expected, s(t["bits"]))
+            }
+            // What the core refuses, and what is no input, is refused: a
+            // snapshot whose text doesn't match its digest is never rendered.
+            let input = o(framingPrompts[2]["input"])
+            _ = try framingRenderForVectors(inputJson: js(input), tagBits: 1)
+            var firstContext = o(a(input["context"])[0])
+            firstContext["text"] = "not what the digest says"
+            var tampered = input
+            tampered["context"] = [firstContext]
+            try throwsCode("malformed") { _ = try framingRenderForVectors(inputJson: js(tampered), tagBits: 1) }
+            var headless = input
+            headless["header"] = nil
+            try throwsCode("malformed") { _ = try framingRenderForVectors(inputJson: js(headless), tagBits: 1) }
+        }
+        check("framing: the size section (typical, worst, worst with a mark, at the bound)") {
+            let size = o(framing["size"])
+            func vault(_ id: String, _ version: UInt64, _ n: Int) -> [String: Any] {
+                snapshot("vault", id, version, String(repeating: "c", count: n))
+            }
+            // A typical task: 5,120 bytes of context, a 1,024-byte prompt.
+            let typical = try checkedLen(String(repeating: "t", count: 1024), nil, [vault("api-contract", 3, 5120)])
+            try eq(typical - 1024 - 5120, u(o(size["typical"])["checked_atem_bytes"]), "typical")
+            // The worst: eight 1,000-byte contexts with 128-byte ids and
+            // 16-digit versions, a 1,000-byte prompt.
+            var worst: [[String: Any]] = []
+            for i in 0..<8 {
+                worst.append(snapshot("memory", "\(i)" + String(repeating: "m", count: 127), 9_007_199_254_740_991, String(repeating: "c", count: 1000)))
+            }
+            let text = String(repeating: "t", count: 1000)
+            let worstLen = try checkedLen(text, nil, worst)
+            try eq(worstLen - 1000 - 8 * 1000, u(o(size["worst"])["checked_atem_bytes"]), "worst")
+            // The same with a mark (the vectors' own, with a 128-byte mark id).
+            let withMark = framingPrompts.first(where: { o($0["input"])["mark"] != nil })!
+            var mark = o(o(withMark["input"])["mark"])
+            mark["mark_id"] = String(repeating: "k", count: 128)
+            try eq(try checkedLen(text, mark, worst), u(o(size["worst_mark"])["checked_bytes"]), "worst with a mark")
+            // At the bound: one byte more is over it.
+            let n = Int(u(o(size["at_bound"])["context_bytes"]))
+            func at(_ k: Int) throws -> UInt64 {
+                try checkedLen("x", nil, [snapshot("vault", "c", 1, String(repeating: "y", count: k))])
+            }
+            let bound = u(framingSize["max_prompt_bytes"])
+            try eq(try at(n), u(o(size["at_bound"])["checked_len"]), "at the bound")
+            try eq(try at(n), bound, "exactly the bound")
+            try eq(try at(n + 1), bound + 1, "one byte over")
+        }
+        check("framing: every framing-size-v1 case with its complete inputs") {
+            try eq(u(framingSize["max_prompt_bytes"]), 32768)
+            try eq(u(framingSize["attachment_reserve"]), 4096)
+            let cases = a(framingSize["cases"]).map(o)
+            if cases.count < 10 { throw Failure(description: "only \(cases.count) cases") }
+            for c in cases {
+                let got = try framingCheckedLen(text: s(c["text"]), markJson: c["mark"].map { js($0) }, contextJson: js(c["context"]!))
+                try eq(got, u(c["checked_len"]), s(c["name"]))
+            }
+            // What the preflight takes is exactly the host-work shapes:
+            // anything else is refused, never read loosely.
+            let okContext = js([snapshot("vault", "a", 1, "x")])
+            _ = try framingCheckedLen(text: "t", markJson: nil, contextJson: "[]")
+            _ = try framingCheckedLen(text: "t", markJson: nil, contextJson: okContext)
+            let dup = okContext.replacingOccurrences(of: "\"id\":\"a\"", with: "\"id\":\"a\",\"id\":\"b\"")
+            let float = okContext.replacingOccurrences(of: "\"version\":1", with: "\"version\":1.5")
+            if dup == okContext || float == okContext { throw Failure(description: "the refusal inputs changed nothing") }
+            try throwsCode("not_strict_json") { _ = try framingCheckedLen(text: "t", markJson: nil, contextJson: "[") }
+            try throwsCode("not_strict_json") { _ = try framingCheckedLen(text: "t", markJson: nil, contextJson: dup) }
+            try throwsCode("not_strict_json") { _ = try framingCheckedLen(text: "t", markJson: nil, contextJson: float) }
+            for context in [
+                "{}",
+                "null",
+                #"[{"kind":"vault","id":"a","version":1,"digest":"d"}]"#,
+                #"[{"kind":"notes","id":"a","version":1,"digest":"d","text":"x"}]"#,
+            ] {
+                try throwsCode("malformed") { _ = try framingCheckedLen(text: "t", markJson: nil, contextJson: context) }
+            }
+            for mark in ["null", "{}", "[]", #"{"mark_id":"m"}"#] {
+                try throwsCode("malformed") { _ = try framingCheckedLen(text: "t", markJson: mark, contextJson: "[]") }
+            }
+        }
+
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 53)
+        XCTAssertEqual(passed, 57)
     }
 }

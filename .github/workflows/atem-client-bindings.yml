@@ -214,7 +214,7 @@ jobs:
           unzip -q "$RUNNER_TEMP/pkg-android/atem-client-$ATEM_CLIENT_VERSION-android.zip" -d "$RUNNER_TEMP/android-x"
           file "$RUNNER_TEMP"/android-x/atem-client-android/jniLibs/*/libatem_client_ffi.so
 
-      - name: The check refuses a host-role symbol, a missing export, 4 KB alignment
+      - name: The check refuses a host-role or vectors-only symbol, a missing export, 4 KB alignment
         run: READELF=readelf ./scripts/test-check-atem-client-packages.sh "$ATEM_CLIENT_VERSION" "$RUNNER_TEMP/pkg-android"
 
       - name: Upload the Android package
@@ -263,7 +263,7 @@ jobs:
           # The shipped package builds without the test features, and
           # carries no test-only or host-role export.
           (cd "$OUT/AtemClient" && swift build)
-          if grep -qE 'SoftwareKeyStore|signSeen|admitCarrier|AdmissionInfo' "$OUT/AtemClient/Sources/AtemClient/atem_client_ffi.swift"; then
+          if grep -qE 'SoftwareKeyStore|signSeen|admitCarrier|AdmissionInfo|framingRenderForVectors' "$OUT/AtemClient/Sources/AtemClient/atem_client_ffi.swift"; then
             echo "a test-only or host-role export is in the package" >&2
             exit 1
           fi
