@@ -416,18 +416,40 @@ fn adjtimex_status() -> Option<libc::c_int> {
     (rc >= 0).then_some(tx.status)
 }
 
+/// `ntp_gettime` as `<sys/timex.h>` declares it.
+#[cfg(target_os = "macos")]
+type NtpGettime = unsafe extern "C" fn(*mut libc::ntptimeval) -> libc::c_int;
+
+/// libSystem's `ntp_gettime`, looked up at run time: it is macOS 10.13+
+/// (the 10.12 SDK has no `<sys/timex.h>`), and Atem runs on 10.12, where a
+/// linked reference could keep the whole binary from loading. `None` where
+/// the symbol is absent.
+#[cfg(target_os = "macos")]
+fn ntp_gettime_symbol() -> Option<NtpGettime> {
+    // SAFETY: a lookup in the loaded images by a NUL-terminated name.
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"ntp_gettime".as_ptr()) };
+    if symbol.is_null() {
+        return None;
+    }
+    // SAFETY: the symbol is libSystem's `ntp_gettime`, whose C signature is
+    // `NtpGettime`'s.
+    Some(unsafe { std::mem::transmute::<*mut libc::c_void, NtpGettime>(symbol) })
+}
+
 /// macOS's `ntp_gettime` clock state (`TIME_OK` 0 … `TIME_ERROR` 5), for
 /// the real-OS check that confirms or refutes it as `timed`'s report; `None`
-/// when it can't be read, and off macOS. xnu returns the state as the
-/// call's own result, so every state but `TIME_OK` comes back as -1 with the
-/// state in `errno`; the structure holds it either way.
+/// when it can't be read (no `ntp_gettime` before macOS 10.13), and off
+/// macOS. xnu returns the state as the call's own result, so every state
+/// but `TIME_OK` comes back as -1 with the state in `errno`; the structure
+/// holds it either way.
 #[cfg(target_os = "macos")]
 pub fn macos_ntp_state() -> Option<i32> {
+    let ntp_gettime = ntp_gettime_symbol()?;
     // SAFETY: an all-zero `ntptimeval` is a valid value.
     let mut ntv: libc::ntptimeval = unsafe { std::mem::zeroed() };
     ntv.time_state = -1;
     // SAFETY: `ntv` is a valid ntptimeval for the call to fill.
-    unsafe { libc::ntp_gettime(&mut ntv) };
+    unsafe { ntp_gettime(&mut ntv) };
     (libc::TIME_OK..=libc::TIME_ERROR)
         .contains(&ntv.time_state)
         .then_some(ntv.time_state)
@@ -802,6 +824,17 @@ mod tests {
         };
         eprintln!("ntp_gettime: {state} ({name})");
         assert!((libc::TIME_OK..=libc::TIME_ERROR).contains(&state));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ntp_gettime_is_resolved_at_run_time_and_answers_on_a_current_macos() {
+        // Looked up in the loaded images (macOS 10.13+), never linked, so a
+        // 10.12 Mac still loads atem and gets `None` here.
+        assert!(ntp_gettime_symbol().is_some(), "libSystem has ntp_gettime");
+        for _ in 0..100 {
+            assert!(macos_ntp_state().is_some());
+        }
     }
 
     #[test]
