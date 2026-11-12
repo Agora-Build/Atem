@@ -1860,8 +1860,18 @@ fn the_link_is_fenced_and_dropped_at_its_authorization_deadline() {
 fn an_r8_link_never_welcomed_is_still_dropped_at_its_deadline() {
     local(async {
         let mut rt = Runtime::start(true).await;
-        // The link authenticated; Astation never says hello.
-        rt.peer.drain(Duration::from_millis(300)).await;
+        // The link authenticated; Astation never says hello. Its deadline
+        // is set when the broker attaches it: wait for that (on a slow
+        // runner, a fixed 300 ms let the skip land first, and the deadline
+        // was then 24 h after it).
+        let mut client = rt.client().await;
+        tokio::time::timeout(WAIT, async {
+            while !status(&mut client).await.attachment {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the broker never attached the link");
         rt.clock.skip(super::LINK_AUTHORIZATION_MS + 1);
         tokio::time::timeout(WAIT, async {
             while rt.peer.from_atem.recv().await.is_some() {}
