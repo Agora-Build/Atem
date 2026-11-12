@@ -16,10 +16,9 @@ use atem_client::connect::{Attached, Event as CEvent, Identity};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 use support::astation::{FakeAstation, write_verified_pairing};
+use support::host_clock::HostClock;
 use support::r9::{Router, client_ms, write_pin};
 use support::r9log::{self, TestLog, auth, secret};
 use support::{Sandbox, within};
@@ -30,84 +29,6 @@ const MIN: u64 = 60_000;
 /// Grant lifetime + `issued_at` skew (the quarantine's length).
 const WINDOW: u64 = 65 * MIN;
 const UNREADABLE: &str = "revoked grants unreadable";
-
-/// The device list's host clock (`ATEM_TEST_HOST_CLOCK`): the real wall
-/// clock plus a signed offset and the real monotonic clock plus an offset,
-/// both moved by the test, one boot id; rewritten every 20 ms.
-struct HostClock {
-    path: PathBuf,
-    wall_offset: Arc<AtomicI64>,
-    mono_offset: Arc<AtomicU64>,
-    stop: Arc<AtomicBool>,
-}
-
-fn real_mono_ms() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: `ts` is a valid timespec for the call to fill.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000
-}
-
-impl HostClock {
-    fn start(dir: &Path) -> HostClock {
-        let path = dir.join("host-clock");
-        let wall_offset = Arc::new(AtomicI64::new(0));
-        let mono_offset = Arc::new(AtomicU64::new(0));
-        let stop = Arc::new(AtomicBool::new(false));
-        let write = {
-            let path = path.clone();
-            let wall_offset = wall_offset.clone();
-            let mono_offset = mono_offset.clone();
-            move || {
-                let wall = r9log::host_now().wall_ms as i64 + wall_offset.load(Ordering::SeqCst);
-                let mono = real_mono_ms() + mono_offset.load(Ordering::SeqCst);
-                let tmp = path.with_extension("tmp");
-                std::fs::write(&tmp, format!("{wall} {mono} boot-revoked")).unwrap();
-                std::fs::rename(&tmp, &path).unwrap();
-            }
-        };
-        write();
-        let s = stop.clone();
-        std::thread::spawn(move || {
-            while !s.load(Ordering::SeqCst) {
-                write();
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        });
-        HostClock {
-            path,
-            wall_offset,
-            mono_offset,
-            stop,
-        }
-    }
-
-    /// Sets the wall clock `ms` from the real one (negative: behind).
-    fn set_wall(&self, ms: i64) {
-        self.wall_offset.store(ms, Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    /// Moves the monotonic clock `ms` on (it never goes back).
-    fn add_mono(&self, ms: u64) {
-        self.mono_offset.fetch_add(ms, Ordering::SeqCst);
-        // A pass (100 ms) sees it.
-        std::thread::sleep(Duration::from_millis(400));
-    }
-
-    fn wall(&self) -> u64 {
-        (r9log::host_now().wall_ms as i64 + self.wall_offset.load(Ordering::SeqCst)) as u64
-    }
-}
-
-impl Drop for HostClock {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-    }
-}
 
 struct Rig {
     sandbox: Sandbox,
@@ -128,7 +49,7 @@ impl Rig {
         log.add_host(HOST, 1, &host_seed);
         log.add_native("dev-phone", &["control", "view"]);
         write_pin(&sandbox.config(), &log, HOST, 1, &host_seed);
-        let clock = HostClock::start(sandbox.dir.path());
+        let clock = HostClock::start(sandbox.dir.path(), "host-clock");
         Rig {
             sandbox,
             astation: FakeAstation::start(),
@@ -163,9 +84,9 @@ impl Rig {
             .env("ASTATION_WS", &self.astation.url)
             .env("ASTATION_RELAY_URL", "http://127.0.0.1:1")
             .env("ATEM_TEST_HOST_CLOCK", &self.clock.path)
-            // The host clock lags on a loaded machine: the one-init-a-second
-            // limit (the engine tests check it) could answer `busy` before the
-            // refusal this file checks.
+            // On a loaded machine the one-init-a-second limit (the engine
+            // tests check it) could answer `busy` before the refusal this
+            // file checks.
             .env("ATEM_TEST_NO_INIT_LIMIT", "1")
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
