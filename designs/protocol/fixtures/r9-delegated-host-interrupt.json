@@ -1,0 +1,182 @@
+{
+  "name": "r9-delegated-host-interrupt",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "host",
+  "log": "r9-vectors-membership-log",
+  "note": "session-v1 R9.14 items 5 and 6. A native takes the lease over while host-work's attempt runs. The interrupt with host authority checks the turn first, then revokes the native's lease (`lease_changed{revoked}`) and writes the Esc, receipt-less. Retaken on a free lease, the lease is revoked again by the revoke-only call, with nothing written. The runtime restarts while the turn runs: the adopted worker's chat shows turn-1 still current, so the attempt stays `executing`, rebound to it, and the interrupt is delivered once more. The turn then ends interrupted, and the attempt's receipt completes `interrupted`. The real runtime runs this with a real agent: its worker is adopted, and the chat snapshot and the turn's end are real.",
+  "setup": {
+    "host": {
+      "account_id": "acct-test-1",
+      "atem_device_id": "host-a",
+      "host_id": "host-a",
+      "host_trust_gen": 1,
+      "runtime_gen": "11111111-1111-4111-8111-111111111111",
+      "runtime_epoch": 1,
+      "wall_clock_ms": 1793264000000
+    },
+    "pinned": [
+      "E1",
+      "E2",
+      "E3",
+      "E4",
+      "E5",
+      "E6"
+    ],
+    "sessions": [
+      {
+        "session_id": "ses-aaaaaaaaaaaa",
+        "process_gen": "22222222-2222-4222-8222-222222222222",
+        "chat": true
+      }
+    ],
+    "clients": [
+      {
+        "name": "mac",
+        "principal": "member:dev-mac",
+        "key": "dev-mac"
+      }
+    ],
+    "connected": [
+      "mac"
+    ]
+  },
+  "steps": [
+    {
+      "host_work_submit": "ses-aaaaaaaaaaaa",
+      "request_id": "cccccccc-0000-4000-8000-000000000401",
+      "task_id": "dddddddd-0000-4000-8000-000000000401",
+      "sender": "member:dev-phone",
+      "text": "run the tests",
+      "result": {
+        "state": "executing"
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "lease_changed",
+        "reason": "granted"
+      }
+    },
+    {
+      "send": "mac",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "acquire",
+          "id": "aaaaaaaa-0000-4000-8000-000000000401",
+          "binding": "${binding:mac:ses-aaaaaaaaaaaa}",
+          "takeover": true
+        }
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "lease"
+      }
+    },
+    {
+      "host_work_interrupt": "ses-aaaaaaaaaaaa",
+      "request_id": "cccccccc-0000-4000-8000-000000000401",
+      "result": "written"
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "lease_changed",
+        "reason": "revoked"
+      }
+    },
+    {
+      "send": "mac",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "acquire",
+          "id": "aaaaaaaa-0000-4000-8000-000000000402",
+          "binding": "${binding:mac:ses-aaaaaaaaaaaa}",
+          "takeover": false
+        }
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "lease"
+      }
+    },
+    {
+      "host_work_interrupt": "ses-aaaaaaaaaaaa",
+      "request_id": "cccccccc-0000-4000-8000-000000000401",
+      "result": "revoked",
+      "revoke_only": true
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "lease_changed",
+        "reason": "revoked"
+      }
+    },
+    {
+      "assert": {
+        "receipts": {
+          "cccccccc-0000-4000-8000-000000000401": {
+            "state": "executing",
+            "detail": null
+          }
+        }
+      }
+    },
+    {
+      "restart_runtime": {
+        "runtime_gen": "11111111-1111-4111-8111-000000000002",
+        "runtime_epoch": 2
+      }
+    },
+    {
+      "adopted_chat": "ses-aaaaaaaaaaaa",
+      "current_turn": "turn-1",
+      "last_completed": null
+    },
+    {
+      "assert": {
+        "receipts": {
+          "cccccccc-0000-4000-8000-000000000401": {
+            "state": "executing",
+            "detail": null
+          }
+        }
+      }
+    },
+    {
+      "host_work_interrupt": "ses-aaaaaaaaaaaa",
+      "request_id": "cccccccc-0000-4000-8000-000000000401",
+      "result": "written"
+    },
+    {
+      "turn_complete": "ses-aaaaaaaaaaaa",
+      "turn_id": "turn-1",
+      "outcome": "interrupted"
+    },
+    {
+      "assert": {
+        "receipts": {
+          "cccccccc-0000-4000-8000-000000000401": {
+            "state": "completed",
+            "detail": "interrupted"
+          }
+        }
+      }
+    },
+    {
+      "host_work_interrupt": "ses-aaaaaaaaaaaa",
+      "request_id": "cccccccc-0000-4000-8000-000000000401",
+      "result": "not_executing"
+    }
+  ]
+}

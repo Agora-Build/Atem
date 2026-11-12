@@ -1004,3 +1004,51 @@ fn a_turn_started_survives_reload_and_compaction() {
     let text = text(&log(&sd(&dir), S1));
     assert!(!text.contains("run the tests"), "{text}");
 }
+
+/// Task 16a's review (M2): compaction keeps the turn on the other settled
+/// states too: a prompt `completed` with its result (the common path:
+/// `executing`, `turn_started`, `completed{result}`), and one `rejected`
+/// after `executing` (its turn written between the two, so it replays).
+#[test]
+fn compaction_keeps_the_turn_of_a_completed_and_a_rejected_prompt() {
+    use crate::session_protocol::journal::TurnIds;
+    let dir = tempfile::tempdir().unwrap();
+    let mut j = open(&sd(&dir));
+    let records = vec![
+        host_work_accepted("c"),
+        to("c", ReceiptState::Executing, 2),
+        turn_started("c", "turn-1"),
+        Record::Transition {
+            request_id: "c".into(),
+            state: ReceiptState::Completed,
+            detail: Some("done".into()),
+            updated_at: 3,
+            result: Some(TurnIds {
+                turn_id: "turn-1".into(),
+                user_message_id: "turn-1-u".into(),
+            }),
+        },
+        host_work_accepted("r"),
+        to("r", ReceiptState::Executing, 4),
+        turn_started("r", "turn-2"),
+        to("r", ReceiptState::Rejected, 5),
+    ];
+    for r in &records {
+        j.append(r.clone()).unwrap();
+    }
+    j.compact_all().unwrap();
+    drop(j);
+    let j = open(&sd(&dir));
+    let state = state(j.load().unwrap());
+    assert_eq!(state, mem_state(&records));
+    for (id, turn) in [("c", "turn-1"), ("r", "turn-2")] {
+        assert_eq!(
+            state.0[id].turn.as_ref().map(|t| t.turn_id.as_str()),
+            Some(turn),
+            "{id}"
+        );
+    }
+    assert_eq!(state.0["c"].state, ReceiptState::Completed);
+    assert_eq!(state.0["r"].state, ReceiptState::Rejected);
+    assert!(state.0["c"].result.is_some());
+}

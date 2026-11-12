@@ -94,6 +94,17 @@ pub struct Scenario {
     pub note: Option<String>,
 }
 
+/// An attempt of host-work (session-v1 R9.14) as the r9 fixtures name it:
+/// its session, request id and task, the task's sender and the prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostWorkAttempt {
+    pub session_id: String,
+    pub request_id: String,
+    pub task_id: String,
+    pub sender: String,
+    pub text: String,
+}
+
 /// Transport, failure and durability events a host scenario injects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostEvent {
@@ -157,10 +168,39 @@ pub enum HostEvent {
     CloseSession {
         session_id: String,
     },
-    /// The provider reports the end of the session's executing prompt turn.
+    /// The provider reports the end of the session's executing prompt turn
+    /// (`interrupted`: it ended interrupted, `outcome: "interrupted"`).
     TurnComplete {
         session_id: String,
         turn_id: String,
+        interrupted: bool,
+    },
+    /// r9, session-v1 R9.14: host-work submits an attempt's prompt on its
+    /// internal attachment, acquiring the lease (`host_work_submit`).
+    HostWorkSubmit(HostWorkAttempt),
+    /// r9: host-work's start check answers go or withdraw from now on
+    /// (`host_work_verdict`; go at each runtime start).
+    HostWorkVerdict {
+        go: bool,
+    },
+    /// r9: host-work withdraws an attempt (`host_work_withdraw`).
+    HostWorkWithdraw(HostWorkAttempt),
+    /// r9: the interrupt with host authority, with the chat's half of the
+    /// turn check, or its revoke-only call (`host_work_interrupt`).
+    HostWorkInterrupt {
+        session_id: String,
+        request_id: String,
+        revoke_only: bool,
+    },
+    /// r9: the adopted worker's chat arrives after a restart
+    /// (`adopted_chat`), as its `chat_snapshot` shows the turns.
+    AdoptedChat {
+        session_id: String,
+        chat: bool,
+        current_turn: Option<String>,
+        last_completed: Option<String>,
+        /// How `last_completed` ended (`true`: interrupted), when known.
+        interrupted: Option<bool>,
     },
     /// Remote PTY writes queue at the writer until `FlushPtyWrites`.
     HoldPtyWrites,
@@ -617,7 +657,7 @@ impl Runner {
             ("fail_next_pty_enqueue", &[]),
             ("fail_next_pty_write_after_partial", &[]),
             ("close_session", &[]),
-            ("turn_complete", &["turn_id"]),
+            ("turn_complete", &["turn_id", "outcome"]),
             ("hold_pty_writes", &[]),
             ("flush_pty_writes", &[]),
             (
@@ -936,6 +976,12 @@ impl Runner {
             "turn_complete" => HostEvent::TurnComplete {
                 session_id: as_str(arg, "turn_complete")?.into(),
                 turn_id: as_str(take(step, "turn_id")?, "turn_id")?.into(),
+                interrupted: match step.get("outcome").map(|o| as_str(o, "outcome")) {
+                    None => false,
+                    Some(Ok("done")) => false,
+                    Some(Ok("interrupted")) => true,
+                    Some(_) => return Err("outcome must be done or interrupted".into()),
+                },
             },
             "hold_pty_writes" => yes(arg).map(|_| HostEvent::HoldPtyWrites)?,
             "flush_pty_writes" => yes(arg).map(|_| HostEvent::FlushPtyWrites)?,

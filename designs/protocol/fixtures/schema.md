@@ -365,6 +365,39 @@ definition (host-work-v1 §11.4, "Reports") and its report's integration
 and host. They run in `crates/atem-client/tests/r9_fixtures.rs` and in the
 Swift, Kotlin and WASM conformance suites (through `AckLedgerHandle`).
 
+Delegated host work (`r9-delegated-*`, `side: "host"`; session-v1 R9.14,
+planned behind `host.delegated`, never advertised). The harness plays
+host-work's side: the in-process runner (`membership::fixtures_tests`)
+through the fake runtime, the real-runtime runner through the runtime's
+debug-only drive hook (`ATEM_TEST_HOST_WORK_DRIVE`, with
+`ATEM_TEST_HOST_FEATURES=host.delegated`; `src/runtime/test_hooks.rs`).
+Host-work's internal attachment is made at each runtime start, after the
+start's recovery, with a start check that says `go`. Every prompt pasted
+on a session is its agent's turn `turn-<n>` (`n` counts the prompts that
+process took), taken at once, so the chat's acceptance journals a host-work
+prompt's turn; the turn ends at `turn_complete`. Host-work's lease is
+released at the pass after its turn ended, as the runtime's renewal pass
+does; its renewals aren't played, so a host-work turn stays under the 15 s
+lease (no `advance_ms` while one runs).
+
+| step | meaning |
+|---|---|
+| `{"host_work_submit": session_id, "request_id": r, "task_id": t, "sender": s, "text": x, "result": {…}}` | host-work submits attempt `r` of task `t` (sent by `s`): a session-v1 `submit` of the prompt `x` on its internal attachment, acquiring the lease, with the attempt's provenance. `result` holds keys of what host-work heard: the refusal (`{"code", "detail"?}`), or the receipt after the step (`{"state", "detail"?}`; a withdrawn request's late submit: the `rejected` receipt of its reply, which the journal records only at the restart) |
+| `{"host_work_verdict": "go"\|"withdraw"}` | host-work's start check answers that from now on (a runtime start resets it to `go`) |
+| `{"host_work_withdraw": session_id, "request_id": r, "task_id": t, "sender": s, "text": x, "result": w}` | host-work withdraws attempt `r` (its immutable values from those fields): `w` is `rejected`, `listed`, `reused`, `list_full`, `started` or `halted` |
+| `{"host_work_interrupt": session_id, "request_id": r, "revoke_only"?: true, "result": i}` | the interrupt with host authority of `r`'s turn, through the runtime's bridge entry (the turn check's chat half from the session's chat), or its revoke-only call: `i` is `written`, `revoked`, `not_current_turn`, `not_executing` or `halted`; `written`: the key reached the agent (the worker's report `ok`) |
+| `{"adopted_chat": session_id, "current_turn": t\|null, "last_completed": t\|null, "outcome"?: "done"\|"interrupted", "chat"?: false}` | after a restart, the adopted worker's chat arrives showing those turns (`outcome`: how `last_completed` ended, absent when not known; `chat: false`: no turn state). A host-work prompt `executing` at the restart stays `executing` until then, at most `RECONCILE_MS` (60 s), and is decided with the session host's one table (`host::reconcile_turn`): still current → it stays `executing`, rebound; ended → `completed` with that outcome; gone → `outcome_unknown` `agent exited`; anything else → `outcome_unknown`. The in-process runner feeds it; the real-runtime runner waits until the runtime's real chat shows it and every reconciliation is decided |
+| `{"turn_complete": session_id, "turn_id": t, "outcome"?: "done"\|"interrupted"}` | as r8's; `interrupted`: the turn ends interrupted (the agent's `[Request interrupted by user]` entry) |
+
+| fixture | checks |
+|---|---|
+| `r9-delegated-provenance` | items 1, 2: host-work acquires the lease as any controller (`lease_changed{granted}`, a native's Send `lease_held`); its receipt carries `task_id` and `sender` for a native's `receipt_query`, through the turn's end; the lease is released at the turn's end |
+| `r9-delegated-start-check-withdraws` | item 3: withdraw → `rejected` `withdrawn by the host` before any effect; go → it runs; a queued attempt is checked when it would start, not at admission |
+| `r9-delegated-withdrawal-refusal-list` | item 4: an attempt not in the journal is `listed`, its late submit `rejected` and never run, recorded so at the restart; a queued one `rejected`, an executing one `started` |
+| `r9-delegated-host-interrupt` | item 5 (and 6): the turn check first, a native's taken-over lease revoked with the Esc, again by the revoke-only call; a restart while the turn runs keeps it `executing` (adopted chat), the interrupt delivered once more, the turn's real end `completed` `interrupted` |
+| `r9-delegated-recovery-withdrawn` | item 6: after an orderly restart and after a crash, recovered `accepted` host-work requests `withdrawn at recovery`, a refusal-list entry with its own detail, nothing of host-work run at its re-welcome, a native's queued prompt keeping §H |
+| `r9-delegated-request-id-across-submitters` | item 7: `request_id_reused` both ways between host-work and a native, even with every immutable value equal |
+
 In r9 scenarios `advance_ms` moves the host's (or relay's) monotonic
 and wall clocks together, and `set_wall_clock` the wall clock only.
 `expect_push` takes `due_at` (the stage's due time on the relay's clock,

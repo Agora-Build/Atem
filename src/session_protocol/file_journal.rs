@@ -61,6 +61,18 @@
 //! point leaves the old or the new log, both valid and replaying to the same
 //! state; leftover temp files are removed on open.
 //!
+//! Downgrades: `turn_started` (session-v1 R9.14 items 5, 6) is the first
+//! record tag an older build can't read (the provenance before it added
+//! only optional fields, which older readers ignore). An older build that
+//! meets one stops reading that log there and truncates it on disk at that
+//! byte, so every later record of the session's log is lost, other
+//! principals' included: those requests become unknown (a retry with the
+//! same `request_id` could be admitted and run again, r8 §I.5) and their
+//! `executing` receipts are never reconciled. Only a runtime that ran
+//! host-work prompts (a debug build with `ATEM_TEST_HOST_FEATURES`) writes
+//! one: move `runtime/journal/` aside before running an older build on such
+//! a profile. There is no shim (no legacy shims).
+//!
 //! Prompt payloads are user content: the files are private and nothing here
 //! logs a payload.
 

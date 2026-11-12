@@ -32,6 +32,14 @@
 //!   agent's dialog; `approval_applied ok`: the agent acts on its hook's
 //!   answer by itself; `turn_complete`: the fake Claude ends its turn;
 //! - `local_input`: the frontend's `input`;
+//! - delegated host work (session-v1 R9.14; the `host_work_*` steps): the
+//!   runtime runs `host.delegated` (`ATEM_TEST_HOST_FEATURES`) and the
+//!   harness plays host-work's side through the drive hook
+//!   (`ATEM_TEST_HOST_WORK_DRIVE`): each step a command file, its result a
+//!   line the runtime appends to `done`; `adopted_chat` waits until the
+//!   adopted worker's real chat shows what the fixture says (the state
+//!   dump's `chats`), and a `turn_complete` with `outcome: "interrupted"`
+//!   has the fake agent end its turn interrupted (`$FAKE_DIR/interrupt`);
 //! - `unpair`: the real `atem unpair --yes`;
 //! - services' `projects` scopes: the session's launch project key is the
 //!   runtime's own (`local:work-<n>`, its cwd); its keyed hash comes from a
@@ -356,8 +364,15 @@ struct Rt {
     chans: BTreeMap<String, Chan>,
     handles: u64,
     asks: Vec<Ask>,
-    /// Terminal input sent, in order: (real session id, local, bytes).
-    chunks: Vec<(String, bool, Vec<u8>)>,
+    /// Terminal input sent, in order: (real session id, local (`Some(true)`)
+    /// or remote, or `None` for the host's own interrupt key, R9.14 item 5).
+    chunks: Vec<(String, Option<bool>, Vec<u8>)>,
+    /// The drive hook's directory (delegated host work), when on.
+    drive: Option<PathBuf>,
+    /// Drive commands written so far (their file numbers).
+    drive_n: u64,
+    /// Result lines taken per command file name, and reports per request.
+    drive_taken: HashMap<String, usize>,
     dropped_acks: u64,
     approvals_opened: Vec<String>,
     approvals_closed: HashMap<String, String>,
@@ -430,6 +445,11 @@ impl Rt {
             .stderr(log);
         if !self.env_limit {
             command.env("ATEM_TEST_NO_INIT_LIMIT", "1");
+        }
+        if let Some(drive) = &self.drive {
+            command
+                .env("ATEM_TEST_HOST_FEATURES", "host.delegated")
+                .env("ATEM_TEST_HOST_WORK_DRIVE", drive);
         }
         let _ = std::fs::remove_file(&self.dump);
         self.sandbox.runtime = Some(command.spawn().unwrap());
@@ -569,6 +589,52 @@ impl Rt {
             .iter()
             .find(|(f, _)| f == fixture)
             .map_or(fixture.to_string(), |(_, r)| r.clone())
+    }
+
+    /// The drive hook's result lines so far.
+    fn driven(&self) -> Vec<Value> {
+        let dir = self.drive.as_ref().expect("the drive hook is on");
+        std::fs::read_to_string(dir.join("done"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// Waits for the next result line `pick` takes (`key` counts those
+    /// taken already).
+    fn next_driven(&mut self, key: String, pick: impl Fn(&Value) -> bool) -> Value {
+        let taken = *self.drive_taken.get(&key).unwrap_or(&0);
+        let deadline = Instant::now() + WAIT;
+        loop {
+            if let Some(line) = self.driven().into_iter().filter(|l| pick(l)).nth(taken) {
+                self.drive_taken.insert(key, taken + 1);
+                return line;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{}: the drive hook never answered {key}",
+                self.name
+            );
+            self.pump(Duration::from_millis(50));
+        }
+    }
+
+    /// Host-work's side (session-v1 R9.14) through the drive hook: writes
+    /// the command `kind` with `body` and waits for its result line.
+    fn drive(&mut self, kind: &str, body: Value) -> Value {
+        let dir = self.drive.clone().expect("the drive hook is on");
+        let name = if kind == "verdict" {
+            "verdict.json".to_string()
+        } else {
+            self.drive_n += 1;
+            format!("{kind}-{:04}.json", self.drive_n)
+        };
+        let tmp = dir.join(format!("{name}.tmp"));
+        std::fs::write(&tmp, body.to_string()).unwrap();
+        std::fs::rename(&tmp, dir.join(&name)).unwrap();
+        let file = name.clone();
+        self.next_driven(name, move |l| l["file"] == file.as_str())
     }
 
     fn client_of_handle(&self, handle: &str) -> Option<String> {
@@ -719,10 +785,11 @@ impl Rt {
             for (sid, is_local, bytes) in &self.chunks {
                 if *sid == s.real_id && terminal[at..].starts_with(bytes) {
                     at += bytes.len();
-                    if *is_local {
-                        local += 1;
-                    } else {
-                        remote += 1;
+                    match is_local {
+                        Some(true) => local += 1,
+                        Some(false) => remote += 1,
+                        // The host's interrupt key: no client's input.
+                        None => {}
                     }
                 }
             }
@@ -876,6 +943,11 @@ impl Runner {
         // space their inits on the host clock); the others connect back to
         // back.
         let env_limit = steps.iter().any(|s| s.get("link_up").is_some());
+        // The delegated fixtures: host-work's side through the drive hook.
+        let host_work = steps.iter().any(|s| {
+            s.as_object()
+                .is_some_and(|o| o.keys().any(|k| k.starts_with("host_work_")))
+        });
         let mut specs = Vec::new();
         if let Some(host) = setup.get("host") {
             specs.push((String::new(), host.clone()));
@@ -975,6 +1047,7 @@ impl Runner {
             }
             let projects = sandbox.dir.path().join("projects.json");
             std::fs::write(&projects, Value::Object(table).to_string()).unwrap();
+            let sandbox_dir = sandbox.dir.path().to_path_buf();
             let mut rt = Rt {
                 name: format!("{} host {name}", self.name),
                 host_clock: sandbox.dir.path().join("host-clock"),
@@ -1003,6 +1076,13 @@ impl Runner {
                 handles: 0,
                 asks: Vec::new(),
                 chunks: Vec::new(),
+                drive: host_work.then(|| {
+                    let dir = sandbox_dir.join("drive");
+                    std::fs::create_dir_all(&dir).unwrap();
+                    dir
+                }),
+                drive_n: 0,
+                drive_taken: HashMap::new(),
                 dropped_acks: 0,
                 approvals_opened: Vec::new(),
                 approvals_closed: HashMap::new(),
@@ -1982,6 +2062,20 @@ impl Runner {
         }
     }
 
+    /// What host-work heard (the drive hook's result line `got`) has
+    /// every key of `want`, with its value.
+    fn host_work_result(&mut self, got: &Value, want: &Value) {
+        for (key, value) in want.as_object().unwrap() {
+            assert_eq!(
+                got.get(key),
+                Some(value),
+                "{}: host-work heard {got}",
+                self.name
+            );
+        }
+        self.pass();
+    }
+
     fn step(&mut self, step: &Value) {
         let object = step.as_object().unwrap();
         let kinds = [
@@ -2036,6 +2130,11 @@ impl Runner {
             "stall_link",
             "unstall_link",
             "fill_queue",
+            "host_work_submit",
+            "host_work_verdict",
+            "host_work_withdraw",
+            "host_work_interrupt",
+            "adopted_chat",
         ];
         let kind = kinds
             .into_iter()
@@ -2291,7 +2390,7 @@ impl Runner {
                         .decode(json["data"]["bytes"].as_str().unwrap_or(""))
                         .unwrap_or_default();
                     let real = self.host().real(&sid);
-                    self.host().chunks.push((real, false, bytes));
+                    self.host().chunks.push((real, Some(false), bytes));
                 }
                 if json["type"] == "session"
                     && json["data"]["op"] == "list"
@@ -2328,7 +2427,7 @@ impl Runner {
                     .unwrap();
                 let host = self.host();
                 let real = host.real(&fixture);
-                host.chunks.push((real.clone(), true, bytes));
+                host.chunks.push((real.clone(), Some(true), bytes));
                 host.frontend()
                     .send(json!({"op": "input", "session_id": real, "bytes": text}));
                 host.pump(SETTLE);
@@ -2392,8 +2491,77 @@ impl Runner {
                     .unwrap()
                     .dir
                     .clone();
-                std::fs::write(dir.join("complete"), turn).unwrap();
+                // The agent ends its turn: done, or interrupted (its
+                // `[Request interrupted by user]` entry, as after an Esc).
+                let control = match step.get("outcome").and_then(Value::as_str) {
+                    None | Some("done") => "complete",
+                    Some("interrupted") => "interrupt",
+                    Some(other) => panic!("{}: outcome {other}", self.name),
+                };
+                std::fs::write(dir.join(control), turn).unwrap();
                 host.pump(SETTLE);
+                self.drain();
+                self.pass();
+            }
+            "host_work_submit" | "host_work_withdraw" => {
+                let fixture = step[kind].as_str().unwrap().to_owned();
+                let real = self.host().real(&fixture);
+                let body = json!({"session_id": real, "request_id": step["request_id"],
+                    "task_id": step["task_id"], "sender": step["sender"], "text": step["text"]});
+                let command = kind.strip_prefix("host_work_").unwrap();
+                let got = self.host().drive(command, body);
+                let want = match &step["result"] {
+                    Value::String(w) => json!({"withdrawal": w}),
+                    other => other.clone(),
+                };
+                self.host_work_result(&got, &want);
+                self.host().pump(SETTLE);
+                self.drain();
+            }
+            "host_work_verdict" => {
+                let verdict = step[kind].clone();
+                let got = self.host().drive("verdict", json!({"verdict": verdict}));
+                self.host_work_result(&got, &json!({"verdict": verdict}));
+            }
+            "host_work_interrupt" => {
+                let fixture = step[kind].as_str().unwrap().to_owned();
+                let real = self.host().real(&fixture);
+                let rid = step["request_id"].as_str().unwrap().to_owned();
+                let body = json!({"session_id": real, "request_id": rid,
+                    "revoke_only": step["revoke_only"].as_bool().unwrap_or(false)});
+                let got = self.host().drive("interrupt", body);
+                let want = step["result"].clone();
+                self.host_work_result(&got, &json!({"interrupt": want}));
+                if want == "written" {
+                    // The write reaches the agent: the worker's answer.
+                    let host = self.host();
+                    let r = rid.clone();
+                    let report = host
+                        .next_driven(format!("report {rid}"), move |l| l["report"] == r.as_str());
+                    assert_eq!(report["outcome"], "ok", "{}: {report}", self.name);
+                    self.host().chunks.push((real, None, vec![0x1b]));
+                }
+                self.host().pump(SETTLE);
+                self.drain();
+            }
+            "adopted_chat" => {
+                // The adopted worker's real chat arrives by itself: wait
+                // until it shows what the fixture says, and every
+                // reconciliation it decides is done.
+                let fixture = step[kind].as_str().unwrap().to_owned();
+                let real = self.host().real(&fixture);
+                let want = json!({"synced": true,
+                    "chat": step["chat"].as_bool().unwrap_or(true),
+                    "current_turn": step["current_turn"], "last_completed": step["last_completed"],
+                    "outcome": step.get("outcome").cloned().unwrap_or(Value::Null)});
+                self.settle_state(&format!("adopted_chat {want}"), |s| {
+                    let chat = &s["chats"][&real];
+                    want.as_object()
+                        .unwrap()
+                        .iter()
+                        .all(|(k, v)| chat.get(k).unwrap_or(&Value::Null) == v)
+                        && s["reconciling"] == json!([])
+                });
                 self.drain();
                 self.pass();
             }

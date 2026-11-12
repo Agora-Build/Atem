@@ -77,9 +77,9 @@ use crate::chat::wire::{self as chat_wire, ChatEnvelope, CloseReason, Inbound};
 use crate::session::{Provider, SessionId};
 use crate::session_protocol::file_journal::FileJournal;
 use crate::session_protocol::host::{
-    Attach, ChatReply, DETAIL_TURN_DONE, DETAIL_TURN_INTERRUPTED, DispatchReport, Effect,
-    HostConfig, HostContext, HostInterrupt, LEASE_EPOCH_BLOCK, LEASE_MS, Origin, SessionHost,
-    SessionSpec, random_ids,
+    AdoptedChat, Attach, ChatReply, DETAIL_TURN_DONE, DETAIL_TURN_INTERRUPTED, DispatchReport,
+    Effect, HostConfig, HostContext, HostInterrupt, LEASE_EPOCH_BLOCK, LEASE_MS, Origin,
+    RECONCILE_MS, Reconciled, SessionHost, SessionSpec, random_ids, reconcile_turn,
 };
 use crate::session_protocol::journal::TurnIds;
 use crate::session_protocol::membership::{
@@ -496,6 +496,26 @@ pub enum Interrupted {
     Refused(HostInterrupt),
 }
 
+/// Host-work's start check under the drive hook (debug builds): the
+/// verdict the test last gave (`verdict.json`).
+#[cfg(debug_assertions)]
+struct DriveCheck(Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(debug_assertions)]
+impl crate::session_protocol::host::StartCheck for DriveCheck {
+    fn check(
+        &self,
+        _req: &crate::session_protocol::host::StartRequest<'_>,
+    ) -> crate::session_protocol::host::StartVerdict {
+        use crate::session_protocol::host::StartVerdict;
+        if self.0.load(Ordering::SeqCst) {
+            StartVerdict::Go
+        } else {
+            StartVerdict::Withdraw
+        }
+    }
+}
+
 /// Host-work's prompt `executing` at a start, reconciled with the adopted
 /// worker's chat (session-v1 R9.14 items 5, 6; `reconcile_host_work`).
 struct Reconciling {
@@ -503,17 +523,9 @@ struct Reconciling {
     process_gen: String,
     /// The turn it started, as journaled at the chat's acceptance.
     turn: TurnIds,
-}
-
-/// What a session's chat says of host-work's prompt's turn at a start.
-enum Reconciled {
-    /// The adopted worker's chat hasn't arrived: decided at a later pass.
-    Wait,
-    /// The turn still runs: the receipt stays `executing`, the chat's
-    /// current turn rebound to it.
-    Running,
-    /// Settled with this report.
-    Report(DispatchReport),
+    /// When the start's recovery asked (the bridge's clock, ms): the wait
+    /// for the adopted chat ends `RECONCILE_MS` after.
+    since: u64,
 }
 
 /// The broker's view of one session the host knows.
@@ -618,6 +630,10 @@ pub struct HostBridge {
     /// adopted worker's chat (`reconcile_host_work`): request id → what is
     /// reconciled.
     reconciling: BTreeMap<String, Reconciling>,
+    /// The drive hook's start-check verdict (debug builds): go, until the
+    /// test says otherwise.
+    #[cfg(debug_assertions)]
+    drive_go: Arc<std::sync::atomic::AtomicBool>,
     /// terminal-v1 messages in order (frames, acks, errors) waiting for the
     /// bounded terminal queue.
     terminal_out: VecDeque<Queued>,
@@ -887,6 +903,8 @@ impl HostBridge {
             pending: HashMap::new(),
             interrupt_reports: Vec::new(),
             reconciling: BTreeMap::new(),
+            #[cfg(debug_assertions)]
+            drive_go: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             terminal_out: VecDeque::new(),
             approvals: HashMap::new(),
             revokes: HashMap::new(),
@@ -1642,6 +1660,8 @@ impl HostBridge {
             // Host-work's executing prompts whose adopted chat arrived.
             self.reconcile_host_work(&mut cx);
             self.sync_host_work(&mut cx);
+            #[cfg(debug_assertions)]
+            self.drive_pass(&mut cx);
         }
         self.sync_r9_link(r9_app_link(app), &mut cx);
         if !adopting
@@ -1727,6 +1747,8 @@ impl HostBridge {
         self.flush_pushes(&mut cx);
         let effects = self.r9_call(|r9, parts| r9.reap(parts));
         self.r9_exec(effects, &mut cx);
+        #[cfg(debug_assertions)]
+        let chats = chat_dump(&cx);
         let client = cx.client;
         // §R9.8a: a committed relay-only result's write is what a local
         // link waits for before it closes.
@@ -1760,14 +1782,14 @@ impl HostBridge {
             app.drop_astation_link(reason.into());
         }
         #[cfg(debug_assertions)]
-        self.dump_state();
+        self.dump_state(chats);
     }
 
     /// Debug builds (`ATEM_TEST_STATE_DUMP`): the state the r9 fixtures
     /// assert, written after each pass with the pass number
     /// (`tests/r9_runner`).
     #[cfg(debug_assertions)]
-    fn dump_state(&mut self) {
+    fn dump_state(&mut self, chats: Value) {
         use serde_json::json;
         let Some(file) = super::test_hooks::state_dump() else {
             return;
@@ -1843,6 +1865,8 @@ impl HostBridge {
                     "blob_version": k.blob_version, "backup_hash": k.backup_hash.to_hex()})),
             });
         }
+        state["chats"] = chats;
+        state["reconciling"] = json!(self.reconciling.keys().collect::<Vec<_>>());
         // The pass number: a reader can wait for a pass after its own
         // action (a dump from before it can't satisfy an assert).
         static PASS: AtomicU64 = AtomicU64::new(0);
@@ -2168,7 +2192,13 @@ impl HostBridge {
             Ok(effects) => {
                 self.exec(effects, cx);
                 match self.host.welcome_r9(&attachment, self.clock.now()) {
-                    Ok(_) => self.host_work = Some(attachment),
+                    Ok(_) => {
+                        self.host_work = Some(attachment);
+                        #[cfg(debug_assertions)]
+                        if super::test_hooks::host_work_drive_on() {
+                            self.install_drive_check();
+                        }
+                    }
                     Err(code) => {
                         eprintln!(
                             "atem runtime: the host-work attachment was not welcomed ({code:?})"
@@ -2588,6 +2618,7 @@ impl HostBridge {
                         sid: target.session_id,
                         process_gen: target.process_gen,
                         turn,
+                        since: self.clock.now(),
                     };
                     self.reconciling.insert(request_id, reconciling);
                     self.reconcile_host_work(cx);
@@ -2742,16 +2773,20 @@ impl HostBridge {
     }
 
     /// Host-work's prompts `executing` at the start (R9.14 items 5, 6; the
-    /// session host's `Reconcile` with their turn), each decided once its
-    /// adopted worker's chat arrived (`BrokerSession::chat_synced`), at
-    /// this pass or a later one (`reconciled`): a turn still running stays
-    /// `executing`, the restored chat's current turn rebound to it
-    /// (`ChatSession::rebind_turn`), so the turn check
+    /// session host's `Reconcile` with their turn), each decided by the
+    /// session host's one table (`reconcile_turn`, which the fixtures' fake
+    /// runtime reads too) from its adopted worker's chat, once that arrived
+    /// (`BrokerSession::chat_synced`), at this pass or a later one, and
+    /// `RECONCILE_MS` after the recovery at the latest: a turn still
+    /// running stays `executing`, the restored chat's current turn rebound
+    /// to it (`ChatSession::rebind_turn`), so the turn check
     /// (`running_request`) and the turn's end (`chat_outs`) find it again;
     /// a turn that ended completes with its outcome when known, else
     /// `outcome_unknown`; a process that is gone is `outcome_unknown`
-    /// (`agent exited`), and so is a chat without turn state (fail closed).
+    /// (`agent exited`), and so is a chat without turn state, one showing
+    /// another turn, or one that never arrived (fail closed).
     fn reconcile_host_work(&mut self, cx: &mut Cx) {
+        let now = self.clock.now();
         let ids: Vec<String> = self.reconciling.keys().cloned().collect();
         for request_id in ids {
             let executing = self
@@ -2764,7 +2799,8 @@ impl HostBridge {
                 continue;
             }
             let r = &self.reconciling[&request_id];
-            match reconciled(session_of(cx, &r.sid).map(|s| &*s), r) {
+            let expired = now >= r.since.saturating_add(RECONCILE_MS);
+            match reconciled(session_of(cx, &r.sid).map(|s| &*s), r, expired) {
                 Reconciled::Wait => {}
                 Reconciled::Running => {
                     let r = self.reconciling.remove(&request_id).unwrap();
@@ -2782,6 +2818,189 @@ impl HostBridge {
                 }
             }
         }
+    }
+
+    // ── The drive hook (debug builds, `ATEM_TEST_HOST_WORK_DRIVE`) ──
+    // The delegated fixtures play host-work's side (session-v1 R9.14)
+    // through these, as its dispatcher (Task 19) and intents (Task 26) will.
+
+    /// Host-work's start check answers what the drive hook last said
+    /// (`verdict.json`; `go` at each runtime start).
+    #[cfg(debug_assertions)]
+    fn install_drive_check(&mut self) {
+        self.host
+            .set_start_check(Box::new(DriveCheck(self.drive_go.clone())));
+    }
+
+    /// The drive hook's pass: each write's outcome since the last pass,
+    /// then its commands, once host-work's attachment exists (until then
+    /// they wait in their directory).
+    #[cfg(debug_assertions)]
+    fn drive_pass(&mut self, cx: &mut Cx) {
+        use super::test_hooks;
+        if !test_hooks::host_work_drive_on() {
+            return;
+        }
+        for line in self.drive_reports() {
+            test_hooks::host_work_driven(&line);
+        }
+        if self.host_work_attachment().is_none() {
+            return;
+        }
+        for command in test_hooks::host_work_drive() {
+            let line = self.drive(command, cx);
+            test_hooks::host_work_driven(&line);
+        }
+    }
+
+    /// Performs one drive command; its result line.
+    #[cfg(debug_assertions)]
+    fn drive(&mut self, command: super::test_hooks::DriveCommand, cx: &mut Cx) -> Value {
+        use super::test_hooks::DriveAction;
+        let mut line = json!({"file": command.file});
+        let result = match command.action {
+            DriveAction::Verdict(go) => {
+                self.drive_go.store(go, Ordering::SeqCst);
+                json!({"verdict": if go { "go" } else { "withdraw" }})
+            }
+            DriveAction::Submit(a) => self.drive_submit(&a, cx),
+            DriveAction::Withdraw(a) => match self.drive_immutable(&a) {
+                Some((rid, immutable)) => {
+                    let withdrawal = self.host.withdraw(&rid, &immutable);
+                    let effects = self.host.take_effects();
+                    self.exec(effects, cx);
+                    json!({"withdrawal": withdrawal.as_str()})
+                }
+                None => json!({"error": "unknown session"}),
+            },
+            DriveAction::Interrupt {
+                session_id,
+                request_id,
+                revoke_only,
+            } => {
+                let outcome = if revoke_only {
+                    self.host_interrupt_revoke_lease(&session_id, &request_id, cx)
+                } else {
+                    self.host_interrupt(&session_id, &request_id, cx)
+                };
+                let word = match &outcome {
+                    Interrupted::Written => "written",
+                    Interrupted::Revoked => "revoked",
+                    Interrupted::Refused(refused) => refused.as_str(),
+                };
+                json!({"interrupt": word})
+            }
+            DriveAction::Unreadable(why) => json!({"error": why}),
+        };
+        line.as_object_mut()
+            .unwrap()
+            .extend(result.as_object().unwrap().clone());
+        line
+    }
+
+    /// The attempt's request id and its immutable values (§6): the
+    /// session's current target, the digest of its prompt, its provenance.
+    #[cfg(debug_assertions)]
+    fn drive_immutable(
+        &self,
+        a: &super::test_hooks::DriveAttempt,
+    ) -> Option<(String, crate::session_protocol::host::Immutable)> {
+        let ctx = self.host.context();
+        let target = wire::Target {
+            account_id: ctx.account_id.clone(),
+            atem_device_id: ctx.atem_device_id.clone(),
+            host_trust_gen: ctx.host_trust_gen,
+            session_id: a.session_id.clone(),
+            process_gen: self.host.descriptor_of(&a.session_id)?.process_gen,
+        };
+        let payload_digest =
+            crate::session_protocol::canonical::payload_digest(&json!({"text": a.text})).ok()?;
+        let provenance = crate::session_protocol::host::Provenance {
+            task_id: a.task_id.clone(),
+            sender: a.sender.clone(),
+        };
+        Some((
+            a.request_id.clone(),
+            crate::session_protocol::host::Immutable {
+                target,
+                payload_digest,
+                provenance,
+            },
+        ))
+    }
+
+    /// Host-work submits the attempt's prompt on its internal attachment,
+    /// acquiring the lease, and the effects are performed (its dispatch
+    /// pastes the prompt, so the chat's acceptance journals its turn): the
+    /// refusal host-work heard, else its receipt after the step.
+    #[cfg(debug_assertions)]
+    fn drive_submit(&mut self, a: &super::test_hooks::DriveAttempt, cx: &mut Cx) -> Value {
+        let Some(att) = self.host_work_attachment().map(str::to_string) else {
+            return json!({"error": "no host-work attachment"});
+        };
+        let Some((rid, immutable)) = self.drive_immutable(a) else {
+            return json!({"error": "unknown session"});
+        };
+        let effects = self.host.advance(self.clock.now());
+        self.exec(effects, cx);
+        let id = uuid::Uuid::new_v4().to_string();
+        let data = json!({"v": 1, "op": "submit", "id": id,
+            "binding": {"target": immutable.target, "attachment_gen": att},
+            "request_id": rid, "kind": "prompt", "payload": {"text": a.text},
+            "acquire": true});
+        let effects = self.host.submit_host_work(&att, data, immutable.provenance);
+        let out = |first: &str, value: Value, detail: Option<&String>| {
+            let mut r = json!({first: value});
+            if let Some(d) = detail {
+                r["detail"] = json!(d);
+            }
+            r
+        };
+        // What host-work heard: a refusal, or the receipt the reply names.
+        let reply = effects.iter().find_map(|e| match e {
+            Effect::Send {
+                attachment,
+                message: Envelope::Session(m),
+            } if *attachment == att && m.re.as_deref() == Some(id.as_str()) => match &m.op {
+                wire::Op::Error { code, detail, .. } => {
+                    Some((true, out("code", json!(code), detail.as_ref())))
+                }
+                wire::Op::Receipt(r) => {
+                    Some((false, out("state", json!(r.state), r.detail.as_ref())))
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        self.exec(effects, cx);
+        match (reply, self.host.receipt(&rid)) {
+            (Some((true, refused)), _) => refused,
+            // The receipt after the step.
+            (_, Some(r)) => out("state", json!(r.state), r.detail.as_ref()),
+            // A withdrawn request's late submit: its `rejected` receipt is
+            // only in the reply (until the restart).
+            (Some((false, receipt)), None) => receipt,
+            (None, None) => json!({"error": "no reply"}),
+        }
+    }
+
+    /// The outcomes of host interrupt writes since the last call, as the
+    /// drive hook reports them.
+    #[cfg(debug_assertions)]
+    fn drive_reports(&mut self) -> Vec<Value> {
+        self.host_interrupt_reports()
+            .into_iter()
+            .map(|(request_id, report)| {
+                let outcome = match report {
+                    InterruptReport::Ok => "ok",
+                    InterruptReport::Consumed => "consumed",
+                    InterruptReport::Dropped => "dropped",
+                    InterruptReport::NoEffect => "no_effect",
+                    InterruptReport::ErrorAfterQueue => "error_after_queue",
+                };
+                json!({"report": request_id, "outcome": outcome})
+            })
+            .collect()
     }
 
     /// What became of the interrupts written with host authority since the
@@ -4731,40 +4950,54 @@ fn running_request(cx: &mut Cx, sid: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Each session's chat as the reconciliation of host-work's prompts reads
+/// it (R9.14 items 5, 6), for the state dump (debug builds).
+#[cfg(debug_assertions)]
+fn chat_dump(cx: &Cx) -> Value {
+    let chats: Map<String, Value> = cx
+        .sessions
+        .iter()
+        .map(|(id, s)| {
+            let outcome = s.chat.last_outcome().map(|o| match o {
+                crate::chat::adapter::Outcome::Done => "done",
+                crate::chat::adapter::Outcome::Interrupted => "interrupted",
+            });
+            let chat = json!({"synced": s.chat_synced, "chat": s.chat_v1,
+                "current_turn": s.chat.current_turn_id(),
+                "last_completed": s.chat.last_completed_turn(), "outcome": outcome,
+                "request_id": s.chat.current_request_id()});
+            (id.to_string(), chat)
+        })
+        .collect();
+    Value::Object(chats)
+}
+
 /// What `s`, the session of host-work's prompt `r` as the broker has it,
-/// shows of the turn the prompt started, at a start (R9.14 items 5, 6).
-fn reconciled(s: Option<&BrokerSession>, r: &Reconciling) -> Reconciled {
-    let Some(s) = s.filter(|s| s.is_live() && s.process_gen == r.process_gen) else {
-        // No worker of that process was adopted.
-        return Reconciled::Report(DispatchReport::AgentExited);
+/// shows of the turn the prompt started, at a start (R9.14 items 5, 6),
+/// read with the session host's table (`reconcile_turn`). A worker with
+/// no chat adapter sends no chat: none is waited for.
+fn reconciled(s: Option<&BrokerSession>, r: &Reconciling, expired: bool) -> Reconciled {
+    let s = s.filter(|s| s.is_live() && s.process_gen == r.process_gen);
+    let chat = match s {
+        // No worker of that process was adopted, or its agent exited.
+        None => AdoptedChat {
+            live: false,
+            arrived: false,
+            chat: false,
+            current_turn: None,
+            last_completed: None,
+            last_outcome: None,
+        },
+        Some(s) => AdoptedChat {
+            live: true,
+            arrived: s.chat_synced || !s.chat_offered,
+            chat: s.chat_v1,
+            current_turn: s.chat.current_turn_id(),
+            last_completed: s.chat.last_completed_turn(),
+            last_outcome: s.chat.last_outcome(),
+        },
     };
-    // An adopted worker with a chat adapter sends its chat on connecting:
-    // until it arrived, this broker's chat knows none of its turns.
-    if !s.chat_synced && s.chat_offered {
-        return Reconciled::Wait;
-    }
-    let turn = r.turn.turn_id.as_str();
-    if !s.chat_v1 {
-        // No turn state (the chat withdrawn): nothing can be established.
-        return Reconciled::Report(DispatchReport::Unknown);
-    }
-    if s.chat.last_completed_turn() == Some(turn) {
-        let detail = match s.chat.last_outcome() {
-            Some(crate::chat::adapter::Outcome::Done) => DETAIL_TURN_DONE,
-            Some(crate::chat::adapter::Outcome::Interrupted) => DETAIL_TURN_INTERRUPTED,
-            None => return Reconciled::Report(DispatchReport::Unknown),
-        };
-        return Reconciled::Report(DispatchReport::Completed {
-            detail: Some(detail.to_string()),
-            turn_id: Some(turn.to_string()),
-            user_message_id: Some(r.turn.user_message_id.clone()),
-        });
-    }
-    if s.chat.current_turn_id() == Some(turn) {
-        return Reconciled::Running;
-    }
-    // Another turn is current, or none: it ended, how is unknown.
-    Reconciled::Report(DispatchReport::Unknown)
+    reconcile_turn(&r.turn, &chat, expired)
 }
 
 /// §6: what a failed host write proves (`None`: it was written).

@@ -2174,3 +2174,141 @@ fn an_attempt_reads_only_its_own_receipt() {
     let r = rt.host.attempt_receipt(&rid(5), TASK).expect("its own");
     assert_eq!(r.state, ReceiptState::Rejected);
 }
+
+/// The one decision table of a host-work prompt's reconciliation at a
+/// start (`reconcile_turn`), shared by the runtime's bridge and the
+/// fixtures' fake runtime: every branch, and the 60 s bound on the wait
+/// for the adopted chat (Task 16a's review, M1, M2).
+#[test]
+fn the_reconciliation_table() {
+    use crate::chat::adapter::Outcome;
+    let turn = turn_ids();
+    let running = AdoptedChat {
+        live: true,
+        arrived: true,
+        chat: true,
+        current_turn: Some("turn-1"),
+        last_completed: None,
+        last_outcome: None,
+    };
+    let completed = |detail: &str| {
+        Reconciled::Report(DispatchReport::Completed {
+            detail: Some(detail.into()),
+            turn_id: Some("turn-1".into()),
+            user_message_id: Some("turn-1-u".into()),
+        })
+    };
+    let unknown = Reconciled::Report(DispatchReport::Unknown);
+    let cases = [
+        // Still running: rebound.
+        (running, false, Reconciled::Running),
+        // Its process gone.
+        (
+            AdoptedChat {
+                live: false,
+                ..running
+            },
+            false,
+            Reconciled::Report(DispatchReport::AgentExited),
+        ),
+        (
+            AdoptedChat {
+                live: false,
+                arrived: false,
+                ..running
+            },
+            true,
+            Reconciled::Report(DispatchReport::AgentExited),
+        ),
+        // The chat hasn't arrived: wait, until the bound.
+        (
+            AdoptedChat {
+                arrived: false,
+                ..running
+            },
+            false,
+            Reconciled::Wait,
+        ),
+        (
+            AdoptedChat {
+                arrived: false,
+                ..running
+            },
+            true,
+            unknown.clone(),
+        ),
+        // No turn state (the chat withdrawn).
+        (
+            AdoptedChat {
+                chat: false,
+                ..running
+            },
+            false,
+            unknown.clone(),
+        ),
+        // Another turn is current (typed at the terminal), or none.
+        (
+            AdoptedChat {
+                current_turn: Some("turn-2"),
+                ..running
+            },
+            false,
+            unknown.clone(),
+        ),
+        (
+            AdoptedChat {
+                current_turn: None,
+                ..running
+            },
+            false,
+            unknown.clone(),
+        ),
+        // Ended, with its outcome; ended with none known.
+        (
+            AdoptedChat {
+                last_completed: Some("turn-1"),
+                last_outcome: Some(Outcome::Done),
+                ..running
+            },
+            false,
+            completed(DETAIL_TURN_DONE),
+        ),
+        (
+            AdoptedChat {
+                current_turn: Some("turn-2"),
+                last_completed: Some("turn-1"),
+                last_outcome: Some(Outcome::Interrupted),
+                ..running
+            },
+            true,
+            completed(DETAIL_TURN_INTERRUPTED),
+        ),
+        (
+            AdoptedChat {
+                last_completed: Some("turn-1"),
+                last_outcome: None,
+                ..running
+            },
+            false,
+            unknown.clone(),
+        ),
+        // Another turn ended: not this one's end.
+        (
+            AdoptedChat {
+                last_completed: Some("turn-0"),
+                last_outcome: Some(Outcome::Done),
+                ..running
+            },
+            false,
+            Reconciled::Running,
+        ),
+    ];
+    for (i, (chat, expired, want)) in cases.into_iter().enumerate() {
+        assert_eq!(
+            reconcile_turn(&turn, &chat, expired),
+            want,
+            "case {i}: {chat:?}"
+        );
+    }
+    assert_eq!(RECONCILE_MS, CONFIRM_MS);
+}

@@ -28,7 +28,7 @@ use super::*;
 use crate::runtime::project_scope::{CredAgentHasher, ProjectScopes, TableAgent};
 use crate::session_protocol::fake_runtime::FakeRuntime;
 use crate::session_protocol::file_journal::FileJournal;
-use crate::session_protocol::fixtures::{HostEvent, HostUnderTest};
+use crate::session_protocol::fixtures::{HostEvent, HostUnderTest, HostWorkAttempt};
 use crate::session_protocol::host::HostConfig;
 use crate::session_protocol::r9::envelope::{self, Event as EnvEvent, Transport};
 use crate::session_protocol::r9::{
@@ -505,6 +505,12 @@ impl Runner {
             .unwrap()
             .iter()
             .any(|s| s.get("hold_dispatch").is_some());
+        // The delegated fixtures (session-v1 R9.14): the harness plays
+        // host-work, as the runtime's drive hook lets a test.
+        let host_work = file["steps"].as_array().unwrap().iter().any(|s| {
+            s.as_object()
+                .is_some_and(|o| o.keys().any(|k| k.starts_with("host_work_")))
+        });
         let mut specs = Vec::new();
         if let Some(host) = setup.get("host") {
             specs.push((String::new(), host.clone()));
@@ -563,6 +569,8 @@ impl Runner {
             let mut rt = FakeRuntime::from_json_with(r8, HostConfig::default(), journal);
             rt.host.hold_dispatch(hold_dispatch);
             rt.host.set_refuse_r8(true);
+            // As the real runtime's fake agent: each pasted prompt a turn.
+            rt.agent_turns = true;
             let epoch = spec["runtime_epoch"].as_u64().unwrap();
             let mut fences = HostFences::new(&mut rt.host);
             let (m, fenced) =
@@ -572,6 +580,9 @@ impl Runner {
             assert!(fenced.is_empty());
             let effects = fences.effects;
             rt.apply(effects);
+            if host_work {
+                rt.host_work_connect();
+            }
             let engine = policy_engine(&rig.pairing, &rig.journal);
             let mut host = HostRt {
                 rig,
@@ -1377,6 +1388,11 @@ impl Runner {
             "relay_ack",
             "relay_lost",
             "expect_client_refusal",
+            "host_work_submit",
+            "host_work_verdict",
+            "host_work_withdraw",
+            "host_work_interrupt",
+            "adopted_chat",
         ];
         let kind = kinds
             .into_iter()
@@ -1648,6 +1664,71 @@ impl Runner {
                 let event = HostEvent::TurnComplete {
                     session_id: step["turn_complete"].as_str().unwrap().to_owned(),
                     turn_id: step["turn_id"].as_str().unwrap().to_owned(),
+                    interrupted: match step.get("outcome").and_then(Value::as_str) {
+                        None | Some("done") => false,
+                        Some("interrupted") => true,
+                        Some(other) => panic!("{}: outcome {other}", self.name),
+                    },
+                };
+                self.host_event(event);
+            }
+            "host_work_submit" | "host_work_withdraw" => {
+                let attempt = HostWorkAttempt {
+                    session_id: step[kind].as_str().unwrap().to_owned(),
+                    request_id: step["request_id"].as_str().unwrap().to_owned(),
+                    task_id: step["task_id"].as_str().unwrap().to_owned(),
+                    sender: step["sender"].as_str().unwrap().to_owned(),
+                    text: step["text"].as_str().unwrap().to_owned(),
+                };
+                let event = if kind == "host_work_submit" {
+                    HostEvent::HostWorkSubmit(attempt)
+                } else {
+                    HostEvent::HostWorkWithdraw(attempt)
+                };
+                self.host_event(event);
+                let want = match &step["result"] {
+                    Value::String(w) => json!({"withdrawal": w}),
+                    other => other.clone(),
+                };
+                self.host_work_result(&want);
+            }
+            "host_work_verdict" => {
+                let go = match step[kind].as_str().unwrap() {
+                    "go" => true,
+                    "withdraw" => false,
+                    other => panic!("{}: verdict {other}", self.name),
+                };
+                self.host_event(HostEvent::HostWorkVerdict { go });
+            }
+            "host_work_interrupt" => {
+                let request_id = step["request_id"].as_str().unwrap().to_owned();
+                let event = HostEvent::HostWorkInterrupt {
+                    session_id: step[kind].as_str().unwrap().to_owned(),
+                    request_id: request_id.clone(),
+                    revoke_only: step["revoke_only"].as_bool().unwrap_or(false),
+                };
+                self.host_event(event);
+                let want = step["result"].clone();
+                self.host_work_result(&json!({"interrupt": want}));
+                // A write reaches the agent: its report says so.
+                let reports = std::mem::take(&mut self.host().rt.host_work_reports);
+                let reported = json!([{"report": request_id, "outcome": "ok"}]);
+                let want_reports = if want == "written" {
+                    reported
+                } else {
+                    json!([])
+                };
+                assert_eq!(json!(reports), want_reports, "{}: reports", self.name);
+            }
+            "adopted_chat" => {
+                let event = HostEvent::AdoptedChat {
+                    session_id: step[kind].as_str().unwrap().to_owned(),
+                    chat: step["chat"].as_bool().unwrap_or(true),
+                    current_turn: step["current_turn"].as_str().map(str::to_owned),
+                    last_completed: step["last_completed"].as_str().map(str::to_owned),
+                    interrupted: step
+                        .get("outcome")
+                        .map(|o| o.as_str() == Some("interrupted")),
                 };
                 self.host_event(event);
             }
@@ -1721,6 +1802,22 @@ impl Runner {
     /// `expect_relay`: the next relay message Atem sent matches each
     /// `path: value` (`a.b.0.c`; `x.#` an array's length; `${…}`
     /// resolved); `capture` takes values by path.
+    /// What host-work heard of its last step (`host_work_*`) has every key
+    /// of `want`, with its value.
+    fn host_work_result(&mut self, want: &Value) {
+        let name = self.name.clone();
+        let got = self
+            .host()
+            .rt
+            .host_work_result
+            .take()
+            .unwrap_or_else(|| panic!("{name}: no host-work result"));
+        for (key, value) in want.as_object().unwrap() {
+            assert_eq!(got.get(key), Some(value), "{name}: host-work heard {got}");
+        }
+        self.pass();
+    }
+
     fn expect_relay(&mut self, step: &Value) {
         self.drain();
         let name = self.name.clone();

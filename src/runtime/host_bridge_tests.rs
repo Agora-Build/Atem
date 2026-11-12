@@ -5457,10 +5457,16 @@ async fn an_outstanding_write_is_never_written_twice() {
 }
 
 /// Every message the broker sent `id`'s worker so far was handled: the
-/// answer to a screen request sent after them came back.
+/// answer to a screen request sent after them came back. No other screen
+/// request may be outstanding (its answer would come first and prove
+/// nothing of what was sent after it; Task 16a's review, M4): a launched
+/// session asks for none.
 async fn worker_caught_up(cx: &mut super::Cx<'_>, id: &crate::session::SessionId) {
     let session = cx.sessions.get_mut(id).unwrap();
-    session.request_screen_now();
+    assert!(
+        !session.request_screen_now(),
+        "a screen request was outstanding"
+    );
     tokio::time::timeout(WAIT, async {
         while !session.pump().resync {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -5846,4 +5852,419 @@ async fn executing_host_work_is_reconciled_or_outcome_unknown() {
             let _ = session.stop();
         }
     }
+}
+
+/// Host-work attempts on `ids`' sessions, each prompt accepted by the chat
+/// (its turn journaled, `turn-1`), `before(i, session)` then run on each
+/// session; the broker goes (no clean close) and the next one, over the
+/// same journal on `clock`, adopts the sessions (their chats not arrived)
+/// and runs its first pass. The new bridge, the request ids, and each
+/// session's chat as its worker's `chat_snapshot` carries it.
+async fn restarted(
+    dir: &Path,
+    app: &mut App,
+    sessions: &mut std::collections::BTreeMap<
+        crate::session::SessionId,
+        crate::runtime::broker::BrokerSession,
+    >,
+    ids: &[crate::session::SessionId],
+    clock: Clock,
+    before: impl Fn(usize, &mut crate::runtime::broker::BrokerSession),
+) -> (
+    super::HostBridge,
+    Vec<String>,
+    Vec<crate::chat::session::ChatSnapshot>,
+) {
+    let journal = dir.join("journal");
+    let mut bridge = super::HostBridge::open(&journal, None, clock.clone()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, app);
+    let mut rids = Vec::new();
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions,
+    };
+    for id in ids {
+        worker_caught_up(&mut cx, id).await;
+    }
+    for (i, id) in ids.iter().enumerate() {
+        let rid = host_work_attempt(&mut bridge, id, &mut cx);
+        accept_turn(&mut bridge, id, &mut cx, &rid);
+        assert!(bridge.host().recorded_turn(&rid).is_some());
+        before(i, cx.sessions.get_mut(id).unwrap());
+        rids.push(rid);
+    }
+    drop(bridge);
+    let mut snapshots = Vec::new();
+    for id in ids {
+        let session = sessions.get_mut(id).unwrap();
+        snapshots.push(worker_snapshot(session));
+        adopted(session);
+    }
+    let mut bridge = super::HostBridge::open(&journal, None, clock).unwrap();
+    bridge.features.delegated = true;
+    pass_with(&mut bridge, app, sessions);
+    (bridge, rids, snapshots)
+}
+
+/// Task 16a's review (M2): the reconciliation's other branches, end to
+/// end. The adopted chat shows another turn current (one typed at the
+/// terminal after the prompt's), or arrives without chat-v1 (withdrawn):
+/// `outcome_unknown`, `outcome could not be established`, and nothing is
+/// rebound; a turn that ended interrupted: `completed`, `interrupted`.
+#[tokio::test]
+async fn a_reconciled_turn_shown_as_another_or_without_chat_is_unknown_and_an_interrupted_one_completes_so()
+ {
+    use crate::chat::adapter::{LogItem, Outcome};
+    use crate::session_protocol::host::{DETAIL_TURN_INTERRUPTED, DETAIL_UNRECONCILED};
+    use crate::session_protocol::wire::ReceiptState;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let mut app = idle_app();
+    let mut sessions = std::collections::BTreeMap::new();
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let session = broker_session(dir.path()).await;
+        ids.push(session.id.clone());
+        sessions.insert(session.id.clone(), session);
+    }
+    let (another, withdrawn, interrupted) = (0, 1, 2);
+    let (mut bridge, rids, snapshots) = restarted(
+        dir.path(),
+        &mut app,
+        &mut sessions,
+        &ids,
+        Clock::default(),
+        |i, session| {
+            let item = match i {
+                // A turn typed at the terminal after the prompt's.
+                0 => LogItem::UserMessage {
+                    id: "user-2".into(),
+                    turn_id: "turn-2".into(),
+                    text: "typed here".into(),
+                    created_at_ms: 20,
+                },
+                2 => LogItem::TurnEnded {
+                    turn_id: "turn-1".into(),
+                    outcome: Outcome::Interrupted,
+                    at_ms: 20,
+                },
+                _ => return,
+            };
+            let _unread = session.chat.on_log(item, 20, 0);
+        },
+    )
+    .await;
+    for i in [another, withdrawn, interrupted] {
+        assert!(bridge.host_work_reconciling(&rids[i]), "{i}");
+    }
+    for (i, snapshot) in snapshots.into_iter().enumerate() {
+        let session = sessions.get_mut(&ids[i]).unwrap();
+        snapshot_arrives(session, snapshot);
+        if i == withdrawn {
+            session.chat_v1 = false;
+        }
+    }
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    let receipt = |i: usize| bridge.host().receipt(&rids[i]).unwrap();
+    for i in [another, withdrawn] {
+        let r = receipt(i);
+        assert_eq!(
+            (r.state, r.detail.as_deref()),
+            (ReceiptState::OutcomeUnknown, Some(DETAIL_UNRECONCILED)),
+            "{i}"
+        );
+        assert_eq!(sessions[&ids[i]].chat.current_request_id(), None, "{i}");
+        assert!(!bridge.host_work_reconciling(&rids[i]), "{i}");
+    }
+    assert_eq!(
+        sessions[&ids[another]].chat.current_turn_id(),
+        Some("turn-2")
+    );
+    let r = receipt(interrupted);
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (ReceiptState::Completed, Some(DETAIL_TURN_INTERRUPTED))
+    );
+    assert_eq!(r.result.expect("its turn").turn_id, "turn-1");
+    for id in &ids {
+        let _ = sessions.get_mut(id).unwrap().stop();
+    }
+}
+
+/// Task 16a's review (M1): an adopted worker whose chat never arrives
+/// holds the reconciliation `RECONCILE_MS` after the start's recovery at
+/// most (60 s, as §H's confirmation window): then `outcome_unknown`,
+/// `outcome could not be established`, no longer reconciling; a chat that
+/// arrives later changes nothing.
+#[tokio::test]
+async fn an_adopted_chat_that_never_arrives_settles_at_the_deadline() {
+    use crate::session_protocol::host::{DETAIL_UNRECONCILED, RECONCILE_MS};
+    use crate::session_protocol::wire::ReceiptState;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let mut app = idle_app();
+    let session = broker_session(dir.path()).await;
+    let ids = vec![session.id.clone()];
+    let mut sessions = std::collections::BTreeMap::from([(session.id.clone(), session)]);
+    let clock = Clock::default();
+    let (mut bridge, rids, mut snapshots) = restarted(
+        dir.path(),
+        &mut app,
+        &mut sessions,
+        &ids,
+        clock.clone(),
+        |_, _| {},
+    )
+    .await;
+    let rid = &rids[0];
+    assert!(bridge.host_work_reconciling(rid));
+    // The bridge's clock also runs in real time: a second short of the
+    // bound, then the rest of it.
+    clock.skip(RECONCILE_MS - 1_000);
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    assert!(bridge.host_work_reconciling(rid));
+    assert_eq!(
+        bridge.host().receipt(rid).unwrap().state,
+        ReceiptState::Executing
+    );
+    clock.skip(1_000);
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    assert!(!bridge.host_work_reconciling(rid));
+    let r = bridge.host().receipt(rid).unwrap();
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (ReceiptState::OutcomeUnknown, Some(DETAIL_UNRECONCILED))
+    );
+    // Late: nothing rebinds it.
+    snapshot_arrives(sessions.get_mut(&ids[0]).unwrap(), snapshots.remove(0));
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    assert_eq!(sessions[&ids[0]].chat.current_request_id(), None);
+    assert_eq!(
+        bridge.host().receipt(rid).unwrap().state,
+        ReceiptState::OutcomeUnknown
+    );
+    let _ = sessions.get_mut(&ids[0]).unwrap().stop();
+}
+
+// ── The drive hook (`ATEM_TEST_HOST_WORK_DRIVE`): host-work's side of the
+//    delegated fixtures, played through the bridge ──
+
+/// A chat started on `session` (ready for a prompt), as the worker's
+/// would be after the agent's SessionStart.
+#[cfg(debug_assertions)]
+fn chat_ready(session: &mut crate::runtime::broker::BrokerSession) {
+    use crate::chat::adapter::AgentEvent;
+    use crate::chat::session::ChatSession;
+    let mut chat = ChatSession::new(session.process_gen.clone(), 0);
+    let _ = chat.on_event(
+        AgentEvent::SessionStarted {
+            session_id: "fake-session".into(),
+            log_path: PathBuf::new(),
+            source: "startup".into(),
+            same_log: false,
+        },
+        1,
+        0,
+    );
+    session.chat = chat;
+    session.chat_v1 = true;
+    session.chat_offered = true;
+}
+
+/// The drive hook's commands, as the bridge performs them (the file layer
+/// is `test_hooks::parse_drive`'s): the verdict the start check gives, a
+/// submit through the normal dispatch (pasted, so the chat's acceptance
+/// journals the turn), a duplicate, a withdrawal, and the interrupt with
+/// host authority through the bridge entry, whose write's outcome comes as
+/// a report line. The hook is debug-only: release builds compile it out.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn the_drive_hook_plays_host_works_side_through_the_bridge() {
+    use crate::chat::adapter::{AgentEvent, LogItem};
+    use crate::runtime::test_hooks::{DriveAction, DriveAttempt, DriveCommand};
+    use crate::session_protocol::host::DETAIL_WITHDRAWN_BY_HOST;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let session = broker_session(dir.path()).await;
+    let mut app = idle_app();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    bridge.install_drive_check();
+    let id = session.id.clone();
+    let sid = id.to_string();
+    let mut sessions = std::collections::BTreeMap::from([(id.clone(), session)]);
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    worker_caught_up(&mut cx, &id).await;
+    bridge.register(&id, &mut cx);
+    chat_ready(cx.sessions.get_mut(&id).unwrap());
+    let attempt = |rid: &str| DriveAttempt {
+        session_id: sid.clone(),
+        request_id: rid.into(),
+        task_id: uuid::Uuid::new_v4().to_string(),
+        sender: "member:dev-phone".into(),
+        text: "run the tests".into(),
+    };
+    let drive = |bridge: &mut super::HostBridge, cx: &mut super::Cx<'_>, file: &str, action| {
+        bridge.drive(
+            DriveCommand {
+                file: file.into(),
+                action,
+            },
+            cx,
+        )
+    };
+    let (r1, r2, r3) = (
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+    );
+
+    // Withdraw: the start check refuses, before any effect.
+    assert_eq!(
+        drive(
+            &mut bridge,
+            &mut cx,
+            "verdict.json",
+            DriveAction::Verdict(false)
+        ),
+        json!({"file": "verdict.json", "verdict": "withdraw"})
+    );
+    assert_eq!(
+        drive(
+            &mut bridge,
+            &mut cx,
+            "submit-1.json",
+            DriveAction::Submit(attempt(&r1))
+        ),
+        json!({"file": "submit-1.json", "state": "rejected", "detail": DETAIL_WITHDRAWN_BY_HOST})
+    );
+    assert!(bridge.prompts.is_empty(), "nothing pasted");
+    // Go: it runs through the normal dispatch.
+    drive(
+        &mut bridge,
+        &mut cx,
+        "verdict.json",
+        DriveAction::Verdict(true),
+    );
+    assert_eq!(
+        drive(
+            &mut bridge,
+            &mut cx,
+            "submit-2.json",
+            DriveAction::Submit(attempt(&r2))
+        ),
+        json!({"file": "submit-2.json", "state": "executing"})
+    );
+    assert_eq!(bridge.prompts.get(&r2), Some(&sid), "pasted");
+    // Its own duplicate: the recorded receipt.
+    assert_eq!(
+        drive(
+            &mut bridge,
+            &mut cx,
+            "submit-3.json",
+            DriveAction::Submit(attempt(&r2))
+        )["state"],
+        "executing"
+    );
+    assert_eq!(
+        drive(
+            &mut bridge,
+            &mut cx,
+            "withdraw-1.json",
+            DriveAction::Withdraw(attempt(&r3))
+        ),
+        json!({"file": "withdraw-1.json", "withdrawal": "listed"})
+    );
+    assert_eq!(
+        drive(
+            &mut bridge,
+            &mut cx,
+            "withdraw-2.json",
+            DriveAction::Withdraw(attempt(&r2))
+        ),
+        json!({"file": "withdraw-2.json", "withdrawal": "started"})
+    );
+    // No turn shown yet: the chat's half refuses.
+    let interrupt = |revoke_only| DriveAction::Interrupt {
+        session_id: sid.clone(),
+        request_id: r2.clone(),
+        revoke_only,
+    };
+    assert_eq!(
+        drive(&mut bridge, &mut cx, "interrupt-1.json", interrupt(false)),
+        json!({"file": "interrupt-1.json", "interrupt": "not_current_turn"})
+    );
+    // The agent takes the prompt: its turn is journaled.
+    let session = cx.sessions.get_mut(&id).unwrap();
+    let mut outs = session.chat.on_event(
+        AgentEvent::PromptSubmitted {
+            text: "run the tests".into(),
+            turn_id: None,
+            at_ms: None,
+        },
+        5,
+        0,
+    );
+    outs.extend(session.chat.on_log(
+        LogItem::UserMessage {
+            id: "user-1".into(),
+            turn_id: "turn-1".into(),
+            text: "run the tests".into(),
+            created_at_ms: i64::MAX / 2,
+        },
+        5,
+        0,
+    ));
+    bridge.chat_outs(&sid, outs, &mut cx);
+    assert_eq!(
+        bridge.host().recorded_turn(&r2).map(|t| t.turn_id.as_str()),
+        Some("turn-1")
+    );
+    assert_eq!(
+        drive(&mut bridge, &mut cx, "interrupt-2.json", interrupt(false)),
+        json!({"file": "interrupt-2.json", "interrupt": "written"})
+    );
+    assert_eq!(
+        drive(&mut bridge, &mut cx, "interrupt-3.json", interrupt(true)),
+        json!({"file": "interrupt-3.json", "interrupt": "revoked"})
+    );
+    // The write's outcome, once the worker answered.
+    let results = tokio::time::timeout(WAIT, async {
+        loop {
+            let session = cx.sessions.get_mut(&id).unwrap();
+            session.pump();
+            let results = session.take_results();
+            if !results.is_empty() {
+                return results;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for result in results {
+        bridge.write_result(&sid, result, &mut cx);
+    }
+    assert_eq!(
+        bridge.drive_reports(),
+        [json!({"report": r2, "outcome": "ok"})]
+    );
+    assert!(bridge.drive_reports().is_empty(), "once");
+    let unknown = drive(
+        &mut bridge,
+        &mut cx,
+        "submit-9.json",
+        DriveAction::Unreadable("expected value".into()),
+    );
+    assert_eq!(
+        unknown,
+        json!({"file": "submit-9.json", "error": "expected value"})
+    );
+    let _ = cx.sessions.get_mut(&id).unwrap().stop();
 }

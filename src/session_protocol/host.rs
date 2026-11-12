@@ -465,6 +465,90 @@ pub enum DispatchReport {
     AgentExited,
 }
 
+/// What the chat of the session a host-work prompt ran in shows at a start
+/// (session-v1 R9.14 items 5, 6): the adopted worker's chat as the
+/// runtime's bridge has it, or the fixtures' fake runtime's
+/// (`adopted_chat`). Read by `reconcile_turn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdoptedChat<'a> {
+    /// A live agent process of the prompt's `process_gen`: its worker was
+    /// adopted, and its agent hasn't exited.
+    pub live: bool,
+    /// The adopted worker's chat arrived (a worker with a chat adapter
+    /// sends it on connecting; one without sends none, and nothing is
+    /// waited for).
+    pub arrived: bool,
+    /// It has turn state (chat-v1; false: no chat, or it was withdrawn).
+    pub chat: bool,
+    pub current_turn: Option<&'a str>,
+    pub last_completed: Option<&'a str>,
+    /// How `last_completed` ended, when known.
+    pub last_outcome: Option<crate::chat::adapter::Outcome>,
+}
+
+/// How a host-work prompt `executing` at a start is reconciled
+/// (`reconcile_turn`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reconciled {
+    /// The adopted worker's chat hasn't arrived: decided later, at the
+    /// latest `RECONCILE_MS` after the start's recovery.
+    Wait,
+    /// The turn it started still runs: it stays `executing`, and the
+    /// runtime rebinds the chat's current turn to it.
+    Running,
+    /// Settled with this report.
+    Report(DispatchReport),
+}
+
+/// A host-work prompt's reconciliation waits this long at most for its
+/// adopted worker's chat after the start's recovery (as §H's confirmation
+/// window, `CONFIRM_MS`); then it is `outcome_unknown`, `outcome could not
+/// be established` (Task 16a's review, M1). The chat comes right after the
+/// worker's `hello`, so only a worker that breaks that rule ever reaches it.
+pub const RECONCILE_MS: u64 = CONFIRM_MS;
+
+/// The one decision table of the reconciliation of host-work's prompt
+/// `executing` at a start, which started `turn` (R9.14 items 5, 6),
+/// from `chat` (the runtime's bridge and the fixtures' fake runtime both
+/// read it). `expired`: `RECONCILE_MS` passed since the start's recovery.
+/// - its process gone → `outcome_unknown`, `agent exited`;
+/// - its chat not arrived → wait (past the bound: `outcome_unknown`);
+/// - no turn state → `outcome_unknown`: nothing can be established;
+/// - its turn ended → `completed` with that outcome and the turn's ids, or
+///   `outcome_unknown` when the outcome isn't known;
+/// - its turn still current → it runs (stays `executing`, rebound);
+/// - another turn current, or none → `outcome_unknown`: it ended, how is
+///   unknown.
+pub fn reconcile_turn(turn: &TurnIds, chat: &AdoptedChat<'_>, expired: bool) -> Reconciled {
+    let unknown = Reconciled::Report(DispatchReport::Unknown);
+    if !chat.live {
+        return Reconciled::Report(DispatchReport::AgentExited);
+    }
+    if !chat.arrived {
+        return if expired { unknown } else { Reconciled::Wait };
+    }
+    if !chat.chat {
+        return unknown;
+    }
+    let id = turn.turn_id.as_str();
+    if chat.last_completed == Some(id) {
+        let detail = match chat.last_outcome {
+            Some(crate::chat::adapter::Outcome::Done) => DETAIL_TURN_DONE,
+            Some(crate::chat::adapter::Outcome::Interrupted) => DETAIL_TURN_INTERRUPTED,
+            None => return unknown,
+        };
+        return Reconciled::Report(DispatchReport::Completed {
+            detail: Some(detail.to_string()),
+            turn_id: Some(id.to_string()),
+            user_message_id: Some(turn.user_message_id.clone()),
+        });
+    }
+    if chat.current_turn == Some(id) {
+        return Reconciled::Running;
+    }
+    unknown
+}
+
 /// What the runtime knows of an agent permission prompt (r7). The runtime
 /// redacts before opening: `summary` is the command's first line or the
 /// file path (never full inputs such as file contents) and rule labels are
@@ -581,13 +665,42 @@ pub enum HostInterrupt {
     /// The attempt isn't executing: queued (`accepted`), settled, or not in
     /// the journal (never admitted, or settled and evicted). Nothing done:
     /// one not yet started is host-work's to withdraw (I.5.7). After a
-    /// broker restart it doesn't mean the turn ended: an attempt whose turn
-    /// an adopted worker still runs is reconciled `outcome_unknown` today
-    /// (reconnecting it is planned, R9.14 item 6).
+    /// broker restart it doesn't mean the turn ended: an attempt the start's
+    /// reconciliation settled `outcome_unknown` may still be running (no
+    /// turn state proved it current; `recover`).
     NotExecuting,
     /// The journal halted (r8 §I): nothing done; the restart settles the
     /// attempt.
     Halted,
+}
+
+impl Withdrawal {
+    /// Its name in the drive hook's results and the fixtures
+    /// (`host_work_withdraw`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Withdrawal::Rejected => "rejected",
+            Withdrawal::Listed => "listed",
+            Withdrawal::Reused => "reused",
+            Withdrawal::ListFull => "list_full",
+            Withdrawal::Started => "started",
+            Withdrawal::Halted => "halted",
+        }
+    }
+}
+
+impl HostInterrupt {
+    /// Its name in the drive hook's results and the fixtures
+    /// (`host_work_interrupt`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HostInterrupt::Written(_) => "written",
+            HostInterrupt::Revoked(_) => "revoked",
+            HostInterrupt::NotCurrentTurn => "not_current_turn",
+            HostInterrupt::NotExecuting => "not_executing",
+            HostInterrupt::Halted => "halted",
+        }
+    }
 }
 
 // ── State ─────────────────────────────────────────────────────────────────
@@ -2298,17 +2411,26 @@ impl<J: Journal> SessionHost<J> {
     /// step 3, the reconciliation of its tasks with their attempts'
     /// receipts at step 4). A host-work prompt's `Reconcile` carries the
     /// turn it started (`turn_started`), and the runtime decides it from the
-    /// adopted worker's chat (`HostBridge`): a turn still running stays
-    /// `executing`, its request rebound to the chat's current turn, so the
-    /// intents carried out after this find it executing and current
+    /// adopted worker's chat with `reconcile_turn`: a turn still running
+    /// stays `executing`, its request rebound to the chat's current turn, so
+    /// the intents carried out after this find it executing and current
     /// (R9.14 item 5: "delivering once more if that turn is still the
-    /// session's current turn"); only a turn that ended, a worker that is
-    /// gone or a turn never journaled is settled here, and for those an
-    /// intent does nothing anyway ("a turn that has already ended makes it
-    /// do nothing"). Until the adopted chat arrives the receipt stays
-    /// `executing` and the interrupt's turn check refuses (`NotCurrentTurn`,
-    /// no turn state): `HostBridge::host_work_reconciling` tells host-work's
-    /// recovery (Task 26) to keep such an intent pending until the decision.
+    /// session's current turn"). Every other case is settled here:
+    /// - a turn that ended (`completed` with its outcome, or
+    ///   `outcome_unknown` when the outcome isn't known) or a worker that is
+    ///   gone (`agent exited`): nothing is left to deliver ("a turn that has
+    ///   already ended makes it do nothing");
+    /// - a turn never journaled, a chat without turn state (withdrawn), a
+    ///   chat showing another turn, or one that never arrived within
+    ///   `RECONCILE_MS` (`outcome could not be established`): the turn may
+    ///   still run, but no turn state proves it current, and the interrupt
+    ///   writes no blind Esc, so an intent can't be delivered; the owner
+    ///   learns of it through the `outcome_unknown` alert (host.alerts).
+    ///
+    /// Until the adopted chat arrives the receipt stays `executing` and the
+    /// interrupt's turn check refuses (`NotCurrentTurn`, no turn state):
+    /// `HostBridge::host_work_reconciling` tells host-work's recovery (Task
+    /// 26) to keep such an intent pending until the decision.
     pub fn recover(&mut self) -> Vec<Effect> {
         self.resolve_once();
         if self.start_error.is_some() {

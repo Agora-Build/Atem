@@ -380,11 +380,13 @@ impl BrokerSession {
     /// Tests: asks the worker for its screen now, whether or not a request
     /// is outstanding. The worker handles the broker's messages in order,
     /// so its answer (`Pumped::resync`) says it handled every message sent
-    /// before this one.
+    /// before this one. True when an earlier request was outstanding: its
+    /// answer comes first, and proves nothing of what was sent after it.
     #[cfg(test)]
-    pub fn request_screen_now(&mut self) {
-        self.screen_requested = false;
+    pub fn request_screen_now(&mut self) -> bool {
+        let outstanding = std::mem::take(&mut self.screen_requested);
         self.request_screen();
+        outstanding
     }
 
     fn request_screen(&mut self) {
