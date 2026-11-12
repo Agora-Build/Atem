@@ -24,6 +24,10 @@ pub enum SignLabel {
     ChannelClient,
     /// `atem-host-route` bodies (§R9.7b).
     HostRoute,
+    /// A host's `enc_sig` inside a `host_enc_key` entry (delegated
+    /// host-work design II.4.1): Ed25519 by its `host_key` over
+    /// [`SigningInput::fields`], not over a body.
+    HostEncKey,
 }
 
 impl SignLabel {
@@ -37,11 +41,12 @@ impl SignLabel {
             SignLabel::ChannelHost => "atem-ch1-host-sig-v1",
             SignLabel::ChannelClient => "atem-ch1-client-sig-v1",
             SignLabel::HostRoute => "atem-host-route-v1",
+            SignLabel::HostEncKey => "atem-host-enc-key-v1",
         }
     }
 
-    /// The label of a signed body's `type` (§R9.1 table). The co-signature
-    /// and the channel signatures have no body type.
+    /// The label of a signed body's `type` (§R9.1 table). The co-signature,
+    /// the channel signatures and a host's `enc_sig` have no body type.
     pub fn of_body_type(body_type: &str) -> Option<Self> {
         match body_type {
             "atem-membership-entry" => Some(SignLabel::MembershipEntry),
@@ -54,7 +59,9 @@ impl SignLabel {
     }
 }
 
-/// Exactly the bytes a signer signs: `enc([label, payload])`.
+/// Exactly the bytes a signer signs: `enc([label, payload])`, or
+/// `enc([label, f1, …])` for a signature over fields ([`Self::fields`]).
+/// The label is always the first field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SigningInput {
     label: SignLabel,
@@ -65,9 +72,18 @@ impl SigningInput {
     /// `enc([label, jcs(body)])` for a signed object, or
     /// `enc([label, th])` for a channel signature.
     pub fn new(label: SignLabel, payload: &[u8]) -> Self {
+        Self::fields(label, &[payload])
+    }
+
+    /// `enc([label, f1, …])`: a signature over fields rather than a body
+    /// (a host's `enc_sig`, II.4.1). `new(label, p)` is `fields(label, &[p])`.
+    pub fn fields(label: SignLabel, fields: &[&[u8]]) -> Self {
+        let mut all = Vec::with_capacity(fields.len() + 1);
+        all.push(label.as_str().as_bytes());
+        all.extend_from_slice(fields);
         SigningInput {
             label,
-            bytes: enc(&[label.as_str().as_bytes(), payload]),
+            bytes: enc(&all),
         }
     }
 
@@ -104,19 +120,60 @@ pub const SAFETY_CODE: &str = "atem-safety-code-v2";
 mod tests {
     use super::*;
 
+    /// Every label, in one list. The match fails to compile until a new
+    /// label is listed here too, so the distinctness test covers it.
+    const LABELS: [SignLabel; 9] = [
+        SignLabel::MembershipEntry,
+        SignLabel::RecoveryCosign,
+        SignLabel::BrowserGrant,
+        SignLabel::PushHint,
+        SignLabel::Seen,
+        SignLabel::ChannelHost,
+        SignLabel::ChannelClient,
+        SignLabel::HostRoute,
+        SignLabel::HostEncKey,
+    ];
+
+    const fn listed(label: SignLabel) -> usize {
+        match label {
+            SignLabel::MembershipEntry => 0,
+            SignLabel::RecoveryCosign => 1,
+            SignLabel::BrowserGrant => 2,
+            SignLabel::PushHint => 3,
+            SignLabel::Seen => 4,
+            SignLabel::ChannelHost => 5,
+            SignLabel::ChannelClient => 6,
+            SignLabel::HostRoute => 7,
+            SignLabel::HostEncKey => 8,
+        }
+    }
+
+    #[test]
+    fn every_label_is_listed() {
+        for (i, label) in LABELS.iter().enumerate() {
+            assert_eq!(listed(*label), i, "{label:?}");
+        }
+    }
+
+    #[test]
+    fn a_fields_input_is_enc_with_the_label_first() {
+        let input = SigningInput::fields(SignLabel::HostEncKey, &[b"a", b"", b"bc"]);
+        assert_eq!(input.label(), SignLabel::HostEncKey);
+        assert_eq!(
+            crate::encoding::dec(input.as_bytes()).unwrap(),
+            [&b"atem-host-enc-key-v1"[..], b"a", b"", b"bc"]
+        );
+        assert_eq!(
+            SigningInput::new(SignLabel::Seen, b"{}"),
+            SigningInput::fields(SignLabel::Seen, &[b"{}"])
+        );
+        // Not a body's label.
+        assert_eq!(SignLabel::of_body_type("atem-host-enc-key"), None);
+    }
+
     #[test]
     fn every_domain_string_is_distinct() {
-        let signing = [
-            SignLabel::MembershipEntry,
-            SignLabel::RecoveryCosign,
-            SignLabel::BrowserGrant,
-            SignLabel::PushHint,
-            SignLabel::Seen,
-            SignLabel::ChannelHost,
-            SignLabel::ChannelClient,
-            SignLabel::HostRoute,
-        ]
-        .map(SignLabel::as_str);
+        let signing = LABELS.map(SignLabel::as_str);
         let others = [
             MEMBERSHIP_HASH,
             BROWSER_GRANT_HASH,

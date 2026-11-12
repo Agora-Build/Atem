@@ -42,6 +42,21 @@ unit_enum! {
         Roles,
         /// `add_host` / `remove_host`.
         Host,
+        /// `project_set` / `project_remove`: a project grant, which hosts of
+        /// the account may send each other which operations (show the
+        /// project's name, its hosts and ops, or that it is removed).
+        Project,
+        /// `host_sender_revoke` / `host_sender_readmit`: stop (and with
+        /// `interrupt_running`, also interrupt what it already started) or
+        /// resume accepting one host as a sender of host work (show the host
+        /// and which of the two).
+        HostSender,
+        /// `host_enc_key`: install a host's encryption key, the one it
+        /// vouched for itself (`enc_sig`), which other hosts seal mail to
+        /// (show the host, its trust generation, the key's `enc_kid`, and
+        /// `retire_previous`: the key it replaces stops opening mail at
+        /// once). Not the host's own `enc_sig`, which is `HostSigning`.
+        HostEncKey,
         /// `recovery_add`, `recovery_approve`, `recovery_veto`.
         Recovery,
         /// `set_recovery_key` and the current kit's co-signature.
@@ -50,8 +65,8 @@ unit_enum! {
         KeyBackup,
         /// A browser grant (a QR handed to a browser).
         BrowserGrant,
-        /// Host-only signatures (`sig_h`, push hints, seens): never asked
-        /// of a phone or a desktop client.
+        /// Host-only signatures (`sig_h`, push hints, seens, a host's
+        /// `enc_sig`): never asked of a phone or a desktop client.
         HostSigning,
     }
 }
@@ -252,6 +267,14 @@ data_enum! {
         /// service's last grant (its add, or a change that granted
         /// something new; signed at `last_signed_at`): retry at `retry_at`.
         ServiceChangeTooSoon { last_signed_at: u64, retry_at: u64 },
+        /// A `host_sender_revoke` of a host already revoked.
+        AlreadyRevoked,
+        /// A `host_sender_readmit` of a host that isn't revoked.
+        NotRevoked,
+        /// A `host_enc_key` of a key already set for that host since its
+        /// newest `add_host` (current, previous, retired or no longer
+        /// kept): ask the host for a new key.
+        EncKeyReused,
     }
 }
 
@@ -280,6 +303,69 @@ record! {
 }
 
 data_enum! {
+    /// A host's sending authorization (delegated host-work II.3.1), from its
+    /// `add_host` and the `host_sender_revoke` / `host_sender_readmit`
+    /// entries after it.
+    pub enum HostSenderStateInfo {
+        /// Its envelopes signed at or after `generation` are accepted: the
+        /// `seq` of its first `add_host`, or of its latest readmit.
+        Authorized { generation: u64 },
+        /// Revoked by the entry at `seq`: none are accepted.
+        Revoked { seq: u64 },
+    }
+}
+
+record! {
+    /// A project in effect (II.2.2): the hosts it lets send each other the
+    /// `ops` (`launch`, `message`, `notify`, `prompt`).
+    pub struct ProjectInfo {
+        pub name: String,
+        /// The hosts as the latest `project_set` signed them (sorted).
+        pub hosts: Vec<String>,
+        /// The hosts of `hosts` whose membership is still in effect (no
+        /// `remove_host` of them since; sorted).
+        pub members: Vec<String>,
+        /// Sorted.
+        pub ops: Vec<String>,
+    }
+}
+
+record! {
+    /// A host encryption key as a `host_enc_key` entry set it (II.4.1).
+    pub struct HostEncKeyInfo {
+        /// R9.9's `enc_kid` of `key` (16 hex characters).
+        pub enc_kid: String,
+        /// X25519.
+        pub key: PublicKeyData,
+        /// The `seq` of the entry that set it.
+        pub seq: u64,
+        /// The host's trust generation it is bound to.
+        pub host_trust_gen: u64,
+    }
+}
+
+record! {
+    /// The key a rotation replaced.
+    pub struct PreviousHostEncKeyInfo {
+        pub key: HostEncKeyInfo,
+        /// Retired at once (`retire_previous`): it opens nothing. Otherwise
+        /// the host keeps it for 24 h on its own clock from when it applied
+        /// the entry at `replaced_at_seq`.
+        pub retired: bool,
+        /// The `seq` of the entry that replaced it.
+        pub replaced_at_seq: u64,
+    }
+}
+
+record! {
+    /// A host's encryption keys for its current trust generation.
+    pub struct HostEncKeysInfo {
+        pub current: HostEncKeyInfo,
+        pub previous: Option<PreviousHostEncKeyInfo>,
+    }
+}
+
+data_enum! {
     /// A state change the verifier committed (or would commit).
     pub enum MembershipEffect {
         Appended { head: LogHead },
@@ -293,6 +379,11 @@ data_enum! {
         RecoveryCancelled { entry_hash: String, reason: String },
         RecoveryKeyReplaced,
         KBackupRecorded { blob_version: u64 },
+        ProjectSet { name: String },
+        ProjectRemoved { name: String },
+        HostSenderRevoked { host_id: String, seq: u64, interrupt_running: bool },
+        HostSenderReadmitted { host_id: String, seq: u64 },
+        HostEncKeySet { host_id: String, retire_previous: bool },
         VetoReplaced { head: LogHead },
         Evidence { reason: String },
         Frozen,

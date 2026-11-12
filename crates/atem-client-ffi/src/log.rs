@@ -183,6 +183,28 @@ pub(crate) fn effect_info(effect: &Effect) -> MembershipEffect {
         Effect::KBackupRecorded { blob_version } => MembershipEffect::KBackupRecorded {
             blob_version: *blob_version,
         },
+        Effect::ProjectSet { name } => MembershipEffect::ProjectSet { name: name.clone() },
+        Effect::ProjectRemoved { name } => MembershipEffect::ProjectRemoved { name: name.clone() },
+        Effect::HostSenderRevoked {
+            host_id,
+            seq,
+            interrupt_running,
+        } => MembershipEffect::HostSenderRevoked {
+            host_id: host_id.clone(),
+            seq: *seq,
+            interrupt_running: *interrupt_running,
+        },
+        Effect::HostSenderReadmitted { host_id, seq } => MembershipEffect::HostSenderReadmitted {
+            host_id: host_id.clone(),
+            seq: *seq,
+        },
+        Effect::HostEncKeySet {
+            host_id,
+            retire_previous,
+        } => MembershipEffect::HostEncKeySet {
+            host_id: host_id.clone(),
+            retire_previous: *retire_previous,
+        },
         Effect::VetoReplaced(h) => MembershipEffect::VetoReplaced { head: (*h).into() },
         Effect::Evidence(reason) => MembershipEffect::Evidence {
             reason: reason.as_str().into(),
@@ -630,7 +652,10 @@ impl MembershipLog {
     /// ahead, else why not (`LogFull`, `MembersFull`, `HostsFull`, or `ServiceChangeTooSoon` for a
     /// service change that grants anything new, e.g. a renewal, within
     /// 24 h of that service's last grant; narrowing and `remove` are never
-    /// paced and never restart the 24 h). Advisory, for signers only: hosts accept any valid entry.
+    /// paced and never restart the 24 h; `AlreadyRevoked`/`NotRevoked` for
+    /// a host sender's revoke or readmit the verifier would refuse;
+    /// `EncKeyReused` for a `host_enc_key` of a key already set for that
+    /// host since its newest `add_host`). Advisory, for signers only: hosts accept any valid entry.
     /// A malformed action is `Invalid`/`Membership` as in `draft_entry`.
     pub fn check_change(
         &self,
@@ -659,6 +684,9 @@ impl MembershipLog {
                     last_signed_at,
                     retry_at,
                 }),
+                Err(ChangeRefusal::AlreadyRevoked) => Some(ChangeRefusalInfo::AlreadyRevoked),
+                Err(ChangeRefusal::NotRevoked) => Some(ChangeRefusalInfo::NotRevoked),
+                Err(ChangeRefusal::EncKeyReused) => Some(ChangeRefusalInfo::EncKeyReused),
             },
         )
     }

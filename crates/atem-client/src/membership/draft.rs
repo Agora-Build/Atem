@@ -104,6 +104,32 @@ impl Action {
                 json!({"target": target.to_hex()})
             }
             Action::KBackup(record) => json!({"k_backup": record.to_json()}),
+            Action::ProjectSet { project } => json!({"project": project.to_json()}),
+            Action::ProjectRemove { name } => json!({"name": name}),
+            Action::HostSenderRevoke {
+                host_id,
+                interrupt_running,
+            } => json!({"host_id": host_id, "interrupt_running": interrupt_running}),
+            Action::HostSenderReadmit { host_id } => json!({"host_id": host_id}),
+            Action::HostEncKey {
+                host_id,
+                host_trust_gen,
+                enc_key,
+                enc_sig,
+                retire_previous,
+            } => {
+                let mut fields = json!({
+                    "host_id": host_id,
+                    "host_trust_gen": host_trust_gen,
+                    "enc_key": enc_key.to_json(),
+                    "enc_sig": crate::encoding::b64u(enc_sig),
+                });
+                // Absent means false (§R9.1: absent fields omitted).
+                if *retire_previous {
+                    fields["retire_previous"] = json!(true);
+                }
+                fields
+            }
         };
         match value {
             Value::Object(map) => map,
@@ -173,6 +199,24 @@ pub fn sign_entry_cosigned(
     let mut object = SignedObject::sign(provider, key, body)?;
     object.cosign(kit, kit_key)?;
     Entry::parse(object)
+}
+
+/// The action as the verifier parses it, for the typed builders (services,
+/// projects, host senders, host encryption keys): drafted on a placeholder chain position
+/// (account, `seq`, hashes and signer don't affect the action's own rules)
+/// at `signed_at` (a service's expiry bound counts from it), then
+/// [`check_body`].
+pub(super) fn verified(action: Action, signed_at: u64) -> Result<Action, Invalid> {
+    let body = draft_on(
+        "draft-check",
+        &Hash32([0; 32]),
+        2,
+        &Hash32([0; 32]),
+        "draft-check",
+        signed_at,
+        &action,
+    );
+    Ok(check_body(&body)?.action)
 }
 
 /// The verifier's structural check of an unsigned body (`draft`'s output):

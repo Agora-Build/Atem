@@ -9,9 +9,11 @@
 //! signed entry stays valid on every host). [`Membership::capacity`] reads
 //! the verifier's own counters against its own limits, so the two can't
 //! drift; [`check_change`] is what a managing device asks before it drafts
-//! an entry, so a bot's renewals can't use up the list.
+//! an entry, so a bot's renewals can't use up the list, and a host
+//! sender's redundant revoke or readmit, or a host encryption key set
+//! before, isn't drafted at all.
 use super::entry::{Action, MemberKind, RolesChange, Scope};
-use super::{MAX_ENTRIES, MAX_HOSTS, MAX_MEMBERS, MemberStatus, Membership};
+use super::{HostSenderState, MAX_ENTRIES, MAX_HOSTS, MAX_MEMBERS, MemberStatus, Membership};
 
 /// A limit counts as nearly full from this share of it (%), for each
 /// limit: 922 of 1024 entries, 231 of 256 members, 58 of 64 hosts.
@@ -147,6 +149,18 @@ pub enum ChangeRefusal {
     /// that grants anything new waits until `retry_at`
     /// ([`SERVICE_CHANGE_MIN_INTERVAL_MS`]).
     ServiceChangeTooSoon { last_signed_at: u64, retry_at: u64 },
+    /// A `host_sender_revoke` of a host already revoked (the verifier
+    /// would refuse it, `already_revoked`; II.3.1). "Also interrupt" after
+    /// a revoke is a control record, not another revoke.
+    AlreadyRevoked,
+    /// A `host_sender_readmit` of a host that isn't revoked (the verifier
+    /// would refuse it, `not_revoked`; II.3.1).
+    NotRevoked,
+    /// A `host_enc_key` of a key already set for that host since its newest
+    /// `add_host` (the verifier would refuse it, `enc_key_reused`; II.4.1):
+    /// e.g. two managers handed the same key, the second redrafting after
+    /// the relay's compare-and-swap failure.
+    EncKeyReused,
 }
 
 impl ChangeRefusal {
@@ -156,6 +170,9 @@ impl ChangeRefusal {
             ChangeRefusal::MembersFull => "members_full",
             ChangeRefusal::HostsFull => "hosts_full",
             ChangeRefusal::ServiceChangeTooSoon { .. } => "service_change_too_soon",
+            ChangeRefusal::AlreadyRevoked => "already_revoked",
+            ChangeRefusal::NotRevoked => "not_revoked",
+            ChangeRefusal::EncKeyReused => "enc_key_reused",
         }
     }
 }
@@ -170,8 +187,9 @@ impl std::error::Error for ChangeRefusal {}
 
 /// Whether a signer should draft `action` as the next entry of `log` at
 /// `now_ms` (the signer's clock, as its `signed_at` would be). Advisory
-/// and deterministic; it judges capacity and pace only (the verifier still
-/// judges the entry itself):
+/// and deterministic; it judges capacity, pace, a host sender's redundant
+/// drafts and a reused host encryption key only (the verifier still judges
+/// the entry itself):
 ///
 /// - a full log ([`MAX_ENTRIES`]) refuses every action;
 /// - full members refuse `add` and `recovery_add`;
@@ -182,7 +200,30 @@ impl std::error::Error for ChangeRefusal {}
 ///   [`SERVICE_CHANGE_MIN_INTERVAL_MS`] of that service's last grant (its
 ///   `add` or a `set_roles` that granted something new) is refused; one
 ///   that only narrows is never rate-limited, nor is `remove`. A last grant
-///   signed after `now_ms` counts as within the interval.
+///   signed after `now_ms` counts as within the interval;
+/// - project entries (`project_set`, `project_remove`, delegated host-work
+///   II.2.2) take one entry each and are never paced: a project adds no
+///   member or host;
+/// - a host sender's revoke and readmit (II.3.1) are never paced (both are
+///   rare, and a revoke must never wait), but a revoke of a host already
+///   revoked is refused ([`ChangeRefusal::AlreadyRevoked`]) and a readmit of
+///   one that isn't revoked ([`ChangeRefusal::NotRevoked`], a host never
+///   added included): the drafting guard, so a manager doesn't sign an
+///   entry every verifier refuses. A revoke of a host never added isn't
+///   refused here: the verifier refuses it (`unknown_host`);
+/// - a host's encryption key (`host_enc_key`, II.4.1) takes one entry per
+///   host and rotation and is never paced: the key a host gets after
+///   `atem pair verify` must not wait (it gets no host-sender mail until
+///   the entry lands), nor must a rotation with `retire_previous` after a
+///   suspected compromise; it adds no member or host. Each is signed by a
+///   manager with a fresh confirmation, so nothing drafts them in bulk.
+///   A key already set for that host since its newest `add_host` is
+///   refused ([`ChangeRefusal::EncKeyReused`]): the drafting guard for the
+///   verifier's `enc_key_reused`. The rest of the entry's validity (a
+///   current host, its newest generation, the host's `enc_sig`) is the
+///   verifier's to judge;
+/// - every other action (genesis, a native's roles, removals, recovery and
+///   kit entries, K backups) is never paced.
 ///
 /// Scope lists are compared as the verifier holds them: canonical (sorted,
 /// unique), as every parsed entry and the bindings' `action_json` are. A
@@ -193,17 +234,21 @@ pub fn check_change(log: &Membership, action: &Action, now_ms: u64) -> Result<()
     if capacity.entries_level() == CapacityLevel::Full {
         return Err(ChangeRefusal::LogFull);
     }
+    // Exhaustive, no wildcard: each action's pacing is a conscious choice.
     match action {
-        Action::Add { .. } | Action::RecoveryAdd { .. }
-            if capacity.members_level() == CapacityLevel::Full =>
-        {
-            Err(ChangeRefusal::MembersFull)
+        Action::Add { .. } | Action::RecoveryAdd { .. } => {
+            if capacity.members_level() == CapacityLevel::Full {
+                Err(ChangeRefusal::MembersFull)
+            } else {
+                Ok(())
+            }
         }
-        Action::AddHost { host }
-            if capacity.hosts_level() == CapacityLevel::Full
-                && log.host(&host.host_id).is_none() =>
-        {
-            Err(ChangeRefusal::HostsFull)
+        Action::AddHost { host } => {
+            if capacity.hosts_level() == CapacityLevel::Full && log.host(&host.host_id).is_none() {
+                Err(ChangeRefusal::HostsFull)
+            } else {
+                Ok(())
+            }
         }
         Action::SetRoles {
             device_id,
@@ -236,7 +281,35 @@ pub fn check_change(log: &Membership, action: &Action, now_ms: u64) -> Result<()
                 _ => Ok(()),
             }
         }
-        _ => Ok(()),
+        Action::Genesis { .. }
+        | Action::SetRoles {
+            change: RolesChange::Native(_),
+            ..
+        }
+        | Action::Remove { .. }
+        | Action::RemoveHost { .. }
+        | Action::SetRecoveryKey { .. }
+        | Action::RecoveryApprove { .. }
+        | Action::RecoveryVeto { .. }
+        | Action::KBackup(_) => Ok(()),
+        Action::ProjectSet { .. } | Action::ProjectRemove { .. } => Ok(()),
+        Action::HostSenderRevoke { host_id, .. } => match log.host_sender_state(host_id) {
+            Some(HostSenderState::Revoked { .. }) => Err(ChangeRefusal::AlreadyRevoked),
+            Some(HostSenderState::Authorized { .. }) | None => Ok(()),
+        },
+        Action::HostSenderReadmit { host_id } => match log.host_sender_state(host_id) {
+            Some(HostSenderState::Revoked { .. }) => Ok(()),
+            Some(HostSenderState::Authorized { .. }) | None => Err(ChangeRefusal::NotRevoked),
+        },
+        Action::HostEncKey {
+            host_id, enc_key, ..
+        } => {
+            if log.derived.host_enc_keys.was_set(host_id, enc_key) {
+                Err(ChangeRefusal::EncKeyReused)
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 

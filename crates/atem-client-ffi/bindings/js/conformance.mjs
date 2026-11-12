@@ -111,6 +111,11 @@ check("log L verifies to its head", () => eq(logL().head(), { seq: mlog.head.seq
 check("every entry: jcs, signing input, entry_hash", () => {
   for (const v of [...mlog.log, ...mlog.others]) {
     if (v.label === "K7_current_no_kit_sig") continue;
+    // A set out of order: the signed-object parse itself refuses it.
+    if (v.reason === "array_not_canonical") {
+      throwsCode(() => m.signedObjectInfo(str(v.entry)), "array_not_canonical");
+      continue;
+    }
     const info = m.signedObjectInfo(str(v.entry));
     if (v.jcs !== undefined) eq(info.bodyJcs, v.jcs, `${v.label} jcs`);
     if (v.signing_input_hex !== undefined) eq(hex(info.signingInput), v.signing_input_hex, `${v.label} input`);
@@ -298,6 +303,161 @@ check("project keys and hashes (§R9.6)", () => {
   throwsCode(() => m.projectHashFromMac("0123abcd", new Uint8Array(31)), "malformed");
   eq(m.isProjectHash(byLabel.E5.entry.body.member.scope.projects[0]), true);
   eq(m.isProjectHash("h1.0123abcd.zz"), false);
+});
+
+// ----------------------------------- delegated host work: device-list actions
+// The vectors of `others` that follow a `chain` on log L (P*, EK*, HS*): a
+// valid one carries `expect`, the state a verifier derives after it (read
+// here through the log's queries); a refused one `valid: false` and `reason`
+// (`evaluate` stops with it at index 0; a body the signed-object parse
+// refuses, `array_not_canonical`, never reaches the log: `evaluate` throws).
+// `project_set`, `project_remove`, `host_sender_revoke`,
+// `host_sender_readmit` and `host_enc_key` are also rebuilt by their
+// builders, byte for byte, where a builder can write the body.
+const FIVE = ["project_set", "project_remove", "host_sender_revoke", "host_sender_readmit", "host_enc_key"];
+const delegated = mlog.others.filter((v) => v.chain !== undefined);
+const sorted = (v) =>
+  Array.isArray(v) ? v.map(sorted) : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sorted(v[k])])) : v;
+const same = (a, b, what) => eq(str(sorted(a)), str(sorted(b)), what);
+const logAfter = (chain) => {
+  const log = logL();
+  eq(log.extend(chain.map(entry), NOW).stop, null, `chain ${chain}`);
+  return log;
+};
+const hostKeyName = (hostId, gen) => (gen === 1 ? hostId : `${hostId}-gen-${gen}`);
+const encKeyOf = (k) => ({ alg: k.alg, raw: b64u(k.pub) });
+const stateOf = (log) => {
+  const state = { hosts: {}, projects: {}, host_senders: {}, host_enc_keys: {} };
+  const keyOut = (k) => ({ enc_kid: k.encKid, pub: Buffer.from(k.key.raw).toString("base64url"), seq: k.seq, host_trust_gen: k.hostTrustGen });
+  for (const id of ["host-a", "host-b"]) {
+    const host = log.host(id);
+    if (host) state.hosts[id] = host.hostTrustGen;
+    const sender = log.hostSenderState(id);
+    const epoch = log.hostMembershipEpoch(id) ?? null;
+    if (sender) {
+      state.host_senders[id] = { state: sender.type, seq: sender.type === "authorized" ? sender.generation : sender.seq };
+      if (epoch !== null) state.host_senders[id].membership_epoch = epoch;
+    } else eq(epoch, null, `${id} epoch without an add_host`);
+    const keysOf = log.hostEncKey(id);
+    if (keysOf) {
+      state.host_enc_keys[id] = { current: keyOut(keysOf.current) };
+      if (keysOf.previous) state.host_enc_keys[id].previous = { ...keyOut(keysOf.previous.key), retired: keysOf.previous.retired, replaced_at_seq: keysOf.previous.replacedAtSeq };
+    }
+  }
+  for (const p of log.projects()) state.projects[p.name] = { hosts: p.hosts, members: p.members, ops: p.ops };
+  return state;
+};
+const opsBetween = (expect, a, b) => {
+  if (a === b) return [];
+  const ops = new Set();
+  for (const p of Object.values(expect.projects)) if (p.members.includes(a) && p.members.includes(b)) for (const op of p.ops) ops.add(op);
+  return [...ops].sort();
+};
+check("device-list actions: the queries read every vector's expect, refusals carry their reason", () => {
+  let valid = 0;
+  let refused = 0;
+  for (const v of delegated) {
+    const log = logAfter(v.chain);
+    if (v.valid === false) {
+      refused++;
+      if (v.reason === "array_not_canonical") throwsCode(() => log.evaluate([entry(v.label)], NOW), v.reason);
+      else eq(log.evaluate([entry(v.label)], NOW).stop, { type: "invalid", index: 0, code: v.reason }, v.label);
+      continue;
+    }
+    valid++;
+    const r = log.extend([entry(v.label)], NOW);
+    eq(r.stop, null, v.label);
+    eq(r.appended, 1, v.label);
+    eq(r.head.hash, v.entry_hash, v.label);
+    same(stateOf(log), v.expect, v.label);
+    for (const [a, b] of [["host-a", "host-b"], ["host-b", "host-a"], ["host-a", "host-a"]]) eq(log.projectOpsBetween(a, b), opsBetween(v.expect, a, b), `${v.label} ${a} ${b}`);
+    for (const id of ["host-a", "host-b"]) eq(log.hostProjects(id), Object.entries(v.expect.projects).filter(([, p]) => p.members.includes(id)).map(([name]) => name).sort(), `${v.label} ${id}`);
+  }
+  if (valid < 34 || refused < 35) throw new Error(`${valid} valid, ${refused} refused`);
+});
+const buildAction = (body) => {
+  const at = body.signed_at;
+  switch (body.action) {
+    case "project_set": return m.projectSetAction(body.project.name, body.project.hosts, body.project.ops, at);
+    case "project_remove": return m.projectRemoveAction(body.name, at);
+    case "host_sender_revoke": return m.hostSenderRevokeAction(body.host_id, body.interrupt_running, at);
+    case "host_sender_readmit": return m.hostSenderReadmitAction(body.host_id, at);
+    case "host_enc_key": return m.hostEncKeyAction(body.host_id, body.host_trust_gen, body.enc_key.alg, b64u(body.enc_key.pub), body.enc_sig, body.retire_previous === true, at);
+    default: throw new Error(body.action);
+  }
+};
+// A body no builder writes: another signer's entry (a builder's action is
+// drafted for the signer that asks), or a shape outside the builders' inputs
+// (`retire_previous: false`, a revoke without `interrupt_running`, a field
+// the action doesn't have, a set out of order).
+const unbuildable = (v) =>
+  v.entry.body.signer !== "dev-mac" ||
+  v.entry.body.retire_previous === false ||
+  (v.entry.body.action === "host_sender_revoke" && typeof v.entry.body.interrupt_running !== "boolean") ||
+  v.reason === "unknown_field" ||
+  v.reason === "array_not_canonical";
+const ADVICE = ["already_revoked", "not_revoked", "enc_key_reused"];
+check("device-list actions: the builders reproduce the vectors; check_change advises on a redundant revoke or readmit and a reused key", () => {
+  let built = 0;
+  for (const v of delegated.filter((x) => FIVE.includes(x.entry.body.action))) {
+    const body = v.entry.body;
+    if (unbuildable(v)) continue;
+    // A shape the verifier refuses by itself is the builder's refusal too.
+    if (["bad_project", "malformed", "wrong_alg"].includes(v.reason)) {
+      throwsCode(() => buildAction(body), v.reason);
+      continue;
+    }
+    const log = logAfter(v.chain);
+    const action = buildAction(body);
+    built++;
+    eq(log.draftEntry("dev-mac", body.signed_at, action), v.jcs, v.label);
+    const advice = log.checkChange(action, body.signed_at);
+    eq(advice, ADVICE.includes(v.reason) ? { type: v.reason } : null, `${v.label} check_change`);
+  }
+  if (built < 38) throw new Error(`${built} built`);
+});
+check("device-list actions: shapes the verifier refuses by itself", () => {
+  const two = ["host-a", "host-b"];
+  throwsCode(() => m.projectSetAction("astation", two, ["deploy"], 1), "bad_project");
+  throwsCode(() => m.projectSetAction("astation", two, [], 1), "bad_project");
+  throwsCode(() => m.projectSetAction("astation", ["host-a"], ["message"], 1), "bad_project");
+  throwsCode(() => m.projectSetAction("Astation", two, ["message"], 1), "bad_project");
+  throwsCode(() => m.projectSetAction("astation", two, ["notify", "prompt"], 1), "bad_project");
+  throwsCode(() => m.projectRemoveAction("Bad Name", 1), "bad_project");
+  throwsCode(() => m.hostSenderRevokeAction("Not an id", false, 1), "malformed");
+  throwsCode(() => m.hostSenderReadmitAction("", 1), "malformed");
+  const ek = byLabel.EK7_set.entry.body;
+  throwsCode(() => m.hostEncKeyAction("host-a", 1, "ed25519", unhex(keys["host-a"].host_key.pub_hex), ek.enc_sig, false, 1), "wrong_alg");
+  throwsCode(() => m.hostEncKeyAction("host-a", 1, "x25519", b64u(ek.enc_key.pub), "AAAA", false, 1), "malformed");
+  throwsCode(() => m.hostEncKeyAction("host-a", 1, "x25519", b64u(ek.enc_key.pub), `${ek.enc_sig}=`, false, 1), "malformed");
+});
+check("device-list actions: verifyHostEncSig binds every field of a host's enc_sig", () => {
+  const ek = byLabel.EK7_set.entry.body;
+  const hostA = ["ed25519", unhex(keys["host-a"].host_key.pub_hex)];
+  const verify = (host, account, genesis, hostId, gen, key, sig) => m.verifyHostEncSig(...host, account, genesis, hostId, gen, key.alg, key.raw, sig);
+  const key = encKeyOf(ek.enc_key);
+  eq(verify(hostA, ACCOUNT, GENESIS, "host-a", 1, key, ek.enc_sig), true);
+  eq(verify(["ed25519", unhex(keys["host-b"].host_key.pub_hex)], ACCOUNT, GENESIS, "host-a", 1, key, ek.enc_sig), false, "another host's key");
+  eq(verify(hostA, "acct-other", GENESIS, "host-a", 1, key, ek.enc_sig), false, "account");
+  eq(verify(hostA, ACCOUNT, "00".repeat(32), "host-a", 1, key, ek.enc_sig), false, "genesis");
+  eq(verify(hostA, ACCOUNT, GENESIS, "host-b", 1, key, ek.enc_sig), false, "host id");
+  eq(verify(hostA, ACCOUNT, GENESIS, "host-a", 2, key, ek.enc_sig), false, "generation");
+  eq(verify(hostA, ACCOUNT, GENESIS, "host-a", 1, encKeyOf(byLabel.EK8_rotate.entry.body.enc_key), ek.enc_sig), false, "key");
+  eq(verify(["p256", unhex(keys["dev-mac"].auth.pub_hex)], ACCOUNT, GENESIS, "host-a", 1, key, ek.enc_sig), false, "a P-256 host key");
+  eq(verify(hostA, ACCOUNT, GENESIS, "host-a", 1, { alg: "ed25519", raw: key.raw }, ek.enc_sig), false, "an Ed25519 enc_key");
+  eq(verify(hostA, ACCOUNT, "not hex", "host-a", 1, key, ek.enc_sig), false, "a malformed genesis");
+  eq(verify(hostA, ACCOUNT, GENESIS, "host-a", 1, key, "AAAA"), false, "a short signature");
+  // Inputs no key, generation or algorithm can be: false, never a throw.
+  eq(verify(["rsa", hostA[1]], ACCOUNT, GENESIS, "host-a", 1, key, ek.enc_sig), false, "an unknown host alg");
+  eq(verify(hostA, ACCOUNT, GENESIS, "host-a", 1, { alg: "rsa", raw: key.raw }, ek.enc_sig), false, "an unknown enc alg");
+  for (const gen of [-1, 1.5, 2 ** 53]) eq(verify(hostA, ACCOUNT, GENESIS, "host-a", gen, key, ek.enc_sig), false, `generation ${gen}`);
+  // Every enc_sig of the vectors whose binding fields parse (they carry
+  // enc_sig_input_hex) verifies under the host key of its generation, but the bad one.
+  for (const v of delegated.filter((x) => x.enc_sig_input_hex !== undefined)) {
+    const b = v.entry.body;
+    const host = ["ed25519", unhex(keys[hostKeyName(b.host_id, b.host_trust_gen)].host_key.pub_hex)];
+    eq(verify(host, ACCOUNT, GENESIS, b.host_id, b.host_trust_gen, encKeyOf(b.enc_key), b.enc_sig), v.reason !== "bad_enc_sig", v.label);
+  }
 });
 
 // ---------------------------------------------------------------- recovery

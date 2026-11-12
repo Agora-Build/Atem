@@ -132,7 +132,9 @@ impl TestLog {
         self.log.genesis_hash()
     }
 
-    fn append(&mut self, signer: &str, action: Action) -> Value {
+    /// An entry by `signer` on the head, signed with its key in
+    /// [`TestLog::keys`] and appended; its wire form.
+    pub fn append(&mut self, signer: &str, action: Action) -> Value {
         let body = self.log.draft(signer, now_wall(), &action);
         let entry = sign_entry(&self.keys, &auth(signer), body).unwrap();
         self.entries.push(entry.clone());
@@ -422,4 +424,80 @@ impl TestLog {
 /// `b64u` of a host channel key's public half.
 pub fn host_pub_b64u(seed: &[u8; 32]) -> String {
     b64u(&ed_pub(seed))
+}
+
+/// The device-list entries of the delegated host-work design, for a list
+/// where `host_id` is a current host at `host_trust_gen` whose `host_key` is
+/// the Ed25519 key of `host_seed`, each valid after the one before it: an
+/// `add_host` of `other_host` (a project lists at least two hosts), then one
+/// of each new action: `project_set` (twice) and `project_remove` (II.2.2),
+/// `host_sender_revoke` and `host_sender_readmit` of `host_id` (II.3.1) and
+/// its `host_enc_key` (II.4.1, the `enc_sig` signed with `host_seed`).
+pub fn delegated_actions(
+    account: &str,
+    genesis: &Hash32,
+    host_id: &str,
+    host_trust_gen: u64,
+    host_seed: &[u8; 32],
+    other_host: &str,
+    signed_at: u64,
+) -> Vec<Action> {
+    use atem_client::KeyProvider;
+    use atem_client::membership::{
+        ProjectOp, host_enc_key, host_sender_readmit, host_sender_revoke, project_remove,
+        project_set, sign_host_enc_key,
+    };
+    let mut keys = SoftwareKeys::new();
+    let host_key = KeyId::new("host key");
+    keys.insert_ed25519(host_key.clone(), host_seed);
+    let enc = KeyId::new("host enc key");
+    keys.insert_x25519(enc.clone(), &secret("host enc key"));
+    let enc_key = keys.public_key(&enc).unwrap();
+    let enc_sig = sign_host_enc_key(
+        &keys,
+        &host_key,
+        account,
+        genesis,
+        host_id,
+        host_trust_gen,
+        enc_key.as_32().unwrap(),
+    )
+    .unwrap();
+    let hosts = [host_id, other_host];
+    vec![
+        Action::AddHost {
+            host: HostRecord {
+                host_id: other_host.into(),
+                host_trust_gen: 1,
+                host_key: PublicKey::new(Alg::Ed25519, &ed_pub(&secret("other host seed")))
+                    .unwrap(),
+            },
+        },
+        project_set(
+            "demo",
+            hosts,
+            [ProjectOp::Launch, ProjectOp::Message],
+            signed_at,
+        )
+        .unwrap(),
+        project_set(
+            "demo",
+            hosts,
+            [ProjectOp::Message, ProjectOp::Notify, ProjectOp::Prompt],
+            signed_at,
+        )
+        .unwrap(),
+        project_remove("demo", signed_at).unwrap(),
+        host_sender_revoke(host_id, true, signed_at).unwrap(),
+        host_sender_readmit(host_id, signed_at).unwrap(),
+        host_enc_key(
+            host_id,
+            host_trust_gen,
+            &enc_key,
+            &enc_sig,
+            false,
+            signed_at,
+        )
+        .unwrap(),
+    ]
 }

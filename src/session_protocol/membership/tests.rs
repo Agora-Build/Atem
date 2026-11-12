@@ -1515,3 +1515,212 @@ fn the_runtime_status_line_carries_the_capacity() {
         "pinned at seq 6 (1 remote client); 6/1024 entries, 3/256 members, 1/64 hosts"
     );
 }
+
+// ── The delegated host-work design's device-list actions (step 3) ──
+
+/// After the vectors' entries (the last is at 1792400006000), before `t0()`.
+const NEW_AT: u64 = 1_792_400_100_000;
+
+/// dev-mac's P-256 `auth_key` (`r9-vectors-keys`) as a software key, the
+/// manager that signs the new entries.
+fn mac_keys() -> (atem_client::SoftwareKeys, atem_client::KeyId) {
+    let bytes = std::fs::read(fixtures_dir().join("r9-vectors-keys.json")).unwrap();
+    let file: Value = serde_json::from_slice(&bytes).unwrap();
+    let hex = file["keys"]["dev-mac"]["auth"]["secret_hex"]
+        .as_str()
+        .unwrap();
+    let id = atem_client::KeyId::new("dev-mac/auth");
+    let mut keys = atem_client::SoftwareKeys::new();
+    keys.insert_p256(id.clone(), &Hash32::from_hex(hex).unwrap().0)
+        .unwrap();
+    (keys, id)
+}
+
+/// A second host, then one entry of each new action, valid on the vectors'
+/// list (host-a at trust generation 1, its `host_key` the vectors' seed),
+/// each after the one before it.
+fn new_actions() -> Vec<atem_client::membership::Action> {
+    r9log::delegated_actions(
+        "acct-test-1",
+        &vectors().hash("E1"),
+        "host-a",
+        1,
+        &host_a_seed(),
+        "host-b",
+        NEW_AT,
+    )
+}
+
+/// `actions` signed one after another by dev-mac on top of `m`, as the
+/// carriage a device would send and the list it makes.
+fn signed_on(
+    m: &Membership,
+    actions: &[atem_client::membership::Action],
+) -> (Vec<StrictValue>, Membership) {
+    let (keys, key) = mac_keys();
+    let mut m = m.clone();
+    let mut carriage = Vec::new();
+    for (i, action) in actions.iter().enumerate() {
+        let body = m.draft("dev-mac", NEW_AT + i as u64, action);
+        let entry = atem_client::membership::sign_entry(&keys, &key, body).unwrap();
+        let wire = entry.object().to_json().to_string();
+        carriage.push(StrictValue::parse(wire.as_bytes(), usize::MAX).unwrap());
+        let eval = m.evaluate_objects(&[entry.object().clone()], &t0());
+        assert_eq!(eval.stop, None, "{action:?}");
+        m = eval.next;
+    }
+    (carriage, m)
+}
+
+/// II.3.1 "Crash safety: effects belong to R9.3's step 4": a host principal
+/// has no attachments, so the five actions fence nothing; the host-work
+/// effects (cancellations, interrupt intents) come in step 4 with
+/// host-work's own applied device-list seq. Alone or after a removal (whose
+/// fence keeps its own seq), committed in one go or killed between the
+/// commit and its fences and replayed at the restart.
+#[test]
+fn carriage_with_new_actions_commits_without_fences() {
+    let v = vectors();
+    let actions = new_actions();
+    for (with_removal, crash) in [(false, false), (false, true), (true, false), (true, true)] {
+        let case = format!("removal: {with_removal}, crash: {crash}");
+        let rig = Rig::new();
+        rig.pin(&LOG6);
+        let (mut host, mut f) = opened(&rig, 1);
+        let (base, mut carriage) = if with_removal {
+            let e7: Vec<&str> = LOG6.iter().copied().chain(["E7"]).collect();
+            (pinned(&e7, &t0()), v.carry(&["E7"]))
+        } else {
+            (host.membership().clone(), Vec::new())
+        };
+        let (new, list) = signed_on(&base, &actions);
+        carriage.extend(new);
+        assert_eq!(list.head().seq, 6 + with_removal as u64 + 7);
+        // Only a removal fences, at its own entry; the new entries after it
+        // add nothing.
+        let fenced = if with_removal {
+            vec![(SVC.to_owned(), 7)]
+        } else {
+            Vec::new()
+        };
+        if crash {
+            host.crash_after_commit();
+        }
+        let result = host.apply_carriage(&carriage, &t0(), &mut f);
+        assert_eq!(rig.disk_head(), list.head(), "{case}");
+        assert_eq!(host.head(), list.head(), "{case}");
+        if crash {
+            assert_eq!(result.carried, Carried::Crashed, "{case}");
+            assert!(f.fenced.is_empty(), "{case}: died before the fences");
+            assert!(rig.exists(DlFile::Intent) && rig.exists(DlFile::Carriage));
+            drop(host);
+            let mut f2 = remote();
+            let (host, replayed) = rig.open(2, &t0(), &mut f2).unwrap();
+            assert_eq!(f2.fenced, fenced, "{case}");
+            assert_eq!(replayed.len(), fenced.len(), "{case}");
+            assert_eq!(host.head(), list.head(), "{case}");
+            assert_eq!(host.applied().head, list.head(), "{case}");
+            assert!(host.held().is_none() && host.faulted().is_none(), "{case}");
+            assert!(!host.is_frozen(), "{case}");
+            assert!(!rig.exists(DlFile::Intent) && !rig.exists(DlFile::Carriage));
+            continue;
+        }
+        assert_eq!(result.carried, Carried::Committed, "{case}");
+        assert!(result.announce, "{case}");
+        assert_eq!(f.fenced, fenced, "{case}");
+        assert_eq!(result.fences.len(), fenced.len(), "{case}");
+        assert!(f.faults.is_empty(), "{case}");
+        assert_eq!(host.applied().head, list.head(), "{case}");
+        assert!(host.held().is_none() && host.faulted().is_none(), "{case}");
+        assert!(!host.is_frozen(), "{case}");
+        assert!(!rig.exists(DlFile::Carriage) && !rig.exists(DlFile::Intent));
+        // The verifier did take every entry in: each action's effect is in
+        // the evaluation, in order, and none is a fence.
+        let eval = result.evaluation.as_ref().unwrap();
+        assert_eq!(eval.stop, None, "{case}");
+        let first = 7 + with_removal as u64;
+        let effects: Vec<&Change> = eval
+            .effects
+            .iter()
+            .filter(|e| !matches!(e, Change::Appended(_)))
+            .skip(with_removal as usize)
+            .collect();
+        assert_eq!(
+            effects,
+            vec![
+                &Change::HostKeyChanged {
+                    host_id: "host-b".into()
+                },
+                &Change::ProjectSet {
+                    name: "demo".into()
+                },
+                &Change::ProjectSet {
+                    name: "demo".into()
+                },
+                &Change::ProjectRemoved {
+                    name: "demo".into()
+                },
+                &Change::HostSenderRevoked {
+                    host_id: "host-a".into(),
+                    seq: first + 4,
+                    interrupt_running: true
+                },
+                &Change::HostSenderReadmitted {
+                    host_id: "host-a".into(),
+                    seq: first + 5
+                },
+                &Change::HostEncKeySet {
+                    host_id: "host-a".into(),
+                    retire_previous: false
+                },
+            ],
+            "{case}"
+        );
+    }
+}
+
+/// Every new entry counts as an entry (the head's `seq`, against the limit
+/// of 1,024); only `add_host` moves the hosts, and a `project_set`, a
+/// sender revocation or a `host_enc_key` adds no host and no member.
+#[test]
+fn capacity_counts_new_entries() {
+    let rig = Rig::new();
+    rig.pin(&LOG6);
+    let (mut host, mut f) = opened(&rig, 1);
+    let before = host.membership().capacity();
+    assert_eq!(before, Capacity::of(6, 3, 1));
+    let actions = new_actions();
+    let (carriage, list) = signed_on(host.membership(), &actions);
+    // Each entry is committed on its own, so each count is seen.
+    let mut seen = Vec::new();
+    for (i, entry) in carriage.iter().enumerate() {
+        let result = host.apply_carriage(std::slice::from_ref(entry), &t0(), &mut f);
+        assert_eq!(result.carried, Carried::Committed, "{}", actions[i].name());
+        seen.push(host.membership().capacity());
+    }
+    // `add_host` of host-b: one entry, one host; then six that change neither
+    // members nor hosts.
+    assert_eq!(
+        seen,
+        [
+            Capacity::of(7, 3, 2),
+            Capacity::of(8, 3, 2),
+            Capacity::of(9, 3, 2),
+            Capacity::of(10, 3, 2),
+            Capacity::of(11, 3, 2),
+            Capacity::of(12, 3, 2),
+            Capacity::of(13, 3, 2),
+        ]
+    );
+    assert_eq!(host.membership().capacity(), list.capacity());
+    assert_eq!(host.head(), list.head());
+    assert!(f.fenced.is_empty() && f.faults.is_empty());
+    // Nothing nearly full: no log line, and the status says the new use.
+    assert_eq!(capacity_crossing(&before, &list.capacity()), None);
+    let status =
+        crate::runtime::host_bridge::device_list_status_of(Some(&host), None, 1, &t0()).unwrap();
+    assert_eq!(
+        status.text,
+        "pinned at seq 13 (1 remote client); 13/1024 entries, 3/256 members, 2/64 hosts"
+    );
+}

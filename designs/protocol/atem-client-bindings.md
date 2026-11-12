@@ -160,11 +160,17 @@ UpperCamelCase types (`MembershipLog.verify(accountId:genesisHash:entries:now:)`
 | `draft_entry(signer, signed_at, action_json)` | the next entry's body, checked with the verifier's own schema; show it, then publish (below) |
 | `check_member(member_json)` | a member object for `add` / `recovery_add`, checked |
 | `capacity()` | `CapacityInfo{entries, max_entries, members, max_members, hosts, max_hosts, level, entries_level, members_level, hosts_level}`: the verifier's own counts against its limits (1024 entries; 256 members, counting members in effect and pending `recovery_add`s; 64 current hosts); `level` `ok` / `nearly_full` (≥ 90 % of any) / `full`. From `nearly_full` show a warning per limit (D23): entries, "renewals use one entry each; a full list needs re-pairing"; members, "remove expired or unused services so a place stays free for a Recovery Kit" (a full member list refuses the kit's `recovery_add` too); hosts, "remove hosts no longer used" |
-| `check_change(action_json, now_ms)` | before `draft_entry` (same `action_json`; `now_ms` the `signed_at` it would carry): `None` to go ahead, else `ChangeRefusalInfo` `LogFull` (no entry fits, a removal included), `MembersFull` (no `add`, and no `recovery_add`: a Recovery Kit can't bring the account back until a member is removed), `HostsFull` (no `add_host` of a host that isn't current), `ServiceChangeTooSoon{last_signed_at, retry_at}` (JS `service_change_too_soon`: a service `set_roles` that grants anything new, e.g. a renewal, within 24 h of that service's last grant; a narrowing doesn't restart the clock; narrowing and `remove` are never paced). Advisory for signers: hosts still accept any valid entry |
+| `check_change(action_json, now_ms)` | before `draft_entry` (same `action_json`; `now_ms` the `signed_at` it would carry): `None` to go ahead, else `ChangeRefusalInfo` `LogFull` (no entry fits, a removal included), `MembersFull` (no `add`, and no `recovery_add`: a Recovery Kit can't bring the account back until a member is removed), `HostsFull` (no `add_host` of a host that isn't current), `ServiceChangeTooSoon{last_signed_at, retry_at}` (JS `service_change_too_soon`: a service `set_roles` that grants anything new, e.g. a renewal, within 24 h of that service's last grant; a narrowing doesn't restart the clock; narrowing and `remove` are never paced), `AlreadyRevoked` (JS `already_revoked`: a `host_sender_revoke` of a host already revoked; the verifier would refuse it, `already_revoked`), `NotRevoked` (JS `not_revoked`: a `host_sender_readmit` of a host that isn't revoked, a host never added included; `not_revoked`), `EncKeyReused` (JS `enc_key_reused`: a `host_enc_key` of a key already set for that host since its newest `add_host`, the current, previous, a retired or a dropped one; the verifier would refuse it, `enc_key_reused`: ask the host for a new key). The project actions and a revoke of a host never added (the verifier refuses it, `unknown_host`) are never refused here; none of the five actions is paced. Advisory for signers: hosts still accept any valid entry |
 | `admit_carrier(device_id, entries, more, now)` | host role, feature `host` only (never in an app build) |
 | `service_grant(device_id)` | `ServiceGrantInfo{scope, expires_at}` of an active service member (its scope in canonical order), else `None`: what a renewal or narrowing starts from. Status only: an expired service is still returned; compare `expires_at` with the time yourself |
 | `service_renewal_action(device_id, expires_at, signed_at)` | the action JSON of a renewal (the current scope, a later `expires_at` ≤ 90 days after `signed_at`); `Invalid` `not_a_service` / `not_a_renewal`. Run `check_change` on it first: a renewal is paced |
 | `service_narrowing_action(device_id, scope, expires_at?, signed_at)` | the action JSON of a narrowing (`expires_at` `None`: unchanged): nothing new granted and something changed, else `Invalid` `not_a_narrowing`; never paced |
+| `host_sender_state(host_id)` | `HostSenderStateInfo` `Authorized{generation}` or `Revoked{seq}` (JS `{type: "authorized", generation}` / `{type: "revoked", seq}`) of a host an `add_host` ever named (a removed host keeps it), else `None`: its sending authorization (delegated host work II.3.1). Only a revoke or readmit changes it; a re-verification, a removal and a re-add never do |
+| `host_membership_epoch(host_id)` | the `seq` of the host's first `add_host` after its last `remove_host` (its first if never removed); `None` for a host never added, or removed and not added again |
+| `projects()` | the projects in effect, by name: `ProjectInfo{name, hosts, members, ops}` (`hosts` as the latest `project_set` signed them, `members` the ones whose membership is still in effect, `ops` from `launch`, `message`, `notify`, `prompt`; all sorted). A project whose hosts were all removed stays, with no `members`, until a `project_remove` |
+| `host_projects(host_id)` | the names of the projects the host is an in-effect member of, in order |
+| `project_ops_between(a, b)` | what two hosts may send each other: the sorted union of the `ops` of every project both are in-effect members of; empty when `a` is `b` |
+| `host_enc_key(host_id)` | `HostEncKeysInfo{current, previous?}` of a current host for its newest `add_host` (II.4.1), else `None`: each key `HostEncKeyInfo{enc_kid, key (X25519), seq, host_trust_gen}`, the previous `PreviousHostEncKeyInfo{key, retired, replaced_at_seq}`. A re-verification (a newer `add_host`) or a removal voids both |
 
 The log object is shared by reference: `extend`, `advance`, a publisher's
 or writer's reply change it in place. `snapshot()` copies.
@@ -481,6 +487,51 @@ with the new kid's hashes) before the old generation is dropped (§R9.13
 item 4). The host compares a session's hash under the kid each entry
 names, so both generations' hashes can be listed during the change.
 
+### Host senders, projects and host keys (delegated host work; signing planned)
+
+What a native manager drafts to authorize hosts to send each other work
+(delegated host work design II.2.2, II.3.1, II.4.1; the entries, rules and
+vectors are in `atem-session-v1.md` R9.2, "Host senders and projects").
+Like the service builders, each returns action JSON for `check_change`,
+then `draft_entry`, already checked by the verifier's own structural
+parse (a shape it refuses by itself is its refusal here, `Membership`
+`bad_project` or `malformed`; there is no second wire form). Whether the
+entry is valid on the chain (hosts current, a project in effect, a host's
+sending state, the key binding) is the verifier's, after signing.
+**Atem never signs these entries, and Astation's signing gate stays
+closed until every strict verifier of the account knows them** (an older
+verifier refuses the whole chain at the first one, II.2.2): the bindings
+carry the builders and queries so Astation can be ready.
+
+| call | effect for the app |
+|---|---|
+| `project_set_action(name, hosts, ops, signed_at)` | a `project_set`: the project's whole new state, replacing any earlier one of that name. `name` 1–32 of `[a-z0-9-]`, `hosts` 2–64 host ids, `ops` from `launch`, `message`, `notify`, `prompt` (`notify` needs `message` and `prompt`); lists in any order, duplicates dropped. `bad_project` otherwise. Purpose `Project` |
+| `project_remove_action(name, signed_at)` | a `project_remove` (the project must be in effect: the verifier says `not_a_project`). Purpose `Project` |
+| `host_sender_revoke_action(host_id, interrupt_running, signed_at)` | a `host_sender_revoke`: the host's later envelopes are refused, and with `interrupt_running` each receiving host also interrupts what it already started from it. The verifier: `unknown_host`, `already_revoked` (`check_change` says it first). Purpose `HostSender` |
+| `host_sender_readmit_action(host_id, signed_at)` | a `host_sender_readmit` of a revoked host (`not_revoked` otherwise; `check_change` says it first). Purpose `HostSender` |
+| `host_enc_key_action(host_id, host_trust_gen, enc_key, enc_sig_b64u, retire_previous, signed_at)` | a `host_enc_key`: install the X25519 `enc_key` the host vouched for with `enc_sig` (64 bytes of base64url, from the host over its channel), for its newest trust generation. `retire_previous` (false is omitted: its only form) retires the key this one replaces at once, after a suspected compromise. `wrong_alg` for a key that isn't X25519. The verifier: `not_a_host`, `host_trust_gen_not_current`, `bad_enc_sig`, `enc_key_reused` (a key set for the host since its newest `add_host` never comes back, a retired one included; `check_change` says it first). Purpose `HostEncKey` |
+| `verify_host_enc_sig(host_key, account_id, genesis_hash, host_id, host_trust_gen, enc_key, enc_sig_b64u)` | `true` when `enc_sig` is the host's (`host_key`, Ed25519 strict) signature over exactly this account, genesis, host, generation and `enc_key`; `false` for anything else, malformed inputs included, never an error (JS `verifyHostEncSig` too: an unknown `hostAlg` or `encAlg`, or a `hostTrustGen` that isn't a non-negative safe integer, is `false`). Check what the host handed over before building the entry. The host signs `enc_sig` itself, in Rust (label `atem-host-enc-key-v1`); no binding signs it, and an app provider never sees that label except as `HostSigning` |
+
+The queries are on `MembershipLog` (`host_sender_state`,
+`host_membership_epoch`, `projects`, `host_projects`, `project_ops_between`,
+`host_enc_key`, above). Their effects through `extend`/`evaluate`:
+`ProjectSet{name}`, `ProjectRemoved{name}`, `HostSenderRevoked{host_id, seq,
+interrupt_running}`, `HostSenderReadmitted{host_id, seq}` and
+`HostEncKeySet{host_id, retire_previous}`. The vectors (`others`: `P*`,
+`EK*`, `HS*`, each with its `chain` on log L and either `expect`, the state
+the queries above read, or `valid: false` and its `reason`) run through
+all three conformance suites: the queries against `expect`, the refusals
+against `reason` (a set out of order, `array_not_canonical`, is refused by
+the signed-object parse itself: `evaluate` throws it rather than stopping),
+every builder against the vector's `jcs` byte for byte where a builder can
+write the body (not another signer's entry, `retire_previous: false`, a
+missing or extra field, or a set out of order; a shape the verifier refuses
+by itself is the builder's `bad_project`, `malformed` or `wrong_alg` too),
+`check_change` on the redundant revoke and readmit and on a reused host
+key, `verify_host_enc_sig` on every `enc_sig` whose binding fields parse,
+and (Kotlin and Swift, whose providers see the request) the signing
+purposes.
+
 ### Encoding helpers
 
 `canonical_json`, `encode_fields`, `hash_fields` (SHA-256 of `enc`),
@@ -584,11 +635,14 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
   | `Remove` | `remove` | fresh |
   | `Roles` | `set_roles` | fresh |
   | `Host` | `add_host`, `remove_host` | fresh |
+  | `Project` | `project_set`, `project_remove`: a project grant, which hosts may send each other which ops (show the name, hosts and ops, or the removal) | fresh |
+  | `HostSender` | `host_sender_revoke`, `host_sender_readmit`: stop (with `interrupt_running`, also interrupt what it started) or resume accepting one host as a sender of host work | fresh |
+  | `HostEncKey` | `host_enc_key`: install the encryption key a host vouched for, which other hosts seal mail to (show the host, its trust generation, the key's `enc_kid` and `retire_previous`) | fresh |
   | `Recovery` | `recovery_add`, `recovery_approve`, `recovery_veto` | fresh |
   | `Kit` | `set_recovery_key`, the current kit's co-signature | fresh |
   | `KeyBackup` | `k_backup` | fresh (decision: a manager entry like the others) |
   | `BrowserGrant` | a browser grant | fresh |
-  | `HostSigning` | `sig_h`, push hints, seens | never asked of a client |
+  | `HostSigning` | `sig_h`, push hints, seens, a host's `enc_sig` | never asked of a client |
 
   `fresh_confirmation` is true for every purpose but `Channel` and
   `HostSigning`. A fresh confirmation covers exactly `body_json` (show the
@@ -793,7 +847,9 @@ jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (the same 45 checks in each language, over
+- **Conformance** (49 checks in JS, 50 in Kotlin and in Swift: the same 49
+  in each language, plus one in Kotlin and Swift, whose provider sees the
+  signing request and so the purposes of the five device-list actions; over
   `designs/protocol/fixtures/r9-vectors-*.json`, atem-client's own
   `crates/atem-client/vectors/r9-svc-fingerprint.json` and the framing vectors
   `designs/protocol/fixtures/host-work/{prompt-framing-v1,framing-size-v1}.json`,
@@ -804,8 +860,18 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   (with a Kotlin `AppKeyProvider` on the JDK's crypto: P-256 signing, HPKE
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
   (with a CryptoKit `AppKeyProvider`).
-- **Durable log** (`tests/stored_log.rs`, Rust; one conformance check per
-  language): a partly elapsed wait across a same-boot restart and a reboot,
+- **Device-list actions** (`tests/host_actions.rs`, Rust; four conformance
+  checks in JS, five in Kotlin and Swift, of the 45 and 46 above): every
+  `P*`/`EK*`/`HS*` vector of
+  `r9-vectors-membership-log` through the queries (`expect`) and the
+  refusals (`reason`), the builders against the vectors' `jcs` and
+  `check_change`'s advice, `verify_host_enc_sig` on every `enc_sig` whose
+  binding fields parse (and `false`, never a throw, for inputs that can't
+  be a key, a generation or an algorithm), and a manager signing each
+  action through a recording provider under its own purpose and publishing
+  it (the verifier takes the entry).
+- **Durable log** (`tests/stored_log.rs`, Rust; two conformance checks per
+  language, of the 45 above): a partly elapsed wait across a same-boot restart and a reboot,
   the wall clock set back after restore, a wait-ended decision at its chain
   position (with the entry that relies on it), pending, approved and vetoed
   recovery and key-replacement records, a frozen log, corrupted, oversize,

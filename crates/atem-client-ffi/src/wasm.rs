@@ -490,8 +490,14 @@ impl MembershipLog {
         to_js(&self.0.capacity())
     }
     /// `null` to go ahead, else `{type: "log_full" | "members_full" |
-    /// "hosts_full" | "service_change_too_soon", lastSignedAt?, retryAt?}` (advisory, for
-    /// signers).
+    /// "hosts_full" | "service_change_too_soon" | "already_revoked" |
+    /// "not_revoked" | "enc_key_reused", lastSignedAt?, retryAt?}`
+    /// (advisory, for signers: `service_change_too_soon` carries
+    /// `lastSignedAt` and `retryAt`; `already_revoked` is a
+    /// `host_sender_revoke` of a host already revoked, `not_revoked` a
+    /// `host_sender_readmit` of one that isn't revoked, a host never added
+    /// included; `enc_key_reused` a `host_enc_key` of a key already set for
+    /// that host since its newest `add_host`).
     #[wasm_bindgen(js_name = checkChange)]
     pub fn check_change(&self, action_json: String, now_ms: f64) -> JsResult<JsValue> {
         ok(self.0.check_change(action_json, ms(now_ms)?))
@@ -511,6 +517,42 @@ impl MembershipLog {
     #[wasm_bindgen(js_name = serviceKeyFingerprint)]
     pub fn service_key_fingerprint(&self, device_id: String) -> Option<String> {
         self.0.service_key_fingerprint(device_id)
+    }
+    /// `{type: "authorized", generation}` or `{type: "revoked", seq}` (a
+    /// host's sending authorization, delegated host-work II.3.1), or `null`
+    /// for a host no `add_host` named.
+    #[wasm_bindgen(js_name = hostSenderState)]
+    pub fn host_sender_state(&self, host_id: String) -> JsResult<JsValue> {
+        to_js(&self.0.host_sender_state(host_id))
+    }
+    /// The `seq` of the host's first `add_host` after its last
+    /// `remove_host`, or `null`.
+    #[wasm_bindgen(js_name = hostMembershipEpoch)]
+    pub fn host_membership_epoch(&self, host_id: String) -> JsResult<JsValue> {
+        to_js(&self.0.host_membership_epoch(host_id))
+    }
+    /// The projects in effect: `[{name, hosts, members, ops}]` (`hosts` as
+    /// signed, `members` those whose membership is in effect).
+    pub fn projects(&self) -> JsResult<JsValue> {
+        to_js(&self.0.projects())
+    }
+    /// The names of the projects the host's membership of is in effect.
+    #[wasm_bindgen(js_name = hostProjects)]
+    pub fn host_projects(&self, host_id: String) -> Vec<String> {
+        self.0.host_projects(host_id)
+    }
+    /// The ops the two hosts may send each other (the union over the
+    /// projects both are members of; empty for one host with itself).
+    #[wasm_bindgen(js_name = projectOpsBetween)]
+    pub fn project_ops_between(&self, a: String, b: String) -> Vec<String> {
+        self.0.project_ops_between(a, b)
+    }
+    /// `{current, previous}` of a host's encryption keys, each `{encKid,
+    /// key, seq, hostTrustGen}` (`previous` adds `retired` and
+    /// `replacedAtSeq`: `{key, retired, replacedAtSeq}`), or `null`.
+    #[wasm_bindgen(js_name = hostEncKey)]
+    pub fn host_enc_key(&self, host_id: String) -> JsResult<JsValue> {
+        to_js(&self.0.host_enc_key(host_id))
     }
     /// A renewal's action JSON (current scope, later `expiresAt`).
     #[wasm_bindgen(js_name = serviceRenewalAction)]
@@ -598,6 +640,113 @@ pub fn service_set_roles_action(
         ms(expires_at)?,
         ms(signed_at)?,
     ))
+}
+
+/// The action JSON of a `project_set` (ops: `launch`, `message`, `notify`,
+/// `prompt`; any order).
+#[wasm_bindgen(js_name = projectSetAction)]
+pub fn project_set_action(
+    name: String,
+    hosts: Vec<String>,
+    ops: Vec<String>,
+    signed_at: f64,
+) -> JsResult<String> {
+    err(crate::host_actions::project_set_action(
+        name,
+        hosts,
+        ops,
+        ms(signed_at)?,
+    ))
+}
+
+/// The action JSON of a `project_remove`.
+#[wasm_bindgen(js_name = projectRemoveAction)]
+pub fn project_remove_action(name: String, signed_at: f64) -> JsResult<String> {
+    err(crate::host_actions::project_remove_action(
+        name,
+        ms(signed_at)?,
+    ))
+}
+
+/// The action JSON of a `host_sender_revoke`.
+#[wasm_bindgen(js_name = hostSenderRevokeAction)]
+pub fn host_sender_revoke_action(
+    host_id: String,
+    interrupt_running: bool,
+    signed_at: f64,
+) -> JsResult<String> {
+    err(crate::host_actions::host_sender_revoke_action(
+        host_id,
+        interrupt_running,
+        ms(signed_at)?,
+    ))
+}
+
+/// The action JSON of a `host_sender_readmit`.
+#[wasm_bindgen(js_name = hostSenderReadmitAction)]
+pub fn host_sender_readmit_action(host_id: String, signed_at: f64) -> JsResult<String> {
+    err(crate::host_actions::host_sender_readmit_action(
+        host_id,
+        ms(signed_at)?,
+    ))
+}
+
+/// The action JSON of a `host_enc_key` (`encAlg` `x25519`; `encSigB64u` the
+/// host's own signature over the key, 64 bytes of base64url).
+#[wasm_bindgen(js_name = hostEncKeyAction)]
+pub fn host_enc_key_action(
+    host_id: String,
+    host_trust_gen: f64,
+    enc_alg: &str,
+    enc_raw: Vec<u8>,
+    enc_sig_b64u: String,
+    retire_previous: bool,
+    signed_at: f64,
+) -> JsResult<String> {
+    err(crate::host_actions::host_enc_key_action(
+        host_id,
+        ms(host_trust_gen)?,
+        key(enc_alg, enc_raw)?,
+        enc_sig_b64u,
+        retire_previous,
+        ms(signed_at)?,
+    ))
+}
+
+/// Whether the host's `enc_sig` over its `enc_key` verifies: `false` for
+/// anything else, never a throw, as the UniFFI `verify_host_enc_sig`
+/// (malformed values included: an unknown `hostAlg` or `encAlg`, and a
+/// `hostTrustGen` that isn't a non-negative safe integer, which UniFFI's
+/// `u64` can't carry).
+#[wasm_bindgen(js_name = verifyHostEncSig)]
+#[allow(clippy::too_many_arguments)]
+pub fn verify_host_enc_sig(
+    host_alg: &str,
+    host_raw: Vec<u8>,
+    account_id: String,
+    genesis_hash: String,
+    host_id: String,
+    host_trust_gen: f64,
+    enc_alg: &str,
+    enc_raw: Vec<u8>,
+    enc_sig_b64u: String,
+) -> bool {
+    let (Ok(host_key), Ok(host_trust_gen), Ok(enc_key)) = (
+        key(host_alg, host_raw),
+        ms(host_trust_gen),
+        key(enc_alg, enc_raw),
+    ) else {
+        return false;
+    };
+    crate::host_actions::verify_host_enc_sig(
+        host_key,
+        account_id,
+        genesis_hash,
+        host_id,
+        host_trust_gen,
+        enc_key,
+        enc_sig_b64u,
+    )
 }
 
 /// `r9_svc` of a service `auth_key` (`alg` `p256` or `ed25519`, raw bytes).

@@ -53,6 +53,8 @@ fn array_rule(label: SignLabel, path: &[&str]) -> Option<ArrayKind> {
         (SignLabel::MembershipEntry, ["k_backup", "kids"]) => Some(ArrayKind::Sequence {
             max: MAX_BACKUP_KEYS,
         }),
+        // A project grant's hosts and ops (delegated host-work II.2.2).
+        (SignLabel::MembershipEntry, ["project", "hosts" | "ops"]) => Some(ArrayKind::Set),
         (SignLabel::BrowserGrant, ["ops"]) => Some(ArrayKind::Set),
         _ => None,
     }

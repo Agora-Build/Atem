@@ -28,8 +28,8 @@ use atem_client::hpke;
 use atem_client::keys::{Alg, PublicKey, ed25519_public_to_x25519, enc_kid};
 use atem_client::kit::{self, RecoveryKit};
 use atem_client::membership::{
-    Check, Entry, Head, HostNow, Invalid, Member, MemberKind, Membership, RECOVERY_WAIT_MS,
-    RecoveryState, Role, Stop,
+    Action, Check, Entry, Head, HostNow, HostRecord, HostSenderState, Invalid, Member, MemberKind,
+    Membership, RECOVERY_WAIT_MS, RecoveryState, Role, Stop,
 };
 use atem_client::principal::{Authority, BrowserGrant, Need, Op, Refusal as PrincipalRefusal};
 use atem_client::provider::sign;
@@ -320,7 +320,7 @@ fn keys() {
     let keys = run.get("keys");
     // Labels of `secret = SHA-256(enc(["atem-r9-test-key", label]))`
     // (schema.md). Labels the fixtures name or that follow their pattern.
-    let labels: BTreeMap<&str, &str> = [
+    let labels: BTreeMap<String, &str> = [
         ("dev-evil/auth", "dev-evil auth"),
         ("dev-evil/enc", "dev-evil enc"),
         ("dev-ipad/auth", "dev-ipad auth"),
@@ -342,6 +342,13 @@ fn keys() {
         ("not-recovery/", "not the recovery key"),
     ]
     .into_iter()
+    .map(|(id, label)| (id.to_owned(), label))
+    // The keys the delegated-action vectors add.
+    .chain(
+        DELEGATED_KEYS
+            .iter()
+            .map(|&(name, part, label, _)| (format!("{name}/{part}"), label)),
+    )
     .collect();
     let test_key = |label: &str| {
         hex(&Sha256::digest(enc(&[
@@ -457,6 +464,7 @@ fn signer_of(label: &str, signer: &str) -> SigExpect {
         (_, "dev-ipad") => SigExpect::Valid("dev-ipad"),
         (_, "dev-newmac") => SigExpect::Valid("dev-newmac"),
         (_, "dev-evil") => SigExpect::Valid("dev-evil"),
+        (_, "svc-discord") => SigExpect::Valid("svc-discord"),
         other => panic!("no signer for {other:?}"),
     }
 }
@@ -477,6 +485,51 @@ fn chain_reason(label: &str) -> Option<&'static str> {
         "R8_oldkit" | "R8_oldkit_after_lost" => Some("invalid: recovery_key_retired"),
         "A8_k_self" => Some("invalid: self_approval"),
         "KB8_stale" => Some("invalid: blob_version_not_increasing"),
+        // The delegated host-work actions (II.2.2, II.3.1, II.4.1).
+        "P11_remove_again" => Some("invalid: no project of that name in effect: not_a_project"),
+        "P9_bad_project" => Some("invalid: notify without message: bad_project"),
+        "P7_not_a_host" | "EK7_not_a_host" => {
+            Some("invalid: host-b isn't a current host: not_a_host")
+        }
+        "EK8_same_key" => Some("invalid: the host's current key set again: enc_key_reused"),
+        "EK8_bad_enc_sig" => Some("invalid: enc_sig over another key's binding: bad_enc_sig"),
+        "EK8_retire_false" => Some("invalid: retire_previous present as false: malformed"),
+        "EK9_stale_gen" => {
+            Some("invalid: generation 1 after a newer add_host: host_trust_gen_not_current")
+        }
+        "HS8_revoke_again" => Some("invalid: a revoke in revoked: already_revoked"),
+        "HS7_readmit_authorized" | "HS7_readmit_unknown" => {
+            Some("invalid: a readmit of a host that isn't revoked: not_revoked")
+        }
+        "HS7_revoke_unknown" => Some("invalid: no add_host names the host: unknown_host"),
+        "EK9_removed_host" | "P10_set_removed_host" => {
+            Some("invalid: the host was added but is removed: not_a_host")
+        }
+        "P9_bad_name" => Some("invalid: a name outside [a-z0-9-]: bad_project"),
+        "P9_one_host" => Some("invalid: one host listed: bad_project"),
+        "P9_unknown_op" => Some("invalid: an unknown op: bad_project"),
+        "EK9_previous_again" => Some("invalid: the host's previous key set again: enc_key_reused"),
+        "EK10_retired_again" => Some("invalid: a retired key set again: enc_key_reused"),
+        "EK10_dropped_again" => Some("invalid: a key no longer kept set again: enc_key_reused"),
+        "HS7_revoke_no_interrupt" => Some("invalid: a revoke without interrupt_running: malformed"),
+        "HS8_readmit_interrupt" => Some("invalid: interrupt_running on a readmit: unknown_field"),
+        "EK7_gen_zero" => Some("invalid: host_trust_gen 0: malformed"),
+        "EK7_short_enc_sig" | "EK7_long_enc_sig" => {
+            Some("invalid: an enc_sig of 63 or 65 bytes: malformed")
+        }
+        "EK7_ed25519_enc_key" => Some("invalid: an Ed25519 enc_key: wrong_alg"),
+        "P9_unknown_field" => Some("invalid: a fourth field in project: unknown_field"),
+        "P9_hosts_unsorted" | "P9_hosts_duplicate" => {
+            Some("invalid: project.hosts isn't a canonical set: array_not_canonical")
+        }
+        "P9_empty_ops" => Some("invalid: no ops: bad_project"),
+        "P9_64_hosts" => Some("invalid: 64 hosts, none added: not_a_host"),
+        "P9_65_hosts" => Some("invalid: 65 hosts: bad_project"),
+        "P9_remove_bad_name" => Some("invalid: a name outside [a-z0-9-]: bad_project"),
+        "HS7_revoke_by_service" => Some("invalid: signed by a service: signer_not_manager"),
+        "P9_set_by_recovery" => {
+            Some("invalid: the recovery key signs recovery_add only: recovery_signer_action")
+        }
         _ => None,
     }
 }
@@ -542,6 +595,14 @@ impl Context {
             Check::Invalid(reason) => reason.code().to_owned(),
             other => panic!("{label}: {other:?}"),
         };
+        // The delegated-action vectors name their context.
+        if self.vectors[label].get("chain").is_some() {
+            let chain = chain_labels(&self.vectors[label]);
+            return match self.parse(label) {
+                Err(reason) => reason.code().to_owned(),
+                Ok(entry) => invalid(self.chain(&chain).check_next(&entry)),
+            };
+        }
         match label {
             "X5_svc91d" | "R7_roles" | "R7_remove" => {
                 self.parse(label).unwrap_err().code().to_owned()
@@ -714,6 +775,39 @@ fn membership_log() {
             run.pass(format!("{label}: jcs, signing input, entry_hash"));
             continue;
         }
+        if vector.get("reason") == Some(&Value::from("array_not_canonical")) {
+            // Refused by the signed-object parse itself (a set out of
+            // order), before the action is read: its values are checked
+            // from the body as written.
+            assert_eq!(
+                SignedObject::from_strict(&strict(&vector["entry"])),
+                Err(Error::ArrayNotCanonical),
+                "{label}"
+            );
+            let body_jcs = jcs(body).unwrap();
+            assert_eq!(body_jcs, s(vector, "jcs"), "{label}");
+            let input = SigningInput::new(SignLabel::MembershipEntry, body_jcs.as_bytes());
+            assert_eq!(hex(input.as_bytes()), s(vector, "signing_input_hex"));
+            let hash = Hash32::of_enc(&[b"atem-membership-hash-v1", body_jcs.as_bytes()]);
+            assert_eq!(hash.to_hex(), s(vector, "entry_hash"), "{label}");
+            let SigExpect::Valid(name) = signer_of(label, s(body, "signer")) else {
+                panic!("{label}: a valid signature expected");
+            };
+            let sig = b64u_decode(s(&vector["entry"], "sig")).unwrap();
+            book.signer_public(name).verify(&input, &sig).unwrap();
+            assert_eq!(
+                sign(&book.provider, &book.signer(name), &input).unwrap(),
+                sig,
+                "{label}: deterministic signature"
+            );
+            let reason = chain_reason(label).unwrap();
+            assert_eq!(context.refusal(label), "array_not_canonical", "{label}");
+            assert!(reason.ends_with("array_not_canonical"), "{label}");
+            run.pass(format!(
+                "{label}: refused array_not_canonical by the signed-object parse; jcs, signing input, entry_hash, signature by {name}"
+            ));
+            continue;
+        }
         let object = SignedObject::from_strict(&strict(&vector["entry"]))
             .unwrap_or_else(|e| panic!("{label}: {e}"));
         assert_eq!(object.body_type(), "atem-membership-entry");
@@ -842,6 +936,8 @@ fn membership_log() {
     assert!(l.host("host-a").is_some());
     run.pass("log L E1–E6: chain verification (seq, prev_hash, signers in effect, action rules)");
     alternatives_in_context(&mut run, &context);
+    let file = run.file.clone();
+    delegated_in_context(&mut run, &context, &book, &file);
     run.finish();
 }
 
@@ -2297,4 +2393,1524 @@ fn host_route() {
         run.pass(format!("relay reply {label}: refused"));
     }
     run.finish();
+}
+
+// ------------------------------------- delegated host-work: device-list actions
+
+// The five actions the delegated host-work design adds to the device list
+// (II.2.2 projects, II.3.1 host-sender revoke and readmit, II.4.1 the host
+// encryption key), as `others` of `r9-vectors-membership-log`: every one
+// chains on log L and the entries its `chain` names, and every valid one
+// carries `expect`, the state a verifier derives after it. They are made by
+// `write_delegated_vectors` (ignored; run it to regenerate) from the test
+// keys it adds to `r9-vectors-keys`, and `membership_log` checks each of them
+// against the verifier and against what `delegated_vectors` makes now.
+
+/// `signed_at` of the delegated-action vectors: this plus `seq` seconds.
+const DELEGATED_T0: u64 = 1_793_620_800_000;
+
+/// The test keys the delegated-action vectors add to `r9-vectors-keys`:
+/// `(name, part, label, note)`, secret = SHA-256(enc(["atem-r9-test-key",
+/// label])). `enc` parts are X25519, `host_key` parts Ed25519.
+const DELEGATED_KEYS: [(&str, &str, &str, &str); 8] = [
+    (
+        "host-a-enc-1",
+        "enc",
+        "host-a host_enc_key 1",
+        "host-a's first host encryption key (label \"host-a host_enc_key 1\"), installed by host_enc_key entries (delegated host-work II.4.1)",
+    ),
+    (
+        "host-a-enc-2",
+        "enc",
+        "host-a host_enc_key 2",
+        "host-a's second host encryption key (label \"host-a host_enc_key 2\")",
+    ),
+    (
+        "host-a-enc-3",
+        "enc",
+        "host-a host_enc_key 3",
+        "host-a's third host encryption key (label \"host-a host_enc_key 3\")",
+    ),
+    (
+        "host-a-gen-2",
+        "host_key",
+        "host-a host_channel_key gen 2",
+        "host-a's host_channel_key at host_trust_gen 2, after a re-verification (label \"host-a host_channel_key gen 2\")",
+    ),
+    (
+        "host-a-gen-3",
+        "host_key",
+        "host-a host_channel_key gen 3",
+        "host-a's host_channel_key at host_trust_gen 3, added again after its remove_host (label \"host-a host_channel_key gen 3\")",
+    ),
+    (
+        "host-b",
+        "host_key",
+        "host-b host_channel_key",
+        "the second host of the project vectors, host_trust_gen 1 (label \"host-b host_channel_key\")",
+    ),
+    (
+        "host-b-enc-1",
+        "enc",
+        "host-b host_enc_key 1",
+        "host-b's host encryption key (label \"host-b host_enc_key 1\")",
+    ),
+    (
+        "host-b-gen-2",
+        "host_key",
+        "host-b host_channel_key gen 2",
+        "host-b's host_channel_key at host_trust_gen 2, added again after its remove_host (label \"host-b host_channel_key gen 2\")",
+    ),
+];
+
+/// SHA-256(enc(["atem-r9-test-key", label])) (`schema.md`).
+fn test_key_secret(label: &str) -> [u8; 32] {
+    Sha256::digest(enc(&[b"atem-r9-test-key", label.as_bytes()])).into()
+}
+
+/// The `r9-vectors-keys` name of `host_id`'s host key at a generation:
+/// generation 1 under the host's own name.
+fn host_key_name(host_id: &str, host_trust_gen: u64) -> String {
+    if host_trust_gen == 1 {
+        host_id.to_owned()
+    } else {
+        format!("{host_id}-gen-{host_trust_gen}")
+    }
+}
+
+/// The `keys` entries of `DELEGATED_KEYS`, as `r9-vectors-keys` holds them.
+fn delegated_key_entries() -> Vec<(&'static str, Value)> {
+    DELEGATED_KEYS
+        .iter()
+        .map(|&(name, part, label, note)| {
+            let secret = test_key_secret(label);
+            let key = if part == "enc" {
+                serde_json::json!({
+                    "pub_hex": hex(&hpke::public_of(&secret).unwrap()),
+                    "secret_hex": hex(&secret),
+                })
+            } else {
+                let mut provider = SoftwareKeys::new();
+                provider.insert_ed25519(KeyId::new("k"), &secret);
+                let public = provider.public_key(&KeyId::new("k")).unwrap();
+                serde_json::json!({
+                    "alg": "ed25519",
+                    "pub_hex": hex(public.as_bytes()),
+                    "secret_hex": hex(&secret),
+                })
+            };
+            (name, serde_json::json!({ part: key, "note": note }))
+        })
+        .collect()
+}
+
+/// The parts of `expect` for one host's sending state.
+fn sender(state: &str, seq: u64, epoch: Option<u64>) -> Value {
+    let mut v = serde_json::json!({"state": state, "seq": seq});
+    if let Some(epoch) = epoch {
+        v["membership_epoch"] = epoch.into();
+    }
+    v
+}
+
+/// A project in `expect`: as signed (`hosts`), its members in effect and
+/// its ops.
+fn project_state(hosts: &[&str], members: &[&str], ops: &[&str]) -> Value {
+    serde_json::json!({"hosts": hosts, "members": members, "ops": ops})
+}
+
+/// What a verifier derives after a vector: current hosts and their
+/// generation, projects in effect, host-sender states and host encryption
+/// keys (hosts never added, or without keys, are left out).
+fn expect(hosts: Value, projects: Value, host_senders: Value, host_enc_keys: Value) -> Value {
+    serde_json::json!({
+        "hosts": hosts,
+        "projects": projects,
+        "host_senders": host_senders,
+        "host_enc_keys": host_enc_keys,
+    })
+}
+
+/// Builds the delegated-action vectors on log L with the test keys.
+struct Delegated<'a> {
+    book: &'a Book,
+    genesis: Hash32,
+    now: HostNow,
+    entries: BTreeMap<String, Entry>,
+    vectors: Vec<Value>,
+}
+
+impl<'a> Delegated<'a> {
+    fn new(book: &'a Book, file: &Value) -> Self {
+        let entries = file["log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                let entry = Entry::from_strict(&strict(&v["entry"])).unwrap();
+                (s(v, "label").to_owned(), entry)
+            })
+            .collect();
+        Delegated {
+            book,
+            genesis: Hash32::from_hex(s(file, "genesis_hash")).unwrap(),
+            now: HostNow {
+                wall_ms: 1_793_177_601_000,
+                mono_ms: 1_000,
+                boot_id: "boot-1".into(),
+            },
+            entries,
+            vectors: Vec::new(),
+        }
+    }
+
+    /// Log L followed by `chain`.
+    fn chain(&self, chain: &[&str]) -> Membership {
+        let entries: Vec<Entry> = ["E1", "E2", "E3", "E4", "E5", "E6"]
+            .iter()
+            .chain(chain)
+            .map(|l| self.entries[*l].clone())
+            .collect();
+        Membership::verify_chain("acct-test-1", &self.genesis, &entries, &self.now)
+            .unwrap()
+            .membership
+    }
+
+    fn host_key(&self, host_id: &str, host_trust_gen: u64) -> PublicKey {
+        self.book.public(&format!(
+            "{}/host_key",
+            host_key_name(host_id, host_trust_gen)
+        ))
+    }
+
+    fn enc_key(&self, name: &str) -> PublicKey {
+        self.book.public(&format!("{name}/enc"))
+    }
+
+    fn add_host(&self, host_id: &str, host_trust_gen: u64) -> Action {
+        Action::AddHost {
+            host: HostRecord {
+                host_id: host_id.into(),
+                host_trust_gen,
+                host_key: self.host_key(host_id, host_trust_gen),
+            },
+        }
+    }
+
+    /// The host's `enc_sig` (its key at `host_trust_gen`) over its binding
+    /// of the key `enc_name`.
+    fn enc_sig(&self, host_id: &str, host_trust_gen: u64, enc_name: &str) -> Vec<u8> {
+        use atem_client::membership::sign_host_enc_key;
+        let signer = KeyId::new(format!(
+            "{}/host_key",
+            host_key_name(host_id, host_trust_gen)
+        ));
+        sign_host_enc_key(
+            &self.book.provider,
+            &signer,
+            "acct-test-1",
+            &self.genesis,
+            host_id,
+            host_trust_gen,
+            self.enc_key(enc_name).as_32().unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A `host_enc_key` of `enc_name`, the host vouching with `enc_sig`.
+    fn enc_entry(
+        &self,
+        host_id: &str,
+        host_trust_gen: u64,
+        enc_name: &str,
+        enc_sig: &[u8],
+        retire_previous: bool,
+    ) -> Action {
+        atem_client::membership::host_enc_key(
+            host_id,
+            host_trust_gen,
+            &self.enc_key(enc_name),
+            enc_sig,
+            retire_previous,
+            DELEGATED_T0,
+        )
+        .unwrap()
+    }
+
+    /// The `expect` key info of `enc_name` set at `seq`.
+    fn key_info(&self, enc_name: &str, seq: u64, host_trust_gen: u64) -> Value {
+        let key = self.enc_key(enc_name);
+        serde_json::json!({
+            "enc_kid": enc_kid(&key).unwrap(),
+            "pub": b64u(key.as_bytes()),
+            "seq": seq,
+            "host_trust_gen": host_trust_gen,
+        })
+    }
+
+    /// A previous key in `expect`.
+    fn previous(
+        &self,
+        enc_name: &str,
+        seq: u64,
+        host_trust_gen: u64,
+        retired: bool,
+        replaced_at_seq: u64,
+    ) -> Value {
+        let mut v = self.key_info(enc_name, seq, host_trust_gen);
+        v["retired"] = retired.into();
+        v["replaced_at_seq"] = replaced_at_seq.into();
+        v
+    }
+
+    /// Signs `action` by dev-mac as the next entry after L + `chain`
+    /// (`edit` changes the drafted body first), and records the vector:
+    /// valid with `expect`, or refused for `reason`.
+    fn push(
+        &mut self,
+        label: &str,
+        chain: &[&str],
+        note: &str,
+        action: &Action,
+        edit: impl FnOnce(&mut Value),
+        outcome: Result<Value, &str>,
+    ) {
+        self.push_by("dev-mac", label, chain, note, action, edit, outcome);
+    }
+
+    /// `push`, drafted for and signed by `signer` (a member's `auth` key,
+    /// or `recovery`, the kit's key). A body the signed-object parse
+    /// refuses (a set out of order) is signed over its `jcs` as it stands,
+    /// so the vector shows exactly that refusal.
+    #[allow(clippy::too_many_arguments)]
+    fn push_by(
+        &mut self,
+        signer: &str,
+        label: &str,
+        chain: &[&str],
+        note: &str,
+        action: &Action,
+        edit: impl FnOnce(&mut Value),
+        outcome: Result<Value, &str>,
+    ) {
+        let m = self.chain(chain);
+        let seq = m.head().seq + 1;
+        let mut body = m.draft(signer, DELEGATED_T0 + seq * 1000, action);
+        edit(&mut body);
+        let key = self.book.signer(signer);
+        let (wire, text, input, hash, object) =
+            match SignedObject::sign(&self.book.provider, &key, body.clone()) {
+                Ok(object) => (
+                    object.to_json(),
+                    object.jcs().to_owned(),
+                    object.signing_input(),
+                    object.entry_hash().unwrap(),
+                    Some(object),
+                ),
+                Err(Error::ArrayNotCanonical) => {
+                    let text = jcs(&body).unwrap();
+                    let input = SigningInput::new(SignLabel::MembershipEntry, text.as_bytes());
+                    let sig = sign(&self.book.provider, &key, &input).unwrap();
+                    let hash = Hash32::of_enc(&[b"atem-membership-hash-v1", text.as_bytes()]);
+                    let wire = serde_json::json!({"body": body, "sig": b64u(&sig)});
+                    (wire, text, input, hash, None)
+                }
+                Err(e) => panic!("{label}: {e}"),
+            };
+        let mut v = serde_json::json!({
+            "label": label,
+            "note": note,
+            "chain": chain,
+            "entry": wire,
+            "jcs": text,
+            "signing_input_hex": hex(input.as_bytes()),
+            "entry_hash": hash.to_hex(),
+        });
+        if let Some(input) = self.binding_input(&body) {
+            v["enc_sig_input_hex"] = hex(input.as_bytes()).into();
+        }
+        match outcome {
+            Ok(expect) => v["expect"] = expect,
+            Err(reason) => {
+                v["valid"] = false.into();
+                v["reason"] = reason.into();
+            }
+        }
+        if let Some(Ok(entry)) = object.map(Entry::parse) {
+            self.entries.insert(label.to_owned(), entry);
+        }
+        self.vectors.push(v);
+    }
+
+    /// The host's `enc_sig` signing input of a `host_enc_key` body, from
+    /// its fields as written: only when the binding's own fields parse (a
+    /// generation of at least 1, an X25519 key, a 64-byte `enc_sig`).
+    fn binding_input(&self, body: &Value) -> Option<SigningInput> {
+        if body["action"] != "host_enc_key" {
+            return None;
+        }
+        let host_trust_gen = body["host_trust_gen"].as_u64().filter(|g| *g >= 1)?;
+        let enc_key = PublicKey::from_json_as(&body["enc_key"], Alg::X25519).ok()?;
+        let enc_sig = b64u_decode(body["enc_sig"].as_str()?).ok()?;
+        (enc_sig.len() == 64).then(|| {
+            atem_client::membership::host_enc_sig_input(
+                "acct-test-1",
+                &self.genesis,
+                body["host_id"].as_str().unwrap(),
+                host_trust_gen,
+                enc_key.as_32().unwrap(),
+            )
+        })
+    }
+}
+
+/// The delegated-action vectors, in file order. Each `expect` is written
+/// out by hand here; `membership_log` compares it with the verifier.
+fn delegated_vectors(book: &Book, file: &Value) -> Vec<Value> {
+    use atem_client::membership::{
+        Project, ProjectOp, host_sender_readmit, host_sender_revoke, project_remove, project_set,
+    };
+    let mut g = Delegated::new(book, file);
+    let no_edit = |_: &mut Value| {};
+    let all = ["launch", "message", "notify", "prompt"];
+    let all_ops = ProjectOp::ALL;
+    let none = serde_json::json!({});
+    let a1 = serde_json::json!({"host-a": 1});
+    let ab = serde_json::json!({"host-a": 1, "host-b": 1});
+    let a_l = sender("authorized", 2, Some(2));
+    let senders_l = serde_json::json!({"host-a": a_l});
+    let senders_ab = serde_json::json!({"host-a": a_l, "host-b": sender("authorized", 7, Some(7))});
+    let astation = |members: &[&str], ops: &[&str]| serde_json::json!({"astation": project_state(&["host-a", "host-b"], members, ops)});
+    let set_ab = |ops: &[ProjectOp]| {
+        project_set(
+            "astation",
+            ["host-a", "host-b"],
+            ops.iter().copied(),
+            DELEGATED_T0,
+        )
+        .unwrap()
+    };
+    let remove = |host_id: &str| Action::RemoveHost {
+        host_id: host_id.into(),
+    };
+
+    // ---- projects (II.2.2)
+    let p7 = ["P7_add_host_b"];
+    let p8 = ["P7_add_host_b", "P8_set"];
+    let p9_rb = ["P7_add_host_b", "P8_set", "P9_remove_host_b"];
+    g.push(
+        "P7_add_host_b",
+        &[],
+        "add_host host-b (host_trust_gen 1, key \"host-b host_channel_key\") on E6, signed by dev-mac: the second host the project vectors need (a project lists at least two); host-b is authorized(7), membership epoch 7",
+        &g.add_host("host-b", 1),
+        no_edit,
+        Ok(expect(ab.clone(), none.clone(), senders_ab.clone(), none.clone())),
+    );
+    g.push(
+        "P8_set",
+        &p7,
+        "project_set \"astation\" on P7_add_host_b: hosts host-a and host-b, ops launch, message, notify, prompt; each host may send the other those ops, and a host itself gets none",
+        &set_ab(&all_ops),
+        no_edit,
+        Ok(expect(ab.clone(), astation(&["host-a", "host-b"], &all), senders_ab.clone(), none.clone())),
+    );
+    g.push(
+        "P9_narrow",
+        &p8,
+        "project_set \"astation\" on P8_set with ops [message] only: the body is the project's whole new state and replaces P8_set's (a narrowing)",
+        &set_ab(&[ProjectOp::Message]),
+        no_edit,
+        Ok(expect(ab.clone(), astation(&["host-a", "host-b"], &["message"]), senders_ab.clone(), none.clone())),
+    );
+    g.push(
+        "P10_remove",
+        &["P7_add_host_b", "P8_set", "P9_narrow"],
+        "project_remove \"astation\" on P9_narrow: no project is in effect",
+        &project_remove("astation", DELEGATED_T0).unwrap(),
+        no_edit,
+        Ok(expect(
+            ab.clone(),
+            none.clone(),
+            senders_ab.clone(),
+            none.clone(),
+        )),
+    );
+    g.push(
+        "P11_remove_again",
+        &["P7_add_host_b", "P8_set", "P9_narrow", "P10_remove"],
+        "project_remove \"astation\" on P10_remove: invalid (no project of that name in effect): not_a_project",
+        &project_remove("astation", DELEGATED_T0).unwrap(),
+        no_edit,
+        Err("not_a_project"),
+    );
+    g.push(
+        "P9_bad_project",
+        &p8,
+        "project_set \"astation\" on P8_set with ops [notify, prompt]: invalid (notify needs message and prompt): bad_project",
+        &Action::ProjectSet {
+            project: Project {
+                name: "astation".into(),
+                hosts: vec!["host-a".into(), "host-b".into()],
+                ops: vec![ProjectOp::Notify, ProjectOp::Prompt],
+            },
+        },
+        no_edit,
+        Err("bad_project"),
+    );
+    g.push(
+        "P7_not_a_host",
+        &[],
+        "project_set \"astation\" listing host-a and host-b on E6, where host-b was never added: invalid (every listed host must be current): not_a_host",
+        &set_ab(&[ProjectOp::Message]),
+        no_edit,
+        Err("not_a_host"),
+    );
+    g.push(
+        "P9_remove_host_b",
+        &p8,
+        "remove_host host-b on P8_set: host-b leaves every project at once; \"astation\" stays in effect (as signed it still lists host-b) with host-a its only member, so it grants nothing between host-a and host-b; host-b stays authorized(7) with no membership epoch",
+        &remove("host-b"),
+        no_edit,
+        Ok(expect(
+            a1.clone(),
+            astation(&["host-a"], &all),
+            serde_json::json!({"host-a": a_l, "host-b": sender("authorized", 7, None)}),
+            none.clone(),
+        )),
+    );
+    g.push(
+        "P10_readd_host_b",
+        &p9_rb,
+        "add_host host-b again (host_trust_gen 2, key \"host-b host_channel_key gen 2\") on P9_remove_host_b: a current host again, membership epoch 10, but in no project until a new project_set lists it",
+        &g.add_host("host-b", 2),
+        no_edit,
+        Ok(expect(
+            serde_json::json!({"host-a": 1, "host-b": 2}),
+            astation(&["host-a"], &all),
+            serde_json::json!({"host-a": a_l, "host-b": sender("authorized", 7, Some(10))}),
+            none.clone(),
+        )),
+    );
+    g.push(
+        "P11_set_again",
+        &["P7_add_host_b", "P8_set", "P9_remove_host_b", "P10_readd_host_b"],
+        "project_set \"astation\" on P10_readd_host_b with the same project state as P8_set: valid as a new entry; host-b is a member again",
+        &set_ab(&all_ops),
+        no_edit,
+        Ok(expect(
+            serde_json::json!({"host-a": 1, "host-b": 2}),
+            astation(&["host-a", "host-b"], &all),
+            serde_json::json!({"host-a": a_l, "host-b": sender("authorized", 7, Some(10))}),
+            none.clone(),
+        )),
+    );
+    let gone = serde_json::json!({
+        "host-a": sender("authorized", 2, None),
+        "host-b": sender("authorized", 7, None),
+    });
+    g.push(
+        "P10_remove_host_a",
+        &p9_rb,
+        "remove_host host-a on P9_remove_host_b: no member of \"astation\" is left, yet the project stays in effect (set and not removed)",
+        &remove("host-a"),
+        no_edit,
+        Ok(expect(none.clone(), astation(&[], &all), gone.clone(), none.clone())),
+    );
+    g.push(
+        "P11_remove_emptied",
+        &["P7_add_host_b", "P8_set", "P9_remove_host_b", "P10_remove_host_a"],
+        "project_remove \"astation\" on P10_remove_host_a: valid (a project whose members all left through remove_host is in effect until removed)",
+        &project_remove("astation", DELEGATED_T0).unwrap(),
+        no_edit,
+        Ok(expect(none.clone(), none.clone(), gone.clone(), none.clone())),
+    );
+    g.push(
+        "P9_reverify_a",
+        &p8,
+        "add_host host-a at host_trust_gen 2 (a re-verification, key \"host-a host_channel_key gen 2\") on P8_set, with no remove_host: host-a stays in \"astation\" and keeps membership epoch 2",
+        &g.add_host("host-a", 2),
+        no_edit,
+        Ok(expect(
+            serde_json::json!({"host-a": 2, "host-b": 1}),
+            astation(&["host-a", "host-b"], &all),
+            senders_ab.clone(),
+            none.clone(),
+        )),
+    );
+
+    // ---- the host encryption key (II.4.1)
+    let ek7 = ["EK7_set"];
+    let ek8_rv = ["EK7_set", "EK8_reverify_a"];
+    let sig_a1_1 = g.enc_sig("host-a", 1, "host-a-enc-1");
+    let sig_a1_2 = g.enc_sig("host-a", 1, "host-a-enc-2");
+    let sig_a1_3 = g.enc_sig("host-a", 1, "host-a-enc-3");
+    let keys_of = |current: Value, previous: Option<Value>| {
+        let mut keys = serde_json::json!({"current": current});
+        if let Some(previous) = previous {
+            keys["previous"] = previous;
+        }
+        serde_json::json!({"host-a": keys})
+    };
+    g.push(
+        "EK7_set",
+        &[],
+        "host_enc_key host-a (host_trust_gen 1) on E6: enc_key \"host-a host_enc_key 1\", enc_sig by host-a's host_key over enc_sig_input_hex, no retire_previous: host-a's current key",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, false),
+        no_edit,
+        Ok(expect(a1.clone(), none.clone(), senders_l.clone(), keys_of(g.key_info("host-a-enc-1", 7, 1), None))),
+    );
+    g.push(
+        "EK8_rotate",
+        &ek7,
+        "a routine rotation on EK7_set: \"host-a host_enc_key 2\" current; host_enc_key 1 kept as the previous key, not retired (the host still opens mail with it for 24 h on its own clock)",
+        &g.enc_entry("host-a", 1, "host-a-enc-2", &sig_a1_2, false),
+        no_edit,
+        Ok(expect(
+            a1.clone(),
+            none.clone(),
+            senders_l.clone(),
+            keys_of(
+                g.key_info("host-a-enc-2", 8, 1),
+                Some(g.previous("host-a-enc-1", 7, 1, false, 8)),
+            ),
+        )),
+    );
+    g.push(
+        "EK9_rotate_retire",
+        &["EK7_set", "EK8_rotate"],
+        "a rotation with retire_previous: true on EK8_rotate (a suspected compromise): host_enc_key 3 current, host_enc_key 2 the previous key and retired at once; host_enc_key 1 is no longer kept (one previous key only)",
+        &g.enc_entry("host-a", 1, "host-a-enc-3", &sig_a1_3, true),
+        no_edit,
+        Ok(expect(
+            a1.clone(),
+            none.clone(),
+            senders_l.clone(),
+            keys_of(
+                g.key_info("host-a-enc-3", 9, 1),
+                Some(g.previous("host-a-enc-2", 8, 1, true, 9)),
+            ),
+        )),
+    );
+    g.push(
+        "EK7_retire_first",
+        &[],
+        "host_enc_key host-a with retire_previous: true and no previous key, on E6: valid; host_enc_key 1 current, nothing to retire",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, true),
+        no_edit,
+        Ok(expect(a1.clone(), none.clone(), senders_l.clone(), keys_of(g.key_info("host-a-enc-1", 7, 1), None))),
+    );
+    g.push(
+        "EK8_same_key",
+        &ek7,
+        "host-a's current key (host_enc_key 1) set again with retire_previous: true on EK7_set: invalid (a key set for the host since its newest add_host never comes back; here the previous key would be the live one, same kid, and retired): enc_key_reused",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, true),
+        no_edit,
+        Err("enc_key_reused"),
+    );
+    g.push(
+        "EK8_bad_enc_sig",
+        &ek7,
+        "host_enc_key 2 on EK7_set carrying the enc_sig of host_enc_key 1's binding: invalid (enc_sig doesn't verify over enc_sig_input_hex with host-a's host_key): bad_enc_sig",
+        &g.enc_entry("host-a", 1, "host-a-enc-2", &sig_a1_1, false),
+        no_edit,
+        Err("bad_enc_sig"),
+    );
+    g.push(
+        "EK8_retire_false",
+        &ek7,
+        "host_enc_key 2 on EK7_set with retire_previous: false: invalid (the field is present only as true; false is omitted, one form per meaning): malformed",
+        &g.enc_entry("host-a", 1, "host-a-enc-2", &sig_a1_2, false),
+        |body: &mut Value| body["retire_previous"] = false.into(),
+        Err("malformed"),
+    );
+    g.push(
+        "EK8_reverify_a",
+        &ek7,
+        "add_host host-a at host_trust_gen 2 (atem pair verify, key \"host-a host_channel_key gen 2\") on EK7_set: voids host-a's encryption keys until an entry for generation 2",
+        &g.add_host("host-a", 2),
+        no_edit,
+        Ok(expect(serde_json::json!({"host-a": 2}), none.clone(), senders_l.clone(), none.clone())),
+    );
+    g.push(
+        "EK9_stale_gen",
+        &ek8_rv,
+        "host_enc_key for host_trust_gen 1 (host_enc_key 2, enc_sig by the generation-1 key) on EK8_reverify_a: invalid (not the newest add_host's generation): host_trust_gen_not_current",
+        &g.enc_entry("host-a", 1, "host-a-enc-2", &sig_a1_2, false),
+        no_edit,
+        Err("host_trust_gen_not_current"),
+    );
+    let sig_a2_3 = g.enc_sig("host-a", 2, "host-a-enc-3");
+    g.push(
+        "EK9_set_gen_2",
+        &ek8_rv,
+        "host_enc_key for host_trust_gen 2 on EK8_reverify_a: enc_key \"host-a host_enc_key 3\", enc_sig by the generation-2 key; current, with no previous key (none carries over a newer add_host)",
+        &g.enc_entry("host-a", 2, "host-a-enc-3", &sig_a2_3, false),
+        no_edit,
+        Ok(expect(
+            serde_json::json!({"host-a": 2}),
+            none.clone(),
+            senders_l.clone(),
+            keys_of(g.key_info("host-a-enc-3", 9, 2), None),
+        )),
+    );
+    let sig_b1 = g.enc_sig("host-b", 1, "host-b-enc-1");
+    g.push(
+        "EK7_not_a_host",
+        &[],
+        "host_enc_key host-b on E6, where host-b was never added (enc_sig by \"host-b host_channel_key\"): invalid: not_a_host",
+        &g.enc_entry("host-b", 1, "host-b-enc-1", &sig_b1, false),
+        no_edit,
+        Err("not_a_host"),
+    );
+
+    // ---- host-sender revoke and readmit (II.3.1)
+    let hs7 = ["HS7_revoke"];
+    let revoke = |host_id: &str, interrupt: bool| {
+        host_sender_revoke(host_id, interrupt, DELEGATED_T0).unwrap()
+    };
+    let readmit = |host_id: &str| host_sender_readmit(host_id, DELEGATED_T0).unwrap();
+    let a = |state: &str, seq: u64, epoch: Option<u64>| serde_json::json!({"host-a": sender(state, seq, epoch)});
+    g.push(
+        "HS7_revoke",
+        &[],
+        "host_sender_revoke host-a, interrupt_running false, on E6: host-a goes from authorized(2) (its first add_host, E2) to revoked(7)",
+        &revoke("host-a", false),
+        no_edit,
+        Ok(expect(a1.clone(), none.clone(), a("revoked", 7, Some(2)), none.clone())),
+    );
+    g.push(
+        "HS8_revoke_again",
+        &hs7,
+        "host_sender_revoke host-a on HS7_revoke (a revoke in revoked): invalid: already_revoked",
+        &revoke("host-a", true),
+        no_edit,
+        Err("already_revoked"),
+    );
+    g.push(
+        "HS7_readmit_authorized",
+        &[],
+        "host_sender_readmit host-a on E6 (a readmit in authorized): invalid: not_revoked",
+        &readmit("host-a"),
+        no_edit,
+        Err("not_revoked"),
+    );
+    g.push(
+        "HS7_readmit_unknown",
+        &[],
+        "host_sender_readmit host-b on E6, where host-b was never added: invalid (only a revoked host is readmitted): not_revoked",
+        &readmit("host-b"),
+        no_edit,
+        Err("not_revoked"),
+    );
+    g.push(
+        "HS7_revoke_unknown",
+        &[],
+        "host_sender_revoke host-b on E6, where no add_host names host-b: invalid: unknown_host",
+        &revoke("host-b", false),
+        no_edit,
+        Err("unknown_host"),
+    );
+    g.push(
+        "HS8_readmit",
+        &hs7,
+        "host_sender_readmit host-a on HS7_revoke: authorized(8), for work signed at or after seq 8 only",
+        &readmit("host-a"),
+        no_edit,
+        Ok(expect(a1.clone(), none.clone(), a("authorized", 8, Some(2)), none.clone())),
+    );
+    g.push(
+        "HS8_reverify_a",
+        &hs7,
+        "add_host host-a at host_trust_gen 2 (a re-verification, no removal) on HS7_revoke: host-a stays revoked(7) and keeps membership epoch 2",
+        &g.add_host("host-a", 2),
+        no_edit,
+        Ok(expect(serde_json::json!({"host-a": 2}), none.clone(), a("revoked", 7, Some(2)), none.clone())),
+    );
+    g.push(
+        "HS9_remove_host_a",
+        &["HS7_revoke", "HS8_reverify_a"],
+        "remove_host host-a on HS8_reverify_a: still revoked(7); no membership epoch while removed",
+        &remove("host-a"),
+        no_edit,
+        Ok(expect(
+            none.clone(),
+            none.clone(),
+            a("revoked", 7, None),
+            none.clone(),
+        )),
+    );
+    g.push(
+        "HS10_readd_host_a",
+        &["HS7_revoke", "HS8_reverify_a", "HS9_remove_host_a"],
+        "add_host host-a again at host_trust_gen 3 (key \"host-a host_channel_key gen 3\") on HS9_remove_host_a: still revoked(7); membership epoch 10",
+        &g.add_host("host-a", 3),
+        no_edit,
+        Ok(expect(serde_json::json!({"host-a": 3}), none.clone(), a("revoked", 7, Some(10)), none.clone())),
+    );
+    let hs10 = [
+        "HS7_revoke",
+        "HS8_reverify_a",
+        "HS9_remove_host_a",
+        "HS10_readd_host_a",
+    ];
+    g.push(
+        "HS11_readmit",
+        &hs10,
+        "host_sender_readmit host-a on HS10_readd_host_a: only a native manager's readmit admits it again: authorized(11)",
+        &readmit("host-a"),
+        no_edit,
+        Ok(expect(serde_json::json!({"host-a": 3}), none.clone(), a("authorized", 11, Some(10)), none.clone())),
+    );
+    let mut hs11 = hs10.to_vec();
+    hs11.push("HS11_readmit");
+    g.push(
+        "HS12_revoke_interrupt",
+        &hs11,
+        "host_sender_revoke host-a, interrupt_running true, on HS11_readmit: revoked(12); its running turns are interrupted too",
+        &revoke("host-a", true),
+        no_edit,
+        Ok(expect(serde_json::json!({"host-a": 3}), none.clone(), a("revoked", 12, Some(10)), none.clone())),
+    );
+    g.push(
+        "HS7_remove_host_a",
+        &[],
+        "remove_host host-a on E6: host-a can't send (not a current host), its sending state stays authorized(2), no membership epoch",
+        &remove("host-a"),
+        no_edit,
+        Ok(expect(none.clone(), none.clone(), a("authorized", 2, None), none.clone())),
+    );
+    g.push(
+        "HS8_revoke_removed",
+        &["HS7_remove_host_a"],
+        "host_sender_revoke host-a on HS7_remove_host_a: valid (an add_host names host-a, current or removed): revoked(8)",
+        &revoke("host-a", false),
+        no_edit,
+        Ok(expect(none.clone(), none.clone(), a("revoked", 8, None), none.clone())),
+    );
+
+    // ---- removal: keys voided, and "current" (no later remove_host)
+    // rather than "ever added" (review fix: appended, so earlier vectors
+    // keep their place in the file)
+    let ek8_rm = ["EK7_set", "EK8_remove_host_a"];
+    g.push(
+        "EK8_remove_host_a",
+        &ek7,
+        "remove_host host-a on EK7_set: host-a is no longer current and its encryption keys are voided (no current or previous key); its sending state stays authorized(2), no membership epoch",
+        &remove("host-a"),
+        no_edit,
+        Ok(expect(none.clone(), none.clone(), a("authorized", 2, None), none.clone())),
+    );
+    g.push(
+        "EK9_removed_host",
+        &ek8_rm,
+        "host_enc_key host-a (host_trust_gen 1, host_enc_key 2, enc_sig by host-a's generation-1 key, which verifies) on EK8_remove_host_a: invalid (host-a was added but is removed, not current): not_a_host",
+        &g.enc_entry("host-a", 1, "host-a-enc-2", &sig_a1_2, false),
+        no_edit,
+        Err("not_a_host"),
+    );
+    g.push(
+        "EK9_readd_a",
+        &ek8_rm,
+        "add_host host-a again at host_trust_gen 2 (key \"host-a host_channel_key gen 2\") on EK8_remove_host_a: current again, membership epoch 9, still authorized(2), and no encryption key carried over",
+        &g.add_host("host-a", 2),
+        no_edit,
+        Ok(expect(
+            serde_json::json!({"host-a": 2}),
+            none.clone(),
+            a("authorized", 2, Some(9)),
+            none.clone(),
+        )),
+    );
+    let sig_a2_1 = g.enc_sig("host-a", 2, "host-a-enc-1");
+    g.push(
+        "EK10_set_after_readd",
+        &["EK7_set", "EK8_remove_host_a", "EK9_readd_a"],
+        "host_enc_key for host_trust_gen 2 on EK9_readd_a with \"host-a host_enc_key 1\", the key the removal voided: a new key here (not the current one, none is), current with no previous key",
+        &g.enc_entry("host-a", 2, "host-a-enc-1", &sig_a2_1, false),
+        no_edit,
+        Ok(expect(
+            serde_json::json!({"host-a": 2}),
+            none.clone(),
+            a("authorized", 2, Some(9)),
+            keys_of(g.key_info("host-a-enc-1", 10, 2), None),
+        )),
+    );
+    g.push(
+        "P10_set_removed_host",
+        &p9_rb,
+        "project_set \"astation\" listing host-a and host-b on P9_remove_host_b: invalid (host-b was added but is removed, not current): not_a_host",
+        &set_ab(&[ProjectOp::Message]),
+        no_edit,
+        Err("not_a_host"),
+    );
+    let bad_project = |name: &str, hosts: &[&str]| Action::ProjectSet {
+        project: Project {
+            name: name.into(),
+            hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            ops: vec![ProjectOp::Message],
+        },
+    };
+    g.push(
+        "P9_bad_name",
+        &p8,
+        "project_set named \"Astation\" on P8_set: invalid (a name is 1 to 32 characters of [a-z0-9-]): bad_project",
+        &bad_project("Astation", &["host-a", "host-b"]),
+        no_edit,
+        Err("bad_project"),
+    );
+    g.push(
+        "P9_one_host",
+        &p8,
+        "project_set \"astation\" listing host-a only, on P8_set: invalid (a project lists 2 to 64 hosts): bad_project",
+        &bad_project("astation", &["host-a"]),
+        no_edit,
+        Err("bad_project"),
+    );
+    g.push(
+        "P9_unknown_op",
+        &p8,
+        "project_set \"astation\" with ops [deploy, message] on P8_set: invalid (an op outside launch, message, notify, prompt): bad_project",
+        &set_ab(&[ProjectOp::Message]),
+        |body: &mut Value| body["project"]["ops"] = serde_json::json!(["deploy", "message"]),
+        Err("bad_project"),
+    );
+
+    // ---- PR 2 review: a key set in a generation never comes back
+    // (`enc_key_reused`), and the readings a verifier written from the
+    // text could get wrong (appended, so earlier vectors keep their place)
+    let ek9_rr = ["EK7_set", "EK8_rotate", "EK9_rotate_retire"];
+    g.push(
+        "EK9_previous_again",
+        &["EK7_set", "EK8_rotate"],
+        "host_enc_key 1 on EK8_rotate, where it is host-a's previous key (not retired), set again with its own enc_sig (EK7_set's): invalid (a key set for the host since its newest add_host never comes back): enc_key_reused",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, false),
+        no_edit,
+        Err("enc_key_reused"),
+    );
+    g.push(
+        "EK10_retired_again",
+        &ek9_rr,
+        "host_enc_key 2 on EK9_rotate_retire, which retired it (retire_previous), set again with its own enc_sig (EK8_rotate's): invalid (a retired key stays retired): enc_key_reused",
+        &g.enc_entry("host-a", 1, "host-a-enc-2", &sig_a1_2, false),
+        no_edit,
+        Err("enc_key_reused"),
+    );
+    g.push(
+        "EK10_dropped_again",
+        &ek9_rr,
+        "host_enc_key 1 on EK9_rotate_retire, no longer kept (one previous key only), set again with its own enc_sig (EK7_set's): invalid: enc_key_reused",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, false),
+        no_edit,
+        Err("enc_key_reused"),
+    );
+    g.push(
+        "HS9_readmit_removed",
+        &["HS7_remove_host_a", "HS8_revoke_removed"],
+        "host_sender_readmit host-a on HS8_revoke_removed, where host-a is removed and revoked: valid (a readmit needs revoked, not a current host): authorized(9), no membership epoch, and it sends nothing until an add_host makes it current",
+        &readmit("host-a"),
+        no_edit,
+        Ok(expect(none.clone(), none.clone(), a("authorized", 9, None), none.clone())),
+    );
+    let revoked_ab = serde_json::json!({
+        "host-a": sender("revoked", 8, Some(2)),
+        "host-b": sender("authorized", 7, Some(7)),
+    });
+    g.push(
+        "P8_revoke_a",
+        &p7,
+        "host_sender_revoke host-a, interrupt_running false, on P7_add_host_b: host-a revoked(8), host-b still authorized(7)",
+        &revoke("host-a", false),
+        no_edit,
+        Ok(expect(ab.clone(), none.clone(), revoked_ab.clone(), none.clone())),
+    );
+    g.push(
+        "P9_set_revoked",
+        &["P7_add_host_b", "P8_revoke_a"],
+        "project_set \"astation\" listing host-a and host-b on P8_revoke_a, where host-a is revoked: valid (a listed host must be current; its sending state is apart): both are members, and host-a stays revoked(8), so it sends nothing until readmitted",
+        &set_ab(&all_ops),
+        no_edit,
+        Ok(expect(ab.clone(), astation(&["host-a", "host-b"], &all), revoked_ab.clone(), none.clone())),
+    );
+    g.push(
+        "HS8_enc_key_revoked",
+        &hs7,
+        "host_enc_key host-a (host_enc_key 1) on HS7_revoke, where host-a is revoked: valid (its keys are apart from its sending state): host-a's current key, and host-a stays revoked(7)",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, false),
+        no_edit,
+        Ok(expect(
+            a1.clone(),
+            none.clone(),
+            a("revoked", 7, Some(2)),
+            keys_of(g.key_info("host-a-enc-1", 8, 1), None),
+        )),
+    );
+    g.push(
+        "P11_set_after_remove",
+        &["P7_add_host_b", "P8_set", "P9_narrow", "P10_remove"],
+        "project_set \"astation\" with ops [launch] on P10_remove: valid (unlike a device id, a project name may be set again after its project_remove): a new project of that name",
+        &set_ab(&[ProjectOp::Launch]),
+        no_edit,
+        Ok(expect(ab.clone(), astation(&["host-a", "host-b"], &["launch"]), senders_ab.clone(), none.clone())),
+    );
+    let two = ["host-a", "host-b"];
+    g.push(
+        "P10_second_project",
+        &["P7_add_host_b", "P8_set", "P9_narrow"],
+        "project_set \"chisel\" listing host-a and host-b with ops [launch] on P9_narrow (\"astation\": [message]): two projects over the same hosts; between host-a and host-b the grant is the union, launch and message, and each host is a member of both",
+        &project_set("chisel", two, [ProjectOp::Launch], DELEGATED_T0).unwrap(),
+        no_edit,
+        Ok(expect(
+            ab.clone(),
+            serde_json::json!({
+                "astation": project_state(&two, &two, &["message"]),
+                "chisel": project_state(&two, &two, &["launch"]),
+            }),
+            senders_ab.clone(),
+            none.clone(),
+        )),
+    );
+    g.push(
+        "HS7_revoke_no_interrupt",
+        &[],
+        "host_sender_revoke host-a on E6 without interrupt_running: invalid (a required boolean, written as false too): malformed",
+        &revoke("host-a", false),
+        |body: &mut Value| {
+            body.as_object_mut().unwrap().remove("interrupt_running");
+        },
+        Err("malformed"),
+    );
+    g.push(
+        "HS8_readmit_interrupt",
+        &hs7,
+        "host_sender_readmit host-a on HS7_revoke carrying interrupt_running: false: invalid (a readmit has host_id only): unknown_field",
+        &readmit("host-a"),
+        |body: &mut Value| body["interrupt_running"] = false.into(),
+        Err("unknown_field"),
+    );
+    g.push(
+        "EK7_gen_zero",
+        &[],
+        "host_enc_key host-a on E6 with host_trust_gen 0 (EK7_set's key and enc_sig otherwise): invalid (a generation is at least 1): malformed",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, false),
+        |body: &mut Value| body["host_trust_gen"] = 0.into(),
+        Err("malformed"),
+    );
+    let short = b64u(&sig_a1_1[..63]);
+    g.push(
+        "EK7_short_enc_sig",
+        &[],
+        "host_enc_key host-a on E6 whose enc_sig is 63 bytes (EK7_set's without its last byte): invalid (exactly 64 bytes): malformed",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, false),
+        move |body: &mut Value| body["enc_sig"] = short.into(),
+        Err("malformed"),
+    );
+    let long = b64u(&[&sig_a1_1[..], &[0]].concat());
+    g.push(
+        "EK7_long_enc_sig",
+        &[],
+        "host_enc_key host-a on E6 whose enc_sig is 65 bytes (EK7_set's and a zero byte): invalid (exactly 64 bytes): malformed",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, false),
+        move |body: &mut Value| body["enc_sig"] = long.into(),
+        Err("malformed"),
+    );
+    let host_a_key = g.host_key("host-a", 1).to_json();
+    g.push(
+        "EK7_ed25519_enc_key",
+        &[],
+        "host_enc_key host-a on E6 whose enc_key is host-a's own Ed25519 host_key (alg ed25519): invalid (an encryption key is x25519 only): wrong_alg",
+        &g.enc_entry("host-a", 1, "host-a-enc-1", &sig_a1_1, false),
+        move |body: &mut Value| body["enc_key"] = host_a_key,
+        Err("wrong_alg"),
+    );
+    g.push(
+        "P9_unknown_field",
+        &p8,
+        "project_set \"astation\" on P8_set whose project carries a fourth field, note: invalid (exactly name, hosts and ops): unknown_field",
+        &set_ab(&[ProjectOp::Message]),
+        |body: &mut Value| body["project"]["note"] = "x".into(),
+        Err("unknown_field"),
+    );
+    g.push(
+        "P9_hosts_unsorted",
+        &p8,
+        "project_set \"astation\" on P8_set listing [host-b, host-a]: invalid (project.hosts is a set, sorted by bytes with no duplicates, refused by the signed-object parse before the action's own rules): array_not_canonical",
+        &set_ab(&[ProjectOp::Message]),
+        |body: &mut Value| body["project"]["hosts"] = serde_json::json!(["host-b", "host-a"]),
+        Err("array_not_canonical"),
+    );
+    g.push(
+        "P9_hosts_duplicate",
+        &p8,
+        "project_set \"astation\" on P8_set listing [host-a, host-a, host-b]: invalid (a set has no duplicates): array_not_canonical",
+        &set_ab(&[ProjectOp::Message]),
+        |body: &mut Value| {
+            body["project"]["hosts"] = serde_json::json!(["host-a", "host-a", "host-b"])
+        },
+        Err("array_not_canonical"),
+    );
+    g.push(
+        "P9_empty_ops",
+        &p8,
+        "project_set \"astation\" on P8_set with ops []: invalid (an empty array is a canonical set, and the project's rule wants a non-empty one): bad_project",
+        &set_ab(&[ProjectOp::Message]),
+        |body: &mut Value| body["project"]["ops"] = serde_json::json!([]),
+        Err("bad_project"),
+    );
+    let hosts = |n: usize| (0..n).map(|i| format!("h-{i:02}")).collect::<Vec<_>>();
+    g.push(
+        "P9_64_hosts",
+        &p8,
+        "project_set \"astation\" on P8_set listing the 64 hosts h-00 to h-63, none of them added: within the bound of 2 to 64, so judged against the chain: not_a_host",
+        &project_set("astation", hosts(64), [ProjectOp::Message], DELEGATED_T0).unwrap(),
+        no_edit,
+        Err("not_a_host"),
+    );
+    let sixty_five = hosts(65);
+    g.push(
+        "P9_65_hosts",
+        &p8,
+        "project_set \"astation\" on P8_set listing the 65 hosts h-00 to h-64: invalid (2 to 64 hosts, judged at parse, before whether they are current): bad_project",
+        &set_ab(&[ProjectOp::Message]),
+        move |body: &mut Value| body["project"]["hosts"] = serde_json::json!(sixty_five),
+        Err("bad_project"),
+    );
+    g.push(
+        "P9_remove_bad_name",
+        &p8,
+        "project_remove \"Astation\" on P8_set (\"astation\" is in effect): invalid (a name outside [a-z0-9-], refused at parse before whether a project of that name is in effect): bad_project",
+        &project_remove("astation", DELEGATED_T0).unwrap(),
+        |body: &mut Value| body["name"] = "Astation".into(),
+        Err("bad_project"),
+    );
+    g.push_by(
+        "svc-discord",
+        "HS7_revoke_by_service",
+        &[],
+        "host_sender_revoke host-a on E6 signed by svc-discord, a service member in effect: invalid (only a native manager signs these actions): signer_not_manager",
+        &revoke("host-a", false),
+        no_edit,
+        Err("signer_not_manager"),
+    );
+    g.push_by(
+        "recovery",
+        "P9_set_by_recovery",
+        &p8,
+        "project_set \"astation\" on P8_set signed by the recovery key (kit 1): invalid (the recovery key signs recovery_add only): recovery_signer_action",
+        &set_ab(&[ProjectOp::Message]),
+        no_edit,
+        Err("recovery_signer_action"),
+    );
+    g.vectors
+}
+
+/// The labels of a vector's `chain`.
+fn chain_labels(vector: &Value) -> Vec<&str> {
+    vector["chain"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap())
+        .collect()
+}
+
+/// The state `expect` describes, read from a verifier (the two hosts the
+/// vectors use).
+fn derived_state(m: &Membership) -> Value {
+    let mut hosts = serde_json::Map::new();
+    let mut senders = serde_json::Map::new();
+    let mut keys = serde_json::Map::new();
+    for host_id in ["host-a", "host-b"] {
+        if let Some(record) = m.host(host_id) {
+            hosts.insert(host_id.into(), record.host_trust_gen.into());
+        }
+        if let Some(state) = m.host_sender_state(host_id) {
+            let (name, seq) = match state {
+                HostSenderState::Authorized { generation } => ("authorized", generation),
+                HostSenderState::Revoked { seq } => ("revoked", seq),
+            };
+            senders.insert(
+                host_id.into(),
+                sender(name, seq, m.host_membership_epoch(host_id)),
+            );
+        } else {
+            assert_eq!(m.host_membership_epoch(host_id), None, "{host_id}");
+        }
+        if let Some(k) = m.host_enc_key(host_id) {
+            let info = |key: &atem_client::membership::EncKey| {
+                assert_eq!(hex(&key.kid), enc_kid(&key.key).unwrap());
+                serde_json::json!({
+                    "enc_kid": hex(&key.kid),
+                    "pub": b64u(key.key.as_bytes()),
+                    "seq": key.seq,
+                    "host_trust_gen": key.host_trust_gen,
+                })
+            };
+            let mut v = serde_json::json!({"current": info(&k.current)});
+            if let Some(p) = &k.previous {
+                let mut previous = info(&p.key);
+                previous["retired"] = p.retired.into();
+                previous["replaced_at_seq"] = p.replaced_at_seq.into();
+                v["previous"] = previous;
+            }
+            keys.insert(host_id.into(), v);
+        }
+    }
+    let projects: serde_json::Map<String, Value> = m
+        .projects()
+        .map(|p| {
+            let ops: Vec<&str> = p.ops.iter().map(|op| op.as_str()).collect();
+            (
+                p.name.clone(),
+                project_state(
+                    &p.hosts.iter().map(String::as_str).collect::<Vec<_>>(),
+                    &m.project_hosts(&p.name),
+                    &ops,
+                ),
+            )
+        })
+        .collect();
+    expect(
+        Value::Object(hosts),
+        Value::Object(projects),
+        Value::Object(senders),
+        Value::Object(keys),
+    )
+}
+
+/// The delegated-action vectors in context: each as the generator makes it,
+/// every valid one valid on its chain with the stated `expect`, every
+/// refused one refused for its `reason`, every `enc_sig`, and the conflict
+/// rule (§R9.4) judging these actions against `C[..seq-1]`.
+fn delegated_in_context(run: &mut Run, ctx: &Context, book: &Book, file: &Value) {
+    use atem_client::membership::{
+        Conflict, Effect, EvidenceReason, ProjectOp, host_enc_sig_input, verify_host_enc_sig,
+    };
+    let generated = delegated_vectors(book, file);
+    let in_file: Vec<&Value> = file["others"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v.get("chain").is_some())
+        .collect();
+    assert_eq!(in_file.len(), generated.len(), "the delegated vectors");
+    for (vector, made) in in_file.iter().zip(&generated) {
+        let label = s(vector, "label");
+        assert_eq!(*vector, made, "{label}: as delegated_vectors makes it");
+        let chain = chain_labels(vector);
+        let entry = ctx.parse(label);
+        if let Some(expected) = vector.get("expect") {
+            assert_eq!(vector.get("valid"), None, "{label}");
+            assert_eq!(ctx.check(&chain, label), Check::Valid, "{label}");
+            let mut after = chain.clone();
+            after.push(label);
+            let m = ctx.chain(&after);
+            assert_eq!(derived_state(&m), *expected, "{label}: expect");
+            // Project grants between the two hosts are the union of the
+            // ops of every project listing both as members; none to itself.
+            for (x, y) in [
+                ("host-a", "host-b"),
+                ("host-b", "host-a"),
+                ("host-a", "host-a"),
+            ] {
+                let want: BTreeSet<&str> = expected["projects"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .filter(|p| {
+                        x != y
+                            && [x, y]
+                                .iter()
+                                .all(|h| p["members"].as_array().unwrap().iter().any(|m| m == h))
+                    })
+                    .flat_map(|p| {
+                        p["ops"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|o| o.as_str().unwrap())
+                    })
+                    .collect();
+                let got: BTreeSet<&str> = m
+                    .project_ops_between(x, y)
+                    .into_iter()
+                    .map(ProjectOp::as_str)
+                    .collect();
+                assert_eq!(got, want, "{label}: ops {x} → {y}");
+            }
+            // The projects each host's membership of is in effect.
+            for h in ["host-a", "host-b"] {
+                let mut want: Vec<&str> = expected["projects"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, p)| p["members"].as_array().unwrap().iter().any(|m| m == h))
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                want.sort_unstable();
+                assert_eq!(m.host_projects(h), want, "{label}: projects of {h}");
+            }
+            run.pass(format!("{label}: valid on L + {chain:?}, expect matches"));
+        } else {
+            assert_eq!(vector["valid"], false, "{label}");
+            let reason = s(vector, "reason");
+            let detail = match entry {
+                Err(e) => e.code().to_owned(),
+                Ok(_) => match ctx.check(&chain, label) {
+                    Check::Invalid(e) => e.code().to_owned(),
+                    other => panic!("{label}: {other:?}"),
+                },
+            };
+            assert_eq!(detail, reason, "{label}");
+            assert!(chain_reason(label).unwrap().ends_with(reason), "{label}");
+            run.pass(format!("{label}: refused {reason} on L + {chain:?}"));
+        }
+        // The host's enc_sig: its input from the body, and the signature by
+        // the host key of the generation it names (bad only where refused so).
+        if let Some(input_hex) = vector.get("enc_sig_input_hex") {
+            let body = &vector["entry"]["body"];
+            let host_id = s(body, "host_id");
+            let host_trust_gen = body["host_trust_gen"].as_u64().unwrap();
+            let enc_pub = PublicKey::from_json_as(&body["enc_key"], Alg::X25519).unwrap();
+            let input = host_enc_sig_input(
+                "acct-test-1",
+                &ctx.genesis,
+                host_id,
+                host_trust_gen,
+                enc_pub.as_32().unwrap(),
+            );
+            assert_eq!(
+                hex(input.as_bytes()),
+                input_hex.as_str().unwrap(),
+                "{label}"
+            );
+            let host_key = book.signer_public(&host_key_name(host_id, host_trust_gen));
+            let sig = b64u_decode(s(body, "enc_sig")).unwrap();
+            let verified = verify_host_enc_sig(
+                &host_key,
+                "acct-test-1",
+                &ctx.genesis,
+                host_id,
+                host_trust_gen,
+                enc_pub.as_32().unwrap(),
+                &sig,
+            );
+            if vector.get("reason") == Some(&Value::from("bad_enc_sig")) {
+                assert_eq!(verified, Err(Error::BadSignature), "{label}");
+            } else {
+                verified.unwrap_or_else(|e| panic!("{label}: {e}"));
+            }
+            run.pass(format!("{label}: enc_sig input and signature"));
+        } else if vector["entry"]["body"]["action"] == "host_enc_key" {
+            // No binding input: the binding's own fields don't parse (a
+            // generation of 0, a key that isn't X25519, an enc_sig that
+            // isn't 64 bytes), and the entry is refused at parse for it.
+            let reason = vector.get("reason").and_then(Value::as_str);
+            assert!(matches!(reason, Some("malformed" | "wrong_alg")), "{label}");
+            assert!(ctx.parse(label).is_err(), "{label}");
+            run.pass(format!("{label}: no binding input, refused at parse"));
+        }
+    }
+
+    // The effects of a commit name what step 4 replays (II.3.1).
+    let effects = |chain: &[&str], label: &str| {
+        let eval = ctx
+            .chain(chain)
+            .evaluate(&[strict(&ctx.vectors[label]["entry"])], &ctx.now);
+        assert_eq!(eval.stop, None, "{label}");
+        eval.effects
+    };
+    assert!(
+        effects(&[], "HS7_revoke").contains(&Effect::HostSenderRevoked {
+            host_id: "host-a".into(),
+            seq: 7,
+            interrupt_running: false,
+        })
+    );
+    let hs11 = [
+        "HS7_revoke",
+        "HS8_reverify_a",
+        "HS9_remove_host_a",
+        "HS10_readd_host_a",
+        "HS11_readmit",
+    ];
+    assert!(
+        effects(&hs11, "HS12_revoke_interrupt").contains(&Effect::HostSenderRevoked {
+            host_id: "host-a".into(),
+            seq: 12,
+            interrupt_running: true,
+        })
+    );
+    assert!(
+        effects(&hs11[..4], "HS11_readmit").contains(&Effect::HostSenderReadmitted {
+            host_id: "host-a".into(),
+            seq: 11,
+        })
+    );
+    assert!(
+        effects(&["P7_add_host_b"], "P8_set").contains(&Effect::ProjectSet {
+            name: "astation".into()
+        })
+    );
+    assert!(
+        effects(&["P7_add_host_b", "P8_set", "P9_narrow"], "P10_remove").contains(
+            &Effect::ProjectRemoved {
+                name: "astation".into()
+            }
+        )
+    );
+    assert!(
+        effects(&["EK7_set", "EK8_rotate"], "EK9_rotate_retire").contains(&Effect::HostEncKeySet {
+            host_id: "host-a".into(),
+            retire_previous: true,
+        })
+    );
+    run.pass("effects: HostSenderRevoked/Readmitted name seq and interrupt_running, ProjectSet/Removed, HostEncKeySet");
+
+    // L: host-a authorized at its first add_host (E2), epoch 2.
+    let l = ctx.chain(&[]);
+    assert_eq!(
+        l.host_sender_state("host-a"),
+        Some(HostSenderState::Authorized { generation: 2 })
+    );
+    assert_eq!(l.host_membership_epoch("host-a"), Some(2));
+    assert_eq!(l.host_sender_state("host-b"), None);
+    let m = ctx.chain(&hs11);
+    for seq in 1..=11 {
+        let label = match seq {
+            1..=6 => format!("E{seq}"),
+            _ => hs11[seq as usize - 7].to_owned(),
+        };
+        assert_eq!(m.entry_hash_at(seq), Some(ctx.hash(&label)), "{label}");
+    }
+    assert_eq!(m.entry_hash_at(12), None);
+    run.pass("log L: host-a authorized(2), epoch 2; entry_hash_at names each entry");
+
+    // A removal voids the keys and a re-add carries none over; "current"
+    // means no later remove_host, not "ever added" (`EK9_removed_host`,
+    // `P10_set_removed_host` name hosts an add_host added).
+    let keyed = ctx.chain(&["EK7_set"]);
+    assert_eq!(keyed.host_enc_key("host-a").map(|k| k.current.seq), Some(7));
+    let removed = ctx.chain(&["EK7_set", "EK8_remove_host_a"]);
+    assert_eq!(removed.host("host-a"), None);
+    assert_eq!(removed.host_enc_key("host-a"), None);
+    let readded = ctx.chain(&["EK7_set", "EK8_remove_host_a", "EK9_readd_a"]);
+    assert_eq!(readded.host_enc_key("host-a"), None);
+    for (base, label) in [
+        (&["EK7_set", "EK8_remove_host_a"][..], "EK9_removed_host"),
+        (
+            &["P7_add_host_b", "P8_set", "P9_remove_host_b"][..],
+            "P10_set_removed_host",
+        ),
+    ] {
+        let m = ctx.chain(base);
+        let entry = ctx.entry(label);
+        let host = match &entry.action {
+            Action::HostEncKey { host_id, .. } => host_id.clone(),
+            Action::ProjectSet { .. } => "host-b".to_owned(),
+            other => panic!("{label}: {other:?}"),
+        };
+        assert!(
+            m.host_sender_state(&host).is_some(),
+            "{label}: {host} was added"
+        );
+        assert_eq!(m.host(&host), None, "{label}: {host} isn't current");
+        assert_eq!(
+            m.check_next(&entry),
+            Check::Invalid(Invalid::NotAHost),
+            "{label}"
+        );
+    }
+    run.pass("remove_host voids keys, a re-add carries none; not_a_host for removed (added) hosts");
+
+    // §R9.4 with these actions: an alternative at `seq` is judged against
+    // C[..seq-1], replayed with the host-sender state, projects and keys.
+    let conflict = |base: &[&str], label: &str| {
+        let m = ctx.chain(base);
+        let eval = m.evaluate(&[strict(&ctx.vectors[label]["entry"])], &ctx.now);
+        match eval.stop {
+            Some(Stop::Conflict { outcome, .. }) => outcome,
+            other => panic!("{label}: {other:?}"),
+        }
+    };
+    let invalid = Conflict::Ignored(EvidenceReason::Invalid);
+    // Against HS7_revoke at seq 7: invalid at seq 6 (host-a authorized,
+    // host-b unknown) is ignored; a valid entry by a current manager freezes.
+    assert_eq!(conflict(&["HS7_revoke"], "HS7_readmit_authorized"), invalid);
+    assert_eq!(conflict(&["HS7_revoke"], "HS7_revoke_unknown"), invalid);
+    assert_eq!(conflict(&["HS7_revoke"], "EK7_set"), Conflict::Freeze);
+    assert_eq!(
+        conflict(&["HS7_revoke"], "HS7_remove_host_a"),
+        Conflict::Freeze
+    );
+    // Against HS8_reverify_a at seq 8: host-a revoked at seq 7, so another
+    // revoke is invalid there, and a readmit valid (freeze).
+    let base = ["HS7_revoke", "HS8_reverify_a"];
+    assert_eq!(conflict(&base, "HS8_revoke_again"), invalid);
+    assert_eq!(conflict(&base, "HS8_readmit"), Conflict::Freeze);
+    // Projects and keys the same way: a removal on another branch is valid
+    // at seq 9 (freeze); setting EK7_set's key again, or a binding that
+    // doesn't verify, is invalid at seq 8 (ignored).
+    let base = ["P7_add_host_b", "P8_set", "P9_narrow"];
+    assert_eq!(conflict(&base, "P9_remove_host_b"), Conflict::Freeze);
+    assert_eq!(
+        conflict(&["EK7_set", "EK8_rotate"], "EK8_same_key"),
+        invalid
+    );
+    assert_eq!(
+        conflict(&["EK7_set", "EK8_rotate"], "EK8_bad_enc_sig"),
+        invalid
+    );
+    run.pass("conflicts (§R9.4): host-sender, project and key entries judged against C[..seq-1]");
+}
+
+/// Writes the delegated-action keys into `r9-vectors-keys` (between host-a
+/// and host-evil, existing bytes unchanged) and the vectors into
+/// `r9-vectors-membership-log` (appended to `others`, replacing earlier
+/// copies of the same labels).
+#[test]
+#[ignore = "writes the delegated-action vectors and keys"]
+fn write_delegated_vectors() {
+    // The keys file: text insertion, so nothing else in it moves.
+    let path = fixtures_dir().join("r9-vectors-keys.json");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    let anchor = "    \"host-evil\": {\n";
+    let first = format!("    \"{}\": {{\n", DELEGATED_KEYS[0].0);
+    if let Some(start) = text.find(&first) {
+        let end = text.find(anchor).unwrap();
+        text.replace_range(start..end, "");
+    }
+    let mut block = String::new();
+    for (name, entry) in delegated_key_entries() {
+        let pretty = serde_json::to_string_pretty(&serde_json::json!({ name: entry })).unwrap();
+        let lines: Vec<&str> = pretty.lines().collect();
+        for line in &lines[1..lines.len() - 1] {
+            block.push_str("  ");
+            block.push_str(line);
+            block.push('\n');
+        }
+        // Every entry is followed by another (host-evil at the end).
+        block.pop();
+        block.push_str(",\n");
+    }
+    let at = text.find(anchor).unwrap();
+    text.insert_str(at, &block);
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    for (name, entry) in delegated_key_entries() {
+        assert_eq!(parsed["keys"][name], entry);
+    }
+    std::fs::write(&path, text).unwrap();
+
+    // The membership-log file: its own pretty form, so a round trip keeps
+    // every existing byte.
+    let book = Book::load();
+    let path = fixtures_dir().join("r9-vectors-membership-log.json");
+    let mut file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let generated = delegated_vectors(&book, &file);
+    let labels: BTreeSet<String> = generated.iter().map(|v| s(v, "label").to_owned()).collect();
+    let others = file["others"].as_array_mut().unwrap();
+    others.retain(|v| !labels.contains(s(v, "label")));
+    others.extend(generated);
+    let mut text = serde_json::to_string_pretty(&file).unwrap();
+    text.push('\n');
+    std::fs::write(path, text).unwrap();
 }
