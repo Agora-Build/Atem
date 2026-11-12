@@ -2699,9 +2699,20 @@ impl<J: Journal> SessionHost<J> {
     }
 
     pub fn receipt(&self, request_id: &str) -> Option<Receipt> {
-        self.receipts
-            .get(request_id)
-            .map(|e| self.render(&e.stored))
+        self.stored_or_listed(request_id).map(|s| self.render(&s))
+    }
+
+    /// The recorded request `request_id`; or, for one host-work withdrew
+    /// before it was journaled (R9.14 item 4), the `rejected` request its
+    /// refusal-list entry stands for in this run, as the restart records it
+    /// (`refused_stored`). So a listed request reads the same before the
+    /// restart as after (PR 5 review M2).
+    fn stored_or_listed(&self, request_id: &str) -> Option<std::borrow::Cow<'_, Stored>> {
+        if let Some(e) = self.receipts.get(request_id) {
+            return Some(std::borrow::Cow::Borrowed(&e.stored));
+        }
+        let r = self.listed.get(request_id)?;
+        Some(std::borrow::Cow::Owned(refused_stored(r, 0)))
     }
 
     /// The receipt of host-work's attempt `request_id` for the task
@@ -2713,13 +2724,9 @@ impl<J: Journal> SessionHost<J> {
     /// attempt was never admitted; Task 14's review).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn attempt_receipt(&self, request_id: &str, task_id: &str) -> Option<Receipt> {
-        let e = self.receipts.get(request_id)?;
-        let its = by_host_work(&e.stored)
-            && e.stored
-                .provenance
-                .as_ref()
-                .is_some_and(|p| p.task_id == task_id);
-        its.then(|| self.render(&e.stored))
+        let s = self.stored_or_listed(request_id)?;
+        let its = by_host_work(&s) && s.provenance.as_ref().is_some_and(|p| p.task_id == task_id);
+        its.then(|| self.render(&s))
     }
 
     /// The chat accepted host-work's prompt `request_id`, which started
@@ -2757,13 +2764,17 @@ impl<J: Journal> SessionHost<J> {
         self.receipts.get(request_id)?.stored.turn.as_ref()
     }
 
-    /// Every receipt's request id, every registered session's id and
-    /// every principal with a control state (debug builds: the real
-    /// runtime's fixture state dump).
+    /// Every receipt's request id (a listed request's too, as `receipt`
+    /// reads it), every registered session's id and every principal with a
+    /// control state (debug builds: the real runtime's fixture state dump).
     #[cfg(any(test, debug_assertions))]
     pub fn debug_ids(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
         (
-            self.receipts.keys().cloned().collect(),
+            self.receipts
+                .keys()
+                .chain(self.listed.keys())
+                .cloned()
+                .collect(),
             self.sessions.keys().cloned().collect(),
             self.principals.keys().cloned().collect(),
         )
@@ -2833,15 +2844,17 @@ impl<J: Journal> SessionHost<J> {
 
     /// Delegated host work (session-v1 R9.14 item 2): the `host-work`
     /// principal's internal `attachment` submits `data` (a session-v1
-    /// `submit`'s `data`: a `prompt`, which may `acquire`) with its
-    /// `provenance`, recorded with `accepted` and carried by each of the
-    /// request's receipts as `task_id` and `sender`. The rest is §6 and §F,
-    /// answered on the attachment, where nothing leaves the host: the
-    /// runtime reads the outcome with `receipt`. Refused `invalid_request`,
-    /// nothing recorded: another principal's attachment, a provenance the
-    /// receipt reader would refuse, anything but a `prompt` submit, a
-    /// `takeover` (R9.14 item 1: it acquires only while nobody holds the
-    /// lease). The `host-work` principal submits no other way. Admitted, the
+    /// `submit`'s `data`: a `prompt`, which must acquire, `acquire: true`)
+    /// with its `provenance`, recorded with `accepted` and carried by each
+    /// of the request's receipts as `task_id` and `sender`. The rest is §6
+    /// and §F, answered on the attachment, where nothing leaves the host:
+    /// the runtime reads the outcome with `receipt`. Refused
+    /// `invalid_request`, nothing recorded: another principal's attachment,
+    /// a provenance the receipt reader would refuse, anything but a
+    /// `prompt` submit, one that doesn't acquire (R9.14 item 1: each prompt
+    /// acquires with the prompt), a `takeover` (it acquires only while
+    /// nobody holds the lease). The `host-work` principal submits no other
+    /// way. Admitted, the
     /// request starts only after the start check says so (R9.14 item 3); a
     /// `request_id` recorded under another submitter is `request_id_reused`
     /// (item 7), and one host-work withdrew before it was journaled gets
@@ -2863,6 +2876,7 @@ impl<J: Journal> SessionHost<J> {
                 m.op,
                 Op::Submit {
                     kind: ReceiptKind::Prompt,
+                    acquire: Some(true),
                     takeover: None,
                     ..
                 }
@@ -4673,9 +4687,9 @@ impl<J: Journal> SessionHost<J> {
                 seen.push(*rid);
                 first
             })
-            .filter_map(|rid| self.receipts.get(rid))
-            .filter(|e| e.stored.target == b.target)
-            .map(|e| self.render(&e.stored))
+            .filter_map(|rid| self.stored_or_listed(rid))
+            .filter(|s| s.target == b.target)
+            .map(|s| self.render(&s))
             .collect();
         self.send(att, re, Op::Receipts { receipts });
         Ok(())

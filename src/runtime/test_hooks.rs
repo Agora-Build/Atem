@@ -105,8 +105,21 @@
 //!     line, `{report: request_id, outcome}` (`ok`, `consumed`, `dropped`,
 //!     `no_effect`, `error_after_queue`).
 //!
-//!   A command that doesn't parse: `{file, error}`. `RuntimeClient` never
-//!   passes it on (as every `ATEM_TEST_*`); release builds compile it out.
+//!   A command that doesn't parse: `{file, error}`. A writer writes each
+//!   command to a temporary name and renames it into place (a file written
+//!   in place can be read torn: it is taken and answered `{file, error}`),
+//!   and waits for each command's `done` line before writing the next:
+//!   commands taken in one pass go in byte order of their names across
+//!   kinds (`interrupt-` < `submit-` < `verdict.json` < `withdraw-`), not
+//!   in the order written, and `verdict.json` reuses its name.
+//!   `RuntimeClient` never passes it on (as every `ATEM_TEST_*`); release
+//!   builds compile it out.
+//!
+//! Like the other hooks, both are read from the process environment once:
+//! a unit-test process started with either set sees it in every
+//! `HostBridge` it opens (`ATEM_TEST_HOST_FEATURES` turns host-work on in
+//! them; the drive hook would take and answer files in that directory), so
+//! run the bin's tests without them (PR 5 review M11).
 
 /// The delegated host-work features this runtime runs (session-v1 R9.14,
 /// host-work-v1 §11.6): off unless the debug-only hook turns them on
@@ -197,21 +210,28 @@ pub struct DriveCommand {
     pub action: DriveAction,
 }
 
+/// The kind of drive command a file named `name` holds, from its name
+/// alone; `None` for a name that isn't a command's (`submit-*.json`,
+/// `verdict.json`, `withdraw-*.json`, `interrupt-*.json`): such a file is
+/// never read.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+pub fn drive_kind(name: &str) -> Option<&'static str> {
+    if name == "verdict.json" {
+        return Some("verdict");
+    }
+    ["submit", "withdraw", "interrupt"].into_iter().find(|k| {
+        name.strip_prefix(k)
+            .and_then(|r| r.strip_prefix('-'))
+            .and_then(|r| r.strip_suffix(".json"))
+            .is_some_and(|n| !n.is_empty() && !n.contains('.'))
+    })
+}
+
 /// The drive command a file named `name` holding `text` is; `None` for a
-/// name that isn't a command's (`submit-*.json`, `verdict.json`,
-/// `withdraw-*.json`, `interrupt-*.json`).
+/// name that isn't a command's (`drive_kind`).
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub fn parse_drive(name: &str, text: &str) -> Option<DriveCommand> {
-    let kind = if name == "verdict.json" {
-        "verdict"
-    } else {
-        ["submit", "withdraw", "interrupt"].into_iter().find(|k| {
-            name.strip_prefix(k)
-                .and_then(|r| r.strip_prefix('-'))
-                .and_then(|r| r.strip_suffix(".json"))
-                .is_some_and(|n| !n.is_empty() && !n.contains('.'))
-        })?
-    };
+    let kind = drive_kind(name)?;
     let action = drive_action(kind, text).unwrap_or_else(DriveAction::Unreadable);
     Some(DriveCommand {
         file: name.to_string(),
@@ -449,7 +469,11 @@ mod imp {
             .flatten()
             .flatten()
             .filter_map(|e| e.file_name().into_string().ok())
+            // Commands only, by name: `done` and a `*.tmp` being written
+            // are never read.
+            .filter(|n| super::drive_kind(n).is_some())
             .collect();
+        // Byte order, across kinds.
         names.sort();
         let mut commands = Vec::new();
         for name in names {

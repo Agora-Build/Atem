@@ -1568,8 +1568,10 @@ authority it was accepted under only while that principal keeps `control`.
 - **Recovery** (broker restart, with worker adoption). Before anything is
   dispatched, every recovered `accepted` request not yet `executing` is
   resolved in this order, each resolution persisted:
-  1. on the refusal list (§I.3) → `rejected`, `detail:"acceptance not
-     confirmed"`;
+  1. on the refusal list (§I.3) → `rejected`, with the detail its entry
+     records: `acceptance not confirmed` for a failed admission write,
+     `withdrawn by the host` for the `host-work` principal's withdrawal
+     (R9.14 items 4 and 6);
   2. the previous run did **not** end with a clean close → `rejected`,
      `detail:"authorization history unknown"`, for every principal,
      whatever the journal holds (a fence on disk or not: a failed write
@@ -1586,7 +1588,10 @@ authority it was accepted under only while that principal keeps `control`.
      confirmed"`.
 
   `executing` work is unaffected: reconciled, else `outcome_unknown`
-  (§6). If a resolution can't be persisted, the host starts with remote
+  (§6). The `host-work` principal's requests follow R9.14 item 6 instead
+  of steps 2 and 3: every other recovered `accepted` one is `rejected`,
+  `withdrawn at recovery`, and its `executing` prompts are reconciled from
+  the adopted worker's chat. If a resolution can't be persisted, the host starts with remote
   sessions disabled (`welcome.host_error`) and dispatches nothing.
   Requests already `rejected` in the journal keep their detail; the
   in-memory rejections of a failed revocation write (above) were never
@@ -1664,10 +1669,21 @@ and every later append refused until the journal is reopened.
    request's immutable values (§6; no payload) go on the journal's refusal
    list (`<journal>/refused`, replaced atomically: temp, fsync, rename,
    directory fsync). Then the reply: `error{code:"busy", detail:"acceptance
-   not recorded"}`.
+   not recorded"}`. The list holds one entry per `request_id`: the first
+   one stays, whoever submitted it, and an entry for an id already listed
+   writes nothing. It never grows past what a restart reads back (its JSON
+   within 8 MiB, `MAX_RECORD_BYTES`): an entry that would is refused, and
+   nothing is written (R9.14 item 4 says what that means for a withdrawal;
+   a failed admission write has halted the journal first, so it never
+   meets a full list in practice). (**Changed agreed meaning, needs
+   Astation's agreement**: §I.2 named neither rule. Before them the only
+   writer was this one, which halts first, so neither changes r8's
+   outcomes.)
 3. **Resolved at restart, never executed.** When the journal reopens,
    before recovery dispatches anything, each request on the refusal list
-   is made durably `rejected`, `detail:"acceptance not confirmed"`: a
+   is made durably `rejected`, with the detail its entry records
+   (`acceptance not confirmed` for a failed admission write; `withdrawn by
+   the host` for the `host-work` principal's withdrawal, R9.14 item 4): a
    `Transition` when its `accepted` record is on disk after all (the write
    failed after a partial or complete write, or the rollback failed), else
    a receipt recorded directly as `rejected` (— → `rejected`, nothing
@@ -1709,7 +1725,9 @@ and every later append refused until the journal is reopened.
    refusal list) is resolved first and wins over §H's "authorization
    history unknown": the client was told `busy`, and the detail confirms
    that refusal. Both are `rejected`, final and never executed, so the
-   choice changes no outcome (§H, Recovery, gives the full order).
+   choice changes no outcome (§H, Recovery, gives the full order). A
+   withdrawal's entry wins the same way: `withdrawn by the host` over
+   `withdrawn at recovery` (R9.14 item 6, whose order is agreed).
 
 Fixtures: `r8-failed-persistence-changes-no-lease` (single failure, the
 retry with the same id while halted, then the restart: `rejected`, the
@@ -4060,7 +4078,7 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 | `unknown_session` | all | also: a session outside a service's or grant's scope |
 | `busy` | channel/session | also: `init` rate; a device list that exists but can't be opened (clear, at `init`); a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3) |
 | `unsupported_version` | session | also: `hello` without `revision: 9`; the removed outer `transportPolicy`/`transportPolicyAck` (R9.8a) |
-| `request_id_reused` | session | also: a `host_policy_set` reusing a `request_id` with another body (R9.8a); planned: a `request_id` recorded under another submitter when either is the `host-work` principal (R9.14) |
+| `request_id_reused` | session | also: a `host_policy_set` reusing a `request_id` with another body (R9.8a); a `request_id` recorded under another submitter when either is the `host-work` principal (R9.14 item 7; built, behind the unadvertised `host.delegated`) |
 | relay `push_hint` refusals | relay | `skew`, `invalid_times`, `duplicate`, `bad_signature`, `stale` |
 | relay `host_route` refusals | relay | `malformed`, `frozen`, `wrong_account`, `unknown_host`, `bad_signature`, `stale_log`, `fork`, `nonce_mismatch`, `room_mismatch`, `atem_id_mismatch` (R9.7b; the verifier's codes, sent to the host in `host_route_refused`) |
 
@@ -4287,22 +4305,30 @@ sets versus sequences (R9.2). Still open:
    compromise remedy (`retire_previous`) need a way to ask the host for a
    new key: a flag on the op, or a local command. Needed before step 4.
 
-### R9.14 Delegated host work (planned; not advertised)
+### R9.14 Delegated host work (items 1-7 built behind a debug-only hook; not advertised)
 
 The delegated host-work design ([../delegated-host-work.md](../delegated-host-work.md),
 agreed revision 6b, I.7) revises session-v1 so that Atem runs a delegated
 sender's task itself, under a host-local principal, while the sender is
 offline. Host-work's side (the task lifecycle, its states and details, the
 clocks) is [atem-host-work-v1.md](atem-host-work-v1.md) §11.6. **Nothing
-here is advertised or running in this version:** no host lists
-`host.delegated`, `host.alerts` or `host.senders`, no `host-work`
-principal exists, no receipt carries `task_id` or `sender`, and
-`host_enc_key_get` is refused (below). The host builds it in step 4 of the
-design's order of work. The shared core already has the wire: the
-principal's name, the receipt fields and their reader, and the op and its
-answer. Each choice that fills in the design is marked. Astation agreed R9.14
-(2026-11-11, #120 comment 6810116314), except the two questions still marked
-open (item 1's UI question, item 8's request for a new key).
+here is advertised in this version:** no host lists `host.delegated`,
+`host.alerts` or `host.senders`. Items 1 to 7 are built (step 4 of the
+design's order of work) behind a debug-only hook,
+`ATEM_TEST_HOST_FEATURES=host.delegated`, read once when the runtime
+starts. Release builds compile the hook out, so without it no `host-work`
+principal exists and no receipt carries `task_id` or `sender`. Item 8 is
+still refused (below). The shared core has the wire: the principal's name,
+the receipt fields and their reader, and the op and its answer. Each choice
+that fills in the design is marked. Astation agreed R9.14 (2026-11-11, #120
+comment 6810116314), except the two questions still marked open (item 1's
+UI question, item 8's request for a new key) and what step 4 added since,
+each marked where it is: item 1's leases (no prompt that doesn't acquire,
+the lease kept while a request is open, none after a restart) and item 3's
+fail-closed rules (Atem's choices, for Astation to confirm); item 4's
+refusal-list rules (with §I.2's), item 5's delivery after a restart and
+item 6's reconciliation of `executing` prompts (changed agreed meaning,
+needs Astation's agreement).
 
 1. **The `host-work` principal.** Its name is `host-work`
    (`atem_client::session::wire::HOST_WORK_PRINCIPAL`), a bare word like
@@ -4333,6 +4359,15 @@ open (item 1's UI question, item 8's request for a new key).
      item 2 say which task holds it. (**Needs Astation's agreement:**
      whether its UI needs to tell the host-work holder apart from a device;
      this revision adds no field for it.)
+   - **Leases, as built** (**Atem's choice, for Astation to confirm**). A
+     prompt it submits without `acquire: true`, or with `takeover`, is
+     `invalid_request`, and nothing is recorded. It keeps the lease while
+     any request of its on that session is open (`accepted` or
+     `executing`), not only for one turn, and releases it at the first
+     pass after the last one settled. After a restart a turn still running
+     and rebound (item 6) holds no lease: leases aren't persisted and
+     host-work doesn't acquire again, so a native may acquire it without a
+     takeover.
    - **Approvals.** The runtime answers no approval through this
      attachment. A delegated turn's approval cards go, as today, to the
      attachments with `control` (§G; design I.4.2).
@@ -4386,6 +4421,13 @@ open (item 1's UI question, item 8's request for a new key).
    device list. The requests of every other principal keep §H's dispatch
    check only, which the `host-work` principal passes trivially (item 1).
 
+   As built (**Atem's choice, for Astation to confirm**): with no check
+   installed, every request of the `host-work` principal is withdrawn
+   (`withdrawn by the host`, fail closed). A refusal whose `rejected`
+   write fails halts the journal (§I), and the request goes on the refusal
+   list best effort, so the restart resolves it `withdrawn by the host`
+   (item 6; `withdrawn at recovery` if that listing failed too).
+
 4. **Host-internal withdrawal.** Host-work may ask the session host to
    withdraw its own request: after a revoke, a hold, a narrowing, a route
    change, or an interrupt intent (design I.5.6, I.5.7). The session host
@@ -4409,6 +4451,30 @@ open (item 1's UI question, item 8's request for a new key).
    settles the request. Withdrawal is never offered to a client: it
    applies only to the `host-work` principal's own requests, and is seen
    only as the receipt's `rejected` state.
+
+   As built (**changed agreed meaning, needs Astation's agreement**: the
+   refusal list's own rules, §I.2):
+   - **One entry per `request_id`.** The first entry stays, whoever
+     submitted it. A withdrawal of an id already listed writes nothing and
+     reports it listed.
+   - **An id recorded under another submitter.** Nothing is written or
+     changed (that request isn't host-work's). Host-work's own submit of
+     that id is `request_id_reused` (item 7), so its attempt never runs.
+   - **The bound.** The list never grows past what a restart reads back
+     (its JSON within 8 MiB). A withdrawal whose entry wouldn't fit writes
+     nothing, and the journal doesn't halt: a submit of that id in this run
+     is `busy`, `detail: "refusal list full"`, never admitted, and after a
+     restart the id is absent (never admitted; host-work never sends that
+     attempt id again). Past 4096 such ids in one run, the next one halts
+     the journal instead (§I), so memory stays bounded too.
+   - **A failed rejection write** of an `accepted` request halts the
+     journal and lists the request best effort, so the restart resolves it
+     `withdrawn by the host`.
+   - **Another submitter's late submit** of a listed id is
+     `request_id_reused` (item 7).
+   - **In the run**, a listed id reads as the restart will record it: its
+     receipt, by `receipt_query` too (a viewer of its target), is
+     `rejected`, `withdrawn by the host`, with its provenance.
 
 5. **Interrupt with host authority** (design I.5.7). An interrupt intent
    comes from a `revoke` with `interrupt_running`, a later
@@ -4466,7 +4532,30 @@ open (item 1's UI question, item 8's request for a new key).
        owner's choice.
      - After a restart a pending intent is carried out again, delivering
        once more if that turn is still the session's current turn; a
-       turn that has already ended makes it do nothing.
+       turn that has already ended makes it do nothing. **As built
+       (changed agreed meaning, needs Astation's agreement):** the host
+       knows that turn is still current only when the prompt's turn was
+       journaled (item 6's `turn_started`) and the adopted worker's chat
+       shows it running: then the attempt stays `executing`, rebound to
+       it, and the interrupt is delivered once more. Until that chat
+       arrives (at most 60 s, item 6) the turn check refuses, no turn
+       state yet, and the intent stays pending. In every other case the
+       start's reconciliation settles the attempt `outcome_unknown` (item
+       6) and no Esc is written: the turn may still run, but nothing
+       proves it current, and the host never writes a blind Esc. The owner
+       learns of it from the `outcome_unknown` alert (`host.alerts`).
+
+   - **As built.** The chat's half of step 1's turn check is today's Esc
+     rule: chat-v1 shows the session `working` or `waiting`, and its
+     current turn is the one the attempt's prompt began; without chat, or
+     in any other state, the interrupt is dropped and nothing is written.
+     The repeated revocation is a call of its own, which writes nothing.
+     While an attempt's write waits for the worker's answer, the interrupt
+     runs only that revocation, so one attempt never has two writes in
+     flight. Each write's outcome is reported once: `ok` (written,
+     delivered), `consumed`, `dropped` or `no_effect` (nothing written:
+     written again on the next pass), or `error_after_queue` (counts as
+     delivered).
 
 6. **§H recovery.** The `host-work` principal's requests are never
    confirmed. Before anything is dispatched, each recovered `accepted`
@@ -4484,6 +4573,50 @@ open (item 1's UI question, item 8's request for a new key).
    `outcome_unknown`, `agent exited`). The order (the refusal list first,
    as §I.7 rules for every principal) is **Atem's choice, agreed with Astation
    (2026-11-11, #120 comment 6810116314)**.
+
+   **The reconciliation, as built (changed agreed meaning, needs
+   Astation's agreement):**
+   - **The turn a prompt started is journaled** (`turn_started`): ids
+     only, the turn and the user message, written durably at the chat's
+     acceptance (after the paste, while `executing`), for the `host-work`
+     principal's prompts only. No other request has one, so other
+     journals are written as before.
+   - **An `executing` prompt of the `host-work` principal** is decided at
+     the start from the adopted worker's chat:
+     - its agent process gone (no live worker of the prompt's
+       `process_gen`) → `outcome_unknown`, `agent exited`;
+     - the chat not arrived yet → it stays `executing` and waits, at most
+       60 s after the start's recovery (as §H's confirmation window), then
+       `outcome_unknown`, `outcome could not be established`;
+     - no turn state (no chat-v1) → `outcome_unknown`, `outcome could not
+       be established`;
+     - its turn ended → `completed` with that turn's outcome and ids, or
+       `outcome_unknown`, `outcome could not be established`, when the
+       outcome isn't known;
+     - its turn still current → it stays `executing`, rebound to that
+       turn: the interrupt (item 5) and the turn's end find it again;
+     - another turn current, or none → `outcome_unknown`, `outcome could
+       not be established`;
+     - no turn journaled (a crash before `turn_started` was durable) →
+       `outcome_unknown`, `outcome could not be established`, at once.
+
+     Every other principal's `executing` requests keep §6
+     (`outcome_unknown`, `outcome could not be established`, as v1's
+     reconciliation has always written it).
+   - **Corrupt journals.** A record a journal can read but whose rules it
+     breaks (a provenance off a `host-work` prompt, a turn result off a
+     `completed` prompt, a turn started anywhere but an `executing`
+     `host-work` prompt, or twice) ends that session's log there, as an
+     invalid transition always has, instead of disabling remote sessions.
+     This changes what any host does with such a corrupt journal.
+   - **Downgrades.** An older build can't read `turn_started`: it ends
+     that session's log at the record, losing the later records of every
+     principal on that session (a retry of one of those ids could run
+     again). It also can't read a refusal list whose entries carry a
+     `detail` or a `provenance`, so its start disables remote sessions
+     until a newer build's start clears the list. Before running an older
+     build on a profile where the hook ran, move `runtime/journal/` aside.
+     There is no shim.
 
 7. **`request_id_reused` across submitters.** A `submit` whose
    `request_id` is recorded under another submitter, where the recorded
@@ -4592,8 +4725,11 @@ open (item 1's UI question, item 8's request for a new key).
        - Listed in R9.13 (item 8).
 
 **Errors and details (additions).** Receipt details: `withdrawn by the
-host` (items 3, 4), `withdrawn at recovery` (item 6). `request_id_reused`
-(item 7). `busy`, details `host encryption key unavailable` and `device
+host` (items 3, 4), `withdrawn at recovery` (item 6); `outcome_unknown`
+with `agent exited` or `outcome could not be established` for a
+reconciled `host-work` prompt (item 6). `request_id_reused` (item 7).
+`busy`, detail `refusal list full`, which only a submitter of an id
+withdrawn while the refusal list was full hears (item 4). `busy`, details `host encryption key unavailable` and `device
 list not reconciled` (item 8). `unsupported_version`, detail `host.senders
 is not advertised` (item 8, while unadvertised).
 
@@ -4611,5 +4747,13 @@ is not advertised` (item 8, while unadvertised).
   refused).
 - **The host's step 3 refusal:** tested in
   `src/session_protocol/r9/tests.rs` (`host_enc_key_get`).
-- **Scenario fixtures for items 1 to 7** come with the host (step 4), with
-  Astation.
+- **Scenario fixtures for items 1 to 7:** `fixtures/r9-delegated-*.json`
+  (`provenance`, `start-check-withdraws`, `withdrawal-refusal-list`,
+  `host-interrupt`, `recovery-withdrawn`,
+  `request-id-across-submitters`; `fixtures/schema.md` defines their
+  steps). Two host runners run them: Atem's in-process r9 host runner
+  (`membership::fixtures_tests`) and its real-runtime runner with the
+  drive hook (`ATEM_TEST_HOST_WORK_DRIVE`). No client-side runner runs
+  them: their host-work steps are host-internal, and what a client
+  observes is in their `expect` steps. Atem's unit tests pin what the
+  fixtures can't show (the turn check coming first, the 60 s bound).

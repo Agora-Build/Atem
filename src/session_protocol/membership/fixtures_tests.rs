@@ -1726,9 +1726,11 @@ impl Runner {
                     chat: step["chat"].as_bool().unwrap_or(true),
                     current_turn: step["current_turn"].as_str().map(str::to_owned),
                     last_completed: step["last_completed"].as_str().map(str::to_owned),
-                    interrupted: step
-                        .get("outcome")
-                        .map(|o| o.as_str() == Some("interrupted")),
+                    interrupted: step.get("outcome").map(|o| match o.as_str() {
+                        Some("done") => false,
+                        Some("interrupted") => true,
+                        _ => panic!("{}: outcome {o}", self.name),
+                    }),
                 };
                 self.host_event(event);
             }
@@ -1799,9 +1801,6 @@ impl Runner {
         }
     }
 
-    /// `expect_relay`: the next relay message Atem sent matches each
-    /// `path: value` (`a.b.0.c`; `x.#` an array's length; `${…}`
-    /// resolved); `capture` takes values by path.
     /// What host-work heard of its last step (`host_work_*`) has every key
     /// of `want`, with its value.
     fn host_work_result(&mut self, want: &Value) {
@@ -1818,6 +1817,9 @@ impl Runner {
         self.pass();
     }
 
+    /// `expect_relay`: the next relay message Atem sent matches each
+    /// `path: value` (`a.b.0.c`; `x.#` an array's length; `${…}`
+    /// resolved); `capture` takes values by path.
     fn expect_relay(&mut self, step: &Value) {
         self.drain();
         let name = self.name.clone();

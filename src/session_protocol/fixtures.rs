@@ -169,7 +169,8 @@ pub enum HostEvent {
         session_id: String,
     },
     /// The provider reports the end of the session's executing prompt turn
-    /// (`interrupted`: it ended interrupted, `outcome: "interrupted"`).
+    /// (`interrupted`: it ended interrupted; r9's `outcome: "interrupted"`,
+    /// which r8 fixtures don't have).
     TurnComplete {
         session_id: String,
         turn_id: String,
@@ -657,7 +658,7 @@ impl Runner {
             ("fail_next_pty_enqueue", &[]),
             ("fail_next_pty_write_after_partial", &[]),
             ("close_session", &[]),
-            ("turn_complete", &["turn_id", "outcome"]),
+            ("turn_complete", &["turn_id"]),
             ("hold_pty_writes", &[]),
             ("flush_pty_writes", &[]),
             (
@@ -976,12 +977,8 @@ impl Runner {
             "turn_complete" => HostEvent::TurnComplete {
                 session_id: as_str(arg, "turn_complete")?.into(),
                 turn_id: as_str(take(step, "turn_id")?, "turn_id")?.into(),
-                interrupted: match step.get("outcome").map(|o| as_str(o, "outcome")) {
-                    None => false,
-                    Some(Ok("done")) => false,
-                    Some(Ok("interrupted")) => true,
-                    Some(_) => return Err("outcome must be done or interrupted".into()),
-                },
+                // `outcome` is r9's (the delegated fixtures), not r8's.
+                interrupted: false,
             },
             "hold_pty_writes" => yes(arg).map(|_| HostEvent::HoldPtyWrites)?,
             "flush_pty_writes" => yes(arg).map(|_| HostEvent::FlushPtyWrites)?,

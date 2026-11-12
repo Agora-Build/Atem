@@ -348,6 +348,18 @@ fn host_work_receipts_carry_task_id_and_sender() {
         error_code(&got(&mut rt, HOST_WORK_PRINCIPAL)),
         "invalid_request"
     );
+    // … a prompt that doesn't acquire, on its own held lease (each prompt
+    // must acquire with `acquire: true`, R9.14 item 1; PR 5 review M1) …
+    assert_eq!(rt.host.lease_holder(S1), Some(HW));
+    let mut own = prompt_data(HW, 24);
+    own.as_object_mut().unwrap().remove("acquire");
+    own["binding"]["lease_epoch"] = json!(rt.host.lease_epoch(S1).unwrap());
+    submit_host_work(&mut rt, HW, own, provenance(TASK, SENDER));
+    assert!(rt.host.receipt(&rid(24)).is_none());
+    assert_eq!(
+        error_code(&got(&mut rt, HOST_WORK_PRINCIPAL)),
+        "invalid_request"
+    );
     // … a prompt of the host-work principal without provenance (the plain
     // session path) …
     let plain = json!({"type": "session", "data": prompt_data(HW, 21)});
@@ -932,7 +944,11 @@ fn withdraw_absent_lists_it_and_a_late_submit_gets_the_rejected_receipt() {
     assert_eq!(entry.payload_digest, imm.payload_digest);
     assert_eq!(entry.detail.as_deref(), Some(DETAIL_WITHDRAWN_BY_HOST));
     assert_eq!(entry.provenance, Some(provenance(TASK, SENDER)));
-    assert!(rt.host.receipt(&rid(1)).is_none());
+    // Read as the restart will record it (PR 5 review M2), with nothing in
+    // the journal's log yet.
+    let r = rt.host.receipt(&rid(1)).expect("listed");
+    assert_eq!(r.state, ReceiptState::Rejected);
+    assert_eq!(r.detail.as_deref(), Some(DETAIL_WITHDRAWN_BY_HOST));
     assert!(logged(&log_path(dir.path()), &rid(1)).is_empty());
     // Withdrawn again: still listed, once.
     assert_eq!(withdraw(&mut rt, 1), Withdrawal::Listed);
@@ -2311,4 +2327,55 @@ fn the_reconciliation_table() {
         );
     }
     assert_eq!(RECONCILE_MS, CONFIRM_MS);
+}
+
+/// PR 5 review M2 (Task 14 M2): a request host-work withdrew before it was
+/// journaled is seen in this run as the restart will record it, `rejected`
+/// (`withdrawn by the host`) with its provenance: by `receipt`, by
+/// `attempt_receipt` and by a viewer's `receipt_query` of its target (not
+/// of another one).
+#[test]
+fn a_listed_request_reads_in_the_run_as_the_restart_records_it() {
+    let mut rt = setup();
+    host_work(&mut rt, HW);
+    assert_eq!(withdraw(&mut rt, 1), Withdrawal::Listed);
+    let want = |r: &wire::Receipt| {
+        assert_eq!(r.request_id, rid(1));
+        assert_eq!(r.state, ReceiptState::Rejected);
+        assert_eq!(r.detail.as_deref(), Some(DETAIL_WITHDRAWN_BY_HOST));
+        assert_eq!(
+            (r.task_id.as_deref(), r.sender.as_deref()),
+            (Some(TASK), Some(SENDER))
+        );
+    };
+    want(&rt.host.receipt(&rid(1)).expect("listed"));
+    want(&rt.host.attempt_receipt(&rid(1), TASK).expect("its own"));
+    assert_eq!(rt.host.attempt_receipt(&rid(1), TASK2), None);
+    let query = |target: Value| {
+        json!({"type": "session", "data": {"v": 1, "op": "receipt_query", "id": id(),
+            "binding": {"target": target, "attachment_gen": V}, "request_ids": [rid(1)]}})
+    };
+    got(&mut rt, "v");
+    rt.send("v", &query(target()));
+    let answer = got(&mut rt, "v");
+    assert_eq!(
+        answer[0]["receipts"].as_array().unwrap().len(),
+        1,
+        "{answer:#?}"
+    );
+    assert_eq!(answer[0]["receipts"][0]["state"], "rejected");
+    assert_eq!(answer[0]["receipts"][0]["task_id"], TASK);
+    decodes(&answer[0]);
+    // Another process of the session: not this target's.
+    let mut other = target();
+    other["process_gen"] = json!(GEN2);
+    rt.send("v", &query(other));
+    let answer = got(&mut rt, "v");
+    assert!(
+        answer[0]["receipts"].as_array().is_none_or(Vec::is_empty),
+        "{answer:#?}"
+    );
+    // After the restart: the same.
+    restart(&mut rt, GEN3, 9);
+    want(&rt.host.receipt(&rid(1)).expect("recorded"));
 }

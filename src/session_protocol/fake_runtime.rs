@@ -1476,27 +1476,24 @@ impl<J: Journal> FakeRuntime<J> {
         let fx = self.host.submit_host_work(&att, data, immutable.provenance);
         self.apply(fx);
         let heard = self.take(wire::HOST_WORK_PRINCIPAL);
-        let reply = heard
+        let refused = heard
             .iter()
             .map(|m| &m["data"])
-            .find(|d| d["re"] == json!(id))
-            .ok_or("no reply")?;
-        let out = |first: &str, value: &Value, detail: Option<&Value>| {
-            let mut r = json!({first: value});
-            if let Some(d) = detail.filter(|d| !d.is_null()) {
+            .find(|d| d["re"] == json!(id) && d["op"] == "error");
+        if let Some(e) = refused {
+            let mut r = json!({"code": e["code"]});
+            if let Some(d) = e.get("detail") {
                 r["detail"] = d.clone();
             }
-            r
-        };
-        if reply["op"] == "error" {
-            return Ok(out("code", &reply["code"], reply.get("detail")));
+            return Ok(r);
         }
-        // The receipt after the step; a withdrawn request's late submit has
-        // its `rejected` receipt only in the reply (until the restart).
-        Ok(match self.host.receipt(&a.request_id) {
-            Some(r) => out("state", &json!(r.state), r.detail.map(Value::from).as_ref()),
-            None => out("state", &reply["state"], reply.get("detail")),
-        })
+        // The receipt after the step (a listed request's too, in the run).
+        let receipt = self.host.receipt(&a.request_id).ok_or("no receipt")?;
+        let mut r = json!({"state": receipt.state});
+        if let Some(d) = receipt.detail {
+            r["detail"] = json!(d);
+        }
+        Ok(r)
     }
 }
 

@@ -105,6 +105,7 @@ const CLIENT_SIDE: &str =
     "the client's side of the handshake (atem-client's channel_fixtures, on the vectors)";
 const VECTOR_BYTES: &str = "the vector's exact bytes (fixed ephemeral keys and nonces: atem-client's channel_fixtures); here the same step runs on a live handshake";
 const STALL: &str = "not expressed without a hook that stalls Atem's link writer: the link is a real WebSocket, and a peer that stops reading leaves up to tcp_wmem + tcp_rmem (4 MiB + 6 MiB here) in kernel buffers before Atem's own queue holds anything, so 'queued output passes 4 MiB' can't be produced from outside at a known step; the per-channel 4 MiB bound runs on the engine (r9::fixtures_tests::the_envelope_fixtures_pass_on_the_engine)";
+const NO_WITHDRAWN_CHAT: &str = "an adopted chat without turn state (`chat: false`): the fake agent's chat can't be withdrawn on demand, so the real runtime can't show it; the in-process host runner (membership::fixtures_tests) feeds it, and the bridge's tests run that branch of the reconciliation";
 const OUTSIDE_LOG: &str = "host-b's add_host is outside the vectors (the fixture's note): the real runtime opens that device list but refuses every r9 channel to a host its list doesn't name (host_channel_key isn't the key the device list names for host-b), and an add_host signed for it with the vectors' dev-mac key would take seq 6, which E6 and S6_phone need; so its chain side runs on the real runtime B as its own relay fetch (ATEM_TEST_MEMBERSHIP_FAULTS/carry.json, §R9.3: no more trust than any carrier) and is checked on its state, while the welcome or fence a channel would carry can't be";
 
 /// Why a whole file can't run against the real runtime, if it can't: it
@@ -591,13 +592,18 @@ impl Rt {
             .map_or(fixture.to_string(), |(_, r)| r.clone())
     }
 
-    /// The drive hook's result lines so far.
+    /// The drive hook's result lines so far (a last line still being
+    /// written, with no `\n` yet, isn't one; any other line must parse).
     fn driven(&self) -> Vec<Value> {
         let dir = self.drive.as_ref().expect("the drive hook is on");
-        std::fs::read_to_string(dir.join("done"))
-            .unwrap_or_default()
+        let text = std::fs::read_to_string(dir.join("done")).unwrap_or_default();
+        let complete = text.rfind('\n').map_or("", |end| &text[..end]);
+        complete
             .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
+            .map(|l| {
+                serde_json::from_str(l)
+                    .unwrap_or_else(|e| panic!("{}: a done line {l:?}: {e}", self.name))
+            })
             .collect()
     }
 
@@ -2545,13 +2551,16 @@ impl Runner {
                 self.drain();
             }
             "adopted_chat" => {
+                if step["chat"] == false {
+                    self.later("adopted_chat with chat: false", NO_WITHDRAWN_CHAT);
+                    return;
+                }
                 // The adopted worker's real chat arrives by itself: wait
                 // until it shows what the fixture says, and every
                 // reconciliation it decides is done.
                 let fixture = step[kind].as_str().unwrap().to_owned();
                 let real = self.host().real(&fixture);
-                let want = json!({"synced": true,
-                    "chat": step["chat"].as_bool().unwrap_or(true),
+                let want = json!({"synced": true, "chat": true,
                     "current_turn": step["current_turn"], "last_completed": step["last_completed"],
                     "outcome": step.get("outcome").cloned().unwrap_or(Value::Null)});
                 self.settle_state(&format!("adopted_chat {want}"), |s| {

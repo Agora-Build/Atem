@@ -68,10 +68,15 @@
 //! byte, so every later record of the session's log is lost, other
 //! principals' included: those requests become unknown (a retry with the
 //! same `request_id` could be admitted and run again, r8 §I.5) and their
-//! `executing` receipts are never reconciled. Only a runtime that ran
-//! host-work prompts (a debug build with `ATEM_TEST_HOST_FEATURES`) writes
-//! one: move `runtime/journal/` aside before running an older build on such
-//! a profile. There is no shim (no legacy shims).
+//! `executing` receipts are never reconciled. An older build also can't
+//! read a refusal list whose entries carry `detail` (a withdrawal) or
+//! `provenance` (a host-work request's failed admission): its `Refusal` is
+//! `deny_unknown_fields`, so its start's resolution fails and remote
+//! sessions stay disabled (fail closed) until a newer build's start clears
+//! the list. Only a runtime that ran host-work requests (a debug build with
+//! `ATEM_TEST_HOST_FEATURES`) writes either: move `runtime/journal/` aside
+//! before running an older build on such a profile. There is no shim (no
+//! legacy shims).
 //!
 //! Prompt payloads are user content: the files are private and nothing here
 //! logs a payload.

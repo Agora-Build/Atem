@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "session-v1 R9.14 item 4. A withdrawal of an attempt not in the journal puts it on the refusal list (`listed`): its late submit gets the `rejected` receipt, `withdrawn by the host`, and never runs. That receipt is in the reply only until the restart records it. A queued attempt is withdrawn (`rejected`); an executing one can't be (`started`). After a restart the listed attempt is recorded `rejected` with the same detail, and its submit returns that receipt.",
+  "note": "session-v1 R9.14 item 4. A withdrawal of an attempt not in the journal puts it on the refusal list (`listed`): its receipt reads `rejected`, `withdrawn by the host`, and its late submit gets that receipt and never runs. A queued attempt is withdrawn (`rejected`); an executing one can't be (`started`). After a restart the listed attempt is recorded `rejected` with the same detail, and its submit returns that receipt.",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -47,6 +47,16 @@
       "sender": "member:dev-phone",
       "text": "run the tests",
       "result": "listed"
+    },
+    {
+      "assert": {
+        "receipts": {
+          "cccccccc-0000-4000-8000-000000000301": {
+            "state": "rejected",
+            "detail": "withdrawn by the host"
+          }
+        }
+      }
     },
     {
       "host_work_submit": "ses-aaaaaaaaaaaa",
@@ -107,6 +117,10 @@
     {
       "assert": {
         "receipts": {
+          "cccccccc-0000-4000-8000-000000000301": {
+            "state": "rejected",
+            "detail": "withdrawn by the host"
+          },
           "cccccccc-0000-4000-8000-000000000302": {
             "state": "completed",
             "detail": "done"

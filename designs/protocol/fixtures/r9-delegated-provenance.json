@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "session-v1 R9.14 items 1 and 2. The host-work principal submits its attempt on its internal attachment, acquiring the lease as any controller would: a native viewer sees `lease_changed{granted}` and its own acquiring Send is `lease_held`. The attempt's receipt carries `task_id` and `sender`, for a native's `receipt_query` too, through its turn's end. At the turn's end the runtime releases the lease, and the native's own prompt runs (its receipt carries neither field: host_work_tests::other_receipts_carry_no_provenance). The fake agent takes each pasted prompt as turn `turn-<n>`.",
+  "note": "session-v1 R9.14 items 1 and 2. The host-work principal acquires the lease only while nobody holds it: while a native holds it, host-work's attempt is `lease_held` and nothing runs. Once the native released it, host-work submits its attempt on its internal attachment, acquiring the lease as any controller would: a native viewer sees `lease_changed{granted}` and its own acquiring Send is `lease_held`. The attempt's receipt carries `task_id` and `sender`, for a native's `receipt_query` too, through its turn's end. At the turn's end the runtime releases the lease, and the native's own prompt runs. R9.14 item 2: both fields or neither, only on host-work's receipts; the shared core's `receipt_provenance.rs` pins the reader. The fake agent takes each pasted prompt as turn `turn-<n>`.",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -42,6 +42,58 @@
     ]
   },
   "steps": [
+    {
+      "send": "mac",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "acquire",
+          "id": "aaaaaaaa-0000-4000-8000-000000000100",
+          "binding": "${binding:mac:ses-aaaaaaaaaaaa}",
+          "takeover": false
+        }
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "lease"
+      }
+    },
+    {
+      "host_work_submit": "ses-aaaaaaaaaaaa",
+      "request_id": "cccccccc-0000-4000-8000-000000000100",
+      "task_id": "dddddddd-0000-4000-8000-000000000100",
+      "sender": "member:dev-phone",
+      "text": "run the tests",
+      "result": {
+        "code": "lease_held"
+      }
+    },
+    {
+      "assert": {
+        "dispatches": 0
+      }
+    },
+    {
+      "send": "mac",
+      "json": {
+        "type": "session",
+        "data": {
+          "v": 1,
+          "op": "release",
+          "id": "aaaaaaaa-0000-4000-8000-000000000105",
+          "binding": "${lease_binding:mac:ses-aaaaaaaaaaaa}"
+        }
+      }
+    },
+    {
+      "expect": "mac",
+      "match": {
+        "op": "lease_released"
+      }
+    },
     {
       "host_work_submit": "ses-aaaaaaaaaaaa",
       "request_id": "cccccccc-0000-4000-8000-000000000101",

@@ -4714,7 +4714,8 @@ fn host_work_renews_every_5s_while_its_turn_runs_and_releases_at_the_end() {
     use crate::session_protocol::wire::{ClientKind, Permission, ReceiptState};
     let _profile = crate::test_profile::temp();
     let dir = short_dir();
-    let clock = Clock::default();
+    // Moved only by the test: no margin against real time (PR 5 review I3).
+    let clock = Clock::manual();
     let mut app = idle_app();
     let mut bridge =
         super::HostBridge::open(&dir.path().join("journal"), None, clock.clone()).unwrap();
@@ -4801,8 +4802,8 @@ fn host_work_renews_every_5s_while_its_turn_runs_and_releases_at_the_end() {
     clock.skip(1_000);
     pass(&mut bridge, &mut app);
     let renewed = bridge.host().lease_deadline(sid).unwrap();
-    assert!(renewed >= granted + 5_000, "{renewed} {granted}");
-    assert!(renewed >= clock.now() + LEASE_MS - 100);
+    assert_eq!(renewed, granted + 5_000);
+    assert_eq!(renewed, clock.now() + LEASE_MS);
     assert_eq!(bridge.host().lease_deadline(other), Some(theirs));
     // While the turn runs (30 s, a pass a second): held throughout, renewed
     // every 5 s and never sooner; the other lease lapses on its own.
@@ -4812,7 +4813,7 @@ fn host_work_renews_every_5s_while_its_turn_runs_and_releases_at_the_end() {
         pass(&mut bridge, &mut app);
         let deadline = bridge.host().lease_deadline(sid).expect("still held");
         if deadline != last {
-            assert!(deadline >= last + 5_000, "{deadline} {last}");
+            assert_eq!(deadline, last + 5_000);
             renewals += 1;
             last = deadline;
         }
@@ -6042,7 +6043,8 @@ async fn an_adopted_chat_that_never_arrives_settles_at_the_deadline() {
     let session = broker_session(dir.path()).await;
     let ids = vec![session.id.clone()];
     let mut sessions = std::collections::BTreeMap::from([(session.id.clone(), session)]);
-    let clock = Clock::default();
+    // Moved only by the test: no margin against real time (PR 5 review I3).
+    let clock = Clock::manual();
     let (mut bridge, rids, mut snapshots) = restarted(
         dir.path(),
         &mut app,
@@ -6054,16 +6056,15 @@ async fn an_adopted_chat_that_never_arrives_settles_at_the_deadline() {
     .await;
     let rid = &rids[0];
     assert!(bridge.host_work_reconciling(rid));
-    // The bridge's clock also runs in real time: a second short of the
-    // bound, then the rest of it.
-    clock.skip(RECONCILE_MS - 1_000);
+    // A millisecond short of the bound, then the bound.
+    clock.skip(RECONCILE_MS - 1);
     pass_with(&mut bridge, &mut app, &mut sessions);
     assert!(bridge.host_work_reconciling(rid));
     assert_eq!(
         bridge.host().receipt(rid).unwrap().state,
         ReceiptState::Executing
     );
-    clock.skip(1_000);
+    clock.skip(1);
     pass_with(&mut bridge, &mut app, &mut sessions);
     assert!(!bridge.host_work_reconciling(rid));
     let r = bridge.host().receipt(rid).unwrap();
@@ -6269,23 +6270,20 @@ async fn the_drive_hook_plays_host_works_side_through_the_bridge() {
         drive(&mut bridge, &mut cx, "interrupt-3.json", interrupt(true)),
         json!({"file": "interrupt-3.json", "interrupt": "revoked"})
     );
-    // The write's outcome, once the worker answered.
-    let results = tokio::time::timeout(WAIT, async {
-        loop {
+    // The write's outcome, once the worker answered it (the paste's answer
+    // may come in an earlier batch: PR 5 review M4).
+    tokio::time::timeout(WAIT, async {
+        while pending_interrupt(&bridge, &sid, &r2).is_some() {
             let session = cx.sessions.get_mut(&id).unwrap();
             session.pump();
-            let results = session.take_results();
-            if !results.is_empty() {
-                return results;
+            for result in session.take_results() {
+                bridge.write_result(&sid, result, &mut cx);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .unwrap();
-    for result in results {
-        bridge.write_result(&sid, result, &mut cx);
-    }
     assert_eq!(
         bridge.drive_reports(),
         [json!({"report": r2, "outcome": "ok"})]
@@ -6302,4 +6300,42 @@ async fn the_drive_hook_plays_host_works_side_through_the_bridge() {
         json!({"file": "submit-9.json", "error": "expected value"})
     );
     let _ = cx.sessions.get_mut(&id).unwrap().stop();
+}
+
+/// PR 5 review M10: the reconciliation reads only a live session of the
+/// prompt's own process. The same session id adopted under another
+/// `process_gen` (the agent process the prompt ran in is gone) is
+/// `outcome_unknown`, `agent exited`, whatever its chat shows.
+#[tokio::test]
+async fn a_reconciled_turn_of_another_process_is_agent_exited() {
+    use crate::session_protocol::host::DETAIL_AGENT_EXITED;
+    use crate::session_protocol::wire::ReceiptState;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let mut app = idle_app();
+    let session = broker_session(dir.path()).await;
+    let ids = vec![session.id.clone()];
+    let mut sessions = std::collections::BTreeMap::from([(session.id.clone(), session)]);
+    let (mut bridge, rids, snapshots) = restarted(
+        dir.path(),
+        &mut app,
+        &mut sessions,
+        &ids,
+        Clock::manual(),
+        |_, session| session.process_gen = uuid::Uuid::new_v4().to_string(),
+    )
+    .await;
+    // Its chat even shows the journaled turn running.
+    for (i, snapshot) in snapshots.into_iter().enumerate() {
+        snapshot_arrives(sessions.get_mut(&ids[i]).unwrap(), snapshot);
+    }
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    let r = bridge.host().receipt(&rids[0]).unwrap();
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (ReceiptState::OutcomeUnknown, Some(DETAIL_AGENT_EXITED))
+    );
+    assert!(!bridge.host_work_reconciling(&rids[0]));
+    assert_eq!(sessions[&ids[0]].chat.current_request_id(), None);
+    let _ = sessions.get_mut(&ids[0]).unwrap().stop();
 }

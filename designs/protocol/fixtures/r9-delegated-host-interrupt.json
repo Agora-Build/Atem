@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "host",
   "log": "r9-vectors-membership-log",
-  "note": "session-v1 R9.14 items 5 and 6. A native takes the lease over while host-work's attempt runs. The interrupt with host authority checks the turn first, then revokes the native's lease (`lease_changed{revoked}`) and writes the Esc, receipt-less. Retaken on a free lease, the lease is revoked again by the revoke-only call, with nothing written. The runtime restarts while the turn runs: the adopted worker's chat shows turn-1 still current, so the attempt stays `executing`, rebound to it, and the interrupt is delivered once more. The turn then ends interrupted, and the attempt's receipt completes `interrupted`. The real runtime runs this with a real agent: its worker is adopted, and the chat snapshot and the turn's end are real.",
+  "note": "session-v1 R9.14 items 5 and 6. A native takes the lease over while host-work's attempt runs. The interrupt with host authority passes the turn check (that it comes first is pinned by the host's unit tests), then revokes the native's lease (`lease_changed{revoked}`) and writes the Esc, receipt-less. Retaken on a free lease, the lease is revoked again by the revoke-only call, with nothing written. The runtime restarts while the turn runs: the adopted worker's chat shows turn-1 still current, so the attempt stays `executing`, rebound to it, and the interrupt is delivered once more. The turn then ends interrupted, and the attempt's receipt completes `interrupted`. The real runtime runs this with a real agent: its worker is adopted, and the chat snapshot and the turn's end are real.",
   "setup": {
     "host": {
       "account_id": "acct-test-1",
@@ -177,6 +177,11 @@
       "host_work_interrupt": "ses-aaaaaaaaaaaa",
       "request_id": "cccccccc-0000-4000-8000-000000000401",
       "result": "not_executing"
+    },
+    {
+      "assert": {
+        "dispatches": 1
+      }
     }
   ]
 }

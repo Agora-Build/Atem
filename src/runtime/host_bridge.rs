@@ -166,6 +166,10 @@ pub struct Clock {
     origin: Instant,
     skew: Arc<AtomicU64>,
     wall_skew: Arc<AtomicU64>,
+    /// Tests (`Clock::manual`): the monotonic clock moves only with
+    /// `skip`, never in real time.
+    #[cfg(test)]
+    manual: bool,
 }
 
 impl Default for Clock {
@@ -174,12 +178,28 @@ impl Default for Clock {
             origin: Instant::now(),
             skew: Arc::new(AtomicU64::new(0)),
             wall_skew: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            manual: false,
         }
     }
 }
 
 impl Clock {
+    /// Tests: a monotonic clock at 0 that moves only with `skip`, so a "not
+    /// yet" assertion needs no margin against real time (PR 5 review I3).
+    #[cfg(test)]
+    pub fn manual() -> Self {
+        Self {
+            manual: true,
+            ..Self::default()
+        }
+    }
+
     pub fn now(&self) -> u64 {
+        #[cfg(test)]
+        if self.manual {
+            return self.skew.load(Ordering::SeqCst);
+        }
         // The shared fixtures run the real runtime on their own clock.
         let base = super::test_hooks::clock_ms()
             .unwrap_or_else(|| self.origin.elapsed().as_millis() as u64);
@@ -1747,8 +1767,11 @@ impl HostBridge {
         self.flush_pushes(&mut cx);
         let effects = self.r9_call(|r9, parts| r9.reap(parts));
         self.r9_exec(effects, &mut cx);
+        // Only for the state dump (PR 5 review M9).
         #[cfg(debug_assertions)]
-        let chats = chat_dump(&cx);
+        let chats = super::test_hooks::state_dump()
+            .is_some()
+            .then(|| chat_dump(&cx));
         let client = cx.client;
         // §R9.8a: a committed relay-only result's write is what a local
         // link waits for before it closes.
@@ -1789,7 +1812,7 @@ impl HostBridge {
     /// assert, written after each pass with the pass number
     /// (`tests/r9_runner`).
     #[cfg(debug_assertions)]
-    fn dump_state(&mut self, chats: Value) {
+    fn dump_state(&mut self, chats: Option<Value>) {
         use serde_json::json;
         let Some(file) = super::test_hooks::state_dump() else {
             return;
@@ -1865,7 +1888,7 @@ impl HostBridge {
                     "blob_version": k.blob_version, "backup_hash": k.backup_hash.to_hex()})),
             });
         }
-        state["chats"] = chats;
+        state["chats"] = chats.unwrap_or_default();
         state["reconciling"] = json!(self.reconciling.keys().collect::<Vec<_>>());
         // The pass number: a reader can wait for a pass after its own
         // action (a dump from before it can't satisfy an assert).
@@ -2878,6 +2901,10 @@ impl HostBridge {
                 request_id,
                 revoke_only,
             } => {
+                // After the session host's `advance`, as `host_interrupt`
+                // asks (PR 5 review M5).
+                let effects = self.host.advance(self.clock.now());
+                self.exec(effects, cx);
                 let outcome = if revoke_only {
                     self.host_interrupt_revoke_lease(&session_id, &request_id, cx)
                 } else {
@@ -2949,38 +2976,36 @@ impl HostBridge {
             "request_id": rid, "kind": "prompt", "payload": {"text": a.text},
             "acquire": true});
         let effects = self.host.submit_host_work(&att, data, immutable.provenance);
-        let out = |first: &str, value: Value, detail: Option<&String>| {
-            let mut r = json!({first: value});
-            if let Some(d) = detail {
-                r["detail"] = json!(d);
-            }
-            r
-        };
-        // What host-work heard: a refusal, or the receipt the reply names.
-        let reply = effects.iter().find_map(|e| match e {
+        let refused = effects.iter().find_map(|e| match e {
             Effect::Send {
                 attachment,
                 message: Envelope::Session(m),
             } if *attachment == att && m.re.as_deref() == Some(id.as_str()) => match &m.op {
                 wire::Op::Error { code, detail, .. } => {
-                    Some((true, out("code", json!(code), detail.as_ref())))
-                }
-                wire::Op::Receipt(r) => {
-                    Some((false, out("state", json!(r.state), r.detail.as_ref())))
+                    let mut r = json!({"code": code});
+                    if let Some(d) = detail {
+                        r["detail"] = json!(d);
+                    }
+                    Some(r)
                 }
                 _ => None,
             },
             _ => None,
         });
         self.exec(effects, cx);
-        match (reply, self.host.receipt(&rid)) {
-            (Some((true, refused)), _) => refused,
-            // The receipt after the step.
-            (_, Some(r)) => out("state", json!(r.state), r.detail.as_ref()),
-            // A withdrawn request's late submit: its `rejected` receipt is
-            // only in the reply (until the restart).
-            (Some((false, receipt)), None) => receipt,
-            (None, None) => json!({"error": "no reply"}),
+        if let Some(refused) = refused {
+            return refused;
+        }
+        // The receipt after the step (a listed request's too, in the run).
+        match self.host.receipt(&rid) {
+            Some(r) => {
+                let mut out = json!({"state": r.state});
+                if let Some(d) = r.detail {
+                    out["detail"] = json!(d);
+                }
+                out
+            }
+            None => json!({"error": "no receipt"}),
         }
     }
 
