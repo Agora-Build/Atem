@@ -78,7 +78,8 @@ use crate::session::{Provider, SessionId};
 use crate::session_protocol::file_journal::FileJournal;
 use crate::session_protocol::host::{
     Attach, ChatReply, DETAIL_TURN_DONE, DETAIL_TURN_INTERRUPTED, DispatchReport, Effect,
-    HostConfig, HostContext, LEASE_EPOCH_BLOCK, Origin, SessionHost, SessionSpec, random_ids,
+    HostConfig, HostContext, LEASE_EPOCH_BLOCK, LEASE_MS, Origin, SessionHost, SessionSpec,
+    random_ids,
 };
 use crate::session_protocol::membership::{
     self, CarriageResult, Held, HostFences, MembershipHost, host_now,
@@ -106,6 +107,12 @@ mod host_work_bridge;
 
 /// `advance` runs this often.
 const ADVANCE_EVERY: u64 = 100;
+/// The `host-work` principal's lease is renewed this long after its grant
+/// or last renewal while its turn runs (session-v1 R9.14 item 1: every 5 s,
+/// a 15 s lease).
+const HOST_WORK_RENEW_MS: u64 = 5_000;
+/// The client name of the `host-work` principal's internal attachment.
+const HOST_WORK_CLIENT: &str = "atem-internal-host-work";
 /// Identical session messages within this window are handled once.
 const DEDUP_MS: u64 = 60_000;
 /// The authorization of an authenticated link (compatibility mode has no
@@ -484,6 +491,13 @@ struct Link {
 
 pub struct HostBridge {
     local: Option<(String, Identity)>,
+    /// The delegated host-work features this runtime runs, read once at its
+    /// start (`test_hooks::host_features`: off unless the debug-only hook
+    /// turns them on).
+    features: super::test_hooks::HostFeatures,
+    /// The `host-work` principal's internal attachment (session-v1 R9.14
+    /// item 1), only with `host.delegated`: new at every start.
+    host_work: Option<String>,
     work: host_work_bridge::State,
     host: SessionHost<FileJournal>,
     dir: std::path::PathBuf,
@@ -750,6 +764,8 @@ impl HostBridge {
         };
         Ok(Self {
             local: None,
+            features: super::test_hooks::host_features(),
+            host_work: None,
             work: host_work_bridge::State::open(dir, profile.is_some()),
             projects: ProjectScopes::new(hasher),
             project_unread: HashMap::new(),
@@ -1544,6 +1560,11 @@ impl HostBridge {
                 eprintln!("atem runtime: {error}");
             }
         }
+        // After the start's recovery, so recovered work meets the sessions
+        // adopted by then.
+        if self.recovered {
+            self.sync_host_work(&mut cx);
+        }
         self.sync_r9_link(r9_app_link(app), &mut cx);
         if !adopting
             && app
@@ -1607,6 +1628,11 @@ impl HostBridge {
             self.membership_pass(&mut cx);
             let effects = self.r9_call(|r9, parts| r9.tick(parts));
             self.r9_exec(effects, &mut cx);
+        }
+        if self.host_work.is_some() {
+            self.renew_host_work_leases();
+            let effects = self.host.take_effects();
+            self.exec(effects, &mut cx);
         }
         self.test_carriage(&mut cx);
         self.sync_local(&mut cx);
@@ -1935,6 +1961,22 @@ impl HostBridge {
             || (!attachment.is_empty() && attachment == self.local_attachment())
     }
 
+    /// The `host-work` principal's internal attachment, while the session
+    /// host has it (`host.delegated` on; session-v1 R9.14 item 1).
+    pub fn host_work_attachment(&self) -> Option<&str> {
+        self.host_work
+            .as_deref()
+            .filter(|att| self.host.attachment_principal(att) == Some(wire::HOST_WORK_PRINCIPAL))
+    }
+
+    /// One of the runtime's internal attachments (`local`'s, `host-work`'s):
+    /// nothing addressed to it leaves the host.
+    fn internal(&self, attachment: &str) -> bool {
+        !attachment.is_empty()
+            && (attachment == self.local_attachment()
+                || self.host_work.as_deref() == Some(attachment))
+    }
+
     pub(super) fn local_attachment(&self) -> &str {
         self.local.as_ref().map_or("", |(attachment, _)| attachment)
     }
@@ -2014,6 +2056,81 @@ impl HostBridge {
             }
             let effects = self.host.take_effects();
             self.exec(effects, cx);
+        }
+    }
+
+    /// Keeps the `host-work` principal's internal attachment (session-v1
+    /// R9.14 item 1), only while `host.delegated` is on: made through the
+    /// session host's connect and welcome path as `local`'s is, with `view`
+    /// and `control`, never over a link. It is new at every start (a new
+    /// bridge) and after the session host dropped it (a new identity
+    /// restarts the host). Unlike `local`'s it is never fenced: a frozen,
+    /// faulted or held device list, or a halted journal, stops delegated
+    /// tasks through the start check. A halted journal welcomes nobody, so a
+    /// missing one waits for the restart.
+    fn sync_host_work(&mut self, cx: &mut Cx) {
+        if !self.features.delegated || self.host_work_attachment().is_some() {
+            return;
+        }
+        self.host_work = None;
+        if self.host.journal_halted() {
+            return;
+        }
+        let attachment = uuid::Uuid::new_v4().to_string();
+        let attach = Attach {
+            client: HOST_WORK_CLIENT.into(),
+            principal: wire::HOST_WORK_PRINCIPAL.into(),
+            attachment_gen: attachment.clone(),
+            permissions: vec![Permission::View, Permission::Control],
+            client_kind: ClientKind::Native,
+            authorization_ms: atem_client::canonical::MAX_SAFE_INTEGER
+                .saturating_sub(self.clock.now()),
+        };
+        match self.host.connect(attach) {
+            Ok(effects) => {
+                self.exec(effects, cx);
+                match self.host.welcome_r9(&attachment, self.clock.now()) {
+                    Ok(_) => self.host_work = Some(attachment),
+                    Err(code) => {
+                        eprintln!(
+                            "atem runtime: the host-work attachment was not welcomed ({code:?})"
+                        );
+                        let effects = self.host.disconnect(&attachment);
+                        self.exec(effects, cx);
+                    }
+                }
+                let effects = self.host.take_effects();
+                self.exec(effects, cx);
+            }
+            Err(error) => eprintln!("atem runtime: the host-work attachment was refused: {error}"),
+        }
+    }
+
+    /// The `host-work` principal's leases (session-v1 R9.14 item 1, design
+    /// I.4.2): each lease its attachment holds is renewed on the runtime's
+    /// own pass every 5 s (`HOST_WORK_RENEW_MS`; a lease lasts 15 s) while
+    /// its turn runs (a request of it on that session is still `accepted`
+    /// or `executing`), and released at the first pass after the turn ended.
+    /// If the runtime stops, the lease lapses like any other. The effects
+    /// (its own replies, which go nowhere, and the viewers' `lease_changed`)
+    /// wait in the session host for the pass (`take_effects`).
+    pub fn renew_host_work_leases(&mut self) {
+        let Some(att) = self.host_work_attachment().map(str::to_string) else {
+            return;
+        };
+        let now = self.clock.now();
+        for sid in self.host.leases_of(&att) {
+            if self.host.has_open_request(wire::HOST_WORK_PRINCIPAL, &sid) {
+                // Last granted or renewed `LEASE_MS - deadline + now` ago.
+                let due = self.host.lease_deadline(&sid).is_some_and(|deadline| {
+                    now.saturating_add(LEASE_MS - HOST_WORK_RENEW_MS) >= deadline
+                });
+                if due {
+                    let _ = self.host.renew(&att, &sid, now);
+                }
+            } else {
+                let _ = self.host.release(&att, &sid, now);
+            }
         }
     }
 
@@ -2146,7 +2263,7 @@ impl HostBridge {
     }
 
     fn send(&mut self, attachment: &str, message: &Envelope, cx: &mut Cx) {
-        if !attachment.is_empty() && attachment == self.local_attachment() {
+        if self.internal(attachment) {
             return;
         }
         if self.r9.owns(attachment) {
@@ -2189,7 +2306,7 @@ impl HostBridge {
     }
 
     fn send_chat(&mut self, attachment: &str, env: ChatEnvelope, cx: &mut Cx) {
-        if !attachment.is_empty() && attachment == self.local_attachment() {
+        if self.internal(attachment) {
             return;
         }
         if env.op == "error"
@@ -2263,6 +2380,10 @@ impl HostBridge {
                 Effect::Close { attachment } => {
                     if !attachment.is_empty() && attachment == self.local_attachment() {
                         self.local = None;
+                        continue;
+                    }
+                    if self.host_work.as_deref() == Some(attachment.as_str()) {
+                        self.host_work = None;
                         continue;
                     }
                     if self.r9.owns(&attachment) {

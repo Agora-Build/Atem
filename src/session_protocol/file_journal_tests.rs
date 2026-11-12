@@ -27,6 +27,7 @@ fn accepted(id: &str, sid: &str, text: &str) -> Record {
         updated_at: 1,
         principal: "astation:account-a:a1".into(),
         control_gen: 1,
+        provenance: None,
     }
 }
 
@@ -499,6 +500,7 @@ fn compaction_backs_off_as_the_live_state_grows() {
             updated_at: n,
             principal: "p1".into(),
             control_gen: 1,
+            provenance: None,
         })
         .unwrap();
     }

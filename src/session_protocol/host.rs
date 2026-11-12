@@ -86,8 +86,19 @@
 //! lease, which it never needs, checks, takes or moves; an active rule of
 //! that exact process only, else `stale_target`), dispatched to the runtime
 //! like other work.
+//!
+//! Delegated host work (session-v1 R9.14, planned; only behind the
+//! runtime's debug-only hook): the host-local `host-work` principal has one
+//! internal attachment, connected and welcomed by the runtime (`welcome_r9`;
+//! an r8 `hello` never welcomes it) with `view` and `control`. It is no
+//! remote principal and is never fenced: its `control_gen` stays 1 through
+//! device-list fences, freezes and faults. It submits only through
+//! `submit_host_work`, whose provenance (`task_id`, `sender`) is recorded
+//! with `accepted` and carried by the request's receipts; no other receipt
+//! has one. It renews and releases its own leases (`renew`, `release`).
 
 use super::canonical::{self, MAX_SAFE_INTEGER};
+pub use super::journal::Provenance;
 use super::journal::{self, ControlState, Journal, JournalError, Record, Refusal, Stored, TurnIds};
 use super::revision::{FEATURES, RECEIPT_RESULT, REVISION};
 use super::wire::{
@@ -609,6 +620,10 @@ pub struct SessionHost<J: Journal> {
     /// `hello` is refused (`unsupported_version`, `revision: 9`) and no
     /// attachment is welcomed outside the channel.
     refuse_r8: bool,
+    /// The provenance of the `host-work` submit being admitted
+    /// (`submit_host_work`, session-v1 R9.14 item 2), recorded with its
+    /// `accepted`; `None` for every other request.
+    admitting: Option<Provenance>,
     /// Fixtures (`hold_dispatch`; debug builds only, the real runtime's
     /// fixture hook): accepted work stays queued.
     #[cfg(any(test, debug_assertions))]
@@ -673,6 +688,7 @@ impl<J: Journal> SessionHost<J> {
             refused: Refused::default(),
             out: Vec::new(),
             refuse_r8: false,
+            admitting: None,
             #[cfg(any(test, debug_assertions))]
             dispatch_held: false,
         };
@@ -957,6 +973,10 @@ impl<J: Journal> SessionHost<J> {
             return Err("principal must be an opaque id".into());
         }
         let has_control = a.permissions.contains(&Permission::Control);
+        if is_host_work(&a.principal) && !has_control {
+            // R9.14 item 1: it never loses `control`.
+            return Err("the host-work principal holds control".into());
+        }
         self.resolve_once();
         self.principal_control(&a.principal, has_control);
         let old: Vec<String> = self
@@ -1034,7 +1054,14 @@ impl<J: Journal> SessionHost<J> {
     /// `control`), every lease held by one of its attachments (live or
     /// gone) is revoked, and each of its accepted requests not yet executing
     /// is rejected (`control revoked`), in memory when a write fails.
+    ///
+    /// The `host-work` principal is never fenced (session-v1 R9.14 item 1):
+    /// its `control_gen` stays 1, and a frozen, faulted or held device list
+    /// or a halted journal stops delegated tasks through the start check.
     fn fence(&mut self, principal: &str, raise: bool, fence_seq: u64, all_attachments: bool) {
+        if is_host_work(principal) {
+            return;
+        }
         let st = self.principal(principal);
         let mut durable = true;
         if raise {
@@ -1148,7 +1175,13 @@ impl<J: Journal> SessionHost<J> {
     /// (no clean close → `authorization history unknown`, an older
     /// `control_gen` → `control revoked`). A failed write follows §H "A
     /// failed revocation write" (in memory, the journal halts).
+    ///
+    /// The `host-work` principal is no remote principal and is never fenced
+    /// (session-v1 R9.14 item 1): nothing happens.
     pub fn fence_principal(&mut self, principal: &str, seq: u64) -> Vec<Effect> {
+        if is_host_work(principal) {
+            return self.take();
+        }
         let raise = seq == 0 || self.principal(principal).fence_seq < seq;
         if !self.resolved {
             if raise {
@@ -1179,7 +1212,8 @@ impl<J: Journal> SessionHost<J> {
 
     /// Every principal the host knows to be remote: attachments, lease
     /// holders, accepted work and principals holding `control` (§R9.3
-    /// "every remote principal").
+    /// "every remote principal"). Never the host-local `host-work`
+    /// principal (session-v1 R9.14 item 1).
     pub fn remote_principals(&self) -> Vec<String> {
         let mut all: BTreeSet<String> = self
             .attachments
@@ -1201,6 +1235,7 @@ impl<J: Journal> SessionHost<J> {
                 all.insert(p.clone());
             }
         }
+        all.remove(wire::HOST_WORK_PRINCIPAL);
         all.into_iter().collect()
     }
 
@@ -1211,7 +1246,9 @@ impl<J: Journal> SessionHost<J> {
     /// epoch rises, so queued raw bytes are dropped at the write boundary)
     /// and its accepted work not yet executing rejected (`control
     /// revoked`); then the journal halts (§I) until the restart, which
-    /// replays the carriage record and the fences.
+    /// replays the carriage record and the fences. The `host-work`
+    /// principal, named or not, is never fenced (R9.14 item 1): the halt
+    /// stops its tasks through the start check.
     pub fn membership_fault(&mut self, principals: Option<&[String]>) -> Vec<Effect> {
         self.resolve_once();
         self.halt_journal();
@@ -2110,6 +2147,7 @@ impl<J: Journal> SessionHost<J> {
             order,
             principal: String::new(),
             control_gen: 0,
+            provenance: None,
         };
         self.index(&r.target.session_id, &r.request_id);
         self.receipts.insert(
@@ -2173,6 +2211,23 @@ impl<J: Journal> SessionHost<J> {
             .lease
             .as_ref()
             .map(|l| l.deadline)
+    }
+
+    /// Whether a request of `principal` on `session_id` is still open
+    /// (`accepted` or `executing`): the `host-work` principal's turn runs
+    /// (session-v1 R9.14 item 1).
+    pub fn has_open_request(&self, principal: &str, session_id: &str) -> bool {
+        self.receipts_of(session_id)
+            .any(|e| e.stored.principal == principal && !journal::is_final(e.stored.state))
+    }
+
+    /// The sessions whose lease `attachment` holds.
+    pub fn leases_of(&self, attachment: &str) -> Vec<String> {
+        self.sessions
+            .iter()
+            .filter(|(_, s)| s.lease.as_ref().is_some_and(|l| l.attachment == attachment))
+            .map(|(sid, _)| sid.clone())
+            .collect()
     }
 
     /// Live attachments that were welcomed (r8 fixtures' `attachments`).
@@ -2279,6 +2334,100 @@ impl<J: Journal> SessionHost<J> {
             Ok(Envelope::Family(f)) => self.on_family(attachment, f),
         }
         self.take()
+    }
+
+    /// Delegated host work (session-v1 R9.14 item 2): the `host-work`
+    /// principal's internal `attachment` submits `data` (a session-v1
+    /// `submit`'s `data`: a `prompt`, which may `acquire`) with its
+    /// `provenance`, recorded with `accepted` and carried by each of the
+    /// request's receipts as `task_id` and `sender`. The rest is §6 and §F,
+    /// answered on the attachment, where nothing leaves the host: the
+    /// runtime reads the outcome with `receipt`. Refused `invalid_request`,
+    /// nothing recorded: another principal's attachment, a provenance the
+    /// receipt reader would refuse, anything but a `prompt` submit, a
+    /// `takeover` (R9.14 item 1: it acquires only while nobody holds the
+    /// lease). The `host-work` principal submits no other way.
+    pub fn submit_host_work(
+        &mut self,
+        attachment: &str,
+        data: Value,
+        provenance: Provenance,
+    ) -> Vec<Effect> {
+        let bytes = serde_json::to_vec(&json!({"type": "session", "data": data}))
+            .expect("JSON values serialize");
+        let decoded = wire::decode(&bytes);
+        let now = self.now;
+        if let (Some(a), Ok(Envelope::Session(m))) = (self.attachments.get(attachment), &decoded) {
+            // A prompt that never takes over (only an interrupt the owner
+            // chose may, R9.14 item 5).
+            let prompt = matches!(
+                m.op,
+                Op::Submit {
+                    kind: ReceiptKind::Prompt,
+                    takeover: None,
+                    ..
+                }
+            );
+            if !is_host_work(&a.principal) || !prompt || !provenance.valid() {
+                let re = Some(m.id.clone());
+                self.error(attachment, re, ErrorCode::InvalidRequest, None);
+                return self.take();
+            }
+        }
+        self.admitting = Some(provenance);
+        let effects = self.receive_decoded(attachment, decoded, now);
+        self.admitting = None;
+        effects
+    }
+
+    /// The `host-work` principal's internal `attachment` renews the lease
+    /// it holds on `session_id` at monotonic `now` (session-v1 R9.14 item
+    /// 1: the runtime does on its own pass, every 5 s while the turn runs).
+    /// As a client's `renew` (§5): it never acquires, and a lease it
+    /// doesn't hold live is `stale_lease`. Its effects wait for
+    /// `take_effects` (its own `lease` reply goes nowhere).
+    pub fn renew(&mut self, attachment: &str, session_id: &str, now: u64) -> Checked {
+        let b = self.internal_binding(attachment, session_id, now)?;
+        self.on_renew(attachment, None, &b)
+    }
+
+    /// The `host-work` principal's internal `attachment` releases the lease
+    /// it holds on `session_id` at monotonic `now` (its turn ended, R9.14
+    /// item 1), as a client's `release` (§5): viewers get `lease_changed`
+    /// (`released`). Its effects wait for `take_effects`.
+    pub fn release(&mut self, attachment: &str, session_id: &str, now: u64) -> Checked {
+        let b = self.internal_binding(attachment, session_id, now)?;
+        self.on_release(attachment, None, &b)
+    }
+
+    /// The binding a `host-work` attachment's own lease request carries:
+    /// the session's current process and lease epoch. Timers due by `now`
+    /// fire first; refused as any request after a journal halt (`busy`).
+    fn internal_binding(&mut self, att: &str, session_id: &str, now: u64) -> Checked<Binding> {
+        self.tick(now);
+        if !self
+            .attachments
+            .get(att)
+            .is_some_and(|a| is_host_work(&a.principal))
+        {
+            return Err(ErrorCode::Unauthorized);
+        }
+        self.admit_request(att)?;
+        let s = self
+            .sessions
+            .get(session_id)
+            .ok_or(ErrorCode::UnknownSession)?;
+        Ok(Binding {
+            target: Target {
+                account_id: self.ctx.account_id.clone(),
+                atem_device_id: self.ctx.atem_device_id.clone(),
+                host_trust_gen: self.ctx.host_trust_gen,
+                session_id: session_id.to_string(),
+                process_gen: s.spec.process_gen.clone(),
+            },
+            attachment_gen: att.to_string(),
+            lease_epoch: Some(s.lease_epoch),
+        })
     }
 
     fn send(&mut self, attachment: &str, re: Option<String>, op: Op) {
@@ -2435,6 +2584,11 @@ impl<J: Journal> SessionHost<J> {
     fn on_session(&mut self, att: &str, m: SessionMessage) {
         let re = Some(m.id.clone());
         let result = match m.op {
+            // R9.14 item 1: never welcomed over a link, only through the
+            // runtime's internal path (`welcome_r9`).
+            Op::Hello { .. } if is_host_work(&self.attachments[att].principal) => {
+                Err(ErrorCode::Unauthorized)
+            }
             Op::Hello { .. } if self.refuse_r8 => {
                 self.refuse_r8_hello(att, re);
                 return;
@@ -2450,8 +2604,8 @@ impl<J: Journal> SessionHost<J> {
                 Op::Acquire { binding, takeover } => {
                     self.acquire(att, re.clone(), &binding, takeover)
                 }
-                Op::Renew { binding } => self.renew(att, re.clone(), &binding),
-                Op::Release { binding } => self.release(att, re.clone(), &binding),
+                Op::Renew { binding } => self.on_renew(att, re.clone(), &binding),
+                Op::Release { binding } => self.on_release(att, re.clone(), &binding),
                 Op::Submit {
                     binding,
                     request_id,
@@ -2899,7 +3053,7 @@ impl<J: Journal> SessionHost<J> {
     }
 
     /// Renews only the live lease at its epoch; never re-acquires.
-    fn renew(&mut self, att: &str, re: Option<String>, b: &Binding) -> Checked {
+    fn on_renew(&mut self, att: &str, re: Option<String>, b: &Binding) -> Checked {
         self.holds(att, b)?;
         if !self.attachments[att].can(Permission::Control) {
             return Err(ErrorCode::Forbidden);
@@ -2914,7 +3068,7 @@ impl<J: Journal> SessionHost<J> {
         Ok(())
     }
 
-    fn release(&mut self, att: &str, re: Option<String>, b: &Binding) -> Checked {
+    fn on_release(&mut self, att: &str, re: Option<String>, b: &Binding) -> Checked {
         self.holds(att, b)?;
         self.end_lease(&b.target.session_id, LeaseChangeReason::Released, Some(att));
         self.send(att, re, Op::LeaseReleased {});
@@ -3012,6 +3166,11 @@ impl<J: Journal> SessionHost<J> {
         payload: Value,
         send: SendParams,
     ) -> Checked {
+        // R9.14 item 2: the `host-work` principal submits only with its
+        // provenance (`submit_host_work`), and only it carries one.
+        if is_host_work(&self.attachments[att].principal) != self.admitting.is_some() {
+            return Err(ErrorCode::InvalidRequest);
+        }
         self.check_binding(att, b)?;
         let acquire = self.send_rules(kind, b, &send)?;
         let digest =
@@ -3117,6 +3276,7 @@ impl<J: Journal> SessionHost<J> {
             updated_at,
             principal: principal.clone(),
             control_gen,
+            provenance: self.admitting.clone(),
         };
         // §I.1: accepted only once durable; only then does anything act.
         if !self.append(record) {
@@ -3137,6 +3297,7 @@ impl<J: Journal> SessionHost<J> {
             order,
             principal,
             control_gen,
+            provenance: self.admitting.clone(),
         };
         let chat = match &reply {
             Reply::Chat { conversation_id } => Some(conversation_id.clone()),
@@ -4280,11 +4441,16 @@ fn to_receipt(s: &Stored, with_result: bool) -> Receipt {
         updated_at: s.updated_at,
         lease: None,
         result,
-        // Delegated host work (session-v1 R9.14): only the `host-work`
-        // principal's receipts carry them, and it doesn't exist yet.
-        task_id: None,
-        sender: None,
+        // Delegated host work (session-v1 R9.14 item 2): only the
+        // `host-work` principal's prompts carry them, as admitted.
+        task_id: s.provenance.as_ref().map(|p| p.task_id.clone()),
+        sender: s.provenance.as_ref().map(|p| p.sender.clone()),
     }
+}
+
+/// The host-local principal of delegated host work (session-v1 R9.14).
+fn is_host_work(principal: &str) -> bool {
+    principal == wire::HOST_WORK_PRINCIPAL
 }
 
 /// A turn's replies as the retained history holds them (r8 §D), from the

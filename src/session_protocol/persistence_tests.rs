@@ -596,6 +596,7 @@ fn recovered_work_is_resolved_before_a_connect_changes_control() {
         updated_at: 1,
         principal: "c1".into(),
         control_gen: 1,
+        provenance: None,
     })
     .unwrap();
     let mut host =

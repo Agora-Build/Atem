@@ -61,7 +61,7 @@
 //! Prompt payloads are user content: the files are private and nothing here
 //! logs a payload.
 
-use super::journal::{self, Journal, JournalError, Record, Refusal, TurnIds};
+use super::journal::{self, Journal, JournalError, Provenance, Record, Refusal, TurnIds};
 use super::wire::{self, ReceiptKind, ReceiptState, Target};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -173,6 +173,10 @@ enum Disk {
         principal: String,
         #[serde(default)]
         control_gen: u64,
+        /// Session-v1 R9.14 item 2: only a `host-work` prompt's record has
+        /// it, so every other record is written as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance: Option<Provenance>,
     },
     Rejected {
         seq: u64,
@@ -216,6 +220,7 @@ impl Disk {
                 updated_at,
                 principal,
                 control_gen,
+                provenance,
             } => Disk::Accepted {
                 seq,
                 request_id,
@@ -226,6 +231,7 @@ impl Disk {
                 updated_at,
                 principal,
                 control_gen,
+                provenance,
             },
             Record::Rejected {
                 request_id,
@@ -282,6 +288,7 @@ impl Disk {
                 updated_at,
                 principal,
                 control_gen,
+                provenance,
             } => (
                 seq,
                 Record::Accepted {
@@ -293,6 +300,7 @@ impl Disk {
                     updated_at,
                     principal,
                     control_gen,
+                    provenance,
                 },
             ),
             Disk::Rejected {
@@ -1184,6 +1192,7 @@ impl FileJournal {
                     updated_at: s.updated_at,
                     principal: s.principal,
                     control_gen: s.control_gen,
+                    provenance: s.provenance,
                 },
             )?);
             let mut step =

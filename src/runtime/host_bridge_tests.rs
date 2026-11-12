@@ -4492,3 +4492,304 @@ fn a_frozen_host_answers_no_host_challenge() {
         None
     );
 }
+
+// ── The `host-work` principal (session-v1 R9.14 item 1) ──
+
+/// An App with no Astation link that never reconnects: passes run only the
+/// host's own work.
+fn idle_app() -> App {
+    let mut app = App::new();
+    app.hosted = Some(Default::default());
+    app.astation_reconnect = false;
+    app
+}
+
+/// One broker pass with no sessions of its own.
+fn pass(bridge: &mut super::HostBridge, app: &mut App) {
+    let mut sessions = std::collections::BTreeMap::new();
+    bridge.tick(app, &mut sessions, false);
+}
+
+/// Whether the journal's durable control states name `principal`.
+fn principals_name(journal: &Path, principal: &str) -> bool {
+    std::fs::read_to_string(journal.join("principals"))
+        .is_ok_and(|text| text.contains(&format!("\"{principal}\"")))
+}
+
+/// Debug-only hook off (the default), nothing of the principal exists, as
+/// on main; a runtime started with it has the internal attachment; started
+/// again without it, none.
+#[test]
+fn host_work_attachment_exists_only_with_the_hook() {
+    use crate::runtime::test_hooks::HostFeatures;
+    use crate::session_protocol::wire::{HOST_WORK_PRINCIPAL, Permission};
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let journal = dir.path().join("journal");
+    let mut app = idle_app();
+
+    let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    assert_eq!(bridge.features, HostFeatures::default());
+    for _ in 0..3 {
+        pass(&mut bridge, &mut app);
+    }
+    assert_eq!(bridge.host_work_attachment(), None);
+    assert_eq!(bridge.host().welcomed_attachments(), 0);
+    assert!(!principals_name(&journal, HOST_WORK_PRINCIPAL));
+    bridge.close_cleanly();
+    drop(bridge);
+
+    let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    bridge.features = HostFeatures::parse("host.delegated").unwrap();
+    pass(&mut bridge, &mut app);
+    let att = bridge
+        .host_work_attachment()
+        .expect("made with the hook")
+        .to_string();
+    let host = bridge.host();
+    assert_eq!(host.attachment_principal(&att), Some(HOST_WORK_PRINCIPAL));
+    assert!(host.attachment_can(&att, Permission::View));
+    assert!(host.attachment_can(&att, Permission::Control));
+    assert_eq!(host.welcomed_attachments(), 1, "welcomed");
+    assert_eq!(host.control_gen(HOST_WORK_PRINCIPAL), 1);
+    assert!(principals_name(&journal, HOST_WORK_PRINCIPAL));
+    pass(&mut bridge, &mut app);
+    assert_eq!(bridge.host_work_attachment(), Some(att.as_str()));
+    bridge.close_cleanly();
+    drop(bridge);
+
+    let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    for _ in 0..3 {
+        pass(&mut bridge, &mut app);
+    }
+    assert_eq!(bridge.host_work_attachment(), None);
+    assert_eq!(bridge.host().welcomed_attachments(), 0);
+}
+
+/// A new attachment (and so a new `controller_session`) at every start,
+/// the session host's restart under a new identity included; an r8 `hello`
+/// never welcomes it, and nothing addressed to it leaves the host.
+#[test]
+fn host_work_attachment_is_new_at_each_start_and_never_welcomed_over_a_link() {
+    use crate::session_protocol::host::Effect;
+    use crate::session_protocol::wire::{Envelope, ErrorCode, HOST_WORK_PRINCIPAL, Op};
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let journal = dir.path().join("journal");
+    let mut app = idle_app();
+    let open = || {
+        let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+        bridge.features.delegated = true;
+        bridge
+    };
+
+    let mut bridge = open();
+    pass(&mut bridge, &mut app);
+    let first = bridge.host_work_attachment().unwrap().to_string();
+    // Welcomed only through the internal path: an r8 `hello` on it is
+    // refused and replaces nothing.
+    let hello = json!({"type": "session", "data": {"v": 1, "op": "hello",
+        "id": uuid::Uuid::new_v4().to_string(), "revision": 8}});
+    let now = bridge.clock.now();
+    let effects = bridge
+        .host
+        .receive(&first, hello.to_string().as_bytes(), now);
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Replaced { .. })),
+        "{effects:?}"
+    );
+    let sent: Vec<&Op> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Send {
+                attachment,
+                message: Envelope::Session(m),
+            } if *attachment == first => Some(&m.op),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(
+            sent.as_slice(),
+            [Op::Error {
+                code: ErrorCode::Unauthorized,
+                ..
+            }]
+        ),
+        "{sent:?}"
+    );
+    // Nothing addressed to it leaves the host (`send`, `send_chat`).
+    assert!(bridge.internal(&first));
+    assert!(bridge.link.is_none());
+    pass(&mut bridge, &mut app);
+    assert_eq!(bridge.host_work_attachment(), Some(first.as_str()));
+    bridge.close_cleanly();
+    drop(bridge);
+
+    // The next start: a new one; the old one is unknown.
+    let mut bridge = open();
+    pass(&mut bridge, &mut app);
+    let second = bridge.host_work_attachment().unwrap().to_string();
+    assert_ne!(second, first);
+    assert_eq!(bridge.host().attachment_principal(&first), None);
+    assert_eq!(
+        bridge.host().attachment_principal(&second),
+        Some(HOST_WORK_PRINCIPAL)
+    );
+
+    // The session host restarts under a new identity: new again.
+    let mut sessions = std::collections::BTreeMap::new();
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    let identity = super::Identity {
+        account_id: "acct-2".into(),
+        atem_device_id: "host-2".into(),
+        host_trust_gen: 1,
+    };
+    assert!(bridge.adopt_identity(&identity, &mut cx));
+    assert_eq!(bridge.host_work_attachment(), None);
+    pass(&mut bridge, &mut app);
+    let third = bridge.host_work_attachment().unwrap().to_string();
+    assert_ne!(third, second);
+    assert_eq!(bridge.host().attachment_principal(&second), None);
+    assert_eq!(bridge.host().control_gen(HOST_WORK_PRINCIPAL), 1);
+}
+
+/// I.4.2: while its turn runs, the host-work holder's lease is renewed on
+/// the runtime's own pass every 5 s (a 15 s lease), never sooner, and it is
+/// released at the pass after the turn ends. Another controller's lease is
+/// none of its business.
+#[test]
+fn host_work_renews_every_5s_while_its_turn_runs_and_releases_at_the_end() {
+    use crate::session_protocol::host::{
+        Attach, DispatchReport, LEASE_MS, Provenance, SessionSpec,
+    };
+    use crate::session_protocol::wire::{ClientKind, Permission, ReceiptState};
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let clock = Clock::default();
+    let mut app = idle_app();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, clock.clone()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    let att = bridge.host_work_attachment().unwrap().to_string();
+    // Sessions the host serves; the prompt's dispatch isn't performed here,
+    // so its turn runs until its end is reported.
+    let (sid, other) = ("ses-aaaaaaaaaaaa", "ses-bbbbbbbbbbbb");
+    let process_gen = uuid::Uuid::new_v4().to_string();
+    for session_id in [sid, other] {
+        bridge
+            .host
+            .add_session(SessionSpec {
+                session_id: session_id.into(),
+                process_gen: process_gen.clone(),
+                provider: "claude".into(),
+                cwd_label: "work".into(),
+                chat: true,
+                rows: 24,
+                cols: 80,
+            })
+            .unwrap();
+    }
+    let ctx = bridge.host().context().clone();
+    let target = |session_id: &str| {
+        json!({"account_id": ctx.account_id, "atem_device_id": ctx.atem_device_id,
+               "host_trust_gen": ctx.host_trust_gen, "session_id": session_id,
+               "process_gen": process_gen})
+    };
+    let rid = uuid::Uuid::new_v4().to_string();
+    let data = json!({"v": 1, "op": "submit", "id": uuid::Uuid::new_v4().to_string(),
+        "binding": {"target": target(sid), "attachment_gen": att},
+        "request_id": rid, "kind": "prompt", "payload": {"text": "run the tests"},
+        "acquire": true});
+    bridge.host.advance(clock.now());
+    let _ = bridge.host.submit_host_work(
+        &att,
+        data,
+        Provenance {
+            task_id: uuid::Uuid::new_v4().to_string(),
+            sender: "member:phone-1".into(),
+        },
+    );
+    assert_eq!(
+        bridge.host().receipt(&rid).unwrap().state,
+        ReceiptState::Executing
+    );
+    assert_eq!(bridge.host().lease_holder(sid), Some(att.as_str()));
+    let granted = bridge.host().lease_deadline(sid).unwrap();
+
+    // Another controller's lease on another session.
+    let c1 = uuid::Uuid::new_v4().to_string();
+    let effects = bridge
+        .host
+        .connect(Attach {
+            client: "c1".into(),
+            principal: "c1".into(),
+            attachment_gen: c1.clone(),
+            permissions: vec![Permission::View, Permission::Control],
+            client_kind: ClientKind::Native,
+            authorization_ms: 24 * 60 * 60 * 1000,
+        })
+        .unwrap();
+    drop(effects);
+    bridge.host.welcome_r9(&c1, clock.now()).unwrap();
+    let acquire = json!({"type": "session", "data": {"v": 1, "op": "acquire",
+        "id": uuid::Uuid::new_v4().to_string(),
+        "binding": {"target": target(other), "attachment_gen": c1}, "takeover": false}});
+    let _ = bridge
+        .host
+        .receive(&c1, acquire.to_string().as_bytes(), clock.now());
+    let theirs = bridge.host().lease_deadline(other).unwrap();
+
+    // Within 5 s of the grant: left as it is.
+    clock.skip(4_000);
+    pass(&mut bridge, &mut app);
+    assert_eq!(bridge.host().lease_deadline(sid), Some(granted));
+    // 5 s after it: renewed for a full lease.
+    clock.skip(1_000);
+    pass(&mut bridge, &mut app);
+    let renewed = bridge.host().lease_deadline(sid).unwrap();
+    assert!(renewed >= granted + 5_000, "{renewed} {granted}");
+    assert!(renewed >= clock.now() + LEASE_MS - 100);
+    assert_eq!(bridge.host().lease_deadline(other), Some(theirs));
+    // While the turn runs (30 s, a pass a second): held throughout, renewed
+    // every 5 s and never sooner; the other lease lapses on its own.
+    let (mut renewals, mut last) = (0, renewed);
+    for _ in 0..30 {
+        clock.skip(1_000);
+        pass(&mut bridge, &mut app);
+        let deadline = bridge.host().lease_deadline(sid).expect("still held");
+        if deadline != last {
+            assert!(deadline >= last + 5_000, "{deadline} {last}");
+            renewals += 1;
+            last = deadline;
+        }
+        assert_eq!(bridge.host().lease_holder(sid), Some(att.as_str()));
+    }
+    assert_eq!(renewals, 6);
+    assert_eq!(
+        bridge.host().lease_holder(other),
+        None,
+        "expired, never renewed"
+    );
+
+    // The turn ends: the next pass releases it.
+    let _ = bridge.host.dispatch_report(
+        &rid,
+        DispatchReport::Completed {
+            detail: Some("done".into()),
+            turn_id: Some("turn-1".into()),
+            user_message_id: Some("turn-1-u".into()),
+        },
+    );
+    assert_eq!(bridge.host().lease_holder(sid), Some(att.as_str()));
+    pass(&mut bridge, &mut app);
+    assert_eq!(bridge.host().lease_holder(sid), None);
+    assert_eq!(
+        bridge.host().receipt(&rid).unwrap().state,
+        ReceiptState::Completed
+    );
+}

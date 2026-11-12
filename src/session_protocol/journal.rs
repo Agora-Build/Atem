@@ -29,7 +29,9 @@ pub enum Record {
     /// A new request admitted as `accepted`, with what a dispatch after a
     /// crash needs (its payload) and, r8 §H, the submitter principal and its
     /// control generation at admission (admission metadata: ids only, in
-    /// neither the digest nor the immutable request).
+    /// neither the digest nor the immutable request). `provenance` only on
+    /// a `host-work` prompt (session-v1 R9.14 item 2), admission metadata
+    /// too.
     Accepted {
         request_id: String,
         target: Target,
@@ -39,6 +41,7 @@ pub enum Record {
         updated_at: u64,
         principal: String,
         control_gen: u64,
+        provenance: Option<Provenance>,
     },
     /// A later state of a recorded request. `result` only on a prompt's
     /// `completed` (r8 §D): its turn's ids (the outcome is `detail`).
@@ -89,6 +92,29 @@ pub struct JournalError(pub String);
 pub struct TurnIds {
     pub turn_id: String,
     pub user_message_id: String,
+}
+
+/// Delegated host work (session-v1 R9.14 item 2): the task a request of
+/// the `host-work` principal attempts and the sender that enqueued it.
+/// Admission metadata, like §H's principal: recorded with `accepted`, never
+/// changed after it, in neither the payload digest nor the immutable
+/// request. Its receipts carry it as `task_id` and `sender`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Provenance {
+    /// The delegated task (host-work-v1 §11.6): a UUID v4.
+    pub task_id: String,
+    /// `member:<id>`, `service:<id>` or `host:<host_id>`: never `local`, a
+    /// browser or `host-work` itself (design I.1.3).
+    pub sender: String,
+}
+
+impl Provenance {
+    /// The receipt reader's rules (`atem_client::session::wire`): a UUID v4
+    /// task and a delegated sender.
+    pub fn valid(&self) -> bool {
+        super::wire::is_uuid_v4(&self.task_id) && super::wire::is_delegated_sender(&self.sender)
+    }
 }
 
 /// A request refused `busy` because its admission write failed (§I.2): its
@@ -325,6 +351,9 @@ pub struct Stored {
     /// (r8 §H); empty and 0 for a request nothing accepted.
     pub principal: String,
     pub control_gen: u64,
+    /// The delegated task and sender of a `host-work` prompt (R9.14 item
+    /// 2); `None` for every other request.
+    pub provenance: Option<Provenance>,
 }
 
 /// A principal's durable control state (§H).
@@ -380,9 +409,19 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                 updated_at,
                 principal,
                 control_gen,
+                provenance,
             } => {
                 if out.receipts.contains_key(&request_id) {
                     return Err(JournalError(format!("request {request_id} admitted twice")));
+                }
+                // R9.14 item 2: a valid task and sender, on a prompt only.
+                if provenance
+                    .as_ref()
+                    .is_some_and(|p| kind != ReceiptKind::Prompt || !p.valid())
+                {
+                    return Err(JournalError(format!(
+                        "invalid provenance on {kind:?} {request_id}"
+                    )));
                 }
                 let stored = Stored {
                     request_id: request_id.clone(),
@@ -397,6 +436,7 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                     order: i as u64,
                     principal,
                     control_gen,
+                    provenance,
                 };
                 out.receipts.insert(request_id, stored);
             }
@@ -424,6 +464,7 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                     order: i as u64,
                     principal: String::new(),
                     control_gen: 0,
+                    provenance: None,
                 };
                 out.receipts.insert(request_id, stored);
             }
@@ -517,6 +558,7 @@ mod tests {
             updated_at: 1,
             principal: "p1".into(),
             control_gen: 1,
+            provenance: None,
         }
     }
 
