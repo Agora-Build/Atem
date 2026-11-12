@@ -4854,13 +4854,17 @@ fn host_work_attempt(
 /// The chat of a session whose current turn host-work's attempt
 /// `request_id` began and still runs (its prompt accepted: the hook and
 /// the log agree; the agent working): what the turn check reads. The fake
-/// agents keep no chat of their own.
-fn show_turn(session: &mut crate::runtime::broker::BrokerSession, request_id: &str) {
+/// agents keep no chat of their own. What the chat produced, as the
+/// worker's batches bring it to a pass.
+fn show_turn(
+    session: &mut crate::runtime::broker::BrokerSession,
+    request_id: &str,
+) -> Vec<crate::chat::session::Out> {
     use crate::chat::adapter::{AgentEvent, LogItem};
     use crate::chat::session::{ChatSession, State};
     let generation = session.process_gen.clone();
     let mut chat = ChatSession::new(generation.clone(), 0);
-    chat.on_event(
+    let mut outs = chat.on_event(
         AgentEvent::SessionStarted {
             session_id: "fake-session".into(),
             log_path: PathBuf::new(),
@@ -4874,7 +4878,7 @@ fn show_turn(session: &mut crate::runtime::broker::BrokerSession, request_id: &s
         .submit(request_id, &generation, "run the tests", 0, false)
         .unwrap();
     chat.mark_pasted(request_id, Instant::now(), 2);
-    chat.on_event(
+    outs.extend(chat.on_event(
         AgentEvent::PromptSubmitted {
             text: text.clone(),
             turn_id: None,
@@ -4882,8 +4886,8 @@ fn show_turn(session: &mut crate::runtime::broker::BrokerSession, request_id: &s
         },
         3,
         0,
-    );
-    chat.on_log(
+    ));
+    outs.extend(chat.on_log(
         LogItem::UserMessage {
             id: "user-1".into(),
             turn_id: "turn-1".into(),
@@ -4892,11 +4896,12 @@ fn show_turn(session: &mut crate::runtime::broker::BrokerSession, request_id: &s
         },
         3,
         0,
-    );
+    ));
     assert_eq!(chat.current_request_id(), Some(request_id));
     assert_eq!(chat.status().state, State::Working);
     session.chat = chat;
     session.chat_v1 = true;
+    outs
 }
 
 /// Pumps `id`'s worker until it answered a write, hands the answers to the
@@ -5332,6 +5337,44 @@ async fn a_chat_refusal_leaves_another_holders_lease_and_the_workers_epoch() {
         assert_eq!(epochs(&bridge, &id, &cx), before, "{shown:?}");
         assert!(!bridge.host_interrupt_outstanding(&sid, &rid));
     }
+    // Task 15's re-review (N1): the attempt's own request is the chat's
+    // current one, but no turn is known to run (today's Esc rule): its
+    // chat withdrawn (`chat_v1` false), its turn ended (`ready`), or the
+    // chat's agent gone (`unknown`). Refused alike, nothing moved.
+    for state in ["withdrawn", "ready", "unknown"] {
+        use crate::chat::adapter::AgentEvent;
+        use crate::chat::session::State;
+        let session = cx.sessions.get_mut(&id).unwrap();
+        show_turn(session, &rid);
+        match state {
+            "withdrawn" => session.chat_v1 = false,
+            "ready" => {
+                session
+                    .chat
+                    .on_event(AgentEvent::TurnEnded { at_ms: Some(10) }, 10, 0);
+                assert_eq!(session.chat.status().state, State::Ready);
+            }
+            _ => {
+                session.chat.on_process_exit(10);
+                assert_eq!(session.chat.status().state, State::Unknown);
+            }
+        }
+        assert_eq!(session.chat.current_request_id(), Some(rid.as_str()));
+        assert!(session.is_live());
+        assert_eq!(
+            bridge.host_interrupt(&sid, &rid, &mut cx),
+            Interrupted::Refused(HostInterrupt::NotCurrentTurn),
+            "{state}"
+        );
+        assert_eq!(
+            bridge.host_interrupt_revoke_lease(&sid, &rid, &mut cx),
+            Interrupted::Refused(HostInterrupt::NotCurrentTurn),
+            "{state}"
+        );
+        assert_eq!(bridge.host().lease_holder(&sid), Some(c1.as_str()));
+        assert_eq!(epochs(&bridge, &id, &cx), before, "{state}");
+        assert!(!bridge.host_interrupt_outstanding(&sid, &rid));
+    }
 
     show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
     assert_eq!(
@@ -5413,25 +5456,48 @@ async fn an_outstanding_write_is_never_written_twice() {
     let _ = cx.sessions.get_mut(&id).unwrap().stop();
 }
 
+/// Every message the broker sent `id`'s worker so far was handled: the
+/// answer to a screen request sent after them came back.
+async fn worker_caught_up(cx: &mut super::Cx<'_>, id: &crate::session::SessionId) {
+    let session = cx.sessions.get_mut(id).unwrap();
+    session.request_screen_now();
+    tokio::time::timeout(WAIT, async {
+        while !session.pump().resync {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the worker answers its screen request");
+}
+
 /// A native's bytes already handed to the worker are dropped there once
 /// its lease ends: by the interrupt on one session, by the revoke-only call
-/// on another. Behind an agent that reads nothing yet, the worker answers
-/// `dropped` for the chunks still queued; the interrupt's Esc, written
-/// under the new epoch, lands once the agent reads.
+/// on another. No timing (Task 15's re-review, N2): the agents read nothing
+/// until the test opens their gate (a file it creates once each worker
+/// handled every message sent to it, the epoch's rise included), so the
+/// writes queue at the worker (192 KiB is far past what a PTY buffers); it
+/// answers `dropped` for the chunks still queued, and the interrupt's Esc,
+/// written under the new epoch, lands once the agent reads. The control:
+/// the same traffic on a third session, with no interrupt, is written
+/// whole.
 #[tokio::test]
 async fn a_natives_bytes_at_the_worker_are_dropped_after_the_interrupt() {
     use super::super::broker::WriteOutcome;
     use super::{InterruptReport, Interrupted};
     let _profile = crate::test_profile::temp();
     let dir = short_dir();
+    let gate = dir.path().join("gate");
     let mut sessions = std::collections::BTreeMap::new();
     let mut ids = Vec::new();
-    for name in ["sleepy-1", "sleepy-2"] {
-        // Raw, no echo: reads nothing for 3 s, so writes queue.
+    for name in ["gated-1", "gated-2", "gated-3"] {
+        // Raw, no echo: reads nothing until the gate opens.
         let agent = script(
             dir.path(),
             name,
-            "stty raw -echo\nprintf 'SLEEPING\\r\\n'\nsleep 3\nexec cat",
+            &format!(
+                "stty raw -echo\nprintf 'GATED\\r\\n'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\nexec cat",
+                gate.display()
+            ),
         );
         let session = session_running(dir.path(), &agent).await;
         ids.push(session.id.clone());
@@ -5455,6 +5521,7 @@ async fn a_natives_bytes_at_the_worker_are_dropped_after_the_interrupt() {
         native_types(&mut bridge, &c1, id, &mut cx, lease, 24);
         rids.push(rid);
     }
+    let control = bridge.host().lease_epoch(ids[2].as_str());
     assert_eq!(
         bridge.host_interrupt(ids[0].as_str(), &rids[0], &mut cx),
         Interrupted::Written
@@ -5463,12 +5530,25 @@ async fn a_natives_bytes_at_the_worker_are_dropped_after_the_interrupt() {
         bridge.host_interrupt_revoke_lease(ids[1].as_str(), &rids[1], &mut cx),
         Interrupted::Revoked
     );
-    for id in &ids {
+    for id in &ids[..2] {
         assert_eq!(bridge.host().lease_holder(id.as_str()), None);
     }
+    assert_eq!(
+        bridge.host().lease_holder(ids[2].as_str()),
+        Some(c1.as_str())
+    );
+    assert_eq!(bridge.host().lease_epoch(ids[2].as_str()), control);
+    for id in &ids {
+        worker_caught_up(&mut cx, id).await;
+    }
+    std::fs::write(&gate, b"").unwrap();
 
     // Every write is answered once the agents read.
-    for (id, writes) in [(&ids[0], 25), (&ids[1], 24)] {
+    for (id, writes, interrupted) in [
+        (&ids[0], 25, true),
+        (&ids[1], 24, true),
+        (&ids[2], 24, false),
+    ] {
         let mut results: Vec<WriteOutcome> = Vec::new();
         tokio::time::timeout(WAIT, async {
             while results.len() < writes {
@@ -5481,7 +5561,12 @@ async fn a_natives_bytes_at_the_worker_are_dropped_after_the_interrupt() {
         .await
         .unwrap_or_else(|_| panic!("unanswered writes of {id}"));
         let dropped = results.iter().filter(|r| r.dropped).count();
-        assert!(dropped > 0, "nothing queued was dropped: {results:?}");
+        if interrupted {
+            assert!(dropped > 0, "nothing queued was dropped: {results:?}");
+        } else {
+            assert_eq!(dropped, 0, "{results:?}");
+            assert!(results.iter().all(|r| r.ok), "{results:?}");
+        }
         for result in results {
             bridge.write_result(id.as_str(), result, &mut cx);
         }
@@ -5492,5 +5577,273 @@ async fn a_natives_bytes_at_the_worker_are_dropped_after_the_interrupt() {
     );
     for id in &ids {
         let _ = cx.sessions.get_mut(id).unwrap().stop();
+    }
+}
+
+// ── §H recovery: host-work's executing prompts at a start (session-v1
+//    R9.14 items 5, 6) ──
+
+/// As `show_turn`, and the bridge reads what the chat produced, as a pass
+/// does: the prompt's acceptance journals the turn it started.
+fn accept_turn(
+    bridge: &mut super::HostBridge,
+    id: &crate::session::SessionId,
+    cx: &mut super::Cx<'_>,
+    request_id: &str,
+) {
+    use crate::chat::session::Out;
+    let outs = show_turn(cx.sessions.get_mut(id).unwrap(), request_id);
+    assert!(
+        outs.iter()
+            .any(|o| matches!(o, Out::Accepted { request_id: r } if r == request_id)),
+        "{outs:?}"
+    );
+    // As the prompt's dispatch (its paste) records it.
+    bridge.prompts.insert(request_id.into(), id.to_string());
+    bridge.chat_outs(id.as_str(), outs, cx);
+}
+
+/// What an adopted worker's `chat_snapshot` carries of `session`'s chat:
+/// the worker's own session never submitted, so no message names a
+/// request.
+fn worker_snapshot(
+    session: &crate::runtime::broker::BrokerSession,
+) -> crate::chat::session::ChatSnapshot {
+    use crate::chat::session::{MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGES};
+    let mut snapshot = session
+        .chat
+        .snapshot(MAX_HISTORY_MESSAGES, MAX_HISTORY_BYTES);
+    for message in &mut snapshot.history {
+        message.request_id = None;
+    }
+    snapshot
+}
+
+/// `session` as a new broker adopts it: its worker connected, its chat not
+/// arrived yet.
+fn adopted(session: &mut crate::runtime::broker::BrokerSession) {
+    session.chat = crate::chat::session::ChatSession::new(session.process_gen.clone(), 0);
+    session.chat_v1 = false;
+    session.chat_synced = false;
+}
+
+/// The worker's `chat_snapshot` reaches the broker (`BrokerSession`'s
+/// `ChatSnapshot` arm).
+fn snapshot_arrives(
+    session: &mut crate::runtime::broker::BrokerSession,
+    snapshot: crate::chat::session::ChatSnapshot,
+) {
+    session.chat =
+        crate::chat::session::ChatSession::restore(session.process_gen.clone(), snapshot);
+    session.chat_v1 = true;
+    session.chat_synced = true;
+}
+
+/// A broker pass over `sessions`.
+fn pass_with(
+    bridge: &mut super::HostBridge,
+    app: &mut App,
+    sessions: &mut std::collections::BTreeMap<
+        crate::session::SessionId,
+        crate::runtime::broker::BrokerSession,
+    >,
+) {
+    bridge.tick(app, sessions, false);
+}
+
+/// R9.14 items 5, 6 (Task 15's review, Q2): at a start, host-work's
+/// `executing` prompt is decided from the adopted worker's chat, never by
+/// the plain `Unknown` a v1 prompt gets, and only once that chat arrived
+/// (until then it stays `executing` and the turn check refuses). Its turn,
+/// journaled at the chat's acceptance:
+/// - still running: it stays `executing`, the restored chat's current turn
+///   is rebound to it (`current_request_id`), so the host interrupt writes
+///   once and the turn's end completes the receipt;
+/// - ended: completed with its outcome; the interrupt writes nothing;
+/// - its worker gone: `outcome_unknown`, `agent exited`;
+/// - no turn journaled (a crash between the acceptance and its write):
+///   `outcome_unknown` at once (fail closed).
+#[tokio::test]
+async fn executing_host_work_is_reconciled_or_outcome_unknown() {
+    use super::{InterruptReport, Interrupted};
+    use crate::chat::adapter::AgentEvent;
+    use crate::session_protocol::host::{
+        DETAIL_AGENT_EXITED, DETAIL_TURN_DONE, DETAIL_UNRECONCILED, HostInterrupt,
+    };
+    use crate::session_protocol::wire::ReceiptState;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let journal = dir.path().join("journal");
+    let mut app = idle_app();
+    let mut sessions = std::collections::BTreeMap::new();
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let session = broker_session(dir.path()).await;
+        ids.push(session.id.clone());
+        sessions.insert(session.id.clone(), session);
+    }
+    let (running, ended, gone, unjournaled) = (0, 1, 2, 3);
+    let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    let mut rids = Vec::new();
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    // The workers' own chats (the fake agent has none) are in: what the
+    // test shows below isn't replaced when a worker is pumped.
+    for id in &ids {
+        worker_caught_up(&mut cx, id).await;
+    }
+    for (i, id) in ids.iter().enumerate() {
+        let rid = host_work_attempt(&mut bridge, id, &mut cx);
+        if i == unjournaled {
+            show_turn(cx.sessions.get_mut(id).unwrap(), &rid);
+            assert_eq!(bridge.host().recorded_turn(&rid), None);
+        } else {
+            accept_turn(&mut bridge, id, &mut cx, &rid);
+            let turn = bridge.host().recorded_turn(&rid).expect("journaled");
+            assert_eq!(
+                (turn.turn_id.as_str(), turn.user_message_id.as_str()),
+                ("turn-1", "user-1")
+            );
+        }
+        assert_eq!(
+            bridge.host().receipt(&rid).unwrap().state,
+            ReceiptState::Executing
+        );
+        rids.push(rid);
+    }
+    // The ended one's turn ends after the old broker read its last batch.
+    let _unread = cx.sessions.get_mut(&ids[ended]).unwrap().chat.on_event(
+        AgentEvent::TurnEnded { at_ms: Some(10) },
+        10,
+        0,
+    );
+    // The broker goes (no clean close); the gone one's worker with it.
+    drop(bridge);
+    let gone_session = sessions.remove(&ids[gone]).unwrap();
+    let _ = gone_session.stop();
+    let mut snapshots = std::collections::BTreeMap::new();
+    for i in [running, ended, unjournaled] {
+        let session = sessions.get_mut(&ids[i]).unwrap();
+        snapshots.insert(i, worker_snapshot(session));
+        adopted(session);
+    }
+
+    // The next broker: its first pass recovers; the adopted chats haven't
+    // arrived.
+    let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    let receipt = |bridge: &super::HostBridge, i: usize| bridge.host().receipt(&rids[i]).unwrap();
+    for i in [running, ended] {
+        assert_eq!(receipt(&bridge, i).state, ReceiptState::Executing, "{i}");
+        assert!(bridge.host_work_reconciling(&rids[i]), "{i}");
+    }
+    let r = receipt(&bridge, gone);
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (ReceiptState::OutcomeUnknown, Some(DETAIL_AGENT_EXITED))
+    );
+    let r = receipt(&bridge, unjournaled);
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (ReceiptState::OutcomeUnknown, Some(DETAIL_UNRECONCILED))
+    );
+    assert!(!bridge.host_work_reconciling(&rids[gone]));
+    assert!(!bridge.host_work_reconciling(&rids[unjournaled]));
+    {
+        let mut cx = super::Cx {
+            client: &app.astation_client,
+            sessions: &mut sessions,
+        };
+        // No turn state yet: the turn check refuses, nothing moves.
+        assert_eq!(
+            bridge.host_interrupt(ids[running].as_str(), &rids[running], &mut cx),
+            Interrupted::Refused(HostInterrupt::NotCurrentTurn)
+        );
+    }
+    // Passes go by: still waiting for the chat.
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    assert!(bridge.host_work_reconciling(&rids[running]));
+
+    // The chats arrive.
+    for i in [running, ended, unjournaled] {
+        let snapshot = snapshots.remove(&i).unwrap();
+        snapshot_arrives(sessions.get_mut(&ids[i]).unwrap(), snapshot);
+    }
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    for i in [running, ended] {
+        assert!(!bridge.host_work_reconciling(&rids[i]), "{i}");
+    }
+    // Ended: completed with its outcome and its turn.
+    let r = receipt(&bridge, ended);
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (ReceiptState::Completed, Some(DETAIL_TURN_DONE))
+    );
+    let result = r.result.expect("its turn");
+    assert_eq!(
+        (result.turn_id.as_str(), result.user_message_id.as_str()),
+        ("turn-1", "user-1")
+    );
+    // Running: still executing, its turn rebound.
+    assert_eq!(receipt(&bridge, running).state, ReceiptState::Executing);
+    assert_eq!(
+        sessions[&ids[running]].chat.current_request_id(),
+        Some(rids[running].as_str())
+    );
+    // The unjournaled one stays as it was.
+    assert_eq!(
+        receipt(&bridge, unjournaled).state,
+        ReceiptState::OutcomeUnknown
+    );
+
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    // The host interrupt: written once on the running turn, nothing on the
+    // others.
+    assert_eq!(
+        bridge.host_interrupt(ids[running].as_str(), &rids[running], &mut cx),
+        Interrupted::Written
+    );
+    for i in [ended, gone, unjournaled] {
+        assert_eq!(
+            bridge.host_interrupt(ids[i].as_str(), &rids[i], &mut cx),
+            Interrupted::Refused(HostInterrupt::NotExecuting),
+            "{i}"
+        );
+    }
+    assert_eq!(
+        answered(&mut bridge, &ids[running], &mut cx).await,
+        [(rids[running].clone(), InterruptReport::Ok)]
+    );
+    assert_eq!(bridge.pending.len(), 0, "one write, answered");
+
+    // The turn ends: its receipt completes, with its turn.
+    let outs = cx.sessions.get_mut(&ids[running]).unwrap().chat.on_event(
+        AgentEvent::TurnEnded { at_ms: Some(20) },
+        20,
+        0,
+    );
+    bridge.chat_outs(ids[running].as_str(), outs, &mut cx);
+    let r = receipt(&bridge, running);
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (ReceiptState::Completed, Some(DETAIL_TURN_DONE))
+    );
+    let result = r.result.expect("its turn");
+    assert_eq!(
+        (result.turn_id.as_str(), result.user_message_id.as_str()),
+        ("turn-1", "user-1")
+    );
+    for id in &ids {
+        if let Some(session) = cx.sessions.get_mut(id) {
+            let _ = session.stop();
+        }
     }
 }

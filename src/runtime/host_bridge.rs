@@ -81,6 +81,7 @@ use crate::session_protocol::host::{
     HostConfig, HostContext, HostInterrupt, LEASE_EPOCH_BLOCK, LEASE_MS, Origin, SessionHost,
     SessionSpec, random_ids,
 };
+use crate::session_protocol::journal::TurnIds;
 use crate::session_protocol::membership::{
     self, CarriageResult, Held, HostFences, MembershipHost, host_now,
 };
@@ -90,7 +91,7 @@ use crate::session_protocol::r9::{
 };
 use crate::session_protocol::wire::{
     self, Activity, ApprovalCloseReason, ApprovalDecision, ApprovalRequest, ClientKind, Envelope,
-    FamilyMessage, Permission, ReceiptKind, SessionState,
+    FamilyMessage, Permission, ReceiptKind, ReceiptState, SessionState,
 };
 use crate::terminal_share::{FrameStream, Message as TerminalMessage};
 use crate::websocket_client::{AstationClient, AstationMessage};
@@ -495,6 +496,26 @@ pub enum Interrupted {
     Refused(HostInterrupt),
 }
 
+/// Host-work's prompt `executing` at a start, reconciled with the adopted
+/// worker's chat (session-v1 R9.14 items 5, 6; `reconcile_host_work`).
+struct Reconciling {
+    sid: String,
+    process_gen: String,
+    /// The turn it started, as journaled at the chat's acceptance.
+    turn: TurnIds,
+}
+
+/// What a session's chat says of host-work's prompt's turn at a start.
+enum Reconciled {
+    /// The adopted worker's chat hasn't arrived: decided at a later pass.
+    Wait,
+    /// The turn still runs: the receipt stays `executing`, the chat's
+    /// current turn rebound to it.
+    Running,
+    /// Settled with this report.
+    Report(DispatchReport),
+}
+
 /// The broker's view of one session the host knows.
 struct PerSession {
     /// Registered with the host (an invalid id or generation never is).
@@ -593,6 +614,10 @@ pub struct HostBridge {
     /// report), in the order the answers came (a session's in its write
     /// order).
     interrupt_reports: Vec<(String, InterruptReport)>,
+    /// Host-work's prompts `executing` at the start, waiting for their
+    /// adopted worker's chat (`reconcile_host_work`): request id → what is
+    /// reconciled.
+    reconciling: BTreeMap<String, Reconciling>,
     /// terminal-v1 messages in order (frames, acks, errors) waiting for the
     /// bounded terminal queue.
     terminal_out: VecDeque<Queued>,
@@ -861,6 +886,7 @@ impl HostBridge {
             interrupts: HashMap::new(),
             pending: HashMap::new(),
             interrupt_reports: Vec::new(),
+            reconciling: BTreeMap::new(),
             terminal_out: VecDeque::new(),
             approvals: HashMap::new(),
             revokes: HashMap::new(),
@@ -1613,6 +1639,8 @@ impl HostBridge {
         // After the start's recovery, so recovered work meets the sessions
         // adopted by then.
         if self.recovered {
+            // Host-work's executing prompts whose adopted chat arrived.
+            self.reconcile_host_work(&mut cx);
             self.sync_host_work(&mut cx);
         }
         self.sync_r9_link(r9_app_link(app), &mut cx);
@@ -2548,8 +2576,26 @@ impl HostBridge {
                         self.exec(effects, cx);
                     }
                 }
+                // R9.14 items 5, 6: host-work's prompt, with the turn it
+                // started, is decided from the adopted worker's chat.
+                Effect::Reconcile {
+                    request_id,
+                    target,
+                    kind: ReceiptKind::Prompt,
+                    turn: Some(turn),
+                } => {
+                    let reconciling = Reconciling {
+                        sid: target.session_id,
+                        process_gen: target.process_gen,
+                        turn,
+                    };
+                    self.reconciling.insert(request_id, reconciling);
+                    self.reconcile_host_work(cx);
+                }
                 Effect::Reconcile { request_id, .. } => {
-                    // A broker restart can't tell what an executing request did.
+                    // A broker restart can't tell what an executing request
+                    // did (a host-work prompt without its turn too: fail
+                    // closed).
                     let effects = self
                         .host
                         .dispatch_report(&request_id, DispatchReport::Unknown);
@@ -2681,6 +2727,60 @@ impl HostBridge {
                 Interrupted::Revoked
             }
             refused => Interrupted::Refused(refused),
+        }
+    }
+
+    /// Host-work's prompt `request_id`, `executing` at the start, still
+    /// waits for its adopted worker's chat to be reconciled (R9.14 items 5,
+    /// 6; `SessionHost::recover` has the order at a start). Until then its
+    /// turn check refuses (`NotCurrentTurn`: no turn state yet), which says
+    /// nothing of the turn, so host-work's recovery keeps an interrupt
+    /// intent of it pending (Task 26).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn host_work_reconciling(&self, request_id: &str) -> bool {
+        self.reconciling.contains_key(request_id)
+    }
+
+    /// Host-work's prompts `executing` at the start (R9.14 items 5, 6; the
+    /// session host's `Reconcile` with their turn), each decided once its
+    /// adopted worker's chat arrived (`BrokerSession::chat_synced`), at
+    /// this pass or a later one (`reconciled`): a turn still running stays
+    /// `executing`, the restored chat's current turn rebound to it
+    /// (`ChatSession::rebind_turn`), so the turn check
+    /// (`running_request`) and the turn's end (`chat_outs`) find it again;
+    /// a turn that ended completes with its outcome when known, else
+    /// `outcome_unknown`; a process that is gone is `outcome_unknown`
+    /// (`agent exited`), and so is a chat without turn state (fail closed).
+    fn reconcile_host_work(&mut self, cx: &mut Cx) {
+        let ids: Vec<String> = self.reconciling.keys().cloned().collect();
+        for request_id in ids {
+            let executing = self
+                .host
+                .receipt(&request_id)
+                .is_some_and(|r| r.state == ReceiptState::Executing);
+            if !executing {
+                // Settled meanwhile (its process ended, its session went).
+                self.reconciling.remove(&request_id);
+                continue;
+            }
+            let r = &self.reconciling[&request_id];
+            match reconciled(session_of(cx, &r.sid).map(|s| &*s), r) {
+                Reconciled::Wait => {}
+                Reconciled::Running => {
+                    let r = self.reconciling.remove(&request_id).unwrap();
+                    let rebound = session_of(cx, &r.sid).is_some_and(|s| {
+                        s.chat
+                            .rebind_turn(&r.turn.turn_id, &request_id, &r.turn.user_message_id)
+                    });
+                    debug_assert!(rebound, "decided from the same chat");
+                    self.prompts.insert(request_id, r.sid);
+                }
+                Reconciled::Report(report) => {
+                    self.reconciling.remove(&request_id);
+                    let effects = self.host.dispatch_report(&request_id, report);
+                    self.exec(effects, cx);
+                }
+            }
         }
     }
 
@@ -4213,7 +4313,14 @@ impl HostBridge {
         for out in outs {
             let mut except = None;
             match &out {
-                Out::Accepted { .. } => continue,
+                Out::Accepted { request_id } => {
+                    // R9.14 items 5, 6: a host-work prompt journals the turn
+                    // it started.
+                    if self.prompts.contains_key(request_id) {
+                        self.turn_started(sid, request_id, cx);
+                    }
+                    continue;
+                }
                 Out::Error {
                     request_id: Some(request_id),
                     ..
@@ -4267,6 +4374,24 @@ impl HostBridge {
                 _ => {}
             }
             self.broadcast(sid, &out, except.as_deref(), cx);
+        }
+    }
+
+    /// The chat accepted the prompt `request_id` this runtime pasted: for
+    /// host-work's (R9.14 items 5, 6), the turn it started and its user
+    /// message, as the retained history shows them, are journaled
+    /// (`SessionHost::turn_started`; for any other prompt nothing is
+    /// written). When the history doesn't show them, nothing is, and a
+    /// restart fails the receipt closed.
+    fn turn_started(&mut self, sid: &str, request_id: &str, cx: &mut Cx) {
+        let turn = session_of(cx, sid)
+            .and_then(|s| s.chat.prompt_turn(request_id))
+            .map(|(turn_id, user_message_id)| TurnIds {
+                turn_id: turn_id.to_string(),
+                user_message_id: user_message_id.to_string(),
+            });
+        if let Some(turn) = turn {
+            let _ = self.host.turn_started(request_id, turn);
         }
     }
 
@@ -4604,6 +4729,42 @@ fn running_request(cx: &mut Cx, sid: &str) -> Option<String> {
         .then(|| s.chat.current_request_id())
         .flatten()
         .map(str::to_string)
+}
+
+/// What `s`, the session of host-work's prompt `r` as the broker has it,
+/// shows of the turn the prompt started, at a start (R9.14 items 5, 6).
+fn reconciled(s: Option<&BrokerSession>, r: &Reconciling) -> Reconciled {
+    let Some(s) = s.filter(|s| s.is_live() && s.process_gen == r.process_gen) else {
+        // No worker of that process was adopted.
+        return Reconciled::Report(DispatchReport::AgentExited);
+    };
+    // An adopted worker with a chat adapter sends its chat on connecting:
+    // until it arrived, this broker's chat knows none of its turns.
+    if !s.chat_synced && s.chat_offered {
+        return Reconciled::Wait;
+    }
+    let turn = r.turn.turn_id.as_str();
+    if !s.chat_v1 {
+        // No turn state (the chat withdrawn): nothing can be established.
+        return Reconciled::Report(DispatchReport::Unknown);
+    }
+    if s.chat.last_completed_turn() == Some(turn) {
+        let detail = match s.chat.last_outcome() {
+            Some(crate::chat::adapter::Outcome::Done) => DETAIL_TURN_DONE,
+            Some(crate::chat::adapter::Outcome::Interrupted) => DETAIL_TURN_INTERRUPTED,
+            None => return Reconciled::Report(DispatchReport::Unknown),
+        };
+        return Reconciled::Report(DispatchReport::Completed {
+            detail: Some(detail.to_string()),
+            turn_id: Some(turn.to_string()),
+            user_message_id: Some(r.turn.user_message_id.clone()),
+        });
+    }
+    if s.chat.current_turn_id() == Some(turn) {
+        return Reconciled::Running;
+    }
+    // Another turn is current, or none: it ended, how is unknown.
+    Reconciled::Report(DispatchReport::Unknown)
 }
 
 /// §6: what a failed host write proves (`None`: it was written).

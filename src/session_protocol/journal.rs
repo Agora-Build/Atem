@@ -68,6 +68,12 @@ pub enum Record {
         updated_at: u64,
         provenance: Option<Provenance>,
     },
+    /// The turn a `host-work` prompt started (session-v1 R9.14 items 5,
+    /// 6), journaled once at the chat's acceptance while the prompt is
+    /// `executing`: what a restart reconciles the receipt with (the adopted
+    /// worker's chat). Ids only. No other request has one, so every other
+    /// journal is written as before.
+    TurnStarted { request_id: String, turn: TurnIds },
     /// The receipt left the retention window and is forgotten.
     Evicted { request_id: String },
     /// Lease epochs up to `reserved` may have been issued for `session_id`;
@@ -168,13 +174,57 @@ pub fn refused_principal(provenance: Option<&Provenance>) -> String {
     }
 }
 
-/// R9.14 item 2: a provenance is valid and on a prompt only.
+// The record rules `replay` enforces beyond the transition table. The file
+// journal checks the same ones while it reads a log (`parse_log`), so a
+// record that breaks one truncates that log there, as an invalid
+// transition does, instead of failing the whole start (Task 13's review,
+// M3).
+
+/// R9.14 item 2: a provenance is valid and only on a prompt of the
+/// `host-work` principal. `principal` is `None` for a request nothing
+/// accepted (`Record::Rejected`): the provenance names its submitter.
+pub fn provenance_coherent(
+    kind: ReceiptKind,
+    principal: Option<&str>,
+    provenance: Option<&Provenance>,
+) -> bool {
+    provenance.is_none_or(|p| {
+        kind == ReceiptKind::Prompt
+            && p.valid()
+            && principal.is_none_or(|who| who == super::wire::HOST_WORK_PRINCIPAL)
+    })
+}
+
+/// r8 §D: a turn result only on a prompt's `completed`.
+pub fn result_coherent(kind: ReceiptKind, state: ReceiptState, result: Option<&TurnIds>) -> bool {
+    result.is_none() || (state == ReceiptState::Completed && kind == ReceiptKind::Prompt)
+}
+
+/// R9.14 items 5, 6: the turn a prompt started is recorded once
+/// (`recorded`: one is already), while it is `executing`, only for a
+/// prompt of the `host-work` principal, with opaque ids.
+pub fn turn_coherent(
+    state: ReceiptState,
+    kind: ReceiptKind,
+    host_work: bool,
+    recorded: bool,
+    turn: &TurnIds,
+) -> bool {
+    state == ReceiptState::Executing
+        && kind == ReceiptKind::Prompt
+        && host_work
+        && !recorded
+        && super::wire::is_opaque_id(&turn.turn_id)
+        && super::wire::is_opaque_id(&turn.user_message_id)
+}
+
 fn check_provenance(
     provenance: Option<&Provenance>,
     kind: ReceiptKind,
+    principal: Option<&str>,
     request_id: &str,
 ) -> Result<(), JournalError> {
-    if provenance.is_some_and(|p| kind != ReceiptKind::Prompt || !p.valid()) {
+    if !provenance_coherent(kind, principal, provenance) {
         return Err(JournalError(format!(
             "invalid provenance on {kind:?} {request_id}"
         )));
@@ -418,6 +468,9 @@ pub struct Stored {
     /// The delegated task and sender of a `host-work` prompt (R9.14 item
     /// 2); `None` for every other request.
     pub provenance: Option<Provenance>,
+    /// The turn a `host-work` prompt started (`Record::TurnStarted`, R9.14
+    /// items 5, 6); `None` for every other request.
+    pub turn: Option<TurnIds>,
 }
 
 /// A principal's durable control state (§H).
@@ -458,7 +511,8 @@ pub fn valid_transition(from: ReceiptState, to: ReceiptState) -> bool {
 
 /// Folds durable records into the current receipts, epoch reservations and
 /// principal control states. A record that breaks the transition table or
-/// names an unknown request is a corrupt journal; a control generation never
+/// the rules above (a provenance, a turn result, a turn started), or names
+/// an unknown request, is a corrupt journal; a control generation never
 /// goes down (the highest seen wins).
 pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
     let mut out = Replayed::default();
@@ -478,7 +532,7 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                 if out.receipts.contains_key(&request_id) {
                     return Err(JournalError(format!("request {request_id} admitted twice")));
                 }
-                check_provenance(provenance.as_ref(), kind, &request_id)?;
+                check_provenance(provenance.as_ref(), kind, Some(&principal), &request_id)?;
                 let stored = Stored {
                     request_id: request_id.clone(),
                     target,
@@ -493,6 +547,7 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                     principal,
                     control_gen,
                     provenance,
+                    turn: None,
                 };
                 out.receipts.insert(request_id, stored);
             }
@@ -508,7 +563,7 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                 if out.receipts.contains_key(&request_id) {
                     return Err(JournalError(format!("request {request_id} recorded twice")));
                 }
-                check_provenance(provenance.as_ref(), kind, &request_id)?;
+                check_provenance(provenance.as_ref(), kind, None, &request_id)?;
                 let stored = Stored {
                     request_id: request_id.clone(),
                     target,
@@ -523,6 +578,7 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                     principal: refused_principal(provenance.as_ref()),
                     control_gen: 0,
                     provenance,
+                    turn: None,
                 };
                 out.receipts.insert(request_id, stored);
             }
@@ -543,9 +599,7 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                         s.state
                     )));
                 }
-                if result.is_some()
-                    && (state != ReceiptState::Completed || s.kind != ReceiptKind::Prompt)
-                {
+                if !result_coherent(s.kind, state, result.as_ref()) {
                     return Err(JournalError(format!(
                         "a turn result on {state:?} {:?} {request_id}",
                         s.kind
@@ -556,6 +610,20 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                 s.detail = detail;
                 s.updated_at = updated_at;
                 s.result = result;
+            }
+            Record::TurnStarted { request_id, turn } => {
+                let s = out
+                    .receipts
+                    .get_mut(&request_id)
+                    .ok_or_else(|| JournalError(format!("turn of unknown {request_id}")))?;
+                let host_work = s.principal == super::wire::HOST_WORK_PRINCIPAL;
+                if !turn_coherent(s.state, s.kind, host_work, s.turn.is_some(), &turn) {
+                    return Err(JournalError(format!(
+                        "a turn on {:?} {:?} {request_id}",
+                        s.state, s.kind
+                    )));
+                }
+                s.turn = Some(turn);
             }
             Record::Evicted { request_id } => {
                 out.receipts.remove(&request_id);

@@ -196,6 +196,10 @@ pub const DETAIL_TURN_INTERRUPTED: &str = "interrupted";
 /// A `host-work` request its start check refused, or host-work withdrew
 /// (session-v1 R9.14 items 3, 4): `rejected` before any effect.
 pub const DETAIL_WITHDRAWN_BY_HOST: &str = "withdrawn by the host";
+/// A recovered `accepted` request of the `host-work` principal (R9.14
+/// item 6): never confirmed, `rejected` at the start before anything is
+/// dispatched, whether or not the previous run ended cleanly.
+pub const DETAIL_WITHDRAWN_AT_RECOVERY: &str = "withdrawn at recovery";
 /// `busy` for a submit of a request host-work withdrew while the refusal
 /// list was full (R9.14 item 4): never admitted.
 pub const DETAIL_REFUSAL_LIST_FULL: &str = journal::REFUSAL_LIST_FULL;
@@ -346,6 +350,10 @@ pub enum Effect {
         request_id: String,
         target: Target,
         kind: ReceiptKind,
+        /// The turn a `host-work` prompt started, as journaled at the
+        /// chat's acceptance (R9.14 items 5, 6): reconciled with the
+        /// adopted worker's chat. `None` for every other request.
+        turn: Option<TurnIds>,
     },
     /// Hand the lease holder's answer to the agent's waiting permission
     /// prompt (`executing` is already durable). Report back with
@@ -452,6 +460,9 @@ pub enum DispatchReport {
     FailedAfterPossibleEffect,
     /// Reconciliation could not establish the outcome.
     Unknown,
+    /// Reconciliation found the agent process the request ran in gone:
+    /// `outcome_unknown`, `agent exited` (R9.14 item 6).
+    AgentExited,
 }
 
 /// What the runtime knows of an agent permission prompt (r7). The runtime
@@ -1807,6 +1818,10 @@ impl<J: Journal> SessionHost<J> {
                 ReceiptState::OutcomeUnknown,
                 Some(DETAIL_UNRECONCILED.to_string()),
             ),
+            DispatchReport::AgentExited => (
+                ReceiptState::OutcomeUnknown,
+                Some(DETAIL_AGENT_EXITED.to_string()),
+            ),
         };
         let no_effect = state == ReceiptState::Rejected;
         self.transition_with(request_id, state, detail.as_deref(), result);
@@ -2265,16 +2280,35 @@ impl<J: Journal> SessionHost<J> {
     /// anything is dispatched: requests on the refusal list are `rejected`
     /// with the detail each entry records ("acceptance not confirmed" for a
     /// failed admission write, "withdrawn by the host" for host-work's
-    /// withdrawal, R9.14 item 4), then the list is cleared; after a run
-    /// without a clean close every other recovered `accepted` request is
-    /// `rejected` ("authorization history unknown"); after a clean close a
-    /// changed trust generation rejects it ("host trust changed"), a
-    /// `control_gen` below its principal's durable one too ("control
-    /// revoked"), and the rest waits for its principal to be welcomed with
-    /// `control` (`CONFIRM_MS`). `executing` work is never dispatched again,
-    /// only reconciled. If a resolution can't be persisted, remote sessions
-    /// stay disabled (`start_error`, the journal halted) and nothing is
-    /// dispatched or reconciled.
+    /// withdrawal, R9.14 item 4), then the list is cleared; every other
+    /// recovered `accepted` request of the `host-work` principal is
+    /// `rejected` ("withdrawn at recovery", R9.14 item 6: it is never
+    /// confirmed, whatever the clean close says); after a run without a
+    /// clean close every other one is `rejected` ("authorization history
+    /// unknown"); after a clean close a changed trust generation rejects it
+    /// ("host trust changed"), a `control_gen` below its principal's durable
+    /// one too ("control revoked"), and the rest waits for its principal to
+    /// be welcomed with `control` (`CONFIRM_MS`). `executing` work is never
+    /// dispatched again, only reconciled (`Effect::Reconcile`). If a
+    /// resolution can't be persisted, remote sessions stay disabled
+    /// (`start_error`, the journal halted) and nothing is dispatched or
+    /// reconciled.
+    ///
+    /// Host-work's order at a start (design I.6.2: its interrupt intents at
+    /// step 3, the reconciliation of its tasks with their attempts'
+    /// receipts at step 4). A host-work prompt's `Reconcile` carries the
+    /// turn it started (`turn_started`), and the runtime decides it from the
+    /// adopted worker's chat (`HostBridge`): a turn still running stays
+    /// `executing`, its request rebound to the chat's current turn, so the
+    /// intents carried out after this find it executing and current
+    /// (R9.14 item 5: "delivering once more if that turn is still the
+    /// session's current turn"); only a turn that ended, a worker that is
+    /// gone or a turn never journaled is settled here, and for those an
+    /// intent does nothing anyway ("a turn that has already ended makes it
+    /// do nothing"). Until the adopted chat arrives the receipt stays
+    /// `executing` and the interrupt's turn check refuses (`NotCurrentTurn`,
+    /// no turn state): `HostBridge::host_work_reconciling` tells host-work's
+    /// recovery (Task 26) to keep such an intent pending until the decision.
     pub fn recover(&mut self) -> Vec<Effect> {
         self.resolve_once();
         if self.start_error.is_some() {
@@ -2292,6 +2326,7 @@ impl<J: Journal> SessionHost<J> {
                 request_id: e.stored.request_id.clone(),
                 target: e.stored.target.clone(),
                 kind: e.stored.kind,
+                turn: e.stored.turn.clone(),
             })
             .collect();
         self.out.extend(reconcile);
@@ -2358,20 +2393,37 @@ impl<J: Journal> SessionHost<J> {
         // was accepted (`principals`), at a generation no lower than the
         // request's: one the file doesn't name, or names lower, means the
         // control history was lost (a missing or older `principals`), and a
-        // fence it held can't be told from none.
+        // fence it held can't be told from none. The `host-work`
+        // principal's requests are left out: they are withdrawn whatever
+        // that history says (R9.14 item 6), and its control state is never
+        // fenced (item 1).
         let history_lost = queued.iter().any(|(_, rid)| {
             let s = &self.receipts[rid].stored;
-            self.principals
-                .get(&s.principal)
-                .is_none_or(|p| p.control_gen < s.control_gen)
+            !by_host_work(s)
+                && self
+                    .principals
+                    .get(&s.principal)
+                    .is_none_or(|p| p.control_gen < s.control_gen)
         });
         for (_, rid) in queued {
             debug_assert!(!on_list.contains(&rid));
-            let (principal, control_gen, trust) = {
+            let (principal, control_gen, trust, host_work) = {
                 let s = &self.receipts[&rid].stored;
-                (s.principal.clone(), s.control_gen, s.target.host_trust_gen)
+                let host_work = by_host_work(s);
+                (
+                    s.principal.clone(),
+                    s.control_gen,
+                    s.target.host_trust_gen,
+                    host_work,
+                )
             };
-            let detail = if !self.previous_clean || history_lost {
+            let detail = if host_work {
+                // R9.14 item 6: never confirmed, so never scheduled (nor
+                // when `welcome_r9` confirms the principal): no side effect,
+                // and host-work queues the task again for a new attempt.
+                // §H's rules 2 and 3 don't apply to it.
+                Some(DETAIL_WITHDRAWN_AT_RECOVERY)
+            } else if !self.previous_clean || history_lost {
                 Some(DETAIL_HISTORY_UNKNOWN)
             } else if trust != self.ctx.host_trust_gen {
                 Some(DETAIL_TRUST_CHANGED)
@@ -2528,6 +2580,59 @@ impl<J: Journal> SessionHost<J> {
         self.receipts
             .get(request_id)
             .map(|e| self.render(&e.stored))
+    }
+
+    /// The receipt of host-work's attempt `request_id` for the task
+    /// `task_id`, which host-work settles the attempt by (design I.6.3,
+    /// I.6.4). Only a request of the `host-work` principal whose provenance
+    /// names that task is the attempt's: a receipt recorded under another
+    /// submitter under that id (R9.14 item 7), or host-work's for another
+    /// task, is not, and reads as `None`, as an absent one does (the
+    /// attempt was never admitted; Task 14's review).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn attempt_receipt(&self, request_id: &str, task_id: &str) -> Option<Receipt> {
+        let e = self.receipts.get(request_id)?;
+        let its = by_host_work(&e.stored)
+            && e.stored
+                .provenance
+                .as_ref()
+                .is_some_and(|p| p.task_id == task_id);
+        its.then(|| self.render(&e.stored))
+    }
+
+    /// The chat accepted host-work's prompt `request_id`, which started
+    /// `turn` (R9.14 items 5, 6): journaled durably, once, so a restart
+    /// reconciles the receipt with the adopted worker's chat
+    /// (`Effect::Reconcile`'s `turn`). Only for an `executing` prompt of the
+    /// `host-work` principal with no turn yet, and opaque ids
+    /// (`journal::turn_coherent`): for anything else nothing is written, so
+    /// a v1 prompt's journal is unchanged. Nothing is sent. True when it is
+    /// durable; a failed write halts the journal (§I), and the restart then
+    /// fails the receipt closed (`outcome_unknown`).
+    pub fn turn_started(&mut self, request_id: &str, turn: TurnIds) -> bool {
+        let Some(e) = self.receipts.get(request_id) else {
+            return false;
+        };
+        let s = &e.stored;
+        let host_work = is_host_work(&s.principal);
+        if !journal::turn_coherent(s.state, s.kind, host_work, s.turn.is_some(), &turn) {
+            return false;
+        }
+        let record = Record::TurnStarted {
+            request_id: request_id.to_string(),
+            turn: turn.clone(),
+        };
+        if !self.append(record) {
+            return false;
+        }
+        self.receipts.get_mut(request_id).unwrap().stored.turn = Some(turn);
+        true
+    }
+
+    /// The turn host-work's prompt `request_id` started, as journaled.
+    #[cfg(test)]
+    pub fn recorded_turn(&self, request_id: &str) -> Option<&TurnIds> {
+        self.receipts.get(request_id)?.stored.turn.as_ref()
     }
 
     /// Every receipt's request id, every registered session's id and
@@ -2765,7 +2870,8 @@ impl<J: Journal> SessionHost<J> {
     /// halted (§I) and it stays `accepted` until the restart. It goes on the
     /// refusal list too, best effort, so the restart rejects it `withdrawn
     /// by the host` before anything is dispatched (R9.14 items 4, 6.1);
-    /// should that write fail as well, the restart's recovery settles it.
+    /// should that write fail as well, the restart's recovery settles it
+    /// (`withdrawn at recovery`, item 6.2).
     fn list_unwritten_withdrawal(&mut self, rid: &str) {
         self.halt_journal();
         let s = &self.receipts[rid].stored;
@@ -3718,6 +3824,7 @@ impl<J: Journal> SessionHost<J> {
             principal,
             control_gen,
             provenance: self.admitting.clone(),
+            turn: None,
         };
         let chat = match &reply {
             Reply::Chat { conversation_id } => Some(conversation_id.clone()),
@@ -4963,6 +5070,7 @@ fn refused_stored(r: &Refusal, order: u64) -> Stored {
         principal: journal::refused_principal(r.provenance.as_ref()),
         control_gen: 0,
         provenance: r.provenance.clone(),
+        turn: None,
     }
 }
 

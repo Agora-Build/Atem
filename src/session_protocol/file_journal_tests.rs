@@ -798,3 +798,209 @@ fn a_listed_request_id_is_never_listed_again_or_replaced() {
     assert_eq!(j.refusals().unwrap(), vec![first.clone()]);
     assert_eq!(m.refusals().unwrap(), vec![first]);
 }
+
+// ── Session-v1 R9.14: provenance coherence (Task 13's review, M3) and the
+//    turn a host-work prompt started (items 5, 6) ──
+
+const TASK: &str = "5ba7b810-9dad-41d1-80b4-00c04fd430c8";
+
+/// A `host-work` prompt's `accepted` record, with its provenance.
+fn host_work_accepted(id: &str) -> Record {
+    Record::Accepted {
+        request_id: id.into(),
+        target: target(S1),
+        kind: ReceiptKind::Prompt,
+        payload_digest: "0".repeat(64),
+        payload: json!({ "text": "run the tests" }),
+        updated_at: 1,
+        principal: wire::HOST_WORK_PRINCIPAL.into(),
+        control_gen: 1,
+        provenance: Some(Provenance {
+            task_id: TASK.into(),
+            sender: "member:phone-1".into(),
+        }),
+    }
+}
+
+fn turn_started(id: &str, turn: &str) -> Record {
+    Record::TurnStarted {
+        request_id: id.into(),
+        turn: journal::TurnIds {
+            turn_id: turn.into(),
+            user_message_id: format!("{turn}-u"),
+        },
+    }
+}
+
+/// What a journal replays to (`state`): its receipts and lease floors.
+type Replay = (BTreeMap<String, Stored>, Vec<(String, u64)>);
+
+/// `records` written as one session log in a fresh journal, then opened:
+/// the bytes written, the log's length after the open and what it replays
+/// to.
+fn reopen_log(records: &[Record]) -> (u64, u64, Replay) {
+    let dir = tempfile::tempdir().unwrap();
+    drop(open(&sd(&dir)));
+    let path = log(&sd(&dir), S1);
+    let mut bytes = Vec::new();
+    for (i, r) in records.iter().enumerate() {
+        bytes.extend(encode(5 + i as u64, r.clone()).unwrap());
+    }
+    fs::write(&path, &bytes).unwrap();
+    let j = open(&sd(&dir));
+    let len = fs::metadata(&path).map_or(0, |m| m.len());
+    (bytes.len() as u64, len, state(j.load().unwrap()))
+}
+
+/// The length of `records`' framed lines.
+fn framed(records: &[Record]) -> u64 {
+    records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| encode(5 + i as u64, r.clone()).unwrap().len() as u64)
+        .sum()
+}
+
+/// Task 13's review (M3): a provenance on anything but a `host-work`
+/// prompt (another principal's record, or another kind) is incoherent.
+/// `replay` refuses it, and the file journal truncates its log there, as
+/// for an invalid transition, so it can't fail the whole start.
+#[test]
+fn a_provenance_off_a_host_work_prompt_truncates_the_log() {
+    let good = [accepted("a", S1, "t")];
+    let mut other_principal = host_work_accepted("b");
+    if let Record::Accepted { principal, .. } = &mut other_principal {
+        *principal = "astation:account-a:a1".into();
+    }
+    let mut other_kind = host_work_accepted("b");
+    if let Record::Accepted { kind, .. } = &mut other_kind {
+        *kind = ReceiptKind::Interrupt;
+    }
+    for bad in [other_principal, other_kind] {
+        assert!(journal::replay(vec![bad.clone()]).is_err(), "{bad:?}");
+        let records = [
+            good[0].clone(),
+            bad.clone(),
+            to("a", ReceiptState::Executing, 2),
+        ];
+        let (written, len, replayed) = reopen_log(&records);
+        assert!(len < written);
+        assert_eq!(len, framed(&good), "{bad:?}");
+        assert_eq!(replayed, mem_state(&good));
+    }
+    // A host-work prompt's is coherent.
+    let records = [host_work_accepted("b")];
+    let (written, len, replayed) = reopen_log(&records);
+    assert_eq!(len, written);
+    assert_eq!(replayed, mem_state(&records));
+}
+
+/// A turn result off a completed prompt is mirrored the same way: the log
+/// is truncated there (`replay` refuses it,
+/// `a_turn_result_off_a_completed_prompt_is_not_trusted`).
+#[test]
+fn a_turn_result_off_a_completed_prompt_truncates_the_log() {
+    let mut executing = to("a", ReceiptState::Executing, 2);
+    if let Record::Transition { result, .. } = &mut executing {
+        *result = Some(journal::TurnIds {
+            turn_id: "t".into(),
+            user_message_id: "u".into(),
+        });
+    }
+    let good = [accepted("a", S1, "x")];
+    let (_, len, replayed) = reopen_log(&[good[0].clone(), executing]);
+    assert_eq!(len, framed(&good));
+    assert_eq!(replayed, mem_state(&good));
+}
+
+/// R9.14 items 5, 6: `turn_started` is coherent once, on an `executing`
+/// prompt of the `host-work` principal, with opaque ids. Anything else is
+/// refused by `replay` and truncates the log there.
+#[test]
+fn a_turn_started_record_is_trusted_only_on_an_executing_host_work_prompt() {
+    use ReceiptState::*;
+    let base = [
+        host_work_accepted("h"),
+        to("h", Executing, 2),
+        turn_started("h", "turn-1"),
+    ];
+    assert!(journal::replay(base.to_vec()).is_ok());
+    // (Opening compacts a log whose payload is stale: compare states.)
+    let (_, _, replayed) = reopen_log(&base);
+    assert_eq!(replayed, mem_state(&base));
+    assert_eq!(
+        replayed.0["h"].turn,
+        Some(journal::TurnIds {
+            turn_id: "turn-1".into(),
+            user_message_id: "turn-1-u".into(),
+        })
+    );
+
+    let cases: Vec<(Vec<Record>, Vec<Record>)> = vec![
+        // Before `executing`.
+        (
+            vec![host_work_accepted("h")],
+            vec![turn_started("h", "turn-1")],
+        ),
+        // Another principal's prompt.
+        (
+            vec![accepted("a", S1, "x"), to("a", Executing, 2)],
+            vec![turn_started("a", "turn-1")],
+        ),
+        // Twice.
+        (base.to_vec(), vec![turn_started("h", "turn-2")]),
+        // After the receipt settled.
+        (
+            vec![
+                host_work_accepted("h"),
+                to("h", Executing, 2),
+                to("h", OutcomeUnknown, 3),
+            ],
+            vec![turn_started("h", "turn-1")],
+        ),
+        // Not an opaque id.
+        (
+            vec![host_work_accepted("h"), to("h", Executing, 2)],
+            vec![turn_started("h", "turn 1")],
+        ),
+        // An unknown request.
+        (vec![], vec![turn_started("h", "turn-1")]),
+    ];
+    for (good, bad) in cases {
+        let all: Vec<Record> = good.iter().chain(&bad).cloned().collect();
+        assert!(journal::replay(all.clone()).is_err(), "{bad:?}");
+        let (_, _, replayed) = reopen_log(&all);
+        assert_eq!(replayed, mem_state(&good), "{bad:?}");
+    }
+}
+
+/// The turn survives a reload and every compaction, while the receipt
+/// executes and once it settled.
+#[test]
+fn a_turn_started_survives_reload_and_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut j = open(&sd(&dir));
+    let records = [
+        host_work_accepted("h"),
+        to("h", ReceiptState::Executing, 2),
+        turn_started("h", "turn-1"),
+    ];
+    for r in &records {
+        j.append(r.clone()).unwrap();
+    }
+    assert_eq!(state(j.load().unwrap()), mem_state(&records));
+    j.compact_all().unwrap();
+    drop(j);
+    let mut j = open(&sd(&dir));
+    assert_eq!(state(j.load().unwrap()), mem_state(&records));
+    let settled = to("h", ReceiptState::OutcomeUnknown, 4);
+    j.append(settled.clone()).unwrap();
+    j.compact_all().unwrap();
+    drop(j);
+    let j = open(&sd(&dir));
+    let mut all = records.to_vec();
+    all.push(settled);
+    assert_eq!(state(j.load().unwrap()), mem_state(&all));
+    let text = text(&log(&sd(&dir), S1));
+    assert!(!text.contains("run the tests"), "{text}");
+}

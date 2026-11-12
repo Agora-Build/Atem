@@ -1830,3 +1830,347 @@ fn a_takeover_after_the_interrupt_is_revoked_again_on_request() {
     );
     assert_eq!(rt.host.lease_holder(S1), Some(C1));
 }
+
+// ── §H recovery of host-work requests and the turn identity (session-v1
+//    R9.14 items 5, 6) ──
+
+fn turn_ids() -> super::journal::TurnIds {
+    super::journal::TurnIds {
+        turn_id: "turn-1".into(),
+        user_message_id: "turn-1-u".into(),
+    }
+}
+
+/// With dispatch held: c1's prompt `rid(2)` queued (the lease it took
+/// released), then host-work's `rid(1)`, both `accepted`.
+fn queue_both<J: Journal + FailFsync>(rt: &mut FakeRuntime<J>) {
+    client_prompt(rt, "c1", C1, 2);
+    release(rt, "c1", C1);
+    submit_host_work(rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+}
+
+/// R9.14 item 6: a recovered `accepted` request of the host-work principal
+/// is never confirmed. It is `rejected`, `withdrawn at recovery`, durably
+/// and before anything is dispatched, whether or not the previous run
+/// ended with a clean close, and keeps its provenance. Welcoming host-work's
+/// attachment again (Task 13's carry-forward: `welcome_r9` confirms the
+/// principal) schedules nothing of it. Another principal's queued work
+/// keeps §H's rules.
+#[test]
+fn recovered_host_work_accepted_is_withdrawn_at_recovery() {
+    for orderly in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rt = setup_file(dir.path());
+        host_work(&mut rt, HW);
+        rt.host.hold_dispatch(true);
+        queue_both(&mut rt);
+        for n in [1, 2] {
+            assert_eq!(
+                rt.host.receipt(&rid(n)).unwrap().state,
+                ReceiptState::Accepted
+            );
+        }
+        let now = rt.now();
+        let event = if orderly {
+            HostEvent::RestartRuntime {
+                runtime_gen: GEN2.into(),
+                runtime_epoch: 8,
+            }
+        } else {
+            HostEvent::CrashRuntime {
+                runtime_gen: GEN2.into(),
+                runtime_epoch: 8,
+            }
+        };
+        rt.event(&event, now).unwrap();
+        assert_eq!(rt.host.previous_run_clean(), orderly);
+        rt.host.hold_dispatch(false);
+        let withdrawn = |host: &SessionHost<FileJournal>| {
+            let r = host.receipt(&rid(1)).unwrap();
+            assert_eq!(r.state, ReceiptState::Rejected, "orderly {orderly}");
+            assert_eq!(r.detail.as_deref(), Some(DETAIL_WITHDRAWN_AT_RECOVERY));
+            assert_eq!(
+                (r.task_id.as_deref(), r.sender.as_deref()),
+                (Some(TASK), Some(SENDER))
+            );
+        };
+        withdrawn(&rt.host);
+        assert_eq!(
+            logged(&log_path(dir.path()), &rid(1)),
+            ["accepted", "rejected: withdrawn at recovery"]
+        );
+        // c1's: §H as before (waiting for its principal after a clean
+        // close; history unknown after a crash).
+        let theirs = rt.host.receipt(&rid(2)).unwrap();
+        if orderly {
+            assert_eq!(theirs.state, ReceiptState::Accepted);
+        } else {
+            assert_eq!(theirs.detail.as_deref(), Some(DETAIL_HISTORY_UNKNOWN));
+        }
+
+        // The principal's attachment is welcomed again: nothing of it runs.
+        host_work(&mut rt, HW2);
+        assert!(!dispatched(&rt, &rid(1)), "orderly {orderly}");
+        withdrawn(&rt.host);
+        rt.attach("c1", C2).unwrap();
+        assert_eq!(dispatched(&rt, &rid(2)), orderly);
+
+        // A new process over the files: the same.
+        drop(rt);
+        withdrawn(&reopened(dir.path()));
+    }
+}
+
+/// §H's rule 2 ("authorization history unknown") reads the control history
+/// of the queued requests' principals. The host-work principal's requests
+/// are left out of it: they are withdrawn at recovery whatever that history
+/// says, so a control history that doesn't name host-work (here forgotten,
+/// as a `principals` file from before its first connect would be) leaves
+/// another principal's queued work waiting for its confirmation, as it
+/// would without host-work's request.
+#[test]
+fn host_work_is_left_out_of_history_lost() {
+    let mut rt = setup();
+    host_work(&mut rt, HW);
+    rt.host.hold_dispatch(true);
+    queue_both(&mut rt);
+    rt.host
+        .journal_mut()
+        .forget_principals(&[HOST_WORK_PRINCIPAL.to_string()]);
+    restart(&mut rt, GEN2, 8);
+    assert!(rt.host.previous_run_clean());
+    rt.host.hold_dispatch(false);
+
+    let r = rt.host.receipt(&rid(1)).unwrap();
+    assert_eq!(r.state, ReceiptState::Rejected);
+    assert_eq!(r.detail.as_deref(), Some(DETAIL_WITHDRAWN_AT_RECOVERY));
+    let theirs = rt.host.receipt(&rid(2)).unwrap();
+    assert_eq!(theirs.state, ReceiptState::Accepted, "{theirs:?}");
+    // Its principal welcomed with `control`: it runs.
+    rt.attach("c1", C2).unwrap();
+    assert!(dispatched(&rt, &rid(2)));
+    assert_eq!(
+        rt.host.receipt(&rid(2)).unwrap().state,
+        ReceiptState::Executing
+    );
+}
+
+/// R9.14 item 6's order: the refusal list first, each entry with the
+/// detail it records (a withdrawal whose write failed: `withdrawn by the
+/// host`; a failed admission write whose record reached the disk anyway:
+/// `acceptance not confirmed`), then every other recovered host-work
+/// request `withdrawn at recovery`; another principal's queued work after a
+/// halted run (no clean close): `authorization history unknown`.
+#[test]
+fn refusal_list_entries_resolve_first_with_their_detail() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    host_work(&mut rt, HW);
+    rt.host.hold_dispatch(true);
+    // c1's prompt is queued, and the lease it took released.
+    client_prompt(&mut rt, "c1", C1, 4);
+    release(&mut rt, "c1", C1);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    submit_host_work(&mut rt, HW, prompt_data(HW, 2), provenance(TASK2, SENDER));
+    for n in [1, 2, 4] {
+        assert_eq!(
+            rt.host.receipt(&rid(n)).unwrap().state,
+            ReceiptState::Accepted
+        );
+    }
+    got(&mut rt, HOST_WORK_PRINCIPAL);
+    // rid(3)'s admission write fails and its rollback too: `busy`, listed,
+    // its `accepted` record on disk after all.
+    rt.host.journal_mut().fail_fsync_of(1, true);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 3), provenance(TASK, SENDER));
+    assert_eq!(error_code(&got(&mut rt, HOST_WORK_PRINCIPAL)), "busy");
+    assert!(rt.host.journal_halted());
+    // rid(1)'s withdrawal can't be written: listed with its detail.
+    assert_eq!(withdraw(&mut rt, 1), Withdrawal::Halted);
+    let listed: Vec<(String, Option<String>)> = rt
+        .host
+        .journal()
+        .refusals()
+        .unwrap()
+        .iter()
+        .map(|r| (r.request_id.clone(), r.detail.clone()))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (rid(3), None),
+            (rid(1), Some(DETAIL_WITHDRAWN_BY_HOST.to_string()))
+        ]
+    );
+    let on_disk = |n| logged(&log_path(dir.path()), &rid(n));
+    assert_eq!(on_disk(3), ["accepted"], "the failed write's record stays");
+
+    // A halted run writes no clean close.
+    restart(&mut rt, GEN2, 8);
+    assert!(!rt.host.previous_run_clean());
+    let want = |host: &SessionHost<FileJournal>| {
+        for (n, detail, task) in [
+            (1, DETAIL_WITHDRAWN_BY_HOST, Some(TASK)),
+            (2, DETAIL_WITHDRAWN_AT_RECOVERY, Some(TASK2)),
+            (3, DETAIL_ACCEPTANCE_NOT_CONFIRMED, Some(TASK)),
+            (4, DETAIL_HISTORY_UNKNOWN, None),
+        ] {
+            let r = host.receipt(&rid(n)).unwrap();
+            assert_eq!(r.state, ReceiptState::Rejected, "{n}");
+            assert_eq!(r.detail.as_deref(), Some(detail), "{n}");
+            assert_eq!(r.task_id.as_deref(), task, "{n}");
+        }
+    };
+    want(&rt.host);
+    assert!(rt.host.journal().refusals().unwrap().is_empty());
+    for (n, detail) in [
+        (1, DETAIL_WITHDRAWN_BY_HOST),
+        (2, DETAIL_WITHDRAWN_AT_RECOVERY),
+        (3, DETAIL_ACCEPTANCE_NOT_CONFIRMED),
+    ] {
+        assert_eq!(
+            on_disk(n),
+            ["accepted".to_string(), format!("rejected: {detail}")]
+        );
+    }
+    host_work(&mut rt, HW2);
+    rt.host.hold_dispatch(false);
+    for n in 1..=4 {
+        assert!(!dispatched(&rt, &rid(n)), "{n}");
+    }
+    drop(rt);
+    want(&reopened(dir.path()));
+}
+
+/// The turn a host-work prompt started is journaled at the chat's
+/// acceptance (`turn_started`), durably and once, for an `executing`
+/// prompt of the host-work principal only: a v1 prompt's journal is left
+/// byte for byte as it was. A restart's `Reconcile` carries it, through a
+/// compaction and a new process; a v1 prompt's carries none.
+#[test]
+fn the_turn_a_host_work_prompt_started_is_journaled_once_and_only_for_it() {
+    use super::journal::TurnIds;
+    // A v1 prompt: nothing is written, and its reconciliation names no turn.
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    client_prompt(&mut rt, "c1", C1, 2);
+    assert_eq!(
+        rt.host.receipt(&rid(2)).unwrap().state,
+        ReceiptState::Executing
+    );
+    let before = std::fs::read(log_path(dir.path())).unwrap();
+    assert!(!rt.host.turn_started(&rid(2), turn_ids()));
+    assert_eq!(std::fs::read(log_path(dir.path())).unwrap(), before);
+    drop(rt);
+    let mut host = reopened(dir.path());
+    assert_eq!(host.recorded_turn(&rid(2)), None);
+    let fx = host.recover();
+    assert!(
+        fx.iter().any(
+            |e| matches!(e, Effect::Reconcile { request_id, turn: None, .. }
+            if *request_id == rid(2))
+        ),
+        "{fx:#?}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    host_work(&mut rt, HW);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    submit_host_work(&mut rt, HW, prompt_data(HW, 3), provenance(TASK2, SENDER));
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Executing
+    );
+    assert_eq!(
+        rt.host.receipt(&rid(3)).unwrap().state,
+        ReceiptState::Accepted
+    );
+    let before = std::fs::read(log_path(dir.path())).unwrap();
+    // Not executing (queued behind it), or ids that aren't opaque ids:
+    // nothing.
+    assert!(!rt.host.turn_started(&rid(3), turn_ids()));
+    let bad = TurnIds {
+        turn_id: String::new(),
+        user_message_id: "turn-1-u".into(),
+    };
+    assert!(!rt.host.turn_started(&rid(1), bad));
+    assert_eq!(std::fs::read(log_path(dir.path())).unwrap(), before);
+    got(&mut rt, HOST_WORK_PRINCIPAL);
+
+    assert!(rt.host.turn_started(&rid(1), turn_ids()));
+    assert_eq!(rt.host.recorded_turn(&rid(1)), Some(&turn_ids()));
+    // Once: another turn later changes nothing.
+    let later = TurnIds {
+        turn_id: "turn-2".into(),
+        user_message_id: "turn-2-u".into(),
+    };
+    assert!(!rt.host.turn_started(&rid(1), later));
+    assert_eq!(rt.host.recorded_turn(&rid(1)), Some(&turn_ids()));
+    assert_eq!(
+        logged(&log_path(dir.path()), &rid(1)),
+        ["accepted", "executing", "turn_started"]
+    );
+    let log = std::fs::read_to_string(log_path(dir.path())).unwrap();
+    let line = log.lines().find(|l| l.contains("turn_started")).unwrap();
+    let json: Value = serde_json::from_str(line.splitn(3, ' ').nth(2).unwrap()).unwrap();
+    assert_eq!(
+        json,
+        json!({"seq": json["seq"], "t": "turn_started", "request_id": rid(1),
+               "turn": {"turn_id": "turn-1", "user_message_id": "turn-1-u"}})
+    );
+    // Still executing, and nobody was told anything.
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Executing
+    );
+    assert!(got(&mut rt, HOST_WORK_PRINCIPAL).is_empty());
+
+    // A new process over the files, after a compaction: the restart's
+    // reconciliation names the turn.
+    drop(rt);
+    let mut host = reopened(dir.path());
+    assert_eq!(host.recorded_turn(&rid(1)), Some(&turn_ids()));
+    let fx = host.recover();
+    let reconciled: Vec<(String, Option<TurnIds>)> = fx
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Reconcile {
+                request_id, turn, ..
+            } => Some((request_id.clone(), turn.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reconciled, [(rid(1), Some(turn_ids()))]);
+}
+
+/// Task 14's note: host-work settles an attempt by its receipt only when
+/// the receipt is that attempt's: the host-work principal's, for the
+/// attempt's task. A receipt recorded under another submitter under the
+/// same id, or host-work's for another task, is not it.
+#[test]
+fn an_attempt_reads_only_its_own_receipt() {
+    let mut rt = setup();
+    host_work(&mut rt, HW);
+    client_prompt(&mut rt, "c1", C1, 2);
+    assert!(rt.host.receipt(&rid(2)).is_some());
+    assert_eq!(rt.host.attempt_receipt(&rid(2), TASK), None, "c1's");
+    let fx = rt.host.dispatch_report(&rid(2), done());
+    rt.apply(fx);
+    release(&mut rt, "c1", C1);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    let r = rt.host.attempt_receipt(&rid(1), TASK).expect("its own");
+    assert_eq!(r.request_id, rid(1));
+    assert_eq!(r.task_id.as_deref(), Some(TASK));
+    assert_eq!(
+        rt.host.attempt_receipt(&rid(1), TASK2),
+        None,
+        "another task's"
+    );
+    assert_eq!(rt.host.attempt_receipt(&rid(9), TASK), None, "none");
+    // A withdrawal recorded straight from the refusal list is the attempt's.
+    assert_eq!(withdraw(&mut rt, 5), Withdrawal::Listed);
+    restart(&mut rt, GEN2, 8);
+    let r = rt.host.attempt_receipt(&rid(5), TASK).expect("its own");
+    assert_eq!(r.state, ReceiptState::Rejected);
+}

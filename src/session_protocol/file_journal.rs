@@ -14,7 +14,9 @@
 //! ```
 //!
 //! A session's log holds its `Accepted` records (the target names the
-//! session) and their `Transition`/`Evicted` records (routed by request id).
+//! session) and their `Transition`/`TurnStarted`/`Evicted` records (routed
+//! by request id; `TurnStarted` only for a `host-work` prompt, session-v1
+//! R9.14 items 5, 6).
 //! Lease-epoch floors (`LeaseEpochs`) live in the shared `floors` file, one
 //! framed record replaced atomically (temp, fsync, rename, directory fsync)
 //! whenever a floor rises; a damaged floors file is refused, never guessed.
@@ -48,11 +50,12 @@
 //!
 //! Compaction rewrites a log with only its live state — the current receipts
 //! with their latest state (a payload only while `accepted`; the digest
-//! always), no evicted receipts — to `<sid>.log.tmp`, which is fsynced,
-//! renamed over the log, and the directory fsynced; a log with nothing live
-//! is removed (and its handle dropped). It runs when a request carrying a
-//! payload leaves `accepted` (so finished prompt text doesn't stay on disk),
-//! when a session's last receipt is evicted, when a log grows past
+//! always; a host-work prompt's turn once recorded), no evicted receipts —
+//! to `<sid>.log.tmp`, which is fsynced, renamed over the log, and the
+//! directory fsynced; a log with nothing live is removed (and its handle
+//! dropped). It runs when a request carrying a payload leaves `accepted`
+//! (so finished prompt text doesn't stay on disk), when a session's last
+//! receipt is evicted, when a log grows past
 //! max(threshold (1 MiB by default), 2 × its size after the last compaction),
 //! at open for logs with such leftovers, and on `compact_all`. A crash at any
 //! point leaves the old or the new log, both valid and replaying to the same
@@ -201,6 +204,13 @@ enum Disk {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<TurnIds>,
     },
+    /// Session-v1 R9.14 items 5, 6: only a `host-work` prompt's log has
+    /// one.
+    TurnStarted {
+        seq: u64,
+        request_id: String,
+        turn: TurnIds,
+    },
     Evicted {
         seq: u64,
         request_id: String,
@@ -268,6 +278,11 @@ impl Disk {
                 detail,
                 updated_at,
                 result,
+            },
+            Record::TurnStarted { request_id, turn } => Disk::TurnStarted {
+                seq,
+                request_id,
+                turn,
             },
             Record::Evicted { request_id } => Disk::Evicted { seq, request_id },
             Record::LeaseEpochs {
@@ -347,6 +362,11 @@ impl Disk {
                     result,
                 },
             ),
+            Disk::TurnStarted {
+                seq,
+                request_id,
+                turn,
+            } => (seq, Record::TurnStarted { request_id, turn }),
             Disk::Evicted { seq, request_id } => (seq, Record::Evicted { request_id }),
             Disk::LeaseEpochs {
                 seq,
@@ -422,15 +442,39 @@ struct Parsed {
     total_len: u64,
 }
 
+/// What `parse_log` keeps of a live request to judge its later records.
+struct Live {
+    state: ReceiptState,
+    kind: ReceiptKind,
+    /// The `host-work` principal's (R9.14).
+    host_work: bool,
+    /// Its turn is recorded (`TurnStarted`).
+    turn: bool,
+}
+
+impl Live {
+    fn new(state: ReceiptState, kind: ReceiptKind, host_work: bool) -> Self {
+        Self {
+            state,
+            kind,
+            host_work,
+            turn: false,
+        }
+    }
+}
+
 /// Reads records while they are well formed and coherent: the session they
 /// name is this log's, `seq` never goes back, a transition follows the §6
-/// table from the request's current state, an eviction names a live request,
-/// and no lease floor or control state appears (those live in their files).
+/// table from the request's current state, an eviction names a live
+/// request, `replay`'s other record rules hold (a provenance, a turn
+/// result, a turn started: `journal::provenance_coherent`,
+/// `result_coherent`, `turn_coherent`), and no lease floor or control
+/// state appears (those live in their files).
 fn parse_log(bytes: &[u8], sid: &str) -> Parsed {
     let mut records = Vec::new();
     let mut at = 0usize;
     let mut last_seq = 0u64;
-    let mut live: HashMap<String, ReceiptState> = HashMap::new();
+    let mut live: HashMap<String, Live> = HashMap::new();
     while at < bytes.len() {
         let Some((seq, record, used)) = decode_line(&bytes[at..]) else {
             break;
@@ -440,30 +484,70 @@ fn parse_log(bytes: &[u8], sid: &str) -> Parsed {
         }
         let coherent = match &record {
             Record::Accepted {
-                request_id, target, ..
+                request_id,
+                target,
+                kind,
+                principal,
+                provenance,
+                ..
             } => {
-                target.session_id == sid
-                    && live
-                        .insert(request_id.clone(), ReceiptState::Accepted)
-                        .is_none()
+                let coherent = target.session_id == sid
+                    && journal::provenance_coherent(*kind, Some(principal), provenance.as_ref())
+                    && !live.contains_key(request_id);
+                if coherent {
+                    let host_work = principal == wire::HOST_WORK_PRINCIPAL;
+                    let entry = Live::new(ReceiptState::Accepted, *kind, host_work);
+                    live.insert(request_id.clone(), entry);
+                }
+                coherent
             }
             Record::Transition {
-                request_id, state, ..
+                request_id,
+                state,
+                result,
+                ..
             } => match live.get_mut(request_id) {
-                Some(current) if journal::valid_transition(*current, *state) => {
-                    *current = *state;
+                Some(current)
+                    if journal::valid_transition(current.state, *state)
+                        && journal::result_coherent(current.kind, *state, result.as_ref()) =>
+                {
+                    current.state = *state;
                     true
                 }
                 _ => false,
             },
             Record::Rejected {
-                request_id, target, ..
+                request_id,
+                target,
+                kind,
+                provenance,
+                ..
             } => {
-                target.session_id == sid
-                    && live
-                        .insert(request_id.clone(), ReceiptState::Rejected)
-                        .is_none()
+                let coherent = target.session_id == sid
+                    && journal::provenance_coherent(*kind, None, provenance.as_ref())
+                    && !live.contains_key(request_id);
+                if coherent {
+                    // A provenance names the `host-work` principal.
+                    let entry = Live::new(ReceiptState::Rejected, *kind, provenance.is_some());
+                    live.insert(request_id.clone(), entry);
+                }
+                coherent
             }
+            Record::TurnStarted { request_id, turn } => match live.get_mut(request_id) {
+                Some(current)
+                    if journal::turn_coherent(
+                        current.state,
+                        current.kind,
+                        current.host_work,
+                        current.turn,
+                        turn,
+                    ) =>
+                {
+                    current.turn = true;
+                    true
+                }
+                _ => false,
+            },
             Record::Evicted { request_id } => live.remove(request_id).is_some(),
             Record::LeaseEpochs { .. } | Record::Control { .. } => false,
         };
@@ -1027,7 +1111,8 @@ impl FileJournal {
                         *self.live.entry(sid.clone()).or_default() += 1;
                         self.owner.insert(request_id.clone(), sid.clone());
                     }
-                    Record::Transition { request_id, .. } => {
+                    Record::Transition { request_id, .. }
+                    | Record::TurnStarted { request_id, .. } => {
                         stale_payload |= self.with_payload.remove(&request_id);
                     }
                     Record::Evicted { request_id } => {
@@ -1119,7 +1204,9 @@ impl FileJournal {
             }
             Record::LeaseEpochs { session_id, .. } => session_id.clone(),
             Record::Control { .. } => unreachable!("control states are not logged"),
-            Record::Transition { request_id, .. } | Record::Evicted { request_id } => self
+            Record::Transition { request_id, .. }
+            | Record::TurnStarted { request_id, .. }
+            | Record::Evicted { request_id } => self
                 .owner
                 .get(request_id)
                 .cloned()
@@ -1223,27 +1310,37 @@ impl FileJournal {
                     provenance: s.provenance,
                 },
             )?);
-            let mut step =
+            let transition =
                 |state: ReceiptState, detail: Option<String>, result: Option<TurnIds>| {
-                    encode(
-                        seq,
-                        Record::Transition {
-                            request_id: s.request_id.clone(),
-                            state,
-                            detail,
-                            updated_at: s.updated_at,
-                            result,
-                        },
-                    )
-                    .map(|line| out.extend(line))
+                    Record::Transition {
+                        request_id: s.request_id.clone(),
+                        state,
+                        detail,
+                        updated_at: s.updated_at,
+                        result,
+                    }
                 };
-            match s.state {
-                ReceiptState::Accepted => {}
-                ReceiptState::Executing | ReceiptState::Rejected => step(s.state, s.detail, None)?,
-                final_state => {
-                    step(ReceiptState::Executing, None, None)?;
-                    step(final_state, s.detail, s.result)?;
+            // The turn a host-work prompt started is kept, while it executes
+            // and after, right after its `executing` (R9.14 items 5, 6).
+            let turn = s.turn.clone().map(|turn| Record::TurnStarted {
+                request_id: s.request_id.clone(),
+                turn,
+            });
+            let later: Vec<Record> = match s.state {
+                ReceiptState::Accepted => Vec::new(),
+                ReceiptState::Executing => std::iter::once(transition(s.state, s.detail, None))
+                    .chain(turn)
+                    .collect(),
+                ReceiptState::Rejected if turn.is_none() => {
+                    vec![transition(s.state, s.detail, None)]
                 }
+                final_state => std::iter::once(transition(ReceiptState::Executing, None, None))
+                    .chain(turn)
+                    .chain(std::iter::once(transition(final_state, s.detail, s.result)))
+                    .collect(),
+            };
+            for record in later {
+                out.extend(encode(seq, record)?);
             }
         }
         if out.is_empty() {
@@ -1353,6 +1450,7 @@ impl FileJournal {
             Record::Accepted { request_id, .. }
             | Record::Rejected { request_id, .. }
             | Record::Transition { request_id, .. }
+            | Record::TurnStarted { request_id, .. }
             | Record::Evicted { request_id } => request_id.clone(),
             Record::LeaseEpochs { .. } | Record::Control { .. } => unreachable!("handled above"),
         };

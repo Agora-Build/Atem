@@ -182,6 +182,10 @@ pub struct BrokerSession {
     /// The worker runs a chat adapter (its `hello`): the session offers
     /// chat-v1 (Claude; Codex with Atem's Codex hooks on).
     pub chat_offered: bool,
+    /// `chat` is the worker's: from the launch, or, for an adopted worker,
+    /// since its `chat_snapshot` arrived (until then a fresh session that
+    /// knows nothing of the worker's turns).
+    pub chat_synced: bool,
     /// What its chat can't provide (`Capabilities::unavailable`).
     pub chat_unavailable: Vec<String>,
     pub activity: Activity,
@@ -261,6 +265,7 @@ impl BrokerSession {
             chat_v1: false,
             chat_reason: None,
             chat_offered: false,
+            chat_synced: false,
             chat_unavailable: Vec::new(),
             activity: Activity::Unknown,
             activity_detail: None,
@@ -288,6 +293,8 @@ impl BrokerSession {
         // launch size; anything else is asked for.
         let fresh = handle.info.offset == 0 && handle.info.exited.is_none();
         session.connect(handle, fresh);
+        // Its chat follows the worker's from the start.
+        session.chat_synced = true;
         session
     }
 
@@ -368,6 +375,16 @@ impl BrokerSession {
         if let Some(status) = exited {
             self.record_exit(status);
         }
+    }
+
+    /// Tests: asks the worker for its screen now, whether or not a request
+    /// is outstanding. The worker handles the broker's messages in order,
+    /// so its answer (`Pumped::resync`) says it handled every message sent
+    /// before this one.
+    #[cfg(test)]
+    pub fn request_screen_now(&mut self) {
+        self.screen_requested = false;
+        self.request_screen();
     }
 
     fn request_screen(&mut self) {
@@ -1084,6 +1101,7 @@ impl BrokerSession {
                 self.chat_v1 = chat_v1;
                 self.chat_reason = reason;
                 self.chat_unavailable = unavailable;
+                self.chat_synced = true;
                 self.chat_reset = Some(CloseReason::Switched);
             }
         }
