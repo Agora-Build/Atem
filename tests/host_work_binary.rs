@@ -1125,7 +1125,11 @@ fn a_dispatch_that_cannot_record_its_tag_waits_and_leaves_nothing() {
     );
     std::thread::sleep(Duration::from_millis(300));
     assert!(!input(&rig).contains("Framed task whose tag must wait"));
-    assert!(!pause.exists(), "the attempt's pause was left behind");
+    // Every pass tries again: it writes its attempt's pause, fails on the
+    // tag, then removes the pause, so the file is there while an attempt
+    // runs (longer while fsyncs are slow). One left behind would never go:
+    // the next attempt's rename replaces it, never removes it.
+    within("the attempt's pause removed", || !pause.exists());
     std::fs::remove_dir(&tags).unwrap();
     within("the prompt pasted", || {
         input(&rig).contains("Framed task whose tag must wait")

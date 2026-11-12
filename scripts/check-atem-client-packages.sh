@@ -3,9 +3,12 @@
 #
 # Checks what scripts/package-atem-client-bindings.sh put in <dir>, the way
 # Astation should after downloading it (designs/protocol/atem-client-bindings.md
-# §7): the SHA-256 sums, the source pin, no test-only or host-role export
-# in the shipped bindings, and each package used once: the Node build of
-# the WASM package and the JVM jar (through JNA) both read the r9 pairing
+# §7): the SHA-256 sums, the source pin, the shared host-work vectors listed in
+# the sums (requests, prompt framing, framing size), no test-only or host-role
+# export in the shipped bindings (the framing's vectors-only rendering
+# included), and each package used once: the Node build of the WASM package
+# runs the packaged framing vectors (escaping, Unicode version, the preflight
+# size check) and, with the JVM jar (through JNA), reads the r9 pairing
 # vectors' verifyCommit messages with the shared parser. The Android zip:
 # each ABI's ELF class, machine, 16 KB LOAD alignment and exports (READELF,
 # default readelf).
@@ -23,6 +26,16 @@ trap 'rm -rf "$WORK"' EXIT
 VECTORS="$ROOT/designs/protocol/fixtures/r9-vectors-pairing.json"
 
 (cd "$DIR" && sha256sum -c "atem-client-${VERSION}-SHA256SUMS.txt")
+# The shared host-work vectors ship beside the packages, each listed in the
+# sums (sha256sum -c above checked what is listed, not that it is listed).
+for VECTOR_NAME in requests-v1 prompt-framing-v1 framing-size-v1; do
+  VECTOR_FILE="atem-client-${VERSION}-host-work-${VECTOR_NAME}.json"
+  test -s "$DIR/$VECTOR_FILE" || { echo "$VECTOR_FILE: missing from the package directory" >&2; exit 1; }
+  awk -v f="$VECTOR_FILE" '$2 == f {found = 1} END {exit !found}' "$DIR/atem-client-${VERSION}-SHA256SUMS.txt" \
+    || { echo "$VECTOR_FILE: not listed in the sums" >&2; exit 1; }
+done
+FRAMING_VECTORS="$DIR/atem-client-${VERSION}-host-work-prompt-framing-v1.json"
+FRAMING_SIZE_VECTORS="$DIR/atem-client-${VERSION}-host-work-framing-size-v1.json"
 python3 - "$DIR/atem-client-${VERSION}-SOURCE.json" "${EXPECT_COMMIT:-}" <<'EOF'
 import json, re, sys
 pin = json.load(open(sys.argv[1]))
@@ -38,7 +51,7 @@ assert pin["toolchain"].get("rustc"), pin
 print("source pin:", pin["commit"], "dirty" if pin["tree_dirty"] else "clean")
 EOF
 # No test-only or host-role export ships.
-FORBIDDEN='SoftwareKeyStore|signSeen|sign_seen|admitCarrier|admit_carrier|AdmissionInfo'
+FORBIDDEN='SoftwareKeyStore|signSeen|sign_seen|admitCarrier|admit_carrier|AdmissionInfo|framingRenderForVectors|framing_render_for_vectors'
 
 WASM="$DIR/atem-client-${VERSION}-wasm.tar.gz"
 if [ -f "$WASM" ]; then
@@ -61,6 +74,27 @@ if [ -f "$WASM" ]; then
     }
     console.log(`wasm (nodejs): ${v.valid.length + v.invalid.length} verifyCommit vectors`);
   ' "$WORK/atem-client-wasm/nodejs/atem_client_ffi.js" "$VECTORS"
+  # The packaged framing exports against the packaged vectors: the escaping,
+  # the pinned Unicode version and every size case with its complete inputs.
+  # Rendering is vectors-only: a shipped build must not have it.
+  "$NODE" -e '
+    const ffi = require(process.argv[1]);
+    const framing = require(process.argv[2]);
+    const sizes = require(process.argv[3]);
+    if (ffi.framingRenderForVectors !== undefined) throw new Error("framingRenderForVectors is exported");
+    if (ffi.framingUnicodeVersion() !== framing.unicode_version) throw new Error("Unicode version");
+    if (framing.escape.length < 1 || sizes.cases.length < 1) throw new Error("no framing vectors");
+    for (const c of framing.escape) {
+      const r = ffi.framingEscape(c.text);
+      if (r.escaped !== c.escaped || r.barsAdded !== c.bars_added) throw new Error(`escape: ${c.name}`);
+    }
+    for (const c of sizes.cases) {
+      const mark = c.mark === undefined ? undefined : JSON.stringify(c.mark);
+      const got = ffi.framingCheckedLen(c.text, mark, JSON.stringify(c.context));
+      if (got !== c.checked_len) throw new Error(`size: ${c.name}: ${got}`);
+    }
+    console.log(`wasm (nodejs): ${framing.escape.length} framing escape and ${sizes.cases.length} size vectors`);
+  ' "$WORK/atem-client-wasm/nodejs/atem_client_ffi.js" "$FRAMING_VECTORS" "$FRAMING_SIZE_VECTORS"
   for t in web bundler; do
     test -s "$WORK/atem-client-wasm/$t/atem_client_ffi_bg.wasm"
     test -s "$WORK/atem-client-wasm/$t/atem_client_ffi.d.ts"
@@ -137,7 +171,7 @@ if [ -f "$ANDROID" ]; then
     [ "$ALIGNS" = 0x4000 ] || { echo "android $ABI: LOAD alignment '$ALIGNS', need 0x4000" >&2; exit 1; }
     SYMS=$("$READELF" --dyn-syms -W "$SO")
     [ -n "$SYMS" ] || { echo "android $ABI: no dynamic symbols read" >&2; exit 1; }
-    if grep -qiE 'sign_seen|admit_carrier|software_?key' <<<"$SYMS"; then
+    if grep -qiE 'sign_seen|admit_carrier|software_?key|framing_render_for_vectors' <<<"$SYMS"; then
       echo "android $ABI: a test-only or host-role symbol is exported" >&2
       exit 1
     fi
