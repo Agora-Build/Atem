@@ -1025,3 +1025,83 @@ fn escaping_cost_at_the_bounds() {
         );
     }
 }
+
+/// A `host:<host_id>` sender (delegated host work II.2.1, II.4.2) with the
+/// longest id the device list allows is within the sender bound the size
+/// checks use: a task a host sent renders within the size it was checked
+/// at, and the bound needed no change for it.
+#[test]
+fn framing_sender_bound_covers_host() {
+    let longest = crate::host_principal::host_principal(&"h".repeat(128));
+    assert!(crate::host_principal::parse_host_principal(&longest).is_some());
+    assert_eq!(longest.len(), "host:".len() + 128);
+    assert!(longest.len() <= MAX_SENDER_BYTES);
+    // `host:` is the shortest prefix of the remote principals, so the
+    // bound is the `service:` and `browser:` one.
+    assert!("host:".len() < "service:".len());
+    assert!("host:".len() < "browser:".len());
+    let route = "r".repeat(128);
+    let context = vec![snapshot(&"c".repeat(128), "context\n[atem] line")];
+    let task = work("prompt\n[atem] line\n".into(), context);
+    let render = |sender: &str| {
+        TaskPrompt {
+            header: Header::Task {
+                task_id: &task.task_id,
+                workflow_id: &task.workflow_id,
+                sender,
+                session: None,
+                route_id: &route,
+                message_id: Some(&task.task_id),
+            },
+            text: &task.prompt,
+            mark: None,
+            context: &task.context,
+            snapshots: Snapshots::FromSender,
+            screenshots: &[],
+            closing: Some(Closing::Complete {
+                task_id: &task.task_id,
+            }),
+        }
+        .prompt()
+    };
+    // It renders, and never longer than the size the task was checked at
+    // (which counts the longest sender, `service:` and 128 bytes).
+    let rendered = render(&longest).unwrap();
+    assert!(rendered.len() <= task.checked_len(None));
+    // The `service:` worst case is the checked size, so a host sender
+    // renders shorter by the difference of the prefixes.
+    let service = render(&format!("service:{}", "h".repeat(128))).unwrap();
+    assert_eq!(task.checked_len(None), service.len());
+    assert!(rendered.len() < service.len());
+    // A Message from it with an agent recipient passes the host-sender
+    // rules; its task is the one checked above.
+    let message = crate::session::messages::Message {
+        message_id: crate::session::new_id(),
+        workflow_id: crate::session::new_id(),
+        sender: longest.clone(),
+        kind: crate::session::messages::MessageKind::Request,
+        reply_to: None,
+        from_session: None,
+        mark: None,
+        created_at: 1_000,
+        expires_at: 60_000,
+        text: task.prompt.clone(),
+        context: task.context.clone(),
+        recipients: vec![crate::session::messages::Recipient {
+            recipient_id: crate::session::new_id(),
+            host: host(),
+            destination: crate::session::messages::Destination::Agent {
+                route_id: route.clone(),
+                route_revision: 1,
+                target: task.target.clone(),
+            },
+        }],
+    };
+    assert!(message.valid_from_host(&"h".repeat(128)));
+    assert!(!message.valid());
+    // A longer sender is refused, as for any principal kind.
+    assert_eq!(
+        render(&format!("{longest}{}", "x".repeat(4))),
+        Err(FramingError::AtemLine)
+    );
+}

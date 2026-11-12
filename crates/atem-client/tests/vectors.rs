@@ -30,6 +30,11 @@ use atem_client::control::{
 };
 use atem_client::domain::{SignLabel, SigningInput};
 use atem_client::encoding::{Hash32, b64u, b64u_decode, enc, hex, u64_field};
+use atem_client::host_mail::{
+    EnvelopePlain, EnvelopeVerdict, ExpectedResult, HostRef, MailBody, MailFields, MailKind,
+    Recipient as MailRecipient, ResultPlain, ResultVerdict, accept_result, evidence_hash,
+    open_envelope, seal_envelope_with_ikm, seal_info, seal_result_with_ikm,
+};
 use atem_client::hpke;
 use atem_client::keys::{Alg, PublicKey, ed25519_public_to_x25519, enc_kid};
 use atem_client::kit::{self, RecoveryKit};
@@ -244,6 +249,7 @@ fn every_vectors_file_has_a_runner() {
             "r9-vectors-channel-handshake.json",
             "r9-vectors-delegated-wire.json",
             "r9-vectors-encoding.json",
+            "r9-vectors-host-envelope.json",
             "r9-vectors-host-route.json",
             "r9-vectors-host-work-control.json",
             "r9-vectors-keys.json",
@@ -3087,7 +3093,7 @@ const DELEGATED_T0: u64 = 1_793_620_800_000;
 /// The test keys the delegated-action vectors add to `r9-vectors-keys`:
 /// `(name, part, label, note)`, secret = SHA-256(enc(["atem-r9-test-key",
 /// label])). `enc` parts are X25519, `host_key` parts Ed25519.
-const DELEGATED_KEYS: [(&str, &str, &str, &str); 8] = [
+const DELEGATED_KEYS: [(&str, &str, &str, &str); 9] = [
     (
         "host-a-enc-1",
         "enc",
@@ -3129,6 +3135,12 @@ const DELEGATED_KEYS: [(&str, &str, &str, &str); 8] = [
         "enc",
         "host-b host_enc_key 1",
         "host-b's host encryption key (label \"host-b host_enc_key 1\")",
+    ),
+    (
+        "host-b-enc-2",
+        "enc",
+        "host-b host_enc_key 2",
+        "host-b's second host encryption key (label \"host-b host_enc_key 2\"): the host-envelope vectors' rotation of host-b",
     ),
     (
         "host-b-gen-2",
@@ -6337,4 +6349,1942 @@ fn delegated_wire() {
         run.file.clone(),
         "regenerate with write_delegated_wire_vectors"
     );
+}
+
+// ------------------------- delegated host work: envelopes and results (mail)
+
+// `r9-vectors-host-envelope` (delegated host-work design II.4.2, II.4.4,
+// III.1; host-work-v1 §11.5): `atem-envelope` and `atem-result` objects
+// between three hosts of log L's account, and the verdict the receiver's
+// checks give each against a device list and a receiver. The lists are log L
+// followed by the file's `entries` (signed by dev-mac); every object is
+// sealed by the shared core's own `seal_envelope_with_ikm` or
+// `seal_result_with_ikm` (`built`), by the same HPKE seal over raw bytes no
+// sender's builder writes (a plaintext with `null`, one too large, one not
+// canonical, a dropped reply), or is another object's bytes changed after
+// signing. `write_host_envelope_vectors` (ignored) writes the file from
+// `host_envelope_vectors`; `host_envelope` checks the file is exactly what
+// it makes now, every value from its parts, and every check's verdict
+// through `open_envelope` or `accept_result`.
+
+/// `created_at` of the objects (but those whose times are the point).
+const MAIL_T0: u64 = 1_793_620_800_000;
+/// Their `expires_at`: an hour later.
+const MAIL_EXPIRES: u64 = MAIL_T0 + 3_600_000;
+/// The receiver's clock, unless a check names another.
+const MAIL_NOW: u64 = MAIL_T0 + 1_000;
+/// `signed_at` of the file's entries: this plus `seq` seconds (display only).
+const MAIL_ENTRY_T0: u64 = MAIL_T0 - 3_600_000;
+/// The list every object is signed at: log L and four entries (head 10).
+const MAIL_B: [&str; 4] = ["M7_add_host_b", "M8_enc_a", "M9_enc_b", "M10_add_host_evil"];
+
+/// A test id: the first 16 bytes of SHA-256(enc(["atem-r9-test-id", label]))
+/// as a UUID of `version` (4; 5 for a reply's `result_id`).
+fn mail_uuid(label: &str, version: u8) -> String {
+    let mut b: [u8; 32] = Sha256::digest(enc(&[b"atem-r9-test-id", label.as_bytes()])).into();
+    b[6] = (b[6] & 0x0f) | (version << 4);
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h = hex(&b[..16]);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+
+/// A UUID v4 of the host-envelope vectors.
+fn mail_id(label: &str) -> String {
+    mail_uuid(&format!("host-envelope {label}"), 4)
+}
+
+/// The ephemeral's ikmE: SHA-256(enc(["atem-r9-test-ikm", label])).
+fn mail_ikm(label: &str) -> [u8; 32] {
+    Sha256::digest(enc(&[b"atem-r9-test-ikm", label.as_bytes()])).into()
+}
+
+/// A host at a trust generation.
+#[derive(Clone, Copy)]
+struct MailHost(&'static str, u64);
+
+const MAIL_A1: MailHost = MailHost("host-a", 1);
+const MAIL_A2: MailHost = MailHost("host-a", 2);
+const MAIL_B1: MailHost = MailHost("host-b", 1);
+const MAIL_B2: MailHost = MailHost("host-b", 2);
+const MAIL_EVIL: MailHost = MailHost("host-evil", 1);
+
+impl MailHost {
+    fn host_ref(self) -> HostRef {
+        HostRef {
+            host_id: self.0.into(),
+            host_trust_gen: self.1,
+        }
+    }
+
+    /// Its host key in the book (`r9-vectors-keys`).
+    fn key(self) -> KeyId {
+        KeyId::new(format!("{}/host_key", host_key_name(self.0, self.1)))
+    }
+}
+
+/// The plaintext one of the builders seals.
+enum MailPlain {
+    Envelope(EnvelopePlain),
+    Result(ResultPlain),
+}
+
+/// Builds the host-envelope vectors on log L with the test keys.
+struct MailVectors<'a> {
+    book: &'a Book,
+    genesis: Hash32,
+    now: HostNow,
+    log_l: Vec<Entry>,
+    entries: BTreeMap<String, Entry>,
+    entry_vectors: Vec<Value>,
+    objects: BTreeMap<String, SignedObject>,
+    object_vectors: Vec<Value>,
+    checks: Vec<Value>,
+}
+
+impl<'a> MailVectors<'a> {
+    fn new(book: &'a Book) -> Self {
+        let file = load("r9-vectors-membership-log");
+        let log_l = file["log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| Entry::from_strict(&strict(&v["entry"])).unwrap())
+            .collect();
+        MailVectors {
+            book,
+            genesis: genesis_hash(),
+            now: HostNow {
+                wall_ms: MAIL_NOW,
+                mono_ms: 1_000,
+                boot_id: "boot-1".into(),
+            },
+            log_l,
+            entries: BTreeMap::new(),
+            entry_vectors: Vec::new(),
+            objects: BTreeMap::new(),
+            object_vectors: Vec::new(),
+            checks: Vec::new(),
+        }
+    }
+
+    /// Log L followed by the file's entries `chain`.
+    fn list(&self, chain: &[&str]) -> Membership {
+        let entries: Vec<Entry> = self
+            .log_l
+            .iter()
+            .cloned()
+            .chain(chain.iter().map(|l| self.entries[*l].clone()))
+            .collect();
+        let verified =
+            Membership::verify_chain("acct-test-1", &self.genesis, &entries, &self.now).unwrap();
+        assert!(verified.deferred.is_none());
+        verified.membership
+    }
+
+    fn enc_pub(&self, name: &str) -> PublicKey {
+        self.book.public(&format!("{name}/enc"))
+    }
+
+    fn add_host(&self, host: MailHost) -> Action {
+        Action::AddHost {
+            host: HostRecord {
+                host_id: host.0.into(),
+                host_trust_gen: host.1,
+                host_key: self.book.provider.public_key(&host.key()).unwrap(),
+            },
+        }
+    }
+
+    /// A `host_enc_key` of the key `enc_name`, the host vouching for it with
+    /// its key of that generation.
+    fn enc_key(&self, host: MailHost, enc_name: &str, retire_previous: bool) -> Action {
+        use atem_client::membership::{host_enc_key, sign_host_enc_key};
+        let key = self.enc_pub(enc_name);
+        let sig = sign_host_enc_key(
+            &self.book.provider,
+            &host.key(),
+            "acct-test-1",
+            &self.genesis,
+            host.0,
+            host.1,
+            key.as_32().unwrap(),
+        )
+        .unwrap();
+        host_enc_key(host.0, host.1, &key, &sig, retire_previous, MAIL_ENTRY_T0).unwrap()
+    }
+
+    /// `action`, signed by dev-mac as the entry after L + `chain`.
+    fn entry(&mut self, label: &str, chain: &[&str], note: &str, action: Action) {
+        let m = self.list(chain);
+        let seq = m.head().seq + 1;
+        let body = m.draft("dev-mac", MAIL_ENTRY_T0 + seq * 1000, &action);
+        let object =
+            SignedObject::sign(&self.book.provider, &self.book.signer("dev-mac"), body).unwrap();
+        let entry = Entry::parse(object.clone()).unwrap();
+        assert_eq!(m.check_next(&entry), Check::Valid, "{label}");
+        self.entry_vectors.push(serde_json::json!({
+            "label": label,
+            "note": note,
+            "chain": chain,
+            "entry": object.to_json(),
+            "entry_hash": entry.hash().to_hex(),
+        }));
+        self.entries.insert(label.to_owned(), entry);
+    }
+
+    /// The body before the seal: `sender` to `recipient`, sealed to its key
+    /// `enc_name`, the id of `id_label`, signed at the head of L + `head`.
+    fn fields(
+        &self,
+        id_label: &str,
+        sender: MailHost,
+        recipient: MailHost,
+        enc_name: &str,
+        head: &[&str],
+    ) -> MailFields {
+        MailFields {
+            account_id: "acct-test-1".into(),
+            genesis_hash: self.genesis,
+            sender: sender.host_ref(),
+            recipient: recipient.host_ref(),
+            enc_kid: enc_kid(&self.enc_pub(enc_name)).unwrap(),
+            id: mail_id(id_label),
+            created_at: MAIL_T0,
+            expires_at: MAIL_EXPIRES,
+            signed_at_head: self.list(head).head(),
+        }
+    }
+
+    /// Records an object and what makes it: `extra` names its signer, the
+    /// seal and where its bytes came from.
+    fn record(&mut self, label: &str, note: &str, object: SignedObject, extra: Value) {
+        let kind = match object.label() {
+            SignLabel::Envelope => "envelope",
+            SignLabel::Result => "result",
+            other => panic!("{label}: {other:?}"),
+        };
+        let mut v = serde_json::json!({
+            "label": label,
+            "note": note,
+            "kind": kind,
+            "object": object.to_json(),
+            "jcs": object.jcs(),
+            "signing_input_hex": hex(object.signing_input().as_bytes()),
+        });
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        self.objects.insert(label.to_owned(), object);
+        self.object_vectors.push(v);
+    }
+
+    /// The seal's inputs and outputs (`sealed`): the key sealed to, `info`,
+    /// `sealed_hash`, the ephemeral and the plaintext (its length and
+    /// SHA-256 instead when it is over 4 KiB).
+    fn sealed(
+        &self,
+        kind: MailKind,
+        fields: &MailFields,
+        object: &SignedObject,
+        plaintext: &[u8],
+        enc_name: &str,
+        ikm_label: &str,
+    ) -> Value {
+        let part = object.sealed().unwrap();
+        let mut v = serde_json::json!({
+            "to": enc_name,
+            "info_hex": hex(&seal_info(kind, fields)),
+            "sealed_hash": Hash32::of_enc(&[&part.enc, &part.ct]).to_hex(),
+            "ikm_label": ikm_label,
+            "ikmE_hex": hex(&mail_ikm(ikm_label)),
+        });
+        if plaintext.len() > 4096 {
+            v["plaintext_bytes"] = plaintext.len().into();
+            v["plaintext_sha256"] = hex(&Sha256::digest(plaintext)).into();
+        } else {
+            v["plaintext"] = std::str::from_utf8(plaintext).unwrap().into();
+        }
+        v
+    }
+
+    /// `plain` sealed by the shared core's builder to `enc_name` and signed by
+    /// the sender's host key of its generation.
+    fn seal(
+        &mut self,
+        label: &str,
+        note: &str,
+        fields: MailFields,
+        plain: MailPlain,
+        enc_name: &str,
+    ) {
+        let ikm_label = format!("host-envelope {label}");
+        let ikm = mail_ikm(&ikm_label);
+        let to = self.enc_pub(enc_name);
+        let signer = host_key_name(&fields.sender.host_id, fields.sender.host_trust_gen);
+        let key = KeyId::new(format!("{signer}/host_key"));
+        let provider = &self.book.provider;
+        let (kind, object, plaintext) = match plain {
+            MailPlain::Envelope(p) => (
+                MailKind::Envelope,
+                seal_envelope_with_ikm(provider, &key, &fields, &p, &to, &ikm).unwrap(),
+                p.to_bytes().unwrap().to_vec(),
+            ),
+            MailPlain::Result(p) => (
+                MailKind::Result,
+                seal_result_with_ikm(provider, &key, &fields, &p, &to, &ikm).unwrap(),
+                p.to_bytes().unwrap().to_vec(),
+            ),
+        };
+        let sealed = self.sealed(kind, &fields, &object, &plaintext, enc_name, &ikm_label);
+        let extra = serde_json::json!({
+            "signed_with": signer,
+            "built": true,
+            "sealed": sealed,
+        });
+        self.record(label, note, object, extra);
+    }
+
+    /// Raw `plaintext` (one no sender's builder writes) under the same seal
+    /// and signature.
+    fn seal_raw(
+        &mut self,
+        label: &str,
+        note: &str,
+        kind: MailKind,
+        fields: MailFields,
+        plaintext: &[u8],
+        enc_name: &str,
+    ) {
+        use atem_client::signed::SealedPart;
+        let ikm_label = format!("host-envelope {label}");
+        let to = self.enc_pub(enc_name);
+        let sealed = hpke::seal_with_ikm(
+            to.as_32().unwrap(),
+            &seal_info(kind, &fields),
+            b"",
+            plaintext,
+            &mail_ikm(&ikm_label),
+        )
+        .unwrap();
+        let signer = host_key_name(&fields.sender.host_id, fields.sender.host_trust_gen);
+        let key = KeyId::new(format!("{signer}/host_key"));
+        let body = MailBody::from_fields(fields.clone(), sealed.hash()).to_value(kind);
+        let object = SignedObject::sign(&self.book.provider, &key, body)
+            .unwrap()
+            .with_sealed(SealedPart {
+                enc: sealed.enc.to_vec(),
+                ct: sealed.ct,
+            });
+        let details = self.sealed(kind, &fields, &object, plaintext, enc_name, &ikm_label);
+        let extra = serde_json::json!({
+            "signed_with": signer,
+            "built": false,
+            "sealed": details,
+        });
+        self.record(label, note, object, extra);
+    }
+
+    /// `from`'s body with `edit` applied, re-signed by `by`, its sealed part
+    /// kept (`sealed_from`).
+    fn resign(
+        &mut self,
+        label: &str,
+        note: &str,
+        from: &str,
+        by: MailHost,
+        edit: impl FnOnce(&mut MailFields),
+    ) {
+        let source = self.objects[from].clone();
+        let (kind, body) = MailBody::from_object(&source).unwrap();
+        let mut fields = body.fields();
+        edit(&mut fields);
+        let body = MailBody::from_fields(fields, body.sealed_hash).to_value(kind);
+        let object = SignedObject::sign(&self.book.provider, &by.key(), body)
+            .unwrap()
+            .with_sealed(source.sealed().unwrap().clone());
+        let extra = serde_json::json!({
+            "signed_with": host_key_name(by.0, by.1),
+            "built": false,
+            "sealed_from": from,
+        });
+        self.record(label, note, object, extra);
+    }
+
+    /// `from`'s wire object with `edit` applied after signing (`edited_from`).
+    fn edit(&mut self, label: &str, note: &str, from: &str, edit: impl FnOnce(&mut Value)) {
+        let mut wire = self.objects[from].to_json();
+        edit(&mut wire);
+        let object = SignedObject::from_strict(&strict(&wire)).unwrap();
+        let extra = serde_json::json!({"built": false, "edited_from": from});
+        self.record(label, note, object, extra);
+    }
+
+    /// A check of `object`: the verdict `expect` of `open_envelope` (no
+    /// `outbox`) or `accept_result`, on L + `chain`, by the receiver
+    /// `(host, its keys)`, at `now`.
+    #[allow(clippy::too_many_arguments)]
+    fn check(
+        &mut self,
+        label: &str,
+        note: &str,
+        object: &str,
+        chain: &[&str],
+        receiver: (MailHost, &[&str]),
+        now: u64,
+        outbox: Option<Value>,
+        expect: Value,
+    ) {
+        assert!(self.objects.contains_key(object), "{label}: {object}");
+        let mut v = serde_json::json!({
+            "label": label,
+            "note": note,
+            "object": object,
+            "call": if outbox.is_some() { "accept_result" } else { "open_envelope" },
+            "chain": chain,
+            "receiver": {
+                "host_id": receiver.0.0,
+                "host_trust_gen": receiver.0.1,
+                "keys": receiver.1,
+            },
+            "now": now,
+            "expect": expect,
+        });
+        if let Some(outbox) = outbox {
+            v["outbox"] = outbox;
+        }
+        self.checks.push(v);
+    }
+
+    fn refused(&self, object: &str, reason: &str) -> Value {
+        serde_json::json!({
+            "verdict": "refused",
+            "reason": reason,
+            "evidence": evidence_hash(&self.objects[object]).to_hex(),
+        })
+    }
+
+    fn refused_authenticated(&self, object: &str, reason: &str) -> Value {
+        serde_json::json!({
+            "verdict": "refused_authenticated",
+            "object_id": s(self.objects[object].body(), "id"),
+            "reason": reason,
+        })
+    }
+}
+
+fn mail_open(sender: &str) -> Value {
+    serde_json::json!({"verdict": "open", "sender": format!("host:{sender}")})
+}
+
+fn mail_pending(host: MailHost) -> Value {
+    serde_json::json!({"verdict": "pending", "host_id": host.0, "host_trust_gen": host.1})
+}
+
+/// The request Message of a host sender (`Message::valid_from_host`): from
+/// `fields`' sender, with its id and times, a notice for the recipient host.
+fn mail_message(fields: &MailFields) -> atem_client::session::messages::Message {
+    use atem_client::host_principal::host_principal;
+    use atem_client::session::host_work::HostTarget;
+    use atem_client::session::messages::{Destination, Message, MessageKind, Recipient};
+    Message {
+        message_id: fields.id.clone(),
+        workflow_id: mail_id("workflow"),
+        sender: host_principal(&fields.sender.host_id),
+        kind: MessageKind::Request,
+        reply_to: None,
+        from_session: None,
+        created_at: fields.created_at,
+        expires_at: fields.expires_at,
+        recipients: vec![Recipient {
+            recipient_id: mail_id("request recipient"),
+            host: HostTarget {
+                account_id: fields.account_id.clone(),
+                atem_device_id: fields.recipient.host_id.clone(),
+                host_trust_gen: fields.recipient.host_trust_gen,
+            },
+            destination: Destination::Host,
+        }],
+        text: "Review the contract".into(),
+        context: vec![],
+        mark: None,
+    }
+}
+
+/// A Memory snapshot of `text`.
+fn mail_snapshot(id: &str, text: String) -> atem_client::session::host_work::ContextSnapshot {
+    use atem_client::session::host_work::{ContextKind, ContextSnapshot, digest};
+    ContextSnapshot {
+        kind: ContextKind::Memory,
+        id: id.into(),
+        version: 1,
+        digest: digest(text.as_bytes()),
+        text,
+    }
+}
+
+/// `mail_message(fields)` with three snapshots, the last sized so the
+/// Message serializes to exactly `target` bytes.
+fn mail_message_of_size(
+    fields: &MailFields,
+    target: usize,
+) -> atem_client::session::messages::Message {
+    let build = |last: usize| {
+        let mut m = mail_message(fields);
+        m.context = vec![
+            mail_snapshot("ctx-0", "a".repeat(80 * 1024)),
+            mail_snapshot("ctx-1", "b".repeat(80 * 1024)),
+            mail_snapshot("ctx-2", "c".repeat(last)),
+        ];
+        m
+    };
+    let len = |m: &atem_client::session::messages::Message| serde_json::to_vec(m).unwrap().len();
+    let probe = 80 * 1024;
+    let m = build(probe + target - len(&build(probe)));
+    assert_eq!(len(&m), target);
+    m
+}
+
+/// A submitted reply (`dropped`: the host no longer keeps its text).
+fn mail_reply(dropped: bool) -> atem_client::session::host_work::ResultReply {
+    use atem_client::session::host_work::{ReplyState, ResultReply, digest};
+    let text = "Done: the contract reads well.";
+    ResultReply {
+        result_id: mail_uuid("host-envelope reply", 5),
+        state: ReplyState::Submitted,
+        digest: digest(text.as_bytes()),
+        text: if dropped { String::new() } else { text.into() },
+        context: vec![],
+        submitted_at: Some(MAIL_T0 + 60_000),
+        dropped,
+    }
+}
+
+/// The host-envelope vectors file, as `write_host_envelope_vectors` writes it.
+fn host_envelope_vectors(book: &Book) -> Value {
+    use atem_client::membership::{host_sender_readmit, host_sender_revoke};
+    use atem_client::session::messages::{Delivery, RecipientReceipt};
+    let mut g = MailVectors::new(book);
+    let b = MAIL_B;
+    let on_b =
+        |more: &[&'static str]| -> Vec<&'static str> { b.iter().chain(more).copied().collect() };
+
+    // The device list: log L, host-b, both hosts' encryption keys and a
+    // third host (B, head 10), then one change at a time on B.
+    let add_b = g.add_host(MAIL_B1);
+    g.entry(
+        "M7_add_host_b",
+        &[],
+        "add_host host-b at generation 1",
+        add_b,
+    );
+    let enc_a = g.enc_key(MAIL_A1, "host-a-enc-1", false);
+    g.entry(
+        "M8_enc_a",
+        &b[..1],
+        "host_enc_key: host-a's key host-a-enc-1",
+        enc_a,
+    );
+    let enc_b = g.enc_key(MAIL_B1, "host-b-enc-1", false);
+    g.entry(
+        "M9_enc_b",
+        &b[..2],
+        "host_enc_key: host-b's key host-b-enc-1",
+        enc_b,
+    );
+    let add_evil = g.add_host(MAIL_EVIL);
+    g.entry(
+        "M10_add_host_evil",
+        &b[..3],
+        "add_host host-evil (the test key host-evil, a third host of the account, with no encryption key): list B, head 10",
+        add_evil,
+    );
+    let reverify_a = g.add_host(MAIL_A2);
+    g.entry(
+        "M11_reverify_a",
+        &b,
+        "host-a re-verified on B: add_host at generation 2 (its key host-a-gen-2)",
+        reverify_a,
+    );
+    g.entry(
+        "M11_revoke_a",
+        &b,
+        "host_sender_revoke host-a on B",
+        host_sender_revoke("host-a", false, MAIL_ENTRY_T0).unwrap(),
+    );
+    g.entry(
+        "M12_readmit_a",
+        &on_b(&["M11_revoke_a"]),
+        "host_sender_readmit host-a: authorized(12)",
+        host_sender_readmit("host-a", MAIL_ENTRY_T0).unwrap(),
+    );
+    g.entry(
+        "M11_remove_a",
+        &b,
+        "remove_host host-a on B",
+        Action::RemoveHost {
+            host_id: "host-a".into(),
+        },
+    );
+    let rotate = g.enc_key(MAIL_A1, "host-a-enc-2", false);
+    g.entry(
+        "M11_rotate_a",
+        &b,
+        "host_enc_key: host-a rotates to host-a-enc-2 (the previous key opens mail for its 24 h window)",
+        rotate,
+    );
+    let rotate_retire = g.enc_key(MAIL_A1, "host-a-enc-2", true);
+    g.entry(
+        "M11_rotate_a_retire",
+        &b,
+        "host_enc_key: host-a rotates to host-a-enc-2 with retire_previous",
+        rotate_retire,
+    );
+    let reverify_b = g.add_host(MAIL_B2);
+    g.entry(
+        "M11_reverify_b",
+        &b,
+        "host-b re-verified on B: add_host at generation 2 (its key host-b-gen-2)",
+        reverify_b,
+    );
+    g.entry(
+        "M11_revoke_b",
+        &b,
+        "host_sender_revoke host-b on B",
+        host_sender_revoke("host-b", false, MAIL_ENTRY_T0).unwrap(),
+    );
+    g.entry(
+        "M11_remove_b",
+        &b,
+        "remove_host host-b on B",
+        Action::RemoveHost {
+            host_id: "host-b".into(),
+        },
+    );
+    let rotate_b = g.enc_key(MAIL_B1, "host-b-enc-2", false);
+    g.entry(
+        "M11_rotate_b",
+        &b,
+        "host_enc_key: host-b rotates to host-b-enc-2 (a key it handed out)",
+        rotate_b,
+    );
+
+    // Envelopes from host-a to host-b, sealed to host-b-enc-1, signed at B's
+    // head (but where the point is another).
+    let ab = |g: &MailVectors, label: &str| g.fields(label, MAIL_A1, MAIL_B1, "host-b-enc-1", &b);
+    let task = mail_id("task");
+    let cancel = |task: &str| EnvelopePlain::Cancel {
+        task_id: task.into(),
+    };
+    let f = ab(&g, "request");
+    let request = MailPlain::Envelope(EnvelopePlain::Request {
+        message: mail_message(&f),
+    });
+    g.seal(
+        "request",
+        "a request: a host-work-v1 §5 Message from host:host-a, a notice for host-b",
+        f,
+        request,
+        "host-b-enc-1",
+    );
+    let f = ab(&g, "cancel");
+    g.seal(
+        "cancel",
+        "a cancel of the request's task",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-1",
+    );
+    let f = ab(&g, "complete");
+    let complete = EnvelopePlain::Complete {
+        task_id: task.clone(),
+        result: mail_snapshot("ctx-result", "The contract reads well.".into()),
+    };
+    g.seal(
+        "complete",
+        "a complete of the request's task with a result snapshot",
+        f,
+        MailPlain::Envelope(complete),
+        "host-b-enc-1",
+    );
+    let f = ab(&g, "request_max");
+    let message = mail_message_of_size(&f, 240 * 1024);
+    g.seal(
+        "request_max",
+        "a request whose Message is 245,760 bytes, host-work v1's bound: its plaintext is 29 bytes more, 245,789, and the sealed object fits a 512 KiB mailbox call",
+        f,
+        MailPlain::Envelope(EnvelopePlain::Request { message }),
+        "host-b-enc-1",
+    );
+    let f = ab(&g, "request_over");
+    let message = mail_message_of_size(&f, 240 * 1024 + 1);
+    let plaintext = jcs(&serde_json::json!({
+        "kind": "request",
+        "message": serde_json::to_value(&message).unwrap(),
+    }))
+    .unwrap();
+    assert_eq!(plaintext.len(), 240 * 1024 + 30);
+    g.seal_raw(
+        "request_over",
+        "a request whose Message is one byte over host-work v1's bound (plaintext 245,790 bytes); no builder seals it",
+        MailKind::Envelope,
+        f,
+        plaintext.as_bytes(),
+        "host-b-enc-1",
+    );
+    let mut f = ab(&g, "pin_mismatch");
+    f.account_id = "acct-other".into();
+    g.seal(
+        "pin_mismatch",
+        "a cancel naming another account",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-1",
+    );
+    let f = g.fields("gen2_before_add_host", MAIL_A2, MAIL_B1, "host-b-enc-1", &b);
+    g.seal(
+        "gen2_before_add_host",
+        "a cancel by host-a claiming generation 2 (signed with host-a-gen-2) at B's head, where host-a's newest add_host is generation 1",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-1",
+    );
+    let f = g.fields(
+        "gen2",
+        MAIL_A2,
+        MAIL_B1,
+        "host-b-enc-1",
+        &on_b(&["M11_reverify_a"]),
+    );
+    g.seal(
+        "gen2",
+        "a cancel by host-a at generation 2, signed at the head of B + M11_reverify_a (seq 11)",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-1",
+    );
+    let mut f = ab(&g, "wrong_hash");
+    f.signed_at_head.hash = g.entries["M9_enc_b"].hash();
+    g.seal(
+        "wrong_hash",
+        "a cancel whose signed_at_head is seq 10 with the hash of the entry at seq 9",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-1",
+    );
+    let f = g.fields(
+        "head_ahead",
+        MAIL_A1,
+        MAIL_B1,
+        "host-b-enc-1",
+        &on_b(&["M11_rotate_a"]),
+    );
+    g.seal(
+        "head_ahead",
+        "a cancel by host-a at generation 1, signed at the head of B + M11_rotate_a (seq 11)",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-1",
+    );
+    let f = ab(&g, "ids_mismatch");
+    let mut message = mail_message(&f);
+    message.message_id = mail_id("another message");
+    g.seal(
+        "ids_mismatch",
+        "a request whose Message's message_id isn't the body's id",
+        f,
+        MailPlain::Envelope(EnvelopePlain::Request { message }),
+        "host-b-enc-1",
+    );
+    let f = ab(&g, "attachments");
+    let mut message = mail_message(&f);
+    message.mark = Some(atem_client::session::mark::MarkTask {
+        mark_id: "mark_123".into(),
+        url: "http://localhost:3000".into(),
+        title: "Page".into(),
+        screenshot: atem_client::session::attachments::Attachment {
+            attachment_id: mail_id("screenshot"),
+            digest: atem_client::session::host_work::digest(b"png"),
+            size: 68,
+            media_type: "image/png".into(),
+        },
+        annotations: vec![],
+    });
+    g.seal(
+        "attachments",
+        "a request whose Message carries a mark (an attachment): none in this version",
+        f,
+        MailPlain::Envelope(EnvelopePlain::Request { message }),
+        "host-b-enc-1",
+    );
+    let f = ab(&g, "from_session");
+    let mut message = mail_message(&f);
+    message.from_session = Some("ses-abcdefghijkl".into());
+    g.seal(
+        "from_session",
+        "a request whose Message carries from_session (local only): not a host sender's Message",
+        f,
+        MailPlain::Envelope(EnvelopePlain::Request { message }),
+        "host-b-enc-1",
+    );
+    let f = ab(&g, "plaintext_null");
+    let text = format!(r#"{{"kind":"cancel","note":null,"task_id":"{task}"}}"#);
+    g.seal_raw(
+        "plaintext_null",
+        "a cancel plaintext holding a null member; no builder seals it",
+        MailKind::Envelope,
+        f,
+        text.as_bytes(),
+        "host-b-enc-1",
+    );
+    let f = ab(&g, "plaintext_not_canonical");
+    let text = format!(r#"{{"task_id":"{task}","kind":"cancel"}}"#);
+    g.seal_raw(
+        "plaintext_not_canonical",
+        "a cancel plaintext whose members aren't in canonical order; the builder seals only the canonical form",
+        MailKind::Envelope,
+        f,
+        text.as_bytes(),
+        "host-b-enc-1",
+    );
+    let mut f = ab(&g, "bad_times");
+    f.expires_at = f.created_at;
+    g.seal(
+        "bad_times",
+        "a cancel whose expires_at equals its created_at",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-1",
+    );
+    let mut f = ab(&g, "lifetime_too_long");
+    f.expires_at = f.created_at + 86_400_001;
+    g.seal(
+        "lifetime_too_long",
+        "a cancel that expires 24 h and 1 ms after its created_at",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-1",
+    );
+    let f = g.fields(
+        "cancel_to_new_key",
+        MAIL_A1,
+        MAIL_B1,
+        "host-b-enc-2",
+        &on_b(&["M11_rotate_b"]),
+    );
+    g.seal(
+        "cancel_to_new_key",
+        "a cancel sealed to host-b's new key host-b-enc-2, signed at the head of B + M11_rotate_b (seq 11), where host-a's list has the rotation",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-2",
+    );
+    let f = g.fields("cancel_to_a", MAIL_B1, MAIL_A1, "host-a-enc-1", &b);
+    g.seal(
+        "cancel_to_a",
+        "a cancel from host-b to host-a, sealed to host-a-enc-1",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-a-enc-1",
+    );
+    let f = g.fields("evil_cancel", MAIL_EVIL, MAIL_B1, "host-b-enc-1", &b);
+    g.seal(
+        "evil_cancel",
+        "a cancel from host-evil to host-b at B's head (seq 10, host-evil's add_host)",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-1",
+    );
+    let f = g.fields(
+        "evil_at_head_9",
+        MAIL_EVIL,
+        MAIL_B1,
+        "host-b-enc-1",
+        &b[..3],
+    );
+    g.seal(
+        "evil_at_head_9",
+        "a cancel from host-evil to host-b signed at seq 9, before host-evil's add_host",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-1",
+    );
+    let at_12 = on_b(&["M11_revoke_a", "M12_readmit_a"]);
+    let f = g.fields(
+        "removed_head_ahead",
+        MAIL_A1,
+        MAIL_B1,
+        "host-b-enc-1",
+        &at_12,
+    );
+    g.seal(
+        "removed_head_ahead",
+        "a cancel by host-a at generation 1, signed at the head of B + M11_revoke_a + M12_readmit_a (seq 12)",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-1",
+    );
+    g.resign(
+        "resigned",
+        "host-evil strips the request and re-signs it as its own (sender host-evil): its signature verifies, but the seal's info binds host-a. Its verdict claims (host-evil, id), never host-a's (host-a, id): host-a's own request, judged after it, still opens (request_opens)",
+        "request",
+        MAIL_EVIL,
+        |f| f.sender = MAIL_EVIL.host_ref(),
+    );
+    g.resign(
+        "resigned_keeping_sender",
+        "host-evil re-signs the request's body as it is (sender host-a)",
+        "request",
+        MAIL_EVIL,
+        |_| {},
+    );
+    g.resign(
+        "head_ahead_bad_signature",
+        "head_ahead's body signed by host-b's key: host-a's at generation 1 is known, so the signature is checked before waiting",
+        "head_ahead",
+        MAIL_B1,
+        |_| {},
+    );
+    let to_a = enc_kid(&g.enc_pub("host-a-enc-1")).unwrap();
+    g.edit(
+        "redirected_edited",
+        "the request with its recipient changed to host-a (and host-a's enc_kid) after signing",
+        "request",
+        |v| {
+            v["body"]["recipient"] =
+                serde_json::json!({"host_id": "host-a", "host_trust_gen": 1, "enc_kid": to_a})
+        },
+    );
+    let other_hash = s(g.objects["cancel"].body(), "sealed_hash").to_owned();
+    g.edit(
+        "tampered_sealed_hash",
+        "the request with its body's sealed_hash changed (to the cancel's) after signing",
+        "request",
+        |v| v["body"]["sealed_hash"] = other_hash.into(),
+    );
+    g.edit(
+        "tampered_ct",
+        "the request with a byte of its ciphertext changed after signing: not the sender's copy",
+        "request",
+        |v| {
+            let mut ct = b64u_decode(v["ct"].as_str().unwrap()).unwrap();
+            ct[3] ^= 1;
+            v["ct"] = b64u(&ct).into();
+        },
+    );
+    g.edit(
+        "head_ahead_tampered_ct",
+        "head_ahead with a byte of its ciphertext changed after signing: a variant of a known sender's waiting object",
+        "head_ahead",
+        |v| {
+            let mut ct = b64u_decode(v["ct"].as_str().unwrap()).unwrap();
+            ct[3] ^= 1;
+            v["ct"] = b64u(&ct).into();
+        },
+    );
+    g.edit(
+        "bare",
+        "the request without its sealed part",
+        "request",
+        |v| {
+            let o = v.as_object_mut().unwrap();
+            o.remove("enc");
+            o.remove("ct");
+        },
+    );
+
+    // Results from host-b (which ran the request) to host-a, sealed to
+    // host-a-enc-1.
+    let ba = |g: &MailVectors, label: &str| g.fields(label, MAIL_B1, MAIL_A1, "host-a-enc-1", &b);
+    let request_id = mail_id("request");
+    let status = || ResultPlain::Status {
+        message_id: mail_id("request"),
+        recipients: vec![RecipientReceipt {
+            recipient_id: mail_id("request recipient"),
+            delivery: Delivery::Stored,
+        }],
+    };
+    let f = ba(&g, "status");
+    g.seal(
+        "status",
+        "host-b's receipt for the request: stored",
+        f,
+        MailPlain::Result(status()),
+        "host-a-enc-1",
+    );
+    let f = ba(&g, "refusal");
+    let refusal = ResultPlain::Refusal {
+        object_id: mail_id("cancel"),
+        refused: "invalid_request".into(),
+    };
+    g.seal(
+        "refusal",
+        "host-b refused the cancel envelope at check 5 or 6",
+        f,
+        MailPlain::Result(refusal),
+        "host-a-enc-1",
+    );
+    let f = ba(&g, "result");
+    let result = ResultPlain::Result {
+        task_id: task.clone(),
+        reply: mail_reply(false),
+    };
+    g.seal(
+        "result",
+        "the agent's reply to the request's task, as reply_query returns it once submitted",
+        f,
+        MailPlain::Result(result),
+        "host-a-enc-1",
+    );
+    let f = g.fields("evil_status", MAIL_EVIL, MAIL_A1, "host-a-enc-1", &b);
+    g.seal(
+        "evil_status",
+        "a status for the request from host-evil, a host of the account the outbox row didn't go to",
+        f,
+        MailPlain::Result(status()),
+        "host-a-enc-1",
+    );
+    let f = g.fields(
+        "status_head_ahead",
+        MAIL_B1,
+        MAIL_A1,
+        "host-a-enc-1",
+        &on_b(&["M11_revoke_a", "M12_readmit_a"]),
+    );
+    g.seal(
+        "status_head_ahead",
+        "host-b's status for the request, signed at the head of B + M11_revoke_a + M12_readmit_a (seq 12)",
+        f,
+        MailPlain::Result(status()),
+        "host-a-enc-1",
+    );
+    let f = ba(&g, "dropped_reply");
+    let text = jcs(&serde_json::json!({
+        "kind": "result",
+        "task_id": &task,
+        "reply": serde_json::to_value(mail_reply(true)).unwrap(),
+    }))
+    .unwrap();
+    g.seal_raw(
+        "dropped_reply",
+        "a result whose reply the host dropped (no text left); no builder seals it",
+        MailKind::Result,
+        f,
+        text.as_bytes(),
+        "host-a-enc-1",
+    );
+
+    // The verdicts. Envelopes: host-b at generation 1 with its key.
+    let to_b: (MailHost, &[&str]) = (MAIL_B1, &["host-b-enc-1"]);
+    let at =
+        |g: &mut MailVectors,
+         label: &str,
+         object: &str,
+         chain: &[&str],
+         expect: Value,
+         note: &str| { g.check(label, note, object, chain, to_b, MAIL_NOW, None, expect) };
+    for (label, object) in [
+        ("request_opens", "request"),
+        ("cancel_opens", "cancel"),
+        ("complete_opens", "complete"),
+        ("request_max_opens", "request_max"),
+    ] {
+        at(
+            &mut g,
+            label,
+            object,
+            &b,
+            mail_open("host-a"),
+            "checks 1 to 6 pass",
+        );
+    }
+    let e = g.refused_authenticated("request_over", "plaintext_too_large");
+    at(
+        &mut g,
+        "request_over_too_large",
+        "request_over",
+        &b,
+        e,
+        "the plaintext is over the request's bound",
+    );
+    let e = g.refused("pin_mismatch", "pin_mismatch");
+    at(
+        &mut g,
+        "pin_mismatch",
+        "pin_mismatch",
+        &b,
+        e,
+        "check 1: another account",
+    );
+    let e = g.refused_authenticated("resigned", "open_failed");
+    at(
+        &mut g,
+        "resigned",
+        "resigned",
+        &b,
+        e,
+        "a re-signed copy: host-evil is authenticated, the seal doesn't open",
+    );
+    let e = g.refused("resigned_keeping_sender", "bad_signature");
+    at(
+        &mut g,
+        "resigned_keeping_sender",
+        "resigned_keeping_sender",
+        &b,
+        e,
+        "host-evil's signature isn't host-a's",
+    );
+    let e = g.refused("request", "not_for_this_host");
+    g.check(
+        "redirected",
+        "a redirected copy: host-b's request handed to host-evil",
+        "request",
+        &b,
+        (MAIL_EVIL, &[]),
+        MAIL_NOW,
+        None,
+        e,
+    );
+    let e = g.refused("redirected_edited", "bad_signature");
+    g.check(
+        "redirected_edited",
+        "a redirected copy whose recipient was changed: the signature breaks",
+        "redirected_edited",
+        &b,
+        (MAIL_A1, &["host-a-enc-1"]),
+        MAIL_NOW,
+        None,
+        e,
+    );
+    let e = g.refused("request", "recipient_generation_not_current");
+    g.check(
+        "recipient_generation_not_current",
+        "host-b re-verified (generation 2): mail to its generation 1 never opens",
+        "request",
+        &on_b(&["M11_reverify_b"]),
+        (MAIL_B2, &[]),
+        MAIL_NOW,
+        None,
+        e,
+    );
+    let e = g.refused("request", "stale_sender_generation");
+    at(
+        &mut g,
+        "stale_generation",
+        "request",
+        &on_b(&["M11_reverify_a"]),
+        e,
+        "a stale generation: host-a re-verified after signing",
+    );
+    at(
+        &mut g,
+        "newer_generation_pending",
+        "gen2",
+        &b,
+        mail_pending(MAIL_A2),
+        "a newer generation, signed at a head beyond B: pending",
+    );
+    at(
+        &mut g,
+        "newer_generation_opens",
+        "gen2",
+        &on_b(&["M11_reverify_a"]),
+        mail_open("host-a"),
+        "the same object once the list has host-a's generation 2",
+    );
+    let e = g.refused("gen2_before_add_host", "generation_ahead");
+    at(
+        &mut g,
+        "generation_ahead",
+        "gen2_before_add_host",
+        &b,
+        e,
+        "a generation the list doesn't hold, at a head it holds",
+    );
+    let e = g.refused("gen2_before_add_host", "generation_ahead");
+    at(
+        &mut g,
+        "generation_ahead_add_host_after_head",
+        "gen2_before_add_host",
+        &on_b(&["M11_reverify_a"]),
+        e,
+        "the claimed generation's add_host (seq 11) comes after signed_at_head (seq 10)",
+    );
+    let e = g.refused("tampered_sealed_hash", "bad_signature");
+    at(
+        &mut g,
+        "tampered_sealed_hash",
+        "tampered_sealed_hash",
+        &b,
+        e,
+        "a tampered sealed_hash breaks the signature",
+    );
+    let e = g.refused("tampered_ct", "sealed_hash_mismatch");
+    at(
+        &mut g,
+        "tampered_ct",
+        "tampered_ct",
+        &b,
+        e,
+        "the signed sealed_hash names other bytes than the sealed part: the signature never covered them, so the copy isn't the sender's (refused unauthenticated, claiming no id; the sender's own copy still opens)",
+    );
+    let e = g.refused("tampered_ct", "sealed_hash_mismatch");
+    g.check(
+        "tampered_ct_expired",
+        "the same copy at its expires_at: intact before any authenticated verdict, so still sealed_hash_mismatch, never expired",
+        "tampered_ct",
+        &b,
+        to_b,
+        MAIL_EXPIRES,
+        None,
+        e,
+    );
+    let e = g.refused("request", "signed_at_head_before_generation");
+    at(
+        &mut g,
+        "signed_at_head_before_generation",
+        "request",
+        &on_b(&["M11_revoke_a", "M12_readmit_a"]),
+        e,
+        "signed at seq 10, before host-a's readmit (authorized(12)): refused for good",
+    );
+    let e = g.refused("evil_at_head_9", "signed_at_head_before_generation");
+    at(
+        &mut g,
+        "signed_at_head_before_first_add_host",
+        "evil_at_head_9",
+        &b,
+        e,
+        "signed at seq 9, before host-evil's authorized(10)",
+    );
+    let e = g.refused("wrong_hash", "signed_at_head_wrong_hash");
+    at(
+        &mut g,
+        "signed_at_head_wrong_hash",
+        "wrong_hash",
+        &b,
+        e,
+        "signed_at_head names a wrong hash",
+    );
+    let e = g.refused("request", "revoked_sender");
+    at(
+        &mut g,
+        "revoked_sender",
+        "request",
+        &on_b(&["M11_revoke_a"]),
+        e,
+        "the request that opened at B, once host-a is revoked",
+    );
+    let e = g.refused("request", "removed_sender");
+    at(
+        &mut g,
+        "removed_sender",
+        "request",
+        &on_b(&["M11_remove_a"]),
+        e,
+        "the request that opened at B, once host-a is removed",
+    );
+    let e = g.refused("removed_head_ahead", "removed_sender");
+    at(
+        &mut g,
+        "removed_sender_head_ahead",
+        "removed_head_ahead",
+        &on_b(&["M11_remove_a"]),
+        e,
+        "a removed host at the generation it last held, signed beyond the receiver's head: refused at any head (that generation never returns)",
+    );
+    let e = g.refused("removed_head_ahead", "expired");
+    g.check(
+        "removed_sender_head_ahead_times_first",
+        "the same, at its expires_at: the body's times come first",
+        "removed_head_ahead",
+        &on_b(&["M11_remove_a"]),
+        to_b,
+        MAIL_EXPIRES,
+        None,
+        e,
+    );
+    at(
+        &mut g,
+        "revoked_sender_head_ahead_pending",
+        "removed_head_ahead",
+        &on_b(&["M11_revoke_a"]),
+        mail_pending(MAIL_A1),
+        "a revoked host's envelope signed beyond the receiver's head waits: a readmit may be among the entries it lacks",
+    );
+    at(
+        &mut g,
+        "readmitted_sender_opens",
+        "removed_head_ahead",
+        &on_b(&["M11_revoke_a", "M12_readmit_a"]),
+        mail_open("host-a"),
+        "the same object once the list has the readmit it was signed after",
+    );
+    at(
+        &mut g,
+        "new_key_head_ahead_pending",
+        "cancel_to_new_key",
+        &b,
+        mail_pending(MAIL_A1),
+        "sealed to a key host-b handed out but hasn't applied (its host_enc_key is beyond its head): it waits",
+    );
+    g.check(
+        "new_key_opens",
+        "once host-b applies the rotation and lists the key, it opens",
+        "cancel_to_new_key",
+        &on_b(&["M11_rotate_b"]),
+        (MAIL_B1, &["host-b-enc-2", "host-b-enc-1"]),
+        MAIL_NOW,
+        None,
+        mail_open("host-a"),
+    );
+    let e = g.refused("cancel_to_new_key", "enc_key_not_accepted");
+    at(
+        &mut g,
+        "new_key_not_listed",
+        "cancel_to_new_key",
+        &on_b(&["M11_rotate_b"]),
+        e,
+        "the rotation applied but the key not listed: this head settles it",
+    );
+    let e = g.refused("evil_at_head_9", "unknown_sender");
+    at(
+        &mut g,
+        "unknown_sender",
+        "evil_at_head_9",
+        &b[..3],
+        e,
+        "no add_host names host-evil up to the receiver's head (9)",
+    );
+    at(
+        &mut g,
+        "unknown_sender_head_ahead_pending",
+        "evil_cancel",
+        &b[..3],
+        mail_pending(MAIL_EVIL),
+        "an unknown sender signed at a head beyond the receiver's: pending",
+    );
+    at(
+        &mut g,
+        "evil_cancel_opens",
+        "evil_cancel",
+        &b,
+        mail_open("host-evil"),
+        "the same object once the list has host-evil",
+    );
+    at(
+        &mut g,
+        "head_ahead_pending",
+        "head_ahead",
+        &b,
+        mail_pending(MAIL_A1),
+        "signed at a head beyond B, the signature verified first: pending",
+    );
+    at(
+        &mut g,
+        "head_ahead_opens",
+        "head_ahead",
+        &on_b(&["M11_rotate_a"]),
+        mail_open("host-a"),
+        "the same object once the list reaches its head",
+    );
+    let e = g.refused("head_ahead_bad_signature", "bad_signature");
+    at(
+        &mut g,
+        "head_ahead_bad_signature",
+        "head_ahead_bad_signature",
+        &b,
+        e,
+        "beyond B, from a known generation: the signature is checked before waiting",
+    );
+    let e = g.refused("head_ahead_tampered_ct", "sealed_hash_mismatch");
+    at(
+        &mut g,
+        "head_ahead_tampered_ct",
+        "head_ahead_tampered_ct",
+        &b,
+        e,
+        "beyond B, from a known generation: verified means signed and intact, so a ciphertext variant is refused, never held",
+    );
+    let e = g.refused_authenticated("request", "expired");
+    g.check(
+        "expired",
+        "the request at its expires_at",
+        "request",
+        &b,
+        to_b,
+        MAIL_EXPIRES,
+        None,
+        e,
+    );
+    let e = g.refused_authenticated("request", "created_too_far_ahead");
+    g.check(
+        "created_too_far_ahead",
+        "the request on a clock 60,001 ms behind its created_at",
+        "request",
+        &b,
+        to_b,
+        MAIL_T0 - 60_001,
+        None,
+        e,
+    );
+    let e = g.refused_authenticated("bad_times", "bad_times");
+    at(
+        &mut g,
+        "bad_times",
+        "bad_times",
+        &b,
+        e,
+        "expires_at isn't after created_at",
+    );
+    let e = g.refused_authenticated("lifetime_too_long", "lifetime_too_long");
+    at(
+        &mut g,
+        "lifetime_too_long",
+        "lifetime_too_long",
+        &b,
+        e,
+        "more than 24 h between created_at and expires_at",
+    );
+    let e = g.refused_authenticated("ids_mismatch", "plaintext_mismatch");
+    at(
+        &mut g,
+        "plaintext_ids_mismatch",
+        "ids_mismatch",
+        &b,
+        e,
+        "the plaintext's ids don't match the body's",
+    );
+    let e = g.refused_authenticated("attachments", "attachments_not_allowed");
+    at(
+        &mut g,
+        "attachments",
+        "attachments",
+        &b,
+        e,
+        "a host sender's Message carries no attachments",
+    );
+    let e = g.refused_authenticated("from_session", "invalid_message");
+    at(
+        &mut g,
+        "invalid_message",
+        "from_session",
+        &b,
+        e,
+        "not a Message a host sender may send",
+    );
+    let e = g.refused_authenticated("plaintext_null", "plaintext_null");
+    at(
+        &mut g,
+        "plaintext_null",
+        "plaintext_null",
+        &b,
+        e,
+        "a null in the plaintext",
+    );
+    let e = g.refused_authenticated("plaintext_not_canonical", "plaintext_malformed");
+    at(
+        &mut g,
+        "plaintext_not_canonical",
+        "plaintext_not_canonical",
+        &b,
+        e,
+        "a plaintext that isn't its canonical form",
+    );
+    let e = g.refused("bare", "malformed");
+    at(
+        &mut g,
+        "malformed",
+        "bare",
+        &b,
+        e,
+        "check 1: an envelope carries enc and ct",
+    );
+    let e = g.refused("status", "wrong_kind");
+    g.check(
+        "wrong_kind",
+        "a result given to open_envelope",
+        "status",
+        &b,
+        (MAIL_A1, &["host-a-enc-1"]),
+        MAIL_NOW,
+        None,
+        e,
+    );
+    // host-a's keys: the previous one opens mail only inside its window and
+    // never after a rotation with retire_previous.
+    for (label, chain, keys, expect, note) in [
+        (
+            "cancel_to_a_opens",
+            b.to_vec(),
+            &["host-a-enc-1"][..],
+            mail_open("host-b"),
+            "sealed to host-a's current key",
+        ),
+        (
+            "previous_key_in_window",
+            on_b(&["M11_rotate_a"]),
+            &["host-a-enc-2", "host-a-enc-1"][..],
+            mail_open("host-b"),
+            "host-a rotated; its previous key's window is open",
+        ),
+        (
+            "previous_key_after_window",
+            on_b(&["M11_rotate_a"]),
+            &["host-a-enc-2"][..],
+            g.refused("cancel_to_a", "enc_key_not_accepted"),
+            "host-a rotated; its previous key's window has closed",
+        ),
+        (
+            "retired_previous_key",
+            on_b(&["M11_rotate_a_retire"]),
+            &["host-a-enc-2"][..],
+            g.refused("cancel_to_a", "enc_key_not_accepted"),
+            "a retired previous key: refused at once",
+        ),
+    ] {
+        g.check(
+            label,
+            note,
+            "cancel_to_a",
+            &chain,
+            (MAIL_A1, keys),
+            MAIL_NOW,
+            None,
+            expect,
+        );
+    }
+
+    // Results: host-a's outbox row for the request went to host-b.
+    let outbox = |message_id: &str| {
+        serde_json::json!({
+            "recipient": {"host_id": "host-b", "host_trust_gen": 1},
+            "message_id": message_id,
+            "cancel_complete_ids": [mail_id("cancel"), mail_id("complete")],
+            "task_ids": [&task],
+        })
+    };
+    let to_a: (MailHost, &[&str]) = (MAIL_A1, &["host-a-enc-1"]);
+    let accepted = serde_json::json!({"verdict": "accepted", "sender": "host:host-b"});
+    for (label, object) in [
+        ("status_accepted", "status"),
+        ("refusal_accepted", "refusal"),
+        ("result_accepted", "result"),
+    ] {
+        g.check(
+            label,
+            "checks 1 to 6 pass and it answers the row",
+            object,
+            &b,
+            to_a,
+            MAIL_NOW,
+            Some(outbox(&request_id)),
+            accepted.clone(),
+        );
+    }
+    let e = g.refused("evil_status", "not_the_recipient");
+    g.check(
+        "result_from_non_recipient",
+        "a result from a host the row didn't go to",
+        "evil_status",
+        &b,
+        to_a,
+        MAIL_NOW,
+        Some(outbox(&request_id)),
+        e,
+    );
+    g.check(
+        "removed_result_head_ahead_pending",
+        "a removed host's result signed beyond the receiver's head waits (its signature checked first), to be kept as data",
+        "status_head_ahead",
+        &on_b(&["M11_remove_b"]),
+        to_a,
+        MAIL_NOW,
+        Some(outbox(&request_id)),
+        mail_pending(MAIL_B1),
+    );
+    for (label, chain, detail, note) in [
+        (
+            "result_sender_revoked",
+            on_b(&["M11_revoke_b"]),
+            "result not delivered: sender revoked",
+            "host-b revoked: verified with its key, kept as data",
+        ),
+        (
+            "result_sender_removed",
+            on_b(&["M11_remove_b"]),
+            "result not delivered: sender removed",
+            "host-b removed: verified with its last key, kept as data",
+        ),
+    ] {
+        let e = serde_json::json!({"verdict": "not_delivered", "sender": "host:host-b", "reason": detail});
+        g.check(
+            label,
+            note,
+            "status",
+            &chain,
+            to_a,
+            MAIL_NOW,
+            Some(outbox(&request_id)),
+            e,
+        );
+    }
+    let e = g.refused_authenticated("dropped_reply", "plaintext_malformed");
+    g.check(
+        "dropped_reply",
+        "a dropped reply isn't a result",
+        "dropped_reply",
+        &b,
+        to_a,
+        MAIL_NOW,
+        Some(outbox(&request_id)),
+        e,
+    );
+    let e = g.refused_authenticated("status", "does_not_answer_outbox_row");
+    g.check(
+        "does_not_answer_outbox_row",
+        "a status for another message than the row's",
+        "status",
+        &b,
+        to_a,
+        MAIL_NOW,
+        Some(outbox(&mail_id("another message"))),
+        e,
+    );
+    let e = g.refused("request", "wrong_kind");
+    g.check(
+        "result_wrong_kind",
+        "an envelope given to accept_result",
+        "request",
+        &b,
+        to_a,
+        MAIL_NOW,
+        Some(outbox(&request_id)),
+        e,
+    );
+
+    serde_json::json!({
+        "name": "r9-vectors-host-envelope",
+        "kind": "vectors",
+        "requires": "r9",
+        "note": "Envelopes and results between hosts (delegated host-work II.4.2, II.4.4; host-work-v1 §11.5). Each object is {body, sig, enc, ct}: the body signed by the sender's host_key (Ed25519) over enc([\"atem-envelope-v1\" or \"atem-result-v1\", jcs(body)]); the plaintext sealed with RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, to the recipient's host encryption key, info = enc([\"atem-envelope-seal-v1\" or \"atem-result-seal-v1\", account_id, genesis_hash (32 bytes), sender.host_id, u64(sender.host_trust_gen), recipient.host_id, u64(recipient.host_trust_gen), enc_kid, id, u64(created_at), u64(expires_at)]); sealed_hash = SHA-256(enc([enc, ct])). The sender's ephemeral is DeriveKeyPair(ikmE), ikmE = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Device lists: log L of r9-vectors-membership-log followed by `chain`, labels of `entries` (signed by dev-mac); the objects are signed at B = L + M7..M10 (head 10) unless their signed_at_head says otherwise. Objects: `signed_with` names the r9-vectors-keys host key whose signature `sig` is; `built` objects are what seal_envelope / seal_result make from the body's fields, `sealed.plaintext` and ikmE; `sealed` gives the seal's inputs and outputs (`plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB); `sealed_from` names the object whose sealed part it carries, `edited_from` the object it is after a change made after signing. Checks: `call` (open_envelope, or accept_result with `outbox`, the sending host's row) on L + `chain`, by `receiver` (its host_id, current host_trust_gen and the keys it accepts, r9-vectors-keys names), at `now`; `expect` is the verdict: open or accepted (with `sender`; the plaintext is the object's), not_delivered (with `sender` and the return grant's detail as `reason`), pending (the claimed host_id and host_trust_gen), refused (before the copy is shown to be the sender's, signed and intact (step 4): `reason` and `evidence` = SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent; it claims no id) or refused_authenticated (after it: the object's id and `reason`; it claims the id for its authenticated sender, (sender.host_id, id)).",
+        "account_id": "acct-test-1",
+        "genesis_hash": g.genesis.to_hex(),
+        "now": MAIL_NOW,
+        "entries": g.entry_vectors,
+        "objects": g.object_vectors,
+        "checks": g.checks,
+    })
+}
+
+/// A verdict as a check's `expect` writes it, and the plaintext it opened.
+fn mail_verdict(verdict: EnvelopeVerdict) -> (Value, Option<Vec<u8>>) {
+    match verdict {
+        EnvelopeVerdict::Open { plain, sender } => (
+            serde_json::json!({"verdict": "open", "sender": sender}),
+            Some(plain.to_bytes().unwrap().to_vec()),
+        ),
+        EnvelopeVerdict::Pending {
+            host_id,
+            host_trust_gen,
+        } => (
+            serde_json::json!({"verdict": "pending", "host_id": host_id, "host_trust_gen": host_trust_gen}),
+            None,
+        ),
+        EnvelopeVerdict::Refused { reason, evidence } => (
+            serde_json::json!({"verdict": "refused", "reason": reason, "evidence": evidence.to_hex()}),
+            None,
+        ),
+        EnvelopeVerdict::RefusedAuthenticated { object_id, reason } => (
+            serde_json::json!({"verdict": "refused_authenticated", "object_id": object_id, "reason": reason}),
+            None,
+        ),
+        EnvelopeVerdict::Unavailable { error } => panic!("unavailable: {error}"),
+    }
+}
+
+/// [`mail_verdict`] for a result.
+fn mail_result_verdict(verdict: ResultVerdict) -> (Value, Option<Vec<u8>>) {
+    match verdict {
+        ResultVerdict::Accepted { plain, sender } => (
+            serde_json::json!({"verdict": "accepted", "sender": sender}),
+            Some(plain.to_bytes().unwrap().to_vec()),
+        ),
+        ResultVerdict::NotDelivered {
+            plain,
+            sender,
+            reason,
+        } => (
+            serde_json::json!({"verdict": "not_delivered", "sender": sender, "reason": reason}),
+            Some(plain.to_bytes().unwrap().to_vec()),
+        ),
+        ResultVerdict::Pending {
+            host_id,
+            host_trust_gen,
+        } => mail_verdict(EnvelopeVerdict::Pending {
+            host_id,
+            host_trust_gen,
+        }),
+        ResultVerdict::Refused { reason, evidence } => {
+            mail_verdict(EnvelopeVerdict::Refused { reason, evidence })
+        }
+        ResultVerdict::RefusedAuthenticated { object_id, reason } => {
+            mail_verdict(EnvelopeVerdict::RefusedAuthenticated { object_id, reason })
+        }
+        ResultVerdict::Unavailable { error } => panic!("unavailable: {error}"),
+    }
+}
+
+#[test]
+fn host_envelope() {
+    let mut run = Run::new("r9-vectors-host-envelope");
+    let book = Book::load();
+    let made = host_envelope_vectors(&book);
+    for (field, value) in made.as_object().unwrap() {
+        assert_eq!(
+            run.get(field),
+            *value,
+            "{field}: as host_envelope_vectors makes it"
+        );
+    }
+    run.pass("the file is exactly what the shared core's builders make now");
+    let file = run.file.clone();
+
+    // The entries: each the valid next entry on L + its chain.
+    let mut g = MailVectors::new(&book);
+    for v in file["entries"].as_array().unwrap() {
+        let label = s(v, "label");
+        let entry = Entry::from_strict(&strict(&v["entry"])).unwrap();
+        assert_eq!(entry.hash().to_hex(), s(v, "entry_hash"), "{label}");
+        let chain: Vec<&str> = chain_labels(v);
+        assert_eq!(g.list(&chain).check_next(&entry), Check::Valid, "{label}");
+        g.entries.insert(label.to_owned(), entry);
+    }
+    run.pass("entries: each valid on L + its chain (dev-mac), entry_hash");
+
+    // The objects: signature, seal, plaintext and bounds from their parts.
+    let mut plaintexts: BTreeMap<String, Value> = BTreeMap::new();
+    let objects: BTreeMap<String, &Value> = file["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| (s(v, "label").to_owned(), v))
+        .collect();
+    for (label, v) in &objects {
+        let wire = v["object"].to_string();
+        assert!(
+            wire.len() <= atem_client::host_mail::MAX_MAIL_OBJECT_BYTES,
+            "{label}"
+        );
+        let object = SignedObject::from_strict(&strict(&v["object"])).unwrap();
+        assert_eq!(object.jcs(), s(v, "jcs"), "{label}");
+        assert!(object.jcs().len() <= 4096, "{label}");
+        assert_eq!(
+            hex(object.signing_input().as_bytes()),
+            s(v, "signing_input_hex")
+        );
+        let kind = match s(v, "kind") {
+            "envelope" => MailKind::Envelope,
+            _ => MailKind::Result,
+        };
+        assert_eq!(object.label(), kind.sign_label(), "{label}");
+        if let Some(name) = v.get("signed_with").and_then(Value::as_str) {
+            object.verify(&book.signer_public(name)).unwrap();
+        }
+        if let Some(from) = v.get("edited_from").and_then(Value::as_str) {
+            assert_eq!(
+                object.sig(),
+                b64u_decode(s(&objects[from]["object"], "sig")).unwrap()
+            );
+        }
+        if let Some(from) = v.get("sealed_from").and_then(Value::as_str) {
+            assert_eq!(
+                v["object"]["enc"], objects[from]["object"]["enc"],
+                "{label}"
+            );
+            assert_eq!(v["object"]["ct"], objects[from]["object"]["ct"], "{label}");
+        }
+        let Some(sealed) = v.get("sealed") else {
+            continue;
+        };
+        let (_, body) = MailBody::from_object(&object).unwrap();
+        let fields = body.fields();
+        let info = seal_info(kind, &fields);
+        assert_eq!(hex(&info), s(sealed, "info_hex"), "{label}");
+        let part = object.sealed().unwrap();
+        assert_eq!(
+            body.sealed_hash.to_hex(),
+            s(sealed, "sealed_hash"),
+            "{label}"
+        );
+        assert!(body.names(part), "{label}");
+        let to = s(sealed, "to");
+        assert_eq!(
+            enc_kid(&book.public(&format!("{to}/enc"))).unwrap(),
+            fields.enc_kid
+        );
+        let secret = unhex32(s(&book.keys[to]["enc"], "secret_hex"));
+        let plain = hpke::open_with_secret(&secret, &part.enc, &part.ct, &info, b"").unwrap();
+        match sealed.get("plaintext") {
+            Some(text) => assert_eq!(&plain[..], text.as_str().unwrap().as_bytes(), "{label}"),
+            None => {
+                assert_eq!(
+                    plain.len() as u64,
+                    sealed["plaintext_bytes"].as_u64().unwrap()
+                );
+                assert_eq!(
+                    hex(&Sha256::digest(&plain[..])),
+                    s(sealed, "plaintext_sha256")
+                );
+            }
+        }
+        let ikm = mail_ikm(s(sealed, "ikm_label"));
+        assert_eq!(hex(&ikm), s(sealed, "ikmE_hex"));
+        let resealed = hpke::seal_with_ikm(
+            book.public(&format!("{to}/enc")).as_32().unwrap(),
+            &info,
+            b"",
+            &plain,
+            &ikm,
+        )
+        .unwrap();
+        assert_eq!(
+            (resealed.enc.to_vec(), resealed.ct),
+            (part.enc.clone(), part.ct.clone())
+        );
+        if v["built"] == true {
+            // The builder makes it from its parts, byte for byte.
+            let signer = KeyId::new(format!("{}/host_key", s(v, "signed_with")));
+            let to = book.public(&format!("{to}/enc"));
+            let rebuilt = match kind {
+                MailKind::Envelope => seal_envelope_with_ikm(
+                    &book.provider,
+                    &signer,
+                    &fields,
+                    &EnvelopePlain::parse(&plain).unwrap(),
+                    &to,
+                    &ikm,
+                ),
+                MailKind::Result => seal_result_with_ikm(
+                    &book.provider,
+                    &signer,
+                    &fields,
+                    &ResultPlain::parse(&plain).unwrap(),
+                    &to,
+                    &ikm,
+                ),
+            }
+            .unwrap();
+            assert_eq!(rebuilt, object, "{label}");
+        }
+        plaintexts.insert(label.clone(), Value::from(hex(&plain)));
+    }
+    run.pass(format!(
+        "objects ({}): jcs, signing input, signatures, info, sealed_hash, open, the seal from ikmE, builders reproduce the built ones",
+        objects.len()
+    ));
+
+    // Every check, through the receiver's checks.
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for c in file["checks"].as_array().unwrap() {
+        let label = s(c, "label");
+        let list = g.list(&chain_labels(c));
+        let receiver = &c["receiver"];
+        let me = MailRecipient {
+            host_id: s(receiver, "host_id").into(),
+            host_trust_gen: receiver["host_trust_gen"].as_u64().unwrap(),
+            keys: receiver["keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|k| {
+                    let name = k.as_str().unwrap();
+                    let key = book.public(&format!("{name}/enc"));
+                    (
+                        KeyId::new(format!("{name}/enc")),
+                        atem_client::keys::enc_kid_bytes(&key).unwrap(),
+                    )
+                })
+                .collect(),
+        };
+        let object_label = s(c, "object");
+        let object = SignedObject::from_strict(&strict(&objects[object_label]["object"])).unwrap();
+        let now = c["now"].as_u64().unwrap();
+        let (got, plain) = match s(c, "call") {
+            "open_envelope" => {
+                mail_verdict(open_envelope(&object, &list, &me, &book.provider, now))
+            }
+            "accept_result" => {
+                let o = &c["outbox"];
+                let strs = |k: &str| -> Vec<String> {
+                    o[k].as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.as_str().unwrap().to_owned())
+                        .collect()
+                };
+                let outbox = ExpectedResult {
+                    recipient: HostRef {
+                        host_id: s(&o["recipient"], "host_id").into(),
+                        host_trust_gen: o["recipient"]["host_trust_gen"].as_u64().unwrap(),
+                    },
+                    message_id: s(o, "message_id").into(),
+                    cancel_complete_ids: strs("cancel_complete_ids"),
+                    task_ids: strs("task_ids"),
+                };
+                mail_result_verdict(accept_result(
+                    &object,
+                    &list,
+                    &me,
+                    &outbox,
+                    &book.provider,
+                    now,
+                ))
+            }
+            other => panic!("{other}"),
+        };
+        assert_eq!(got, c["expect"], "{label}");
+        if let Some(plain) = plain {
+            assert_eq!(
+                Value::from(hex(&plain)),
+                plaintexts[object_label],
+                "{label}"
+            );
+        }
+        *counts
+            .entry(s(&c["expect"], "verdict").to_owned())
+            .or_default() += 1;
+    }
+    run.pass(format!(
+        "checks: every verdict as open_envelope / accept_result give it ({counts:?})"
+    ));
+
+    // Every reason the receiver's checks name has a check.
+    let reasons: BTreeSet<&str> = file["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["expect"].get("reason").and_then(Value::as_str))
+        .collect();
+    for reason in atem_client::host_mail::receive::reason::ALL {
+        assert!(reasons.contains(reason), "no check refuses for {reason}");
+    }
+    run.pass("every reason of host_mail::receive has a check");
+    run.finish();
+}
+
+/// Writes `r9-vectors-host-envelope` from `host_envelope_vectors`.
+#[test]
+#[ignore = "writes the host-envelope vectors"]
+fn write_host_envelope_vectors() {
+    let book = Book::load();
+    let mut text = serde_json::to_string_pretty(&host_envelope_vectors(&book)).unwrap();
+    text.push('\n');
+    std::fs::write(fixtures_dir().join("r9-vectors-host-envelope.json"), text).unwrap();
 }

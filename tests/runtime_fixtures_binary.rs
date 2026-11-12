@@ -2025,8 +2025,9 @@ fn r9_files() -> Vec<Value> {
 )]
 fn r9_fixtures_run_against_the_real_runtime() {
     let files = r9_files();
-    // 88 with `r9-vectors-delegated-wire` (session-v1 R9.14's shapes).
-    assert_eq!(files.len(), 88, "the r9 fixture files");
+    // 89 with `r9-vectors-delegated-wire` (session-v1 R9.14's shapes) and
+    // `r9-vectors-host-envelope` (host-work-v1 §11.5).
+    assert_eq!(files.len(), 89, "the r9 fixture files");
     let only = std::env::var("ATEM_FIXTURE").ok();
     let mut not_expressible = Vec::new();
     let mut runnable = Vec::new();

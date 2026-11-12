@@ -781,6 +781,157 @@ fun main(args: Array<String>) {
         }
     }
 
+    // ------------------------------- delegated host work: envelopes and results
+    // r9-vectors-host-envelope (host-work-v1 §11.5; planned, host role, feature
+    // `host`): the device lists (log L and the file's `entries`), the builders
+    // reproducing every `built` object byte for byte, and every check's
+    // verdict through openEnvelope or acceptResult, with the plaintext an open
+    // gives.
+    val mail = load("r9-vectors-host-envelope")
+    val mailEntry = mail["entries"].arr().associateBy { it["label"].s() }
+    val mailObject = mail["objects"].arr().associateBy { it["label"].s() }
+    val mailNow = mail["now"].l().toULong()
+    fun mailList(chain: List<String>): MembershipLog {
+        val log = logL()
+        eq(log.extend(chain.map { Json.write(mailEntry.getValue(it)["entry"]) }, now).stop, null, "chain $chain")
+        return log
+    }
+    // Every host key under its r9-vectors-keys name, and every host encryption key.
+    fun mailStore(): AppKeyProvider {
+        val store = SoftwareKeyStore()
+        for ((name, k) in keys.obj()) {
+            if (k !is Map<*, *>) continue
+            val parts = k.obj()
+            parts["host_key"]?.let { store.insertEd25519(name, unhex(it["secret_hex"].s())) }
+            if (name.startsWith("host-")) parts["enc"]?.let { store.insertX25519(name, unhex(it["secret_hex"].s())) }
+        }
+        return store.provider()
+    }
+    fun encKey(name: String) = PublicKeyData(KeyAlg.X25519, unhex(keys[name]["enc"]["pub_hex"].s()))
+    fun mailHost(h: Any?) = MailHostData(h["host_id"].s(), h["host_trust_gen"].l().toULong())
+    fun mailFields(b: Any?) = MailFieldsData(
+        b["account_id"].s(), b["genesis_hash"].s(), mailHost(b["sender"]), mailHost(b["recipient"]),
+        b["recipient"]["enc_kid"].s(), b["id"].s(), b["created_at"].l().toULong(), b["expires_at"].l().toULong(),
+        LogHead(b["signed_at_head"]["seq"].l().toULong(), b["signed_at_head"]["hash"].s()))
+    fun mailRecipient(r: Any?) = MailRecipientData(
+        r["host_id"].s(), r["host_trust_gen"].l().toULong(), r["keys"].arr().map { MailKeyData(it.s(), encKid(encKey(it.s()))) })
+    fun mailOutbox(o: Any?) = MailOutboxData(
+        mailHost(o["recipient"]), o["message_id"].s(), o["cancel_complete_ids"].arr().map { it.s() }, o["task_ids"].arr().map { it.s() })
+    fun sha256(text: String) = hex(java.security.MessageDigest.getInstance("SHA-256").digest(utf8(text)))
+    // A verdict as `expect` writes it; an open's plaintext against the object's.
+    fun mailExpect(c: Any?, verdict: Map<String, Any?>, plain: String?) {
+        val label = c["label"].s()
+        eq(verdict, c["expect"].obj(), label)
+        if (plain == null) return
+        val sealed = mailObject.getValue(c["object"].s())["sealed"]
+        if (sealed.obj().containsKey("plaintext")) eq(plain, sealed["plaintext"], label)
+        else eq(listOf(utf8(plain).size.toLong(), sha256(plain)), listOf(sealed["plaintext_bytes"], sealed["plaintext_sha256"]), label)
+    }
+    fun envelopeVerdict(got: EnvelopeVerdictInfo): Pair<Map<String, Any?>, String?> = when (got) {
+        is EnvelopeVerdictInfo.Open -> mapOf("verdict" to "open", "sender" to got.sender) to got.plainJson
+        is EnvelopeVerdictInfo.Pending -> mapOf("verdict" to "pending", "host_id" to got.hostId, "host_trust_gen" to got.hostTrustGen.toLong()) to null
+        is EnvelopeVerdictInfo.Refused -> mapOf("verdict" to "refused", "reason" to got.reason, "evidence" to got.evidence) to null
+        is EnvelopeVerdictInfo.RefusedAuthenticated -> mapOf("verdict" to "refused_authenticated", "object_id" to got.objectId, "reason" to got.reason) to null
+        is EnvelopeVerdictInfo.Unavailable -> mapOf("verdict" to "unavailable", "code" to got.code, "detail" to got.detail) to null
+    }
+    fun resultVerdict(got: ResultVerdictInfo): Pair<Map<String, Any?>, String?> = when (got) {
+        is ResultVerdictInfo.Accepted -> mapOf("verdict" to "accepted", "sender" to got.sender) to got.plainJson
+        is ResultVerdictInfo.NotDelivered -> mapOf("verdict" to "not_delivered", "sender" to got.sender, "reason" to got.reason) to got.plainJson
+        is ResultVerdictInfo.Pending -> mapOf("verdict" to "pending", "host_id" to got.hostId, "host_trust_gen" to got.hostTrustGen.toLong()) to null
+        is ResultVerdictInfo.Refused -> mapOf("verdict" to "refused", "reason" to got.reason, "evidence" to got.evidence) to null
+        is ResultVerdictInfo.RefusedAuthenticated -> mapOf("verdict" to "refused_authenticated", "object_id" to got.objectId, "reason" to got.reason) to null
+        is ResultVerdictInfo.Unavailable -> mapOf("verdict" to "unavailable", "code" to got.code, "detail" to got.detail) to null
+    }
+    check("host mail: the entries extend log L to their hashes") {
+        for (e in mail["entries"].arr()) {
+            val r = mailList(e["chain"].arr().map { it.s() }).extend(listOf(Json.write(e["entry"])), now)
+            eq(r.stop, null, e["label"].s())
+            eq(r.head.hash, e["entry_hash"], e["label"].s())
+        }
+    }
+    check("host mail: the builders reproduce every built object; a fresh seal opens; what no builder seals is refused") {
+        val store = mailStore()
+        var built = 0
+        for (o in mail["objects"].arr().filter { it["built"] == true && it["sealed"].obj().containsKey("plaintext") }) {
+            val sealed = o["sealed"]
+            val args = listOf(o["signed_with"].s(), sealed["plaintext"].s(), sealed["to"].s())
+            val made = if (o["kind"] == "envelope") {
+                sealEnvelopeWithIkm(store, args[0], mailFields(o["object"]["body"]), args[1], encKey(args[2]), unhex(sealed["ikmE_hex"].s()))
+            } else {
+                sealResultWithIkm(store, args[0], mailFields(o["object"]["body"]), args[1], encKey(args[2]), unhex(sealed["ikmE_hex"].s()))
+            }
+            eq(made, canonicalJson(Json.write(o["object"])), o["label"].s())
+            built++
+        }
+        check(built >= 20) { "$built built" }
+        val b = listOf("M7_add_host_b", "M8_enc_a", "M9_enc_b", "M10_add_host_evil")
+        val toB = MailRecipientData("host-b", 1uL, listOf(MailKeyData("host-b-enc-1", encKid(encKey("host-b-enc-1")))))
+        val req = mailObject.getValue("request")
+        val plain = req["sealed"]["plaintext"].s()
+        val fresh = sealEnvelope(store, "host-a", mailFields(req["object"]["body"]), plain, encKey("host-b-enc-1"))
+        eq(openEnvelope(fresh, mailList(b), toB, store, mailNow), EnvelopeVerdictInfo.Open(plain, "host:host-a"))
+        // The builder seals a plaintext's canonical form only.
+        val loose = mailObject.getValue("plaintext_not_canonical")
+        val canonical = sealEnvelope(store, "host-a", mailFields(loose["object"]["body"]), loose["sealed"]["plaintext"].s(), encKey("host-b-enc-1"))
+        eq((openEnvelope(canonical, mailList(b), toB, store, mailNow) as EnvelopeVerdictInfo.Open).plainJson, canonicalJson(loose["sealed"]["plaintext"].s()))
+        val status = mailObject.getValue("status")
+        val freshResult = sealResult(store, "host-b", mailFields(status["object"]["body"]), status["sealed"]["plaintext"].s(), encKey("host-a-enc-1"))
+        val toA = MailRecipientData("host-a", 1uL, listOf(MailKeyData("host-a-enc-1", encKid(encKey("host-a-enc-1")))))
+        val row = mailOutbox(mail["checks"].arr().first { it["label"] == "status_accepted" }["outbox"])
+        check(acceptResult(freshResult, mailList(b), toA, row, store, mailNow) is ResultVerdictInfo.Accepted) { "a fresh result is accepted" }
+        val nul = mailObject.getValue("plaintext_null")
+        throwsCode("null_value") { sealEnvelope(store, "host-a", mailFields(nul["object"]["body"]), nul["sealed"]["plaintext"].s(), encKey("host-b-enc-1")) }
+        val dropped = mailObject.getValue("dropped_reply")
+        throwsCode("malformed") { sealResult(store, "host-b", mailFields(dropped["object"]["body"]), dropped["sealed"]["plaintext"].s(), encKey("host-a-enc-1")) }
+        // The enc_kid names the key sealed to.
+        throwsCode("malformed") { sealEnvelope(store, "host-a", mailFields(req["object"]["body"]), plain, encKey("host-a-enc-1")) }
+    }
+    check("host mail: every envelope check's verdict (openEnvelope)") {
+        val store = mailStore()
+        var n = 0
+        for (c in mail["checks"].arr().filter { it["call"] == "open_envelope" }) {
+            val got = openEnvelope(Json.write(mailObject.getValue(c["object"].s())["object"]), mailList(c["chain"].arr().map { it.s() }),
+                mailRecipient(c["receiver"]), store, c["now"].l().toULong())
+            val (verdict, plain) = envelopeVerdict(got)
+            mailExpect(c, verdict, plain)
+            n++
+        }
+        check(n >= 44) { "$n checks" }
+        // Through a platform provider (the JDK's crypto, as an app's
+        // Keystore would): the request opens, and the re-signed copy's seal
+        // doesn't (ProviderException.OpenFailed), so it is refused
+        // authenticated, open_failed, as through the software store.
+        val jdk = JdkKeys()
+        val encB = keys["host-b-enc-1"]["enc"]
+        jdk.addX25519("host-b-enc-1", unhex(encB["secret_hex"].s()), unhex(encB["pub_hex"].s()))
+        for (label in listOf("request_opens", "resigned")) {
+            val c = mail["checks"].arr().first { it["label"] == label }
+            val got = openEnvelope(Json.write(mailObject.getValue(c["object"].s())["object"]), mailList(c["chain"].arr().map { it.s() }),
+                mailRecipient(c["receiver"]), jdk, c["now"].l().toULong())
+            val (verdict, plain) = envelopeVerdict(got)
+            mailExpect(c, verdict, plain)
+        }
+        // A low-order `enc` (the zero point) doesn't open either: the XDH's
+        // own refusal is OpenFailed too, never a provider failure.
+        try {
+            jdk.hpkeOpen("host-b-enc-1", ByteArray(32), ByteArray(16), ByteArray(0), ByteArray(0))
+            throw AssertionError("a low-order enc opened")
+        } catch (e: ProviderException.OpenFailed) {
+        }
+    }
+    check("host mail: every result check's verdict (acceptResult)") {
+        val store = mailStore()
+        var n = 0
+        for (c in mail["checks"].arr().filter { it["call"] == "accept_result" }) {
+            val got = acceptResult(Json.write(mailObject.getValue(c["object"].s())["object"]), mailList(c["chain"].arr().map { it.s() }),
+                mailRecipient(c["receiver"]), mailOutbox(c["outbox"]), store, c["now"].l().toULong())
+            val (verdict, plain) = resultVerdict(got)
+            mailExpect(c, verdict, plain)
+            n++
+        }
+        check(n >= 9) { "$n checks" }
+    }
+
     // ------------------------------------------------------------ recovery
     fun kit1() = RecoveryKitHandle.read(unhex(rec["R_hex"].s()), rec["kit"]["account_id"].s(), rec["kit"]["genesis_hash"].s(), unhex(rec["kit"]["kit_tag_hex"].s()))
     check("kit 1: tag, recovery key, X25519 key") {

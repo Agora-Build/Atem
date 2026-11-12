@@ -66,19 +66,29 @@ work; `agent.prompt` alone does not authorize creating a process.
 
 Every production SDK artifact includes
 `atem-client-<version>-host-work-requests-v1.json`,
-`atem-client-<version>-host-work-prompt-framing-v1.json` and
-`atem-client-<version>-host-work-framing-size-v1.json` and
-`atem-client-<version>-r9-vectors-host-work-control.json` in its SHA-256
+`atem-client-<version>-host-work-prompt-framing-v1.json`,
+`atem-client-<version>-host-work-framing-size-v1.json`,
+`atem-client-<version>-r9-vectors-host-work-control.json`,
+`atem-client-<version>-r9-vectors-push-hint.json`,
+`atem-client-<version>-r9-vectors-delegated-wire.json` and
+`atem-client-<version>-r9-vectors-host-envelope.json` in its SHA-256
 manifest. These are the shared positive/negative request vectors from
 `fixtures/host-work/requests-v1.json`, the prompt framing's vectors from
 `fixtures/host-work/prompt-framing-v1.json` (tags, escaping, rendered prompts
 and the size check; delegated host-work design III.2), the preflight size
 cases from `fixtures/host-work/framing-size-v1.json` (each with its complete
-inputs and the expected checked length) and the control records' vectors from
-`fixtures/r9-vectors-host-work-control.json` (§9). The Rust core's tests run
-all four; the Swift, Kotlin and WASM conformance suites run the framing vectors
-through the exports of [Prompt framing](#prompt-framing-delegated-host-work-design-iii2)
-(VII.C test 40) and the control records' vectors, and
+inputs and the expected checked length), the control records' vectors from
+`fixtures/r9-vectors-host-work-control.json` (§9), the push hints' vectors
+from `fixtures/r9-vectors-push-hint.json` (approvals and `outcome_unknown`
+alerts, R9.9), the delegated wire shapes from
+`fixtures/r9-vectors-delegated-wire.json` (session-v1 R9.14) and the
+envelopes' and results' vectors from `fixtures/r9-vectors-host-envelope.json`
+(host-work-v1 §11.5; planned, host role). The Rust core's tests run all
+seven; the Swift, Kotlin and WASM conformance suites run the framing vectors
+through the exports of
+[Prompt framing](#prompt-framing-delegated-host-work-design-iii2) (VII.C test
+40), the control records', the push hints' and the envelopes' and results'
+vectors, and
 `scripts/check-atem-client-packages.sh` runs the framing vectors through the
 packaged WASM build. They are fixture data, not a live integration test: the
 host renders every prompt (`session::framing`); a client never does.
@@ -587,6 +597,37 @@ for a service or a host sender. Production exports for Station builders:
 `interrupt_running` with `build_control_record` under purpose
 `ControlRecord` (§3).
 
+### Mail between hosts (delegated host work; planned, host role)
+
+The `atem-envelope` a host sender seals to another host of the account (a
+request, a cancel or a complete) and the `atem-result` the host that ran the
+work sends back (a status, a refusal or a result): host-work-v1 §11.5, the
+objects, seals, plaintexts, the receiver's checks and their verdicts. **Host
+role only** (feature `host`, never in an app build, like `sign_seen`):
+nothing sends them in this version, and an app never holds a host's keys.
+The bindings carry them so the Swift, Kotlin and WASM suites run
+`r9-vectors-host-envelope` through the host's own code.
+
+| call | effect |
+|---|---|
+| `seal_envelope(provider, host_key_id, fields, plain_json, recipient_enc)`, `seal_result(…)` | the object's wire JSON (canonical): `plain_json` (one plaintext shape, read by the receiver's own strict parse: no `null`, exactly its fields; its canonical form is what is sealed; within its bound) sealed to the recipient host's X25519 encryption key, whose `enc_kid` must be `fields.enc_kid` (`malformed` otherwise), and the body signed with the Ed25519 `host_key_id` (purpose `HostSigning`). `fields` is `MailFieldsData{account_id, genesis_hash, sender, recipient, enc_kid, id, created_at, expires_at, signed_at_head}`, its `sender` and `recipient` each a `MailHostData{host_id, host_trust_gen}` |
+| `seal_envelope_with_ikm(…, ikm_e)`, `seal_result_with_ikm(…, ikm_e)` | the same with the ephemeral `DeriveKeyPair(ikm_e)`: the vectors' objects byte for byte (feature `test-vectors`) |
+| `open_envelope(object_json, log, me, provider, now_ms)` | the receiver's checks 1 to 6 against its device list: `EnvelopeVerdictInfo` `Open{plain_json, sender}`, `Pending{host_id, host_trust_gen}`, `Refused{reason, evidence}`, `RefusedAuthenticated{object_id, reason}` or `Unavailable{code, detail}`. `Pending` may also mean the object is sealed to a key this host hasn't applied yet (signed at a head beyond its own): judge it again after each device-list advance and each change of `me.keys`. `Refused` (any refusal before the copy is shown to be the sender's, signed and intact: steps 1 to 4, for example a bad signature or a sealed part its `sealed_hash` doesn't name) claims no id and is never reported; the ids `Open` and `RefusedAuthenticated` claim are the authenticated sender's, `(sender.host_id, id)`. `me` is `MailRecipientData{host_id, host_trust_gen, keys}`: the host's own trust generation from its pairing (never one read from its device list) and the keys it accepts now (`MailKeyData{key_id, enc_kid}`) |
+| `accept_result(object_json, log, me, outbox, provider, now_ms)` | the sending host's check of a result against its row `MailOutboxData{recipient, message_id, cancel_complete_ids, task_ids}`: `ResultVerdictInfo` `Accepted`, `NotDelivered{plain_json, sender, reason}` (a revoked or removed sender's result, kept as data), and the same `Pending`, `Refused`, `RefusedAuthenticated`, `Unavailable` |
+
+The verdict functions throw only for bytes that don't parse as a signed
+object: for example not strict JSON (a duplicate key, a float, a `null`),
+over 512 KiB, not an object, no `body` or `sig`, a `sig`, `enc` or `ct`
+that isn't base64url, an unknown top-level field, a `kit_sig`, `enc`
+without `ct`, a body without a known `type` or with `v` other than 1, an
+array in a mail body, or a body over 4,096 bytes; or anything else the
+signed-object parse refuses. The host refuses
+those bytes too, under the SHA-256 of the bytes as fetched (host-work-v1
+§11.5). Anything about a signed object's content is a verdict. JS: `sealEnvelope`, `sealResult`,
+`sealEnvelopeWithIkm`, `sealResultWithIkm`, `openEnvelope`, `acceptResult`
+with a `SoftwareKeyStore` (builds with `software-keys` and `host`), the
+fields and records as camelCase objects, the verdicts as `{type, …}`.
+
 ### Encoding helpers
 
 `canonical_json`, `encode_fields`, `hash_fields` (SHA-256 of `enc`),
@@ -668,8 +709,25 @@ trait AppKeyProvider (Swift protocol / Kotlin interface):
   sign(SignRequest{key_id, purpose, fresh_confirmation, label, input, body_json}) -> bytes
   x25519(key_id, peer) -> 32 bytes
   hpke_open(key_id, enc, ct, info, aad) -> plaintext
-errors: ProviderError.Cancelled{reason} | UnknownKey | Failed{reason}
+errors: ProviderError.Cancelled{reason} | UnknownKey | OpenFailed | Failed{reason}
 ```
+
+- **`ProviderError.OpenFailed`** (planned, for host mail; **for Astation's
+  agreement**: a new error case its providers can construct, a source
+  change for an app that switches over `ProviderError` exhaustively). From
+  `hpke_open` only, when the seal doesn't open under the key: the AEAD
+  refuses the ciphertext (CryptoKit's authentication failure, the JDK's
+  `AEADBadTagException`), or `enc` isn't a valid X25519 public key. The
+  core reads it as the seal's own failure (`open_failed`), as it reads
+  `UnknownKey` as `unknown_key`, and the host refuses the object as the
+  sender's doing. Any other failure (a missing or locked key, a cancelled
+  prompt, the provider's own fault) is `Failed` or `Cancelled`: the host
+  decides nothing and tries again later (`Unavailable`). A provider that
+  reports a failed open another way only delays that refusal to the
+  object's expiry. `SoftwareKeyStore` returns it for exactly those cases.
+  WASM has no foreign provider (JS passes a `SoftwareKeyStore`), so there
+  a failed open is the core's `open_failed` code already, as `unknown_key`
+  is.
 
 - **Formats.** P-256: public key SEC1 uncompressed (65 bytes); signature
   ECDSA over SHA-256 of `input`, 64-byte `r‖s`, either S (the core
@@ -816,7 +874,7 @@ Feature flags of `atem-client-ffi`:
 | `wasm` | the wasm-bindgen surface (`--no-default-features --features wasm`) |
 | `software-keys` | `SoftwareKeyStore` (bots, tests) |
 | `test-vectors` | raw primitive verification and `framing_render_for_vectors`, for the vectors (implies `software-keys`) |
-| `host` | host-role functions and types (`sign_seen`, `admit_carrier`, `AdmissionInfo`), for the conformance and host-side tests |
+| `host` | host-role functions and types (`sign_seen`, `admit_carrier`, `AdmissionInfo`, and host mail: `seal_envelope`, `seal_result`, `open_envelope`, `accept_result` and their records), for the conformance and host-side tests |
 
 Shipped artifacts use the defaults only (`wasm` alone for JS); the
 conformance builds add `software-keys,test-vectors,host`.
@@ -895,7 +953,8 @@ pin naming another commit (for instance a merge commit) or `tree_dirty:
 true` means the download is not the build you asked for: don't use it.
 `EXPECT_COMMIT=<sha> scripts/check-atem-client-packages.sh <version> <dir>`
 is what CI runs on the Linux packages (sums, the pin's commit and clean
-tree, the three host-work vectors listed in the sums, no test-only or
+tree, the seven shipped vectors files listed in the sums and the same bytes
+as the repository's, no test-only or
 host-role export (the framing's vectors-only rendering included), the
 packaged framing vectors through the Node build, and one call through the JVM
 jar); it can be run on a download the same way.
@@ -907,7 +966,7 @@ jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (55 checks in JS, 57 in Kotlin and in Swift: the same 55
+- **Conformance** (59 checks in JS, 61 in Kotlin and in Swift: the same 59
   in each language, plus two in Kotlin and Swift, whose provider sees the
   signing request and so the purposes of the five device-list actions and
   of control records; over `designs/protocol/fixtures/r9-vectors-*.json`,
@@ -921,8 +980,19 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   (with a Kotlin `AppKeyProvider` on the JDK's crypto: P-256 signing, HPKE
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
   (with a CryptoKit `AppKeyProvider`).
+- **Host mail** (planned, host role; four conformance checks per language,
+  of the 59 and 61 above): every entry of `r9-vectors-host-envelope`
+  extends log L to its hash, the builders reproduce every `built` object
+  byte for byte (a fresh seal opens, a builder refuses a plaintext with
+  `null`, a dropped reply and a key that isn't the `enc_kid`'s, and seals a
+  plaintext's canonical form only), and every check's verdict and reason
+  through `open_envelope` and `accept_result`, with the plaintext an open
+  gives (the largest by its length and SHA-256). Kotlin and Swift also open
+  the request and the re-signed copy through their own platform providers
+  (`JdkKeys`, `CryptoKitKeys`), whose failed open is
+  `ProviderError.OpenFailed` (§3): the same verdicts.
 - **Device-list actions** (`tests/host_actions.rs`, Rust; four conformance
-  checks in JS, five in Kotlin and Swift, of the 55 and 57 above): every
+  checks in JS, five in Kotlin and Swift, of the 59 and 61 above): every
   `P*`/`EK*`/`HS*` vector of
   `r9-vectors-membership-log` through the queries (`expect`) and the
   refusals (`reason`), the builders against the vectors' `jcs` and
@@ -932,7 +1002,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   action through a recording provider under its own purpose and publishing
   it (the verifier takes the entry).
 - **Control records** (`tests/control.rs`, Rust; four conformance checks
-  in JS, five in Kotlin and Swift, of the 55 and 57 above): every record of
+  in JS, five in Kotlin and Swift, of the 59 and 61 above): every record of
   `r9-vectors-host-work-control` parsed (or refused by the parse with its
   code) and verified on each of its chains as `checks` says, the builders
   reproducing it byte for byte (a software store, and the signing input
@@ -948,7 +1018,7 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   integration's own key and `ControlRecord` (a fresh confirmation of the
   body) for a native manager.
 - **Durable log** (`tests/stored_log.rs`, Rust; two conformance checks per
-  language, of the 49 above): a partly elapsed wait across a same-boot restart and a reboot,
+  language, of the 59 and 61 above): a partly elapsed wait across a same-boot restart and a reboot,
   the wall clock set back after restore, a wait-ended decision at its chain
   position (with the entry that relies on it), pending, approved and vetoed
   recovery and key-replacement records, a frozen log, corrupted, oversize,

@@ -44,6 +44,7 @@ use crate::canonical::MAX_SAFE_INTEGER;
 use crate::domain::{SignLabel, SigningInput};
 use crate::encoding::Hash32;
 use crate::error::{Error, Result};
+use crate::host_principal::{host_principal, parse_host_principal};
 use crate::keys::PublicKey;
 use crate::membership::entry::{RECOVERY_SIGNER, id_ok};
 use crate::membership::service_key_fingerprint;
@@ -177,22 +178,22 @@ pub enum ControlPrincipal {
 
 impl ControlPrincipal {
     /// `service:<id>` (a device id: `[A-Za-z0-9._:-]`, 1 to 128 bytes, never
-    /// `recovery`) or `host:<host_id>` (an opaque id of the same grammar).
+    /// `recovery`) or `host:<host_id>` (an opaque id of the same grammar,
+    /// read by [`parse_host_principal`], the one definition of a host
+    /// sender's principal).
     pub fn parse(name: &str) -> Option<Self> {
         if let Some(id) = name.strip_prefix("service:") {
             device_id_ok(id).then(|| ControlPrincipal::Service(id.to_owned()))
-        } else if let Some(id) = name.strip_prefix("host:") {
-            id_ok(id).then(|| ControlPrincipal::Host(id.to_owned()))
         } else {
-            None
+            parse_host_principal(name).map(|id| ControlPrincipal::Host(id.to_owned()))
         }
     }
 
-    /// `service:<id>` or `host:<host_id>`.
+    /// `service:<id>` or `host:<host_id>` ([`host_principal`]).
     pub fn name(&self) -> String {
         match self {
             ControlPrincipal::Service(id) => format!("service:{id}"),
-            ControlPrincipal::Host(id) => format!("host:{id}"),
+            ControlPrincipal::Host(id) => host_principal(id),
         }
     }
 

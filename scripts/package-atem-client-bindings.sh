@@ -214,6 +214,10 @@ FILES+=("$PUSH_VECTOR")
 WIRE_VECTOR="atem-client-${VERSION}-r9-vectors-delegated-wire.json"
 cp designs/protocol/fixtures/r9-vectors-delegated-wire.json "$OUT/$WIRE_VECTOR"
 FILES+=("$WIRE_VECTOR")
+# Envelopes and results between hosts (host-work-v1 §11.5; planned).
+MAIL_VECTOR="atem-client-${VERSION}-r9-vectors-host-envelope.json"
+cp designs/protocol/fixtures/r9-vectors-host-envelope.json "$OUT/$MAIL_VECTOR"
+FILES+=("$MAIL_VECTOR")
 SUMS="atem-client-${VERSION}-SHA256SUMS.txt"
 (cd "$OUT" && sha256sum "${FILES[@]}" >"$SUMS")
 echo "Packaged into $OUT:"

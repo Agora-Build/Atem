@@ -29,6 +29,8 @@
 //! - [`control`]: control records of delegated host work (build, parse,
 //!   verify) and the reference control state with its per-effect results,
 //!   production exports for Station builders;
+//! - `host_mail` (feature `host`; planned, host role only): envelopes and
+//!   results between hosts, sealed and judged by the receiver's checks;
 //! - [`encoding`]: canonical JSON, `enc`, signing inputs and hashes;
 //! - [`framing`]: the prompt framing's escaping and marker check, the
 //!   Unicode version pinned for them and a task's preflight size check
@@ -55,6 +57,8 @@ pub mod encoding;
 pub mod error;
 pub mod framing;
 pub mod host_actions;
+#[cfg(feature = "host")]
+pub mod host_mail;
 pub mod kit;
 pub mod log;
 pub mod provider;

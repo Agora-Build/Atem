@@ -31,6 +31,12 @@ pub enum SignLabel {
     /// `atem-host-work-control` bodies: control records (delegated
     /// host-work design I.5.3).
     HostWorkControl,
+    /// `atem-envelope` bodies (delegated host-work design II.4.2): a host
+    /// sender's request, cancel or complete, signed by its `host_key`.
+    Envelope,
+    /// `atem-result` bodies (II.4.4): the status or result the host that ran
+    /// the work sends back, signed by its `host_key`.
+    Result,
 }
 
 impl SignLabel {
@@ -46,6 +52,8 @@ impl SignLabel {
             SignLabel::HostRoute => "atem-host-route-v1",
             SignLabel::HostEncKey => "atem-host-enc-key-v1",
             SignLabel::HostWorkControl => "atem-host-work-control-v1",
+            SignLabel::Envelope => "atem-envelope-v1",
+            SignLabel::Result => "atem-result-v1",
         }
     }
 
@@ -59,6 +67,8 @@ impl SignLabel {
             "atem-seen" => Some(SignLabel::Seen),
             "atem-host-route" => Some(SignLabel::HostRoute),
             "atem-host-work-control" => Some(SignLabel::HostWorkControl),
+            "atem-envelope" => Some(SignLabel::Envelope),
+            "atem-result" => Some(SignLabel::Result),
             _ => None,
         }
     }
@@ -113,6 +123,10 @@ pub const CH1_AP_H2C: &str = "atem-ch1 ap h2c";
 pub const CH1_FINISH_AAD: &str = "atem-ch1-finish";
 pub const CH1_RECORD_AAD: &str = "atem-ch1-rec";
 pub const PUSH_SEAL: &str = "atem-push-seal-v1";
+/// The HPKE `info` label of an `atem-envelope`'s sealed part (II.4.2).
+pub const ENVELOPE_SEAL: &str = "atem-envelope-seal-v1";
+/// The HPKE `info` label of an `atem-result`'s sealed part (II.4.4).
+pub const RESULT_SEAL: &str = "atem-result-seal-v1";
 pub const ENC_KID: &str = "atem-enc-kid-v1";
 pub const K_BACKUP: &str = "atem-k-backup-v2";
 pub const RECOVERY_KIT: &str = "atem-recovery-kit-v2";
@@ -127,7 +141,7 @@ mod tests {
 
     /// Every label, in one list. The match fails to compile until a new
     /// label is listed here too, so the distinctness test covers it.
-    const LABELS: [SignLabel; 10] = [
+    const LABELS: [SignLabel; 12] = [
         SignLabel::MembershipEntry,
         SignLabel::RecoveryCosign,
         SignLabel::BrowserGrant,
@@ -138,6 +152,8 @@ mod tests {
         SignLabel::HostRoute,
         SignLabel::HostEncKey,
         SignLabel::HostWorkControl,
+        SignLabel::Envelope,
+        SignLabel::Result,
     ];
 
     const fn listed(label: SignLabel) -> usize {
@@ -152,6 +168,8 @@ mod tests {
             SignLabel::HostRoute => 7,
             SignLabel::HostEncKey => 8,
             SignLabel::HostWorkControl => 9,
+            SignLabel::Envelope => 10,
+            SignLabel::Result => 11,
         }
     }
 
@@ -179,6 +197,22 @@ mod tests {
     }
 
     #[test]
+    fn the_mailbox_objects_have_their_own_labels() {
+        assert_eq!(
+            SignLabel::of_body_type("atem-envelope"),
+            Some(SignLabel::Envelope)
+        );
+        assert_eq!(
+            SignLabel::of_body_type("atem-result"),
+            Some(SignLabel::Result)
+        );
+        assert_eq!(SignLabel::Envelope.as_str(), "atem-envelope-v1");
+        assert_eq!(SignLabel::Result.as_str(), "atem-result-v1");
+        assert_eq!(ENVELOPE_SEAL, "atem-envelope-seal-v1");
+        assert_eq!(RESULT_SEAL, "atem-result-seal-v1");
+    }
+
+    #[test]
     fn every_domain_string_is_distinct() {
         let signing = LABELS.map(SignLabel::as_str);
         let others = [
@@ -193,6 +227,8 @@ mod tests {
             CH1_FINISH_AAD,
             CH1_RECORD_AAD,
             PUSH_SEAL,
+            ENVELOPE_SEAL,
+            RESULT_SEAL,
             ENC_KID,
             K_BACKUP,
             RECOVERY_KIT,

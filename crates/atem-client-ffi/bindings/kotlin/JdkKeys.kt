@@ -88,7 +88,23 @@ class JdkKeys : AppKeyProvider {
     override fun hpkeOpen(keyId: String, enc: ByteArray, ct: ByteArray, info: ByteArray, aad: ByteArray): ByteArray {
         val k = key(keyId)
         if (k.alg != KeyAlg.X25519) throw ProviderException.Failed("not an X25519 key")
-        return Hpke.open(dh(k, enc), enc, k.public, ct, info, aad)
+        // A seal that doesn't open under this key is the typed OpenFailed,
+        // which the core judges: `enc` isn't a key the XDH takes (a wrong
+        // length, a small-order point), or the AEAD refuses the ciphertext.
+        // Anything else is this provider's own failure.
+        if (enc.size != 32) throw ProviderException.OpenFailed()
+        val shared = try {
+            dh(k, enc)
+        } catch (e: java.security.InvalidKeyException) {
+            throw ProviderException.OpenFailed()
+        } catch (e: java.security.spec.InvalidKeySpecException) {
+            throw ProviderException.OpenFailed()
+        }
+        return try {
+            Hpke.open(shared, enc, k.public, ct, info, aad)
+        } catch (e: javax.crypto.AEADBadTagException) {
+            throw ProviderException.OpenFailed()
+        }
     }
 
     private fun dh(k: Key, peer: ByteArray): ByteArray {

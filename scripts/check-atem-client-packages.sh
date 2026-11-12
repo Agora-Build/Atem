@@ -26,23 +26,26 @@ trap 'rm -rf "$WORK"' EXIT
 VECTORS="$ROOT/designs/protocol/fixtures/r9-vectors-pairing.json"
 
 (cd "$DIR" && sha256sum -c "atem-client-${VERSION}-SHA256SUMS.txt")
-# The shared vectors ship beside the bindings, each listed in the sums and
-# the same bytes as the repository's.
+# The shared host-work and r9 vectors ship beside the packages, each listed in
+# the sums (sha256sum -c above checked what is listed, not that it is listed)
+# and the same bytes as the repository's.
 for vector in \
   host-work/requests-v1.json:host-work-requests-v1.json \
   host-work/prompt-framing-v1.json:host-work-prompt-framing-v1.json \
   host-work/framing-size-v1.json:host-work-framing-size-v1.json \
   r9-vectors-host-work-control.json:r9-vectors-host-work-control.json \
   r9-vectors-push-hint.json:r9-vectors-push-hint.json \
-  r9-vectors-delegated-wire.json:r9-vectors-delegated-wire.json; do
+  r9-vectors-delegated-wire.json:r9-vectors-delegated-wire.json \
+  r9-vectors-host-envelope.json:r9-vectors-host-envelope.json; do
   source="$ROOT/designs/protocol/fixtures/${vector%%:*}"
   shipped="atem-client-${VERSION}-${vector#*:}"
-  grep -q "  $shipped\$" "$DIR/atem-client-${VERSION}-SHA256SUMS.txt" ||
-    { echo "vectors: $shipped is not in the SHA256SUMS" >&2; exit 1; }
+  test -s "$DIR/$shipped" || { echo "$shipped: missing from the package directory" >&2; exit 1; }
+  awk -v f="$shipped" '$2 == f {found = 1} END {exit !found}' "$DIR/atem-client-${VERSION}-SHA256SUMS.txt" \
+    || { echo "$shipped: not listed in the sums" >&2; exit 1; }
   cmp -s "$source" "$DIR/$shipped" ||
     { echo "vectors: $shipped differs from ${vector%%:*}" >&2; exit 1; }
 done
-echo "vectors: 6 files shipped, listed and unchanged"
+echo "vectors: 7 files shipped, listed and unchanged"
 FRAMING_VECTORS="$DIR/atem-client-${VERSION}-host-work-prompt-framing-v1.json"
 FRAMING_SIZE_VECTORS="$DIR/atem-client-${VERSION}-host-work-framing-size-v1.json"
 python3 - "$DIR/atem-client-${VERSION}-SOURCE.json" "${EXPECT_COMMIT:-}" <<'EOF'
@@ -60,7 +63,7 @@ assert pin["toolchain"].get("rustc"), pin
 print("source pin:", pin["commit"], "dirty" if pin["tree_dirty"] else "clean")
 EOF
 # No test-only or host-role export ships.
-FORBIDDEN='SoftwareKeyStore|signSeen|sign_seen|admitCarrier|admit_carrier|AdmissionInfo|framingRenderForVectors|framing_render_for_vectors'
+FORBIDDEN='SoftwareKeyStore|signSeen|sign_seen|admitCarrier|admit_carrier|AdmissionInfo|framingRenderForVectors|framing_render_for_vectors|sealEnvelope|seal_envelope|openEnvelope|open_envelope|sealResult|seal_result|acceptResult|accept_result|MailFieldsData'
 
 WASM="$DIR/atem-client-${VERSION}-wasm.tar.gz"
 if [ -f "$WASM" ]; then
@@ -180,7 +183,7 @@ if [ -f "$ANDROID" ]; then
     [ "$ALIGNS" = 0x4000 ] || { echo "android $ABI: LOAD alignment '$ALIGNS', need 0x4000" >&2; exit 1; }
     SYMS=$("$READELF" --dyn-syms -W "$SO")
     [ -n "$SYMS" ] || { echo "android $ABI: no dynamic symbols read" >&2; exit 1; }
-    if grep -qiE 'sign_seen|admit_carrier|software_?key|framing_render_for_vectors' <<<"$SYMS"; then
+    if grep -qiE 'sign_seen|admit_carrier|software_?key|framing_render_for_vectors|seal_envelope|open_envelope|seal_result|accept_result' <<<"$SYMS"; then
       echo "android $ABI: a test-only or host-role symbol is exported" >&2
       exit 1
     fi

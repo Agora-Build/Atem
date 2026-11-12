@@ -1837,6 +1837,8 @@ Planned:
 | `atem-host-route` | `atem-host-route-v1` | the host's `host_channel_key` (R9.7b) |
 | (`enc_sig` inside a `host_enc_key` entry; planned, R9.2 "Host senders and projects") | `atem-host-enc-key-v1` over fields, never a body: `enc([label, account_id, genesis_hash, host_id, u64(host_trust_gen), enc_pub])` | the host's `host_channel_key` (its newest `add_host`'s `host_key`) |
 | `atem-host-work-control` (control records; planned, host-work-v1 §11.1) | `atem-host-work-control-v1` | the principal's own key (a service: an `auth_key` it had in the list, the one the body's `principal_key` names; the Station that hosts the integration holds it), any action; or a native member holding `manage` at the verifier's head (`member:<device_id>`), `revoke` and `interrupt_running` only. A host's key signs none |
+| `atem-envelope` (a host sender's request, cancel or complete; planned, host-work-v1 §11.5) | `atem-envelope-v1`; its sealed part's HPKE `info` begins with the seal label `atem-envelope-seal-v1` | the sending host's `host_channel_key` (its newest `add_host`'s `host_key`) |
+| `atem-result` (the status or result sent back; planned, host-work-v1 §11.5) | `atem-result-v1`; seal label `atem-result-seal-v1` | the `host_channel_key` of the host that ran the work |
 
 Other domain strings (never signing inputs of another kind):
 `atem-membership-hash-v1`, `atem-browser-grant-hash-v1`,
@@ -1845,9 +1847,12 @@ Other domain strings (never signing inputs of another kind):
 `atem-ch1 ap h2c`, `atem-ch1-finish`, `atem-ch1-rec`,
 `atem-push-seal-v1`, `atem-enc-kid-v1`, `atem-k-backup-v2`,
 `atem-recovery-kit-v2`, `atem-recovery-kit-tag-v1`,
-`atem-k-backup-hash-v1`, `atem-recovery-sign-v1`, `atem-safety-code-v2`.
+`atem-k-backup-hash-v1`, `atem-recovery-sign-v1`, `atem-safety-code-v2`,
+and, planned, the mailbox seals `atem-envelope-seal-v1` and
+`atem-result-seal-v1` (host-work-v1 §11.5).
 Vectors: `r9-vectors-encoding`, `r9-vectors-keys`; control records:
-`r9-vectors-host-work-control`.
+`r9-vectors-host-work-control`; the envelopes and results,
+`r9-vectors-host-envelope`.
 
 ### R9.2 The membership log
 
@@ -2944,7 +2949,18 @@ substitute chain `SUB1`–`SUB3`) and the kits in `r9-vectors-keys`
 | `native` | member of kind `native` at Atem's head; `sig_c` by its `auth_key` | `member:<device_id>` | `view`; `control` if in its roles (`manage` gives the host nothing but the host policy, R9.8a, and, planned, `host_enc_key_get`, R9.14) |
 | `service` | member of kind `service`, not expired, host in `scope.hosts`; `sig_c` by its `auth_key` | `service:<device_id>` | `view`; `control` if `scope.ops` has any of `prompt`, `interrupt`, `stop`, `terminal`, `approval`, `rule_revoke`; each op checked separately |
 | `browser` | grant (below) whose issuer is a native member with `control` at Atem's head; `sig_c` by the grant's `browser_key` | `browser:<grant_id>` (issuer recorded) | `view`; `control` if the grant's `ops` have a control op; never more than the issuer |
-| `host` | newest `add_host` of `host_id`; `sig_h` | — (never a client) | — |
+| `host` | newest `add_host` of `host_id`; `sig_h` | — (never a client). **Planned** (delegated host work, step 3; nothing advertised): `host:<host_id>`, a sender in envelopes and route principals only | — |
+
+**The `host:<host_id>` principal** (planned, delegated host work II.2.1;
+nothing advertised). It names a host as the signer of an envelope and in
+a route's principals, never as a client: it isn't an `atem-ch1` principal
+kind and no admission reads it. `host_id` is the `atem_device_id` of the
+host's `add_host`, with the device list's id grammar (1–128 bytes of
+`[A-Za-z0-9._:-]`); anything else after `host:`, another case or spacing
+is no host principal. Its key is the `host_key` of the host's newest
+`add_host` (Ed25519, the `host_channel_key`), and its principal key is the
+lowercase hex SHA-256 of that key's raw bytes, the shape of `r9_svc`
+(`atem_client::host_principal`).
 
 Each principal has its own §H `control_gen`; `attachment_gen` and
 `controller_session` stay per attachment.
@@ -4034,12 +4050,28 @@ the crate's own dependencies and cross-checked independently):
 `r9-vectors-browser-grant`, `r9-vectors-push-hint`, `r9-vectors-pairing`,
 `r9-vectors-host-route`, and, planned, `r9-vectors-delegated-wire`
 (R9.14's shapes: `host_enc_key_get`, `host_enc_key`, receipts with and
-without provenance) and `r9-vectors-host-work-control`
+without provenance), `r9-vectors-host-work-control`
 (control records, host-work-v1 §11.1: service records for each action,
 native managers' and a host principal's records, a record signed by a
 manager removed before the host received it, every verification reason
 and parse code, records reusing another record's id, and `ControlState`
-sequences with their per-effect results). The membership log also carries the planned
+sequences with their per-effect results) and `r9-vectors-host-envelope`
+(host-work-v1 §11.5: envelopes and results between hosts on device lists
+the file carries after log L, each `built` one reproduced by the shared
+core's builders, and checks naming every verdict and reason of the
+receiver's checks and of the sending host's result check: a re-signed and
+a redirected copy, stale, newer and unheld generations, a tampered
+`sealed_hash`, `signed_at_head` before the sender's generation or naming a
+wrong hash, revoked, removed and unknown senders (a removed host's
+envelope refused even when signed beyond the receiver's head, its result
+waiting; a revoked host's waiting until its readmit), a copy whose sealed
+part its `sealed_hash` doesn't name (refused unauthenticated), mail to a
+key the receiver hasn't applied yet (waiting when signed beyond its head),
+expiry and every time
+check, mismatched plaintext ids, attachments, a plaintext with `null`, a
+retired previous key, a result from a host the row didn't go to, a dropped
+reply, results of revoked and removed hosts kept as data, and an object at
+each plaintext bound). The membership log also carries the planned
 actions of R9.2 "Host senders and projects" (signed only behind the
 signing gate): projects (`P7_add_host_b`, `P8_set`, the replacing
 `P9_narrow`, `P10_remove`; a host removed and added again,
@@ -4098,11 +4130,19 @@ input, every signature by the key its chain names for the signer, the
 `r9Svc` beside each service record's `principal_key`, the record
 digests a sequence's state keeps (each the body of a record of that
 principal with that `record_id`) and each step's position against the
-file's stations), and exits non-zero on a mismatch; it
-grows a checker per file. It
-derives no verdict: `expect` and each refusal's `reason` are checked by
-the Rust runner (`crates/atem-client/tests/vectors.rs`) and the binding
-conformance suites. Scenarios
+file's stations),
+and of `r9-vectors-host-envelope` (its entries' chain, hashes and
+signatures, each object's `jcs`, signing input, signature, seal `info`,
+`sealed_hash`, the open with the recipient key, the seal again from the
+ephemeral to the same bytes, the plaintext's bounds and the object's size
+on the wire, with RFC 9180 written there from the `cryptography`
+package's X25519, HKDF and ChaCha20-Poly1305), and exits non-zero on a
+mismatch; it grows a checker per file. It derives no verdict, but those of
+`r9-vectors-host-envelope`, which it recomputes from the bytes, the device
+list and the receiver (host-work-v1 §11.5's checks, written there from the
+text): every other `expect` and each refusal's `reason` are checked by the
+Rust runner (`crates/atem-client/tests/vectors.rs`) and the binding
+conformance suites, which run the host-envelope checks too. Scenarios
 (`kind: "scenario"`): chain (`valid-suffix`, `rollback`,
 `removed-signer-conflict`, `current-manager-conflict`, `unknown-carrier`,
 `honest-concurrent-appends`, `relay-cas-failure`, `signature-retry`,
