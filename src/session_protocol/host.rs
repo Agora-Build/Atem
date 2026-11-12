@@ -103,7 +103,9 @@
 //! any effect. Host-work may withdraw its own request (`withdraw`): an
 //! `accepted` one is rejected so, one not in the journal goes on the
 //! refusal list with that detail (a late submit gets that receipt, the
-//! restart records it), an `executing` one is reported started. A
+//! restart records it; with the list full, a submit of it is `busy` in this
+//! run), an `executing` one is reported started, and an id recorded under
+//! another submitter is left alone. A
 //! `request_id` recorded under another submitter, where either is the
 //! `host-work` principal, is `request_id_reused` even with every immutable
 //! value equal (R9.14 items 3, 4, 7).
@@ -187,6 +189,13 @@ pub const DETAIL_TURN_INTERRUPTED: &str = "interrupted";
 /// A `host-work` request its start check refused, or host-work withdrew
 /// (session-v1 R9.14 items 3, 4): `rejected` before any effect.
 pub const DETAIL_WITHDRAWN_BY_HOST: &str = "withdrawn by the host";
+/// `busy` for a submit of a request host-work withdrew while the refusal
+/// list was full (R9.14 item 4): never admitted.
+pub const DETAIL_REFUSAL_LIST_FULL: &str = journal::REFUSAL_LIST_FULL;
+/// Requests held closed in memory once the refusal list is full
+/// (`Withdrawal::ListFull`), at most; one more halts the journal instead
+/// (`Withdrawal::Halted`), so memory stays bounded too.
+pub const MAX_UNLISTED: usize = 4096;
 
 // ── Inputs and outputs ────────────────────────────────────────────────────
 
@@ -505,6 +514,17 @@ pub enum Withdrawal {
     /// runs (a late submit gets the `rejected` receipt, a restart records
     /// it). No side effect.
     Listed,
+    /// The id is recorded under another submitter (R9.14 item 7): that
+    /// request isn't host-work's, and nothing is written or changed. The
+    /// attempt's own submit is `request_id_reused`, so it never runs: never
+    /// admitted, and not counted as an attempt (host-work-v1 §11.6).
+    Reused,
+    /// It wasn't in the journal, and the refusal list is full: nothing
+    /// written, and the journal doesn't halt. A submit of it in this run is
+    /// refused `busy` (`refusal list full`), so it never runs here; after a
+    /// restart it is simply absent (never admitted, design I.6.4). No side
+    /// effect. (Past `MAX_UNLISTED` such requests in a run: `Halted`.)
+    ListFull,
     /// It is `executing` or past it: the task is running (or ran).
     Started,
     /// A write the withdrawal needed failed: the journal halted, and
@@ -716,6 +736,10 @@ pub struct SessionHost<J: Journal> {
     /// it before the dedup. (A failed admission write's entry needs no
     /// consulting: the journal halted, so every later submit is `busy`.)
     listed: HashMap<String, Refusal>,
+    /// Requests host-work withdrew before they were journaled while the
+    /// refusal list was full (`Withdrawal::ListFull`): a submit of one in
+    /// this run is `busy`, never admitted.
+    unlisted: HashSet<String>,
     /// Fixtures (`hold_dispatch`; debug builds only, the real runtime's
     /// fixture hook): accepted work stays queued.
     #[cfg(any(test, debug_assertions))]
@@ -783,6 +807,7 @@ impl<J: Journal> SessionHost<J> {
             admitting: None,
             start_check: None,
             listed: HashMap::new(),
+            unlisted: HashSet::new(),
             #[cfg(any(test, debug_assertions))]
             dispatch_held: false,
         };
@@ -2010,6 +2035,7 @@ impl<J: Journal> SessionHost<J> {
     fn install(&mut self, replayed: journal::Replayed) {
         // A new run: the start's resolution records the list's entries.
         self.listed.clear();
+        self.unlisted.clear();
         self.receipts = replayed
             .receipts
             .into_iter()
@@ -2491,27 +2517,30 @@ impl<J: Journal> SessionHost<J> {
     ///   with that detail and the attempt's provenance (`Listed`): a late
     ///   submit of it gets that `rejected` receipt instead of running, and
     ///   the restart records it so. An id this run listed already is
-    ///   `Listed`, nothing written. So is one recorded under another
-    ///   submitter: that request isn't host-work's to withdraw, and the
-    ///   attempt's own submit would be `request_id_reused` (item 7), so it
-    ///   never runs;
+    ///   `Listed`, nothing written. With the list full nothing is written
+    ///   and the journal doesn't halt (`ListFull`): a submit of it in this
+    ///   run is `busy` (`refusal list full`); past `MAX_UNLISTED` of those,
+    ///   the journal halts (`Halted`);
+    /// - **recorded under another submitter:** `Reused`, nothing written or
+    ///   changed (that request isn't host-work's to withdraw; the attempt's
+    ///   own submit is `request_id_reused`, item 7);
     /// - **`executing` or past it:** `Started`, nothing changes.
     ///
     /// A write it needs that fails halts the journal (§I), and nothing
     /// becomes `executing` until the restart, which settles the request
     /// (`Halted`). An `accepted` request whose rejection couldn't be
     /// written goes on the refusal list too, if that write works, so the
-    /// restart rejects it with this detail. A recorded request of
-    /// host-work's is found by its id, whatever `immutable` says. Never
-    /// offered to a client. Its effects (the submitter's `rejected`
-    /// receipt) wait for `take_effects`.
+    /// restart rejects it with this detail (as the start check's refusal
+    /// does). A recorded request of host-work's is found by its id,
+    /// whatever `immutable` says. Never offered to a client. Its effects
+    /// (the submitter's `rejected` receipt) wait for `take_effects`.
     pub fn withdraw(&mut self, request_id: &str, immutable: &Immutable) -> Withdrawal {
         let state = self.receipts.get(request_id).map(|e| {
             let s = &e.stored;
             (by_host_work(s), s.state)
         });
         match state {
-            Some((false, _)) => Withdrawal::Listed,
+            Some((false, _)) => Withdrawal::Reused,
             Some((true, ReceiptState::Accepted)) => {
                 if self.transition(
                     request_id,
@@ -2521,48 +2550,76 @@ impl<J: Journal> SessionHost<J> {
                     self.waiting.remove(request_id);
                     return Withdrawal::Rejected;
                 }
-                // The journal halted: the restart resolves the list first.
-                self.halt_journal();
-                let _ = self.list_withdrawn(request_id, immutable);
+                self.list_unwritten_withdrawal(request_id);
                 Withdrawal::Halted
             }
             Some((true, ReceiptState::Rejected)) => Withdrawal::Rejected,
             Some((true, _)) => Withdrawal::Started,
             None if self.listed.contains_key(request_id) => Withdrawal::Listed,
-            None => match self.list_withdrawn(request_id, immutable) {
-                Ok(refusal) => {
-                    self.listed.insert(request_id.to_string(), refusal);
-                    Withdrawal::Listed
+            None if self.unlisted.contains(request_id) => Withdrawal::ListFull,
+            None => {
+                debug_assert!(immutable.provenance.valid(), "{immutable:?}");
+                let refusal = self.withdrawn_refusal(
+                    request_id,
+                    &immutable.target,
+                    &immutable.payload_digest,
+                    Some(immutable.provenance.clone()),
+                );
+                match self.journal.record_refusal(refusal.clone()) {
+                    Ok(()) => {
+                        self.listed.insert(request_id.to_string(), refusal);
+                        Withdrawal::Listed
+                    }
+                    // A certain refusal, nothing written: fail closed for
+                    // this request only (the log is healthy), while memory
+                    // allows; past that, as a failed write.
+                    Err(e) if e.refusal_list_full() && self.unlisted.len() < MAX_UNLISTED => {
+                        self.unlisted.insert(request_id.to_string());
+                        Withdrawal::ListFull
+                    }
+                    Err(_) => {
+                        self.halt_journal();
+                        Withdrawal::Halted
+                    }
                 }
-                Err(_) => {
-                    self.halt_journal();
-                    Withdrawal::Halted
-                }
-            },
+            }
         }
     }
 
-    /// Puts host-work's withdrawn request on the refusal list (R9.14 item
-    /// 4): its immutable values, `withdrawn by the host` and the attempt's
-    /// provenance (left out if it isn't valid: no receipt may carry such a
-    /// provenance, and a submit with it is refused anyway).
-    fn list_withdrawn(
-        &mut self,
+    /// The refusal-list entry of host-work's withdrawn request (R9.14 item
+    /// 4): its immutable values (a `prompt`), `withdrawn by the host` and
+    /// the attempt's provenance (left out if it isn't valid: no receipt may
+    /// carry such a provenance, and a submit with it is refused anyway).
+    fn withdrawn_refusal(
+        &self,
         request_id: &str,
-        immutable: &Immutable,
-    ) -> Result<Refusal, JournalError> {
-        debug_assert!(immutable.provenance.valid(), "{immutable:?}");
-        let refusal = Refusal {
+        target: &Target,
+        payload_digest: &str,
+        provenance: Option<Provenance>,
+    ) -> Refusal {
+        Refusal {
             request_id: request_id.to_string(),
-            target: immutable.target.clone(),
+            target: target.clone(),
             kind: ReceiptKind::Prompt,
-            payload_digest: immutable.payload_digest.clone(),
+            payload_digest: payload_digest.to_string(),
             updated_at: self.wall(),
             detail: Some(DETAIL_WITHDRAWN_BY_HOST.to_string()),
-            provenance: Some(immutable.provenance.clone()).filter(Provenance::valid),
-        };
-        self.journal.record_refusal(refusal.clone())?;
-        Ok(refusal)
+            provenance: provenance.filter(Provenance::valid),
+        }
+    }
+
+    /// A withdrawal of the `accepted` host-work request `rid` (the start
+    /// check's refusal, or `withdraw`) couldn't be written, so the journal
+    /// halted (§I) and it stays `accepted` until the restart. It goes on the
+    /// refusal list too, best effort, so the restart rejects it `withdrawn
+    /// by the host` before anything is dispatched (R9.14 items 4, 6.1);
+    /// should that write fail as well, the restart's recovery settles it.
+    fn list_unwritten_withdrawal(&mut self, rid: &str) {
+        self.halt_journal();
+        let s = &self.receipts[rid].stored;
+        let refusal =
+            self.withdrawn_refusal(rid, &s.target, &s.payload_digest, s.provenance.clone());
+        let _ = self.journal.record_refusal(refusal);
     }
 
     /// The `host-work` principal's internal `attachment` renews the lease
@@ -3361,6 +3418,12 @@ impl<J: Journal> SessionHost<J> {
         let digest =
             canonical::payload_digest(&payload).map_err(|_| ErrorCode::UnsupportedVersion)?;
         let host_work = is_host_work(&self.attachments[att].principal);
+        // A request host-work withdrew while the refusal list was full: in
+        // this run it is never admitted, whoever submits it.
+        if self.unlisted.contains(request_id) {
+            self.refused.detail = Some(DETAIL_REFUSAL_LIST_FULL);
+            return Err(ErrorCode::Busy);
+        }
         // R9.14 item 4: a request host-work withdrew before it was
         // journaled gets the `rejected` receipt its refusal-list entry
         // records instead of running (no lease, nothing recorded); the
@@ -3765,7 +3828,10 @@ impl<J: Journal> SessionHost<J> {
         // start check, in this same step, before its `executing` record and
         // any effect; refused, it is `rejected` (`withdrawn by the host`).
         if is_host_work(&self.receipts[rid].stored.principal) && !self.may_start(rid) {
-            self.finish(rid, ReceiptState::Rejected, Some(DETAIL_WITHDRAWN_BY_HOST));
+            if !self.transition(rid, ReceiptState::Rejected, Some(DETAIL_WITHDRAWN_BY_HOST)) {
+                // The journal halted, as `withdraw`'s failed write does.
+                self.list_unwritten_withdrawal(rid);
+            }
             return;
         }
         // The payload is dropped once the request leaves `accepted`.

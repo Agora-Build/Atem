@@ -1216,3 +1216,217 @@ fn a_refused_host_work_admission_keeps_its_provenance_across_a_restart() {
     drop(rt);
     want(&reopened(dir.path()));
 }
+
+// ── Task 14 review fixes (ruling T14a): a bounded refusal list (M1), the
+//    `Reused` withdrawal (M3), the start check's unwritten refusal (M4) ──
+
+/// The refusal list's bound in these tests (bytes of JSON, written and
+/// read alike): a few entries.
+const REFUSAL_LIMIT: usize = 2_000;
+
+/// The JSON length a framed file names (`<len> <crc32> <json>\n`).
+fn framed_len(bytes: &[u8]) -> usize {
+    let text = std::str::from_utf8(bytes).unwrap();
+    text.split(' ').next().unwrap().parse().unwrap()
+}
+
+#[test]
+fn a_full_refusal_list_fails_the_withdrawn_request_closed_and_a_start_still_works() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state/refused");
+    let mut rt = setup_file(dir.path());
+    rt.host.journal_mut().set_refusal_limit(REFUSAL_LIMIT);
+    host_work(&mut rt, HW);
+
+    // Withdrawals of requests not in the journal fill the list.
+    let mut listed = Vec::new();
+    let mut n = 1;
+    let full = loop {
+        match withdraw(&mut rt, n) {
+            // A few fit (bounded, so a list that never fills fails here).
+            Withdrawal::Listed if n < 100 => {
+                listed.push(rid(n));
+                n += 1;
+            }
+            other => break other,
+        }
+    };
+    assert_eq!(full, Withdrawal::ListFull);
+    assert!(listed.len() >= 2, "{listed:?}");
+    // The list is within the bound and read back whole: nothing of the one
+    // that didn't fit.
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(framed_len(&bytes) <= REFUSAL_LIMIT);
+    let on_list: Vec<String> = rt
+        .host
+        .journal()
+        .refusals()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.request_id)
+        .collect();
+    assert_eq!(on_list, listed);
+
+    // Closed for that request only, and the journal doesn't halt. Again:
+    // still `ListFull`, nothing written.
+    assert!(!rt.host.journal_halted());
+    assert_eq!(withdraw(&mut rt, n), Withdrawal::ListFull);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    // Its submit, by anyone, is `busy` (`refusal list full`): never
+    // admitted, nothing recorded, no lease.
+    submit_host_work(&mut rt, HW, prompt_data(HW, n), provenance(TASK, SENDER));
+    let msgs = got(&mut rt, HOST_WORK_PRINCIPAL);
+    assert_eq!(error_code(&msgs), "busy");
+    let error = msgs.iter().find(|m| m["op"] == "error").unwrap();
+    assert_eq!(error["detail"], DETAIL_REFUSAL_LIST_FULL);
+    assert_eq!(DETAIL_REFUSAL_LIST_FULL, "refusal list full");
+    got(&mut rt, "c1");
+    client_prompt(&mut rt, "c1", C1, n);
+    assert_eq!(error_code(&got(&mut rt, "c1")), "busy");
+    assert!(rt.host.receipt(&rid(n)).is_none());
+    assert_eq!(rt.host.lease_holder(S1), None);
+    assert!(!dispatched(&rt, &rid(n)));
+    // Other work goes on.
+    submit_host_work(&mut rt, HW, prompt_data(HW, 100), provenance(TASK2, SENDER));
+    assert_eq!(
+        rt.host.receipt(&rid(100)).unwrap().state,
+        ReceiptState::Executing
+    );
+
+    // A start after reaching the bound works: each listed request is
+    // recorded `rejected` with its detail, the list is emptied, and the one
+    // that didn't fit is simply absent (never admitted).
+    restart(&mut rt, GEN2, 8);
+    assert_eq!(rt.host.start_error(), None);
+    assert!(!rt.host.journal_halted());
+    for id in &listed {
+        let r = rt.host.receipt(id).unwrap();
+        assert_eq!(r.state, ReceiptState::Rejected, "{id}");
+        assert_eq!(r.detail.as_deref(), Some(DETAIL_WITHDRAWN_BY_HOST));
+        assert_eq!(r.task_id.as_deref(), Some(TASK));
+    }
+    assert!(rt.host.receipt(&rid(n)).is_none());
+    assert!(rt.host.journal().refusals().unwrap().is_empty());
+    // And the list takes entries again.
+    host_work(&mut rt, HW2);
+    assert_eq!(withdraw(&mut rt, n + 1), Withdrawal::Listed);
+}
+
+#[test]
+fn withdraw_of_an_id_recorded_under_another_submitter_is_reused() {
+    let mut rt = setup();
+    host_work(&mut rt, HW);
+    client_prompt(&mut rt, "c1", C1, 1);
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Executing
+    );
+    got(&mut rt, "c1");
+    let records = rt.host.journal().records().len();
+
+    // Not host-work's request: nothing written or changed.
+    assert_eq!(withdraw(&mut rt, 1), Withdrawal::Reused);
+    assert!(rt.host.journal().refusals().unwrap().is_empty());
+    assert_eq!(rt.host.journal().records().len(), records);
+    let r = rt.host.receipt(&rid(1)).unwrap();
+    assert_eq!((r.state, r.task_id), (ReceiptState::Executing, None));
+    assert!(got(&mut rt, "c1").is_empty());
+    // The attempt's own submit is `request_id_reused`: never admitted.
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    assert_eq!(
+        error_code(&got(&mut rt, HOST_WORK_PRINCIPAL)),
+        "request_id_reused"
+    );
+    // c1's duplicate still gets its receipt.
+    client_prompt(&mut rt, "c1", C1, 1);
+    let mine = receipts(&got(&mut rt, "c1"));
+    assert_eq!(states(&mine), ["executing"], "{mine:#?}");
+}
+
+#[test]
+fn withdraw_of_a_request_rejected_for_another_reason_is_rejected() {
+    let mut rt = setup();
+    host_work(&mut rt, HW);
+    rt.host.hold_dispatch(true);
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    let fx = rt.host.process_exited(S1, None);
+    rt.apply(fx);
+    let r = rt.host.receipt(&rid(1)).unwrap();
+    assert_eq!(r.state, ReceiptState::Rejected);
+    assert_eq!(r.detail.as_deref(), Some("session closed"));
+    let records = rt.host.journal().records().len();
+    assert_eq!(withdraw(&mut rt, 1), Withdrawal::Rejected);
+    assert_eq!(rt.host.journal().records().len(), records);
+    assert!(rt.host.journal().refusals().unwrap().is_empty());
+    let r = rt.host.receipt(&rid(1)).unwrap();
+    assert_eq!(r.detail.as_deref(), Some("session closed"));
+}
+
+#[test]
+fn a_start_check_refusal_whose_write_fails_is_listed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    connect_host_work(&mut rt, HW);
+    let verdicts = Verdicts::new(StartVerdict::Go);
+    rt.host.set_start_check(Box::new(verdicts.clone()));
+    submit_host_work(&mut rt, HW, prompt_data(HW, 1), provenance(TASK, SENDER));
+    submit_host_work(&mut rt, HW, prompt_data(HW, 2), provenance(TASK, SENDER));
+    verdicts.set(StartVerdict::Withdraw);
+
+    // The turn's end is written; the start check's refusal of the next
+    // request isn't: the journal halts, and it stays `accepted`.
+    rt.host.journal_mut().fail_fsync_of(2, false);
+    let fx = rt.host.dispatch_report(&rid(1), done());
+    rt.apply(fx);
+    assert_eq!(
+        rt.host.receipt(&rid(1)).unwrap().state,
+        ReceiptState::Completed
+    );
+    assert_eq!(
+        rt.host.receipt(&rid(2)).unwrap().state,
+        ReceiptState::Accepted
+    );
+    assert!(rt.host.journal_halted());
+    assert!(!dispatched(&rt, &rid(2)));
+    // On the refusal list, as `withdraw`'s unwritten rejection is.
+    let listed = rt.host.journal().refusals().unwrap();
+    assert_eq!(listed.len(), 1, "{listed:#?}");
+    assert_eq!(listed[0].request_id, rid(2));
+    assert_eq!(listed[0].detail.as_deref(), Some(DETAIL_WITHDRAWN_BY_HOST));
+    assert_eq!(listed[0].provenance, Some(provenance(TASK, SENDER)));
+
+    // The restart rejects it so, before anything runs.
+    restart(&mut rt, GEN2, 8);
+    let r = rt.host.receipt(&rid(2)).unwrap();
+    assert_eq!(r.state, ReceiptState::Rejected);
+    assert_eq!(r.detail.as_deref(), Some(DETAIL_WITHDRAWN_BY_HOST));
+    assert_eq!(r.task_id.as_deref(), Some(TASK));
+    assert!(!dispatched(&rt, &rid(2)));
+}
+
+/// Memory stays bounded too: past `MAX_UNLISTED` requests held closed after
+/// the list filled, the next withdrawal halts the journal (nothing is
+/// admitted until the restart), and the start after it works.
+#[test]
+fn past_the_bound_in_memory_a_full_list_halts_the_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = setup_file(dir.path());
+    // No entry fits.
+    rt.host.journal_mut().set_refusal_limit(100);
+    host_work(&mut rt, HW);
+    for n in 1..=MAX_UNLISTED as u64 {
+        assert_eq!(withdraw(&mut rt, n), Withdrawal::ListFull, "{n}");
+    }
+    assert!(!rt.host.journal_halted());
+    let next = MAX_UNLISTED as u64 + 1;
+    assert_eq!(withdraw(&mut rt, next), Withdrawal::Halted);
+    assert!(rt.host.journal_halted());
+    submit_host_work(&mut rt, HW, prompt_data(HW, next), provenance(TASK, SENDER));
+    assert_eq!(error_code(&got(&mut rt, HOST_WORK_PRINCIPAL)), "busy");
+    assert!(rt.host.journal().refusals().unwrap().is_empty());
+
+    restart(&mut rt, GEN2, 8);
+    assert_eq!(rt.host.start_error(), None);
+    assert!(!rt.host.journal_halted());
+    assert!(rt.host.receipt(&rid(next)).is_none());
+}

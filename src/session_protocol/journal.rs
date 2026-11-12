@@ -90,6 +90,18 @@ pub enum Record {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalError(pub String);
 
+/// `record_refusal`'s error when the refusal list can't take another entry
+/// and still be read back whole: nothing was written.
+pub const REFUSAL_LIST_FULL: &str = "refusal list full";
+
+impl JournalError {
+    /// The refusal list is full (`REFUSAL_LIST_FULL`): a certain refusal,
+    /// not a write error, so the list on disk is as it was.
+    pub fn refusal_list_full(&self) -> bool {
+        self.0 == REFUSAL_LIST_FULL
+    }
+}
+
 /// A completed prompt's turn as journaled (r8 §D): ids only, never text.
 /// Its outcome is the receipt's `detail` (`done`/`interrupted`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,7 +198,12 @@ pub trait Journal {
     /// Every durable record, in append order.
     fn load(&self) -> Result<Vec<Record>, JournalError>;
     /// Adds `refusal` to the refusal list durably (replaced atomically),
-    /// apart from the appended log: it works after a failed append.
+    /// apart from the appended log: it works after a failed append. One
+    /// entry per request id: an id already listed, by whichever submitter,
+    /// writes nothing and is `Ok` (the restart records one receipt per id,
+    /// and existing entries are never replaced). A list that would grow
+    /// past what `refusals` reads back is refused with `REFUSAL_LIST_FULL`,
+    /// nothing written.
     fn record_refusal(&mut self, refusal: Refusal) -> Result<(), JournalError>;
     /// The refusal list.
     fn refusals(&self) -> Result<Vec<Refusal>, JournalError>;
@@ -328,8 +345,14 @@ impl Journal for MemJournal {
         if std::mem::take(&mut self.fail_refusal) || self.crashed {
             return Err(JournalError("cannot write the refusal list".into()));
         }
-        self.refused.retain(|r| r.request_id != refusal.request_id);
-        self.refused.push(refusal);
+        // One entry per id, never replaced (no size bound in memory).
+        if !self
+            .refused
+            .iter()
+            .any(|r| r.request_id == refusal.request_id)
+        {
+            self.refused.push(refusal);
+        }
         Ok(())
     }
 

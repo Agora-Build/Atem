@@ -604,6 +604,9 @@ struct Plan {
     fail_refusal: bool,
     /// Every rollback attempt fails (a log that can't be cut back).
     undo_stuck: bool,
+    /// The refusal list's bound, read and write alike, in place of
+    /// `MAX_RECORD_BYTES` (so a test fills it quickly).
+    refusal_limit: Option<usize>,
 }
 
 struct SessionLog {
@@ -780,6 +783,23 @@ impl FileJournal {
     #[cfg(test)]
     pub fn fail_next_refusal(&mut self) {
         self.plan.fail_refusal = true;
+    }
+
+    /// The refusal list's JSON may be at most `bytes` long, written or read
+    /// (`MAX_RECORD_BYTES` otherwise).
+    #[cfg(test)]
+    pub fn set_refusal_limit(&mut self, bytes: usize) {
+        self.plan.refusal_limit = Some(bytes);
+    }
+
+    /// How long the refusal list's JSON may be: what `refusals` reads back,
+    /// so `record_refusal` never writes more.
+    fn refusal_limit(&self) -> usize {
+        #[cfg(test)]
+        if let Some(limit) = self.plan.refusal_limit {
+            return limit;
+        }
+        MAX_RECORD_BYTES
     }
 
     #[cfg(test)]
@@ -1413,10 +1433,19 @@ impl Journal for FileJournal {
             return Err(JournalError("injected refusal-list failure".into()));
         }
         let mut refused = self.refusals()?;
-        refused.retain(|r| r.request_id != refusal.request_id);
+        // One entry per request id, never replaced: the restart records one
+        // receipt per id (R9.14 item 4).
+        if refused.iter().any(|r| r.request_id == refusal.request_id) {
+            return Ok(());
+        }
         refused.push(refusal);
         let json = serde_json::to_vec(&RefusedFile { refused })
             .map_err(|e| JournalError(format!("cannot encode the refusal list: {e}")))?;
+        // Never a list `refusals` can't read back (the next start couldn't
+        // resolve it): the file stays as it was.
+        if json.len() > self.refusal_limit() {
+            return Err(JournalError(journal::REFUSAL_LIST_FULL.into()));
+        }
         self.replace_file(REFUSED, &frame(&json))
     }
 
@@ -1426,7 +1455,7 @@ impl Journal for FileJournal {
             return Ok(Vec::new());
         }
         let bytes = Self::read_private(&path)?;
-        unframe(&bytes)
+        unframe_within(&bytes, self.refusal_limit())
             .filter(|(_, used)| *used == bytes.len())
             .and_then(|(json, _)| serde_json::from_slice::<RefusedFile>(json).ok())
             .map(|f| f.refused)
@@ -1497,7 +1526,12 @@ impl Journal for FileJournal {
         self.failed = None;
         #[cfg(test)]
         {
-            self.plan = Plan::default();
+            // Faults are one run's; the refusal list's bound is the journal's.
+            let refusal_limit = self.plan.refusal_limit;
+            self.plan = Plan {
+                refusal_limit,
+                ..Plan::default()
+            };
         }
         self.load_state()
             .map_err(|e| self.fail(format!("cannot reload: {}", e.0)))

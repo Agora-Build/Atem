@@ -698,3 +698,103 @@ fn a_large_principals_file_is_read_whole() {
     assert_eq!(replayed.principals["member:dev-phone"].control_gen, 7);
     assert_eq!(replayed.principals["member:dev-phone"].fence_seq, 3);
 }
+
+/// A refusal-list entry of one size (ids of one length).
+fn refusal(n: u64, provenance: Option<Provenance>) -> Refusal {
+    Refusal {
+        request_id: format!("44444444-4444-4444-8444-{n:012}"),
+        target: target(S1),
+        kind: ReceiptKind::Prompt,
+        payload_digest: "0".repeat(64),
+        updated_at: 1,
+        detail: Some("withdrawn by the host".into()),
+        provenance,
+    }
+}
+
+/// The refusal list never grows past what `refusals` reads back (its JSON
+/// within `MAX_RECORD_BYTES`): the entry that would is refused `refusal
+/// list full` with nothing written, and the list at the bound is read
+/// whole, here and by a new process.
+#[test]
+fn the_refusal_list_never_grows_past_what_it_reads_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = sd(&dir);
+    let path = state.join(REFUSED);
+    let mut j = open(&state);
+    let size = |list: &[Refusal]| {
+        serde_json::to_vec(&RefusedFile {
+            refused: list.to_vec(),
+        })
+        .unwrap()
+        .len()
+    };
+    let empty = size(&[]);
+    let entry = size(&[refusal(0, None)]) - empty;
+    // The most entries whose list fits: `empty + n * entry + (n - 1)`.
+    let n = ((MAX_RECORD_BYTES - empty + 1) / (entry + 1)) as u64;
+    let mut list: Vec<Refusal> = (0..n - 1).map(|i| refusal(i, None)).collect();
+    let json = serde_json::to_vec(&RefusedFile {
+        refused: list.clone(),
+    })
+    .unwrap();
+    fs::write(&path, frame(&json)).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // The last one that fits is written: the list is at the bound.
+    j.record_refusal(refusal(n - 1, None)).unwrap();
+    list.push(refusal(n - 1, None));
+    let at_bound = fs::read(&path).unwrap();
+    let written = size(&list);
+    assert!(written <= MAX_RECORD_BYTES, "{written}");
+    assert!(written + entry + 1 > MAX_RECORD_BYTES, "{written}");
+    // One more is refused, and the file is left as it was.
+    let full = j.record_refusal(refusal(n, None)).unwrap_err();
+    assert!(full.refusal_list_full(), "{full:?}");
+    assert_eq!(full.0, "refusal list full");
+    assert_eq!(fs::read(&path).unwrap(), at_bound);
+    // Read whole, here and in a new process.
+    assert_eq!(j.refusals().unwrap().len(), n as usize);
+    drop(j);
+    let j = open(&state);
+    assert_eq!(j.refusals().unwrap(), list);
+}
+
+/// One entry per request id, never replaced: a refusal of an id already
+/// listed, by the same submitter or another, writes nothing, in both
+/// journals.
+#[test]
+fn a_listed_request_id_is_never_listed_again_or_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = sd(&dir);
+    let provenance = Provenance {
+        task_id: "5ba7b810-9dad-41d1-80b4-00c04fd430c8".into(),
+        sender: "member:phone-1".into(),
+    };
+    let first = refusal(1, Some(provenance));
+    let again = [
+        // The same submitter (a provenance names `host-work`), another detail.
+        Refusal {
+            detail: None,
+            ..first.clone()
+        },
+        // Another submitter (no provenance).
+        Refusal {
+            detail: None,
+            provenance: None,
+            ..first.clone()
+        },
+    ];
+    let mut j = open(&state);
+    j.record_refusal(first.clone()).unwrap();
+    let bytes = fs::read(state.join(REFUSED)).unwrap();
+    let mut m = MemJournal::default();
+    m.record_refusal(first.clone()).unwrap();
+    for r in again {
+        j.record_refusal(r.clone()).unwrap();
+        m.record_refusal(r).unwrap();
+    }
+    assert_eq!(fs::read(state.join(REFUSED)).unwrap(), bytes);
+    assert_eq!(j.refusals().unwrap(), vec![first.clone()]);
+    assert_eq!(m.refusals().unwrap(), vec![first]);
+}
