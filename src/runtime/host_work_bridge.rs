@@ -1,5 +1,6 @@
 //! Opt-in host operations. Work reaches agents only through session-v1 receipts.
 use super::*;
+use crate::runtime::host_clock::HostClock;
 use crate::runtime::host_work::{
     AUTHORIZATION_EXPIRED, Accepted, Config, LaunchRecord, MessageFrame, Profile, Store,
     WorkRecord,
@@ -15,6 +16,9 @@ use std::sync::atomic::AtomicBool;
 
 /// The longest `paused: <reason>` detail a waiting local task carries.
 const MAX_PAUSE_DETAIL: usize = 240;
+
+/// How often the delegated clock takes a reading (host-work-v1 §11.6).
+const CLOCK_EVERY: Duration = Duration::from_secs(1);
 
 /// How often the payloads of host-work records settled a day past their
 /// deadline are dropped, and collaboration counters whose windows passed
@@ -158,6 +162,11 @@ pub(super) struct State {
     /// Why the runtime refused to start a launch it was handed (the
     /// live-session limit, a restart): the detail of its local tasks.
     refused: HashMap<String, String>,
+    /// The delegated clock (host-work-v1 §11.6), beside the store whose
+    /// `clock` table holds its record: loaded with the store's first pass.
+    clock: Option<HostClock>,
+    /// When the clock next takes a reading (`clock_pass`).
+    clock_due: Instant,
 }
 
 impl State {
@@ -187,6 +196,8 @@ impl State {
             recheck_grants: true,
             named: HashSet::new(),
             refused: HashMap::new(),
+            clock: None,
+            clock_due: Instant::now(),
         }
     }
 }
@@ -459,7 +470,40 @@ impl HostBridge {
             )
     }
 
+    /// The delegated clock (host-work-v1 §11.6), once a second while the
+    /// store is open and healthy, hosting on or not, so its record goes on
+    /// (`HostClock::tick` writes it when due).
+    fn clock_pass(&mut self) {
+        let Some(store) = self.work.store.as_ref() else {
+            return;
+        };
+        if self.work.error || Instant::now() < self.work.clock_due {
+            return;
+        }
+        self.work.clock_due = Instant::now() + CLOCK_EVERY;
+        self.work
+            .clock
+            .get_or_insert_with(|| HostClock::load(store))
+            .tick(store);
+    }
+
+    /// At an orderly stop: the delegated clock's last reading, written.
+    pub(super) fn work_close(&mut self) {
+        if let (Some(clock), Some(store)) = (self.work.clock.as_mut(), self.work.store.as_ref())
+            && !self.work.error
+        {
+            clock.close(store);
+        }
+    }
+
+    /// The delegated clock's `atem status` line, while it holds deadlines
+    /// back (`HostClock::status_line`).
+    pub fn clock_status(&self) -> Option<String> {
+        self.work.clock.as_ref()?.status_line().map(str::to_string)
+    }
+
     pub(super) fn work_pass(&mut self, cx: &mut Cx) {
+        self.clock_pass();
         let identity = self.work_host();
         // An unverified host has no identity to keep records under yet.
         if !self.hosting_enabled() || identity.account_id == UNPAIRED {
@@ -605,6 +649,11 @@ impl HostBridge {
                     "atem runtime: agent hosting records of this host's previous identity moved aside to {}",
                     aside.display()
                 );
+                // The clock is the host's, not the identity's: its record
+                // goes on in the new store.
+                if let Some(clock) = self.work.clock.as_mut() {
+                    clock.moved(&store);
+                }
                 self.work.store = Some(store);
                 true
             }
@@ -1943,6 +1992,36 @@ principals = ["local"]
             .build()
             .unwrap();
         tokio::task::LocalSet::new().block_on(&rt, body(dir.path()));
+    }
+
+    /// The delegated clock (host-work-v1 §11.6) lives beside the store: the
+    /// pass reads it once a second and writes its record (here its first
+    /// reading), and an orderly stop writes a last reading.
+    #[test]
+    fn the_pass_keeps_the_host_clock_and_an_orderly_stop_writes_it() {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let stored = |rig: &LocalRig| {
+                rig.bridge
+                    .work
+                    .store
+                    .as_ref()
+                    .unwrap()
+                    .load_clock()
+                    .unwrap()
+            };
+            rig.bridge.work.clock_due = Instant::now();
+            one_pass(&mut rig);
+            let first = stored(&rig).expect("written at its first reading");
+            // Within the second, no reading.
+            std::thread::sleep(Duration::from_millis(5));
+            one_pass(&mut rig);
+            assert_eq!(stored(&rig), Some(first.clone()));
+            // An orderly stop takes one and writes it.
+            rig.bridge.close_cleanly();
+            assert_ne!(stored(&rig), Some(first));
+            assert_eq!(rig.bridge.clock_status(), None);
+        });
     }
 
     #[test]
@@ -4280,8 +4359,10 @@ launch = "on_message"
     fn a_pass_where_nothing_changed_does_the_same_work_beside_thousands_of_awaiting_tasks() {
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
-            // The payload pass (once a minute) is not this pass.
+            // The payload pass (once a minute) is not this pass, nor is the
+            // delegated clock's (once a second; its record once a minute).
             rig.bridge.work.cleanup = Instant::now() + Duration::from_secs(3600);
+            rig.bridge.work.clock_due = Instant::now() + Duration::from_secs(3600);
             count_store_steps(&rig);
             add_awaiting(&rig, 500, 4096);
             drain(&mut rig);
@@ -4313,6 +4394,7 @@ launch = "on_message"
             local_test(async |root| {
                 let mut rig = LocalRig::new(root).await;
                 rig.bridge.work.cleanup = Instant::now() + Duration::from_secs(3600);
+                rig.bridge.work.clock_due = Instant::now() + Duration::from_secs(3600);
                 count_store_steps(&rig);
                 add_awaiting(&rig, 4096, prompt);
                 drain(&mut rig);

@@ -861,8 +861,10 @@ impl HostBridge {
     }
 
     /// At an orderly stop (signal, idle exit, replacement), after the last
-    /// pass: the journal's clean-close record, if it is healthy (r8 §H).
+    /// pass: the delegated clock's last reading (host-work-v1 §11.6), and
+    /// the journal's clean-close record, if it is healthy (r8 §H).
     pub fn close_cleanly(&mut self) {
+        self.work_close();
         if let Some(membership) = self.membership.as_mut()
             && membership.close(&host_now())
         {

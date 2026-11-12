@@ -796,6 +796,9 @@ pub struct Store {
     pub(super) state: PathBuf,
 }
 
+/// How many damaged clock records `clock_aside` keeps (the latest).
+const CLOCK_ASIDE_KEPT: u32 = 8;
+
 pub(super) fn valid_owner(owner: &str) -> bool {
     atem_client::session::wire::is_digest(owner)
 }
@@ -1018,7 +1021,9 @@ impl Store {
                 size INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(owner,id));
             CREATE TABLE IF NOT EXISTS closed_records (
                 kind TEXT NOT NULL, id TEXT NOT NULL, at_ms INTEGER NOT NULL,
-                PRIMARY KEY(kind,id)) WITHOUT ROWID;")?;
+                PRIMARY KEY(kind,id)) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS clock (id INTEGER PRIMARY KEY CHECK (id = 1), state TEXT);
+            CREATE TABLE IF NOT EXISTS clock_aside (at_ms INTEGER NOT NULL, state);")?;
         track_open_records(&db)?;
         track_waits(&db)?;
         std::fs::File::open(state)?.sync_all()?;
@@ -1037,6 +1042,52 @@ impl Store {
         if self.bound()?.as_ref() != Some(host) {
             bail!("host work database belongs to another account or trust generation");
         }
+        Ok(())
+    }
+
+    /// The delegated clock's record as stored (`host_clock::HostClock`
+    /// reads it): none before its first write, else the value as it is,
+    /// whatever its type, so a damaged one is never taken for none.
+    pub fn load_clock(&self) -> Result<Option<rusqlite::types::Value>> {
+        Ok(self
+            .db
+            .query_row("SELECT state FROM clock WHERE id=1", [], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Writes the delegated clock's record.
+    pub fn save_clock(&self, state: &crate::runtime::host_clock::state::ClockState) -> Result<()> {
+        self.put_clock(&rusqlite::types::Value::Text(state.to_json()))
+    }
+
+    /// Writes `value` as the clock's record as it is (a damaged one carried
+    /// into a new store stays damaged).
+    pub fn put_clock(&self, value: &rusqlite::types::Value) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO clock(id,state) VALUES(1,?1)
+            ON CONFLICT(id) DO UPDATE SET state=excluded.state",
+            [value],
+        )?;
+        Ok(())
+    }
+
+    /// Keeps the clock's stored record aside (`clock_aside`, found at
+    /// `at_ms`), as it is, never read again: once, while it is the latest
+    /// copy, and only the latest `CLOCK_ASIDE_KEPT` copies.
+    pub fn keep_clock_aside(&self, at_ms: u64) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO clock_aside(at_ms,state) SELECT ?1,c.state FROM clock c
+            WHERE c.id=1 AND NOT EXISTS(SELECT 1 FROM clock_aside a
+                WHERE a.rowid=(SELECT max(rowid) FROM clock_aside) AND a.state IS c.state)",
+            [at_ms],
+        )?;
+        tx.execute(
+            "DELETE FROM clock_aside WHERE rowid NOT IN
+            (SELECT rowid FROM clock_aside ORDER BY rowid DESC LIMIT ?1)",
+            [CLOCK_ASIDE_KEPT],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
