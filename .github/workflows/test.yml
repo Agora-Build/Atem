@@ -92,6 +92,53 @@ jobs:
           fi
           exit $status
 
+      # The atem binary's release-only unit tests (`#[cfg(not(debug_assertions))]`:
+      # they prove the debug-only hooks are compiled out, e.g. that a release
+      # build can't turn on `host.delegated`), each by its exact name, in the
+      # release build the step above made (nothing is rebuilt): the step
+      # fails unless every one of them ran and passed, on every target.
+      - name: Run the release-only unit tests (release build)
+        shell: bash
+        run: |
+          set -o pipefail
+          units=(runtime::test_hooks::tests::host_work_drive_is_off_in_release
+                 runtime::test_hooks::tests::host_features_are_off_in_release
+                 runtime::delegated::tests::release_builds_never_turn_on_host_features)
+          # Every such test in src is in the list: a test fn whose attributes
+          # (the lines above it, doc comments included) say
+          # `cfg(not(debug_assertions))`. The scan is the same on every
+          # target, so it runs on Linux (GNU awk) only.
+          if [ "$RUNNER_OS" = Linux ]; then
+            found=$(find src -name '*.rs' -print0 | xargs -0 awk '
+              /^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/ {
+                if (attrs ~ /cfg\([[:space:]]*not\([[:space:]]*debug_assertions[[:space:]]*\)[[:space:]]*\)/ &&
+                    attrs ~ /#\[(tokio::)?test[]( ]/) {
+                  sub(/^.*fn[[:space:]]+/, ""); sub(/[^A-Za-z0-9_].*$/, ""); print
+                }
+                attrs = ""; next
+              }
+              /^[[:space:]]*$/ || /[;{}][[:space:]]*$/ { attrs = ""; next }
+              { attrs = attrs " " $0 }')
+            for n in $found; do
+              if [[ " ${units[*]} " != *"::$n "* ]]; then
+                echo "::error::$n is a release-only unit test; add it to this step's units"
+                exit 1
+              fi
+            done
+          fi
+          cargo test --release --target ${{ matrix.target }} --bin atem -- --exact --format pretty "${units[@]}" 2>&1 \
+            | tee release-unit-tests.log
+          for u in "${units[@]}"; do
+            if ! grep -qxF "test $u ... ok" release-unit-tests.log; then
+              echo "::error::$u did not run in the release build"
+              exit 1
+            fi
+          done
+          if ! grep -qE "^test result: ok\. ${#units[@]} passed;" release-unit-tests.log; then
+            echo "::error::the release-only unit tests did not all run"
+            exit 1
+          fi
+
       # Every test binary with debug-only `#[ignore]` tests (they need the
       # test hooks in src/runtime/test_hooks.rs and the r9 host clock, which
       # release builds leave out, so the release run above ignores them):

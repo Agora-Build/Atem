@@ -3326,6 +3326,136 @@ mod delegated_work_ops {
         rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
         assert_eq!(rig.engine.take_host_work().len(), 1);
     }
+
+    /// Step 4, Decision 10: the runtime hands the engine the hook's
+    /// features (`HostFeatures`, read once when it starts). `host.delegated`
+    /// and `host.alerts` are listed only when the hook turns them on, and
+    /// only while hosting is on (they are host-work features: a host lists
+    /// those only then, §1); `host.senders` never. Listed, their ops are
+    /// taken: decoded, queued for the runtime, and answered with what it
+    /// says (`busy` until their handlers exist, with its detail).
+    #[test]
+    fn welcome_lists_delegated_and_alerts_only_with_the_hook() {
+        use crate::runtime::test_hooks::HostFeatures;
+        fn lists(rig: &mut Rig, handle: &str) -> [bool; 3] {
+            let features = welcome(rig, handle).features;
+            [DELEGATED_FEATURE, ALERTS_FEATURE, SENDERS_FEATURE]
+                .map(|feature| features.iter().any(|f| f == feature))
+        }
+        let both = HostFeatures::parse("host.delegated,host.alerts").unwrap();
+        let mut rig = Rig::new();
+        rig.link_up();
+        let cases = [
+            (None, true, [false, false, false]),
+            (Some("host.delegated"), true, [true, false, false]),
+            (
+                Some("host.delegated,host.alerts"),
+                true,
+                [true, true, false],
+            ),
+            (
+                Some("host.delegated,host.alerts"),
+                false,
+                [false, false, false],
+            ),
+        ];
+        for (n, (hook, hosting, listed)) in cases.into_iter().enumerate() {
+            let features =
+                hook.map_or_else(HostFeatures::default, |v| HostFeatures::parse(v).unwrap());
+            rig.engine
+                .set_delegated_features(features.delegated, features.alerts);
+            rig.engine.enable_host_work(hosting);
+            let handle = format!("ch-{n}");
+            rig.advance(1000);
+            rig.connect(&handle, phone());
+            assert_eq!(
+                lists(&mut rig, &handle),
+                listed,
+                "hook {hook:?}, hosting {hosting}"
+            );
+            assert_eq!(
+                welcome(&mut rig, &handle)
+                    .features
+                    .iter()
+                    .any(|f| f == "host.work"),
+                hosting
+            );
+        }
+        // The hook on, hosting on: each op is queued for the runtime, and
+        // nothing is answered before it answers.
+        rig.engine
+            .set_delegated_features(both.delegated, both.alerts);
+        rig.engine.enable_host_work(true);
+        for op in OPS {
+            let plain = message(&mut rig, "ch-2", op);
+            let (att, authority) = match &rig.engine.chans["ch-2"].phase {
+                Phase::Open(a) => (a.attachment.clone(), a.authority.clone()),
+                _ => panic!("open"),
+            };
+            rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
+        }
+        rig.pump();
+        assert!(rig.events("ch-2").is_empty(), "queued, not answered");
+        let queued = rig.engine.take_host_work();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|q| q.request.feature())
+                .collect::<Vec<_>>(),
+            [DELEGATED_FEATURE, DELEGATED_FEATURE, ALERTS_FEATURE]
+        );
+        for q in queued {
+            let reply = crate::runtime::delegated::request(both, &q.request);
+            let mono = rig.now.mono;
+            rig.engine
+                .host_work_reply(&q.attachment, &q.request, reply, mono);
+            rig.pump();
+            let events = rig.events("ch-2");
+            assert_eq!(
+                Rig::last_error(&events),
+                Some((
+                    "busy".into(),
+                    Some(format!("{} is not served yet", q.request.feature()))
+                )),
+                "{events:?}"
+            );
+        }
+        assert!(rig.relay.is_empty());
+    }
+
+    /// `host.alerts` without `host.delegated` is ignored (Decision 10): the
+    /// hook's value turns nothing on, and an engine handed it anyway lists
+    /// neither feature and takes none of the ops.
+    #[test]
+    fn host_alerts_without_host_delegated_is_ignored() {
+        use crate::runtime::test_hooks::HostFeatures;
+        assert_eq!(
+            HostFeatures::parse("host.alerts"),
+            Ok(HostFeatures::default())
+        );
+        let mut rig = Rig::new();
+        rig.engine.enable_host_work(true);
+        rig.engine.set_delegated_features(false, true);
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        let features = welcome(&mut rig, "ch-phone").features;
+        assert!(
+            features.iter().any(|f| f == "host.work"),
+            "hosting is on: {features:?}"
+        );
+        for feature in [DELEGATED_FEATURE, ALERTS_FEATURE, SENDERS_FEATURE] {
+            assert!(!features.iter().any(|f| f == feature), "{feature}");
+        }
+        for op in OPS {
+            assert_eq!(
+                refusal(&mut rig, "ch-phone", op),
+                not_advertised(op),
+                "{op}"
+            );
+        }
+        assert!(rig.engine.take_host_work().is_empty());
+        assert!(rig.relay.is_empty());
+    }
 }
 
 /// `host_enc_key_get` (delegated host-work design II.4.1, feature

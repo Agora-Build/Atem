@@ -9,6 +9,7 @@ pub mod client;
 pub mod collab;
 pub mod collab_context;
 pub mod commands;
+pub mod delegated;
 pub mod host_bridge;
 pub mod host_clock;
 pub mod host_work;

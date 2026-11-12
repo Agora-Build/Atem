@@ -971,8 +971,9 @@ mod tests {
     #[cfg(not(debug_assertions))]
     #[test]
     fn host_features_are_off_in_release() {
-        // SAFETY: no other test reads or writes this variable, and release
-        // builds never read it at all.
+        // SAFETY: the tests that write this variable (this one and
+        // `delegated::tests::release_builds_never_turn_on_host_features`)
+        // write this one value, and release builds never read it at all.
         unsafe { std::env::set_var("ATEM_TEST_HOST_FEATURES", "host.delegated,host.alerts") };
         assert_eq!(host_features(), HostFeatures::default());
         assert!(!host_features().delegated && !host_features().alerts);

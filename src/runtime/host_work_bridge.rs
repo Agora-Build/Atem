@@ -5,7 +5,7 @@ use crate::runtime::host_work::{
     AUTHORIZATION_EXPIRED, Accepted, Config, LaunchRecord, MessageFrame, Profile, Store,
     WorkRecord,
 };
-use crate::session_protocol::r9::ProjectScope;
+use crate::session_protocol::r9::{HostWorkError, ProjectScope};
 use atem_client::principal::{Authority, Need, Op};
 use atem_client::session::host_work::{
     self as hw, HostTarget, LaunchState, LaunchStatus, ResultBody, WorkState, WorkStatus,
@@ -389,6 +389,11 @@ impl HostBridge {
             self.projects
                 .session(&p.scope_key(), Some(p.project.clone()));
         }
+        // `host.delegated` and `host.alerts` as the debug-only hook turned
+        // them on when the runtime started (step 4, Decision 10): listed
+        // with the other host-work features, so only with hosting on.
+        self.r9
+            .set_delegated_features(self.features.delegated, self.features.alerts);
         self.r9
             .enable_host_work(self.hosting_enabled() && self.work.store.is_some());
     }
@@ -512,7 +517,7 @@ impl HostBridge {
                 self.r9.host_work_reply(
                     &request.attachment,
                     &request.request,
-                    Err("busy"),
+                    Err("busy".into()),
                     self.clock.now(),
                 );
             }
@@ -725,10 +730,10 @@ impl HostBridge {
         attachment: &str,
         req: &hw::Request,
         cx: &mut Cx,
-    ) -> Result<ResultBody, &'static str> {
+    ) -> Result<ResultBody, HostWorkError> {
         use hw::Request;
         if req.host() != &self.work_host() {
-            return Err("stale_target");
+            return Err("stale_target".into());
         }
         let a = self.work_authority(attachment).ok_or("unauthorized")?;
         let principal = a.name();
@@ -748,7 +753,7 @@ impl HostBridge {
                     .and_then(|s| s.hosts.as_ref())
                     .is_some_and(|hosts| !hosts.contains(&req.host().atem_device_id))
             {
-                return Err("forbidden");
+                return Err("forbidden".into());
             }
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(data)
@@ -765,7 +770,7 @@ impl HostBridge {
             // Its tasks compare their sender's control generation with this
             // one: it is kept from now on (`schedule_work` renews the set).
             self.host.keep_principal(&principal);
-            return self.message_request(req, &a, cx);
+            return Ok(self.message_request(req, &a, cx)?);
         }
         let store = self.work.store.as_ref().ok_or("busy")?;
         match req {
@@ -802,17 +807,17 @@ impl HostBridge {
                 );
                 if let Some(old) = store.launch(request_id).map_err(|_| "busy")? {
                     if old.principal != principal || old.digest != digest {
-                        return Err("request_id_reused");
+                        return Err("request_id_reused".into());
                     }
                     return Ok(ResultBody::Launch { launch: old.status });
                 }
                 if *expires_at <= wall || *expires_at > wall.saturating_add(hw::MAX_LIFETIME_MS) {
-                    return Err("invalid_request");
+                    return Err("invalid_request".into());
                 }
                 if cx.sessions.values().filter(|s| s.is_live()).count() + self.work.pending.len()
                     >= crate::session::MAX_LIVE
                 {
-                    return Err("busy");
+                    return Err("busy".into());
                 }
                 let status = LaunchStatus {
                     request_id: request_id.clone(),
@@ -876,7 +881,7 @@ impl HostBridge {
                         p.revision != old.profile_revision || !self.profile_allowed(p, &a, true)
                     })
                 {
-                    return Err("forbidden");
+                    return Err("forbidden".into());
                 }
                 Ok(ResultBody::Launch { launch: old.status })
             }
@@ -921,20 +926,20 @@ impl HostBridge {
                 };
                 if let Some(old) = store.work(&task.task_id).map_err(|_| "busy")? {
                     if old.principal != record.principal || old.digest != record.digest {
-                        return Err("request_id_reused");
+                        return Err("request_id_reused".into());
                     }
                     if !self.work_route_allowed(&old, &a) {
-                        return Err("forbidden");
+                        return Err("forbidden".into());
                     }
                     return Ok(ResultBody::Work { work: old.status });
                 }
                 if !self.work_allowed(&record, &a, cx.sessions) {
-                    return Err("forbidden");
+                    return Err("forbidden".into());
                 }
                 if task.expires_at <= wall
                     || task.expires_at > wall.saturating_add(hw::MAX_LIFETIME_MS)
                 {
-                    return Err("invalid_request");
+                    return Err("invalid_request".into());
                 }
                 store.enqueue(&record).map_err(|_| "busy")?;
                 self.host.keep_principal(&record.principal);
@@ -951,7 +956,7 @@ impl HostBridge {
                     .map_err(|_| "busy")?
                     .ok_or("forbidden")?;
                 if r.principal != principal || !self.work_route_allowed(&r, &a) {
-                    return Err("forbidden");
+                    return Err("forbidden".into());
                 }
                 if r.status.state == WorkState::OutcomeUnknown {
                     self.reconcile_work(&mut r).map_err(|_| "busy")?;
@@ -972,7 +977,7 @@ impl HostBridge {
                             r.status.state,
                             WorkState::Queued | WorkState::Blocked | WorkState::Cancelled
                         ) {
-                            return Err("busy");
+                            return Err("busy".into());
                         }
                         r.status.state = WorkState::Cancelled;
                         r.status.detail = "cancelled before submission".into();
@@ -980,11 +985,11 @@ impl HostBridge {
                     Request::Complete { result, .. } => {
                         if r.status.state == WorkState::Completed {
                             if r.status.result.as_ref() != Some(result) {
-                                return Err("request_id_reused");
+                                return Err("request_id_reused".into());
                             }
                         } else {
                             if r.status.state != WorkState::AwaitingResult {
-                                return Err("busy");
+                                return Err("busy".into());
                             }
                             r.status.state = WorkState::Completed;
                             r.status.result = Some(result.clone());
@@ -996,13 +1001,14 @@ impl HostBridge {
                 store.save_work(&r).map_err(|_| "busy")?;
                 Ok(ResultBody::Work { work: r.status })
             }
-            // `host.delegated`'s and `host.alerts`' ops: the channel refuses
-            // them while the host doesn't advertise the feature (none does
-            // yet, step 3), so none gets here; one that did would be refused,
-            // never half-served.
+            // `host.delegated`'s and `host.alerts`' ops: the channel takes
+            // them only while the host advertises the feature (the debug-only
+            // hook, step 4's Decision 10), and `delegated` answers them; one
+            // that got here otherwise is refused as before, never
+            // half-served.
             Request::WorkInterrupt { .. }
             | Request::WorkResolve { .. }
-            | Request::AlertList { .. } => Err("busy"),
+            | Request::AlertList { .. } => crate::runtime::delegated::request(self.features, req),
             Request::Publish { .. }
             | Request::MessageQuery { .. }
             | Request::AttachmentPut { .. } => unreachable!(),
@@ -2971,6 +2977,35 @@ principals = ["local"]
         });
     }
 
+    /// `work_interrupt`, `work_resolve` and `alert_list` as a channel hands
+    /// them to the bridge.
+    fn delegated_requests(host: &HostTarget) -> [hw::Request; 3] {
+        let id = || uuid::Uuid::new_v4().to_string();
+        [
+            hw::Request::WorkInterrupt {
+                v: 1,
+                id: id(),
+                host: host.clone(),
+                task_id: id(),
+            },
+            hw::Request::WorkResolve {
+                v: 1,
+                id: id(),
+                host: host.clone(),
+                task_id: id(),
+                resolution: hw::Resolution::Failed {
+                    detail: "agent exited".into(),
+                },
+            },
+            hw::Request::AlertList {
+                v: 1,
+                id: id(),
+                host: host.clone(),
+                after: None,
+            },
+        ]
+    }
+
     /// The delegated ops of step 3 never reach the bridge (the channel
     /// refuses an op of a feature the host doesn't advertise). One that did
     /// is refused `busy`, never half-served: `work_interrupt`,
@@ -2981,31 +3016,7 @@ principals = ["local"]
             let mut rig = LocalRig::new(root).await;
             let local = rig.bridge.local_attachment().to_string();
             let host = rig.bridge.work_host();
-            let id = || uuid::Uuid::new_v4().to_string();
-            let requests = [
-                hw::Request::WorkInterrupt {
-                    v: 1,
-                    id: id(),
-                    host: host.clone(),
-                    task_id: id(),
-                },
-                hw::Request::WorkResolve {
-                    v: 1,
-                    id: id(),
-                    host: host.clone(),
-                    task_id: id(),
-                    resolution: hw::Resolution::Failed {
-                        detail: "agent exited".into(),
-                    },
-                },
-                hw::Request::AlertList {
-                    v: 1,
-                    id: id(),
-                    host: host.clone(),
-                    after: None,
-                },
-            ];
-            for request in &requests {
+            for request in &delegated_requests(&host) {
                 assert_eq!(
                     rig.bridge.work_request(
                         &local,
@@ -3015,10 +3026,53 @@ principals = ["local"]
                             sessions: &mut rig.sessions,
                         },
                     ),
-                    Err("busy"),
+                    Err("busy".into()),
                     "{request:?}"
                 );
             }
+        });
+    }
+
+    /// With the hook on (step 4, Decision 10) the bridge hands the ops to
+    /// `delegated`, after the checks every request has (the host triple,
+    /// the caller's authority): `busy`, saying the feature isn't served
+    /// yet, until their handlers exist; `alert_list` needs `host.alerts`.
+    #[test]
+    fn delegated_ops_with_the_hook_are_handed_to_delegated() {
+        use crate::runtime::delegated::{ALERTS_NOT_SERVED, DELEGATED_NOT_SERVED};
+        use crate::runtime::test_hooks::HostFeatures;
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let local = rig.bridge.local_attachment().to_string();
+            let host = rig.bridge.work_host();
+            let ask = |rig: &mut LocalRig, request: &hw::Request| {
+                rig.bridge.work_request(
+                    &local,
+                    request,
+                    &mut Cx {
+                        client: &rig.app.astation_client,
+                        sessions: &mut rig.sessions,
+                    },
+                )
+            };
+            let busy = |detail| {
+                Err(crate::session_protocol::r9::HostWorkError {
+                    code: "busy",
+                    detail,
+                })
+            };
+            let [interrupt, resolve, alerts] = delegated_requests(&host);
+            rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
+            assert_eq!(ask(&mut rig, &interrupt), busy(Some(DELEGATED_NOT_SERVED)));
+            assert_eq!(ask(&mut rig, &resolve), busy(Some(DELEGATED_NOT_SERVED)));
+            assert_eq!(ask(&mut rig, &alerts), busy(None), "host.alerts is off");
+            rig.bridge.features = HostFeatures::parse("host.delegated,host.alerts").unwrap();
+            assert_eq!(ask(&mut rig, &alerts), busy(Some(ALERTS_NOT_SERVED)));
+            // The checks every request has come first.
+            let mut other = host.clone();
+            other.host_trust_gen += 1;
+            let [stale, ..] = delegated_requests(&other);
+            assert_eq!(ask(&mut rig, &stale), Err("stale_target".into()));
         });
     }
 
@@ -3083,7 +3137,7 @@ principals = ["local"]
             other.prompt.push('!');
             assert_eq!(
                 request(&mut rig, &enqueue(&other)),
-                Err("request_id_reused")
+                Err("request_id_reused".into())
             );
             let mut other = message.clone();
             other.text.push('!');

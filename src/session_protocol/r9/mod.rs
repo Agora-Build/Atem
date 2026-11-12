@@ -295,8 +295,27 @@ pub struct HostWorkRequest {
     pub request: atem_client::session::host_work::Request,
 }
 
+/// A host-work request refused (host-work-v1 §7): its code, and the
+/// `detail` its session `error` carries (none unless a refusal names one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostWorkError {
+    pub code: &'static str,
+    pub detail: Option<&'static str>,
+}
+
+impl From<&'static str> for HostWorkError {
+    fn from(code: &'static str) -> Self {
+        Self { code, detail: None }
+    }
+}
+
 pub struct R9Host {
     host_work_enabled: bool,
+    /// `host.delegated` and `host.alerts` (`alerts` only with `delegated`),
+    /// as the runtime's debug-only hook turned them on (step 4, Decision
+    /// 10); listed only with hosting on.
+    delegated: bool,
+    alerts: bool,
     host_work_requests: VecDeque<HostWorkRequest>,
     limits: Limits,
     /// The live link generation.
@@ -506,11 +525,22 @@ impl R9Host {
         self.host_work_enabled = enabled;
     }
 
+    /// The delegated features the runtime runs (`host.delegated`,
+    /// `host.alerts`): off unless its debug-only hook turned them on (step 4
+    /// of delegated host work, Decision 10; never in a release build).
+    /// `alerts` counts only with `delegated`.
+    pub fn set_delegated_features(&mut self, delegated: bool, alerts: bool) {
+        self.delegated = delegated;
+        self.alerts = alerts && delegated;
+    }
+
     /// The features a welcome lists: the one source of what this host takes
     /// (an op of a feature not listed here is `unsupported_version`,
-    /// session-v1 §A). Step 3 of delegated host work advertises none of
-    /// `host.delegated`, `host.alerts` and `host.senders`.
-    fn advertised_features(&self) -> Vec<String> {
+    /// session-v1 §A). `host.delegated` and `host.alerts` only as the
+    /// runtime's debug-only hook turned them on, and like the other
+    /// host-work features only with hosting on; `host.senders` never in
+    /// step 4 of delegated host work.
+    pub(crate) fn advertised_features(&self) -> Vec<String> {
         let mut features: Vec<String> = crate::session_protocol::revision::FEATURES
             .iter()
             .map(|f| f.to_string())
@@ -524,6 +554,12 @@ impl R9Host {
                 atem_client::session::messages::FEATURE.to_owned(),
                 atem_client::session::attachments::FEATURE.to_owned(),
             ]);
+            if self.delegated {
+                features.push(atem_client::session::host_work::DELEGATED_FEATURE.to_owned());
+            }
+            if self.alerts {
+                features.push(atem_client::session::host_work::ALERTS_FEATURE.to_owned());
+            }
         }
         features
     }
@@ -579,7 +615,7 @@ impl R9Host {
         &mut self,
         attachment: &str,
         request: &atem_client::session::host_work::Request,
-        result: Result<atem_client::session::host_work::ResultBody, &'static str>,
+        result: Result<atem_client::session::host_work::ResultBody, HostWorkError>,
         now: u64,
     ) {
         let Some(handle) = self.by_attachment.get(attachment) else {
@@ -599,7 +635,7 @@ impl R9Host {
             )
             .to_string()
             .into_bytes(),
-            Err(code) => error(code, Some(request.id()), None).to_bytes(),
+            Err(e) => error(e.code, Some(request.id()), e.detail).to_bytes(),
         };
         self.seal_to(attachment, &bytes, now);
     }
@@ -623,6 +659,8 @@ impl R9Host {
         let revoked_path = journal_dir.map(|d| d.join(REVOKED_GRANTS_FILE));
         let mut host = R9Host {
             host_work_enabled: false,
+            delegated: false,
+            alerts: false,
             host_work_requests: VecDeque::new(),
             limits,
             link: None,
@@ -1704,10 +1742,11 @@ impl R9Host {
                 )
             ) {
                 // A host-work op of a feature this host doesn't advertise
-                // (`host.delegated`'s and `host.alerts`', none in step 3) is
-                // refused as every host-work request the host can't take is
-                // (`busy`, host-work v1 §7), naming the feature; it is never
-                // decoded or queued.
+                // (`host.delegated`'s and `host.alerts`', listed only as the
+                // runtime's debug-only hook turns them on) is refused as every
+                // host-work request the host can't take is (`busy`, host-work
+                // v1 §7), naming the feature; it is never decoded or queued.
+                // Advertised, it is queued for the runtime like the others.
                 if let Some(feature) = unadvertised {
                     refuse(
                         self,
