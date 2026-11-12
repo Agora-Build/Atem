@@ -110,17 +110,19 @@ pub fn in_order(alerts: &[Alert]) -> bool {
 /// whether more follow.
 /// - `Ok(None)` for an `after` the host has no alert for (the alert ended,
 ///   or never was): `stale_target`, detail `unknown alert`.
-/// - `Err("invalid_request")` for a `limit` of 0, checked first: a page of
-///   no alert that says more follow is a result no reader takes (`more`
-///   needs a last alert to continue from) and a caller could not follow. The
-///   limit is the host's own (the request has no such field; the host passes
-///   [`MAX_PAGE`]), so this is a host's fault, never a wire input.
+/// - `Err("invalid_request")` for a `limit` outside `1..=`[`MAX_PAGE`],
+///   checked first: 0 is a page of no alert that says more follow, a result
+///   no reader takes (`more` needs a last alert to continue from) and a
+///   caller could not follow; above [`MAX_PAGE`] is a page the reader
+///   refuses for its size. The limit is the host's own (the request has no
+///   such field; the host passes [`MAX_PAGE`]), so this is a host's fault,
+///   never a wire input.
 pub fn page(
     alerts: &[Alert],
     after: Option<&str>,
     limit: usize,
 ) -> Result<Option<(Vec<Alert>, bool)>, &'static str> {
-    if limit == 0 {
+    if !(1..=MAX_PAGE).contains(&limit) {
         return Err("invalid_request");
     }
     let mut ordered: Vec<&Alert> = alerts.iter().collect();
@@ -356,9 +358,10 @@ mod tests {
         }
     }
 
-    /// A page asks for at least one alert: with a limit of 0 the host would
-    /// answer an empty page with `more` true, which no reader takes (`more`
-    /// needs a last alert to continue from) and a caller could never follow.
+    /// A page asks for between 1 and `MAX_PAGE` alerts: with a limit of 0 the
+    /// host would answer an empty page with `more` true, which no reader takes
+    /// (`more` needs a last alert to continue from) and a caller could never
+    /// follow, and above `MAX_PAGE` a page the reader refuses for its size.
     /// It is refused as a request is, `invalid_request`, and the check comes
     /// before the cursor's, so it is no `stale_target` either.
     #[test]
@@ -376,6 +379,19 @@ mod tests {
             page(&held, Some("aaaaaaaa-0000-4000-8000-0000000000ff"), 0),
             Err("invalid_request")
         );
+        // Above the most a result carries it is refused too, whatever the
+        // list holds; `MAX_PAGE` itself is the most there is.
+        assert_eq!(page(&held, None, MAX_PAGE + 1), Err("invalid_request"));
+        assert_eq!(page(&[], None, usize::MAX), Err("invalid_request"));
+        assert_eq!(
+            page(
+                &held,
+                Some("aaaaaaaa-0000-4000-8000-0000000000ff"),
+                MAX_PAGE + 1
+            ),
+            Err("invalid_request")
+        );
+        assert!(page(&held, None, MAX_PAGE).is_ok());
         // One alert is the least a page carries, and it goes on.
         let (one, more) = page(&held, None, 1).unwrap().unwrap();
         assert_eq!((one.len(), more), (1, true));

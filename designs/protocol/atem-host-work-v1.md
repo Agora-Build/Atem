@@ -1037,9 +1037,10 @@ a revocation already interrupted), `pending` (not in force yet, and it can
 be later), `refused` (not in force, and never from this record). The
 record's `result` is `applied` when any effect is, `duplicate` when every
 effect is, else `pending` when any effect is, else `refused`
-(`ApplicationResult::of_effects`; a `control_records_result` whose record
-`result` doesn't follow from its `effects` this way is malformed, and the
-client core refuses it). **Consumers
+(`ApplicationResult::of_effects`; **for Astation**, amended for step 4: a
+`control_records_result` whose record `result` doesn't follow from its
+`effects` this way is malformed, and the client core refuses it).
+**Consumers
 read `effects`, not only `result`**: a revoke that adds `interrupt_running:
 true` to one already applied is `applied` for its interrupt and `duplicate`
 for its revocation. For the revocation, `duplicate` means "already in force
@@ -1260,7 +1261,10 @@ while a release issued after it applies, an evicted hold replayed holds
 again, and an evicted revoke replayed is still a duplicate), each step with the `standing` of its record's principal after
 it. Each step's position is `{origin, feed_id, feed_seq}`; a state (v2)
 keeps one part per principal, naming its device list, its records the
-`[record_id, digest, issued_at]` triples that counted, oldest first.
+`[record_id, digest, issued_at]` triples that counted, oldest first
+(**for Astation**, amended for step 4: every sequence's `state` is v2,
+each step carries its `standing`, and two sequences and three records are
+new in the file; its steps' other fields are as they were).
 They run in `crates/atem-client/tests/vectors.rs`, in the bindings'
 `tests/control.rs` and in the Swift, Kotlin and WASM conformance suites;
 `scripts/check-r9-vectors.py` recomputes their cryptographic values
@@ -1436,7 +1440,7 @@ alerts.)
 | `session_id` | the task's target session (`ses-` and 12 characters) |
 | `task_id` | the task: a UUID v4 (a delegated task's id) |
 | `sender` | the delegated sender that enqueued the task: `member:<id>`, `service:<id>` or `host:<id>` (an id of 1-128 bytes of `[A-Za-z0-9._:-]`), as a receipt's provenance names it (session-v1 R9.14). Never `local` or `browser:` |
-| `reason` | why the outcome is unknown, for people: 1-256 bytes, not blank (something besides White_Space), no control or Cf character (`agent exited`, `write interrupted`, `deadline passed; outcome unknown`) |
+| `reason` | why the outcome is unknown, for people: 1-256 bytes, not blank (something besides White_Space; **for Astation**, amended for step 4), no control or Cf character (`agent exited`, `write interrupted`, `deadline passed; outcome unknown`) |
 | `created_at` | Unix ms on the host's wall clock: when the task became `outcome_unknown`. For people only: it orders nothing |
 | `more` | `true` when alerts follow this page; then the page isn't empty |
 
@@ -1463,10 +1467,11 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
     `alert_id` it read, until `more` is `false`. The cursor stays the
     `alert_id`; the host finds it and lists what follows it in `seq`. A page
     never carries its `after`.
-  - `atem_client::session::alerts::page` is the host's reference. Its
-    `limit` is the host's own (the request has none) and at least 1: a
-    limit of 0 is refused (`invalid_request`), since a page of no alert
-    with `more` true is a result no reader takes.
+  - `atem_client::session::alerts::page` is the host's reference
+    (**for Astation**, amended for step 4, with no effect on the wire): it
+    returns `invalid_request` for a limit outside 1 to 64, since a page of
+    no alert with `more` true, or of more than 64, is a result no reader
+    takes. The host passes 64, and no request carries a limit.
 - **An unknown cursor.** An `after` the host has no alert for (the alert
   ended, or never was) is `stale_target`, detail `unknown alert`; the caller
   lists again from the start (**Atem's choice of code, for Astation to
@@ -1526,7 +1531,8 @@ Vectors:
   and the `alerts` results. These are an empty page, a page, every delegated
   sender and the bounds, a later alert with an earlier `created_at` (valid:
   the order is `seq`'s), and each refusal, `local`, a browser grant, a
-  UUID v5 task and a blank `reason` among them.
+  UUID v5 task and, **for Astation** (amended for step 4), a blank `reason`
+  among them.
 - `fixtures/r9-vectors-push-hint.json`: the hints, and
   `outcome_unknown_invalid_facts` (a `local` and a browser grant's task,
   refused at open).
@@ -2277,7 +2283,7 @@ storage and its receipts are the host's.
 |---|---|---|
 | `Open{plain, sender}` | checks 1 to 6 passed; `sender` is `host:<host_id>` | step 7 |
 | `Pending{host_id, host_trust_gen}` | above | keeps it, not done; judges it again |
-| `Refused{reason, evidence}` | before the copy is shown to be the sender's: steps 1 to 4 (step 2's key part at a head this host holds, or for a key id this host never made), and step 5 on an object signed beyond this host's head | marks it done under `evidence = SHA-256(enc([jcs(body), sig, enc, ct]))` (`enc` and `ct` empty when absent); claims no id; tells nobody |
+| `Refused{reason, evidence}` | before the copy is shown to be the sender's: steps 1 to 4 (step 2's key part at a head this host holds, or for a key id this host never made (**for Astation**, amended for step 4)), and step 5 on an object signed beyond this host's head | marks it done under `evidence = SHA-256(enc([jcs(body), sig, enc, ct]))` (`enc` and `ct` empty when absent); claims no id; tells nobody |
 | `RefusedAuthenticated{object_id, reason, sender}` | steps 5 and 6, once step 4 showed the copy to be the sender's, intact; `sender` is `{host_id, host_trust_gen}`: the host, and the generation whose `add_host` key verified the copy (**for Astation**, amended for step 4) | marks it done; it claims `(sender.host_id, object_id)`; reports it to the sender as `{"kind":"status","object_id":<id>,"refused":"invalid_request"}`, whatever the reason (for a result, nothing is reported back) |
 | `Unavailable{error}` | a local failure: the key provider failed (the key missing, or not the one its kid names) | decides nothing; judges it again later |
 
@@ -2292,10 +2298,10 @@ comment 6810116314)**; design II.4.2,
 id)`, the key of the Station's puts (design II.4.3). Only a copy whose signature
 verified and whose sealed part its `sealed_hash` names (step 4) claims that
 pair: its verdict is Open, RefusedAuthenticated, Accepted or NotDelivered,
-and each names that sender (RefusedAuthenticated as `sender{host_id,
-host_trust_gen}`, where `host_trust_gen` only says which `add_host` key
-verified the copy and is no part of the claim; the others as
-`host:<host_id>`). A
+and each names that sender (**for Astation**, amended for step 4:
+RefusedAuthenticated as `sender{host_id, host_trust_gen}`, where
+`host_trust_gen` only says which `add_host` key verified the copy and is no
+part of the claim; the others as `host:<host_id>`). A
 later object from that sender with that `id` and the same `sealed_hash` (the
 body's field, so the sender may re-sign the same sealed part at a newer
 head) is a duplicate, acknowledged with the first verdict; one with another
