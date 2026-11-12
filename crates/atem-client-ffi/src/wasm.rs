@@ -319,6 +319,53 @@ pub fn ed25519_public_to_x25519(raw: Vec<u8>) -> JsResult<Vec<u8>> {
     )?))
 }
 
+// ------------------------------------------------------------ framing
+
+#[wasm_bindgen(js_name = framingUnicodeVersion)]
+pub fn framing_unicode_version() -> String {
+    crate::framing::framing_unicode_version()
+}
+
+/// `{escaped, barsAdded}`.
+#[wasm_bindgen(js_name = framingEscape)]
+pub fn framing_escape(text: String) -> JsResult<JsValue> {
+    to_js(&crate::framing::framing_escape(text))
+}
+
+#[wasm_bindgen(js_name = framingFoldsToMarker)]
+pub fn framing_folds_to_marker(line: String) -> bool {
+    crate::framing::framing_folds_to_marker(line)
+}
+
+/// A task's rendered size, as a JS number (`markJson` a host-work
+/// `MarkTask` or `undefined`, `contextJson` a JSON array of host-work
+/// `ContextSnapshot`s). A size-only preflight: compare it with 32,768, or
+/// with 28,672 when the task has attachments, which a message with a mark
+/// always has (its screenshot). The host stays authoritative.
+#[wasm_bindgen(js_name = framingCheckedLen)]
+pub fn framing_checked_len(
+    text: String,
+    mark_json: Option<String>,
+    context_json: String,
+) -> JsResult<f64> {
+    err(crate::framing::framing_checked_len(
+        text,
+        mark_json,
+        context_json,
+    ))
+    .map(|n| n as f64)
+}
+
+/// The vectors' prompt rendered with a tag (`tagBits` a `BigInt`: 60 bits
+/// don't fit a JS number). Never in a shipped package.
+#[cfg(feature = "test-vectors")]
+#[wasm_bindgen(js_name = framingRenderForVectors)]
+pub fn framing_render_for_vectors(input_json: String, tag_bits: u64) -> JsResult<String> {
+    err(crate::framing::framing_render_for_vectors(
+        input_json, tag_bits,
+    ))
+}
+
 // ------------------------------------------------------------ the log
 
 #[wasm_bindgen]

@@ -56,8 +56,8 @@ impl HostBridge {
         }
         // A session this runtime started for a route stays that route's
         // candidate until its launch project is known (its worker's record
-        // is read a pass after it starts): a message in that window must not
-        // start a second one.
+        // is read when the runtime adds the session, else at a later pass):
+        // a message in that window must not start a second one.
         let store = self.work.store.as_ref().unwrap();
         for session in sessions
             .values()

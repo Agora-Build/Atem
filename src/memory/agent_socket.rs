@@ -3842,9 +3842,12 @@ mod tests {
         make_private(&run_b);
         let agent = cred_agent_process(&home, &run_a, &dir.path().join("a.log"));
         let socket_a = sock(&run_a);
-        assert!(eventually(
-            || CredAgentClient::at(socket_a.clone()).is_running()
-        ));
+        // Serving, not just listening: its socket accepts from the moment it
+        // is bound, while the agent still records it and inspects it for
+        // its watch, which an unreadable directory fails (the agent exits,
+        // its lock freed). Only a served request proves it got past that.
+        let serving = || CredAgentClient::at(socket_a.clone()).status().is_ok();
+        assert!(eventually(serving), "the agent never answered");
         let pid = agent.0.id();
         // Its socket directory can't be entered: nobody can connect, yet the
         // agent itself can't tell (not a NotFound) and keeps its lock.
