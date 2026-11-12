@@ -15,8 +15,11 @@
 //! its scan cursor, and adopts the next state only once that transaction
 //! committed; if the transaction fails, it applies the record again to the
 //! state it kept, which gives the same results and actions. It resumes
-//! with [`ControlState::from_parts`], the device list giving the account
-//! and genesis. [`ControlState::to_json`] and [`ControlState::from_json`]
+//! with [`ControlState::from_parts`] for its pinned device list, which
+//! loads that list's parts only and reports an earlier pairing's leftover
+//! rows to delete ([`LoadedParts::foreign`]); at a live re-pair the host
+//! deletes the old list's rows in the transaction that adopts the new
+//! list's empty state. [`ControlState::to_json`] and [`ControlState::from_json`]
 //! carry the same parts whole, for a store that keeps one value. A state
 //! belongs to one device list (its account and genesis); re-pairing starts
 //! a new one (II.3.1, "After a freeze").
@@ -82,18 +85,21 @@
 //!    feed, the Station or a carrier that rewrites its pages such as the
 //!    `:8080` proxy, which signs no release, could re-serve an evicted
 //!    release at a fresh position and lift a hold in force). It is
-//!    `refused` and kept as evidence ([`Why::PossibleReplay`]); a
-//!    legitimate one is issued after the floor, since a Station's
-//!    `issued_at` for a principal's covers and releases only rises. A
+//!    `refused` and kept as evidence ([`Why::PossibleReplay`]). A cover
+//!    or release applies when it was issued after every evicted record of
+//!    that principal, which a Station meets for every record it signed
+//!    itself when each cover or release it signs for a principal is issued
+//!    after every record it signed for it before. A
 //!    stop never meets the floor: a `hold` applies as any hold (an
 //!    evicted one replayed holds again, which grants nothing), and a
 //!    `revoke` or `interrupt_running` replayed is a `duplicate` (a
 //!    revocation and its interrupts are final). A revoked principal's
-//!    cover and release are inert already (rule 7). The residual: after a
-//!    switch to a Station whose clock lags the floor, its covers and
-//!    releases are refused as possible replays until its `issued_at`
-//!    passes the floor, which fails safe (holds stay, nothing new
-//!    starts). An evicted manager's copy whose signer was removed since
+//!    cover and release are inert already (rule 7). The residual: a
+//!    Station whose clock lags the floor (after a switch to it, or after
+//!    another Station's record issued ahead of its clock was evicted) has
+//!    its covers and releases refused as possible replays until its
+//!    `issued_at` passes the floor, which fails safe (holds stay, nothing
+//!    new starts). An evicted manager's copy whose signer was removed since
 //!    comes back `refused` as evidence (verified against today's list),
 //!    and changes nothing.
 //! 2. **Verification.** A `Pending` verdict is `pending`; a `Refused` one
@@ -188,7 +194,10 @@ const STATE_VERSION: u64 = 2;
 /// channel, which is bound to no feed. A record is read at its own feed's
 /// position only when `origin` and `feed_id` are its body's; otherwise
 /// `apply` treats it as read at no position (a Station that copies another
-/// Station's `feed_id` gets no position in that feed).
+/// Station's `feed_id` gets no position in that feed). **Host rule:**
+/// `origin` is the host's own configured Station origin, the feed it
+/// syncs, never one taken from a page or a record: that is what bounds a
+/// part's `order` (one entry per origin).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeedPos {
     pub origin: String,
@@ -508,6 +517,16 @@ pub struct Coverage {
     pub feed_id: String,
 }
 
+/// What [`ControlState::from_parts`] loaded: the state of the device list
+/// it was given, and the principals whose stored parts name another list
+/// (an earlier pairing's leftovers), never loaded: delete their rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedParts {
+    pub state: ControlState,
+    /// Sorted.
+    pub foreign: Vec<String>,
+}
+
 /// A host's control state (the module docs give the rules).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlState {
@@ -755,10 +774,7 @@ impl Part {
             )?
         };
         // Its device list: the state's.
-        let account = o["account_id"]
-            .as_str()
-            .ok_or(Error::Malformed("control state part account_id"))?;
-        let genesis = hash(&o["genesis_hash"], "control state part genesis_hash")?;
+        let (account, genesis) = part_list(value)?;
         if account != account_id || genesis != *genesis_hash {
             return Err(Error::GenesisMismatch);
         }
@@ -901,8 +917,9 @@ impl ControlState {
         // the bound evicted, may be an evicted record replayed: `feed_seq`
         // isn't signed, so whoever serves the feed could re-serve one at a
         // fresh position. Refused, as evidence (ruling T4a). A legitimate
-        // one is issued after it (a Station's `issued_at` for a principal's
-        // covers and releases only rises). Never a stop (ruling T4d): a
+        // one is issued after every record of the principal its Station
+        // signed before, so after the floor unless another Station's record
+        // issued ahead of it was evicted. Never a stop (ruling T4d): a
         // hold applies as any hold, a replayed one only holding again, and
         // a revoke or interrupt replayed is a duplicate (both are final).
         // Nor a revoked principal's: rule 7 makes its cover and release
@@ -1028,48 +1045,71 @@ impl ControlState {
         Some(part.to_json(is_host(principal), &self.account_id, &self.genesis_hash))
     }
 
-    /// The state of `list`'s device list made of `parts` (each
-    /// [`ControlState::part`] with its principal, in any order), read
-    /// strictly: each principal once, its part of `list`'s account and
-    /// genesis (else [`Error::GenesisMismatch`]: after a re-pair the old
-    /// list's parts never load, so a recurring service id inherits nothing),
-    /// exactly its kind's form, its types and grammars, and its invariants
-    /// (an interrupt only after a revocation; the revocation's and the
+    /// The state of `list`'s device list (the pinned list the caller
+    /// holds; never inferred from the parts) made of the `parts` of that
+    /// list (each [`ControlState::part`] with its principal, in any order),
+    /// and the principals whose parts name another account or genesis
+    /// (ruling T4e). Those are an earlier pairing's leftovers, such as the
+    /// rows a live re-pair didn't delete: never loaded, so a service id
+    /// that recurs in the new list inherits no revoke, hold or coverage,
+    /// and reported in [`LoadedParts::foreign`] for the host to delete. The
+    /// list's own parts are read strictly: each principal once (a key
+    /// given twice fails, whichever list its parts name), exactly its
+    /// kind's form, its types and grammars, and its invariants (an
+    /// interrupt only after a revocation; the revocation's and the
     /// coverage's cover records among its records; an evicted floor only
     /// with full records; one feed per origin in `order`; sorted unique
-    /// `revoke_seq`s; no empty list or map).
+    /// `revoke_seq`s; no empty list or map). A part whose device list can't
+    /// be read (no `account_id`, a `genesis_hash` that isn't hex) might be
+    /// the list's own, so it fails too: nothing is skipped unless it names
+    /// another list. Never [`Error::GenesisMismatch`].
     pub fn from_parts(
         list: &Membership,
         parts: impl IntoIterator<Item = (String, Value)>,
-    ) -> Result<Self> {
+    ) -> Result<LoadedParts> {
         let parts: Vec<(String, Value)> = parts.into_iter().collect();
-        Self::assemble(
+        let (state, foreign) = Self::assemble(
             list.account_id().to_owned(),
             list.genesis_hash(),
             parts.iter().map(|(p, part)| (p.as_str(), part)),
-        )
+            true,
+        )?;
+        Ok(LoadedParts { state, foreign })
     }
 
+    /// The state of `account_id`/`genesis_hash` made of `parts`; a part of
+    /// another list is skipped and its principal returned when
+    /// `skip_foreign`, else it fails ([`Error::GenesisMismatch`]).
     fn assemble<'a>(
         account_id: String,
         genesis_hash: Hash32,
         parts: impl Iterator<Item = (&'a str, &'a Value)>,
-    ) -> Result<Self> {
+        skip_foreign: bool,
+    ) -> Result<(Self, Vec<String>)> {
         let mut principals = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        let mut foreign = Vec::new();
         for (principal, value) in parts {
-            let part = Part::from_json(principal, value, &account_id, &genesis_hash)?;
-            if principals
-                .insert(principal.to_owned(), Arc::new(part))
-                .is_some()
-            {
+            if !seen.insert(principal) {
                 return Err(Error::Malformed("control state principal given twice"));
             }
+            if skip_foreign {
+                let (account, genesis) = part_list(value)?;
+                if account != account_id || genesis != genesis_hash {
+                    foreign.push(principal.to_owned());
+                    continue;
+                }
+            }
+            let part = Part::from_json(principal, value, &account_id, &genesis_hash)?;
+            principals.insert(principal.to_owned(), Arc::new(part));
         }
-        Ok(ControlState {
+        foreign.sort();
+        let state = ControlState {
             account_id,
             genesis_hash,
             principals,
-        })
+        };
+        Ok((state, foreign))
     }
 
     /// The whole state's durable form: every part by principal, sorted.
@@ -1116,12 +1156,28 @@ impl ControlState {
             .to_owned();
         let genesis_hash = hash(&o["genesis_hash"], "control state genesis_hash")?;
         let principals = object(&o["principals"], "control state principals")?;
-        Self::assemble(
+        let (state, _) = Self::assemble(
             account_id,
             genesis_hash,
             principals.iter().map(|(p, part)| (p.as_str(), part)),
-        )
+            false,
+        )?;
+        Ok(state)
     }
+}
+
+/// The device list a part names: its `account_id` and `genesis_hash`.
+fn part_list(value: &Value) -> Result<(&str, Hash32)> {
+    let o = object(value, "control state part")?;
+    let account = o
+        .get("account_id")
+        .and_then(Value::as_str)
+        .ok_or(Error::Malformed("control state part account_id"))?;
+    let genesis = o
+        .get("genesis_hash")
+        .map(|g| hash(g, "control state part genesis_hash"))
+        .unwrap_or(Err(Error::Malformed("control state part genesis_hash")))?;
+    Ok((account, genesis))
 }
 
 /// Whether `principal` (a canonical name) is a host principal's.
@@ -4097,15 +4153,20 @@ mod control_state_tests {
         for (p, part) in &parts {
             assert_eq!(&json["principals"][p], part, "{p}");
         }
+        let loaded = ControlState::from_parts(&fx.list, parts.clone()).unwrap();
+        assert_eq!(loaded.state, state);
+        assert!(loaded.foreign.is_empty());
+        let reversed: Vec<_> = parts.iter().rev().cloned().collect();
         assert_eq!(
-            ControlState::from_parts(&fx.list, parts.clone()).unwrap(),
+            ControlState::from_parts(&fx.list, reversed).unwrap().state,
             state
         );
-        let reversed: Vec<_> = parts.iter().rev().cloned().collect();
-        assert_eq!(ControlState::from_parts(&fx.list, reversed).unwrap(), state);
         assert_eq!(
             ControlState::from_parts(&fx.list, Vec::new()).unwrap(),
-            fx.state()
+            LoadedParts {
+                state: fx.state(),
+                foreign: Vec::new()
+            }
         );
         assert_eq!(state.part("service:svc-3"), None);
 
@@ -4128,7 +4189,9 @@ mod control_state_tests {
                 store.insert(p.clone(), t.next.part(&p).unwrap());
             }
             kept = t.next;
-            let loaded = ControlState::from_parts(&fx.list, store.clone()).unwrap();
+            let loaded = ControlState::from_parts(&fx.list, store.clone())
+                .unwrap()
+                .state;
             assert_eq!(loaded, kept, "{}", rec.record_id());
         }
         assert_eq!(kept, state);
@@ -4913,12 +4976,26 @@ mod control_state_tests {
         assert_eq!(ControlState::from_json(&state.to_json()).unwrap(), state);
     }
 
+    /// The parts of `state`, by principal.
+    fn parts_of(state: &ControlState) -> Vec<(String, Value)> {
+        state
+            .principals()
+            .into_iter()
+            .map(|p| {
+                let part = state.part(&p).unwrap();
+                (p, part)
+            })
+            .collect()
+    }
+
     /// Parts carry their device list's account and genesis: after a re-pair
     /// (a new genesis), the old list's parts never load, so a service id
     /// that recurs in the new list doesn't inherit the old revoke, hold or
-    /// coverage. The whole state reads only parts of its own list.
+    /// coverage. `from_parts` loads only the list it is given and reports
+    /// the others' keys for the host to delete (ruling T4e). The whole
+    /// state reads only parts of its own list.
     #[test]
-    fn parts_of_another_device_list_are_refused_after_a_re_pair() {
+    fn parts_of_another_device_list_are_skipped_and_reported_after_a_re_pair() {
         let fx = Fx::new();
         let mut state = fx.state();
         let s1 = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A);
@@ -4930,36 +5007,40 @@ mod control_state_tests {
             at(A, 3),
             0,
         );
-        let parts: Vec<(String, Value)> = state
-            .principals()
-            .into_iter()
-            .map(|p| {
-                let part = state.part(&p).unwrap();
-                assert_eq!(part["account_id"], json!(ACCOUNT), "{p}");
-                assert_eq!(
-                    part["genesis_hash"],
-                    json!(fx.list.genesis_hash().to_hex()),
-                    "{p}"
-                );
-                (p, part)
-            })
-            .collect();
-        assert_eq!(
-            ControlState::from_parts(&fx.list, parts.clone()).unwrap(),
-            state
-        );
+        let parts = parts_of(&state);
+        for (p, part) in &parts {
+            assert_eq!(part["account_id"], json!(ACCOUNT), "{p}");
+            assert_eq!(
+                part["genesis_hash"],
+                json!(fx.list.genesis_hash().to_hex()),
+                "{p}"
+            );
+        }
+        let loaded = ControlState::from_parts(&fx.list, parts.clone()).unwrap();
+        assert_eq!(loaded.state, state);
+        assert!(loaded.foreign.is_empty());
 
         // Re-paired: the same account, a new genesis, svc-1 and svc-2 again.
         let repaired = Fx::with_genesis_at(ACCOUNT, T0 + 1);
         assert_ne!(repaired.list.genesis_hash(), fx.list.genesis_hash());
         assert!(repaired.list.member("svc-1").is_some());
-        for parts in [parts.clone(), parts[..1].to_vec(), parts[1..].to_vec()] {
-            assert!(ControlState::from_parts(&repaired.list, parts).is_err());
-        }
         let other = Fx::account("acct-test-2");
-        assert!(ControlState::from_parts(&other.list, parts.clone()).is_err());
-        // The new list starts with nothing in force for the recurring ids.
-        let fresh = repaired.state();
+        for list in [&repaired.list, &other.list] {
+            // Every part foreign: the list's empty state, every key reported.
+            let loaded = ControlState::from_parts(list, parts.clone()).unwrap();
+            assert_eq!(loaded.state, ControlState::new(list));
+            assert_eq!(loaded.foreign, vec![service("svc-1"), service("svc-2")],);
+            // In any order, and a subset reports its own keys.
+            let reversed: Vec<_> = parts.iter().rev().cloned().collect();
+            let loaded = ControlState::from_parts(list, reversed).unwrap();
+            assert_eq!(loaded.foreign, vec![service("svc-1"), service("svc-2")]);
+            let loaded = ControlState::from_parts(list, parts[1..].to_vec()).unwrap();
+            assert_eq!(loaded.foreign, vec![service("svc-2")]);
+        }
+        // The recurring ids inherit nothing.
+        let fresh = ControlState::from_parts(&repaired.list, parts.clone())
+            .unwrap()
+            .state;
         for p in ["service:svc-1", "service:svc-2"] {
             assert_eq!(fresh.standing(p), Standing::default(), "{p}");
         }
@@ -4983,5 +5064,129 @@ mod control_state_tests {
             edit(&mut bad);
             assert!(ControlState::from_json(&bad).is_err(), "{bad}");
         }
+    }
+
+    /// A store mixing the current list's parts with an old list's leftovers
+    /// (a live re-pair whose old rows weren't deleted) loads the current
+    /// list's: its revoke, interrupt and hold stay in force; the old parts
+    /// are reported, never loaded (ruling T4e).
+    #[test]
+    fn a_mixed_store_keeps_the_current_lists_parts_and_reports_the_old() {
+        // The old list: svc-2 covered and held, host-a interrupted.
+        let mut old = Fx::new();
+        let r = old.revoke_host(false);
+        let mut before = old.state();
+        before.adopt(
+            &old.svc(1, "svc-2", "svc-2", C::Cover, A),
+            &old.list,
+            at(A, 1),
+            0,
+        );
+        before.adopt(
+            &old.svc(2, "svc-2", "svc-2", C::Hold, A),
+            &old.list,
+            at(A, 2),
+            0,
+        );
+        before.adopt(&old.host(3, "mac", r), &old.list, None, old.list.head().seq);
+        // The current list: svc-1 held, then revoked with its interrupt.
+        let current = Fx::with_genesis_at(ACCOUNT, T0 + 1);
+        let mut now = current.state();
+        let s1 = |n: u32, action: ControlAction| current.svc(n, "svc-1", "svc-1", action, A);
+        assert_eq!(
+            now.adopt(&s1(4, C::Hold), &current.list, at(A, 1), 0),
+            held("svc-1")
+        );
+        assert_eq!(
+            now.adopt(&s1(5, revoke(true)), &current.list, at(A, 2), 0)
+                .record_result,
+            R::Applied
+        );
+        // The store: the current list's svc-1 beside the old svc-2 and host-a.
+        let mut store = parts_of(&before);
+        store.extend(parts_of(&now));
+        for order in [store.clone(), store.iter().rev().cloned().collect()] {
+            let loaded = ControlState::from_parts(&current.list, order).unwrap();
+            assert_eq!(loaded.state, now);
+            assert_eq!(
+                loaded.foreign,
+                vec!["host:host-a".to_string(), service("svc-2")]
+            );
+            assert_eq!(
+                loaded.state.standing(&service("svc-1")),
+                standing(Some(rid(5)), &[rid(5)], true, None)
+            );
+            assert_eq!(
+                loaded.state.standing(&service("svc-2")),
+                Standing::default()
+            );
+        }
+    }
+
+    /// A part of the current list that fails strict reading still fails the
+    /// load, and so does a part whose device list can't be read or a
+    /// principal given twice: nothing is skipped that might be the current
+    /// list's (ruling T4e).
+    #[test]
+    fn a_damaged_part_of_the_current_list_still_fails() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        state.adopt(
+            &fx.svc(1, "svc-1", "svc-1", C::Hold, A),
+            &fx.list,
+            at(A, 1),
+            0,
+        );
+        let (p, part) = parts_of(&state).remove(0);
+        let damaged = |edit: &dyn Fn(&mut Value)| {
+            let mut part = part.clone();
+            edit(&mut part);
+            vec![(p.clone(), part)]
+        };
+        let cases: Vec<(&str, Vec<(String, Value)>)> = vec![
+            ("held not a boolean", damaged(&|j| j["held"] = json!(1))),
+            ("no records", damaged(&|j| j["records"] = json!([]))),
+            (
+                "genesis not hex",
+                damaged(&|j| j["genesis_hash"] = json!("zz")),
+            ),
+            (
+                "no account",
+                damaged(&|j| {
+                    j.as_object_mut().unwrap().remove("account_id");
+                }),
+            ),
+            ("not an object", vec![(p.clone(), json!([]))]),
+            (
+                "given twice",
+                vec![(p.clone(), part.clone()), (p.clone(), part.clone())],
+            ),
+            (
+                "a name that is no principal",
+                vec![("svc-1".into(), part.clone())],
+            ),
+        ];
+        for (what, parts) in cases {
+            assert!(ControlState::from_parts(&fx.list, parts).is_err(), "{what}");
+        }
+        // A foreign part beside it changes nothing about that: the
+        // damaged part names this list.
+        let other = Fx::with_genesis_at(ACCOUNT, T0 + 1);
+        let mut theirs = other.state();
+        theirs.adopt(
+            &other.svc(2, "svc-2", "svc-2", C::Hold, A),
+            &other.list,
+            at(A, 1),
+            0,
+        );
+        let mut mixed = parts_of(&theirs);
+        assert_eq!(
+            ControlState::from_parts(&fx.list, mixed.clone())
+                .unwrap()
+                .foreign,
+            vec![service("svc-2")]
+        );
+        mixed.extend(damaged(&|j| j["held"] = json!(1)));
+        assert!(ControlState::from_parts(&fx.list, mixed).is_err());
     }
 }

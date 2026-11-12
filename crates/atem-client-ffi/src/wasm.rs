@@ -968,32 +968,6 @@ impl ControlStateHandle {
             crate::control::ControlStateHandle::from_json(log.0.clone(), state_json),
         )?))
     }
-    /// A state made of its parts, for `log`'s device list
-    /// (`ControlStateHandle::from_parts`): `parts` is an array of
-    /// `{principal, partJson}`, in any order.
-    #[wasm_bindgen(js_name = fromParts)]
-    pub fn from_parts(log: &MembershipLog, parts: JsValue) -> JsResult<ControlStateHandle> {
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct P {
-            principal: String,
-            part_json: String,
-        }
-        let parts = items::<P>(
-            &parts,
-            &["principal", "partJson"],
-            "parts [{principal, partJson}]",
-        )?
-        .into_iter()
-        .map(|p| crate::types::ControlStatePart {
-            principal: p.principal,
-            part_json: p.part_json,
-        })
-        .collect();
-        Ok(ControlStateHandle(err(
-            crate::control::ControlStateHandle::from_parts(log.0.clone(), parts),
-        )?))
-    }
     /// The durable state (canonical JSON): store the next state's after
     /// every `apply`.
     #[wasm_bindgen(js_name = toJson)]
@@ -1058,6 +1032,64 @@ impl ControlStateHandle {
             next: transition.next,
             touched: transition.touched,
         })
+    }
+}
+
+/// The state of `log`'s device list made of the stored parts that name it
+/// (`control_state_from_parts`): `parts` is an array of `{principal,
+/// partJson}`, in any order. Returns a `ControlLoadedParts`: `state` (a
+/// `ControlStateHandle`) and `foreign`, the principals whose parts name
+/// another account or genesis, skipped: delete their rows.
+#[wasm_bindgen(js_name = controlStateFromParts)]
+pub fn control_state_from_parts(
+    log: &MembershipLog,
+    parts: JsValue,
+) -> JsResult<ControlLoadedParts> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct P {
+        principal: String,
+        part_json: String,
+    }
+    let parts = items::<P>(
+        &parts,
+        &["principal", "partJson"],
+        "parts [{principal, partJson}]",
+    )?
+    .into_iter()
+    .map(|p| crate::types::ControlStatePart {
+        principal: p.principal,
+        part_json: p.part_json,
+    })
+    .collect();
+    let loaded = err(crate::control::control_state_from_parts(
+        log.0.clone(),
+        parts,
+    ))?;
+    Ok(ControlLoadedParts {
+        state: loaded.state,
+        foreign: loaded.foreign,
+    })
+}
+
+/// What `controlStateFromParts` gives (`crate::control::ControlLoadedParts`).
+#[wasm_bindgen]
+pub struct ControlLoadedParts {
+    state: Arc<crate::control::ControlStateHandle>,
+    foreign: Vec<String>,
+}
+
+#[wasm_bindgen]
+impl ControlLoadedParts {
+    /// The state of the device list, made of its own parts.
+    #[wasm_bindgen(getter)]
+    pub fn state(&self) -> ControlStateHandle {
+        ControlStateHandle(self.state.clone())
+    }
+    /// The principals whose parts name another list (sorted): delete them.
+    #[wasm_bindgen(getter)]
+    pub fn foreign(&self) -> Vec<String> {
+        self.foreign.clone()
     }
 }
 

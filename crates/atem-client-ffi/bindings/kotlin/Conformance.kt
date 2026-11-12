@@ -751,7 +751,7 @@ fun main(args: Array<String>) {
             val text = canonicalJson(Json.write(q["state"]))
             eq(state.toJson(), text, label)
             eq(ControlStateHandle.fromJson(logL(), text).toJson(), text, label)
-            eq(ControlStateHandle.fromParts(logL(), controlPartsOf(state)).toJson(), text, "$label from its parts")
+            eq(controlStateFromParts(logL(), controlPartsOf(state)).state.toJson(), text, "$label from its parts")
         }
         // Only its own device list's state, exactly as written.
         val text = canonicalJson(Json.write(ctl["sequences"][0]["state"]))
@@ -765,17 +765,27 @@ fun main(args: Array<String>) {
         val parts = controlPartsOf(state)
         eq(parts.map { it.principal }, listOf("host:host-a", "service:svc-discord"))
         for (part in parts) eq(part.partJson, canonicalJson(Json.write(q["state"]["principals"][part.principal])), part.principal)
-        eq(ControlStateHandle.fromParts(logL(), parts.reversed()).toJson(), state.toJson(), "any order")
-        eq(ControlStateHandle.fromParts(logL(), emptyList()).toJson(), ControlStateHandle(logL()).toJson(), "none")
+        eq(controlStateFromParts(logL(), parts.reversed()).state.toJson(), state.toJson(), "any order")
+        eq(controlStateFromParts(logL(), emptyList()).state.toJson(), ControlStateHandle(logL()).toJson(), "none")
         eq(state.part("service:svc-other"), null)
         eq(controlStandingOf(state.standing("member:dev-mac")), mapOf("held" to false, "interrupted" to emptyList<String>()))
-        throwsCode("stored_invalid") { ControlStateHandle.fromParts(logL(), listOf(parts[1], parts[1])) }
-        throwsCode("malformed") { ControlStateHandle.fromParts(logL(), listOf(ControlStatePart("service:svc-discord", "{"))) }
-        throwsCode("stored_invalid") { ControlStateHandle.fromParts(logL(), listOf(ControlStatePart("service:svc-discord", parts[0].partJson))) }
-        throwsCode("stored_invalid") { ControlStateHandle.fromParts(logL(), listOf(ControlStatePart("svc-discord", parts[1].partJson))) }
-        // Each part names its device list: another one's never loads (a re-pair).
-        throwsCode("account_mismatch") { ControlStateHandle.fromParts(logL(), listOf(ControlStatePart("service:svc-discord", parts[1].partJson.replace("\"acct-test-1\"", "\"acct-other\"")))) }
-        throwsCode("genesis_mismatch") { ControlStateHandle.fromParts(logL(), listOf(ControlStatePart("host:host-a", parts[0].partJson.replace(ctl["genesis_hash"].s(), "11".repeat(32))))) }
+        throwsCode("stored_invalid") { controlStateFromParts(logL(), listOf(parts[1], parts[1])) }
+        throwsCode("malformed") { controlStateFromParts(logL(), listOf(ControlStatePart("service:svc-discord", "{"))) }
+        throwsCode("stored_invalid") { controlStateFromParts(logL(), listOf(ControlStatePart("service:svc-discord", parts[0].partJson))) }
+        throwsCode("stored_invalid") { controlStateFromParts(logL(), listOf(ControlStatePart("svc-discord", parts[1].partJson))) }
+        // A part whose device list can't be read might be this list's: it fails.
+        throwsCode("stored_invalid") { controlStateFromParts(logL(), listOf(ControlStatePart("host:host-a", parts[0].partJson.replace(ctl["genesis_hash"].s(), "zz")))) }
+        // Each part names its device list: another list's (an earlier pairing's
+        // leftovers) is skipped and reported for deletion, this list's loads.
+        val otherAccount = ControlStatePart("service:svc-discord", parts[1].partJson.replace("\"acct-test-1\"", "\"acct-other\""))
+        val otherGenesis = ControlStatePart("host:host-a", parts[0].partJson.replace(ctl["genesis_hash"].s(), "11".repeat(32)))
+        val mixed = controlStateFromParts(logL(), listOf(otherGenesis, parts[1]))
+        eq(mixed.foreign, listOf("host:host-a"))
+        eq(mixed.state.principals(), listOf("service:svc-discord"))
+        eq(mixed.state.part("service:svc-discord"), parts[1].partJson)
+        val foreign = controlStateFromParts(logL(), listOf(otherAccount, otherGenesis))
+        eq(foreign.foreign, listOf("host:host-a", "service:svc-discord"))
+        eq(foreign.state.toJson(), ControlStateHandle(logL()).toJson())
     }
     check("control records: a failed commit loses no effect (apply leaves its handle as it was)") {
         val state = ControlStateHandle(logL())

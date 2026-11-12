@@ -20,7 +20,8 @@ use atem_client::provider::KeyId;
 use atem_client_ffi::AtemError;
 use atem_client_ffi::control::{
     ControlStateHandle, build_control_record, control_record_signing_input,
-    control_record_with_signature, parse_control_record, verify_control_record,
+    control_record_with_signature, control_state_from_parts, parse_control_record,
+    verify_control_record,
 };
 use atem_client_ffi::log::MembershipLog;
 use atem_client_ffi::provider::{AppKeyProvider, ProviderError};
@@ -502,17 +503,19 @@ fn the_sequences_through_the_state_handle() {
             let want = &q["state"]["principals"][&part.principal];
             assert_eq!(part.part_json, atem_client::canonical::jcs(want).unwrap());
         }
-        let back = ControlStateHandle::from_parts(l.clone(), parts).unwrap();
-        assert_eq!(back.to_json(), text, "{label}: from its parts");
+        let back = control_state_from_parts(l.clone(), parts).unwrap();
+        assert_eq!(back.state.to_json(), text, "{label}: from its parts");
+        assert!(back.foreign.is_empty(), "{label}");
     }
 }
 
 /// A state loads from its parts, one per principal in any order, exactly
 /// as written and only for its own device list (each part names its
-/// account and genesis: after a re-pair the old list's parts never load):
-/// a principal given twice, a part that isn't strict JSON, out of its
-/// kind's form, of another device list or not exactly as `part` writes it,
-/// or parts larger in all than a whole state may be, are refused.
+/// account and genesis: another list's parts, an earlier pairing's
+/// leftovers, are skipped and reported, never loaded): a principal given
+/// twice, a part that isn't strict JSON, out of its kind's form, whose
+/// device list can't be read or not exactly as `part` writes it, or parts
+/// larger in all than a whole state may be, are refused.
 #[test]
 fn the_state_loads_from_its_parts_only_as_written() {
     let v = Vectors::load();
@@ -538,14 +541,16 @@ fn the_state_loads_from_its_parts_only_as_written() {
     );
     let reversed: Vec<_> = parts.iter().rev().cloned().collect();
     assert_eq!(
-        ControlStateHandle::from_parts(l.clone(), reversed)
+        control_state_from_parts(l.clone(), reversed)
             .unwrap()
+            .state
             .to_json(),
         state.to_json()
     );
     assert_eq!(
-        ControlStateHandle::from_parts(l.clone(), Vec::new())
+        control_state_from_parts(l.clone(), Vec::new())
             .unwrap()
+            .state
             .to_json(),
         ControlStateHandle::new(l.clone()).to_json()
     );
@@ -555,7 +560,7 @@ fn the_state_loads_from_its_parts_only_as_written() {
         other => panic!("{other:?}"),
     };
     let load = |parts: Vec<ControlStatePart>| {
-        ControlStateHandle::from_parts(l.clone(), parts)
+        control_state_from_parts(l.clone(), parts)
             .map(|_| ())
             .map_err(stored)
     };
@@ -586,28 +591,48 @@ fn the_state_loads_from_its_parts_only_as_written() {
             )],
             "too_large",
         ),
+        // A part whose device list can't be read might be this list's.
         (
             vec![with(
-                "service:svc-discord",
-                &svc.replace("\"acct-test-1\"", "\"acct-other\""),
+                "host:host-a",
+                &host.replace(&genesis_hash().to_hex(), "zz"),
             )],
-            "account_mismatch",
-        ),
-        (
-            vec![
-                parts[1].clone(),
-                with(
-                    "host:host-a",
-                    &host.replace(&genesis_hash().to_hex(), &"11".repeat(32)),
-                ),
-            ],
-            "genesis_mismatch",
+            "stored_invalid",
         ),
     ];
     for (parts, want) in cases {
         assert_eq!(load(parts.clone()), Err(want.to_owned()), "{parts:?}");
     }
-    // Re-paired (another genesis): the old list's parts load into nothing.
+    // Parts of another account or genesis (an earlier pairing's leftovers)
+    // are skipped and reported, beside this list's, whose stops load.
+    let other_account = with(
+        "service:svc-discord",
+        &svc.replace("\"acct-test-1\"", "\"acct-other\""),
+    );
+    let other_genesis = with(
+        "host:host-a",
+        &host.replace(&genesis_hash().to_hex(), &"11".repeat(32)),
+    );
+    let loaded =
+        control_state_from_parts(l.clone(), vec![parts[1].clone(), other_genesis]).unwrap();
+    assert_eq!(loaded.foreign, ["host:host-a"]);
+    assert_eq!(
+        loaded.state.principals(),
+        ["service:svc-discord"],
+        "this list's part loaded"
+    );
+    assert_eq!(
+        loaded.state.part("service:svc-discord".into()),
+        Some(svc.clone())
+    );
+    let loaded = control_state_from_parts(l.clone(), vec![other_account]).unwrap();
+    assert_eq!(loaded.foreign, ["service:svc-discord"]);
+    assert_eq!(
+        loaded.state.to_json(),
+        ControlStateHandle::new(l.clone()).to_json()
+    );
+    // Re-paired (another genesis): the old list's parts load into nothing,
+    // every key reported for deletion.
     let other = MembershipLog::verify(
         ACCOUNT.into(),
         v.hash("SUB1").to_hex(),
@@ -615,11 +640,11 @@ fn the_state_loads_from_its_parts_only_as_written() {
         now(),
     )
     .unwrap();
+    let loaded = control_state_from_parts(other.clone(), parts).unwrap();
+    assert_eq!(loaded.foreign, ["host:host-a", "service:svc-discord"]);
     assert_eq!(
-        ControlStateHandle::from_parts(other, parts)
-            .map(|_| ())
-            .map_err(stored),
-        Err("genesis_mismatch".to_owned())
+        loaded.state.to_json(),
+        ControlStateHandle::new(other).to_json()
     );
 }
 

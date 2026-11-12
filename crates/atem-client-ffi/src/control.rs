@@ -29,8 +29,8 @@
 //!   transaction as your own state, use the next handle once that
 //!   transaction committed (keep the old one if it failed: applying the
 //!   record again gives the same results), and load the state with
-//!   `from_json` or `from_parts` at start. `standing` is what is in force
-//!   for one principal.
+//!   `from_json` or `control_state_from_parts` at start. `standing` is what
+//!   is in force for one principal.
 //!
 //! Errors: a record its parse refuses is `Invalid{code}` (`malformed`,
 //! `unknown_field`, `field_not_allowed`, `not_for_host_principal`,
@@ -59,7 +59,8 @@ use crate::types::{
 };
 
 /// Largest control state `ControlStateHandle::from_json` reads, checked
-/// before parsing (and the most `from_parts` reads, its parts in all). A
+/// before parsing (and the most `control_state_from_parts` reads, its parts
+/// in all). A
 /// principal's part keeps at most 256 counted record ids (about 125 bytes
 /// each, `MAX_RECORD_IDS`) and one order entry per Station origin, and
 /// only principals of the device list count records (at most 1,024
@@ -315,7 +316,7 @@ fn applied_info(applied: Applied) -> ControlApplied {
 /// it committed, use `next` from then on; if it failed, keep the handle
 /// you applied on and apply the record again: the same results and
 /// actions come back, so no effect is lost. Load the state with
-/// `from_json` or `from_parts` at start; never re-apply records to rebuild
+/// `from_json` or `control_state_from_parts` at start; never re-apply records to rebuild
 /// it (a record verified then may not verify against today's list, and
 /// idempotency is by the records kept). Each principal keeps at most 256
 /// counted record ids, oldest evicted first (never its revocation's record
@@ -440,91 +441,6 @@ impl ControlStateHandle {
         Ok(Self::wrap(state))
     }
 
-    /// The state of `log`'s device list made of `parts` (each principal's
-    /// `part`, in any order), read as `from_json` reads a whole state.
-    /// Every part names its device list. `Stored{code}`: `too_large` (over
-    /// 64 MiB in all), `malformed` (a part that isn't strict JSON or not an
-    /// object), `account_mismatch`, `genesis_mismatch` (a part of another
-    /// device list: after a re-pair, start the new list with `new` and
-    /// clear the old parts; a recurring service id then inherits nothing),
-    /// `stored_invalid` (a principal given twice, a name that is no
-    /// principal, a part its rules refuse or not exactly `part()`'s form).
-    /// Nothing is loaded then; on any code but `genesis_mismatch` keep the
-    /// work it guards stopped.
-    #[cfg_attr(feature = "uniffi", uniffi::constructor)]
-    pub fn from_parts(log: Arc<MembershipLog>, parts: Vec<ControlStatePart>) -> Result<Arc<Self>> {
-        let total: usize = parts
-            .iter()
-            .map(|p| p.principal.len() + p.part_json.len())
-            .sum();
-        if total > MAX_CONTROL_STATE_JSON {
-            return Err(AtemError::stored(
-                "too_large",
-                format!(
-                    "a control state's parts are at most {MAX_CONTROL_STATE_JSON} bytes in all"
-                ),
-            ));
-        }
-        let mut values = Vec::with_capacity(parts.len());
-        for part in parts {
-            let value = parse_strict(
-                part.part_json.as_bytes(),
-                MAX_CONTROL_STATE_JSON,
-                Numbers::IntegersOnly,
-            )
-            .map_err(|e| {
-                AtemError::stored(
-                    "malformed",
-                    format!("{}'s part: not strict JSON: {e:?}", part.principal),
-                )
-            })?;
-            values.push((part.principal, value));
-        }
-        let list = log.lock();
-        // Each part of this device list, named as `from_json` names it.
-        for (principal, value) in &values {
-            let object = value.as_object().ok_or_else(|| {
-                AtemError::stored("malformed", format!("{principal}'s part: not an object"))
-            })?;
-            if object.get("account_id").and_then(Value::as_str) != Some(list.account_id()) {
-                return Err(AtemError::stored(
-                    "account_mismatch",
-                    format!("{principal}'s part is of another account"),
-                ));
-            }
-            let genesis = object
-                .get("genesis_hash")
-                .and_then(Value::as_str)
-                .and_then(|h| Hash32::from_hex(h).ok());
-            if genesis != Some(list.genesis_hash()) {
-                return Err(AtemError::stored(
-                    "genesis_mismatch",
-                    format!("{principal}'s part is of another device list"),
-                ));
-            }
-        }
-        let state = ControlState::from_parts(&list, values.iter().cloned())
-            .map_err(|e| AtemError::stored("stored_invalid", e.to_string()))?;
-        drop(list);
-        // Exactly the export: another spelling of a part is refused.
-        for (principal, value) in &values {
-            let exact = match (
-                state.part(principal).map(|p| canonical(&p)),
-                canonical(value),
-            ) {
-                (Some(Ok(ours)), Ok(theirs)) => ours == theirs,
-                _ => false,
-            };
-            if !exact {
-                return Err(AtemError::stored(
-                    "stored_invalid",
-                    format!("{principal}'s part isn't exactly part()'s form"),
-                ));
-            }
-        }
-        Ok(Self::wrap(state))
-    }
-
     /// The durable state: canonical JSON (`"v": 2`, one part per
     /// principal). Store the next state's after every `apply` (or its
     /// touched parts), in the same transaction as what you do with the
@@ -570,7 +486,9 @@ impl ControlStateHandle {
     /// result, what the host does, and whether to keep the record as
     /// evidence, with the next state (`ControlTransition`). This handle
     /// doesn't change. `pos` is where it was read: a feed the caller syncs
-    /// (`None` over a channel). A record whose body names another `origin`
+    /// (`None` over a channel), its `origin` the Station origin the caller
+    /// syncs from, never one taken from a page or the record (that bounds
+    /// a part's `order`). A record whose body names another `origin`
     /// or `feed_id` than `pos` counts as read at no position: its hold
     /// still applies, its cover and release don't. `host_applied_seq` is
     /// host-work's applied device-list `seq` (a host principal's interrupt
@@ -605,4 +523,87 @@ impl ControlStateHandle {
             next: Self::wrap(transition.next),
         })
     }
+}
+
+/// What `control_state_from_parts` loaded: the state of the device list it
+/// was given, and the principals whose stored parts name another list.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct ControlLoadedParts {
+    /// The state of `log`'s device list, made of its own parts.
+    pub state: Arc<ControlStateHandle>,
+    /// The principals whose parts name another account or genesis (an
+    /// earlier pairing's leftovers, such as the rows a live re-pair didn't
+    /// delete), sorted: never loaded, so a service id that recurs in the
+    /// new list inherits nothing. Delete their rows.
+    pub foreign: Vec<String>,
+}
+
+/// The state of `log`'s device list (the pinned list you hold; never
+/// inferred from the parts) made of the stored `parts` that name that list
+/// (each principal's `part`, in any order), read as `from_json` reads a
+/// whole state; the parts naming another account or genesis are skipped
+/// and reported in `foreign` for you to delete (an earlier pairing's
+/// leftovers: at a live re-pair, delete the old list's rows in the
+/// transaction that adopts `new`). `Stored{code}`: `too_large` (over 64
+/// MiB in all), `malformed` (a part that isn't strict JSON),
+/// `stored_invalid` (a principal given twice, a name that is no principal,
+/// a part whose device list can't be read, one of this list its rules
+/// refuse, or not exactly `part()`'s form). Nothing is loaded then; keep
+/// the work it guards stopped and never start again from an empty state.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn control_state_from_parts(
+    log: Arc<MembershipLog>,
+    parts: Vec<ControlStatePart>,
+) -> Result<ControlLoadedParts> {
+    let total: usize = parts
+        .iter()
+        .map(|p| p.principal.len() + p.part_json.len())
+        .sum();
+    if total > MAX_CONTROL_STATE_JSON {
+        return Err(AtemError::stored(
+            "too_large",
+            format!("a control state's parts are at most {MAX_CONTROL_STATE_JSON} bytes in all"),
+        ));
+    }
+    let mut values = Vec::with_capacity(parts.len());
+    for part in parts {
+        let value = parse_strict(
+            part.part_json.as_bytes(),
+            MAX_CONTROL_STATE_JSON,
+            Numbers::IntegersOnly,
+        )
+        .map_err(|e| {
+            AtemError::stored(
+                "malformed",
+                format!("{}'s part: not strict JSON: {e:?}", part.principal),
+            )
+        })?;
+        values.push((part.principal, value));
+    }
+    let loaded = ControlState::from_parts(&log.lock(), values.iter().cloned())
+        .map_err(|e| AtemError::stored("stored_invalid", e.to_string()))?;
+    // Exactly the export: another spelling of a loaded part is refused.
+    for (principal, value) in values
+        .iter()
+        .filter(|(p, _)| loaded.foreign.binary_search(p).is_err())
+    {
+        let exact = match (
+            loaded.state.part(principal).map(|p| canonical(&p)),
+            canonical(value),
+        ) {
+            (Some(Ok(ours)), Ok(theirs)) => ours == theirs,
+            _ => false,
+        };
+        if !exact {
+            return Err(AtemError::stored(
+                "stored_invalid",
+                format!("{principal}'s part isn't exactly part()'s form"),
+            ));
+        }
+    }
+    Ok(ControlLoadedParts {
+        state: ControlStateHandle::wrap(loaded.state),
+        foreign: loaded.foreign,
+    })
 }

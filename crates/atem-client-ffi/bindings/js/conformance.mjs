@@ -592,7 +592,7 @@ check("control records: every sequence's per-effect results, standing and state 
     const text = m.canonicalJson(str(q.state));
     eq(state.toJson(), text, q.label);
     eq(m.ControlStateHandle.fromJson(logL(), text).toJson(), text, q.label);
-    eq(m.ControlStateHandle.fromParts(logL(), controlPartsOf(state)).toJson(), text, `${q.label} from its parts`);
+    eq(m.controlStateFromParts(logL(), controlPartsOf(state)).state.toJson(), text, `${q.label} from its parts`);
   }
   // Only its own device list's state, exactly as written.
   const text = m.canonicalJson(str(ctl.sequences[0].state));
@@ -606,19 +606,29 @@ check("control records: a state's parts per principal load in any order, only as
   const parts = controlPartsOf(state);
   same(parts.map((p) => p.principal), ["host:host-a", "service:svc-discord"]);
   for (const part of parts) eq(part.partJson, m.canonicalJson(str(q.state.principals[part.principal])), part.principal);
-  eq(m.ControlStateHandle.fromParts(logL(), [...parts].reverse()).toJson(), state.toJson(), "any order");
-  eq(m.ControlStateHandle.fromParts(logL(), []).toJson(), new m.ControlStateHandle(logL()).toJson(), "none");
+  eq(m.controlStateFromParts(logL(), [...parts].reverse()).state.toJson(), state.toJson(), "any order");
+  eq(m.controlStateFromParts(logL(), []).state.toJson(), new m.ControlStateHandle(logL()).toJson(), "none");
   eq(state.part("service:svc-other"), undefined);
   same(controlStandingOf(state.standing("member:dev-mac")), { held: false, interrupted: [] });
-  throwsCode(() => m.ControlStateHandle.fromParts(logL(), [parts[1], parts[1]]), "stored_invalid");
-  throwsCode(() => m.ControlStateHandle.fromParts(logL(), [{ principal: "service:svc-discord", partJson: "{" }]), "malformed");
-  throwsCode(() => m.ControlStateHandle.fromParts(logL(), [{ principal: "service:svc-discord", partJson: parts[0].partJson }]), "stored_invalid");
-  throwsCode(() => m.ControlStateHandle.fromParts(logL(), [{ principal: "svc-discord", partJson: parts[1].partJson }]), "stored_invalid");
+  throwsCode(() => m.controlStateFromParts(logL(), [parts[1], parts[1]]), "stored_invalid");
+  throwsCode(() => m.controlStateFromParts(logL(), [{ principal: "service:svc-discord", partJson: "{" }]), "malformed");
+  throwsCode(() => m.controlStateFromParts(logL(), [{ principal: "service:svc-discord", partJson: parts[0].partJson }]), "stored_invalid");
+  throwsCode(() => m.controlStateFromParts(logL(), [{ principal: "svc-discord", partJson: parts[1].partJson }]), "stored_invalid");
   // A part names exactly its two fields.
-  throwsCode(() => m.ControlStateHandle.fromParts(logL(), [{ ...parts[1], part_json: parts[1].partJson }]), "malformed");
-  // Each part names its device list: another one's never loads (a re-pair).
-  throwsCode(() => m.ControlStateHandle.fromParts(logL(), [{ principal: "service:svc-discord", partJson: parts[1].partJson.replace('"acct-test-1"', '"acct-other"') }]), "account_mismatch");
-  throwsCode(() => m.ControlStateHandle.fromParts(logL(), [{ principal: "host:host-a", partJson: parts[0].partJson.replace(ctl.genesis_hash, "11".repeat(32)) }]), "genesis_mismatch");
+  throwsCode(() => m.controlStateFromParts(logL(), [{ ...parts[1], part_json: parts[1].partJson }]), "malformed");
+  // A part whose device list can't be read might be this list's: it fails.
+  throwsCode(() => m.controlStateFromParts(logL(), [{ principal: "host:host-a", partJson: parts[0].partJson.replace(ctl.genesis_hash, "zz") }]), "stored_invalid");
+  // Each part names its device list: another list's (an earlier pairing's
+  // leftovers) is skipped and reported for deletion, this list's loads.
+  const otherAccount = { principal: "service:svc-discord", partJson: parts[1].partJson.replace('"acct-test-1"', '"acct-other"') };
+  const otherGenesis = { principal: "host:host-a", partJson: parts[0].partJson.replace(ctl.genesis_hash, "11".repeat(32)) };
+  const mixed = m.controlStateFromParts(logL(), [otherGenesis, parts[1]]);
+  same(mixed.foreign, ["host:host-a"]);
+  same(mixed.state.principals(), ["service:svc-discord"]);
+  eq(mixed.state.part("service:svc-discord"), parts[1].partJson);
+  const foreign = m.controlStateFromParts(logL(), [otherAccount, otherGenesis]);
+  same(foreign.foreign, ["host:host-a", "service:svc-discord"]);
+  eq(foreign.state.toJson(), new m.ControlStateHandle(logL()).toJson());
 });
 check("control records: a failed commit loses no effect (apply leaves its handle as it was)", () => {
   const state = new m.ControlStateHandle(logL());

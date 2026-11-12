@@ -6138,10 +6138,11 @@ fn host_work_control() {
             parts.len(),
             q["state"]["principals"].as_object().unwrap().len()
         );
-        assert_eq!(
-            ControlState::from_parts(&l, parts).unwrap(),
-            state,
-            "{label}: from_parts"
+        let loaded = ControlState::from_parts(&l, parts).unwrap();
+        assert_eq!(loaded.state, state, "{label}: from_parts");
+        assert!(
+            loaded.foreign.is_empty(),
+            "{label}: no part of another list"
         );
         run.pass(format!(
             "{label}: every step's results, standing and touched, the state, its round trip and its parts"

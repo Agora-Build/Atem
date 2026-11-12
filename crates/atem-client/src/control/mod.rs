@@ -43,7 +43,7 @@ pub use relay::{
 };
 pub use state::{
     ApplicationResult, Applied, ControlState, Coverage, EffectKind, EffectResult, FeedPos,
-    HostAction, MAX_RECORD_IDS, Standing, Transition, Why,
+    HostAction, LoadedParts, MAX_RECORD_IDS, Standing, Transition, Why,
 };
 pub use verify::{
     ControlCheck, PendingReason, RefusalReason, VerifiedControl, VerifiedSigner, verify_control,

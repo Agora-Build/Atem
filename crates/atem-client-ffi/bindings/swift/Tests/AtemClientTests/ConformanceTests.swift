@@ -959,7 +959,7 @@ final class ConformanceTests: XCTestCase {
                 let text = try canonicalJson(json: js(q["state"]!))
                 try eq(state.toJson(), text, label)
                 try eq(try ControlStateHandle.fromJson(log: try logL(), stateJson: text).toJson(), text, label)
-                try eq(try ControlStateHandle.fromParts(log: try logL(), parts: controlPartsOf(state)).toJson(), text, "\(label) from its parts")
+                try eq(try controlStateFromParts(log: try logL(), parts: controlPartsOf(state)).state.toJson(), text, "\(label) from its parts")
             }
             // Only its own device list's state, exactly as written.
             let text = try canonicalJson(json: js(o(a(ctl["sequences"])[0])["state"]!))
@@ -975,17 +975,27 @@ final class ConformanceTests: XCTestCase {
             for part in parts {
                 try eq(part.partJson, try canonicalJson(json: js(o(o(q["state"])["principals"])[part.principal]!)), part.principal)
             }
-            try eq(try ControlStateHandle.fromParts(log: try logL(), parts: parts.reversed()).toJson(), state.toJson(), "any order")
-            try eq(try ControlStateHandle.fromParts(log: try logL(), parts: []).toJson(), ControlStateHandle(log: try logL()).toJson(), "none")
+            try eq(try controlStateFromParts(log: try logL(), parts: parts.reversed()).state.toJson(), state.toJson(), "any order")
+            try eq(try controlStateFromParts(log: try logL(), parts: []).state.toJson(), ControlStateHandle(log: try logL()).toJson(), "none")
             try eq(state.part(principal: "service:svc-other"), nil)
             try eq(canon(controlStandingOf(state.standing(principal: "member:dev-mac"))), canon(["held": false, "interrupted": [String]()] as [String: Any]))
-            try throwsCode("stored_invalid") { _ = try ControlStateHandle.fromParts(log: try logL(), parts: [parts[1], parts[1]]) }
-            try throwsCode("malformed") { _ = try ControlStateHandle.fromParts(log: try logL(), parts: [ControlStatePart(principal: "service:svc-discord", partJson: "{")]) }
-            try throwsCode("stored_invalid") { _ = try ControlStateHandle.fromParts(log: try logL(), parts: [ControlStatePart(principal: "service:svc-discord", partJson: parts[0].partJson)]) }
-            try throwsCode("stored_invalid") { _ = try ControlStateHandle.fromParts(log: try logL(), parts: [ControlStatePart(principal: "svc-discord", partJson: parts[1].partJson)]) }
-            // Each part names its device list: another one's never loads (a re-pair).
-            try throwsCode("account_mismatch") { _ = try ControlStateHandle.fromParts(log: try logL(), parts: [ControlStatePart(principal: "service:svc-discord", partJson: parts[1].partJson.replacingOccurrences(of: "\"acct-test-1\"", with: "\"acct-other\""))]) }
-            try throwsCode("genesis_mismatch") { _ = try ControlStateHandle.fromParts(log: try logL(), parts: [ControlStatePart(principal: "host:host-a", partJson: parts[0].partJson.replacingOccurrences(of: s(ctl["genesis_hash"]), with: String(repeating: "11", count: 32)))]) }
+            try throwsCode("stored_invalid") { _ = try controlStateFromParts(log: try logL(), parts: [parts[1], parts[1]]) }
+            try throwsCode("malformed") { _ = try controlStateFromParts(log: try logL(), parts: [ControlStatePart(principal: "service:svc-discord", partJson: "{")]) }
+            try throwsCode("stored_invalid") { _ = try controlStateFromParts(log: try logL(), parts: [ControlStatePart(principal: "service:svc-discord", partJson: parts[0].partJson)]) }
+            try throwsCode("stored_invalid") { _ = try controlStateFromParts(log: try logL(), parts: [ControlStatePart(principal: "svc-discord", partJson: parts[1].partJson)]) }
+            // A part whose device list can't be read might be this list's: it fails.
+            try throwsCode("stored_invalid") { _ = try controlStateFromParts(log: try logL(), parts: [ControlStatePart(principal: "host:host-a", partJson: parts[0].partJson.replacingOccurrences(of: s(ctl["genesis_hash"]), with: "zz"))]) }
+            // Each part names its device list: another list's (an earlier pairing's
+            // leftovers) is skipped and reported for deletion, this list's loads.
+            let otherAccount = ControlStatePart(principal: "service:svc-discord", partJson: parts[1].partJson.replacingOccurrences(of: "\"acct-test-1\"", with: "\"acct-other\""))
+            let otherGenesis = ControlStatePart(principal: "host:host-a", partJson: parts[0].partJson.replacingOccurrences(of: s(ctl["genesis_hash"]), with: String(repeating: "11", count: 32)))
+            let mixed = try controlStateFromParts(log: try logL(), parts: [otherGenesis, parts[1]])
+            try eq(mixed.foreign, ["host:host-a"])
+            try eq(mixed.state.principals(), ["service:svc-discord"])
+            try eq(mixed.state.part(principal: "service:svc-discord"), parts[1].partJson)
+            let foreign = try controlStateFromParts(log: try logL(), parts: [otherAccount, otherGenesis])
+            try eq(foreign.foreign, ["host:host-a", "service:svc-discord"])
+            try eq(foreign.state.toJson(), ControlStateHandle(log: try logL()).toJson())
         }
         check("control records: a failed commit loses no effect (apply leaves its handle as it was)") {
             let state = ControlStateHandle(log: try logL())

@@ -1029,7 +1029,7 @@ record! {
 record! {
     /// One principal's part of a control state, as `ControlStateHandle::part`
     /// writes it (canonical JSON), for a store that keeps one row per
-    /// principal (`ControlStateHandle::from_parts`).
+    /// principal (`control_state_from_parts`).
     pub struct ControlStatePart {
         /// `service:<id>` or `host:<host_id>`.
         pub principal: String,
@@ -1041,7 +1041,9 @@ record! {
     /// Where a record was read: its feed's Station `origin` and `feed_id`,
     /// and its position (`feed_seq`). None over a channel. A record counts
     /// as read at its own feed's position only when its body names the
-    /// same `origin` and `feed_id`.
+    /// same `origin` and `feed_id`. `origin` is always the Station origin
+    /// you sync the feed from (a host's own configured Station), never one
+    /// taken from a page or the record: that bounds a part's `order`.
     pub struct ControlFeedPos {
         pub origin: String,
         pub feed_id: String,

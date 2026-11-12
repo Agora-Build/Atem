@@ -1063,17 +1063,20 @@ The rules:
    that isn't revoked, under a `record_id` it doesn't count and issued no
    later than its evicted floor, is `refused` as a possible replay
    (`possible_replay`) and kept as evidence, whatever its position. A
-   legitimate one is issued after the floor: a Station's `issued_at` for
-   a principal's covers and releases only rises (its duty below). A stop
+   cover or release applies when it was issued after every evicted record
+   of that principal, which a Station meets for every record it signed
+   itself when its `issued_at` for the principal only rises (its duty
+   below). A stop
    never meets the floor (a stop always wins): a `hold` applies as any
    hold, so an evicted hold replayed holds again, which grants nothing;
    a `revoke` or an `interrupt_running` replayed is a `duplicate` (a
    revocation and its interrupts are final, the revoking record pinned),
    and a new one is a stop. A revoked principal's cover and release are
-   inert already (rule 7). **The residual:** after a switch to a Station
-   whose clock lags the floor, its covers and releases are refused as
-   possible replays until its `issued_at` passes the floor. That fails
-   safe: holds stay, and nothing new starts. An evicted manager's copy
+   inert already (rule 7). **The residual:** a Station whose clock lags
+   the floor (after a switch to it, or after another Station's record
+   issued ahead of its clock was evicted) has its covers and releases
+   refused as possible replays until its `issued_at` passes the floor.
+   That fails safe: holds stay, and nothing new starts. An evicted manager's copy
    whose signer was removed since comes back `refused` as evidence
    (verified against today's list) and changes nothing.
 2. **Verification** (above): `pending` waits for every effect; `refused` is
@@ -1116,20 +1119,31 @@ The rules:
 **The state, per principal** (planned with the feeds; for Astation's
 agreement with the bound above). A host's control state is one part per
 principal (`ControlState::part`, `from_parts`; the bindings'
-`ControlStateHandle::{principals, part, from_parts}`), and a record changes
+`ControlStateHandle::{principals, part}` and `control_state_from_parts`), and a record changes
 at most its own principal's: the transition names it (`touched`), and the
 host writes only that part in the record's transaction (one row per
 principal), never the whole state. **Every part names its device list**
-(`account_id`, `genesis_hash`; ruling T4c), and `from_parts` refuses a part
-of another list (the bindings' `account_mismatch`, `genesis_mismatch`), as
-`from_json` refuses a whole state: after a re-pair the old list's parts
-never load, so a service id that recurs in the new list inherits no
-revoke, hold or coverage. A part keeps its records that counted oldest
+(`account_id`, `genesis_hash`; ruling T4c). `from_parts` loads the parts
+of the list it is given (the host's pinned device list, never inferred
+from the parts) and **skips every part of another account or genesis,
+reporting its principal for the host to delete** (ruling T4e): an earlier
+pairing's leftovers never load, so a service id that recurs in the new list
+inherits no revoke, hold or coverage, while the current list's parts beside
+them (a live re-pair whose old rows weren't deleted yet) load with their
+stops. A part of the current list that fails strict reading, or one whose
+device list can't be read, still fails the load; nothing is skipped
+unless it names another list. At a live re-pair the host deletes the old
+list's rows in the transaction that adopts the new list's empty state.
+A whole state (`from_json`) is one list's: a part of another list in it
+is refused. A part keeps its records that counted oldest
 first, `[record_id, digest, issued_at]` triples, its evicted floor, and
 what is in force for the principal; the order a release follows keeps
 **one feed per Station origin** (ruling T4b): another feed of the origin
 replaces it, never the covering feed's, the only one a release reads (a
-reset's new feed starts after its cover). A part is so at most 256 records
+reset's new feed starts after its cover). **Host rule:** a position's
+`origin` is the host's own configured Station origin, the feed it syncs,
+never one taken from a page or a record; that is what bounds `order` (a
+record whose body names another origin is read at no position). A part is so at most 256 records
 of some 125 bytes (about 32 KB), one order entry per origin the
 principal's holds and releases were read from (one, for a host syncing its
 own Station), and a few hundred bytes more. The whole state (`to_json`,
@@ -1176,12 +1190,14 @@ ordering can't stop a key holder. The Station's duties:
   principal is newer, by `(issued_at, record_id)`, than any cover issued
   for that principal before, a handed-over integration's included (the
   handover carries the last cover's `issued_at`). **Its releases' too
-  (with the bound of rule 1; needs Astation's agreement):** a Station's
-  `issued_at` for a principal's covers and releases only rises, since a
-  cover or release issued no later than a record a host evicted is
+  (with the bound of rule 1; needs Astation's agreement):** each cover
+  or release a Station signs for a principal is issued after every
+  record it signed for that principal before, its holds included, since
+  a cover or release issued no later than a record a host evicted is
   refused there as a possible replay; a snapshot's covers and releases
-  signed anew are issued now, never with an old `issued_at`. Holds need
-  no such duty: the floor never refuses a stop.
+  signed anew are issued now, never with an old `issued_at`, and a
+  handover carries the newest `issued_at` of any record signed for the
+  principal. Holds need no such duty: the floor never refuses a stop.
 - A Station re-issues covers only for principals it currently covers.
 - A Station that hands an integration over stops signing for it, and the
   key leaves with it (or the integration is created again as a new
