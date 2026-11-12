@@ -5500,6 +5500,31 @@ fn control_vectors(book: &Book) -> Value {
         vec![(l, own_())],
     );
 
+    // ---- records issued after the evicted floor (decision 19, ruling T4a)
+    for (n, label, action, note) in [
+        (
+            80,
+            "F1_hold",
+            C::Hold,
+            "a pause issued after every record the bound evicted: it applies",
+        ),
+        (
+            81,
+            "F2_hold",
+            C::Hold,
+            "another pause issued after them, while one is in force: a duplicate",
+        ),
+        (
+            82,
+            "F3_release",
+            C::Release,
+            "a resume issued after them: it applies",
+        ),
+    ] {
+        let body = g.svc(n, SVC, action, FEED_A, "owner");
+        g.push(label, note, "svc-discord", &body, vec![(l, own_())]);
+    }
+
     // ---- sequences: one host's control state, step by step
     let a = |n| Some((FEED_A, n));
     let b = |n| Some((FEED_B, n));
@@ -5779,22 +5804,28 @@ fn control_vectors(book: &Book) -> Value {
             ],
         ),
         g.sequence_on(
-            "Q19_evicted_hold_holds_again",
-            "a principal keeps at most 256 counted record ids, oldest first, never evicting the coverage's cover (decision 19, for Astation's agreement): from svc-discord covered, held and full (S1_cover, S2_hold, then 254 copies of S2_hold), S3_release lifts the hold and evicts S2_hold, which replayed holds again (a stop its key holder could sign anew); S3_release, still counted, is a duplicate that lifts nothing; a later release does",
+            "Q19_evicted_records_replayed_are_refused",
+            "a principal keeps at most 256 counted record ids, oldest first, never evicting the coverage's cover, and its evicted floor is the newest issued_at evicted (decision 19, ruling T4a, for Astation's agreement): from svc-discord covered, held, released and full (S1_cover, S2_hold, S3_release, then 253 copies of S3_release), F1_hold holds and evicts S2_hold, F2_hold evicts S3_release; S3_release re-served at a fresh position of the covering feed is a possible replay, refused and kept as evidence, so the hold stays (feed_seq isn't signed: a carrier that controls positions could otherwise lift it); F3_release, issued after the floor, lifts it; S2_hold replayed is refused the same way (harmless: a hold the Station means now is issued after the floor)",
             Some((
-                &g.filled(&[("S1_cover", a(1)), ("S2_hold", a(2))], "S2_hold", "svc-discord", 254),
-                "S2_hold",
+                &g.filled(
+                    &[("S1_cover", a(1)), ("S2_hold", a(2)), ("S3_release", a(3))],
+                    "S3_release",
+                    "svc-discord",
+                    253,
+                ),
+                "S3_release",
             )),
             vec![
-                step("S3_release", a(3), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
-                step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
-                step("S3_release", a(3), applied("duplicate", &[("release", "duplicate")], none.clone(), false)),
-                step("S11_release", a(4), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+                step("F1_hold", a(4), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("F2_hold", a(5), applied("duplicate", &[("hold", "duplicate")], none.clone(), false)),
+                step("S3_release", a(6), applied("refused", &[("release", "refused")], none.clone(), true)),
+                step("F3_release", a(7), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+                step("S2_hold", a(8), applied("refused", &[("hold", "refused")], none.clone(), true)),
             ],
         ),
         g.sequence_on(
             "Q20_evicted_revoke_still_duplicate",
-            "the record that revoked a principal is never evicted; another revoke evicted and replayed is verified again and is still a duplicate: from svc-discord revoked and full (S4_revoke, M1_revoke, then 254 copies of S4_revoke), S5_revoke_interrupt adds the interrupt and evicts M1_revoke, which comes back a duplicate, as S4_revoke (pinned) and a later interrupt do",
+            "the record that revoked a principal is never evicted; another revoke evicted and replayed is verified again and is still a duplicate, since no evicted floor applies to a revoke or an interrupt (a replay of one is a duplicate, a new one a stop): from svc-discord revoked and full (S4_revoke, M1_revoke, then 254 copies of S4_revoke), S5_revoke_interrupt adds the interrupt and evicts M1_revoke, which comes back a duplicate, as S4_revoke (pinned) and a later interrupt do; a hold issued before the floor is ignored by rule 7 (refused, no evidence), not taken for a replay",
             Some((
                 &g.filled(&[("S4_revoke", a(4)), ("M1_revoke", a(5))], "S4_revoke", "svc-discord", 254),
                 "S4_revoke",
@@ -5813,6 +5844,7 @@ fn control_vectors(book: &Book) -> Value {
                 step("M1_revoke", a(7), applied("duplicate", &[("revocation", "duplicate")], none.clone(), false)),
                 step("S4_revoke", a(4), applied("duplicate", &[("revocation", "duplicate")], none.clone(), false)),
                 step("M2_interrupt", a(8), applied("duplicate", &[("interrupt", "duplicate")], none.clone(), false)),
+                step("S7_hold_after_revoke", a(9), applied("refused", &[("hold", "refused")], none.clone(), false)),
             ],
         ),
     ];
@@ -5822,7 +5854,7 @@ fn control_vectors(book: &Book) -> Value {
         "name": "r9-vectors-host-work-control",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part's `records` the [record_id, digest] pairs that counted, oldest first). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover (decision 19, for Astation's agreement).",
+        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part names its device list, account_id and genesis_hash, and its `records` are the [record_id, digest, issued_at] triples that counted, oldest first; `order` holds one feed per Station origin). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover, and raises the part's `evicted_floor` to the newest issued_at evicted; a cover, hold or release of a principal not revoked, under an id not counted and issued no later than the floor, is refused as a possible replay and kept as evidence (decision 19, ruling T4a, for Astation's agreement).",
         "account_id": "acct-test-1",
         "genesis_hash": genesis_hash().to_hex(),
         "stations": {

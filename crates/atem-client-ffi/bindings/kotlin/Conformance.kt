@@ -773,6 +773,9 @@ fun main(args: Array<String>) {
         throwsCode("malformed") { ControlStateHandle.fromParts(logL(), listOf(ControlStatePart("service:svc-discord", "{"))) }
         throwsCode("stored_invalid") { ControlStateHandle.fromParts(logL(), listOf(ControlStatePart("service:svc-discord", parts[0].partJson))) }
         throwsCode("stored_invalid") { ControlStateHandle.fromParts(logL(), listOf(ControlStatePart("svc-discord", parts[1].partJson))) }
+        // Each part names its device list: another one's never loads (a re-pair).
+        throwsCode("account_mismatch") { ControlStateHandle.fromParts(logL(), listOf(ControlStatePart("service:svc-discord", parts[1].partJson.replace("\"acct-test-1\"", "\"acct-other\"")))) }
+        throwsCode("genesis_mismatch") { ControlStateHandle.fromParts(logL(), listOf(ControlStatePart("host:host-a", parts[0].partJson.replace(ctl["genesis_hash"].s(), "11".repeat(32))))) }
     }
     check("control records: a failed commit loses no effect (apply leaves its handle as it was)") {
         val state = ControlStateHandle(logL())

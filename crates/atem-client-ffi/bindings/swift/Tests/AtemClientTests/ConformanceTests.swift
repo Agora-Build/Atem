@@ -983,6 +983,9 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("malformed") { _ = try ControlStateHandle.fromParts(log: try logL(), parts: [ControlStatePart(principal: "service:svc-discord", partJson: "{")]) }
             try throwsCode("stored_invalid") { _ = try ControlStateHandle.fromParts(log: try logL(), parts: [ControlStatePart(principal: "service:svc-discord", partJson: parts[0].partJson)]) }
             try throwsCode("stored_invalid") { _ = try ControlStateHandle.fromParts(log: try logL(), parts: [ControlStatePart(principal: "svc-discord", partJson: parts[1].partJson)]) }
+            // Each part names its device list: another one's never loads (a re-pair).
+            try throwsCode("account_mismatch") { _ = try ControlStateHandle.fromParts(log: try logL(), parts: [ControlStatePart(principal: "service:svc-discord", partJson: parts[1].partJson.replacingOccurrences(of: "\"acct-test-1\"", with: "\"acct-other\""))]) }
+            try throwsCode("genesis_mismatch") { _ = try ControlStateHandle.fromParts(log: try logL(), parts: [ControlStatePart(principal: "host:host-a", partJson: parts[0].partJson.replacingOccurrences(of: s(ctl["genesis_hash"]), with: String(repeating: "11", count: 32)))]) }
         }
         check("control records: a failed commit loses no effect (apply leaves its handle as it was)") {
             let state = ControlStateHandle(log: try logL())
@@ -2072,6 +2075,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 71)
+        XCTAssertEqual(passed, 72)
     }
 }

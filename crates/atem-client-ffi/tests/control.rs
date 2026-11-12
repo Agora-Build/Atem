@@ -508,9 +508,11 @@ fn the_sequences_through_the_state_handle() {
 }
 
 /// A state loads from its parts, one per principal in any order, exactly
-/// as written: a principal given twice, a part that isn't strict JSON, out
-/// of its kind's form or not exactly as `part` writes it, or parts larger
-/// in all than a whole state may be, are refused.
+/// as written and only for its own device list (each part names its
+/// account and genesis: after a re-pair the old list's parts never load):
+/// a principal given twice, a part that isn't strict JSON, out of its
+/// kind's form, of another device list or not exactly as `part` writes it,
+/// or parts larger in all than a whole state may be, are refused.
 #[test]
 fn the_state_loads_from_its_parts_only_as_written() {
     let v = Vectors::load();
@@ -584,10 +586,41 @@ fn the_state_loads_from_its_parts_only_as_written() {
             )],
             "too_large",
         ),
+        (
+            vec![with(
+                "service:svc-discord",
+                &svc.replace("\"acct-test-1\"", "\"acct-other\""),
+            )],
+            "account_mismatch",
+        ),
+        (
+            vec![
+                parts[1].clone(),
+                with(
+                    "host:host-a",
+                    &host.replace(&genesis_hash().to_hex(), &"11".repeat(32)),
+                ),
+            ],
+            "genesis_mismatch",
+        ),
     ];
     for (parts, want) in cases {
         assert_eq!(load(parts.clone()), Err(want.to_owned()), "{parts:?}");
     }
+    // Re-paired (another genesis): the old list's parts load into nothing.
+    let other = MembershipLog::verify(
+        ACCOUNT.into(),
+        v.hash("SUB1").to_hex(),
+        wires(&v, &["SUB1", "SUB2", "SUB3"]),
+        now(),
+    )
+    .unwrap();
+    assert_eq!(
+        ControlStateHandle::from_parts(other, parts)
+            .map(|_| ())
+            .map_err(stored),
+        Err("genesis_mismatch".to_owned())
+    );
 }
 
 /// A state loads only for its own device list, exactly as written; the
@@ -642,8 +675,9 @@ fn the_state_loads_only_as_written_for_its_own_list() {
         (
             edit(&|s| {
                 s["principals"]["host:host-a"] = json!({
+                    "account_id": ACCOUNT, "genesis_hash": genesis_hash().to_hex(),
                     "interrupted": [7, 7],
-                    "records": [["00000000-0000-4000-8000-000000000001", "11".repeat(32)]],
+                    "records": [["00000000-0000-4000-8000-000000000001", "11".repeat(32), 1]],
                 })
             }),
             "stored_invalid",
@@ -652,9 +686,17 @@ fn the_state_loads_only_as_written_for_its_own_list() {
         (
             edit(&|s| {
                 let ids: Vec<Value> = (0..=atem_client::control::MAX_RECORD_IDS)
-                    .map(|n| json!([format!("00000000-0000-4000-8000-{n:012x}"), "11".repeat(32)]))
+                    .map(|n| {
+                        json!([
+                            format!("00000000-0000-4000-8000-{n:012x}"),
+                            "11".repeat(32),
+                            1
+                        ])
+                    })
                     .collect();
-                s["principals"]["host:host-a"] = json!({"records": ids});
+                s["principals"]["host:host-a"] = json!({
+                    "account_id": ACCOUNT, "genesis_hash": genesis_hash().to_hex(), "records": ids,
+                });
             }),
             "stored_invalid",
         ),

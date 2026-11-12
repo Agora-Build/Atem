@@ -1114,7 +1114,7 @@ acknowledgments").
 | `parse_control_record(record_json)` | the body, field by field (strict JSON, at most 16 KiB, exactly the body's fields); no signature check |
 | `verify_control_record(log, record_json)` | against a verified `MembershipLog`: `Valid{signer, key_seq, head}` (`signer` `service:<id>` for the principal's own key, from the entry at `key_seq`; `member:<id>` for a current native manager), `Pending{reason}` (`principal_unknown`, `signer_unknown`, `revoke_not_in_list`: verify again after the list advances) or `Refused{reason}` (`wrong_account`, `bad_signature`, `key_mismatch`, `signer_not_allowed`, `removed_manager`, `host_key_signed`, `not_a_service`, `not_a_revoke`: keep it as evidence). A record the parse refuses is `Invalid{code}` |
 | `ControlStateHandle::new(log)`, `from_json(log, state_json)`, `to_json()`, `apply(record_json, log, pos, host_applied_seq)` | the reference control state of one device list, as a host keeps it. A handle never changes: `apply` verifies the record against `log` (the device list at the head of this transaction) and returns `ControlTransition{applied, next, touched}`, `applied` being `ControlApplied{result, effects, actions, evidence}`, `next` the state after the record, a new handle, and `touched` the principals whose part it changed (the record's, or none). `pos` is `ControlFeedPos{origin, feed_id, feed_seq}`, where the record was read; a record whose body names another `origin` or `feed_id` counts as read at no position (its hold still applies, its cover and release don't) |
-| `principals()`, `part(principal)`, `from_parts(log, parts)` | the state one part per principal, for a store that keeps a row per principal: `part` is a principal's canonical JSON (`None` when the state has none), `from_parts` loads `ControlStatePart{principal, part_json}`s in any order, read as strictly as `from_json`. Write the parts a transition `touched`; no other part changed |
+| `principals()`, `part(principal)`, `from_parts(log, parts)` | the state one part per principal, for a store that keeps a row per principal: `part` is a principal's canonical JSON (`None` when the state has none), `from_parts` loads `ControlStatePart{principal, part_json}`s in any order, read as strictly as `from_json`. Every part names its device list (`account_id`, `genesis_hash`): one of another list is `account_mismatch` or `genesis_mismatch`. Write the parts a transition `touched` (a touched principal always has a part in `next`); no other part changed |
 | `standing(principal)` | what is in force for `service:<id>` or `host:<host_id>`: `ControlStanding{revoked, interrupted, held, coverage}`: the revoking record's `record_id` (never for a host principal, whose revocation is a device-list entry), the revocations whose interrupt a record put in force (a service's revoking `record_id`, a host principal's `revoke_seq` in decimal), the hold, and `ControlCoverage{origin, feed_id}`, the covering feed. A principal the state holds nothing for has nothing in force |
 
 JS takes a body as a plain object with `ControlRecordBody`'s fields in
@@ -1168,22 +1168,33 @@ synchronized clock: it orders covers (below).
    `malformed`, `unsupported_version`, `account_mismatch`,
    `genesis_mismatch`, `stored_invalid`). `genesis_mismatch` after a
    re-pair means the stored state is the old device list's: the new list
-   starts with `new`. Parts carry no account: a store of parts belongs to
-   one device list, and a re-pair clears it and starts with `new`. On any
-   other code stop the work it guards and never start again from an empty
-   state. A `v` 1 state, the format before parts per principal, is
+   starts with `new`. Parts name their device list too, so a store of
+   another list's parts (a re-pair that didn't clear it) is
+   `genesis_mismatch` and never loads: a service id that recurs in the
+   new list inherits no revoke, hold or coverage; clear the old parts and
+   start with `new`. On any other code stop the work it guards and never
+   start again from an empty state. A `v` 1 state, the format before parts per principal, is
    `unsupported_version`: this version reads `v` 2 only.
 
 **Its size.** Each principal keeps at most 256 counted record ids (about
-110 bytes each, `MAX_RECORD_IDS`), the next evicting its oldest but never
-its revocation's record or the coverage's cover (**Atem's proposal, for
-Astation's agreement**, host-work-v1 §11.1 rule 1: an evicted record
-coming back is applied as a new one, and the only changes it can make
-are a replayed hold holding again and a release its own Station serves
-again at a later position of the covering feed). Only principals of the
-device list count records, so a state stays far under the 64 MiB that
-`from_json` and `from_parts` read (a larger one is `too_large`). The
-acknowledgment ledger doesn't prune in this version.
+125 bytes each, `MAX_RECORD_IDS`), the next evicting its oldest but never
+its revocation's record or the coverage's cover, and the order a release
+follows keeps one feed per Station origin: a part is about 32 KB at most,
+plus one order entry per origin (**Atem's proposal, for Astation's
+agreement**, host-work-v1 §11.1 rule 1 and "The state, per principal").
+**An evicted record that comes back grants nothing:** `feed_seq` isn't
+signed, so whoever serves a host the covering feed (you, or a carrier
+that rewrites your pages, such as Astation's `:8080` proxy) could
+otherwise re-serve an evicted release at a fresh position and lift a
+hold. A `cover`, `hold` or `release` of a principal that isn't revoked,
+under an id the state no longer counts and issued no later than the
+newest record evicted (the part's `evicted_floor`), is `refused` as a
+possible replay and kept as evidence. So your `issued_at` must only rise
+(your duty below): a record you sign now always applies. Revokes and
+interrupts are never refused for it (replayed, they are duplicates).
+Only principals of the device list count records, so a state stays far
+under the 64 MiB that `from_json` and `from_parts` read (a larger one is
+`too_large`). The acknowledgment ledger doesn't prune in this version.
 
 **Reading results.** `apply` gives the record's `result` and one result per
 effect it carries (`revocation`, `interrupt`, `hold`, `release`, `cover`).
@@ -1207,7 +1218,9 @@ trust model"):
 
 - Covers are ordered by `(issued_at, record_id)`: another Station's cover
   takes coverage only when strictly newer, and a cover never releases a
-  hold. Your covers' `issued_at` only rises: each cover you sign for a
+  hold. Your records' `issued_at` only rises (a `cover`, `hold` or
+  `release` issued no later than a record a host evicted is refused there
+  as a possible replay). Your covers' `issued_at` only rises: each cover you sign for a
   principal is newer than any cover issued for it before, a handed-over
   integration's included (the handover carries the last cover's
   `issued_at`). A cover that isn't newer than the coverage's takes

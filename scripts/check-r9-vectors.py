@@ -810,37 +810,47 @@ def check_host_work_control(file, data, report, context):
 
     def check_state(case, state, fill, what):
         """A state (v2: one part per principal): its account, each part's
-        records (one to 256 [record_id, digest] pairs, each id once, the
-        revocation's record and the coverage's cover among them), and each
-        digest: the SHA-256 of a record body of that principal with that id,
-        or, for an id no record of the file has, of the record `fill`'s
-        body under that id."""
+        device list (the file's account and genesis), its records (one to
+        256 [record_id, digest, issued_at] triples, each id once, the
+        revocation's record and the coverage's cover among them), an
+        evicted floor only with the records full, one feed per origin in
+        `order`, and each record: the SHA-256 of a record body of that
+        principal with that id and its issued_at, or, for an id no record of
+        the file has, of the record `fill`'s body under that id."""
         case.equal(state["v"], 2, f"{what}: v 2")
         case.equal((state["account_id"], state["genesis_hash"]), (data["account_id"], data["genesis_hash"]), f"{what}: the account")
         for principal, part in state["principals"].items():
+            case.equal((part["account_id"], part["genesis_hash"]), (data["account_id"], data["genesis_hash"]), f"{what} {principal}: its device list")
             records = part["records"]
-            ids = [record_id for record_id, _ in records]
-            case.check(1 <= len(records) <= MAX_RECORD_IDS and len(set(ids)) == len(ids), f"{what} {principal}: 1 to {MAX_RECORD_IDS} record ids, each once")
+            ids = [record[0] for record in records]
+            case.check(
+                1 <= len(records) <= MAX_RECORD_IDS and len(set(ids)) == len(ids) and all(len(r) == 3 for r in records),
+                f"{what} {principal}: 1 to {MAX_RECORD_IDS} [record_id, digest, issued_at], each id once",
+            )
             for pin in [part.get("revoked_by"), part.get("coverage", {}).get("cover", {}).get("record_id")]:
                 case.check(pin is None or pin in ids, f"{what} {principal}: its revocation's and cover's records kept")
+            if "evicted_floor" in part:
+                case.equal(len(records), MAX_RECORD_IDS, f"{what} {principal}: an evicted floor, its records full")
+            case.check(all(len(feeds) == 1 for feeds in part.get("order", {}).values()), f"{what} {principal}: one feed per origin in order")
             copies, wrong = 0, []
-            for record_id, digest in records:
+            for record_id, digest, issued_at in records:
                 texts = jcs_by_record_id.get((principal, record_id), set())
                 if texts:
+                    bodies = {sha256(t.encode()).hex(): json.loads(t) for t in texts}
                     case.check(
-                        digest in {sha256(t.encode()).hex() for t in texts},
-                        f"{what} {principal} {record_id[-4:]}: the SHA-256 of a record body of that principal with that id",
+                        digest in bodies and bodies[digest]["issued_at"] == issued_at,
+                        f"{what} {principal} {record_id[-4:]}: the SHA-256 and issued_at of a record body of that principal with that id",
                     )
                     continue
                 body = dict(by_label[fill]["record"]["body"]) if fill in by_label else {}
                 body["record_id"] = record_id
                 copies += 1
-                if body.get("principal") != principal or sha256(jcs(body).encode()).hex() != digest:
+                if body.get("principal") != principal or sha256(jcs(body).encode()).hex() != digest or body.get("issued_at") != issued_at:
                     wrong.append(record_id)
             if copies:
                 case.check(
                     not wrong,
-                    f"{what} {principal}: {copies} ids no record of the file has, each the SHA-256 of {fill}'s body under that id"
+                    f"{what} {principal}: {copies} ids no record of the file has, each the SHA-256 and issued_at of {fill}'s body under that id"
                     + (f" (not: {', '.join(wrong)})" if wrong else ""),
                 )
 

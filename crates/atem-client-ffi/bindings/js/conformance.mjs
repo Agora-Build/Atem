@@ -616,6 +616,9 @@ check("control records: a state's parts per principal load in any order, only as
   throwsCode(() => m.ControlStateHandle.fromParts(logL(), [{ principal: "svc-discord", partJson: parts[1].partJson }]), "stored_invalid");
   // A part names exactly its two fields.
   throwsCode(() => m.ControlStateHandle.fromParts(logL(), [{ ...parts[1], part_json: parts[1].partJson }]), "malformed");
+  // Each part names its device list: another one's never loads (a re-pair).
+  throwsCode(() => m.ControlStateHandle.fromParts(logL(), [{ principal: "service:svc-discord", partJson: parts[1].partJson.replace('"acct-test-1"', '"acct-other"') }]), "account_mismatch");
+  throwsCode(() => m.ControlStateHandle.fromParts(logL(), [{ principal: "host:host-a", partJson: parts[0].partJson.replace(ctl.genesis_hash, "11".repeat(32)) }]), "genesis_mismatch");
 });
 check("control records: a failed commit loses no effect (apply leaves its handle as it was)", () => {
   const state = new m.ControlStateHandle(logL());

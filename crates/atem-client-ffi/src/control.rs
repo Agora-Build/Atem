@@ -60,9 +60,10 @@ use crate::types::{
 
 /// Largest control state `ControlStateHandle::from_json` reads, checked
 /// before parsing (and the most `from_parts` reads, its parts in all). A
-/// principal's part keeps at most 256 counted record ids (about 110 bytes
-/// each, `MAX_RECORD_IDS`), and only principals of the device list count
-/// records (at most 1,024 entries), so a state stays well under this.
+/// principal's part keeps at most 256 counted record ids (about 125 bytes
+/// each, `MAX_RECORD_IDS`) and one order entry per Station origin, and
+/// only principals of the device list count records (at most 1,024
+/// entries), so a state stays well under this.
 pub const MAX_CONTROL_STATE_JSON: usize = 64 << 20;
 
 /// The control state's format (`"v"`): 2, one part per principal.
@@ -318,7 +319,9 @@ fn applied_info(applied: Applied) -> ControlApplied {
 /// it (a record verified then may not verify against today's list, and
 /// idempotency is by the records kept). Each principal keeps at most 256
 /// counted record ids, oldest evicted first (never its revocation's record
-/// nor the coverage's cover).
+/// nor the coverage's cover; a cover, hold or release under an evicted
+/// id, issued no later than the newest evicted, is refused as a possible
+/// replay). Every part names its device list (account and genesis).
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct ControlStateHandle {
     state: ControlState,
@@ -438,12 +441,15 @@ impl ControlStateHandle {
 
     /// The state of `log`'s device list made of `parts` (each principal's
     /// `part`, in any order), read as `from_json` reads a whole state.
-    /// `Stored{code}`: `too_large` (over 64 MiB in all), `malformed` (a
-    /// part that isn't strict JSON), `stored_invalid` (a principal given
-    /// twice, a name that is no principal, a part its rules refuse or not
-    /// exactly `part()`'s form). Nothing is loaded then; keep the work it
-    /// guards stopped. A store of another device list's parts (a re-pair)
-    /// starts with `new` instead: parts carry no account.
+    /// Every part names its device list. `Stored{code}`: `too_large` (over
+    /// 64 MiB in all), `malformed` (a part that isn't strict JSON or not an
+    /// object), `account_mismatch`, `genesis_mismatch` (a part of another
+    /// device list: after a re-pair, start the new list with `new` and
+    /// clear the old parts; a recurring service id then inherits nothing),
+    /// `stored_invalid` (a principal given twice, a name that is no
+    /// principal, a part its rules refuse or not exactly `part()`'s form).
+    /// Nothing is loaded then; on any code but `genesis_mismatch` keep the
+    /// work it guards stopped.
     #[cfg_attr(feature = "uniffi", uniffi::constructor)]
     pub fn from_parts(log: Arc<MembershipLog>, parts: Vec<ControlStatePart>) -> Result<Arc<Self>> {
         let total: usize = parts
@@ -473,8 +479,32 @@ impl ControlStateHandle {
             })?;
             values.push((part.principal, value));
         }
-        let state = ControlState::from_parts(&log.lock(), values.iter().cloned())
+        let list = log.lock();
+        // Each part of this device list, named as `from_json` names it.
+        for (principal, value) in &values {
+            let object = value.as_object().ok_or_else(|| {
+                AtemError::stored("malformed", format!("{principal}'s part: not an object"))
+            })?;
+            if object.get("account_id").and_then(Value::as_str) != Some(list.account_id()) {
+                return Err(AtemError::stored(
+                    "account_mismatch",
+                    format!("{principal}'s part is of another account"),
+                ));
+            }
+            let genesis = object
+                .get("genesis_hash")
+                .and_then(Value::as_str)
+                .and_then(|h| Hash32::from_hex(h).ok());
+            if genesis != Some(list.genesis_hash()) {
+                return Err(AtemError::stored(
+                    "genesis_mismatch",
+                    format!("{principal}'s part is of another device list"),
+                ));
+            }
+        }
+        let state = ControlState::from_parts(&list, values.iter().cloned())
             .map_err(|e| AtemError::stored("stored_invalid", e.to_string()))?;
+        drop(list);
         // Exactly the export: another spelling of a part is refused.
         for (principal, value) in &values {
             let exact = match (

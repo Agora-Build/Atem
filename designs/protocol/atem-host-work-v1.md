@@ -1048,21 +1048,29 @@ The rules:
    `interrupt_running`) still applies its effects (a stop only ever adds),
    while a `cover` or `release` is `refused`. A record kept pending or
    refused takes no `record_id`. **Bounded** (**Atem's proposal, for
-   Astation's agreement**; plan decision 19): a host keeps at most 256
-   counted record ids per principal (`MAX_RECORD_IDS`), and the next
-   evicts the oldest, never the record that revoked the principal nor the
-   coverage's cover. An evicted record that comes back is verified and
-   applied as a new one. A revoke stays a `duplicate` (the revocation is
-   in force, and so is its interrupt once applied) and a cover is no newer
-   than the coverage's, so it changes the state in two ways only: a
-   replayed `hold` holds again, a stop (whoever can replay it holds the
-   principal's key, which signs holds anyway), and a `release` its own
-   Station serves again at a later position of the covering feed lifts a
-   hold (only that feed's Station can place it there, and it could sign a
-   new release anyway). Its result may differ from `duplicate`
-   (`refused` for another Station's older cover, or for a manager's copy
-   whose signer was removed since), and another body under its id is no
-   longer a collision.
+   Astation's agreement**; plan decision 19, ruling T4a): a host keeps at
+   most 256 counted record ids per principal (`MAX_RECORD_IDS`), and the
+   next evicts the oldest, never the record that revoked the principal nor
+   the coverage's cover; the principal's **evicted floor** is the newest
+   `issued_at` among the records evicted. **An evicted record that comes
+   back grants nothing.** `feed_seq` isn't signed, so whoever serves the
+   host the covering feed's pages (the Station, which holds the key, or a
+   carrier that rewrites them, such as the `:8080` proxy, a native manager
+   that never signs a release, or an impostor on 127.0.0.1:8080) could
+   otherwise re-serve an evicted `release` at a fresh position and lift a
+   hold in force. So a `cover`, `hold` or `release` of a principal that
+   isn't revoked, under a `record_id` it doesn't count and issued no later
+   than its evicted floor, is `refused` as a possible replay
+   (`possible_replay`) and kept as evidence, whatever its position. A
+   legitimate one is issued after the floor: a Station's `issued_at` only
+   rises (its duty below); refusing a replayed hold is harmless, since a
+   hold the Station means now is newer and applies. A `revoke` or an
+   `interrupt_running` is never refused for it: replayed, one is a
+   `duplicate` (a revocation and its interrupts are final, the revoking
+   record pinned); new, it is a stop. A revoked principal's cover, hold
+   and release are inert already (rule 7). An evicted manager's copy
+   whose signer was removed since comes back `refused` as evidence
+   (verified against today's list) and changes nothing.
 2. **Verification** (above): `pending` waits for every effect; `refused` is
    evidence. A list of another account or genesis applies nothing.
 3. **A revoke is final**, from any feed or from none.
@@ -1106,11 +1114,22 @@ principal (`ControlState::part`, `from_parts`; the bindings'
 `ControlStateHandle::{principals, part, from_parts}`), and a record changes
 at most its own principal's: the transition names it (`touched`), and the
 host writes only that part in the record's transaction (one row per
-principal), never the whole state. A part keeps its records that counted
-oldest first, `[record_id, digest]` pairs, with what is in force for the
-principal; the whole state (`to_json`, `"v": 2`) is the parts by principal
-with the device list's account and genesis, which a host's parts take
-from its device list. `standing(principal)` is what is in force: its
+principal), never the whole state. **Every part names its device list**
+(`account_id`, `genesis_hash`; ruling T4c), and `from_parts` refuses a part
+of another list (the bindings' `account_mismatch`, `genesis_mismatch`), as
+`from_json` refuses a whole state: after a re-pair the old list's parts
+never load, so a service id that recurs in the new list inherits no
+revoke, hold or coverage. A part keeps its records that counted oldest
+first, `[record_id, digest, issued_at]` triples, its evicted floor, and
+what is in force for the principal; the order a release follows keeps
+**one feed per Station origin** (ruling T4b): another feed of the origin
+replaces it, never the covering feed's, the only one a release reads (a
+reset's new feed starts after its cover). A part is so at most 256 records
+of some 125 bytes (about 32 KB), one order entry per origin the
+principal's holds and releases were read from (one, for a host syncing its
+own Station), and a few hundred bytes more. The whole state (`to_json`,
+`"v": 2`) is the parts by principal under the device list's account and
+genesis. `standing(principal)` is what is in force: its
 revocation (the revoking record's `record_id`; a host principal's
 revocation is a device-list entry, never here), the revocations whose
 interrupt a record put in force (a service's revoking `record_id`, a host
@@ -1119,9 +1138,9 @@ principal's `revoke_seq` in decimal), the hold, and the covering feed
 (the verifier's reason, or `list_frozen`, `not_revoked`: a service's
 interrupt before its revocation, `revoke_not_applied`: a host principal's
 before host-work applied its revoke) or `refused` (the verifier's reason,
-or `order`, `after_revoke`, `not_newer`), or kept as evidence
-(`collision`): `Applied.why`, the host's for its pending store, evidence
-and alerts.
+or `order`, `after_revoke`, `not_newer`, `possible_replay`), or kept as
+evidence (`collision`, `possible_replay`): `Applied.why`, the host's for its
+pending store, evidence and alerts.
 
 **Resets** (**Atem's proposal, for Astation's and Auth/Portal's
 agreement**: design I.5.2's snapshot re-issues "the latest revoke, hold or
@@ -1151,7 +1170,11 @@ ordering can't stop a key holder. The Station's duties:
 - A Station's covers' `issued_at` only rises: each cover it signs for a
   principal is newer, by `(issued_at, record_id)`, than any cover issued
   for that principal before, a handed-over integration's included (the
-  handover carries the last cover's `issued_at`).
+  handover carries the last cover's `issued_at`). So does every `hold`
+  and `release` it signs (with the bound of rule 1, for Astation's
+  agreement): one issued no later than a record a host evicted is refused
+  there as a possible replay, so a snapshot's records signed anew are
+  issued now, never with an old `issued_at`.
 - A Station re-issues covers only for principals it currently covers.
 - A Station that hands an integration over stops signing for it, and the
   key leaves with it (or the integration is created again as a new
@@ -1190,21 +1213,24 @@ with no coverage, the old Station's cover replayed after a move, an
 body under a counted id: a stop applies, a release or cover is refused,
 and the bound: from an `initial` state whose principal's records are full
 (those not in the file copies of the record `fill` under other ids), an
-evicted hold replayed after a release holds again and an evicted revoke
-replayed is still a duplicate), each step with the `standing` of its
-record's principal after it. Each step's position is `{origin, feed_id,
-feed_seq}`; a state (v2) keeps one part per principal, its records the
-`[record_id, digest]` pairs that counted, oldest first.
+evicted release re-served at a fresh position of the covering feed and an
+evicted hold are refused as possible replays while records issued after
+the evicted floor apply, and an evicted revoke replayed is still a
+duplicate), each step with the `standing` of its record's principal after
+it. Each step's position is `{origin, feed_id, feed_seq}`; a state (v2)
+keeps one part per principal, naming its device list, its records the
+`[record_id, digest, issued_at]` triples that counted, oldest first.
 They run in `crates/atem-client/tests/vectors.rs`, in the bindings'
 `tests/control.rs` and in the Swift, Kotlin and WASM conformance suites;
 `scripts/check-r9-vectors.py` recomputes their cryptographic values
 (`jcs`, signing inputs, every signature by the key its chain names, the
-`r9Svc` values, the record digests a state keeps, each a body of that
-principal with that `record_id` or, for an id no record of the file has,
-the `fill` record's body under it, each part's 256-id bound and its
-revocation's and cover's records among them, each step's position against
-the stations, and the last step's `standing` against the state) and
-derives no verdict.
+`r9Svc` values, the record digests and `issued_at`s a state keeps, each a
+body of that principal with that `record_id` or, for an id no record of the
+file has, the `fill` record's body under it, each part's device list, its
+256-id bound with its revocation's and cover's records among them, an
+evicted floor only with full records, one feed per origin in `order`, each
+step's position against the stations, and the last step's `standing`
+against the state) and derives no verdict.
 Every SDK package's checksum manifest lists the file.
 
 ### 11.2 `work_interrupt` and `work_resolve`

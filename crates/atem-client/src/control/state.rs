@@ -70,19 +70,25 @@
 //!    `revoke`, `interrupt_running`) still applies its effects (a stop
 //!    only ever adds), while a `cover` or `release` is `refused`. A record
 //!    kept pending or refused takes no `record_id`, so a forgery never
-//!    blocks the genuine record. **Bounded** (decision 19, for Astation's
-//!    agreement): a principal keeps at most [`MAX_RECORD_IDS`] counted
-//!    ids, and the next evicts its oldest, never the record that revoked
-//!    it nor the coverage's cover. An evicted record coming back is
-//!    verified and applied as a new one: its effects are already in force
-//!    or ordered out (a revoke and its interrupt stay `duplicate`, a cover
-//!    is no newer than the coverage's), so the only change it can make is
-//!    a stop, a replayed hold holding again, or a release its own Station
-//!    serves again at a later position of the covering feed, which that
-//!    Station could sign anew. Its result may differ from `duplicate`
-//!    (`refused` for an old Station's cover, or for a manager's copy whose
-//!    signer was removed since), and another body under its id is no
-//!    longer a collision.
+//!    blocks the genuine record. **Bounded** (decision 19 and ruling T4a,
+//!    for Astation's agreement): a principal keeps at most
+//!    [`MAX_RECORD_IDS`] counted ids, and the next evicts its oldest,
+//!    never the record that revoked it nor the coverage's cover; the
+//!    principal's evicted floor is the newest `issued_at` evicted. An
+//!    evicted record that comes back grants nothing. A `cover`, `hold` or
+//!    `release` under an id not counted, issued no later than the floor,
+//!    may be one replayed: `feed_seq` isn't signed, so whoever serves the
+//!    host the covering feed (the Station, or a carrier that rewrites its
+//!    pages, such as the `:8080` proxy, which signs no release) could
+//!    re-serve an evicted release at a fresh position and lift a hold in
+//!    force. It is `refused` and kept as evidence ([`Why::PossibleReplay`]);
+//!    a legitimate one is issued after the floor, since a Station's
+//!    `issued_at` only rises. A revoke or an interrupt is never refused
+//!    for it: replayed, one is a `duplicate` (a revocation and its
+//!    interrupts are final); new, it is a stop. A revoked principal's
+//!    cover, hold and release are inert already (rule 7). An evicted
+//!    manager's copy whose signer was removed since comes back `refused`
+//!    as evidence (verified against today's list), and changes nothing.
 //! 2. **Verification.** A `Pending` verdict is `pending`; a `Refused` one
 //!    is `refused` and `evidence` (I.5.4: kept as evidence, alerted).
 //! 3. **A revoke is final**, from any feed or from none: a stop counts
@@ -161,7 +167,9 @@ use super::verify::{ControlCheck, PendingReason, RefusalReason, verify_control};
 
 /// The most counted record ids a principal keeps (rule 1, decision 19);
 /// the next evicts the oldest, never the record that revoked it nor the
-/// coverage's cover. A part holds at most this many, some 30 KiB.
+/// coverage's cover, and raises the principal's evicted floor. Its records
+/// are then at most this many triples of some 125 bytes, about 32 KB (see
+/// [`ControlState::part`] for the whole part's bound).
 pub const MAX_RECORD_IDS: usize = 256;
 
 /// The state's format: `"v"` of [`ControlState::to_json`].
@@ -359,6 +367,11 @@ pub enum Why {
     Collision,
     /// Another Station's `cover`, no newer than the coverage's (rule 5).
     NotNewer,
+    /// A `cover`, `hold` or `release` whose `record_id` isn't counted,
+    /// issued no later than the newest record of its principal the bound
+    /// evicted (its evicted floor): possibly an evicted record replayed, so
+    /// refused and kept as evidence (rule 1, ruling T4a).
+    PossibleReplay,
 }
 
 impl Why {
@@ -373,6 +386,7 @@ impl Why {
             Why::AfterRevoke => "after_revoke",
             Why::Collision => "collision",
             Why::NotNewer => "not_newer",
+            Why::PossibleReplay => "possible_replay",
         }
     }
 
@@ -382,7 +396,13 @@ impl Why {
             .into_iter()
             .map(Why::Pending)
             .chain(RefusalReason::ALL.into_iter().map(Why::Refused))
-            .chain([Why::Order, Why::AfterRevoke, Why::Collision, Why::NotNewer])
+            .chain([
+                Why::Order,
+                Why::AfterRevoke,
+                Why::Collision,
+                Why::NotNewer,
+                Why::PossibleReplay,
+            ])
             .find(|why| why.code() == code)
     }
 }
@@ -497,14 +517,28 @@ pub struct ControlState {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Part {
     /// Every record of the principal that counted and wasn't evicted,
-    /// oldest first: its `record_id` and the SHA-256 of its body's `jcs`.
-    /// At most [`MAX_RECORD_IDS`]; never empty in a stored part.
-    records: Vec<(String, Hash32)>,
+    /// oldest first. At most [`MAX_RECORD_IDS`]; never empty in a stored
+    /// part.
+    records: Vec<Counted>,
+    /// The newest `issued_at` among the records the bound evicted: a
+    /// `cover`, `hold` or `release` under an id not counted, issued no
+    /// later, may be one of them replayed (rule 1). `None` until one is
+    /// evicted; from then on the records stay full.
+    evicted_floor: Option<u64>,
     /// A service's control state (the default for a host principal).
     service: ServiceControl,
     /// A host principal's: the `revoke_seq`s a record interrupted (empty
     /// for a service).
     interrupted: BTreeSet<u64>,
+}
+
+/// A record that counted: its `record_id`, the SHA-256 of its body's
+/// `jcs`, and its `issued_at` (the evicted floor's input).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Counted {
+    record_id: String,
+    digest: Hash32,
+    issued_at: u64,
 }
 
 /// One service's control state.
@@ -517,10 +551,14 @@ struct ServiceControl {
     coverage: Option<Covering>,
     /// A hold is in force.
     held: bool,
-    /// By feed (its origin, then its `feed_id`), the position of the last
-    /// hold or release taken from it: a release from the covering feed
-    /// comes after it.
-    order: BTreeMap<String, BTreeMap<String, u64>>,
+    /// By Station origin, one feed (its `feed_id`) and the position of the
+    /// last hold or release taken from it: a release from the covering
+    /// feed comes after it. Another feed of the origin replaces the entry,
+    /// but never the covering feed's, the only one a release reads (a
+    /// reset's new feed starts after its cover, `since`); so the map holds
+    /// one entry per origin the principal's holds and releases were read
+    /// from.
+    order: BTreeMap<String, (String, u64)>,
 }
 
 /// The Station whose feed covers a service: its feed's current
@@ -571,15 +609,27 @@ impl Part {
     fn counted(&self, record_id: &str) -> Option<Hash32> {
         self.records
             .iter()
-            .find(|(id, _)| id == record_id)
-            .map(|(_, digest)| *digest)
+            .find(|c| c.record_id == record_id)
+            .map(|c| c.digest)
+    }
+
+    /// Whether a `cover`, `hold` or `release` issued at `issued_at`, under
+    /// an id not counted, may be an evicted record replayed: issued no
+    /// later than the newest one evicted.
+    fn possible_replay(&self, issued_at: u64) -> bool {
+        self.evicted_floor.is_some_and(|floor| issued_at <= floor)
     }
 
     /// Counts `record_id` (not counted yet) as the newest; past
     /// [`MAX_RECORD_IDS`], evicts the oldest id that is neither the
-    /// revocation's record nor the coverage's cover.
-    fn count(&mut self, record_id: &str, digest: Hash32) {
-        self.records.push((record_id.to_owned(), digest));
+    /// revocation's record nor the coverage's cover, raising the evicted
+    /// floor to its `issued_at`.
+    fn count(&mut self, record_id: &str, digest: Hash32, issued_at: u64) {
+        self.records.push(Counted {
+            record_id: record_id.to_owned(),
+            digest,
+            issued_at,
+        });
         if self.records.len() <= MAX_RECORD_IDS {
             return;
         }
@@ -594,50 +644,131 @@ impl Part {
         if let Some(oldest) = self
             .records
             .iter()
-            .position(|(id, _)| !pinned.contains(&Some(id.as_str())))
+            .position(|c| !pinned.contains(&Some(c.record_id.as_str())))
         {
-            self.records.remove(oldest);
+            let evicted = self.records.remove(oldest);
+            self.evicted_floor = Some(
+                self.evicted_floor
+                    .map_or(evicted.issued_at, |floor| floor.max(evicted.issued_at)),
+            );
         }
     }
 
     fn is_empty(&self) -> bool {
         self.records.is_empty()
+            && self.evicted_floor.is_none()
             && self.service == ServiceControl::default()
             && self.interrupted.is_empty()
     }
 
-    /// The part's durable form (keys in sorted order): a service's control
-    /// state with its `records`, or a host principal's `records` and the
-    /// `interrupted` `revoke_seq`s (omitted when none).
-    fn to_json(&self, host: bool) -> Value {
+    /// The part's durable form (keys in sorted order): its device list's
+    /// `account_id` and `genesis_hash`, its `records` and `evicted_floor`,
+    /// and a service's control state, or a host principal's `interrupted`
+    /// `revoke_seq`s (omitted when none).
+    fn to_json(&self, host: bool, account_id: &str, genesis_hash: &Hash32) -> Value {
         let records: Vec<Value> = self
             .records
             .iter()
-            .map(|(id, digest)| json!([id, digest.to_hex()]))
+            .map(|c| json!([c.record_id, c.digest.to_hex(), c.issued_at]))
             .collect();
         let mut o = Map::new();
+        o.insert("account_id".into(), json!(account_id));
+        // A host principal's service state is the default: no coverage.
+        if let Some(c) = &self.service.coverage {
+            let cover = json!({"issued_at": c.cover.issued_at, "record_id": c.cover.record_id});
+            let coverage = json!({
+                "cover": cover, "feed_id": c.feed_id, "origin": c.origin, "since": c.since,
+            });
+            o.insert("coverage".into(), coverage);
+        }
+        if let Some(floor) = self.evicted_floor {
+            o.insert("evicted_floor".into(), json!(floor));
+        }
+        o.insert("genesis_hash".into(), json!(genesis_hash.to_hex()));
         if host {
             if !self.interrupted.is_empty() {
                 o.insert("interrupted".into(), json!(self.interrupted));
             }
-            o.insert("records".into(), Value::Array(records));
         } else {
-            self.service.write(&mut o, Value::Array(records));
+            let service = &self.service;
+            o.insert("held".into(), json!(service.held));
+            o.insert("interrupted".into(), json!(service.interrupted));
+            if !service.order.is_empty() {
+                let order: Map<String, Value> = service
+                    .order
+                    .iter()
+                    .map(|(origin, (feed_id, at))| {
+                        let mut feed = Map::new();
+                        feed.insert(feed_id.clone(), json!(at));
+                        (origin.clone(), Value::Object(feed))
+                    })
+                    .collect();
+                o.insert("order".into(), Value::Object(order));
+            }
+        }
+        o.insert("records".into(), Value::Array(records));
+        if let Some(by) = self.service.revoked_by.as_ref().filter(|_| !host) {
+            o.insert("revoked_by".into(), json!(by));
         }
         Value::Object(o)
     }
 
-    /// A part [`Part::to_json`] wrote for `principal` (its canonical name),
-    /// read strictly.
-    fn from_json(principal: &str, value: &Value) -> Result<Self> {
+    /// A part [`Part::to_json`] wrote for `principal` (its canonical name)
+    /// of the device list `account_id`/`genesis_hash`, read strictly. A part
+    /// of another device list is [`Error::GenesisMismatch`].
+    fn from_json(
+        principal: &str,
+        value: &Value,
+        account_id: &str,
+        genesis_hash: &Hash32,
+    ) -> Result<Self> {
         let parsed = ControlPrincipal::parse(principal)
             .filter(|p| p.name() == principal)
             .ok_or(Error::Malformed("control state principal"))?;
-        if parsed.is_host() {
-            let what = "control state host";
-            let o = fields(value, &["records"], &["interrupted"], what)?;
-            let records = records(&o["records"])?;
-            let mut interrupted = BTreeSet::new();
+        let host = parsed.is_host();
+        let o = if host {
+            fields(
+                value,
+                &["account_id", "genesis_hash", "records"],
+                &["evicted_floor", "interrupted"],
+                "control state host",
+            )?
+        } else {
+            fields(
+                value,
+                &[
+                    "account_id",
+                    "genesis_hash",
+                    "held",
+                    "interrupted",
+                    "records",
+                ],
+                &["coverage", "evicted_floor", "order", "revoked_by"],
+                "control state service",
+            )?
+        };
+        // Its device list: the state's.
+        let account = o["account_id"]
+            .as_str()
+            .ok_or(Error::Malformed("control state part account_id"))?;
+        let genesis = hash(&o["genesis_hash"], "control state part genesis_hash")?;
+        if account != account_id || genesis != *genesis_hash {
+            return Err(Error::GenesisMismatch);
+        }
+        let records = records(&o["records"])?;
+        let evicted_floor = match o.get("evicted_floor") {
+            None => None,
+            // Evicting leaves the records full.
+            Some(floor) => Some(
+                floor
+                    .as_u64()
+                    .filter(|floor| *floor <= MAX_SAFE_INTEGER)
+                    .filter(|_| records.len() == MAX_RECORD_IDS)
+                    .ok_or(Error::Malformed("control state evicted_floor"))?,
+            ),
+        };
+        let mut interrupted = BTreeSet::new();
+        let service = if host {
             if let Some(seqs) = o.get("interrupted") {
                 let what = "control state host interrupted";
                 let seqs = seqs
@@ -656,26 +787,16 @@ impl Part {
                     interrupted.insert(seq);
                 }
             }
-            Ok(Part {
-                records,
-                service: ServiceControl::default(),
-                interrupted,
-            })
+            ServiceControl::default()
         } else {
-            let o = fields(
-                value,
-                &["held", "interrupted", "records"],
-                &["revoked_by", "coverage", "order"],
-                "control state service",
-            )?;
-            let records = records(&o["records"])?;
-            let service = ServiceControl::from_json(o, &records)?;
-            Ok(Part {
-                records,
-                service,
-                interrupted: BTreeSet::new(),
-            })
-        }
+            ServiceControl::from_json(o, &records)?
+        };
+        Ok(Part {
+            records,
+            evicted_floor,
+            service,
+            interrupted,
+        })
     }
 }
 
@@ -750,10 +871,8 @@ impl ControlState {
             return Applied::all(action, Refused, false, Some(why));
         }
         let digest = Hash32::of(rec.object().jcs().as_bytes());
-        let counted = self
-            .principals
-            .get(principal)
-            .and_then(|part| part.counted(rec.record_id()));
+        let kept = self.principals.get(principal);
+        let counted = kept.and_then(|part| part.counted(rec.record_id()));
         if counted == Some(digest) {
             return Applied::all(action, Duplicate, false, None);
         }
@@ -769,6 +888,27 @@ impl ControlState {
             ControlCheck::Refused(reason) => {
                 return Applied::all(action, Refused, true, Some(Why::Refused(reason)));
             }
+        }
+        // A cover, hold or release under an id this principal doesn't
+        // count, issued no later than the newest record the bound evicted,
+        // may be an evicted record replayed: `feed_seq` isn't signed, so
+        // whoever serves the feed could re-serve one at a fresh position.
+        // Refused, as evidence (ruling T4a). A legitimate one is issued
+        // after it (a Station's `issued_at` only rises). Never a revoke or
+        // an interrupt: replayed, one is a duplicate (both are final); new,
+        // it is a stop. Nor a revoked principal's: rule 7 makes its cover,
+        // hold and release inert already.
+        let guarded = matches!(
+            action,
+            ControlAction::Cover | ControlAction::Hold | ControlAction::Release
+        );
+        if counted.is_none()
+            && guarded
+            && kept.is_some_and(|part| {
+                part.service.revoked_by.is_none() && part.possible_replay(rec.issued_at())
+            })
+        {
+            return Applied::all(action, Refused, true, Some(Why::PossibleReplay));
         }
         // Another body under a record_id this principal's record counted
         // with: evidence, and the first body keeps the id. A stop still
@@ -793,7 +933,7 @@ impl ControlState {
         }
         let record_result = out.record_result();
         if !collides && matches!(record_result, ApplicationResult::Applied | Duplicate) {
-            part.count(rec.record_id(), digest);
+            part.count(rec.record_id(), digest, rec.issued_at());
         }
         self.store(principal, part);
         let why = if collides {
@@ -855,30 +995,43 @@ impl ControlState {
     /// none (no record of it counted). Keys in sorted order:
     ///
     /// ```json
-    /// service:<id>:   {"coverage":{"cover":{"issued_at":<ms>,"record_id":"…"},
+    /// service:<id>:   {"account_id":"…",
+    ///                  "coverage":{"cover":{"issued_at":<ms>,"record_id":"…"},
     ///                              "feed_id":"…","origin":"…","since":<feed_seq>},
+    ///                  "evicted_floor":<ms>,"genesis_hash":"<hex>",
     ///                  "held":true,"interrupted":false,
     ///                  "order":{"<origin>":{"<feed_id>":<feed_seq>}},
-    ///                  "records":[["<record_id>","<hex SHA-256 of the body's jcs>"],…],
+    ///                  "records":[["<record_id>","<hex SHA-256 of the body's jcs>",<issued_at>],…],
     ///                  "revoked_by":"<record_id>"}
-    /// host:<host_id>: {"interrupted":[<revoke_seq>,…],"records":[…]}
+    /// host:<host_id>: {"account_id":"…","evicted_floor":<ms>,"genesis_hash":"<hex>",
+    ///                  "interrupted":[<revoke_seq>,…],"records":[…]}
     /// ```
     ///
-    /// `records` are oldest first, one to [`MAX_RECORD_IDS`]; a service's
-    /// `coverage`, `order` and `revoked_by`, and a host's `interrupted`,
-    /// are omitted when there are none.
+    /// Every part names its device list (`account_id`, `genesis_hash`), so
+    /// a store of parts never loads into another list's state. `records`
+    /// are oldest first, one to [`MAX_RECORD_IDS`]; `order` holds one feed
+    /// per Station origin. A service's `coverage`, `order` and
+    /// `revoked_by`, a host's `interrupted`, and `evicted_floor` until a
+    /// record is evicted, are omitted when there are none. A part is at
+    /// most 256 records of some 125 bytes (about 32 KB), plus one `order`
+    /// entry per origin the principal's holds and releases were read from
+    /// (a host syncs its own Station's origin only), and a few hundred
+    /// bytes more. A touched principal always has a part in `next`.
     pub fn part(&self, principal: &str) -> Option<Value> {
         let part = self.principals.get(principal)?;
-        Some(part.to_json(is_host(principal)))
+        Some(part.to_json(is_host(principal), &self.account_id, &self.genesis_hash))
     }
 
     /// The state of `list`'s device list made of `parts` (each
     /// [`ControlState::part`] with its principal, in any order), read
-    /// strictly: each principal once, its part exactly its kind's form,
-    /// its types and grammars, and its invariants (an interrupt only after
-    /// a revocation; the revocation's and the coverage's cover records
-    /// among its records; sorted unique `revoke_seq`s; no empty list or
-    /// map).
+    /// strictly: each principal once, its part of `list`'s account and
+    /// genesis (else [`Error::GenesisMismatch`]: after a re-pair the old
+    /// list's parts never load, so a recurring service id inherits nothing),
+    /// exactly its kind's form, its types and grammars, and its invariants
+    /// (an interrupt only after a revocation; the revocation's and the
+    /// coverage's cover records among its records; an evicted floor only
+    /// with full records; one feed per origin in `order`; sorted unique
+    /// `revoke_seq`s; no empty list or map).
     pub fn from_parts(
         list: &Membership,
         parts: impl IntoIterator<Item = (String, Value)>,
@@ -898,7 +1051,7 @@ impl ControlState {
     ) -> Result<Self> {
         let mut principals = BTreeMap::new();
         for (principal, value) in parts {
-            let part = Part::from_json(principal, value)?;
+            let part = Part::from_json(principal, value, &account_id, &genesis_hash)?;
             if principals
                 .insert(principal.to_owned(), Arc::new(part))
                 .is_some()
@@ -923,7 +1076,10 @@ impl ControlState {
         let principals: Map<String, Value> = self
             .principals
             .iter()
-            .map(|(principal, part)| (principal.clone(), part.to_json(is_host(principal))))
+            .map(|(principal, part)| {
+                let part = part.to_json(is_host(principal), &self.account_id, &self.genesis_hash);
+                (principal.clone(), part)
+            })
             .collect();
         // Keys in sorted order, whatever `serde_json::Map` preserves.
         let mut o = Map::new();
@@ -936,7 +1092,7 @@ impl ControlState {
 
     /// A state from [`ControlState::to_json`], read strictly: exactly its
     /// fields, `v` 2, and each part as [`ControlState::from_parts`] reads
-    /// it.
+    /// it, of the header's account and genesis.
     pub fn from_json(value: &Value) -> Result<Self> {
         let o = fields(
             value,
@@ -1150,14 +1306,28 @@ fn cover(
 }
 
 /// The last hold or release taken from `pos`'s feed, at `pos` if later.
+/// One feed per origin (ruling T4b): another feed of the origin replaces
+/// the entry, unless the entry is the covering feed's, the only one a
+/// release reads (another feed's matters only once a cover moves the
+/// coverage there, and a release must then come after that cover).
 fn take_order(state: &mut ServiceControl, pos: &FeedPos) {
-    let at = state
+    let covering = state
+        .coverage
+        .as_ref()
+        .filter(|c| c.origin == pos.origin)
+        .map(|c| c.feed_id.clone());
+    if let Some((feed_id, at)) = state.order.get_mut(&pos.origin) {
+        if *feed_id == pos.feed_id {
+            *at = (*at).max(pos.feed_seq);
+            return;
+        }
+        if covering.as_deref() == Some(feed_id.as_str()) {
+            return;
+        }
+    }
+    state
         .order
-        .entry(pos.origin.clone())
-        .or_default()
-        .entry(pos.feed_id.clone())
-        .or_default();
-    *at = (*at).max(pos.feed_seq);
+        .insert(pos.origin.clone(), (pos.feed_id.clone(), pos.feed_seq));
 }
 
 /// A `hold`, read at `pos` (its own feed's position, or none): a stop, it
@@ -1213,8 +1383,8 @@ fn release(state: &mut ServiceControl, principal: String, pos: Option<FeedPos>, 
         }) && state
             .order
             .get(&pos.origin)
-            .and_then(|feeds| feeds.get(&pos.feed_id))
-            .is_none_or(|last| pos.feed_seq > *last)
+            .filter(|(feed_id, _)| *feed_id == pos.feed_id)
+            .is_none_or(|(_, last)| pos.feed_seq > *last)
     });
     if let Some(pos) = pos.as_ref().filter(|_| in_order) {
         take_order(state, pos);
@@ -1231,41 +1401,9 @@ fn release(state: &mut ServiceControl, principal: String, pos: Option<FeedPos>, 
 }
 
 impl ServiceControl {
-    /// The service's fields, and its part's `records`, into `o` in sorted
-    /// key order.
-    fn write(&self, o: &mut Map<String, Value>, records: Value) {
-        if let Some(c) = &self.coverage {
-            let cover = json!({"issued_at": c.cover.issued_at, "record_id": c.cover.record_id});
-            let coverage = json!({
-                "cover": cover, "feed_id": c.feed_id, "origin": c.origin, "since": c.since,
-            });
-            o.insert("coverage".into(), coverage);
-        }
-        o.insert("held".into(), json!(self.held));
-        o.insert("interrupted".into(), json!(self.interrupted));
-        if !self.order.is_empty() {
-            let order: Map<String, Value> = self
-                .order
-                .iter()
-                .map(|(origin, feeds)| {
-                    let feeds: Map<String, Value> = feeds
-                        .iter()
-                        .map(|(feed_id, at)| (feed_id.clone(), json!(at)))
-                        .collect();
-                    (origin.clone(), Value::Object(feeds))
-                })
-                .collect();
-            o.insert("order".into(), Value::Object(order));
-        }
-        o.insert("records".into(), records);
-        if let Some(by) = &self.revoked_by {
-            o.insert("revoked_by".into(), json!(by));
-        }
-    }
-
     /// A service part's fields `o`, its `records` read already.
-    fn from_json(o: &Map<String, Value>, records: &[(String, Hash32)]) -> Result<Self> {
-        let counted = |id: &str| records.iter().any(|(counted, _)| counted == id);
+    fn from_json(o: &Map<String, Value>, records: &[Counted]) -> Result<Self> {
+        let counted = |id: &str| records.iter().any(|c| c.record_id == id);
         let revoked_by = match o.get("revoked_by") {
             None => None,
             Some(by) => Some(
@@ -1315,18 +1453,16 @@ impl ServiceControl {
                 return Err(Error::Malformed(what));
             }
             for (at_origin, feeds) in feeds_by_origin {
+                // One feed per origin.
                 let feeds = object(feeds, what)?;
-                if feeds.is_empty() {
+                let [(id, at)] = feeds.iter().collect::<Vec<_>>()[..] else {
                     return Err(Error::Malformed(what));
-                }
-                let mut positions = BTreeMap::new();
-                for (id, at) in feeds {
-                    positions.insert(
-                        feed_id(&json!(id), what)?,
-                        at.as_u64().ok_or(Error::Malformed(what))?,
-                    );
-                }
-                order.insert(origin(&json!(at_origin), what)?, positions);
+                };
+                let entry = (
+                    feed_id(&json!(id), what)?,
+                    at.as_u64().ok_or(Error::Malformed(what))?,
+                );
+                order.insert(origin(&json!(at_origin), what)?, entry);
             }
         }
         Ok(ServiceControl {
@@ -1339,9 +1475,9 @@ impl ServiceControl {
     }
 }
 
-/// A part's `records`: one to [`MAX_RECORD_IDS`] `[record_id, digest]`
-/// pairs, oldest first, each id a UUID v4 once.
-fn records(value: &Value) -> Result<Vec<(String, Hash32)>> {
+/// A part's `records`: one to [`MAX_RECORD_IDS`] `[record_id, digest,
+/// issued_at]` triples, oldest first, each id a UUID v4 once.
+fn records(value: &Value) -> Result<Vec<Counted>> {
     let what = "control state records";
     let items = value
         .as_array()
@@ -1350,18 +1486,21 @@ fn records(value: &Value) -> Result<Vec<(String, Hash32)>> {
     let mut seen = BTreeSet::new();
     let mut records = Vec::with_capacity(items.len());
     for item in items {
-        let pair = item
-            .as_array()
-            .filter(|pair| pair.len() == 2)
-            .ok_or(Error::Malformed(what))?;
-        let id = pair[0]
+        let [id, digest, issued_at] = item.as_array().map(Vec::as_slice).unwrap_or_default() else {
+            return Err(Error::Malformed(what));
+        };
+        let id = id
             .as_str()
             .filter(|id| is_uuid_v4(id) && seen.insert(*id))
             .ok_or(Error::Malformed("control state record_id"))?;
-        records.push((
-            id.to_owned(),
-            hash(&pair[1], "control state record digest")?,
-        ));
+        records.push(Counted {
+            record_id: id.to_owned(),
+            digest: hash(digest, "control state record digest")?,
+            issued_at: issued_at
+                .as_u64()
+                .filter(|at| *at <= MAX_SAFE_INTEGER)
+                .ok_or(Error::Malformed("control state record issued_at"))?,
+        });
     }
     Ok(records)
 }
@@ -1589,6 +1728,12 @@ mod control_state_tests {
         /// Managers `mac` (its genesis) and `phone`, the services `svc-1`
         /// and `svc-2`, and the host `host-a`.
         fn account(account_id: &str) -> Self {
+            Self::with_genesis_at(account_id, T0)
+        }
+
+        /// The same members, under a genesis signed at `genesis_at`: a
+        /// re-pair of the account is another genesis.
+        fn with_genesis_at(account_id: &str, genesis_at: u64) -> Self {
             let keys = keys();
             let body = draft_on(
                 account_id,
@@ -1596,7 +1741,7 @@ mod control_state_tests {
                 1,
                 &Hash32([0; 32]),
                 "mac",
-                T0,
+                genesis_at,
                 &Action::Genesis {
                     member: native(&keys, "mac", &ALL),
                     recovery_key: key(&keys, "kit"),
@@ -3125,9 +3270,10 @@ mod control_state_tests {
         // first: svc-1's cover and host-a's interrupt share an id.
         let pairs = |recs: &[&ControlRecord]| -> Value {
             recs.iter()
-                .map(|rec| json!([rec.record_id(), digest(rec)]))
+                .map(|rec| json!([rec.record_id(), digest(rec), rec.issued_at()]))
                 .collect()
         };
+        let genesis = fx.list.genesis_hash().to_hex();
         assert_eq!(records[5].record_id(), rid(1));
         assert_eq!(
             json,
@@ -3136,10 +3282,12 @@ mod control_state_tests {
                 "genesis_hash": fx.list.genesis_hash().to_hex(),
                 "principals": {
                     "host:host-a": {
+                        "account_id": ACCOUNT, "genesis_hash": genesis,
                         "interrupted": [r],
                         "records": pairs(&[&records[5]]),
                     },
                     "service:svc-1": {
+                        "account_id": ACCOUNT, "genesis_hash": genesis,
                         "records": pairs(&[&records[0], &records[1], &records[2]]),
                         "revoked_by": rid(3), "interrupted": true,
                         "coverage": {
@@ -3150,6 +3298,7 @@ mod control_state_tests {
                         "order": {A.0: {A.1: 2}},
                     },
                     "service:svc-2": {
+                        "account_id": ACCOUNT, "genesis_hash": genesis,
                         "records": pairs(&[&records[3], &records[4], &records[6]]),
                         "interrupted": false,
                         "coverage": {
@@ -3230,10 +3379,55 @@ mod control_state_tests {
                 Box::new(move |j| j["principals"][svc1]["records"][0][1] = json!("00")),
             ),
             (
-                "record not a pair",
+                "record without its issued_at",
                 Box::new(move |j| {
-                    j["principals"][svc1]["records"][0] = json!([rid(1), "00".repeat(32), 1])
+                    j["principals"][svc1]["records"][0] = json!([rid(1), "00".repeat(32)])
                 }),
+            ),
+            (
+                "record of four",
+                Box::new(move |j| {
+                    j["principals"][svc1]["records"][0] = json!([rid(1), "00".repeat(32), 1, 1])
+                }),
+            ),
+            (
+                "record issued_at",
+                Box::new(move |j| j["principals"][svc1]["records"][0][2] = json!("1")),
+            ),
+            (
+                "record issued_at unsafe",
+                Box::new(move |j| {
+                    j["principals"][svc1]["records"][0][2] = json!(MAX_SAFE_INTEGER + 1)
+                }),
+            ),
+            (
+                "a part of another account",
+                Box::new(move |j| j["principals"][svc1]["account_id"] = json!("acct-test-2")),
+            ),
+            (
+                "a part of another genesis",
+                Box::new(move |j| j["principals"][host]["genesis_hash"] = json!("11".repeat(32))),
+            ),
+            (
+                "a part without its genesis",
+                Box::new(move |j| {
+                    j["principals"][svc2]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("genesis_hash");
+                }),
+            ),
+            (
+                "an evicted floor before the records are full",
+                Box::new(move |j| j["principals"][svc1]["evicted_floor"] = json!(5)),
+            ),
+            (
+                "an evicted floor that isn't an integer",
+                Box::new(move |j| j["principals"][host]["evicted_floor"] = json!("5")),
+            ),
+            (
+                "order with two feeds of one origin",
+                Box::new(move |j| j["principals"][svc1]["order"][A.0][A2.1] = json!(3)),
             ),
             (
                 "record id twice",
@@ -3253,7 +3447,7 @@ mod control_state_tests {
                 "records over the bound",
                 Box::new(move |j| {
                     j["principals"][host]["records"] = (1..=MAX_RECORD_IDS as u32 + 1)
-                        .map(|n| json!([rid(1000 + n), "00".repeat(32)]))
+                        .map(|n| json!([rid(1000 + n), "00".repeat(32), 1]))
                         .collect();
                 }),
             ),
@@ -4192,6 +4386,7 @@ mod control_state_tests {
             Why::AfterRevoke,
             Why::Collision,
             Why::NotNewer,
+            Why::PossibleReplay,
         ];
         let codes: BTreeSet<&str> = all.iter().map(|w| w.code()).collect();
         assert_eq!(codes.len(), all.len());
@@ -4199,6 +4394,7 @@ mod control_state_tests {
             [Why::Order, Why::AfterRevoke, Why::Collision, Why::NotNewer].map(Why::code),
             ["order", "after_revoke", "collision", "not_newer"]
         );
+        assert_eq!(Why::PossibleReplay.code(), "possible_replay");
         assert_eq!(Why::Pending(P::ListFrozen).code(), "list_frozen");
         assert_eq!(Why::Pending(P::NotRevoked).code(), "not_revoked");
         assert_eq!(
@@ -4240,7 +4436,8 @@ mod control_state_tests {
 
     /// A principal keeps at most `MAX_RECORD_IDS` counted record ids; the
     /// next one evicts its oldest, but never the revocation's record nor
-    /// the coverage's cover. Another principal's ids are its own.
+    /// the coverage's cover, and raises the principal's evicted floor (the
+    /// newest `issued_at` evicted). Another principal's ids are its own.
     #[test]
     fn record_ids_per_principal_are_bounded_oldest_first() {
         assert_eq!(MAX_RECORD_IDS, 256);
@@ -4269,6 +4466,7 @@ mod control_state_tests {
         );
         fill(&mut state, &fx, 3..=256, C::Hold);
         assert_eq!(ids_of(&state, &svc2), ids(&mut (1..=256)));
+        assert_eq!(state.part(&svc2).unwrap().get("evicted_floor"), None);
         // The 257th evicts the oldest that isn't pinned: rid 2, not the
         // coverage's cover (rid 1).
         fill(&mut state, &fx, 257..=257, C::Hold);
@@ -4279,17 +4477,20 @@ mod control_state_tests {
             ids_of(&state, &svc2),
             ids(&mut std::iter::once(1).chain(4..=258))
         );
+        assert_eq!(
+            state.part(&svc2).unwrap()["evicted_floor"],
+            json!(issued(3))
+        );
         assert_eq!(ids_of(&state, &service("svc-1")), vec![rid(2)]);
-        // A record the state no longer counts is verified again: this one
-        // is a hold while held, a duplicate, and counts again (newest).
+        // A record the state no longer counts, issued no later than the
+        // newest evicted, is refused as a possible replay: evidence, and
+        // nothing changes (it isn't counted again).
+        let t = state.apply(&fx.svc(3, "svc-2", "svc-2", C::Hold, A), &fx.list, None, 0);
         assert_eq!(
-            state.adopt(&fx.svc(3, "svc-2", "svc-2", C::Hold, A), &fx.list, None, 0),
-            dup(&[E::Hold])
+            (t.applied.record_result, t.applied.evidence, t.applied.why),
+            (R::Refused, true, Some(Why::PossibleReplay))
         );
-        assert_eq!(
-            ids_of(&state, &svc2),
-            ids(&mut std::iter::once(1).chain(5..=258).chain(std::iter::once(3)))
-        );
+        assert_eq!(t.next, state);
 
         // The revocation's record is pinned too, however old it gets.
         state.adopt(
@@ -4303,18 +4504,30 @@ mod control_state_tests {
         assert_eq!(got.len(), MAX_RECORD_IDS);
         assert_eq!(&got[..2], &[rid(1), rid(300)]);
         assert_eq!(&got[2..], &ids(&mut (303..=556))[..]);
+        assert_eq!(
+            state.part(&svc2).unwrap()["evicted_floor"],
+            json!(issued(302))
+        );
         // The state still reads back (its pins are among its records).
         assert_eq!(ControlState::from_json(&state.to_json()).unwrap(), state);
         assert_eq!(
             state.standing(&svc2),
             standing(Some(rid(300)), &[], true, Some(A))
         );
+        // Revoked, its cover, hold and release are ignored by rule 7 before
+        // any floor: an evicted hold back is a duplicate (held), no evidence.
+        assert_eq!(
+            state.adopt(&fx.svc(5, "svc-2", "svc-2", C::Hold, A), &fx.list, None, 0),
+            dup(&[E::Hold])
+        );
     }
 
     /// A revoke the state evicted, coming back, is verified again and is
-    /// still a duplicate: the revocation is in force. The revoking record
-    /// itself is never evicted. (A manager's copy whose signer was removed
-    /// since is refused instead, as evidence; nothing changes either way.)
+    /// still a duplicate: the revocation is in force, and no floor applies
+    /// to a revoke or an interrupt (a replay of one is always a duplicate;
+    /// a new one is a stop). The revoking record itself is never evicted.
+    /// (A manager's copy whose signer was removed since is refused instead,
+    /// as evidence; nothing changes either way.)
     #[test]
     fn an_evicted_revoke_replayed_is_still_duplicate() {
         let mut fx = Fx::new();
@@ -4339,6 +4552,10 @@ mod control_state_tests {
         let ids = ids_of(&state, &svc2);
         assert_eq!(ids[0], rid(1));
         assert!(!ids.contains(&rid(2)) && !ids.contains(&rid(3)), "evicted");
+        assert_eq!(
+            state.part(&svc2).unwrap()["evicted_floor"],
+            json!(issued(3))
+        );
         let before = state.clone();
 
         // Each comes back a duplicate, whatever its position.
@@ -4376,14 +4593,71 @@ mod control_state_tests {
         );
     }
 
-    /// A hold the state evicted, replayed after a release, holds again: a
-    /// stop, which whoever could replay it (the principal's key holder)
-    /// could sign anew. Nothing else an evicted record does when it comes
-    /// back changes the state, except its Station serving a release again
-    /// at a later position of the covering feed, which that Station could
-    /// sign anew too.
+    /// svc-2 covered by A, held, released and held again, then full of
+    /// duplicate holds until its first release is evicted: the floor is
+    /// `issued(4)`, the release's.
+    fn held_with_its_release_evicted(fx: &Fx) -> ControlState {
+        let mut state = fx.state();
+        let s2 = |n: u32, action: ControlAction| fx.svc(n, "svc-2", "svc-2", action, A);
+        state.adopt(&s2(2, C::Cover), &fx.list, at(A, 1), 0);
+        assert_eq!(
+            state.adopt(&s2(3, C::Hold), &fx.list, at(A, 2), 0),
+            held("svc-2")
+        );
+        assert_eq!(
+            state.adopt(&s2(4, C::Release), &fx.list, at(A, 3), 0),
+            released("svc-2")
+        );
+        assert_eq!(
+            state.adopt(&s2(5, C::Hold), &fx.list, at(A, 4), 0),
+            held("svc-2")
+        );
+        fill(&mut state, fx, 10..=263, C::Hold);
+        let ids = ids_of(&state, &service("svc-2"));
+        assert!(!ids.contains(&rid(3)) && !ids.contains(&rid(4)), "evicted");
+        assert_eq!(
+            state.part(&service("svc-2")).unwrap()["evicted_floor"],
+            json!(issued(4))
+        );
+        state
+    }
+
+    /// A release the state evicted, re-served at a fresh position of the
+    /// covering feed (by anyone who controls feed positions: `feed_seq`
+    /// isn't signed, so the `:8080` proxy or an impostor on 127.0.0.1:8080
+    /// could), would lift a hold in force; issued no later than the newest
+    /// evicted record, it is refused as a possible replay (T4a), and the
+    /// hold stays.
     #[test]
-    fn an_evicted_hold_replayed_after_a_release_holds_again() {
+    fn an_evicted_release_replayed_at_a_fresh_position_is_refused_and_the_hold_stays() {
+        let fx = Fx::new();
+        let mut state = held_with_its_release_evicted(&fx);
+        let svc2 = service("svc-2");
+        let release = fx.svc(4, "svc-2", "svc-2", C::Release, A);
+        for pos in [at(A, 9), at(A, 3), None] {
+            let t = state.apply(&release, &fx.list, pos.clone(), 0);
+            assert_eq!(
+                (t.applied.record_result, t.applied.evidence, t.applied.why),
+                (R::Refused, true, Some(Why::PossibleReplay)),
+                "{pos:?}"
+            );
+            assert!(t.applied.actions.is_empty() && t.touched().is_empty());
+            assert_eq!(t.next, state);
+        }
+        assert_eq!(
+            state.adopt(&release, &fx.list, at(A, 9), 0),
+            evidence(all(R::Refused, &[E::Release]))
+        );
+        assert_eq!(state.standing(&svc2), standing(None, &[], true, Some(A)));
+    }
+
+    /// A hold the state evicted, replayed after a release, is refused as a
+    /// possible replay too, at any position: harmless, since a hold its
+    /// Station means now is issued after every evicted record (a Station's
+    /// `issued_at` only rises) and applies. The old Station's cover and the
+    /// release, replayed, are refused the same way; nothing changes.
+    #[test]
+    fn an_evicted_hold_replayed_after_a_release_is_refused() {
         let fx = Fx::new();
         let mut state = fx.state();
         let svc2 = service("svc-2");
@@ -4408,42 +4682,36 @@ mod control_state_tests {
             state.adopt(&release, &fx.list, at(A, 3), 0),
             released("svc-2")
         );
-        // Duplicate releases (nothing held) until the four are evicted.
+        // Duplicate releases (nothing held) until the three are evicted.
         fill(&mut state, &fx, 10..=264, C::Release);
         let ids = ids_of(&state, &svc2);
         assert_eq!(ids[0], rid(2), "the coverage's cover is pinned");
         for n in [1, 3, 4] {
             assert!(!ids.contains(&rid(n)), "{n} evicted");
         }
-        let released_state = state.clone();
 
-        // The old Station's cover: not newer, refused; nothing changes.
-        let t = state.apply(&stale_cover, &fx.list, at(B, 1), 0);
-        assert_eq!(t.applied.record_result, R::Refused);
-        assert_eq!(t.next.standing(&svc2), released_state.standing(&svc2));
-        // The release at its own position: nothing held, a duplicate.
-        let t = state.apply(&release, &fx.list, at(A, 3), 0);
-        assert_eq!(t.applied, dup(&[E::Release]));
-        // The hold, at its own position: it holds again.
-        assert_eq!(state.adopt(&hold, &fx.list, at(A, 2), 0), held("svc-2"));
-        assert_eq!(state.standing(&svc2), standing(None, &[], true, Some(A)));
-        // Its release, at its own position, doesn't lift it.
+        for (rec, pos) in [
+            (&stale_cover, at(B, 1)),
+            (&release, at(A, 3)),
+            (&hold, at(A, 2)),
+            (&hold, at(A, 9)),
+            (&hold, None),
+        ] {
+            let t = state.apply(rec, &fx.list, pos, 0);
+            assert_eq!(
+                (t.applied.record_result, t.applied.evidence, t.applied.why),
+                (R::Refused, true, Some(Why::PossibleReplay)),
+                "{}",
+                rec.record_id()
+            );
+            assert!(t.applied.actions.is_empty() && t.touched().is_empty());
+            assert_eq!(t.next, state);
+        }
         assert_eq!(
-            state.adopt(&release, &fx.list, at(A, 3), 0),
-            all(R::Refused, &[E::Release])
+            state.adopt(&hold, &fx.list, at(A, 2), 0),
+            evidence(all(R::Refused, &[E::Hold]))
         );
-        assert!(state.standing(&svc2).held);
-        // A release the covering feed serves after it does; so would that
-        // Station's same release served again at a later position.
-        let mut again = state.clone();
-        assert_eq!(
-            again.adopt(&s2(5, C::Release, A), &fx.list, at(A, 4), 0),
-            released("svc-2")
-        );
-        assert_eq!(
-            state.adopt(&release, &fx.list, at(A, 4), 0),
-            released("svc-2")
-        );
+        assert_eq!(state.standing(&svc2), standing(None, &[], false, Some(A)));
 
         // Where nothing was evicted, the same hold is a duplicate.
         let mut kept = fx.state();
@@ -4457,5 +4725,186 @@ mod control_state_tests {
         }
         assert_eq!(kept.adopt(&hold, &fx.list, at(A, 2), 0), dup(&[E::Hold]));
         assert!(!kept.standing(&svc2).held);
+    }
+
+    /// A record issued after the newest evicted record applies as ever,
+    /// one millisecond above the floor included; one issued at the floor is
+    /// a possible replay.
+    #[test]
+    fn a_fresh_record_above_the_evicted_floor_applies() {
+        let fx = Fx::new();
+        let mut state = held_with_its_release_evicted(&fx);
+        let svc2 = service("svc-2");
+        let floor = issued(4);
+        let at_floor = fx.svc_issued(600, "svc-2", C::Release, A, floor);
+        assert_eq!(
+            state.adopt(&at_floor, &fx.list, at(A, 9), 0),
+            evidence(all(R::Refused, &[E::Release]))
+        );
+        let just_above = fx.svc_issued(601, "svc-2", C::Release, A, floor + 1);
+        assert_eq!(
+            state.adopt(&just_above, &fx.list, at(A, 9), 0),
+            released("svc-2")
+        );
+        let s2 = |n: u32, action: ControlAction| fx.svc(n, "svc-2", "svc-2", action, A);
+        assert_eq!(
+            state.adopt(&s2(602, C::Hold), &fx.list, at(A, 10), 0),
+            held("svc-2")
+        );
+        assert_eq!(
+            state.adopt(&s2(603, C::Release), &fx.list, at(A, 11), 0),
+            released("svc-2")
+        );
+        // Another Station's newer cover takes coverage.
+        assert_eq!(
+            state.adopt(
+                &fx.svc(604, "svc-2", "svc-2", C::Cover, B),
+                &fx.list,
+                at(B, 1),
+                0
+            ),
+            out(
+                R::Applied,
+                &[(E::Cover, R::Applied)],
+                vec![cover_action("svc-2", B)]
+            )
+        );
+        assert_eq!(state.standing(&svc2), standing(None, &[], false, Some(B)));
+    }
+
+    /// The order a release follows keeps one feed per Station origin: a
+    /// reset's new feed replaces the old one's entry, and a hold read from
+    /// a feed that doesn't cover never displaces the covering feed's entry
+    /// (the only one a release reads). Many resets keep the part small.
+    #[test]
+    fn the_order_map_keeps_one_feed_per_origin_across_resets() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let svc2 = service("svc-2");
+        let feed = |k: u32| -> Feed {
+            let id = format!("{k:08x}-1111-4111-8111-111111111111");
+            (A.0, Box::leak(id.into_boxed_str()))
+        };
+        let s2 = |n: u32, action: ControlAction, f: Feed| fx.svc(n, "svc-2", "svc-2", action, f);
+        let mut sizes = Vec::new();
+        for k in 0..60 {
+            let f = feed(k);
+            let n = 3 * k + 1;
+            let covered = state.adopt(&s2(n, C::Cover, f), &fx.list, at(f, 1), 0);
+            assert!(matches!(covered.record_result, R::Applied | R::Duplicate));
+            assert_eq!(
+                state.adopt(&s2(n + 1, C::Hold, f), &fx.list, at(f, 2), 0),
+                held("svc-2")
+            );
+            assert_eq!(
+                state.adopt(&s2(n + 2, C::Release, f), &fx.list, at(f, 3), 0),
+                released("svc-2")
+            );
+            let part = state.part(&svc2).unwrap();
+            assert_eq!(part["order"], json!({A.0: {f.1: 3}}), "reset {k}");
+            sizes.push(part.to_string().len() - part["records"].to_string().len());
+        }
+        // Everything but the records stays the same size.
+        assert!(sizes.windows(2).all(|w| w[0] == w[1]), "{sizes:?}");
+
+        // A hold from an older feed of the origin (a pending record applied
+        // late) doesn't displace the covering feed's entry; another
+        // origin's hold adds that origin's.
+        let covering = feed(59);
+        assert_eq!(
+            state.adopt(&s2(400, C::Hold, feed(58)), &fx.list, at(feed(58), 9), 0),
+            held("svc-2")
+        );
+        assert_eq!(
+            state.adopt(&s2(401, C::Hold, B), &fx.list, at(B, 5), 0),
+            dup(&[E::Hold])
+        );
+        assert_eq!(
+            state.part(&svc2).unwrap()["order"],
+            json!({A.0: {covering.1: 3}, B.0: {B.1: 5}})
+        );
+        // So the covering feed's release after its last hold or release
+        // still applies; one before it is refused.
+        assert_eq!(
+            state.adopt(&s2(402, C::Release, covering), &fx.list, at(covering, 3), 0),
+            all(R::Refused, &[E::Release])
+        );
+        assert_eq!(
+            state.adopt(&s2(403, C::Release, covering), &fx.list, at(covering, 4), 0),
+            released("svc-2")
+        );
+        assert_eq!(ControlState::from_json(&state.to_json()).unwrap(), state);
+    }
+
+    /// Parts carry their device list's account and genesis: after a re-pair
+    /// (a new genesis), the old list's parts never load, so a service id
+    /// that recurs in the new list doesn't inherit the old revoke, hold or
+    /// coverage. The whole state reads only parts of its own list.
+    #[test]
+    fn parts_of_another_device_list_are_refused_after_a_re_pair() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let s1 = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A);
+        state.adopt(&s1(1, C::Cover), &fx.list, at(A, 1), 0);
+        state.adopt(&s1(2, C::Hold), &fx.list, at(A, 2), 0);
+        state.adopt(
+            &fx.svc(3, "svc-2", "svc-2", revoke(true), A),
+            &fx.list,
+            at(A, 3),
+            0,
+        );
+        let parts: Vec<(String, Value)> = state
+            .principals()
+            .into_iter()
+            .map(|p| {
+                let part = state.part(&p).unwrap();
+                assert_eq!(part["account_id"], json!(ACCOUNT), "{p}");
+                assert_eq!(
+                    part["genesis_hash"],
+                    json!(fx.list.genesis_hash().to_hex()),
+                    "{p}"
+                );
+                (p, part)
+            })
+            .collect();
+        assert_eq!(
+            ControlState::from_parts(&fx.list, parts.clone()).unwrap(),
+            state
+        );
+
+        // Re-paired: the same account, a new genesis, svc-1 and svc-2 again.
+        let repaired = Fx::with_genesis_at(ACCOUNT, T0 + 1);
+        assert_ne!(repaired.list.genesis_hash(), fx.list.genesis_hash());
+        assert!(repaired.list.member("svc-1").is_some());
+        for parts in [parts.clone(), parts[..1].to_vec(), parts[1..].to_vec()] {
+            assert!(ControlState::from_parts(&repaired.list, parts).is_err());
+        }
+        let other = Fx::account("acct-test-2");
+        assert!(ControlState::from_parts(&other.list, parts.clone()).is_err());
+        // The new list starts with nothing in force for the recurring ids.
+        let fresh = repaired.state();
+        for p in ["service:svc-1", "service:svc-2"] {
+            assert_eq!(fresh.standing(p), Standing::default(), "{p}");
+        }
+
+        // The whole state: a part of another list (or another account) in
+        // it is refused, whatever its header says.
+        let json = state.to_json();
+        type Edit = Box<dyn Fn(&mut Value)>;
+        let edits: Vec<Edit> = vec![
+            Box::new(|j| j["principals"]["service:svc-1"]["genesis_hash"] = json!("11".repeat(32))),
+            Box::new(|j| j["principals"]["service:svc-2"]["account_id"] = json!("acct-test-2")),
+            Box::new(|j| {
+                j["principals"]["service:svc-1"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("account_id");
+            }),
+        ];
+        for edit in edits {
+            let mut bad = json.clone();
+            edit(&mut bad);
+            assert!(ControlState::from_json(&bad).is_err(), "{bad}");
+        }
     }
 }
