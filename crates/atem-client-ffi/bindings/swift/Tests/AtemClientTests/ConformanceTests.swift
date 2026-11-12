@@ -742,7 +742,7 @@ final class ConformanceTests: XCTestCase {
         // The verifier's own inventory: r9-vectors-delegated-wire's
         // `verifier`, what this binding's verifier reports about itself
         // (session-v1 R9.2 "How a verifier reports itself"; Atem's proposal,
-        // for Astation's agreement, Decision 23): version 2, the sixteen
+        // for Astation's agreement): version 2, the sixteen
         // actions, sorted by bytes, each once; every action the
         // membership-log vectors sign is one of them.
         let wireShapes = try load("r9-vectors-delegated-wire")

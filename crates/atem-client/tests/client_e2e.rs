@@ -735,7 +735,8 @@ fn a_contradicting_welcome_is_refused() {
 }
 
 /// The welcome's `verifier` through the connect path (R9.2 "How a verifier
-/// reports itself"; Atem's proposal, Decision 23): a host's inventory is
+/// reports itself"; Atem's proposal, for Astation's agreement): a host's
+/// inventory is
 /// read into the attachment's welcome, a host sending none gives `None`,
 /// and a malformed one (or `null`) refuses the welcome: the client never
 /// attaches (`Malformed("verifier")`).
@@ -753,6 +754,21 @@ fn a_welcome_carries_the_hosts_verifier() {
         attached.welcome().verifier(),
         Some(&VerifierInventory::ours())
     );
+    // A newer host's, unlike the client's own: read as sent.
+    fn newer() -> VerifierInventory {
+        let mut actions: Vec<String> = atem_client::membership::known_actions()
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        actions.push("later_action".into());
+        actions.sort();
+        VerifierInventory::new(3, actions).unwrap()
+    }
+    world.core.lock().unwrap().welcome_override = Some(|w| w.verifier = Some(newer()));
+    let mut wire = world.tcp();
+    let attached = phone.connect(&mut wire).unwrap();
+    assert_eq!(attached.welcome().verifier(), Some(&newer()));
+    assert_ne!(newer(), VerifierInventory::ours());
 
     world.core.lock().unwrap().welcome_override = None;
     let mut wire = world.tcp();

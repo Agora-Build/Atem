@@ -1185,9 +1185,9 @@ def check_push_hint(file, data, report, context):
             case.check(not delegated_task(case_["facts"]), "not a delegated sender's UUID v4 task")
 
 
-# R9.2's table of actions, in its order: v0.8.x's eleven, then delegated host
-# work's five. A verifier of version 2 knows exactly these (R9.2 "How a
-# verifier reports itself"; Atem's proposal, Decision 23).
+# R9.2's table of actions, in its order: the eleven of version 1 (v0.8.x),
+# then delegated host work's five. A verifier of version 2 knows exactly these (R9.2 "How a
+# verifier reports itself"; Atem's proposal, for Astation's agreement).
 R9_2_ACTIONS = (
     "genesis", "add", "remove", "set_roles", "add_host", "remove_host", "recovery_add",
     "set_recovery_key", "recovery_approve", "recovery_veto", "k_backup",

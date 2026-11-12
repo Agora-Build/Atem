@@ -1497,7 +1497,8 @@ impl R9Host {
                 .collect(),
             channel_id: channel.channel_id().to_owned(),
             // The host's device-list verifier, in every welcome (R9.2 "How
-            // a verifier reports itself"; Atem's proposal, Decision 23).
+            // a verifier reports itself"; Atem's proposal, for Astation's
+            // agreement).
             verifier: Some(atem_client::membership::VerifierInventory::ours()),
         };
         let frame = match channel.seal(&welcome.to_bytes(), mono) {

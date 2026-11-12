@@ -273,20 +273,25 @@ action_names! {
     Action::SetRoles { .. } => "set_roles",
 }
 
-/// The version of this verifier's action set (R9.2 "How a verifier reports
-/// itself"): 1 is the set v0.8.x released (`genesis` to `k_backup`, never
-/// reported: those releases predate the report), 2 adds delegated host
-/// work's five (`project_set`, `project_remove`, `host_sender_revoke`,
-/// `host_sender_readmit`, `host_enc_key`). Every change to
-/// [`known_actions`], or to what this verifier accepts in one of them, is a
-/// new version. `verifier_version_pins_its_action_set` pins the set; the
-/// rules have no such guard, so the vectors are the check: a change in the
-/// verdict a device-list vector gives for an entry of a known action
-/// (accepted where it was refused, refused where it was accepted, another
-/// refusal reason, or another state derived from it) in
-/// `r9-vectors-membership-log` or its kin (`r9-vectors-recovery`, the
-/// `r9-chain-*` fixtures) needs a new version. A new vector that pins an
-/// unchanged rule doesn't.
+/// The version of this verifier's action set and rules (R9.2 "How a
+/// verifier reports itself"). Versions only widen.
+///
+/// - 1: the eleven actions `genesis` to `k_backup` with the rules of v0.8.2
+///   to v0.8.5, whose service scopes take ten ops ([`OPS`]). v0.8.0 and
+///   v0.8.1 lack the scope ops `launch`, `message` and `notify`. No v0.8.x
+///   release reports an inventory, so an absent one means any of them.
+/// - 2: adds delegated host work's five (`project_set`, `project_remove`,
+///   `host_sender_revoke`, `host_sender_readmit`, `host_enc_key`).
+///
+/// Every change to [`known_actions`], or to what this verifier accepts in
+/// one of them, is a new version. For the rules that is any entry of a
+/// known action whose verdict or derived state differs (accepted where it
+/// was refused, refused where it was accepted, another refusal reason,
+/// another derived state), whether or not a vector covered it before. The
+/// device-list vectors (`r9-vectors-membership-log`, `r9-vectors-recovery`,
+/// the `r9-chain-*` fixtures) then pin the new rule.
+/// `verifier_version_pins_its_action_set` pins the set; the rules have no
+/// mechanical guard.
 pub const VERIFIER_VERSION: u32 = 2;
 
 /// A verifier reports at most this many actions.
@@ -1076,10 +1081,11 @@ mod tests {
         }
     }
 
-    /// A verifier's version names its action set. Version 1 is what v0.8.x
-    /// released (never reported: those releases predate the field); 2 adds
-    /// delegated host work's five. A change to the set is a new version,
-    /// pinned here.
+    /// A verifier's version names its action set and rules. Version 1 is
+    /// the eleven actions with v0.8.2 to v0.8.5's rules (never reported:
+    /// those releases predate the field; v0.8.0 and v0.8.1 also lack three
+    /// scope ops); 2 adds delegated host work's five. A change to the set is
+    /// a new version, pinned here.
     #[test]
     fn verifier_version_pins_its_action_set() {
         const V1: [&str; 11] = [

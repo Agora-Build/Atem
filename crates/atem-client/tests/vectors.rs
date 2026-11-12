@@ -5965,8 +5965,8 @@ fn write_control_vectors() {
 // `r9-vectors-delegated-wire` (session-v1 R9.14, planned): the shapes of
 // `host_enc_key_get` and its `host_enc_key` answer, and of receipts with and
 // without provenance (`task_id`, `sender`), valid and refused; and the r9
-// welcome's optional `verifier` (R9.2, R9.8; Atem's proposal, Decision 23)
-// with this build's own inventory. Every value
+// welcome's optional `verifier` (R9.2, R9.8; Atem's proposal, for
+// Astation's agreement) with this build's own inventory. Every value
 // comes from the crate's own builders; the valid answer's `enc_key` and
 // `enc_sig` are `r9-vectors-membership-log`'s first `host_enc_key` pair, so
 // its binding verifies against log L.
@@ -6220,7 +6220,8 @@ fn delegated_wire_vectors(book: &Book) -> Value {
     }
 
     // The r9 welcome's optional `verifier` (R9.2 "How a verifier reports
-    // itself", R9.8; Atem's proposal, Decision 23): a welcome without one
+    // itself", R9.8; Atem's proposal, for Astation's agreement): a welcome
+    // without one
     // (as every host sends today), with this build's, with a newer host's
     // (names this build doesn't know are read, never judged), the bounds,
     // and one refused case per rule.
@@ -6230,7 +6231,7 @@ fn delegated_wire_vectors(book: &Book) -> Value {
         "name": "r9-vectors-delegated-wire",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4 and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without; and the r9 welcome's optional verifier (R9.2 \"How a verifier reports itself\", R9.8; Atem's proposal, for Astation's agreement, Decision 23): absent, or exactly version (an integer from 1 to 2^32 - 1) and actions (1-64 names, sorted by bytes, each once, each 1-32 bytes of [a-z0-9_] starting with a letter; a name the reader doesn't know is read, never refused); `verifier` is this release's own (version 2: R9.2's sixteen actions). Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
+        "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4 and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without; and the r9 welcome's optional verifier (R9.2 \"How a verifier reports itself\", R9.8; Atem's proposal, for Astation's agreement): absent, or exactly version (an integer from 1 to 2^32 - 1) and actions (1-64 names, sorted by bytes, each once, each 1-32 bytes of [a-z0-9_] starting with a letter; a name the reader doesn't know is read, never refused); `verifier` is this release's own (version 2: R9.2's sixteen actions). Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
         "host_enc_key_binding": {
             "account_id": log.account_id(),
             "genesis_hash": genesis.to_hex(),
@@ -6292,7 +6293,15 @@ fn welcome_cases(log: &Membership) -> Vec<Value> {
     let mut newer: Vec<String> = ours.actions().to_vec();
     newer.push("later_action".into());
     newer.sort();
-    let names = |n: usize| (0..n).map(|i| format!("action_{i:02}")).collect::<Vec<_>>();
+    // The sixteen actions and `n` made-up ones, sorted: a newer verifier
+    // lists every action of the versions before it (R9.2, versions only
+    // widen).
+    let names = |n: usize| {
+        let mut all = ours.actions().to_vec();
+        all.extend((0..n).map(|i| format!("action_{i:02}")));
+        all.sort();
+        all
+    };
     let case = |name: &str, valid: bool, message: Value| json!({"name": name, "valid": valid, "message": message});
     let mut cases = vec![
         case("welcome_without_verifier", true, with(None)),
@@ -6305,17 +6314,22 @@ fn welcome_cases(log: &Membership) -> Vec<Value> {
         case(
             "welcome_verifier_64_actions",
             true,
-            with(inventory(1, names(64))),
+            with(inventory(3, names(48))),
         ),
         case(
             "welcome_verifier_32_byte_action",
             true,
-            with(inventory(1, vec![format!("a{}", "_".repeat(31))])),
+            with(inventory(3, {
+                let mut all = ours.actions().to_vec();
+                all.push(format!("a{}", "_".repeat(31)));
+                all.sort();
+                all
+            })),
         ),
         case(
             "welcome_verifier_largest_version",
             true,
-            with(inventory(u32::MAX, vec!["add".into()])),
+            with(inventory(u32::MAX, ours.actions().to_vec())),
         ),
     ];
     let edit = |f: &dyn Fn(&mut Value)| {
@@ -6368,7 +6382,7 @@ fn welcome_cases(log: &Membership) -> Vec<Value> {
         ),
         (
             "welcome_verifier_at_most_64_actions",
-            edit(&|v| v["actions"] = json!(names(65))),
+            edit(&|v| v["actions"] = json!(names(49))),
         ),
         (
             "welcome_verifier_actions_sorted",

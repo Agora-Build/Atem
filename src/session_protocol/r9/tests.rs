@@ -584,7 +584,8 @@ fn a_phone_a_bot_and_a_browser_are_admitted_on_one_link() {
 }
 
 /// Every welcome names the host's device-list verifier (R9.2 "How a
-/// verifier reports itself", R9.8; Atem's proposal, Decision 23): its
+/// verifier reports itself", R9.8; Atem's proposal, for Astation's
+/// agreement): its
 /// version and the actions it knows, the shared core's own, for a native
 /// member, a service and a browser alike. It is no feature: the features
 /// are what they were.

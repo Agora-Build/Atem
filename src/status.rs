@@ -364,9 +364,10 @@ pub fn passive_device_list_line(
         text.push_str("; ");
         text.push_str(&crate::session_protocol::membership::capacity_text(&c));
     }
-    // This build's verifier: the runtime it starts judges the list.
+    // This build's verifier (labelled: no runtime reported one), the one
+    // the runtime it starts judges the list with.
     text.push_str(&format!(
-        "; verifier v{}",
+        "; verifier v{} (this build)",
         atem_client::membership::VERIFIER_VERSION
     ));
     for (subject, action, at) in pending {
@@ -917,7 +918,7 @@ pub(crate) mod tests {
         let line = report(dir.path()).device_list.unwrap().value;
         // Three entries; the mac and the pending dev-new count as members.
         // This build's verifier (the runtime it starts judges the list).
-        assert!(line.starts_with("pinned at seq 3 (from disk; no runtime running); 3/1024 entries, 2/256 members, 1/64 hosts; verifier v2; recovery pending: dev-new (recovery_add) takes effect at "), "{line}");
+        assert!(line.starts_with("pinned at seq 3 (from disk; no runtime running); 3/1024 entries, 2/256 members, 1/64 hosts; verifier v2 (this build); recovery pending: dev-new (recovery_add) takes effect at "), "{line}");
         // An unfinished write after a plain crash: replayed at the next
         // start, no managing device asked for (Astation's review of
         // 66ea556).

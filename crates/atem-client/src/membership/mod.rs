@@ -87,9 +87,9 @@ pub use wait::{HostNow, RECOVERY_WAIT_MS, WaitClock};
 
 /// What a verifier reports about itself (R9.2 "How a verifier reports
 /// itself", the r9 `welcome`'s `verifier`, R9.8): its version and the
-/// actions it knows. Atem's proposal, for Astation's agreement (Decision
-/// 23). A signer reads it as a claim of the verifier that sent it, over the
-/// channel that authenticated it; it never opens the signing gate alone.
+/// actions it knows. Atem's proposal, for Astation's agreement. A signer
+/// reads it as a claim of the verifier that sent it, over the channel that
+/// authenticated it; it never opens the signing gate alone.
 ///
 /// Built only through [`VerifierInventory::new`] (or [`ours`](Self::ours),
 /// [`from_json`](Self::from_json)), which checks what a reader checks: a

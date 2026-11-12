@@ -333,8 +333,8 @@ fn member_action(member: serde_json::Value) -> serde_json::Value {
 }
 
 /// This binding's device-list verifier (session-v1 R9.2 "How a verifier
-/// reports itself"; Atem's proposal, for Astation's agreement, Decision
-/// 23): its version and the actions `MembershipLog` accepts. A strict
+/// reports itself"; Atem's proposal, for Astation's agreement): its
+/// version and the actions `MembershipLog` accepts. A strict
 /// verifier refuses a chain at an entry of any other action, so a signer
 /// counts this app's verifier among the account's before it signs a newer
 /// action.

@@ -408,7 +408,8 @@ fn pending_list(value: &Value) -> Option<Vec<PendingRecovery>> {
 /// The r9 `welcome` (§R9.8): r8's fields with `revision: 9`, plus the
 /// principal, its kind, permissions and scope, the head after the carriage,
 /// `pending_recovery` (always present), `channel_id`, and the host
-/// verifier's report `verifier` (optional; Atem's proposal, Decision 23).
+/// verifier's report `verifier` (optional; Atem's proposal, for Astation's
+/// agreement).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Welcome {
     pub id: String,
@@ -437,7 +438,8 @@ pub struct Welcome {
 
 impl Welcome {
     /// What the host's verifier reports about itself, if it did (R9.2 "How
-    /// a verifier reports itself"; Atem's proposal, Decision 23).
+    /// a verifier reports itself"; Atem's proposal, for Astation's
+    /// agreement).
     pub fn verifier(&self) -> Option<&crate::membership::VerifierInventory> {
         self.verifier.as_ref()
     }
@@ -1647,7 +1649,8 @@ mod tests {
     }
 
     /// The welcome's optional `verifier` (R9.2 "How a verifier reports
-    /// itself", R9.8; Atem's proposal, Decision 23): read strictly when
+    /// itself", R9.8; Atem's proposal, for Astation's agreement): read
+    /// strictly when
     /// present, absent as before.
     mod verifier {
         use super::*;
@@ -1719,7 +1722,7 @@ mod tests {
             // The bounds: 64 names, a 32-byte name, the largest version.
             let many: Vec<String> = (0..64).map(|i| format!("a{i:02}")).collect();
             assert_eq!(
-                read(&data_with(json!({"version": 1, "actions": many})))
+                read(&data_with(json!({"version": 3, "actions": many})))
                     .unwrap()
                     .verifier()
                     .unwrap()
@@ -1728,7 +1731,7 @@ mod tests {
                 64
             );
             let long = format!("a{}", "_".repeat(31));
-            assert!(read(&data_with(json!({"version": 1, "actions": [long]}))).is_ok());
+            assert!(read(&data_with(json!({"version": 3, "actions": [long]}))).is_ok());
             assert!(read(&data_with(json!({"version": u32::MAX, "actions": ["add"]}))).is_ok());
         }
 

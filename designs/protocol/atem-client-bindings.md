@@ -81,8 +81,9 @@ cases from `fixtures/host-work/framing-size-v1.json` (each with its complete
 inputs and the expected checked length), the control records' vectors from
 `fixtures/r9-vectors-host-work-control.json` (§9), the push hints' vectors
 from `fixtures/r9-vectors-push-hint.json` (approvals and `outcome_unknown`
-alerts, R9.9), the delegated wire shapes from
-`fixtures/r9-vectors-delegated-wire.json` (session-v1 R9.14), the
+alerts, R9.9), the delegated wire shapes and the r9 welcome's `verifier`
+from `fixtures/r9-vectors-delegated-wire.json` (session-v1 R9.14; R9.2 and
+R9.8), the
 envelopes' and results' vectors from `fixtures/r9-vectors-host-envelope.json`
 (host-work-v1 §11.5; planned, host role) and the Station's acknowledgment
 fixtures `fixtures/r9-control-ack-*.json` (§9, delegated host-work test 48).
@@ -591,21 +592,49 @@ and (Kotlin and Swift, whose providers see the request) the signing
 purposes.
 
 **The verifier's inventory** (**Atem's proposal, for Astation's
-agreement**; Decision 23; session-v1 R9.2 "How a verifier reports
-itself"). `verifier_inventory()` returns `VerifierInventory{version,
-actions}` (JS `verifierInventory()`: `{version, actions}`). It describes
-this binding's own verifier: version 2, the sixteen actions
-`MembershipLog` accepts, sorted by bytes. A strict verifier refuses a chain
-at an entry of any other action, so a signer's gate counts each app's
-verifier by this. `WelcomeInfo.verifier` is the host's inventory when its
-`welcome` carried one. Atem hosts after v0.8.5 send one in every welcome,
-and v0.8.x hosts send none. It is the host's claim
-about itself and never opens the gate alone. All three suites check
-`verifier_inventory()` against `r9-vectors-delegated-wire`'s `verifier`.
-The end-to-end test (`check-atem-client-bindings.sh e2e`) checks
-`WelcomeInfo.verifier`. The Kotlin phone and the Node browser read a test
-host's report, and the Node bot gets `null` from a host that sends none. A
-malformed report refuses the welcome (`Invalid{malformed, verifier}`).
+agreement**; session-v1 R9.2 "How a verifier reports itself").
+`verifier_inventory()` returns `VerifierInventory{version, actions}` (JS
+`verifierInventory()`: `{version, actions}`). It describes this binding's
+own verifier: version 2, the sixteen actions `MembershipLog` accepts,
+sorted by bytes. A strict verifier refuses a chain at an entry of any
+other action, so a signer's gate counts each app's verifier by this.
+`WelcomeInfo.verifier` is the host's inventory when its `welcome` carried
+one. Atem hosts send one in every welcome from the first release that
+carries this change; v0.8.x hosts send none. It is the host's claim about
+itself and never opens the gate alone.
+
+How a signer's gate uses it (**Atem's proposal, for Astation's
+agreement**; session-v1 R9.2 "How the signing gate uses it"):
+
+- Versions only widen. A version lists every action of the one before it
+  and accepts every entry that one accepts, with the same derived state.
+- A signer signs an entry only when every verifier it counts for the
+  account has a confirmed inventory, from its latest welcome, that lists
+  the entry's action, at a version at least the first one that accepts
+  the entry. Today that is version 2 for the five delegated host work
+  actions.
+- A verifier is unconfirmed when its latest welcome carries no
+  `verifier`, when it is offline, or when it isn't a host and the signer
+  has no report from it. For it the gate signs nothing that some v0.8.x
+  release refuses: none of the five actions, and no service scope with
+  `launch`, `message` or `notify` (v0.8.0 and v0.8.1 lack those ops).
+- A later welcome with a lower version, or with no `verifier`, makes the
+  verifier unconfirmed again.
+- Entries already signed stay signed.
+- How the signer learns the inventories of verifiers that aren't hosts
+  (each app calls `verifier_inventory()`) is Astation's.
+
+Tests:
+- All three suites check `verifier_inventory()` against
+  `r9-vectors-delegated-wire`'s `verifier`.
+- The end-to-end test (`check-atem-client-bindings.sh e2e`) checks
+  `WelcomeInfo.verifier`: the Kotlin phone and the Node browser read a
+  test host's report, and the Node bot gets `null` from a host that sends
+  none.
+- A malformed report refuses the welcome (`Invalid{malformed,
+  verifier}`). That case is checked natively, in the FFI's
+  `no_lock_during_signing.rs` and the core's `client_e2e.rs`, not by the
+  end-to-end test.
 
 ### Control records (delegated host work; planned)
 
