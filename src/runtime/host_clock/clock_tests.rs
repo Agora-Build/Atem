@@ -1131,3 +1131,29 @@ fn a_damaged_record_not_kept_aside_takes_no_station_time() {
     assert_eq!(now.d_ms, os.wall(), "nothing of it was kept");
     assert_eq!(stored(&store), clock.state);
 }
+
+/// Task 19 review M5 (PR 4 review D1): with no reading (the debug hook's
+/// file has none) the clock never reads the OS, whose machine and boot
+/// aren't the hook's: `now()` is the last reading's, else the record's own.
+#[test]
+fn without_a_reading_now_never_reads_the_os() {
+    let (_dir, store) = open_store();
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::Yes);
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    clock.tick(&store);
+    let at = clock.now();
+    assert_eq!(at.h_ms, T);
+    // The hook's file empties: the last reading stands.
+    clock.read = Arc::new(|| None);
+    assert_eq!(clock.now(), at);
+    // A new run with no reading at all: the record's own `H`.
+    let fresh = HostClock::with_reader(&store, Arc::new(|| None));
+    assert_eq!(fresh.now().h_ms, T, "never the OS's time");
+    assert_eq!(fresh.reading().map(|n| n.h_ms), Some(T));
+    // No record either: no reading.
+    let (_dir, empty) = open_store();
+    assert_eq!(
+        HostClock::with_reader(&empty, Arc::new(|| None)).reading(),
+        None
+    );
+}

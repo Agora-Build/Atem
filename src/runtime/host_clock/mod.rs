@@ -371,15 +371,28 @@ impl HostClock {
         }
     }
 
-    /// `H` and `D` at a reading taken now: read once a scheduling pass
-    /// (each call is a full OS reading).
+    /// `H` and `D` at a reading taken now ([`HostClock::reading`]); zero
+    /// when there is none at all. (The runtime reads `reading`.)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn now(&self) -> DelegatedNow {
-        let r = (self.read)()
-            .or_else(|| self.last.clone())
-            .unwrap_or_else(os::read);
-        DelegatedNow {
-            h_ms: self.state.h_ms(&r),
-            d_ms: self.state.deadline_ms(&r),
+        self.reading().unwrap_or(DelegatedNow { h_ms: 0, d_ms: 0 })
+    }
+
+    /// `H` and `D` at a reading taken now (each call is a full OS reading:
+    /// once a pass). Without one (only the debug hook's file can have none),
+    /// the last reading observed, else the record's own values; never the
+    /// OS's, whose machine and boot aren't the hook's (PR 4 review D1). None
+    /// without a record either.
+    pub fn reading(&self) -> Option<DelegatedNow> {
+        match (self.read)().or_else(|| self.last.clone()) {
+            Some(r) => Some(DelegatedNow {
+                h_ms: self.state.h_ms(&r),
+                d_ms: self.state.deadline_ms(&r),
+            }),
+            None => self
+                .state
+                .stored_ms()
+                .map(|(h_ms, d_ms)| DelegatedNow { h_ms, d_ms }),
         }
     }
 

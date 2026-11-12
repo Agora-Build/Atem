@@ -2651,6 +2651,79 @@ fn a_native_is_caught_up_while_its_channel_carried_the_host_to_its_head() {
     assert!(rig.engine.native_caught_up("member:dev-phone", &phone_key));
 }
 
+/// Design I.5.8 ("whose carriage"), Task 19 review M2: a native's
+/// `membership` op updates its channel's caught-up standing as its `hello`
+/// did. Its carriage stops at a deferred entry: not caught up (the host
+/// doesn't hold what it carried last), and still not after the wait ends
+/// by another carrier's approval; once it carries the head the host holds,
+/// caught up again. An empty carriage changes nothing.
+#[test]
+fn a_membership_op_updates_the_natives_caught_up_standing() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    let phone_key = rig
+        .log
+        .log
+        .member("dev-phone")
+        .unwrap()
+        .member
+        .auth_key
+        .as_bytes()
+        .to_vec();
+    let caught_up = |rig: &Rig| rig.engine.native_caught_up("member:dev-phone", &phone_key);
+    rig.connect("ph", phone());
+    rig.attached("ph");
+    assert!(caught_up(&rig));
+    let op = |entries: Vec<Value>| {
+        json!({"type": "session", "data": {"v": 1, "op": "membership",
+            "id": new_id(), "entries": entries}})
+    };
+    // A pending `recovery_add`, and an entry its subject signed: deferred.
+    let recovery = rig.log.recovery_add("dev-new");
+    let recovery_hash = rig.log.entries.last().unwrap().hash();
+    let body = rig.log.log.draft(
+        "dev-new",
+        rig.now.host.wall_ms,
+        &atem_client::membership::entry::Action::Remove {
+            device_id: "dev-phone".into(),
+        },
+    );
+    let deferred =
+        atem_client::membership::sign_entry(&rig.log.keys, &r9log::auth("dev-new"), body)
+            .unwrap()
+            .object()
+            .to_json();
+    rig.send("ph", &op(vec![recovery, deferred]));
+    assert!(rig.m.as_ref().unwrap().deferred_stop().is_some());
+    assert!(
+        !caught_up(&rig),
+        "the host doesn't hold what it carried last"
+    );
+    // An empty carriage changes nothing.
+    rig.send("ph", &op(vec![]));
+    assert!(!caught_up(&rig));
+    // The wait ends by the Mac's approval, carried by another device: the
+    // phone carried nothing since, so it stays not caught up.
+    let approve = rig.log.append(
+        r9log::MAC,
+        atem_client::membership::entry::Action::RecoveryApprove {
+            target: recovery_hash,
+        },
+    );
+    let entry = StrictValue::parse(approve.to_string().as_bytes(), usize::MAX).unwrap();
+    {
+        let now = rig.now.host.clone();
+        let m = rig.m.as_mut().unwrap();
+        let mut fences = HostFences::new(&mut rig.rt.host);
+        m.apply_carriage(&[entry], &now, &mut fences);
+    }
+    assert_eq!(rig.m.as_ref().unwrap().deferred_stop(), None);
+    assert!(!caught_up(&rig), "no re-carry, no standing");
+    // It carries the head the host holds now: caught up again.
+    rig.send("ph", &op(vec![approve]));
+    assert!(caught_up(&rig));
+}
+
 /// Re-review N1a: a grant revoked while it isn't live and the wall clock
 /// is behind the high-water mark is kept for the window after the host's
 /// trusted time (`max(wall, high_water)`), not after the rolled-back wall

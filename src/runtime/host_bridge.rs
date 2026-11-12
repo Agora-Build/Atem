@@ -871,11 +871,13 @@ impl HostBridge {
             }
             _ => (None, None),
         };
-        // The start view is told the list's state at every change
-        // (Decision 16); its deferral is kept on disk with `host.delegated`.
+        // With `host.delegated` on, the start view is told the list's state
+        // at every change (Decision 16) and its deferral is kept on disk.
         let mut membership = membership;
-        if let Some(m) = membership.as_mut() {
-            m.set_persist_deferred(features.delegated);
+        if let Some(m) = membership.as_mut()
+            && features.delegated
+        {
+            m.set_persist_deferred(true);
             m.set_publisher(list_publisher(&start_view));
         }
         // r9 "No compatibility": a device list (even one that failed to
@@ -1299,6 +1301,9 @@ impl HostBridge {
     /// senders"): those holding an open channel whose `hello` carriage
     /// brought the host up to their own head (`R9Host::native_caught_up`).
     fn refresh_gates(&mut self) {
+        if !self.features.delegated {
+            return;
+        }
         let natives = self
             .r9
             .caught_up_natives()
@@ -1320,11 +1325,16 @@ impl HostBridge {
     /// opened tells it its state at every change (a new one is given the
     /// publisher here), and none (unpaired, failed, being reopened) leaves
     /// it without one, so no delegated task starts.
+    /// Only while `host.delegated` is on: with it off nothing reads the view
+    /// (Task 19 review M1).
     fn sync_list_view(&mut self) {
+        if !self.features.delegated {
+            return;
+        }
         match self.membership.as_mut() {
             Some(m) if m.has_publisher() => {}
             Some(m) => {
-                m.set_persist_deferred(self.features.delegated);
+                m.set_persist_deferred(true);
                 m.set_publisher(list_publisher(&self.start_view));
             }
             None => self.start_view().list = None,

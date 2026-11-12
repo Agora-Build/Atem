@@ -329,8 +329,9 @@ pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> R
 
 /// Host-work's start check in the session host (session-v1 R9.14 item 3):
 /// the attempt being made `executing` may start when it is a live attempt
-/// of a delegated task and [`may_start`] says so; anything else is
-/// withdrawn (fail closed), and the event is kept with the attempt.
+/// of a delegated task, the view has a reading of the delegated clock, and
+/// [`may_start`] says so; anything else is withdrawn (fail closed), and the
+/// event, when there is one, is kept with the attempt.
 pub struct DelegatedStart(pub Arc<Mutex<StartView>>);
 
 impl StartCheck for DelegatedStart {
@@ -344,6 +345,11 @@ impl StartCheck for DelegatedStart {
             && task.target.session_id == req.session_id
             && task.target.process_gen == req.process_gen;
         if !its {
+            return StartVerdict::Withdraw;
+        }
+        // No reading of the delegated clock: the deadline can't be compared,
+        // so the attempt doesn't start (Task 19 review M3).
+        if view.now_d_ms.is_none() {
             return StartVerdict::Withdraw;
         }
         match may_start(&view, task, view.now_d_ms) {

@@ -21,6 +21,10 @@ const MAX_PAUSE_DETAIL: usize = 240;
 /// How often the delegated clock takes a reading (host-work-v1 §11.6).
 const CLOCK_EVERY: Duration = Duration::from_secs(1);
 
+/// How often `D` and the journal's halt reach the start view outside the
+/// scheduling pass (`take_reading`).
+const READ_EVERY: Duration = Duration::from_millis(100);
+
 /// How often the payloads of host-work records settled a day past their
 /// deadline are dropped, and collaboration counters whose windows passed
 /// are pruned (counters also at each counted send).
@@ -176,6 +180,9 @@ pub(super) struct State {
     /// The store was asked whether it holds a delegated task
     /// (`ensure_clock`).
     clock_checked: bool,
+    /// When the next reading of `D` is due outside the scheduling pass
+    /// (`take_reading`).
+    read_due: Instant,
 }
 
 impl State {
@@ -210,6 +217,7 @@ impl State {
             clock: None,
             clock_due: Instant::now(),
             clock_checked: false,
+            read_due: Instant::now(),
         }
     }
 }
@@ -376,7 +384,9 @@ impl HostBridge {
                 }
                 self.work.scoped = retained;
                 // What the start check reads, as it loaded (Decision 16).
-                self.start_view().config = config.clone();
+                if self.features.delegated {
+                    self.start_view().config = config.clone();
+                }
                 config
             }
             Err(error) => {
@@ -579,49 +589,61 @@ impl HostBridge {
         }
     }
 
-    /// The parts of the start view that follow the scheduling pass (the
-    /// device list and `runtime.toml` tell it at commit; both again here):
-    /// the journal's halt, the host's id, the project-scope hashes, and the
-    /// delegated clock's reading, taken once here. `D`, or none without a clock (or with a
-    /// damaged record): delegated work waits then.
-    fn refresh_start_view(&mut self) -> Option<u64> {
-        self.sync_list_view();
+    /// The delegated clock's `D` now: none without a clock, with a damaged
+    /// record, or with no reading at all (delegated work waits then). Taken
+    /// once a scheduling pass, and every 100 ms whatever the pass does,
+    /// hosting on or off (Task 19 review M3), into the start view with the
+    /// journal's halt while `host.delegated` is on.
+    fn take_reading(&mut self) -> Option<u64> {
+        self.work.read_due = Instant::now() + READ_EVERY;
         let now_d = self
             .work
             .clock
             .as_ref()
             .filter(|c| !c.damaged())
-            .map(|c| c.now().d_ms);
-        let halted = self.host.journal_halted();
+            .and_then(|c| c.reading())
+            .map(|n| n.d_ms);
+        if self.features.delegated {
+            let halted = self.host.journal_halted();
+            let mut view = self.start_view();
+            view.now_d_ms = now_d;
+            view.halted = halted;
+        }
+        now_d
+    }
+
+    /// The parts of the start view that follow the scheduling pass, while
+    /// `host.delegated` is on (with it off nothing reads the view, so
+    /// nothing is copied: Task 19 review M1): the device list and
+    /// `runtime.toml` (which also tell it at commit), the host's id and the
+    /// project-scope hashes.
+    fn refresh_start_view(&mut self) {
+        if !self.features.delegated {
+            return;
+        }
+        self.sync_list_view();
         let host_id = self.host.context().atem_device_id.clone();
-        let scopes = if self.features.delegated {
-            let mut kids = self.r9.scope_project_kids();
-            if let Some(m) = &self.membership {
-                kids.extend(crate::runtime::project_scope::project_kids_of(
-                    m.membership(),
-                    0,
-                ));
-            }
-            crate::runtime::delegated::start::ScopeHashes {
-                hashes: self.projects.known_hashes(),
-                pending: kids
-                    .into_iter()
-                    .filter(|kid| self.projects.pending_for(kid))
-                    .collect(),
-            }
-        } else {
-            Default::default()
+        let mut kids = self.r9.scope_project_kids();
+        if let Some(m) = &self.membership {
+            kids.extend(crate::runtime::project_scope::project_kids_of(
+                m.membership(),
+                0,
+            ));
+        }
+        let scopes = crate::runtime::delegated::start::ScopeHashes {
+            hashes: self.projects.known_hashes(),
+            pending: kids
+                .into_iter()
+                .filter(|kid| self.projects.pending_for(kid))
+                .collect(),
         };
         let config = self.work.config.clone();
         let mut view = self.start_view();
-        view.now_d_ms = now_d;
-        view.halted = halted;
         view.host_id = host_id;
         view.scopes = scopes;
         // As `work_config` gave it when it loaded (a pass runs only with a
         // file that loaded and hosting on).
         view.config = config;
-        now_d
     }
 
     /// At an orderly stop: the delegated clock's last reading, written.
@@ -642,6 +664,9 @@ impl HostBridge {
 
     pub(super) fn work_pass(&mut self, cx: &mut Cx) {
         self.clock_pass();
+        if Instant::now() >= self.work.read_due {
+            self.take_reading();
+        }
         let identity = self.work_host();
         // An unverified host has no identity to keep records under yet.
         if !self.hosting_enabled() || identity.account_id == UNPAIRED {
@@ -1461,7 +1486,8 @@ impl HostBridge {
     fn schedule_work(&mut self, cx: &mut Cx) -> anyhow::Result<()> {
         let now = host_now().wall_ms;
         // `D`, read once a pass (each read is a full OS reading).
-        let now_d = self.refresh_start_view();
+        let now_d = self.take_reading();
+        self.refresh_start_view();
         // Awaiting a result, or of unknown outcome: past the deadline,
         // expired, and past the sender's authorization, failed (their due
         // times, through an index); under a sender's authority, a route or a
@@ -4755,9 +4781,14 @@ launch = "on_message"
         });
     }
 
-    /// VM steps of every statement the work store ran since the counter was
-    /// read (`count_steps`, through `sqlite3_trace_v2`).
-    static STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    thread_local! {
+        /// VM steps of every statement the work store ran since the counter
+        /// was read (`count_steps`, through `sqlite3_trace_v2`). Per thread:
+        /// the callback runs on the thread that runs the statement (the
+        /// test's), so tests that count in parallel don't add to each
+        /// other's counts.
+        static STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
 
     unsafe extern "C" fn count_steps(
         kind: std::os::raw::c_uint,
@@ -4775,7 +4806,7 @@ launch = "on_message"
                     1,
                 )
             };
-            STEPS.fetch_add(steps.max(0) as u64, Ordering::SeqCst);
+            STEPS.with(|n| n.set(n.get() + steps.max(0) as u64));
         }
         0
     }
@@ -4865,10 +4896,10 @@ launch = "on_message"
             s.pump();
         }
         rig.bridge.work.scheduled = Instant::now();
-        STEPS.store(0, Ordering::SeqCst);
+        STEPS.with(|n| n.set(0));
         let started = Instant::now();
         rig.bridge.tick(&mut rig.app, &mut rig.sessions, false);
-        (STEPS.load(Ordering::SeqCst), started.elapsed())
+        (STEPS.with(std::cell::Cell::get), started.elapsed())
     }
 
     fn awaiting(rig: &LocalRig) -> i64 {

@@ -250,9 +250,10 @@ struct Attached {
     attachment: String,
     authority: Authority,
     grant: Option<atem_client::SignedObject>,
-    /// A native member's `hello` carriage left the host holding the
-    /// native's own head (design I.5.8, "Native senders"): its delegated
-    /// tasks pass the revocation gate while this channel is open.
+    /// A native member's latest carriage (its `hello`'s, then each
+    /// `membership` op's) left the host holding what it carried last (design
+    /// I.5.8, "Native senders"): its delegated tasks pass the revocation
+    /// gate while this channel is open.
     caught_up: bool,
 }
 
@@ -772,7 +773,6 @@ impl R9Host {
         self.by_attachment.contains_key(att)
     }
 
-    /// The r9 attachments, with their principals.
     /// Design I.5.8 ("Native senders"): `principal` (a native member, with
     /// the auth key `key`, its raw bytes) holds an open channel whose
     /// `hello` carriage brought this host up to the native's own head: its
@@ -805,6 +805,7 @@ impl R9Host {
             .collect()
     }
 
+    /// The r9 attachments, with their principals.
     pub fn attachments(&self) -> Vec<(String, String)> {
         self.chans
             .values()
@@ -2062,6 +2063,28 @@ impl R9Host {
         let mut fences = HostFences::new(parts.host);
         let result = m.apply_carriage(&entries, &parts.now.host, &mut fences);
         let mut effects = fences.effects;
+        // Design I.5.8 ("whose carriage"): a native's standing follows its
+        // latest carriage, as its `hello`'s did. Caught up when the host now
+        // holds the last entry it carried; an empty carriage changes nothing.
+        if let Some(last) = entries
+            .last()
+            .map(|e| atem_client::membership::Entry::from_strict(e).ok())
+        {
+            let holds = last.is_some_and(|e| {
+                m.membership()
+                    .entry(e.seq)
+                    .is_some_and(|ours| ours.hash() == e.hash())
+            });
+            if let Some(Phase::Open(a)) = self
+                .by_attachment
+                .get(att)
+                .and_then(|handle| self.chans.get_mut(handle))
+                .map(|c| &mut c.phase)
+                && a.authority.client_kind == ClientKind::Native
+            {
+                a.caught_up = holds;
+            }
+        }
         let reply = match result.carried {
             Carried::NotRecorded | Carried::Refused | Carried::Crashed => {
                 error(code::BUSY, re, Some(DETAIL_NOT_RECORDED)).to_bytes()

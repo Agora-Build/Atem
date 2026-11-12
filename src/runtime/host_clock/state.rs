@@ -512,6 +512,14 @@ impl ClockState {
         to_ms(self.deadline_ns(r))
     }
 
+    /// `H` and `D` as the record and the floor stand, with no reading to
+    /// count boot time from (none without a record).
+    pub fn stored_ms(&self) -> Option<(u64, u64)> {
+        let h = self.record.as_ref()?.value_ms;
+        let d = self.floor.as_ref().map_or(h, |f| h.max(f.value_ms));
+        Some((h, d))
+    }
+
     /// The latest repair or lowering, for `atem status`.
     pub fn last_change(&self) -> Option<&Change> {
         self.last_change.as_ref()

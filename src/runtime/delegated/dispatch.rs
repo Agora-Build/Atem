@@ -171,6 +171,11 @@ impl HostBridge {
         let Some((binding, _)) = self.host.binding_for_work(&att, &r.task.target) else {
             return self.block(r, "target session unavailable");
         };
+        // A journal that halted earlier in this pass (the view's halt is the
+        // pass's): no attempt it would only refuse (Task 19 review M4).
+        if self.host.journal_halted() {
+            return self.block(r, details::JOURNAL_HALTED);
+        }
         // A fresh tag for this attempt, drawn after its input is fixed.
         let (prompt, tag) = match self.render_task_prompt(r, &paths)? {
             Ok(rendered) => rendered,

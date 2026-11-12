@@ -80,13 +80,15 @@ fn input(rig: &LocalRig) -> String {
     std::fs::read_to_string(rig.fake.join("input")).unwrap_or_default()
 }
 
-/// `n` scheduling passes (no wall-time margin: each forces one).
+/// `n` scheduling passes (no wall-time margin: each forces one, and a
+/// reading of the delegated clock with it).
 fn passes(rig: &mut LocalRig, n: usize) {
     for _ in 0..n {
         for s in rig.sessions.values_mut() {
             s.pump();
         }
         rig.bridge.work.scheduled = Instant::now();
+        rig.bridge.work.read_due = Instant::now();
         rig.bridge.tick(&mut rig.app, &mut rig.sessions, false);
     }
 }
@@ -637,6 +639,7 @@ fn withdrawals_at_the_start_settle_from_the_event() {
         });
         let att = rig.bridge.host_work_attachment().unwrap().to_string();
         // The view as a pass leaves it (its routes, the clock's reading).
+        rig.bridge.take_reading();
         rig.bridge.refresh_start_view();
         let attempt = |rig: &LocalRig, task: &str| {
             let store = rig.bridge.work.store.as_ref().unwrap();
@@ -740,5 +743,131 @@ fn withdrawals_at_the_start_settle_from_the_event() {
         );
         let text = input(&rig);
         assert!(!text.contains("HELD_PROMPT") && !text.contains("REVOKED_PROMPT"));
+    });
+}
+
+/// Task 19 review M3: the start view's reading of the delegated clock, and
+/// the journal's halt, follow every pass, hosting on or off (an attempt
+/// waiting `accepted` behind a turn is checked against them while hosting
+/// is switched off too).
+#[test]
+fn the_start_views_reading_follows_the_clock_with_hosting_off() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        delegated(&mut rig, root, &os, true);
+        passes(&mut rig, 2);
+        let d = rig.bridge.start_view().now_d_ms.expect("a reading");
+        rig.bridge.work.config.enabled = false;
+        assert!(!rig.bridge.hosting_enabled());
+        os.pass(3_600_000);
+        rig.bridge.host.journal_mut().fail_append_of(1, false);
+        let effects = rig.bridge.host.fence_principal("service:other", 0);
+        rig.bridge.exec(
+            effects,
+            &mut Cx {
+                client: &rig.app.astation_client,
+                sessions: &mut rig.sessions,
+            },
+        );
+        passes(&mut rig, 2);
+        let view = rig.bridge.start_view();
+        assert_eq!(view.now_d_ms, Some(d + 3_600_000));
+        assert!(view.halted);
+    });
+}
+
+/// Task 19 review M4: a journal that halted earlier in the same pass (the
+/// view still says it didn't) makes no attempt: the task is `blocked`,
+/// `journal halted; restart Atem`, and no counted attempt is spent.
+#[test]
+fn a_journal_halted_in_the_pass_makes_no_attempt() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let (phone, _) = delegated(&mut rig, root, &os, true);
+        rig.bridge.sync_host_work(&mut Cx {
+            client: &rig.app.astation_client,
+            sessions: &mut rig.sessions,
+        });
+        let task = enqueue(&mut rig, &phone, "HALTED_IN_THE_PASS");
+        let now_d = rig.bridge.take_reading();
+        rig.bridge.refresh_start_view();
+        rig.bridge.host.journal_mut().fail_append_of(1, false);
+        let effects = rig.bridge.host.fence_principal("service:other", 0);
+        rig.bridge.exec(
+            effects,
+            &mut Cx {
+                client: &rig.app.astation_client,
+                sessions: &mut rig.sessions,
+            },
+        );
+        assert!(rig.bridge.host.journal_halted());
+        assert!(!rig.bridge.start_view().halted, "as earlier in the pass");
+        let mut record = stored_record(&rig, &task);
+        rig.bridge
+            .schedule_delegated(
+                &mut record,
+                &mut HashSet::new(),
+                &mut super::delegated_dispatch::Waits::default(),
+                now_d,
+                &mut Cx {
+                    client: &rig.app.astation_client,
+                    sessions: &mut rig.sessions,
+                },
+            )
+            .unwrap();
+        let record = stored_record(&rig, &task);
+        assert_eq!(
+            (record.status.state, record.status.detail.as_str()),
+            (WorkState::Blocked, details::JOURNAL_HALTED)
+        );
+        assert!(attempts(&rig, &task).is_empty());
+    });
+}
+
+/// Task 19 review M1: with the hook off the start view is left alone (no
+/// publisher on the device list, no list, routes or gates copied into it),
+/// so the pass does no work main doesn't.
+#[test]
+fn the_start_view_is_left_alone_with_the_hook_off() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let (_, _phone) = pin_phone(&mut rig, root);
+        passes(&mut rig, 3);
+        assert!(!rig.bridge.membership.as_ref().unwrap().has_publisher());
+        let view = rig.bridge.start_view();
+        assert!(view.list.is_none());
+        assert!(view.config.routes.is_empty());
+        assert_eq!(view.now_d_ms, None);
+    });
+}
+
+/// Task 19 review M7 (spec section 17, "Scaling", with `D` ahead): with the
+/// delegated clock an hour and more ahead of the wall clock, a pass where
+/// nothing changed reads no v1 task due between the wall clock and `D`:
+/// beside 3,000 of them it runs exactly the VM steps it runs beside 500.
+#[test]
+fn a_pass_where_nothing_changed_reads_nothing_with_d_ahead() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms + 2 * 3_600_000);
+        delegated(&mut rig, root, &os, true);
+        // No clock record written within the measured passes.
+        rig.bridge.work.clock_due = Instant::now() + Duration::from_secs(3600);
+        rig.bridge.work.cleanup = Instant::now() + Duration::from_secs(3600);
+        count_store_steps(&rig);
+        add_awaiting(&rig, 500, 64);
+        drain(&mut rig);
+        let fewer: Vec<u64> = (0..3).map(|_| one_pass(&mut rig).0).collect();
+        add_awaiting(&rig, 2500, 64);
+        drain(&mut rig);
+        let more: Vec<u64> = (0..3).map(|_| one_pass(&mut rig).0).collect();
+        assert_eq!(fewer, more);
+        assert_eq!(
+            awaiting(&rig),
+            3000,
+            "none settled: v1 waits for its wall-clock deadline"
+        );
     });
 }

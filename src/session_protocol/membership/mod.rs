@@ -442,9 +442,13 @@ pub struct MembershipHost {
     /// Where the last carriage stopped at a deferred entry (see
     /// [`DeferredStop`]).
     deferred: Option<DeferredStop>,
-    /// The deferral is kept in `membership_deferred` (only with
-    /// `host.delegated` on: [`MembershipHost::set_persist_deferred`]).
+    /// The deferral is kept in `membership_deferred`, and its changes
+    /// logged (only with `host.delegated` on:
+    /// [`MembershipHost::set_persist_deferred`]).
     persist_deferred: bool,
+    /// `membership_deferred` couldn't be read at the start (why): logged
+    /// once deferrals are kept.
+    deferred_unreadable: Option<String>,
     /// Host-work's start view of the list (Decision 16).
     publisher: Option<Publisher>,
     #[cfg(test)]
@@ -479,6 +483,15 @@ fn parse_json(bytes: &[u8]) -> Option<Value> {
 
 fn log(line: &str) {
     eprintln!("atem runtime: device list: {line}");
+    #[cfg(test)]
+    LOGGED.with(|l| l.borrow_mut().push(line.to_string()));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The lines written on this thread (tests read them).
+    pub(super) static LOGGED: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The device list's use of its limits for `atem status` (D23): `N/1024
@@ -807,6 +820,7 @@ impl MembershipHost {
             unpaired: false,
             deferred: None,
             persist_deferred: false,
+            deferred_unreadable: None,
             publisher: None,
             #[cfg(test)]
             crash_after_commit: false,
@@ -967,6 +981,12 @@ impl MembershipHost {
         let turned_on = persist && !self.persist_deferred;
         self.persist_deferred = persist;
         if turned_on {
+            if let Some(why) = self.deferred_unreadable.take() {
+                log(&format!(
+                    "{} can't be read ({why}); delegated remote tasks wait until a pending entry's wait ends or a carriage commits past the head",
+                    self.store.path(DlFile::Deferred).display()
+                ));
+            }
             self.write_deferred();
         }
     }
@@ -1008,23 +1028,23 @@ impl MembershipHost {
     /// that can't be read holds delegated work as a deferral at the next
     /// `seq` naming no pending entry (fail closed), until a pending entry's
     /// wait ends or a carriage commits past it.
-    fn read_deferred(&self) -> Option<DeferredStop> {
-        let unreadable = |why: String| {
-            log(&format!(
-                "{} can't be read ({why}); delegated remote tasks wait until a pending entry's wait ends or a carriage commits past the head",
-                self.store.path(DlFile::Deferred).display()
-            ));
-            Some(DeferredStop {
-                seq: self.m.head().seq.saturating_add(1),
-                until_ms: 0,
-                on: None,
-            })
+    fn read_deferred(&mut self) -> Option<DeferredStop> {
+        let why = match self.store.read(DlFile::Deferred) {
+            Ok(None) => return None,
+            Ok(Some(bytes)) => match parse_deferred(&bytes) {
+                Some(d) => return Some(d),
+                None => "damaged".to_string(),
+            },
+            Err(e) => e.to_string(),
         };
-        match self.store.read(DlFile::Deferred) {
-            Ok(None) => None,
-            Ok(Some(bytes)) => parse_deferred(&bytes).or_else(|| unreadable("damaged".into())),
-            Err(e) => unreadable(e.to_string()),
-        }
+        // Logged once the hook keeps deferrals (`set_persist_deferred`): the
+        // file exists only if a run with it wrote one.
+        self.deferred_unreadable = Some(why);
+        Some(DeferredStop {
+            seq: self.m.head().seq.saturating_add(1),
+            until_ms: 0,
+            on: None,
+        })
     }
 
     /// `membership_deferred` as the deferral is, when it is kept (a failed
@@ -1043,17 +1063,26 @@ impl MembershipHost {
         }
     }
 
+    /// Where the deferral stands now. Only a change of where it stopped
+    /// (`seq`, `on`) counts: the estimated end moves with every carriage's
+    /// clocks (each read to the millisecond on its own) and is kept as first
+    /// estimated. A change is logged and kept on disk only with
+    /// `host.delegated` on (`persist_deferred`): without it the host logs
+    /// and writes nothing main doesn't (Task 19 review I1).
     fn set_deferred(&mut self, next: Option<DeferredStop>) {
-        if next == self.deferred {
+        let at = |d: &Option<DeferredStop>| d.map(|d| (d.seq, d.on));
+        if at(&next) == at(&self.deferred) {
             return;
         }
-        match (&self.deferred, &next) {
-            (_, Some(d)) => log(&format!(
-                "a carriage stopped at a deferred entry (seq {}); delegated remote tasks wait until its wait ends",
-                d.seq
-            )),
-            (Some(_), None) => log("the deferral ended; delegated remote tasks go on"),
-            (None, None) => {}
+        if self.persist_deferred {
+            match (&self.deferred, &next) {
+                (_, Some(d)) => log(&format!(
+                    "a carriage stopped at a deferred entry (seq {}); delegated remote tasks wait until its wait ends",
+                    d.seq
+                )),
+                (Some(_), None) => log("the deferral ended; delegated remote tasks go on"),
+                (None, None) => {}
+            }
         }
         self.deferred = next;
         self.write_deferred();

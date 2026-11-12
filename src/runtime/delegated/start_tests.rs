@@ -171,6 +171,7 @@ fn view(log: &TestLog) -> StartView {
     view.scopes
         .hashes
         .insert((S1.into(), KID.into()), PROJECT.into());
+    view.now_d_ms = Some(0);
     view
 }
 
@@ -540,4 +541,30 @@ fn conditions_2_to_5_withdraw_at_executing() {
         )
     );
     assert_eq!(shared.lock().unwrap().refused(&rid(99)), None);
+}
+
+/// Task 19 review M3: without a reading of the delegated clock the start
+/// check can't compare the deadline, so it withdraws the attempt (fail
+/// closed), naming no event; with one, the same attempt starts.
+#[test]
+fn the_start_check_withdraws_without_a_reading() {
+    let log = log_with(|_| {});
+    let phone = task(&log, PHONE, LATER);
+    let mut rt = setup();
+    let shared = Arc::new(Mutex::new(view(&log)));
+    shared.lock().unwrap().now_d_ms = None;
+    rt.host
+        .set_start_check(Box::new(DelegatedStart(shared.clone())));
+    submit(&mut rt, &shared, &phone, 1);
+    assert_eq!(
+        state_of(&rt, 1),
+        (
+            ReceiptState::Rejected,
+            Some(DETAIL_WITHDRAWN_BY_HOST.to_string())
+        )
+    );
+    assert_eq!(shared.lock().unwrap().refused(&rid(1)), None);
+    shared.lock().unwrap().now_d_ms = Some(0);
+    submit(&mut rt, &shared, &phone, 2);
+    assert_eq!(state_of(&rt, 2).0, ReceiptState::Executing);
 }

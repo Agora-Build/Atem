@@ -1857,6 +1857,55 @@ mod deferrals {
         assert_eq!(host.deferred_stop(), None);
     }
 
+    /// The lines this thread logged about deferrals since the last call.
+    fn deferral_lines() -> Vec<String> {
+        super::super::LOGGED
+            .with(|l| std::mem::take(&mut *l.borrow_mut()))
+            .into_iter()
+            .filter(|l| l.contains("deferr"))
+            .collect()
+    }
+
+    /// Hook off = main (Task 19 review I1): a carriage that stops at a
+    /// deferred entry writes no new runtime.log line and no file without
+    /// `host.delegated`. With it, one line per change of where it stopped
+    /// (`seq`, `on`): carried again at a moment whose wall and monotonic
+    /// clocks moved 1 ms apart (its estimated end moves with them), nothing
+    /// more is logged or written.
+    #[test]
+    fn a_deferral_logs_once_per_entry_and_only_with_the_hook() {
+        for hook in [false, true] {
+            let (rig, mut log) = list();
+            let recovery = log.recovery_add("dev-new");
+            let deferred = by_the_pending(&log);
+            let mut host = open(&rig);
+            host.set_persist_deferred(hook);
+            deferral_lines();
+            let mut f = RecFences::default();
+            let first = host_now();
+            host.apply_carriage(&[strict(&recovery), strict(&deferred)], &first, &mut f);
+            let stop = host.deferred_stop().expect("stopped at the deferred entry");
+            let written = rig.read(DlFile::Deferred);
+            // Later, its wall clock 1 ms further than its monotonic clock.
+            let later = HostNow {
+                wall_ms: first.wall_ms + 1_001,
+                mono_ms: first.mono_ms + 1_000,
+                boot_id: first.boot_id.clone(),
+            };
+            host.apply_carriage(&[strict(&deferred)], &later, &mut f);
+            assert_eq!(host.deferred_stop(), Some(stop), "the same entry");
+            assert_eq!(rig.read(DlFile::Deferred), written, "not written again");
+            let lines = deferral_lines();
+            if hook {
+                assert_eq!(lines.len(), 1, "{lines:?}");
+                assert!(written.is_some());
+            } else {
+                assert!(lines.is_empty(), "{lines:?}");
+                assert!(written.is_none());
+            }
+        }
+    }
+
     /// The fences a commit brings in the order the session host sees them.
     struct Ordered(Arc<Mutex<Vec<String>>>);
 
