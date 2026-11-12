@@ -16,6 +16,9 @@ derives from the bytes, the device list and the receiver (II.4.2's checks 1
 to 6 and II.4.4's, written here from host-work-v1 §11.5). The other files'
 `expect` and each `reason` are checked by the Rust runner
 (`crates/atem-client/tests/vectors.rs`) and the binding suites.
+It also recomputes every Station report id of the acknowledgment fixtures
+(`r9-control-ack-*`, host-work-v1 §11.4): the known answers of the
+reference ledger's `report_id`.
 
 Usage: python3 -I scripts/check-r9-vectors.py designs/protocol/fixtures
 
@@ -749,6 +752,7 @@ def check_host_work_control(file, data, report, context):
             case.equal(service["auth_key"], replay_l.members.get(name), f"{name}'s auth_key in log L")
             case.equal(entries[LOG_L[service["seq"] - 1]]["member"]["device_id"], name, f"enrolled at seq {service['seq']}")
 
+    context["host_work_control"] = data
     by_label = {}
     jcs_by_record_id = {}
     stations = {(station["origin"], station["feed_id"]) for station in data["stations"].values()}
@@ -819,6 +823,135 @@ def check_host_work_control(file, data, report, context):
                         digest in {sha256(t.encode()).hex() for t in texts},
                         f"{principal} {record_id[-4:]}: the SHA-256 of a record body of that principal with that id",
                     )
+
+
+# ------------------------------------------------ r9-control-ack-* fixtures
+
+
+def report_id(kind, account_id, genesis_hash, principal, integration_id, host=None):
+    """A Station report's id (host-work-v1 §11.4): `<kind>:` + hex SHA-256 of
+    enc(["atem-station-report-id-v1", kind, account_id, genesis_hash (32 raw
+    bytes), principal, integration_id, host]), without the host for
+    `revoked`."""
+    fields = ["atem-station-report-id-v1", kind, account_id, unhex(genesis_hash), principal, integration_id]
+    if host is not None:
+        fields.append(host)
+    return f"{kind}:{sha256(enc(fields)).hex()}"
+
+
+def ids_in(step):
+    """Every report id a step names."""
+    out = list(step.get("made", []))
+    for intent in step.get("expect_report", []):
+        out.append(intent["report_id"])
+        out += intent["not_before"]
+    if "confirm" in step:
+        out.append(step["confirm"])
+    failure = step.get("report_failure", {})
+    if "report_id" in failure:
+        out.append(failure["report_id"])
+    for alert in failure.get("alerts", []) + step.get("alerts", []):
+        out += [alert["report_id"]] if "report_id" in alert else alert.get("dropped", [])
+    out += step.get("expect_refused", []) + step.get("expect_dropped", []) + step.get("expect_portal", [])
+    if "replica" in step:
+        out += ids_in(step["replica"])
+    return out
+
+
+def check_control_ack(file, data, report, context):
+    """A Station acknowledgment fixture (test 48): its device list is log
+    L's, its records and integrations are the control vectors', every ack
+    claims its link's association at the Station's origin and names records
+    of the vectors, and every report id it names is one of its reports',
+    recomputed here: each expected report's id from its own kind,
+    integration and host. Which reports are made, and when, is the ledger's
+    (the Rust runner and the binding suites, R9.12)."""
+    mlog = context["membership_log"]
+    control = context["host_work_control"]
+    records = {v["label"]: v["record"]["body"] for v in control["records"]}
+    principal_of = {}
+    for body in records.values():
+        integration = body.get("about", {}).get("integration_id")
+        if integration is not None:
+            principal_of.setdefault(integration, set()).add(body["principal"])
+    setup = data["setup"]
+    station = setup["station"]
+    account, genesis = station["account_id"], station["genesis_hash"]
+
+    with report.case(file, "setup") as case:
+        case.equal((account, genesis), (mlog["account_id"], mlog["genesis_hash"]), "the station's device list is log L")
+        case.equal(setup["records"], "r9-vectors-host-work-control", "records from the control vectors")
+        for integration, principal in setup["integrations"].items():
+            case.check(
+                principal in principal_of.get(integration, set()),
+                f"{integration} is an integration of {principal} in the vectors",
+            )
+        for name, link in setup["links"].items():
+            case.equal((link["account_id"], link["genesis_hash"], link["host_id"]), (account, genesis, name), f"link {name}")
+
+    # Every report this fixture's Station can make, by id.
+    known = {}
+    for integration, principal in setup["integrations"].items():
+        known[report_id("revoked", account, genesis, principal, integration)] = ("revoked", integration, None)
+        for host in setup["links"]:
+            rid = report_id("revocation_applied", account, genesis, principal, integration, host)
+            known[rid] = ("revocation_applied", integration, host)
+
+    with report.case(file, "report ids") as case:
+        steps = data["steps"]
+        named = [rid for step in steps for rid in ids_in(step)]
+        unknown = sorted({rid for rid in named if rid not in known})
+        case.check(not unknown, f"{len(set(named))} distinct report ids, each one of the station's reports", f"unknown {unknown}")
+        intents = [intent for step in steps for intent in step.get("expect_report", [])]
+        for intent in intents:
+            r = intent["report"]
+            host = r.get("host") if r["kind"] == "revocation_applied" else None
+            principal = setup["integrations"].get(r["integration_id"], "")
+            want = report_id(r["kind"], account, genesis, principal, r["integration_id"], host)
+            case.check(intent["report_id"] == want, "", f"{r['kind']} {host or ''}: got {intent['report_id']}, want {want}")
+            if r["kind"] == "revocation_applied":
+                case.check(
+                    any(b["record_id"] == r["record_id"] and b["principal"] == principal for b in records.values()),
+                    "",
+                    f"{r['record_id']} is no record of {principal}",
+                )
+            else:
+                case.check(r["outcome"] in ("all_applied", "deadline_passed"), "", f"outcome {r['outcome']}")
+                case.check((r["outcome"] == "all_applied") == (r["pending_hosts"] == []), "", "all_applied exactly when no host is pending")
+        case.done = [d for d in case.done if d]
+        case.check(True, f"{len(intents)} expected reports: each id recomputed from its kind, integration and host")
+        if intents:
+            case.check(True, "each revocation_applied names a record of the principal; all_applied exactly when no host is pending")
+
+    with report.case(file, "acks and records") as case:
+        acks, labels = [], []
+
+        def collect(step):
+            if "control_record" in step:
+                labels.append(step["control_record"])
+            if "control_ack" in step:
+                acks.append(step)
+            if "replica" in step:
+                collect(step["replica"])
+
+        for step in data["steps"]:
+            collect(step)
+        missing = sorted({label for label in labels if label not in records})
+        case.check(not missing, f"{len(labels)} records, each a control vector", f"not vectors: {missing}")
+        ids = {b["record_id"] for b in records.values()}
+        bad = []
+        for step in acks:
+            a = step["control_ack"]
+            link = setup["links"][step["link"]]
+            claim = (a["account_id"], a["genesis_hash"], a["host_id"], a["host_trust_gen"])
+            own = (link["account_id"], link["genesis_hash"], link["host_id"], link["host_trust_gen"])
+            if claim != own and step.get("refused") != "not_the_link":
+                bad.append(f"{step['link']}'s ack claims another association")
+            if a["origin"] != station["origin"]:
+                bad.append(f"{step['link']}'s ack names another origin")
+            if not all(r.get("record_id", "") in ids for r in a["results"]):
+                bad.append(f"{step['link']}'s ack names a record outside the vectors")
+        case.check(not bad, f"{len(acks)} acks: each claims its link's association (or is refused not_the_link), at the station's origin, naming records of the vectors", "; ".join(bad))
 
 
 # ------------------------------------------------- r9-vectors-push-hint
@@ -1694,6 +1827,16 @@ def main(argv):
             data = load_strict(path)
             case.equal((data.get("name"), data.get("kind"), data.get("requires")), (name, "vectors", "r9"), "name, kind, requires")
         checker(name, data, report, context)
+    for path in sorted(fixtures.glob("r9-control-ack-*.json")):
+        name = path.stem
+        with report.case(name, "file") as case:
+            data = load_strict(path)
+            case.equal(
+                (data.get("name"), data.get("kind"), data.get("requires"), data.get("side")),
+                (name, "scenario", "r9", "relay"),
+                "name, kind, requires, side",
+            )
+        check_control_ack(name, data, report, context)
     print(f"{report.cases} cases, {report.failures} failed")
     return 1 if report.failures else 0
 

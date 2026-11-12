@@ -1039,6 +1039,494 @@ impl ControlTransition {
     }
 }
 
+// ----------------------- Station calls and acknowledgments (Station builders)
+
+/// The objects of the array `v`, each with no key outside `fields`, read
+/// as `T`.
+fn items<T: serde::de::DeserializeOwned>(
+    v: &JsValue,
+    fields: &[&str],
+    what: &str,
+) -> JsResult<Vec<T>> {
+    use wasm_bindgen::JsCast;
+    let array = v
+        .dyn_ref::<js_sys::Array>()
+        .ok_or_else(|| bad(&format!("{what} is an array")))?;
+    array
+        .iter()
+        .map(|item| {
+            only_fields(&item, fields, what)?;
+            serde_wasm_bindgen::from_value(item).map_err(|e| bad(&format!("{what}: {e}")))
+        })
+        .collect()
+}
+
+/// `[{effect, result}]`, by their wire names.
+fn effect_results(v: &JsValue) -> JsResult<Vec<crate::types::ControlEffectResult>> {
+    #[derive(Deserialize)]
+    struct E {
+        effect: String,
+        result: String,
+    }
+    items::<E>(v, &["effect", "result"], "effects [{effect, result}]")?
+        .into_iter()
+        .map(|e| {
+            Ok(crate::types::ControlEffectResult {
+                effect: crate::station::effect_kind_of(&e.effect)
+                    .ok_or_else(|| bad("effect: revocation, interrupt, hold, release or cover"))?,
+                result: crate::station::result_kind_of(&e.result)
+                    .ok_or_else(|| bad("result: applied, duplicate, pending or refused"))?,
+            })
+        })
+        .collect()
+}
+
+fn strict_head(v: JsValue) -> JsResult<crate::types::LogHead> {
+    only_fields(&v, &["seq", "hash"], "head {seq, hash}")?;
+    head(v)
+}
+
+/// A host's call to its Station, read strictly (`relay_decode_to_station`):
+/// `{type: "control_sync", origin, feedId?, after}`, `{type:
+/// "control_ack", ack: {…}}` or `{type: "membership_fetch", after}`.
+#[wasm_bindgen(js_name = relayDecodeToStation)]
+pub fn relay_decode_to_station(message: String) -> JsResult<JsValue> {
+    ok(crate::station::relay_decode_to_station(message))
+}
+
+/// A Station's message to a host, read strictly (`relay_decode_to_host`).
+#[wasm_bindgen(js_name = relayDecodeToHost)]
+pub fn relay_decode_to_host(message: String) -> JsResult<JsValue> {
+    ok(crate::station::relay_decode_to_host(message))
+}
+
+/// `control_sync{origin, feed_id?, after}` (`relay_control_sync`).
+#[wasm_bindgen(js_name = relayControlSync)]
+pub fn relay_control_sync(origin: String, feed_id: Option<String>, after: f64) -> JsResult<String> {
+    err(crate::station::relay_control_sync(
+        origin,
+        feed_id,
+        ms(after)?,
+    ))
+}
+
+/// `control_sync_result` (`relay_control_sync_result`): `records` is
+/// `[{feedSeq, recordJson}]`, each record one the control parser accepts.
+#[wasm_bindgen(js_name = relayControlSyncResult)]
+pub fn relay_control_sync_result(
+    origin: String,
+    feed_id: String,
+    head: f64,
+    station_time: f64,
+    records: JsValue,
+) -> JsResult<String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct R {
+        feed_seq: f64,
+        record_json: String,
+    }
+    let records = items::<R>(&records, &["feedSeq", "recordJson"], "records")?
+        .into_iter()
+        .map(|r| {
+            Ok(crate::types::RelayFeedRecord {
+                feed_seq: ms(r.feed_seq)?,
+                record_json: r.record_json,
+            })
+        })
+        .collect::<JsResult<Vec<_>>>()?;
+    err(crate::station::relay_control_sync_result(
+        origin,
+        feed_id,
+        ms(head)?,
+        ms(station_time)?,
+        records,
+    ))
+}
+
+/// `heads{feeds, membership}` (`relay_heads`): `feeds` is `[{origin,
+/// feedId, head, stationTime}]`, `membership` `{seq, hash}`.
+#[wasm_bindgen(js_name = relayHeads)]
+pub fn relay_heads(feeds: JsValue, membership: JsValue) -> JsResult<String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct F {
+        origin: String,
+        feed_id: String,
+        head: f64,
+        station_time: f64,
+    }
+    let feeds = items::<F>(
+        &feeds,
+        &["origin", "feedId", "head", "stationTime"],
+        "feeds",
+    )?
+    .into_iter()
+    .map(|f| {
+        Ok(crate::types::RelayFeedHead {
+            origin: f.origin,
+            feed_id: f.feed_id,
+            head: ms(f.head)?,
+            station_time: ms(f.station_time)?,
+        })
+    })
+    .collect::<JsResult<Vec<_>>>()?;
+    err(crate::station::relay_heads(feeds, strict_head(membership)?))
+}
+
+/// `control_ack` (`relay_control_ack`): `{accountId, genesisHash, hostId,
+/// hostTrustGen, origin, feedId, cursor, results}`, each result `{type:
+/// "record", recordId, effects}` or `{type: "entry", seq, entryHash,
+/// appliedSeq, effects}`.
+#[wasm_bindgen(js_name = relayControlAck)]
+pub fn relay_control_ack(ack: JsValue) -> JsResult<String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct A {
+        account_id: String,
+        genesis_hash: String,
+        host_id: String,
+        host_trust_gen: f64,
+        origin: String,
+        feed_id: String,
+        cursor: f64,
+        #[serde(with = "serde_wasm_bindgen::preserve")]
+        results: JsValue,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct R {
+        #[serde(rename = "type")]
+        kind: String,
+        #[serde(default)]
+        record_id: Option<String>,
+        #[serde(default)]
+        seq: Option<f64>,
+        #[serde(default)]
+        entry_hash: Option<String>,
+        #[serde(default)]
+        applied_seq: Option<f64>,
+        #[serde(with = "serde_wasm_bindgen::preserve")]
+        effects: JsValue,
+    }
+    let fields = [
+        "accountId",
+        "genesisHash",
+        "hostId",
+        "hostTrustGen",
+        "origin",
+        "feedId",
+        "cursor",
+        "results",
+    ];
+    only_fields(&ack, &fields, "control_ack")?;
+    let a: A =
+        serde_wasm_bindgen::from_value(ack).map_err(|e| bad(&format!("control_ack: {e}")))?;
+    let results = items::<R>(
+        &a.results,
+        &["type", "recordId", "seq", "entryHash", "appliedSeq", "effects"],
+        "results",
+    )?
+    .into_iter()
+    .map(|r| {
+        let effects = effect_results(&r.effects)?;
+        match (r.kind.as_str(), r.record_id, r.seq, r.entry_hash, r.applied_seq) {
+            ("record", Some(record_id), None, None, None) => {
+                Ok(crate::types::RelayAckResult::Record { record_id, effects })
+            }
+            ("entry", None, Some(seq), Some(entry_hash), Some(applied_seq)) => {
+                Ok(crate::types::RelayAckResult::Entry {
+                    seq: ms(seq)?,
+                    entry_hash,
+                    applied_seq: ms(applied_seq)?,
+                    effects,
+                })
+            }
+            _ => Err(bad(
+                "a result is {type: \"record\", recordId, effects} or {type: \"entry\", seq, entryHash, appliedSeq, effects}",
+            )),
+        }
+    })
+    .collect::<JsResult<Vec<_>>>()?;
+    err(crate::station::relay_control_ack(
+        crate::types::ControlAckInfo {
+            account_id: a.account_id,
+            genesis_hash: a.genesis_hash,
+            host_id: a.host_id,
+            host_trust_gen: ms(a.host_trust_gen)?,
+            origin: a.origin,
+            feed_id: a.feed_id,
+            cursor: ms(a.cursor)?,
+            results,
+        },
+    ))
+}
+
+fn refusal_code(code: &str) -> JsResult<crate::types::RelayRefusalCode> {
+    match code {
+        "forbidden" => Ok(crate::types::RelayRefusalCode::Forbidden),
+        _ => Err(bad("a refusal's code is \"forbidden\"")),
+    }
+}
+
+/// `control_sync_refused{code}` (`relay_control_sync_refused`; `code` is
+/// `"forbidden"`).
+#[wasm_bindgen(js_name = relayControlSyncRefused)]
+pub fn relay_control_sync_refused(code: String) -> JsResult<String> {
+    err(crate::station::relay_control_sync_refused(refusal_code(
+        &code,
+    )?))
+}
+
+/// `membership_fetch_refused{code}` (`relay_membership_fetch_refused`).
+#[wasm_bindgen(js_name = relayMembershipFetchRefused)]
+pub fn relay_membership_fetch_refused(code: String) -> JsResult<String> {
+    err(crate::station::relay_membership_fetch_refused(
+        refusal_code(&code)?,
+    ))
+}
+
+/// `control_ack_refused{code}` (`relay_control_ack_refused`).
+#[wasm_bindgen(js_name = relayControlAckRefused)]
+pub fn relay_control_ack_refused(code: String) -> JsResult<String> {
+    err(crate::station::relay_control_ack_refused(refusal_code(
+        &code,
+    )?))
+}
+
+/// `membership_fetch{after}` (`relay_membership_fetch`).
+#[wasm_bindgen(js_name = relayMembershipFetch)]
+pub fn relay_membership_fetch(after: f64) -> JsResult<String> {
+    err(crate::station::relay_membership_fetch(ms(after)?))
+}
+
+/// `membership_fetch_result{head, entries}`
+/// (`relay_membership_fetch_result`): `head` `{seq, hash}`, `entries` the
+/// signed objects' JSON.
+#[wasm_bindgen(js_name = relayMembershipFetchResult)]
+pub fn relay_membership_fetch_result(head: JsValue, entries: Vec<String>) -> JsResult<String> {
+    err(crate::station::relay_membership_fetch_result(
+        strict_head(head)?,
+        entries,
+    ))
+}
+
+/// The class of the Portal's HTTP status for a report: `"confirm"`,
+/// `"retry"`, `"refuse"` or `"stop_reporting"` (`report_answer`).
+#[wasm_bindgen(js_name = reportAnswer)]
+pub fn report_answer(status: f64) -> JsResult<JsValue> {
+    if !(status.is_finite() && status.fract() == 0.0 && (0.0..=65535.0).contains(&status)) {
+        return Err(bad("an HTTP status is an integer from 0 to 65535"));
+    }
+    to_js(&crate::station::report_answer(status as u16))
+}
+
+/// The Station's reference acknowledgment ledger (`AckLedgerHandle`).
+#[wasm_bindgen]
+pub struct AckLedgerHandle(Arc<crate::station::AckLedgerHandle>);
+
+fn ack_transition(t: crate::station::AckTransition) -> JsResult<AckTransition> {
+    Ok(AckTransition {
+        made: to_js(&t.made)?,
+        alerts: to_js(&t.alerts)?,
+        next: t.next,
+    })
+}
+
+#[wasm_bindgen]
+impl AckLedgerHandle {
+    /// The empty ledger of the device list `accountId`/`genesisHash` at
+    /// the Station `origin`.
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        origin: String,
+        account_id: String,
+        genesis_hash: String,
+    ) -> JsResult<AckLedgerHandle> {
+        Ok(AckLedgerHandle(err(crate::station::AckLedgerHandle::new(
+            origin,
+            account_id,
+            genesis_hash,
+        ))?))
+    }
+    /// A state `toJson()` wrote.
+    #[wasm_bindgen(js_name = fromJson)]
+    pub fn from_json(state_json: String) -> JsResult<AckLedgerHandle> {
+        Ok(AckLedgerHandle(err(
+            crate::station::AckLedgerHandle::from_json(state_json),
+        )?))
+    }
+    /// The durable state (canonical JSON): store the next state's after
+    /// every call that returns a transition.
+    #[wasm_bindgen(js_name = toJson)]
+    pub fn to_json(&self) -> String {
+        self.0.to_json()
+    }
+    pub fn origin(&self) -> String {
+        self.0.origin()
+    }
+    #[wasm_bindgen(js_name = accountId)]
+    pub fn account_id(&self) -> String {
+        self.0.account_id()
+    }
+    #[wasm_bindgen(js_name = genesisHash)]
+    pub fn genesis_hash(&self) -> String {
+        self.0.genesis_hash()
+    }
+    /// A record the Station stored in its feed (`record`): for its own
+    /// `revoke`, the revocation starts at `min(revokedAtMs, the record's
+    /// issued_at + 1 hour)`.
+    pub fn record(
+        &self,
+        record_json: String,
+        revoked_at_ms: f64,
+        covered_hosts: Vec<String>,
+        now_ms: f64,
+    ) -> JsResult<AckTransition> {
+        ack_transition(err(self.0.record(
+            record_json,
+            ms(revoked_at_ms)?,
+            covered_hosts,
+            ms(now_ms)?,
+        ))?)
+    }
+    /// A host's `control_ack` on the link `link` (`{accountId, genesisHash,
+    /// hostId, hostTrustGen, connectionId}`, the link's verified
+    /// association), at `nowMs` (`ack`).
+    pub fn ack(&self, link: JsValue, ack_json: String, now_ms: f64) -> JsResult<AckTransition> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct L {
+            account_id: String,
+            genesis_hash: String,
+            host_id: String,
+            host_trust_gen: f64,
+            connection_id: String,
+        }
+        only_fields(
+            &link,
+            &[
+                "accountId",
+                "genesisHash",
+                "hostId",
+                "hostTrustGen",
+                "connectionId",
+            ],
+            "link",
+        )?;
+        let l: L = serde_wasm_bindgen::from_value(link).map_err(|e| {
+            bad(&format!(
+                "link {{accountId, genesisHash, hostId, hostTrustGen, connectionId}}: {e}"
+            ))
+        })?;
+        let link = crate::types::LinkAssociationInfo {
+            account_id: l.account_id,
+            genesis_hash: l.genesis_hash,
+            host_id: l.host_id,
+            host_trust_gen: ms(l.host_trust_gen)?,
+            connection_id: l.connection_id,
+        };
+        ack_transition(err(self.0.ack(link, ack_json, ms(now_ms)?))?)
+    }
+    /// The Station's timer (`tick`).
+    pub fn tick(&self, now_ms: f64) -> JsResult<AckTransition> {
+        ack_transition(self.0.tick(ms(now_ms)?))
+    }
+    /// The Portal answered `200` (`confirm`).
+    pub fn confirm(&self, report_id: String) -> JsResult<AckTransition> {
+        ack_transition(self.0.confirm(report_id))
+    }
+    /// The Portal refused the report for good (`refuse`).
+    pub fn refuse(&self, report_id: String) -> JsResult<AckTransition> {
+        ack_transition(self.0.refuse(report_id))
+    }
+    /// The Portal answered `403` to the report client `clientId`
+    /// (`stop_reporting`): every report held until a resume.
+    #[wasm_bindgen(js_name = stopReporting)]
+    pub fn stop_reporting(&self, client_id: String) -> JsResult<AckTransition> {
+        ack_transition(err(self.0.stop_reporting(client_id))?)
+    }
+    /// The Station reports again as the report client `clientId`
+    /// (`resume_reporting`): the stop's own ID keeps every report, another
+    /// drops the reports pending then.
+    #[wasm_bindgen(js_name = resumeReporting)]
+    pub fn resume_reporting(&self, client_id: String) -> JsResult<AckTransition> {
+        ack_transition(err(self.0.resume_reporting(client_id))?)
+    }
+    /// The report client ID reporting is stopped under, or `undefined`.
+    #[wasm_bindgen(js_name = stoppedClientId)]
+    pub fn stopped_client_id(&self) -> Option<String> {
+        self.0.stopped_client_id()
+    }
+    /// What to send now, in order: `[{reportId, report: {type, …},
+    /// notBefore}]`. For each principal only its earliest report not yet
+    /// settled (confirmed, refused or dropped), when every report its
+    /// `notBefore` names is settled too: the reports of one principal go in
+    /// the order they were made, one at a time. Nothing while reporting is
+    /// stopped.
+    #[wasm_bindgen(js_name = pendingReports)]
+    pub fn pending_reports(&self) -> JsResult<JsValue> {
+        to_js(&self.0.pending_reports())
+    }
+    /// The native-signed records still to re-sign (`record_id`s, sorted).
+    #[wasm_bindgen(js_name = resignAlerts)]
+    pub fn resign_alerts(&self) -> Vec<String> {
+        self.0.resign_alerts()
+    }
+    /// The reports refused for good.
+    #[wasm_bindgen(js_name = refusedReports)]
+    pub fn refused_reports(&self) -> Vec<String> {
+        self.0.refused_reports()
+    }
+    /// The reports a resume under another report client ID dropped.
+    #[wasm_bindgen(js_name = droppedReports)]
+    pub fn dropped_reports(&self) -> Vec<String> {
+        self.0.dropped_reports()
+    }
+    /// The report client ID each of `droppedReports()` was dropped under,
+    /// in the same order.
+    #[wasm_bindgen(js_name = droppedClientIds)]
+    pub fn dropped_client_ids(&self) -> Vec<String> {
+        self.0.dropped_client_ids()
+    }
+    /// The Portal refused this Station's reports (`403`).
+    #[wasm_bindgen(js_name = reportingStopped)]
+    pub fn reporting_stopped(&self) -> bool {
+        self.0.reporting_stopped()
+    }
+}
+
+/// What a ledger call gives (`crate::station::AckTransition`).
+#[wasm_bindgen]
+pub struct AckTransition {
+    made: JsValue,
+    alerts: JsValue,
+    next: Arc<crate::station::AckLedgerHandle>,
+}
+
+#[wasm_bindgen]
+impl AckTransition {
+    /// What the call made: `[{reportId, report, notBefore}]`. Never send
+    /// these: send `next.pendingReports()` once the state committed.
+    #[wasm_bindgen(getter)]
+    pub fn made(&self) -> JsValue {
+        self.made.clone()
+    }
+    /// The operator alerts it raised: `{type: "report_refused", reportId}`,
+    /// `{type: "reporting_stopped", clientId}` or `{type:
+    /// "reports_dropped", clientId, dropped}`.
+    #[wasm_bindgen(getter)]
+    pub fn alerts(&self) -> JsValue {
+        self.alerts.clone()
+    }
+    /// The state after the call: use it once the transaction storing
+    /// `next.toJson()` committed.
+    #[wasm_bindgen(getter)]
+    pub fn next(&self) -> AckLedgerHandle {
+        AckLedgerHandle(self.next.clone())
+    }
+}
+
 // ------------------------------------------------------- kit and backup
 
 #[wasm_bindgen]

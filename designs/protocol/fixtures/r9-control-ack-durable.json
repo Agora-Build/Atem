@@ -1,0 +1,427 @@
+{
+  "name": "r9-control-ack-durable",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "relay",
+  "log": "r9-vectors-membership-log",
+  "note": "Test 48, durability around the state and report boundary (Astation's review). A transition's next state and its report intents are persisted in one transaction before any POST; the Station adopts the next state only after that commit. host-b's first ack is lost with the Station's crash before the commit: the host resends it, and the same transition gives the same report_id. A restart after the commit and before delivery delivers it; a 503 is retried with the same report_id and body; a POST that reached the Portal whose answer was lost is sent again after a restart, and the Portal answers its recorded 200. host-b's ack resent after that counts nothing. Two replicas load the same committed state and process host-c's ack: byte-identical states and intents (so the Portal would deduplicate); the first commits, the second's compare-and-swap fails and it processes the ack again on the new state, making nothing. Duplicate acks for the original (M3) and the re-signed (M4) native record count nothing twice. revoked{all_applied} is delivered only after both per-host reports. Each report_id reaches the Portal with one body.",
+  "setup": {
+    "station": {
+      "origin": "https://station-dev.agora.build",
+      "account_id": "acct-test-1",
+      "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89"
+    },
+    "records": "r9-vectors-host-work-control",
+    "integrations": {
+      "i-01jc5zq9x8w7v6t5s4r3q2p1n0": "service:svc-discord"
+    },
+    "links": {
+      "host-b": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "connection_id": "relay-1:host-b"
+      },
+      "host-c": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-c",
+        "host_trust_gen": 1,
+        "connection_id": "relay-1:host-c"
+      }
+    },
+    "station_now_ms": 1793620940000
+  },
+  "steps": [
+    {
+      "control_record": "S4_revoke",
+      "revoked_at_ms": 1793620903000,
+      "covered_hosts": [
+        "host-b",
+        "host-c"
+      ],
+      "made": []
+    },
+    {
+      "control_record": "M3_revoke_by_removed_manager",
+      "covered_hosts": [
+        "host-b",
+        "host-c"
+      ],
+      "made": []
+    },
+    {
+      "control_record": "M4_revoke_resigned",
+      "covered_hosts": [
+        "host-b",
+        "host-c"
+      ],
+      "made": []
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 3,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000004",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-b",
+      "made": [
+        "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+      ],
+      "commit": false
+    },
+    {
+      "restart": true
+    },
+    {
+      "expect_report": []
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 3,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000004",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-b",
+      "made": [
+        "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+      ]
+    },
+    {
+      "restart": true
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [],
+          "report": {
+            "host": "host-b",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revocation_applied",
+            "record_id": "00000000-0000-4000-8000-000000000004"
+          },
+          "report_id": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+        }
+      ]
+    },
+    {
+      "report_failure": {
+        "report_id": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca",
+        "status": 503,
+        "answer": "retry"
+      }
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [],
+          "report": {
+            "host": "host-b",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revocation_applied",
+            "record_id": "00000000-0000-4000-8000-000000000004"
+          },
+          "report_id": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+        }
+      ]
+    },
+    {
+      "report_failure": {
+        "report_id": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca",
+        "status": "no_answer",
+        "reached": true,
+        "answer": "retry"
+      }
+    },
+    {
+      "restart": true
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [],
+          "report": {
+            "host": "host-b",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revocation_applied",
+            "record_id": "00000000-0000-4000-8000-000000000004"
+          },
+          "report_id": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+        }
+      ]
+    },
+    {
+      "confirm": "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca"
+    },
+    {
+      "expect_report": []
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 3,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000004",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-b",
+      "made": []
+    },
+    {
+      "replica": {
+        "control_ack": {
+          "type": "relay",
+          "op": "control_ack",
+          "account_id": "acct-test-1",
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-c",
+          "host_trust_gen": 1,
+          "origin": "https://station-dev.agora.build",
+          "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+          "cursor": 3,
+          "results": [
+            {
+              "record_id": "00000000-0000-4000-8000-000000000016",
+              "effects": [
+                {
+                  "effect": "revocation",
+                  "result": "applied"
+                },
+                {
+                  "effect": "interrupt",
+                  "result": "applied"
+                }
+              ]
+            }
+          ]
+        },
+        "link": "host-c",
+        "made": [
+          "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d",
+          "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+        ]
+      }
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-c",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 3,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000016",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              },
+              {
+                "effect": "interrupt",
+                "result": "applied"
+              }
+            ]
+          },
+          {
+            "record_id": "00000000-0000-4000-8000-000000000017",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "duplicate"
+              },
+              {
+                "effect": "interrupt",
+                "result": "duplicate"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-c",
+      "made": []
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-c",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 3,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000017",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "duplicate"
+              },
+              {
+                "effect": "interrupt",
+                "result": "duplicate"
+              }
+            ]
+          },
+          {
+            "record_id": "00000000-0000-4000-8000-000000000004",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "duplicate"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-c",
+      "made": []
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [],
+          "report": {
+            "host": "host-c",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revocation_applied",
+            "record_id": "00000000-0000-4000-8000-000000000016"
+          },
+          "report_id": "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+        }
+      ]
+    },
+    {
+      "restart": true
+    },
+    {
+      "confirm": "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [
+            "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca",
+            "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+          ],
+          "report": {
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revoked",
+            "outcome": "all_applied",
+            "pending_hosts": []
+          },
+          "report_id": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+        }
+      ]
+    },
+    {
+      "confirm": "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+    },
+    {
+      "expect_report": []
+    },
+    {
+      "expect_resign_alerts": [
+        "M3_revoke_by_removed_manager",
+        "M4_revoke_resigned"
+      ]
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 3,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000017",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "duplicate"
+              },
+              {
+                "effect": "interrupt",
+                "result": "applied"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-b",
+      "made": []
+    },
+    {
+      "expect_resign_alerts": []
+    },
+    {
+      "expect_portal": [
+        "revocation_applied:86c1170fe8aef244b2dae929c5671ec7f3a499e159fa3fe6ef263793455fe5ca",
+        "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d",
+        "revoked:1123bcebb0e3668d1867fa213b5e03eddbfb95efa1077e3ffe4cd837b109d1b1"
+      ]
+    }
+  ]
+}

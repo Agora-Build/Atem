@@ -3451,7 +3451,16 @@ route) and push relay messages (`push_hint`, `push_seen`, `push_ack`,
 R9.9), nothing else: r8 session-family messages are dropped unanswered, no Astation
 operation (pair, pair verify, cred unlock/projects, the token refresh)
 runs on it, no `credentialSync` or encryption message is applied, no mark
-task is taken or reported. Astation's `auth_required` on the same link is
+task is taken or reported. **Planned (delegated host work; changed for
+host senders, needs Astation's agreement):** a routed link also carries the
+Station calls of host-work-v1 §11.4 (`control_sync`,
+`control_sync_result`, `heads`, `control_ack`, `membership_fetch`,
+`membership_fetch_result`, and the refusals `control_sync_refused`,
+`membership_fetch_refused`, `control_ack_refused`) and, in stage 3, the mailbox calls (delegated
+host-work design II.4.3), because unattended hosts are where delegated and
+host-sender work runs. The Station takes the calling host from the route
+the host proved (its verified root, host and connection binding), never
+from a field of a call (host-work-v1 §11.4, "Which host is calling"). Astation's `auth_required` on the same link is
 answered with the connect path's semantics (the pairing's saved session,
 pinned to the pairing's Astation = the room; a granted session is saved;
 the connect path's session advice and its 300 s completion bound); the
@@ -3896,7 +3905,14 @@ several `push_hint` messages (one hint, about 0.8–1.5 KiB, always fits),
 and the relay splits its acknowledgments over several `push_ack`
 messages (about 340 bytes an identity). Atem drops a larger relay
 message unread (counted in its log); what it would have acknowledged is
-resent and acknowledged again.
+resent and acknowledged again. **Planned (delegated host work, stage 3;
+owner choice 13; changed agreed meaning, needs Astation's agreement):**
+mailbox calls (design II.4.3: put, stored, sync, done) carry one object
+each and may be up to 524,288 bytes (512 KiB) as sent, so a host sender's
+Message keeps host-work-v1 §5's 240 KiB bound; the drop-unread rule
+exempts them up to that bound, and drops a larger one unread as any other.
+Every other relay message, the Station calls of host-work-v1 §11.4
+included, keeps the 256 KiB bound.
 
 What Atem keeps for delivery is bounded, and a bound never cuts a
 lifecycle the relay may already hold: once an approval's open hints were
@@ -4130,7 +4146,8 @@ input, every signature by the key its chain names for the signer, the
 `r9Svc` beside each service record's `principal_key`, the record
 digests a sequence's state keeps (each the body of a record of that
 principal with that `record_id`) and each step's position against the
-file's stations),
+file's stations), every Station report id of the acknowledgment
+fixtures `r9-control-ack-*` (host-work-v1 §11.4),
 and of `r9-vectors-host-envelope` (its entries' chain, hashes and
 signatures, each object's `jcs`, signing input, signature, seal `info`,
 `sealed_hash`, the open with the recipient key, the seal again from the
@@ -4194,7 +4211,12 @@ the lease), and the channel envelope (R9.7a): `r9-envelope-vectors`,
 `r9-host-policy-failed-true-to-false-stays-relay-only`,
 `r9-host-policy-restart-with-a-pending-write-rolls-forward` (their host runs with
 `setup.host.link: "relay"`: the fake Astation is reached as the relay
-identity room, so a relay-only commit keeps the link).
+identity room, so a relay-only commit keeps the link), and, planned, the
+Station's acknowledgments (delegated host work, host-work-v1 §11.4;
+`side: "relay"`, run against atem-client's reference ledger):
+`r9-control-ack-resign`, `r9-control-ack-per-effect`,
+`r9-control-ack-deadline`, `r9-control-ack-durable`,
+`r9-control-ack-portal-refusals`.
 
 ### R9.13 Open questions for Astation
 

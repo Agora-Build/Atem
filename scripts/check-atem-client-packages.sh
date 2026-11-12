@@ -3,15 +3,16 @@
 #
 # Checks what scripts/package-atem-client-bindings.sh put in <dir>, the way
 # Astation should after downloading it (designs/protocol/atem-client-bindings.md
-# §7): the SHA-256 sums, the source pin, the shared host-work vectors listed in
-# the sums (requests, prompt framing, framing size), no test-only or host-role
-# export in the shipped bindings (the framing's vectors-only rendering
-# included), and each package used once: the Node build of the WASM package
-# runs the packaged framing vectors (escaping, Unicode version, the preflight
-# size check) and, with the JVM jar (through JNA), reads the r9 pairing
-# vectors' verifyCommit messages with the shared parser. The Android zip:
-# each ABI's ELF class, machine, 16 KB LOAD alignment and exports (READELF,
-# default readelf).
+# §7): the SHA-256 sums, the source pin, the shared vectors listed in the sums
+# and unchanged (host-work requests, prompt framing, framing size; r9 control,
+# push-hint, delegated-wire and host-envelope vectors; the acknowledgment
+# fixtures), no test-only or host-role export in the shipped bindings (the
+# framing's vectors-only rendering and host mail included), and each package
+# used once: the Node build of the WASM package runs the packaged framing
+# vectors (escaping, Unicode version, the preflight size check) and, with the
+# JVM jar (through JNA), reads the r9 pairing vectors' verifyCommit messages
+# with the shared parser. The Android zip: each ABI's ELF class, machine,
+# 16 KB LOAD alignment and exports (READELF, default readelf).
 #   EXPECT_COMMIT  the full SHA the packages must pin (with a clean tree)
 #   NODE  node (default: node on PATH)
 #   JAVA, JAVAC  java and javac (default: on PATH), and JNA_JAR: the jar check
@@ -26,17 +27,23 @@ trap 'rm -rf "$WORK"' EXIT
 VECTORS="$ROOT/designs/protocol/fixtures/r9-vectors-pairing.json"
 
 (cd "$DIR" && sha256sum -c "atem-client-${VERSION}-SHA256SUMS.txt")
-# The shared host-work and r9 vectors ship beside the packages, each listed in
-# the sums (sha256sum -c above checked what is listed, not that it is listed)
-# and the same bytes as the repository's.
-for vector in \
-  host-work/requests-v1.json:host-work-requests-v1.json \
-  host-work/prompt-framing-v1.json:host-work-prompt-framing-v1.json \
-  host-work/framing-size-v1.json:host-work-framing-size-v1.json \
-  r9-vectors-host-work-control.json:r9-vectors-host-work-control.json \
-  r9-vectors-push-hint.json:r9-vectors-push-hint.json \
-  r9-vectors-delegated-wire.json:r9-vectors-delegated-wire.json \
-  r9-vectors-host-envelope.json:r9-vectors-host-envelope.json; do
+# The shared host-work and r9 vectors and the Station's acknowledgment
+# fixtures (test 48) ship beside the packages, each listed in the sums
+# (sha256sum -c above checked what is listed, not that it is listed) and the
+# same bytes as the repository's.
+SHIPPED_VECTORS=(
+  host-work/requests-v1.json:host-work-requests-v1.json
+  host-work/prompt-framing-v1.json:host-work-prompt-framing-v1.json
+  host-work/framing-size-v1.json:host-work-framing-size-v1.json
+  r9-vectors-host-work-control.json:r9-vectors-host-work-control.json
+  r9-vectors-push-hint.json:r9-vectors-push-hint.json
+  r9-vectors-delegated-wire.json:r9-vectors-delegated-wire.json
+  r9-vectors-host-envelope.json:r9-vectors-host-envelope.json
+)
+for fixture in "$ROOT"/designs/protocol/fixtures/r9-control-ack-*.json; do
+  SHIPPED_VECTORS+=("$(basename "$fixture"):$(basename "$fixture")")
+done
+for vector in "${SHIPPED_VECTORS[@]}"; do
   source="$ROOT/designs/protocol/fixtures/${vector%%:*}"
   shipped="atem-client-${VERSION}-${vector#*:}"
   test -s "$DIR/$shipped" || { echo "$shipped: missing from the package directory" >&2; exit 1; }
@@ -45,7 +52,7 @@ for vector in \
   cmp -s "$source" "$DIR/$shipped" ||
     { echo "vectors: $shipped differs from ${vector%%:*}" >&2; exit 1; }
 done
-echo "vectors: 7 files shipped, listed and unchanged"
+echo "vectors: ${#SHIPPED_VECTORS[@]} files shipped, listed and unchanged"
 FRAMING_VECTORS="$DIR/atem-client-${VERSION}-host-work-prompt-framing-v1.json"
 FRAMING_SIZE_VECTORS="$DIR/atem-client-${VERSION}-host-work-framing-size-v1.json"
 python3 - "$DIR/atem-client-${VERSION}-SOURCE.json" "${EXPECT_COMMIT:-}" <<'EOF'

@@ -5,7 +5,7 @@
 // The same checks run through Kotlin (bindings/kotlin/Conformance.kt) and
 // Swift (bindings/swift/Tests/…/ConformanceTests.swift).
 import { createRequire } from "node:module";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { createHash, createHmac } from "node:crypto";
 import { join, resolve } from "node:path";
 
@@ -601,6 +601,242 @@ check("control records: a failed commit loses no effect (apply leaves its handle
   eq(again.next.apply(record, logL(), pos, 6).applied.result, "duplicate");
   // A position names its Station's origin too.
   throwsCode(() => state.apply(record, logL(), { feedId: ctl.stations.A.feed_id, feedSeq: 1 }, 6), "malformed");
+});
+
+// ------------------------------- delegated host work: the Station's side
+// r9-control-ack-*: every acknowledgment fixture through AckLedgerHandle as
+// a Station persists it (each call's next state committed before the
+// reports go, adopted after; restarts reload the committed state; replicas
+// serialized); a call never changes its handle; the relay builders and
+// readers agree; the Portal's statuses in their classes.
+const canon = (v) => m.canonicalJson(str(v));
+const intentOut = (i) => ({
+  not_before: i.notBefore,
+  report:
+    i.report.type === "revocation_applied"
+      ? { kind: "revocation_applied", integration_id: i.report.integrationId, host: i.report.host, record_id: i.report.recordId }
+      : { kind: "revoked", integration_id: i.report.integrationId, outcome: i.report.outcome, pending_hosts: i.report.pendingHosts },
+  report_id: i.reportId,
+});
+const alertOut = (a) =>
+  a.type === "report_refused"
+    ? { kind: "report_refused", report_id: a.reportId }
+    : a.type === "reporting_stopped"
+      ? { kind: "reporting_stopped", client_id: a.clientId }
+      : { kind: "reports_dropped", client_id: a.clientId, dropped: a.dropped };
+const linkOf = (l) => ({ accountId: l.account_id, genesisHash: l.genesis_hash, hostId: l.host_id, hostTrustGen: l.host_trust_gen, connectionId: l.connection_id });
+const ctlRecord = (label) => str(ctlByLabel[label].record);
+const ACKS = readdirSync(fixturesDir)
+  .filter((n) => n.startsWith("r9-control-ack-") && n.endsWith(".json"))
+  .map((n) => n.slice(0, -5))
+  .sort();
+for (const name of ACKS) {
+  check(`Station acks: ${name} through AckLedgerHandle`, () => {
+    eq(ACKS.length, 5, "the acknowledgment fixtures");
+    const f = load(name);
+    const setup = f.setup;
+    const st = setup.station;
+    let ledger = new m.AckLedgerHandle(st.origin, st.account_id, st.genesis_hash);
+    let committed = ledger.toJson();
+    let now = setup.station_now_ms;
+    let clientId = setup.report_client_id;
+    const input = (on, step) => {
+      if (step.control_record !== undefined) return on.record(ctlRecord(step.control_record), step.revoked_at_ms ?? now, step.covered_hosts, now);
+      if (step.control_ack !== undefined) {
+        const link = linkOf(setup.links[step.link]);
+        if (step.refused !== undefined) {
+          throwsCode(() => on.ack(link, str(step.control_ack), now), step.refused);
+          return undefined;
+        }
+        return on.ack(link, str(step.control_ack), now);
+      }
+      if (step.tick !== undefined) return on.tick(now);
+      throw new Error(`not an input: ${str(step)}`);
+    };
+    const made = (t, step) => {
+      eq(t.made.map((i) => i.reportId), step.made, `${name} made`);
+      eq(t.alerts, [], `${name} alerts`);
+    };
+    const commit = (t) => {
+      committed = t.next.toJson();
+      ledger = t.next;
+    };
+    const sendable = (id) => {
+      if (!ledger.pendingReports().some((i) => i.reportId === id)) throw new Error(`${id} is not sendable`);
+    };
+    for (const step of f.steps) {
+      if ("control_record" in step || "control_ack" in step || "tick" in step) {
+        const t = input(ledger, step);
+        if (t === undefined) continue;
+        made(t, step);
+        if (step.commit !== false) commit(t);
+      } else if ("replica" in step) {
+        const t1 = input(m.AckLedgerHandle.fromJson(committed), step.replica);
+        const t2 = input(m.AckLedgerHandle.fromJson(committed), step.replica);
+        eq(t1.next.toJson(), t2.next.toJson(), `${name} replicas' states`);
+        eq(t1.made, t2.made, `${name} replicas' intents`);
+        made(t1, step.replica);
+        commit(t1);
+        eq(input(m.AckLedgerHandle.fromJson(committed), step.replica).made, [], `${name} the replica that lost`);
+      } else if ("advance_ms" in step) {
+        now += step.advance_ms;
+      } else if ("restart" in step) {
+        ledger = m.AckLedgerHandle.fromJson(committed);
+        eq(ledger.toJson(), committed, `${name} restart`);
+      } else if ("expect_report" in step) {
+        eq(canon(ledger.pendingReports().map(intentOut)), canon(step.expect_report), `${name} reports`);
+      } else if ("confirm" in step) {
+        sendable(step.confirm);
+        commit(ledger.confirm(step.confirm));
+      } else if ("report_failure" in step) {
+        const fl = step.report_failure;
+        sendable(fl.report_id);
+        const answer = typeof fl.status === "number" ? m.reportAnswer(fl.status) : "retry";
+        eq(answer, fl.answer, `${name} answer`);
+        const t = answer === "refuse" ? ledger.refuse(fl.report_id) : answer === "stop_reporting" ? ledger.stopReporting(clientId) : undefined;
+        eq(canon(t === undefined ? [] : t.alerts.map(alertOut)), canon(fl.alerts ?? []), `${name} alerts`);
+        if (t !== undefined) commit(t);
+      } else if ("expect_resign_alerts" in step) {
+        eq(ledger.resignAlerts(), step.expect_resign_alerts.map((l) => ctlByLabel[l].record.body.record_id).sort(), `${name} resign alerts`);
+      } else if ("expect_dropped" in step) {
+        eq(ledger.droppedReports(), step.expect_dropped, `${name} dropped`);
+      } else if ("expect_refused" in step) {
+        eq(ledger.refusedReports(), step.expect_refused, `${name} refused`);
+      } else if ("resume_reporting" in step) {
+        clientId = step.resume_reporting;
+        const t = ledger.resumeReporting(clientId);
+        eq(canon(t.alerts.map(alertOut)), canon(step.alerts), `${name} resume alerts`);
+        eq(t.made, [], `${name} resume`);
+        commit(t);
+      } else if ("expect_stopped" in step) {
+        eq(ledger.stoppedClientId() ?? false, step.expect_stopped, `${name} stopped`);
+        eq(ledger.reportingStopped(), step.expect_stopped !== false, `${name} stopped`);
+      } else if (!("expect_portal" in step)) {
+        // expect_portal is the Portal's side: no Portal model here.
+        throw new Error(`unknown step ${str(step)}`);
+      }
+    }
+  });
+}
+check("Station acks: a call never changes its handle; the state loads only as written", () => {
+  const f = load("r9-control-ack-per-effect");
+  const st = f.setup.station;
+  const linkB = linkOf(f.setup.links["host-b"]);
+  const nowMs = 1793620940000;
+  const l = new m.AckLedgerHandle(st.origin, st.account_id, st.genesis_hash).record(ctlRecord("S4_revoke"), 1793620903000, ["host-b", "host-c"], nowMs).next;
+  const before = l.toJson();
+  const ack = str(f.steps[6].control_ack);
+  const t1 = l.ack(linkB, ack, nowMs);
+  const t2 = l.ack(linkB, ack, nowMs);
+  // The commit failed: the handle is as it was, and the same call again gives the same.
+  eq(l.toJson(), before);
+  eq(t1.next.toJson(), t2.next.toJson());
+  eq(t1.made, t2.made);
+  eq(t1.made.length, 1);
+  const id = t1.made[0].reportId;
+  eq(t1.next.refuse(id).alerts, [{ type: "report_refused", reportId: id }]);
+  eq(t1.next.pendingReports().length, 1);
+  const stopped = t1.next.stopReporting("station-1").next;
+  eq([stopped.reportingStopped(), stopped.stoppedClientId(), stopped.pendingReports()], [true, "station-1", []]);
+  eq(t1.next.reportingStopped(), false);
+  // The same report client ID keeps every report; another drops them.
+  eq(stopped.resumeReporting("station-1").next.pendingReports(), t1.next.pendingReports());
+  const other = stopped.resumeReporting("station-2");
+  eq(other.alerts, [{ type: "reports_dropped", clientId: "station-1", dropped: [id] }]);
+  eq([other.next.droppedReports(), other.next.droppedClientIds()], [[id], ["station-1"]]);
+  throwsCode(() => l.stopReporting("a b"), "malformed");
+  const text = t1.next.toJson();
+  eq(m.AckLedgerHandle.fromJson(text).toJson(), text);
+  throwsCode(() => m.AckLedgerHandle.fromJson("["), "malformed");
+  throwsCode(() => m.AckLedgerHandle.fromJson(text.replace('"v":1', '"v":2')), "unsupported_version");
+  throwsCode(() => m.AckLedgerHandle.fromJson(text.replace("{", '{"extra":1,')), "stored_invalid");
+  throwsCode(() => new m.AckLedgerHandle("https://Station-dev.agora.build/", st.account_id, st.genesis_hash), "malformed");
+  throwsCode(() => l.ack({ ...linkB, connectionId: "" }, ack, nowMs), "incomplete_link");
+  throwsCode(() => l.ack({ ...linkB, hostID: "host-b" }, ack, nowMs), "malformed");
+  throwsCode(() => l.ack(linkB, ack.replaceAll("host-b", "host-c"), nowMs), "not_the_link");
+  throwsCode(() => l.record(ctlRecord("P4_unknown_field"), 0, [], nowMs), "unknown_field");
+});
+check("Station calls: fixture acks read and write back; pages, heads and fetches round-trip; builders refuse what readers refuse", () => {
+  for (const name of ACKS) {
+    for (const step of load(name).steps) {
+      const msg = (step.replica ?? step).control_ack;
+      if (msg === undefined) continue;
+      const read = m.relayDecodeToStation(str(msg));
+      eq(read.type, "control_ack");
+      eq(m.canonicalJson(m.relayControlAck(read.ack)), canon(msg), name);
+    }
+  }
+  const { origin, feed_id: feed } = ctl.stations.A;
+  const sync = m.relayDecodeToStation(m.relayControlSync(origin, feed, 7));
+  eq([sync.type, sync.origin, sync.feedId, sync.after], ["control_sync", origin, feed, 7]);
+  const first = m.relayDecodeToStation(m.relayControlSync(origin, undefined, 0));
+  eq([first.type, first.feedId ?? null, first.after], ["control_sync", null, 0]);
+  throwsCode(() => m.relayControlSync(origin, undefined, 5), "malformed");
+  const page = ["S1_cover", "S4_revoke", "M1_revoke"].map((label, i) => ({ feedSeq: i + 1, recordJson: ctlRecord(label) }));
+  const read = m.relayDecodeToHost(m.relayControlSyncResult(origin, feed, 3, 1793620940000, page));
+  eq(read.type, "control_sync_result");
+  eq(read.records.map((r) => m.canonicalJson(r.recordJson)), page.map((r) => m.canonicalJson(r.recordJson)));
+  const refusedPage = page.map((r, i) => (i === 1 ? { ...r, recordJson: ctlRecord("P4_unknown_field") } : r));
+  throwsCode(() => m.relayControlSyncResult(origin, feed, 3, 0, refusedPage), "unknown_field");
+  throwsCode(() => m.relayControlSyncResult(origin, feed, 2, 0, page), "malformed");
+  throwsCode(() => m.relayControlSyncResult(origin, feed, 3, 0, [page[1], page[0]]), "malformed");
+  const membership = { seq: mlog.head.seq, hash: mlog.head.hash };
+  const feeds = [{ origin, feedId: feed, head: 3, stationTime: 1793620940000 }];
+  const hm = m.relayHeads(feeds, membership);
+  const heads = m.relayDecodeToHost(hm);
+  eq([heads.type, heads.feeds, heads.membership], ["heads", feeds, membership]);
+  throwsCode(() => m.relayDecodeToHost(str({ ...JSON.parse(hm), mailbox: { mailbox_id: feed, head: 1 } })), "unknown_field");
+  const fetch = m.relayDecodeToStation(m.relayMembershipFetch(2));
+  eq([fetch.type, fetch.after], ["membership_fetch", 2]);
+  const entries = ["E3", "E4", "E5", "E6"].map(entry);
+  const fetched = m.relayDecodeToHost(m.relayMembershipFetchResult(membership, entries));
+  eq([fetched.type, fetched.head], ["membership_fetch_result", membership]);
+  eq(fetched.entries.map((e) => m.canonicalJson(e)), entries.map((e) => m.canonicalJson(e)));
+  throwsCode(() => m.relayDecodeToHost(m.relayControlSync(origin, undefined, 0)), "wrong_message");
+  throwsCode(() => m.relayDecodeToStation(str({ type: "relay", op: "push_hint", hints: [] })), "wrong_message");
+  throwsCode(() => m.relayDecodeToStation("{"), "not_strict");
+});
+check("Station calls: the three refusals exactly and read strictly; a stale-association ack refused without disclosure or ledger advance", () => {
+  const refusals = [
+    [m.relayControlSyncRefused, "control_sync_refused"],
+    [m.relayMembershipFetchRefused, "membership_fetch_refused"],
+    [m.relayControlAckRefused, "control_ack_refused"],
+  ];
+  for (const [build, op] of refusals) {
+    const msg = build("forbidden");
+    eq(canon(JSON.parse(msg)), canon({ type: "relay", op, code: "forbidden" }), op);
+    eq(m.relayDecodeToHost(msg), { type: op, code: "forbidden" }, op);
+    throwsCode(() => m.relayDecodeToStation(msg), "wrong_message");
+    throwsCode(() => build("not_found"), "malformed");
+    const bad = [
+      ['"code":"not_found"', "malformed"],
+      ['"code":null', "malformed"],
+      ['"code":"forbidden","feed_id":"x"', "unknown_field"],
+      ['"code":"forbidden","code":"forbidden"', "not_strict"],
+    ];
+    for (const [fields, code] of bad) throwsCode(() => m.relayDecodeToHost(`{"type":"relay","op":"${op}",${fields}}`), code);
+  }
+  // A stale association: the link was verified at trust generation 2, the ack claims 1.
+  const f = load("r9-control-ack-deadline");
+  const st = f.setup.station;
+  const nowMs = 1793620940000;
+  const l = new m.AckLedgerHandle(st.origin, st.account_id, st.genesis_hash).record(ctlRecord("S4_revoke"), 1793620903000, ["host-b"], nowMs).next;
+  const before = l.toJson();
+  const ack = str(f.steps[1].control_ack);
+  const link = { ...linkOf(f.setup.links["host-b"]), hostTrustGen: 2 };
+  throwsCode(() => l.ack(link, ack, nowMs), "not_the_link");
+  eq(l.toJson(), before);
+  eq(l.pendingReports(), []);
+  const reply = m.relayControlAckRefused("forbidden");
+  for (const secret of [st.account_id, st.genesis_hash, st.origin, "host-b", ctlByLabel.S4_revoke.record.body.record_id]) {
+    if (reply.includes(secret)) throw new Error(`the refusal names ${secret}`);
+  }
+  eq(l.ack({ ...link, hostTrustGen: 1 }, ack, nowMs).made.length, 2);
+});
+check("Station: the Portal's statuses in their classes", () => {
+  const want = { 200: "confirm", 401: "retry", 408: "retry", 429: "retry", 500: "retry", 503: "retry", 400: "refuse", 404: "refuse", 409: "refuse", 413: "refuse", 415: "refuse", 204: "refuse", 302: "refuse", 403: "stop_reporting" };
+  for (const [status, answer] of Object.entries(want)) eq(m.reportAnswer(Number(status)), answer, status);
+  throwsCode(() => m.reportAnswer(200.5), "malformed");
 });
 
 // ------------------------------- delegated host work: envelopes and results

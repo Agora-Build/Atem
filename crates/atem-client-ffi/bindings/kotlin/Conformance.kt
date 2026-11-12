@@ -781,6 +781,258 @@ fun main(args: Array<String>) {
         }
     }
 
+    // ------------------------------- delegated host work: the Station's side
+    // r9-control-ack-*: every acknowledgment fixture through AckLedgerHandle
+    // as a Station persists it (each call's next state committed before the
+    // reports go, adopted after; restarts reload the committed state;
+    // replicas serialized); a call never changes its handle; the relay
+    // builders and readers agree; the Portal's statuses in their classes.
+    fun canon(v: Any?) = canonicalJson(Json.write(v))
+    fun intentOf(i: ReportIntentInfo): Map<String, Any?> = mapOf(
+        "not_before" to i.notBefore,
+        "report" to when (val r = i.report) {
+            is StationReport.RevocationApplied -> mapOf("kind" to "revocation_applied", "integration_id" to r.integrationId,
+                "host" to r.host, "record_id" to r.recordId)
+            is StationReport.Revoked -> mapOf("kind" to "revoked", "integration_id" to r.integrationId,
+                "outcome" to r.outcome, "pending_hosts" to r.pendingHosts)
+        },
+        "report_id" to i.reportId)
+    fun alertOf(a: LedgerAlertInfo): Map<String, Any?> = when (a) {
+        is LedgerAlertInfo.ReportRefused -> mapOf("kind" to "report_refused", "report_id" to a.reportId)
+        is LedgerAlertInfo.ReportingStopped -> mapOf("kind" to "reporting_stopped", "client_id" to a.clientId)
+        is LedgerAlertInfo.ReportsDropped -> mapOf("kind" to "reports_dropped", "client_id" to a.clientId, "dropped" to a.dropped)
+    }
+    fun answerOf(a: ReportAnswerKind) = when (a) {
+        ReportAnswerKind.CONFIRM -> "confirm"
+        ReportAnswerKind.RETRY -> "retry"
+        ReportAnswerKind.REFUSE -> "refuse"
+        ReportAnswerKind.STOP_REPORTING -> "stop_reporting"
+    }
+    fun linkOf(l: Any?) = LinkAssociationInfo(l["account_id"].s(), l["genesis_hash"].s(), l["host_id"].s(),
+        l["host_trust_gen"].l().toULong(), l["connection_id"].s())
+    fun ctlRecord(label: String) = Json.write(ctlByLabel.getValue(label)["record"])
+    val ackNames = dir.list()!!.filter { it.startsWith("r9-control-ack-") && it.endsWith(".json") }
+        .map { it.removeSuffix(".json") }.sorted()
+    for (name in ackNames) check("Station acks: $name through AckLedgerHandle") {
+        eq(ackNames.size, 5, "the acknowledgment fixtures")
+        val f = load(name)
+        val setup = f["setup"]
+        val st = setup["station"]
+        var ledger = AckLedgerHandle(st["origin"].s(), st["account_id"].s(), st["genesis_hash"].s())
+        var committed = ledger.toJson()
+        var now = setup["station_now_ms"].l().toULong()
+        var clientId = setup.obj()["report_client_id"] as String?
+        fun input(on: AckLedgerHandle, step: Any?): AckTransition? {
+            val o = step.obj()
+            return when {
+                "control_record" in o -> on.record(ctlRecord(o["control_record"].s()),
+                    o["revoked_at_ms"]?.l()?.toULong() ?: now, strs(o["covered_hosts"]), now)
+                "control_ack" in o -> {
+                    val link = linkOf(setup["links"][o["link"].s()])
+                    val ack = Json.write(o["control_ack"])
+                    if ("refused" in o) {
+                        throwsCode(o["refused"].s()) { on.ack(link, ack, now) }
+                        null
+                    } else on.ack(link, ack, now)
+                }
+                "tick" in o -> on.tick(now)
+                else -> throw AssertionError("not an input: ${Json.write(step)}")
+            }
+        }
+        fun made(t: AckTransition, step: Any?) {
+            eq(t.made.map { it.reportId }, strs(step["made"]), "$name made")
+            eq(t.alerts, emptyList<LedgerAlertInfo>(), "$name alerts")
+        }
+        fun commit(t: AckTransition) {
+            committed = t.next.toJson()
+            ledger = t.next
+        }
+        fun sendable(id: String) {
+            if (ledger.pendingReports().none { it.reportId == id }) throw AssertionError("$id is not sendable")
+        }
+        for (step in f["steps"].arr()) {
+            val o = step.obj()
+            when {
+                "control_record" in o || "control_ack" in o || "tick" in o -> {
+                    val t = input(ledger, step)
+                    if (t != null) {
+                        made(t, step)
+                        if (o["commit"] != false) commit(t)
+                    }
+                }
+                "replica" in o -> {
+                    val inner = o["replica"]
+                    val t1 = input(AckLedgerHandle.fromJson(committed), inner)!!
+                    val t2 = input(AckLedgerHandle.fromJson(committed), inner)!!
+                    eq(t1.next.toJson(), t2.next.toJson(), "$name replicas' states")
+                    eq(t1.made, t2.made, "$name replicas' intents")
+                    made(t1, inner)
+                    commit(t1)
+                    eq(input(AckLedgerHandle.fromJson(committed), inner)!!.made, emptyList<ReportIntentInfo>(), "$name the replica that lost")
+                }
+                "advance_ms" in o -> now += o["advance_ms"].l().toULong()
+                "restart" in o -> {
+                    ledger = AckLedgerHandle.fromJson(committed)
+                    eq(ledger.toJson(), committed, "$name restart")
+                }
+                "expect_report" in o -> eq(canon(ledger.pendingReports().map(::intentOf)), canon(o["expect_report"]), "$name reports")
+                "confirm" in o -> {
+                    sendable(o["confirm"].s())
+                    commit(ledger.confirm(o["confirm"].s()))
+                }
+                "report_failure" in o -> {
+                    val fl = o["report_failure"]
+                    val id = fl["report_id"].s()
+                    sendable(id)
+                    val status = fl["status"]
+                    val answer = if (status is Long) answerOf(reportAnswer(status.toInt().toUShort())) else "retry"
+                    eq(answer, fl["answer"], "$name answer")
+                    val t = when (answer) {
+                        "refuse" -> ledger.refuse(id)
+                        "stop_reporting" -> ledger.stopReporting(clientId!!)
+                        else -> null
+                    }
+                    eq(canon(t?.alerts?.map(::alertOf) ?: emptyList<Any?>()), canon(fl.obj()["alerts"] ?: emptyList<Any?>()), "$name alerts")
+                    if (t != null) commit(t)
+                }
+                "expect_resign_alerts" in o -> eq(ledger.resignAlerts(),
+                    strs(o["expect_resign_alerts"]).map { ctlByLabel.getValue(it)["record"]["body"]["record_id"].s() }.sorted(), "$name resign alerts")
+                "expect_refused" in o -> eq(ledger.refusedReports(), strs(o["expect_refused"]), "$name refused")
+                "expect_dropped" in o -> eq(ledger.droppedReports(), strs(o["expect_dropped"]), "$name dropped")
+                "resume_reporting" in o -> {
+                    clientId = o["resume_reporting"].s()
+                    val t = ledger.resumeReporting(clientId!!)
+                    eq(canon(t.alerts.map(::alertOf)), canon(o["alerts"]), "$name resume alerts")
+                    eq(t.made, emptyList<ReportIntentInfo>(), "$name resume")
+                    commit(t)
+                }
+                "expect_stopped" in o -> {
+                    eq(ledger.stoppedClientId() ?: false, o["expect_stopped"], "$name stopped")
+                    eq(ledger.reportingStopped(), o["expect_stopped"] != false, "$name stopped")
+                }
+                "expect_portal" in o -> {} // the Portal's side: no Portal model here
+                else -> throw AssertionError("unknown step ${Json.write(step)}")
+            }
+        }
+    }
+    check("Station acks: a call never changes its handle; the state loads only as written") {
+        val f = load("r9-control-ack-per-effect")
+        val st = f["setup"]["station"]
+        val linkB = linkOf(f["setup"]["links"]["host-b"])
+        val nowMs = 1793620940000uL
+        val l = AckLedgerHandle(st["origin"].s(), st["account_id"].s(), st["genesis_hash"].s())
+            .record(ctlRecord("S4_revoke"), 1793620903000uL, listOf("host-b", "host-c"), nowMs).next
+        val before = l.toJson()
+        val ack = Json.write(f["steps"][6]["control_ack"])
+        val t1 = l.ack(linkB, ack, nowMs)
+        val t2 = l.ack(linkB, ack, nowMs)
+        // The commit failed: the handle is as it was, and the same call again gives the same.
+        eq(l.toJson(), before)
+        eq(t1.next.toJson(), t2.next.toJson())
+        eq(t1.made, t2.made)
+        eq(t1.made.size, 1)
+        val id = t1.made[0].reportId
+        eq(t1.next.refuse(id).alerts, listOf(LedgerAlertInfo.ReportRefused(id)))
+        eq(t1.next.pendingReports().size, 1)
+        val stopped = t1.next.stopReporting("station-1").next
+        eq(stopped.reportingStopped(), true)
+        eq(stopped.stoppedClientId(), "station-1")
+        eq(stopped.pendingReports(), emptyList<ReportIntentInfo>())
+        eq(t1.next.reportingStopped(), false)
+        // The same report client ID keeps every report; another drops them.
+        eq(stopped.resumeReporting("station-1").next.pendingReports(), t1.next.pendingReports())
+        val other = stopped.resumeReporting("station-2")
+        eq(other.alerts, listOf(LedgerAlertInfo.ReportsDropped("station-1", listOf(id))))
+        eq(other.next.droppedReports(), listOf(id))
+        eq(other.next.droppedClientIds(), listOf("station-1"))
+        throwsCode("malformed") { l.stopReporting("a b") }
+        val text = t1.next.toJson()
+        eq(AckLedgerHandle.fromJson(text).toJson(), text)
+        throwsCode("malformed") { AckLedgerHandle.fromJson("[") }
+        throwsCode("unsupported_version") { AckLedgerHandle.fromJson(text.replace("\"v\":1", "\"v\":2")) }
+        throwsCode("stored_invalid") { AckLedgerHandle.fromJson(text.replaceFirst("{", "{\"extra\":1,")) }
+        throwsCode("malformed") { AckLedgerHandle("https://Station-dev.agora.build/", st["account_id"].s(), st["genesis_hash"].s()) }
+        throwsCode("incomplete_link") { l.ack(linkB.copy(connectionId = ""), ack, nowMs) }
+        throwsCode("not_the_link") { l.ack(linkB, ack.replace("host-b", "host-c"), nowMs) }
+        throwsCode("unknown_field") { l.record(ctlRecord("P4_unknown_field"), 0uL, emptyList(), nowMs) }
+    }
+    check("Station calls: fixture acks read and write back; pages, heads and fetches round-trip; builders refuse what readers refuse") {
+        for (name in ackNames) for (step in load(name)["steps"].arr()) {
+            val inner = step.obj()["replica"] ?: step
+            val msg = inner.obj()["control_ack"] ?: continue
+            val read = relayDecodeToStation(Json.write(msg)) as RelayToStation.ControlAck
+            eq(canonicalJson(relayControlAck(read.ack)), canon(msg), name)
+        }
+        val a = ctl["stations"]["A"]
+        val origin = a["origin"].s()
+        val feed = a["feed_id"].s()
+        eq(relayDecodeToStation(relayControlSync(origin, feed, 7uL)), RelayToStation.ControlSync(origin, feed, 7uL))
+        eq(relayDecodeToStation(relayControlSync(origin, null, 0uL)), RelayToStation.ControlSync(origin, null, 0uL))
+        throwsCode("malformed") { relayControlSync(origin, null, 5uL) }
+        val page = listOf("S1_cover", "S4_revoke", "M1_revoke").mapIndexed { i, label -> RelayFeedRecord((i + 1).toULong(), ctlRecord(label)) }
+        val read = relayDecodeToHost(relayControlSyncResult(origin, feed, 3uL, 1793620940000uL, page)) as RelayToHost.ControlSyncResult
+        eq(read.records.map { canonicalJson(it.recordJson) }, page.map { canonicalJson(it.recordJson) })
+        val refusedPage = page.mapIndexed { i, r -> if (i == 1) RelayFeedRecord(r.feedSeq, ctlRecord("P4_unknown_field")) else r }
+        throwsCode("unknown_field") { relayControlSyncResult(origin, feed, 3uL, 0uL, refusedPage) }
+        throwsCode("malformed") { relayControlSyncResult(origin, feed, 2uL, 0uL, page) }
+        throwsCode("malformed") { relayControlSyncResult(origin, feed, 3uL, 0uL, listOf(page[1], page[0])) }
+        val heads = listOf(RelayFeedHead(origin, feed, 3uL, 1793620940000uL))
+        val hm = relayHeads(heads, mlogHead)
+        eq(relayDecodeToHost(hm), RelayToHost.Heads(heads, mlogHead))
+        val withMailbox = Json.parse(hm).obj() + ("mailbox" to mapOf("mailbox_id" to feed, "head" to 1L))
+        throwsCode("unknown_field") { relayDecodeToHost(Json.write(withMailbox)) }
+        eq(relayDecodeToStation(relayMembershipFetch(2uL)), RelayToStation.MembershipFetch(2uL))
+        val entries = listOf("E3", "E4", "E5", "E6").map(::entry)
+        val fetched = relayDecodeToHost(relayMembershipFetchResult(mlogHead, entries)) as RelayToHost.MembershipFetchResult
+        eq(fetched.head, mlogHead)
+        eq(fetched.entries.map(::canonicalJson), entries.map(::canonicalJson))
+        throwsCode("wrong_message") { relayDecodeToHost(relayControlSync(origin, null, 0uL)) }
+        throwsCode("wrong_message") { relayDecodeToStation("{\"type\":\"relay\",\"op\":\"push_hint\",\"hints\":[]}") }
+        throwsCode("not_strict") { relayDecodeToStation("{") }
+    }
+    check("Station calls: the three refusals exactly and read strictly; a stale-association ack refused without disclosure or ledger advance") {
+        val refusals: List<Triple<(RelayRefusalCode) -> String, String, RelayToHost>> = listOf(
+            Triple({ c -> relayControlSyncRefused(c) }, "control_sync_refused", RelayToHost.ControlSyncRefused(RelayRefusalCode.FORBIDDEN)),
+            Triple({ c -> relayMembershipFetchRefused(c) }, "membership_fetch_refused", RelayToHost.MembershipFetchRefused(RelayRefusalCode.FORBIDDEN)),
+            Triple({ c -> relayControlAckRefused(c) }, "control_ack_refused", RelayToHost.ControlAckRefused(RelayRefusalCode.FORBIDDEN)))
+        for ((build, op, want) in refusals) {
+            val msg = build(RelayRefusalCode.FORBIDDEN)
+            eq(canonicalJson(msg), canon(mapOf("type" to "relay", "op" to op, "code" to "forbidden")), op)
+            eq(relayDecodeToHost(msg), want, op)
+            throwsCode("wrong_message") { relayDecodeToStation(msg) }
+            for ((fields, code) in listOf("\"code\":\"not_found\"" to "malformed", "\"code\":null" to "malformed",
+                "\"code\":\"forbidden\",\"feed_id\":\"x\"" to "unknown_field",
+                "\"code\":\"forbidden\",\"code\":\"forbidden\"" to "not_strict")) {
+                throwsCode(code) { relayDecodeToHost("{\"type\":\"relay\",\"op\":\"$op\",$fields}") }
+            }
+        }
+        // A stale association: the link was verified at trust generation 2, the ack claims 1.
+        val f = load("r9-control-ack-deadline")
+        val st = f["setup"]["station"]
+        val nowMs = 1793620940000uL
+        val l = AckLedgerHandle(st["origin"].s(), st["account_id"].s(), st["genesis_hash"].s())
+            .record(ctlRecord("S4_revoke"), 1793620903000uL, listOf("host-b"), nowMs).next
+        val before = l.toJson()
+        val ack = Json.write(f["steps"][1]["control_ack"])
+        val link = linkOf(f["setup"]["links"]["host-b"]).copy(hostTrustGen = 2uL)
+        throwsCode("not_the_link") { l.ack(link, ack, nowMs) }
+        eq(l.toJson(), before)
+        eq(l.pendingReports(), emptyList<ReportIntentInfo>())
+        val reply = relayControlAckRefused(RelayRefusalCode.FORBIDDEN)
+        for (secret in listOf(st["account_id"].s(), st["genesis_hash"].s(), st["origin"].s(), "host-b",
+            ctlByLabel.getValue("S4_revoke")["record"]["body"]["record_id"].s())) {
+            if (reply.contains(secret)) throw AssertionError("the refusal names $secret")
+        }
+        eq(l.ack(link.copy(hostTrustGen = 1uL), ack, nowMs).made.size, 2)
+    }
+    check("Station: the Portal's statuses in their classes") {
+        for ((status, want) in listOf(200 to "confirm", 401 to "retry", 408 to "retry", 429 to "retry", 500 to "retry", 503 to "retry",
+            400 to "refuse", 404 to "refuse", 409 to "refuse", 413 to "refuse", 415 to "refuse", 204 to "refuse",
+            302 to "refuse", 403 to "stop_reporting")) {
+            eq(answerOf(reportAnswer(status.toUShort())), want, "$status")
+        }
+    }
+
     // ------------------------------- delegated host work: envelopes and results
     // r9-vectors-host-envelope (host-work-v1 §11.5; planned, host role, feature
     // `host`): the device lists (log L and the file's `entries`), the builders
