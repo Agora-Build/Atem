@@ -44,9 +44,10 @@ kernel clocks instead of the `CLOCK_BOOTTIME` the decision names, so that the OS
 **Amended for step 4, for Astation's review (host mail).** Two changes to II.4.2's receiver, built in the shared core
 (host-work-v1 §11.5). Only a key the host made waits: mail sealed to a key id the host never made in its current trust
 generation is refused at once, even when signed beyond its head, since every `host_enc_key` entry for the host carries
-the host's own `enc_sig`. And a refusal of a verified copy (steps 5 and 6) names its sender, the `(host_id,
-host_trust_gen)` whose key verified it, which the claim on its `id` is keyed by. Each changed passage in II.4.2 is
-marked "Amended for step 4, for Astation's review".
+the host's own `enc_sig`; so the host records every key id it makes durably, before it hands the key out (II.4.1). And
+a refusal of a verified copy (steps 5 and 6) names its sender, `(host_id, host_trust_gen)`: the claim on its `id` is
+`(sender.host_id, id)`, as before, and `host_trust_gen` says which `add_host` key verified the copy. Each changed
+passage (in II.4.1 and II.4.2) is marked "Amended for step 4, for Astation's review".
 
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256
@@ -1743,10 +1744,15 @@ devices' keys):
 every one, the private key is `pairing/host_enc_key`, 0600, plain like `host_channel_key`, so a host whose cred agent
 is locked can still open its mail. The host makes it at pairing and at `atem pair verify`, with a new
 `host_channel_key`, and, on a host paired earlier, at the first start of a build that knows it when the file is
-missing. `atem unpair` deletes it, as it deletes `host_channel_key` (R9.3). In (a) and (b) the host vouches for its
-key with `enc_sig`: Ed25519 by `host_key` over `enc(["atem-host-enc-key-v1", account_id, genesis_hash, host_id,
-u64(host_trust_gen), enc_pub])`. The ceremony already authenticates `host_key` (it is inside the commitment and the
-safety code, R9.2 "Pairing"), so the commitment and the safety code don't change.
+missing. `atem unpair` deletes it, as it deletes `host_channel_key` (R9.3). **Amended for step 4, for Astation's
+review.** The host records the `enc_kid` of every key it makes durably, before `host_enc_key_get` returns the key, and
+keeps the record for that trust generation. It passes the record to II.4.2's receiver (`generated`, host-work-v1
+§11.5), with the kid of every key it accepts added. A lost record is rebuilt from the private keys the host still holds for that generation; mail sealed to
+a key whose private part is gone couldn't be opened anyway. Mail sealed to a key whose id the record lacks, and signed
+beyond the host's head, is refused for good. In (a) and (b) the host vouches for its key with `enc_sig`: Ed25519 by
+`host_key` over `enc(["atem-host-enc-key-v1", account_id, genesis_hash, host_id, u64(host_trust_gen), enc_pub])`. The
+ceremony already authenticates `host_key` (it is inside the commitment and the safety code, R9.2 "Pairing"), so the
+commitment and the safety code don't change.
 
 | Option | What it is | Cost |
 |---|---|---|
@@ -1816,7 +1822,8 @@ with the sealed part beside it.
    entries it lacks. A key the host generated and handed out but whose `host_enc_key` its own list hasn't applied yet
    should be accepted too: a sender whose list already has the entry seals to it, and the mail then opens at once
    instead of waiting. **Amended for step 4, for Astation's review.** Only a key the host made waits. The host keeps
-   the id of every key it made in its current trust generation, recorded before it hands the key out. Every
+   the id of every key it made in its current trust generation, recorded durably before it hands the key out (II.4.1),
+   and passes them with the ids of the keys it accepts: a key whose id is missing has its mail refused for good. Every
    `host_enc_key` entry for the host carries the host's own `enc_sig`, so no entry it lacks can make any other key one
    it accepts. Mail sealed to a key id the host never made is refused even when `signed_at_head.seq` is beyond its head,
    and never waits. There the refusal comes after the checks that settle at any head (step 3's, below), step 5's times
@@ -1865,9 +1872,9 @@ with the sealed part beside it.
   can't stop its other work. **New rule.**
 - **Steps 5 and 6, once step 4 passed:** the sender is authenticated, so the refusal is reported back to it as a
   status naming the object's `id`, `refused` with `invalid_request` (II.4.4); its outbox doesn't stay `sent` until
-  expiry. **Amended for step 4, for Astation's review.** The refusal names that sender, the `(host_id,
-  host_trust_gen)` whose `add_host` key verified the copy: the claim on the `id` (Duplicates, below) is that sender's,
-  never the host whose object another host re-signed.
+  expiry. **Amended for step 4, for Astation's review.** The refusal names that sender, `(host_id, host_trust_gen)`.
+  The claim on the `id` is `(sender.host_id, id)` (Duplicates, below), never the host's whose object another host
+  re-signed; `host_trust_gen` only says which `add_host` key verified the copy.
 - **Step 7:** a recorded decision (`refused`), reported back (II.4.4).
 - **Duplicates.** **Amended after agreement, 2026-11-10 (for Astation)** (it read: "The same `id` with the same
   `sealed_hash` is a duplicate: acknowledged, nothing changes. The same `id` with other bytes is refused and kept as

@@ -9062,6 +9062,20 @@ fn host_envelope_vectors(book: &Book) -> Value {
         "host-b-enc-1",
     );
     let f = g.fields(
+        "evil_cancel_to_new_key",
+        MAIL_EVIL,
+        MAIL_B1,
+        "host-b-enc-2",
+        &on_b(&["M11_rotate_b"]),
+    );
+    g.seal(
+        "evil_cancel_to_new_key",
+        "a cancel from host-evil to host-b sealed to host-b-enc-2, signed at the head of B + M11_rotate_b (seq 11)",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-2",
+    );
+    let f = g.fields(
         "evil_at_head_9",
         MAIL_EVIL,
         MAIL_B1,
@@ -9612,6 +9626,41 @@ fn host_envelope_vectors(book: &Book) -> Value {
         mail_pending(MAIL_A1),
         "signed at a head beyond B, the signature verified first: pending",
     );
+    g.check_made(
+        "listed_key_not_generated_head_ahead_pending",
+        "the same, by a receiver whose generated lists nothing: a key it accepts now waits whatever generated says (only a key in neither is refused)",
+        "head_ahead",
+        &b,
+        to_b,
+        &[],
+        MAIL_NOW,
+        None,
+        mail_pending(MAIL_A1),
+    );
+    let e = g.refused("evil_cancel_to_new_key", "enc_key_not_accepted");
+    g.check_made(
+        "unverifiable_never_generated_key_head_ahead",
+        "an unknown sender signed beyond the receiver's head (its copy can't be verified yet), sealed to a key host-b never made: refused, unauthenticated, with no wait",
+        "evil_cancel_to_new_key",
+        &b[..3],
+        to_b,
+        &["host-b-enc-1"],
+        MAIL_NOW,
+        None,
+        e,
+    );
+    let e = g.refused("evil_cancel_to_new_key", "expired");
+    g.check_made(
+        "unverifiable_never_generated_key_head_ahead_times_first",
+        "the same at its expires_at: the body's times come before the key",
+        "evil_cancel_to_new_key",
+        &b[..3],
+        to_b,
+        &["host-b-enc-1"],
+        MAIL_EXPIRES,
+        None,
+        e,
+    );
     at(
         &mut g,
         "head_ahead_opens",
@@ -9863,6 +9912,17 @@ fn host_envelope_vectors(book: &Book) -> Value {
         "status_head_ahead",
         &on_b(&["M11_remove_b"]),
         to_a,
+        MAIL_NOW,
+        Some(outbox(&request_id)),
+        mail_pending(MAIL_B1),
+    );
+    g.check_made(
+        "result_listed_key_not_generated_head_ahead_pending",
+        "a result signed beyond the receiver's head, sealed to a key it accepts now, by a receiver whose generated lists nothing: it waits",
+        "status_head_ahead",
+        &b,
+        to_a,
+        &[],
         MAIL_NOW,
         Some(outbox(&request_id)),
         mail_pending(MAIL_B1),

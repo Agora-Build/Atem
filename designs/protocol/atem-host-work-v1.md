@@ -2244,7 +2244,7 @@ storage and its receipts are the host's.
 | `Open{plain, sender}` | checks 1 to 6 passed; `sender` is `host:<host_id>` | step 7 |
 | `Pending{host_id, host_trust_gen}` | above | keeps it, not done; judges it again |
 | `Refused{reason, evidence}` | before the copy is shown to be the sender's: steps 1 to 4 (step 2's key part at a head this host holds, or for a key id this host never made), and step 5 on an object signed beyond this host's head | marks it done under `evidence = SHA-256(enc([jcs(body), sig, enc, ct]))` (`enc` and `ct` empty when absent); claims no id; tells nobody |
-| `RefusedAuthenticated{object_id, reason, sender}` | steps 5 and 6, once step 4 showed the copy to be the sender's, intact; `sender` is `{host_id, host_trust_gen}`, the host whose `add_host` key verified it (**for Astation**, amended for step 4) | marks it done; it claims the object's id for `sender`; reports it to the sender as `{"kind":"status","object_id":<id>,"refused":"invalid_request"}`, whatever the reason (for a result, nothing is reported back) |
+| `RefusedAuthenticated{object_id, reason, sender}` | steps 5 and 6, once step 4 showed the copy to be the sender's, intact; `sender` is `{host_id, host_trust_gen}`: the host, and the generation whose `add_host` key verified the copy (**for Astation**, amended for step 4) | marks it done; it claims `(sender.host_id, object_id)`; reports it to the sender as `{"kind":"status","object_id":<id>,"refused":"invalid_request"}`, whatever the reason (for a result, nothing is reported back) |
 | `Unavailable{error}` | a local failure: the key provider failed (the key missing, or not the one its kid names) | decides nothing; judges it again later |
 
 A seal that doesn't open under the key is `open_failed`, the sender's
@@ -2258,7 +2258,9 @@ id)`, the key of the Station's puts (design II.4.3). Only a copy whose signature
 verified and whose sealed part its `sealed_hash` names (step 4) claims that
 pair: its verdict is Open, RefusedAuthenticated, Accepted or NotDelivered,
 and each names that sender (RefusedAuthenticated as `sender{host_id,
-host_trust_gen}`, the others as `host:<host_id>`). A
+host_trust_gen}`, where `host_trust_gen` only says which `add_host` key
+verified the copy and is no part of the claim; the others as
+`host:<host_id>`). A
 later object from that sender with that `id` and the same `sealed_hash` (the
 body's field, so the sender may re-sign the same sealed part at a newer
 head) is a duplicate, acknowledged with the first verdict; one with another
@@ -2333,11 +2335,15 @@ again after each device-list advance and each change of the keys it accepts.
 Mail to any other key it made is refused `enc_key_not_accepted` once this
 host's head is at or beyond the head the object names. **For Astation**
 (amended for step 4): the host also passes the id of every key it made in
-its current trust generation (`generated`), from its own records, each
-recorded before it hands the key out, never from its device list. Every
+its current trust generation (`generated`), from its own record, never
+from its device list, with the id of every key it accepts added. It writes
+each id to that record durably before `host_enc_key_get` hands the key
+out, and keeps it for the generation; a lost record is rebuilt from the
+private keys it still holds for that generation (design II.4.1). Every
 `host_enc_key` entry for a host carries the host's own `enc_sig`, so no
 other key id can ever become one it accepts: mail sealed to one is refused
-`enc_key_not_accepted` at any head and never waits.
+`enc_key_not_accepted` at any head and never waits. So a key whose id the
+record lacks has its mail refused for good.
 
 **Open items, for Astation.** Both wait for cross-host `select`
 (collaboration §5): the wire form of `no_match` in a status (a selector of

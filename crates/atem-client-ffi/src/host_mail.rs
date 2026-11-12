@@ -35,8 +35,9 @@
 //!   keys it accepts now (`MailRecipientData.keys`: its current key, and the
 //!   previous one only inside its 24 h window unless `retire_previous`
 //!   retired it) and every key id it made in that generation
-//!   (`MailRecipientData.generated`): mail sealed to a key id it never made
-//!   is refused even when signed beyond its head, with no wait.
+//!   (`MailRecipientData.generated`, from its own record, each id written
+//!   durably before the key was handed out): mail sealed to a key id in
+//!   neither list is refused for good, even when signed beyond its head.
 #[cfg(feature = "uniffi")]
 use std::sync::Arc;
 
@@ -106,10 +107,12 @@ record! {
         pub host_trust_gen: u64,
         pub keys: Vec<MailKeyData>,
         /// Every `enc_kid` (16 hex) this host made at that generation, from
-        /// its own records, never from its device list. A key id in neither
-        /// `keys` nor `generated` is refused `enc_key_not_accepted` even when
-        /// the object is signed beyond this host's head; one here but not in
-        /// `keys` waits there.
+        /// its own record (each id written durably before the key was handed
+        /// out; a lost record rebuilt from the private keys it still holds),
+        /// never from its device list, with the ids of `keys` added. A key id
+        /// in neither `keys` nor `generated` is refused `enc_key_not_accepted`
+        /// for good, even when the object is signed beyond this host's head;
+        /// one here but not in `keys` waits there.
         pub generated: Vec<String>,
     }
 }
@@ -147,8 +150,9 @@ data_enum! {
         Refused { reason: String, evidence: String },
         /// Refused after the signature verified and the sealed part matched:
         /// the host reports it to the sender (a status naming `object_id`,
-        /// `refused: invalid_request`), and it claims the id for `sender`,
-        /// the host and generation whose key verified the copy.
+        /// `refused: invalid_request`), and it claims `(sender.host_id,
+        /// object_id)`; `sender.host_trust_gen` says which `add_host` key
+        /// verified the copy.
         RefusedAuthenticated {
             object_id: String,
             reason: String,
