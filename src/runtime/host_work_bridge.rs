@@ -55,6 +55,8 @@ mod collab_launch_bridge;
 mod delegated_dispatch;
 #[path = "delegated/interrupts.rs"]
 mod delegated_interrupts;
+#[path = "delegated/launches.rs"]
+mod delegated_launches;
 #[path = "delegated/recovery.rs"]
 mod delegated_recovery;
 #[path = "delegated/requests.rs"]
@@ -99,12 +101,17 @@ impl Sender {
     }
 }
 
+#[derive(Clone)]
 pub struct RemoteLaunch {
     pub request_id: String,
     pub profile: Profile,
     pub session_id: String,
     pub process_gen: String,
     pub guard: super::super::adopt::SpawnGuard,
+    /// A delegated sender's launch's check at the spawn boundary, in place
+    /// of `guard` there (design I.4.3, "Launches"); none for every other
+    /// launch, whose guard decides there as before.
+    pub check: Option<super::super::adopt::PreSpawnCheck>,
 }
 
 struct PendingLaunch {
@@ -115,6 +122,9 @@ struct PendingLaunch {
     expires_at: u64,
     permit: Arc<AtomicBool>,
     local_route: Option<crate::runtime::host_work::Route>,
+    /// A delegated sender's launch: checked at the spawn boundary, never
+    /// fenced by its sender's authority (`delegated_launches`).
+    delegated: Option<delegated_launches::DelegatedLaunch>,
 }
 
 /// What the authority, route and grant checks of tasks awaiting their
@@ -175,7 +185,8 @@ pub(super) struct State {
     /// kept (`SessionHost::keep_principals`).
     named: HashSet<String>,
     /// Why the runtime refused to start a launch it was handed (the
-    /// live-session limit, a restart): the detail of its local tasks.
+    /// live-session limit, a restart; a delegated launch's check before
+    /// its spawn): the detail of its local tasks.
     refused: HashMap<String, String>,
     /// The delegated clock (host-work-v1 §11.6), beside the store whose
     /// `clock` table holds its record: built with `host.delegated` on, or
@@ -309,6 +320,9 @@ impl HostBridge {
         }
         self.work_fence_launches();
         let paused = self.work.config_problem.is_some();
+        // A delegated sender's launch that isn't fenced: the check at the
+        // spawn boundary (design I.4.3, "Launches").
+        let delegated = self.delegated_handouts(paused);
         let pending = &self.work.pending;
         let waits = |id: &str| {
             paused
@@ -316,15 +330,22 @@ impl HostBridge {
                     .get(id)
                     .is_some_and(|p| p.permit.load(Ordering::SeqCst))
         };
-        let (mut ready, mut waiting) = (Vec::new(), VecDeque::new());
+        let (mut ready, mut waiting, mut failed) = (Vec::new(), VecDeque::new(), Vec::new());
         for launch in self.work.launches.drain(..) {
-            if waits(&launch.request_id) {
-                waiting.push_back(launch);
-            } else {
-                ready.push(launch);
+            match delegated.get(&launch.request_id) {
+                Some(delegated_launches::Handout::Now) => ready.push(launch),
+                Some(delegated_launches::Handout::Wait(_)) => waiting.push_back(launch),
+                Some(delegated_launches::Handout::Fail(detail)) => {
+                    failed.push((launch.request_id, *detail))
+                }
+                None if waits(&launch.request_id) => waiting.push_back(launch),
+                None => ready.push(launch),
             }
         }
         self.work.launches = waiting;
+        for (id, detail) in failed {
+            self.launch_failed_before_spawn(&id, detail);
+        }
         ready
     }
 
@@ -943,6 +964,16 @@ impl HostBridge {
         let paused = self.work.config_problem.is_some();
         let ids: Vec<String> = self.work.pending.keys().cloned().collect();
         for id in ids {
+            // A delegated sender's launch: hosting §5's fences only; what
+            // its sender's authority, its profile and its expiry say is the
+            // check's at the spawn boundary, which waits or fails it, never
+            // a fence (design I.4.3, "Launches"; `delegated_launches`).
+            if self.work.pending[&id].delegated.is_some() {
+                if self.delegated_launch_fenced(paused) {
+                    self.work.pending[&id].permit.store(false, Ordering::SeqCst);
+                }
+                continue;
+            }
             let attachment = self.work.pending[&id].attachment.clone();
             let remote = self.work.pending[&id].local_route.is_none();
             let authority = if remote {
@@ -1118,39 +1149,52 @@ impl HostBridge {
                     })
                     .map_err(|_| "busy")?;
                 let permit = Arc::new(AtomicBool::new(true));
-                let (flag, approved, dir, deadline) = (
-                    permit.clone(),
-                    p.clone(),
-                    self.work.dir.clone(),
-                    *expires_at,
-                );
-                let guard = Arc::new(move || {
-                    flag.load(Ordering::SeqCst)
-                        && host_now().wall_ms < deadline
-                        && Config::load(&dir)
-                            .is_ok_and(|c| c.enabled && c.profile(&approved.id) == Some(&approved))
-                        && crate::memory::project::project_key_for(&approved.cwd)
-                            == approved.project
-                });
+                // A delegated sender's: checked at the spawn boundary
+                // (design I.4.3, "Launches").
+                let delegated = self.delegated_launch(&a, &p, *expires_at, &permit);
+                let (guard, check, delegated) = match delegated {
+                    Some((launch, guard, check)) => (guard, Some(check), Some(launch)),
+                    None => {
+                        let (flag, approved, dir, deadline) = (
+                            permit.clone(),
+                            p.clone(),
+                            self.work.dir.clone(),
+                            *expires_at,
+                        );
+                        let guard: super::super::adopt::SpawnGuard = Arc::new(move || {
+                            flag.load(Ordering::SeqCst)
+                                && host_now().wall_ms < deadline
+                                && Config::load(&dir).is_ok_and(|c| {
+                                    c.enabled && c.profile(&approved.id) == Some(&approved)
+                                })
+                                && crate::memory::project::project_key_for(&approved.cwd)
+                                    == approved.project
+                        });
+                        (guard, None, None)
+                    }
+                };
+                let launch = RemoteLaunch {
+                    request_id: request_id.clone(),
+                    profile: p.clone(),
+                    session_id: status.session_id.clone(),
+                    process_gen: status.process_gen.clone(),
+                    guard,
+                    check,
+                };
                 self.work.pending.insert(
                     request_id.clone(),
                     PendingLaunch {
                         attachment: attachment.to_string(),
                         principal: principal.clone(),
                         control_gen: self.host.control_gen(&principal),
-                        profile: p.clone(),
+                        profile: p,
                         expires_at: *expires_at,
                         permit,
                         local_route: None,
+                        delegated: delegated.map(|d| Self::delegated_pending(d, &launch)),
                     },
                 );
-                self.work.launches.push_back(RemoteLaunch {
-                    request_id: request_id.clone(),
-                    profile: p,
-                    session_id: status.session_id.clone(),
-                    process_gen: status.process_gen.clone(),
-                    guard,
-                });
+                self.work.launches.push_back(launch);
                 Ok(ResultBody::Launch { launch: status })
             }
             Request::LaunchQuery { request_id, .. } => {
@@ -2240,6 +2284,7 @@ mod local_tests {
         include!("delegated/recovery_tests.rs");
         include!("delegated/intents_tests.rs");
         include!("delegated/work_interrupt_tests.rs");
+        include!("delegated/launch_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};

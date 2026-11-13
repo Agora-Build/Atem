@@ -525,6 +525,27 @@ place of `notify` and `prompt`), 4 and 5 at the spawn boundary, where the spawn 
   hosting, for every sender at once, and the first two end only with a restart; the rules above are about one
   sender's authority, which can come back (a release) or is settled for good (a revoke).
 
+**As built in step 4** (host-work-v1 §11.6, "Launches"):
+- **Only `host_launch` reaches it.** A launch on message starts only from `atem message send --launch`, whose sender is
+  `local` (v1; collaboration §5), so no delegated sender's launch on message exists yet.
+- **Condition 4 is the profile.** A `host_launch` has no route: the profile it was approved under (its id, revision,
+  principals, directory and project) stands for one, and a change is `route changed`, as is a directory that is now of
+  another project. Condition 3 asks for `launch` and no `sessions` scope, and compares a `projects` scope on the
+  profile, as `host_launch` itself does.
+- **Where the detail goes.** The launch result has no `detail` (host-work-v1 §3): a waiting launch reads `starting`, a
+  refused one `failed`, and the reason goes to `runtime.log`.
+- **The linearization point. Atem's reading, for Astation to confirm.** The check runs in each pass while the launch is
+  queued, and again just before its worker is spawned, before anything is written; a wait there hands it back to the
+  queue. After the spawn, up to the worker's `start`, its guard only fences, as every launch's (`outcome_unknown`: the
+  worker may run). An event after that check doesn't stop the launch; the session it starts is like any other, and the
+  sender's tasks for it pass their own start check.
+- **A `runtime.toml` that doesn't load is waited out at the spawn boundary too,** since nothing is spawned there yet
+  (hosting §5 fences a v1 launch there). Hosting switched off, a receipt-database fault and a halted journal alone still
+  fence it. With no reading of the delegated clock it waits, its expiry not compared.
+- **Residual: a restart.** A launch still waiting is lost with the runtime's memory, as every launch not started: at
+  the restart `starting` becomes `outcome_unknown` (host-work-v1 §3), since the restart can't tell that it never
+  reached the launcher.
+
 ### I.4.4 The deadline bounds the whole task
 
 R4 bounds accepted tasks by their original deadline (at most 24 h after admission). So:

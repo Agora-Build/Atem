@@ -2368,6 +2368,16 @@ The sender's channel and online status are not conditions.
   that can't clear ends it `failed` at once with the event's detail, and
   never `outcome_unknown`. A receipt-database fault, a halted journal and
   hosting switched off still fence it as §4 says.
+  - **As built in step 4.** Only `host_launch` reaches it (a launch on
+    message's sender is `local`). Its profile stands for the route of
+    condition 4. A waiting launch reads `starting`, a refused one `failed`;
+    the reason goes to `runtime.log` (§3 has no `detail`). A
+    `runtime.toml` that doesn't load is waited out at the spawn boundary
+    too. **Atem's reading, for Astation to confirm:** the check just
+    before the worker is spawned is the launch's linearization point; after
+    the spawn its guard only fences, as every launch's. A restart turns a
+    launch still waiting into `outcome_unknown`, as §3 says of every
+    `starting` launch.
 
 #### Attempts and `receipt_id`
 

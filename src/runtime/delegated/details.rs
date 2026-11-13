@@ -31,9 +31,8 @@ pub const ROUTE_CHANGED: &str = "route changed";
 pub const AUTHORITY_CHANGED: &str = "sender's authority changed";
 /// `failed`: 8 attempts.
 pub const TOO_MANY_ATTEMPTS: &str = "too many attempts";
-/// `failed`: a launch still waiting at the spawn boundary at its expiry.
-// Used by Task 28: delegated launches.
-#[allow(dead_code)]
+/// `failed`: a launch still waiting at the spawn boundary at its expiry
+/// (`start::launch_check`).
 pub const EXPIRED_BEFORE_THE_SPAWN: &str = "expired before the spawn";
 /// `awaiting_result`: a running turn interrupted at the task's deadline
 /// (then `expired`, as in v1).

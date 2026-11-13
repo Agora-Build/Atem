@@ -616,3 +616,129 @@ fn the_start_check_withdraws_without_a_reading() {
     submit(&mut rt, &shared, &phone, 2);
     assert_eq!(state_of(&rt, 2).0, ReceiptState::Executing);
 }
+
+/// Design I.4.3, "Launches": the spawn-boundary check of a launch is
+/// [`may_start`]'s events in their order, with `launch` for `notify` and
+/// `prompt`, the profile for the route and the launch's expiry for the
+/// deadline: what settles a task fails the launch with the event's detail,
+/// what blocks one makes it wait, and an expiry passed is `expired before
+/// the spawn`. A service's `projects` scope is compared on the profile's
+/// scope key: pending, it waits for unlock, never narrowed.
+#[test]
+fn the_launch_check_gives_may_starts_events_for_a_launch() {
+    use crate::runtime::delegated::details;
+    let log = log_of(&["launch", "notify", "prompt", "view"], |_| {});
+    let profile = config(1).profile("p").unwrap().clone();
+    let key = profile.scope_key();
+    let launch = |principal: &str| StartLaunch {
+        admission: task(&log, principal, LATER).admission,
+        profile: profile.clone(),
+        expires_at: 1_000,
+    };
+    let (phone, bot) = (launch(PHONE), launch(BOT));
+    let ready = || {
+        let mut v = view(&log);
+        v.scopes
+            .hashes
+            .insert((key.clone(), KID.into()), PROJECT.into());
+        v
+    };
+    let v = ready();
+    assert_eq!(launch_check(&v, &phone, 0), LaunchVerdict::Go);
+    assert_eq!(launch_check(&v, &bot, 999), LaunchVerdict::Go);
+    assert_eq!(
+        launch_check(&v, &bot, 1_000),
+        LaunchVerdict::Fail(details::EXPIRED_BEFORE_THE_SPAWN)
+    );
+    // The bot's project: pending, then another one.
+    let mut v = ready();
+    v.scopes.hashes.clear();
+    v.scopes.pending.insert(KID.into());
+    assert_eq!(
+        launch_check(&v, &bot, 0),
+        LaunchVerdict::Wait(details::WAITING_FOR_UNLOCK)
+    );
+    v.scopes.pending.clear();
+    v.scopes.hashes.insert((key.clone(), KID.into()), OTHER.into());
+    assert_eq!(
+        launch_check(&v, &bot, 0),
+        LaunchVerdict::Fail(details::AUTHORIZATION_NARROWED)
+    );
+    // A grant without `launch` (the bot of `log_with`) is narrowed.
+    let no_launch = log_with(|_| {});
+    let mut v = view(&no_launch);
+    v.scopes
+        .hashes
+        .insert((key.clone(), KID.into()), PROJECT.into());
+    let bot_without = StartLaunch {
+        admission: task(&no_launch, BOT, LATER).admission,
+        profile: profile.clone(),
+        expires_at: 1_000,
+    };
+    assert_eq!(
+        launch_check(&v, &bot_without, 0),
+        LaunchVerdict::Fail(details::AUTHORIZATION_NARROWED)
+    );
+    // The profile changed: the route of condition 4.
+    let mut v = ready();
+    v.config.profiles[0].revision = 2;
+    assert_eq!(
+        launch_check(&v, &phone, 0),
+        LaunchVerdict::Fail(details::ROUTE_CHANGED)
+    );
+    // Settling events first: held and revoked is revoked; held, frozen.
+    let mut v = ready();
+    v.standings.insert(
+        PHONE.into(),
+        SenderStanding {
+            held: true,
+            ..SenderStanding::default()
+        },
+    );
+    assert_eq!(
+        launch_check(&v, &phone, 0),
+        LaunchVerdict::Wait(details::PAUSED)
+    );
+    v.list.as_mut().unwrap().frozen = true;
+    assert_eq!(
+        launch_check(&v, &phone, 0),
+        LaunchVerdict::Fail(details::AUTHORITY_CHANGED)
+    );
+    v.list.as_mut().unwrap().frozen = false;
+    v.standings.get_mut(PHONE).unwrap().revoked = Some("rec-1".into());
+    assert_eq!(
+        launch_check(&v, &phone, 0),
+        LaunchVerdict::Fail(details::SENDER_REVOKED)
+    );
+    // The journal halted alone: the check says wait (its callers fence a
+    // launch on a halt first, hosting §5); beside a faulted list, failed.
+    let mut v = ready();
+    v.halted = true;
+    assert_eq!(
+        launch_check(&v, &phone, 0),
+        LaunchVerdict::Wait(details::JOURNAL_HALTED)
+    );
+    v.list.as_mut().unwrap().faulted = true;
+    assert_eq!(
+        launch_check(&v, &phone, 0),
+        LaunchVerdict::Fail(details::AUTHORITY_CHANGED)
+    );
+    // The gate closed and a deferred entry wait.
+    let mut v = ready();
+    v.gates.set_caught_up(BTreeSet::new());
+    v.gates.close_stations();
+    assert_eq!(
+        launch_check(&v, &phone, 0),
+        LaunchVerdict::Wait(details::REVOCATIONS_NOT_YET_CHECKED)
+    );
+    let mut v = ready();
+    v.list.as_mut().unwrap().deferred = Some(DeferredStop {
+        seq: 9,
+        until_ms: u64::MAX,
+        on: None,
+    });
+    assert_eq!(
+        launch_check(&v, &bot, 0),
+        LaunchVerdict::Wait(details::DEVICE_LIST_UPDATE_PENDING)
+    );
+}

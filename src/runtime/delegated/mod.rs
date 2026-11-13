@@ -8,7 +8,9 @@
 //! Here so far: who is delegated ([`classify`]: design I.1.3, Decision 13),
 //! the admission record a delegated sender's task gets ([`Admission`],
 //! I.4.1), its attempts ([`attempts`], I.6.4), the start check and the
-//! gates ([`start`], [`gate`], I.4.3, I.5.8), who may query, cancel or
+//! gates ([`start`], [`gate`], I.4.3, I.5.8) and the same check of a
+//! delegated sender's launch at the spawn boundary
+//! ([`start::launch_check`], I.4.3 "Launches"), who may query, cancel or
 //! complete it ([`authority`], I.4.5, Decision 15), the interrupt intents
 //! that stop its attempt at its deadline ([`intents`], I.4.4, I.5.7), which
 //! `work_interrupt` shares (§11.2; the bridge serves it), what the bridge

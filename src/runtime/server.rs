@@ -726,20 +726,10 @@ impl Server {
             request,
             result,
         } = done;
-        if let Some(id) = &remote {
-            if let Some(bridge) = self.bridge.as_mut() {
-                use atem_client::session::host_work::LaunchState;
-                bridge.remote_launched(
-                    id,
-                    if result.is_ok() {
-                        LaunchState::Started
-                    } else if no_start {
-                        LaunchState::Failed
-                    } else {
-                        LaunchState::OutcomeUnknown
-                    },
-                );
-            }
+        if let Some(id) = &remote
+            && let Some(bridge) = self.bridge.as_mut()
+        {
+            bridge.launch_finished(id, result.as_ref().map(|_| ()), no_start);
         }
         match result {
             Ok((handle, created_at_ms)) => {
@@ -756,6 +746,11 @@ impl Server {
                     self.send(client, &RuntimeMsg::Launched { session: summary });
                 }
             }
+            // Refused by a delegated launch's check before the spawn:
+            // nothing started, and the bridge said why.
+            Err(error)
+                if remote.is_some()
+                    && error.downcast_ref::<super::adopt::NotSpawned>().is_some() => {}
             Err(_) if remote.is_some() => eprintln!(
                 "atem runtime: remote launch did not confirm a start; query its durable outcome"
             ),
@@ -1798,7 +1793,9 @@ impl Server {
                 .await
                 {
                     Ok(Ok((checked, env))) => (
-                        launcher.spawn_guarded(checked, env, launch.guard).await,
+                        launcher
+                            .spawn_guarded(checked, env, launch.guard, launch.check)
+                            .await,
                         false,
                     ),
                     Ok(Err(error)) => (Err(error), true),

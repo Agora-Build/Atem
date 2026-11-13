@@ -260,6 +260,7 @@ impl HostBridge {
                     expires_at,
                     permit,
                     local_route: Some(route),
+                    delegated: None,
                 },
             );
             self.work.launches.push_back(RemoteLaunch {
@@ -268,6 +269,7 @@ impl HostBridge {
                 session_id: status.session_id,
                 process_gen: status.process_gen,
                 guard,
+                check: None,
             });
         }
     }

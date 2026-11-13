@@ -1604,3 +1604,101 @@ fn work_interrupt_is_served_while_hosting_is_paused() {
     wait_stored(&rig, tid, "awaiting_result", "turn interrupted");
     assert_eq!(escs(&rig), 1);
 }
+
+/// The stand-in's feed covering [`SVC`] (its gate open), the service held
+/// or revoked as `standing` adds.
+fn svc_standing(standing: Value) -> Value {
+    let mut svc = json!({"coverage": {"origin": ORIGIN, "feed_id": "feed-1"}});
+    for (key, value) in standing.as_object().unwrap() {
+        svc[key] = value.clone();
+    }
+    json!({"own": ORIGIN, "open": [ORIGIN], "standings": {format!("service:{SVC}"): svc}})
+}
+
+/// `dev`'s `host_launch` of profile `backend`, expiring in a minute: its
+/// request id and session id (the reply says `starting`).
+fn launch_backend(dev: &mut Dev, r: &mut Router) -> (String, String) {
+    let rid = uuid();
+    let reply = dev.request(
+        r,
+        json!({"op":"host_launch","host":host(),"request_id":rid,
+            "profile_id":"backend","profile_revision":1,
+            "expires_at":r9log::host_now().wall_ms + MIN}),
+    );
+    let launch = &reply["result"]["launch"];
+    assert_eq!(launch["state"], "starting", "{reply}");
+    (rid, launch["session_id"].as_str().unwrap().to_string())
+}
+
+/// Launch `rid`'s state, as its sender's `host_launch_query` reads it.
+fn launch_state(dev: &mut Dev, r: &mut Router, rid: &str) -> Value {
+    let reply = dev.request(
+        r,
+        json!({"op":"host_launch_query","host":host(),"request_id":rid}),
+    );
+    reply["result"]["launch"]["state"].clone()
+}
+
+/// No worker was ever spawned for session `sid` (no spec, no record).
+fn never_spawned(rig: &Rig, sid: &str) -> bool {
+    let workers = rig.sandbox.config().join("runtime/workers");
+    !workers.join(format!("{sid}.spec.json")).exists()
+        && !workers.join(format!("{sid}.json")).exists()
+}
+
+/// VII.A test 19, its launch half (design I.4.3, "Launches"; host-work-v1
+/// §11.6): in the real runtime, a covered service's `host_launch` while the
+/// stand-in holds it waits at the spawn boundary through host-work's
+/// passes: `starting`, no worker spawned, its reason in `runtime.log`. The
+/// release lets it start. A launch while the service is revoked ends
+/// `failed` at once, nothing spawned, never `outcome_unknown`, the detail
+/// in `runtime.log`.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_held_senders_launch_waits_and_a_revoked_ones_fails() {
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_controls(svc_standing(json!({"held": true})));
+    rig.dump = true;
+    rig.start();
+    let log = rig.sandbox.dir.path().join("runtime.log");
+    // The stand-in's file, rewritten while the runtime runs.
+    let controls = rig.controls.clone().unwrap();
+    let standing = |value: Value| replace(&controls, &svc_standing(value).to_string());
+    let logged = |text: &str| {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains(text)
+    };
+    let mut r = Router::new(&rig.astation);
+    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let (held, sid) = launch_backend(&mut svc, &mut r);
+    within("the wait logged", || {
+        logged(&format!(
+            "launch {held} waits at the spawn boundary: paused"
+        ))
+    });
+    work_passes(&rig, 5);
+    assert_eq!(launch_state(&mut svc, &mut r, &held), "starting");
+    assert!(never_spawned(&rig, &sid), "nothing spawned while held");
+    // Released: it starts.
+    standing(json!({}));
+    within("the released launch started", || {
+        launch_state(&mut svc, &mut r, &held) == "started"
+    });
+    // Revoked: the next launch fails at once.
+    standing(json!({"revoked": "rec-revoke"}));
+    work_passes(&rig, 2);
+    let (revoked, sid) = launch_backend(&mut svc, &mut r);
+    within("the revoked launch failed", || {
+        let state = launch_state(&mut svc, &mut r, &revoked);
+        assert_ne!(state, "outcome_unknown");
+        state == "failed"
+    });
+    assert!(never_spawned(&rig, &sid), "nothing spawned when revoked");
+    assert!(logged(&format!(
+        "launch {revoked} failed before its spawn: sender revoked"
+    )));
+}
