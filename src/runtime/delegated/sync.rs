@@ -259,6 +259,8 @@ struct Reset {
 /// The `control_sync` in flight: its answer is owed (rulings T33d, T33e).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Ask {
+    /// Its `request_id` (wire rule 11): fresh for every call.
+    request_id: String,
     origin: String,
     feed_id: String,
     after: u64,
@@ -1105,7 +1107,9 @@ impl FeedSync {
             None => read.is_none(),
         };
         let after = if restart { 0 } else { read.unwrap_or(0) };
+        let request_id = fresh_request_id();
         self.in_flight = Some(Ask {
+            request_id: request_id.clone(),
             origin: own.clone(),
             feed_id: announced.feed_id.clone(),
             after,
@@ -1116,9 +1120,21 @@ impl FeedSync {
             epoch: self.epoch,
         });
         Some(ControlSync {
+            request_id,
             origin: own,
             feed_id: Some(announced.feed_id),
             after,
+        })
+    }
+
+    /// The call in flight, as it was sent (tests answer it).
+    #[cfg(test)]
+    pub(crate) fn live_call(&self) -> Option<ControlSync> {
+        self.in_flight.as_ref().map(|ask| ControlSync {
+            request_id: ask.request_id.clone(),
+            origin: ask.origin.clone(),
+            feed_id: Some(ask.feed_id.clone()),
+            after: ask.after,
         })
     }
 
@@ -1167,6 +1183,20 @@ impl FeedSync {
             "atem runtime: {text}{more}; at most one such line an hour"
         ));
     }
+}
+
+/// A fresh `request_id` for a `control_sync` (wire rule 11): a lowercase
+/// UUID v4 from the operating system's CSPRNG, never derived from the
+/// cursor, the feed or the link generation (two calls at the same cursor
+/// differ only by it).
+fn fresh_request_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    uuid::Builder::from_random_bytes(bytes)
+        .into_uuid()
+        .hyphenated()
+        .to_string()
 }
 
 impl GateView for FeedSync {

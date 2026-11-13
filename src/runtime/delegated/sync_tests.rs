@@ -37,6 +37,9 @@ struct Rig {
     mono_ms: u64,
     issued: u64,
     minted: u64,
+    /// Every call the sync asked, as sent (each `request_id` checked fresh
+    /// and lowercase v4 when asked).
+    asked: Vec<ControlSync>,
 }
 
 fn host() -> HostTarget {
@@ -149,6 +152,7 @@ fn rig() -> Rig {
         mono_ms: 3 * HOUR,
         issued: 1_700_000_000_000,
         minted: 0,
+        asked: Vec::new(),
     };
     rig.pass(0);
     rig
@@ -192,13 +196,38 @@ impl Rig {
     }
 
     /// What the bridge does after each step of the sync: a reset found is
-    /// marked durably, and its read from 0 asked then.
+    /// marked durably, and its read from 0 asked then. The calls as
+    /// [`Rig::seen`] gives them.
     fn marked(&mut self, mut calls: Vec<ControlSync>) -> Vec<ControlSync> {
         // A mark that can't be written is tried again at the next step.
         if let Ok(Some(ask)) = self.sync.persist_mark(&self.store, &mut self.feeds) {
             calls.push(ask);
         }
+        self.seen(calls)
+    }
+
+    /// Calls the sync asked: each `request_id` a lowercase UUID v4 from no
+    /// earlier call (wire rule 11), kept in [`Rig::asked`]; given back with
+    /// the id blanked, to compare with [`sync_call`].
+    fn seen(&mut self, calls: Vec<ControlSync>) -> Vec<ControlSync> {
         calls
+            .into_iter()
+            .map(|call| {
+                let id = &call.request_id;
+                let parsed = uuid::Uuid::parse_str(id).expect("a UUID");
+                assert_eq!(parsed.get_version_num(), 4, "{id}");
+                assert_eq!(parsed.hyphenated().to_string(), *id, "lowercase: {id}");
+                assert!(
+                    self.asked.iter().all(|a| a.request_id != *id),
+                    "a fresh id: {id}"
+                );
+                self.asked.push(call.clone());
+                ControlSync {
+                    request_id: String::new(),
+                    ..call
+                }
+            })
+            .collect()
     }
 
     /// The host restarts (a crash): the feed store loaded again from the
@@ -282,16 +311,38 @@ impl Rig {
     }
 
     /// The page as the reader gives it: `records` (position, the record's
-    /// value) of `feed_id`, its head `head`.
+    /// value) of `feed_id`, its head `head`, answering the call in flight
+    /// (its `request_id` and `after`: wire rule 11); with none in flight,
+    /// a call never asked (a fresh id, `after` just before its first
+    /// record, or its head).
     fn page_of(
         &self,
         feed_id: &str,
         head: u64,
         records: Vec<(u64, Value)>,
     ) -> Result<ControlSyncResult, RelayError> {
+        let call = self.sync.live_call().unwrap_or_else(|| ControlSync {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            origin: ORIGIN.into(),
+            feed_id: Some(feed_id.into()),
+            after: records.first().map_or(head, |(seq, _)| seq - 1),
+        });
+        self.page_for(&call, feed_id, head, records)
+    }
+
+    /// The page as the reader gives it, answering `call` (its `request_id`
+    /// and `after`), of `feed_id` (the call's, unless a test says another).
+    fn page_for(
+        &self,
+        call: &ControlSync,
+        feed_id: &str,
+        head: u64,
+        records: Vec<(u64, Value)>,
+    ) -> Result<ControlSyncResult, RelayError> {
         let message = json!({
-            "type": "relay", "op": "control_sync_result", "origin": ORIGIN,
-            "feed_id": feed_id, "head": head, "station_time": self.wall(),
+            "type": "relay", "op": "control_sync_result", "request_id": call.request_id,
+            "origin": ORIGIN, "feed_id": feed_id, "after": call.after, "head": head,
+            "station_time": self.wall(),
             "records": records.into_iter()
                 .map(|(feed_seq, record)| json!({"feed_seq": feed_seq, "record": record}))
                 .collect::<Vec<_>>(),
@@ -323,6 +374,7 @@ impl Rig {
                 }),
             )
             .unwrap();
+        synced.next = self.seen(synced.next.into_iter().collect()).pop();
         if let Some(ask) = self.marked(Vec::new()).pop() {
             synced.next = synced.next.or(Some(ask));
         }
@@ -365,8 +417,10 @@ impl Rig {
     }
 }
 
+/// A call as [`Rig::seen`] gives it back: its `request_id` blanked.
 fn sync_call(feed_id: &str, after: u64) -> ControlSync {
     ControlSync {
+        request_id: String::new(),
         origin: ORIGIN.into(),
         feed_id: Some(feed_id.into()),
         after,
@@ -836,7 +890,15 @@ fn a_page_of_another_feed_than_asked_applies_nothing() {
     rig.pass(SEC);
     assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
     let cover = rig.record(FEED_2, ControlAction::Cover);
-    let synced = rig.page(FEED_2, 1, &[(1, &cover)]);
+    // The call's id, the new feed from 0.
+    let live = rig.sync.live_call().unwrap();
+    let page = rig.page_for(
+        &ControlSync { after: 0, ..live },
+        FEED_2,
+        1,
+        vec![(1, cover.object().to_json())],
+    );
+    let synced = rig.on_page(page);
     assert!(synced.applied.is_empty());
     assert_eq!(rig.sync.closed(), Some(Closed::Reset));
     assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
@@ -1353,8 +1415,15 @@ fn a_page_with_a_record_at_or_below_its_after_is_a_station_fault() {
     );
     rig.pass(SEC);
     assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 2)]);
-    // Only a record at 2: it would read as "no record after the cursor".
-    let synced = rig.page(FEED, 4, &[(2, &hold)]);
+    // Another call's page (its own `after` 1; one holding a record at or
+    // below its own `after` doesn't read at all, wire rule 11): only a
+    // record at 2, it would read as "no record after the cursor".
+    let other = |rig: &Rig| ControlSync {
+        after: 1,
+        ..rig.sync.live_call().unwrap()
+    };
+    let page = rig.page_for(&other(&rig), FEED, 4, vec![(2, hold.object().to_json())]);
+    let synced = rig.on_page(page);
     assert!(synced.applied.is_empty() && synced.next.is_none());
     assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
     assert_eq!(rig.sync.closed(), Some(Closed::Fault(CONTRADICTS_CALL)));
@@ -1364,7 +1433,12 @@ fn a_page_with_a_record_at_or_below_its_after_is_a_station_fault() {
     assert!(lines[0].contains("contradicts its call"), "{}", lines[0]);
     // Asked again after the pause: records at and after 2, a fault too.
     assert_eq!(rig.pass(STALL_PAUSE_MS), [sync_call(FEED, 2)]);
-    let synced = rig.page(FEED, 4, &[(2, &hold), (3, &release), (4, &revoke)]);
+    let records = [(2, &hold), (3, &release), (4, &revoke)]
+        .iter()
+        .map(|(n, r)| (*n, r.object().to_json()))
+        .collect();
+    let page = rig.page_for(&other(&rig), FEED, 4, records);
+    let synced = rig.on_page(page);
     assert!(synced.applied.is_empty());
     assert!(rig.feeds.standing(BOT).held, "the release not applied");
     assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
@@ -1400,6 +1474,7 @@ fn a_new_generation_on_the_same_socket_keeps_the_owed_call() {
     let r6 = rig.record(FEED, ControlAction::Release);
     rig.pass(SEC);
     assert_eq!(rig.heads(FEED, 6), [sync_call(FEED, 2)], "A");
+    let a_call = rig.asked.last().unwrap().clone();
     // A new generation on the same socket: A's answer still owed on it.
     rig.sync.on_link(Some(&link(2, ORIGIN)));
     rig.pass(SEC);
@@ -1409,9 +1484,14 @@ fn a_new_generation_on_the_same_socket_keeps_the_owed_call() {
     let a = rig.page(FEED, 6, &[(3, &r3), (4, &r4)]);
     assert_eq!(a.applied.len(), 2);
     assert_eq!(a.next, Some(sync_call(FEED, 4)), "C");
-    // The same page again, taken for C: it contradicts C, a fault.
+    // The same page again (A's), taken for C: it contradicts C, a fault.
     rig.sync.take_lines();
-    let stale = rig.page(FEED, 6, &[(3, &r3), (4, &r4)]);
+    let records = [(3, &r3), (4, &r4)]
+        .iter()
+        .map(|(n, r)| (*n, r.object().to_json()))
+        .collect();
+    let page = rig.page_for(&a_call, FEED, 6, records);
+    let stale = rig.on_page(page);
     assert!(stale.applied.is_empty());
     assert_eq!(rig.cursor(), Some((FEED.to_string(), 4)));
     assert_eq!(rig.sync.closed(), Some(Closed::Fault(CONTRADICTS_CALL)));

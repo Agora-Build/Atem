@@ -103,7 +103,7 @@ fn bridge_page(
     records: &[(u64, &atem_client::control::ControlRecord)],
 ) -> Vec<crate::runtime::delegated::station::Call> {
     use crate::runtime::delegated::station::Inbound;
-    let text = page_text(head, records);
+    let text = page_text(rig, head, records);
     let inbound = rig
         .bridge
         .station
@@ -120,17 +120,58 @@ fn bridge_page(
 }
 
 /// A page of the own feed (`records`: positions and records) at `head`, as
-/// the Station sends it.
-fn page_text(head: u64, records: &[(u64, &atem_client::control::ControlRecord)]) -> String {
+/// the Station sends it: the answer to the sync's call in flight (its
+/// `request_id` and `after`, wire rule 11), or with none, to a call never
+/// asked (a fresh id, `after` just before its first record, or its head).
+fn page_text(
+    rig: &LocalRig,
+    head: u64,
+    records: &[(u64, &atem_client::control::ControlRecord)],
+) -> String {
     use atem_client::control::{ControlSyncResult, FeedEntry};
+    let live = rig
+        .bridge
+        .station
+        .as_ref()
+        .and_then(|station| station.feed.live_call());
+    let (request_id, after) = match live {
+        Some(call) => (call.request_id, call.after),
+        None => (
+            uuid::Uuid::new_v4().to_string(),
+            records.first().map_or(head, |(n, _)| n - 1),
+        ),
+    };
     let page = ControlSyncResult {
+        request_id,
         origin: ORIGIN.into(),
         feed_id: OWN_FEED.into(),
+        after,
         head,
         station_time: host_now().wall_ms,
         records: records.iter().map(|(n, r)| FeedEntry::new(*n, r)).collect(),
     };
     page.to_json().unwrap().to_string()
+}
+
+/// The calls with each `control_sync`'s `request_id` (a lowercase UUID v4,
+/// checked) blanked, to compare with expected calls.
+fn blank(
+    calls: Vec<crate::runtime::delegated::station::Call>,
+) -> Vec<crate::runtime::delegated::station::Call> {
+    use crate::runtime::delegated::station::Call;
+    calls
+        .into_iter()
+        .map(|call| match call {
+            Call::Sync(mut sync) => {
+                let id = uuid::Uuid::parse_str(&sync.request_id).expect("a UUID");
+                assert_eq!(id.get_version_num(), 4);
+                assert_eq!(id.hyphenated().to_string(), sync.request_id);
+                sync.request_id = String::new();
+                Call::Sync(sync)
+            }
+            other => other,
+        })
+        .collect()
 }
 
 /// A record of `service` in the own feed, signed with its key.
@@ -170,8 +211,9 @@ fn a_page_through_the_bridge_reaches_the_start_view_at_its_commit() {
         let head = s.log.log.head();
         let calls = bridge_heads(&mut rig, 1, head);
         assert_eq!(
-            calls,
+            blank(calls),
             [Call::Sync(ControlSync {
+                request_id: String::new(),
                 origin: ORIGIN.into(),
                 feed_id: Some(OWN_FEED.into()),
                 after: 0
@@ -556,7 +598,7 @@ fn the_reset_mark_is_no_table_with_the_hook_off() {
         assert!(!rig.bridge.features.delegated);
         passes(&mut rig, 3);
         assert!(rig.bridge.station.is_none());
-        let page = page_text(1, &[]);
+        let page = page_text(&rig, 1, &[]);
         let mut cx = Cx {
             client: &rig.app.astation_client,
             sessions: &mut rig.sessions,
@@ -596,6 +638,7 @@ fn the_read_a_mark_lets_go_is_asked_at_the_pass() {
         let hold = own_record(&s.log, "svc-bot", ControlAction::Hold, 2);
         bridge_page(&mut rig, 2, &[(1, &cover), (2, &hold)]);
         let from_0 = Call::Sync(ControlSync {
+            request_id: String::new(),
             origin: ORIGIN.into(),
             feed_id: Some(OWN_FEED.into()),
             after: 0,
@@ -625,7 +668,7 @@ fn the_read_a_mark_lets_go_is_asked_at_the_pass() {
         // The next pass: its first step, then its tick, which asks.
         rig.bridge.feed_advance(clocks_after(2_100));
         assert_eq!(
-            rig.bridge.feed_tick(clocks_after(2_100)),
+            blank(rig.bridge.feed_tick(clocks_after(2_100))),
             std::slice::from_ref(&from_0)
         );
 
@@ -637,7 +680,7 @@ fn the_read_a_mark_lets_go_is_asked_at_the_pass() {
         bridge_heads(&mut rig, 0, head);
         rig.bridge.ensure_feeds();
         rig.bridge.feed_advance(clocks_after(4_100));
-        assert_eq!(rig.bridge.feed_tick(clocks_after(4_100)), [from_0]);
+        assert_eq!(blank(rig.bridge.feed_tick(clocks_after(4_100))), [from_0]);
     });
 }
 
@@ -657,7 +700,7 @@ fn a_page_handled_after_the_deadline_is_taken_before_the_tick() {
         assert_eq!(bridge_heads(&mut rig, 1, head).len(), 1, "asked");
         let alerts = rig.bridge.station.as_ref().unwrap().feed.alerts().0;
         let cover = own_record(&s.log, "svc-bot", ControlAction::Cover, 1);
-        let page = page_text(1, &[(1, &cover)]);
+        let page = page_text(&rig, 1, &[(1, &cover)]);
         // The page came just before the deadline; the pass that handles it
         // runs just after: its first step, then the Station's messages and
         // the sync's tick.

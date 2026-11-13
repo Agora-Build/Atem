@@ -486,20 +486,28 @@ impl Rig {
             .collect()
     }
 
-    /// The host's feed syncs so far.
+    /// The host's feed syncs so far, each `request_id` checked (a
+    /// lowercase UUID v4, none twice: wire rule 11) and blanked, as
+    /// [`Rig::sync`] writes them.
     fn syncs(&self) -> Vec<ControlSync> {
-        self.calls()
+        let syncs: Vec<ControlSync> = self
+            .calls()
             .into_iter()
             .filter_map(|call| match call {
                 ToStation::ControlSync(sync) => Some(sync),
                 _ => None,
             })
-            .collect()
+            .collect();
+        let ids: std::collections::BTreeSet<_> = syncs.iter().map(|s| &s.request_id).collect();
+        assert_eq!(ids.len(), syncs.len(), "a fresh id per call: {syncs:?}");
+        syncs.into_iter().map(blank).collect()
     }
 
-    /// A `control_sync` of the served feed (as now) after `after`.
+    /// A `control_sync` of the served feed (as now) after `after`, its
+    /// `request_id` blanked ([`blank`]).
     fn sync(&self, after: u64) -> ControlSync {
         ControlSync {
+            request_id: String::new(),
             origin: self.origin(),
             feed_id: Some(self.station().feed_id().to_string()),
             after,
@@ -628,6 +636,27 @@ impl Rig {
             evidence: self.evidence(),
             resets: self.reset_marks(),
         }
+    }
+}
+
+/// `sync` with its `request_id` checked (a lowercase UUID v4) and blanked,
+/// to compare with [`Rig::sync`].
+fn blank(sync: ControlSync) -> ControlSync {
+    let id = uuid::Uuid::parse_str(&sync.request_id).expect("a UUID");
+    assert_eq!(id.get_version_num(), 4, "{}", sync.request_id);
+    assert_eq!(id.hyphenated().to_string(), sync.request_id, "lowercase");
+    ControlSync {
+        request_id: String::new(),
+        ..sync
+    }
+}
+
+/// The `control_sync` the fake Station holds, as [`blank`] gives it.
+#[track_caller]
+fn sync_of(held: &support::station::Held) -> ControlSync {
+    match held.call() {
+        Ok(ToStation::ControlSync(sync)) => blank(sync),
+        other => panic!("not a control_sync: {other:?}"),
     }
 }
 
@@ -1050,12 +1079,21 @@ fn the_hosts_station_calls_match_the_goldens() {
     let golden_feed = sync_case["fields"]["feed_id"].as_str().unwrap().to_string();
     let golden_origin = sync_case["fields"]["origin"].as_str().unwrap().to_string();
     let wire = sync_case["wire"].as_str().unwrap();
+    let golden_id = sync_case["fields"]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let origin_field = format!("\"origin\":\"{golden_origin}\"");
+    let id_field = format!("\"request_id\":\"{golden_id}\"");
     assert_eq!(wire.matches(&origin_field).count(), 1, "{wire}");
+    assert_eq!(wire.matches(&id_field).count(), 1, "{wire}");
     assert_eq!(wire.matches("\"after\":2,").count(), 1, "{wire}");
-    let sync_wire = |after: u64| {
+    // The vector's wire with the host's origin, `after` and `request_id`
+    // (its own, fresh for every call: wire rule 11).
+    let sync_wire = |after: u64, request_id: &str| {
         wire.replace(&origin_field, &format!("\"origin\":\"{NO_RELAY}\""))
             .replace("\"after\":2,", &format!("\"after\":{after},"))
+            .replace(&id_field, &format!("\"request_id\":\"{request_id}\""))
     };
 
     let mut rig = Rig::start(Via::Local, true, false);
@@ -1087,13 +1125,28 @@ fn the_hosts_station_calls_match_the_goldens() {
     rig.serve_until("the read from 0", |rig| {
         rig.cursor() == Some(1) && rig.reset_marks().is_empty() && rig.gate_open()
     });
+    // Each call's own id: a lowercase UUID v4 ([`blank`] checks it), none
+    // twice ([`Rig::syncs`]).
+    let sent = rig.station().sent();
+    let ids: Vec<String> = sent
+        .iter()
+        .filter_map(|bytes| match ToStation::decode(bytes.as_bytes()) {
+            Ok(ToStation::ControlSync(sync)) => {
+                let id = sync.request_id.clone();
+                blank(sync);
+                Some(id)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 3, "{sent:?}");
     assert_eq!(
-        rig.station().sent(),
+        sent,
         [
             fetch_case["wire"].as_str().unwrap().to_string(),
-            sync_wire(0),
-            sync_wire(2),
-            sync_wire(0),
+            sync_wire(0, &ids[0]),
+            sync_wire(2, &ids[1]),
+            sync_wire(0, &ids[2]),
         ]
     );
     // And as the shared reader reads them.
@@ -1155,7 +1208,7 @@ fn a_remote_task_waits_revocations_not_yet_checked_until_the_gate_opens() {
         station.heads_now();
         station.hold_call(rig.link())
     };
-    assert_eq!(held.call(), Ok(ToStation::ControlSync(rig.sync(0))));
+    assert_eq!(sync_of(&held), rig.sync(0));
     // Asked and not answered: still closed.
     rig.two_passes();
     assert!(!rig.gate_open(), "{}", rig.dump()["station"]);
@@ -1564,7 +1617,7 @@ fn restored_from_backup(mode: StaleFeed) {
         station.hold_call(link)
     };
     let old = rig.station().feed_id().to_string();
-    assert_eq!(call.call(), Ok(ToStation::ControlSync(rig.sync(2))));
+    assert_eq!(sync_of(&call), rig.sync(2));
     {
         let mut station = rig.station();
         station.stale_feed(mode);
@@ -1601,7 +1654,7 @@ fn restored_from_backup(mode: StaleFeed) {
         station.heads_now();
         station.hold_call(link)
     };
-    assert_eq!(call.call(), Ok(ToStation::ControlSync(rig.sync(0))));
+    assert_eq!(sync_of(&call), rig.sync(0));
     rig.two_passes();
     // (A refusal's reason stands until a page asked after it reads.)
     assert_eq!(rig.feed()["closed"], expected, "{mode:?}");
@@ -1654,7 +1707,7 @@ fn rolled_back_across_a_crash() {
             station.heads_now();
             station.hold_call(link)
         };
-        assert_eq!(call.call(), Ok(ToStation::ControlSync(rig.sync(0))));
+        assert_eq!(sync_of(&call), rig.sync(0));
         assert_eq!(rig.reset_marks(), [(NO_RELAY.to_string(), String::new())]);
         t = task(IDS, &launch, "AFTER_THE_ROLLBACK", HOUR);
         enqueue(&mut svc, &mut r, &t);
@@ -1683,7 +1736,7 @@ fn rolled_back_across_a_crash() {
         station.heads_now();
         station.hold_call(link)
     };
-    assert_eq!(call.call(), Ok(ToStation::ControlSync(rig.sync(0))));
+    assert_eq!(sync_of(&call), rig.sync(0));
     rig.two_passes();
     assert!(!rig.gate_open());
     assert_eq!(rig.feed()["closed"], RESET, "{}", rig.feed());
@@ -1809,7 +1862,7 @@ fn a_reset_read_in_a_pause_after_the_link_dropped_lowers_the_cursor_first() {
         station.heads_now();
         station.hold_call(link)
     };
-    assert_eq!(call.call(), Ok(ToStation::ControlSync(rig.sync(0))));
+    assert_eq!(sync_of(&call), rig.sync(0));
     rig.two_passes();
     assert!(!rig.gate_open());
     assert_eq!(rig.cursor(), Some(3));
@@ -1856,7 +1909,7 @@ fn a_late_answer_on_the_same_socket_resumes_the_sync() {
         station.heads_now();
         station.hold_call(link)
     };
-    assert_eq!(call.call(), Ok(ToStation::ControlSync(rig.sync(1))));
+    assert_eq!(sync_of(&call), rig.sync(1));
     // Unanswered for 30 s.
     rig.clock.add_mono(31_000);
     rig.until_feed("the timeout", |f| f["in_flight"]["timed_out"] == true);
@@ -1931,10 +1984,10 @@ fn a_reauthentication_mid_read_never_reads_past_a_revoke() {
             station.heads_now();
             station.hold_call(link)
         };
-        assert_eq!(first.call(), Ok(ToStation::ControlSync(rig.sync(1))));
+        assert_eq!(sync_of(&first), rig.sync(1));
         rig.station().answer_held(first).unwrap();
         let owed = rig.station().hold_call(link);
-        assert_eq!(owed.call(), Ok(ToStation::ControlSync(rig.sync(65))));
+        assert_eq!(sync_of(&owed), rig.sync(65));
         let t = task(IDS, &launch, "PAST_THE_REVOKE", HOUR);
         enqueue(&mut svc, &mut r, &t);
         wait_stored(&rig, &t["task_id"], "blocked", GATE_CLOSED);
@@ -1980,7 +2033,7 @@ fn a_reauthentication_mid_read_never_reads_past_a_revoke() {
             station.heads_now();
             station.hold_call(link)
         };
-        assert_eq!(owed.call(), Ok(ToStation::ControlSync(rig.sync(3))));
+        assert_eq!(sync_of(&owed), rig.sync(3));
         let t = task(IDS, &launch, "PAST_THE_ROLLBACK", HOUR);
         enqueue(&mut svc, &mut r, &t);
         wait_stored(&rig, &t["task_id"], "blocked", GATE_CLOSED);
@@ -2050,8 +2103,12 @@ fn a_page_contradicting_its_call_applies_nothing_and_keeps_the_gate_closed() {
         station.heads_now();
         station.hold_call(link)
     };
-    assert_eq!(call.call(), Ok(ToStation::ControlSync(rig.sync(1))));
-    // Its answer holds record 1 too.
+    assert_eq!(sync_of(&call), rig.sync(1));
+    // Its answer holds record 1 too: another call's page (after 0), with
+    // its id.
+    let ToStation::ControlSync(asked) = call.call().unwrap() else {
+        panic!("a control_sync");
+    };
     let page = {
         let station = rig.station();
         let entries: Vec<FeedEntry> = station
@@ -2061,8 +2118,10 @@ fn a_page_contradicting_its_call_applies_nothing_and_keeps_the_gate_closed() {
             .collect();
         assert_eq!(entries.len(), 2);
         ControlSyncResult {
+            request_id: asked.request_id.clone(),
             origin: rig.origin(),
             feed_id: station.feed_id().to_string(),
+            after: 0,
             head: 2,
             station_time: r9log::host_now().wall_ms,
             records: entries,

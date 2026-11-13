@@ -525,8 +525,10 @@ impl HostSide {
     }
 }
 
+/// A `control_sync` with a fresh `request_id` (wire rule 11).
 fn sync(feed_id: Option<&str>, after: u64) -> Value {
     ControlSync {
+        request_id: uuid::Uuid::new_v4().to_string(),
         origin: FS_ORIGIN.into(),
         feed_id: feed_id.map(str::to_owned),
         after,
@@ -602,15 +604,19 @@ fn fake_station_speaks_only_the_shared_builders() {
     assert_eq!(station.append(revoke.clone()), 2);
     assert_eq!(host.next().1, heads(2));
 
-    // control_sync from the start: the feed's page, as the builder writes it.
-    host.call(sync(None, 0));
+    // control_sync from the start: the feed's page, as the builder writes it,
+    // with the call's id and `after` (wire rule 11).
+    let call = sync(None, 0);
+    host.call(call.clone());
     assert!(matches!(
         station.next_call(host.link),
         Ok(ToStation::ControlSync(_))
     ));
     let expected = ControlSyncResult {
+        request_id: call["request_id"].as_str().unwrap().to_owned(),
         origin: FS_ORIGIN.into(),
         feed_id: feed_id.clone(),
+        after: 0,
         head: 2,
         station_time: T0,
         records: vec![
@@ -620,9 +626,12 @@ fn fake_station_speaks_only_the_shared_builders() {
     };
     assert_eq!(host.next().0, expected.to_json().unwrap().to_string());
     // After the cursor: nothing more.
-    host.call(sync(Some(&feed_id), 2));
+    let call = sync(Some(&feed_id), 2);
+    host.call(call.clone());
     station.next_call(host.link).unwrap();
     let empty = ControlSyncResult {
+        request_id: call["request_id"].as_str().unwrap().to_owned(),
+        after: 2,
         records: Vec::new(),
         ..expected
     };
@@ -729,8 +738,13 @@ fn fake_station_speaks_only_the_shared_builders() {
     assert_eq!(station.acks(), &ledger);
     // And served again once it says no more.
     station.refuse(RefusedCall::ControlSync, false);
-    host.call(sync(Some(&feed_id), 2));
+    let call = sync(Some(&feed_id), 2);
+    host.call(call.clone());
     station.next_call(host.link).unwrap();
+    let empty = ControlSyncResult {
+        request_id: call["request_id"].as_str().unwrap().to_owned(),
+        ..empty
+    };
     assert_eq!(host.next().0, empty.to_json().unwrap().to_string());
 
     // The host's calls, as the bytes it sent, in order.
@@ -852,6 +866,7 @@ fn fake_station_refuses_other_feeds_and_serves_another_account_when_told() {
     // One feed per account: a feed that isn't this account's at this
     // Station is refused, and nothing of it served.
     let elsewhere = ControlSync {
+        request_id: uuid::Uuid::new_v4().to_string(),
         origin: "https://other.test".into(),
         feed_id: None,
         after: 0,
@@ -1010,16 +1025,17 @@ fn fake_station_reset_mints_a_feed_and_snapshots_each_principals_state() {
         seen = again.next;
     }
 
-    // A call naming the old feed: §11.4 doesn't say. Refused by default
-    // (Atem's literal reading) ...
+    // A call naming the old feed is refused (§11.4 wire rule 11, as
+    // Astation decided on #164) ...
     host.call(sync(Some(&old_feed), 3));
     station.next_call(host.link).unwrap();
     assert_eq!(
         host.next().1,
         ToHost::ControlSyncRefused(RefusalCode::Forbidden)
     );
-    // ... or, in the other reading, the current feed from position 0 (the
-    // old cursor is no position in it): the new `feed_id` tells the host.
+    // ... and a Station that breaks the rule (for the host's defences)
+    // serves the current feed from position 0 (the old cursor is no
+    // position in it), its `feed_id` not the call's.
     station.stale_feed(StaleFeed::ServeCurrent);
     host.call(sync(Some(&old_feed), 3));
     station.next_call(host.link).unwrap();
@@ -1125,11 +1141,13 @@ fn fake_station_keeps_the_hosts_exact_bytes() {
     // Whitespace and escapes the strict reader accepts: read, answered,
     // and kept byte for byte.
     let spaced = r#"{ "type": "relay", "op": "control_syn\u0063",
+        "request_id": "5d0e9a3c-2b1f-4c8d-9e7a-6b5c4d3e2f1\u0030",
         "origin": "https://station.tes\u0074", "after": 0 }"#;
     host.ws.send(WsMessage::Text(spaced.into())).unwrap();
     assert_eq!(
         station.next_call(host.link),
         Ok(ToStation::ControlSync(ControlSync {
+            request_id: "5d0e9a3c-2b1f-4c8d-9e7a-6b5c4d3e2f10".into(),
             origin: FS_ORIGIN.into(),
             feed_id: None,
             after: 0,

@@ -794,8 +794,12 @@ impl FakeStation {
         let now = self.now();
         fit(entries.len().min(MAX_FEED_RECORDS), |n| {
             ControlSyncResult {
+                // The call's id, and the `after` served from (the call's
+                // own, but for another feed's: wire rule 11).
+                request_id: sync.request_id.clone(),
                 origin: self.origin.clone(),
                 feed_id: served.feed_id.clone(),
+                after,
                 head: served.feed_head(),
                 station_time: now,
                 records: entries[..n].to_vec(),
