@@ -2069,10 +2069,17 @@ impl HostBridge {
         use crate::session_protocol::wire::ReceiptState;
         let Some(receipt) = self.task_receipt(r) else {
             // Submitted, and its receipt gone (evicted or lost): what became
-            // of it can't be known any more.
+            // of it can't be known any more. A delegated task says so with
+            // §11.6's reason, the one its alert names (no turn state proves
+            // its turn ran); a v1 task with v1's text.
             if r.status.state == WorkState::Submitted {
                 r.status.state = WorkState::OutcomeUnknown;
-                r.status.detail = RECEIPT_GONE.into();
+                r.status.detail = if r.delegated.is_some() {
+                    details::OUTCOME_NOT_ESTABLISHED
+                } else {
+                    RECEIPT_GONE
+                }
+                .into();
             }
             return Ok(());
         };

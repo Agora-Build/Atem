@@ -54,8 +54,10 @@
 //! an alert has no resolved hint and no seen), or `expires_at + 300 s`
 //! passes (a resend already queued for the link is taken back when the alert
 //! ends); no guard on Atem's side (nothing cancels an alert's hint, and its
-//! ack is still wanted). Only while the welcome lists `host.alerts`
-//! (`R9Host` checks it). The same suppression and the same message bounds;
+//! ack is still wanted). Signed and first sent only while the welcome lists
+//! `host.alerts` (`R9Host` checks it); hints already made are resent as
+//! above whatever the welcome lists then. The same suppression and the same
+//! message bounds;
 //! at most [`MAX_ALERTS`] alerts tracked, a published alert never forgotten
 //! for room (a new alert finding none gets no hint, a counted runtime.log
 //! line; `alert_list` still lists it). A broker restart ends them, as it

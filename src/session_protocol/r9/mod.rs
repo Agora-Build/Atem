@@ -541,8 +541,10 @@ impl R9Host {
 
     /// Whether this host's welcome lists `host.alerts`: hosting on, and the
     /// hook's `host.delegated` and `host.alerts`. The one rule for both the
-    /// welcome and the `outcome_unknown` hints (host-work-v1 §11.3: "only
-    /// behind `host.alerts`"), so the two can't disagree.
+    /// welcome and the making (signing and first send) of `outcome_unknown`
+    /// hints (host-work-v1 §11.3: "only behind `host.alerts`"), so the two
+    /// can't disagree; hints already made are resent whatever it says then
+    /// (session-v1 R9.9).
     fn alerts_advertised(&self) -> bool {
         self.host_work_enabled && self.delegated && self.alerts
     }

@@ -60,8 +60,6 @@ pub const UNKNOWN_OUTCOME_REASONS: [&str; 3] =
 #[allow(dead_code)]
 pub const NOT_RUNNING: &str = "not running";
 /// An error, `busy`: the 64 (per sender) or 256 (per host) limit.
-// Used by Task 22: the capacity limits.
-#[allow(dead_code)]
 pub const TOO_MANY_UNRESOLVED_OUTCOMES: &str = "too many unresolved outcomes";
 /// `alert_list`'s `stale_target` for an `after` the host has no unresolved
 /// alert for (host-work-v1 §11.3, "An unknown cursor"). Not a row of

@@ -833,3 +833,238 @@ fn an_alert_raised_while_hosting_is_off_is_never_hinted() {
         assert!(hints.iter().all(|h| h.key().alert_id == on_alert.alert_id));
     });
 }
+
+/// The phone's task runs (its turn journaled); its agent's reply, with vault
+/// context, is stored and publishing (its publication never comes back),
+/// or, with `refused`, its publication was then refused for good. Then the
+/// agent exits.
+async fn exits_with_a_reply(root: &Path, refused: bool) {
+    use crate::runtime::collab::results::{self, Binding, Reply, ReplyState, ResultRow};
+    use crate::runtime::collab_context::{ContextSpec, VaultRef};
+    let mut rig = LocalRig::new(root).await;
+    let start = host_now().wall_ms;
+    let os = ManualOs::at(start);
+    let (phone, _) = delegated(&mut rig, root, &os, true);
+    alerts_on(&mut rig);
+    let task = phone_task(&mut rig, &phone, "EXITS_WITH_A_REPLY", start + HOUR);
+    turn_journaled(&mut rig, &task, "EXITS_WITH_A_REPLY").await;
+    let mut record = stored_record(&rig, &task);
+    let row = ResultRow::new(
+        Reply {
+            binding: Binding {
+                task_id: task.clone(),
+                session_id: rig.sid.to_string(),
+                process_gen: record.task.target.process_gen.clone(),
+                turn_id: rig
+                    .bridge
+                    .collab_task_turn(&record, &rig.sessions)
+                    .expect("its turn"),
+            },
+            text: "the reply".into(),
+            references: vec![ContextSpec::Vault {
+                reference: VaultRef::parse("v-context:1@1").unwrap(),
+            }],
+            context: vec![],
+            dropped: false,
+        },
+        start,
+    );
+    let store = rig.bridge.work.store.as_ref().unwrap();
+    let tx = store.db.unchecked_transaction().unwrap();
+    results::submit(&tx, &row).unwrap();
+    collab_bridge::apply_reply(&mut record, &row);
+    store.save_work(&record).unwrap();
+    tx.commit().unwrap();
+    // Its publication never comes back.
+    let (_publishing, rx) = tokio::sync::oneshot::channel();
+    rig.bridge
+        .work
+        .context_jobs
+        .insert(row.result_id.clone(), rx);
+    let mut expected = ReplyState::Publishing;
+    if refused {
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let tx = store.db.unchecked_transaction().unwrap();
+        results::refuse(&tx, &task, "context changed").unwrap();
+        let refused = results::load(&tx, &task).unwrap().unwrap();
+        let mut record = stored_record(&rig, &task);
+        collab_bridge::apply_reply(&mut record, &refused);
+        store.save_work(&record).unwrap();
+        tx.commit().unwrap();
+        rig.bridge.work.context_jobs.remove(&row.result_id);
+        expected = ReplyState::Refused;
+    }
+    // In its turn, the task's detail says how the reply stands (v1's rule).
+    let reply = results::load(&rig.bridge.work.store.as_ref().unwrap().db, &task)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        settled(&rig, &task),
+        (WorkState::Submitted, reply.task_detail())
+    );
+    std::fs::write(rig.fake.join("exit"), "").unwrap();
+    rig.until(|r| settled(r, &task).0 == WorkState::OutcomeUnknown)
+        .await;
+    passes(&mut rig, 3);
+    // Its detail and its alert say why, as its receipt does.
+    assert_eq!(
+        settled(&rig, &task),
+        (WorkState::OutcomeUnknown, details::AGENT_EXITED.into())
+    );
+    let (alerts, _) = page_for(&mut rig, &phone, None);
+    assert_eq!(
+        alerts
+            .iter()
+            .map(|a| (a.task_id.as_str(), a.reason.as_str()))
+            .collect::<Vec<_>>(),
+        [(task.as_str(), details::AGENT_EXITED)]
+    );
+    // The reply stands as it did (`reply_query`'s to show).
+    let stored = results::load(&rig.bridge.work.store.as_ref().unwrap().db, &task)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (stored.state, stored.reply.text.as_str()),
+        (expected, "the reply")
+    );
+}
+
+/// PR 7 review I1 (ruling PR7a), host-work-v1 §11.6 Details ("why, as its
+/// attempt's receipt says … the reason the owner's alert names"): the
+/// agent exits while its reply is still publishing. The task's outcome is
+/// unknown, and its detail and its alert say `agent exited`, not how the
+/// reply stands; the reply stays stored, publishing.
+#[test]
+fn an_agent_that_exits_while_its_reply_publishes_alerts_agent_exited() {
+    local_test(async |root| exits_with_a_reply(root, false).await);
+}
+
+/// The same with the reply's publication refused for good: `agent
+/// exited`, not the refusal.
+#[test]
+fn an_agent_that_exits_after_its_reply_was_refused_alerts_agent_exited() {
+    local_test(async |root| exits_with_a_reply(root, true).await);
+}
+
+/// PR 7 review I1 (b): a delegated task in its turn whose attempt receipt
+/// the session host no longer has (evicted or lost) becomes
+/// `outcome_unknown` with §11.6's reason for "no turn state proves its turn
+/// ran", `outcome could not be established`, and its alert says so (v1
+/// keeps `receipt no longer available`).
+#[test]
+fn a_delegated_task_whose_receipt_is_gone_alerts_outcome_could_not_be_established() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, true);
+        alerts_on(&mut rig);
+        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        let task = phone_task(&mut rig, &phone, "RECEIPT_GONE", start + HOUR);
+        // Submitted on an attempt the session host no longer has.
+        let mut record = stored_record(&rig, &task);
+        record.status.state = WorkState::Submitted;
+        record.status.receipt_id = uuid::Uuid::new_v4().to_string();
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        store.save_work(&record).unwrap();
+        passes(&mut rig, 2);
+        assert_eq!(
+            settled(&rig, &task),
+            (
+                WorkState::OutcomeUnknown,
+                details::OUTCOME_NOT_ESTABLISHED.into()
+            )
+        );
+        let (alerts, _) = page_for(&mut rig, &phone, None);
+        assert_eq!(
+            alerts
+                .iter()
+                .map(|a| (a.task_id.as_str(), a.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [(task.as_str(), details::OUTCOME_NOT_ESTABLISHED)]
+        );
+    });
+}
+
+/// PR 7 review I1 (a) and (c): a reply never becomes a delegated unknown
+/// outcome's detail (its reason stays, as its alert names it; the reply is
+/// `reply_query`'s), while a v1 task of unknown outcome still shows how its
+/// reply stands, as before. A submitted reply before the deadline still
+/// moves either to `awaiting_result`. An alert raised on a detail that is
+/// no §11.6 reason names `outcome could not be established`.
+#[test]
+fn a_reply_never_becomes_a_delegated_unknown_outcomes_detail() {
+    use crate::runtime::collab::results::{Binding, Reply, ReplyState, ResultRow};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        alerts_on(&mut rig);
+        let task = phone_unknowns(&mut rig, &s, 1, start + HOUR).remove(0);
+        let delegated_record = stored_record(&rig, &task);
+        let mut v1_record = delegated_record.clone();
+        v1_record.delegated = None;
+        let mut row = ResultRow::new(
+            Reply {
+                binding: Binding {
+                    task_id: task.clone(),
+                    session_id: rig.sid.to_string(),
+                    process_gen: delegated_record.task.target.process_gen.clone(),
+                    turn_id: "turn-1".into(),
+                },
+                text: "a reply".into(),
+                references: vec![],
+                context: vec![],
+                dropped: false,
+            },
+            start,
+        );
+        for state in [ReplyState::Publishing, ReplyState::Refused] {
+            row.state = state;
+            let mut delegated = delegated_record.clone();
+            collab_bridge::apply_reply(&mut delegated, &row);
+            assert_eq!(
+                (delegated.status.state, delegated.status.detail.as_str()),
+                (WorkState::OutcomeUnknown, details::AGENT_EXITED),
+                "{state:?}"
+            );
+            let mut v1 = v1_record.clone();
+            collab_bridge::apply_reply(&mut v1, &row);
+            assert_eq!(
+                (v1.status.state, v1.status.detail),
+                (WorkState::OutcomeUnknown, row.task_detail()),
+                "{state:?}"
+            );
+        }
+        row.state = ReplyState::Submitted;
+        for mut record in [delegated_record.clone(), v1_record] {
+            collab_bridge::apply_reply(&mut record, &row);
+            assert_eq!(
+                (record.status.state, record.status.detail.as_str()),
+                (WorkState::AwaitingResult, "reply submitted")
+            );
+        }
+        // (c): another delegated task written `outcome_unknown` with a
+        // detail that is no §11.6 reason.
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let mut odd = delegated_record.clone();
+        let fresh = uuid::Uuid::new_v4().to_string();
+        odd.task.task_id = fresh.clone();
+        odd.status.task_id = fresh.clone();
+        odd.status.state = WorkState::Queued;
+        assert!(store.enqueue(&odd).unwrap());
+        odd.status.state = WorkState::OutcomeUnknown;
+        odd.status.detail = "reply received; publishing its context".into();
+        store.save_work(&odd).unwrap();
+        let reason: String = store
+            .db
+            .query_row(
+                "SELECT reason FROM alerts WHERE task_id=?1",
+                [&fresh],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, details::OUTCOME_NOT_ESTABLISHED);
+    });
+}

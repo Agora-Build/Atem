@@ -3904,8 +3904,11 @@ it has neither `state` nor `session_id`, `process_gen` or `approval_id`:
   - It resends them until acknowledged or until `expires_at + 300 000`. The
     host applies no guard of its own; an approval's opens stop at `expires_at
     − 15 000`, and the relay's guard still bounds every provider send.
-  - It signs and sends them only while its welcome lists `host.alerts`
-    (hosting on, and the feature on), and never while push is suppressed.
+  - It signs them, and sends them the first time, only while its welcome
+    lists `host.alerts` (hosting on, and the feature on), and never while
+    push is suppressed. Hints already made are resent until acknowledged,
+    the alert ends, push is suppressed or `expires_at + 300 000`, whatever
+    the welcome lists then.
   - A hint is never made again for an alert:
     - raised while push was suppressed or `host.alerts` wasn't listed;
     - raised before a broker restart;

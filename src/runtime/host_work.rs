@@ -1695,8 +1695,8 @@ impl Store {
     /// (design I.4.6, §11.6 "Unknown outcomes"): at its deadline it stops
     /// holding its session, its detail `deadline passed; outcome unknown`,
     /// and stays `outcome_unknown`, unresolved, with its alert, until it is
-    /// resolved or a reply moves it (`deadline_passed`: its `work_waits` row
-    /// goes, so no pass reads it again).
+    /// resolved (`deadline_passed`: its `work_waits` row goes, so no pass
+    /// reads it again; no reply moves it any more).
     pub fn settle_due(&self, now: u64, now_d: Option<u64>) -> Result<usize> {
         let d = now_d.unwrap_or(now);
         let mut due = Vec::new();

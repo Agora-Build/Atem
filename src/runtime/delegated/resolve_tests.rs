@@ -867,6 +867,38 @@ fn a_reply_after_the_deadline_on_d_is_refused_and_the_task_stays_unresolved() {
     });
 }
 
+/// PR 7 review m4 (the Task 23 re-review's Minor 1): the deadline on `D`
+/// refuses a reply before any pass marks the task past it. `D` reaches the
+/// deadline with no pass run (as while hosting is paused): the task isn't
+/// marked yet and the wall clock is short of the deadline, yet the reply is
+/// refused `expired` and nothing is stored; later passes leave the task of
+/// unknown outcome. Compared on the wall clock alone, the reply would be
+/// taken.
+#[test]
+fn a_reply_after_the_deadline_on_d_is_refused_before_any_pass_marks_it() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, true);
+        alerts_on(&mut rig);
+        let task = unknown_in_its_turn(&mut rig, &phone, "UNMARKED_REPLY", start + HOUR).await;
+        os.pass(HOUR);
+        assert!(!stored_record(&rig, &task).deadline_passed);
+        assert!(host_now().wall_ms < start + HOUR);
+        let refused = reply(&mut rig, &task, "UNMARKED_REPLY_TEXT", &[]).unwrap_err();
+        assert_eq!(refused, format!("task {task} expired"));
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        assert!(
+            crate::runtime::collab::results::load(&store.db, &task)
+                .unwrap()
+                .is_none()
+        );
+        passes(&mut rig, 3);
+        assert_eq!(settled(&rig, &task).0, WorkState::OutcomeUnknown);
+    });
+}
+
 /// The same with a reply stored before the deadline that was still
 /// publishing its context: its publication completes once the delegated
 /// clock passed the deadline (the wall clock hasn't). The pass refuses the

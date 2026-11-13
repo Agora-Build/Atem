@@ -1338,7 +1338,7 @@ alerts.)
 | `session_id` | the task's target session (`ses-` and 12 characters) |
 | `task_id` | the task: a UUID v4 (a delegated task's id) |
 | `sender` | the delegated sender that enqueued the task: `member:<id>`, `service:<id>` or `host:<id>` (an id of 1-128 bytes of `[A-Za-z0-9._:-]`), as a receipt's provenance names it (session-v1 R9.14). Never `local` or `browser:` |
-| `reason` | why the outcome is unknown, for people: 1-256 bytes, no control or Cf character (`agent exited`, `write interrupted`, `deadline passed; outcome unknown`) |
+| `reason` | why the outcome is unknown, for people: 1-256 bytes, no control or Cf character. Atem gives one of §11.6's `outcome_unknown` reasons as the task's receipt says (`agent exited`, `outcome could not be established`, `write interrupted`), with the note below at 32. Kept as raised: the task's `detail` changes at its deadline, the alert's `reason` doesn't |
 | `created_at` | Unix ms on the host's wall clock: when the task became `outcome_unknown`. For people only: it orders nothing |
 | `more` | `true` when alerts follow this page; then the page isn't empty |
 
@@ -1357,10 +1357,11 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
     miss it (**Atem's choice, agreed with Astation (2026-11-11, #120
     comment 6810116314)**).
   - At most **64** alerts per result (**Atem's choice, agreed with
-    Astation (2026-11-11, #120 comment 6810116314)**). A host holds at
-    most 256 unresolved outcomes (design I.4.6), so a full list is four
-    pages. An alert is typically about 450 bytes, at most about 750, and
-    about 1 KB with escaping.
+    Astation (2026-11-11, #120 comment 6810116314)**). New remote tasks
+    stop at 256 unresolved outcomes (design I.4.6, §11.6 "Capacity"), but
+    tasks already accepted can still add to them, so a client pages until
+    `more` is `false`, never assuming four pages. An alert is typically
+    about 450 bytes, at most about 750, and about 1 KB with escaping.
   - A caller asks for the next page with `after` equal to the last
     `alert_id` it read, until `more` is `false`. The cursor stays the
     `alert_id`; the host finds it and lists what follows it in `seq`. A page
@@ -1375,10 +1376,11 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
   `outcome_unknown` and unresolved, one alert each. An alert ends when its
   task is resolved (`work_resolve`, or the host's command) or a reply
   moves it to `awaiting_result` (design I.4.6, "Ending"); an ended alert is
-  no longer listed. No other ending exists in this store: a delegated
-  task's `outcome_unknown` never expires (§11.6, "Unknown outcomes"), and a
-  new host identity moves the whole store aside, alerts included (design
-  I.3.3). A task reaches `outcome_unknown` once, so an alert is never raised
+  no longer listed. A delegated task's `outcome_unknown` never expires
+  (§11.6, "Unknown outcomes"). Two other endings exist: a task whose record
+  the host can't read any more is settled `failed` (`record unreadable`),
+  and its alert ends with it; and a new host identity moves the whole store
+  aside, alerts included (design I.3.3). A task reaches `outcome_unknown` once, so an alert is never raised
   twice for one. The host keeps an alert for every unresolved outcome; at 32
   unresolved on a host the `reason` of a new alert says so (for example
   `agent exited; 32 outcomes unresolved on this host`) within the 256 bytes
@@ -2354,9 +2356,19 @@ The sender's channel and online status are not conditions.
   unknown`. It stays `outcome_unknown` until `work_resolve` (§11.2) or the
   host's own command (below) resolves it, which records the resolver and
   the time (`resolved`).
-- A reply its agent submits proves the turn ran: the task moves to
-  `awaiting_result` and still needs `work_complete`. A reply that arrives
-  after a `failed` resolution is stored, and the task stays `failed`.
+- A reply its agent submits before the task's deadline proves the turn
+  ran: the task moves to `awaiting_result` and still needs
+  `work_complete`. A reply that arrives after a `failed` resolution, before
+  the deadline, is stored, and the task stays `failed`. **Atem's reading,
+  for Astation:** after the task's deadline (on the delegated clock below),
+  as for every task, a reply is refused (`expired`) and nothing is stored.
+- **Atem's choice, for Astation:** while the task stays `outcome_unknown`
+  (its reply still publishing, or refused), its `detail` stays its reason
+  (the Details table's `outcome_unknown` rows: `agent exited`, `outcome
+  could not be established`, `write interrupted`, or the deadline's text);
+  `reply_query` shows the reply. A delegated task in its turn whose
+  attempt's receipt is gone (evicted or lost) says `outcome could not be
+  established`.
 - Each one raises an alert (§11.3); the alert ends when the task is
   resolved, or a reply moves it to `awaiting_result`.
 

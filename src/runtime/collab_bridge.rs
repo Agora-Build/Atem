@@ -52,9 +52,13 @@ const GRANTS_PER_PASS: i64 = 256;
 /// says how the reply stands. A reply never completes its task, and a
 /// settled task (a delegated one resolved `failed` among them, design
 /// I.4.6) stays as it is. A delegated task of unknown outcome past its
-/// deadline is moved by no reply and keeps saying so: it stays
-/// `outcome_unknown` until it is resolved (design I.4.6, host-work-v1
-/// §11.3; an `awaiting_result` past its deadline would only expire).
+/// deadline is moved by no reply: it stays `outcome_unknown` until it is
+/// resolved (design I.4.6, host-work-v1 §11.3; an `awaiting_result` past
+/// its deadline would only expire). A delegated task that stays
+/// `outcome_unknown` keeps its reason as its detail (`agent exited`, …, or
+/// the deadline's), the one its alert names (§11.6 Details; PR 7 review
+/// I1): a reply publishing or refused shows in `reply_query`, not there. A
+/// v1 task's detail says how its reply stands, as before.
 pub(super) fn apply_reply(task: &mut WorkRecord, reply: &ResultRow) {
     if reply.state == ReplyState::Submitted
         && task.status.state == WorkState::OutcomeUnknown
@@ -62,11 +66,11 @@ pub(super) fn apply_reply(task: &mut WorkRecord, reply: &ResultRow) {
     {
         task.status.state = WorkState::AwaitingResult;
     }
-    let past_deadline = task.status.state == WorkState::OutcomeUnknown && task.deadline_passed;
+    let keeps_reason = task.delegated.is_some() && task.status.state == WorkState::OutcomeUnknown;
     if matches!(
         task.status.state,
         WorkState::Submitted | WorkState::AwaitingResult | WorkState::OutcomeUnknown
-    ) && !past_deadline
+    ) && !keeps_reason
     {
         task.status.detail = reply.task_detail();
     }

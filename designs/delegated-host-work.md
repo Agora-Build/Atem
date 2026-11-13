@@ -573,6 +573,8 @@ and `complete`. Status and replies come back to it as signed, sealed objects; it
 - A reply the agent submits for the task proves its turn ran, so it moves the task to `awaiting_result`, as today.
   That isn't success: the task still needs `work_complete`. A reply that arrives after a `failed` resolution is stored
   and the task stays `failed`.
+  - **Atem's reading (for Astation):** both hold for a reply before the task's deadline; after it, as for every task, a
+    reply is refused (`expired`) and nothing is stored (host-work-v1 §11.6, "Unknown outcomes").
 - Nothing ever treats `outcome_unknown` as success. To try again, the sender enqueues a **new** task.
 
 **Alerting (owner decision).** An unknown outcome needs a person, so the owner is told and can answer from the alert:

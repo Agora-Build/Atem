@@ -1635,3 +1635,47 @@ fn an_ended_alerts_queued_resend_is_not_sent() {
     assert_eq!(sent, [key(2).alert_id.clone(), key(2).alert_id.clone()]);
     assert_eq!(push.status(wall).pending, 2);
 }
+
+/// PR 7 review m7 (the Task 24 re-review's N2): an alert that ends with
+/// its only resend queued leaves no message at all (one whose hints all
+/// went is dropped, never sent empty), and nothing is pending.
+#[test]
+fn an_ended_alerts_only_queued_resend_leaves_nothing_to_send() {
+    let rig = alert_rig();
+    let wall = rig.now.host.wall_ms;
+    let m = rig.m.as_ref().unwrap();
+    let key = AlertKey::new(
+        m.membership(),
+        super::tests::HOST,
+        1,
+        "8c3e9d6b-1f40-4b52-8dae-000000000001",
+    );
+    let facts = facts(&alert_now(&rig, 1));
+    let mut push = HostPush::default();
+    push.link_up(None, wall);
+    push.alert_opened(
+        key.clone(),
+        wall,
+        &facts,
+        Some(Signer {
+            log: m.membership(),
+            key: &rig.key,
+        }),
+        wall,
+    );
+    let mut sent = 0;
+    push.flush(&mut |_| {
+        sent += 1;
+        true
+    });
+    assert_eq!(sent, 1, "the first send");
+    push.tick(None, wall + 10_000);
+    push.alert_ended(&key.alert_id);
+    let mut texts = Vec::new();
+    push.flush(&mut |text| {
+        texts.push(text);
+        true
+    });
+    assert!(texts.is_empty(), "{texts:?}");
+    assert_eq!(push.status(wall).pending, 0);
+}

@@ -158,9 +158,10 @@ impl Store {
     /// The alert of the delegated task `task`, which just became
     /// `outcome_unknown` (host-work-v1 §11.3), written in `tx`: the
     /// transaction that writes the task's state (durable before anything
-    /// shows it). Its reason is `reason` (the task's detail: `agent
-    /// exited`, `write interrupted`, …), or `outcome could not be
-    /// established` for one no reader would take; at [`NOTE_AT`] unresolved
+    /// shows it). Its reason is `reason` (from [`Store::track_alert`]: the
+    /// receipt's reason the task's detail carries, `agent exited`, `write
+    /// interrupted`, …), or `outcome could not be established` for one no
+    /// reader would take; at [`NOTE_AT`] unresolved
     /// on the host, this one counted, it says how many there are, within
     /// the reason's 256 bytes ([`reason_with_note`]). Its `seq` is the
     /// host's next (`alert_seq`, never reused), its `created_at` the host's
@@ -279,8 +280,10 @@ impl Store {
     /// Keeps the alert of the task `record` in step with the record being
     /// written, in `db`'s transaction ([`Store::save_work`]'s): a delegated
     /// task `outcome_unknown` and not resolved has one (raised the first
-    /// time, never again: a task reaches `outcome_unknown` once); any other
-    /// state, or a resolution, ends it. A v1 task has none.
+    /// time, never again: a task reaches `outcome_unknown` once), its
+    /// reason the receipt's (`alert_reason`: one of §11.6's
+    /// `outcome_unknown` reasons, never a reply's or another detail); any
+    /// other state, or a resolution, ends it. A v1 task has none.
     pub(crate) fn track_alert(&self, db: &Connection, record: &WorkRecord) -> Result<()> {
         if record.delegated.is_none() {
             return Ok(());
@@ -296,7 +299,7 @@ impl Store {
             |r| r.get(0),
         )?;
         if !raised {
-            self.raise_alert(db, record, &record.status.detail)?;
+            self.raise_alert(db, record, alert_reason(&record.status.detail))?;
         }
         Ok(())
     }
@@ -313,6 +316,10 @@ impl Store {
         after: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<Alert>, bool), PageRefused> {
+        // Until PR 2 (feat/delegated-core-host-api, 750d2a3 and eb20698) is
+        // in this stack: `page()` there returns `Result` and refuses a limit
+        // outside 1..=64. Then: `page(..).map_err(|_| InvalidLimit)?
+        // .ok_or(StaleCursor)`, and drop this local check.
         if !(1..=MAX_PAGE).contains(&limit) {
             return Err(PageRefused::InvalidLimit);
         }
@@ -362,6 +369,20 @@ impl Store {
     }
 }
 
+/// The reason a task's alert names (host-work-v1 §11.6 Details: "why, as
+/// its attempt's receipt says … the reason the owner's alert names"): its
+/// detail when that is one of §11.6's `outcome_unknown` reasons (`agent
+/// exited`, `outcome could not be established`, `write interrupted`), else
+/// `outcome could not be established`. Never another text a task's detail
+/// may carry (a reply's, v1's), whatever wrote the state (PR 7 review I1).
+fn alert_reason(detail: &str) -> &str {
+    if details::UNKNOWN_OUTCOME_REASONS.contains(&detail) {
+        detail
+    } else {
+        details::OUTCOME_NOT_ESTABLISHED
+    }
+}
+
 /// An alert's reason (host-work-v1 §11.3): `reason` when a reader takes it
 /// (1-256 bytes, no control or Cf character, not blank), else `outcome
 /// could not be established`; with `unresolved` at [`NOTE_AT`] or more,
@@ -369,6 +390,9 @@ impl Store {
 /// example), the reason cut at a character boundary so the whole stays
 /// within 256 bytes.
 pub fn reason_with_note(reason: &str, unresolved: u32) -> String {
+    // Until PR 2 (feat/delegated-core-host-api, 750d2a3 and eb20698) is in
+    // this stack: `valid_reason()` there refuses a blank reason. Then drop
+    // the local blank check.
     let base = if valid_reason(reason) && !reason.trim().is_empty() {
         reason
     } else {
@@ -480,9 +504,9 @@ mod tests {
     /// (`agent exited; 32 outcomes unresolved on this host`), within its
     /// 256 bytes: a long reason is cut, at a character boundary, so the
     /// note fits. Before the 32nd, and once resolutions bring the count
-    /// under it again, the reason is the task's detail alone. A detail no
-    /// reader would take (a control character, blank, too long) is no
-    /// reason: the alert says `outcome could not be established`.
+    /// under it again, the reason is the task's detail alone. A detail that
+    /// is no §11.6 reason (a reply's, a long one, one no reader would take)
+    /// gives `outcome could not be established` (PR 7 review I1).
     #[test]
     fn thirty_two_unresolved_says_so_in_the_reason() {
         let dir = tempfile::tempdir().unwrap();
@@ -504,26 +528,33 @@ mod tests {
             reason_of(&store, &next),
             "agent exited; 33 outcomes unresolved on this host"
         );
-        // A reason of the full 256 bytes is cut at a character boundary
-        // (`é` is two bytes) so the note fits.
-        let long = unknown(&store, "member:dev-phone", &"é".repeat(128));
-        let reason = reason_of(&store, &long);
+        // A reason of the full 256 bytes would be cut at a character
+        // boundary (`é` is two bytes) so the note fits (§11.6's reasons are
+        // short; the bound is kept all the same).
+        let reason = reason_with_note(&"é".repeat(128), 34);
         let note = "; 34 outcomes unresolved on this host";
         assert!(reason.ends_with(note), "{reason}");
         assert!(reason.len() <= MAX_REASON_BYTES, "{}", reason.len());
         assert_eq!(reason.len(), 2 * 109 + note.len());
         assert!(reason.starts_with('é') && valid_reason(&reason));
-        // A detail that is no reason.
-        for (n, detail) in ["agent\nexited", "   ", &"x".repeat(257)]
-            .iter()
-            .enumerate()
+        // A detail that is no §11.6 reason (PR 7 review I1): a long one, a
+        // reply's, one no reader takes.
+        for (n, detail) in [
+            "é".repeat(128).as_str(),
+            "reply received; publishing its context",
+            "agent\nexited",
+            "   ",
+            &"x".repeat(257),
+        ]
+        .iter()
+        .enumerate()
         {
             let task = unknown(&store, "member:dev-phone", detail);
             assert_eq!(
                 reason_of(&store, &task),
                 format!(
                     "outcome could not be established; {} outcomes unresolved on this host",
-                    35 + n
+                    34 + n
                 )
             );
         }
@@ -531,7 +562,7 @@ mod tests {
         for task in &first[..10] {
             assert!(store.end_alert(&store.db, task).unwrap());
         }
-        assert_eq!(store.unresolved().unwrap().0, 27);
+        assert_eq!(store.unresolved().unwrap().0, 28);
         let under = unknown(&store, "member:dev-phone", details::AGENT_EXITED);
         assert_eq!(reason_of(&store, &under), details::AGENT_EXITED);
         // Every reason is one the reader takes.
@@ -541,8 +572,25 @@ mod tests {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        assert_eq!(reasons.len(), 38);
+        assert_eq!(reasons.len(), 39);
         assert!(reasons.iter().all(|r| valid_reason(r)), "{reasons:?}");
+    }
+
+    /// PR 7 review m2: `alert_page`'s limit is 1 to 64 (`MAX_PAGE`); 0 and
+    /// 65 are refused `invalid_request`, whatever the store holds.
+    #[test]
+    fn alert_page_takes_a_limit_of_1_to_64() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        unknown(&store, "member:dev-phone", details::AGENT_EXITED);
+        for limit in [1, MAX_PAGE] {
+            let (alerts, more) = store.alert_page(None, limit).unwrap();
+            assert_eq!((alerts.len(), more), (1, false), "{limit}");
+        }
+        for limit in [0, MAX_PAGE + 1] {
+            let refused = store.alert_page(None, limit).unwrap_err();
+            assert_eq!(refused.error().code, "invalid_request", "{limit}");
+        }
     }
 
     /// Durable before visible (host-work-v1 §11.6; the plan's constraints):
