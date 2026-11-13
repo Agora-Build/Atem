@@ -4617,6 +4617,11 @@ meaning, needs Astation's agreement).
      delivered), `consumed`, `dropped` or `no_effect` (nothing written:
      written again on the next pass), or `error_after_queue` (counts as
      delivered).
+   - **(as built; host-internal, no wire change)** `work_interrupt`
+     (host-work-v1 §11.2) uses this interrupt once, with no intent. Every
+     interrupt written to an attempt's turn is recorded, whichever wrote
+     it, so a turn gets one Esc in a run from requests and intents
+     together.
 
 6. **§H recovery.** The `host-work` principal's requests are never
    confirmed. Before anything is dispatched, each recovered `accepted`

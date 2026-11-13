@@ -1486,6 +1486,71 @@ not name is `forbidden`, as for `work_query`.
   `resolved`. A resolved task shows there only as its state and `detail`;
   `work_query` gives the resolver.
 
+**`work_interrupt`, as built in step 4** (behind the debug-only hook):
+- **Only a delegated task.** A task of a sender that isn't delegated
+  (`local`, a browser grant, a service no feed covers) is `forbidden`, to
+  its sender and to the owner, as for `work_resolve`: only a delegated
+  task's turn runs under the host's own principal, which is what the host
+  interrupts (session-v1 R9.14 item 5). **Atem's reading, for Astation to
+  confirm.**
+- **The session's current turn** is the task's current attempt
+  `executing`, its turn shown running by the session's chat (R9.14 item
+  5's turn check). Anything else answers `not running`: a queued task, an
+  attempt still waiting `accepted` (nothing is withdrawn: it stays
+  queued), a turn the start's reconciliation hasn't rebound yet after a
+  restart (that says nothing of the turn), or a turn that ended.
+- **A halted session journal** is `busy`, not `not running`: the turn may
+  still be current, and nothing is written until the restart.
+- **One Esc per attempt and turn, from host-work's own sources**
+  (`work_interrupt` and the intents, §11.6's deadline interrupt
+  included). The request is one-shot: no intent, nothing
+  repeated on later passes. Every interrupt written to an attempt's turn,
+  by a request or by an intent, is recorded. While that write waits for
+  the worker's answer, or once the turn got its interrupt, a later request
+  or intent in that turn writes nothing (it only revokes another
+  controller's lease). Such a request's result is the task's status as it
+  is: its own `detail`, not `not running`, since the turn is current.
+  - **Where it is kept.** In memory for the turn, with or without an
+    intent. Where the attempt has a pending intent, it is also stored with
+    that intent, marked as the request's.
+  - **The detail.** A turn the request's interrupt ended reads `turn
+    interrupted`, never `interrupted at deadline`.
+  - **An error after queueing** (R9.14 item 5) counts as the turn's
+    interrupt, but it may not have reached the terminal: a request or
+    intent 10 s later, the turn still current, writes it again. That is
+    item 5's own exception, now shared by requests.
+  - **A write that wrote nothing** (`consumed`: on Codex the Esc only
+    handed a waiting approval to its own dialog; `dropped`; `no_effect`)
+    leaves the turn without its interrupt. A request isn't repeated (an
+    intent is, on its next pass), and its result, given before the write's
+    outcome, doesn't say so. The caller sees the turn go on in later
+    queries and may ask again; a request takes the outcomes reported so far
+    into account first, so asking again right away is written.
+  - **Residual.** The record lives for one run. After a restart, a turn
+    still current (rebound) can get one more Esc, from a request as from a
+    pending intent (R9.14 item 5's restart rule).
+  - **Not counted.** An Esc host-work didn't write: a principal holding
+    `control` can still send its own (a takeover, then its session-v1
+    `interrupt`), and so can the person at the terminal, as the session
+    host allows today. With one of those in the same turn, the turn can
+    get two.
+  - **Atem's choice.**
+- **While hosting is paused** (`runtime.toml` doesn't load, or `enabled =
+  false`), `work_interrupt` is still served: a stop always wins, as for
+  the deadline's interrupt (§11.6). **Atem's reading, for Astation to
+  confirm.**
+  - **Which channels.** While hosting is paused, the host takes
+    `work_interrupt` only from a channel whose welcome listed
+    `host.delegated`, that is one welcomed before the pause. A welcome
+    during the pause lists no host-work feature, so the client core sends
+    nothing, and the host refuses it from such a channel (`busy`,
+    `host.delegated is not advertised`). With hosting on, the host judges
+    every host-work op by its current features, as before.
+  - **What else.** Every other host-work request stays `busy`.
+  - **Still `busy`:** after a receipt-database fault, before the store is
+    recovered (a runtime started while paused), and with a halted session
+    journal.
+
 **Client core.** `Attached::send` refuses both unless `welcome.features`
 lists `host.delegated` (`host feature not available`). A result answers
 `work_interrupt` when it is that task's status; it answers `work_resolve`
@@ -2931,6 +2996,16 @@ The sender's channel and online status are not conditions.
   that can't clear ends it `failed` at once with the event's detail, and
   never `outcome_unknown`. A receipt-database fault, a halted journal and
   hosting switched off still fence it as §4 says.
+  - **As built in step 4.** Only `host_launch` reaches it (a launch on
+    message's sender is `local`). Its profile stands for the route of
+    condition 4. A waiting launch reads `starting`, a refused one `failed`;
+    the reason goes to `runtime.log` (§3 has no `detail`). A
+    `runtime.toml` that doesn't load is waited out at the spawn boundary
+    too. **Atem's reading, for Astation to confirm:** the check just
+    before the worker is spawned is the launch's linearization point; after
+    the spawn its guard only fences, as every launch's. A restart turns a
+    launch still waiting into `outcome_unknown`, as §3 says of every
+    `starting` launch.
 
 #### Attempts and `receipt_id`
 
@@ -2960,6 +3035,47 @@ The sender's channel and online status are not conditions.
   gate opens, after pending interrupt intents are carried out, every
   task is reconciled with its latest attempt's receipt and route changes
   are applied (design I.6.2, I.6.3).
+
+#### The deadline interrupt
+
+A delegated task whose turn still runs at its deadline (on the clock below)
+is interrupted (design I.4.4, I.5.7):
+- **The intent.** The host writes an interrupt intent with reason
+  `deadline` for its attempt. It is durable before anything acts on it.
+- **The interrupt.** The host interrupts the turn with host authority
+  (session-v1 R9.14 item 5): once per turn in a run, and only the lease
+  revocation repeats while the intent is pending.
+- **What the task does.** The turn ends interrupted, the task goes to
+  `awaiting_result`, `interrupted at deadline`, and then `expired` as
+  today.
+- **An attempt still waiting `accepted`** is withdrawn instead, and the
+  task is `expired`, `expired before submission`.
+
+As built in step 4:
+- **The detail.** `interrupted at deadline` names only a turn the
+  deadline's interrupt reached. A turn that ended interrupted otherwise
+  keeps `turn interrupted`.
+- **While hosting is paused. Atem's reading, for Astation to confirm.**
+  The interrupt, and every pending intent, is carried out while hosting
+  is paused (`runtime.toml` doesn't load, or `enabled = false`). A stop
+  grants nothing, and the turn's own lease goes on renewing during a
+  pause. Host-work dispatches nothing, and the task's record waits for
+  the pause to end, but for one stop: an attempt still waiting `accepted`
+  at its deadline is withdrawn, and its task expires (`expired before
+  submission`) at once, even while paused. An attempt already `accepted`
+  behind another turn follows the session host's queue and its start
+  check, which doesn't read the pause.
+  - **Residuals.** A receipt-database fault holds the intents until the
+    restart it asks for (recovery step 3 carries them out then). A runtime
+    started while paused carries them out once hosting is on.
+- **At a restart. Atem's reading, for Astation to confirm.** A pending
+  intent whose attempt is `rejected` at recovery step 3 gives the task the
+  intent's state. That covers `withdrawn at recovery`, and also a
+  `session closed` not yet processed: the task becomes `expired`, not
+  `failed`. Design I.6.3, "As built in step 4", has the details.
+- **With `host.delegated` turned off after tasks were accepted** (the
+  debug-only hook removed), a started task's turn is still interrupted at
+  its deadline.
 
 #### Unknown outcomes
 

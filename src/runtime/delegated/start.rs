@@ -20,6 +20,12 @@
 //!   deadline on the delegated clock. It answers the event that stops the
 //!   task, if any ([`Event`]), whose state the task takes
 //!   ([`Event::outcome`]).
+//! - **A launch** ([`launch_check`]) of a delegated sender is checked the
+//!   same way at the spawn boundary, before its worker is spawned
+//!   ("Launches"): conditions 2, 2a, 3 with `launch`, 4 (the profile it was
+//!   approved under) and 5, and its expiry on the delegated clock. A reason
+//!   that can clear makes it wait, one that can't fails it
+//!   ([`LaunchVerdict`]); the bridge's `launches` acts on it.
 //! - **At the start** ([`DelegatedStart`], the session host's `StartCheck`)
 //!   the same check runs for the attempt being made `executing`; a refusal
 //!   withdraws it (`withdrawn by the host`) and the event is kept with the
@@ -30,13 +36,13 @@ use super::details;
 use super::fetch::ListPart;
 use super::gate::{GateView, Gates};
 use super::{Admission, DelegatedSender, SenderStanding};
-use crate::runtime::host_work::{Accepted, Config, WorkRecord};
+use crate::runtime::host_work::{Accepted, Config, Profile, WorkRecord};
 use crate::session_protocol::host::{StartCheck, StartRequest, StartVerdict};
 use crate::session_protocol::membership::ListState;
 use crate::session_protocol::wire::Target;
 use atem_client::channel::Principal;
-use atem_client::membership::MemberStatus;
 use atem_client::membership::entry::MemberKind;
+use atem_client::membership::{MemberState, MemberStatus};
 use atem_client::principal::{Authority, Need, Op};
 use atem_client::session::host_work::WorkState;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -278,6 +284,51 @@ impl StartView {
 /// Expiry alone is ignored: a lapsed grant is judged as it stood (3).
 pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> Result<(), Event> {
     let adm = &task.admission;
+    let sender = in_effect(view, adm)?;
+    if view.config.route_changed(&task.accepted) {
+        return Err(Event::RouteChanged);
+    }
+    let authority = sender.authority(view)?;
+    if !authority.allows(Need::Op(Op::Notify)) || !authority.allows(Need::Op(Op::Prompt)) {
+        return Err(Event::Narrowed);
+    }
+    let scope_pending = scope_pending(
+        view,
+        adm,
+        &authority,
+        &task.target.session_id,
+        &task.accepted.project,
+    )?;
+    if now_d_ms.is_some_and(|d| d >= task.deadline) {
+        return Err(Event::Expired);
+    }
+    waits(view, &sender, adm, scope_pending)
+}
+
+/// A delegated sender as the committed device list and control state have
+/// it now (conditions 2a and 2, the parts that settle a task): the list it
+/// was checked on, its member entry and principal, and its standing.
+struct InEffect<'v> {
+    list: &'v ListState,
+    member: &'v MemberState,
+    principal: Principal,
+    standing: SenderStanding,
+}
+
+impl InEffect<'_> {
+    /// Its authority as its grant stands, whatever its expiry (time 0):
+    /// a lapsed grant is judged as it stood (condition 3).
+    fn authority(&self, view: &StartView) -> Result<Authority, Event> {
+        Authority::of_member(&self.principal, &self.member.member, &view.host_id, 0)
+            .map_err(|_| Event::Narrowed)
+    }
+}
+
+/// Conditions 2a and 2 (what settles): the device list usable, else
+/// `AuthorityChanged`; the sender a member in effect under the key and kind
+/// it was admitted with, else `Removed`; then no `revoke` record, else
+/// `Revoked`.
+fn in_effect<'v>(view: &'v StartView, adm: &Admission) -> Result<InEffect<'v>, Event> {
     let Some(list) = &view.list else {
         return Err(Event::AuthorityChanged);
     };
@@ -324,36 +375,55 @@ pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> R
     if standing.revoked.is_some() {
         return Err(Event::Revoked);
     }
-    if view.config.route_changed(&task.accepted) {
-        return Err(Event::RouteChanged);
-    }
-    // Judged as the grant stands, whatever its expiry (time 0).
-    let authority = Authority::of_member(&principal, &member.member, &view.host_id, 0)
-        .map_err(|_| Event::Narrowed)?;
-    if !authority.allows(Need::Op(Op::Notify)) || !authority.allows(Need::Op(Op::Prompt)) {
-        return Err(Event::Narrowed);
-    }
-    let session = &task.target.session_id;
+    Ok(InEffect {
+        list,
+        member,
+        principal,
+        standing,
+    })
+}
+
+/// Condition 3's scope for `key` (a task's session, or a launch's profile
+/// scope key) whose launch project is `project` (the task's record's, or
+/// the launch's profile's; its hashes outlive the session, ruling T20c):
+/// `Narrowed` when it is out of `authority`'s scope whatever the
+/// comparisons still pending say; else whether one is pending (in scope
+/// only if they match: waiting for unlock, never narrowed).
+fn scope_pending(
+    view: &StartView,
+    adm: &Admission,
+    authority: &Authority,
+    key: &str,
+    project: &str,
+) -> Result<bool, Event> {
     // An entry the task's project matched at admission decides without a
     // hash (Task 20 review I1); the hashes only for a kid it didn't see.
-    let project = &task.accepted.project;
-    let live = |entry: &str| view.scopes.matches(session, project, entry);
-    let scope_pending = !authority.session_in_scope(&view.host_id, session, &|entry| {
+    let live = |entry: &str| view.scopes.matches(key, project, entry);
+    let pending = !authority.session_in_scope(&view.host_id, key, &|entry| {
         adm.project_matches(entry, &live)
     });
-    if scope_pending {
+    if pending {
         // In scope if every comparison still pending matched: waiting for
         // unlock, never narrowed; out of it whatever they say: narrowed.
-        let pending_in = authority.session_in_scope(&view.host_id, session, &|entry| {
+        let pending_in = authority.session_in_scope(&view.host_id, key, &|entry| {
             adm.project_matches(entry, &live).or(Some(true))
         });
         if !pending_in {
             return Err(Event::Narrowed);
         }
     }
-    if now_d_ms.is_some_and(|d| d >= task.deadline) {
-        return Err(Event::Expired);
-    }
+    Ok(pending)
+}
+
+/// What makes it wait: the journal halted (2a), the sender held (2), a
+/// deferred entry (2), the gate closed (5), then a project scope pending
+/// (3).
+fn waits(
+    view: &StartView,
+    sender: &InEffect<'_>,
+    adm: &Admission,
+    scope_pending: bool,
+) -> Result<(), Event> {
     if view.halted {
         return Err(Event::Halted);
     }
@@ -361,22 +431,26 @@ pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> R
     if view.controls_damaged {
         return Err(Event::GateClosed);
     }
-    if standing.held {
+    if sender.standing.held {
         return Err(Event::Held);
     }
-    if list.deferred.is_some() {
+    if sender.list.deferred.is_some() {
         return Err(Event::Deferred);
     }
     // A service's gate is its current coverage's origin (Decision 14); a
     // Station's gate needs its device-list part too (I.5.8).
-    let fetched = view.fetched(list);
+    let fetched = view.fetched(sender.list);
     let gate_of = match &adm.sender {
         DelegatedSender::Native { .. } => Some(adm.sender.clone()),
         DelegatedSender::Service { device_id, .. } => {
-            standing.coverage.map(|feed| DelegatedSender::Service {
-                device_id: device_id.clone(),
-                feed,
-            })
+            sender
+                .standing
+                .coverage
+                .clone()
+                .map(|feed| DelegatedSender::Service {
+                    device_id: device_id.clone(),
+                    feed,
+                })
         }
     };
     if !gate_of.is_some_and(|sender| view.gates.open_for(&sender, fetched)) {
@@ -386,6 +460,90 @@ pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> R
         return Err(Event::ScopePending);
     }
     Ok(())
+}
+
+/// What the spawn-boundary check says of a delegated sender's launch
+/// (design I.4.3, "Launches"; host-work-v1 §11.6, "Launches").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchVerdict {
+    /// It may be spawned now.
+    Go,
+    /// A reason that can clear (§11.6's `blocked` details: the sender held,
+    /// the gate closed, a deferred entry, a scope waiting for unlock, the
+    /// journal halted): it waits at the spawn boundary while its expiry
+    /// holds, nothing spawned.
+    Wait(&'static str),
+    /// A reason that can't clear, with the event's detail (the sender
+    /// revoked or removed, narrowed, its profile changed, the device list
+    /// frozen, held or faulted), or its expiry passed (`expired before the
+    /// spawn`): it ends `failed` at once, nothing spawned. Never
+    /// `outcome_unknown`.
+    Fail(&'static str),
+}
+
+/// What the spawn-boundary check needs of a delegated sender's launch
+/// (`host_launch`, §3): its admission record, the profile it was approved
+/// under and its expiry. A launch has no route: the admission's `route_id`
+/// is empty, and the profile stands for the route of condition 4 (its id,
+/// revision, principals, directory and project as approved); its `projects`
+/// entries were matched against the profile's scope key (as the launch
+/// itself was authorized).
+#[derive(Clone)]
+pub struct StartLaunch {
+    pub admission: Admission,
+    pub profile: Profile,
+    /// `expires_at`, compared with the delegated clock.
+    pub expires_at: u64,
+}
+
+/// Conditions 2, 2a, 3 (with `launch` in place of `notify` and `prompt`),
+/// 4 and 5 of design I.4.3 for a delegated sender's `launch`, and its
+/// expiry, against `view` at `now_d_ms` (the delegated clock's reading):
+/// checked at the spawn boundary, before the worker is spawned ("Launches").
+/// The events and their order are [`may_start`]'s, condition 4 being the
+/// profile it was approved under and the deadline its expiry; what settles
+/// a task fails the launch with the event's detail, what blocks one makes it
+/// wait, and an expiry passed is `expired before the spawn`.
+///
+/// Hosting §5's fences come first and are its callers': a receipt-database
+/// fault, a halted session journal alone and hosting switched off fence a
+/// launch (`outcome_unknown`), so the halt's wait here is only what the
+/// check alone says.
+pub fn launch_check(view: &StartView, launch: &StartLaunch, now_d_ms: u64) -> LaunchVerdict {
+    match launch_event(view, launch, now_d_ms) {
+        Ok(()) => LaunchVerdict::Go,
+        Err(Event::Expired) => LaunchVerdict::Fail(details::EXPIRED_BEFORE_THE_SPAWN),
+        Err(event) => match event.outcome() {
+            (WorkState::Blocked, detail) => LaunchVerdict::Wait(detail),
+            (_, detail) => LaunchVerdict::Fail(detail),
+        },
+    }
+}
+
+/// [`launch_check`]'s event, as [`may_start`] gives a task's.
+fn launch_event(view: &StartView, launch: &StartLaunch, now_d_ms: u64) -> Result<(), Event> {
+    let adm = &launch.admission;
+    let sender = in_effect(view, adm)?;
+    if view.config.profile(&launch.profile.id) != Some(&launch.profile) {
+        return Err(Event::RouteChanged);
+    }
+    let authority = sender.authority(view)?;
+    // `launch`, no `sessions` scope, and still among the profile's
+    // principals (as `host_launch` was authorized, §3).
+    if !launch.profile.permits(&authority) {
+        return Err(Event::Narrowed);
+    }
+    let scope_pending = scope_pending(
+        view,
+        adm,
+        &authority,
+        &launch.profile.scope_key(),
+        &launch.profile.project,
+    )?;
+    if now_d_ms >= launch.expires_at {
+        return Err(Event::Expired);
+    }
+    waits(view, &sender, adm, scope_pending)
 }
 
 /// Host-work's start check in the session host (session-v1 R9.14 item 3):

@@ -669,6 +669,16 @@ pub struct HostBridge {
     /// report), in the order the answers came (a session's in its write
     /// order).
     interrupt_reports: Vec<(String, InterruptReport)>,
+    /// The drive hook's own copy of `interrupt_reports` (debug builds): it
+    /// reads this one, so host-work's intents, which drain the shared
+    /// stream every pass, see every report (Task 16b review m7). Cleared
+    /// each pass while the hook isn't set.
+    #[cfg(debug_assertions)]
+    drive_interrupt_reports: Vec<(String, InterruptReport)>,
+    /// Debug builds: host interrupt writes handed to a worker so far, for
+    /// the state dump (a test counts the writes themselves).
+    #[cfg(debug_assertions)]
+    host_interrupt_writes: u64,
     /// Host-work's prompts `executing` at the start, waiting for their
     /// adopted worker's chat (`reconcile_host_work`): request id → what is
     /// reconciled.
@@ -974,6 +984,10 @@ impl HostBridge {
             interrupts: HashMap::new(),
             pending: HashMap::new(),
             interrupt_reports: Vec::new(),
+            #[cfg(debug_assertions)]
+            drive_interrupt_reports: Vec::new(),
+            #[cfg(debug_assertions)]
+            host_interrupt_writes: 0,
             reconciling: BTreeMap::new(),
             #[cfg(debug_assertions)]
             drive_go: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -2193,6 +2207,10 @@ impl HostBridge {
         }
         state["chats"] = chats.unwrap_or_default();
         state["reconciling"] = json!(self.reconciling.keys().collect::<Vec<_>>());
+        // Host-work's scheduling passes and the host interrupt writes so far
+        // (a broker tick isn't a scheduling pass: those run every 100 ms).
+        state["host_work"] = json!({"passes": self.work.passes,
+            "interrupt_writes": self.host_interrupt_writes});
         // The pass number: a reader can wait for a pass after its own
         // action (a dump from before it can't satisfy an assert).
         static PASS: AtomicU64 = AtomicU64::new(0);
@@ -2996,13 +3014,15 @@ impl HostBridge {
                         .map(|s| s.write_tagged(INTERRUPT_KEY, WriteTag::Host, None));
                     match written {
                         Some(Ok(seq)) => {
+                            #[cfg(debug_assertions)]
+                            {
+                                self.host_interrupt_writes += 1;
+                            }
                             self.pending
                                 .insert((session_id, seq), Pending::HostInterrupt(request_id));
                         }
                         // Nothing reached the worker.
-                        _ => self
-                            .interrupt_reports
-                            .push((request_id, InterruptReport::NoEffect)),
+                        _ => self.interrupt_reported(request_id, InterruptReport::NoEffect),
                     }
                 }
                 Effect::PushApproval { request } => self.approval_opened(request, cx),
@@ -3021,8 +3041,8 @@ impl HostBridge {
     }
 
     // ── Interrupt with host authority (session-v1 R9.14 item 5) ──
-    // Host-work's delegated-work bridge (a later step) calls these; until
-    // then only the tests do.
+    // Host-work's interrupt intents carry their decisions out through these
+    // (`delegated/interrupts.rs`; design I.5.7), as the drive hook does.
 
     /// Interrupts the turn of host-work's attempt `request_id` on `sid`
     /// with the host's own authority (`SessionHost::host_interrupt`, given
@@ -3035,7 +3055,6 @@ impl HostBridge {
     /// comes once in `host_interrupt_reports`; while it is outstanding,
     /// this runs only the revoke-only step (`Revoked`), so one attempt never
     /// has two writes in flight. Run it after the pass's `advance`.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn host_interrupt(&mut self, sid: &str, request_id: &str, cx: &mut Cx) -> Interrupted {
         if self.host_interrupt_outstanding(sid, request_id) {
             return self.host_interrupt_revoke_lease(sid, request_id, cx);
@@ -3055,7 +3074,6 @@ impl HostBridge {
 
     /// A host interrupt write for `request_id` on `sid` waits for the
     /// worker's answer (its report hasn't come).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn host_interrupt_outstanding(&self, sid: &str, request_id: &str) -> bool {
         self.pending.iter().any(|((s, _), p)| {
             s == sid && matches!(p, Pending::HostInterrupt(r) if r == request_id)
@@ -3066,7 +3084,6 @@ impl HostBridge {
     /// turn check, then only another controller's lease revoked (the
     /// worker's epoch raised, so its queued bytes are dropped); nothing
     /// written. Performed here, as `host_interrupt`.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn host_interrupt_revoke_lease(
         &mut self,
         sid: &str,
@@ -3091,9 +3108,8 @@ impl HostBridge {
     /// waits for its adopted worker's chat to be reconciled (R9.14 items 5,
     /// 6; `SessionHost::recover` has the order at a start). Until then its
     /// turn check refuses (`NotCurrentTurn`: no turn state yet), which says
-    /// nothing of the turn, so host-work's recovery keeps an interrupt
-    /// intent of it pending (Task 26).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// nothing of the turn, so an interrupt intent of it stays pending
+    /// (`intents::AttemptNow::Reconciling`, design I.5.7).
     pub fn host_work_reconciling(&self, request_id: &str) -> bool {
         self.reconciling.contains_key(request_id)
     }
@@ -3148,7 +3164,7 @@ impl HostBridge {
 
     // ── The drive hook (debug builds, `ATEM_TEST_HOST_WORK_DRIVE`) ──
     // The delegated fixtures play host-work's side (session-v1 R9.14)
-    // through these, as its dispatcher does and its intents (Task 26) will.
+    // through these, as its dispatcher and its interrupt intents do.
 
     /// Host-work's start check answers what the drive hook last said
     /// (`verdict.json`; `go` at each runtime start).
@@ -3165,6 +3181,8 @@ impl HostBridge {
     fn drive_pass(&mut self, cx: &mut Cx) {
         use super::test_hooks;
         if !test_hooks::host_work_drive_on() {
+            // Nobody reads the copy: kept bounded.
+            self.drive_interrupt_reports.clear();
             return;
         }
         for line in self.drive_reports() {
@@ -3313,10 +3331,11 @@ impl HostBridge {
     }
 
     /// The outcomes of host interrupt writes since the last call, as the
-    /// drive hook reports them.
+    /// drive hook reports them: from its own copy, never the stream host-
+    /// work's intents read (Task 16b review m7).
     #[cfg(debug_assertions)]
     fn drive_reports(&mut self) -> Vec<Value> {
-        self.host_interrupt_reports()
+        std::mem::take(&mut self.drive_interrupt_reports)
             .into_iter()
             .map(|(request_id, report)| {
                 let outcome = match report {
@@ -3332,10 +3351,19 @@ impl HostBridge {
     }
 
     /// What became of the interrupts written with host authority since the
-    /// last call: (attempt's request id, report), each write's once.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// last call: (attempt's request id, report), each write's once. Host-
+    /// work's intents take them every scheduling pass.
     pub fn host_interrupt_reports(&mut self) -> Vec<(String, InterruptReport)> {
         std::mem::take(&mut self.interrupt_reports)
+    }
+
+    /// A host interrupt write's outcome, for host-work (and, in debug
+    /// builds, the drive hook's own copy).
+    fn interrupt_reported(&mut self, request_id: String, report: InterruptReport) {
+        #[cfg(debug_assertions)]
+        self.drive_interrupt_reports
+            .push((request_id.clone(), report));
+        self.interrupt_reports.push((request_id, report));
     }
 
     /// `sid`'s process ended or the session went: its host interrupt
@@ -3350,8 +3378,7 @@ impl HostBridge {
             .collect();
         for key in keys {
             if let Some(Pending::HostInterrupt(request_id)) = self.pending.remove(&key) {
-                self.interrupt_reports
-                    .push((request_id, InterruptReport::NoEffect));
+                self.interrupt_reported(request_id, InterruptReport::NoEffect);
             }
         }
     }
@@ -3836,8 +3863,7 @@ impl HostBridge {
                 }
             }
             Pending::HostInterrupt(request_id) => {
-                self.interrupt_reports
-                    .push((request_id, interrupt_report(&result)));
+                self.interrupt_reported(request_id, interrupt_report(&result));
             }
             Pending::Interrupt(request_id) => {
                 let failure = if result.consumed {
@@ -5282,7 +5308,6 @@ fn turn_known_to_run(s: &BrokerSession) -> bool {
 /// state (no chat: no blind Esc), shows no turn running (its prompt not
 /// taken yet, the turn ended, Codex before its first prompt) or one typed
 /// at the terminal.
-#[cfg_attr(not(test), allow(dead_code))]
 fn running_request(cx: &mut Cx, sid: &str) -> Option<String> {
     let s = session_of(cx, sid).filter(|s| s.is_live())?;
     turn_known_to_run(s)

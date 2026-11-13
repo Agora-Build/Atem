@@ -256,6 +256,11 @@ struct Attached {
     /// I.5.8, "Native senders"): its delegated tasks pass the revocation
     /// gate while this channel is open.
     caught_up: bool,
+    /// Its welcome listed `host.delegated`: while hosting is paused, the
+    /// host takes `work_interrupt` only from such a channel (ruling T27a,
+    /// Task 27 review I1). With hosting on, host-work ops are judged by the
+    /// host's current features, not the channel's welcome.
+    offered_delegated: bool,
 }
 
 enum Phase {
@@ -317,6 +322,9 @@ impl From<&'static str> for HostWorkError {
 
 pub struct R9Host {
     host_work_enabled: bool,
+    /// While host work is off (hosting paused), `work_interrupt` is still
+    /// taken: a stop (ruling T27a), when the runtime can serve it.
+    host_work_stops: bool,
     /// `host.delegated` and `host.alerts` (`alerts` only with `delegated`),
     /// as the runtime's debug-only hook turned them on (step 4, Decision
     /// 10); listed only with hosting on.
@@ -548,6 +556,27 @@ impl R9Host {
         self.host_work_enabled = enabled;
     }
 
+    /// While host work is off (hosting paused), whether `work_interrupt` of
+    /// `host.delegated` (when the runtime's hook turned it on) is still
+    /// taken and queued for the runtime: a stop always wins (ruling T27a,
+    /// like the deadline's interrupt, T26a). The runtime says so only while
+    /// it can serve it (its store recovered, no receipt-database fault).
+    /// Only from a channel whose welcome listed `host.delegated` (one
+    /// welcomed before the pause; Task 27 review I1). Nothing else is
+    /// taken, and no welcome lists more for it.
+    pub fn enable_host_work_stops(&mut self, enabled: bool) {
+        self.host_work_stops = enabled;
+    }
+
+    /// The open channel of `attachment` was offered `host.delegated` in its
+    /// welcome.
+    fn offered_delegated(&self, attachment: &str) -> bool {
+        self.by_attachment
+            .get(attachment)
+            .and_then(|handle| self.chans.get(handle))
+            .is_some_and(|c| matches!(&c.phase, Phase::Open(a) if a.offered_delegated))
+    }
+
     /// The delegated features the runtime runs (`host.delegated`,
     /// `host.alerts`): off unless its debug-only hook turned them on (step 4
     /// of delegated host work, Decision 10; never in a release build).
@@ -692,6 +721,7 @@ impl R9Host {
         let revoked_path = journal_dir.map(|d| d.join(REVOKED_GRANTS_FILE));
         let mut host = R9Host {
             host_work_enabled: false,
+            host_work_stops: false,
             delegated: false,
             alerts: false,
             host_work_requests: VecDeque::new(),
@@ -1582,6 +1612,9 @@ impl R9Host {
         effects.extend(parts.host.take_effects());
         let ctx = parts.host.context().clone();
         let features = self.advertised_features();
+        let offered_delegated = features
+            .iter()
+            .any(|f| f == atem_client::session::host_work::DELEGATED_FEATURE);
         let welcome = Welcome {
             id: new_id(),
             re: re.clone(),
@@ -1633,6 +1666,7 @@ impl R9Host {
             authority,
             grant: hello.grant.clone(),
             caught_up,
+            offered_delegated,
         }));
         self.by_attachment.insert(attachment, handle.to_string());
         effects
@@ -1791,11 +1825,17 @@ impl R9Host {
             // advertise, if the op is one: after the authority check (a
             // principal outside the op's right still learns `forbidden`),
             // before anything is read.
+            let stop_while_paused = !self.host_work_enabled
+                && self.host_work_stops
+                && self.delegated
+                && data.get("op").and_then(Value::as_str) == Some("work_interrupt")
+                && self.offered_delegated(att);
             let unadvertised = data
                 .get("op")
                 .and_then(Value::as_str)
                 .and_then(delegated_feature_of)
-                .filter(|feature| !self.advertised_features().iter().any(|f| f == feature));
+                .filter(|feature| !self.advertised_features().iter().any(|f| f == feature))
+                .filter(|_| !stop_while_paused);
             if matches!(
                 data.get("op").and_then(Value::as_str),
                 Some(
@@ -1827,7 +1867,9 @@ impl R9Host {
                         code::BUSY,
                         Some(&format!("{feature} is not advertised")),
                     );
-                } else if !self.host_work_enabled || self.host_work_requests.len() >= 64 {
+                } else if !(self.host_work_enabled || stop_while_paused)
+                    || self.host_work_requests.len() >= 64
+                {
                     refuse(self, code::BUSY, Some("agent hosting is disabled or busy"));
                 } else {
                     match atem_client::session::host_work::Request::decode(plain) {

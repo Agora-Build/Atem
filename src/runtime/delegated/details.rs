@@ -31,14 +31,11 @@ pub const ROUTE_CHANGED: &str = "route changed";
 pub const AUTHORITY_CHANGED: &str = "sender's authority changed";
 /// `failed`: 8 attempts.
 pub const TOO_MANY_ATTEMPTS: &str = "too many attempts";
-/// `failed`: a launch still waiting at the spawn boundary at its expiry.
-// Used by Task 28: delegated launches.
-#[allow(dead_code)]
+/// `failed`: a launch still waiting at the spawn boundary at its expiry
+/// (`start::launch_check`).
 pub const EXPIRED_BEFORE_THE_SPAWN: &str = "expired before the spawn";
 /// `awaiting_result`: a running turn interrupted at the task's deadline
 /// (then `expired`, as in v1).
-// Used by Task 26: the deadline interrupt.
-#[allow(dead_code)]
 pub const INTERRUPTED_AT_DEADLINE: &str = "interrupted at deadline";
 /// `outcome_unknown`: its deadline passed unresolved.
 pub const DEADLINE_PASSED_OUTCOME_UNKNOWN: &str = "deadline passed; outcome unknown";
@@ -56,8 +53,6 @@ pub const UNKNOWN_OUTCOME_REASONS: [&str; 3] =
     [AGENT_EXITED, OUTCOME_NOT_ESTABLISHED, WRITE_INTERRUPTED];
 /// A `work_interrupt` result: the task's turn isn't the session's current
 /// turn (§11.2); that result only, never stored.
-// Used by Task 27: `work_interrupt`.
-#[allow(dead_code)]
 pub const NOT_RUNNING: &str = "not running";
 /// An error, `busy`: the 64 (per sender) or 256 (per host) limit.
 pub const TOO_MANY_UNRESOLVED_OUTCOMES: &str = "too many unresolved outcomes";

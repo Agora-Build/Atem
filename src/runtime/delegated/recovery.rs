@@ -12,7 +12,13 @@
 //!    never deciding it again. A journal that halted at its start resolved
 //!    nothing: an attempt it still shows `accepted` stays live, and nothing
 //!    starts until the restart that withdraws it.
-//! 3. **Pending interrupt intents**: none yet (PR 8 carries them out here).
+//! 3. **Pending interrupt intents** are carried out (`carry_out_intents`,
+//!    design I.5.7): an attempt not yet `executing` is withdrawn (its task
+//!    expired or cancelled; one `withdrawn at recovery` at step 2 ends so),
+//!    a turn the start's reconciliation rebound is interrupted once more,
+//!    one still being reconciled keeps its intent pending (its chat hasn't
+//!    arrived: the next passes carry it out once it is rebound), and a turn
+//!    that ended (or was settled `outcome_unknown`) makes it do nothing.
 //! 4. **Reconcile** every delegated task, the start view made current first
 //!    (the device list, `runtime.toml`, the standings, the project scopes,
 //!    a reading of the delegated clock), so a task takes the event that
@@ -82,7 +88,7 @@ pub(super) enum RecoveryStep {
     /// 2: the session journal recovered (`halted`: its start resolved
     /// nothing, so nothing starts until the restart).
     SessionJournal { halted: bool },
-    /// 3: the interrupt intents carried out (none until PR 8).
+    /// 3: the interrupt intents carried out: their tasks, oldest first.
     PendingIntents(Vec<String>),
     /// 4: each task the step reconciled by its receipt, or settled.
     Reconcile(Vec<Recovered>),
@@ -105,8 +111,12 @@ impl HostBridge {
             RecoveryStep::SessionJournal {
                 halted: self.host.journal_halted(),
             },
-            RecoveryStep::PendingIntents(Vec::new()),
         ];
+        // Step 3, after the session journal's start and the reconciliation
+        // of host-work's executing prompts with their adopted chats so far
+        // (`reconcile_host_work`, earlier in this tick): an attempt still
+        // reconciled keeps its intent pending.
+        steps.push(RecoveryStep::PendingIntents(self.carry_out_intents(cx)?));
         // The start view current before any start condition is read.
         self.refresh_start_view();
         self.take_reading();
