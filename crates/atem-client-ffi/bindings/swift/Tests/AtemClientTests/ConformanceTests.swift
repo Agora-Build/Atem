@@ -921,7 +921,12 @@ final class ConformanceTests: XCTestCase {
             }
         }
         func controlAppliedOf(_ applied: ControlApplied) -> [String: Any] {
-            let effects: [[String: Any]] = applied.effects.map { ["effect": effectCode($0.effect), "result": resultCode($0.result)] }
+            // Each effect: `why` (O5) only when there is one.
+            let effects: [[String: Any]] = applied.effects.map { e in
+                var m: [String: Any] = ["effect": effectCode(e.effect), "result": resultCode(e.result)]
+                if let why = e.why { m["why"] = why }
+                return m
+            }
             var out: [String: Any] = ["result": resultCode(applied.result), "effects": effects, "actions": applied.actions.map(controlActionOf), "evidence": applied.evidence]
             // Why it is pending, refused or evidence: present exactly then.
             if let why = applied.why { out["why"] = why }
@@ -1087,7 +1092,7 @@ final class ConformanceTests: XCTestCase {
             .sorted()
         for name in ackNames {
             check("Station acks: \(name) through AckLedgerHandle") {
-                try eq(ackNames.count, 5, "the acknowledgment fixtures")
+                try eq(ackNames.count, 6, "the acknowledgment fixtures")
                 let f = try load(name)
                 let setup = o(f["setup"])
                 let st = o(setup["station"])
@@ -1344,6 +1349,17 @@ final class ConformanceTests: XCTestCase {
             }
             try eq(u(stationCalls["max_message_bytes"]), 262144)
             try eq(a(stationCalls["calls"]).count >= 20, true, "goldens")
+            // The shared vocabulary of reasons (O5), exported: a reason
+            // outside it is a later version's, unrecognized.
+            let vocabulary = controlWhyCodes()
+            try eq(vocabulary, a(stationCalls["why_codes"]).map(s), "the vocabulary of reasons")
+            func reasonsOf(_ name: String) -> [String] {
+                let golden = a(stationCalls["calls"]).map(o).first { s($0["name"]) == name }!
+                let results = a(o(golden["fields"])["results"]).map(o)
+                return results.flatMap { a($0["effects"]).map(o) }.compactMap { $0["why"] as? String }
+            }
+            try eq(reasonsOf("control_ack_with_reasons").allSatisfy { vocabulary.contains($0) }, true, "known reasons")
+            try eq(reasonsOf("control_ack_with_unrecognized_reasons").filter { !vocabulary.contains($0) }.count, 2, "unrecognized reasons")
             for c in a(stationCalls["calls"]).map(o) {
                 let f = o(c["fields"])
                 let wire = s(c["wire"])
@@ -1400,7 +1416,11 @@ final class ConformanceTests: XCTestCase {
                     // What it decoded to, field by field, against the golden's fields
                     // (a mapping wrong both ways round wouldn't show in the re-encoding).
                     func effectsOf(_ e: [ControlEffectResult]) -> [[String: Any]] {
-                        e.map { ["effect": effectCode($0.effect), "result": resultCode($0.result)] }
+                        e.map { effect in
+                            var m: [String: Any] = ["effect": effectCode(effect.effect), "result": resultCode(effect.result)]
+                            if let why = effect.why { m["why"] = why }
+                            return m
+                        }
                     }
                     let results: [[String: Any]] = ack.results.map { r in
                         switch r {
@@ -1872,7 +1892,8 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("bad_sealed") { _ = try PushHintBook().offer(hint: swapped) }
             try throwsCode("open_failed") { _ = try swapped.open(provider: providerFor("dev-phone"), encKeyId: "enc", deviceId: "dev-phone") }
             // Well signed and well sealed, but the sealed facts aren't a
-            // delegated sender's UUID v4 task: verified and kept, refused at open.
+            // delegated sender's UUID v4 task, or the reason is blank:
+            // verified and kept, refused at open.
             for c in a(push["outcome_unknown_invalid_facts"]).map(o) {
                 for verifier in [PushVerifier.client, PushVerifier.relay] {
                     _ = try verifyPushHint(hintJson: js(c["hint"]!), log: logL(), nowMs: nowP, verifier: verifier)
@@ -2112,6 +2133,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 72)
+        XCTAssertEqual(passed, 73)
     }
 }

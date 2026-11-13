@@ -948,6 +948,16 @@ record! {
     pub struct ControlEffectResult {
         pub effect: ControlEffectKind,
         pub result: ControlResultKind,
+        /// Why the effect isn't in force (O5; **for Astation**, amended for
+        /// step 4): set exactly when `result` is `pending` or `refused`,
+        /// else `None` (JS `null`). Information only: it never changes
+        /// `result` and counts nothing. A code of the shared vocabulary
+        /// (`ControlApplied.why`'s), or, read from a `control_ack`, a
+        /// well-formed one this build doesn't know (1 to 64 bytes of
+        /// `[a-z0-9_]`), given as it came: a code outside
+        /// `control_why_codes()` is unrecognized. A builder refuses one beside `applied` or
+        /// `duplicate`, or one that isn't well formed (`malformed`).
+        pub why: Option<String>,
     }
 }
 
@@ -1003,7 +1013,8 @@ record! {
         /// `removed_manager`, `host_key_signed`, `not_a_service`,
         /// `not_a_revoke`), or the state's: `list_frozen`, `not_revoked`,
         /// `revoke_not_applied`, `order`, `after_revoke`, `collision`,
-        /// `not_newer`, `possible_replay` (host-work-v1 §11.1).
+        /// `not_newer`, `possible_replay`, `not_after_hold` (host-work-v1
+        /// §11.1).
         pub why: Option<String>,
     }
 }

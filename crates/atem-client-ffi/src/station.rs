@@ -37,9 +37,9 @@ use std::sync::Arc;
 use atem_client::canonical::{Numbers, parse_strict};
 use atem_client::control::{
     AckLedger, AckResult, ApplicationResult, CallRefused, ControlAck, ControlRecord, ControlSync,
-    ControlSyncResult, EffectKind, EffectResult, EntryRef, FeedEntry, FeedHead, Heads, LedgerAlert,
-    LedgerTransition, LinkAssociation, MembershipFetch, MembershipFetchResult, RefusalCode,
-    RefusedCall, Report, ReportAnswer, ReportIntent, ToHost, ToStation,
+    ControlSyncResult, EffectKind, EffectResult, EffectWhy, EntryRef, FeedEntry, FeedHead, Heads,
+    LedgerAlert, LedgerTransition, LinkAssociation, MembershipFetch, MembershipFetchResult,
+    RefusalCode, RefusedCall, Report, ReportAnswer, ReportIntent, ToHost, ToStation,
 };
 use serde_json::Value;
 
@@ -108,12 +108,17 @@ pub(crate) fn result_kind_of(code: &str) -> Option<ControlResultKind> {
     ApplicationResult::from_code(code).map(result_kind)
 }
 
+/// The effects as the core takes them. A reason that isn't well formed is
+/// passed on as written, for the ack's own check to refuse (`malformed`).
 fn effects_of(effects: &[ControlEffectResult]) -> Vec<EffectResult> {
     effects
         .iter()
         .map(|e| EffectResult {
             effect: effect_of(e.effect),
             result: result_of(e.result),
+            why: e.why.as_ref().map(|why| {
+                EffectWhy::read(why).unwrap_or_else(|| EffectWhy::Unrecognized(why.clone()))
+            }),
         })
         .collect()
 }
@@ -124,6 +129,7 @@ fn effects_info(effects: &[EffectResult]) -> Vec<ControlEffectResult> {
         .map(|e| ControlEffectResult {
             effect: effect_kind(e.effect),
             result: result_kind(e.result),
+            why: e.why.as_ref().map(|why| why.code().to_owned()),
         })
         .collect()
 }

@@ -567,9 +567,12 @@ check("control records: the builders reproduce every record; a body the parse re
   throwsCode(() => m.controlRecordSigningInput({ ...controlBodyOf(ctl.records[0].record.body), feed_id: "x" }), "malformed");
 });
 const controlActionOut = ({ feedId, ...rest }) => (feedId === undefined ? rest : { ...rest, feed_id: feedId });
+// An effect as the vectors write it: `why` (O5) only when there is one.
+const effectOut = ({ why, ...rest }) => (why === null || why === undefined ? rest : { ...rest, why });
 // An applied object as the vectors write it: `why` only when there is one.
-const controlAppliedOut = ({ why, actions, ...rest }) => ({
+const controlAppliedOut = ({ why, actions, effects, ...rest }) => ({
   ...rest,
+  effects: effects.map(effectOut),
   actions: actions.map(controlActionOut),
   ...(why === null || why === undefined ? {} : { why }),
 });
@@ -687,7 +690,7 @@ const ACKS = readdirSync(fixturesDir)
   .sort();
 for (const name of ACKS) {
   check(`Station acks: ${name} through AckLedgerHandle`, () => {
-    eq(ACKS.length, 5, "the acknowledgment fixtures");
+    eq(ACKS.length, 6, "the acknowledgment fixtures");
     const f = load(name);
     const setup = f.setup;
     const st = setup.station;
@@ -907,6 +910,17 @@ check("Station calls: the byte goldens build exactly, read back to their fields 
   };
   eq(calls.max_message_bytes, 262144);
   eq(calls.calls.length >= 20, true, "goldens");
+  // The shared vocabulary of reasons (O5), exported: a reason outside it is
+  // a later version's, unrecognized.
+  const vocabulary = m.controlWhyCodes();
+  same(vocabulary, calls.why_codes, "the vocabulary of reasons");
+  const reasonsOf = (name) =>
+    calls.calls
+      .find((c) => c.name === name)
+      .fields.results.flatMap((r) => r.effects)
+      .flatMap((e) => (e.why === undefined ? [] : [e.why]));
+  eq(reasonsOf("control_ack_with_reasons").every((w) => vocabulary.includes(w)), true, "known reasons");
+  eq(reasonsOf("control_ack_with_unrecognized_reasons").filter((w) => !vocabulary.includes(w)).length, 2, "unrecognized reasons");
   for (const c of calls.calls) {
     const f = c.fields;
     const wire = c.wire;
@@ -959,8 +973,8 @@ check("Station calls: the byte goldens build exactly, read back to their fields 
             origin: read.ack.origin,
             results: read.ack.results.map((r) =>
               r.type === "entry"
-                ? { applied_seq: r.appliedSeq, effects: r.effects, entry: { entry_hash: r.entryHash, seq: r.seq } }
-                : { effects: r.effects, record_id: r.recordId },
+                ? { applied_seq: r.appliedSeq, effects: r.effects.map(effectOut), entry: { entry_hash: r.entryHash, seq: r.seq } }
+                : { effects: r.effects.map(effectOut), record_id: r.recordId },
             ),
           },
           f,
@@ -1266,7 +1280,8 @@ check("outcome_unknown hints: refusals, dedup and acks", () => {
   throwsCode(() => new m.PushHintBook().offer(swapped), "bad_sealed");
   throwsCode(() => swapped.open(sealedTo("dev-phone"), "enc", "dev-phone"), "open_failed");
   // Well signed and well sealed, but the sealed facts aren't a delegated
-  // sender's UUID v4 task: verified and kept, refused at open.
+  // sender's UUID v4 task, or the reason is blank: verified and kept,
+  // refused at open.
   for (const c of push.outcome_unknown_invalid_facts) {
     for (const verifier of ["client", "relay"]) m.verifyPushHint(str(c.hint), logL(), NOWP, verifier);
     const hint = verified(c.hint);

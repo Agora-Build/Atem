@@ -74,7 +74,8 @@
 //!    only ever adds), while a `cover` or `release` is `refused`. A record
 //!    kept pending or refused takes no `record_id`, so a forgery never
 //!    blocks the genuine record. **Bounded** (decision 19, rulings T4a and
-//!    T4d, for Astation's agreement): a principal keeps at most
+//!    T4d, agreed with Astation: stops are never blocked by it, and the
+//!    floor complements O1, rule 6): a principal keeps at most
 //!    [`MAX_RECORD_IDS`] counted ids, and the next evicts its oldest,
 //!    never the record that revoked it nor the coverage's cover; the
 //!    principal's evicted floor is the newest `issued_at` evicted. An
@@ -88,8 +89,9 @@
 //!    `refused` and kept as evidence ([`Why::PossibleReplay`]). A cover
 //!    or release applies when it was issued after every evicted record of
 //!    that principal, which a Station meets for every record it signed
-//!    itself when each cover or release it signs for a principal is issued
-//!    after every record it signed for it before. A
+//!    itself when each record it signs for a principal, holds included,
+//!    is issued after every record it signed for it before (its signing
+//!    duty, agreed with Astation, host-work-v1 §11.1). A
 //!    stop never meets the floor: a `hold` applies as any hold (an
 //!    evicted one replayed holds again, which grants nothing), and a
 //!    `revoke` or `interrupt_running` replayed is a `duplicate` (a
@@ -141,7 +143,20 @@
 //!    (a hold read at its own feed's position counts there whether or not
 //!    that feed covers the principal); it lifts every hold, another feed's
 //!    included. A release while none is in force is a `duplicate`; else
-//!    one in order is `applied`, and any other `refused`.
+//!    one in order is `applied`, and any other `refused`. **And only a
+//!    release issued after the holds** (O1, Astation's review of PR 2,
+//!    #120 comment 6848326392): the state keeps, per principal, the newest
+//!    `issued_at` of every hold it verified while the principal wasn't
+//!    revoked (one that held, one that found it held, one read out of
+//!    order, from another feed or at no position, one under a counted id),
+//!    and a release in order lifts the hold only when issued strictly
+//!    after it; one issued no later (the same millisecond included) is
+//!    `refused` ([`Why::NotAfterHold`], no evidence) and takes no position
+//!    in the feed's order. Feed order alone can't stop it: `feed_seq` isn't
+//!    signed, so a carrier that withheld an older release, or the Station's
+//!    own release refused before, could serve it after a newer hold. The
+//!    time is never lowered or cleared: no release, cover, eviction, reset
+//!    or restart erases it.
 //! 7. **After a revoke**, `cover`, `hold` and `release` are ignored: they
 //!    change nothing, a `duplicate` when they ask for what is recorded
 //!    (the coverage's Station, the hold state), else `refused`. A revoked
@@ -319,10 +334,60 @@ impl EffectKind {
 }
 
 /// One effect's result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectResult {
     pub effect: EffectKind,
     pub result: ApplicationResult,
+    /// Why the effect isn't in force (O5): set exactly when `result` is
+    /// `pending` or `refused`, never beside `applied` or `duplicate`.
+    /// Information only: it never changes `result`.
+    pub why: Option<EffectWhy>,
+}
+
+/// The most bytes of a reason an effect result carries (O5): 1 to this
+/// many of `[a-z0-9_]`.
+pub const MAX_WHY_BYTES: usize = 64;
+
+/// Why an effect isn't in force, as an effect result carries it (O5): a
+/// code of the shared vocabulary ([`Why`]), or one this build doesn't
+/// know (a later version's), read from an acknowledgment. The state gives
+/// [`EffectWhy::Known`] only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectWhy {
+    Known(Why),
+    /// Well formed, outside this build's vocabulary: information only.
+    Unrecognized(String),
+}
+
+impl EffectWhy {
+    /// The code as written.
+    pub fn code(&self) -> &str {
+        match self {
+            EffectWhy::Known(why) => why.code(),
+            EffectWhy::Unrecognized(code) => code,
+        }
+    }
+
+    /// Whether `code` is a reason's form: 1 to [`MAX_WHY_BYTES`] bytes of
+    /// `[a-z0-9_]`.
+    pub fn well_formed(code: &str) -> bool {
+        (1..=MAX_WHY_BYTES).contains(&code.len())
+            && code
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    }
+
+    /// A reason as read: a known code, or a well-formed one this build
+    /// doesn't know; `None` for anything else.
+    pub fn read(code: &str) -> Option<Self> {
+        if !Self::well_formed(code) {
+            return None;
+        }
+        Some(Why::from_code(code).map_or_else(
+            || EffectWhy::Unrecognized(code.to_owned()),
+            EffectWhy::Known,
+        ))
+    }
 }
 
 /// What the host does in the transaction that applies the record (I.5.5).
@@ -358,7 +423,8 @@ pub enum HostAction {
 
 /// Why a record is pending or refused, or kept as evidence
 /// ([`Applied::why`]): what a host keeps beside a pending record or a
-/// record kept as evidence, and alerts with.
+/// record kept as evidence, and alerts with. The shared vocabulary of
+/// reasons: an effect result carries one too ([`EffectWhy`], O5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Why {
     /// It waits: [`verify_control`]'s reason, a frozen list, a service's
@@ -388,12 +454,17 @@ pub enum Why {
     /// evicted floor): possibly an evicted record replayed, so refused and
     /// kept as evidence (rule 1, rulings T4a and T4d; never a stop).
     PossibleReplay,
+    /// A `release` taken in feed order while a hold is in force, issued no
+    /// later than the newest hold the state verified for its principal
+    /// (rule 6, O1): it would lift a hold signed after it, so refused (no
+    /// evidence: a genuine record, only stale).
+    NotAfterHold,
 }
 
 impl Why {
     /// A stable name: the reason's own for `Pending` and `Refused` (the
-    /// sets are disjoint), else `order`, `after_revoke`, `collision` or
-    /// `not_newer`.
+    /// sets are disjoint), else `order`, `after_revoke`, `collision`,
+    /// `not_newer`, `possible_replay` or `not_after_hold`.
     pub fn code(self) -> &'static str {
         match self {
             Why::Pending(reason) => reason.code(),
@@ -403,11 +474,15 @@ impl Why {
             Why::Collision => "collision",
             Why::NotNewer => "not_newer",
             Why::PossibleReplay => "possible_replay",
+            Why::NotAfterHold => "not_after_hold",
         }
     }
 
-    /// From the name, exactly.
-    pub fn from_code(code: &str) -> Option<Self> {
+    /// The shared vocabulary, every reason once, in a fixed order: the
+    /// verifier's pending reasons, its refusal reasons, then the state's.
+    /// A well-formed code outside it is a later version's (O5:
+    /// [`EffectWhy::Unrecognized`]).
+    pub fn vocabulary() -> Vec<Why> {
         PendingReason::ALL
             .into_iter()
             .map(Why::Pending)
@@ -418,8 +493,14 @@ impl Why {
                 Why::Collision,
                 Why::NotNewer,
                 Why::PossibleReplay,
+                Why::NotAfterHold,
             ])
-            .find(|why| why.code() == code)
+            .collect()
+    }
+
+    /// From the name, exactly.
+    pub fn from_code(code: &str) -> Option<Self> {
+        Why::vocabulary().into_iter().find(|why| why.code() == code)
     }
 }
 
@@ -444,17 +525,26 @@ pub struct Applied {
 
 impl Applied {
     /// Every effect of a record with `action` gets `result`; nothing done.
+    /// Each effect not in force says `why` too (O5).
     fn all(
         action: ControlAction,
         result: ApplicationResult,
         evidence: bool,
         why: Option<Why>,
     ) -> Self {
+        let not_in_force = matches!(
+            result,
+            ApplicationResult::Pending | ApplicationResult::Refused
+        );
         Applied {
             record_result: result,
             effects: EffectKind::of(action)
                 .into_iter()
-                .map(|effect| EffectResult { effect, result })
+                .map(|effect| EffectResult {
+                    effect,
+                    result,
+                    why: why.filter(|_| not_in_force).map(EffectWhy::Known),
+                })
                 .collect(),
             actions: Vec::new(),
             evidence,
@@ -578,6 +668,13 @@ struct ServiceControl {
     coverage: Option<Covering>,
     /// A hold is in force.
     held: bool,
+    /// The newest `issued_at` of every hold verified for the principal
+    /// while it wasn't revoked (rule 6, O1): applied, a duplicate while
+    /// held, read out of order, from another feed or at none, or under a
+    /// counted id. A release lifts the hold only when issued after it. Never
+    /// lowered and never cleared: a release, a cover, an eviction, a reset
+    /// and a restart keep it. `None`: no hold's time known.
+    hold_issued_at: Option<u64>,
     /// By Station origin, one feed (its `feed_id`) and the position of the
     /// last hold or release taken from it: a release from the covering
     /// feed comes after it. Another feed of the origin replaces the entry,
@@ -617,12 +714,21 @@ struct Outcome {
 
 impl Outcome {
     fn effect(&mut self, effect: EffectKind, result: ApplicationResult) {
-        self.effects.push(EffectResult { effect, result });
+        self.effects.push(EffectResult {
+            effect,
+            result,
+            why: None,
+        });
     }
 
-    /// An effect that isn't in force (`pending` or `refused`), and why.
+    /// An effect that isn't in force (`pending` or `refused`), and why: the
+    /// effect says it too (O5).
     fn not_in_force(&mut self, effect: EffectKind, result: ApplicationResult, why: Why) {
-        self.effect(effect, result);
+        self.effects.push(EffectResult {
+            effect,
+            result,
+            why: Some(EffectWhy::Known(why)),
+        });
         self.why.get_or_insert(why);
     }
 
@@ -719,6 +825,9 @@ impl Part {
         } else {
             let service = &self.service;
             o.insert("held".into(), json!(service.held));
+            if let Some(at) = service.hold_issued_at {
+                o.insert("hold_issued_at".into(), json!(at));
+            }
             o.insert("interrupted".into(), json!(service.interrupted));
             if !service.order.is_empty() {
                 let order: Map<String, Value> = service
@@ -770,7 +879,13 @@ impl Part {
                     "interrupted",
                     "records",
                 ],
-                &["coverage", "evicted_floor", "order", "revoked_by"],
+                &[
+                    "coverage",
+                    "evicted_floor",
+                    "hold_issued_at",
+                    "order",
+                    "revoked_by",
+                ],
                 "control state service",
             )?
         };
@@ -1023,7 +1138,7 @@ impl ControlState {
     ///                  "coverage":{"cover":{"issued_at":<ms>,"record_id":"…"},
     ///                              "feed_id":"…","origin":"…","since":<feed_seq>},
     ///                  "evicted_floor":<ms>,"genesis_hash":"<hex>",
-    ///                  "held":true,"interrupted":false,
+    ///                  "held":true,"hold_issued_at":<ms>,"interrupted":false,
     ///                  "order":{"<origin>":{"<feed_id>":<feed_seq>}},
     ///                  "records":[["<record_id>","<hex SHA-256 of the body's jcs>",<issued_at>],…],
     ///                  "revoked_by":"<record_id>"}
@@ -1034,9 +1149,17 @@ impl ControlState {
     /// Every part names its device list (`account_id`, `genesis_hash`), so
     /// a store of parts never loads into another list's state. `records`
     /// are oldest first, one to [`MAX_RECORD_IDS`]; `order` holds one feed
-    /// per Station origin. A service's `coverage`, `order` and
-    /// `revoked_by`, a host's `interrupted`, and `evicted_floor` until a
-    /// record is evicted, are omitted when there are none. A part is at
+    /// per Station origin; `hold_issued_at` is the newest `issued_at` of
+    /// every hold verified for the service (rule 6, O1), present from the
+    /// first one on and whenever `held`. A service's `coverage`, `order`,
+    /// `hold_issued_at` and `revoked_by`, a host's `interrupted`, and
+    /// `evicted_floor` until a record is evicted, are omitted when there
+    /// are none. **A stored part without `hold_issued_at`** (written
+    /// before O1, still `"v": 2`) is read as "no hold's time known" only
+    /// while `held` is false: every hold a later release could lift is
+    /// then verified after the load, so its time is recorded first; a
+    /// held part without it is refused as damage
+    /// ([`Error::Malformed`]), since the hold in force has no known time. A part is at
     /// most 256 records of some 125 bytes (about 32 KB), plus one `order`
     /// entry per origin the principal's holds and releases were read from
     /// (a host syncs its own Station's origin only), and a few hundred
@@ -1059,8 +1182,9 @@ impl ControlState {
     /// kind's form, its types and grammars, and its invariants (an
     /// interrupt only after a revocation; the revocation's and the
     /// coverage's cover records among its records; an evicted floor only
-    /// with full records; one feed per origin in `order`; sorted unique
-    /// `revoke_seq`s; no empty list or map). A part whose device list can't
+    /// with full records; one feed per origin in `order`; a hold's time
+    /// whenever held; sorted unique `revoke_seq`s; no empty list or map).
+    /// A part whose device list can't
     /// be read (no `account_id`, a `genesis_hash` that isn't hex) might be
     /// the list's own, so it fails too: nothing is skipped unless it names
     /// another list. Never [`Error::GenesisMismatch`].
@@ -1232,8 +1356,8 @@ fn apply_service(
             };
             cover(state, principal, key, pos, out);
         }
-        ControlAction::Hold => hold(state, principal, pos, out),
-        ControlAction::Release => release(state, principal, pos, out),
+        ControlAction::Hold => hold(state, principal, rec.issued_at(), pos, out),
+        ControlAction::Release => release(state, principal, rec.issued_at(), pos, out),
     }
 }
 
@@ -1393,10 +1517,17 @@ fn take_order(state: &mut ServiceControl, pos: &FeedPos) {
         .insert(pos.origin.clone(), (pos.feed_id.clone(), pos.feed_seq));
 }
 
-/// A `hold`, read at `pos` (its own feed's position, or none): a stop, it
-/// applies whichever feed it comes from.
-fn hold(state: &mut ServiceControl, principal: String, pos: Option<FeedPos>, out: &mut Outcome) {
-    // Ignored after a revoke.
+/// A `hold` issued at `issued_at`, read at `pos` (its own feed's position,
+/// or none): a stop, it applies whichever feed it comes from, and its time
+/// is kept whether it holds or finds the principal held (O1).
+fn hold(
+    state: &mut ServiceControl,
+    principal: String,
+    issued_at: u64,
+    pos: Option<FeedPos>,
+    out: &mut Outcome,
+) {
+    // Ignored after a revoke (nothing lifts a hold then).
     if state.revoked_by.is_some() {
         if state.held {
             out.effect(EffectKind::Hold, ApplicationResult::Duplicate);
@@ -1416,6 +1547,7 @@ fn hold(state: &mut ServiceControl, principal: String, pos: Option<FeedPos>, out
         out.actions.push(HostAction::Hold(principal));
         ApplicationResult::Applied
     };
+    state.hold_issued_at = Some(state.hold_issued_at.map_or(issued_at, |t| t.max(issued_at)));
     // A later release from this feed comes after it.
     if let Some(pos) = &pos {
         take_order(state, pos);
@@ -1423,10 +1555,18 @@ fn hold(state: &mut ServiceControl, principal: String, pos: Option<FeedPos>, out
     out.effect(EffectKind::Hold, result);
 }
 
-/// A `release`, read at `pos`: taken only from the coverage's current
-/// feed, after its cover and after the last hold or release taken from
-/// that feed; it lifts every hold.
-fn release(state: &mut ServiceControl, principal: String, pos: Option<FeedPos>, out: &mut Outcome) {
+/// A `release` issued at `issued_at`, read at `pos`: taken only from the
+/// coverage's current feed, after its cover and after the last hold or
+/// release taken from that feed; it lifts every hold, and only when issued
+/// strictly after every hold verified for the principal (O1). One issued
+/// no later is refused and takes no position in the feed's order.
+fn release(
+    state: &mut ServiceControl,
+    principal: String,
+    issued_at: u64,
+    pos: Option<FeedPos>,
+    out: &mut Outcome,
+) {
     // Ignored after a revoke.
     if state.revoked_by.is_some() {
         if state.held {
@@ -1449,17 +1589,29 @@ fn release(state: &mut ServiceControl, principal: String, pos: Option<FeedPos>, 
             .filter(|(feed_id, _)| *feed_id == pos.feed_id)
             .is_none_or(|(_, last)| pos.feed_seq > *last)
     });
-    if let Some(pos) = pos.as_ref().filter(|_| in_order) {
-        take_order(state, pos);
-    }
+    let after_holds = state.hold_issued_at.is_none_or(|at| issued_at > at);
     if !state.held {
+        if let Some(pos) = pos.as_ref().filter(|_| in_order) {
+            take_order(state, pos);
+        }
         out.effect(EffectKind::Release, ApplicationResult::Duplicate);
-    } else if in_order {
+    } else if !in_order {
+        out.not_in_force(EffectKind::Release, ApplicationResult::Refused, Why::Order);
+    } else if !after_holds {
+        // Signed no later than a hold it would lift: a release withheld,
+        // or refused before, served after a newer hold.
+        out.not_in_force(
+            EffectKind::Release,
+            ApplicationResult::Refused,
+            Why::NotAfterHold,
+        );
+    } else {
+        if let Some(pos) = &pos {
+            take_order(state, pos);
+        }
         state.held = false;
         out.actions.push(HostAction::Release(principal));
         out.effect(EffectKind::Release, ApplicationResult::Applied);
-    } else {
-        out.not_in_force(EffectKind::Release, ApplicationResult::Refused, Why::Order);
     }
 }
 
@@ -1483,6 +1635,18 @@ impl ServiceControl {
         let held = o["held"]
             .as_bool()
             .ok_or(Error::Malformed("control state held"))?;
+        // Absent: no hold's time known, safe only while nothing is held
+        // (a hold applied after the load records its time before any
+        // release could lift it). A held part without it is damage.
+        let hold_issued_at = match o.get("hold_issued_at") {
+            None if held => return Err(Error::Malformed("control state hold_issued_at")),
+            None => None,
+            Some(at) => Some(
+                at.as_u64()
+                    .filter(|at| *at <= MAX_SAFE_INTEGER)
+                    .ok_or(Error::Malformed("control state hold_issued_at"))?,
+            ),
+        };
         let coverage = match o.get("coverage") {
             None => None,
             Some(c) => {
@@ -1538,6 +1702,7 @@ impl ServiceControl {
             interrupted,
             coverage,
             held,
+            hold_issued_at,
             order,
         })
     }
@@ -1748,6 +1913,17 @@ mod control_state_tests {
                 applied.record_result,
                 rec.record_id()
             );
+            // Each effect not in force says why (the record's why); one in
+            // force says nothing (O5).
+            for e in &mut applied.effects {
+                let not_in_force = matches!(
+                    e.result,
+                    ApplicationResult::Pending | ApplicationResult::Refused
+                );
+                let want = applied.why.filter(|_| not_in_force).map(EffectWhy::Known);
+                assert_eq!(e.why, want, "{:?} of {}", e.effect, rec.record_id());
+                e.why = None;
+            }
             applied.why = None;
             *self = next;
             applied
@@ -1986,7 +2162,11 @@ mod control_state_tests {
             record_result,
             effects: effects
                 .iter()
-                .map(|&(effect, result)| EffectResult { effect, result })
+                .map(|&(effect, result)| EffectResult {
+                    effect,
+                    result,
+                    why: None,
+                })
                 .collect(),
             actions,
             evidence: false,
@@ -3363,6 +3543,7 @@ mod control_state_tests {
                             "cover": {"issued_at": issued(1), "record_id": rid(1)},
                         },
                         "held": true,
+                        "hold_issued_at": issued(2),
                         "order": {A.0: {A.1: 2}},
                     },
                     "service:svc-2": {
@@ -3374,6 +3555,7 @@ mod control_state_tests {
                             "cover": {"issued_at": issued(4), "record_id": rid(4)},
                         },
                         "held": true,
+                        "hold_issued_at": issued(6),
                         "order": {A.0: {A.1: 4}, B.0: {B.1: 2}},
                     },
                 },
@@ -4854,7 +5036,8 @@ mod control_state_tests {
     /// hold, issued below the floor, applies (a stop always wins); its
     /// cover and release below the floor are refused as possible replays
     /// until its `issued_at` passes the floor, which fails safe: the hold
-    /// stays and nothing new starts.
+    /// stays and nothing new starts. Its release lifts the hold only once
+    /// issued after every hold too (O1): the fill's holds are newer.
     #[test]
     fn a_lagging_stations_fresh_hold_below_the_floor_applies() {
         let fx = Fx::new();
@@ -4906,9 +5089,19 @@ mod control_state_tests {
                 vec![cover_action("svc-2", B)]
             )
         );
+        let past_the_floor = fx.svc_issued(605, "svc-2", C::Release, B, floor_now(&state) + 1);
+        refused_for(
+            &state,
+            &fx.list,
+            &past_the_floor,
+            at(B, 5),
+            Why::NotAfterHold,
+        );
+        let newest_hold = hold_time(&state, &svc2).unwrap();
+        assert!(newest_hold > floor_now(&state));
         assert_eq!(
             state.adopt(
-                &fx.svc_issued(605, "svc-2", C::Release, B, floor_now(&state) + 1),
+                &fx.svc_issued(606, "svc-2", C::Release, B, newest_hold + 1),
                 &fx.list,
                 at(B, 5),
                 0
@@ -4917,9 +5110,11 @@ mod control_state_tests {
         );
     }
 
-    /// A record issued after the newest evicted record applies as ever,
-    /// one millisecond above the floor included; a cover or release issued
-    /// at the floor is a possible replay.
+    /// A record issued after the newest evicted record is no possible
+    /// replay, one millisecond above the floor included; a cover or release
+    /// issued at the floor is one. A release above the floor still lifts
+    /// the hold only when issued after every hold (O1): the fill's newer
+    /// holds leave one just above the floor refused, not as evidence.
     #[test]
     fn a_fresh_record_above_the_evicted_floor_applies() {
         let fx = Fx::new();
@@ -4932,8 +5127,16 @@ mod control_state_tests {
             evidence(all(R::Refused, &[E::Release]))
         );
         let just_above = fx.svc_issued(601, "svc-2", C::Release, A, floor + 1);
+        refused_for(&state, &fx.list, &just_above, at(A, 9), Why::NotAfterHold);
+        let after_the_holds = fx.svc_issued(
+            605,
+            "svc-2",
+            C::Release,
+            A,
+            hold_time(&state, &svc2).unwrap() + 1,
+        );
         assert_eq!(
-            state.adopt(&just_above, &fx.list, at(A, 9), 0),
+            state.adopt(&after_the_holds, &fx.list, at(A, 9), 0),
             released("svc-2")
         );
         let s2 = |n: u32, action: ControlAction| fx.svc(n, "svc-2", "svc-2", action, A);
@@ -5252,5 +5455,450 @@ mod control_state_tests {
         );
         mixed.extend(damaged(&|j| j["held"] = json!(1)));
         assert!(ControlState::from_parts(&fx.list, mixed).is_err());
+    }
+
+    // ------------------- O1: a release lifts only holds issued before it
+
+    /// `rec` is refused, not as evidence, for `why`, and changes nothing:
+    /// no action, no part touched, the same state.
+    fn refused_for(
+        state: &ControlState,
+        list: &Membership,
+        rec: &ControlRecord,
+        pos: Option<FeedPos>,
+        want: Why,
+    ) {
+        let t = state.apply(rec, list, pos.clone(), 0);
+        assert_eq!(
+            (t.applied.record_result, t.applied.evidence, t.applied.why),
+            (R::Refused, false, Some(want)),
+            "{} at {pos:?}",
+            rec.record_id()
+        );
+        assert!(t.applied.actions.is_empty(), "{}", rec.record_id());
+        assert!(t.touched().is_empty(), "{}", rec.record_id());
+        assert_eq!(&t.next, state, "{}", rec.record_id());
+    }
+
+    /// The newest `issued_at` of a hold `principal`'s part keeps.
+    fn hold_time(state: &ControlState, principal: &str) -> Option<u64> {
+        state
+            .part(principal)
+            .and_then(|part| part.get("hold_issued_at").map(|t| t.as_u64().unwrap()))
+    }
+
+    /// O1 (Astation's review of PR 2, #120 comment 6848326392): a release
+    /// lifts a hold only when it was issued strictly after every hold the
+    /// state verified for the principal. A release the carrier withheld,
+    /// or one refused before, served in feed order after a newer hold, is
+    /// refused (`not_after_hold`; a genuine record, only stale, so no
+    /// evidence) and changes nothing, the feed's order included; a release
+    /// issued after the hold lifts it.
+    #[test]
+    fn a_release_lifts_only_holds_issued_before_it() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let svc1 = service("svc-1");
+        let s = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A);
+        let refused_before = s(5, C::Release);
+        let withheld = s(4, C::Release);
+        run(
+            &mut state,
+            &fx.list,
+            vec![
+                Step::new(
+                    &s(1, C::Cover),
+                    at(A, 1),
+                    out(
+                        R::Applied,
+                        &[(E::Cover, R::Applied)],
+                        vec![cover_action("svc-1", A)],
+                    ),
+                ),
+                Step::new(&s(2, C::Hold), at(A, 2), held("svc-1")),
+                // At the hold's own position: not after it in the feed.
+                Step::new(&refused_before, at(A, 2), all(R::Refused, &[E::Release])),
+                Step::new(&s(3, C::Release), at(A, 3), released("svc-1")),
+                Step::new(&s(6, C::Hold), at(A, 4), held("svc-1")),
+            ],
+        );
+        assert_eq!(hold_time(&state, &svc1), Some(issued(6)));
+        // Both in feed order now, both issued before the hold in force.
+        refused_for(&state, &fx.list, &withheld, at(A, 5), Why::NotAfterHold);
+        refused_for(
+            &state,
+            &fx.list,
+            &refused_before,
+            at(A, 6),
+            Why::NotAfterHold,
+        );
+        assert_eq!(
+            state.adopt(&withheld, &fx.list, at(A, 5), 0),
+            all(R::Refused, &[E::Release])
+        );
+        assert!(state.standing(&svc1).held);
+        // The refused release took no position: one issued after the hold,
+        // at the same position, lifts it.
+        assert_eq!(
+            state.adopt(&s(7, C::Release), &fx.list, at(A, 5), 0),
+            released("svc-1")
+        );
+        assert_eq!(state.standing(&svc1), standing(None, &[], false, Some(A)));
+        // The hold's time stays: a later release changes nothing of it.
+        assert_eq!(hold_time(&state, &svc1), Some(issued(6)));
+    }
+
+    /// The tie rule is conservative: a release issued in the same
+    /// millisecond as the hold leaves it; one a millisecond later lifts it.
+    #[test]
+    fn a_release_issued_at_the_holds_time_leaves_it() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let s = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A);
+        state.adopt(&s(1, C::Cover), &fx.list, at(A, 1), 0);
+        assert_eq!(
+            state.adopt(&s(2, C::Hold), &fx.list, at(A, 2), 0),
+            held("svc-1")
+        );
+        let tie = fx.svc_issued(3, "svc-1", C::Release, A, issued(2));
+        refused_for(&state, &fx.list, &tie, at(A, 3), Why::NotAfterHold);
+        let after = fx.svc_issued(4, "svc-1", C::Release, A, issued(2) + 1);
+        assert_eq!(
+            state.adopt(&after, &fx.list, at(A, 3), 0),
+            released("svc-1")
+        );
+    }
+
+    /// A newer hold while held is a duplicate, yet its time is kept (the
+    /// part changes): a release issued after the hold in force but not
+    /// after the newer one leaves the principal held. An older hold never
+    /// lowers the time.
+    #[test]
+    fn a_newer_hold_while_held_protects_too() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let svc1 = service("svc-1");
+        let s = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A);
+        state.adopt(&s(1, C::Cover), &fx.list, at(A, 1), 0);
+        state.adopt(&s(2, C::Hold), &fx.list, at(A, 2), 0);
+        let newer = state.apply(&s(5, C::Hold), &fx.list, at(A, 3), 0);
+        assert_eq!(newer.applied, dup(&[E::Hold]));
+        assert_eq!(newer.touched(), vec![svc1.clone()]);
+        state.adopt(&s(5, C::Hold), &fx.list, at(A, 3), 0);
+        assert_eq!(hold_time(&state, &svc1), Some(issued(5)));
+        // A record id already counted, re-served: nothing changes.
+        assert!(
+            state
+                .apply(&s(5, C::Hold), &fx.list, at(A, 3), 0)
+                .touched()
+                .is_empty()
+        );
+        // An older hold, delivered late: a duplicate, the time stays.
+        assert_eq!(
+            state.adopt(&s(3, C::Hold), &fx.list, None, 0),
+            dup(&[E::Hold])
+        );
+        assert_eq!(hold_time(&state, &svc1), Some(issued(5)));
+        refused_for(
+            &state,
+            &fx.list,
+            &s(4, C::Release),
+            at(A, 4),
+            Why::NotAfterHold,
+        );
+        assert_eq!(
+            state.adopt(&s(6, C::Release), &fx.list, at(A, 4), 0),
+            released("svc-1")
+        );
+    }
+
+    /// Every verified hold counts, wherever it was read: from a feed that
+    /// doesn't cover the principal, over a channel (no position), and one
+    /// under a counted record id (evidence, still applied as a stop).
+    #[test]
+    fn a_hold_from_another_feed_with_no_position_or_a_colliding_id_protects() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let svc1 = service("svc-1");
+        let a = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A);
+        let b = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, B);
+        state.adopt(&a(1, C::Cover), &fx.list, at(A, 1), 0);
+        // Station B covers nothing here: its hold applies all the same.
+        assert_eq!(
+            state.adopt(&b(5, C::Hold), &fx.list, at(B, 1), 0),
+            held("svc-1")
+        );
+        refused_for(
+            &state,
+            &fx.list,
+            &a(3, C::Release),
+            at(A, 2),
+            Why::NotAfterHold,
+        );
+        // A hold over a channel, read at no position.
+        assert_eq!(
+            state.adopt(&a(8, C::Hold), &fx.list, None, 0),
+            dup(&[E::Hold])
+        );
+        assert_eq!(hold_time(&state, &svc1), Some(issued(8)));
+        refused_for(
+            &state,
+            &fx.list,
+            &a(6, C::Release),
+            at(A, 2),
+            Why::NotAfterHold,
+        );
+        // A hold under the cover's record id: evidence, applied as a stop,
+        // and its time is kept like any hold's.
+        let mut colliding = fx.service_body(10, "svc-1", "svc-1", C::Hold, A);
+        colliding.record_id = rid(1);
+        let colliding = fx.sign(&colliding, "svc-1");
+        assert_eq!(
+            state.adopt(&colliding, &fx.list, at(A, 2), 0),
+            evidence(dup(&[E::Hold]))
+        );
+        assert_eq!(hold_time(&state, &svc1), Some(issued(10)));
+        refused_for(
+            &state,
+            &fx.list,
+            &a(9, C::Release),
+            at(A, 3),
+            Why::NotAfterHold,
+        );
+        assert_eq!(
+            state.adopt(&a(11, C::Release), &fx.list, at(A, 3), 0),
+            released("svc-1")
+        );
+    }
+
+    /// No floor, eviction, feed reset, coverage change or restart erases
+    /// the hold's time. The evicted floor can't protect here (the release
+    /// was issued after it): the hold's time does.
+    #[test]
+    fn the_hold_time_survives_eviction_reset_coverage_change_and_restart() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let svc2 = service("svc-2");
+        let s2 =
+            |n: u32, action: ControlAction, feed: Feed| fx.svc(n, "svc-2", "svc-2", action, feed);
+        // A release, record `n`, issued at `at` (after the floor, before
+        // the newest hold): its id none the fill counts.
+        let release =
+            |n: u32, feed: Feed, at: u32| fx.svc_issued(n, "svc-2", C::Release, feed, issued(at));
+        state.adopt(&s2(1, C::Cover, A), &fx.list, at(A, 1), 0);
+        assert_eq!(
+            state.adopt(&s2(2, C::Hold, A), &fx.list, at(A, 2), 0),
+            held("svc-2")
+        );
+        // Newer holds at no position, duplicates, until the first hold is
+        // evicted: the floor is its time, the hold's time the newest.
+        fill(&mut state, &fx, 10..=264, C::Hold);
+        assert!(!ids_of(&state, &svc2).contains(&rid(2)), "evicted");
+        let part = state.part(&svc2).unwrap();
+        assert_eq!(part["evicted_floor"], json!(issued(2)));
+        assert_eq!(part["hold_issued_at"], json!(issued(264)));
+        refused_for(
+            &state,
+            &fx.list,
+            &release(300, A, 100),
+            at(A, 3),
+            Why::NotAfterHold,
+        );
+        // A reset: the newer cover moves the order to the new feed.
+        assert_eq!(
+            state
+                .adopt(&s2(400, C::Cover, A2), &fx.list, at(A2, 1), 0)
+                .actions,
+            vec![cover_action("svc-2", A2)]
+        );
+        refused_for(
+            &state,
+            &fx.list,
+            &release(301, A2, 200),
+            at(A2, 2),
+            Why::NotAfterHold,
+        );
+        // Another Station takes the coverage over.
+        assert_eq!(
+            state
+                .adopt(&s2(401, C::Cover, B), &fx.list, at(B, 1), 0)
+                .actions,
+            vec![cover_action("svc-2", B)]
+        );
+        refused_for(
+            &state,
+            &fx.list,
+            &release(302, B, 250),
+            at(B, 2),
+            Why::NotAfterHold,
+        );
+        assert_eq!(hold_time(&state, &svc2), Some(issued(264)));
+        // A restart, from the whole state or from the parts.
+        let whole = ControlState::from_json(&state.to_json()).unwrap();
+        let parts = ControlState::from_parts(&fx.list, parts_of(&state))
+            .unwrap()
+            .state;
+        for resumed in [&whole, &parts] {
+            assert_eq!(resumed, &state);
+            refused_for(
+                resumed,
+                &fx.list,
+                &release(303, B, 260),
+                at(B, 2),
+                Why::NotAfterHold,
+            );
+        }
+        assert_eq!(
+            state.adopt(&s2(500, C::Release, B), &fx.list, at(B, 2), 0),
+            released("svc-2")
+        );
+    }
+
+    /// A revoke stays final: no release, however new, lifts the hold, and
+    /// a hold after it changes nothing (its time included).
+    #[test]
+    fn no_release_lifts_a_hold_after_a_revoke() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let svc1 = service("svc-1");
+        let s = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A);
+        state.adopt(&s(1, C::Cover), &fx.list, at(A, 1), 0);
+        state.adopt(&s(2, C::Hold), &fx.list, at(A, 2), 0);
+        state.adopt(&s(3, revoke(false)), &fx.list, at(A, 3), 0);
+        refused_for(
+            &state,
+            &fx.list,
+            &s(10, C::Release),
+            at(A, 4),
+            Why::AfterRevoke,
+        );
+        let later = state.apply(&s(11, C::Hold), &fx.list, at(A, 4), 0);
+        assert_eq!(later.applied, dup(&[E::Hold]));
+        state.adopt(&s(11, C::Hold), &fx.list, at(A, 4), 0);
+        assert_eq!(hold_time(&state, &svc1), Some(issued(2)));
+        assert_eq!(
+            state.standing(&svc1),
+            standing(Some(rid(3)), &[], true, Some(A))
+        );
+    }
+
+    /// The hold's time in a stored part: a service part keeps it once a
+    /// hold was verified, never a host principal's. A part without it is
+    /// read as "no hold's time known" only while it holds nothing (every
+    /// hold a later release could lift is then verified after the load,
+    /// and so recorded); a held part without it is damage.
+    #[test]
+    fn a_stored_part_reads_the_hold_time_strictly() {
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let svc1 = service("svc-1");
+        let s = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A);
+        state.adopt(&s(1, C::Cover), &fx.list, at(A, 1), 0);
+        state.adopt(&s(5, C::Hold), &fx.list, at(A, 2), 0);
+        let held_part = state.part(&svc1).unwrap();
+        assert_eq!(held_part["hold_issued_at"], json!(issued(5)));
+        state.adopt(&s(6, C::Release), &fx.list, at(A, 3), 0);
+        let free_part = state.part(&svc1).unwrap();
+        assert_eq!(free_part["held"], json!(false));
+        let load = |part: Value| ControlState::from_parts(&fx.list, vec![(svc1.clone(), part)]);
+        let without = |mut part: Value| {
+            part.as_object_mut().unwrap().remove("hold_issued_at");
+            part
+        };
+        // Free: no time known, read as none.
+        let mut unknown = load(without(free_part.clone())).unwrap().state;
+        assert_eq!(hold_time(&unknown, &svc1), None);
+        assert_eq!(
+            unknown.adopt(&s(3, C::Hold), &fx.list, at(A, 4), 0),
+            held("svc-1")
+        );
+        assert_eq!(
+            unknown.adopt(&s(4, C::Release), &fx.list, at(A, 5), 0),
+            released("svc-1")
+        );
+        // Held: damage, never "no time known".
+        assert!(load(without(held_part.clone())).is_err());
+        let mut whole = state.to_json();
+        whole["principals"][&svc1] = without(held_part.clone());
+        assert!(ControlState::from_json(&whole).is_err());
+        // Its form: a safe integer, never null.
+        for bad in [
+            json!(null),
+            json!("1"),
+            json!(-1),
+            json!(1.5),
+            json!(9_007_199_254_740_992u64),
+        ] {
+            let mut part = held_part.clone();
+            part["hold_issued_at"] = bad.clone();
+            assert!(load(part).is_err(), "{bad}");
+        }
+        // Never on a host principal's part.
+        let mut fx = Fx::new();
+        let r = fx.revoke_host(false);
+        let mut host = fx.state();
+        host.adopt(&fx.host(7, "mac", r), &fx.list, None, r);
+        let mut part = host.part("host:host-a").unwrap();
+        part["hold_issued_at"] = json!(issued(5));
+        assert!(ControlState::from_parts(&fx.list, vec![("host:host-a".into(), part)]).is_err());
+    }
+
+    /// O5: each effect result says why it isn't in force (the record's
+    /// `why`), and nothing when it is, a colliding stop's included (its
+    /// record is evidence; its effects apply).
+    #[test]
+    fn an_effect_not_in_force_says_why() {
+        use super::super::verify::{PendingReason as P, RefusalReason as F};
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let s = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A);
+        let effect = |rec: &ControlRecord, pos, state: &ControlState| {
+            state.apply(rec, &fx.list, pos, 0).applied.effects
+        };
+        let why = |kind, result, why| EffectResult {
+            effect: kind,
+            result,
+            why: Some(EffectWhy::Known(why)),
+        };
+        assert_eq!(
+            effect(&s(1, INTERRUPT), at(A, 1), &state),
+            vec![why(E::Interrupt, R::Pending, Why::Pending(P::NotRevoked))]
+        );
+        let forged = fx.sign(
+            &fx.service_body(2, "svc-1", "svc-1", revoke(true), A),
+            "svc-2",
+        );
+        assert_eq!(
+            effect(&forged, at(A, 1), &state),
+            vec![
+                why(E::Revocation, R::Refused, Why::Refused(F::BadSignature)),
+                why(E::Interrupt, R::Refused, Why::Refused(F::BadSignature)),
+            ]
+        );
+        state.adopt(&s(3, C::Cover), &fx.list, at(A, 1), 0);
+        state.adopt(&s(5, C::Hold), &fx.list, at(A, 2), 0);
+        assert_eq!(
+            effect(&s(4, C::Release), at(A, 3), &state),
+            vec![why(E::Release, R::Refused, Why::NotAfterHold)]
+        );
+        // A hold under the cover's id: evidence, a duplicate, no reason.
+        let mut colliding = fx.service_body(6, "svc-1", "svc-1", C::Hold, A);
+        colliding.record_id = rid(3);
+        let t = state.apply(&fx.sign(&colliding, "svc-1"), &fx.list, at(A, 3), 0);
+        assert_eq!(t.applied.why, Some(Why::Collision));
+        assert_eq!(
+            t.applied.effects,
+            vec![EffectResult {
+                effect: E::Hold,
+                result: R::Duplicate,
+                why: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn not_after_hold_is_a_why() {
+        assert_eq!(Why::NotAfterHold.code(), "not_after_hold");
+        assert_eq!(Why::from_code("not_after_hold"), Some(Why::NotAfterHold));
     }
 }

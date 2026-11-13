@@ -1581,6 +1581,163 @@
     {
       "direction": "to_station",
       "fields": {
+        "account_id": "acct-test-1",
+        "cursor": 9,
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "results": [
+          {
+            "effects": [
+              {
+                "effect": "release",
+                "result": "refused",
+                "why": "not_after_hold"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-00000000005a"
+          },
+          {
+            "effects": [
+              {
+                "effect": "interrupt",
+                "result": "pending",
+                "why": "not_revoked"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-000000000006"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-000000000001"
+          },
+          {
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "duplicate"
+              },
+              {
+                "effect": "interrupt",
+                "result": "applied"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-000000000005"
+          },
+          {
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "refused",
+                "why": "removed_manager"
+              },
+              {
+                "effect": "interrupt",
+                "result": "refused",
+                "why": "removed_manager"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-000000000016"
+          },
+          {
+            "effects": [
+              {
+                "effect": "release",
+                "result": "refused",
+                "why": "possible_replay"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-000000000003"
+          },
+          {
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "pending",
+                "why": "principal_unknown"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-00000000002c"
+          },
+          {
+            "applied_seq": 6,
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "pending",
+                "why": "revoke_not_applied"
+              }
+            ],
+            "entry": {
+              "entry_hash": "c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3",
+              "seq": 7
+            }
+          }
+        ]
+      },
+      "name": "control_ack_with_reasons",
+      "note": "partial effects with typed reasons (O5): each effect pending or refused says why, a code of the shared why vocabulary (a release issued before the hold in force, an interrupt waiting for its revocation, a stop signed by a removed manager on both its effects, a release that may be an evicted one replayed, a principal the list doesn't hold yet, an entry host-work hasn't applied); the effects in force beside them say nothing. A reason never changes a result and counts nothing",
+      "op": "control_ack",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":9,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"not_after_hold\"}],\"record_id\":\"00000000-0000-4000-8000-00000000005a\"},{\"effects\":[{\"effect\":\"interrupt\",\"result\":\"pending\",\"why\":\"not_revoked\"}],\"record_id\":\"00000000-0000-4000-8000-000000000006\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000001\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"refused\",\"why\":\"removed_manager\"},{\"effect\":\"interrupt\",\"result\":\"refused\",\"why\":\"removed_manager\"}],\"record_id\":\"00000000-0000-4000-8000-000000000016\"},{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"possible_replay\"}],\"record_id\":\"00000000-0000-4000-8000-000000000003\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"principal_unknown\"}],\"record_id\":\"00000000-0000-4000-8000-00000000002c\"},{\"applied_seq\":6,\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"revoke_not_applied\"}],\"entry\":{\"entry_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":7}}],\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_station",
+      "fields": {
+        "account_id": "acct-test-1",
+        "cursor": 9,
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "results": [
+          {
+            "effects": [
+              {
+                "effect": "release",
+                "result": "refused",
+                "why": "a_later_reason"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-00000000005a"
+          },
+          {
+            "effects": [
+              {
+                "effect": "release",
+                "result": "refused",
+                "why": "a_later_reason_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-00000000005b"
+          },
+          {
+            "effects": [
+              {
+                "effect": "interrupt",
+                "result": "pending",
+                "why": "not_revoked"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-000000000006"
+          }
+        ]
+      },
+      "name": "control_ack_with_unrecognized_reasons",
+      "note": "reasons this reader doesn't know (a later version's), one at the 64-byte bound: well formed (1 to 64 bytes of [a-z0-9_]), so read as unrecognized, information only; each result is unchanged and the reason is written back as it came",
+      "op": "control_ack",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":9,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"a_later_reason\"}],\"record_id\":\"00000000-0000-4000-8000-00000000005a\"},{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"a_later_reason_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"}],\"record_id\":\"00000000-0000-4000-8000-00000000005b\"},{\"effects\":[{\"effect\":\"interrupt\",\"result\":\"pending\",\"why\":\"not_revoked\"}],\"record_id\":\"00000000-0000-4000-8000-000000000006\"}],\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_station",
+      "fields": {
         "after": 2
       },
       "name": "membership_fetch",
@@ -2280,6 +2437,76 @@
       "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
     },
     {
+      "code": "malformed",
+      "name": "control_ack_why_null",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":9,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":null}],\"record_id\":\"00000000-0000-4000-8000-00000000005a\"},{\"effects\":[{\"effect\":\"interrupt\",\"result\":\"pending\",\"why\":\"not_revoked\"}],\"record_id\":\"00000000-0000-4000-8000-000000000006\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000001\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"refused\",\"why\":\"removed_manager\"},{\"effect\":\"interrupt\",\"result\":\"refused\",\"why\":\"removed_manager\"}],\"record_id\":\"00000000-0000-4000-8000-000000000016\"},{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"possible_replay\"}],\"record_id\":\"00000000-0000-4000-8000-000000000003\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"principal_unknown\"}],\"record_id\":\"00000000-0000-4000-8000-00000000002c\"},{\"applied_seq\":6,\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"revoke_not_applied\"}],\"entry\":{\"entry_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":7}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_why_not_a_string",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":9,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":7}],\"record_id\":\"00000000-0000-4000-8000-00000000005a\"},{\"effects\":[{\"effect\":\"interrupt\",\"result\":\"pending\",\"why\":\"not_revoked\"}],\"record_id\":\"00000000-0000-4000-8000-000000000006\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000001\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"refused\",\"why\":\"removed_manager\"},{\"effect\":\"interrupt\",\"result\":\"refused\",\"why\":\"removed_manager\"}],\"record_id\":\"00000000-0000-4000-8000-000000000016\"},{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"possible_replay\"}],\"record_id\":\"00000000-0000-4000-8000-000000000003\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"principal_unknown\"}],\"record_id\":\"00000000-0000-4000-8000-00000000002c\"},{\"applied_seq\":6,\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"revoke_not_applied\"}],\"entry\":{\"entry_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":7}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_why_empty",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":9,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"\"}],\"record_id\":\"00000000-0000-4000-8000-00000000005a\"},{\"effects\":[{\"effect\":\"interrupt\",\"result\":\"pending\",\"why\":\"not_revoked\"}],\"record_id\":\"00000000-0000-4000-8000-000000000006\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000001\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"refused\",\"why\":\"removed_manager\"},{\"effect\":\"interrupt\",\"result\":\"refused\",\"why\":\"removed_manager\"}],\"record_id\":\"00000000-0000-4000-8000-000000000016\"},{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"possible_replay\"}],\"record_id\":\"00000000-0000-4000-8000-000000000003\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"principal_unknown\"}],\"record_id\":\"00000000-0000-4000-8000-00000000002c\"},{\"applied_seq\":6,\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"revoke_not_applied\"}],\"entry\":{\"entry_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":7}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_why_over_64_bytes",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":9,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"}],\"record_id\":\"00000000-0000-4000-8000-00000000005a\"},{\"effects\":[{\"effect\":\"interrupt\",\"result\":\"pending\",\"why\":\"not_revoked\"}],\"record_id\":\"00000000-0000-4000-8000-000000000006\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000001\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"refused\",\"why\":\"removed_manager\"},{\"effect\":\"interrupt\",\"result\":\"refused\",\"why\":\"removed_manager\"}],\"record_id\":\"00000000-0000-4000-8000-000000000016\"},{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"possible_replay\"}],\"record_id\":\"00000000-0000-4000-8000-000000000003\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"principal_unknown\"}],\"record_id\":\"00000000-0000-4000-8000-00000000002c\"},{\"applied_seq\":6,\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"revoke_not_applied\"}],\"entry\":{\"entry_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":7}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_why_upper_case",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":9,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"Not_after_hold\"}],\"record_id\":\"00000000-0000-4000-8000-00000000005a\"},{\"effects\":[{\"effect\":\"interrupt\",\"result\":\"pending\",\"why\":\"not_revoked\"}],\"record_id\":\"00000000-0000-4000-8000-000000000006\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000001\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"refused\",\"why\":\"removed_manager\"},{\"effect\":\"interrupt\",\"result\":\"refused\",\"why\":\"removed_manager\"}],\"record_id\":\"00000000-0000-4000-8000-000000000016\"},{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"possible_replay\"}],\"record_id\":\"00000000-0000-4000-8000-000000000003\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"principal_unknown\"}],\"record_id\":\"00000000-0000-4000-8000-00000000002c\"},{\"applied_seq\":6,\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"revoke_not_applied\"}],\"entry\":{\"entry_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":7}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_why_outside_the_characters",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":9,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"not-after-hold\"}],\"record_id\":\"00000000-0000-4000-8000-00000000005a\"},{\"effects\":[{\"effect\":\"interrupt\",\"result\":\"pending\",\"why\":\"not_revoked\"}],\"record_id\":\"00000000-0000-4000-8000-000000000006\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000001\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"refused\",\"why\":\"removed_manager\"},{\"effect\":\"interrupt\",\"result\":\"refused\",\"why\":\"removed_manager\"}],\"record_id\":\"00000000-0000-4000-8000-000000000016\"},{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"possible_replay\"}],\"record_id\":\"00000000-0000-4000-8000-000000000003\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"principal_unknown\"}],\"record_id\":\"00000000-0000-4000-8000-00000000002c\"},{\"applied_seq\":6,\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"revoke_not_applied\"}],\"entry\":{\"entry_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":7}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_why_beside_applied",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":9,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"not_after_hold\"}],\"record_id\":\"00000000-0000-4000-8000-00000000005a\"},{\"effects\":[{\"effect\":\"interrupt\",\"result\":\"pending\",\"why\":\"not_revoked\"}],\"record_id\":\"00000000-0000-4000-8000-000000000006\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\",\"why\":\"order\"}],\"record_id\":\"00000000-0000-4000-8000-000000000001\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"refused\",\"why\":\"removed_manager\"},{\"effect\":\"interrupt\",\"result\":\"refused\",\"why\":\"removed_manager\"}],\"record_id\":\"00000000-0000-4000-8000-000000000016\"},{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"possible_replay\"}],\"record_id\":\"00000000-0000-4000-8000-000000000003\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"principal_unknown\"}],\"record_id\":\"00000000-0000-4000-8000-00000000002c\"},{\"applied_seq\":6,\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"revoke_not_applied\"}],\"entry\":{\"entry_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":7}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_why_beside_duplicate",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":9,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"not_after_hold\"}],\"record_id\":\"00000000-0000-4000-8000-00000000005a\"},{\"effects\":[{\"effect\":\"interrupt\",\"result\":\"pending\",\"why\":\"not_revoked\"}],\"record_id\":\"00000000-0000-4000-8000-000000000006\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000001\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\",\"why\":\"order\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"refused\",\"why\":\"removed_manager\"},{\"effect\":\"interrupt\",\"result\":\"refused\",\"why\":\"removed_manager\"}],\"record_id\":\"00000000-0000-4000-8000-000000000016\"},{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"possible_replay\"}],\"record_id\":\"00000000-0000-4000-8000-000000000003\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"principal_unknown\"}],\"record_id\":\"00000000-0000-4000-8000-00000000002c\"},{\"applied_seq\":6,\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"revoke_not_applied\"}],\"entry\":{\"entry_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":7}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "unknown_field",
+      "name": "control_ack_effect_unknown_field",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":9,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"release\",\"reason\":\"not_after_hold\",\"result\":\"refused\",\"why\":\"not_after_hold\"}],\"record_id\":\"00000000-0000-4000-8000-00000000005a\"},{\"effects\":[{\"effect\":\"interrupt\",\"result\":\"pending\",\"why\":\"not_revoked\"}],\"record_id\":\"00000000-0000-4000-8000-000000000006\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000001\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"refused\",\"why\":\"removed_manager\"},{\"effect\":\"interrupt\",\"result\":\"refused\",\"why\":\"removed_manager\"}],\"record_id\":\"00000000-0000-4000-8000-000000000016\"},{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"possible_replay\"}],\"record_id\":\"00000000-0000-4000-8000-000000000003\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"principal_unknown\"}],\"record_id\":\"00000000-0000-4000-8000-00000000002c\"},{\"applied_seq\":6,\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"revoke_not_applied\"}],\"entry\":{\"entry_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":7}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "not_strict",
+      "name": "control_ack_why_duplicate_key",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":9,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"order\",\"why\":\"not_after_hold\"}],\"record_id\":\"00000000-0000-4000-8000-00000000005a\"},{\"effects\":[{\"effect\":\"interrupt\",\"result\":\"pending\",\"why\":\"not_revoked\"}],\"record_id\":\"00000000-0000-4000-8000-000000000006\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000001\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"refused\",\"why\":\"removed_manager\"},{\"effect\":\"interrupt\",\"result\":\"refused\",\"why\":\"removed_manager\"}],\"record_id\":\"00000000-0000-4000-8000-000000000016\"},{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\",\"why\":\"possible_replay\"}],\"record_id\":\"00000000-0000-4000-8000-000000000003\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"principal_unknown\"}],\"record_id\":\"00000000-0000-4000-8000-00000000002c\"},{\"applied_seq\":6,\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\",\"why\":\"revoke_not_applied\"}],\"entry\":{\"entry_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":7}}],\"type\":\"relay\"}"
+    },
+    {
       "code": "unknown_field",
       "name": "membership_fetch_unknown_field",
       "op": "membership_fetch",
@@ -2500,6 +2727,28 @@
   "kind": "vectors",
   "max_message_bytes": 262144,
   "name": "r9-vectors-station-calls",
-  "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", for Astation's agreement). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
-  "requires": "r9"
+  "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", agreed with Astation on 2026-11-13, #120 comment 6848326392: a strict-JSON page may hold individually invalid records, whose evidence is kept, which aren't applied, and whose delivery is no application evidence). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. `why_codes` is the shared vocabulary of typed reasons (O5, host-work-v1 §11.4 wire rule 10, for Astation's sign-off), in the core's order: a well-formed reason outside it is a later version's, read as unrecognized. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
+  "requires": "r9",
+  "why_codes": [
+    "principal_unknown",
+    "signer_unknown",
+    "revoke_not_in_list",
+    "list_frozen",
+    "not_revoked",
+    "revoke_not_applied",
+    "wrong_account",
+    "bad_signature",
+    "key_mismatch",
+    "signer_not_allowed",
+    "removed_manager",
+    "host_key_signed",
+    "not_a_service",
+    "not_a_revoke",
+    "order",
+    "after_revoke",
+    "collision",
+    "not_newer",
+    "possible_replay",
+    "not_after_hold"
+  ]
 }

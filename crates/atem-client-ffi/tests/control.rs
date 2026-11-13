@@ -174,7 +174,13 @@ fn applied_json(a: &ControlApplied) -> Value {
     let effects: Vec<Value> = a
         .effects
         .iter()
-        .map(|e| json!({"effect": effect_code(e.effect), "result": result_code(e.result)}))
+        .map(|e| {
+            let mut v = json!({"effect": effect_code(e.effect), "result": result_code(e.result)});
+            if let Some(why) = &e.why {
+                v["why"] = why.as_str().into();
+            }
+            v
+        })
         .collect();
     let mut v = json!({
         "result": result_code(a.result),
@@ -680,6 +686,60 @@ fn the_state_loads_from_its_parts_only_as_written() {
         loaded.state.to_json(),
         ControlStateHandle::new(other).to_json()
     );
+}
+
+/// A service part's hold time (O1): a part written before it (no
+/// `hold_issued_at`) loads only while it holds nothing; a held one without
+/// it is `stored_invalid`, through the parts and the whole state alike.
+#[test]
+fn a_part_without_the_hold_time_loads_only_while_free() {
+    let v = Vectors::load();
+    let file = control();
+    let l = log_after(&v, &[]);
+    let state_of = |label: &str| {
+        let q = file["sequences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|q| q["label"] == label)
+            .unwrap();
+        q["state"].clone()
+    };
+    let svc = "service:svc-discord";
+    let stored = |e: AtemError| match e {
+        AtemError::Stored { code, .. } => code,
+        other => panic!("{other:?}"),
+    };
+    // Q22 ends released, Q27 held (revoked).
+    for (label, loads) in [
+        ("Q22_release_at_the_holds_time", true),
+        ("Q27_no_release_after_a_revoke", false),
+    ] {
+        let mut whole = state_of(label);
+        assert!(whole["principals"][svc].get("hold_issued_at").is_some());
+        whole["principals"][svc]
+            .as_object_mut()
+            .unwrap()
+            .remove("hold_issued_at");
+        let part = ControlStatePart {
+            principal: svc.into(),
+            part_json: atem_client::canonical::jcs(&whole["principals"][svc]).unwrap(),
+        };
+        let from_parts = control_state_from_parts(l.clone(), vec![part])
+            .map(|_| ())
+            .map_err(stored);
+        let from_json =
+            ControlStateHandle::from_json(l.clone(), atem_client::canonical::jcs(&whole).unwrap())
+                .map(|_| ())
+                .map_err(stored);
+        let want = if loads {
+            Ok(())
+        } else {
+            Err("stored_invalid".to_owned())
+        };
+        assert_eq!(from_parts, want, "{label}: parts");
+        assert_eq!(from_json, want, "{label}: whole");
+    }
 }
 
 /// A state loads only for its own device list, exactly as written; the

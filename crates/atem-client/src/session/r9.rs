@@ -19,7 +19,7 @@ use crate::SignedObject;
 use crate::canonical::{StrictValue, jcs};
 use crate::channel::carriage::Carriage;
 use crate::channel::{ClientProof, MAX_PLAINTEXT, Principal};
-use crate::control::{ApplicationResult, ControlRecord, EffectKind, EffectResult};
+use crate::control::{ApplicationResult, Applied, ControlRecord, EffectKind, EffectResult};
 use crate::encoding::{b64u, b64u_decode};
 use crate::membership::Head;
 use crate::session::wire::is_uuid_v4;
@@ -710,12 +710,42 @@ impl ControlRecordsRequest {
 pub struct RecordResult {
     pub record_id: String,
     pub result: ApplicationResult,
-    /// Every effect the record carries, once each.
+    /// Every effect the record carries, once each, with no reason (`why`
+    /// `None`): a `control_records_result` carries none (step 3's wire,
+    /// unchanged; typed reasons, O5, are the Station acknowledgment's).
+    /// Build it from the state with [`RecordResult::of`], which clears
+    /// them; writing one with a reason stops a debug build.
     pub effects: Vec<EffectResult>,
 }
 
 impl RecordResult {
+    /// The result of `rec` as the state applied it: its record and effect
+    /// results, without the effects' reasons, which this wire doesn't carry
+    /// (step 3's, unchanged; typed reasons are the Station
+    /// acknowledgment's, O5). So it equals its own decoded copy.
+    pub fn of(rec: &ControlRecord, applied: &Applied) -> Self {
+        RecordResult {
+            record_id: rec.record_id().to_owned(),
+            result: applied.record_result,
+            effects: applied
+                .effects
+                .iter()
+                .map(|e| EffectResult {
+                    effect: e.effect,
+                    result: e.result,
+                    why: None,
+                })
+                .collect(),
+        }
+    }
+
     fn to_json(&self) -> Value {
+        // The wire has no reason: one here would be dropped silently, and
+        // the result would no longer equal its decoded copy.
+        debug_assert!(
+            self.effects.iter().all(|e| e.why.is_none()),
+            "a control_records_result carries no reason (build it with RecordResult::of)"
+        );
         json!({"record_id": self.record_id, "result": self.result.code(),
             "effects": self.effects.iter().map(|e| json!({
                 "effect": e.effect.code(), "result": e.result.code()})).collect::<Vec<_>>()})
@@ -758,7 +788,13 @@ impl RecordResult {
             if effects.iter().any(|seen| seen.effect == effect) {
                 return Err("effects");
             }
-            effects.push(EffectResult { effect, result });
+            // A `control_records_result` carries no reason (step 3's
+            // wire, unchanged; O5 is the acknowledgment's).
+            effects.push(EffectResult {
+                effect,
+                result,
+                why: None,
+            });
         }
         // The record's result follows from its effects' (§11.1).
         if result != ApplicationResult::of_effects(&effects) {
@@ -1155,7 +1191,11 @@ mod tests {
         }
 
         fn effect(effect: EffectKind, result: ApplicationResult) -> EffectResult {
-            EffectResult { effect, result }
+            EffectResult {
+                effect,
+                result,
+                why: None,
+            }
         }
 
         fn results_for(records: &[ControlRecord]) -> Vec<RecordResult> {
@@ -1455,6 +1495,54 @@ mod tests {
                     effects.iter().map(|&(e, r)| effect(e, r)).collect();
                 assert_eq!(ApplicationResult::of_effects(&effects), want);
             }
+        }
+
+        /// A host builds a record's result from what the state applied: its
+        /// reasons (O5) are the acknowledgment's, not this wire's, so the
+        /// result carries none and equals its own decoded copy. A result
+        /// built by hand with a reason is a bug: debug builds stop at it.
+        #[test]
+        fn a_result_from_the_state_carries_no_reason() {
+            use crate::control::{Applied, EffectWhy, Why};
+            let applied = Applied {
+                record_result: ApplicationResult::Refused,
+                effects: vec![EffectResult {
+                    effect: EffectKind::Interrupt,
+                    result: ApplicationResult::Refused,
+                    why: Some(EffectWhy::Known(Why::Order)),
+                }],
+                actions: Vec::new(),
+                evidence: false,
+                why: Some(Why::Order),
+            };
+            let sent = records(1);
+            let result = RecordResult::of(&sent[0], &applied);
+            assert_eq!(result.record_id, sent[0].record_id());
+            assert_eq!(result.result, ApplicationResult::Refused);
+            assert_eq!(
+                result.effects,
+                vec![effect(EffectKind::Interrupt, ApplicationResult::Refused)]
+            );
+            let wire = control_records_result(RE, ID, std::slice::from_ref(&result));
+            let read = parse_result(&wire["data"]).unwrap();
+            assert_eq!(read.results, vec![result]);
+        }
+
+        #[cfg(debug_assertions)]
+        #[test]
+        #[should_panic(expected = "carries no reason")]
+        fn a_hand_built_result_with_a_reason_stops_debug_builds() {
+            use crate::control::{EffectWhy, Why};
+            let result = RecordResult {
+                record_id: records(1)[0].record_id().to_owned(),
+                result: ApplicationResult::Refused,
+                effects: vec![EffectResult {
+                    effect: EffectKind::Interrupt,
+                    result: ApplicationResult::Refused,
+                    why: Some(EffectWhy::Known(Why::Order)),
+                }],
+            };
+            control_records_result(RE, ID, &[result]);
         }
 
         /// The result's words are the four results and the five effects,

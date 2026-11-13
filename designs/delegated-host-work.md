@@ -50,25 +50,37 @@ comment 6810116314), and confirmed #148's refusal wire (2026-11-12, #148 comment
 report items (2026-11-11, #148 comment 6803727308) and #147's items 1 to 3 (2026-11-12, #147 comment
 6813332550). The agreed items are marked in host-work-v1 §11, session-v1 R9.2, R9.3, R9.7b, R9.8, R9.9 and
 R9.14 and in the bindings contract. Still open, or step 4 acceptance: the runtime's enforcement of the feed store
-and the host's gates and cursors, byte-level goldens for the relay messages (proposed in step 4,
-`r9-vectors-station-calls.json`, for Astation's acceptance), the clock provider's tests,
+and the host's gates and cursors, byte-level goldens for the relay messages (`r9-vectors-station-calls.json`, new in step 4,
+agreed with Astation on 2026-11-13, #120 comment 6848326392), the clock provider's tests,
 `no_match`'s wire form and the status of a selector-resolved (UUID v5) task. The design text below changes only in
 these marks and the amendments that follow.
 
-**Amended for step 4, for Astation's review (host mail).** Two changes to II.4.2's receiver, built in the shared core
+**Amended for step 4, agreed with Astation (2026-11-13, #120 comment 6848326392) (host mail).** Two changes to II.4.2's receiver, built in the shared core
 (host-work-v1 §11.5). Only a key the host made waits: mail sealed to a key id the host never made in its current trust
 generation is refused at once, even when signed beyond its head, since every `host_enc_key` entry for the host carries
 the host's own `enc_sig`; so the host records every key id it makes durably, before it hands the key out (II.4.1). And
 a refusal of a verified copy (steps 5 and 6) names its sender, `(host_id, host_trust_gen)`: the claim on its `id` is
 `(sender.host_id, id)`, as before, and `host_trust_gen` says which `add_host` key verified the copy. Each changed
-passage (in II.4.1 and II.4.2) is marked "Amended for step 4, for Astation's review".
+passage (in II.4.1 and II.4.2) is marked "Amended for step 4, agreed with Astation".
 
-**Refined in the contract for step 4 (proposed, for Astation's agreement).** host-work-v1 §11.1 rule 1's bound (at most
-256 counted record ids per principal, oldest first, and the evicted floor) refines I.5.4's collision row and I.5.5 step
-1 for evicted ids: an evicted id is no longer known, so another body under it is no collision, and an evicted record
-that comes back is verified and applied as a new one (an evicted hold replayed holds again; an evicted cover or release
-issued no later than the floor is refused as a possible replay). The design text below is unchanged; the contract
-states the refinement.
+**Refined in the contract for step 4.** host-work-v1 §11.1 rule 1's bound (at most 256 counted record ids per
+principal, oldest first, and the evicted floor; **agreed with Astation, 2026-11-13, #120 comment 6848326392**: stops are
+never blocked by it, and the floor complements O1 below, it doesn't replace it) refines I.5.4's collision row and I.5.5
+step 1 for evicted ids: an evicted id is no longer known, so another body under it is no collision, and an evicted
+record that comes back is verified and applied as a new one (an evicted hold replayed holds again; an evicted cover or
+release issued no later than the floor is refused as a possible replay). Rule 6's signed-time rule (O1, requested by
+Astation in the same comment; the built form **for its sign-off**) adds to I.5.5 step 4 for releases: a release lifts
+a hold only when issued strictly after every hold the host verified for the principal (a hold that found it held, read
+out of order, from another feed or none, or under a counted id included), so a release a carrier withheld can't lift a
+newer hold; the host keeps that hold's time in the principal's part, and no eviction, reset, coverage change or restart
+erases it. The Station's signing duty (agreed in the same comment) makes every record a Station signs for a principal,
+holds included, strictly newer than every record it signed for it before, its high-water mark kept durably before
+publishing, carried at handover and across restart and snapshot generation, waiting rather than bypassing it; what O1
+leaves (a hold another signer issued with a clock behind, and a release refused until the Station's clock passes
+another signer's hold) is stated as its residuals. I.5.8's acknowledgment gains typed reasons (O5, requested by
+Astation on the same day; **for its sign-off**): each effect `pending` or `refused` in a `control_ack` may say why, a
+bounded code of the shared vocabulary, information only (it never changes a result, counts nothing and asks for no
+re-signing; host-work-v1 §11.4 wire rule 10). The design text below is unchanged; the contract states the refinement.
 
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256
@@ -1775,8 +1787,8 @@ devices' keys):
 every one, the private key is `pairing/host_enc_key`, 0600, plain like `host_channel_key`, so a host whose cred agent
 is locked can still open its mail. The host makes it at pairing and at `atem pair verify`, with a new
 `host_channel_key`, and, on a host paired earlier, at the first start of a build that knows it when the file is
-missing. `atem unpair` deletes it, as it deletes `host_channel_key` (R9.3). **Amended for step 4, for Astation's
-review.** The host records the `enc_kid` of every key it makes durably, before `host_enc_key_get` returns the key, and
+missing. `atem unpair` deletes it, as it deletes `host_channel_key` (R9.3). **Amended for step 4, agreed with
+Astation (2026-11-13, #120 comment 6848326392).** The host records the `enc_kid` of every key it makes durably, before `host_enc_key_get` returns the key, and
 keeps the record for that trust generation. It passes the record to II.4.2's receiver (`generated`, host-work-v1
 §11.5); a key it accepts counts as made, listed there or not. A lost record is rebuilt from the private keys the host
 still holds for that generation; mail sealed to
@@ -1853,7 +1865,7 @@ with the sealed part beside it.
    is beyond this host's head, a key it doesn't accept waits (below): its own new `host_enc_key` may be among the
    entries it lacks. A key the host generated and handed out but whose `host_enc_key` its own list hasn't applied yet
    should be accepted too: a sender whose list already has the entry seals to it, and the mail then opens at once
-   instead of waiting. **Amended for step 4, for Astation's review.** Only a key the host made waits. The host keeps
+   instead of waiting. **Amended for step 4, agreed with Astation.** Only a key the host made waits. The host keeps
    the id of every key it made in its current trust generation, recorded durably before it hands the key out (II.4.1),
    and passes them with the ids of the keys it accepts: a key whose id is missing has its mail refused for good. Every
    `host_enc_key` entry for the host carries the host's own `enc_sig`, so no entry it lacks can make any other key one
@@ -1884,7 +1896,7 @@ with the sealed part beside it.
   after `signed_at_head.seq`: the list the sender signed at is the one this host holds. Two are refused at any head,
   since `add_host` generations strictly rise: a generation below the sender's newest, and an envelope from a removed
   host at the generation it last held (after step 5's times when the head is beyond this host's). **Amended for step 4,
-  for Astation's review.** A third is refused at any head: a key id this host never made (step 2). These refusals claim
+  agreed with Astation.** A third is refused at any head: a key id this host never made (step 2). These refusals claim
   no `id` (Duplicates, below): the sender's own copy, sent again, is still judged.
 - **Amended after agreement, 2026-11-10 (agreed with Astation, 2026-11-11, #120 comment 6810116314).** **Step 3 for a `signed_at_head.seq` beyond this host's head**
   (it read: "for a `sender.host_trust_gen`, or a `signed_at_head.seq`, beyond this host's head"): the host may not have
@@ -1894,7 +1906,7 @@ with the sealed part beside it.
   result), it then verifies the copy as step 4 does, its signature with that `add_host`'s `host_key` and its sealed part
   against the signed `sealed_hash`, and refuses an object that fails, since that pair has one key forever (so neither
   junk nor a variant of the sender's own object takes its slots); otherwise (a sender it doesn't know, or a generation
-  above its newest) the signature can't be checked yet. **Amended for step 4, for Astation's review.** Then one sealed
+  above its newest) the signature can't be checked yet. **Amended for step 4, agreed with Astation.** Then one sealed
   to a key id this host never made is refused (step 2). One that passes stays pending, isn't marked done, and is judged
   again after each device-list advance and each change of the keys it accepts, until it expires. At most 64 objects stay
   pending per claimed `(host_id, host_trust_gen)` and 256 in all; more are dropped undecided (it read: "more are refused
@@ -1903,7 +1915,7 @@ with the sealed part beside it.
   can't stop its other work. **New rule.**
 - **Steps 5 and 6, once step 4 passed:** the sender is authenticated, so the refusal is reported back to it as a
   status naming the object's `id`, `refused` with `invalid_request` (II.4.4); its outbox doesn't stay `sent` until
-  expiry. **Amended for step 4, for Astation's review.** The refusal names that sender, `(host_id, host_trust_gen)`.
+  expiry. **Amended for step 4, agreed with Astation.** The refusal names that sender, `(host_id, host_trust_gen)`.
   The claim on the `id` is `(sender.host_id, id)` (Duplicates, below), never the host's whose object another host
   re-signed; `host_trust_gen` only says which `add_host` key verified the copy.
 - **Step 7:** a recorded decision (`refused`), reported back (II.4.4).

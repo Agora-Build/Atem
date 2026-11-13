@@ -2575,8 +2575,80 @@ fn check_outcome_unknown(run: &mut Run, book: &Book) {
             s(case, "reason")
         ));
     }
+    // The deferred blank-reason case (Astation's review of PR 2, #120
+    // comment 6848326392: before phone hint support is accepted): a
+    // delegated sender's UUID v4 task whose reason is blank, nothing but
+    // White_Space, is refused at open like the others.
+    use atem_client::session::alerts::{valid_reason, valid_sender, valid_task_id};
+    use atem_client::session::framing::is_format;
+    let blank = run
+        .get("outcome_unknown_invalid_facts")
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| {
+            let facts = &case["facts"];
+            let reason = s(facts, "reason");
+            // Refused by the blank rule alone: no control or format
+            // character a reader might refuse it for instead.
+            valid_task_id(s(facts, "task_id"))
+                && valid_sender(s(facts, "sender"))
+                && !reason.is_empty()
+                && reason.trim().is_empty()
+                && !reason.chars().any(|c| c.is_control() || is_format(c))
+                && !valid_reason(reason)
+        })
+        .count();
+    assert_eq!(
+        blank, 1,
+        "a delegated task's blank reason, with no control or format character"
+    );
+    run.pass("outcome_unknown_invalid_facts: a delegated task's blank reason among them");
     // The key type is the one the builder makes.
     let _: &AlertKey = first[0].key();
+}
+
+/// The independent checker writes out General_Category Cf (`CF_RANGES` in
+/// `scripts/check-r9-vectors.py`) so its reason rule doesn't follow
+/// Python's own Unicode version: it must be exactly the set the core's
+/// `framing::is_format` gives (Unicode 18.0.0), and its Cc rule
+/// `char::is_control`.
+#[test]
+fn checker_format_ranges_are_the_framing_modules() {
+    use atem_client::session::framing::is_format;
+    let script = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/check-r9-vectors.py"),
+    )
+    .unwrap();
+    let start = script
+        .find("CF_RANGES = [")
+        .expect("CF_RANGES in the checker");
+    let end = start + script[start..].find("\n]").unwrap();
+    let hex = |t: &str| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).unwrap();
+    let theirs: Vec<(u32, u32)> = script[start..end]
+        .split('(')
+        .skip(1)
+        .map(|pair| {
+            let pair = pair.split(')').next().unwrap();
+            let (a, b) = pair.split_once(',').unwrap();
+            (hex(a), hex(b))
+        })
+        .collect();
+    let mut ours: Vec<(u32, u32)> = Vec::new();
+    for cp in 0..=0x10FFFFu32 {
+        let Some(c) = char::from_u32(cp) else {
+            continue;
+        };
+        if is_format(c) {
+            match ours.last_mut() {
+                Some(r) if r.1 + 1 == cp => r.1 = cp,
+                _ => ours.push((cp, cp)),
+            }
+        }
+        let checker_cc = cp <= 0x1F || (0x7F..=0x9F).contains(&cp);
+        assert_eq!(c.is_control(), checker_cc, "{cp:#x}");
+    }
+    assert_eq!(theirs, ours, "the checker's CF_RANGES");
 }
 
 /// The `outcome_unknown` entries of `r9-vectors-push-hint` (kept apart from
@@ -2811,6 +2883,16 @@ fn outcome_unknown_vectors(book: &Book) -> BTreeMap<&'static str, Value> {
             }),
             "a browser grant's task: browser grants keep v1 and raise no alert",
         ),
+        (
+            "ae6fb035-7182-4dac-b50d-4b2ca31e6f78",
+            json!({
+                "task_id": "c4d9e8f7-1a2b-4c3d-8e5f-6a7b8c9d0e1f",
+                "session_id": "ses-aaaaaaaaaaaa",
+                "sender": "service:svc-discord",
+                "reason": " \u{a0}\u{3000}",
+            }),
+            "a delegated sender's task whose reason is blank (nothing but White_Space: a space, a no-break space and an ideographic space, none a control or format character, so only the blank rule refuses it): refused at open (Astation's review of PR 2, #120 comment 6848326392: the deferred blank-reason vector, before phone hint support is accepted)",
+        ),
     ] {
         let device = "dev-phone";
         let template = Alert {
@@ -2868,7 +2950,7 @@ fn outcome_unknown_vectors(book: &Book) -> BTreeMap<&'static str, Value> {
         (
             "outcome_unknown_note",
             json!(
-                "Hints of kind outcome_unknown (delegated host-work I.4.6): the body's type is atem-push-hint and its label atem-push-hint-v1 like an approval hint's, told apart by `kind` (no `state`, no session_id, process_gen or approval_id; `alert_id` instead). The task, session, sender and reason are only in the sealed part, jcs of {reason, sender, session_id, task_id}. info = enc([\"atem-push-seal-v1\", account_id, genesis_hash, host_id, u64(host_trust_gen), \"outcome_unknown\", alert_id, u64(created_at), u64(expires_at), device_id, enc_kid]) (11 fields; an approval's has 12). ikmE_hex = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Entries 0 and 1 are one alert for two recipients; entry 2 is another alert at the bounds. Only a delegated sender's (member:, service: or host:) UUID v4 task raises an alert. outcome_unknown_acks are the push_ack entries, one per hint. Each outcome_unknown_invalid carries the first hint's sealed envelope (except bad_sealed's, which is the point) so only its code refuses it; the runner checks the code with both verifiers. Each outcome_unknown_invalid_facts is well signed and well sealed (both verifiers take it, and its sealed_hash names its sealed part), but its sealed facts aren't a delegated task's: the recipient refuses it at open (malformed)."
+                "Hints of kind outcome_unknown (delegated host-work I.4.6): the body's type is atem-push-hint and its label atem-push-hint-v1 like an approval hint's, told apart by `kind` (no `state`, no session_id, process_gen or approval_id; `alert_id` instead). The task, session, sender and reason are only in the sealed part, jcs of {reason, sender, session_id, task_id}. info = enc([\"atem-push-seal-v1\", account_id, genesis_hash, host_id, u64(host_trust_gen), \"outcome_unknown\", alert_id, u64(created_at), u64(expires_at), device_id, enc_kid]) (11 fields; an approval's has 12). ikmE_hex = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Entries 0 and 1 are one alert for two recipients; entry 2 is another alert at the bounds. Only a delegated sender's (member:, service: or host:) UUID v4 task raises an alert. outcome_unknown_acks are the push_ack entries, one per hint. Each outcome_unknown_invalid carries the first hint's sealed envelope (except bad_sealed's, which is the point) so only its code refuses it; the runner checks the code with both verifiers. Each outcome_unknown_invalid_facts is well signed and well sealed (both verifiers take it, and its sealed_hash names its sealed part), but its sealed facts aren't a delegated task's, or its reason is blank (nothing but White_Space; for Astation, amended for step 4: the deferred blank-reason case, Astation's review of PR 2): the recipient refuses it at open (malformed)."
             ),
         ),
     ])
@@ -4927,6 +5009,12 @@ impl<'a> ControlGen<'a> {
             assert_eq!(why.is_some(), explains, "{label} step {}: why", i + 1);
             if let Some(why) = why {
                 step["expect"]["why"] = why.into();
+                // Each effect not in force says why too (O5).
+                for e in step["expect"]["effects"].as_array_mut().unwrap() {
+                    if matches!(e["result"].as_str(), Some("pending" | "refused")) {
+                        e["why"] = why.into();
+                    }
+                }
             }
         }
         let mut v = serde_json::json!({"label": label, "note": note, "steps": steps, "state": state.to_json()});
@@ -5020,7 +5108,13 @@ const CONTROL_WHY: &[(&str, usize, &str)] = &[
         "not_newer",
     ),
     ("Q10_hold_from_a_station_that_lost_the_takeover", 4, "order"),
+    (
+        "Q10_hold_from_a_station_that_lost_the_takeover",
+        5,
+        "not_after_hold",
+    ),
     ("Q11_reset_cover_not_newer", 4, "order"),
+    ("Q11_reset_cover_not_newer", 5, "not_after_hold"),
     ("Q12_service_interrupt_waits", 1, "not_revoked"),
     ("Q13_out_of_order_in_one_feed", 5, "order"),
     ("Q14_hold_with_no_coverage", 2, "order"),
@@ -5042,6 +5136,61 @@ const CONTROL_WHY: &[(&str, usize, &str)] = &[
         "possible_replay",
     ),
     ("Q20_evicted_revoke_still_duplicate", 5, "after_revoke"),
+    ("Q21_release_issued_before_a_newer_hold", 3, "order"),
+    (
+        "Q21_release_issued_before_a_newer_hold",
+        6,
+        "not_after_hold",
+    ),
+    (
+        "Q21_release_issued_before_a_newer_hold",
+        7,
+        "not_after_hold",
+    ),
+    ("Q22_release_at_the_holds_time", 3, "not_after_hold"),
+    ("Q23_newer_hold_while_held", 4, "not_after_hold"),
+    (
+        "Q24_holds_from_another_feed_no_position_or_a_colliding_id",
+        5,
+        "not_after_hold",
+    ),
+    (
+        "Q24_holds_from_another_feed_no_position_or_a_colliding_id",
+        7,
+        "not_after_hold",
+    ),
+    (
+        "Q24_holds_from_another_feed_no_position_or_a_colliding_id",
+        8,
+        "collision",
+    ),
+    (
+        "Q24_holds_from_another_feed_no_position_or_a_colliding_id",
+        9,
+        "not_after_hold",
+    ),
+    (
+        "Q25_hold_time_kept_across_restart_and_eviction",
+        1,
+        "not_after_hold",
+    ),
+    (
+        "Q25_hold_time_kept_across_restart_and_eviction",
+        3,
+        "not_after_hold",
+    ),
+    (
+        "Q26_hold_time_kept_across_reset_and_coverage_change",
+        4,
+        "not_after_hold",
+    ),
+    (
+        "Q26_hold_time_kept_across_reset_and_coverage_change",
+        6,
+        "not_after_hold",
+    ),
+    ("Q27_no_release_after_a_revoke", 4, "after_revoke"),
+    ("Q27_no_release_after_a_revoke", 5, "after_revoke"),
 ];
 
 /// What a principal has in force as the vectors write it
@@ -5596,6 +5745,71 @@ fn control_vectors(book: &Book) -> Value {
         g.push(label, note, "svc-discord", &body, vec![(l, own_())]);
     }
 
+    // ---- releases by the time they were signed (O1, Astation's review of
+    // PR 2): a release lifts only holds issued before it
+    for (n, label, feed, issued_at, note) in [
+        (
+            90,
+            "W1_release_withheld",
+            FEED_A,
+            control_issued(61) - 500,
+            "a resume issued half a second before S9_hold: a carrier that withheld it serves it after that hold",
+        ),
+        (
+            91,
+            "W2_release_refused_before",
+            FEED_A,
+            control_issued(61) - 250,
+            "a resume issued a quarter second before S9_hold, refused once (out of feed order) and served again after it",
+        ),
+        (
+            92,
+            "W3_release_newer",
+            FEED_A,
+            control_issued(92),
+            "a resume issued after every hold of the file: it lifts them",
+        ),
+        (
+            93,
+            "W4_release_tie",
+            FEED_A,
+            control_issued(2),
+            "a resume issued in the same millisecond as S2_hold",
+        ),
+        (
+            94,
+            "W5_release_after_tie",
+            FEED_A,
+            control_issued(2) + 1,
+            "a resume issued one millisecond after S2_hold",
+        ),
+        (
+            95,
+            "W6_release_before_b4",
+            FEED_A,
+            control_issued(12) - 500,
+            "a resume issued half a second before B4_hold",
+        ),
+        (
+            96,
+            "W7_release_before_x2",
+            FEED_A,
+            control_issued(68) - 500,
+            "a resume issued half a second before X2_hold_under_s3_id",
+        ),
+        (
+            97,
+            "W8_b_release_newer",
+            FEED_B,
+            control_issued(97),
+            "station-b's resume issued after every hold of the file",
+        ),
+    ] {
+        let mut body = g.svc(n, SVC, C::Release, feed, "owner");
+        body.issued_at = issued_at;
+        g.push(label, note, "svc-discord", &body, vec![(l, own_())]);
+    }
+
     // ---- sequences: one host's control state, step by step
     let a = |n| Some((FEED_A, n));
     let b = |n| Some((FEED_B, n));
@@ -5746,25 +5960,27 @@ fn control_vectors(book: &Book) -> Value {
         ),
         g.sequence(
             "Q10_hold_from_a_station_that_lost_the_takeover",
-            "a stop always wins: the hold of a Station whose cover wasn't newer applies; its release is refused, the covering feed's release lifts the hold, and the hold replayed is a duplicate",
+            "a stop always wins: the hold of a Station whose cover wasn't newer applies; its release is refused; the covering feed's release issued before that hold leaves it (amended for O1), the covering feed's release issued after it lifts it, and the hold replayed is a duplicate",
             vec![
                 step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
                 step("B1_cover_stale", b(1), applied("refused", &[("cover", "refused")], none.clone(), false)),
                 step("B4_hold", b(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
                 step("B5_release", b(3), applied("refused", &[("release", "refused")], none.clone(), false)),
-                step("S3_release", a(2), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+                step("S3_release", a(2), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W3_release_newer", a(3), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
                 step("B4_hold", b(2), applied("duplicate", &[("hold", "duplicate")], none.clone(), false)),
             ],
         ),
         g.sequence(
             "Q11_reset_cover_not_newer",
-            "a reset whose snapshot cover isn't newer leaves the coverage on the old feed: the new feed's hold applies, its release is refused, and the old feed's release lifts the hold",
+            "a reset whose snapshot cover isn't newer leaves the coverage on the old feed: the new feed's hold applies, its release is refused, the old feed's release issued before that hold leaves it (amended for O1), and the old feed's release issued after it lifts it",
             vec![
                 step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
                 step("A2_cover_not_newer", a2(1), applied("duplicate", &[("cover", "duplicate")], none.clone(), false)),
                 step("A2_hold", a2(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
                 step("A2_release", a2(3), applied("refused", &[("release", "refused")], none.clone(), false)),
-                step("S3_release", a(2), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+                step("S3_release", a(2), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W3_release_newer", a(3), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
             ],
         ),
         g.sequence(
@@ -5876,7 +6092,7 @@ fn control_vectors(book: &Book) -> Value {
         ),
         g.sequence_on(
             "Q19_evicted_records_replayed_are_refused",
-            "a principal keeps at most 256 counted record ids, oldest first, never evicting the coverage's cover, and its evicted floor is the newest issued_at evicted (decision 19, rulings T4a and T4d, for Astation's agreement): from svc-discord covered, held, released and full (S1_cover, S2_hold, S3_release, then 253 copies of S3_release), F1_hold holds and evicts S2_hold, F2_hold evicts S3_release; S3_release re-served at a fresh position of the covering feed is a possible replay, refused and kept as evidence, so the hold stays (feed_seq isn't signed: a carrier that controls positions could otherwise lift it); F3_release, issued after the floor, lifts it; S2_hold replayed holds again, since the floor guards only covers and releases (a stop always wins, and a hold grants nothing); B1_cover_stale, issued before the floor, is refused as a possible replay",
+            "a principal keeps at most 256 counted record ids, oldest first, never evicting the coverage's cover, and its evicted floor is the newest issued_at evicted (decision 19, rulings T4a and T4d, agreed with Astation on 2026-11-13, #120 comment 6848326392): from svc-discord covered, held, released and full (S1_cover, S2_hold, S3_release, then 253 copies of S3_release), F1_hold holds and evicts S2_hold, F2_hold evicts S3_release; S3_release re-served at a fresh position of the covering feed is a possible replay, refused and kept as evidence, so the hold stays (feed_seq isn't signed: a carrier that controls positions could otherwise lift it); F3_release, issued after the floor, lifts it; S2_hold replayed holds again, since the floor guards only covers and releases (a stop always wins, and a hold grants nothing); B1_cover_stale, issued before the floor, is refused as a possible replay",
             Some((
                 &g.filled(
                     &[("S1_cover", a(1)), ("S2_hold", a(2)), ("S3_release", a(3))],
@@ -5919,6 +6135,97 @@ fn control_vectors(book: &Book) -> Value {
                 step("S7_hold_after_revoke", a(9), applied("refused", &[("hold", "refused")], none.clone(), false)),
             ],
         ),
+        // O1 (Astation's review of PR 2, #120 comment 6848326392): a
+        // release lifts only holds issued before it.
+        g.sequence(
+            "Q21_release_issued_before_a_newer_hold",
+            "a release lifts a hold only when issued strictly after every hold verified for the principal (O1): a release a carrier withheld, and one refused before (out of feed order), each served in feed order after a newer hold, are refused and leave the hold; neither takes a position in the feed's order; a release issued after the hold lifts it",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("W2_release_refused_before", a(2), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("S3_release", a(3), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+                step("S9_hold", a(4), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("W1_release_withheld", a(5), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W2_release_refused_before", a(6), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W3_release_newer", a(7), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q22_release_at_the_holds_time",
+            "the tie rule is conservative: a release issued in the same millisecond as the hold leaves it; one issued a millisecond later lifts it",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("W4_release_tie", a(3), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W5_release_after_tie", a(4), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q23_newer_hold_while_held",
+            "a newer hold while held is a duplicate, yet its time is kept: a release issued after the hold in force but before the newer one leaves the principal held",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("S9_hold", a(3), applied("duplicate", &[("hold", "duplicate")], none.clone(), false)),
+                step("S3_release", a(4), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W3_release_newer", a(5), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q24_holds_from_another_feed_no_position_or_a_colliding_id",
+            "every verified hold's time counts, wherever it was read: station-b's hold (a feed that doesn't cover), a hold over a channel (no position) and a hold under a counted record id (evidence, applied as a stop); a release of the covering feed issued before each is refused, one issued after them all lifts the hold",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("S3_release", a(3), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+                step("B4_hold", b(1), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("W6_release_before_b4", a(4), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("S9_hold", None, applied("duplicate", &[("hold", "duplicate")], none.clone(), false)),
+                step("W1_release_withheld", a(4), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("X2_hold_under_s3_id", a(5), applied("duplicate", &[("hold", "duplicate")], none.clone(), true)),
+                step("W7_release_before_x2", a(6), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W3_release_newer", a(6), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence_on(
+            "Q25_hold_time_kept_across_restart_and_eviction",
+            "the hold's time is part of the stored state (hold_issued_at) and no restart or eviction erases it: from svc-discord covered, held and full (S1_cover, S2_hold, then 254 copies of S9_hold), read as a host reads its stored state, S3_release is refused (issued before the copies' hold); F1_hold evicts S2_hold, so the evicted floor is S2_hold's time, below W1_release_withheld's: the floor can't stop that release, the hold's time does; W3_release_newer lifts the hold",
+            Some((
+                &g.filled(&[("S1_cover", a(1)), ("S2_hold", a(2))], "S9_hold", "svc-discord", 254),
+                "S9_hold",
+            )),
+            vec![
+                step("S3_release", a(3), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("F1_hold", a(4), applied("duplicate", &[("hold", "duplicate")], none.clone(), false)),
+                step("W1_release_withheld", a(5), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W3_release_newer", a(5), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q26_hold_time_kept_across_reset_and_coverage_change",
+            "no reset or coverage change erases the hold's time: after a reset (A2_cover moves the order to the new feed) the new feed's release issued before the hold is refused; after another Station takes the coverage over, its release issued before the hold is refused too; its release issued after the hold lifts it",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("S9_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("A2_cover", a2(1), applied("duplicate", &[("cover", "duplicate")], vec![act_cover(FEED_A2)], false)),
+                step("A2_release", a2(2), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("T2_cover_tie", b(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_B)], false)),
+                step("B5_release", b(2), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W8_b_release_newer", b(3), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q27_no_release_after_a_revoke",
+            "a revoke stays final: no release, however new, lifts the hold, and the hold stays in force",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("S4_revoke", a(3), applied("applied", &[("revocation", "applied")], vec![act("revoke", SVC)], false)),
+                step("W3_release_newer", a(4), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("S3_release", a(5), applied("refused", &[("release", "refused")], none.clone(), false)),
+            ],
+        ),
     ];
 
     let svc_key = book.signer_public("svc-discord");
@@ -5926,7 +6233,7 @@ fn control_vectors(book: &Book) -> Value {
         "name": "r9-vectors-host-work-control",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part names its device list, account_id and genesis_hash, and its `records` are the [record_id, digest, issued_at] triples that counted, oldest first; `order` holds one feed per Station origin). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). Its `expect.why` is Applied::why's code (host-work-v1 §11.1: the verifier's pending or refusal reason, or list_frozen, not_revoked, revoke_not_applied, order, after_revoke, collision, not_newer, possible_replay), present exactly when the record is pending or refused or kept as evidence. A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover, and raises the part's `evicted_floor` to the newest issued_at evicted; a cover or release of a principal not revoked, under an id not counted and issued no later than the floor, is refused as a possible replay and kept as evidence; a hold, revoke or interrupt never is (decision 19, rulings T4a and T4d, for Astation's agreement).",
+        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part names its device list, account_id and genesis_hash, and its `records` are the [record_id, digest, issued_at] triples that counted, oldest first; `order` holds one feed per Station origin). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). Its `expect.why` is Applied::why's code (host-work-v1 §11.1: the verifier's pending or refusal reason, or list_frozen, not_revoked, revoke_not_applied, order, after_revoke, collision, not_newer, possible_replay, not_after_hold), present exactly when the record is pending or refused or kept as evidence. A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover, and raises the part's `evicted_floor` to the newest issued_at evicted; a cover or release of a principal not revoked, under an id not counted and issued no later than the floor, is refused as a possible replay and kept as evidence; a hold, revoke or interrupt never is (decision 19, rulings T4a and T4d, agreed with Astation on 2026-11-13, #120 comment 6848326392). A service's part keeps `hold_issued_at`, the newest issued_at of every hold verified while it wasn't revoked (one that held or found it held, read out of order, from another feed, at no position or under a counted id), never lowered or cleared; a release taken in feed order while held lifts the hold only when issued strictly after it, else it is refused with why not_after_hold (no evidence) and takes no position in the feed's order (O1, requested in Astation's review of PR 2, #120 comment 6848326392; for Astation's sign-off). Each effect pending or refused in `expect` carries the step's why (O5, for Astation's sign-off).",
         "account_id": "acct-test-1",
         "genesis_hash": genesis_hash().to_hex(),
         "stations": {
@@ -5974,6 +6281,11 @@ fn applied_of(a: &ControlApplied) -> Value {
     let mut v = applied(a.record_result.code(), &effects, actions, a.evidence);
     if let Some(why) = a.why {
         v["why"] = why.code().into();
+    }
+    for (i, e) in a.effects.iter().enumerate() {
+        if let Some(why) = &e.why {
+            v["effects"][i]["why"] = why.code().into();
+        }
     }
     v
 }
@@ -6223,7 +6535,7 @@ fn host_work_control() {
             "{label}: every step's results, standing and touched, the state, its round trip and its parts"
         ));
     }
-    assert_eq!(evicting, 2, "the two eviction sequences");
+    assert_eq!(evicting, 3, "the three eviction sequences");
     run.finish();
 }
 
@@ -6651,8 +6963,9 @@ fn delegated_wire() {
 
 use atem_client::control::{
     AckResult, ApplicationResult, CallRefused, ControlAck, ControlSync, ControlSyncResult,
-    EffectKind, EffectResult, EntryRef, FeedEntry, FeedHead, Heads, MembershipFetch,
-    MembershipFetchResult, RefusalCode, RefusedCall, RelayError, ToHost, ToStation,
+    EffectKind, EffectResult, EffectWhy, EntryRef, FeedEntry, FeedHead, Heads, MAX_WHY_BYTES,
+    MembershipFetch, MembershipFetchResult, RefusalCode, RefusedCall, RelayError, ToHost,
+    ToStation, Why,
 };
 
 const STATION_CALLS: &str = "r9-vectors-station-calls";
@@ -6696,6 +7009,9 @@ fn call_effects(value: &Value) -> Vec<EffectResult> {
         .map(|e| EffectResult {
             effect: EffectKind::from_code(s(e, "effect")).unwrap(),
             result: ApplicationResult::from_code(s(e, "result")).unwrap(),
+            why: e
+                .get("why")
+                .map(|why| EffectWhy::read(why.as_str().unwrap()).unwrap()),
         })
         .collect()
 }
@@ -6837,7 +7153,14 @@ fn describe_effects(effects: &[EffectResult]) -> Value {
     Value::Array(
         effects
             .iter()
-            .map(|e| serde_json::json!({"effect": e.effect.code(), "result": e.result.code()}))
+            .map(|e| {
+                let mut v =
+                    serde_json::json!({"effect": e.effect.code(), "result": e.result.code()});
+                if let Some(why) = &e.why {
+                    v["why"] = why.code().into();
+                }
+                v
+            })
             .collect(),
     )
 }
@@ -6968,6 +7291,7 @@ const STATION_CALL_OPS: [&str; 9] = [
 fn station_calls_build_byte_for_byte() {
     let mut run = station_calls_file();
     assert_eq!(run.get("max_message_bytes"), RELAY_MAX_BYTES);
+    run.get("why_codes");
     run.get("invalid");
     for case in run.get("at_the_bound").as_array().unwrap() {
         let name = s(case, "name");
@@ -7010,6 +7334,7 @@ fn station_calls_build_byte_for_byte() {
 fn station_calls_decode_to_their_fields() {
     let mut run = station_calls_file();
     run.get("max_message_bytes");
+    run.get("why_codes");
     run.get("invalid");
     // A text of exactly the bound is read (the same bound for every call
     // that can carry a large page), and gives back what `accepts` says.
@@ -7085,12 +7410,83 @@ fn station_calls_decode_to_their_fields() {
     run.finish();
 }
 
+/// Typed reasons (O5): the goldens' reasons decode as the vocabulary's
+/// codes, and those of a later version as unrecognized, their results
+/// unchanged; every reason sits beside an effect not in force.
+#[test]
+fn station_call_reasons_are_known_or_unrecognized() {
+    let file = load(STATION_CALLS);
+    let case = |name: &str| {
+        let c = file["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no golden {name}"));
+        ControlAck::decode(s(c, "wire").as_bytes()).unwrap()
+    };
+    let whys = |ack: &ControlAck| -> Vec<(ApplicationResult, Option<EffectWhy>)> {
+        ack.results
+            .iter()
+            .flat_map(|r| match r {
+                AckResult::Record { effects, .. } | AckResult::Entry { effects, .. } => {
+                    effects.clone()
+                }
+            })
+            .map(|e| (e.result, e.why))
+            .collect()
+    };
+    let known = whys(&case("control_ack_with_reasons"));
+    assert!(known.iter().any(|(r, _)| *r == ApplicationResult::Applied));
+    for (result, why) in &known {
+        let not_in_force = matches!(
+            result,
+            ApplicationResult::Pending | ApplicationResult::Refused
+        );
+        assert_eq!(why.is_some(), not_in_force, "{result:?}");
+        assert!(
+            why.as_ref()
+                .is_none_or(|w| matches!(w, EffectWhy::Known(_)))
+        );
+    }
+    // The vocabulary, as the file lists it: exactly the core's, in its
+    // order, and each code a reason's form.
+    let codes: Vec<String> = file["why_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        codes,
+        Why::vocabulary()
+            .iter()
+            .map(|w| w.code().to_owned())
+            .collect::<Vec<_>>()
+    );
+    assert!(codes.iter().all(|c| EffectWhy::well_formed(c)));
+    let later = whys(&case("control_ack_with_unrecognized_reasons"));
+    assert_eq!(
+        later
+            .iter()
+            .map(|(r, w)| (*r, matches!(w, Some(EffectWhy::Unrecognized(_)))))
+            .collect::<Vec<_>>(),
+        [
+            (ApplicationResult::Refused, true),
+            (ApplicationResult::Refused, true),
+            (ApplicationResult::Pending, false),
+        ]
+    );
+    assert_eq!(later[1].1.as_ref().unwrap().code().len(), MAX_WHY_BYTES);
+}
+
 /// Every invalid variant is refused, with its code, by its side's reader and
 /// by the message's own type's.
 #[test]
 fn station_calls_refuse_the_invalid_variants() {
     let mut run = station_calls_file();
     run.get("max_message_bytes");
+    run.get("why_codes");
     run.get("calls");
     run.get("at_the_bound");
     let invalid = run.get("invalid");
@@ -7431,12 +7827,36 @@ fn station_call_vectors() -> Value {
     );
 
     // -------------------------------------------------------- control_ack
+    // Each effect `(effect, result, why)`: a reason (O5) only where the
+    // effect isn't in force.
+    let effects_why = |codes: &[(&str, &str, Option<&str>)]| -> Vec<EffectResult> {
+        codes
+            .iter()
+            .map(|(e, r, why)| EffectResult {
+                effect: EffectKind::from_code(e).unwrap(),
+                result: ApplicationResult::from_code(r).unwrap(),
+                why: why.map(|why| EffectWhy::read(why).unwrap()),
+            })
+            .collect()
+    };
+    let effects_why_json = |codes: &[(&str, &str, Option<&str>)]| -> Value {
+        Value::Array(
+            codes
+                .iter()
+                .map(|(e, r, why)| match why {
+                    Some(why) => json!({"effect": e, "result": r, "why": why}),
+                    None => json!({"effect": e, "result": r}),
+                })
+                .collect(),
+        )
+    };
     let effects = |codes: &[(&str, &str)]| -> Vec<EffectResult> {
         codes
             .iter()
             .map(|(e, r)| EffectResult {
                 effect: EffectKind::from_code(e).unwrap(),
                 result: ApplicationResult::from_code(r).unwrap(),
+                why: None,
             })
             .collect()
     };
@@ -7455,6 +7875,32 @@ fn station_call_vectors() -> Value {
                 effects: effects(codes),
             },
             json!({"record_id": id, "effects": effects_json(codes)}),
+        )
+    };
+    let record_why = |id: &str, codes: &[(&str, &str, Option<&str>)]| {
+        (
+            AckResult::Record {
+                record_id: id.to_owned(),
+                effects: effects_why(codes),
+            },
+            json!({"record_id": id, "effects": effects_why_json(codes)}),
+        )
+    };
+    let entry_why = |label: &str, applied_seq: u64, codes: &[(&str, &str, Option<&str>)]| {
+        let e = entry(label);
+        let seq = e["entry"]["body"]["seq"].as_u64().unwrap();
+        let hash = s(&e, "entry_hash").to_owned();
+        (
+            AckResult::Entry {
+                entry: EntryRef {
+                    seq,
+                    entry_hash: Hash32::from_hex(&hash).unwrap(),
+                },
+                applied_seq,
+                effects: effects_why(codes),
+            },
+            json!({"entry": {"seq": seq, "entry_hash": hash}, "applied_seq": applied_seq,
+                "effects": effects_why_json(codes)}),
         )
     };
     let entry_result = |label: &str, applied_seq: u64, codes: &[(&str, &str)]| {
@@ -7587,6 +8033,76 @@ fn station_call_vectors() -> Value {
                 )
             })
             .collect(),
+        &mut g,
+    );
+    // Typed reasons (O5, Astation's review of PR 2, #120 comment
+    // 6848326392): each effect not in force says why; information only.
+    ack(
+        "control_ack_with_reasons",
+        "partial effects with typed reasons (O5): each effect pending or refused says why, a code of the shared why vocabulary (a release issued before the hold in force, an interrupt waiting for its revocation, a stop signed by a removed manager on both its effects, a release that may be an evicted one replayed, a principal the list doesn't hold yet, an entry host-work hasn't applied); the effects in force beside them say nothing. A reason never changes a result and counts nothing",
+        &feed,
+        9,
+        vec![
+            record_why(
+                &record_id("W1_release_withheld"),
+                &[("release", "refused", Some("not_after_hold"))],
+            ),
+            record_why(
+                &record_id("S6_interrupt"),
+                &[("interrupt", "pending", Some("not_revoked"))],
+            ),
+            record_why(&record_id("S1_cover"), &[("cover", "applied", None)]),
+            record_why(
+                &record_id("S5_revoke_interrupt"),
+                &[
+                    ("revocation", "duplicate", None),
+                    ("interrupt", "applied", None),
+                ],
+            ),
+            record_why(
+                &record_id("M3_revoke_by_removed_manager"),
+                &[
+                    ("revocation", "refused", Some("removed_manager")),
+                    ("interrupt", "refused", Some("removed_manager")),
+                ],
+            ),
+            record_why(
+                &record_id("S3_release"),
+                &[("release", "refused", Some("possible_replay"))],
+            ),
+            record_why(
+                &record_id("V5_principal_unknown"),
+                &[("revocation", "pending", Some("principal_unknown"))],
+            ),
+            entry_why(
+                "HS7_revoke",
+                6,
+                &[("revocation", "pending", Some("revoke_not_applied"))],
+            ),
+        ],
+        &mut g,
+    );
+    let longest = format!("a_later_reason_{}", "z".repeat(MAX_WHY_BYTES - 15));
+    assert_eq!(longest.len(), MAX_WHY_BYTES);
+    ack(
+        "control_ack_with_unrecognized_reasons",
+        "reasons this reader doesn't know (a later version's), one at the 64-byte bound: well formed (1 to 64 bytes of [a-z0-9_]), so read as unrecognized, information only; each result is unchanged and the reason is written back as it came",
+        &feed,
+        9,
+        vec![
+            record_why(
+                &record_id("W1_release_withheld"),
+                &[("release", "refused", Some("a_later_reason"))],
+            ),
+            record_why(
+                &record_id("W2_release_refused_before"),
+                &[("release", "refused", Some(&longest))],
+            ),
+            record_why(
+                &record_id("S6_interrupt"),
+                &[("interrupt", "pending", Some("not_revoked"))],
+            ),
+        ],
         &mut g,
     );
 
@@ -8129,6 +8645,53 @@ fn station_call_vectors() -> Value {
     g.bad_edit("control_ack_feed_id_missing", a, "malformed", |v| {
         v.as_object_mut().unwrap().remove("feed_id");
     });
+    // Typed reasons (O5): `why` refuses the whole ack when it isn't a
+    // well-formed reason beside an effect not in force.
+    let r = "control_ack_with_reasons";
+    for (name, why) in [
+        ("control_ack_why_null", Value::Null),
+        ("control_ack_why_not_a_string", json!(7)),
+        ("control_ack_why_empty", json!("")),
+        (
+            "control_ack_why_over_64_bytes",
+            json!("z".repeat(MAX_WHY_BYTES + 1)),
+        ),
+        ("control_ack_why_upper_case", json!("Not_after_hold")),
+        (
+            "control_ack_why_outside_the_characters",
+            json!("not-after-hold"),
+        ),
+    ] {
+        g.bad_edit(name, r, "malformed", |v| {
+            v["results"][0]["effects"][0]["why"] = why
+        });
+    }
+    g.bad_edit("control_ack_why_beside_applied", r, "malformed", |v| {
+        v["results"][2]["effects"][0]["why"] = json!("order")
+    });
+    g.bad_edit("control_ack_why_beside_duplicate", r, "malformed", |v| {
+        v["results"][3]["effects"][0]["why"] = json!("order")
+    });
+    g.bad_edit(
+        "control_ack_effect_unknown_field",
+        r,
+        "unknown_field",
+        |v| v["results"][0]["effects"][0]["reason"] = json!("not_after_hold"),
+    );
+    let wire = g.wires[r].clone();
+    let doubled = wire.replacen(
+        r#""why":"not_after_hold""#,
+        r#""why":"order","why":"not_after_hold""#,
+        1,
+    );
+    assert_ne!(doubled, wire);
+    g.bad(
+        "control_ack_why_duplicate_key",
+        "control_ack",
+        "to_station",
+        "not_strict",
+        doubled,
+    );
 
     // membership_fetch
     let f = "membership_fetch";
@@ -8230,8 +8793,17 @@ fn station_call_vectors() -> Value {
         "name": STATION_CALLS,
         "kind": "vectors",
         "requires": "r9",
-        "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", for Astation's agreement). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
+        "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", agreed with Astation on 2026-11-13, #120 comment 6848326392: a strict-JSON page may hold individually invalid records, whose evidence is kept, which aren't applied, and whose delivery is no application evidence). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. `why_codes` is the shared vocabulary of typed reasons (O5, host-work-v1 §11.4 wire rule 10, for Astation's sign-off), in the core's order: a well-formed reason outside it is a later version's, read as unrecognized. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
         "max_message_bytes": RELAY_MAX_BYTES,
+        // The shared vocabulary of reasons (O5), written out by hand in the
+        // core's order; the runner holds it equal to `Why::vocabulary`.
+        "why_codes": [
+            "principal_unknown", "signer_unknown", "revoke_not_in_list", "list_frozen",
+            "not_revoked", "revoke_not_applied", "wrong_account", "bad_signature",
+            "key_mismatch", "signer_not_allowed", "removed_manager", "host_key_signed",
+            "not_a_service", "not_a_revoke", "order", "after_revoke", "collision", "not_newer",
+            "possible_replay", "not_after_hold",
+        ],
         "calls": g.calls,
         "at_the_bound": at_bound,
         "invalid": g.invalid,

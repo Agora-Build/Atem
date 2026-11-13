@@ -739,9 +739,11 @@ def check_host_work_control(file, data, report, context):
     it), each service record's principal_key against the r9_svc of the
     principal's auth_key, each step's position against the stations, and
     the record digests a sequence's state keeps (by principal, then
-    record_id: the SHA-256 of a body of that principal with that id).
-    Verdicts and per-effect results are the Rust runner's and the binding
-    suites' (R9.12)."""
+    record_id: the SHA-256 of a body of that principal with that id), each
+    `why` (of its kind, and on each effect exactly when it isn't in force),
+    and, from the steps alone, the bound (derive_bound) and O1's signed-time
+    rule (derive_hold_time). Verdicts and other per-effect results are the
+    Rust runner's and the binding suites' (R9.12)."""
     keys = context["keys"]
     mlog = context["membership_log"]
     entries = {v["label"]: v["entry"]["body"] for v in mlog["log"] + mlog["others"]}
@@ -840,6 +842,14 @@ def check_host_work_control(file, data, report, context):
                 case.check(pin is None or pin in ids, f"{what} {principal}: its revocation's and cover's records kept")
             if "evicted_floor" in part:
                 case.equal(len(records), MAX_RECORD_IDS, f"{what} {principal}: an evicted floor, its records full")
+            if principal.startswith("host:"):
+                case.check("hold_issued_at" not in part, f"{what} {principal}: a host principal's part keeps no hold's time")
+            else:
+                at = part.get("hold_issued_at")
+                case.check(
+                    (at is None or (isinstance(at, int) and 0 <= at <= SAFE_MAX)) and (at is not None or not part["held"]),
+                    f"{what} {principal}: hold_issued_at a safe integer, present whenever held",
+                )
             case.check(all(len(feeds) == 1 for feeds in part.get("order", {}).values()), f"{what} {principal}: one feed per origin in order")
             copies, wrong = 0, []
             for record_id, digest, issued_at in records:
@@ -878,6 +888,7 @@ def check_host_work_control(file, data, report, context):
             out["coverage"] = {"origin": part["coverage"]["origin"], "feed_id": part["coverage"]["feed_id"]}
         return out
 
+    o1_seen = set()
     for sequence in data["sequences"]:
         with report.case(file, sequence["label"]) as case:
             for step in sequence["steps"]:
@@ -904,7 +915,19 @@ def check_host_work_control(file, data, report, context):
             principal = by_label[last["record"]]["record"]["body"]["principal"]
             case.equal(last["standing"], standing_of(sequence["state"], principal), "the last step's standing is the state's")
             check_why(case, sequence)
-            derive_bound(case, sequence)
+            counted_before = derive_bound(case, sequence)
+            o1_seen.update(derive_hold_time(case, sequence, counted_before))
+    with report.case(file, "O1 coverage") as case:
+        # The sequences must exercise the signed-time rule (O1), derived above.
+        for kind, what in [
+            ("tie", "a release issued at the hold's time, refused"),
+            ("lift", "a release issued strictly after the hold, lifting it"),
+            ("initial", "a hold's time from a stored initial state refusing a release"),
+            ("another_feed", "a hold read from another feed than the release's refusing it"),
+            ("no_position", "a hold read at no position refusing a release"),
+            ("colliding_id", "a hold under a counted id (evidence) refusing a release"),
+        ]:
+            case.check(kind in o1_seen, what)
 
 
 # Applied::why's codes (host-work-v1 §11.1), by what they explain.
@@ -913,7 +936,7 @@ WHY_VERIFIER_REFUSED = {
     "wrong_account", "bad_signature", "key_mismatch", "signer_not_allowed",
     "removed_manager", "host_key_signed", "not_a_service", "not_a_revoke",
 }
-WHY_STATE_REFUSED = {"order", "after_revoke", "not_newer"}
+WHY_STATE_REFUSED = {"order", "after_revoke", "not_newer", "not_after_hold"}
 WHY_EVIDENCE = WHY_VERIFIER_REFUSED | {"collision", "possible_replay"}
 WHY_CODES = WHY_PENDING | WHY_VERIFIER_REFUSED | WHY_STATE_REFUSED | {"collision", "possible_replay"}
 
@@ -929,6 +952,12 @@ def check_why(case, sequence):
     for i, step in enumerate(sequence["steps"], 1):
         expect = step["expect"]
         result, evidence, why = expect["result"], expect["evidence"], expect.get("why")
+        # Each effect not in force says the record's why; one in force says
+        # nothing (O5).
+        for e in expect["effects"]:
+            not_in_force = e["result"] in ("pending", "refused")
+            if e.get("why") != (why if not_in_force else None) or (not_in_force and why is None):
+                bad.append(i)
         explains = result in ("pending", "refused") or evidence
         if (why is not None) != explains or (why is not None and why not in WHY_CODES):
             bad.append(i)
@@ -942,8 +971,9 @@ def check_why(case, sequence):
             bad.append(i)
     case.check(
         not bad,
-        "every step's why: a code of its kind, present exactly when pending, refused or evidence"
-        + (f" (not: steps {bad})" if bad else ""),
+        "every step's why: a code of its kind, present exactly when pending, refused or evidence, "
+        "and on each effect exactly when it isn't in force"
+        + (f" (not: steps {sorted(set(bad))})" if bad else ""),
     )
 
 
@@ -988,12 +1018,13 @@ def derive_bound(case, sequence):
 
     for principal in set(initial) | set(final):
         start(principal)
-    wrong = []
+    wrong, counted_before = [], []
     for i, step in enumerate(sequence["steps"], 1):
         body = by_label_of(step["record"])["record"]["body"]
         principal, rid, expect = body["principal"], body["record_id"], step["expect"]
         if principal not in ids:
             start(principal)
+        counted_before.append(rid in ids[principal])
         guarded = (
             body["action"] in ("cover", "release")
             and not revoked[principal]
@@ -1039,6 +1070,112 @@ def derive_bound(case, sequence):
         # An id evicted and counted again is in the final records.
         gone = set(evicted[principal]) - set(got)
         case.equal(sorted(set(begin + added) - set(got)), sorted(gone), f"{principal}: the ids gone are (initial + counted) - final")
+    return counted_before
+
+
+def derive_hold_time(case, sequence, counted_before):
+    """O1, derived from the file alone (no state machine): per principal,
+    the hold's time starts as `initial`'s `hold_issued_at` and becomes the
+    newest `issued_at` of every hold step that holds or finds the principal
+    held (`applied` or `duplicate`, evidence or not: a hold under a counted
+    id still applies) while it isn't revoked. Each release that reaches the
+    rule (its principal held and not revoked, and not refused for anything
+    else: pending, a verifier's reason, a possible replay, a collision or
+    feed order) must lift the hold (`applied`) exactly when its `issued_at`
+    is strictly greater than that time, and otherwise be `refused` with
+    `why` `not_after_hold`, no evidence; no other step has that `why`. The
+    final state's `hold_issued_at` must be the time derived.
+
+    A hold whose record id is counted already (`counted_before`, from
+    derive_bound) and isn't evidence is the same body replayed: a
+    `duplicate` that holds nothing and records no time. One under a counted
+    id with another body (evidence, a collision) applies as a stop.
+
+    Returns what the sequence exercised, for the file's coverage: a `tie`
+    refused, a `lift` after a known time, and a release refused by a time
+    that came from `initial`, or from a hold read from `another_feed` than
+    the release's, at `no_position`, or under a `colliding_id`.
+
+    Its limits, as derive_bound's: each step's verification and feed order
+    are taken as written (the Rust runner and the suites check those)."""
+    initial = sequence.get("initial", {}).get("principals", {})
+    final = sequence["state"]["principals"]
+    time, held, revoked, source = {}, {}, {}, {}
+    seen = set()
+
+    def start(principal):
+        part = initial.get(principal, {})
+        time[principal] = part.get("hold_issued_at")
+        held[principal] = part.get("held", False)
+        revoked[principal] = "revoked_by" in part
+        source[principal] = "initial" if time[principal] is not None else None
+
+    for principal in set(initial) | set(final):
+        start(principal)
+    other_refusals = WHY_PENDING | WHY_VERIFIER_REFUSED | {"possible_replay", "collision", "order"}
+    wrong, reached = [], 0
+    for i, step in enumerate(sequence["steps"], 1):
+        body = by_label_of(step["record"])["record"]["body"]
+        principal, expect = body["principal"], step["expect"]
+        if principal not in time:
+            start(principal)
+        why = expect.get("why")
+        in_force = expect["result"] in ("applied", "duplicate")
+        action = body["action"]
+        replay = counted_before[i - 1] and not expect["evidence"]
+        if action == "hold" and in_force and not revoked[principal] and not replay:
+            at = time[principal]
+            if at is None or body["issued_at"] > at:
+                time[principal] = body["issued_at"]
+                source[principal] = step
+            held[principal] = True
+            if why == "not_after_hold":
+                wrong.append(i)
+        elif action == "release" and held[principal] and not revoked[principal] and why not in other_refusals:
+            reached += 1
+            at = time[principal]
+            lifts = at is None or body["issued_at"] > at
+            if lifts and expect["result"] != "applied":
+                wrong.append(i)
+            if not lifts and (expect["result"], expect["evidence"], why) != ("refused", False, "not_after_hold"):
+                wrong.append(i)
+            if expect["result"] == "applied":
+                held[principal] = False
+            if lifts and at is not None:
+                seen.add("lift")
+            if not lifts:
+                if body["issued_at"] == at:
+                    seen.add("tie")
+                by = source[principal]
+                if by == "initial":
+                    seen.add("initial")
+                elif by is not None:
+                    if by["expect"]["evidence"]:
+                        seen.add("colliding_id")
+                    if "pos" not in by:
+                        seen.add("no_position")
+                    elif "pos" in step and (by["pos"]["origin"], by["pos"]["feed_id"]) != (step["pos"]["origin"], step["pos"]["feed_id"]):
+                        seen.add("another_feed")
+        elif why == "not_after_hold":
+            wrong.append(i)
+        if action == "revoke" and any(
+            e["effect"] == "revocation" and e["result"] in ("applied", "duplicate") for e in expect["effects"]
+        ):
+            revoked[principal] = True
+    case.check(
+        not wrong,
+        f"{reached} releases reach the signed-time rule: each lifts the hold exactly when issued after every hold verified before it, "
+        "else is refused with why not_after_hold (no other step has it)" + (f" (not: steps {wrong})" if wrong else ""),
+    )
+    for principal in sorted(time):
+        if principal.startswith("host:"):
+            continue
+        case.equal(
+            final.get(principal, {}).get("hold_issued_at"),
+            time[principal],
+            f"{principal}: hold_issued_at, the newest issued_at of every hold verified while not revoked",
+        )
+    return seen
 
 
 # ------------------------------------------------ r9-control-ack-* fixtures
@@ -1263,6 +1400,50 @@ def delegated_task(facts):
     )
 
 
+# Unicode's White_Space property (PropList.txt), written out: an alert's
+# reason must carry something else (host-work-v1 §11.3).
+WHITE_SPACE = set(
+    "\t\n\x0b\x0c\r \x85\xa0\u1680" + "".join(chr(c) for c in range(0x2000, 0x200B))
+    + "\u2028\u2029\u202f\u205f\u3000"
+)
+
+
+# General_Category Cf (format characters) of Unicode 18.0.0, as inclusive
+# code point ranges: the set the Rust core's `framing::is_format` gives
+# (unicode-properties 0.1.5), written out so this checker doesn't depend
+# on Python's own Unicode version. `cargo test -p atem-client --test vectors
+# checker_format_ranges_are_the_framing_modules` holds them equal.
+CF_RANGES = [
+    (0x00AD, 0x00AD), (0x0600, 0x0605), (0x061C, 0x061C), (0x06DD, 0x06DD),
+    (0x070F, 0x070F), (0x0890, 0x0891), (0x08E2, 0x08E2), (0x180E, 0x180E),
+    (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x2064), (0x2066, 0x206F),
+    (0xFEFF, 0xFEFF), (0xFFF9, 0xFFFB), (0x110BD, 0x110BD), (0x110CD, 0x110CD),
+    (0x13430, 0x1343F), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A), (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+]
+
+
+def is_control(c):
+    """General_Category Cc (stable since Unicode 1.1): U+0000-001F, U+007F-009F."""
+    return ord(c) <= 0x1F or 0x7F <= ord(c) <= 0x9F
+
+
+def is_format(c):
+    """General_Category Cf of Unicode 18.0.0 (CF_RANGES)."""
+    return any(a <= ord(c) <= b for a, b in CF_RANGES)
+
+
+def reason_ok(reason):
+    """An outcome_unknown alert's reason (host-work-v1 §11.3): 1-256 bytes,
+    not blank (something besides White_Space), no control (Cc) or format
+    (Cf) character."""
+    return (
+        1 <= len(reason.encode()) <= 256
+        and any(c not in WHITE_SPACE for c in reason)
+        and not any(is_control(c) or is_format(c) for c in reason)
+    )
+
+
 def check_push_hint(file, data, report, context):
     """Push hints (R9.9; delegated host-work I.4.6): every hint's body jcs and
     signing input, the host's signature (by the key the chain names for it),
@@ -1360,7 +1541,7 @@ def check_push_hint(file, data, report, context):
             case.equal(jcs(details["facts"]), details["plain_jcs"], "plain_jcs = jcs of the four facts")
             case.equal(sorted(details["facts"]), ["reason", "sender", "session_id", "task_id"], "exactly the four facts")
             facts = details["facts"]
-            case.check(1 <= len(facts["reason"].encode()) <= 256, "reason within 1-256 bytes")
+            case.check(reason_ok(facts["reason"]), "reason within 1-256 bytes, not blank, no control or format character")
             case.check(delegated_task(facts), "a delegated sender's (member:, service: or host:) UUID v4 task")
             case.check(re.fullmatch(r"ses-[a-z2-7]{12}", facts["session_id"]) is not None, "session_id")
             case.check(re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", body["alert_id"]) is not None, "alert_id is a UUID v4")
@@ -1398,7 +1579,22 @@ def check_push_hint(file, data, report, context):
             plain = hpke_open(unhex(secrets[device]), b64u_decode(wire["enc"]), b64u_decode(wire["ct"]), info)
             case.equal(plain.decode(), jcs(case_["facts"]), "opens to exactly the stated facts")
             case.equal(sorted(case_["facts"]), ["reason", "sender", "session_id", "task_id"], "the four facts")
-            case.check(not delegated_task(case_["facts"]), "not a delegated sender's UUID v4 task")
+            delegated, ok = delegated_task(case_["facts"]), reason_ok(case_["facts"]["reason"])
+            case.check(not delegated or not ok, "not a delegated sender's UUID v4 task, or a reason that isn't one")
+            if delegated:
+                # Refused by the blank rule alone: no control or format
+                # character a reader might refuse it for instead.
+                reason = case_["facts"]["reason"]
+                case.check(
+                    reason != ""
+                    and all(c in WHITE_SPACE for c in reason)
+                    and not any(is_control(c) or is_format(c) for c in reason),
+                    "a delegated task's blank reason (White_Space only, no control or format character)",
+                )
+    with report.case(file, "outcome_unknown_invalid_facts: coverage") as case:
+        kinds = [delegated_task(c["facts"]) for c in data["outcome_unknown_invalid_facts"]]
+        case.check(False in kinds, "a task that isn't a delegated sender's")
+        case.check(kinds.count(True) == 1, "the deferred blank-reason case: a delegated task's blank reason (Astation's review of PR 2)")
 
 
 def check_delegated_wire(file, data, report, context):
@@ -2230,16 +2426,27 @@ def _read_heads(v):
         raise Refused("malformed")  # wire rule 6: an (origin, feed_id) once
 
 
+# An effect's reason (O5): 1 to 64 bytes of [a-z0-9_], only beside an
+# effect not in force; a code outside the vocabulary is read, unrecognized.
+RELAY_WHY = r"[a-z0-9_]{1,64}"
+
+
 def _relay_effects(result):
     items = result.get("effects")
     if not isinstance(items, list) or not 1 <= len(items) <= 2:
         raise Refused("malformed")
     out = []
     for item in items:
-        _relay_exact(item, ["effect", "result"])
+        _relay_exact(item, ["effect", "result", "why"])
         effect, outcome = _relay_text(item, "effect"), _relay_text(item, "result")
         if effect not in RELAY_EFFECTS or outcome not in RELAY_RESULTS:
             raise Refused("malformed")
+        if "why" in item:
+            why = item["why"]
+            if not isinstance(why, str) or re.fullmatch(RELAY_WHY, why) is None:
+                raise Refused("malformed")  # null, not a text, empty, over 64 bytes, another character
+            if outcome not in ("pending", "refused"):
+                raise Refused("malformed")  # a reason says why an effect isn't in force
         out.append((effect, outcome))
     return out
 
@@ -2385,14 +2592,19 @@ def check_station_calls(file, data, report, context):
     allowed more for either (the 512 KiB of stage 3's mailbox calls is no
     exemption for `membership_fetch_result`) fails. A record that is not a
     JSON object is `malformed` to the signed-object parse (R9.1: a signed
-    object is an object), derived here. The builders' exact bytes are the
-    Rust runner's (`station_calls_build_byte_for_byte`) and the binding
-    suites'."""
+    object is an object), derived here. An effect's typed reason (O5) is
+    read by the same rules as the Rust reader: absent, or 1 to 64 bytes of
+    [a-z0-9_] beside `pending` or `refused`, a code outside the vocabulary
+    read as unrecognized. The builders' exact bytes are the Rust runner's
+    (`station_calls_build_byte_for_byte`) and the binding suites'."""
     mlog = context["membership_log"]
     control = context["host_work_control"]
     with report.case(file, "bound") as case:
         case.equal(data["max_message_bytes"], RELAY_MAX_BYTES, "R9.9's 262,144 bytes for every relay message")
-        case.equal(sorted(data), ["at_the_bound", "calls", "invalid", "kind", "max_message_bytes", "name", "note", "requires"], "fields")
+        case.equal(sorted(data), ["at_the_bound", "calls", "invalid", "kind", "max_message_bytes", "name", "note", "requires", "why_codes"], "fields")
+        codes = data["why_codes"]
+        case.check(len(set(codes)) == len(codes) and set(codes) == WHY_CODES, "why_codes: the vocabulary of reasons, each code once (O5)", f"got {codes}")
+        case.check(all(re.fullmatch(RELAY_WHY, c) for c in codes), "each code a reason's form")
 
     stations = {(s["origin"], s["feed_id"]) for s in control["stations"].values()}
     records = {compact_ijson(v["record"]): v for v in control["records"]}
@@ -2470,6 +2682,13 @@ def check_station_calls(file, data, report, context):
                 for v in control["records"]:
                     if "parse_error" not in v:
                         by_id.setdefault(v["record"]["body"]["record_id"], []).append(v["record"]["body"])
+                # Typed reasons (O5): the vocabulary's codes, but in the
+                # golden of a later version's, which carries codes outside it.
+                whys = [e["why"] for r in f["results"] for e in r["effects"] if "why" in e]
+                if "unrecognized" in name:
+                    case.check(any(w not in WHY_CODES for w in whys), "reasons outside the vocabulary: read, unrecognized")
+                else:
+                    case.check(all(w in WHY_CODES for w in whys), "each reason a code of the vocabulary", f"got {whys}")
                 for result in f["results"]:
                     effects = [e["effect"] for e in result["effects"]]
                     if "record_id" in result:
@@ -2560,6 +2779,16 @@ def check_station_calls(file, data, report, context):
             "the byte bound refused one byte over and at 300,000, for a page and a fetch result",
         )
         case.equal(sum("wire_fill" in b for b in data["invalid"]), 4, "four texts over the byte bound")
+        reasons = {
+            "control_ack_why_null", "control_ack_why_not_a_string", "control_ack_why_empty",
+            "control_ack_why_over_64_bytes", "control_ack_why_upper_case", "control_ack_why_outside_the_characters",
+            "control_ack_why_beside_applied", "control_ack_why_beside_duplicate", "control_ack_why_duplicate_key",
+        }
+        case.check(reasons <= seen, "every refused form of a reason (O5)", f"missing {sorted(reasons - seen)}")
+        case.check(
+            {"control_ack_with_reasons", "control_ack_with_unrecognized_reasons"} <= names,
+            "goldens with reasons and with a later version's reasons",
+        )
         counts = {b["name"] for b in data["invalid"] if b["code"] == "too_large"}
         case.check({"control_sync_result_65_records", "heads_65_feeds", "control_ack_65_results", "membership_fetch_result_65_entries"} <= counts, "65 records, feeds, results and entries")
 

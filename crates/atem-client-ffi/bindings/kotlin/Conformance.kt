@@ -716,10 +716,16 @@ fun main(args: Array<String>) {
         is ControlHostAction.Interrupt -> mapOf("type" to "interrupt", "principal" to a.principal, "revocation" to a.revocation)
         is ControlHostAction.Cover -> mapOf("type" to "cover", "principal" to a.principal, "origin" to a.origin, "feed_id" to a.feedId)
     }
+    // An effect as the vectors write it: `why` (O5) only when there is one.
+    fun controlEffectOf(e: ControlEffectResult): Map<String, Any?> {
+        val m = linkedMapOf<String, Any?>("effect" to e.effect.name.lowercase(), "result" to e.result.name.lowercase())
+        e.why?.let { m["why"] = it }
+        return m
+    }
     fun controlAppliedOf(a: ControlApplied): Map<String, Any?> {
         val m = linkedMapOf<String, Any?>(
             "result" to a.result.name.lowercase(),
-            "effects" to a.effects.map { mapOf("effect" to it.effect.name.lowercase(), "result" to it.result.name.lowercase()) },
+            "effects" to a.effects.map(::controlEffectOf),
             "actions" to a.actions.map(::controlActionOf),
             "evidence" to a.evidence)
         // Why it is pending, refused or evidence: present exactly then.
@@ -865,7 +871,7 @@ fun main(args: Array<String>) {
     val ackNames = dir.list()!!.filter { it.startsWith("r9-control-ack-") && it.endsWith(".json") }
         .map { it.removeSuffix(".json") }.sorted()
     for (name in ackNames) check("Station acks: $name through AckLedgerHandle") {
-        eq(ackNames.size, 5, "the acknowledgment fixtures")
+        eq(ackNames.size, 6, "the acknowledgment fixtures")
         val f = load(name)
         val setup = f["setup"]
         val st = setup["station"]
@@ -1095,6 +1101,15 @@ fun main(args: Array<String>) {
         }
         eq(stationCalls["max_message_bytes"].l(), 262144L)
         eq(stationCalls["calls"].arr().size >= 20, true, "goldens")
+        // The shared vocabulary of reasons (O5), exported: a reason outside
+        // it is a later version's, unrecognized.
+        val vocabulary = controlWhyCodes()
+        eq(vocabulary, stationCalls["why_codes"].arr().map { it.s() }, "the vocabulary of reasons")
+        fun reasonsOf(name: String): List<String> =
+            stationCalls["calls"].arr().first { it["name"].s() == name }["fields"]["results"].arr()
+                .flatMap { it["effects"].arr() }.mapNotNull { it.obj()["why"] as String? }
+        eq(reasonsOf("control_ack_with_reasons").all { it in vocabulary }, true, "known reasons")
+        eq(reasonsOf("control_ack_with_unrecognized_reasons").count { it !in vocabulary }, 2, "unrecognized reasons")
         for (c in stationCalls["calls"].arr()) {
             val f = c["fields"]
             val wire = c["wire"].s()
@@ -1138,8 +1153,7 @@ fun main(args: Array<String>) {
                     eq(relayControlAck(read.ack), wire, "$name written again")
                     // What it decoded to, field by field, against the golden's fields
                     // (a mapping wrong both ways round wouldn't show in the re-encoding).
-                    fun effectsOf(e: List<ControlEffectResult>) =
-                        e.map { mapOf("effect" to it.effect.name.lowercase(), "result" to it.result.name.lowercase()) }
+                    fun effectsOf(e: List<ControlEffectResult>) = e.map(::controlEffectOf)
                     val ack = read.ack
                     val decoded = mapOf(
                         "account_id" to ack.accountId, "cursor" to ack.cursor.toLong(), "feed_id" to ack.feedId,
@@ -1534,7 +1548,8 @@ fun main(args: Array<String>) {
         keysJdk.addX25519("enc", unhex(push["recipient_secrets"]["dev-phone"].s()), unhex(keys["dev-phone"]["enc"]["pub_hex"].s()))
         throwsCode("open_failed") { swapped.open(keysJdk, "enc", "dev-phone") }
         // Well signed and well sealed, but the sealed facts aren't a
-        // delegated sender's UUID v4 task: verified and kept, refused at open.
+        // delegated sender's UUID v4 task, or the reason is blank: verified
+        // and kept, refused at open.
         for (c in push["outcome_unknown_invalid_facts"].arr()) {
             for (verifier in listOf(PushVerifier.CLIENT, PushVerifier.RELAY)) {
                 verifyPushHint(Json.write(c["hint"]), logL(), nowP, verifier)
