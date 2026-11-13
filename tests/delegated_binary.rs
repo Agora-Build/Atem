@@ -1512,9 +1512,12 @@ fn a_done_whose_client_goes_away_resolves_nothing_and_says_so() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    // The runtime takes the request and starts the publication; the owner
-    // gives up (Ctrl-C) before it is read back.
-    std::thread::sleep(Duration::from_secs(2));
+    // The runtime takes the request and starts the publication, which the
+    // hold parks (`.held` says so); the owner gives up (Ctrl-C) before it
+    // is read back.
+    within("the publication parked", || {
+        context.join(format!("{name}.held")).exists()
+    });
     cli.kill().unwrap();
     cli.wait().unwrap();
     std::fs::remove_file(context.join(format!("{name}.hold"))).unwrap();
