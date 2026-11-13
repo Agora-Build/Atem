@@ -982,5 +982,5 @@ fn the_control_tables_come_with_the_feeds() {
     };
     assert_eq!(tables(&store), 0);
     FeedStore::load(&store, &list().log).unwrap();
-    assert_eq!(tables(&store), 5);
+    assert_eq!(tables(&store), 6, "control_resets with them");
 }

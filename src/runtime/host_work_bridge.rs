@@ -205,6 +205,9 @@ pub(super) struct State {
     /// Pending control records a re-verification applied, kept for Task 35
     /// (`keep_reapplied`).
     reapplied: Vec<crate::runtime::delegated::feeds::Reapplied>,
+    /// The run's control-alert tally the feed stores count into (it
+    /// outlives a store loaded again: ruling T33c, N3).
+    alert_tally: crate::runtime::delegated::feeds::AlertTally,
     /// Tests: the control view senders are classified on in place of the
     /// feeds (a feed covering a service, standings the test sets).
     #[cfg(test)]
@@ -251,6 +254,7 @@ impl State {
             feeds: crate::runtime::delegated::feeds::Feeds::Unloaded,
             reverified: None,
             reapplied: Vec::new(),
+            alert_tally: Default::default(),
             #[cfg(test)]
             controls: None,
             #[cfg(test)]
@@ -559,6 +563,7 @@ impl HostBridge {
                     eprintln!("{line}");
                 }
                 feeds.set_own_origin(own);
+                feeds.set_alert_tally(self.work.alert_tally.clone());
                 feeds.set_publisher(standings_publisher(&self.start_view));
                 if !stood_in {
                     feeds.publish();

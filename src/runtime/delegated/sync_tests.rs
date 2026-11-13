@@ -176,7 +176,50 @@ impl Rig {
             r.boot_ns += ms * 1_000_000;
         }
         self.mono_ms += ms;
-        self.sync.tick(self.clocks(), Some(&self.feeds))
+        let calls = self.sync.tick(self.clocks(), Some(&self.feeds));
+        self.marked(calls)
+    }
+
+    /// What the bridge does after each step of the sync: a reset found is
+    /// marked durably, and its read from 0 asked then.
+    fn marked(&mut self, mut calls: Vec<ControlSync>) -> Vec<ControlSync> {
+        // A mark that can't be written is tried again at the next step.
+        if let Ok(Some(ask)) = self.sync.persist_mark(&self.store, &mut self.feeds) {
+            calls.push(ask);
+        }
+        calls
+    }
+
+    /// The host restarts (a crash): the feed store loaded again from the
+    /// store, a new sync on a new link, the clocks going on.
+    fn restart(&mut self) {
+        let reading = self.os.clone();
+        self.feeds = FeedStore::load(&self.store, &self.log.log)
+            .unwrap()
+            .with_clock(move || {
+                let r = reading.lock().unwrap();
+                HostNow {
+                    wall_ms: r.wall_ms,
+                    mono_ms: r.boot_ns / 1_000_000,
+                    boot_id: r.boot_id.clone(),
+                }
+            });
+        self.feeds.set_own_origin(Some(ORIGIN.into()));
+        self.sync = FeedSync::new();
+        self.sync.on_link(Some(&link(9, ORIGIN)));
+        self.pass(SEC);
+    }
+
+    /// Whether the durable reset mark of [`ORIGIN`] is stored.
+    fn mark_row(&self) -> Option<String> {
+        self.store
+            .db
+            .query_row(
+                "SELECT restarted FROM control_resets WHERE origin=?1",
+                [ORIGIN],
+                |r| r.get(0),
+            )
+            .ok()
     }
 
     /// `heads` announcing `feeds` (origin, feed, head) at the Station's
@@ -199,11 +242,12 @@ impl Rig {
                 .collect(),
             membership: self.log.log.head(),
         };
-        self.sync.on_heads(
+        let calls = self.sync.on_heads(
             &heads,
             Some((&mut self.clock, &self.store)),
             Some(&self.feeds),
-        )
+        );
+        self.marked(calls)
     }
 
     /// `heads` announcing the own Station's `feed_id` at `head`.
@@ -255,7 +299,8 @@ impl Rig {
         page: Result<ControlSyncResult, RelayError>,
         list: &ListState,
     ) -> Synced {
-        self.sync
+        let mut synced = self
+            .sync
             .on_page(
                 page,
                 Some((&mut self.clock, &self.store)),
@@ -266,7 +311,11 @@ impl Rig {
                     applied_seq: 0,
                 }),
             )
-            .unwrap()
+            .unwrap();
+        if let Some(ask) = self.marked(Vec::new()).pop() {
+            synced.next = synced.next.or(Some(ask));
+        }
+        synced
     }
 
     /// A page of `feed_id` holding `records` at their positions.
@@ -578,9 +627,11 @@ fn a_station_time_beyond_the_cap_closes_the_origins_gate_and_leaves_the_floor() 
         .page_of(FEED, 3, vec![(3, release.object().to_json())])
         .unwrap();
     page.station_time = rig.wall() + 11 * MIN;
+    let alerts = rig.sync.alerts().0;
     rig.on_page(Ok(page));
     assert!(!rig.feeds.standing(BOT).held, "the release applied");
     assert_eq!(rig.sync.closed(), Some(Closed::ClockAhead));
+    assert_eq!(rig.sync.alerts().0, alerts + 1, "counted (ruling T33c, N3)");
     // A heads within the cap: open, the floor raised to it.
     rig.pass(SEC);
     let within = rig.wall() + 5 * MIN;
@@ -1002,4 +1053,93 @@ fn a_page_of_another_origin_or_without_the_feeds_applies_nothing() {
     rig.page(FEED, 3, &[(3, &release)]);
     assert!(!rig.feeds.standing(BOT).held);
     assert!(rig.open(&native()));
+}
+
+/// Ruling T33c (the review's out-of-scope finding): a reset is marked
+/// durably, per origin, before anything is asked for it, and the mark is
+/// cleared only by the commit that reads the feed from 0 up to the
+/// announced head. A crash after the reset was found, the feed grown back
+/// past the old cursor with other records: the host still reads it from 0
+/// and applies the records in between (a stop among them). A crash part
+/// way through the read goes on from where it was (its cursor already
+/// replaced), the gate closed until the read reaches the head.
+#[test]
+fn a_reset_found_before_a_crash_is_read_from_0_after_it() {
+    let mut rig = rig();
+    let cover = rig.record(FEED, ControlAction::Cover);
+    let hold = rig.record(FEED, ControlAction::Hold);
+    let release = rig.record(FEED, ControlAction::Release);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 0)]);
+    rig.page(FEED, 3, &[(1, &cover), (2, &hold), (3, &release)]);
+    assert!(rig.open(&native()));
+    assert!(!rig.feeds.standing(BOT).held);
+    // The feed rolled back under the same id: found, marked, asked from 0.
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 1), [sync_call(FEED, 0)]);
+    assert_eq!(rig.mark_row().as_deref(), Some(""));
+    // The host crashes before the read. The feed grows back past the old
+    // cursor with other records: a hold and a revoke where the release was.
+    rig.restart();
+    assert_eq!(rig.sync.closed(), Some(Closed::NoHeads));
+    let hold_2 = rig.record(FEED, ControlAction::Hold);
+    let revoke = rig.record(
+        FEED,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    let later = rig.record(FEED, ControlAction::Hold);
+    assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 0)], "from 0");
+    assert_eq!(rig.sync.closed(), Some(Closed::Reset));
+    // The read from 0, in two pages; a crash after the first.
+    rig.page(FEED, 4, &[(1, &cover), (2, &hold_2)]);
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)), "lowered");
+    assert_eq!(rig.mark_row().as_deref(), Some(FEED), "begun, not done");
+    assert!(rig.feeds.standing(BOT).held);
+    rig.restart();
+    assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 2)], "goes on");
+    assert_eq!(rig.sync.closed(), Some(Closed::Reset));
+    assert!(!rig.open(&native()));
+    rig.page(FEED, 4, &[(3, &revoke), (4, &later)]);
+    assert_eq!(rig.mark_row(), None, "cleared with the read's last page");
+    assert!(rig.feeds.standing(BOT).revoked.is_some(), "the stop read");
+    assert!(rig.open(&native()));
+}
+
+/// Ruling T33c: nothing is asked for a reset before its mark is durable; a
+/// mark that can't be written keeps the gate closed and is written again at
+/// the next step, and the read from 0 is asked then.
+#[test]
+fn a_reset_asks_nothing_before_its_mark_is_written() {
+    let mut rig = rig();
+    rig.opened();
+    rig.store
+        .db
+        .execute_batch(
+            "CREATE TRIGGER no_mark BEFORE INSERT ON control_resets
+             BEGIN SELECT RAISE(ABORT, 'no mark'); END;",
+        )
+        .unwrap();
+    rig.pass(SEC);
+    let heads = Heads {
+        feeds: vec![FeedHead {
+            origin: ORIGIN.into(),
+            feed_id: FEED.into(),
+            head: 1,
+            station_time: rig.wall(),
+        }],
+        membership: rig.log.log.head(),
+    };
+    assert_eq!(
+        rig.sync
+            .on_heads(&heads, Some((&mut rig.clock, &rig.store)), Some(&rig.feeds)),
+        Vec::new(),
+        "nothing before the mark"
+    );
+    assert!(rig.sync.persist_mark(&rig.store, &mut rig.feeds).is_err());
+    assert_eq!(rig.sync.closed(), Some(Closed::Reset));
+    assert_eq!(rig.pass(SEC), Vec::new(), "still unmarked");
+    rig.store.db.execute_batch("DROP TRIGGER no_mark;").unwrap();
+    assert_eq!(rig.pass(SEC), [sync_call(FEED, 0)]);
+    assert_eq!(rig.mark_row().as_deref(), Some(""));
 }

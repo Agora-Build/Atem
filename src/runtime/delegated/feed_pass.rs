@@ -84,6 +84,38 @@ impl HostBridge {
         self.start_view().list.clone()
     }
 
+    /// A reset the sync found and hasn't marked yet: marked in the feed
+    /// store, durably, before anything is asked for it (ruling T33c); the
+    /// read from 0 to ask then, if it may go now. A write that fails is
+    /// logged (the first, then at powers of two) and tried again at the next
+    /// step: nothing is asked meanwhile, the gate stays closed.
+    fn persist_reset_mark(&mut self, list: Option<&ListState>) -> Option<Call> {
+        let fits = loaded(&self.work, list).is_some();
+        let State {
+            feeds: Feeds::Loaded(feeds),
+            store: Some(store),
+            ..
+        } = &mut self.work
+        else {
+            return None;
+        };
+        let station = self.station.as_mut()?;
+        if !fits {
+            return None;
+        }
+        match station.feed.persist_mark(store, feeds) {
+            Ok(ask) => ask.map(Call::Sync),
+            Err(error) => {
+                if station.feed.failed() {
+                    eprintln!(
+                        "atem runtime: a control feed's reset couldn't be marked ({error:#}); nothing is asked of it until it is"
+                    );
+                }
+                None
+            }
+        }
+    }
+
     /// The pass's clocks: the gate follows them (60 s without `heads`)
     /// with no call; the start view gets the change.
     pub(crate) fn feed_advance(&mut self, now: Clocks) {
@@ -92,6 +124,8 @@ impl HostBridge {
         if let Some(station) = self.station.as_mut() {
             station.feed.advance(now, feeds);
         }
+        // The read from 0 a mark lets go is asked at the pass's tick.
+        let _ = self.persist_reset_mark(list.as_ref());
         self.publish_feed_gates();
     }
 
@@ -103,12 +137,14 @@ impl HostBridge {
         let Some(station) = self.station.as_mut() else {
             return Vec::new();
         };
-        station
+        let mut calls: Vec<Call> = station
             .feed
             .tick(now, feeds)
             .into_iter()
             .map(Call::Sync)
-            .collect()
+            .collect();
+        calls.extend(self.persist_reset_mark(list.as_ref()));
+        calls
     }
 
     /// The Station's `heads`: the sync's calls.
@@ -133,12 +169,14 @@ impl HostBridge {
         let Some(station) = self.station.as_mut() else {
             return Vec::new();
         };
-        station
+        let mut calls: Vec<Call> = station
             .feed
             .on_heads(heads, clock, feeds)
             .into_iter()
             .map(Call::Sync)
-            .collect()
+            .collect();
+        calls.extend(self.persist_reset_mark(list.as_ref()));
+        calls
     }
 
     /// A page (or a message that was one, refused by the reader): applied
@@ -173,7 +211,7 @@ impl HostBridge {
         let Some(station) = self.station.as_mut() else {
             return Vec::new();
         };
-        match station.feed.on_page(page, clock, cx) {
+        let mut calls: Vec<Call> = match station.feed.on_page(page, clock, cx) {
             Ok(synced) => synced.next.map(Call::Sync).into_iter().collect(),
             Err(error) => {
                 if station.feed.failed() {
@@ -183,7 +221,9 @@ impl HostBridge {
                 }
                 Vec::new()
             }
-        }
+        };
+        calls.extend(self.persist_reset_mark(list.as_ref()));
+        calls
     }
 
     /// The pending control records applied again when the device list the
@@ -324,10 +364,8 @@ impl HostBridge {
         // store's (records kept as evidence), how many in this run, the
         // latest.
         let (link_n, link_latest) = station.feed.alerts();
-        let (store_n, store_latest) = loaded(&self.work, list)
-            .map(FeedStore::alerts)
-            .unwrap_or((0, None));
-        let latest = match (link_latest, store_latest) {
+        let (store_n, store_latest) = self.work.alert_tally.get();
+        let latest = match (link_latest, store_latest.as_ref()) {
             (Some(a), Some(b)) => Some(if b.1 > a.1 { b } else { a }),
             (a, b) => a.or(b),
         };

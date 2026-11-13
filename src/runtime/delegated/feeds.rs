@@ -26,7 +26,11 @@
 //!   part's `order`). Any other position is refused ([`NotOwnStation`]).
 //!   One feed per origin is kept: another feed of the origin (a reset's
 //!   new one, or one a carrier minted) replaces the old one's cursor in the
-//!   transaction that reads it. Records carried over a channel
+//!   transaction that reads it. A reset the sync found is marked per origin
+//!   (`control_resets`, [`FeedStore::mark_reset`]) before anything is asked
+//!   for it, and cleared only by the commit that reads the feed from 0 up
+//!   to the announced head: a start with the mark reads the feed from 0
+//!   again (ruling T33c). Records carried over a channel
 //!   ([`FeedStore::apply_carried`]) have no position.
 //! - **Loading** ([`FeedStore::load`]) reads the parts of the host's pinned
 //!   device list ([`ControlState::from_parts`]): a part of another list (an
@@ -102,7 +106,37 @@ const TABLES: &str = "
         n INTEGER PRIMARY KEY, source TEXT NOT NULL, record TEXT NOT NULL,
         reason TEXT NOT NULL, at_ms INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS control_counts (
-        kind TEXT PRIMARY KEY, count INTEGER NOT NULL) WITHOUT ROWID;";
+        kind TEXT PRIMARY KEY, count INTEGER NOT NULL) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS control_resets (
+        origin TEXT PRIMARY KEY, restarted TEXT NOT NULL) WITHOUT ROWID;";
+
+/// A run's count of control alerts and the latest one's text with when it
+/// came, shared by whatever counts into it (`atem status`).
+#[derive(Clone, Default)]
+pub struct AlertTally(Arc<std::sync::Mutex<Tally>>);
+
+/// How many alerts, and the latest one's text with when it came.
+pub type Tally = (u64, Option<(String, std::time::Instant)>);
+
+impl AlertTally {
+    /// One alert more, `text` the latest.
+    pub fn note(&self, text: String) {
+        let mut t = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        t.0 += 1;
+        t.1 = Some((text, std::time::Instant::now()));
+    }
+
+    /// How many, and the latest.
+    pub fn get(&self) -> Tally {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
 
 /// Where the start view's standings go when what they show commits
 /// (Decision 16).
@@ -230,6 +264,9 @@ struct Mem {
     evidence: Evidence,
     /// Alerts of the transaction, raised once it committed.
     alerts: Vec<Alertable>,
+    /// The resets pending, per origin: the feed whose read from 0 began
+    /// (its cursor replaced), or `""` before it did (ruling T33c).
+    resets: BTreeMap<String, String>,
 }
 
 /// Per source: when its last line went and what came since.
@@ -334,9 +371,10 @@ pub struct FeedStore {
     list: (String, atem_client::encoding::Hash32),
     alerts: Alerts,
     /// The alerts raised in this run (their lines are hourly), and the
-    /// latest's text with when it came (`atem status`, Task 33 review m7).
-    alerts_in_run: u64,
-    last_alert: Option<(String, std::time::Instant)>,
+    /// latest's text with when it came (`atem status`, Task 33 review m7):
+    /// a tally the bridge keeps for the run, so a store loaded again (a new
+    /// identity) goes on counting (ruling T33c, N3).
+    tally: AlertTally,
     /// `runtime.log` lines not taken yet.
     lines: Vec<String>,
     publisher: Option<StandingsPublisher>,
@@ -421,7 +459,13 @@ impl FeedStore {
                 });
             }
         }
+        let resets = {
+            let mut st = db.prepare("SELECT origin, restarted FROM control_resets")?;
+            st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<BTreeMap<_, _>>>()?
+        };
         let mem = Mem {
+            resets,
             state: loaded.state,
             cursors,
             pending,
@@ -441,8 +485,7 @@ impl FeedStore {
             own: None,
             list: (list.account_id().to_string(), list.genesis_hash()),
             alerts: Alerts::default(),
-            alerts_in_run: 0,
-            last_alert: None,
+            tally: AlertTally::default(),
             lines,
             publisher: None,
             clock: Box::new(crate::session_protocol::membership::host_now),
@@ -551,6 +594,56 @@ impl FeedStore {
         self.stage(mem, out)
     }
 
+    /// A reset of the host's own Station's feed was found (ruling T33c):
+    /// marked durably, in its own transaction, before anything is asked
+    /// for it; the read from 0 hasn't begun (a mark already there is
+    /// replaced: a new reset during a read starts it again). Cleared only
+    /// by the commit that reads the feed from 0 up to the announced head
+    /// ([`FeedStore::clear_reset`]); while it is there, a start reads the
+    /// feed from 0 again (or goes on with a read that began).
+    pub fn mark_reset(&mut self, store: &Store, origin: &str) -> Result<()> {
+        if self.own.as_deref() != Some(origin) {
+            return Err(NotOwnStation.into());
+        }
+        let tx = self.begin(store)?;
+        let mut mem = self.staged.take().unwrap_or_else(|| self.mem.clone());
+        let out = mem.set_reset(&tx, origin, "");
+        self.stage(mem, out)?;
+        self.commit(tx)
+    }
+
+    /// The reset of `pos.origin` began its read from 0 of `pos.feed_id`
+    /// (its cursor replaced), in `tx`; nothing without a reset pending.
+    pub fn reset_begun(&mut self, tx: &FeedTx, pos: &FeedPos) -> Result<()> {
+        self.ours(tx)?;
+        let mut mem = self.staged.take().unwrap_or_else(|| self.mem.clone());
+        let out = if mem.resets.contains_key(&pos.origin) {
+            mem.set_reset(tx, &pos.origin, &pos.feed_id)
+        } else {
+            Ok(())
+        };
+        self.stage(mem, out)
+    }
+
+    /// The reset of `origin` is done: its feed read from 0 up to the
+    /// announced head, in `tx` (the commit that completes the read).
+    pub fn clear_reset(&mut self, tx: &FeedTx, origin: &str) -> Result<()> {
+        self.ours(tx)?;
+        let mut mem = self.staged.take().unwrap_or_else(|| self.mem.clone());
+        let out = (|| {
+            tx.execute("DELETE FROM control_resets WHERE origin=?1", [origin])?;
+            mem.resets.remove(origin);
+            Ok(())
+        })();
+        self.stage(mem, out)
+    }
+
+    /// The reset of `origin` pending, as committed: the feed whose read
+    /// from 0 began, or `""` before it did.
+    pub fn reset_pending(&self, origin: &str) -> Option<&str> {
+        self.mem.resets.get(origin).map(String::as_str)
+    }
+
     /// A record of the feed at `pos` that doesn't parse (`code`, the
     /// parse's): kept as evidence, the cursor past it, in `tx`.
     pub fn unparsed(&mut self, tx: &FeedTx, text: &str, code: &str, pos: FeedPos) -> Result<()> {
@@ -609,14 +702,10 @@ impl FeedStore {
             self.mem = mem;
             let now = (self.clock)().mono_ms;
             for alert in alerts {
-                self.alerts_in_run += 1;
-                self.last_alert = Some((
-                    format!(
-                        "a control record from {} kept as evidence ({})",
-                        alert.source.label(),
-                        alert.what
-                    ),
-                    std::time::Instant::now(),
+                self.tally.note(format!(
+                    "a control record from {} kept as evidence ({})",
+                    alert.source.label(),
+                    alert.what
                 ));
                 self.alerts.note(alert, now, &mut self.lines);
             }
@@ -757,9 +846,10 @@ impl FeedStore {
         }
     }
 
-    /// The alerts raised in this run and the latest one (its text, when).
-    pub fn alerts(&self) -> (u64, Option<&(String, std::time::Instant)>) {
-        (self.alerts_in_run, self.last_alert.as_ref())
+    /// The run's alert tally this store counts into (the bridge's: it
+    /// outlives a store loaded again).
+    pub fn set_alert_tally(&mut self, tally: AlertTally) {
+        self.tally = tally;
     }
 
     /// Records kept as evidence, ever (this list's store).
@@ -920,6 +1010,19 @@ impl Mem {
             params![pos.origin, pos.feed_id, i64::try_from(cursor)?],
         )?;
         self.cursors.insert(key, cursor);
+        Ok(())
+    }
+
+    /// `origin`'s reset mark, `restarted` the feed whose read from 0 began
+    /// (`""`: none yet).
+    fn set_reset(&mut self, tx: &Connection, origin: &str, restarted: &str) -> Result<()> {
+        tx.execute(
+            "INSERT INTO control_resets(origin,restarted) VALUES(?1,?2)
+            ON CONFLICT(origin) DO UPDATE SET restarted=excluded.restarted",
+            params![origin, restarted],
+        )?;
+        self.resets
+            .insert(origin.to_string(), restarted.to_string());
         Ok(())
     }
 

@@ -26,11 +26,16 @@
 //!   `heads`, a page, or when the feeds load). The gate stays closed until
 //!   the feed is read again from position 0, and that read's first page
 //!   replaces the origin's old cursor in its own transaction
-//!   ([`FeedStore::restart`]), only then. Only a page read to its end ends
-//!   a reset (or a refusal's, a fault's or the recovery's
-//!   resynchronization): one that applied nothing, as with no own Station
-//!   to place it at, ends none ([`Synced::read`]). A feed the host never
-//!   read is read from 0 too (no reset counted).
+//!   ([`FeedStore::restart`]), only then. A reset is marked durably in the
+//!   feed store before anything is asked for it ([`FeedSync::persist_mark`],
+//!   the bridge's step after every call), and only the commit that reads
+//!   the feed from 0 up to the announced head clears the mark: a start
+//!   finds it and reads from 0 again, or goes on with a read from 0 that
+//!   began (ruling T33c). Only a page read to its end ends a reset (or a
+//!   refusal's, a fault's or the recovery's resynchronization): one that
+//!   applied nothing, as with no own Station to place it at, ends none
+//!   ([`Synced::read`]). A feed the host never read is read from 0 too (no
+//!   reset counted, no mark).
 //! - **Only the announced feed is synced.** `control_sync` names the feed
 //!   the last `heads` announced, and a page is taken only for the call in
 //!   flight, whose `(origin, feed_id)` it must carry: positions come only
@@ -194,6 +199,17 @@ struct Announced {
     head: u64,
 }
 
+/// A reset pending (ruling T33c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reset {
+    /// The feed whose read from 0 began (its cursor replaced): it goes on
+    /// after the cursor; none before (it starts from 0).
+    begun: Option<String>,
+    /// Its mark is written (`FeedStore::mark_reset`): nothing is asked for
+    /// it before.
+    durable: bool,
+}
+
 /// The `control_sync` in flight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Ask {
@@ -273,8 +289,9 @@ pub struct FeedSync {
     /// the cap.
     clock: Option<StationTime>,
     resync: Option<Resync>,
-    /// A reset waits for the feed to be read from position 0.
-    reset: bool,
+    /// A reset waits for the feed to be read from position 0 (its durable
+    /// mark is the feed store's: ruling T33c).
+    reset: Option<Reset>,
     /// The last announcement is stale (the Station served another feed
     /// than it named): nothing is asked before the next `heads`.
     wait_heads: bool,
@@ -326,7 +343,7 @@ impl FeedSync {
             own_feeds: 0,
             clock: None,
             resync: None,
-            reset: false,
+            reset: None,
             wait_heads: false,
             synced: None,
             loaded: false,
@@ -542,6 +559,10 @@ impl FeedSync {
         if let Some((clock, store)) = clock {
             let verdict = clock.station_time(&own, page.station_time, store);
             if verdict != StationTime::Within {
+                if verdict == StationTime::Ahead && self.clock != Some(StationTime::Ahead) {
+                    // Counted as a `heads`' (ruling T33c, N3).
+                    self.note_alert("Station clock ahead of this host".into());
+                }
                 self.clock = Some(verdict);
             }
         }
@@ -571,7 +592,23 @@ impl FeedSync {
             return Ok(Synced::default());
         }
         let before = self.synced.clone();
-        let mut synced = apply_page(&page, &ask, cx.store, cx.feeds, cx.list, cx.applied_seq)?;
+        // A reset is done with the commit that reads its feed from 0 up to
+        // the announced head (the page's own, if higher).
+        let complete_at = self.reset.as_ref().map(|_| {
+            self.announced
+                .as_ref()
+                .filter(|a| a.feed_id == page.feed_id)
+                .map_or(page.head, |a| a.head.max(page.head))
+        });
+        let mut synced = apply_page(
+            &page,
+            &ask,
+            cx.store,
+            cx.feeds,
+            cx.list,
+            cx.applied_seq,
+            complete_at,
+        )?;
         self.pages += 1;
         // The page's head is the Station's word as fresh as a `heads`': the
         // gate needs that much read (never lowered: below is a reset).
@@ -588,9 +625,6 @@ impl FeedSync {
             // resynchronization) still does; asked again after the pause.
             self.stalled_at = Some(self.now);
             return Ok(synced);
-        }
-        if ask.restart {
-            self.reset = false;
         }
         self.resync = None;
         let moved = self.synced != before;
@@ -615,6 +649,35 @@ impl FeedSync {
         self.resync = Some(Resync::Refused);
         self.refused_at = Some(self.now);
         self.in_flight = None;
+    }
+
+    /// A reset found and not marked yet: its mark written in the feed
+    /// store (its own transaction), before anything is asked for it; then
+    /// the read from 0, if it may go now (ruling T33c). The bridge calls it
+    /// after every step of the sync. An error: the mark isn't written,
+    /// nothing is asked, the gate stays closed, and it is tried again at
+    /// the next step.
+    pub fn persist_mark(
+        &mut self,
+        store: &Store,
+        feeds: &mut FeedStore,
+    ) -> anyhow::Result<Option<ControlSync>> {
+        let Some(own) = self.own.clone() else {
+            return Ok(None);
+        };
+        if self.reset.as_ref().is_none_or(|r| r.durable) {
+            return Ok(None);
+        }
+        feeds.mark_reset(store, &own)?;
+        self.reset = Some(Reset {
+            begun: None,
+            durable: true,
+        });
+        // As the step that found it would have asked (a heads' pacing was
+        // never reached: nothing went before the mark). One in flight at a
+        // time, and a reset counts once until a read from 0 begins, so marks
+        // and reads stay bounded by the pages.
+        Ok(self.ask(false))
     }
 
     /// The call just asked for couldn't be handed to the link: none in
@@ -667,7 +730,7 @@ impl FeedSync {
         let Some(announced) = &self.announced else {
             return Some(Closed::NoFeed(self.own_feeds));
         };
-        if self.reset {
+        if self.reset.is_some() {
             return Some(Closed::Reset);
         }
         if self.resync == Some(Resync::Restarted) {
@@ -725,6 +788,7 @@ impl FeedSync {
             "refusals": self.refusals,
             "faults": self.faults,
             "resets": self.resets,
+            "reset": self.reset.as_ref().map(|r| json!({"begun": r.begun, "durable": r.durable})),
             "other_origin": self.other_origin,
         })
     }
@@ -740,6 +804,32 @@ impl FeedSync {
             (Some(feeds), Some(own)) => feeds.current_feed(own),
             _ => None,
         };
+        // The durable mark (ruling T33c) is what a written reset is: a
+        // start finds one found before it, a read's commits move it on and
+        // clear it. One not written yet is this sync's until it is.
+        if let (Some(feeds), Some(own)) = (feeds, self.own.clone()) {
+            let mark = feeds
+                .reset_pending(&own)
+                .map(|begun| (!begun.is_empty()).then(|| begun.to_string()));
+            match (mark, self.reset.as_mut()) {
+                (Some(begun), Some(reset)) if reset.durable => reset.begun = begun,
+                (Some(begun), None) => {
+                    self.reset = Some(Reset {
+                        begun,
+                        durable: true,
+                    });
+                    self.resets += 1;
+                    self.alert(
+                        Alert::Reset,
+                        format!(
+                            "the control feed of {own} was reset before this start; reading it again from position 0"
+                        ),
+                    );
+                }
+                (None, Some(reset)) if reset.durable => self.reset = None,
+                _ => {}
+            }
+        }
         self.check_reset();
     }
 
@@ -770,13 +860,17 @@ impl FeedSync {
         }
     }
 
-    /// A reset: the feed is read from position 0 (counted once until that
-    /// read commits).
+    /// A reset: the feed is read from position 0, once its mark is written
+    /// (counted once until that read is done; one found during the read
+    /// starts it again).
     fn note_reset(&mut self, why: &str) {
-        if self.reset {
+        if self.reset.as_ref().is_some_and(|r| r.begun.is_none()) {
             return;
         }
-        self.reset = true;
+        self.reset = Some(Reset {
+            begun: None,
+            durable: false,
+        });
         self.resets += 1;
         let origin = self.own.clone().unwrap_or_default();
         self.alert(
@@ -815,6 +909,11 @@ impl FeedSync {
         if !self.loaded || self.in_flight.is_some() {
             return None;
         }
+        // Nothing for a reset before its mark is written (ruling T33c), nor
+        // of a stale announcement before the next `heads`.
+        if self.reset.as_ref().is_some_and(|r| !r.durable) || self.wait_heads {
+            return None;
+        }
         if let Some(at) = self.refused_at {
             if self.now < at.saturating_add(REFUSAL_BACKOFF_MS) {
                 return None;
@@ -827,7 +926,7 @@ impl FeedSync {
             .filter(|(feed_id, _)| *feed_id == announced.feed_id)
             .map(|(_, cursor)| *cursor);
         let behind = read.is_none_or(|cursor| cursor < announced.head);
-        if !(behind || self.reset || self.resync.is_some()) {
+        if !(behind || self.reset.is_some() || self.resync.is_some()) {
             return None;
         }
         if paced {
@@ -838,7 +937,11 @@ impl FeedSync {
             }
             self.paced_at = Some(self.now);
         }
-        let restart = self.reset || read.is_none();
+        // From 0 unless the reset's read from 0 began on this very feed.
+        let restart = match &self.reset {
+            Some(reset) => reset.begun.as_deref() != Some(announced.feed_id.as_str()),
+            None => read.is_none(),
+        };
         let after = if restart { 0 } else { read.unwrap_or(0) };
         self.in_flight = Some(Ask {
             feed_id: announced.feed_id.clone(),
@@ -931,6 +1034,7 @@ fn apply_page(
     feeds: &mut FeedStore,
     list: &ListState,
     applied_seq: u64,
+    complete_at: Option<u64>,
 ) -> anyhow::Result<Synced> {
     let pos = |feeds: &FeedStore, seq: u64| feeds.position(&page.feed_id, seq);
     // No position can be formed (the store has no own Station's origin):
@@ -943,8 +1047,11 @@ fn apply_page(
         let Some(start) = pos(feeds, 0) else {
             return Ok(Synced::default());
         };
-        feeds.restart(&tx, start)?;
+        feeds.restart(&tx, start.clone())?;
+        feeds.reset_begun(&tx, &start)?;
     }
+    // How far the feed is read with this page.
+    let mut reached = if ask.restart { 0 } else { ask.after };
     let mut applied = Vec::new();
     let mut reapplied = Vec::new();
     let mut stopped = false;
@@ -953,6 +1060,7 @@ fn apply_page(
             stopped = true;
             break;
         };
+        reached = entry.feed_seq;
         match entry.parse_record() {
             Err(e) => feeds.unparsed(&tx, &entry.raw().to_string(), e.code(), at)?,
             Ok(record) => match feeds.apply(&tx, &record, list, at.clone(), applied_seq) {
@@ -967,6 +1075,7 @@ fn apply_page(
                     }
                 }
                 Err(e) if e.is::<ListNotServing>() || e.is::<NotOwnStation>() => {
+                    // Not consumed: the read reached the record before.
                     stopped = true;
                     break;
                 }
@@ -976,9 +1085,20 @@ fn apply_page(
     }
     if !stopped && page.records.iter().all(|e| e.feed_seq <= ask.after) {
         match pos(feeds, page.head.max(ask.after)) {
-            Some(head) => feeds.advance(&tx, head)?,
+            Some(head) => {
+                reached = page.head.max(ask.after);
+                feeds.advance(&tx, head)?;
+            }
             None => stopped = true,
         }
+    }
+    // The reset is done with this commit when its read reached the
+    // announced head (ruling T33c).
+    if !stopped
+        && complete_at.is_some_and(|head| reached >= head)
+        && let Some(origin) = feeds.position(&page.feed_id, 0).map(|p| p.origin)
+    {
+        feeds.clear_reset(&tx, &origin)?;
     }
     feeds.commit(tx)?;
     Ok(Synced {

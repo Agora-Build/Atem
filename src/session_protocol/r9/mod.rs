@@ -2382,28 +2382,42 @@ impl R9Host {
     /// (host-work-v1 §11.4) goes to the Station link, as received
     /// ([`R9Host::take_station_messages`]).
     pub fn relay_message(&mut self, text: &str) {
-        // The `op` alone, peeked with no whole-value parse: a Station page
-        // that isn't strict JSON elsewhere (a lone surrogate) still reaches
-        // the Station link, whose strict reader refuses it as a Station
-        // fault (host-work-v1 §11.4; Task 30 review 5).
-        #[derive(serde::Deserialize)]
-        struct Peek {
-            op: Option<String>,
-        }
-        // One that peek can't read (a duplicate `op` key, a page cut short):
-        // its top-level names, scanned (`peek`, Task 33 review m2).
-        let station = match serde_json::from_str::<Peek>(text) {
-            Ok(Peek { op }) => op.as_deref().is_some_and(is_station_message),
-            Err(_) => peek::relay_op(text, is_station_message),
-        };
-        if station {
-            // At most the App's relay messages of a pass (`RELAY_LIMIT`).
-            self.station_inbox.push(text.to_owned());
-            return;
+        // With `host.delegated` on, the `op` alone is peeked with no
+        // whole-value parse: a Station page that isn't strict JSON elsewhere
+        // (a lone surrogate) still reaches the Station link, whose strict
+        // reader refuses it as a Station fault (host-work-v1 §11.4; Task 30
+        // review 5); one the peek can't read (a duplicate `op` key, a page
+        // cut short) by its top-level names, scanned (`peek`, Task 33 review
+        // m2). With it off (as on main, and in every release build: ruling
+        // T33c, N1) a relay message is read exactly as main reads it: a
+        // whole-value parse, its last `op` winning.
+        if self.delegated {
+            #[derive(serde::Deserialize)]
+            struct Peek {
+                op: Option<String>,
+            }
+            let station = match serde_json::from_str::<Peek>(text) {
+                Ok(Peek { op }) => op.as_deref().is_some_and(is_station_message),
+                Err(_) => peek::relay_op(text, is_station_message),
+            };
+            if station {
+                // At most the App's relay messages of a pass (`RELAY_LIMIT`).
+                self.station_inbox.push(text.to_owned());
+                return;
+            }
         }
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             return;
         };
+        if value
+            .get("op")
+            .and_then(Value::as_str)
+            .is_some_and(is_station_message)
+        {
+            // At most the App's relay messages of a pass (`RELAY_LIMIT`).
+            self.station_inbox.push(text.to_owned());
+            return;
+        }
         let matched = self.push.ack(&value);
         if matched == 0 && value.get("op").and_then(Value::as_str) == Some("push_ack") {
             self.input_log.log(self.last_mono, || {

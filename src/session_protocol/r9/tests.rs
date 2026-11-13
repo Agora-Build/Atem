@@ -3712,6 +3712,7 @@ fn a_stations_messages_go_to_the_station_link() {
 fn a_station_page_that_isnt_strict_still_reaches_the_station_link() {
     let mut rig = Rig::new();
     rig.link_up();
+    rig.engine.set_delegated_features(true, false);
     let pages = [
         r#"{"type":"relay","op":"control_sync_result","feed_id":"\ud800","records":[]}"#,
         r#"{"type":"relay","op":"control_sync_result","head":0.5}"#,
@@ -3732,4 +3733,34 @@ fn a_station_page_that_isnt_strict_still_reaches_the_station_link() {
     rig.engine.relay_message(&deep);
     rig.engine.relay_message(twice);
     assert_eq!(rig.engine.take_station_messages(), [deep.as_str(), twice]);
+}
+
+/// Ruling T33c, N1: with `host.delegated` off (as on main, and in every
+/// release build) relay messages are read exactly as main reads them: a
+/// whole-value parse, the last `op` winning. A `push_ack` with a duplicate
+/// `op` still reaches the push engine (here it acknowledges nothing, which
+/// main logs), and a Station page no parse takes (a lone surrogate) is
+/// dropped, not routed. With it on, both go to the Station link.
+#[test]
+fn with_the_hook_off_relay_messages_are_read_as_main_reads_them() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    let twice = r#"{"type":"relay","op":"heads","op":"push_ack","acks":[]}"#;
+    let surrogate = r#"{"type":"relay","op":"control_sync_result","feed_id":"\ud800"}"#;
+    let before = rig.engine.input_lines_written();
+    rig.engine.relay_message(twice);
+    rig.engine.relay_message(surrogate);
+    assert_eq!(
+        rig.engine.input_lines_written(),
+        before + 1,
+        "the push engine's line"
+    );
+    assert!(rig.engine.take_station_messages().is_empty());
+    rig.engine.set_delegated_features(true, false);
+    rig.advance(10_000);
+    let before = rig.engine.input_lines_written();
+    rig.engine.relay_message(twice);
+    rig.engine.relay_message(surrogate);
+    assert_eq!(rig.engine.input_lines_written(), before);
+    assert_eq!(rig.engine.take_station_messages(), [twice, surrogate]);
 }

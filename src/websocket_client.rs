@@ -97,6 +97,15 @@ pub(crate) fn session_family(text: &str) -> Option<&'static str> {
 /// A relay message for Atem (`{"type":"relay",…}`, atem-session-v1.md
 /// §R9.9: the relay's `push_ack`), from its `type`.
 pub(crate) fn is_relay_message(text: &str) -> bool {
+    is_relay_message_with(
+        text,
+        crate::runtime::test_hooks::host_features().delegated,
+    )
+}
+
+/// [`is_relay_message`] with `host.delegated` on or off (the debug-only
+/// hook; off in every release build).
+fn is_relay_message_with(text: &str, delegated: bool) -> bool {
     #[derive(Deserialize)]
     struct Peek {
         #[serde(rename = "type")]
@@ -105,14 +114,18 @@ pub(crate) fn is_relay_message(text: &str) -> bool {
     match serde_json::from_str::<Peek>(text) {
         Ok(peek) => peek.kind.is_some_and(|kind| kind == "relay"),
         // One the peek can't read (a duplicate key, a message cut short) is
-        // a relay message only when its top-level names say it is a
-        // Station's to this host: it goes to the Station link, whose strict
-        // reader answers it as a Station fault (host-work-v1 §11.4; Task 33
-        // review m2). Any other stays dropped, as before.
-        Err(_) => crate::session_protocol::r9::peek::relay_op(
-            text,
-            crate::session_protocol::r9::is_station_message,
-        ),
+        // a relay message only with `host.delegated` on, and only when its
+        // top-level names say it is a Station's to this host: it goes to
+        // the Station link, whose strict reader answers it as a Station
+        // fault (host-work-v1 §11.4; Task 33 review m2). Otherwise, and with
+        // the hook off (as on main: ruling T33c, N1), it is dropped unread.
+        Err(_) => {
+            delegated
+                && crate::session_protocol::r9::peek::relay_op(
+                    text,
+                    crate::session_protocol::r9::is_station_message,
+                )
+        }
     }
 }
 
@@ -2813,17 +2826,22 @@ mod tests {
             "]".repeat(300)
         );
         assert!(is_relay_message(&deep));
-        // A Station page cut short (or with a duplicate key) still goes to
-        // the Station link; another relay message that doesn't read doesn't.
-        assert!(is_relay_message(
-            r#"{"type":"relay","op":"control_sync_result","records":[{"#
-        ));
-        assert!(is_relay_message(
-            r#"{"type":"relay","type":"relay","op":"heads","feeds":[]}"#
-        ));
-        assert!(!is_relay_message(
-            r#"{"type":"relay","type":"relay","op":"push_ack","acks":[]}"#
-        ));
+        // With `host.delegated` on, a Station page cut short (or with a
+        // duplicate key) still goes to the Station link; another relay
+        // message that doesn't read doesn't. With it off (as on main, and in
+        // every release build: ruling T33c, N1) neither does: dropped
+        // unread, as main drops them, taking no relay slot.
+        let cut = r#"{"type":"relay","op":"control_sync_result","records":[{"#;
+        let twice = r#"{"type":"relay","type":"relay","op":"heads","feeds":[]}"#;
+        let ack = r#"{"type":"relay","type":"relay","op":"push_ack","acks":[]}"#;
+        assert!(is_relay_message_with(cut, true));
+        assert!(is_relay_message_with(twice, true));
+        assert!(!is_relay_message_with(ack, true));
+        for text in [cut, twice, ack] {
+            assert!(!is_relay_message_with(text, false), "{text}");
+        }
+        assert!(!crate::runtime::test_hooks::host_features().delegated);
+        assert!(!is_relay_message(cut), "the hook off in tests");
         assert!(!is_relay_message(&format!(r#"{{"type":"session","x":{}1{}}}"#, "[".repeat(300), "]".repeat(300))));
         assert_eq!(session_family(r#"{"type":"relay","op":"push_ack"}"#), None);
     }

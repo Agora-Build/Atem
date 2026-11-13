@@ -2011,10 +2011,14 @@ only its own Station's feed (step 4's Decision 14):
   `heads`, at a page, or when the feeds load after a `heads`: the feed is
   read again from position 0 (`after: 0`, the same `feed_id` too after a
   rollback), and that read's first page replaces the origin's old cursor
-  in its own transaction, only then (it may lower it). A reset ends only
-  when that read is applied to its end: a page that applied nothing (no
-  own Station to place it at) or stopped part way ends no reset and no
-  resynchronization. A feed the host never read is read from 0 the same
+  in its own transaction, only then (it may lower it). A reset is marked
+  durably, per origin, before anything is asked for it, and the mark is
+  cleared only by the commit that reads the feed from 0 up to the
+  announced head: a host restarted in between reads the feed from 0 again
+  (or goes on with a read from 0 that began), its gate closed until done,
+  so records between a rolled-back head and the old cursor are never
+  skipped. A page that applied nothing (no own Station to place it at) or
+  stopped part way ends no reset and no resynchronization. A feed the host never read is read from 0 the same
   way. A page's `head` above the last announced one raises the
   announcement (the gate needs that much read), never lowers it.
 - **Pages.** A page with no record after the cursor reads the feed up to
@@ -2030,7 +2034,8 @@ only its own Station's feed (step 4's Decision 14):
 - **What stays dropped unread** (**Atem's reading, for Astation**): a
   frame over 256 KiB (dropped and counted at the link, as every relay
   message), and a frame whose top-level `type` and `op` can't be read at
-  all (not a JSON object, or broken before its `op`): nothing tells it is
+  all (not a JSON object, or broken before its `type` or its `op`):
+  nothing tells it is
   the Station's, so it is dropped before any reader, as a broken frame of
   every family on the link is, with no fault alert. Either way the call it
   answered is asked again after 30 seconds unanswered, and the gate stays

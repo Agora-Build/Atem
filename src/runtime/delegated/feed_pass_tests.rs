@@ -364,6 +364,10 @@ fn the_control_feeds_status_line() {
             )),
             "{line}"
         );
+        // The feeds loaded again (ruling T33c, N3): the run's count stays.
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        rig.bridge.ensure_feeds();
+        assert_eq!(rig.bridge.feeds_status().unwrap(), line);
         // The Station announces another entry at the list's head `seq`.
         let fork = atem_client::membership::Head {
             seq: head.seq,
@@ -532,5 +536,26 @@ fn feeds_of_another_list_than_the_committed_one_take_no_page() {
                 .gates
                 .open_for(&native, Some(ORIGIN))
         );
+    });
+}
+
+/// Ruling T33c: the durable reset mark comes with the feeds' tables, so a
+/// host with the hook off (as main) has no such table, and no row.
+#[test]
+fn the_reset_mark_is_no_table_with_the_hook_off() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        assert!(!rig.bridge.features.delegated);
+        passes(&mut rig, 3);
+        let store = rig.bridge.work.store.as_ref().expect("hosting on");
+        let tables: u32 = store
+            .db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name LIKE 'control%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
     });
 }
