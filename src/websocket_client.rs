@@ -561,6 +561,9 @@ pub struct SystemStatus {
 /// queues hold the rest (§R9.7a "Bounds").
 const CHANNEL_INFLIGHT_BYTES: usize = 8 << 20;
 
+/// The next socket's process-wide id ([`AstationClient::socket_id`]).
+static NEXT_SOCKET_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct AstationClient {
     sender: Option<mpsc::UnboundedSender<OutboundMessage>>,
     /// Bytes of channel envelopes queued on `sender` and not yet written.
@@ -577,6 +580,9 @@ pub struct AstationClient {
     /// Counts the sockets this client opened (`connect_raw`): a link
     /// generation's channels live on one socket only (§R9.7a).
     socket_gen: u64,
+    /// The socket this client opened last, named across the process
+    /// ([`NEXT_SOCKET_ID`]; 0: none yet).
+    socket_id: u64,
     connected_astation_id: Option<String>,
     /// The newest challenge answered on this socket, as (astation_id,
     /// challenge): a repeat of it is spent and is not answered again.
@@ -748,6 +754,7 @@ impl AstationClient {
             local_token_path_override: None,
             ws_closed: false,
             socket_gen: 0,
+            socket_id: 0,
             connected_astation_id: None,
             answered_challenge: None,
             held_encryption: Vec::new(),
@@ -1379,6 +1386,7 @@ impl AstationClient {
         self.transport_tasks = vec![writer_task, reader_task];
         self.ws_closed = false;
         self.socket_gen += 1;
+        self.socket_id = NEXT_SOCKET_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         Ok(())
     }
@@ -1386,6 +1394,16 @@ impl AstationClient {
     /// The socket the client uses now (a new one after every reconnect).
     pub fn socket_gen(&self) -> u64 {
         self.socket_gen
+    }
+
+    /// The socket the client uses now, named across the process: no other
+    /// socket any client of this process opened has it (0: none opened).
+    /// Unlike [`AstationClient::socket_gen`], which counts one client's
+    /// sockets and starts again in each new client (every reconnect makes
+    /// one), it tells two links' sockets apart (host-work-v1 §11.4: an
+    /// answer owed on a socket can only come on it).
+    pub fn socket_id(&self) -> u64 {
+        self.socket_id
     }
 
     /// Authenticate with Astation after WebSocket connection.
@@ -3112,6 +3130,43 @@ mod tests {
         assert!(matches!(&got[1], AstationMessage::SessionOversize { id: None, family } if family == "session"), "{got:?}");
         assert!(matches!(&got[2], AstationMessage::Channel(t) if t.contains("\"h2\"")), "{got:?}");
         assert_eq!(got.len(), 3, "nothing else was delivered: {got:?}");
+        server.abort();
+    }
+
+    /// host-work-v1 §11.4 ("Matching a page to its call"): every socket any
+    /// client of the process opens has its own id, while `socket_gen`
+    /// counts one client's sockets and starts again in each new client (a
+    /// reconnect makes a new client).
+    #[tokio::test]
+    async fn every_socket_has_its_own_id() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut open = Vec::new();
+            for _ in 0..3 {
+                let (socket, _) = listener.accept().await.unwrap();
+                open.push(
+                    tokio_tungstenite::accept_async_with_config(
+                        socket,
+                        Some(super::link_ws_config()),
+                    )
+                    .await
+                    .unwrap(),
+                );
+            }
+            std::future::pending::<()>().await;
+        });
+        let url = format!("ws://{address}");
+        let mut a = AstationClient::new();
+        assert_eq!(a.socket_id(), 0, "none opened");
+        a.connect_raw(&url).await.unwrap();
+        let mut b = AstationClient::new();
+        b.connect_raw(&url).await.unwrap();
+        assert_eq!(a.socket_gen(), b.socket_gen(), "each client counts its own");
+        assert_ne!(a.socket_id(), b.socket_id());
+        let first = a.socket_id();
+        a.connect_raw(&url).await.unwrap();
+        assert!(a.socket_id() != first && a.socket_id() != b.socket_id());
         server.abort();
     }
 

@@ -130,8 +130,10 @@ impl HostBridge {
         self.publish_feed_gates();
     }
 
-    /// The sync's calls due at the pass (a timeout, a feed that needs a
-    /// page while a recent `heads` announced it).
+    /// The sync's calls due at the pass, after its messages (a feed that
+    /// needs a page while a recent `heads` announced it, a reset's read from
+    /// 0 its mark lets go), and a call in flight timed out (nothing is asked
+    /// for it: rulings T33d, T33e).
     pub(crate) fn feed_tick(&mut self, now: Clocks) -> Vec<Call> {
         let list = self.sync_list();
         let feeds = loaded(&self.work, list.as_ref());

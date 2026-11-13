@@ -9,8 +9,11 @@
 //! it), Astation's local `:8080` (which proxies the calls to the Station),
 //! or a routed relay link with no Astation (§R9.7b). Its Station is the
 //! selected Station ([`StationLink::origin`]). A new link generation starts
-//! afresh: nothing in flight carries over, and a refusal's backoff ends; the
-//! fetch's pacing carries over ([`DeviceListFetch::next_generation`]).
+//! afresh: the fetch in flight doesn't carry over, and a refusal's backoff
+//! ends; the fetch's pacing carries over
+//! ([`DeviceListFetch::next_generation`]), and so does a `control_sync`
+//! whose answer is still owed on the same socket ([`StationLink::socket`],
+//! [`FeedSync::on_link`]: ruling T33e).
 //!
 //! Here: the device list's fetch ([`super::fetch`]) and its part of the
 //! revocation gate ([`Station::list_fetch`]), the sync of the host's own
@@ -62,6 +65,12 @@ impl LinkKind {
 pub struct StationLink {
     /// The link generation (the App's `astation_link_gen`).
     pub link_gen: u64,
+    /// The socket it runs on (`AstationClient::socket_id`): a new link
+    /// generation on the same socket (Astation re-authenticating it, a
+    /// routed link's upgrade) still gets the answers to calls sent before
+    /// it, a new socket never does (host-work-v1 §11.4, "Matching a page to
+    /// its call").
+    pub socket: u64,
     pub kind: LinkKind,
     /// The selected Station's origin (`station_route::destination`,
     /// normalized by `normalize_relay`), whatever the link: Astation's
@@ -146,13 +155,14 @@ impl Station {
     }
 
     /// The link as the App has it now (`link_gen`: the r9 link generation, none
-    /// while it is down): a new generation starts afresh (the fetch's pacing
-    /// kept), its kind and origin taken then; the kind is followed within a
-    /// generation (a routed link Astation authenticates becomes a relay
-    /// link).
+    /// while it is down; `socket`: the socket it runs on): a new generation
+    /// starts afresh (the fetch's pacing kept), its kind and origin taken
+    /// then; the kind is followed within a generation (a routed link
+    /// Astation authenticates becomes a relay link).
     pub fn sync_link(
         &mut self,
         link_gen: Option<u64>,
+        socket: u64,
         kind: impl FnOnce() -> LinkKind,
         origin: impl FnOnce() -> Option<String>,
     ) {
@@ -164,10 +174,11 @@ impl Station {
             return;
         };
         match self.link.as_mut() {
-            Some(link) if link.link_gen == link_gen => link.kind = kind(),
+            Some(link) if link.link_gen == link_gen && link.socket == socket => link.kind = kind(),
             _ => {
                 self.link = Some(StationLink {
                     link_gen,
+                    socket,
                     kind: kind(),
                     origin: origin(),
                 });
@@ -354,6 +365,7 @@ mod tests {
     fn up(station: &mut Station, link_gen: u64) {
         station.sync_link(
             Some(link_gen),
+            1,
             || LinkKind::Routed,
             || Some("https://s.test".into()),
         );
@@ -370,13 +382,13 @@ mod tests {
             fetched(s.receive(&heads(5), Some(head(3)), None)),
             Some(MembershipFetch { after: 3 })
         );
-        s.sync_link(Some(1), || LinkKind::Relay, || panic!("not asked again"));
+        s.sync_link(Some(1), 1, || LinkKind::Relay, || panic!("not asked again"));
         assert_eq!(s.link().unwrap().kind, LinkKind::Relay);
         assert_eq!(s.dump()["fetch"]["in_flight"], 3, "the same generation");
         up(&mut s, 2);
         assert_eq!(s.dump()["fetch"]["in_flight"], Value::Null);
         assert_eq!(s.link().unwrap().origin.as_deref(), Some("https://s.test"));
-        s.sync_link(None, || LinkKind::Relay, || None);
+        s.sync_link(None, 0, || LinkKind::Relay, || None);
         assert!(s.link().is_none());
     }
 
@@ -468,7 +480,7 @@ mod tests {
         s.tick(10_000 + STALL_PAUSE_MS, Some(head(3)), None);
         assert_eq!(fetched(s.receive(&heads(5), Some(head(3)), None)), fetch(3));
         // Down and up again at once: nothing in flight, the pace kept.
-        s.sync_link(None, || LinkKind::Relay, || None);
+        s.sync_link(None, 0, || LinkKind::Relay, || None);
         up(&mut s, 3);
         assert_eq!(s.dump()["fetch"]["in_flight"], Value::Null);
         assert_eq!(fetched(s.receive(&heads(5), Some(head(3)), None)), None);

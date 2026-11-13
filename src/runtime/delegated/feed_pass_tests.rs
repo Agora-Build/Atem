@@ -33,7 +33,7 @@ fn fed_host(rig: &mut LocalRig, root: &Path, os: &ManualOs) -> Senders {
         feeds.publish();
     }
     let mut station = Station::new();
-    station.sync_link(Some(1), || LinkKind::Routed, || Some(ORIGIN.to_string()));
+    station.sync_link(Some(1), 1, || LinkKind::Routed, || Some(ORIGIN.to_string()));
     rig.bridge.station = Some(station);
     rig.bridge.ensure_feeds();
     rig.bridge.sync_list_view();
@@ -103,15 +103,7 @@ fn bridge_page(
     records: &[(u64, &atem_client::control::ControlRecord)],
 ) -> Vec<crate::runtime::delegated::station::Call> {
     use crate::runtime::delegated::station::Inbound;
-    use atem_client::control::{ControlSyncResult, FeedEntry};
-    let page = ControlSyncResult {
-        origin: ORIGIN.into(),
-        feed_id: OWN_FEED.into(),
-        head,
-        station_time: host_now().wall_ms,
-        records: records.iter().map(|(n, r)| FeedEntry::new(*n, r)).collect(),
-    };
-    let text = page.to_json().unwrap().to_string();
+    let text = page_text(head, records);
     let inbound = rig
         .bridge
         .station
@@ -125,6 +117,20 @@ fn bridge_page(
     rig.bridge.feeds_reverify();
     rig.bridge.publish_feed_gates();
     calls
+}
+
+/// A page of the own feed (`records`: positions and records) at `head`, as
+/// the Station sends it.
+fn page_text(head: u64, records: &[(u64, &atem_client::control::ControlRecord)]) -> String {
+    use atem_client::control::{ControlSyncResult, FeedEntry};
+    let page = ControlSyncResult {
+        origin: ORIGIN.into(),
+        feed_id: OWN_FEED.into(),
+        head,
+        station_time: host_now().wall_ms,
+        records: records.iter().map(|(n, r)| FeedEntry::new(*n, r)).collect(),
+    };
+    page.to_json().unwrap().to_string()
 }
 
 /// A record of `service` in the own feed, signed with its key.
@@ -476,13 +482,13 @@ fn a_reset_read_during_a_pause_lowers_the_cursor_before_the_gate_opens() {
         assert!(open(&rig));
         // The link drops in an unpaused pass.
         let station = rig.bridge.station.as_mut().unwrap();
-        station.sync_link(None, || LinkKind::Routed, || None);
+        station.sync_link(None, 0, || LinkKind::Routed, || None);
         rig.bridge.ensure_feeds();
         rig.bridge.feed_advance(clocks_after(2_000));
         // Hosting pauses; the link comes back (what each pass does with it).
         rig.bridge.work.config_problem = Some("paused by the test".into());
         let station = rig.bridge.station.as_mut().unwrap();
-        station.sync_link(Some(2), || LinkKind::Routed, || Some(ORIGIN.to_string()));
+        station.sync_link(Some(2), 2, || LinkKind::Routed, || Some(ORIGIN.to_string()));
         rig.bridge.feed_advance(clocks_after(4_000));
         // The Station rolled its feed back to position 1.
         bridge_heads(&mut rig, 1, head);
@@ -540,13 +546,24 @@ fn feeds_of_another_list_than_the_committed_one_take_no_page() {
 }
 
 /// Ruling T33c: the durable reset mark comes with the feeds' tables, so a
-/// host with the hook off (as main) has no such table, and no row.
+/// host with the hook off (as main) has no such table, and no row; nor any
+/// Station link, sync or status line, and the pass's Station step does
+/// nothing with a Station's messages (ruling T33e: hook off = main).
 #[test]
 fn the_reset_mark_is_no_table_with_the_hook_off() {
     local_test(async |root| {
         let mut rig = LocalRig::new(root).await;
         assert!(!rig.bridge.features.delegated);
         passes(&mut rig, 3);
+        assert!(rig.bridge.station.is_none());
+        let page = page_text(1, &[]);
+        let mut cx = Cx {
+            client: &rig.app.astation_client,
+            sessions: &mut rig.sessions,
+        };
+        rig.bridge.station_pass(vec![page], &mut cx);
+        assert!(rig.bridge.station.is_none());
+        assert_eq!(rig.bridge.feeds_status(), None);
         let store = rig.bridge.work.store.as_ref().expect("hosting on");
         let tables: u32 = store
             .db
@@ -621,5 +638,68 @@ fn the_read_a_mark_lets_go_is_asked_at_the_pass() {
         rig.bridge.ensure_feeds();
         rig.bridge.feed_advance(clocks_after(4_100));
         assert_eq!(rig.bridge.feed_tick(clocks_after(4_100)), [from_0]);
+    });
+}
+
+/// Task 33 re-review 3, m1 (ruling T33e): the pass takes the Station's
+/// messages before the sync's tick, so a page that came before the 30 s
+/// deadline but is handled at the first pass after it answers its call:
+/// applied, with no timeout and no alert, and the gate open.
+#[test]
+fn a_page_handled_after_the_deadline_is_taken_before_the_tick() {
+    use crate::runtime::delegated::sync::SYNC_TIMEOUT_MS;
+    use atem_client::control::ControlAction;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        let head = s.log.log.head();
+        assert_eq!(bridge_heads(&mut rig, 1, head).len(), 1, "asked");
+        let alerts = rig.bridge.station.as_ref().unwrap().feed.alerts().0;
+        let cover = own_record(&s.log, "svc-bot", ControlAction::Cover, 1);
+        let page = page_text(1, &[(1, &cover)]);
+        // The page came just before the deadline; the pass that handles it
+        // runs just after: its first step, then the Station's messages and
+        // the sync's tick.
+        let late = clocks_after(SYNC_TIMEOUT_MS + 1);
+        rig.bridge.feed_advance(late);
+        let mut cx = Cx {
+            client: &rig.app.astation_client,
+            sessions: &mut rig.sessions,
+        };
+        rig.bridge.station_pass_at(vec![page], late, &mut cx);
+        let feed = &rig.bridge.station.as_ref().unwrap().feed;
+        assert_eq!(feed.dump()["timeouts"], 0, "{}", feed.dump());
+        assert_eq!(feed.dump()["pages"], 1, "{}", feed.dump());
+        assert_eq!(feed.alerts().0, alerts, "no Station-fault alert");
+        assert_eq!(feed.closed(), None);
+        let coverage = rig.bridge.start_view().standings[BOT].coverage.clone();
+        assert_eq!(coverage.map(|c| c.feed_id).as_deref(), Some(OWN_FEED));
+    });
+}
+
+/// Ruling T33e: once the sync stopped for an unanswered call, `atem
+/// status`'s `Control feeds:` line says so and names the way out, `atem
+/// runtime restart`.
+#[test]
+fn an_unanswered_sync_names_the_way_out_in_the_status_line() {
+    use crate::runtime::delegated::sync::{SYNC_TIMEOUT_MS, UNANSWERED};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        assert_eq!(bridge_heads(&mut rig, 1, s.log.log.head()).len(), 1);
+        let late = clocks_after(SYNC_TIMEOUT_MS + 1);
+        rig.bridge.feed_advance(late);
+        assert_eq!(rig.bridge.feed_tick(late), []);
+        let line = rig.bridge.feeds_status().unwrap();
+        assert!(
+            line.starts_with(&format!("revocations not yet checked ({UNANSWERED}); ")),
+            "{line}"
+        );
+        assert!(
+            line.contains("run `atem runtime restart` to reconnect now"),
+            "{line}"
+        );
     });
 }

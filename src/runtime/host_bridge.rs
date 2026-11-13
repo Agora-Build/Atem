@@ -68,6 +68,7 @@ use super::delegated::start::{DelegatedStart, StartView};
 use super::delegated::station::{
     Call as StationCall, Inbound as StationInbound, LinkKind, Station,
 };
+use super::delegated::sync::Clocks;
 use super::project_scope::{AgentHasher, ProjectHasher, ProjectScopes};
 use super::refusal_log::{self, RefusalLog, Request};
 use super::worker_approvals::Event as ApprovalEvent;
@@ -1501,6 +1502,7 @@ impl HostBridge {
         let link_gen = self.r9_link;
         self.station.get_or_insert_with(Station::new).sync_link(
             link_gen,
+            app.astation_client.socket_id(),
             || station_link_kind(app),
             || app.astation_client.selected_station_origin(),
         );
@@ -1531,26 +1533,36 @@ impl HostBridge {
             .map(|d| d.seq)
     }
 
-    /// The Station's messages of this pass, as received (none while
-    /// `host.delegated` is off: dropped), and the host's calls: the device
-    /// list's fetch (design I.5.8, session-v1 R9.3). A fetch result is
-    /// applied as any carriage, with no more trust than any carrier: the
-    /// list's own verification (`carry`), then the r9 engine's effects
-    /// (`R9Host::carried`: fences, push recipients, `membership_head`).
-    /// Calls go on the link's control queue, as the relay's push messages.
+    /// The Station's messages of this pass, as received, and the host's
+    /// calls ([`Self::station_pass_at`], at the pass's clocks). Nothing while
+    /// `host.delegated` is off (no Station: the messages are dropped, and no
+    /// clock is read).
     fn station_pass(&mut self, messages: Vec<String>, cx: &mut Cx) {
+        if self.station.is_none() {
+            return;
+        }
+        self.station_pass_at(messages, host_work_bridge::sync_clocks(), cx);
+    }
+
+    /// The Station's messages of this pass, as received, at the pass's
+    /// clocks `now`, and the host's calls: the device list's fetch (design
+    /// I.5.8, session-v1 R9.3) and the feed sync's (its tick after the
+    /// messages). A fetch result is applied as any carriage, with no more
+    /// trust than any carrier: the list's own verification (`carry`), then
+    /// the r9 engine's effects (`R9Host::carried`: fences, push recipients,
+    /// `membership_head`). Calls go on the link's control queue, as the
+    /// relay's push messages.
+    fn station_pass_at(&mut self, messages: Vec<String>, now: Clocks, cx: &mut Cx) {
         let applied = self.membership.as_ref().map(MembershipHost::head);
         let deferred = self.list_deferral();
-        let now = host_now().mono_ms;
         let Some(station) = self.station.as_mut() else {
             return;
         };
         let mut calls: Vec<StationCall> = station
-            .tick(now, applied, deferred)
+            .tick(now.mono_ms, applied, deferred)
             .into_iter()
             .map(StationCall::Fetch)
             .collect();
-        calls.extend(self.feed_tick(host_work_bridge::sync_clocks()));
         for text in messages {
             let applied = self.membership.as_ref().map(MembershipHost::head);
             let deferred = self.list_deferral();
@@ -1615,6 +1627,10 @@ impl HostBridge {
                 }
             }
         }
+        // The feed sync's tick after the pass's messages: a page that came
+        // before its call's 30 s deadline answers it first, never dropped
+        // as late (Task 33 re-review 3, m1).
+        calls.extend(self.feed_tick(now));
         // The device list may have moved (a carriage): pending control
         // records are applied again.
         self.feeds_reverify();
