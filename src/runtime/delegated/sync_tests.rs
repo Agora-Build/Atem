@@ -412,6 +412,33 @@ impl Rig {
         self.feeds.current_feed(ORIGIN)
     }
 
+    /// The call asked last, as sent.
+    fn last(&self) -> ControlSync {
+        self.asked.last().expect("a call asked").clone()
+    }
+
+    /// The page answering `call` (its id and `after`, on the feed it
+    /// named), holding `records`, handed to the sync.
+    fn answer(
+        &mut self,
+        call: &ControlSync,
+        head: u64,
+        records: &[(u64, &ControlRecord)],
+    ) -> Synced {
+        let feed_id = call.feed_id.clone().expect("a named feed");
+        let records = records
+            .iter()
+            .map(|(seq, r)| (*seq, FeedEntry::new(*seq, r).raw().clone()))
+            .collect();
+        let page = self.page_for(call, &feed_id, head, records);
+        self.on_page(page)
+    }
+
+    /// Pages drained so far: answers to retired calls.
+    fn drained(&self) -> u64 {
+        self.sync.dump()["drained"].as_u64().unwrap()
+    }
+
     fn d_ms(&self) -> u64 {
         self.clock.reading().unwrap().d_ms
     }
@@ -755,11 +782,11 @@ fn each_refusal_advances_no_cursor_head_floor_or_ack_and_opens_no_gate() {
     }
 }
 
-/// §11.4 (Atem's reading): a refusal names a call kind, never a request.
-/// It ends the host's own wait (the sync in flight is dropped), and is
-/// never an answer: not an empty page (the cursor doesn't move to the
-/// head), and the page that answers the earlier call, arriving after it,
-/// is one nobody asked for: nothing of it applies.
+/// §11.4 (Atem's reading; ruling C1b-a): a refusal names a call kind,
+/// never a request. It retires the live sync call, and is never an answer:
+/// not an empty page (the cursor doesn't move to the head), and the page
+/// that answers the retired call, arriving after it, is drained: nothing
+/// of it applies.
 #[test]
 fn a_refusal_correlates_no_request() {
     let mut rig = rig();
@@ -771,11 +798,12 @@ fn a_refusal_correlates_no_request() {
     assert_eq!(rig.sync.dump()["in_flight"], Value::Null, "the wait ended");
     assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)), "no empty page");
     // The page that answers the earlier call.
-    let synced = rig.page(FEED, 3, &[(3, &release)]);
+    let a = rig.last();
+    let synced = rig.answer(&a, 3, &[(3, &release)]);
     assert!(synced.applied.is_empty());
     assert!(rig.feeds.standing(BOT).held, "nothing applied");
     assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
-    assert_eq!(rig.sync.dump()["unasked"], 1);
+    assert_eq!(rig.drained(), 1, "its id retired: drained");
     assert_eq!(rig.sync.closed(), Some(Closed::Refused));
 }
 
@@ -845,8 +873,8 @@ fn the_native_gate_is_the_own_stations() {
 
 /// The pacing (as the fetch's, Task 30 I1): one call in flight; the calls a
 /// `heads` starts at most one a second, none for 30 s after a page that
-/// moved nothing. (One unanswered for 30 s is never asked again: see
-/// `an_unanswered_sync_waits_for_its_answer_or_a_new_socket`.)
+/// moved nothing. (One unanswered for 30 s is retired and asked again: see
+/// `an_unanswered_sync_is_retired_and_asked_again_with_a_fresh_id`.)
 #[test]
 fn syncs_are_paced_like_the_fetch() {
     let mut rig = rig();
@@ -878,35 +906,6 @@ fn a_page_stops_while_the_list_doesnt_serve() {
     assert!(synced.applied.is_empty());
     assert_eq!(rig.cursor(), None);
     assert!(!rig.open(&native()));
-}
-
-/// §11.4's open question (the fake Station's `StaleFeed::ServeCurrent`): a
-/// page of another feed than the one asked applies nothing and reads as a
-/// reset; the next `heads` announcing the new feed reads it from 0.
-#[test]
-fn a_page_of_another_feed_than_asked_applies_nothing() {
-    let mut rig = rig();
-    rig.opened();
-    rig.pass(SEC);
-    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
-    let cover = rig.record(FEED_2, ControlAction::Cover);
-    // The call's id, the new feed from 0.
-    let live = rig.sync.live_call().unwrap();
-    let page = rig.page_for(
-        &ControlSync { after: 0, ..live },
-        FEED_2,
-        1,
-        vec![(1, cover.object().to_json())],
-    );
-    let synced = rig.on_page(page);
-    assert!(synced.applied.is_empty());
-    assert_eq!(rig.sync.closed(), Some(Closed::Reset));
-    assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
-    rig.pass(STALL_PAUSE_MS);
-    assert_eq!(rig.heads(FEED_2, 1), [sync_call(FEED_2, 0)]);
-    rig.page(FEED_2, 1, &[(1, &cover)]);
-    assert!(rig.open(&native()));
-    assert_eq!(rig.cursor(), Some((FEED_2.to_string(), 1)));
 }
 
 /// §11.4's open question, the other answer (the fake Station's
@@ -1088,8 +1087,9 @@ fn an_unrecorded_station_time_closes_the_gate() {
     assert!(rig.open(&native()));
 }
 
-/// Task 33 review m5: a page that names another origin than the host's own
-/// Station's is a Station fault (nothing applies, the gate closes); a page
+/// Task 33 review m5, ruling C1b-a: a page with the live call's id that
+/// names another origin than the call's (the host's own Station's) doesn't
+/// answer it: a Station fault (nothing applies, the gate closes); a page
 /// that arrives while the feeds aren't loaded applies nothing, and the
 /// feed is asked again once they are.
 #[test]
@@ -1107,7 +1107,7 @@ fn a_page_of_another_origin_or_without_the_feeds_applies_nothing() {
     let synced = rig.on_page(Ok(page));
     assert!(synced.applied.is_empty());
     assert!(rig.feeds.standing(BOT).held);
-    assert_eq!(rig.sync.closed(), Some(Closed::Fault("another_origin")));
+    assert_eq!(rig.sync.closed(), Some(Closed::Fault(MISMATCHED_ORIGIN)));
     assert_eq!(rig.sync.take_lines().len(), 1);
     // Asked again after the pause; its page comes while the feeds aren't
     // loaded.
@@ -1266,293 +1266,6 @@ fn a_continuation_in_flight_never_ends_a_reset() {
     assert!(rig.open(&native()));
 }
 
-/// Ruling T33d, T33e (matching after a timeout): a page carries no echo of
-/// its call, so after a `control_sync` unanswered for 30 s nothing more is
-/// asked on its socket (a re-send could bring two answers): the gate stays
-/// closed, the Station-fault alert goes, and `atem status` names the way
-/// out. A new link generation on the same socket still waits for that
-/// answer; only a new socket, where it can't come, syncs afresh, its gate
-/// opening only after a full read.
-#[test]
-fn an_unanswered_sync_waits_for_its_answer_or_a_new_socket() {
-    let mut rig = rig();
-    rig.opened();
-    rig.sync.take_lines();
-    let release = rig.record(FEED, ControlAction::Release);
-    rig.pass(SEC);
-    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
-    assert_eq!(rig.pass(SYNC_TIMEOUT_MS - 1), Vec::new());
-    assert_eq!(rig.pass(1), Vec::new(), "no re-ask");
-    assert_eq!(rig.sync.closed(), Some(Closed::Unanswered));
-    assert!(
-        Closed::Unanswered.text().contains("`atem runtime restart`"),
-        "{}",
-        Closed::Unanswered.text()
-    );
-    assert!(!rig.open(&native()));
-    let lines = rig.sync.take_lines();
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    assert!(lines[0].contains("unanswered"), "{}", lines[0]);
-    assert_eq!(rig.heads(FEED, 3), Vec::new());
-    assert_eq!(rig.pass(STALL_PAUSE_MS), Vec::new());
-    // A new link generation on the same socket: still waiting.
-    rig.sync.on_link(Some(&link(2, ORIGIN)));
-    rig.pass(SEC);
-    assert_eq!(rig.heads(FEED, 3), Vec::new(), "the same socket");
-    assert_eq!(rig.sync.closed(), Some(Closed::Unanswered));
-    assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
-    // A new socket: synced again, open only once read.
-    rig.sync.on_link(Some(&link_on(3, 2, ORIGIN)));
-    rig.pass(SEC);
-    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
-    assert!(!rig.open(&native()));
-    rig.page(FEED, 3, &[(3, &release)]);
-    assert!(!rig.feeds.standing(BOT).held);
-    assert!(rig.open(&native()));
-}
-
-/// Ruling T33e: after a timeout nothing is asked again on its socket, so a
-/// late page there can only be the timed-out call's: it is taken as that
-/// call's answer (its own `after`), and the sync resumes, on the same link
-/// generation or on a later one on the same socket.
-#[test]
-fn a_late_answer_on_the_same_socket_resumes_the_sync() {
-    let mut rig = rig();
-    rig.opened();
-    let release = rig.record(FEED, ControlAction::Release);
-    let hold = rig.record(FEED, ControlAction::Hold);
-    rig.pass(SEC);
-    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
-    assert_eq!(rig.pass(SYNC_TIMEOUT_MS), Vec::new());
-    assert_eq!(rig.sync.closed(), Some(Closed::Unanswered));
-    assert_eq!(rig.heads(FEED, 3), Vec::new(), "nothing asked again");
-    // The late answer: the timed-out call's.
-    let synced = rig.page(FEED, 3, &[(3, &release)]);
-    assert_eq!(synced.applied.len(), 1);
-    assert!(!rig.feeds.standing(BOT).held);
-    assert_eq!(rig.sync.closed(), None);
-    assert!(rig.open(&native()));
-    // Again, with a new link generation on the same socket in between: the
-    // call still owed there, its late answer resumes the sync.
-    rig.pass(SEC);
-    assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 3)]);
-    assert_eq!(rig.pass(SYNC_TIMEOUT_MS), Vec::new());
-    rig.sync.on_link(Some(&link(2, ORIGIN)));
-    rig.pass(SEC);
-    assert_eq!(rig.heads(FEED, 4), Vec::new());
-    assert_eq!(rig.sync.closed(), Some(Closed::Unanswered));
-    let synced = rig.page(FEED, 4, &[(4, &hold)]);
-    assert_eq!(synced.applied.len(), 1);
-    assert!(rig.feeds.standing(BOT).held);
-    assert!(rig.open(&native()));
-    // And on: the next call goes as usual.
-    let release_2 = rig.record(FEED, ControlAction::Release);
-    rig.pass(SEC);
-    assert_eq!(rig.heads(FEED, 5), [sync_call(FEED, 4)]);
-    rig.page(FEED, 5, &[(5, &release_2)]);
-    assert!(rig.open(&native()));
-}
-
-/// Ruling T33e (b): a new socket drops the owed call (its answer can't
-/// come on it), and a page arriving on it is matched only to a call asked
-/// on it: one before any is unasked and applies nothing. While the link is
-/// down the owed call isn't timed (its socket may come back); back on the
-/// same socket its 30 s are judged at once, and the sync waits for its
-/// answer or a new socket.
-#[test]
-fn a_new_socket_drops_the_owed_call() {
-    let mut rig = rig();
-    rig.opened();
-    let release = rig.record(FEED, ControlAction::Release);
-    rig.pass(SEC);
-    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
-    // The link down (a re-authentication over the open socket) past 30 s.
-    rig.sync.on_link(None);
-    rig.sync.take_lines();
-    assert_eq!(rig.pass(SYNC_TIMEOUT_MS), Vec::new());
-    assert_eq!(rig.sync.closed(), Some(Closed::NoLink));
-    assert!(rig.sync.take_lines().is_empty(), "not timed while down");
-    // Back on the same socket: still owed, and unanswered past 30 s.
-    rig.sync.on_link(Some(&link(2, ORIGIN)));
-    assert_eq!(rig.pass(SEC), Vec::new());
-    assert_eq!(rig.sync.closed(), Some(Closed::Unanswered));
-    assert_eq!(rig.sync.take_lines().len(), 1);
-    assert_eq!(rig.heads(FEED, 3), Vec::new());
-    // A new socket: the owed call dropped.
-    rig.sync.on_link(None);
-    rig.sync.on_link(Some(&link_on(3, 2, ORIGIN)));
-    assert_eq!(rig.sync.closed(), Some(Closed::NoHeads));
-    // A page before any call on it: unasked, nothing applied.
-    let synced = rig.page(FEED, 3, &[(3, &release)]);
-    assert!(synced.applied.is_empty());
-    assert!(rig.feeds.standing(BOT).held);
-    assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
-    // Its own call, answered.
-    rig.pass(SEC);
-    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
-    rig.page(FEED, 3, &[(3, &release)]);
-    assert!(!rig.feeds.standing(BOT).held);
-    assert!(rig.open(&native()));
-}
-
-/// Ruling T33e (a): a page carries "the records after `after`" (§11.4), so
-/// one holding a record at or below its call's `after` contradicts its
-/// call: a Station fault. Nothing of it applies (not even its records past
-/// `after`), the cursor stays, the gate stays closed and the Station-fault
-/// alert goes; it is asked again after the pause, and a page that reads
-/// opens the gate.
-#[test]
-fn a_page_with_a_record_at_or_below_its_after_is_a_station_fault() {
-    let mut rig = rig();
-    let (_, hold) = rig.opened();
-    rig.sync.take_lines();
-    let release = rig.record(FEED, ControlAction::Release);
-    let revoke = rig.record(
-        FEED,
-        ControlAction::Revoke {
-            interrupt_running: false,
-        },
-    );
-    rig.pass(SEC);
-    assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 2)]);
-    // Another call's page (its own `after` 1; one holding a record at or
-    // below its own `after` doesn't read at all, wire rule 11): only a
-    // record at 2, it would read as "no record after the cursor".
-    let other = |rig: &Rig| ControlSync {
-        after: 1,
-        ..rig.sync.live_call().unwrap()
-    };
-    let page = rig.page_for(&other(&rig), FEED, 4, vec![(2, hold.object().to_json())]);
-    let synced = rig.on_page(page);
-    assert!(synced.applied.is_empty() && synced.next.is_none());
-    assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
-    assert_eq!(rig.sync.closed(), Some(Closed::Fault(CONTRADICTS_CALL)));
-    assert!(!rig.open(&native()));
-    let lines = rig.sync.take_lines();
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    assert!(lines[0].contains("contradicts its call"), "{}", lines[0]);
-    // Asked again after the pause: records at and after 2, a fault too.
-    assert_eq!(rig.pass(STALL_PAUSE_MS), [sync_call(FEED, 2)]);
-    let records = [(2, &hold), (3, &release), (4, &revoke)]
-        .iter()
-        .map(|(n, r)| (*n, r.object().to_json()))
-        .collect();
-    let page = rig.page_for(&other(&rig), FEED, 4, records);
-    let synced = rig.on_page(page);
-    assert!(synced.applied.is_empty());
-    assert!(rig.feeds.standing(BOT).held, "the release not applied");
-    assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
-    assert!(!rig.open(&native()));
-    // The page as asked: read, the gate open.
-    rig.pass(STALL_PAUSE_MS);
-    assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 2)]);
-    rig.page(FEED, 4, &[(3, &release), (4, &revoke)]);
-    assert!(rig.feeds.standing(BOT).revoked.is_some());
-    assert!(rig.open(&native()));
-}
-
-/// Task 33 re-review 3, R3-1, probe F (ruling T33e (b)): a new link
-/// generation on the same socket (Astation re-authenticating it, a routed
-/// link's upgrade) keeps the owed call, since the Station still answers it
-/// on that socket: the new generation asks nothing until its answer comes,
-/// taken with its own `after`. Before, with truncated pages, the old call's
-/// page was taken for a new call and the new call's for the continuation,
-/// and a revoke was read past. A page taken for a call it contradicts (the
-/// same page again) is a Station fault (a), and the revoke is read next.
-#[test]
-fn a_new_generation_on_the_same_socket_keeps_the_owed_call() {
-    let mut rig = rig();
-    rig.opened();
-    let r3 = rig.record(FEED, ControlAction::Release);
-    let r4 = rig.record(FEED, ControlAction::Hold);
-    let revoke = rig.record(
-        FEED,
-        ControlAction::Revoke {
-            interrupt_running: false,
-        },
-    );
-    let r6 = rig.record(FEED, ControlAction::Release);
-    rig.pass(SEC);
-    assert_eq!(rig.heads(FEED, 6), [sync_call(FEED, 2)], "A");
-    let a_call = rig.asked.last().unwrap().clone();
-    // A new generation on the same socket: A's answer still owed on it.
-    rig.sync.on_link(Some(&link(2, ORIGIN)));
-    rig.pass(SEC);
-    assert_eq!(rig.heads(FEED, 6), Vec::new(), "A owed: nothing asked");
-    assert!(!rig.open(&native()));
-    // A's page, truncated at 4: A's answer; C asked at once.
-    let a = rig.page(FEED, 6, &[(3, &r3), (4, &r4)]);
-    assert_eq!(a.applied.len(), 2);
-    assert_eq!(a.next, Some(sync_call(FEED, 4)), "C");
-    // The same page again (A's), taken for C: it contradicts C, a fault.
-    rig.sync.take_lines();
-    let records = [(3, &r3), (4, &r4)]
-        .iter()
-        .map(|(n, r)| (*n, r.object().to_json()))
-        .collect();
-    let page = rig.page_for(&a_call, FEED, 6, records);
-    let stale = rig.on_page(page);
-    assert!(stale.applied.is_empty());
-    assert_eq!(rig.cursor(), Some((FEED.to_string(), 4)));
-    assert_eq!(rig.sync.closed(), Some(Closed::Fault(CONTRADICTS_CALL)));
-    assert_eq!(rig.sync.take_lines().len(), 1);
-    assert!(rig.feeds.standing(BOT).revoked.is_none());
-    assert!(!rig.open(&native()));
-    // Asked again after the pause: the revoke read, then the gate opens.
-    assert_eq!(rig.pass(STALL_PAUSE_MS), [sync_call(FEED, 4)]);
-    rig.page(FEED, 6, &[(5, &revoke), (6, &r6)]);
-    assert!(rig.feeds.standing(BOT).revoked.is_some());
-    assert_eq!(rig.cursor(), Some((FEED.to_string(), 6)));
-    assert!(rig.open(&native()));
-}
-
-/// Task 33 re-review 3, R3-1, probe G (ruling T33e (b)): the same with a
-/// rollback under the same `feed_id` found on the new generation. The owed
-/// continuation keeps its own `after` and kind, so its page (the feed
-/// regrown) applies as the continuation it is and ends no reset: the read
-/// from 0 is asked once it is answered, and only that read ends the reset.
-#[test]
-fn an_owed_continuation_never_ends_a_reset_found_on_the_next_generation() {
-    let mut rig = rig();
-    let cover = rig.record(FEED, ControlAction::Cover);
-    let hold = rig.record(FEED, ControlAction::Hold);
-    let release = rig.record(FEED, ControlAction::Release);
-    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 0)]);
-    rig.page(FEED, 3, &[(1, &cover), (2, &hold), (3, &release)]);
-    rig.pass(SEC);
-    assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 3)], "A");
-    rig.sync.on_link(Some(&link(2, ORIGIN)));
-    rig.pass(SEC);
-    // The rollback on the new generation: marked, nothing asked (A owed).
-    assert_eq!(rig.heads(FEED, 1), Vec::new());
-    assert_eq!(rig.mark_row().as_deref(), Some(""));
-    assert_eq!(rig.sync.closed(), Some(Closed::Reset));
-    // A's answer, the feed regrown to 5: the continuation it is.
-    let x = rig.record(FEED, ControlAction::Hold);
-    let y = rig.record(FEED, ControlAction::Release);
-    let synced = rig.page(FEED, 5, &[(4, &x), (5, &y)]);
-    assert_eq!(synced.applied.len(), 2);
-    assert_eq!(rig.mark_row().as_deref(), Some(""), "the mark stays");
-    assert_eq!(rig.sync.closed(), Some(Closed::Reset));
-    assert!(!rig.open(&native()));
-    assert_eq!(synced.next, Some(sync_call(FEED, 0)), "the read from 0");
-    // The read from 0 finds a revoke below the old cursor.
-    let revoke = rig.record(
-        FEED,
-        ControlAction::Revoke {
-            interrupt_running: false,
-        },
-    );
-    rig.page(
-        FEED,
-        5,
-        &[(1, &cover), (2, &revoke), (3, &release), (4, &x), (5, &y)],
-    );
-    assert!(rig.feeds.standing(BOT).revoked.is_some());
-    assert_eq!(rig.mark_row(), None);
-    assert!(rig.open(&native()));
-}
-
 /// Ruling T33d ("any other page that could be taken for the read from 0"):
 /// a refusal of another call than `control_sync` doesn't answer the sync in
 /// flight, so the call stays in flight (its answer would otherwise come
@@ -1610,4 +1323,737 @@ fn the_restart_keeps_a_call_in_flight_and_its_page_ends_nothing() {
     assert_eq!(synced.next, Some(sync_call(FEED, 3)));
     rig.page(FEED, 3, &[]);
     assert!(rig.open(&native()));
+}
+
+// ------------------------------------------------------- correlation (C1b)
+
+/// Ruling C1b-a (wire rule 11; Astation's "same-cursor retries"): a call
+/// unanswered for 30 s is retired by its id, and a new one, with a fresh
+/// id, goes at once at the same cursor. The retired call's late page is
+/// drained (counted, never applied, no Station fault: bytes written before
+/// the retry may still come); only the live id's page applies, whichever
+/// of the two arrives first.
+#[test]
+fn a_same_cursor_retry_applies_only_the_live_ids_page() {
+    for live_first in [false, true] {
+        let mut rig = rig();
+        rig.opened();
+        let release = rig.record(FEED, ControlAction::Release);
+        rig.pass(SEC);
+        assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+        let a = rig.last();
+        assert_eq!(
+            rig.pass(SYNC_TIMEOUT_MS),
+            [sync_call(FEED, 2)],
+            "retried at once"
+        );
+        let b = rig.last();
+        assert_ne!(a.request_id, b.request_id);
+        assert_eq!(rig.sync.closed(), Some(Closed::Unanswered));
+        let faults = rig.sync.dump()["faults"].clone();
+        if live_first {
+            rig.answer(&b, 3, &[(3, &release)]);
+            assert!(!rig.feeds.standing(BOT).held);
+            assert!(rig.open(&native()));
+        }
+        // A's late page: drained.
+        let synced = rig.answer(&a, 3, &[(3, &release)]);
+        assert!(synced.applied.is_empty() && synced.next.is_none());
+        assert_eq!(rig.drained(), 1);
+        assert_eq!(rig.sync.dump()["faults"], faults, "no Station fault");
+        if !live_first {
+            assert!(rig.feeds.standing(BOT).held, "nothing applied");
+            assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
+            assert!(!rig.open(&native()));
+            assert_eq!(
+                rig.sync.live_call().map(|c| c.request_id),
+                Some(b.request_id.clone()),
+                "B still live"
+            );
+            rig.answer(&b, 3, &[(3, &release)]);
+            assert!(!rig.feeds.standing(BOT).held);
+        }
+        assert!(rig.open(&native()), "live first: {live_first}");
+        assert_eq!(rig.cursor(), Some((FEED.to_string(), 3)));
+    }
+}
+
+/// Ruling C1b-a (Astation: a call gets its result within 30 s, or the
+/// Station fences the link): a call unanswered for 30 s is retired, an
+/// hourly Station-fault alert goes, `atem status` says so (with no way out
+/// to name: the sync goes on by itself), and the same pass asks again,
+/// with a fresh id, under the pacing. A later timeout retires its call too
+/// (no second line within the hour); the live call's page opens the gate.
+#[test]
+fn an_unanswered_sync_is_retired_and_asked_again_with_a_fresh_id() {
+    let mut rig = rig();
+    rig.opened();
+    rig.sync.take_lines();
+    let release = rig.record(FEED, ControlAction::Release);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    assert_eq!(rig.pass(SYNC_TIMEOUT_MS - 1), Vec::new());
+    assert_eq!(
+        rig.sync.closed(),
+        Some(Closed::Behind {
+            cursor: Some(2),
+            head: 3
+        })
+    );
+    assert_eq!(rig.pass(1), [sync_call(FEED, 2)], "retired, asked again");
+    assert_eq!(rig.sync.closed(), Some(Closed::Unanswered));
+    assert_eq!(Closed::Unanswered.text(), UNANSWERED);
+    assert!(!UNANSWERED.contains("atem runtime restart"), "{UNANSWERED}");
+    assert!(!rig.open(&native()));
+    let lines = rig.sync.take_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("unanswered"), "{}", lines[0]);
+    assert_eq!(rig.sync.dump()["timeouts"], 1);
+    // Unanswered again (a heads keeps the window): retired, asked again;
+    // the alert counted, no second line within the hour.
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), Vec::new(), "one live call");
+    assert_eq!(rig.pass(SYNC_TIMEOUT_MS), [sync_call(FEED, 2)]);
+    assert!(rig.sync.take_lines().is_empty());
+    assert_eq!(rig.sync.dump()["timeouts"], 2);
+    // The live call's page: read, open.
+    let live = rig.last();
+    rig.answer(&live, 3, &[(3, &release)]);
+    assert_eq!(rig.sync.closed(), None);
+    assert!(rig.open(&native()));
+}
+
+/// Ruling C1b-a (Astation's "reordered old replies"): the pages of retired
+/// calls, in any order (here the newer retired call's first), are drained;
+/// only the live call's applies.
+#[test]
+fn reordered_old_replies_are_drained() {
+    let mut rig = rig();
+    rig.opened();
+    let release = rig.record(FEED, ControlAction::Release);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    let a = rig.last();
+    // A new generation on the same socket retires A; its heads asks B.
+    rig.sync.on_link(Some(&link(2, ORIGIN)));
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    let b = rig.last();
+    // B unanswered for 30 s: retired, C asked.
+    assert_eq!(rig.pass(SYNC_TIMEOUT_MS), [sync_call(FEED, 2)]);
+    let c = rig.last();
+    // B's page, then A's: drained.
+    for old in [&b, &a] {
+        let synced = rig.answer(old, 3, &[(3, &release)]);
+        assert!(synced.applied.is_empty());
+    }
+    assert_eq!(rig.drained(), 2);
+    assert_eq!(rig.sync.dump()["faults"], 0);
+    assert!(rig.feeds.standing(BOT).held);
+    assert!(!rig.open(&native()));
+    // C's page applies.
+    rig.answer(&c, 3, &[(3, &release)]);
+    assert!(!rig.feeds.standing(BOT).held);
+    assert!(rig.open(&native()));
+}
+
+/// Ruling C1b-a, probe F (Astation's "same-socket re-authentication and
+/// routed upgrade"): a new link generation on the same socket retires the
+/// call in flight (the Station cancels the old generation's jobs, and
+/// bytes written before that may still come: their retired id is
+/// drained). The new generation asks with a fresh id at its `heads`, and
+/// its gate opens only after a full read. With truncated pages the old
+/// call's page is never taken for a new call's, so a revoke is never read
+/// past.
+#[test]
+fn a_new_generation_on_the_same_socket_retires_the_call_and_asks_afresh() {
+    let mut rig = rig();
+    rig.opened();
+    let r3 = rig.record(FEED, ControlAction::Release);
+    let r4 = rig.record(FEED, ControlAction::Hold);
+    let revoke = rig.record(
+        FEED,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    let r6 = rig.record(FEED, ControlAction::Release);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 6), [sync_call(FEED, 2)], "A");
+    let a = rig.last();
+    rig.sync.on_link(Some(&link(2, ORIGIN)));
+    assert_eq!(rig.sync.live_call(), None, "A retired");
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 6), [sync_call(FEED, 2)], "B, a fresh id");
+    let b = rig.last();
+    assert_ne!(a.request_id, b.request_id);
+    // A's page (truncated at 4): drained.
+    let synced = rig.answer(&a, 6, &[(3, &r3), (4, &r4)]);
+    assert!(synced.applied.is_empty());
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
+    // B's page, truncated at 4: applied, C asked at once; not open yet.
+    let synced = rig.answer(&b, 6, &[(3, &r3), (4, &r4)]);
+    assert_eq!(synced.applied.len(), 2);
+    assert_eq!(synced.next, Some(sync_call(FEED, 4)), "C");
+    let c = rig.last();
+    assert!(!rig.open(&native()), "open only after a full read");
+    // A's page again: drained; the revoke isn't read past.
+    let synced = rig.answer(&a, 6, &[(3, &r3), (4, &r4)]);
+    assert!(synced.applied.is_empty());
+    assert_eq!(rig.drained(), 2);
+    assert_eq!(rig.sync.dump()["faults"], 0);
+    assert!(rig.feeds.standing(BOT).revoked.is_none());
+    // C's page: the revoke read; open.
+    rig.answer(&c, 6, &[(5, &revoke), (6, &r6)]);
+    assert!(rig.feeds.standing(BOT).revoked.is_some());
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 6)));
+    assert!(rig.open(&native()));
+}
+
+/// Ruling C1b-a, probe G: the same with a rollback under the same
+/// `feed_id` found on the new generation. The old continuation's page (the
+/// feed regrown past it) is drained, never taken as a continuation: the
+/// new generation reads the feed from 0 at once (its mark written), and
+/// only that read ends the reset.
+#[test]
+fn a_reset_on_the_next_generation_never_takes_the_old_continuations_page() {
+    let mut rig = rig();
+    let cover = rig.record(FEED, ControlAction::Cover);
+    let hold = rig.record(FEED, ControlAction::Hold);
+    let release = rig.record(FEED, ControlAction::Release);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 0)]);
+    rig.page(FEED, 3, &[(1, &cover), (2, &hold), (3, &release)]);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 3)], "A");
+    let a = rig.last();
+    rig.sync.on_link(Some(&link(2, ORIGIN)));
+    rig.pass(SEC);
+    // The rollback on the new generation: marked, read from 0 at once.
+    assert_eq!(rig.heads(FEED, 1), [sync_call(FEED, 0)], "B");
+    let b = rig.last();
+    assert_eq!(rig.mark_row().as_deref(), Some(""));
+    assert_eq!(rig.sync.closed(), Some(Closed::Reset));
+    // A's page, the feed regrown to 5: drained.
+    let x = rig.record(FEED, ControlAction::Hold);
+    let y = rig.record(FEED, ControlAction::Release);
+    let synced = rig.answer(&a, 5, &[(4, &x), (5, &y)]);
+    assert!(synced.applied.is_empty());
+    assert_eq!(rig.mark_row().as_deref(), Some(""));
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 3)));
+    assert!(!rig.open(&native()));
+    // B's page: the read from 0 finds a revoke below the old cursor.
+    let revoke = rig.record(
+        FEED,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    rig.answer(
+        &b,
+        5,
+        &[(1, &cover), (2, &revoke), (3, &release), (4, &x), (5, &y)],
+    );
+    assert!(rig.feeds.standing(BOT).revoked.is_some());
+    assert_eq!(rig.mark_row(), None);
+    assert!(rig.open(&native()));
+}
+
+/// Ruling C1b-a (Astation's "a reset between call and result"): the feed
+/// goes back under the same id while a continuation is in flight, and the
+/// call's own answer says so: its `head` below its echoed `after`, with no
+/// record (the reader refuses one). A reset: its mark is written durably,
+/// the cursor never moves on that page, and the read from 0 goes at once;
+/// only that read ends the reset. The same when a `heads` announced the
+/// rollback between the call and its answer.
+#[test]
+fn an_answer_whose_head_is_below_its_after_is_a_reset() {
+    for heads_between in [false, true] {
+        let mut rig = rig();
+        let cover = rig.record(FEED, ControlAction::Cover);
+        let hold = rig.record(FEED, ControlAction::Hold);
+        let release = rig.record(FEED, ControlAction::Release);
+        assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 0)]);
+        rig.page(FEED, 3, &[(1, &cover), (2, &hold), (3, &release)]);
+        rig.pass(SEC);
+        assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 3)]);
+        let a = rig.last();
+        if heads_between {
+            rig.pass(SEC);
+            assert_eq!(rig.heads(FEED, 1), Vec::new(), "A live");
+            assert_eq!(rig.mark_row().as_deref(), Some(""));
+        }
+        assert_eq!(
+            rig.page_for(&a, FEED, 1, vec![(1, cover.object().to_json())]),
+            Err(RelayError::Malformed("feed_seq")),
+            "no record with a head below after"
+        );
+        let synced = rig.answer(&a, 1, &[]);
+        assert!(synced.applied.is_empty());
+        assert_eq!(synced.next, Some(sync_call(FEED, 0)), "the read from 0");
+        assert_eq!(rig.mark_row().as_deref(), Some(""));
+        assert_eq!(
+            rig.cursor(),
+            Some((FEED.to_string(), 3)),
+            "never moved on it"
+        );
+        assert_eq!(rig.sync.closed(), Some(Closed::Reset));
+        let b = rig.last();
+        let synced = rig.answer(&b, 1, &[(1, &cover)]);
+        assert_eq!(rig.cursor(), Some((FEED.to_string(), 1)));
+        if !heads_between {
+            // The announced target (4) is kept, never lowered by a page:
+            // the read goes on toward it, and its mark stays until a
+            // `heads` announces the rolled-back head and the feed is read
+            // to it.
+            assert_eq!(synced.next, Some(sync_call(FEED, 1)));
+            let c = rig.last();
+            rig.answer(&c, 1, &[]);
+            assert_eq!(rig.mark_row().as_deref(), Some(FEED), "begun");
+            assert_eq!(rig.sync.closed(), Some(Closed::Reset));
+            assert!(!rig.open(&native()));
+            rig.pass(SEC);
+            assert_eq!(rig.heads(FEED, 1), Vec::new(), "the pause");
+            assert_eq!(rig.pass(STALL_PAUSE_MS), [sync_call(FEED, 1)]);
+            let d = rig.last();
+            rig.answer(&d, 1, &[]);
+        }
+        assert_eq!(rig.mark_row(), None);
+        assert!(rig.open(&native()), "heads between: {heads_between}");
+    }
+}
+
+/// Ruling C1b-a (Astation's "mismatched echoes"): a page carrying the live
+/// call's id that doesn't answer it (`ControlSyncResult::answers`: another
+/// origin, feed or `after`) is a Station fault: nothing of it applies (its
+/// records, head and time), the gate stays closed and the alert goes. The
+/// call is retired (its id answered: a second page with it is drained) and
+/// asked again after the pause, with a fresh id. (Another id: see
+/// `an_unknown_id_is_an_unsolicited_station_fault` and the drained pages.)
+#[test]
+fn a_page_with_the_live_id_and_another_echo_is_a_station_fault() {
+    for (field, code) in [
+        ("origin", MISMATCHED_ORIGIN),
+        ("feed_id", MISMATCHED_FEED),
+        ("after", MISMATCHED_AFTER),
+    ] {
+        let mut rig = rig();
+        rig.opened();
+        rig.sync.take_lines();
+        let release = rig.record(FEED, ControlAction::Release);
+        rig.pass(SEC);
+        assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+        let a = rig.last();
+        let d = rig.d_ms();
+        let mut page = rig
+            .page_for(&a, FEED, 3, vec![(3, release.object().to_json())])
+            .unwrap();
+        match field {
+            "origin" => page.origin = OTHER.into(),
+            "feed_id" => page.feed_id = FEED_2.into(),
+            _ => page.after = 1,
+        }
+        assert_eq!(page.answers(&a).map_err(|m| m.code()), Err(field));
+        // Within the cap, ahead: it would raise the floor if it counted.
+        page.station_time = rig.wall() + 5 * MIN;
+        let synced = rig.on_page(Ok(page));
+        assert!(synced.applied.is_empty(), "{field}");
+        assert!(rig.feeds.standing(BOT).held, "{field}");
+        assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)), "{field}");
+        assert!(rig.d_ms() < d + 2 * SEC, "{field}: the time didn't count");
+        assert_eq!(rig.sync.closed(), Some(Closed::Fault(code)), "{field}");
+        assert!(!rig.open(&native()));
+        let lines = rig.sync.take_lines();
+        assert_eq!(lines.len(), 1, "{field}: {lines:?}");
+        assert!(lines[0].contains("doesn't answer its call"), "{}", lines[0]);
+        assert_eq!(rig.sync.live_call(), None, "{field}: retired");
+        // A second page with its id: drained.
+        assert!(rig.answer(&a, 3, &[(3, &release)]).applied.is_empty());
+        assert_eq!(rig.drained(), 1, "{field}");
+        assert!(rig.feeds.standing(BOT).held, "{field}");
+        // Asked again after the pause, with a fresh id: open with its page.
+        assert_eq!(rig.pass(SEC), Vec::new(), "{field}: the pause");
+        assert_eq!(rig.pass(STALL_PAUSE_MS), [sync_call(FEED, 2)], "{field}");
+        let b = rig.last();
+        assert_ne!(b.request_id, a.request_id);
+        rig.answer(&b, 3, &[(3, &release)]);
+        assert!(rig.open(&native()), "{field}");
+    }
+}
+
+/// Ruling C1b-a: a page whose `request_id` the host never sent is
+/// unsolicited: a Station fault (an hourly alert; nothing applied; the
+/// gate closes, or stays closed). The live call stays live: its own page
+/// still applies, but only a page asked after the fault ends it.
+#[test]
+fn an_unknown_id_is_an_unsolicited_station_fault() {
+    let mut rig = rig();
+    rig.opened();
+    rig.sync.take_lines();
+    let release = rig.record(FEED, ControlAction::Release);
+    let stranger = |rig: &mut Rig| ControlSync {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        ..rig.last()
+    };
+    // The gate open, nothing asked: closed by it.
+    let unsolicited = stranger(&mut rig);
+    let synced = rig.answer(&unsolicited, 3, &[(3, &release)]);
+    assert!(synced.applied.is_empty());
+    assert!(rig.feeds.standing(BOT).held);
+    assert_eq!(rig.sync.closed(), Some(Closed::Fault(UNSOLICITED)));
+    assert!(!rig.open(&native()));
+    assert_eq!(rig.sync.dump()["unsolicited"], 1);
+    assert_eq!(rig.drained(), 0);
+    let lines = rig.sync.take_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    // Asked again after the pause; another unsolicited page meanwhile.
+    assert_eq!(rig.pass(STALL_PAUSE_MS), [sync_call(FEED, 2)]);
+    let a = rig.last();
+    let unsolicited = stranger(&mut rig);
+    assert!(
+        rig.answer(&unsolicited, 3, &[(3, &release)])
+            .applied
+            .is_empty()
+    );
+    assert_eq!(rig.sync.dump()["unsolicited"], 2);
+    assert_eq!(
+        rig.sync.live_call().map(|c| c.request_id),
+        Some(a.request_id.clone()),
+        "the live call stays"
+    );
+    // Its page applies, but ends no fault: it was asked before it.
+    let synced = rig.answer(&a, 3, &[(3, &release)]);
+    assert_eq!(synced.applied.len(), 1);
+    assert!(!rig.feeds.standing(BOT).held);
+    assert_eq!(rig.sync.closed(), Some(Closed::Fault(UNSOLICITED)));
+    // A page asked after it (at once: that page moved the cursor): open.
+    assert_eq!(synced.next, Some(sync_call(FEED, 3)));
+    let b = rig.last();
+    rig.answer(&b, 3, &[]);
+    assert!(rig.open(&native()));
+}
+
+/// Ruling C1b-a (Astation's "late refusal"): a refusal names a call kind,
+/// never a request, so a `control_sync_refused` retires whatever sync call
+/// is live, even one asked after the call it was meant for. That costs
+/// liveness only: the live call's page, arriving after, is drained; the
+/// gate stays closed through the backoff, and a call asked after it, with
+/// a fresh id, opens it.
+#[test]
+fn a_late_refusal_retires_the_live_call_and_costs_liveness_only() {
+    let mut rig = rig();
+    rig.opened();
+    let release = rig.record(FEED, ControlAction::Release);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    // A unanswered for 30 s: retired; B asked.
+    assert_eq!(rig.pass(SYNC_TIMEOUT_MS), [sync_call(FEED, 2)]);
+    let b = rig.last();
+    // A's refusal, late: it retires B.
+    rig.sync.on_refused(RefusedCall::ControlSync);
+    assert_eq!(rig.sync.live_call(), None);
+    assert_eq!(rig.sync.closed(), Some(Closed::Refused));
+    // B's page: drained.
+    assert!(rig.answer(&b, 3, &[(3, &release)]).applied.is_empty());
+    assert!(rig.feeds.standing(BOT).held);
+    assert_eq!(rig.drained(), 1);
+    assert_eq!(rig.sync.closed(), Some(Closed::Refused));
+    // Past the backoff, at a heads: a fresh call; read, open.
+    rig.pass(REFUSAL_BACKOFF_MS);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    let c = rig.last();
+    assert_ne!(c.request_id, b.request_id);
+    rig.answer(&c, 3, &[(3, &release)]);
+    assert!(!rig.feeds.standing(BOT).held);
+    assert!(rig.open(&native()));
+}
+
+/// Ruling C1b-a: a page answering the live call applies only under the
+/// account and genesis the call was asked under (the feeds it was asked
+/// against): handed to the feeds of another device list (a re-pin the
+/// pass hasn't moved the store aside for), it is drained, nothing applied.
+#[test]
+fn a_page_asked_under_another_device_list_applies_nothing() {
+    let mut rig = rig();
+    rig.opened();
+    let release = rig.record(FEED, ControlAction::Release);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    let a = rig.last();
+    // Another account's list and its feeds, in another store.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store.bind(&host()).unwrap();
+    let mut other = TestLog::genesis("acct-other", &secret("other astation"));
+    other.add_host("host", 1, &secret("other host"));
+    let mut feeds = FeedStore::load(&store, &other.log).unwrap();
+    feeds.set_own_origin(Some(ORIGIN.into()));
+    let page = rig.page_for(&a, FEED, 3, vec![(3, release.object().to_json())]);
+    let list = serving(&other);
+    let synced = rig
+        .sync
+        .on_page(
+            page,
+            None,
+            Some(PageCx {
+                store: &store,
+                feeds: &mut feeds,
+                list: &list,
+                applied_seq: 0,
+            }),
+        )
+        .unwrap();
+    assert!(synced.applied.is_empty());
+    assert_eq!(
+        feeds.current_feed(ORIGIN),
+        None,
+        "nothing in the other store"
+    );
+    assert_eq!(feeds.evidence_count(), 0);
+    assert_eq!(rig.drained(), 1);
+    assert_eq!(rig.sync.dump()["faults"], 0);
+    assert_eq!(rig.sync.live_call(), None);
+    assert!(rig.feeds.standing(BOT).held);
+}
+
+/// Ruling C1b-a: what a page carrying the live call's id is to that call.
+/// A discovery call (no `feed_id`, `after: 0`; this host never makes one,
+/// it names the announced feed) is answered only on the own feed this
+/// generation's `heads` announced; a named call by the shared helper's
+/// rules; a call captured on another link generation or socket, or under
+/// another account or genesis, is stale (its page drained).
+#[test]
+fn a_page_answers_the_live_call_only_as_it_was_captured() {
+    let rig = rig();
+    let list_id = rig.feeds.list_id().clone();
+    let discovery = ControlSync {
+        request_id: "5d0e9a3c-2b1f-4c8d-9e7a-6b5c4d3e2f10".into(),
+        origin: ORIGIN.into(),
+        feed_id: None,
+        after: 0,
+    };
+    let ask = |call: &ControlSync| Ask {
+        call: call.clone(),
+        link_gen: 1,
+        socket: SOCKET,
+        list: list_id.clone(),
+        sent_at: 0,
+        restart: true,
+        epoch: 0,
+    };
+    let here = Some((1, SOCKET));
+    let page = rig.page_for(&discovery, FEED, 0, vec![]).unwrap();
+    let d = ask(&discovery);
+    assert_eq!(
+        d.judge(&page, here, Some(&list_id), Some(FEED)),
+        Verdict::Answers
+    );
+    for announced in [Some(FEED_2), None] {
+        assert_eq!(
+            d.judge(&page, here, Some(&list_id), announced),
+            Verdict::Fault(MISMATCHED_FEED),
+            "{announced:?}"
+        );
+    }
+    // A named call: the helper's rules, whatever the announcement.
+    let named = ControlSync {
+        feed_id: Some(FEED.into()),
+        ..discovery.clone()
+    };
+    let n = ask(&named);
+    assert_eq!(
+        n.judge(&page, here, Some(&list_id), Some(FEED_2)),
+        Verdict::Answers
+    );
+    let mut elsewhere = page.clone();
+    elsewhere.feed_id = FEED_2.into();
+    assert_eq!(
+        n.judge(&elsewhere, here, Some(&list_id), Some(FEED_2)),
+        Verdict::Fault(MISMATCHED_FEED)
+    );
+    let mut later = page.clone();
+    later.after = 1;
+    later.head = 1;
+    assert_eq!(
+        n.judge(&later, here, Some(&list_id), Some(FEED)),
+        Verdict::Fault(MISMATCHED_AFTER)
+    );
+    // Captured elsewhere: stale.
+    let other_account = ("acct-other".to_string(), list_id.1);
+    let other_genesis = (list_id.0.clone(), atem_client::encoding::Hash32([9; 32]));
+    for (link, list) in [
+        (Some((2, SOCKET)), &list_id),
+        (Some((1, SOCKET + 1)), &list_id),
+        (None, &list_id),
+        (here, &other_account),
+        (here, &other_genesis),
+    ] {
+        assert_eq!(
+            n.judge(&page, link, Some(list), Some(FEED)),
+            Verdict::Stale,
+            "{link:?} {list:?}"
+        );
+    }
+}
+
+/// Ruling C1b-a: the link dropping ends its generation: the live call is
+/// retired at once (no call is timed while no link is up), and back on a
+/// link, the same socket or another, its page is drained; the new
+/// generation's own call, with a fresh id, opens the gate once read.
+#[test]
+fn a_link_that_drops_retires_the_live_call() {
+    for socket in [SOCKET, SOCKET + 1] {
+        let mut rig = rig();
+        rig.opened();
+        let release = rig.record(FEED, ControlAction::Release);
+        rig.pass(SEC);
+        assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+        let a = rig.last();
+        rig.sync.on_link(None);
+        assert_eq!(rig.sync.live_call(), None);
+        rig.sync.take_lines();
+        assert_eq!(rig.pass(SYNC_TIMEOUT_MS), Vec::new());
+        assert_eq!(rig.sync.closed(), Some(Closed::NoLink));
+        assert!(rig.sync.take_lines().is_empty(), "nothing timed while down");
+        rig.sync.on_link(Some(&link_on(2, socket, ORIGIN)));
+        assert_eq!(rig.sync.closed(), Some(Closed::NoHeads));
+        // A's page: drained.
+        assert!(rig.answer(&a, 3, &[(3, &release)]).applied.is_empty());
+        assert_eq!(rig.drained(), 1, "socket {socket}");
+        assert!(rig.feeds.standing(BOT).held);
+        // Its own call, answered.
+        rig.pass(SEC);
+        assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+        let b = rig.last();
+        assert_ne!(a.request_id, b.request_id);
+        rig.answer(&b, 3, &[(3, &release)]);
+        assert!(!rig.feeds.standing(BOT).held);
+        assert!(rig.open(&native()), "socket {socket}");
+    }
+}
+
+/// Wire rule 11, ruling C1b-a: a page holding a record at or below its own
+/// `after` doesn't read (the reader refuses it, `malformed`): a Station
+/// fault, nothing of it applies, the gate stays closed and the alert goes.
+/// It can't be matched to a call, so it is taken as the live call's answer
+/// (the call is retired: its own page, should it still come, is drained),
+/// and the feed is asked again after the pause.
+#[test]
+fn a_page_with_a_record_at_or_below_its_own_after_doesnt_read() {
+    let mut rig = rig();
+    let (_, hold) = rig.opened();
+    rig.sync.take_lines();
+    let release = rig.record(FEED, ControlAction::Release);
+    let revoke = rig.record(
+        FEED,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 2)]);
+    let a = rig.last();
+    let page = rig.page_for(
+        &a,
+        FEED,
+        4,
+        vec![
+            (2, hold.object().to_json()),
+            (3, release.object().to_json()),
+        ],
+    );
+    assert_eq!(page, Err(RelayError::Malformed("feed_seq")));
+    let synced = rig.on_page(page);
+    assert!(synced.applied.is_empty() && synced.next.is_none());
+    assert!(rig.feeds.standing(BOT).held);
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
+    assert_eq!(rig.sync.closed(), Some(Closed::Fault("malformed")));
+    assert!(!rig.open(&native()));
+    assert_eq!(rig.sync.take_lines().len(), 1);
+    assert_eq!(rig.sync.live_call(), None, "retired");
+    // A's own page, late: drained.
+    assert!(
+        rig.answer(&a, 4, &[(3, &release), (4, &revoke)])
+            .applied
+            .is_empty()
+    );
+    assert_eq!(rig.drained(), 1);
+    // Asked again after the pause: read, open.
+    assert_eq!(rig.pass(STALL_PAUSE_MS), [sync_call(FEED, 2)]);
+    let b = rig.last();
+    rig.answer(&b, 4, &[(3, &release), (4, &revoke)]);
+    assert!(rig.feeds.standing(BOT).revoked.is_some());
+    assert!(rig.open(&native()));
+}
+
+/// Wire rule 11 (Astation, #164: a stale named feed is refused, never
+/// answered on the new feed): a page answering the live call on another
+/// feed than it named doesn't answer it, a Station fault, nothing of it
+/// applied. The next `heads` announcing the new feed reads it from 0 (a
+/// reset, at once once its mark is written), which ends both.
+#[test]
+fn a_page_of_another_feed_than_asked_is_a_station_fault() {
+    let mut rig = rig();
+    rig.opened();
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    let cover = rig.record(FEED_2, ControlAction::Cover);
+    // The call's id, the new feed from 0.
+    let live = rig.last();
+    let page = rig.page_for(
+        &ControlSync { after: 0, ..live },
+        FEED_2,
+        1,
+        vec![(1, cover.object().to_json())],
+    );
+    let synced = rig.on_page(page);
+    assert!(synced.applied.is_empty());
+    assert_eq!(rig.sync.closed(), Some(Closed::Fault(MISMATCHED_FEED)));
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
+    rig.pass(SEC);
+    assert_eq!(
+        rig.heads(FEED_2, 1),
+        [sync_call(FEED_2, 0)],
+        "a reset, read at once"
+    );
+    let b = rig.last();
+    rig.answer(&b, 1, &[(1, &cover)]);
+    assert!(rig.open(&native()));
+    assert_eq!(rig.cursor(), Some((FEED_2.to_string(), 1)));
+}
+
+/// Astation (#164, "Restore/reset"): a rescan from 0 never erases committed
+/// holds or revokes merely because a replacement page omits them. The feed
+/// went back under the same id and regrew without the earlier hold and
+/// revoke: read from 0 to its head (the reset done), the bot stays held
+/// and revoked.
+#[test]
+fn a_rescan_keeps_the_committed_stops_a_regrown_feed_omits() {
+    let mut rig = rig();
+    let (cover, _) = rig.opened();
+    let revoke = rig.record(
+        FEED,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    rig.page(FEED, 3, &[(3, &revoke)]);
+    let standing = rig.feeds.standing(BOT);
+    assert!(standing.held && standing.revoked.is_some());
+    // Rolled back to 1, announced: read from 0, which finds it regrown to
+    // 4 with covers only.
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 1), [sync_call(FEED, 0)]);
+    let b = rig.last();
+    let c2 = rig.record(FEED, ControlAction::Cover);
+    let c3 = rig.record(FEED, ControlAction::Cover);
+    let c4 = rig.record(FEED, ControlAction::Cover);
+    rig.answer(&b, 4, &[(1, &cover), (2, &c2), (3, &c3), (4, &c4)]);
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 4)));
+    assert_eq!(rig.mark_row(), None, "the reset done");
+    assert!(rig.open(&native()));
+    let standing = rig.feeds.standing(BOT);
+    assert!(standing.held, "the hold kept");
+    assert!(standing.revoked.is_some(), "the revoke kept");
 }

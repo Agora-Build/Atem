@@ -1400,8 +1400,8 @@ impl AstationClient {
     /// socket any client of this process opened has it (0: none opened).
     /// Unlike [`AstationClient::socket_gen`], which counts one client's
     /// sockets and starts again in each new client (every reconnect makes
-    /// one), it tells two links' sockets apart (host-work-v1 §11.4: an
-    /// answer owed on a socket can only come on it).
+    /// one), it tells two links' sockets apart (host-work-v1 §11.4: a
+    /// `control_sync` is captured with its socket and answered only there).
     pub fn socket_id(&self) -> u64 {
         self.socket_id
     }

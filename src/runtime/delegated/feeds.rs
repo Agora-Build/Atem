@@ -800,6 +800,11 @@ impl FeedStore {
         self.list.0 == list.account_id() && self.list.1 == list.genesis_hash()
     }
 
+    /// The account and genesis of the device list it was loaded for.
+    pub fn list_id(&self) -> &(String, atem_client::encoding::Hash32) {
+        &self.list
+    }
+
     /// The host's own Station's origin, as set.
     pub fn own_origin(&self) -> Option<&str> {
         self.own.as_deref()

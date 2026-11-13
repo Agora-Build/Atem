@@ -721,29 +721,34 @@ fn a_page_handled_after_the_deadline_is_taken_before_the_tick() {
     });
 }
 
-/// Ruling T33e: once the sync stopped for an unanswered call, `atem
-/// status`'s `Control feeds:` line says so and names the way out, `atem
-/// runtime restart`.
+/// Ruling C1b-a: a call unanswered for 30 s is retired at the pass's tick,
+/// which asks again at once with a fresh id; `atem status`'s `Control
+/// feeds:` line says the call went unanswered, and names no way out (the
+/// sync goes on by itself).
 #[test]
-fn an_unanswered_sync_names_the_way_out_in_the_status_line() {
+fn an_unanswered_sync_is_asked_again_and_the_status_line_says_so() {
+    use crate::runtime::delegated::station::Call;
     use crate::runtime::delegated::sync::{SYNC_TIMEOUT_MS, UNANSWERED};
     local_test(async |root| {
         let mut rig = LocalRig::new(root).await;
         let os = ManualOs::at(host_now().wall_ms);
         let s = fed_host(&mut rig, root, &os);
-        assert_eq!(bridge_heads(&mut rig, 1, s.log.log.head()).len(), 1);
+        let first = bridge_heads(&mut rig, 1, s.log.log.head());
         let late = clocks_after(SYNC_TIMEOUT_MS + 1);
         rig.bridge.feed_advance(late);
-        assert_eq!(rig.bridge.feed_tick(late), []);
+        let again = rig.bridge.feed_tick(late);
+        let (Some(Call::Sync(first)), Some(Call::Sync(again))) = (first.first(), again.first())
+        else {
+            panic!("two calls: {first:?} {again:?}");
+        };
+        assert_eq!((&again.feed_id, again.after), (&first.feed_id, first.after));
+        assert_ne!(again.request_id, first.request_id, "a fresh id");
         let line = rig.bridge.feeds_status().unwrap();
         assert!(
             line.starts_with(&format!("revocations not yet checked ({UNANSWERED}); ")),
             "{line}"
         );
-        assert!(
-            line.contains("run `atem runtime restart` to reconnect now"),
-            "{line}"
-        );
+        assert!(!line.contains("atem runtime restart"), "{line}");
     });
 }
 

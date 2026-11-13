@@ -20,7 +20,7 @@ use atem_client::connect::{Event as ClientEvent, Identity};
 use atem_client::control::relay::MAX_RELAY_MESSAGE_BYTES;
 use atem_client::control::{
     CallRefused, ControlAction, ControlSync, ControlSyncResult, FeedEntry, MembershipFetch,
-    MembershipFetchResult, RefusalCode, RefusedCall, ToStation,
+    MembershipFetchResult, RefusalCode, RefusedCall, RelayError, ToStation,
 };
 use atem_client::membership::ServiceScope;
 use serde_json::{Value, json};
@@ -35,12 +35,12 @@ use support::astation::{
 use support::delegated::WAIT;
 use support::delegated::{
     Dev, HostIds, HostRig, complete_turn, enqueue, enqueue_data, host_db, hosting_toml, in_turn,
-    never_ran, private, record, replace, stored, task, wait_stored,
+    never_ran, private, record, replace, stored, task, uuid, wait_stored,
 };
 use support::host_clock::HostClock;
 use support::r9::{Router, write_pin};
 use support::r9log::{self, MAC, TestLog, auth, secret};
-use support::station::{FakeStation, OTHER_ACCOUNT, Pump, StaleFeed};
+use support::station::{FakeStation, Held, OTHER_ACCOUNT, Pump, StaleFeed};
 use support::{Sandbox, within};
 
 const ACCOUNT: &str = "acct-control-feed";
@@ -63,11 +63,17 @@ const REVOKED: &str = "sender revoked";
 /// The feed part's reasons, as `atem status` gives them (`sync::Closed`).
 const REFUSED: &str = "Station refused feed access (forbidden); retrying";
 const RESET: &str = "the control feed was reset; reading it again from position 0";
-const UNANSWERED: &str = "a control_sync went unanswered; nothing more is asked until its answer comes or the link reconnects: run `atem runtime restart` to reconnect now";
+const UNANSWERED: &str =
+    "a control_sync went unanswered for 30 s; asked again with a new request id";
 const CLOCK_AHEAD: &str = "Station clock ahead of this host";
 const NO_HEADS_60S: &str = "no heads from the Station for 60 s";
-const CONTRADICTS: &str =
-    "Station sent a page that contradicts its call (a record at or below the position asked after)";
+/// The Station faults' reasons (`sync::fault_text`).
+const MALFORMED: &str = "Station sent a page the reader refused (malformed)";
+const OTHER_AFTER: &str =
+    "Station sent a page that doesn't answer its call (another position asked after)";
+const OTHER_FEED: &str = "Station sent a page that doesn't answer its call (another feed)";
+const OTHER_ORIGIN: &str = "Station sent a page that doesn't answer its call (another origin)";
+const UNSOLICITED: &str = "Station sent a page for a call this host never made";
 /// The stored control state that doesn't read (`HostBridge::feeds_status`).
 const DAMAGED: &str = "the stored control state doesn't read; no delegated task starts. Restore ";
 /// The host the clients name.
@@ -653,9 +659,18 @@ fn blank(sync: ControlSync) -> ControlSync {
 
 /// The `control_sync` the fake Station holds, as [`blank`] gives it.
 #[track_caller]
-fn sync_of(held: &support::station::Held) -> ControlSync {
+fn sync_of(held: &Held) -> ControlSync {
     match held.call() {
         Ok(ToStation::ControlSync(sync)) => blank(sync),
+        other => panic!("not a control_sync: {other:?}"),
+    }
+}
+
+/// The `request_id` of the `control_sync` the fake Station holds.
+#[track_caller]
+fn request_id(held: &Held) -> String {
+    match held.call() {
+        Ok(ToStation::ControlSync(sync)) => sync.request_id,
         other => panic!("not a control_sync: {other:?}"),
     }
 }
@@ -714,13 +729,18 @@ fn next_fetch(station: &mut FakeStation, link: u64) -> ToStation {
 }
 
 /// Astation's `auth_required` on the host's link again: Astation
-/// re-authenticates it, a new link generation on the same socket (a new
-/// challenge: one answered is spent).
+/// re-authenticates it (a routed link: authenticates it, its upgrade), a
+/// new link generation on the same socket (a new challenge: one answered
+/// is spent).
 fn reauthenticate(rig: &Rig, n: u8) {
     let generation = rig.dump()["station"]["link"]["gen"].as_u64().unwrap();
+    let transport = match rig.via {
+        Via::Local => "lan",
+        Via::Relay | Via::Routed => "relay",
+    };
     let challenge = json!({"type": "statusUpdate", "data": {"status": "auth_required",
         "data": {"astation_id": ASTATION, "challenge": format!("{n:x}").repeat(64),
-                 "transport": "lan", "protocol": "2"}}});
+                 "transport": transport, "protocol": "2"}}});
     rig.astation.send(rig.link(), challenge.to_string());
     rig.until_station("the next link generation", |s| {
         s["link"]["gen"].as_u64() > Some(generation)
@@ -1563,14 +1583,15 @@ fn a_station_clock_a_year_ahead_closes_the_gate_alerts_once_and_expires_nothing(
 /// VII.A test 10, part 1 (design I.5.2, §11.4 "Resets"): the Station
 /// restored from a backup mints a new feed whose snapshot carries its
 /// current effective state. The host's call for the old feed, in flight at
-/// the restore, gets either reading of §11.4's open question
-/// (`StaleFeed`): refused (`control_sync_refused`: the refusal's backoff),
-/// or the new feed served for the old id (a reset: nothing of that page
-/// applies, nothing asked before the next `heads`). Either way the gate
-/// stays closed (`atem status` says why) until the new feed is read from 0
-/// to its head, and no stop is lost: the service held on the old feed
-/// stays held through the snapshot, its task paused, until the new feed
-/// releases it.
+/// the restore, is refused (`control_sync_refused`, wire rule 11 as
+/// Astation decided on #164: the refusal's backoff, nothing asked before
+/// it), or, from a Station that breaks that rule (`StaleFeed::ServeCurrent`),
+/// answered on the new feed: a page that doesn't answer its call, a Station
+/// fault, nothing of it applied; the next `heads` announces the new feed, a
+/// reset read from 0 at once. Either way the gate stays closed (`atem
+/// status` says why) until the new feed is read from 0 to its head, and no
+/// stop is lost: the service held on the old feed stays held through the
+/// snapshot, its task paused, until the new feed releases it.
 ///
 /// Part 2 (ruling T33c, the reset mark across a whole-runtime crash): the
 /// Station rolls its feed back under the same `feed_id`; the runtime is
@@ -1634,29 +1655,41 @@ fn restored_from_backup(mode: StaleFeed) {
     }
     let expected = match mode {
         StaleFeed::Refuse => REFUSED,
-        StaleFeed::ServeCurrent => RESET,
+        StaleFeed::ServeCurrent => OTHER_FEED,
     };
     rig.until_feed("the old call's answer", |f| f["closed"] == expected);
     rig.status_feeds(&format!("{GATE_CLOSED} ({expected})"));
     assert_eq!(rig.cursor(), Some(2), "{mode:?}: nothing of it applied");
-    // The next heads (the new feed) within 30 s: nothing asked.
-    let sent = rig.station().sent().len();
-    rig.clock.add_mono(1_000);
-    rig.station().heads_now();
-    rig.two_passes();
-    rig.station().serve(link);
-    assert_eq!(rig.station().sent().len(), sent, "{mode:?}");
-    assert!(!rig.gate_open());
-    // Past the 30 s: the new feed is read from 0; closed until it is.
-    rig.clock.add_mono(30_000);
-    let call = {
-        let mut station = rig.station();
-        station.heads_now();
-        station.hold_call(link)
+    let call = match mode {
+        StaleFeed::Refuse => {
+            // The next heads (the new feed) within the backoff: nothing
+            // asked.
+            let sent = rig.station().sent().len();
+            rig.clock.add_mono(1_000);
+            rig.station().heads_now();
+            rig.two_passes();
+            rig.station().serve(link);
+            assert_eq!(rig.station().sent().len(), sent, "{mode:?}");
+            assert!(!rig.gate_open());
+            // Past it: the new feed is read from 0; closed until it is.
+            rig.clock.add_mono(30_000);
+            let mut station = rig.station();
+            station.heads_now();
+            station.hold_call(link)
+        }
+        StaleFeed::ServeCurrent => {
+            // The next heads announces the new feed: a reset, read from 0
+            // at once once marked (a fault's pause holds paced calls only).
+            rig.clock.add_mono(1_000);
+            let mut station = rig.station();
+            station.heads_now();
+            station.hold_call(link)
+        }
     };
     assert_eq!(sync_of(&call), rig.sync(0));
     rig.two_passes();
-    // (A refusal's reason stands until a page asked after it reads.)
+    // (A refusal's or a fault's reason stands until a page asked after it
+    // reads.)
     assert_eq!(rig.feed()["closed"], expected, "{mode:?}");
     assert_eq!(rig.feed()["reset"]["durable"], true, "{mode:?}");
     assert!(!rig.gate_open());
@@ -1885,18 +1918,19 @@ fn a_reset_read_in_a_pause_after_the_link_dropped_lowers_the_cursor_first() {
     );
 }
 
-/// Rulings T33d, T33e (§11.4 "Matching a page to its call"): a
-/// `control_sync` unanswered for 30 seconds stops the sync: the gate stays
-/// closed, the Station-fault alert goes, `atem status` names `atem runtime
-/// restart`, and `heads` ask nothing more on that socket (a re-send could
-/// bring two answers). Its late answer on the same socket is that call's:
-/// applied, and the sync resumes.
+/// Ruling C1b-a (wire rule 11; Astation's "same-cursor retries" and
+/// "reordered old replies"): a `control_sync` unanswered for 30 seconds is
+/// retired, the Station-fault alert goes, `atem status` says so, and the
+/// host asks again at once at the same cursor with a fresh `request_id`;
+/// so again 30 seconds later. The Station's late answers to the retired
+/// calls, the newer first, are drained: nothing of them applies and the
+/// gate stays closed. The live call's page applies and the gate opens.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
     ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
 )]
-fn a_late_answer_on_the_same_socket_resumes_the_sync() {
+fn same_cursor_retries_apply_only_the_live_ids_page() {
     let rig = Rig::full(Via::Local);
     let link = rig.link();
     rig.cover_and_open();
@@ -1904,15 +1938,18 @@ fn a_late_answer_on_the_same_socket_resumes_the_sync() {
     let covered = rig.part(&principal).unwrap();
     rig.append(SVC, ControlAction::Hold);
     rig.clock.add_mono(1_000);
-    let call = {
+    let a = {
         let mut station = rig.station();
         station.heads_now();
         station.hold_call(link)
     };
-    assert_eq!(sync_of(&call), rig.sync(1));
-    // Unanswered for 30 s.
+    assert_eq!(sync_of(&a), rig.sync(1));
+    // Unanswered for 30 s: retired; asked again at once, a fresh id.
     rig.clock.add_mono(31_000);
-    rig.until_feed("the timeout", |f| f["in_flight"]["timed_out"] == true);
+    let b = rig.station().hold_call(link);
+    assert_eq!(sync_of(&b), rig.sync(1));
+    assert_ne!(request_id(&a), request_id(&b));
+    rig.until_feed("the timeout", |f| f["timeouts"] == 1);
     assert_eq!(rig.feed()["closed"], UNANSWERED);
     rig.status_feeds(&format!("{GATE_CLOSED} ({UNANSWERED})"));
     within("the alert", || {
@@ -1920,40 +1957,43 @@ fn a_late_answer_on_the_same_socket_resumes_the_sync() {
             "a control_sync to {NO_RELAY} went unanswered for 30 s"
         ))
     });
-    // Heads ask nothing more on this socket.
-    let sent = rig.station().sent().len();
+    // B unanswered too (the Station's heads keep coming): C.
     rig.clock.add_mono(1_000);
     rig.station().heads_now();
+    rig.clock.add_mono(30_000);
+    let c = rig.station().hold_call(link);
+    assert_eq!(sync_of(&c), rig.sync(1));
+    assert_ne!(request_id(&c), request_id(&b));
+    // The late answers, reordered: B's, then A's. Drained.
+    rig.station().answer_held(b).unwrap();
+    rig.station().answer_held(a).unwrap();
+    rig.until_feed("both drained", |f| f["drained"] == 2);
     rig.two_passes();
-    rig.station().serve(link);
-    assert_eq!(rig.station().sent().len(), sent);
+    assert_eq!(
+        rig.part(&principal),
+        Some(covered.clone()),
+        "nothing applied"
+    );
+    assert_eq!(rig.cursor(), Some(1));
+    assert_eq!(rig.feed()["faults"], 0);
     assert!(!rig.gate_open());
-    assert_eq!(rig.part(&principal), Some(covered.clone()));
-    // The late answer: that call's, applied; the sync resumes.
-    rig.station().answer_held(call).unwrap();
-    rig.until_feed("the late answer taken", |f| {
-        f["late"] == 1 && f["synced"]["cursor"] == 2
-    });
+    // The live call's page: applied, the gate opens.
+    rig.station().answer_held(c).unwrap();
+    rig.until_feed("the live page", |f| f["synced"]["cursor"] == 2);
     assert_ne!(rig.part(&principal), Some(covered), "the hold applied");
     rig.serve_until("open again", |rig| rig.gate_open());
-    rig.append(SVC, ControlAction::Release);
-    rig.clock.add_mono(1_000);
-    rig.announce();
-    rig.serve_until("the sync resumed", |rig| {
-        rig.cursor() == Some(3) && rig.gate_open()
-    });
-    assert_eq!(rig.syncs().last(), Some(&rig.sync(2)));
+    assert_eq!(rig.feed()["drained"], 2);
 }
 
-/// Rulings T33e (§11.4 "Matching a page to its call"), probes F and G at
-/// binary level: Astation re-authenticates the host's link (a new link
-/// generation on the same socket) while a `control_sync` is owed. The new
-/// generation asks nothing until that call's answer comes, and takes it as
-/// that call's (its own `after`, a continuation's): pages of at most 64
-/// records never carry the host past a revoke (F), and a rollback found on
-/// the new generation is read from 0 after the owed continuation, never
-/// ended by it (G). The revokes apply; the service's queued task is
-/// cancelled, never run.
+/// Ruling C1b-a, probes F and G at binary level (Astation's "same-socket
+/// re-authentication"): Astation re-authenticates the host's link (a new
+/// link generation on the same socket) while a `control_sync` is in
+/// flight. The call is retired; the new generation asks at its `heads`
+/// with a fresh id; the old call's page, arriving after, is drained. Pages
+/// of at most 64 records never carry the host past a revoke (F), and a
+/// rollback found on the new generation is read from 0 at once, the old
+/// continuation's page (from the regrown feed) never taken for it (G). The
+/// revokes apply; the service's queued task is cancelled, never run.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -1986,32 +2026,39 @@ fn a_reauthentication_mid_read_never_reads_past_a_revoke() {
         };
         assert_eq!(sync_of(&first), rig.sync(1));
         rig.station().answer_held(first).unwrap();
-        let owed = rig.station().hold_call(link);
-        assert_eq!(sync_of(&owed), rig.sync(65));
+        let old = rig.station().hold_call(link);
+        assert_eq!(sync_of(&old), rig.sync(65));
         let t = task(IDS, &launch, "PAST_THE_REVOKE", HOUR);
         enqueue(&mut svc, &mut r, &t);
         wait_stored(&rig, &t["task_id"], "blocked", GATE_CLOSED);
-        // Re-authenticated mid-read; the new generation's heads ask nothing.
+        // Re-authenticated mid-read: the new generation asks afresh.
         reauthenticate(&rig, 0xd);
-        let sent = rig.station().sent().len();
+        assert_eq!(rig.feed()["in_flight"], Value::Null, "retired");
         rig.clock.add_mono(1_000);
-        rig.station().heads_now();
-        rig.two_passes();
-        rig.station().serve(link);
-        assert_eq!(rig.station().sent().len(), sent, "nothing asked while owed");
-        assert_eq!(rig.feed()["in_flight"]["after"], 65);
-        // The owed answer, then the rest.
-        rig.station().answer_held(owed).unwrap();
+        let new = {
+            let mut station = rig.station();
+            station.heads_now();
+            station.hold_call(link)
+        };
+        assert_eq!(sync_of(&new), rig.sync(65));
+        assert_ne!(request_id(&new), request_id(&old));
+        // The old call's page: drained.
+        rig.station().answer_held(old).unwrap();
+        rig.until_feed("the old page drained", |f| f["drained"] == 1);
+        assert_eq!(rig.cursor(), Some(65));
+        assert!(!rig.gate_open());
+        // The new call's page, then the rest.
+        rig.station().answer_held(new).unwrap();
         rig.serve_until("read to the head", |rig| {
             rig.cursor() == Some(131) && rig.gate_open()
         });
         wait_stored(&rig, &t["task_id"], "cancelled", REVOKED);
         let afters: Vec<_> = rig.syncs().iter().map(|s| s.after).collect();
-        assert_eq!(afters, [0, 1, 65, 129], "{afters:?}");
+        assert_eq!(afters, [0, 1, 65, 65, 129], "{afters:?}");
         assert_eq!(rig.feed()["faults"], 0);
         never_ran(&rig, &t["task_id"], "PAST_THE_REVOKE");
     }
-    // G: a rollback found on the new generation, the owed continuation's
+    // G: a rollback found on the new generation; the old continuation's
     // page from the regrown feed.
     {
         let rig = Rig::full(Via::Local);
@@ -2028,27 +2075,31 @@ fn a_reauthentication_mid_read_never_reads_past_a_revoke() {
         rig.append("svc-fourth", ControlAction::Cover);
         rig.append("svc-fifth", ControlAction::Cover);
         rig.clock.add_mono(1_000);
-        let owed = {
+        let old = {
             let mut station = rig.station();
             station.heads_now();
             station.hold_call(link)
         };
-        assert_eq!(sync_of(&owed), rig.sync(3));
+        assert_eq!(sync_of(&old), rig.sync(3));
         let t = task(IDS, &launch, "PAST_THE_ROLLBACK", HOUR);
         enqueue(&mut svc, &mut r, &t);
         wait_stored(&rig, &t["task_id"], "blocked", GATE_CLOSED);
         // The Station rolls back to 1; re-authenticated (the service's
-        // channel ends with its link generation); the rollback found.
+        // channel ends with its link generation); the rollback found and
+        // read from 0 at once.
         rig.station().truncate(1);
         reauthenticate(&rig, 0xe);
-        let sent = rig.station().sent().len();
         rig.clock.add_mono(1_000);
-        rig.station().heads_now();
-        rig.until_feed("the rollback found", |f| f["closed"] == RESET);
-        rig.two_passes();
-        rig.station().serve(link);
-        assert_eq!(rig.station().sent().len(), sent, "nothing asked while owed");
-        // Regrown with other records, a revoke at 2; then the owed answer.
+        let new = {
+            let mut station = rig.station();
+            station.heads_now();
+            station.hold_call(link)
+        };
+        assert_eq!(sync_of(&new), rig.sync(0), "the read from 0");
+        assert_eq!(rig.reset_marks(), [(NO_RELAY.to_string(), String::new())]);
+        rig.until_feed("the reset", |f| f["closed"] == RESET);
+        // Regrown with other records, a revoke at 2; then the old call's
+        // page: drained.
         rig.append(
             SVC,
             ControlAction::Revoke {
@@ -2058,7 +2109,12 @@ fn a_reauthentication_mid_read_never_reads_past_a_revoke() {
         rig.append("svc-new-3", ControlAction::Cover);
         rig.append("svc-new-4", ControlAction::Cover);
         rig.append("svc-new-5", ControlAction::Cover);
-        rig.station().answer_held(owed).unwrap();
+        rig.station().answer_held(old).unwrap();
+        rig.until_feed("the old page drained", |f| f["drained"] == 1);
+        assert_eq!(rig.cursor(), Some(3));
+        assert_eq!(rig.reset_marks(), [(NO_RELAY.to_string(), String::new())]);
+        // The read from 0.
+        rig.station().answer_held(new).unwrap();
         rig.serve_until("read from 0", |rig| {
             rig.reset_marks().is_empty() && rig.gate_open()
         });
@@ -2070,19 +2126,240 @@ fn a_reauthentication_mid_read_never_reads_past_a_revoke() {
     }
 }
 
-/// Ruling T33e (§11.4 "Pages"): a page holding a record at or below its
-/// call's `after` contradicts the call (a page carries "the records after
-/// `after`"): a Station fault. Nothing of it applies (the revoke it holds
-/// included: the service stays covered, its task waits), the cursor stays,
-/// the gate stays closed with the fault alert, and `atem status` says why.
-/// Past the 30-second pause the call goes again, and the Station's own
-/// page applies the revoke.
+/// Ruling C1b-a (Astation's "routed upgrade"): a routed host (no Astation
+/// in the room) has a `control_sync` in flight when Astation authenticates
+/// its routed link: a new link generation on the same socket. The call is
+/// retired, and its page, arriving after, is drained; the new generation
+/// asks again at its `heads` with a fresh id, and its gate opens only once
+/// that page is read.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
     ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
 )]
-fn a_page_contradicting_its_call_applies_nothing_and_keeps_the_gate_closed() {
+fn a_routed_upgrade_retires_the_call_and_asks_afresh() {
+    let rig = Rig::full(Via::Routed);
+    let link = rig.link();
+    rig.cover_and_open();
+    assert_eq!(rig.dump()["station"]["link"]["kind"], "routed");
+    let principal = format!("service:{SVC}");
+    let covered = rig.part(&principal).unwrap();
+    rig.append(SVC, ControlAction::Hold);
+    rig.clock.add_mono(1_000);
+    let old = {
+        let mut station = rig.station();
+        station.heads_now();
+        station.hold_call(link)
+    };
+    assert_eq!(sync_of(&old), rig.sync(1));
+    // Astation authenticates the routed link.
+    reauthenticate(&rig, 0xa);
+    let station = rig.until_station("the upgrade", |s| s["link"]["kind"] == "relay");
+    assert_eq!(station["feed"]["in_flight"], Value::Null, "retired");
+    rig.clock.add_mono(1_000);
+    let new = {
+        let mut station = rig.station();
+        station.heads_now();
+        station.hold_call(link)
+    };
+    assert_eq!(sync_of(&new), rig.sync(1));
+    assert_ne!(request_id(&new), request_id(&old));
+    // The old call's page: drained.
+    rig.station().answer_held(old).unwrap();
+    rig.until_feed("the old page drained", |f| f["drained"] == 1);
+    assert_eq!(rig.part(&principal), Some(covered.clone()));
+    assert!(!rig.gate_open());
+    // The new call's page: read; open.
+    rig.station().answer_held(new).unwrap();
+    rig.serve_until("open", |rig| rig.cursor() == Some(2) && rig.gate_open());
+    assert_ne!(rig.part(&principal), Some(covered));
+    assert_eq!(rig.dump()["station"]["link"]["kind"], "relay");
+}
+
+/// Ruling C1b-a (Astation's "a reset between call and result"): the Station
+/// rolls its feed back under the same id while the host's continuation is
+/// in flight, and answers it: its `head` below the echoed `after`, with no
+/// record. A reset: the host writes its durable mark, never moves the
+/// cursor on that page, and reads the feed from 0 at once (the gate closed
+/// until done: the read reaches the head the next `heads` announces).
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_reset_between_call_and_result_is_read_from_0() {
+    let rig = Rig::full(Via::Local);
+    let link = rig.link();
+    rig.cover_and_open();
+    rig.append("svc-other", ControlAction::Cover);
+    rig.append("svc-third", ControlAction::Cover);
+    rig.clock.add_mono(1_000);
+    rig.announce();
+    rig.serve_until("the feed read to 3", |rig| {
+        rig.cursor() == Some(3) && rig.gate_open()
+    });
+    rig.append("svc-fourth", ControlAction::Cover);
+    rig.clock.add_mono(1_000);
+    let call = {
+        let mut station = rig.station();
+        station.heads_now();
+        station.hold_call(link)
+    };
+    assert_eq!(sync_of(&call), rig.sync(3));
+    // Rolled back to 1 (no heads), then the call answered: head 1, after 3.
+    rig.station().truncate(1);
+    let from_0 = {
+        let mut station = rig.station();
+        station.answer_held(call).unwrap();
+        station.hold_call(link)
+    };
+    assert_eq!(sync_of(&from_0), rig.sync(0), "the read from 0, at once");
+    assert_eq!(rig.reset_marks(), [(NO_RELAY.to_string(), String::new())]);
+    assert_eq!(rig.cursor(), Some(3), "never moved on that page");
+    rig.until_feed("the reset", |f| f["closed"] == RESET);
+    assert!(!rig.gate_open());
+    // The read from 0, read up to the head announced next.
+    rig.station().answer_held(from_0).unwrap();
+    rig.serve_until("the read from 0", |rig| rig.cursor() == Some(1));
+    rig.clock.add_mono(30_000);
+    rig.open_gate();
+    assert_eq!(rig.cursor(), Some(1));
+    assert!(rig.reset_marks().is_empty());
+}
+
+/// Ruling C1b-a (Astation's "mismatched echoes"): a page carrying the live
+/// call's id that doesn't answer it (another `after`, feed or origin) is a
+/// Station fault: nothing of it applies (the revoke it carries included),
+/// the gate stays closed with the fault's alert, and `atem status` says
+/// which echo. The call is retired: the Station's own page for it,
+/// arriving after, is drained; past the 30-second pause the call goes
+/// again with a fresh id. A page with an id the host never sent is
+/// unsolicited, a fault too, and the live call stays live: its page
+/// applies (the revoke: the queued task is cancelled), and a page asked
+/// after the fault opens the gate.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn mismatched_echoes_and_unsolicited_pages_apply_nothing() {
+    let rig = Rig::full(Via::Local);
+    let link = rig.link();
+    let mut r = Router::on(&rig.astation, link);
+    rig.cover_and_open();
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let principal = format!("service:{SVC}");
+    let covered = rig.part(&principal).unwrap();
+    rig.append(
+        SVC,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    // The Station's page for the held call, as the builder writes it, then
+    // `edit`ed.
+    let page_for = |held: &Held, edit: &dyn Fn(&mut ControlSyncResult)| {
+        let ToStation::ControlSync(call) = held.call().unwrap() else {
+            panic!("a control_sync");
+        };
+        let station = rig.station();
+        let records: Vec<FeedEntry> = station
+            .records()
+            .into_iter()
+            .filter(|(seq, _)| *seq > call.after)
+            .map(|(seq, record)| FeedEntry::new(seq, record))
+            .collect();
+        let mut page = ControlSyncResult {
+            request_id: call.request_id,
+            origin: rig.origin(),
+            feed_id: station.feed_id().to_string(),
+            after: call.after,
+            head: 2,
+            station_time: r9log::host_now().wall_ms,
+            records,
+        };
+        edit(&mut page);
+        page.to_json().unwrap().to_string()
+    };
+    let t = task(IDS, &launch, "BEHIND_A_MISMATCH", HOUR);
+    let cases = [
+        ("after", OTHER_AFTER),
+        ("feed", OTHER_FEED),
+        ("origin", OTHER_ORIGIN),
+    ];
+    for (n, (what, text)) in cases.into_iter().enumerate() {
+        let edit = |p: &mut ControlSyncResult| match what {
+            "after" => p.after = 0,
+            "feed" => p.feed_id = uuid(),
+            _ => p.origin = "https://station-other.test".into(),
+        };
+        let n = n as u64 + 1;
+        rig.clock.add_mono(if n == 1 { 1_000 } else { 30_000 });
+        let held = {
+            let mut station = rig.station();
+            station.heads_now();
+            station.hold_call(link)
+        };
+        assert_eq!(sync_of(&held), rig.sync(1), "{what}");
+        rig.astation.send(link, page_for(&held, &edit));
+        rig.until_feed(&format!("the {what} fault"), |f| f["faults"] == n);
+        let feed = rig.feed();
+        assert_eq!(feed["closed"], text, "{what}");
+        assert_eq!(feed["in_flight"], Value::Null, "{what}: retired");
+        assert_eq!(rig.cursor(), Some(1), "{what}");
+        assert_eq!(rig.part(&principal), Some(covered.clone()), "{what}");
+        assert!(!rig.gate_open());
+        rig.status_feeds(&format!("{GATE_CLOSED} ({text})"));
+        if n == 1 {
+            enqueue(&mut svc, &mut r, &t);
+            wait_stored(&rig, &t["task_id"], "blocked", GATE_CLOSED);
+            within("the fault alert", || {
+                rig.runtime_log().contains(OTHER_AFTER)
+            });
+        }
+        // The Station's own page for it, late: drained.
+        rig.station().answer_held(held).unwrap();
+        rig.until_feed(&format!("{what}: drained"), |f| f["drained"] == n);
+        assert_eq!(rig.part(&principal), Some(covered.clone()), "{what}");
+    }
+    // An id never sent: unsolicited; the live call kept.
+    rig.clock.add_mono(30_000);
+    let held = {
+        let mut station = rig.station();
+        station.heads_now();
+        station.hold_call(link)
+    };
+    rig.astation
+        .send(link, page_for(&held, &|p| p.request_id = uuid()));
+    rig.until_feed("the unsolicited page", |f| f["unsolicited"] == 1);
+    assert_eq!(rig.feed()["closed"], UNSOLICITED);
+    assert_eq!(rig.feed()["in_flight"]["after"], 1, "the live call kept");
+    assert_eq!(rig.part(&principal), Some(covered));
+    rig.status_feeds(&format!("{GATE_CLOSED} ({UNSOLICITED})"));
+    // Its own page: the revoke applies; a page asked after the fault opens
+    // the gate.
+    rig.station().answer_held(held).unwrap();
+    wait_stored(&rig, &t["task_id"], "cancelled", REVOKED);
+    rig.serve_until("open again", |rig| rig.gate_open());
+    assert_eq!(rig.cursor(), Some(2));
+    never_ran(&rig, &t["task_id"], "BEHIND_A_MISMATCH");
+}
+
+/// Wire rule 11, ruling C1b-a: a page holding a record at or below its own
+/// `after` doesn't read: the reader refuses it (`malformed`), a Station
+/// fault. Nothing of it applies (the revoke it carries included), the
+/// cursor stays, the gate stays closed with the fault's alert, and `atem
+/// status` says why. Its id can't be read, so it is taken as the live
+/// call's answer: that call is retired, and the Station's own page for it,
+/// arriving after, is drained. Past the 30-second pause the call goes
+/// again with a fresh id, and its page applies the revoke.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_page_that_doesnt_read_applies_nothing_and_retires_the_call() {
     let rig = Rig::full(Via::Local);
     let link = rig.link();
     let mut r = Router::on(&rig.astation, link);
@@ -2104,46 +2381,40 @@ fn a_page_contradicting_its_call_applies_nothing_and_keeps_the_gate_closed() {
         station.hold_call(link)
     };
     assert_eq!(sync_of(&call), rig.sync(1));
-    // Its answer holds record 1 too: another call's page (after 0), with
-    // its id.
-    let ToStation::ControlSync(asked) = call.call().unwrap() else {
-        panic!("a control_sync");
-    };
+    // Its id and `after`, records 1 and 2 (1 at its `after`): written by
+    // hand, the builder refuses it.
     let page = {
         let station = rig.station();
-        let entries: Vec<FeedEntry> = station
+        let records: Vec<Value> = station
             .records()
             .into_iter()
-            .map(|(seq, record)| FeedEntry::new(seq, record))
+            .map(|(seq, record)| json!({"feed_seq": seq, "record": FeedEntry::new(seq, record).raw()}))
             .collect();
-        assert_eq!(entries.len(), 2);
-        ControlSyncResult {
-            request_id: asked.request_id.clone(),
-            origin: rig.origin(),
-            feed_id: station.feed_id().to_string(),
-            after: 0,
-            head: 2,
-            station_time: r9log::host_now().wall_ms,
-            records: entries,
-        }
-        .to_json()
-        .unwrap()
+        json!({"type": "relay", "op": "control_sync_result", "request_id": request_id(&call),
+            "origin": rig.origin(), "feed_id": station.feed_id(), "after": 1, "head": 2,
+            "station_time": r9log::host_now().wall_ms, "records": records})
         .to_string()
     };
-    drop(call);
+    assert_eq!(
+        ControlSyncResult::decode(page.as_bytes()),
+        Err(RelayError::Malformed("feed_seq"))
+    );
     rig.astation.send(link, page);
     rig.until_feed("the fault", |f| f["faults"] == 1);
-    assert_eq!(rig.feed()["closed"], CONTRADICTS);
+    assert_eq!(rig.feed()["closed"], MALFORMED);
+    assert_eq!(rig.feed()["in_flight"], Value::Null, "retired");
     assert_eq!(rig.cursor(), Some(1));
-    assert_eq!(rig.part(&principal), Some(covered));
+    assert_eq!(rig.part(&principal), Some(covered.clone()));
     assert!(!rig.gate_open());
-    rig.status_feeds(&format!("{GATE_CLOSED} ({CONTRADICTS})"));
-    within("the fault alert", || {
-        rig.runtime_log().contains(CONTRADICTS)
-    });
+    rig.status_feeds(&format!("{GATE_CLOSED} ({MALFORMED})"));
+    within("the fault alert", || rig.runtime_log().contains(MALFORMED));
     let t = task(IDS, &launch, "BEHIND_A_FAULT", HOUR);
     enqueue(&mut svc, &mut r, &t);
     wait_stored(&rig, &t["task_id"], "blocked", GATE_CLOSED);
+    // The Station's own page for it: drained.
+    rig.station().answer_held(call).unwrap();
+    rig.until_feed("drained", |f| f["drained"] == 1);
+    assert_eq!(rig.part(&principal), Some(covered));
     // Past the pause: asked again, the revoke applies.
     rig.clock.add_mono(30_000);
     rig.announce();
@@ -2151,4 +2422,62 @@ fn a_page_contradicting_its_call_applies_nothing_and_keeps_the_gate_closed() {
     wait_stored(&rig, &t["task_id"], "cancelled", REVOKED);
     assert_eq!(rig.syncs().last(), Some(&rig.sync(1)));
     never_ran(&rig, &t["task_id"], "BEHIND_A_FAULT");
+}
+
+/// Ruling C1b-a (Astation's "late refusal"): a refusal names a call kind,
+/// never a request, so a `control_sync_refused` the Station meant for a
+/// retired call retires the live one. That costs liveness only: the live
+/// call's page, arriving after, is drained, nothing applies, and the gate
+/// stays closed (`atem status` says the Station refused) until a call
+/// asked past the backoff, with a fresh id, is read.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_late_refusal_retires_the_live_call_and_costs_liveness_only() {
+    let rig = Rig::full(Via::Local);
+    let link = rig.link();
+    rig.cover_and_open();
+    let principal = format!("service:{SVC}");
+    let covered = rig.part(&principal).unwrap();
+    rig.append(SVC, ControlAction::Hold);
+    rig.clock.add_mono(1_000);
+    let a = {
+        let mut station = rig.station();
+        station.heads_now();
+        station.hold_call(link)
+    };
+    // A unanswered for 30 s: B asked.
+    rig.clock.add_mono(31_000);
+    let b = rig.station().hold_call(link);
+    assert_eq!(sync_of(&b), rig.sync(1));
+    assert_ne!(request_id(&a), request_id(&b));
+    // A's refusal, late: it retires B.
+    rig.astation.send(
+        link,
+        CallRefused {
+            call: RefusedCall::ControlSync,
+            code: RefusalCode::Forbidden,
+        }
+        .to_json()
+        .unwrap()
+        .to_string(),
+    );
+    rig.until_station("the refusal", |s| s["refusals"]["control_sync"] == 1);
+    assert_eq!(rig.feed()["in_flight"], Value::Null);
+    // B's page: drained.
+    rig.station().answer_held(b).unwrap();
+    rig.until_feed("B's page drained", |f| f["drained"] == 1);
+    assert_eq!(rig.part(&principal), Some(covered.clone()));
+    assert_eq!(rig.feed()["closed"], REFUSED);
+    assert!(!rig.gate_open());
+    rig.status_feeds(&format!("{GATE_CLOSED} ({REFUSED})"));
+    drop(a);
+    // Past the backoff: a fresh call, read; open.
+    rig.clock.add_mono(30_000);
+    rig.announce();
+    rig.serve_until("open again", |rig| rig.gate_open());
+    assert_ne!(rig.part(&principal), Some(covered), "the hold applied");
+    assert_eq!(rig.syncs().last(), Some(&rig.sync(1)));
 }

@@ -37,11 +37,9 @@
 //!   ([`Synced::read`]). A feed the host never read is read from 0 too (no
 //!   reset counted, no mark).
 //! - **Only the announced feed is synced.** `control_sync` names the feed
-//!   the last `heads` announced, and a page is taken only for the call in
-//!   flight, whose `(origin, feed_id)` it must carry: positions come only
-//!   from that page's own feed. A page of another feed (a Station serving
-//!   its current feed for an old `feed_id`, §11.4's open question) applies
-//!   nothing and reads as a reset; one nobody asked for applies nothing.
+//!   the last `heads` announced, and a page applies only as the answer to
+//!   the live call (see "Matching"): positions come only from that page's
+//!   own feed.
 //! - **Pages** (§11.4). A page the reader refused as a whole (not strict
 //!   JSON, or out of its grammar) is a Station fault: nothing applies, the
 //!   cursor stays, the gate stays closed until a page that reads, and an
@@ -56,9 +54,8 @@
 //!   Station's: what applied before commits, the cursor stays there. A page
 //!   with no record reads the feed up to its head (§11.4 rule 7: gaps are
 //!   allowed, and an empty page after the cursor says none remains). A page
-//!   holds "the records after `after`" (§11.4), so one holding a record at
-//!   or below its call's `after` contradicts its call: a Station fault
-//!   ([`CONTRADICTS_CALL`], ruling T33e), nothing of it applied.
+//!   holds only the records strictly after its echoed `after` (wire rule
+//!   11): one that doesn't is refused by the reader, a fault as above.
 //! - **Pacing** (as the device-list fetch's, Task 30 I1). One `control_sync`
 //!   in flight at a time. Those a `heads` or the pass start are at most one
 //!   a second, and none for 30 seconds after a page that moved nothing or
@@ -67,29 +64,38 @@
 //!   so is a reset's read from 0 once its mark is written (one call in
 //!   flight, and a reset counts once until its read begins, so it stays
 //!   bounded by the pages).
-//! - **Matching** (rulings T33d, T33e). A page names no call (no echo of
-//!   `feed_id` and `after`; gaps are legal), so it is matched to the one
-//!   call in flight by order, and at most one call is owed per socket: a
-//!   call is never dropped while its answer may still come. A new link
-//!   generation on the same socket (Astation re-authenticating it, a routed
-//!   link's upgrade; [`StationLink::socket`]) keeps it, and asks nothing
-//!   until its answer comes, taken as that call's (its own `after` and
-//!   kind: a continuation's page never ends a reset); a new socket drops
-//!   it, since its answer can't come there. A call unanswered for 30
-//!   seconds (timed only while a link is up) stops the sync: its gate stays
-//!   closed, nothing more is asked on its socket, and the Station-fault
-//!   alert goes. Its late answer is still that call's (nothing was asked
-//!   after it) and resumes the sync; one that never comes waits for a new
-//!   socket (the host has no safe way to ask for a fresh link: `atem
-//!   status` names `atem runtime restart`).
+//! - **Matching** (wire rule 11, ruling C1b-a). Every call gets a fresh
+//!   `request_id` (a lowercase UUID v4 from the OS CSPRNG): a retry and a
+//!   new link generation's call too, whatever the cursor. At most one call
+//!   is live per socket. A page applies only when it carries the live
+//!   call's id, [`ControlSyncResult::answers`] that call (its origin, feed
+//!   and `after`), and the link generation and socket, and the account and
+//!   genesis, are those captured with the call; a discovery call's (no
+//!   `feed_id`; this host never makes one) only on the own feed this
+//!   generation's `heads` announced ([`Ask::judge`]). A call is retired by
+//!   its id when it is answered, when it goes unanswered for 30 seconds
+//!   (the Station's deadline: an hourly Station-fault alert, `atem status`
+//!   says so, and a new call with a fresh id may go at once, under the
+//!   pacing), and when the link generation changes (the Station cancels
+//!   the old generation's jobs; bytes written before may still come). A
+//!   page with a retired id is drained: counted, nothing advanced, no gate
+//!   opened, no fault. A page with an id the host never sent (or no longer
+//!   keeps: the last [`RETIRED_KEPT`]) is unsolicited: a Station fault. A
+//!   page with the live id that doesn't answer it (another origin, feed or
+//!   `after`) is a Station fault too, and retires the call; so does a page
+//!   the reader refuses (its id can't be read: it is taken as the live
+//!   call's answer). A page with the live id whose `head` is below its
+//!   `after` (no records: the reader refuses any) is a reset: marked, the
+//!   cursor never moved on it.
 //! - **Refusals** (Decision 20). Any refusal on the link
 //!   (`control_sync_refused`, `membership_fetch_refused`,
 //!   `control_ack_refused`) closes every gate the link serves: nothing
 //!   advances (no cursor, announced head, clock floor or acknowledgment).
-//!   A `control_sync_refused` ends the host's own wait for the sync in
-//!   flight, timed out or not (it is its answer, so a page arriving after
-//!   it is one nobody asked for); another call's refusal leaves the sync in
-//!   flight (its answer is owed) but its page ends nothing. The gate stays
+//!   A refusal names a call kind, never a request: a
+//!   `control_sync_refused` retires the live sync call, whichever call it
+//!   was meant for (a late one costs liveness only: the live call's page is
+//!   then drained); another call's refusal leaves the sync call live, and
+//!   its page applies but ends nothing (it was asked before). The gate stays
 //!   closed until a page asked for after a 30-second backoff reads
 //!   ("repairs the association and resynchronizes"), at a `heads`, or on
 //!   the next link generation. A refusal completes and correlates nothing.
@@ -99,9 +105,10 @@
 //!   announced is read up to its head. The device-list part is the host's
 //!   own fetch's ([`super::fetch::ListPart`]): [`GateView`] ANDs them. The
 //!   native gate is the host's own Station's. Closed on any disconnect (a
-//!   new link generation starts afresh, but for a call still owed on its
-//!   socket), on a reset, after 60 seconds without `heads`, on a Station
-//!   clock beyond the cap, on any refusal, and while a call is unanswered.
+//!   new link generation starts afresh), on a reset, after 60 seconds
+//!   without `heads`, on a Station clock beyond the cap, on any refusal or
+//!   Station fault (until a page asked after it reads), and while the feed
+//!   isn't read to the announced head (a call unanswered: asked again).
 //! - **The start view** ([`super::gate::Gates`]) gets the feed part as it
 //!   changes ([`FeedSync::take_gates`]), so the start check reads it at
 //!   once (Decision 16).
@@ -115,6 +122,7 @@ use crate::runtime::host_work::Store;
 use crate::session_protocol::membership::ListState;
 use atem_client::control::{
     Applied, ControlSync, ControlSyncResult, FeedPos, Heads, HostAction, RefusedCall, RelayError,
+    SyncMismatch,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -134,9 +142,12 @@ pub struct Clocks {
     pub mono_ms: u64,
     pub boot_ms: Option<u64>,
 }
-/// A `control_sync` unanswered this long stops the sync until its answer
-/// comes or a new socket (ruling T33e): nothing is asked again.
+/// A `control_sync` unanswered this long is retired (Astation's deadline,
+/// ruling C1b-a): a new call, with a fresh id, may go.
 pub const SYNC_TIMEOUT_MS: u64 = 30_000;
+/// The retired `request_id`s kept: a page with one of them is drained;
+/// one older than these reads as unsolicited (a fault: fail closed).
+pub const RETIRED_KEPT: usize = 256;
 /// One alert line an hour per kind (Decision 12, as I.5.4's alerts).
 pub const ALERT_EVERY_MS: u64 = 3_600_000;
 
@@ -154,11 +165,11 @@ pub enum Closed {
     HeadsLate,
     /// A refusal on the link (Decision 20).
     Refused,
-    /// A `control_sync` went unanswered for 30 s: nothing more is asked on
-    /// its socket (a re-send could bring two answers), so the sync waits
-    /// for its answer or a new socket (rulings T33d, T33e).
+    /// The last `control_sync` went unanswered for 30 s and nothing has
+    /// answered since: it was retired and asked again (ruling C1b-a).
     Unanswered,
-    /// A page the reader refused as a whole (its code).
+    /// A Station fault (its code): a page the reader refused as a whole,
+    /// one that doesn't answer the live call, an unsolicited one.
     Fault(&'static str),
     /// A `station_time` beyond the cap.
     ClockAhead,
@@ -207,24 +218,84 @@ impl Closed {
 
 /// Decision 20's `atem status` text.
 pub const REFUSED_STATUS: &str = "Station refused feed access (forbidden); retrying";
-/// The status of a sync that waits for its unanswered call's answer or a
-/// new socket (rulings T33d, T33e), with the way out.
-pub const UNANSWERED: &str = "a control_sync went unanswered; nothing more is asked until its answer comes or the link reconnects: run `atem runtime restart` to reconnect now";
+/// The status after a `control_sync` went unanswered for 30 s (ruling
+/// C1b-a): retired, asked again with a new id.
+pub const UNANSWERED: &str =
+    "a control_sync went unanswered for 30 s; asked again with a new request id";
 
 /// Decision 12's alert for a page that isn't strict JSON.
 pub const NOT_STRICT: &str = "Station sent a page that isn't strict JSON";
 
-/// The fault code of a page that contradicts its call: it holds a record
-/// at or below the call's `after` (ruling T33e).
-pub const CONTRADICTS_CALL: &str = "contradicts_call";
+/// The fault code of a page whose `request_id` the host never sent (ruling
+/// C1b-a).
+pub const UNSOLICITED: &str = "unsolicited";
+/// The fault codes of a page that carries the live call's id and doesn't
+/// answer it ([`ControlSyncResult::answers`]): another origin, feed or
+/// `after` (ruling C1b-a).
+pub const MISMATCHED_ORIGIN: &str = "mismatched_origin";
+pub const MISMATCHED_FEED: &str = "mismatched_feed_id";
+pub const MISMATCHED_AFTER: &str = "mismatched_after";
+
+/// What a page that carries the live call's `request_id` is to that call
+/// ([`Ask::judge`], ruling C1b-a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// It answers the call: it may apply.
+    Answers,
+    /// It doesn't answer it: a Station fault, its code.
+    Fault(&'static str),
+    /// The call was captured on another link generation or socket, or
+    /// under another account or genesis: drained.
+    Stale,
+}
+
+impl Ask {
+    /// What `page` (carrying this call's id) is to this call (ruling
+    /// C1b-a): `link`, the link's generation and socket now (`None`: down);
+    /// `list`, the feed store's account and genesis now (`None`: not
+    /// loaded, nothing applies anyway); `announced`, the own feed this
+    /// generation's `heads` announced. Stale when captured on another
+    /// generation or socket, or under another account or genesis; else the
+    /// shared helper decides ([`ControlSyncResult::answers`]: the same
+    /// origin, feed when named and `after`), and a discovery call (no
+    /// `feed_id`) is answered only on the announced own feed.
+    fn judge(
+        &self,
+        page: &ControlSyncResult,
+        link: Option<(u64, u64)>,
+        list: Option<&ListId>,
+        announced: Option<&str>,
+    ) -> Verdict {
+        if link != Some((self.link_gen, self.socket)) || list.is_some_and(|l| *l != self.list) {
+            return Verdict::Stale;
+        }
+        if let Err(m) = page.answers(&self.call) {
+            return Verdict::Fault(match m {
+                SyncMismatch::Origin => MISMATCHED_ORIGIN,
+                SyncMismatch::FeedId => MISMATCHED_FEED,
+                SyncMismatch::After => MISMATCHED_AFTER,
+                // The caller matched the id: unsolicited otherwise.
+                SyncMismatch::RequestId => UNSOLICITED,
+            });
+        }
+        if self.call.feed_id.is_none() && announced != Some(page.feed_id.as_str()) {
+            return Verdict::Fault(MISMATCHED_FEED);
+        }
+        Verdict::Answers
+    }
+}
 
 /// A Station fault's text (`atem status`, the alert), by its code.
 fn fault_text(code: &str) -> String {
     match code {
         "not_strict" => NOT_STRICT.into(),
-        "another_origin" => "Station sent a page of another origin".into(),
-        CONTRADICTS_CALL => {
-            "Station sent a page that contradicts its call (a record at or below the position asked after)".into()
+        UNSOLICITED => "Station sent a page for a call this host never made".into(),
+        MISMATCHED_ORIGIN => {
+            "Station sent a page that doesn't answer its call (another origin)".into()
+        }
+        MISMATCHED_FEED => "Station sent a page that doesn't answer its call (another feed)".into(),
+        MISMATCHED_AFTER => {
+            "Station sent a page that doesn't answer its call (another position asked after)".into()
         }
         code => format!("Station sent a page the reader refused ({code})"),
     }
@@ -256,26 +327,28 @@ struct Reset {
     durable: bool,
 }
 
-/// The `control_sync` in flight: its answer is owed (rulings T33d, T33e).
+/// The account and genesis of the device list a feed store was loaded
+/// for ([`FeedStore::list_id`]).
+pub(crate) type ListId = (String, atem_client::encoding::Hash32);
+
+/// The live `control_sync` (ruling C1b-a): what it was captured with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Ask {
-    /// Its `request_id` (wire rule 11): fresh for every call.
-    request_id: String,
-    origin: String,
-    feed_id: String,
-    after: u64,
-    sent_at: u64,
+    /// The call as sent.
+    call: ControlSync,
+    /// The link generation it went on.
+    link_gen: u64,
     /// The socket it went on ([`StationLink::socket`]): its answer can come
     /// only there, whatever the link generation.
     socket: u64,
-    /// Unanswered for 30 s: nothing more is asked on its socket; a late
-    /// answer is still this call's.
-    timed_out: bool,
+    /// The account and genesis it was asked under.
+    list: ListId,
+    sent_at: u64,
     /// Read from the feed's start (a reset, or a feed never read): its page
     /// replaces the origin's cursor first.
     restart: bool,
     /// The sync's epoch when it was asked: a page asked before the latest
-    /// refusal or restart ends no resynchronization.
+    /// refusal, fault or restart ends no resynchronization.
     epoch: u64,
 }
 
@@ -352,19 +425,23 @@ pub struct FeedSync {
     /// A reset waits for the feed to be read from position 0 (its durable
     /// mark is the feed store's: ruling T33c).
     reset: Option<Reset>,
-    /// The last announcement is stale (the Station served another feed
-    /// than it named): nothing is asked before the next `heads`.
-    wait_heads: bool,
-    /// Bumped at each refusal and at the start's restart: a page asked
-    /// before ends no resynchronization.
+    /// Bumped at each refusal, Station fault and the start's restart: a
+    /// page asked before ends no resynchronization.
     epoch: u64,
     /// The feed store's committed feed of the own origin, as last seen:
     /// `(feed_id, cursor)`.
     synced: Option<(String, u64)>,
+    /// The account and genesis of the feed store's device list, as last
+    /// seen (a call is asked under it).
+    list_id: Option<ListId>,
     loaded: bool,
-    /// The call whose answer is owed, kept while its socket may still bring
-    /// it (across link generations on that socket; ruling T33e).
+    /// The live call (ruling C1b-a).
     in_flight: Option<Ask>,
+    /// The ids of the calls retired, the latest [`RETIRED_KEPT`]: their
+    /// pages are drained.
+    retired: std::collections::VecDeque<String>,
+    /// The last call went unanswered for 30 s and no page answered since.
+    unanswered: bool,
     refused_at: Option<u64>,
     /// The last ask a `heads` or the pass started, and the last page that
     /// moved nothing (monotonic ms): the pacing, kept across generations.
@@ -382,7 +459,6 @@ pub struct FeedSync {
     // Counts, for the state dump.
     heads: u64,
     pages: u64,
-    unasked: u64,
     refusals: u64,
     faults: u64,
     resets: u64,
@@ -390,8 +466,10 @@ pub struct FeedSync {
     failures: u64,
     mark_failures: u64,
     timeouts: u64,
-    /// Late answers taken (a timed-out call's).
-    late: u64,
+    /// Pages of retired calls, drained.
+    drained: u64,
+    /// Pages of calls never made (a Station fault).
+    unsolicited: u64,
 }
 
 impl Default for FeedSync {
@@ -414,11 +492,13 @@ impl FeedSync {
             clock: None,
             resync: None,
             reset: None,
-            wait_heads: false,
             epoch: 0,
             synced: None,
+            list_id: None,
             loaded: false,
             in_flight: None,
+            retired: std::collections::VecDeque::new(),
+            unanswered: false,
             refused_at: None,
             paced_at: None,
             stalled_at: None,
@@ -429,7 +509,6 @@ impl FeedSync {
             published: (None, false),
             heads: 0,
             pages: 0,
-            unasked: 0,
             refusals: 0,
             faults: 0,
             resets: 0,
@@ -437,18 +516,18 @@ impl FeedSync {
             failures: 0,
             mark_failures: 0,
             timeouts: 0,
-            late: 0,
+            drained: 0,
+            unsolicited: 0,
         }
     }
 
     /// The link as the Station has it (`None`: down). A new generation
     /// starts afresh: no `heads`, nothing announced, no refusal's backoff
     /// and nothing waiting to be read again but a reset (the gate is closed
-    /// until its `heads`); the pacing carries over. A call whose answer is
-    /// owed stays in flight on its own socket (the Station answers it there,
-    /// whatever the generation: ruling T33e), timed out or not, so the new
-    /// generation asks nothing until it is answered; a new socket drops it
-    /// (its answer can't come there).
+    /// until its `heads`); the pacing carries over. The live call is
+    /// retired, whatever the socket (ruling C1b-a: the Station cancels the
+    /// old generation's jobs; a page with its id that still comes is
+    /// drained), and the new generation asks with a fresh id.
     pub fn on_link(&mut self, link: Option<&StationLink>) {
         let Some(link) = link else {
             self.on_link_down();
@@ -457,23 +536,17 @@ impl FeedSync {
         if self.link_gen == Some(link.link_gen) && self.socket == Some(link.socket) {
             return;
         }
+        self.retire_live();
         self.fresh_generation();
-        if self
-            .in_flight
-            .as_ref()
-            .is_some_and(|ask| ask.socket != link.socket)
-        {
-            self.in_flight = None;
-        }
         self.link_gen = Some(link.link_gen);
         self.socket = Some(link.socket);
         self.own = link.origin.clone();
     }
 
-    /// The link went down: every gate it served closes. A call in flight
-    /// stays owed: the next generation may come on its socket (a
-    /// re-authentication), and only a new socket drops it ([`Self::on_link`]).
+    /// The link went down: every gate it served closes, and its generation
+    /// ends: the live call is retired (ruling C1b-a).
     pub fn on_link_down(&mut self) {
+        self.retire_live();
         self.fresh_generation();
         self.link_gen = None;
         self.socket = None;
@@ -482,62 +555,64 @@ impl FeedSync {
 
     fn fresh_generation(&mut self) {
         self.heads_at = None;
-        self.wait_heads = false;
         self.announced = None;
         self.own_feeds = 0;
         self.clock = None;
         self.resync = None;
         self.refused_at = None;
+        self.unanswered = false;
     }
 
-    /// The call in flight went unanswered for 30 s and is still owed.
-    fn unanswered(&self) -> bool {
-        self.in_flight.as_ref().is_some_and(|ask| ask.timed_out)
+    /// The live call, if any, retired by its id: a page that carries it is
+    /// drained from now on.
+    fn retire_live(&mut self) {
+        if let Some(ask) = self.in_flight.take() {
+            self.retire(ask.call.request_id);
+        }
+    }
+
+    /// `request_id` retired (the latest [`RETIRED_KEPT`] are kept).
+    fn retire(&mut self, request_id: String) {
+        if self.retired.len() >= RETIRED_KEPT {
+            self.retired.pop_front();
+        }
+        self.retired.push_back(request_id);
     }
 
     /// The start's recovery (design I.6.2 step 7): the gate closes until a
-    /// page asked from now reads. A call in flight stays (its answer is
-    /// owed: dropped, it would come after the next ask and be taken for its
-    /// page), and its page ends no resynchronization.
+    /// page asked from now reads. The live call stays live (its page still
+    /// applies, matched by its id), but ends no resynchronization.
     pub fn restart(&mut self) {
         self.resync = Some(Resync::Restarted);
         self.epoch += 1;
     }
 
     /// The pass's monotonic time and the feed store (`None`: not loaded):
-    /// a `control_sync` due now (one the feed needs while a recent `heads`
-    /// announced it), a call in flight timed out (30 s unanswered while a
-    /// link is up: its socket may come back while none is), and the hourly
-    /// alert counts due. The bridge runs it after the pass's messages, so a
-    /// page that came in time answers its call first (Task 33 re-review 3,
-    /// m1).
+    /// a live call unanswered for 30 s retired (ruling C1b-a: an hourly
+    /// Station-fault alert), then a `control_sync` due now (one the feed
+    /// needs while a recent `heads` announced it, a new one with a fresh
+    /// id after a timeout, under the pacing), and the hourly alert counts
+    /// due. The bridge runs it after the pass's messages, so a page that
+    /// came in time answers its call first (Task 33 re-review 3, m1).
     pub fn tick(&mut self, now: Clocks, feeds: Option<&FeedStore>) -> Vec<ControlSync> {
         self.advance(now, feeds);
-        let up = self.link_gen.is_some();
-        if let Some(ask) = self.in_flight.as_mut()
-            && up
-            && !ask.timed_out
+        if let Some(ask) = &self.in_flight
             && self.now >= ask.sent_at.saturating_add(SYNC_TIMEOUT_MS)
         {
-            // No page names its call (§11.4: no echo; gaps are legal), so
-            // nothing more is asked on its socket (a re-send could bring two
-            // answers): the call stays owed, its late answer still its own,
-            // and the sync waits for it or a new socket (rulings T33d, T33e).
-            ask.timed_out = true;
-            let origin = ask.origin.clone();
+            let origin = ask.call.origin.clone();
+            self.retire_live();
+            self.unanswered = true;
             self.timeouts += 1;
             self.alert(
                 Alert::Page,
                 format!(
-                    "a control_sync to {origin} went unanswered for 30 s; its gate stays closed and nothing more is asked until its answer comes or the link reconnects: run `atem runtime restart` to reconnect now"
+                    "a control_sync to {origin} went unanswered for 30 s; it is retired and asked again with a new request id, its gate closed until a page is read"
                 ),
             );
-            return Vec::new();
         }
         // After a refusal, only a `heads` past the backoff asks again
-        // (Decision 20); after a page of another feed, only a `heads`
-        // (its announcement is stale).
-        if !self.heads_fresh() || self.resync == Some(Resync::Refused) || self.wait_heads {
+        // (Decision 20).
+        if !self.heads_fresh() || self.resync == Some(Resync::Refused) {
             return Vec::new();
         }
         self.ask(true).into_iter().collect()
@@ -587,7 +662,6 @@ impl FeedSync {
             mono_ms: self.now,
             boot_ms: self.boot,
         });
-        self.wait_heads = false;
         let Some(own) = self.own.clone() else {
             return Vec::new();
         };
@@ -636,13 +710,16 @@ impl FeedSync {
     }
 
     /// A `control_sync_result` on the link, or a message that was one and
-    /// the reader refused (`Err`). Applied in one transaction when it
-    /// answers the call in flight (`cx`: the feed store and the list; none
-    /// while the feeds aren't loaded, and then nothing applies), as that
-    /// call's answer whatever the link generation (its own `after` and
-    /// kind), a timed-out call's too: nothing was asked on its socket after
-    /// it (ruling T33e). An error: the transaction failed and rolled back
-    /// (nothing applied, the cursor stays); the page is asked again.
+    /// the reader refused (`Err`), matched to the live call by its
+    /// `request_id` (ruling C1b-a; the module docs): applied in one
+    /// transaction only when it answers that call as captured (`cx`: the
+    /// feed store and the list; none while the feeds aren't loaded, and
+    /// then nothing applies). A retired id's page is drained; an id never
+    /// sent is a Station fault; so is a page with the live id that doesn't
+    /// answer it, and a page the reader refused (taken as the live call's
+    /// answer: its id can't be read). An error: the transaction failed and
+    /// rolled back (nothing applied, the cursor stays); the page is asked
+    /// again.
     pub fn on_page(
         &mut self,
         page: Result<ControlSyncResult, RelayError>,
@@ -653,48 +730,58 @@ impl FeedSync {
             // Nothing arrives with no link (the bridge drops it).
             return Ok(Synced::default());
         }
-        let Some(ask) = self.in_flight.take() else {
-            self.unasked += 1;
-            if let Err(e) = page {
-                self.fault(e.code());
-            }
-            return Ok(Synced::default());
-        };
-        if ask.timed_out {
-            // Its late answer: the sync resumes with it (ruling T33e).
-            self.late += 1;
-        }
         let page = match page {
             Ok(page) => page,
             Err(e) => {
+                // Its id can't be read: taken as the live call's answer
+                // (a Station answers calls), so that call is retired; a
+                // Station fault either way.
+                self.retire_live();
                 self.fault(e.code());
                 return Ok(Synced::default());
             }
         };
+        let live = self
+            .in_flight
+            .as_ref()
+            .is_some_and(|ask| ask.call.request_id == page.request_id);
+        if !live {
+            if self.retired.contains(&page.request_id) {
+                // A retired call's (timed out, refused, answered, or of an
+                // earlier link generation): bytes the Station wrote before
+                // it saw the retirement. Nothing advances; no fault.
+                self.drained += 1;
+            } else {
+                self.unsolicited += 1;
+                self.fault(UNSOLICITED);
+            }
+            return Ok(Synced::default());
+        }
+        // The live call's answer, whatever it holds: retired now (a second
+        // page with its id is drained).
+        let Some(ask) = self.in_flight.take() else {
+            return Ok(Synced::default());
+        };
+        self.retire(ask.call.request_id.clone());
+        self.unanswered = false;
+        let link = self.link_gen.zip(self.socket);
+        let list = cx.as_ref().map(|cx| cx.feeds.list_id().clone());
+        let announced = self.announced.as_ref().map(|a| a.feed_id.clone());
+        match ask.judge(&page, link, list.as_ref(), announced.as_deref()) {
+            Verdict::Answers => {}
+            Verdict::Stale => {
+                self.drained += 1;
+                return Ok(Synced::default());
+            }
+            Verdict::Fault(code) => {
+                // Nothing of it applies, its head and time included.
+                self.fault(code);
+                return Ok(Synced::default());
+            }
+        }
         let Some(own) = self.own.clone() else {
             return Ok(Synced::default());
         };
-        if page.origin != own {
-            self.fault("another_origin");
-            return Ok(Synced::default());
-        }
-        if page.feed_id != ask.feed_id {
-            // The Station served another feed than the one asked: a reset
-            // (its current feed for an old id). Nothing of it applies.
-            self.note_reset("the Station served another feed than the one asked");
-            self.stalled_at = Some(self.now);
-            // The announcement is stale: nothing more is asked of it.
-            self.wait_heads = true;
-            return Ok(Synced::default());
-        }
-        if page.records.iter().any(|entry| entry.feed_seq <= ask.after) {
-            // A page carries "the records after `after`" (§11.4): one at or
-            // below it answers another call (or none), so the page
-            // contradicts its call: a Station fault, nothing of it applied,
-            // its head and time included (ruling T33e).
-            self.fault(CONTRADICTS_CALL);
-            return Ok(Synced::default());
-        }
         if let Some((clock, store)) = clock {
             let verdict = clock.station_time(&own, page.station_time, store);
             if verdict != StationTime::Within {
@@ -711,12 +798,20 @@ impl FeedSync {
             return Ok(Synced::default());
         };
         self.observe(Some(cx.feeds));
+        // The feed went back under the same id: the answer's `head` below
+        // its `after` (no records: the reader refuses any), or below the
+        // cursor. A reset: marked (the bridge's next step), the cursor never
+        // moved on this page.
         let below = self
             .synced
             .as_ref()
             .is_some_and(|(feed_id, cursor)| *feed_id == page.feed_id && page.head < *cursor);
-        if !ask.restart && below {
-            self.note_reset("its head below this host's cursor");
+        if page.head < ask.call.after || (!ask.restart && below) {
+            self.note_reset(if page.head < ask.call.after {
+                "its answer's head below the position asked after"
+            } else {
+                "its head below this host's cursor"
+            });
             let next = self.ask(false);
             return Ok(Synced {
                 next,
@@ -772,8 +867,8 @@ impl FeedSync {
             self.stalled_at = Some(self.now);
             return Ok(synced);
         }
-        // Only a page asked after the latest refusal or restart ends its
-        // resynchronization.
+        // Only a page asked after the latest refusal, Station fault or
+        // restart ends its resynchronization.
         if ask.epoch == self.epoch {
             self.resync = None;
         }
@@ -789,9 +884,11 @@ impl FeedSync {
 
     /// A refusal of `call` on the link (Decision 20): nothing advances,
     /// every gate the link serves closes, and a page is asked again only
-    /// after the backoff. A `control_sync_refused` answers the sync in
-    /// flight (timed out or not), ending the host's wait for it; another
-    /// call's refusal leaves it owed.
+    /// after the backoff. A refusal names a call kind, never a request: a
+    /// `control_sync_refused` retires the live sync call, whichever it was
+    /// meant for (ruling C1b-a: a late one costs liveness only, its page
+    /// then drained); another call's refusal leaves it live, its page
+    /// applying but ending nothing (the epoch).
     pub fn on_refused(&mut self, call: RefusedCall) {
         if self.link_gen.is_none() {
             return;
@@ -801,13 +898,8 @@ impl FeedSync {
         self.resync = Some(Resync::Refused);
         self.refused_at = Some(self.now);
         self.epoch += 1;
-        // A `control_sync_refused` answers the sync in flight: its wait
-        // ends. Another call's refusal doesn't: the sync's answer is still
-        // owed, so the call stays in flight (dropped, its answer would come
-        // after a later ask and be taken for that one's page); its page
-        // ends no resynchronization (ruling T33d).
         if call == RefusedCall::ControlSync {
-            self.in_flight = None;
+            self.retire_live();
         }
     }
 
@@ -841,7 +933,8 @@ impl FeedSync {
     }
 
     /// The call just asked for couldn't be handed to the link: none in
-    /// flight (asked again at the next `heads` or pass).
+    /// flight (asked again at the next `heads` or pass), its id never sent
+    /// (not retired: a page naming it is unsolicited).
     pub fn unsent(&mut self) {
         self.in_flight = None;
     }
@@ -868,9 +961,6 @@ impl FeedSync {
         if self.link_gen.is_none() || self.own.is_none() {
             return Some(Closed::NoLink);
         }
-        if self.unanswered() {
-            return Some(Closed::Unanswered);
-        }
         match self.resync {
             Some(Resync::Refused) => return Some(Closed::Refused),
             Some(Resync::Fault(code)) => return Some(Closed::Fault(code)),
@@ -893,6 +983,9 @@ impl FeedSync {
         let Some(announced) = &self.announced else {
             return Some(Closed::NoFeed(self.own_feeds));
         };
+        if self.unanswered {
+            return Some(Closed::Unanswered);
+        }
         if self.reset.is_some() {
             return Some(Closed::Reset);
         }
@@ -944,15 +1037,17 @@ impl FeedSync {
             "closed": self.closed().map(|c| c.text()),
             "announced": self.announced.as_ref().map(|a| json!({"feed_id": a.feed_id, "head": a.head})),
             "synced": self.synced.as_ref().map(|(feed_id, cursor)| json!({"feed_id": feed_id, "cursor": cursor})),
-            "in_flight": self.in_flight.as_ref().map(|a| json!({"feed_id": a.feed_id, "after": a.after, "timed_out": a.timed_out})),
+            "in_flight": self.in_flight.as_ref().map(|a| json!({"request_id": a.call.request_id, "feed_id": a.call.feed_id, "after": a.call.after})),
             "heads": self.heads,
             "pages": self.pages,
-            "unasked": self.unasked,
             "refusals": self.refusals,
             "faults": self.faults,
             "resets": self.resets,
             "timeouts": self.timeouts,
-            "late": self.late,
+            "unanswered": self.unanswered,
+            "drained": self.drained,
+            "unsolicited": self.unsolicited,
+            "retired": self.retired.len(),
             "reset": self.reset.as_ref().map(|r| json!({"begun": r.begun, "durable": r.durable})),
             "other_origin": self.other_origin,
         })
@@ -965,6 +1060,7 @@ impl FeedSync {
     /// review m3).
     fn observe(&mut self, feeds: Option<&FeedStore>) {
         self.loaded = feeds.is_some();
+        self.list_id = feeds.map(|feeds| feeds.list_id().clone());
         self.synced = match (feeds, &self.own) {
             (Some(feeds), Some(own)) => feeds.current_feed(own),
             _ => None,
@@ -1046,10 +1142,12 @@ impl FeedSync {
         );
     }
 
-    /// A page the reader refused, one that names another origin, or one
-    /// that contradicts its call: a Station fault.
+    /// A Station fault (a page the reader refused, one with the live id
+    /// that doesn't answer it, an unsolicited one): the gate closes until a
+    /// page asked after it reads (the epoch; ruling C1b-a).
     fn fault(&mut self, code: &'static str) {
         self.faults += 1;
+        self.epoch += 1;
         self.resync = Some(Resync::Fault(code));
         self.stalled_at = Some(self.now);
         let origin = self.own.clone().unwrap_or_default();
@@ -1070,11 +1168,8 @@ impl FeedSync {
         if !self.loaded || self.in_flight.is_some() {
             return None;
         }
-        // Nothing for a reset before its mark is written (ruling T33c), nor
-        // of a stale announcement before the next `heads` (a call whose
-        // answer is owed, timed out or not, is the one in flight: ruling
-        // T33e).
-        if self.reset.as_ref().is_some_and(|r| !r.durable) || self.wait_heads {
+        // Nothing for a reset before its mark is written (ruling T33c).
+        if self.reset.as_ref().is_some_and(|r| !r.durable) {
             return None;
         }
         let socket = self.socket?;
@@ -1107,35 +1202,30 @@ impl FeedSync {
             None => read.is_none(),
         };
         let after = if restart { 0 } else { read.unwrap_or(0) };
-        let request_id = fresh_request_id();
-        self.in_flight = Some(Ask {
-            request_id: request_id.clone(),
-            origin: own.clone(),
-            feed_id: announced.feed_id.clone(),
-            after,
-            sent_at: self.now,
-            socket,
-            timed_out: false,
-            restart,
-            epoch: self.epoch,
-        });
-        Some(ControlSync {
-            request_id,
+        let list = self.list_id.clone()?;
+        let link_gen = self.link_gen?;
+        let call = ControlSync {
+            request_id: fresh_request_id(),
             origin: own,
             feed_id: Some(announced.feed_id),
             after,
-        })
+        };
+        self.in_flight = Some(Ask {
+            call: call.clone(),
+            link_gen,
+            socket,
+            list,
+            sent_at: self.now,
+            restart,
+            epoch: self.epoch,
+        });
+        Some(call)
     }
 
     /// The call in flight, as it was sent (tests answer it).
     #[cfg(test)]
     pub(crate) fn live_call(&self) -> Option<ControlSync> {
-        self.in_flight.as_ref().map(|ask| ControlSync {
-            request_id: ask.request_id.clone(),
-            origin: ask.origin.clone(),
-            feed_id: Some(ask.feed_id.clone()),
-            after: ask.after,
-        })
+        self.in_flight.as_ref().map(|ask| ask.call.clone())
     }
 
     /// One line now for `kind` when its hour passed, else counted (the
@@ -1248,7 +1338,7 @@ fn apply_page(
         feeds.reset_begun(&tx, &start)?;
     }
     // How far the feed is read with this page.
-    let mut reached = if ask.restart { 0 } else { ask.after };
+    let mut reached = if ask.restart { 0 } else { ask.call.after };
     let mut applied = Vec::new();
     let mut reapplied = Vec::new();
     let mut stopped = false;
@@ -1281,9 +1371,9 @@ fn apply_page(
         }
     }
     if !stopped && page.records.is_empty() {
-        match pos(feeds, page.head.max(ask.after)) {
+        match pos(feeds, page.head.max(ask.call.after)) {
             Some(head) => {
-                reached = page.head.max(ask.after);
+                reached = page.head.max(ask.call.after);
                 feeds.advance(&tx, head)?;
             }
             None => stopped = true,

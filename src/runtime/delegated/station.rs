@@ -9,11 +9,11 @@
 //! it), Astation's local `:8080` (which proxies the calls to the Station),
 //! or a routed relay link with no Astation (§R9.7b). Its Station is the
 //! selected Station ([`StationLink::origin`]). A new link generation starts
-//! afresh: the fetch in flight doesn't carry over, and a refusal's backoff
-//! ends; the fetch's pacing carries over
-//! ([`DeviceListFetch::next_generation`]), and so does a `control_sync`
-//! whose answer is still owed on the same socket ([`StationLink::socket`],
-//! [`FeedSync::on_link`]: ruling T33e).
+//! afresh: the fetch in flight doesn't carry over, a refusal's backoff
+//! ends, and the live `control_sync` is retired by its id (a page that
+//! still carries it is drained: [`FeedSync::on_link`], ruling C1b-a); the
+//! fetch's pacing carries over ([`DeviceListFetch::next_generation`]), and
+//! so does the sync's.
 //!
 //! Here: the device list's fetch ([`super::fetch`]) and its part of the
 //! revocation gate ([`Station::list_fetch`]), the sync of the host's own
@@ -65,11 +65,10 @@ impl LinkKind {
 pub struct StationLink {
     /// The link generation (the App's `astation_link_gen`).
     pub link_gen: u64,
-    /// The socket it runs on (`AstationClient::socket_id`): a new link
-    /// generation on the same socket (Astation re-authenticating it, a
-    /// routed link's upgrade) still gets the answers to calls sent before
-    /// it, a new socket never does (host-work-v1 §11.4, "Matching a page to
-    /// its call").
+    /// The socket it runs on (`AstationClient::socket_id`): captured with
+    /// each `control_sync`, which a page answers only on the generation and
+    /// socket it went on (host-work-v1 §11.4, "Matching a page to its
+    /// call"; ruling C1b-a).
     pub socket: u64,
     pub kind: LinkKind,
     /// The selected Station's origin (`station_route::destination`,

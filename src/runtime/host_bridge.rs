@@ -1628,8 +1628,8 @@ impl HostBridge {
             }
         }
         // The feed sync's tick after the pass's messages: a page that came
-        // before its call's 30 s deadline answers it first, never dropped
-        // as late (Task 33 re-review 3, m1).
+        // before its call's 30 s deadline answers it first, never drained
+        // as a retired call's (Task 33 re-review 3, m1; ruling C1b-a).
         calls.extend(self.feed_tick(now));
         // The device list may have moved (a carriage): pending control
         // records are applied again.

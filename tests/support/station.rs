@@ -27,18 +27,17 @@
 //! - `control_sync`: the records after `after` of the account's one feed at
 //!   this Station, ascending, as many as fit in one message (at most 64,
 //!   and the whole message within 256 KiB: the builder's own bounds), with
-//!   the feed's head and the Station's time. A call for a feed that isn't
-//!   the account's at this Station (another origin, a `feed_id` the
-//!   account never had here) is refused, `control_sync_refused` ("One feed
-//!   per account").
-//! - A `control_sync` naming the account's feed from before a reset: §11.4
-//!   doesn't say. Two readings, chosen with [`FakeStation::stale_feed`]:
-//!   [`StaleFeed::Refuse`] (the default), `control_sync_refused`, the
-//!   literal reading of "not its account's feed at this Station": **Atem's
-//!   reading, not confirmed with Astation**; or [`StaleFeed::ServeCurrent`],
-//!   the account's current feed from position 0, as for a call without a
-//!   `feed_id` (the result's `feed_id` is then the only in-band reset
-//!   signal the wire has). A host must handle both until Astation answers.
+//!   the feed's head and the Station's time, the call's `request_id` and
+//!   `after` echoed (wire rule 11). A call for a feed that isn't the
+//!   account's at this Station (another origin, a `feed_id` the account
+//!   never had here) is refused, `control_sync_refused` ("One feed per
+//!   account").
+//! - A `control_sync` naming the account's feed from before a reset is
+//!   refused, `control_sync_refused` (wire rule 11, as Astation decided on
+//!   #164): [`StaleFeed::Refuse`], the default. [`StaleFeed::ServeCurrent`]
+//!   is a Station that breaks the rule, for the host's defences: the
+//!   account's current feed from position 0 (`after: 0` echoed), its
+//!   `feed_id` not the call's, a page the host takes for no answer.
 //! - `membership_fetch`: the device list's entries after `after`, as many
 //!   as fit (at most 64, within 256 KiB), and its head.
 //! - `control_ack`: no answer when the reference [`AckLedger`] counts it;
@@ -91,16 +90,15 @@ const HEARTBEAT: Duration = Duration::from_secs(30);
 const WAIT: Duration = Duration::from_secs(60);
 
 /// What a `control_sync` naming the account's feed from before a reset
-/// gets: §11.4 doesn't say (the module docs).
+/// gets (the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleFeed {
-    /// `control_sync_refused`: the literal "not its account's feed at this
-    /// Station" (Atem's reading, not confirmed with Astation).
+    /// `control_sync_refused`: wire rule 11, as Astation decided on #164.
     Refuse,
-    /// The account's current feed from position 0 (`after` ignored: a
-    /// cursor belongs to a feed), as for a call with no `feed_id`. The
-    /// result's `feed_id` is then the only in-band reset signal the wire
-    /// has.
+    /// A Station that breaks the rule: the account's current feed from
+    /// position 0 (`after: 0`: a cursor belongs to a feed), as for a call
+    /// with no `feed_id`. The page names another feed than the call, so it
+    /// doesn't answer it (`ControlSyncResult::answers`).
     ServeCurrent,
 }
 
