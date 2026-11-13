@@ -2341,6 +2341,43 @@ The sender's channel and online status are not conditions.
   task is reconciled with its latest attempt's receipt and route changes
   are applied (design I.6.2, I.6.3).
 
+#### The deadline interrupt
+
+A delegated task whose turn still runs at its deadline (on the clock below)
+is interrupted (design I.4.4, I.5.7):
+- **The intent.** The host writes an interrupt intent with reason
+  `deadline` for its attempt. It is durable before anything acts on it.
+- **The interrupt.** The host interrupts the turn with host authority
+  (session-v1 R9.14 item 5): once per turn in a run, and only the lease
+  revocation repeats while the intent is pending.
+- **What the task does.** The turn ends interrupted, the task goes to
+  `awaiting_result`, `interrupted at deadline`, and then `expired` as
+  today.
+- **An attempt still waiting `accepted`** is withdrawn instead, and the
+  task is `expired`, `expired before submission`.
+
+As built in step 4:
+- **The detail.** `interrupted at deadline` names only a turn the
+  deadline's interrupt reached. A turn that ended interrupted otherwise
+  keeps `turn interrupted`.
+- **While hosting is paused. Atem's reading, for Astation to confirm.**
+  The interrupt, and every pending intent, is carried out while hosting
+  is paused (`runtime.toml` doesn't load, or `enabled = false`). A stop
+  grants nothing, and the turn's own lease goes on renewing during a
+  pause. Nothing new starts, and the task's record waits for the pause to
+  end.
+  - **Residuals.** A receipt-database fault holds the intents until the
+    restart it asks for (recovery step 3 carries them out then). A runtime
+    started while paused carries them out once hosting is on.
+- **At a restart. Atem's reading, for Astation to confirm.** A pending
+  intent whose attempt is `rejected` at recovery step 3 gives the task the
+  intent's state. That covers `withdrawn at recovery`, and also a
+  `session closed` not yet processed: the task becomes `expired`, not
+  `failed`. Design I.6.3, "As built in step 4", has the details.
+- **With `host.delegated` turned off after tasks were accepted** (the
+  debug-only hook removed), a started task's turn is still interrupted at
+  its deadline.
+
 #### Unknown outcomes
 
 - `outcome_unknown` is final for execution: such a task is never

@@ -43,7 +43,7 @@ use crate::runtime::host_bridge::InterruptReport;
 use crate::runtime::host_work::Store;
 use anyhow::{Result, bail};
 use atem_client::session::host_work::WorkState;
-use rusqlite::{Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::HashMap;
 
 /// An error after queueing counts as delivered; the interrupt is written
@@ -193,6 +193,25 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The turn the interrupt of attempt `attempt_id`'s intent for
+    /// `reason`'s kind reached (`delivered_turn`), if one was delivered.
+    pub fn delivered_turn(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+        reason: &IntentReason,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT delivered_turn FROM intents WHERE attempt_id=?1 AND reason=?3
+                AND task_id=?2 AND delivered_turn IS NOT NULL LIMIT 1",
+                params![attempt_id, task_id, reason.name()],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Whether attempt `attempt_id` of `task_id` has an intent for
     /// `reason`'s kind (any revocation), pending or done.
     pub fn has_intent(
@@ -229,7 +248,6 @@ impl Store {
     /// The intent `id`, as stored.
     #[cfg(test)]
     pub fn intent(&self, id: i64) -> Result<Option<Intent>> {
-        use rusqlite::OptionalExtension;
         Ok(self
             .db
             .query_row(
@@ -323,6 +341,42 @@ impl Runs {
         self.writing.remove(attempt_id);
         self.delivered.remove(attempt_id);
     }
+
+    /// The reports of this run's writes (`reports`: the bridge's
+    /// `host_interrupt_reports`, each write's once), at `now_ms` on the
+    /// bridge clock: `ok` and `error_after_queue` are deliveries (the turn
+    /// written durably as `delivered_turn`), the rest wrote nothing.
+    /// Reports of writes no intent made (the drive hook's) are ignored.
+    pub fn reported(
+        &mut self,
+        store: &Store,
+        reports: &[(String, InterruptReport)],
+        now_ms: u64,
+    ) -> Result<()> {
+        for (attempt, report) in reports {
+            let Some(turn) = self.writing.remove(attempt) else {
+                continue;
+            };
+            let uncertain = match report {
+                InterruptReport::Ok => false,
+                InterruptReport::ErrorAfterQueue => true,
+                // Nothing written: written again on the next pass.
+                InterruptReport::Consumed
+                | InterruptReport::Dropped
+                | InterruptReport::NoEffect => continue,
+            };
+            store.intent_delivered(attempt, &turn)?;
+            self.delivered.insert(
+                attempt.clone(),
+                Delivered {
+                    turn,
+                    at_ms: now_ms,
+                    uncertain,
+                },
+            );
+        }
+        Ok(())
+    }
 }
 
 /// One pass of the pending intents (oldest first): the reports of this
@@ -343,30 +397,7 @@ pub fn intents_pass(
     runs: &mut Runs,
     now_ms: u64,
 ) -> Result<Vec<(Intent, Decision)>> {
-    for (attempt, report) in reports {
-        let Some(turn) = runs.writing.remove(attempt) else {
-            // Not an intent's write (the drive hook's), or one from before
-            // its intent was done.
-            continue;
-        };
-        let uncertain = match report {
-            InterruptReport::Ok => false,
-            InterruptReport::ErrorAfterQueue => true,
-            // Nothing written: written again on the next pass.
-            InterruptReport::Consumed | InterruptReport::Dropped | InterruptReport::NoEffect => {
-                continue;
-            }
-        };
-        store.intent_delivered(attempt, &turn)?;
-        runs.delivered.insert(
-            attempt.clone(),
-            Delivered {
-                turn,
-                at_ms: now_ms,
-                uncertain,
-            },
-        );
-    }
+    runs.reported(store, reports, now_ms)?;
     let mut decided: HashMap<String, Decision> = HashMap::new();
     let mut out = Vec::new();
     for intent in store.pending_intents()? {

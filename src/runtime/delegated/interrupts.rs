@@ -27,8 +27,25 @@
 //!     started, or couldn't be recorded (the journal halted), leaves the
 //!     intent pending;
 //!   - `Done`: `done_ms` written; `Wait`: nothing.
-//! - **The reports** of host interrupt writes are taken every scheduling
-//!   pass (`host_interrupt_reports`), so the stream never grows; the drive
+//! - **While hosting is paused** (`runtime.toml` doesn't load, or `enabled
+//!   = false`; ruling T26a): the stops still run (`paused_stops`), on the
+//!   scheduling pass's 100 ms cadence, once the store was recovered and
+//!   with no receipt-database fault. Each such pass takes a fresh `D`,
+//!   writes the deadline's intents and carries every pending intent out. A
+//!   deadline interrupt only takes execution away (a stop always wins,
+//!   ruling T4d), and the turn's own lease goes on renewing meanwhile.
+//!   Nothing else of the scheduling pass runs: nothing is dispatched,
+//!   reconciled, settled or launched, so nothing new starts. Two residuals:
+//!   - a **receipt-database fault** holds the intents in that database
+//!     until the restart it asks for (`atem runtime restart`); recovery's
+//!     step 3 and the first pass's deadline sweep carry them out then;
+//!   - a **runtime started while paused** opens and recovers its store
+//!     only once hosting is on: its pending intents (step 3) and deadlines
+//!     wait for that.
+//! - **The reports** of host interrupt writes are taken at the start of
+//!   every scheduling pass (`take_interrupt_reports`, so a turn the Esc
+//!   ended reads `interrupted at deadline` in the pass that reconciles it)
+//!   and again by `carry_out_intents`: the stream never grows. The drive
 //!   hook reads a copy of its own (Task 16b review m7).
 use super::*;
 use crate::runtime::delegated::attempts::{AttemptEnd, SessionAnswer, attempt_end};
@@ -37,7 +54,68 @@ use crate::runtime::delegated::intents::{
 };
 use crate::session_protocol::host::{Immutable, Provenance, Withdrawal};
 
+/// Design I.4.4: the delegated task `r` waits to start or runs
+/// (`submitting`, `submitted`: an attempt `accepted`, or its turn) at its
+/// deadline on `D` (`now_d`; none: no reading, nothing compared).
+pub(super) fn past_deadline(r: &WorkRecord, now_d: Option<u64>) -> bool {
+    r.delegated.is_some()
+        && matches!(r.status.state, WorkState::Submitting | WorkState::Submitted)
+        && now_d.is_some_and(|d| d >= r.task.expires_at)
+}
+
 impl HostBridge {
+    /// The reports of host interrupt writes since the last call, taken into
+    /// this run's intents (a delivery's turn stored as `delivered_turn`)
+    /// before the scheduling pass reconciles any receipt, so a turn the
+    /// deadline's Esc ended is known as the deadline's in that pass (Task 26
+    /// review M1). With nothing delegated possible they are dropped.
+    pub(super) fn take_interrupt_reports(&mut self) -> anyhow::Result<()> {
+        let reports = self.host_interrupt_reports();
+        if reports.is_empty() || !self.may_hold_delegated() {
+            return Ok(());
+        }
+        let now = self.clock.now();
+        let work = &mut self.work;
+        let Some(store) = work.store.as_ref() else {
+            return Ok(());
+        };
+        work.intents.reported(store, &reports, now)
+    }
+
+    /// Ruling T26a: hosting is paused (`runtime.toml` doesn't load, or
+    /// `enabled = false`), and the stops still run (see the module doc): a
+    /// fresh `D`, the deadline's intents of tasks past it, every pending
+    /// intent carried out. Only once the store was recovered, with no
+    /// receipt-database fault, and where a delegated task may exist; on the
+    /// scheduling pass's cadence, whose time the caller took.
+    pub(super) fn paused_stops(&mut self, cx: &mut Cx) {
+        if self.work.error
+            || !self.work.recovered
+            || self.work.store.is_none()
+            || !self.may_hold_delegated()
+            // Debug builds: held by the test (`hold_host_work`).
+            || crate::runtime::test_hooks::host_work_held()
+        {
+            return;
+        }
+        #[cfg(debug_assertions)]
+        {
+            self.work.passes += 1;
+        }
+        let now_d = self.take_reading();
+        let stopped = (|| -> anyhow::Result<()> {
+            for r in self.work.store.as_ref().unwrap().active_tasks()? {
+                if past_deadline(&r, now_d) {
+                    self.deadline_intent(&r)?;
+                }
+            }
+            self.carry_out_intents(cx).map(|_| ())
+        })();
+        if stopped.is_err() {
+            self.work_fail();
+        }
+    }
+
     /// Design I.4.4: the delegated task `r`, unstarted or running
     /// (`submitting`, `submitted`), reached its deadline on `D`: an
     /// interrupt intent with reason `deadline` for its current attempt
@@ -187,14 +265,17 @@ impl HostBridge {
             }
             ReceiptState::Executing => {
                 let sid = receipt.target.session_id.as_str();
-                if running_request(cx, sid).as_deref() == Some(attempt) {
-                    // Shown running: the chat's current turn is the attempt's.
-                    let turn = session_of(cx, sid)
-                        .and_then(|s| s.chat.current_turn_id().map(str::to_string))
-                        .unwrap_or_else(|| attempt.to_string());
-                    AttemptNow::Running { turn }
-                } else {
-                    AttemptNow::NotShown
+                let shown = running_request(cx, sid).as_deref() == Some(attempt);
+                // Shown running: the chat's current turn is the attempt's.
+                // A chat that names no turn (unreachable: the request is
+                // the turn's) shows nothing, so it never gets a second Esc
+                // under another name (Task 26 review M3).
+                match session_of(cx, sid)
+                    .filter(|_| shown)
+                    .and_then(|s| s.chat.current_turn_id().map(str::to_string))
+                {
+                    Some(turn) => AttemptNow::Running { turn },
+                    None => AttemptNow::NotShown,
                 }
             }
         })

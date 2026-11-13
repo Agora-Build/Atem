@@ -530,3 +530,182 @@ fn an_intent_revokes_a_native_takeover_again() {
         assert_eq!(escs(&rig), 1);
     });
 }
+
+/// Hosting is paused (`runtime.toml` stopped loading: hosting off, as
+/// `work_config` leaves it) while a delegated turn runs, and the delegated
+/// clock reaches its deadline. Design I.4.4 still holds (ruling T26a): the
+/// deadline's intent is written and the Esc delivered once, while paused.
+/// Nothing new starts during the pause: the next task of the session gets
+/// no attempt, even once the interrupted turn ended. When the file loads
+/// again, the task awaits its result, `interrupted at deadline`, then
+/// expires, and the next task runs.
+#[test]
+fn a_paused_host_still_interrupts_a_turn_at_its_deadline() {
+    use crate::runtime::host_work::EXPIRED_AWAITING;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, true);
+        let task = running_until_deadline(&mut rig, &phone, "PAUSED_RUNNING", start).await;
+        let attempt = stored_record(&rig, &task).status.receipt_id;
+        let next = phone_task(&mut rig, &phone, "PAUSED_NEXT", start + 3 * HOUR);
+        blocked(
+            &mut rig,
+            &next,
+            "waiting for an earlier task on this session",
+        )
+        .await;
+        // `runtime.toml` stops loading.
+        let config = std::mem::take(&mut rig.bridge.work.config);
+        rig.bridge.work.config_problem = Some("expected a table".into());
+        assert!(!rig.bridge.hosting_enabled());
+        os.pass(10 * MIN);
+        passes(&mut rig, 1);
+        let written = intents(&rig, &task);
+        assert_eq!(written.len(), 1, "{written:?}");
+        assert_eq!(written[0].reason, IntentReason::Deadline);
+        assert!(
+            pending_write(&rig, &attempt).is_some(),
+            "written while paused"
+        );
+        rig.until(|r| intents(r, &task)[0].delivered_turn.is_some())
+            .await;
+        for _ in 0..5 {
+            passes(&mut rig, 1);
+            assert_eq!(pending_write(&rig, &attempt), None, "once per turn");
+        }
+        settle(&mut rig).await;
+        assert_eq!(escs(&rig), 1);
+        // The turn ends interrupted; nothing new starts while paused.
+        turn_interrupted(&mut rig, &task).await;
+        passes(&mut rig, 5);
+        settle(&mut rig).await;
+        assert!(intents(&rig, &task)[0].done_ms.is_some(), "its turn ended");
+        assert!(attempts(&rig, &next).is_empty(), "no attempt while paused");
+        assert!(!input(&rig).contains("PAUSED_NEXT"));
+        assert_eq!(settled(&rig, &task).0, WorkState::Submitted, "untouched");
+        // The file loads again.
+        rig.bridge.work.config = config;
+        rig.bridge.work.config_problem = None;
+        passes(&mut rig, 1);
+        assert_eq!(
+            settled(&rig, &task),
+            (
+                WorkState::AwaitingResult,
+                details::INTERRUPTED_AT_DEADLINE.into()
+            )
+        );
+        passes(&mut rig, 1);
+        assert_eq!(
+            settled(&rig, &task),
+            (WorkState::Expired, EXPIRED_AWAITING.into())
+        );
+        rig.until(|r| input(r).contains("PAUSED_NEXT")).await;
+        complete(&mut rig, &next).await;
+        assert_eq!(escs(&rig), 1);
+    });
+}
+
+/// Hosting switched off (`enabled = false`, a deliberate stop) while a
+/// delegated turn runs past its deadline: the deadline's interrupt is
+/// still delivered, once (ruling T26a).
+#[test]
+fn hosting_switched_off_still_interrupts_a_turn_at_its_deadline() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, true);
+        let task = running_until_deadline(&mut rig, &phone, "OFF_RUNNING", start).await;
+        let attempt = stored_record(&rig, &task).status.receipt_id;
+        rig.bridge.work.config.enabled = false;
+        assert!(!rig.bridge.hosting_enabled());
+        os.pass(10 * MIN);
+        passes(&mut rig, 1);
+        assert!(pending_write(&rig, &attempt).is_some(), "written while off");
+        rig.until(|r| intents(r, &task)[0].delivered_turn.is_some())
+            .await;
+        for _ in 0..5 {
+            passes(&mut rig, 1);
+            assert_eq!(pending_write(&rig, &attempt), None, "once per turn");
+        }
+        settle(&mut rig).await;
+        assert_eq!(escs(&rig), 1);
+        assert_eq!(settled(&rig, &task).0, WorkState::Submitted);
+    });
+}
+
+/// Task 26 review M1: a turn that ended interrupted for another reason (an
+/// Esc at the terminal, before the deadline) reads `turn interrupted`, not
+/// `interrupted at deadline`, though the pass that reconciles it after the
+/// deadline writes the deadline's intent too: only a turn the deadline's
+/// interrupt reached is the deadline's. The intent is done, with nothing
+/// written.
+#[test]
+fn a_turn_interrupted_otherwise_reads_turn_interrupted() {
+    use crate::runtime::host_work::EXPIRED_AWAITING;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, true);
+        let task = running_until_deadline(&mut rig, &phone, "OTHER_RUNNING", start).await;
+        hold_host_work(&mut rig);
+        turn_interrupted(&mut rig, &task).await;
+        os.pass(10 * MIN);
+        passes(&mut rig, 1);
+        assert_eq!(
+            settled(&rig, &task),
+            (WorkState::AwaitingResult, TURN_INTERRUPTED.into())
+        );
+        let all = intents(&rig, &task);
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert!(all[0].done_ms.is_some());
+        assert_eq!(all[0].delivered_turn, None);
+        passes(&mut rig, 1);
+        assert_eq!(
+            settled(&rig, &task),
+            (WorkState::Expired, EXPIRED_AWAITING.into())
+        );
+        settle(&mut rig).await;
+        assert_eq!(escs(&rig), 0);
+    });
+}
+
+/// Task 26 review M1, the timing: the worker's report of the deadline's
+/// Esc and the turn's interrupted end reach the same scheduling pass (here
+/// both arrive while host-work's scheduling is held). The report is taken
+/// before that pass reconciles the receipt, so the turn reads
+/// `interrupted at deadline`.
+#[test]
+fn a_delivery_reported_with_the_turns_end_reads_interrupted_at_deadline() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, true);
+        let task = running_until_deadline(&mut rig, &phone, "SAME_PASS_RUNNING", start).await;
+        let attempt = stored_record(&rig, &task).status.receipt_id;
+        os.pass(10 * MIN);
+        passes(&mut rig, 1);
+        assert!(pending_write(&rig, &attempt).is_some());
+        hold_host_work(&mut rig);
+        turn_interrupted(&mut rig, &task).await;
+        rig.until(|r| pending_write(r, &attempt).is_none()).await;
+        assert_eq!(
+            intents(&rig, &task)[0].delivered_turn,
+            None,
+            "not taken yet"
+        );
+        passes(&mut rig, 1);
+        assert!(intents(&rig, &task)[0].delivered_turn.is_some());
+        assert_eq!(
+            settled(&rig, &task),
+            (
+                WorkState::AwaitingResult,
+                details::INTERRUPTED_AT_DEADLINE.into()
+            )
+        );
+    });
+}

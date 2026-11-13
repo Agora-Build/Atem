@@ -194,6 +194,10 @@ pub(super) struct State {
     /// What this run delivered of the interrupt intents (memory only: a
     /// restart delivers once more to a turn still current; design I.5.7).
     intents: crate::runtime::delegated::intents::Runs,
+    /// Debug builds: host-work's scheduling passes (and paused stops) so
+    /// far, for the state dump (a test waits for passes, not ticks).
+    #[cfg(debug_assertions)]
+    pub(super) passes: u64,
     /// Tests: the control view senders are classified on in place of
     /// `NoFeeds` (a feed covering a service, as PR 10's will).
     #[cfg(test)]
@@ -238,6 +242,8 @@ impl State {
             clock_checked: false,
             read_due: Instant::now(),
             intents: Default::default(),
+            #[cfg(debug_assertions)]
+            passes: 0,
             #[cfg(test)]
             controls: None,
             #[cfg(test)]
@@ -737,7 +743,15 @@ impl HostBridge {
                 );
             }
             self.work_fence_launches();
-            self.pause_local_tasks();
+            if Instant::now() >= self.work.scheduled {
+                self.work.scheduled = Instant::now() + Duration::from_millis(100);
+                self.pause_local_tasks();
+                // A stop always wins: the deadline's interrupt and every
+                // pending intent still run (ruling T26a); nothing starts.
+                if identity.account_id != UNPAIRED {
+                    self.paused_stops(cx);
+                }
+            }
             return;
         }
         if !self.work_store_ready(&identity) {
@@ -1565,12 +1579,9 @@ impl HostBridge {
     /// blocked local tasks wait with the reason as their detail. They keep
     /// their place and their return grants, and nothing is fenced: they go on
     /// as soon as the pause is over (spec section 9). Remote tasks are not
-    /// touched (their senders' authority is rechecked as before).
+    /// touched (their senders' authority is rechecked as before). Run on the
+    /// scheduling pass's cadence, as `work_pass` calls it.
     fn pause_local_tasks(&mut self) {
-        if Instant::now() < self.work.scheduled {
-            return;
-        }
-        self.work.scheduled = Instant::now() + Duration::from_millis(100);
         if self.work.error || !self.local_authorized() {
             return;
         }
@@ -1646,9 +1657,16 @@ impl HostBridge {
     /// applies here (`pause_local_tasks` marks local tasks during one).
     fn schedule_work(&mut self, cx: &mut Cx) -> anyhow::Result<()> {
         let now = host_now().wall_ms;
+        #[cfg(debug_assertions)]
+        {
+            self.work.passes += 1;
+        }
         // `D`, read once a pass (each read is a full OS reading).
         let now_d = self.take_reading();
         self.refresh_start_view();
+        // What became of the interrupt intents' writes, before any receipt
+        // is reconciled below (design I.4.4's detail; Task 26 review M1).
+        self.take_interrupt_reports()?;
         // Awaiting a result, or of unknown outcome: past the deadline,
         // expired, and past the sender's authorization, failed (their due
         // times, through an index); under a sender's authority, a route or a
@@ -2070,7 +2088,7 @@ impl HostBridge {
         let interrupted = turn_interrupted(&receipt);
         r.status.detail = if r.status.state == WorkState::Submitted && r.turn_id.is_some() {
             collab_bridge::IN_TURN
-        } else if interrupted && self.interrupted_at_deadline(r)? {
+        } else if interrupted && self.interrupted_at_deadline(r, &receipt)? {
             // Design I.4.4: the deadline's intent interrupted it.
             details::INTERRUPTED_AT_DEADLINE
         } else if interrupted {
@@ -2086,17 +2104,30 @@ impl HostBridge {
         Ok(())
     }
 
-    /// A delegated task's attempt has the deadline's interrupt intent
-    /// (design I.4.4): its turn, ended interrupted, was the deadline's.
-    fn interrupted_at_deadline(&self, r: &WorkRecord) -> anyhow::Result<bool> {
+    /// A delegated task's turn, ended interrupted (`receipt`), was the
+    /// deadline's (design I.4.4): its attempt's deadline intent delivered
+    /// the interrupt to that turn (`delivered_turn`, the receipt's own turn
+    /// when it names one). A turn interrupted otherwise (at the terminal,
+    /// by a controller) is v1's `turn interrupted` (Task 26 review M1).
+    fn interrupted_at_deadline(
+        &self,
+        r: &WorkRecord,
+        receipt: &wire::Receipt,
+    ) -> anyhow::Result<bool> {
         if r.delegated.is_none() {
             return Ok(false);
         }
-        self.work.store.as_ref().unwrap().has_intent(
+        let delivered = self.work.store.as_ref().unwrap().delivered_turn(
             &r.task.task_id,
             &r.status.receipt_id,
             &crate::runtime::delegated::intents::IntentReason::Deadline,
-        )
+        )?;
+        Ok(delivered.is_some_and(|turn| {
+            receipt
+                .result
+                .as_ref()
+                .is_none_or(|result| result.turn_id == turn)
+        }))
     }
 
     /// The task's prompt turn ended interrupted (its receipt's journaled

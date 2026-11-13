@@ -670,6 +670,10 @@ pub struct HostBridge {
     /// each pass while the hook isn't set.
     #[cfg(debug_assertions)]
     drive_interrupt_reports: Vec<(String, InterruptReport)>,
+    /// Debug builds: host interrupt writes handed to a worker so far, for
+    /// the state dump (a test counts the writes themselves).
+    #[cfg(debug_assertions)]
+    host_interrupt_writes: u64,
     /// Host-work's prompts `executing` at the start, waiting for their
     /// adopted worker's chat (`reconcile_host_work`): request id → what is
     /// reconciled.
@@ -969,6 +973,8 @@ impl HostBridge {
             interrupt_reports: Vec::new(),
             #[cfg(debug_assertions)]
             drive_interrupt_reports: Vec::new(),
+            #[cfg(debug_assertions)]
+            host_interrupt_writes: 0,
             reconciling: BTreeMap::new(),
             #[cfg(debug_assertions)]
             drive_go: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -1990,6 +1996,10 @@ impl HostBridge {
         }
         state["chats"] = chats.unwrap_or_default();
         state["reconciling"] = json!(self.reconciling.keys().collect::<Vec<_>>());
+        // Host-work's scheduling passes and the host interrupt writes so far
+        // (a broker tick isn't a scheduling pass: those run every 100 ms).
+        state["host_work"] = json!({"passes": self.work.passes,
+            "interrupt_writes": self.host_interrupt_writes});
         // The pass number: a reader can wait for a pass after its own
         // action (a dump from before it can't satisfy an assert).
         static PASS: AtomicU64 = AtomicU64::new(0);
@@ -2793,6 +2803,10 @@ impl HostBridge {
                         .map(|s| s.write_tagged(INTERRUPT_KEY, WriteTag::Host, None));
                     match written {
                         Some(Ok(seq)) => {
+                            #[cfg(debug_assertions)]
+                            {
+                                self.host_interrupt_writes += 1;
+                            }
                             self.pending
                                 .insert((session_id, seq), Pending::HostInterrupt(request_id));
                         }

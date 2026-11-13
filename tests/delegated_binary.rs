@@ -1293,6 +1293,23 @@ fn intents(rig: &Rig, tid: &Value) -> Vec<Intent> {
     .collect()
 }
 
+/// The host interrupt writes the runtime handed to a worker so far (the
+/// state dump's count).
+fn interrupt_writes(rig: &Rig) -> u64 {
+    dumped(rig)["host_work"]["interrupt_writes"]
+        .as_u64()
+        .unwrap_or(0)
+}
+
+/// Waits for `n` host-work scheduling passes begun after now (every 100
+/// ms; a broker tick isn't one): the count moves past `now + n`, so the
+/// pass under way at `now` doesn't count.
+fn work_passes(rig: &Rig, n: u64) {
+    let passes = |rig: &Rig| dumped(rig)["host_work"]["passes"].as_u64().unwrap_or(0);
+    let now = passes(rig);
+    within("host-work's scheduling passes", || passes(rig) > now + n);
+}
+
 /// VII.A test 12 (design I.4.4, I.5.7; session-v1 R9.14 item 5): a
 /// delegated turn still running when the delegated clock reaches its task's
 /// deadline is interrupted on the host's authority: an intent with reason
@@ -1349,10 +1366,12 @@ fn a_turn_running_at_its_deadline_is_interrupted_and_expires() {
         (attempt.as_str(), "deadline", false)
     );
     assert_eq!(escs(&rig), 1);
+    assert_eq!(interrupt_writes(&rig), 1);
     // The turn goes on (the fake agent ignores the Esc): only the lease
-    // revocation repeats, nothing is written again.
-    two_passes(&rig);
-    two_passes(&rig);
+    // revocation repeats, nothing is written again in three more
+    // scheduling passes (the writes counted as the runtime makes them).
+    work_passes(&rig, 3);
+    assert_eq!(interrupt_writes(&rig), 1, "once per turn");
     assert_eq!(escs(&rig), 1, "once per turn");
     assert_eq!(stored(&rig, tid)["state"], "submitted");
     // The agent's turn ends interrupted, as after an Esc.
@@ -1374,4 +1393,75 @@ fn a_turn_running_at_its_deadline_is_interrupted_and_expires() {
     assert_eq!(ends(&rig, tid), [Some("started".to_string())]);
     let status = work(&mut phone, &mut r, tid);
     assert_eq!(status["result"]["work"]["state"], "expired", "{status}");
+}
+
+/// VII.A test 12 while hosting is paused (ruling T26a; design I.4.4): the
+/// turn runs when `runtime.toml` stops loading (agent hosting off until it
+/// is fixed), and the delegated clock then reaches its task's deadline.
+/// The deadline's interrupt is still delivered, once, while paused; the
+/// turn ends interrupted, and the task's record waits untouched until the
+/// file loads again: then it expires (`expired awaiting a result`).
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_paused_host_still_interrupts_a_turn_at_its_deadline() {
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_controls(gate_open());
+    rig.with_clock();
+    rig.dump = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let t = task_until(&launch, "PAUSED_TURN", rig.clock().wall() + 10 * MIN);
+    let tid = &t["task_id"];
+    enqueue(&mut phone, &mut r, &t);
+    in_turn(&rig, tid, "PAUSED_TURN");
+    let attempt = stored(&rig, tid)["receipt_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // `runtime.toml` stops loading: hosting is paused.
+    let file = rig.sandbox.config().join("runtime.toml");
+    let valid = std::fs::read_to_string(&file).unwrap();
+    replace(&file, "this is not a runtime.toml");
+    let log = rig.sandbox.dir.path().join("runtime.log");
+    within("hosting paused", || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("agent hosting is off until it is fixed")
+    });
+    rig.clock().set(0, 10 * MIN);
+    within("the deadline's interrupt while paused", || {
+        intents(&rig, tid)
+            .first()
+            .is_some_and(|i| i.delivered_turn.is_some())
+    });
+    work_passes(&rig, 3);
+    assert_eq!(interrupt_writes(&rig), 1, "once per turn");
+    assert_eq!(escs(&rig), 1);
+    assert_eq!(intents(&rig, tid)[0].attempt_id, attempt);
+    // The turn ends interrupted, still paused.
+    std::fs::write(rig.fake.join("interrupt"), "").unwrap();
+    within("the turn's interrupted end", || {
+        receipt(&rig, &attempt)["state"] == "completed"
+    });
+    assert_eq!(receipt(&rig, &attempt)["detail"], "interrupted");
+    within("the intent done while paused", || {
+        intents(&rig, tid)[0].done
+    });
+    assert_eq!(
+        stored(&rig, tid)["state"],
+        "submitted",
+        "untouched while paused"
+    );
+    // The file loads again.
+    replace(&file, &valid);
+    wait_stored(&rig, tid, "expired", "expired awaiting a result");
+    assert_eq!(interrupt_writes(&rig), 1);
+    assert_eq!(escs(&rig), 1);
+    assert_eq!(input(&rig).matches("PAUSED_TURN").count(), 1);
 }

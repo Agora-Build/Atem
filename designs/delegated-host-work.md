@@ -537,7 +537,24 @@ R4 bounds accepted tasks by their original deadline (at most 24 h after admissio
   A sender that needs a longer turn sets a later deadline at enqueue, within the 24-hour maximum. This keeps the
   consent text true: work runs "until each task's deadline (at most 24 hours)".
 
-### I.4.5 Queries, cancel, complete, replies, and new operations
+**As built in step 4** (host-work-v1 §11.6, "The deadline interrupt"):
+- **Which turn reads `interrupted at deadline`.** Only a turn the deadline's interrupt reached (its intent's
+  `delivered_turn`). A turn that ended interrupted otherwise (an Esc at the terminal, a controller's `interrupt`) keeps
+  `turn interrupted`, then expires the same way.
+- **An attempt still waiting `accepted` at the deadline** is withdrawn by the same intent (I.5.7), and the task is
+  `expired`, `expired before submission`.
+- **While hosting is paused. Atem's reading, for Astation to confirm.** The interrupt is carried out while hosting is
+  paused (`runtime.toml` doesn't load, or `enabled = false`), as are the intents already pending. A stop takes
+  execution away and grants nothing, and the turn's own lease goes on renewing during a pause. Collaboration §10's
+  pause rules ("nothing expires") are record rules, and the interrupt changes no record: the task's record follows the
+  turn's receipt once the pause ends. Nothing new starts during the pause.
+- **Two residuals.**
+  - A receipt-database fault holds the intents, which live in that database, until the restart it asks for. Recovery
+    step 3 (I.6.2) and the first pass carry them out then.
+  - A runtime started while paused opens and recovers its store only once hosting is on.
+- **With `host.delegated` turned off after tasks were accepted** (step 4's Decision 10, a debug-only hook), a started
+  task's turn is still interrupted at its deadline. Atem-internal.
+
 
 **The sender.**
 - `work_query`, `reply_query`, `work_cancel` and `work_complete` need the **same principal and key** that enqueued the
@@ -957,6 +974,16 @@ Before the runtime dispatches anything:
 | `outcome_unknown` | Kept unresolved until `work_resolve`, or a reply proves the turn ran |
 | `completed`, `failed`, `cancelled`, `expired` | Kept as they are; never executed again |
 | A reply still `publishing` | Publishing continues; a `submitted` reply stays unchanged |
+
+**As built in step 4. Atem's reading, for Astation to confirm.** At step 3 a pending interrupt intent meets the
+attempt's receipt before step 4 does:
+- An `accepted` attempt, or a `rejected` one host-work hasn't ended, is withdrawn by the intent. That covers `withdrawn
+  at recovery`, and also a `session closed` or `host trust changed` the host hadn't processed before the restart. The
+  task takes the intent's state: `expired before submission` for a deadline, `cancelled` (`sender revoked`) for a
+  revocation. The table above would give `failed` with the receipt's detail. Both are terminal and have no side effect;
+  the intent's commitment is the older one.
+- An attempt the start's reconciliation settled (`completed`, `outcome_unknown`) makes the intent do nothing.
+- A turn it rebound is interrupted once more (session-v1 R9.14 item 5).
 
 ### I.6.4 Attempts: no duplicate execution
 
