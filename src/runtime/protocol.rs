@@ -138,6 +138,19 @@ pub enum ClientMsg {
     MessageDirectory {
         selector: Option<String>,
     },
+    /// The owner's view of the delegated tasks whose outcome is unknown and
+    /// unresolved (`atem task list --unknown`; host-work-v1 §11.6 "On the
+    /// host"). From the owner's terminal only. → `task_list`
+    TaskList {
+        unknown: bool,
+    },
+    /// The owner resolves a delegated task of unknown outcome on this host
+    /// (`atem task resolve`; its `resolved.by` is `local`). From the owner's
+    /// terminal only. → `task_resolved`
+    TaskResolve {
+        task_id: String,
+        resolution: LocalResolution,
+    },
     Stop {
         session_id: String,
     },
@@ -165,6 +178,38 @@ pub enum ClientMsg {
         question_id: u64,
         value: AnswerValue,
     },
+}
+
+/// How `atem task resolve` settles a task (step 4's open question 2): as
+/// `failed`, with the owner's detail or, without one, `resolved as failed on
+/// the host`; or as `done`, with one context snapshot the runtime captures
+/// and publishes as `atem message reply` does (`--memory ID` or `--vault
+/// ID:ENTRY@VERSION`), and no free text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LocalResolution {
+    Failed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    Done {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vault: Option<String>,
+    },
+}
+
+/// One unresolved outcome as `atem task list --unknown` shows it: the task,
+/// its session, its sender, why its outcome is unknown and when it became
+/// so (the host's wall clock, Unix ms).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnknownTask {
+    pub task_id: String,
+    pub session_id: String,
+    pub sender: String,
+    pub reason: String,
+    pub at_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +309,8 @@ impl ClientMsg {
             ClientMsg::MessageStatus { .. } => "message_status",
             ClientMsg::MessageCancel { .. } => "message_cancel",
             ClientMsg::MessageDirectory { .. } => "message_directory",
+            ClientMsg::TaskList { .. } => "task_list",
+            ClientMsg::TaskResolve { .. } => "task_resolve",
             ClientMsg::Stop { .. } => "stop",
             ClientMsg::Reload => "reload",
             ClientMsg::Status => "status",
@@ -442,6 +489,18 @@ pub struct RuntimeStatus {
     /// doesn't read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feeds: Option<String>,
+    /// The delegated tasks' line (host-work-v1 §11.6 "On the host"): only
+    /// while something is delegated (`host.delegated` on, a delegated task
+    /// open, or an outcome unresolved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated: Option<DelegatedStatus>,
+}
+
+/// What `atem status`'s `Delegated:` line shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegatedStatus {
+    /// Delegated tasks of unknown outcome nobody resolved yet.
+    pub unresolved: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -523,6 +582,19 @@ pub enum RuntimeMsg {
     },
     MessageDirectory {
         rows: Vec<super::collab::DirectoryRow>,
+    },
+    /// The unresolved outcomes, in the host's order.
+    TaskList {
+        tasks: Vec<UnknownTask>,
+    },
+    /// The task as resolved (committed before this is sent): `failed` or
+    /// `completed`, its detail, and who resolved it (`local`, or the first
+    /// resolver when the same resolution came before).
+    TaskResolved {
+        task_id: String,
+        state: String,
+        detail: String,
+        by: String,
     },
     Detached {
         session_id: String,

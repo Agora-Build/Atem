@@ -70,6 +70,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: MessageCommands,
     },
+    /// The owner's view of delegated tasks on this host (from your own terminal, not inside an agent session)
+    Task {
+        #[command(subcommand)]
+        command: TaskCommands,
+    },
     /// Manage Agora dev servers
     Serv {
         #[command(subcommand)]
@@ -309,6 +314,42 @@ pub enum MessageCommands {
     Cancel { task_id: String },
     /// Show local routes, labels and live agents, optionally filtered
     Directory { selector: Option<String> },
+}
+
+#[derive(Subcommand)]
+pub enum TaskCommands {
+    /// List the delegated tasks whose outcome is unknown and unresolved: task, session, sender, reason, when
+    List {
+        /// Unknown outcomes nobody resolved yet
+        #[arg(long, required = true)]
+        unknown: bool,
+    },
+    /// Resolve a delegated task of unknown outcome as the owner, on this host
+    Resolve {
+        task_id: String,
+        #[command(subcommand)]
+        resolution: ResolveCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ResolveCommands {
+    /// It failed (default detail: "resolved as failed on the host")
+    Failed {
+        /// The detail the task then shows (1-1024 bytes, one line)
+        #[arg(long)]
+        detail: Option<String>,
+    },
+    /// It was done: its result is one Memory fact or vault entry, published and read back
+    #[command(group(clap::ArgGroup::new("result").required(true).args(["memory", "vault"])))]
+    Done {
+        /// A Memory fact's id
+        #[arg(long)]
+        memory: Option<String>,
+        /// A vault entry: ID:ENTRY@VERSION
+        #[arg(long)]
+        vault: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1037,6 +1078,7 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
             Ok(())
         }
         Commands::Message { command } => crate::runtime::commands::message(command).await,
+        Commands::Task { command } => crate::runtime::commands::task(command).await,
         Commands::Agent { agent_command } => match agent_command {
             AgentCommands::Tag { command } => {
                 let (action, name) = match command {
@@ -1708,6 +1750,51 @@ mod tests {
         };
         assert_eq!(agent_type, "claude-code");
         assert!(agent_args.is_empty());
+    }
+
+    /// Host-work-v1 §11.6 "On the host", step 4's open question 2: `atem
+    /// task list --unknown`, `atem task resolve <task_id> failed [--detail
+    /// TEXT]` and `done` with exactly one of `--memory ID` and `--vault
+    /// ID:ENTRY@VERSION` (no free text).
+    #[test]
+    fn cli_task_list_and_resolve_parse() {
+        let parse = |args: &[&str]| Cli::try_parse_from(["atem", "task"].iter().chain(args));
+        assert!(matches!(
+            parse(&["list", "--unknown"]).unwrap().command,
+            Some(Commands::Task { command: TaskCommands::List { unknown: true } })
+        ));
+        assert!(parse(&["list"]).is_err());
+        let resolution = |args: &[&str]| match parse(args).unwrap().command {
+            Some(Commands::Task { command: TaskCommands::Resolve { task_id, resolution } }) => {
+                assert_eq!(task_id, "t-1");
+                resolution
+            }
+            _ => panic!("expected task resolve"),
+        };
+        assert!(matches!(
+            resolution(&["resolve", "t-1", "failed"]),
+            ResolveCommands::Failed { detail: None }
+        ));
+        assert!(matches!(
+            resolution(&["resolve", "t-1", "failed", "--detail", " it broke "]),
+            ResolveCommands::Failed { detail: Some(d) } if d == " it broke "
+        ));
+        assert!(matches!(
+            resolution(&["resolve", "t-1", "done", "--memory", "mem_1"]),
+            ResolveCommands::Done { memory: Some(_), vault: None }
+        ));
+        assert!(matches!(
+            resolution(&["resolve", "t-1", "done", "--vault", "v-1:1@2"]),
+            ResolveCommands::Done { memory: None, vault: Some(_) }
+        ));
+        for refused in [
+            &["resolve", "t-1", "done"][..],
+            &["resolve", "t-1", "done", "--memory", "m", "--vault", "v:1@1"],
+            &["resolve", "t-1", "done", "the text"],
+            &["resolve", "t-1"],
+        ] {
+            assert!(parse(refused).is_err(), "{refused:?}");
+        }
     }
 
     #[test]

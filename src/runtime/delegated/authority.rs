@@ -15,8 +15,8 @@
 //! - **The owner** ([`Caller::Owner`]): a native member holding `control`
 //!   at the host's current head, under its own key. It reads any delegated
 //!   task, a revoked or removed sender's included (Decision 15); what it may
-//!   do beyond reading is the bridge's (`work_query` and `reply_query` here;
-//!   `work_resolve` and `work_interrupt` come with their tasks).
+//!   do beyond reading is the bridge's (`work_query`, `reply_query` and
+//!   `work_resolve` here; `work_interrupt` comes with its task).
 //!
 //! v1 tasks never come here: they keep host-work v1's caller rule.
 //! Anything refused is `forbidden`, with no detail (host-work-v1 §7: §11.6

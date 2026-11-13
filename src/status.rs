@@ -87,6 +87,9 @@ pub struct StatusReport {
     /// control state that doesn't read: the host's own Station's gate and
     /// why it is closed, a refusal included.
     pub feeds: Option<Line>,
+    /// The runtime's delegated tasks (`Delegated:`, host-work-v1 §11.6 "On
+    /// the host"): only while something is delegated.
+    pub delegated: Option<Line>,
     /// Printed after the block (e.g. the reset steps for broken key files).
     pub notes: Vec<String>,
 }
@@ -356,6 +359,13 @@ pub fn gather_full(
         } => status.feeds.clone().map(Line::new),
         _ => None,
     };
+    let delegated = match runtime {
+        Look::Running {
+            status: Some(status),
+            ..
+        } => status.delegated.as_ref().map(delegated_line),
+        _ => None,
+    };
     let connected =
         matches!(runtime, Look::Running { status: Some(status), .. } if status.astation);
     if paired.as_ref().is_some_and(|p| p.relay_only) && !connected {
@@ -372,8 +382,19 @@ pub fn gather_full(
         device_list,
         clock,
         feeds,
+        delegated,
         notes,
     }
+}
+
+/// `Delegated:` (host-work-v1 §11.6 "On the host"): how many delegated
+/// tasks' outcomes are unknown and unresolved, and where to see them.
+fn delegated_line(status: &crate::runtime::protocol::DelegatedStatus) -> Line {
+    Line::new(match status.unresolved {
+        0 => "no unresolved outcomes".to_string(),
+        1 => "1 unresolved outcome (atem task list --unknown)".to_string(),
+        n => format!("{n} unresolved outcomes (atem task list --unknown)"),
+    })
 }
 
 /// `Device list:` from the files when no runtime runs (read only; held is
@@ -463,7 +484,7 @@ fn local_hhmm(at: u64) -> String {
 }
 
 /// A Unix ms time as local `YYYY-MM-DD HH:MM`.
-fn local_datetime(at: u64) -> String {
+pub(crate) fn local_datetime(at: u64) -> String {
     let t = (at / 1000) as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
@@ -630,6 +651,9 @@ pub fn render(report: &StatusReport) -> String {
     }
     if let Some(line) = &report.feeds {
         out.push_str(&format!("{:<16}{}\n", "Control feeds:", line.value));
+    }
+    if let Some(line) = &report.delegated {
+        out.push_str(&format!("{:<16}{}\n", "Delegated:", line.value));
     }
     for note in &report.notes {
         out.push_str(note);
@@ -834,6 +858,7 @@ pub(crate) mod tests {
             device_list: Some(line),
             clock: None,
             feeds: None,
+            delegated: None,
             notes: Vec::new(),
         };
         assert!(render(&report).contains("\nDevice list:    held ("));
@@ -924,6 +949,7 @@ pub(crate) mod tests {
             device_list: None,
             clock: None,
             feeds: None,
+            delegated: None,
             notes: Vec::new(),
         };
         assert_eq!(
@@ -1045,6 +1071,58 @@ pub(crate) mod tests {
             render(&refused)
         );
         assert_eq!(report(dir.path()).feeds, None);
+    }
+
+    /// Host-work-v1 §11.6 "On the host" ("`atem status` shows the number of
+    /// unresolved outcomes"), design I.4.6: the runtime's `Delegated:` line,
+    /// after the others, only while something is delegated (the runtime
+    /// sends it then: `HostBridge::delegated_status`). Without it the block
+    /// is byte for byte what it was before the line existed, the runtime
+    /// running or not.
+    #[test]
+    fn status_shows_unresolved_outcomes() {
+        use crate::runtime::protocol::DelegatedStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        let with = |delegated: Option<DelegatedStatus>| {
+            gather_full(
+                &src,
+                None,
+                &running(RuntimeStatus {
+                    delegated,
+                    ..Default::default()
+                }),
+            )
+        };
+        // Nothing delegated: no line, and the block is exactly the one
+        // before the line existed.
+        let quiet = with(None);
+        assert_eq!(quiet.delegated, None);
+        let before_the_line = StatusReport {
+            delegated: None,
+            ..quiet.clone()
+        };
+        assert_eq!(render(&quiet), render(&before_the_line));
+        assert!(!render(&quiet).contains("Delegated"));
+        assert_eq!(report(dir.path()).delegated, None);
+        for (unresolved, text) in [
+            (0, "no unresolved outcomes"),
+            (1, "1 unresolved outcome (atem task list --unknown)"),
+            (2, "2 unresolved outcomes (atem task list --unknown)"),
+        ] {
+            let report = with(Some(DelegatedStatus { unresolved }));
+            assert_eq!(report.delegated, Some(Line::new(text)));
+            let rendered = render(&report);
+            assert!(
+                rendered.ends_with(&format!("\nDelegated:      {text}\n")),
+                "{rendered}"
+            );
+            // Only the line is added.
+            assert_eq!(
+                rendered.replace(&format!("Delegated:      {text}\n"), ""),
+                { render(&quiet) }
+            );
+        }
     }
 
     #[test]
