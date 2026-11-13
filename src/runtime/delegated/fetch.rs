@@ -35,12 +35,34 @@
 //!   result over 256 KiB, dropped unread: Decision 21) is sent again, from
 //!   the list's head then; not once another carrier (a phone's channel)
 //!   brought the list to the named head.
+//! - **A stop at a deferred entry** (design I.4.3, "Deferred entries";
+//!   R9.5): a result whose carriage stopped at an entry the list defers
+//!   (signed by the subject of a recovery still pending on this host)
+//!   fetches nothing more, since nothing past it applies until the wait
+//!   ends; the stop is kept with the head announced then ([`Stopped`]).
+//!   While the list still defers that entry, a `heads` naming that same head
+//!   isn't "behind" (no fetch, so no carriage written again for nothing); a
+//!   head announced anew is fetched as any, paced. When the deferral ends
+//!   (the wait ended on this host, an approval, a veto, a carriage past it)
+//!   the host fetches again at once, with no `heads`: the entry is carried
+//!   again after the wait (R9.5).
+//!
+//! **The gate's device-list part** ([`ListPart`], design I.5.8): fetched up
+//! to the head the Station announced last on this link generation (the last
+//! `heads`' `membership`, never a result's `head`, which may be lower), or
+//! up to a deferred entry. "Up to the head" is the list holding that very
+//! entry, `(seq, hash)`: a list with another entry at that `seq` differs from
+//! the Station's (a fork, or a Station's word that names nothing), so the
+//! gate stays closed (fail closed) until they agree. The fetch itself still
+//! goes by `seq`: `membership_fetch{after}` returns a suffix, so a list that
+//! holds the `seq` has nothing to ask; a fork reaches the host with a
+//! carrier's window (R9.3) and the conflict rule (R9.4).
 //!
 //! The clock is the host's monotonic clock, given at every pass
 //! ([`DeviceListFetch::tick`]).
 use atem_client::SignedObject;
 use atem_client::control::{MembershipFetch, MembershipFetchResult};
-use atem_client::membership::Head;
+use atem_client::membership::{Head, Membership};
 use serde_json::{Value, json};
 
 /// After a refusal, no fetch at a `heads` before this long (Decision 20).
@@ -70,6 +92,46 @@ struct InFlight {
     sent_at: u64,
 }
 
+/// Where the host's fetch stopped at a deferred entry (design I.4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stopped {
+    /// The deferred entry's `seq`.
+    pub seq: u64,
+    /// The head the Station had announced when the fetch stopped there.
+    pub announced: Head,
+}
+
+/// What the revocation gate reads of the fetch on the link (design I.5.8:
+/// "fetched the device list up to its head, or up to a deferred entry").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListPart {
+    /// The head the Station announced last on this link generation.
+    pub announced: Option<Head>,
+    /// Where the fetch stopped at a deferred entry, if it did.
+    pub stopped: Option<Stopped>,
+}
+
+impl ListPart {
+    /// The gate's device-list part, against the list as it committed
+    /// (`deferred`: the `seq` of the entry its deferral stops at): the list
+    /// holds the announced head's own entry, `(seq, hash)`; or the fetch
+    /// stopped, under that same announced head, at the deferred entry the
+    /// list still defers. Nothing announced: no.
+    pub fn holds(&self, list: &Membership, deferred: Option<u64>) -> bool {
+        let Some(announced) = self.announced else {
+            return false;
+        };
+        if list
+            .entry(announced.seq)
+            .is_some_and(|entry| entry.hash() == announced.hash)
+        {
+            return true;
+        }
+        self.stopped
+            .is_some_and(|stop| stop.announced == announced && deferred == Some(stop.seq))
+    }
+}
+
 /// The fetch on one link generation (the module docs give the rules).
 #[derive(Debug, Clone, Default)]
 pub struct DeviceListFetch {
@@ -78,6 +140,10 @@ pub struct DeviceListFetch {
     /// The head the Station named last (`heads`, or a result's): its word,
     /// not signed authority (I.5.8).
     named: Option<Head>,
+    /// The head the last `heads` announced (never a result's): the gate's.
+    announced: Option<Head>,
+    /// Where a fetch stopped at a deferred entry, kept while it may hold.
+    stopped: Option<Stopped>,
     in_flight: Option<InFlight>,
     /// The last refusal (monotonic ms).
     refused_at: Option<u64>,
@@ -91,9 +157,17 @@ pub struct DeviceListFetch {
 
 impl DeviceListFetch {
     /// The Station announced the device list's head `membership`; the
-    /// host's list is at `applied`. The fetch to send, if any.
-    pub fn on_heads(&mut self, membership: &Head, applied: &Head) -> Option<MembershipFetch> {
+    /// host's list is at `applied`, its deferral (if any) at `deferred`
+    /// (the deferred entry's `seq`). The fetch to send, if any.
+    pub fn on_heads(
+        &mut self,
+        membership: &Head,
+        applied: &Head,
+        deferred: Option<u64>,
+    ) -> Option<MembershipFetch> {
         self.named = Some(*membership);
+        self.announced = Some(*membership);
+        self.settle_stop(deferred);
         if self.in_flight.is_some() {
             return None;
         }
@@ -102,6 +176,14 @@ impl DeviceListFetch {
                 return None;
             }
             self.refused_at = None;
+        }
+        // Not behind while its deferral holds: the head it stopped under
+        // brings nothing that applies before the wait ends.
+        if self
+            .stopped
+            .is_some_and(|stop| stop.announced == *membership)
+        {
+            return None;
         }
         let within =
             |at: Option<u64>, ms: u64| at.is_some_and(|at| self.now < at.saturating_add(ms));
@@ -125,11 +207,25 @@ impl DeviceListFetch {
     }
 
     /// A result's carriage was applied, the list's head going from `before`
-    /// to `after`: the next fetch while still behind, if it moved; if it
-    /// moved nothing, a pause for the fetches a `heads` starts.
-    pub fn carried(&mut self, before: &Head, after: &Head) -> Option<MembershipFetch> {
+    /// to `after`, the carriage stopping at the deferred entry `stopped_at`
+    /// (its `seq`) if it did: the next fetch while still behind, if it moved
+    /// and stopped at no deferred entry (nothing past one applies before
+    /// its wait ends: the stop is kept instead); if it moved nothing, a
+    /// pause for the fetches a `heads` starts.
+    pub fn carried(
+        &mut self,
+        before: &Head,
+        after: &Head,
+        stopped_at: Option<u64>,
+    ) -> Option<MembershipFetch> {
         if after.seq <= before.seq {
             self.stalled_at = Some(self.now);
+        }
+        if let Some(seq) = stopped_at {
+            self.stopped = self.announced.map(|announced| Stopped { seq, announced });
+            return None;
+        }
+        if after.seq <= before.seq {
             return None;
         }
         self.ask(after)
@@ -143,11 +239,28 @@ impl DeviceListFetch {
         self.refused_at = Some(self.now);
     }
 
-    /// The pass's monotonic time, and the list's head (`None`: no list): a
-    /// fetch unanswered too long, sent again from the list's head; none
-    /// once the list reached the named head through another carrier.
-    pub fn tick(&mut self, now_mono: u64, applied: Option<&Head>) -> Option<MembershipFetch> {
+    /// The pass's monotonic time, the list's head (`None`: no list) and its
+    /// deferral (`deferred`, the deferred entry's `seq`): when the deferral
+    /// a fetch stopped at ended, the fetch from the list's head, at once
+    /// (none while one is in flight or a refusal's backoff runs); a fetch
+    /// unanswered too long, sent again from the list's head; none once the
+    /// list reached the named head through another carrier.
+    pub fn tick(
+        &mut self,
+        now_mono: u64,
+        applied: Option<&Head>,
+        deferred: Option<u64>,
+    ) -> Option<MembershipFetch> {
         self.now = now_mono;
+        if self.settle_stop(deferred)
+            && self.in_flight.is_none()
+            && self
+                .refused_at
+                .is_none_or(|at| now_mono >= at.saturating_add(REFUSAL_BACKOFF_MS))
+            && let Some(applied) = applied
+        {
+            return self.ask(applied);
+        }
         let in_flight = self.in_flight?;
         if self
             .named
@@ -175,10 +288,11 @@ impl DeviceListFetch {
     }
 
     /// The fetch on the link's next generation (a new link, or none): nothing
-    /// in flight, no head named and no refusal's backoff (Decision 20), but
-    /// the pacing of the fetches a `heads` starts carries over, so a new
-    /// generation buys a Station no carriage (Task 30 re-review N1). The
-    /// clock and the count of results go on too.
+    /// in flight, no head named or announced, no stop at a deferred entry
+    /// and no refusal's backoff (Decision 20), but the pacing of the fetches
+    /// a `heads` starts carries over, so a new generation buys a Station no
+    /// carriage (Task 30 re-review N1). The clock and the count of results
+    /// go on too.
     pub fn next_generation(&self) -> DeviceListFetch {
         DeviceListFetch {
             now: self.now,
@@ -189,14 +303,35 @@ impl DeviceListFetch {
         }
     }
 
+    /// What the revocation gate reads of the fetch (design I.5.8).
+    pub fn part(&self) -> ListPart {
+        ListPart {
+            announced: self.announced,
+            stopped: self.stopped,
+        }
+    }
+
     /// For the state dump.
     pub fn dump(&self) -> Value {
         json!({
             "named": self.named.map(|h| h.seq),
+            "announced": self.announced.map(|h| h.seq),
+            "stopped": self.stopped.map(|s| s.seq),
             "in_flight": self.in_flight.map(|f| f.after),
             "backoff": self.refused_at.is_some(),
             "results": self.results,
         })
+    }
+
+    /// The stop at a deferred entry is dropped once the list no longer
+    /// defers that entry (`deferred`: the list's deferral now): whether
+    /// one was.
+    fn settle_stop(&mut self, deferred: Option<u64>) -> bool {
+        let ended = self.stopped.is_some_and(|stop| deferred != Some(stop.seq));
+        if ended {
+            self.stopped = None;
+        }
+        ended
     }
 
     fn ask(&mut self, applied: &Head) -> Option<MembershipFetch> {
@@ -240,11 +375,11 @@ mod tests {
     #[test]
     fn fetch_when_the_named_head_is_beyond_the_list() {
         let mut f = DeviceListFetch::default();
-        f.tick(1_000, Some(&head(3)));
-        assert_eq!(f.on_heads(&head(3), &head(3)), None);
-        assert_eq!(f.on_heads(&head(2), &head(3)), None);
-        assert_eq!(f.on_heads(&head(5), &head(3)), fetch(3));
-        assert_eq!(f.on_heads(&head(6), &head(3)), None, "one at a time");
+        f.tick(1_000, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(3), &head(3), None), None);
+        assert_eq!(f.on_heads(&head(2), &head(3), None), None);
+        assert_eq!(f.on_heads(&head(5), &head(3), None), fetch(3));
+        assert_eq!(f.on_heads(&head(6), &head(3), None), None, "one at a time");
     }
 
     /// A result is taken only for a fetch in flight.
@@ -252,7 +387,7 @@ mod tests {
     fn a_result_nobody_asked_for_is_not_applied() {
         let mut f = DeviceListFetch::default();
         assert_eq!(f.on_result(result(5)), FetchApply::Unasked);
-        f.on_heads(&head(5), &head(3));
+        f.on_heads(&head(5), &head(3), None);
         assert_eq!(f.on_result(result(5)), FetchApply::Carry(Vec::new()));
         assert_eq!(f.on_result(result(5)), FetchApply::Unasked, "taken once");
     }
@@ -263,14 +398,18 @@ mod tests {
     #[test]
     fn fetch_again_while_behind_the_announced_head() {
         let mut f = DeviceListFetch::default();
-        f.tick(1_000, Some(&head(3)));
-        assert_eq!(f.on_heads(&head(200), &head(3)), fetch(3));
+        f.tick(1_000, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(200), &head(3), None), fetch(3));
         assert!(matches!(f.on_result(result(200)), FetchApply::Carry(_)));
-        assert_eq!(f.carried(&head(3), &head(67)), fetch(67));
+        assert_eq!(f.carried(&head(3), &head(67), None), fetch(67));
         assert!(matches!(f.on_result(result(200)), FetchApply::Carry(_)));
-        assert_eq!(f.carried(&head(67), &head(131)), fetch(131), "not paced");
+        assert_eq!(
+            f.carried(&head(67), &head(131), None),
+            fetch(131),
+            "not paced"
+        );
         assert!(matches!(f.on_result(result(200)), FetchApply::Carry(_)));
-        assert_eq!(f.carried(&head(131), &head(200)), None, "caught up");
+        assert_eq!(f.carried(&head(131), &head(200), None), None, "caught up");
     }
 
     /// I1: the fetches a `heads` starts are paced on the host's clock: at
@@ -280,24 +419,24 @@ mod tests {
     #[test]
     fn fetches_a_heads_starts_are_paced() {
         let mut f = DeviceListFetch::default();
-        f.tick(10_000, Some(&head(3)));
-        assert_eq!(f.on_heads(&head(9), &head(3)), fetch(3));
+        f.tick(10_000, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(9), &head(3), None), fetch(3));
         assert!(matches!(f.on_result(result(9)), FetchApply::Carry(_)));
-        assert_eq!(f.carried(&head(3), &head(5)), fetch(5), "not paced");
+        assert_eq!(f.carried(&head(3), &head(5), None), fetch(5), "not paced");
         assert!(matches!(f.on_result(result(9)), FetchApply::Carry(_)));
-        assert_eq!(f.carried(&head(5), &head(9)), None, "caught up");
+        assert_eq!(f.carried(&head(5), &head(9), None), None, "caught up");
         // A heads within a second of the last a heads started: nothing.
-        f.tick(10_999, Some(&head(9)));
-        assert_eq!(f.on_heads(&head(12), &head(9)), None);
-        f.tick(11_000, Some(&head(9)));
-        assert_eq!(f.on_heads(&head(12), &head(9)), fetch(9));
+        f.tick(10_999, Some(&head(9)), None);
+        assert_eq!(f.on_heads(&head(12), &head(9), None), None);
+        f.tick(11_000, Some(&head(9)), None);
+        assert_eq!(f.on_heads(&head(12), &head(9), None), fetch(9));
         // Its carriage moved nothing: no fetch at a heads for 30 s.
         assert!(matches!(f.on_result(result(12)), FetchApply::Carry(_)));
-        assert_eq!(f.carried(&head(9), &head(9)), None);
-        f.tick(11_000 + STALL_PAUSE_MS - 1, Some(&head(9)));
-        assert_eq!(f.on_heads(&head(12), &head(9)), None);
-        f.tick(11_000 + STALL_PAUSE_MS, Some(&head(9)));
-        assert_eq!(f.on_heads(&head(12), &head(9)), fetch(9));
+        assert_eq!(f.carried(&head(9), &head(9), None), None);
+        f.tick(11_000 + STALL_PAUSE_MS - 1, Some(&head(9)), None);
+        assert_eq!(f.on_heads(&head(12), &head(9), None), None);
+        f.tick(11_000 + STALL_PAUSE_MS, Some(&head(9)), None);
+        assert_eq!(f.on_heads(&head(12), &head(9), None), fetch(9));
     }
 
     /// I1: many `heads` and junk results in one pass (the host's clock
@@ -305,13 +444,13 @@ mod tests {
     #[test]
     fn heads_and_junk_results_in_one_pass_carry_at_most_once() {
         let mut f = DeviceListFetch::default();
-        f.tick(10_000, Some(&head(3)));
+        f.tick(10_000, Some(&head(3)), None);
         let mut carriages = 0;
         for _ in 0..32 {
-            f.on_heads(&head(9), &head(3));
+            f.on_heads(&head(9), &head(3), None);
             if let FetchApply::Carry(_) = f.on_result(result(9)) {
                 carriages += 1;
-                f.carried(&head(3), &head(3));
+                f.carried(&head(3), &head(3), None);
             }
         }
         assert_eq!(carriages, 1);
@@ -324,15 +463,15 @@ mod tests {
     #[test]
     fn fetch_refused_advances_nothing_and_retries() {
         let mut f = DeviceListFetch::default();
-        f.tick(10_000, Some(&head(3)));
-        assert_eq!(f.on_heads(&head(5), &head(3)), fetch(3));
+        f.tick(10_000, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(5), &head(3), None), fetch(3));
         f.on_refused();
         assert_eq!(f.on_result(result(5)), FetchApply::Unasked, "nothing waits");
-        f.tick(10_000 + REFUSAL_BACKOFF_MS - 1, Some(&head(3)));
-        assert_eq!(f.on_heads(&head(5), &head(3)), None);
+        f.tick(10_000 + REFUSAL_BACKOFF_MS - 1, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(5), &head(3), None), None);
         assert_eq!(f.dump()["backoff"], true);
-        f.tick(10_000 + REFUSAL_BACKOFF_MS, Some(&head(3)));
-        assert_eq!(f.on_heads(&head(5), &head(3)), fetch(3));
+        f.tick(10_000 + REFUSAL_BACKOFF_MS, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(5), &head(3), None), fetch(3));
         assert_eq!(f.dump()["backoff"], false);
 
         // Refused again: the next link generation has no backoff, but keeps
@@ -340,9 +479,13 @@ mod tests {
         f.on_refused();
         let mut next_link = f.next_generation();
         assert_eq!(next_link.dump()["backoff"], false);
-        assert_eq!(next_link.on_heads(&head(5), &head(3)), None, "paced");
-        next_link.tick(10_000 + REFUSAL_BACKOFF_MS + HEADS_PACE_MS, Some(&head(3)));
-        assert_eq!(next_link.on_heads(&head(5), &head(3)), fetch(3));
+        assert_eq!(next_link.on_heads(&head(5), &head(3), None), None, "paced");
+        next_link.tick(
+            10_000 + REFUSAL_BACKOFF_MS + HEADS_PACE_MS,
+            Some(&head(3)),
+            None,
+        );
+        assert_eq!(next_link.on_heads(&head(5), &head(3), None), fetch(3));
     }
 
     /// Decision 21's drop, or a lost answer: the fetch is sent again after
@@ -352,21 +495,109 @@ mod tests {
     #[test]
     fn an_unanswered_fetch_is_sent_again() {
         let mut f = DeviceListFetch::default();
-        f.tick(1_000, Some(&head(3)));
-        assert_eq!(f.on_heads(&head(5), &head(3)), fetch(3));
-        assert_eq!(f.tick(1_000 + FETCH_TIMEOUT_MS - 1, Some(&head(3))), None);
-        assert_eq!(f.tick(1_000 + FETCH_TIMEOUT_MS, Some(&head(3))), fetch(3));
-        assert_eq!(f.tick(1_000 + FETCH_TIMEOUT_MS + 1, Some(&head(3))), None);
+        f.tick(1_000, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(5), &head(3), None), fetch(3));
+        assert_eq!(
+            f.tick(1_000 + FETCH_TIMEOUT_MS - 1, Some(&head(3)), None),
+            None
+        );
+        assert_eq!(
+            f.tick(1_000 + FETCH_TIMEOUT_MS, Some(&head(3)), None),
+            fetch(3)
+        );
+        assert_eq!(
+            f.tick(1_000 + FETCH_TIMEOUT_MS + 1, Some(&head(3)), None),
+            None
+        );
         // A phone's carriage moved the list meanwhile: from its head.
         assert_eq!(
-            f.tick(1_000 + 2 * FETCH_TIMEOUT_MS, Some(&head(4))),
+            f.tick(1_000 + 2 * FETCH_TIMEOUT_MS, Some(&head(4)), None),
             fetch(4)
         );
         // And to the named head: nothing more to fetch, nothing in flight.
-        assert_eq!(f.tick(1_000 + 3 * FETCH_TIMEOUT_MS, Some(&head(5))), None);
+        assert_eq!(
+            f.tick(1_000 + 3 * FETCH_TIMEOUT_MS, Some(&head(5)), None),
+            None
+        );
         assert_eq!(f.dump()["in_flight"], Value::Null);
-        assert_eq!(f.on_heads(&head(6), &head(5)), fetch(5));
+        assert_eq!(f.on_heads(&head(6), &head(5), None), fetch(5));
         f.unsent();
         assert_eq!(f.dump()["in_flight"], Value::Null);
+    }
+
+    /// Design I.4.3, R9.5: a carriage that stops at a deferred entry
+    /// fetches nothing more (nothing past it applies until its wait ends);
+    /// while the list still defers it, the head the Station announced then
+    /// isn't "behind" (no fetch at its `heads`, past every pace), a head it
+    /// announces anew is fetched as any; when the deferral ends, the entry
+    /// is fetched again at once, with no `heads`. The next link generation
+    /// starts with no stop and nothing announced.
+    #[test]
+    fn a_stop_at_a_deferred_entry_holds_the_fetch_until_its_deferral_ends() {
+        let mut f = DeviceListFetch::default();
+        f.tick(10_000, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(9), &head(3), None), fetch(3));
+        assert!(matches!(f.on_result(result(9)), FetchApply::Carry(_)));
+        // 4 and 5 applied, 6 deferred: no fetch again.
+        assert_eq!(f.carried(&head(3), &head(5), Some(6)), None);
+        assert_eq!(f.dump()["stopped"], 6);
+        assert_eq!(f.dump()["announced"], 9);
+        assert_eq!(
+            f.part(),
+            ListPart {
+                announced: Some(head(9)),
+                stopped: Some(Stopped {
+                    seq: 6,
+                    announced: head(9)
+                }),
+            }
+        );
+        // The same head again, past every pace, the deferral holding.
+        let later = 10_000 + STALL_PAUSE_MS + HEADS_PACE_MS;
+        assert_eq!(f.tick(later, Some(&head(5)), Some(6)), None);
+        assert_eq!(f.on_heads(&head(9), &head(5), Some(6)), None);
+        // A head announced anew: fetched (paced as any); stopped again at
+        // the same entry, a stall, under the new head.
+        assert_eq!(f.on_heads(&head(10), &head(5), Some(6)), fetch(5));
+        assert!(matches!(f.on_result(result(10)), FetchApply::Carry(_)));
+        assert_eq!(f.carried(&head(5), &head(5), Some(6)), None);
+        assert_eq!(f.part().stopped.map(|s| s.announced), Some(head(10)));
+        f.tick(later + STALL_PAUSE_MS, Some(&head(5)), Some(6));
+        assert_eq!(f.on_heads(&head(10), &head(5), Some(6)), None);
+        // The deferral ends (the wait ended on this host): fetched again at
+        // once, though paced at a heads.
+        assert_eq!(
+            f.tick(later + STALL_PAUSE_MS + 1, Some(&head(5)), None),
+            fetch(5)
+        );
+        assert_eq!(f.dump()["stopped"], Value::Null);
+        assert_eq!(f.part().announced, Some(head(10)));
+        // The next link generation: nothing announced, no stop.
+        assert_eq!(f.next_generation().part(), ListPart::default());
+    }
+
+    /// A stop whose deferral ended while a fetch was refused waits out the
+    /// refusal's backoff; one whose deferral ends with a fetch in flight
+    /// sends nothing more.
+    #[test]
+    fn a_deferral_that_ends_fetches_only_when_nothing_holds_it() {
+        let mut f = DeviceListFetch::default();
+        f.tick(1_000, Some(&head(3)), None);
+        f.on_heads(&head(9), &head(3), None);
+        f.on_result(result(9));
+        f.carried(&head(3), &head(5), Some(6));
+        f.on_refused();
+        assert_eq!(f.tick(2_000, Some(&head(5)), None), None, "backing off");
+        assert_eq!(f.dump()["stopped"], Value::Null);
+
+        let mut f = DeviceListFetch::default();
+        f.tick(1_000, Some(&head(3)), None);
+        f.on_heads(&head(9), &head(3), None);
+        f.on_result(result(9));
+        f.carried(&head(3), &head(5), Some(6));
+        f.tick(5_000, Some(&head(5)), Some(6));
+        assert_eq!(f.on_heads(&head(10), &head(5), Some(6)), fetch(5));
+        assert_eq!(f.tick(5_001, Some(&head(5)), None), None, "one at a time");
+        assert_eq!(f.dump()["in_flight"], 5);
     }
 }

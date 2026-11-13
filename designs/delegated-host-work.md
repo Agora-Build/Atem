@@ -59,7 +59,8 @@ these marks.
 `cc180912cd8d3afc11c20f77a3ebc4e8a81989ede1327afc90df52d09c39eb83`), changed only by this status block, Appendix B, the link to
 the diagram, the two Astation file references in XI (written so they are not read as paths in this repository), and
 one update marked "updated after agreement" in III.4 (the phone's login is live on dev, Auth #19), and the framing,
-host-mail and clock amendments above, and the marks of step 3's agreements. The diagram is
+host-mail and clock amendments above, the marks of step 3's agreements, and IX.1 Q7's answer (marked "answered in
+step 4"). The diagram is
 `delegated-host-work-flows.html` (frozen `flows.html`, SHA-256
 `587a4c74ca9c2645dd3a2c79908813da573451479c0a0a846896fd3ff909cf6a`), changed only in the phone's login in figures 1
 and 2, marked the same way, and, after step 3's agreements, in figure 1 (both hosts use the same Station) and
@@ -3169,6 +3170,15 @@ forced binding; the rooms the migration can't resolve are refused until claimed 
    beside it), with its relay fixture in Atem's protocol fixtures (III.1, test 48); Atem owns it (VIII.3), and IV row
    5 lists it as a contract change.
 7. Settle account-trust §3.4 and session-v1 R9.5 on the host's own relay fetch of the device list (V.3).
+   **Answered in step 4 (2026-11-13).** The host fetches the device list itself over its one link
+   (`membership_fetch`, host-work-v1 §11.4), behind `host.delegated` until activation; account-trust §3.4 says so in
+   place of "not implemented". It fetches when its Station's `heads` (every (re)connection, every 30 s, at once on a
+   new entry) name a head beyond its own, which takes the place of R9.5's 15-minute schedule (a Station that withholds
+   `heads` could withhold the entries as well), and again at once when a deferral it stopped at ends on this host.
+   A fetch that stops at a deferred entry asks nothing more while the deferral holds and the announced head is the
+   same, and counts as fetched up to that entry for the gate (I.5.8); "the announced head" is the last `heads`'
+   device-list head, which the host's list must hold as that entry, `seq` and hash (a list that differs from the
+   Station's keeps the gate closed). R9.3 and R9.5 each gain one sentence, marked for Astation's agreement.
 
 ### IX.2 Astation
 

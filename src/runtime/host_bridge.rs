@@ -1502,6 +1502,28 @@ impl HostBridge {
             || station_link_kind(app),
             || app.astation_client.selected_station_origin(),
         );
+        self.refresh_fetch_view();
+    }
+
+    /// The start view's copy of the host's own fetch on its Station link
+    /// (the gates' device-list part, design I.5.8), after the link or its
+    /// fetch changed. The list it is judged against is the view's own, as
+    /// it commits.
+    fn refresh_fetch_view(&self) {
+        if !self.features.delegated {
+            return;
+        }
+        let fetch = self.station.as_ref().and_then(Station::list_fetch);
+        self.start_view().fetch = fetch;
+    }
+
+    /// The device list's deferral, as the fetch reads it: the deferred
+    /// entry's `seq` (design I.4.3).
+    fn list_deferral(&self) -> Option<u64> {
+        self.membership
+            .as_ref()
+            .and_then(MembershipHost::deferred_stop)
+            .map(|d| d.seq)
     }
 
     /// The Station's messages of this pass, as received (none while
@@ -1512,20 +1534,26 @@ impl HostBridge {
     /// (`R9Host::carried`: fences, push recipients, `membership_head`).
     /// Calls go on the link's control queue, as the relay's push messages.
     fn station_pass(&mut self, messages: Vec<String>, cx: &mut Cx) {
+        let applied = self.membership.as_ref().map(MembershipHost::head);
+        let deferred = self.list_deferral();
         let Some(station) = self.station.as_mut() else {
             return;
         };
-        let applied = self.membership.as_ref().map(MembershipHost::head);
         let mut calls: Vec<atem_client::control::MembershipFetch> = station
-            .tick(host_now().mono_ms, applied)
+            .tick(host_now().mono_ms, applied, deferred)
             .into_iter()
             .collect();
         for text in messages {
             let applied = self.membership.as_ref().map(MembershipHost::head);
+            let deferred = self.list_deferral();
             let Some(station) = self.station.as_mut() else {
                 return;
             };
-            match station.receive(&text, applied) {
+            let inbound = station.receive(&text, applied, deferred);
+            // A `heads` may name a head beyond the list: the gate's
+            // device-list part follows before anything else runs.
+            self.refresh_fetch_view();
+            match inbound {
                 StationInbound::Nothing => {}
                 StationInbound::Send(call) => calls.push(call),
                 StationInbound::Carry(entries) => {
@@ -1534,9 +1562,13 @@ impl HostBridge {
                         .iter()
                         .map(|e| StrictValue::parse(e.to_json().to_string().as_bytes(), usize::MAX))
                         .collect();
+                    // Where the carriage stopped at a deferred entry, if it
+                    // did: nothing past it applies before its wait ends.
+                    let mut stopped_at = None;
                     match carried {
                         Ok(carried) => {
                             if let Some(result) = self.carry(&carried, cx) {
+                                stopped_at = result.deferred_at();
                                 let effects =
                                     self.r9_call(|r9, parts| r9.carried(&result, None, parts));
                                 self.r9_exec(effects, cx);
@@ -1555,7 +1587,7 @@ impl HostBridge {
                     let after = self.membership.as_ref().map(MembershipHost::head);
                     if let (Some(before), Some(after), Some(station)) =
                         (applied, after, self.station.as_mut())
-                        && let Some(call) = station.fetch.carried(&before, &after)
+                        && let Some(call) = station.fetch.carried(&before, &after, stopped_at)
                     {
                         calls.push(call);
                     }
@@ -1574,6 +1606,7 @@ impl HostBridge {
                 station.fetch.unsent();
             }
         }
+        self.refresh_fetch_view();
     }
 
     /// The device list changed on disk while the runtime runs (a pairing
@@ -2052,7 +2085,14 @@ impl HostBridge {
             "receipts": receipts,
             "receipts_visible": visible,
             "membership_error": self.membership_error,
-            "station": self.station.as_ref().map(Station::dump),
+            "station": self.station.as_ref().map(|station| {
+                let mut dump = station.dump();
+                // The gates' device-list part now (design I.5.8).
+                dump["list_part"] = json!(self.membership.as_ref().is_some_and(|m| {
+                    station.fetch.part().holds(m.membership(), self.list_deferral())
+                }));
+                dump
+            }),
         });
         if let Some(m) = self.membership.as_ref() {
             let control_gen: serde_json::Map<String, serde_json::Value> = principals

@@ -366,6 +366,26 @@ impl FakeStation {
         }
     }
 
+    /// [`FakeStation::set_log`], then `beyond` after `log`'s head: signed
+    /// entries `log` can't verify yet (one its subject signed while a
+    /// recovery's wait runs, R9.5), stored as a Station stores what devices
+    /// send it; the device list's head is the last one's. Announced at the
+    /// next heads.
+    pub fn set_log_beyond(&mut self, log: &TestLog, beyond: &[Value]) {
+        self.set_log(log);
+        let served = self.served_mut();
+        for value in beyond {
+            let entry = atem_client::membership::Entry::parse_bytes(value.to_string().as_bytes())
+                .expect("a signed entry");
+            assert_eq!(entry.seq, served.head.seq + 1, "contiguous");
+            served.head = Head {
+                seq: entry.seq,
+                hash: entry.hash(),
+            };
+            served.entries.push(entry.object().clone());
+        }
+    }
+
     /// Stores `record` at the next position of the served account's feed
     /// (after any [`FakeStation::append_gap`]): the reference ledger sees
     /// it first (for the host's account), then the feed serves it and

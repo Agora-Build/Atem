@@ -12,11 +12,13 @@
 //! afresh: nothing in flight carries over, and a refusal's backoff ends; the
 //! fetch's pacing carries over ([`DeviceListFetch::next_generation`]).
 //!
-//! Here so far: the device list's fetch ([`super::fetch`]) and the
-//! refusals' runtime.log lines (Decision 20: at most one an hour per kind).
+//! Here so far: the device list's fetch ([`super::fetch`]), its part of the
+//! revocation gate ([`Station::list_fetch`]) and the refusals' runtime.log
+//! lines (Decision 20: at most one an hour per kind).
 //! The feeds (`control_sync`, its pages, the gates, `atem status`) are PR
 //! 10's: their messages are read and dropped.
 use super::fetch::{DeviceListFetch, FetchApply};
+use super::start::StationFetch;
 use atem_client::SignedObject;
 use atem_client::control::{MembershipFetch, RefusedCall, ToHost};
 use atem_client::membership::Head;
@@ -66,7 +68,8 @@ pub enum Inbound {
     /// Send this call on the link.
     Send(MembershipFetch),
     /// Apply these entries as any carriage (`HostBridge::carry`, then
-    /// `R9Host::carried`), then [`DeviceListFetch::carried`].
+    /// `R9Host::carried`), then [`DeviceListFetch::carried`] with where the
+    /// carriage stopped at a deferred entry.
     Carry(Vec<SignedObject>),
 }
 
@@ -145,16 +148,38 @@ impl Station {
         self.link.as_ref()
     }
 
-    /// The pass's monotonic time and the device list's head (`None`: no
-    /// list): a call due again.
-    pub fn tick(&mut self, now_mono: u64, applied: Option<Head>) -> Option<MembershipFetch> {
+    /// What the revocation gate reads of the host's own fetch on this link
+    /// (design I.5.8): its Station's origin and the fetch's device-list part;
+    /// none without a link.
+    pub fn list_fetch(&self) -> Option<StationFetch> {
+        let link = self.link.as_ref()?;
+        Some(StationFetch {
+            origin: link.origin.clone(),
+            part: self.fetch.part(),
+        })
+    }
+
+    /// The pass's monotonic time, the device list's head (`None`: no list)
+    /// and its deferral (the deferred entry's `seq`): a call due now.
+    pub fn tick(
+        &mut self,
+        now_mono: u64,
+        applied: Option<Head>,
+        deferred: Option<u64>,
+    ) -> Option<MembershipFetch> {
         self.now = now_mono;
-        self.fetch.tick(now_mono, applied.as_ref())
+        self.fetch.tick(now_mono, applied.as_ref(), deferred)
     }
 
     /// A Station's message on the link (`bytes` as received); `applied`:
-    /// the device list's head (`None`: no list, nothing to fetch).
-    pub fn receive(&mut self, bytes: &str, applied: Option<Head>) -> Inbound {
+    /// the device list's head (`None`: no list, nothing to fetch), and its
+    /// deferral (`deferred`, the deferred entry's `seq`).
+    pub fn receive(
+        &mut self,
+        bytes: &str,
+        applied: Option<Head>,
+        deferred: Option<u64>,
+    ) -> Inbound {
         if self.link.is_none() {
             return Inbound::Nothing;
         }
@@ -162,7 +187,7 @@ impl Station {
             Ok(ToHost::Heads(heads)) => {
                 self.heads += 1;
                 applied
-                    .and_then(|applied| self.fetch.on_heads(&heads.membership, &applied))
+                    .and_then(|applied| self.fetch.on_heads(&heads.membership, &applied, deferred))
                     .map_or(Inbound::Nothing, Inbound::Send)
             }
             Ok(ToHost::MembershipFetchResult(result)) => match self.fetch.on_result(result) {
@@ -280,10 +305,10 @@ mod tests {
     #[test]
     fn a_new_link_generation_starts_afresh() {
         let mut s = Station::new();
-        assert_eq!(s.receive(&heads(5), Some(head(3))), Inbound::Nothing);
+        assert_eq!(s.receive(&heads(5), Some(head(3)), None), Inbound::Nothing);
         up(&mut s, 1);
         assert_eq!(
-            s.receive(&heads(5), Some(head(3))),
+            s.receive(&heads(5), Some(head(3)), None),
             Inbound::Send(MembershipFetch { after: 3 })
         );
         s.sync_link(Some(1), || LinkKind::Relay, || panic!("not asked again"));
@@ -302,7 +327,7 @@ mod tests {
     fn messages_are_read_strictly() {
         let mut s = Station::new();
         up(&mut s, 1);
-        assert_eq!(s.receive(&heads(5), None), Inbound::Nothing);
+        assert_eq!(s.receive(&heads(5), None, None), Inbound::Nothing);
         assert_eq!(s.dump()["heads"], 1);
         let result = MembershipFetchResult {
             head: head(5),
@@ -311,14 +336,14 @@ mod tests {
         .to_json()
         .unwrap()
         .to_string();
-        assert_eq!(s.receive(&result, Some(head(3))), Inbound::Nothing);
-        s.receive(&heads(5), Some(head(3)));
+        assert_eq!(s.receive(&result, Some(head(3)), None), Inbound::Nothing);
+        s.receive(&heads(5), Some(head(3)), None);
         assert_eq!(
-            s.receive(&result, Some(head(3))),
+            s.receive(&result, Some(head(3)), None),
             Inbound::Carry(Vec::new())
         );
         let duplicate = r#"{"type":"relay","op":"heads","feeds":[],"feeds":[],"membership":{"seq":5,"hash":"00"}}"#;
-        assert_eq!(s.receive(duplicate, Some(head(3))), Inbound::Nothing);
+        assert_eq!(s.receive(duplicate, Some(head(3)), None), Inbound::Nothing);
         assert_eq!(s.dump()["unread"], 1);
     }
 
@@ -328,15 +353,18 @@ mod tests {
     fn refusals_are_counted_per_kind() {
         let mut s = Station::new();
         up(&mut s, 1);
-        s.tick(1_000, Some(head(3)));
-        s.receive(&heads(5), Some(head(3)));
+        s.tick(1_000, Some(head(3)), None);
+        s.receive(&heads(5), Some(head(3)), None);
         for call in [
             RefusedCall::ControlSync,
             RefusedCall::ControlAck,
             RefusedCall::MembershipFetch,
             RefusedCall::MembershipFetch,
         ] {
-            assert_eq!(s.receive(&refused(call), Some(head(3))), Inbound::Nothing);
+            assert_eq!(
+                s.receive(&refused(call), Some(head(3)), None),
+                Inbound::Nothing
+            );
         }
         let dump = s.dump();
         assert_eq!(dump["refusals"]["control_sync"], 1);
@@ -346,8 +374,8 @@ mod tests {
         assert_eq!(dump["fetch"]["backoff"], true);
         // Logged once per kind within the hour, again after it.
         assert_eq!(s.logged, [Some(1_000); 3]);
-        s.tick(1_000 + REFUSAL_LOG_EVERY_MS, Some(head(3)));
-        s.receive(&refused(RefusedCall::ControlAck), None);
+        s.tick(1_000 + REFUSAL_LOG_EVERY_MS, Some(head(3)), None);
+        s.receive(&refused(RefusedCall::ControlAck), None, None);
         assert_eq!(s.logged[2], Some(1_000 + REFUSAL_LOG_EVERY_MS));
         assert_eq!(s.logged[0], Some(1_000));
     }
@@ -360,9 +388,9 @@ mod tests {
     fn a_new_link_generation_keeps_the_fetch_pacing() {
         let mut s = Station::new();
         up(&mut s, 1);
-        s.tick(10_000, Some(head(3)));
+        s.tick(10_000, Some(head(3)), None);
         let fetch = |after| Inbound::Send(MembershipFetch { after });
-        assert_eq!(s.receive(&heads(5), Some(head(3))), fetch(3));
+        assert_eq!(s.receive(&heads(5), Some(head(3)), None), fetch(3));
         let junk = MembershipFetchResult {
             head: head(5),
             entries: Vec::new(),
@@ -370,20 +398,23 @@ mod tests {
         .to_json()
         .unwrap()
         .to_string();
-        assert_eq!(s.receive(&junk, Some(head(3))), Inbound::Carry(Vec::new()));
-        assert_eq!(s.fetch.carried(&head(3), &head(3)), None, "a stall");
+        assert_eq!(
+            s.receive(&junk, Some(head(3)), None),
+            Inbound::Carry(Vec::new())
+        );
+        assert_eq!(s.fetch.carried(&head(3), &head(3), None), None, "a stall");
         up(&mut s, 2);
-        s.tick(10_000 + STALL_PAUSE_MS - 1, Some(head(3)));
-        assert_eq!(s.receive(&heads(5), Some(head(3))), Inbound::Nothing);
-        s.tick(10_000 + STALL_PAUSE_MS, Some(head(3)));
-        assert_eq!(s.receive(&heads(5), Some(head(3))), fetch(3));
+        s.tick(10_000 + STALL_PAUSE_MS - 1, Some(head(3)), None);
+        assert_eq!(s.receive(&heads(5), Some(head(3)), None), Inbound::Nothing);
+        s.tick(10_000 + STALL_PAUSE_MS, Some(head(3)), None);
+        assert_eq!(s.receive(&heads(5), Some(head(3)), None), fetch(3));
         // Down and up again at once: nothing in flight, the pace kept.
         s.sync_link(None, || LinkKind::Relay, || None);
         up(&mut s, 3);
         assert_eq!(s.dump()["fetch"]["in_flight"], Value::Null);
-        assert_eq!(s.receive(&heads(5), Some(head(3))), Inbound::Nothing);
-        s.tick(10_000 + STALL_PAUSE_MS + HEADS_PACE_MS, Some(head(3)));
-        assert_eq!(s.receive(&heads(5), Some(head(3))), fetch(3));
+        assert_eq!(s.receive(&heads(5), Some(head(3)), None), Inbound::Nothing);
+        s.tick(10_000 + STALL_PAUSE_MS + HEADS_PACE_MS, Some(head(3)), None);
+        assert_eq!(s.receive(&heads(5), Some(head(3)), None), fetch(3));
     }
 
     /// I1: a Station that sends `heads` and junk results, many in one pass
@@ -392,7 +423,7 @@ mod tests {
     fn heads_and_junk_results_in_one_pass_carry_at_most_once() {
         let mut s = Station::new();
         up(&mut s, 1);
-        s.tick(5_000, Some(head(3)));
+        s.tick(5_000, Some(head(3)), None);
         let junk = MembershipFetchResult {
             head: head(9),
             entries: Vec::new(),
@@ -402,10 +433,10 @@ mod tests {
         .to_string();
         let mut carriages = 0;
         for _ in 0..32 {
-            s.receive(&heads(9), Some(head(3)));
-            if let Inbound::Carry(_) = s.receive(&junk, Some(head(3))) {
+            s.receive(&heads(9), Some(head(3)), None);
+            if let Inbound::Carry(_) = s.receive(&junk, Some(head(3)), None) {
                 carriages += 1;
-                s.fetch.carried(&head(3), &head(3));
+                s.fetch.carried(&head(3), &head(3), None);
             }
         }
         assert_eq!(carriages, 1);
