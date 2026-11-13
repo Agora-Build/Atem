@@ -555,6 +555,7 @@ R4 bounds accepted tasks by their original deadline (at most 24 h after admissio
 - **With `host.delegated` turned off after tasks were accepted** (step 4's Decision 10, a debug-only hook), a started
   task's turn is still interrupted at its deadline. Atem-internal.
 
+### I.4.5 Queries, cancel, complete, replies, and new operations
 
 **The sender.**
 - `work_query`, `reply_query`, `work_cancel` and `work_complete` need the **same principal and key** that enqueued the
