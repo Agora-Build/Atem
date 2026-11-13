@@ -1855,8 +1855,9 @@ messages, not these rules):
       and jointly tested, and never to retry uncorrelated. Every retry is
       now correlated, and the Station cancels an old generation's jobs, so
       the strict rule would stop the sync until a new socket after every
-      re-authentication. So the host retires a call by its id at its
-      30-second deadline and when the link generation changes, drains a
+      re-authentication. So the host retires a call by its id 35 seconds
+      after it asked (the Station's 30-second deadline and a 5-second
+      grace, Atem-internal) and when the link generation changes, drains a
       page with a retired id, and then asks again with a fresh id under its
       pacing ("Matching a page to its call" below).
     - **Unchanged:** the three refusals stay metadata-free, with no id and
@@ -1967,9 +1968,11 @@ host's call on the link with exactly one of:
   correlation, C1b: a refusal names a call kind, not a request: it
   completes and matches none; on that kind the host backs off (its
   device-list fetch 30 s, ended by the link's next generation) and retires
-  what it had live of that kind on the link, so a later result for it is
-  drained; a call of another kind stays live (see "Matching a page to its
-  call" below).)
+  what it had live of that kind on the link: a `control_sync` by its id,
+  so a later result for it is drained; a `membership_fetch`, which has no
+  id (rule 8), so a later result is unasked, or is taken as a newer fetch's
+  (no harm: a carriage gets no more trust than any carrier). A call of
+  another kind stays live (see "Matching a page to its call" below).)
 - The host keeps that link's synchronization gates closed while it repairs
   the association and resynchronizes. The transport may still fence or
   close an invalid or superseded link; a refusal creates no authority for
@@ -2096,7 +2099,7 @@ only its own Station's feed (step 4's Decision 14):
   nothing tells it is
   the Station's, so it is dropped before any reader, as a broken frame of
   every family on the link is, with no fault alert. Either way the call it
-  answered goes unanswered: the gate stays closed, and after 30 seconds
+  answered goes unanswered: the gate stays closed, and after 35 seconds
   the call is retired and asked again with a fresh id (see "Matching a
   page to its call").
 - **Pacing** (as the device-list fetch's). One `control_sync` in flight at
@@ -2121,19 +2124,28 @@ only its own Station's feed (step 4's Decision 14):
     were loaded for). For a discovery call (no `feed_id`, `after: 0`; this
     host never makes one) the page's feed must also be the own feed this
     generation's `heads` announced.
+  - **The deadline** (**Atem-internal**, step 4, C1b-b; nothing on the
+    wire changes). The Station's agreed deadline is 30 seconds (a bounded
+    result, or the link fenced). The host retires a call 35 seconds after
+    it asked it: a 5-second grace, so a result the Station writes just
+    inside its deadline isn't drained on its way.
   - **Retired calls.** A call is retired by its id when its page comes,
-    when it goes unanswered for 30 seconds (the Station's deadline), when
-    the link generation changes (Astation re-authenticating the link, a
-    routed link's upgrade, the link dropping: the Station cancels the old
-    generation's jobs) and at a `control_sync_refused`. A page with a
-    retired id (bytes the Station wrote before the retirement reached it)
-    is drained: counted in the state dump, it advances nothing, opens no
-    gate and is no Station fault. Once a call is retired a new one, with a
-    fresh id, may go under the pacing: after a timeout, at once (an hourly
-    Station-fault alert goes, and `atem status` says `a control_sync went
-    unanswered for 30 s; asked again with a new request id` until a page
-    answers); on a new link generation, at its `heads`. A host keeps the
-    latest 256 retired ids; an older one reads as unsolicited.
+    at the deadline, when the link generation changes (Astation
+    re-authenticating the link, a routed link's upgrade, the link
+    dropping: the Station cancels the old generation's jobs) and at a
+    `control_sync_refused`. A page with a retired id (bytes the Station
+    wrote before the retirement reached it) is drained: counted in the
+    state dump, it advances nothing, opens no gate and is no Station
+    fault. Once a call is retired a new one, with a fresh id, may go under
+    the pacing: after a timeout, at once (after a refusal: at the next
+    `heads` past its backoff), with an hourly Station-fault alert; on a
+    new link generation, at its `heads`. While that retry is live, and
+    only then, `atem status` says `a control_sync went unanswered for 35
+    s; asked again with a new request id`: never when nothing was asked
+    (the feed needing no page). A call retired before it was handed to
+    the link (in the pass that asked it) is never sent, and one the link
+    didn't take is dropped by its id, a newer live call kept. A host keeps
+    the latest 256 retired ids; an older one reads as unsolicited.
   - **Station faults.** A page with an id the host never sent is
     unsolicited: a Station fault (the hourly alert, nothing advanced, the
     gate closed); the live call stays live. A page with the live id that

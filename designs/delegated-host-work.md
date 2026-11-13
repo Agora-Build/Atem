@@ -864,7 +864,7 @@ restart; interrupting a turn that has already ended does nothing.
     relay connection, and gets `{request_id, origin, feed_id, after, head, station_time, records}`. **Amended in
     place on Astation's request (#164 comment 6858189009):** `request_id` (a fresh UUID v4 for every call) and the
     echoed `after` let the host match each result to its live call (host-work-v1 §11.4, wire rule 11). A result of a
-    retired call (one unanswered for 30 seconds, refused, or of an earlier link generation) advances nothing and opens
+    retired call (one unanswered for 35 seconds, refused, or of an earlier link generation) advances nothing and opens
     no gate (§11.4, "Matching a page to its call").
   - **On `:8080`**, Astation proxies the same calls and announcements to the Station unchanged. Records are signed,
     and Astation is a native manager. **New rule:** the host's own device-list fetch (below) and the mailbox calls
