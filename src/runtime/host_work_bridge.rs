@@ -1600,6 +1600,14 @@ impl HostBridge {
             } else {
                 Vec::new()
             };
+            // Their launch projects, kept hashed (ruling T20c), so a
+            // comparison that is pending now (`busy`) can be made: a task
+            // that closed before this run isn't registered by the start's
+            // recovery (Task 32 re-review N1).
+            for t in &delegated {
+                self.keep_task_project(t);
+            }
+            let store = self.work.store.as_ref().ok_or("busy")?;
             if delegated.is_empty() {
                 if old.message.sender != a.name() || old.sender_key != a.key_json() {
                     return Err("forbidden");

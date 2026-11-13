@@ -195,6 +195,34 @@ fn sender_authority(
     Ok(())
 }
 
+/// Who a caller is to a message's delegated tasks together (`message_query`
+/// and a `message_publish` retry), from what [`interaction`] said of each:
+/// every task must let it through; a refusal that stands (`forbidden`) is
+/// answered whatever the recipients' order, before one that can't be
+/// decided yet (`busy`), so a caller that would be refused anyway isn't
+/// told to retry (Task 32 re-review N3). With none refused: the owner when
+/// any task saw the owner in it.
+pub fn every_caller(
+    each: impl IntoIterator<Item = Result<Caller, Refused>>,
+) -> Result<Caller, Refused> {
+    let mut caller = Caller::Sender;
+    let mut undecided = None;
+    for one in each {
+        match one {
+            Ok(Caller::Owner) => caller = Caller::Owner,
+            Ok(Caller::Sender) => {}
+            Err(refused) if refused.code() == "busy" => {
+                undecided.get_or_insert(refused);
+            }
+            Err(refused) => return Err(refused),
+        }
+    }
+    match undecided {
+        Some(refused) => Err(refused),
+        None => Ok(caller),
+    }
+}
+
 /// A native member holding `control` at the head, under its own key.
 fn owner(caller_principal: &str, caller_key: &[u8], list: &Membership) -> bool {
     let Some(device_id) = caller_principal.strip_prefix("member:") else {
@@ -232,6 +260,38 @@ mod tests {
                 ..SenderStanding::default()
             }
         }
+    }
+
+    /// Task 32 re-review N3: a message's tasks answer as one: a definitive
+    /// refusal (`forbidden`) wins over one that can't be decided yet
+    /// (`busy`) whatever the order of the recipients; otherwise the first
+    /// `busy`; with none, the owner when any task saw one.
+    #[test]
+    fn a_definitive_refusal_wins_over_busy_in_either_order() {
+        use Refused::*;
+        let both = |a: Result<Caller, Refused>, b| {
+            (
+                every_caller([a, b]).map_err(Refused::code),
+                every_caller([b, a]).map_err(Refused::code),
+            )
+        };
+        assert_eq!(
+            both(Err(ProjectPending), Err(NotCovered)),
+            (Err("forbidden"), Err("forbidden"))
+        );
+        assert_eq!(
+            both(Err(Unchecked), Err(Revoked)),
+            (Err("forbidden"), Err("forbidden"))
+        );
+        assert_eq!(
+            both(Ok(Caller::Sender), Err(ProjectPending)),
+            (Err("busy"), Err("busy"))
+        );
+        assert_eq!(
+            both(Ok(Caller::Sender), Ok(Caller::Owner)),
+            (Ok(Caller::Owner), Ok(Caller::Owner))
+        );
+        assert_eq!(every_caller([]), Ok(Caller::Sender));
     }
 
     /// A bot expiry a day ahead (the verifier's limit is 90 days).

@@ -9,7 +9,7 @@
 use super::*;
 use crate::runtime::delegated::Admission;
 use crate::runtime::delegated::attempts::{AttemptEnd, SessionAnswer, attempt_end};
-use crate::runtime::delegated::authority::{Caller, Grounds, Refused, interaction};
+use crate::runtime::delegated::authority::{Caller, Grounds, Refused, every_caller, interaction};
 use crate::runtime::delegated::start::Event;
 use crate::session_protocol::host::{Immutable, Provenance, Withdrawal};
 use crate::session_protocol::wire::ReceiptState;
@@ -85,21 +85,18 @@ impl HostBridge {
     /// tasks (`tasks`, each with its admission), for `message_query` and a
     /// `message_publish` retry: the tasks' caller rule, every one of them
     /// (the owner, or the sender with current authority over each); why
-    /// not when it may not (the first task's reason).
+    /// not when it may not: a refusal that stands (`forbidden`) before one
+    /// that can't be decided yet (`busy`), whatever the recipients' order
+    /// (`every_caller`, Task 32 re-review N3).
     pub(super) fn delegated_message_caller(
         &self,
         a: &Sender,
         tasks: &[WorkRecord],
     ) -> Result<Caller, Refused> {
-        let mut caller = Caller::Sender;
-        for t in tasks {
+        every_caller(tasks.iter().map(|t| {
             let adm = t.delegated.as_ref().ok_or(Refused::NotTheSender)?;
-            match self.delegated_caller(a, t, adm)? {
-                Caller::Owner => caller = Caller::Owner,
-                Caller::Sender => {}
-            }
-        }
-        Ok(caller)
+            self.delegated_caller(a, t, adm)
+        }))
     }
 
     /// `work_cancel` of the delegated task `r` by its sender (design I.4.5,

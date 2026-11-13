@@ -1808,6 +1808,67 @@ fn a_task_whose_project_isnt_hashed_yet_is_busy_until_it_is() {
     });
 }
 
+/// Task 32 re-review N1: the same for a `message_query` of the bot's
+/// message whose delegated task closed before a restart (its project not
+/// registered then) and whose session is gone: `busy` while its project
+/// isn't hashed under the grant's new kid, never for good: the query
+/// registers the task's project, which is then hashed.
+#[test]
+fn a_message_whose_tasks_project_isnt_hashed_yet_is_busy_until_it_is() {
+    const NEW_KID: &str = "0e0f0a0d";
+    const NEW_PROJECT: &str =
+        "h1.0e0f0a0d.5555555555555555555555555555555555555555555555555555555555555555";
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let agent = TableAgent::new(true);
+        let mut s =
+            with_project_bot(&mut rig, root, &os, start + 3 * HOUR, &[PROJECT], &agent).await;
+        let (publish, task) = message_from(&rig, BOT, "rs", "PROJECTS_MESSAGE", None);
+        let bot = s.bot.clone();
+        ask_req(&mut rig, &bot, &publish).unwrap();
+        assert!(stored_record(&rig, &task).delegated.is_some());
+        run(&mut rig, &task, "PROJECTS_MESSAGE").await;
+        // As a restart finds it once its record closed: not registered.
+        rig.bridge
+            .projects
+            .forget(&crate::runtime::project_scope::task_project_key(
+                RIG_PROJECT,
+            ));
+        let session = rig.sessions.remove(&rig.sid).unwrap();
+        let _ = session.stop();
+        passes(&mut rig, 3);
+        agent
+            .table
+            .lock()
+            .unwrap()
+            .insert((RIG_PROJECT.into(), NEW_KID.into()), NEW_PROJECT.into());
+        let change = s.log.set_service(
+            "svc-bot",
+            &ServiceScope::new(["host"])
+                .projects(Some([NEW_PROJECT]))
+                .ops(["message", "notify", "prompt", "stop"]),
+            start + 3 * HOUR,
+        );
+        carry(&mut rig, &s.log, change);
+        assert_eq!(
+            ask(&mut rig, &bot, Q::Message(&publish)),
+            busy(),
+            "not yet hashed"
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut asked = ask(&mut rig, &bot, Q::Message(&publish));
+        while asked.is_err() && Instant::now() < deadline {
+            assert_eq!(asked, busy(), "busy until hashed, never forbidden");
+            passes(&mut rig, 1);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            asked = ask(&mut rig, &bot, Q::Message(&publish));
+        }
+        assert!(matches!(asked, Ok(ResultBody::Message { .. })), "{asked:?}");
+    });
+}
+
 /// Task 20 re-review M1, ruling T20c (the first PR that covers services):
 /// the bot's grant is re-issued under a kid its task's admission didn't
 /// see (a K rotation) after the task's session stopped. Its task stays

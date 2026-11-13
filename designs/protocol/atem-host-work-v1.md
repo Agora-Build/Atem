@@ -1193,7 +1193,18 @@ new feed replaces the old one's cursor. A stored control state that
 doesn't read stops every delegated task (`revocations not yet checked`),
 and a service sender is answered `busy` until it reads (its admission, its
 own tasks' queries and completion; the owner still reads): never as
-uncovered, which a revoke or hold wouldn't stop.
+uncovered, which a revoke or hold wouldn't stop. (**Atem's reading**,
+step 4, Task 32 re-review N2.) Likewise a delegated sender's request about
+its own task (`work_query`, `reply_query`, `work_cancel`, `work_complete`,
+and `message_query` or a `message_publish` retry of its message) is `busy`
+while its current grant's `projects` comparison can't be made yet (a
+locked cred agent, or the task's project not hashed yet under the grant's
+kid), as the start check waits `waiting for unlock` (§11.6); it is
+`forbidden` once a comparison made leaves the task out. A message's tasks
+answer as one: `forbidden` when any of them refuses, else `busy` when any
+can't be decided yet. A grant entry under a kid the host never hashes
+(one the cred agent no longer retains) keeps that `busy`, where v1 answers
+`forbidden`; such a grant can't be honoured either way.
 
 **Resets** (**Atem's proposal, agreed with Astation (2026-11-11, #120
 comment 6810116314) and Auth/Portal (2026-11-12, #147 comment 6813332550)**: design I.5.2's snapshot re-issues "the latest revoke, hold or
