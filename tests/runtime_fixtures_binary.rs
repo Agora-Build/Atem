@@ -2027,8 +2027,9 @@ fn r9_fixtures_run_against_the_real_runtime() {
     let files = r9_files();
     // 94 with the five `r9-control-ack-*` (host-work-v1 §11.4),
     // `r9-vectors-delegated-wire` (session-v1 R9.14's shapes) and
-    // `r9-vectors-host-envelope` (host-work-v1 §11.5).
-    assert_eq!(files.len(), 94, "the r9 fixture files");
+    // `r9-vectors-host-envelope` (host-work-v1 §11.5); 100 with the six
+    // `r9-delegated-*` host scenarios (R9.14 items 1-7).
+    assert_eq!(files.len(), 100, "the r9 fixture files");
     let only = std::env::var("ATEM_FIXTURE").ok();
     let mut not_expressible = Vec::new();
     let mut runnable = Vec::new();

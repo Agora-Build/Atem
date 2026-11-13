@@ -77,9 +77,11 @@ use crate::chat::wire::{self as chat_wire, ChatEnvelope, CloseReason, Inbound};
 use crate::session::{Provider, SessionId};
 use crate::session_protocol::file_journal::FileJournal;
 use crate::session_protocol::host::{
-    Attach, ChatReply, DETAIL_TURN_DONE, DETAIL_TURN_INTERRUPTED, DispatchReport, Effect,
-    HostConfig, HostContext, LEASE_EPOCH_BLOCK, Origin, SessionHost, SessionSpec, random_ids,
+    AdoptedChat, Attach, ChatReply, DETAIL_TURN_DONE, DETAIL_TURN_INTERRUPTED, DispatchReport,
+    Effect, HostConfig, HostContext, HostInterrupt, LEASE_EPOCH_BLOCK, LEASE_MS, Origin,
+    RECONCILE_MS, Reconciled, SessionHost, SessionSpec, random_ids, reconcile_turn,
 };
+use crate::session_protocol::journal::TurnIds;
 use crate::session_protocol::membership::{
     self, CarriageResult, Held, HostFences, MembershipHost, host_now,
 };
@@ -89,7 +91,7 @@ use crate::session_protocol::r9::{
 };
 use crate::session_protocol::wire::{
     self, Activity, ApprovalCloseReason, ApprovalDecision, ApprovalRequest, ClientKind, Envelope,
-    FamilyMessage, Permission, ReceiptKind, SessionState,
+    FamilyMessage, Permission, ReceiptKind, ReceiptState, SessionState,
 };
 use crate::terminal_share::{FrameStream, Message as TerminalMessage};
 use crate::websocket_client::{AstationClient, AstationMessage};
@@ -106,6 +108,12 @@ mod host_work_bridge;
 
 /// `advance` runs this often.
 const ADVANCE_EVERY: u64 = 100;
+/// The `host-work` principal's lease is renewed this long after its grant
+/// or last renewal while its turn runs (session-v1 R9.14 item 1: every 5 s,
+/// a 15 s lease).
+const HOST_WORK_RENEW_MS: u64 = 5_000;
+/// The client name of the `host-work` principal's internal attachment.
+const HOST_WORK_CLIENT: &str = "atem-internal-host-work";
 /// Identical session messages within this window are handled once.
 const DEDUP_MS: u64 = 60_000;
 /// The authorization of an authenticated link (compatibility mode has no
@@ -158,6 +166,10 @@ pub struct Clock {
     origin: Instant,
     skew: Arc<AtomicU64>,
     wall_skew: Arc<AtomicU64>,
+    /// Tests (`Clock::manual`): the monotonic clock moves only with
+    /// `skip`, never in real time.
+    #[cfg(test)]
+    manual: bool,
 }
 
 impl Default for Clock {
@@ -166,12 +178,28 @@ impl Default for Clock {
             origin: Instant::now(),
             skew: Arc::new(AtomicU64::new(0)),
             wall_skew: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            manual: false,
         }
     }
 }
 
 impl Clock {
+    /// Tests: a monotonic clock at 0 that moves only with `skip`, so a "not
+    /// yet" assertion needs no margin against real time (PR 5 review I3).
+    #[cfg(test)]
+    pub fn manual() -> Self {
+        Self {
+            manual: true,
+            ..Self::default()
+        }
+    }
+
     pub fn now(&self) -> u64 {
+        #[cfg(test)]
+        if self.manual {
+            return self.skew.load(Ordering::SeqCst);
+        }
         // The shared fixtures run the real runtime on their own clock.
         let base = super::test_hooks::clock_ms()
             .unwrap_or_else(|| self.origin.elapsed().as_millis() as u64);
@@ -442,6 +470,82 @@ enum Pending {
     },
     Prompt(String),
     Interrupt(String),
+    /// The interrupt key the host wrote on its own authority for
+    /// host-work's attempt (session-v1 R9.14 item 5): no receipt; its
+    /// outcome goes to host-work (`host_interrupt_reports`).
+    HostInterrupt(String),
+}
+
+/// What became of an interrupt written with host authority (session-v1
+/// R9.14 item 5), as host-work hears it (`host_interrupt_reports`), once
+/// per write. Everything but `Ok` and `ErrorAfterQueue` wrote nothing, so
+/// host-work writes it again on its next pass while the intent is pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptReport {
+    /// The worker wrote it: delivered.
+    Ok,
+    /// Codex's worker consumed it: it only handed a waiting approval to
+    /// Codex's own dialog, or fell in the consume window after such a
+    /// release (`CONSUME_INPUT`). Nothing written.
+    Consumed,
+    /// Dropped at the worker's write boundary (a newer input epoch).
+    Dropped,
+    /// Nothing written: refused before it was queued, or it never reached
+    /// the worker. Or unanswered: the process ended; nothing is left to
+    /// interrupt, whatever was written.
+    NoEffect,
+    /// A writer error after queueing: it may have reached the terminal, so
+    /// it counts as delivered (no blind second Esc; item 5's 10 s rule).
+    ErrorAfterQueue,
+}
+
+/// What `HostBridge::host_interrupt` (or `host_interrupt_revoke_lease`)
+/// did. Everything it caused is already performed: nothing to carry out.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Interrupted {
+    /// The input epoch moved, another controller's lease was revoked, and
+    /// the interrupt key was written: its outcome comes in
+    /// `host_interrupt_reports`.
+    Written,
+    /// Only another controller's lease was revoked (if any): the revoke-only
+    /// call, or `host_interrupt` while a write of the attempt is
+    /// outstanding. Nothing written.
+    Revoked,
+    /// Refused before anything moved: `NotCurrentTurn`, `NotExecuting` or
+    /// `Halted` (never `Written` or `Revoked`).
+    Refused(HostInterrupt),
+}
+
+/// Host-work's start check under the drive hook (debug builds): the
+/// verdict the test last gave (`verdict.json`).
+#[cfg(debug_assertions)]
+struct DriveCheck(Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(debug_assertions)]
+impl crate::session_protocol::host::StartCheck for DriveCheck {
+    fn check(
+        &self,
+        _req: &crate::session_protocol::host::StartRequest<'_>,
+    ) -> crate::session_protocol::host::StartVerdict {
+        use crate::session_protocol::host::StartVerdict;
+        if self.0.load(Ordering::SeqCst) {
+            StartVerdict::Go
+        } else {
+            StartVerdict::Withdraw
+        }
+    }
+}
+
+/// Host-work's prompt `executing` at a start, reconciled with the adopted
+/// worker's chat (session-v1 R9.14 items 5, 6; `reconcile_host_work`).
+struct Reconciling {
+    sid: String,
+    process_gen: String,
+    /// The turn it started, as journaled at the chat's acceptance.
+    turn: TurnIds,
+    /// When the start's recovery asked (the bridge's clock, ms): the wait
+    /// for the adopted chat ends `RECONCILE_MS` after.
+    since: u64,
 }
 
 /// The broker's view of one session the host knows.
@@ -484,6 +588,13 @@ struct Link {
 
 pub struct HostBridge {
     local: Option<(String, Identity)>,
+    /// The delegated host-work features this runtime runs, read once at its
+    /// start (`test_hooks::host_features`: off unless the debug-only hook
+    /// turns them on).
+    features: super::test_hooks::HostFeatures,
+    /// The `host-work` principal's internal attachment (session-v1 R9.14
+    /// item 1), only with `host.delegated`: new at every start.
+    host_work: Option<String>,
     work: host_work_bridge::State,
     host: SessionHost<FileJournal>,
     dir: std::path::PathBuf,
@@ -530,6 +641,19 @@ pub struct HostBridge {
     /// Interrupts waiting for a turn to end, per session.
     interrupts: HashMap<String, Vec<String>>,
     pending: HashMap<(String, u64), Pending>,
+    /// What became of interrupts written with host authority, for
+    /// host-work (`host_interrupt_reports`): (the attempt's request id,
+    /// report), in the order the answers came (a session's in its write
+    /// order).
+    interrupt_reports: Vec<(String, InterruptReport)>,
+    /// Host-work's prompts `executing` at the start, waiting for their
+    /// adopted worker's chat (`reconcile_host_work`): request id → what is
+    /// reconciled.
+    reconciling: BTreeMap<String, Reconciling>,
+    /// The drive hook's start-check verdict (debug builds): go, until the
+    /// test says otherwise.
+    #[cfg(debug_assertions)]
+    drive_go: Arc<std::sync::atomic::AtomicBool>,
     /// terminal-v1 messages in order (frames, acks, errors) waiting for the
     /// bounded terminal queue.
     terminal_out: VecDeque<Queued>,
@@ -750,6 +874,8 @@ impl HostBridge {
         };
         Ok(Self {
             local: None,
+            features: super::test_hooks::host_features(),
+            host_work: None,
             work: host_work_bridge::State::open(dir, profile.is_some()),
             projects: ProjectScopes::new(hasher),
             project_unread: HashMap::new(),
@@ -795,6 +921,10 @@ impl HostBridge {
             pauses_retry_at: None,
             interrupts: HashMap::new(),
             pending: HashMap::new(),
+            interrupt_reports: Vec::new(),
+            reconciling: BTreeMap::new(),
+            #[cfg(debug_assertions)]
+            drive_go: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             terminal_out: VecDeque::new(),
             approvals: HashMap::new(),
             revokes: HashMap::new(),
@@ -1544,6 +1674,15 @@ impl HostBridge {
                 eprintln!("atem runtime: {error}");
             }
         }
+        // After the start's recovery, so recovered work meets the sessions
+        // adopted by then.
+        if self.recovered {
+            // Host-work's executing prompts whose adopted chat arrived.
+            self.reconcile_host_work(&mut cx);
+            self.sync_host_work(&mut cx);
+            #[cfg(debug_assertions)]
+            self.drive_pass(&mut cx);
+        }
         self.sync_r9_link(r9_app_link(app), &mut cx);
         if !adopting
             && app
@@ -1608,6 +1747,11 @@ impl HostBridge {
             let effects = self.r9_call(|r9, parts| r9.tick(parts));
             self.r9_exec(effects, &mut cx);
         }
+        if self.host_work.is_some() {
+            self.renew_host_work_leases();
+            let effects = self.host.take_effects();
+            self.exec(effects, &mut cx);
+        }
         self.test_carriage(&mut cx);
         self.sync_local(&mut cx);
         self.work_config();
@@ -1623,6 +1767,11 @@ impl HostBridge {
         self.flush_pushes(&mut cx);
         let effects = self.r9_call(|r9, parts| r9.reap(parts));
         self.r9_exec(effects, &mut cx);
+        // Only for the state dump (PR 5 review M9).
+        #[cfg(debug_assertions)]
+        let chats = super::test_hooks::state_dump()
+            .is_some()
+            .then(|| chat_dump(&cx));
         let client = cx.client;
         // §R9.8a: a committed relay-only result's write is what a local
         // link waits for before it closes.
@@ -1656,14 +1805,14 @@ impl HostBridge {
             app.drop_astation_link(reason.into());
         }
         #[cfg(debug_assertions)]
-        self.dump_state();
+        self.dump_state(chats);
     }
 
     /// Debug builds (`ATEM_TEST_STATE_DUMP`): the state the r9 fixtures
     /// assert, written after each pass with the pass number
     /// (`tests/r9_runner`).
     #[cfg(debug_assertions)]
-    fn dump_state(&mut self) {
+    fn dump_state(&mut self, chats: Option<Value>) {
         use serde_json::json;
         let Some(file) = super::test_hooks::state_dump() else {
             return;
@@ -1739,6 +1888,8 @@ impl HostBridge {
                     "blob_version": k.blob_version, "backup_hash": k.backup_hash.to_hex()})),
             });
         }
+        state["chats"] = chats.unwrap_or_default();
+        state["reconciling"] = json!(self.reconciling.keys().collect::<Vec<_>>());
         // The pass number: a reader can wait for a pass after its own
         // action (a dump from before it can't satisfy an assert).
         static PASS: AtomicU64 = AtomicU64::new(0);
@@ -1935,6 +2086,22 @@ impl HostBridge {
             || (!attachment.is_empty() && attachment == self.local_attachment())
     }
 
+    /// The `host-work` principal's internal attachment, while the session
+    /// host has it (`host.delegated` on; session-v1 R9.14 item 1).
+    pub fn host_work_attachment(&self) -> Option<&str> {
+        self.host_work
+            .as_deref()
+            .filter(|att| self.host.attachment_principal(att) == Some(wire::HOST_WORK_PRINCIPAL))
+    }
+
+    /// One of the runtime's internal attachments (`local`'s, `host-work`'s):
+    /// nothing addressed to it leaves the host.
+    fn internal(&self, attachment: &str) -> bool {
+        !attachment.is_empty()
+            && (attachment == self.local_attachment()
+                || self.host_work.as_deref() == Some(attachment))
+    }
+
     pub(super) fn local_attachment(&self) -> &str {
         self.local.as_ref().map_or("", |(attachment, _)| attachment)
     }
@@ -2014,6 +2181,87 @@ impl HostBridge {
             }
             let effects = self.host.take_effects();
             self.exec(effects, cx);
+        }
+    }
+
+    /// Keeps the `host-work` principal's internal attachment (session-v1
+    /// R9.14 item 1), only while `host.delegated` is on: made through the
+    /// session host's connect and welcome path as `local`'s is, with `view`
+    /// and `control`, never over a link. It is new at every start (a new
+    /// bridge) and after the session host dropped it (a new identity
+    /// restarts the host). Unlike `local`'s it is never fenced: a frozen,
+    /// faulted or held device list, or a halted journal, stops delegated
+    /// tasks through the start check. A halted journal welcomes nobody, so a
+    /// missing one waits for the restart.
+    fn sync_host_work(&mut self, cx: &mut Cx) {
+        if !self.features.delegated || self.host_work_attachment().is_some() {
+            return;
+        }
+        self.host_work = None;
+        if self.host.journal_halted() {
+            return;
+        }
+        let attachment = uuid::Uuid::new_v4().to_string();
+        let attach = Attach {
+            client: HOST_WORK_CLIENT.into(),
+            principal: wire::HOST_WORK_PRINCIPAL.into(),
+            attachment_gen: attachment.clone(),
+            permissions: vec![Permission::View, Permission::Control],
+            client_kind: ClientKind::Native,
+            authorization_ms: atem_client::canonical::MAX_SAFE_INTEGER
+                .saturating_sub(self.clock.now()),
+        };
+        match self.host.connect(attach) {
+            Ok(effects) => {
+                self.exec(effects, cx);
+                match self.host.welcome_r9(&attachment, self.clock.now()) {
+                    Ok(_) => {
+                        self.host_work = Some(attachment);
+                        #[cfg(debug_assertions)]
+                        if super::test_hooks::host_work_drive_on() {
+                            self.install_drive_check();
+                        }
+                    }
+                    Err(code) => {
+                        eprintln!(
+                            "atem runtime: the host-work attachment was not welcomed ({code:?})"
+                        );
+                        let effects = self.host.disconnect(&attachment);
+                        self.exec(effects, cx);
+                    }
+                }
+                let effects = self.host.take_effects();
+                self.exec(effects, cx);
+            }
+            Err(error) => eprintln!("atem runtime: the host-work attachment was refused: {error}"),
+        }
+    }
+
+    /// The `host-work` principal's leases (session-v1 R9.14 item 1, design
+    /// I.4.2): each lease its attachment holds is renewed on the runtime's
+    /// own pass every 5 s (`HOST_WORK_RENEW_MS`; a lease lasts 15 s) while
+    /// its turn runs (a request of it on that session is still `accepted`
+    /// or `executing`), and released at the first pass after the turn ended.
+    /// If the runtime stops, the lease lapses like any other. The effects
+    /// (its own replies, which go nowhere, and the viewers' `lease_changed`)
+    /// wait in the session host for the pass (`take_effects`).
+    pub fn renew_host_work_leases(&mut self) {
+        let Some(att) = self.host_work_attachment().map(str::to_string) else {
+            return;
+        };
+        let now = self.clock.now();
+        for sid in self.host.leases_of(&att) {
+            if self.host.has_open_request(wire::HOST_WORK_PRINCIPAL, &sid) {
+                // Last granted or renewed `LEASE_MS - deadline + now` ago.
+                let due = self.host.lease_deadline(&sid).is_some_and(|deadline| {
+                    now.saturating_add(LEASE_MS - HOST_WORK_RENEW_MS) >= deadline
+                });
+                if due {
+                    let _ = self.host.renew(&att, &sid, now);
+                }
+            } else {
+                let _ = self.host.release(&att, &sid, now);
+            }
         }
     }
 
@@ -2146,7 +2394,7 @@ impl HostBridge {
     }
 
     fn send(&mut self, attachment: &str, message: &Envelope, cx: &mut Cx) {
-        if !attachment.is_empty() && attachment == self.local_attachment() {
+        if self.internal(attachment) {
             return;
         }
         if self.r9.owns(attachment) {
@@ -2189,7 +2437,7 @@ impl HostBridge {
     }
 
     fn send_chat(&mut self, attachment: &str, env: ChatEnvelope, cx: &mut Cx) {
-        if !attachment.is_empty() && attachment == self.local_attachment() {
+        if self.internal(attachment) {
             return;
         }
         if env.op == "error"
@@ -2263,6 +2511,10 @@ impl HostBridge {
                 Effect::Close { attachment } => {
                     if !attachment.is_empty() && attachment == self.local_attachment() {
                         self.local = None;
+                        continue;
+                    }
+                    if self.host_work.as_deref() == Some(attachment.as_str()) {
+                        self.host_work = None;
                         continue;
                     }
                     if self.r9.owns(&attachment) {
@@ -2377,8 +2629,27 @@ impl HostBridge {
                         self.exec(effects, cx);
                     }
                 }
+                // R9.14 items 5, 6: host-work's prompt, with the turn it
+                // started, is decided from the adopted worker's chat.
+                Effect::Reconcile {
+                    request_id,
+                    target,
+                    kind: ReceiptKind::Prompt,
+                    turn: Some(turn),
+                } => {
+                    let reconciling = Reconciling {
+                        sid: target.session_id,
+                        process_gen: target.process_gen,
+                        turn,
+                        since: self.clock.now(),
+                    };
+                    self.reconciling.insert(request_id, reconciling);
+                    self.reconcile_host_work(cx);
+                }
                 Effect::Reconcile { request_id, .. } => {
-                    // A broker restart can't tell what an executing request did.
+                    // A broker restart can't tell what an executing request
+                    // did (a host-work prompt without its turn too: fail
+                    // closed).
                     let effects = self
                         .host
                         .dispatch_report(&request_id, DispatchReport::Unknown);
@@ -2410,6 +2681,27 @@ impl HostBridge {
                         let _ = session.release_approval(&open.worker_id);
                     }
                 }
+                // R9.14 item 5: as local input, under the worker's epoch
+                // raised first (another controller's queued bytes are
+                // dropped) and with no lease deadline.
+                Effect::HostInterrupt {
+                    session_id,
+                    request_id,
+                } => {
+                    self.sync_epoch(&session_id, cx);
+                    let written = session_of(cx, &session_id)
+                        .map(|s| s.write_tagged(INTERRUPT_KEY, WriteTag::Host, None));
+                    match written {
+                        Some(Ok(seq)) => {
+                            self.pending
+                                .insert((session_id, seq), Pending::HostInterrupt(request_id));
+                        }
+                        // Nothing reached the worker.
+                        _ => self
+                            .interrupt_reports
+                            .push((request_id, InterruptReport::NoEffect)),
+                    }
+                }
                 Effect::PushApproval { request } => self.approval_opened(request, cx),
                 Effect::PushResolved {
                     approval_id,
@@ -2421,6 +2713,342 @@ impl HostBridge {
                     session_id,
                     reply,
                 } => self.chat_reply(&attachment, &conversation_id, &session_id, reply, cx),
+            }
+        }
+    }
+
+    // ── Interrupt with host authority (session-v1 R9.14 item 5) ──
+    // Host-work's delegated-work bridge (a later step) calls these; until
+    // then only the tests do.
+
+    /// Interrupts the turn of host-work's attempt `request_id` on `sid`
+    /// with the host's own authority (`SessionHost::host_interrupt`, given
+    /// the chat's half of the turn check, `running_request`), in one step:
+    /// the turn check, the input epoch and the revocation of another
+    /// controller's lease (`revoked`), and the interrupt key, written as
+    /// local input is (under the worker's new epoch, no lease deadline).
+    /// Everything is performed here. Receipt-less: the attempt's prompt
+    /// receipt completes `interrupted` with its turn. The write's outcome
+    /// comes once in `host_interrupt_reports`; while it is outstanding,
+    /// this runs only the revoke-only step (`Revoked`), so one attempt never
+    /// has two writes in flight. Run it after the pass's `advance`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn host_interrupt(&mut self, sid: &str, request_id: &str, cx: &mut Cx) -> Interrupted {
+        if self.host_interrupt_outstanding(sid, request_id) {
+            return self.host_interrupt_revoke_lease(sid, request_id, cx);
+        }
+        let running = running_request(cx, sid);
+        match self
+            .host
+            .host_interrupt(sid, request_id, running.as_deref())
+        {
+            HostInterrupt::Written(effects) => {
+                self.exec(effects, cx);
+                Interrupted::Written
+            }
+            refused => Interrupted::Refused(refused),
+        }
+    }
+
+    /// A host interrupt write for `request_id` on `sid` waits for the
+    /// worker's answer (its report hasn't come).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn host_interrupt_outstanding(&self, sid: &str, request_id: &str) -> bool {
+        self.pending.iter().any(|((s, _), p)| {
+            s == sid && matches!(p, Pending::HostInterrupt(r) if r == request_id)
+        })
+    }
+
+    /// Item 5's later passes once the interrupt was delivered: the same
+    /// turn check, then only another controller's lease revoked (the
+    /// worker's epoch raised, so its queued bytes are dropped); nothing
+    /// written. Performed here, as `host_interrupt`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn host_interrupt_revoke_lease(
+        &mut self,
+        sid: &str,
+        request_id: &str,
+        cx: &mut Cx,
+    ) -> Interrupted {
+        let running = running_request(cx, sid);
+        match self
+            .host
+            .host_interrupt_revoke_lease(sid, request_id, running.as_deref())
+        {
+            HostInterrupt::Revoked(effects) => {
+                self.exec(effects, cx);
+                self.sync_epoch(sid, cx);
+                Interrupted::Revoked
+            }
+            refused => Interrupted::Refused(refused),
+        }
+    }
+
+    /// Host-work's prompt `request_id`, `executing` at the start, still
+    /// waits for its adopted worker's chat to be reconciled (R9.14 items 5,
+    /// 6; `SessionHost::recover` has the order at a start). Until then its
+    /// turn check refuses (`NotCurrentTurn`: no turn state yet), which says
+    /// nothing of the turn, so host-work's recovery keeps an interrupt
+    /// intent of it pending (Task 26).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn host_work_reconciling(&self, request_id: &str) -> bool {
+        self.reconciling.contains_key(request_id)
+    }
+
+    /// Host-work's prompts `executing` at the start (R9.14 items 5, 6; the
+    /// session host's `Reconcile` with their turn), each decided by the
+    /// session host's one table (`reconcile_turn`, which the fixtures' fake
+    /// runtime reads too) from its adopted worker's chat, once that arrived
+    /// (`BrokerSession::chat_synced`), at this pass or a later one, and
+    /// `RECONCILE_MS` after the recovery at the latest: a turn still
+    /// running stays `executing`, the restored chat's current turn rebound
+    /// to it (`ChatSession::rebind_turn`), so the turn check
+    /// (`running_request`) and the turn's end (`chat_outs`) find it again;
+    /// a turn that ended completes with its outcome when known, else
+    /// `outcome_unknown`; a process that is gone is `outcome_unknown`
+    /// (`agent exited`), and so is a chat without turn state, one showing
+    /// another turn, or one that never arrived (fail closed).
+    fn reconcile_host_work(&mut self, cx: &mut Cx) {
+        let now = self.clock.now();
+        let ids: Vec<String> = self.reconciling.keys().cloned().collect();
+        for request_id in ids {
+            let executing = self
+                .host
+                .receipt(&request_id)
+                .is_some_and(|r| r.state == ReceiptState::Executing);
+            if !executing {
+                // Settled meanwhile (its process ended, its session went).
+                self.reconciling.remove(&request_id);
+                continue;
+            }
+            let r = &self.reconciling[&request_id];
+            let expired = now >= r.since.saturating_add(RECONCILE_MS);
+            match reconciled(session_of(cx, &r.sid).map(|s| &*s), r, expired) {
+                Reconciled::Wait => {}
+                Reconciled::Running => {
+                    let r = self.reconciling.remove(&request_id).unwrap();
+                    let rebound = session_of(cx, &r.sid).is_some_and(|s| {
+                        s.chat
+                            .rebind_turn(&r.turn.turn_id, &request_id, &r.turn.user_message_id)
+                    });
+                    debug_assert!(rebound, "decided from the same chat");
+                    self.prompts.insert(request_id, r.sid);
+                }
+                Reconciled::Report(report) => {
+                    self.reconciling.remove(&request_id);
+                    let effects = self.host.dispatch_report(&request_id, report);
+                    self.exec(effects, cx);
+                }
+            }
+        }
+    }
+
+    // ── The drive hook (debug builds, `ATEM_TEST_HOST_WORK_DRIVE`) ──
+    // The delegated fixtures play host-work's side (session-v1 R9.14)
+    // through these, as its dispatcher (Task 19) and intents (Task 26) will.
+
+    /// Host-work's start check answers what the drive hook last said
+    /// (`verdict.json`; `go` at each runtime start).
+    #[cfg(debug_assertions)]
+    fn install_drive_check(&mut self) {
+        self.host
+            .set_start_check(Box::new(DriveCheck(self.drive_go.clone())));
+    }
+
+    /// The drive hook's pass: each write's outcome since the last pass,
+    /// then its commands, once host-work's attachment exists (until then
+    /// they wait in their directory).
+    #[cfg(debug_assertions)]
+    fn drive_pass(&mut self, cx: &mut Cx) {
+        use super::test_hooks;
+        if !test_hooks::host_work_drive_on() {
+            return;
+        }
+        for line in self.drive_reports() {
+            test_hooks::host_work_driven(&line);
+        }
+        if self.host_work_attachment().is_none() {
+            return;
+        }
+        for command in test_hooks::host_work_drive() {
+            let line = self.drive(command, cx);
+            test_hooks::host_work_driven(&line);
+        }
+    }
+
+    /// Performs one drive command; its result line.
+    #[cfg(debug_assertions)]
+    fn drive(&mut self, command: super::test_hooks::DriveCommand, cx: &mut Cx) -> Value {
+        use super::test_hooks::DriveAction;
+        let mut line = json!({"file": command.file});
+        let result = match command.action {
+            DriveAction::Verdict(go) => {
+                self.drive_go.store(go, Ordering::SeqCst);
+                json!({"verdict": if go { "go" } else { "withdraw" }})
+            }
+            DriveAction::Submit(a) => self.drive_submit(&a, cx),
+            DriveAction::Withdraw(a) => match self.drive_immutable(&a) {
+                Some((rid, immutable)) => {
+                    let withdrawal = self.host.withdraw(&rid, &immutable);
+                    let effects = self.host.take_effects();
+                    self.exec(effects, cx);
+                    json!({"withdrawal": withdrawal.as_str()})
+                }
+                None => json!({"error": "unknown session"}),
+            },
+            DriveAction::Interrupt {
+                session_id,
+                request_id,
+                revoke_only,
+            } => {
+                // After the session host's `advance`, as `host_interrupt`
+                // asks (PR 5 review M5).
+                let effects = self.host.advance(self.clock.now());
+                self.exec(effects, cx);
+                let outcome = if revoke_only {
+                    self.host_interrupt_revoke_lease(&session_id, &request_id, cx)
+                } else {
+                    self.host_interrupt(&session_id, &request_id, cx)
+                };
+                let word = match &outcome {
+                    Interrupted::Written => "written",
+                    Interrupted::Revoked => "revoked",
+                    Interrupted::Refused(refused) => refused.as_str(),
+                };
+                json!({"interrupt": word})
+            }
+            DriveAction::Unreadable(why) => json!({"error": why}),
+        };
+        line.as_object_mut()
+            .unwrap()
+            .extend(result.as_object().unwrap().clone());
+        line
+    }
+
+    /// The attempt's request id and its immutable values (§6): the
+    /// session's current target, the digest of its prompt, its provenance.
+    #[cfg(debug_assertions)]
+    fn drive_immutable(
+        &self,
+        a: &super::test_hooks::DriveAttempt,
+    ) -> Option<(String, crate::session_protocol::host::Immutable)> {
+        let ctx = self.host.context();
+        let target = wire::Target {
+            account_id: ctx.account_id.clone(),
+            atem_device_id: ctx.atem_device_id.clone(),
+            host_trust_gen: ctx.host_trust_gen,
+            session_id: a.session_id.clone(),
+            process_gen: self.host.descriptor_of(&a.session_id)?.process_gen,
+        };
+        let payload_digest =
+            crate::session_protocol::canonical::payload_digest(&json!({"text": a.text})).ok()?;
+        let provenance = crate::session_protocol::host::Provenance {
+            task_id: a.task_id.clone(),
+            sender: a.sender.clone(),
+        };
+        Some((
+            a.request_id.clone(),
+            crate::session_protocol::host::Immutable {
+                target,
+                payload_digest,
+                provenance,
+            },
+        ))
+    }
+
+    /// Host-work submits the attempt's prompt on its internal attachment,
+    /// acquiring the lease, and the effects are performed (its dispatch
+    /// pastes the prompt, so the chat's acceptance journals its turn): the
+    /// refusal host-work heard, else its receipt after the step.
+    #[cfg(debug_assertions)]
+    fn drive_submit(&mut self, a: &super::test_hooks::DriveAttempt, cx: &mut Cx) -> Value {
+        let Some(att) = self.host_work_attachment().map(str::to_string) else {
+            return json!({"error": "no host-work attachment"});
+        };
+        let Some((rid, immutable)) = self.drive_immutable(a) else {
+            return json!({"error": "unknown session"});
+        };
+        let effects = self.host.advance(self.clock.now());
+        self.exec(effects, cx);
+        let id = uuid::Uuid::new_v4().to_string();
+        let data = json!({"v": 1, "op": "submit", "id": id,
+            "binding": {"target": immutable.target, "attachment_gen": att},
+            "request_id": rid, "kind": "prompt", "payload": {"text": a.text},
+            "acquire": true});
+        let effects = self.host.submit_host_work(&att, data, immutable.provenance);
+        let refused = effects.iter().find_map(|e| match e {
+            Effect::Send {
+                attachment,
+                message: Envelope::Session(m),
+            } if *attachment == att && m.re.as_deref() == Some(id.as_str()) => match &m.op {
+                wire::Op::Error { code, detail, .. } => {
+                    let mut r = json!({"code": code});
+                    if let Some(d) = detail {
+                        r["detail"] = json!(d);
+                    }
+                    Some(r)
+                }
+                _ => None,
+            },
+            _ => None,
+        });
+        self.exec(effects, cx);
+        if let Some(refused) = refused {
+            return refused;
+        }
+        // The receipt after the step (a listed request's too, in the run).
+        match self.host.receipt(&rid) {
+            Some(r) => {
+                let mut out = json!({"state": r.state});
+                if let Some(d) = r.detail {
+                    out["detail"] = json!(d);
+                }
+                out
+            }
+            None => json!({"error": "no receipt"}),
+        }
+    }
+
+    /// The outcomes of host interrupt writes since the last call, as the
+    /// drive hook reports them.
+    #[cfg(debug_assertions)]
+    fn drive_reports(&mut self) -> Vec<Value> {
+        self.host_interrupt_reports()
+            .into_iter()
+            .map(|(request_id, report)| {
+                let outcome = match report {
+                    InterruptReport::Ok => "ok",
+                    InterruptReport::Consumed => "consumed",
+                    InterruptReport::Dropped => "dropped",
+                    InterruptReport::NoEffect => "no_effect",
+                    InterruptReport::ErrorAfterQueue => "error_after_queue",
+                };
+                json!({"report": request_id, "outcome": outcome})
+            })
+            .collect()
+    }
+
+    /// What became of the interrupts written with host authority since the
+    /// last call: (attempt's request id, report), each write's once.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn host_interrupt_reports(&mut self) -> Vec<(String, InterruptReport)> {
+        std::mem::take(&mut self.interrupt_reports)
+    }
+
+    /// `sid`'s process ended or the session went: its host interrupt
+    /// writes get no answer, and there is nothing left to interrupt
+    /// (`NoEffect`).
+    fn host_interrupts_unanswered(&mut self, sid: &str) {
+        let keys: Vec<(String, u64)> = self
+            .pending
+            .iter()
+            .filter(|((s, _), p)| s == sid && matches!(p, Pending::HostInterrupt(_)))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            if let Some(Pending::HostInterrupt(request_id)) = self.pending.remove(&key) {
+                self.interrupt_reports
+                    .push((request_id, InterruptReport::NoEffect));
             }
         }
     }
@@ -2497,8 +3125,7 @@ impl HostBridge {
                         detail: NO_TURN_STATE.into(),
                     });
                 }
-                let state = session.chat.status().state;
-                if !matches!(state, ChatState::Working | ChatState::Waiting) {
+                if !turn_known_to_run(session) {
                     return Some(DispatchReport::Completed {
                         detail: Some(NO_TURN.into()),
                         turn_id: None,
@@ -2563,6 +3190,7 @@ impl HostBridge {
             self.end_conversations(&sid, CloseReason::Restarted, cx);
             self.streams.retain(|(_, s), _| s != &sid);
             self.interrupts.remove(&sid);
+            self.host_interrupts_unanswered(&sid);
             self.revokes.retain(|_, (s, _)| s != &sid);
         }
         let ids: Vec<SessionId> = cx.sessions.keys().cloned().collect();
@@ -2661,6 +3289,7 @@ impl HostBridge {
             };
             self.interrupts.remove(sid);
             // Nothing more is answered for this process's writes.
+            self.host_interrupts_unanswered(sid);
             self.pending.retain(|(s, _), _| s != sid);
             self.prompts.retain(|_, s| s != sid);
             self.revokes.retain(|_, (s, _)| s != sid);
@@ -2902,6 +3531,10 @@ impl HostBridge {
                     let effects = self.host.dispatch_report(&request_id, report);
                     self.exec(effects, cx);
                 }
+            }
+            Pending::HostInterrupt(request_id) => {
+                self.interrupt_reports
+                    .push((request_id, interrupt_report(&result)));
             }
             Pending::Interrupt(request_id) => {
                 let failure = if result.consumed {
@@ -3924,7 +4557,14 @@ impl HostBridge {
         for out in outs {
             let mut except = None;
             match &out {
-                Out::Accepted { .. } => continue,
+                Out::Accepted { request_id } => {
+                    // R9.14 items 5, 6: a host-work prompt journals the turn
+                    // it started.
+                    if self.prompts.contains_key(request_id) {
+                        self.turn_started(sid, request_id, cx);
+                    }
+                    continue;
+                }
                 Out::Error {
                     request_id: Some(request_id),
                     ..
@@ -3978,6 +4618,24 @@ impl HostBridge {
                 _ => {}
             }
             self.broadcast(sid, &out, except.as_deref(), cx);
+        }
+    }
+
+    /// The chat accepted the prompt `request_id` this runtime pasted: for
+    /// host-work's (R9.14 items 5, 6), the turn it started and its user
+    /// message, as the retained history shows them, are journaled
+    /// (`SessionHost::turn_started`; for any other prompt nothing is
+    /// written). When the history doesn't show them, nothing is, and a
+    /// restart fails the receipt closed.
+    fn turn_started(&mut self, sid: &str, request_id: &str, cx: &mut Cx) {
+        let turn = session_of(cx, sid)
+            .and_then(|s| s.chat.prompt_turn(request_id))
+            .map(|(turn_id, user_message_id)| TurnIds {
+                turn_id: turn_id.to_string(),
+                user_message_id: user_message_id.to_string(),
+            });
+        if let Some(turn) = turn {
+            let _ = self.host.turn_started(request_id, turn);
         }
     }
 
@@ -4273,6 +4931,98 @@ fn app_link(app: &App) -> Option<u64> {
         && app.astation_reauth.is_none()
         && !app.astation_client.is_ws_closed())
     .then_some(app.astation_link_gen)
+}
+
+/// The worker's answer to a host interrupt's write, for host-work (the
+/// worker's `consumed` answer also says `no_effect`).
+fn interrupt_report(result: &WriteOutcome) -> InterruptReport {
+    if result.consumed {
+        InterruptReport::Consumed
+    } else if result.dropped {
+        InterruptReport::Dropped
+    } else if result.no_effect {
+        InterruptReport::NoEffect
+    } else if !result.ok {
+        InterruptReport::ErrorAfterQueue
+    } else {
+        InterruptReport::Ok
+    }
+}
+
+/// Today's Esc rule: a turn is known to run only with chat, `working` or
+/// `waiting` (in `ready` or `unknown` nothing is written: Esc on Codex's
+/// startup trust dialog quits it).
+fn turn_known_to_run(s: &BrokerSession) -> bool {
+    s.chat_v1
+        && matches!(
+            s.chat.status().state,
+            ChatState::Working | ChatState::Waiting
+        )
+}
+
+/// The chat's half of R9.14 item 5's turn check, for the session host: the
+/// request whose turn `sid`'s chat shows running under today's Esc rule
+/// (`turn_known_to_run`). None for a session that isn't live, has no turn
+/// state (no chat: no blind Esc), shows no turn running (its prompt not
+/// taken yet, the turn ended, Codex before its first prompt) or one typed
+/// at the terminal.
+#[cfg_attr(not(test), allow(dead_code))]
+fn running_request(cx: &mut Cx, sid: &str) -> Option<String> {
+    let s = session_of(cx, sid).filter(|s| s.is_live())?;
+    turn_known_to_run(s)
+        .then(|| s.chat.current_request_id())
+        .flatten()
+        .map(str::to_string)
+}
+
+/// Each session's chat as the reconciliation of host-work's prompts reads
+/// it (R9.14 items 5, 6), for the state dump (debug builds).
+#[cfg(debug_assertions)]
+fn chat_dump(cx: &Cx) -> Value {
+    let chats: Map<String, Value> = cx
+        .sessions
+        .iter()
+        .map(|(id, s)| {
+            let outcome = s.chat.last_outcome().map(|o| match o {
+                crate::chat::adapter::Outcome::Done => "done",
+                crate::chat::adapter::Outcome::Interrupted => "interrupted",
+            });
+            let chat = json!({"synced": s.chat_synced, "chat": s.chat_v1,
+                "current_turn": s.chat.current_turn_id(),
+                "last_completed": s.chat.last_completed_turn(), "outcome": outcome,
+                "request_id": s.chat.current_request_id()});
+            (id.to_string(), chat)
+        })
+        .collect();
+    Value::Object(chats)
+}
+
+/// What `s`, the session of host-work's prompt `r` as the broker has it,
+/// shows of the turn the prompt started, at a start (R9.14 items 5, 6),
+/// read with the session host's table (`reconcile_turn`). A worker with
+/// no chat adapter sends no chat: none is waited for.
+fn reconciled(s: Option<&BrokerSession>, r: &Reconciling, expired: bool) -> Reconciled {
+    let s = s.filter(|s| s.is_live() && s.process_gen == r.process_gen);
+    let chat = match s {
+        // No worker of that process was adopted, or its agent exited.
+        None => AdoptedChat {
+            live: false,
+            arrived: false,
+            chat: false,
+            current_turn: None,
+            last_completed: None,
+            last_outcome: None,
+        },
+        Some(s) => AdoptedChat {
+            live: true,
+            arrived: s.chat_synced || !s.chat_offered,
+            chat: s.chat_v1,
+            current_turn: s.chat.current_turn_id(),
+            last_completed: s.chat.last_completed_turn(),
+            last_outcome: s.chat.last_outcome(),
+        },
+    };
+    reconcile_turn(&r.turn, &chat, expired)
 }
 
 /// §6: what a failed host write proves (`None`: it was written).

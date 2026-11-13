@@ -9,9 +9,11 @@
 //!
 //! Apart from the appended log, a journal keeps two small records, each
 //! replaced atomically and never counted as an append: the refusal list
-//! (requests answered `busy` because their admission write failed, §I.2)
-//! and the clean-close record (`{"runtime_epoch": n}`, written at an
-//! orderly shutdown with a healthy journal, §H).
+//! (requests answered `busy` because their admission write failed, §I.2,
+//! and `host-work` requests withdrawn before they were journaled,
+//! session-v1 R9.14 item 4) and the clean-close record
+//! (`{"runtime_epoch": n}`, written at an orderly shutdown with a healthy
+//! journal, §H).
 //!
 //! `MemJournal` keeps everything in memory and can fail the n-th next append
 //! (`fail_fsync_of`; with `undo_fails` the failed record is kept, the worst
@@ -29,7 +31,9 @@ pub enum Record {
     /// A new request admitted as `accepted`, with what a dispatch after a
     /// crash needs (its payload) and, r8 §H, the submitter principal and its
     /// control generation at admission (admission metadata: ids only, in
-    /// neither the digest nor the immutable request).
+    /// neither the digest nor the immutable request). `provenance` only on
+    /// a `host-work` prompt (session-v1 R9.14 item 2), admission metadata
+    /// too.
     Accepted {
         request_id: String,
         target: Target,
@@ -39,6 +43,7 @@ pub enum Record {
         updated_at: u64,
         principal: String,
         control_gen: u64,
+        provenance: Option<Provenance>,
     },
     /// A later state of a recorded request. `result` only on a prompt's
     /// `completed` (r8 §D): its turn's ids (the outcome is `detail`).
@@ -51,7 +56,9 @@ pub enum Record {
     },
     /// — → `rejected`: a request on the refusal list whose `accepted` record
     /// never reached the disk, resolved at restart with its immutable values
-    /// (§I.3). Nothing was accepted.
+    /// (§I.3) and the detail its entry records (session-v1 R9.14 item 4).
+    /// Nothing was accepted. `provenance` only for a `host-work` prompt's
+    /// entry (R9.14 item 2).
     Rejected {
         request_id: String,
         target: Target,
@@ -59,7 +66,14 @@ pub enum Record {
         payload_digest: String,
         detail: String,
         updated_at: u64,
+        provenance: Option<Provenance>,
     },
+    /// The turn a `host-work` prompt started (session-v1 R9.14 items 5,
+    /// 6), journaled once at the chat's acceptance while the prompt is
+    /// `executing`: what a restart reconciles the receipt with (the adopted
+    /// worker's chat). Ids only. No other request has one, so every other
+    /// journal is written as before.
+    TurnStarted { request_id: String, turn: TurnIds },
     /// The receipt left the retention window and is forgotten.
     Evicted { request_id: String },
     /// Lease epochs up to `reserved` may have been issued for `session_id`;
@@ -82,6 +96,18 @@ pub enum Record {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalError(pub String);
 
+/// `record_refusal`'s error when the refusal list can't take another entry
+/// and still be read back whole: nothing was written.
+pub const REFUSAL_LIST_FULL: &str = "refusal list full";
+
+impl JournalError {
+    /// The refusal list is full (`REFUSAL_LIST_FULL`): a certain refusal,
+    /// not a write error, so the list on disk is as it was.
+    pub fn refusal_list_full(&self) -> bool {
+        self.0 == REFUSAL_LIST_FULL
+    }
+}
+
 /// A completed prompt's turn as journaled (r8 §D): ids only, never text.
 /// Its outcome is the receipt's `detail` (`done`/`interrupted`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,8 +117,33 @@ pub struct TurnIds {
     pub user_message_id: String,
 }
 
-/// A request refused `busy` because its admission write failed (§I.2): its
-/// immutable values, never its payload.
+/// Delegated host work (session-v1 R9.14 item 2): the task a request of
+/// the `host-work` principal attempts and the sender that enqueued it.
+/// Admission metadata, like §H's principal: recorded with `accepted`, never
+/// changed after it, in neither the payload digest nor the immutable
+/// request. Its receipts carry it as `task_id` and `sender`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Provenance {
+    /// The delegated task (host-work-v1 §11.6): a UUID v4.
+    pub task_id: String,
+    /// `member:<id>`, `service:<id>` or `host:<host_id>`: never `local`, a
+    /// browser or `host-work` itself (design I.1.3).
+    pub sender: String,
+}
+
+impl Provenance {
+    /// The receipt reader's rules (`atem_client::session::wire`): a UUID v4
+    /// task and a delegated sender.
+    pub fn valid(&self) -> bool {
+        super::wire::is_uuid_v4(&self.task_id) && super::wire::is_delegated_sender(&self.sender)
+    }
+}
+
+/// An entry of the refusal list: a request refused `busy` because its
+/// admission write failed (§I.2), or a `host-work` request withdrawn before
+/// it was journaled (session-v1 R9.14 item 4). Its immutable values, never
+/// its payload. The restart records it `rejected` with `detail`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Refusal {
@@ -101,6 +152,84 @@ pub struct Refusal {
     pub kind: ReceiptKind,
     pub payload_digest: String,
     pub updated_at: u64,
+    /// The `rejected` receipt's detail: `withdrawn by the host` for a
+    /// withdrawal; none for a failed admission write (`acceptance not
+    /// confirmed`, §I.3), whose entry is written as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// A `host-work` prompt's provenance (R9.14 item 2), so the receipt
+    /// a late submit or the restart gives carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
+}
+
+/// The submitter of a request recorded straight as `rejected` (§I.3):
+/// nothing was accepted, so none is recorded, but a provenance names the
+/// `host-work` principal, the only one that has one (R9.14 item 2); empty
+/// otherwise.
+pub fn refused_principal(provenance: Option<&Provenance>) -> String {
+    match provenance {
+        Some(_) => super::wire::HOST_WORK_PRINCIPAL.to_string(),
+        None => String::new(),
+    }
+}
+
+// The record rules `replay` enforces beyond the transition table. The file
+// journal checks the same ones while it reads a log (`parse_log`), so a
+// record that breaks one truncates that log there, as an invalid
+// transition does, instead of failing the whole start (Task 13's review,
+// M3).
+
+/// R9.14 item 2: a provenance is valid and only on a prompt of the
+/// `host-work` principal. `principal` is `None` for a request nothing
+/// accepted (`Record::Rejected`): the provenance names its submitter.
+pub fn provenance_coherent(
+    kind: ReceiptKind,
+    principal: Option<&str>,
+    provenance: Option<&Provenance>,
+) -> bool {
+    provenance.is_none_or(|p| {
+        kind == ReceiptKind::Prompt
+            && p.valid()
+            && principal.is_none_or(|who| who == super::wire::HOST_WORK_PRINCIPAL)
+    })
+}
+
+/// r8 §D: a turn result only on a prompt's `completed`.
+pub fn result_coherent(kind: ReceiptKind, state: ReceiptState, result: Option<&TurnIds>) -> bool {
+    result.is_none() || (state == ReceiptState::Completed && kind == ReceiptKind::Prompt)
+}
+
+/// R9.14 items 5, 6: the turn a prompt started is recorded once
+/// (`recorded`: one is already), while it is `executing`, only for a
+/// prompt of the `host-work` principal, with opaque ids.
+pub fn turn_coherent(
+    state: ReceiptState,
+    kind: ReceiptKind,
+    host_work: bool,
+    recorded: bool,
+    turn: &TurnIds,
+) -> bool {
+    state == ReceiptState::Executing
+        && kind == ReceiptKind::Prompt
+        && host_work
+        && !recorded
+        && super::wire::is_opaque_id(&turn.turn_id)
+        && super::wire::is_opaque_id(&turn.user_message_id)
+}
+
+fn check_provenance(
+    provenance: Option<&Provenance>,
+    kind: ReceiptKind,
+    principal: Option<&str>,
+    request_id: &str,
+) -> Result<(), JournalError> {
+    if !provenance_coherent(kind, principal, provenance) {
+        return Err(JournalError(format!(
+            "invalid provenance on {kind:?} {request_id}"
+        )));
+    }
+    Ok(())
 }
 
 /// Durable receipt storage.
@@ -119,7 +248,12 @@ pub trait Journal {
     /// Every durable record, in append order.
     fn load(&self) -> Result<Vec<Record>, JournalError>;
     /// Adds `refusal` to the refusal list durably (replaced atomically),
-    /// apart from the appended log: it works after a failed append.
+    /// apart from the appended log: it works after a failed append. One
+    /// entry per request id: an id already listed, by whichever submitter,
+    /// writes nothing and is `Ok` (the restart records one receipt per id,
+    /// and existing entries are never replaced). A list that would grow
+    /// past what `refusals` reads back is refused with `REFUSAL_LIST_FULL`,
+    /// nothing written.
     fn record_refusal(&mut self, refusal: Refusal) -> Result<(), JournalError>;
     /// The refusal list.
     fn refusals(&self) -> Result<Vec<Refusal>, JournalError>;
@@ -261,8 +395,14 @@ impl Journal for MemJournal {
         if std::mem::take(&mut self.fail_refusal) || self.crashed {
             return Err(JournalError("cannot write the refusal list".into()));
         }
-        self.refused.retain(|r| r.request_id != refusal.request_id);
-        self.refused.push(refusal);
+        // One entry per id, never replaced (no size bound in memory).
+        if !self
+            .refused
+            .iter()
+            .any(|r| r.request_id == refusal.request_id)
+        {
+            self.refused.push(refusal);
+        }
         Ok(())
     }
 
@@ -325,6 +465,12 @@ pub struct Stored {
     /// (r8 §H); empty and 0 for a request nothing accepted.
     pub principal: String,
     pub control_gen: u64,
+    /// The delegated task and sender of a `host-work` prompt (R9.14 item
+    /// 2); `None` for every other request.
+    pub provenance: Option<Provenance>,
+    /// The turn a `host-work` prompt started (`Record::TurnStarted`, R9.14
+    /// items 5, 6); `None` for every other request.
+    pub turn: Option<TurnIds>,
 }
 
 /// A principal's durable control state (§H).
@@ -365,7 +511,8 @@ pub fn valid_transition(from: ReceiptState, to: ReceiptState) -> bool {
 
 /// Folds durable records into the current receipts, epoch reservations and
 /// principal control states. A record that breaks the transition table or
-/// names an unknown request is a corrupt journal; a control generation never
+/// the rules above (a provenance, a turn result, a turn started), or names
+/// an unknown request, is a corrupt journal; a control generation never
 /// goes down (the highest seen wins).
 pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
     let mut out = Replayed::default();
@@ -380,10 +527,12 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                 updated_at,
                 principal,
                 control_gen,
+                provenance,
             } => {
                 if out.receipts.contains_key(&request_id) {
                     return Err(JournalError(format!("request {request_id} admitted twice")));
                 }
+                check_provenance(provenance.as_ref(), kind, Some(&principal), &request_id)?;
                 let stored = Stored {
                     request_id: request_id.clone(),
                     target,
@@ -397,6 +546,8 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                     order: i as u64,
                     principal,
                     control_gen,
+                    provenance,
+                    turn: None,
                 };
                 out.receipts.insert(request_id, stored);
             }
@@ -407,10 +558,12 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                 payload_digest,
                 detail,
                 updated_at,
+                provenance,
             } => {
                 if out.receipts.contains_key(&request_id) {
                     return Err(JournalError(format!("request {request_id} recorded twice")));
                 }
+                check_provenance(provenance.as_ref(), kind, None, &request_id)?;
                 let stored = Stored {
                     request_id: request_id.clone(),
                     target,
@@ -422,8 +575,10 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                     updated_at,
                     result: None,
                     order: i as u64,
-                    principal: String::new(),
+                    principal: refused_principal(provenance.as_ref()),
                     control_gen: 0,
+                    provenance,
+                    turn: None,
                 };
                 out.receipts.insert(request_id, stored);
             }
@@ -444,9 +599,7 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                         s.state
                     )));
                 }
-                if result.is_some()
-                    && (state != ReceiptState::Completed || s.kind != ReceiptKind::Prompt)
-                {
+                if !result_coherent(s.kind, state, result.as_ref()) {
                     return Err(JournalError(format!(
                         "a turn result on {state:?} {:?} {request_id}",
                         s.kind
@@ -457,6 +610,20 @@ pub fn replay(records: Vec<Record>) -> Result<Replayed, JournalError> {
                 s.detail = detail;
                 s.updated_at = updated_at;
                 s.result = result;
+            }
+            Record::TurnStarted { request_id, turn } => {
+                let s = out
+                    .receipts
+                    .get_mut(&request_id)
+                    .ok_or_else(|| JournalError(format!("turn of unknown {request_id}")))?;
+                let host_work = s.principal == super::wire::HOST_WORK_PRINCIPAL;
+                if !turn_coherent(s.state, s.kind, host_work, s.turn.is_some(), &turn) {
+                    return Err(JournalError(format!(
+                        "a turn on {:?} {:?} {request_id}",
+                        s.state, s.kind
+                    )));
+                }
+                s.turn = Some(turn);
             }
             Record::Evicted { request_id } => {
                 out.receipts.remove(&request_id);
@@ -517,6 +684,7 @@ mod tests {
             updated_at: 1,
             principal: "p1".into(),
             control_gen: 1,
+            provenance: None,
         }
     }
 
@@ -587,6 +755,8 @@ mod tests {
             kind: ReceiptKind::Prompt,
             payload_digest: "0".repeat(64),
             updated_at: 1,
+            detail: None,
+            provenance: None,
         };
         j.record_refusal(refusal.clone()).unwrap();
         assert!(j.write_clean_close(7).is_err(), "never after a failure");
@@ -623,6 +793,7 @@ mod tests {
             payload_digest: "0".repeat(64),
             detail: "acceptance not confirmed".into(),
             updated_at: 3,
+            provenance: None,
         };
         let r = replay(vec![rejected.clone()]).unwrap();
         assert_eq!(r.receipts["b"].state, ReceiptState::Rejected);

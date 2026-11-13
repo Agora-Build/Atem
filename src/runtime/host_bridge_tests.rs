@@ -105,10 +105,25 @@ fn local<F: std::future::Future>(body: F) -> F::Output {
     tokio::task::LocalSet::new().block_on(&runtime, body)
 }
 
+/// An executable script `dir/name`. A test may call this again for a
+/// script an earlier session's agent is still exec'ing: writing that file
+/// in place fails with "Text file busy" (or truncates it under the exec).
+/// So an unchanged script is left alone, and a new one is written to a
+/// temp file in the same directory and renamed over the name: a new inode,
+/// while a running exec keeps the old one.
 fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let text = format!("#!/bin/sh\n{body}\n");
+    let unchanged = std::fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o777 == 0o755)
+        && std::fs::read(&path).is_ok_and(|b| b == text.as_bytes());
+    if !unchanged {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".{name}.tmp-{}-{n}", std::process::id()));
+        std::fs::write(&tmp, &text).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+    }
     path
 }
 
@@ -1500,8 +1515,13 @@ fn a_stop_submission_completes_when_the_agent_exits() {
 
 /// A session the broker started, in a worker in this process.
 async fn broker_session(dir: &Path) -> crate::runtime::broker::BrokerSession {
+    session_running(dir, &echo_agent(dir)).await
+}
+
+/// A Codex session the broker started running `agent`, in a worker in
+/// this process.
+async fn session_running(dir: &Path, agent: &Path) -> crate::runtime::broker::BrokerSession {
     use crate::runtime::adopt::SpawnRequest;
-    let agent = echo_agent(dir);
     let launcher = Launcher::InProcess(InProcess {
         state: dir.join("state"),
         socket_dir: dir.join("ws"),
@@ -2626,28 +2646,25 @@ fn input_to_codex_releases_its_waiting_hooks_first() {
     });
 }
 
-#[tokio::test]
-async fn adoption_tells_the_worker_which_approvals_the_broker_knows() {
+/// Codex running the fake approval agent (`FAKE_DIR` = `fake`) in a worker
+/// in this process: its input releases a waiting approval hook first.
+async fn approval_codex(dir: &Path, fake: &Path) -> crate::runtime::broker::BrokerSession {
     use crate::runtime::adopt::SpawnRequest;
-    use crate::runtime::worker_approvals::Event;
-    let _sweep = HookSweep;
-    let dir = short_dir();
-    let fake = dir.path().join("fake");
     let launcher = Launcher::InProcess(InProcess {
-        state: dir.path().join("state"),
-        socket_dir: dir.path().join("ws"),
-        chat_root: dir.path().join("chat"),
+        state: dir.join("state"),
+        socket_dir: dir.join("ws"),
+        chat_root: dir.join("chat"),
     });
     let request = SpawnRequest {
         session_id: crate::session::SessionId::new(),
         process_gen: uuid::Uuid::new_v4().to_string(),
         provider: crate::session::Provider::Codex,
         args: vec![],
-        cwd: dir.path().to_path_buf(),
+        cwd: dir.to_path_buf(),
         rows: 24,
         cols: 80,
     };
-    let hook = crate::chat::codex::hook_command(&dir.path().join("chat/approval-hook.sh"));
+    let hook = crate::chat::codex::hook_command(&dir.join("chat/approval-hook.sh"));
     let env = LaunchEnv(vec![
         ("PATH".into(), "/usr/bin:/bin".into()),
         (
@@ -2658,8 +2675,16 @@ async fn adoption_tells_the_worker_which_approvals_the_broker_knows() {
         ("FAKE_CODEX_HOOK".into(), hook),
     ]);
     let (handle, created_at_ms) = launcher.spawn(request.clone(), env).await.unwrap();
-    let mut session =
-        crate::runtime::broker::BrokerSession::launched(handle, &request, created_at_ms);
+    crate::runtime::broker::BrokerSession::launched(handle, &request, created_at_ms)
+}
+
+#[tokio::test]
+async fn adoption_tells_the_worker_which_approvals_the_broker_knows() {
+    use crate::runtime::worker_approvals::Event;
+    let _sweep = HookSweep;
+    let dir = short_dir();
+    let fake = dir.path().join("fake");
+    let mut session = approval_codex(dir.path(), &fake).await;
     agent_event(&fake, "started").await;
     ask(
         &fake,
@@ -4526,4 +4551,1806 @@ fn a_frozen_host_answers_no_host_challenge() {
         LinkRoute::new(handle, "astation-room", "atem-x").answer(&text),
         None
     );
+}
+
+// ── The `host-work` principal (session-v1 R9.14 item 1) ──
+
+/// An App with no Astation link that never reconnects: passes run only the
+/// host's own work.
+fn idle_app() -> App {
+    let mut app = App::new();
+    app.hosted = Some(Default::default());
+    app.astation_reconnect = false;
+    app
+}
+
+/// One broker pass with no sessions of its own.
+fn pass(bridge: &mut super::HostBridge, app: &mut App) {
+    let mut sessions = std::collections::BTreeMap::new();
+    bridge.tick(app, &mut sessions, false);
+}
+
+/// Whether the journal's durable control states name `principal`.
+fn principals_name(journal: &Path, principal: &str) -> bool {
+    std::fs::read_to_string(journal.join("principals"))
+        .is_ok_and(|text| text.contains(&format!("\"{principal}\"")))
+}
+
+/// Debug-only hook off (the default), nothing of the principal exists, as
+/// on main; a runtime started with it has the internal attachment; started
+/// again without it, none.
+#[test]
+fn host_work_attachment_exists_only_with_the_hook() {
+    use crate::runtime::test_hooks::HostFeatures;
+    use crate::session_protocol::wire::{HOST_WORK_PRINCIPAL, Permission};
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let journal = dir.path().join("journal");
+    let mut app = idle_app();
+
+    let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    assert_eq!(bridge.features, HostFeatures::default());
+    for _ in 0..3 {
+        pass(&mut bridge, &mut app);
+    }
+    assert_eq!(bridge.host_work_attachment(), None);
+    assert_eq!(bridge.host().welcomed_attachments(), 0);
+    assert!(!principals_name(&journal, HOST_WORK_PRINCIPAL));
+    bridge.close_cleanly();
+    drop(bridge);
+
+    let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    bridge.features = HostFeatures::parse("host.delegated").unwrap();
+    pass(&mut bridge, &mut app);
+    let att = bridge
+        .host_work_attachment()
+        .expect("made with the hook")
+        .to_string();
+    let host = bridge.host();
+    assert_eq!(host.attachment_principal(&att), Some(HOST_WORK_PRINCIPAL));
+    assert!(host.attachment_can(&att, Permission::View));
+    assert!(host.attachment_can(&att, Permission::Control));
+    assert_eq!(host.welcomed_attachments(), 1, "welcomed");
+    assert_eq!(host.control_gen(HOST_WORK_PRINCIPAL), 1);
+    assert!(principals_name(&journal, HOST_WORK_PRINCIPAL));
+    pass(&mut bridge, &mut app);
+    assert_eq!(bridge.host_work_attachment(), Some(att.as_str()));
+    bridge.close_cleanly();
+    drop(bridge);
+
+    let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    for _ in 0..3 {
+        pass(&mut bridge, &mut app);
+    }
+    assert_eq!(bridge.host_work_attachment(), None);
+    assert_eq!(bridge.host().welcomed_attachments(), 0);
+}
+
+/// A new attachment (and so a new `controller_session`) at every start,
+/// the session host's restart under a new identity included; an r8 `hello`
+/// never welcomes it, and nothing addressed to it leaves the host.
+#[test]
+fn host_work_attachment_is_new_at_each_start_and_never_welcomed_over_a_link() {
+    use crate::session_protocol::host::Effect;
+    use crate::session_protocol::wire::{Envelope, ErrorCode, HOST_WORK_PRINCIPAL, Op};
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let journal = dir.path().join("journal");
+    let mut app = idle_app();
+    let open = || {
+        let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+        bridge.features.delegated = true;
+        bridge
+    };
+
+    let mut bridge = open();
+    pass(&mut bridge, &mut app);
+    let first = bridge.host_work_attachment().unwrap().to_string();
+    // Welcomed only through the internal path: an r8 `hello` on it is
+    // refused and replaces nothing.
+    let hello = json!({"type": "session", "data": {"v": 1, "op": "hello",
+        "id": uuid::Uuid::new_v4().to_string(), "revision": 8}});
+    let now = bridge.clock.now();
+    let effects = bridge
+        .host
+        .receive(&first, hello.to_string().as_bytes(), now);
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::Replaced { .. })),
+        "{effects:?}"
+    );
+    let sent: Vec<&Op> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Send {
+                attachment,
+                message: Envelope::Session(m),
+            } if *attachment == first => Some(&m.op),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(
+            sent.as_slice(),
+            [Op::Error {
+                code: ErrorCode::Unauthorized,
+                ..
+            }]
+        ),
+        "{sent:?}"
+    );
+    // Nothing addressed to it leaves the host (`send`, `send_chat`).
+    assert!(bridge.internal(&first));
+    assert!(bridge.link.is_none());
+    pass(&mut bridge, &mut app);
+    assert_eq!(bridge.host_work_attachment(), Some(first.as_str()));
+    bridge.close_cleanly();
+    drop(bridge);
+
+    // The next start: a new one; the old one is unknown.
+    let mut bridge = open();
+    pass(&mut bridge, &mut app);
+    let second = bridge.host_work_attachment().unwrap().to_string();
+    assert_ne!(second, first);
+    assert_eq!(bridge.host().attachment_principal(&first), None);
+    assert_eq!(
+        bridge.host().attachment_principal(&second),
+        Some(HOST_WORK_PRINCIPAL)
+    );
+
+    // The session host restarts under a new identity: new again.
+    let mut sessions = std::collections::BTreeMap::new();
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    let identity = super::Identity {
+        account_id: "acct-2".into(),
+        atem_device_id: "host-2".into(),
+        host_trust_gen: 1,
+    };
+    assert!(bridge.adopt_identity(&identity, &mut cx));
+    assert_eq!(bridge.host_work_attachment(), None);
+    pass(&mut bridge, &mut app);
+    let third = bridge.host_work_attachment().unwrap().to_string();
+    assert_ne!(third, second);
+    assert_eq!(bridge.host().attachment_principal(&second), None);
+    assert_eq!(bridge.host().control_gen(HOST_WORK_PRINCIPAL), 1);
+}
+
+/// I.4.2: while its turn runs, the host-work holder's lease is renewed on
+/// the runtime's own pass every 5 s (a 15 s lease), never sooner, and it is
+/// released at the pass after the turn ends. Another controller's lease is
+/// none of its business.
+#[test]
+fn host_work_renews_every_5s_while_its_turn_runs_and_releases_at_the_end() {
+    use crate::session_protocol::host::{
+        Attach, DispatchReport, LEASE_MS, Provenance, SessionSpec,
+    };
+    use crate::session_protocol::wire::{ClientKind, Permission, ReceiptState};
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    // Moved only by the test: no margin against real time (PR 5 review I3).
+    let clock = Clock::manual();
+    let mut app = idle_app();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, clock.clone()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    let att = bridge.host_work_attachment().unwrap().to_string();
+    // Sessions the host serves; the prompt's dispatch isn't performed here,
+    // so its turn runs until its end is reported.
+    let (sid, other) = ("ses-aaaaaaaaaaaa", "ses-bbbbbbbbbbbb");
+    let process_gen = uuid::Uuid::new_v4().to_string();
+    for session_id in [sid, other] {
+        bridge
+            .host
+            .add_session(SessionSpec {
+                session_id: session_id.into(),
+                process_gen: process_gen.clone(),
+                provider: "claude".into(),
+                cwd_label: "work".into(),
+                chat: true,
+                rows: 24,
+                cols: 80,
+            })
+            .unwrap();
+    }
+    let ctx = bridge.host().context().clone();
+    let target = |session_id: &str| {
+        json!({"account_id": ctx.account_id, "atem_device_id": ctx.atem_device_id,
+               "host_trust_gen": ctx.host_trust_gen, "session_id": session_id,
+               "process_gen": process_gen})
+    };
+    let rid = uuid::Uuid::new_v4().to_string();
+    let data = json!({"v": 1, "op": "submit", "id": uuid::Uuid::new_v4().to_string(),
+        "binding": {"target": target(sid), "attachment_gen": att},
+        "request_id": rid, "kind": "prompt", "payload": {"text": "run the tests"},
+        "acquire": true});
+    bridge.host.advance(clock.now());
+    // The start check host-work installs (R9.14 item 3; none withdraws).
+    bridge
+        .host
+        .set_start_check(Box::new(crate::session_protocol::host::StartVerdict::Go));
+    let _ = bridge.host.submit_host_work(
+        &att,
+        data,
+        Provenance {
+            task_id: uuid::Uuid::new_v4().to_string(),
+            sender: "member:phone-1".into(),
+        },
+    );
+    assert_eq!(
+        bridge.host().receipt(&rid).unwrap().state,
+        ReceiptState::Executing
+    );
+    assert_eq!(bridge.host().lease_holder(sid), Some(att.as_str()));
+    let granted = bridge.host().lease_deadline(sid).unwrap();
+
+    // Another controller's lease on another session.
+    let c1 = uuid::Uuid::new_v4().to_string();
+    let effects = bridge
+        .host
+        .connect(Attach {
+            client: "c1".into(),
+            principal: "c1".into(),
+            attachment_gen: c1.clone(),
+            permissions: vec![Permission::View, Permission::Control],
+            client_kind: ClientKind::Native,
+            authorization_ms: 24 * 60 * 60 * 1000,
+        })
+        .unwrap();
+    drop(effects);
+    bridge.host.welcome_r9(&c1, clock.now()).unwrap();
+    let acquire = json!({"type": "session", "data": {"v": 1, "op": "acquire",
+        "id": uuid::Uuid::new_v4().to_string(),
+        "binding": {"target": target(other), "attachment_gen": c1}, "takeover": false}});
+    let _ = bridge
+        .host
+        .receive(&c1, acquire.to_string().as_bytes(), clock.now());
+    let theirs = bridge.host().lease_deadline(other).unwrap();
+
+    // Within 5 s of the grant: left as it is.
+    clock.skip(4_000);
+    pass(&mut bridge, &mut app);
+    assert_eq!(bridge.host().lease_deadline(sid), Some(granted));
+    // 5 s after it: renewed for a full lease.
+    clock.skip(1_000);
+    pass(&mut bridge, &mut app);
+    let renewed = bridge.host().lease_deadline(sid).unwrap();
+    assert_eq!(renewed, granted + 5_000);
+    assert_eq!(renewed, clock.now() + LEASE_MS);
+    assert_eq!(bridge.host().lease_deadline(other), Some(theirs));
+    // While the turn runs (30 s, a pass a second): held throughout, renewed
+    // every 5 s and never sooner; the other lease lapses on its own.
+    let (mut renewals, mut last) = (0, renewed);
+    for _ in 0..30 {
+        clock.skip(1_000);
+        pass(&mut bridge, &mut app);
+        let deadline = bridge.host().lease_deadline(sid).expect("still held");
+        if deadline != last {
+            assert_eq!(deadline, last + 5_000);
+            renewals += 1;
+            last = deadline;
+        }
+        assert_eq!(bridge.host().lease_holder(sid), Some(att.as_str()));
+    }
+    assert_eq!(renewals, 6);
+    assert_eq!(
+        bridge.host().lease_holder(other),
+        None,
+        "expired, never renewed"
+    );
+
+    // The turn ends: the next pass releases it.
+    let _ = bridge.host.dispatch_report(
+        &rid,
+        DispatchReport::Completed {
+            detail: Some("done".into()),
+            turn_id: Some("turn-1".into()),
+            user_message_id: Some("turn-1-u".into()),
+        },
+    );
+    assert_eq!(bridge.host().lease_holder(sid), Some(att.as_str()));
+    pass(&mut bridge, &mut app);
+    assert_eq!(bridge.host().lease_holder(sid), None);
+    assert_eq!(
+        bridge.host().receipt(&rid).unwrap().state,
+        ReceiptState::Completed
+    );
+}
+
+// ── Interrupt with host authority (session-v1 R9.14 item 5) ──
+
+/// Host-work's attempt on `id`'s session: the session registered with the
+/// host (offering chat-v1, as Codex with Atem's hooks on does), the attempt
+/// submitted and started. Its prompt isn't pasted here (the dispatch is
+/// left undone): `show_turn` shows its turn. Its request id.
+fn host_work_attempt(
+    bridge: &mut super::HostBridge,
+    id: &crate::session::SessionId,
+    cx: &mut super::Cx<'_>,
+) -> String {
+    use crate::session_protocol::host::{Provenance, StartVerdict};
+    use crate::session_protocol::wire::ReceiptState;
+    cx.sessions.get_mut(id).unwrap().chat_offered = true;
+    bridge.register(id, cx);
+    let att = bridge
+        .host_work_attachment()
+        .expect("with host.delegated")
+        .to_string();
+    let ctx = bridge.host().context().clone();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let data = json!({"v": 1, "op": "submit", "id": uuid::Uuid::new_v4().to_string(),
+        "binding": {"target": {"account_id": ctx.account_id, "atem_device_id": ctx.atem_device_id,
+            "host_trust_gen": ctx.host_trust_gen, "session_id": id.to_string(),
+            "process_gen": cx.sessions[id].process_gen}, "attachment_gen": att},
+        "request_id": request_id, "kind": "prompt", "payload": {"text": "run the tests"},
+        "acquire": true});
+    bridge.host.set_start_check(Box::new(StartVerdict::Go));
+    let _undone = bridge.host.submit_host_work(
+        &att,
+        data,
+        Provenance {
+            task_id: uuid::Uuid::new_v4().to_string(),
+            sender: "member:phone-1".into(),
+        },
+    );
+    assert_eq!(
+        bridge.host().receipt(&request_id).unwrap().state,
+        ReceiptState::Executing
+    );
+    request_id
+}
+
+/// The chat of a session whose current turn host-work's attempt
+/// `request_id` began and still runs (its prompt accepted: the hook and
+/// the log agree; the agent working): what the turn check reads. The fake
+/// agents keep no chat of their own. What the chat produced, as the
+/// worker's batches bring it to a pass.
+fn show_turn(
+    session: &mut crate::runtime::broker::BrokerSession,
+    request_id: &str,
+) -> Vec<crate::chat::session::Out> {
+    use crate::chat::adapter::{AgentEvent, LogItem};
+    use crate::chat::session::{ChatSession, State};
+    let generation = session.process_gen.clone();
+    let mut chat = ChatSession::new(generation.clone(), 0);
+    let mut outs = chat.on_event(
+        AgentEvent::SessionStarted {
+            session_id: "fake-session".into(),
+            log_path: PathBuf::new(),
+            source: "startup".into(),
+            same_log: false,
+        },
+        1,
+        0,
+    );
+    let text = chat
+        .submit(request_id, &generation, "run the tests", 0, false)
+        .unwrap();
+    chat.mark_pasted(request_id, Instant::now(), 2);
+    outs.extend(chat.on_event(
+        AgentEvent::PromptSubmitted {
+            text: text.clone(),
+            turn_id: None,
+            at_ms: Some(3),
+        },
+        3,
+        0,
+    ));
+    outs.extend(chat.on_log(
+        LogItem::UserMessage {
+            id: "user-1".into(),
+            turn_id: "turn-1".into(),
+            text,
+            created_at_ms: 3,
+        },
+        3,
+        0,
+    ));
+    assert_eq!(chat.current_request_id(), Some(request_id));
+    assert_eq!(chat.status().state, State::Working);
+    session.chat = chat;
+    session.chat_v1 = true;
+    outs
+}
+
+/// Pumps `id`'s worker until it answered a write, hands the answers to the
+/// bridge, and returns what host-work was told since the last call.
+async fn answered(
+    bridge: &mut super::HostBridge,
+    id: &crate::session::SessionId,
+    cx: &mut super::Cx<'_>,
+) -> Vec<(String, super::InterruptReport)> {
+    let results = tokio::time::timeout(WAIT, async {
+        loop {
+            let session = cx.sessions.get_mut(id).unwrap();
+            session.pump();
+            let results = session.take_results();
+            if !results.is_empty() {
+                return results;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the worker answers the write");
+    for result in results {
+        bridge.write_result(id.as_str(), result, cx);
+    }
+    bridge.host_interrupt_reports()
+}
+
+/// The sequence number of `request_id`'s host interrupt write still waiting
+/// for the worker's answer.
+fn pending_interrupt(bridge: &super::HostBridge, sid: &str, request_id: &str) -> Option<u64> {
+    bridge.pending.iter().find_map(|((s, seq), p)| {
+        matches!(p, super::Pending::HostInterrupt(r) if s == sid && r == request_id).then_some(*seq)
+    })
+}
+
+/// The worker's answer to a host interrupt's write, as host-work hears it.
+#[test]
+fn interrupt_reports_follow_the_write_outcome() {
+    use super::super::broker::WriteOutcome;
+    use super::InterruptReport;
+    let outcome = |ok, dropped, no_effect, consumed| WriteOutcome {
+        seq: 0,
+        ok,
+        dropped,
+        no_effect,
+        consumed,
+        error: None,
+    };
+    let cases = [
+        ((true, false, false, false), InterruptReport::Ok),
+        // The worker's `consumed` answer also says nothing was written.
+        ((false, false, true, true), InterruptReport::Consumed),
+        ((false, true, false, false), InterruptReport::Dropped),
+        ((false, false, true, false), InterruptReport::NoEffect),
+        (
+            (false, false, false, false),
+            InterruptReport::ErrorAfterQueue,
+        ),
+    ];
+    for ((ok, dropped, no_effect, consumed), want) in cases {
+        assert_eq!(
+            super::interrupt_report(&outcome(ok, dropped, no_effect, consumed)),
+            want
+        );
+    }
+}
+
+/// Codex with an approval hook waiting: the Esc only hands the approval to
+/// Codex's own dialog, and the worker consumes it (`CONSUME_INPUT`):
+/// reported `Consumed`, once, and nothing reached the agent. Written again
+/// on later passes, it reaches the agent once the worker's consume window
+/// passed, reported `Ok`. Then only the revocation repeats: nothing more is
+/// written.
+#[tokio::test]
+async fn a_consumed_write_is_reported_for_a_retry() {
+    use super::{InterruptReport, Interrupted};
+    use crate::runtime::worker_approvals::Event;
+    use crate::session_protocol::wire::ReceiptState;
+    let _sweep = HookSweep;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let fake = dir.path().join("fake");
+    let mut session = approval_codex(dir.path(), &fake).await;
+    agent_event(&fake, "started").await;
+    ask(
+        &fake,
+        1,
+        json!({"tool_name": "shell", "tool_input": {"command": "ls"}}),
+    );
+    tokio::time::timeout(WAIT, async {
+        loop {
+            session.pump();
+            let events = session.take_approvals();
+            if events.iter().any(|e| matches!(e, Event::Request { .. })) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("no approval request");
+    let mut app = idle_app();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    let id = session.id.clone();
+    let sid = id.to_string();
+    let mut sessions = std::collections::BTreeMap::from([(id.clone(), session)]);
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    let rid = host_work_attempt(&mut bridge, &id, &mut cx);
+    show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+
+    assert_eq!(
+        bridge.host_interrupt(&sid, &rid, &mut cx),
+        Interrupted::Written
+    );
+    assert_eq!(
+        answered(&mut bridge, &id, &mut cx).await,
+        [(rid.clone(), InterruptReport::Consumed)]
+    );
+    assert_eq!(bridge.host_interrupt_reports(), [], "reported once");
+    // The hook got "no decision" (Codex's own dialog asks); the Esc itself
+    // never reached the agent.
+    agent_event(&fake, "answer 1 none").await;
+    assert_eq!(std::fs::read(fake.join("input")).unwrap_or_default(), b"");
+
+    // The retry, as a later pass makes it while the intent is pending.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+        assert_eq!(
+            bridge.host_interrupt(&sid, &rid, &mut cx),
+            Interrupted::Written
+        );
+        match answered(&mut bridge, &id, &mut cx).await.as_slice() {
+            [(r, InterruptReport::Ok)] if *r == rid => break,
+            // Within the worker's consume window.
+            [(r, InterruptReport::Consumed)] if *r == rid && Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    agent_input(&fake, b"\x1b").await;
+    // Delivered: later passes repeat only the revocation (nobody else
+    // holds the lease here), and nothing more is written.
+    show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+    assert_eq!(
+        bridge.host_interrupt_revoke_lease(&sid, &rid, &mut cx),
+        Interrupted::Revoked
+    );
+    assert!(!bridge.host_interrupt_outstanding(&sid, &rid));
+    // No receipt of its own: the attempt's prompt still runs its turn.
+    assert_eq!(
+        bridge.host().receipt(&rid).unwrap().state,
+        ReceiptState::Executing
+    );
+    let _ = cx.sessions.get_mut(&id).unwrap().stop();
+}
+
+/// The chat must show the attempt's turn running first (today's Esc rule):
+/// until then nothing is written. A writer error after the write was
+/// queued (the Esc may have reached the terminal) is reported
+/// `ErrorAfterQueue` once: the same answer again, or the worker's own for
+/// that write, reports nothing. A write the session's end leaves
+/// unanswered is reported `NoEffect` (nothing left to interrupt), once.
+#[tokio::test]
+async fn an_error_after_queueing_is_reported_once() {
+    use super::super::broker::{SessionState as BrokerState, WriteOutcome};
+    use super::{InterruptReport, Interrupted};
+    use crate::session_protocol::host::HostInterrupt;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let session = broker_session(dir.path()).await;
+    let mut app = idle_app();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    let id = session.id.clone();
+    let sid = id.to_string();
+    let mut sessions = std::collections::BTreeMap::from([(id.clone(), session)]);
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    let rid = host_work_attempt(&mut bridge, &id, &mut cx);
+    // Its prompt not taken yet: the chat shows no turn of it.
+    let epoch = bridge.host().input_epoch(&sid);
+    assert_eq!(
+        bridge.host_interrupt(&sid, &rid, &mut cx),
+        Interrupted::Refused(HostInterrupt::NotCurrentTurn)
+    );
+    assert_eq!(bridge.host().input_epoch(&sid), epoch);
+    assert!(!bridge.host_interrupt_outstanding(&sid, &rid));
+
+    show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+    assert_eq!(
+        bridge.host_interrupt(&sid, &rid, &mut cx),
+        Interrupted::Written
+    );
+    let seq = pending_interrupt(&bridge, &sid, &rid).expect("waits for the worker's answer");
+    let failed = WriteOutcome {
+        seq,
+        ok: false,
+        dropped: false,
+        no_effect: false,
+        consumed: false,
+        error: Some("Input/output error".into()),
+    };
+    bridge.write_result(&sid, failed.clone(), &mut cx);
+    assert_eq!(
+        bridge.host_interrupt_reports(),
+        [(rid.clone(), InterruptReport::ErrorAfterQueue)]
+    );
+    assert_eq!(bridge.host_interrupt_reports(), []);
+    bridge.write_result(&sid, failed, &mut cx);
+    assert_eq!(answered(&mut bridge, &id, &mut cx).await, [], "never twice");
+
+    // Written again; the session ends before the worker's answer is read.
+    show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+    assert_eq!(
+        bridge.host_interrupt(&sid, &rid, &mut cx),
+        Interrupted::Written
+    );
+    assert!(bridge.host_interrupt_outstanding(&sid, &rid));
+    let session = cx.sessions.get_mut(&id).unwrap();
+    session.stop().unwrap();
+    tokio::time::timeout(WAIT, async {
+        while session.state == BrokerState::Running {
+            session.pump();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the agent exits");
+    bridge.sync_state(&id, &mut cx);
+    assert_eq!(
+        bridge.host_interrupt_reports(),
+        [(rid.clone(), InterruptReport::NoEffect)]
+    );
+    bridge.worker_reports(&mut cx);
+    assert_eq!(bridge.host_interrupt_reports(), []);
+}
+
+/// A native member's attachment (`view`, `control`) on the bridge's host,
+/// welcomed as r9 admission welcomes one (it is on no link: what is sent
+/// to it goes nowhere).
+fn native(bridge: &mut super::HostBridge) -> String {
+    use crate::session_protocol::host::Attach;
+    use crate::session_protocol::wire::{ClientKind, Permission};
+    let att = uuid::Uuid::new_v4().to_string();
+    bridge
+        .host
+        .connect(Attach {
+            client: "c1".into(),
+            principal: "c1".into(),
+            attachment_gen: att.clone(),
+            permissions: vec![Permission::View, Permission::Control],
+            client_kind: ClientKind::Native,
+            authorization_ms: 24 * 60 * 60 * 1000,
+        })
+        .unwrap();
+    let now = bridge.clock.now();
+    bridge.host.welcome_r9(&att, now).unwrap();
+    let _ = bridge.host.take_effects();
+    att
+}
+
+/// `att`'s binding to `id`'s session, with its lease epoch if any.
+fn native_binding(
+    bridge: &super::HostBridge,
+    att: &str,
+    id: &crate::session::SessionId,
+    cx: &super::Cx<'_>,
+    lease: Option<u64>,
+) -> Value {
+    let ctx = bridge.host().context();
+    let mut binding = json!({"target": {"account_id": ctx.account_id,
+        "atem_device_id": ctx.atem_device_id, "host_trust_gen": ctx.host_trust_gen,
+        "session_id": id.to_string(), "process_gen": cx.sessions[id].process_gen},
+        "attachment_gen": att});
+    if let Some(epoch) = lease {
+        binding["lease_epoch"] = epoch.into();
+    }
+    binding
+}
+
+/// `att` sends `message`; the bridge performs what it causes. Its effects.
+fn from_native(
+    bridge: &mut super::HostBridge,
+    att: &str,
+    cx: &mut super::Cx<'_>,
+    message: Value,
+) -> Vec<crate::session_protocol::host::Effect> {
+    let now = bridge.clock.now();
+    let effects = bridge
+        .host
+        .receive(att, message.to_string().as_bytes(), now);
+    bridge.exec(effects.clone(), cx);
+    effects
+}
+
+/// The native `att` takes `id`'s lease over, and the pass syncs the
+/// workers' epochs as every pass does. Its lease epoch.
+fn take_over(
+    bridge: &mut super::HostBridge,
+    att: &str,
+    id: &crate::session::SessionId,
+    cx: &mut super::Cx<'_>,
+) -> u64 {
+    let binding = native_binding(bridge, att, id, cx, None);
+    from_native(
+        bridge,
+        att,
+        cx,
+        json!({"type": "session", "data": {"v": 1, "op": "acquire",
+            "id": uuid::Uuid::new_v4().to_string(), "binding": binding, "takeover": true}}),
+    );
+    assert_eq!(bridge.host().lease_holder(id.as_str()), Some(att));
+    bridge.sync_all(cx);
+    bridge.host().lease_epoch(id.as_str()).unwrap()
+}
+
+/// The native `att`, holding `id`'s lease at `lease`, subscribes and types
+/// `chunks` chunks of 8 KiB, which the bridge hands to the worker.
+fn native_types(
+    bridge: &mut super::HostBridge,
+    att: &str,
+    id: &crate::session::SessionId,
+    cx: &mut super::Cx<'_>,
+    lease: u64,
+    chunks: u64,
+) {
+    use crate::session_protocol::host::Effect;
+    let (sid, pg) = (id.to_string(), cx.sessions[id].process_gen.clone());
+    let binding = native_binding(bridge, att, id, cx, None);
+    let effects = from_native(
+        bridge,
+        att,
+        cx,
+        json!({"type": "terminal", "data": {"v": 1, "op": "subscribe",
+            "terminal_id": sid, "generation": pg, "binding": binding}}),
+    );
+    let stream = effects
+        .iter()
+        .find_map(|e| match e {
+            Effect::StreamOpened { stream_id, .. } => Some(stream_id.clone()),
+            _ => None,
+        })
+        .expect("subscribed");
+    let binding = native_binding(bridge, att, id, cx, Some(lease));
+    let chunk = STANDARD.encode([b'r'; 8 * 1024]);
+    for sequence in 0..chunks {
+        from_native(
+            bridge,
+            att,
+            cx,
+            json!({"type": "terminal", "data": {"v": 1, "op": "input",
+                "terminal_id": sid, "generation": pg, "binding": binding,
+                "stream_id": stream, "sequence": sequence, "bytes": chunk}}),
+        );
+    }
+    assert_eq!(bridge.per[&sid].remote.len() as u64, chunks, "admitted");
+    bridge.drain_remote(cx);
+    assert!(bridge.per[&sid].remote.is_empty(), "handed to the worker");
+}
+
+/// The input epochs a refusal must leave alone: the host's, the one the
+/// bridge last synced the worker to (`per.host_epoch`), and the worker's
+/// (as the session holds it).
+fn epochs(
+    bridge: &super::HostBridge,
+    id: &crate::session::SessionId,
+    cx: &super::Cx<'_>,
+) -> (Option<u64>, u64, u64) {
+    (
+        bridge.host().input_epoch(id.as_str()),
+        bridge.per[id.as_str()].host_epoch,
+        cx.sessions[id].input_epoch(),
+    )
+}
+
+/// The chat's half refuses before anything moves: with no turn shown
+/// running (no turn state) or another one shown, another holder's lease,
+/// the host's input epoch and the worker's stay, and nothing is written.
+/// With the attempt's turn shown, the interrupt revokes that lease and the
+/// worker's epoch rises.
+#[tokio::test]
+async fn a_chat_refusal_leaves_another_holders_lease_and_the_workers_epoch() {
+    use super::Interrupted;
+    use crate::session_protocol::host::HostInterrupt;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let session = broker_session(dir.path()).await;
+    let mut app = idle_app();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    let id = session.id.clone();
+    let sid = id.to_string();
+    let mut sessions = std::collections::BTreeMap::from([(id.clone(), session)]);
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    let rid = host_work_attempt(&mut bridge, &id, &mut cx);
+    let c1 = native(&mut bridge);
+    take_over(&mut bridge, &c1, &id, &mut cx);
+    let before = epochs(&bridge, &id, &cx);
+    let other = uuid::Uuid::new_v4().to_string();
+    for shown in [None, Some(other.as_str())] {
+        if let Some(other) = shown {
+            show_turn(cx.sessions.get_mut(&id).unwrap(), other);
+        }
+        assert_eq!(
+            bridge.host_interrupt(&sid, &rid, &mut cx),
+            Interrupted::Refused(HostInterrupt::NotCurrentTurn),
+            "{shown:?}"
+        );
+        assert_eq!(
+            bridge.host_interrupt_revoke_lease(&sid, &rid, &mut cx),
+            Interrupted::Refused(HostInterrupt::NotCurrentTurn),
+            "{shown:?}"
+        );
+        assert_eq!(bridge.host().lease_holder(&sid), Some(c1.as_str()));
+        assert_eq!(epochs(&bridge, &id, &cx), before, "{shown:?}");
+        assert!(!bridge.host_interrupt_outstanding(&sid, &rid));
+    }
+    // Task 15's re-review (N1): the attempt's own request is the chat's
+    // current one, but no turn is known to run (today's Esc rule): its
+    // chat withdrawn (`chat_v1` false), its turn ended (`ready`), or the
+    // chat's agent gone (`unknown`). Refused alike, nothing moved.
+    for state in ["withdrawn", "ready", "unknown"] {
+        use crate::chat::adapter::AgentEvent;
+        use crate::chat::session::State;
+        let session = cx.sessions.get_mut(&id).unwrap();
+        show_turn(session, &rid);
+        match state {
+            "withdrawn" => session.chat_v1 = false,
+            "ready" => {
+                session
+                    .chat
+                    .on_event(AgentEvent::TurnEnded { at_ms: Some(10) }, 10, 0);
+                assert_eq!(session.chat.status().state, State::Ready);
+            }
+            _ => {
+                session.chat.on_process_exit(10);
+                assert_eq!(session.chat.status().state, State::Unknown);
+            }
+        }
+        assert_eq!(session.chat.current_request_id(), Some(rid.as_str()));
+        assert!(session.is_live());
+        assert_eq!(
+            bridge.host_interrupt(&sid, &rid, &mut cx),
+            Interrupted::Refused(HostInterrupt::NotCurrentTurn),
+            "{state}"
+        );
+        assert_eq!(
+            bridge.host_interrupt_revoke_lease(&sid, &rid, &mut cx),
+            Interrupted::Refused(HostInterrupt::NotCurrentTurn),
+            "{state}"
+        );
+        assert_eq!(bridge.host().lease_holder(&sid), Some(c1.as_str()));
+        assert_eq!(epochs(&bridge, &id, &cx), before, "{state}");
+        assert!(!bridge.host_interrupt_outstanding(&sid, &rid));
+    }
+
+    show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+    assert_eq!(
+        bridge.host_interrupt(&sid, &rid, &mut cx),
+        Interrupted::Written
+    );
+    assert_eq!(bridge.host().lease_holder(&sid), None);
+    let after = epochs(&bridge, &id, &cx);
+    assert!(
+        after.0 > before.0 && after.1 > before.1,
+        "{before:?} {after:?}"
+    );
+    assert!(
+        after.2 > before.2,
+        "the worker's epoch: {before:?} {after:?}"
+    );
+    let _ = cx.sessions.get_mut(&id).unwrap().stop();
+}
+
+/// While a write for the attempt is outstanding, `host_interrupt` runs
+/// only the revoke-only step: no second Esc, still the one write waiting
+/// for its answer. Once that came (one report), it writes again.
+#[tokio::test]
+async fn an_outstanding_write_is_never_written_twice() {
+    use super::{InterruptReport, Interrupted};
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let session = broker_session(dir.path()).await;
+    let mut app = idle_app();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    let id = session.id.clone();
+    let sid = id.to_string();
+    let mut sessions = std::collections::BTreeMap::from([(id.clone(), session)]);
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    let rid = host_work_attempt(&mut bridge, &id, &mut cx);
+    show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+    let writes = |bridge: &super::HostBridge| {
+        bridge
+            .pending
+            .values()
+            .filter(|p| matches!(p, super::Pending::HostInterrupt(r) if *r == rid))
+            .count()
+    };
+
+    assert!(!bridge.host_interrupt_outstanding(&sid, &rid));
+    assert_eq!(
+        bridge.host_interrupt(&sid, &rid, &mut cx),
+        Interrupted::Written
+    );
+    assert!(bridge.host_interrupt_outstanding(&sid, &rid));
+    let seq = pending_interrupt(&bridge, &sid, &rid).unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            bridge.host_interrupt(&sid, &rid, &mut cx),
+            Interrupted::Revoked
+        );
+        assert_eq!(writes(&bridge), 1);
+        assert_eq!(pending_interrupt(&bridge, &sid, &rid), Some(seq));
+    }
+    assert_eq!(
+        answered(&mut bridge, &id, &mut cx).await,
+        [(rid.clone(), InterruptReport::Ok)]
+    );
+    assert!(!bridge.host_interrupt_outstanding(&sid, &rid));
+    // The worker's chat batches replace the shown turn: shown again.
+    show_turn(cx.sessions.get_mut(&id).unwrap(), &rid);
+    assert_eq!(
+        bridge.host_interrupt(&sid, &rid, &mut cx),
+        Interrupted::Written
+    );
+    assert_eq!(writes(&bridge), 1);
+    assert_ne!(pending_interrupt(&bridge, &sid, &rid), Some(seq));
+    let _ = cx.sessions.get_mut(&id).unwrap().stop();
+}
+
+/// Every message the broker sent `id`'s worker so far was handled: the
+/// answer to a screen request sent after them came back. No other screen
+/// request may be outstanding (its answer would come first and prove
+/// nothing of what was sent after it; Task 16a's review, M4): a launched
+/// session asks for none.
+async fn worker_caught_up(cx: &mut super::Cx<'_>, id: &crate::session::SessionId) {
+    let session = cx.sessions.get_mut(id).unwrap();
+    assert!(
+        !session.request_screen_now(),
+        "a screen request was outstanding"
+    );
+    tokio::time::timeout(WAIT, async {
+        while !session.pump().resync {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the worker answers its screen request");
+}
+
+/// A native's bytes already handed to the worker are dropped there once
+/// its lease ends: by the interrupt on one session, by the revoke-only call
+/// on another. No timing (Task 15's re-review, N2): the agents read nothing
+/// until the test opens their gate (a file it creates once each worker
+/// handled every message sent to it, the epoch's rise included), so the
+/// writes queue at the worker (192 KiB is far past what a PTY buffers); it
+/// answers `dropped` for the chunks still queued, and the interrupt's Esc,
+/// written under the new epoch, lands once the agent reads. The control:
+/// the same traffic on a third session, with no interrupt, is written
+/// whole.
+#[tokio::test]
+async fn a_natives_bytes_at_the_worker_are_dropped_after_the_interrupt() {
+    use super::super::broker::WriteOutcome;
+    use super::{InterruptReport, Interrupted};
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let gate = dir.path().join("gate");
+    let mut sessions = std::collections::BTreeMap::new();
+    let mut ids = Vec::new();
+    for name in ["gated-1", "gated-2", "gated-3"] {
+        // Raw, no echo: reads nothing until the gate opens.
+        let agent = script(
+            dir.path(),
+            name,
+            &format!(
+                "stty raw -echo\nprintf 'GATED\\r\\n'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\nexec cat",
+                gate.display()
+            ),
+        );
+        let session = session_running(dir.path(), &agent).await;
+        ids.push(session.id.clone());
+        sessions.insert(session.id.clone(), session);
+    }
+    let mut app = idle_app();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    let c1 = native(&mut bridge);
+    let mut rids = Vec::new();
+    for id in &ids {
+        let rid = host_work_attempt(&mut bridge, id, &mut cx);
+        show_turn(cx.sessions.get_mut(id).unwrap(), &rid);
+        let lease = take_over(&mut bridge, &c1, id, &mut cx);
+        native_types(&mut bridge, &c1, id, &mut cx, lease, 24);
+        rids.push(rid);
+    }
+    let control = bridge.host().lease_epoch(ids[2].as_str());
+    assert_eq!(
+        bridge.host_interrupt(ids[0].as_str(), &rids[0], &mut cx),
+        Interrupted::Written
+    );
+    assert_eq!(
+        bridge.host_interrupt_revoke_lease(ids[1].as_str(), &rids[1], &mut cx),
+        Interrupted::Revoked
+    );
+    for id in &ids[..2] {
+        assert_eq!(bridge.host().lease_holder(id.as_str()), None);
+    }
+    assert_eq!(
+        bridge.host().lease_holder(ids[2].as_str()),
+        Some(c1.as_str())
+    );
+    assert_eq!(bridge.host().lease_epoch(ids[2].as_str()), control);
+    for id in &ids {
+        worker_caught_up(&mut cx, id).await;
+    }
+    std::fs::write(&gate, b"").unwrap();
+
+    // Every write is answered once the agents read.
+    for (id, writes, interrupted) in [
+        (&ids[0], 25, true),
+        (&ids[1], 24, true),
+        (&ids[2], 24, false),
+    ] {
+        let mut results: Vec<WriteOutcome> = Vec::new();
+        tokio::time::timeout(WAIT, async {
+            while results.len() < writes {
+                let session = cx.sessions.get_mut(id).unwrap();
+                session.pump();
+                results.extend(session.take_results());
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("unanswered writes of {id}"));
+        let dropped = results.iter().filter(|r| r.dropped).count();
+        if interrupted {
+            assert!(dropped > 0, "nothing queued was dropped: {results:?}");
+        } else {
+            assert_eq!(dropped, 0, "{results:?}");
+            assert!(results.iter().all(|r| r.ok), "{results:?}");
+        }
+        for result in results {
+            bridge.write_result(id.as_str(), result, &mut cx);
+        }
+    }
+    assert_eq!(
+        bridge.host_interrupt_reports(),
+        [(rids[0].clone(), InterruptReport::Ok)]
+    );
+    for id in &ids {
+        let _ = cx.sessions.get_mut(id).unwrap().stop();
+    }
+}
+
+// ── §H recovery: host-work's executing prompts at a start (session-v1
+//    R9.14 items 5, 6) ──
+
+/// As `show_turn`, and the bridge reads what the chat produced, as a pass
+/// does: the prompt's acceptance journals the turn it started.
+fn accept_turn(
+    bridge: &mut super::HostBridge,
+    id: &crate::session::SessionId,
+    cx: &mut super::Cx<'_>,
+    request_id: &str,
+) {
+    use crate::chat::session::Out;
+    let outs = show_turn(cx.sessions.get_mut(id).unwrap(), request_id);
+    assert!(
+        outs.iter()
+            .any(|o| matches!(o, Out::Accepted { request_id: r } if r == request_id)),
+        "{outs:?}"
+    );
+    // As the prompt's dispatch (its paste) records it.
+    bridge.prompts.insert(request_id.into(), id.to_string());
+    bridge.chat_outs(id.as_str(), outs, cx);
+}
+
+/// What an adopted worker's `chat_snapshot` carries of `session`'s chat:
+/// the worker's own session never submitted, so no message names a
+/// request.
+fn worker_snapshot(
+    session: &crate::runtime::broker::BrokerSession,
+) -> crate::chat::session::ChatSnapshot {
+    use crate::chat::session::{MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGES};
+    let mut snapshot = session
+        .chat
+        .snapshot(MAX_HISTORY_MESSAGES, MAX_HISTORY_BYTES);
+    for message in &mut snapshot.history {
+        message.request_id = None;
+    }
+    snapshot
+}
+
+/// `session` as a new broker adopts it: its worker connected, its chat not
+/// arrived yet.
+fn adopted(session: &mut crate::runtime::broker::BrokerSession) {
+    session.chat = crate::chat::session::ChatSession::new(session.process_gen.clone(), 0);
+    session.chat_v1 = false;
+    session.chat_synced = false;
+}
+
+/// The worker's `chat_snapshot` reaches the broker (`BrokerSession`'s
+/// `ChatSnapshot` arm).
+fn snapshot_arrives(
+    session: &mut crate::runtime::broker::BrokerSession,
+    snapshot: crate::chat::session::ChatSnapshot,
+) {
+    session.chat =
+        crate::chat::session::ChatSession::restore(session.process_gen.clone(), snapshot);
+    session.chat_v1 = true;
+    session.chat_synced = true;
+}
+
+/// A broker pass over `sessions`.
+fn pass_with(
+    bridge: &mut super::HostBridge,
+    app: &mut App,
+    sessions: &mut std::collections::BTreeMap<
+        crate::session::SessionId,
+        crate::runtime::broker::BrokerSession,
+    >,
+) {
+    bridge.tick(app, sessions, false);
+}
+
+/// R9.14 items 5, 6 (Task 15's review, Q2): at a start, host-work's
+/// `executing` prompt is decided from the adopted worker's chat, never by
+/// the plain `Unknown` a v1 prompt gets, and only once that chat arrived
+/// (until then it stays `executing` and the turn check refuses). Its turn,
+/// journaled at the chat's acceptance:
+/// - still running: it stays `executing`, the restored chat's current turn
+///   is rebound to it (`current_request_id`), so the host interrupt writes
+///   once and the turn's end completes the receipt;
+/// - ended: completed with its outcome; the interrupt writes nothing;
+/// - its worker gone: `outcome_unknown`, `agent exited`;
+/// - no turn journaled (a crash between the acceptance and its write):
+///   `outcome_unknown` at once (fail closed).
+#[tokio::test]
+async fn executing_host_work_is_reconciled_or_outcome_unknown() {
+    use super::{InterruptReport, Interrupted};
+    use crate::chat::adapter::AgentEvent;
+    use crate::session_protocol::host::{
+        DETAIL_AGENT_EXITED, DETAIL_TURN_DONE, DETAIL_UNRECONCILED, HostInterrupt,
+    };
+    use crate::session_protocol::wire::ReceiptState;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let journal = dir.path().join("journal");
+    let mut app = idle_app();
+    let mut sessions = std::collections::BTreeMap::new();
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let session = broker_session(dir.path()).await;
+        ids.push(session.id.clone());
+        sessions.insert(session.id.clone(), session);
+    }
+    let (running, ended, gone, unjournaled) = (0, 1, 2, 3);
+    let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    let mut rids = Vec::new();
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    // The workers' own chats (the fake agent has none) are in: what the
+    // test shows below isn't replaced when a worker is pumped.
+    for id in &ids {
+        worker_caught_up(&mut cx, id).await;
+    }
+    for (i, id) in ids.iter().enumerate() {
+        let rid = host_work_attempt(&mut bridge, id, &mut cx);
+        if i == unjournaled {
+            show_turn(cx.sessions.get_mut(id).unwrap(), &rid);
+            assert_eq!(bridge.host().recorded_turn(&rid), None);
+        } else {
+            accept_turn(&mut bridge, id, &mut cx, &rid);
+            let turn = bridge.host().recorded_turn(&rid).expect("journaled");
+            assert_eq!(
+                (turn.turn_id.as_str(), turn.user_message_id.as_str()),
+                ("turn-1", "user-1")
+            );
+        }
+        assert_eq!(
+            bridge.host().receipt(&rid).unwrap().state,
+            ReceiptState::Executing
+        );
+        rids.push(rid);
+    }
+    // The ended one's turn ends after the old broker read its last batch.
+    let _unread = cx.sessions.get_mut(&ids[ended]).unwrap().chat.on_event(
+        AgentEvent::TurnEnded { at_ms: Some(10) },
+        10,
+        0,
+    );
+    // The broker goes (no clean close); the gone one's worker with it.
+    drop(bridge);
+    let gone_session = sessions.remove(&ids[gone]).unwrap();
+    let _ = gone_session.stop();
+    let mut snapshots = std::collections::BTreeMap::new();
+    for i in [running, ended, unjournaled] {
+        let session = sessions.get_mut(&ids[i]).unwrap();
+        snapshots.insert(i, worker_snapshot(session));
+        adopted(session);
+    }
+
+    // The next broker: its first pass recovers; the adopted chats haven't
+    // arrived.
+    let mut bridge = super::HostBridge::open(&journal, None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    let receipt = |bridge: &super::HostBridge, i: usize| bridge.host().receipt(&rids[i]).unwrap();
+    for i in [running, ended] {
+        assert_eq!(receipt(&bridge, i).state, ReceiptState::Executing, "{i}");
+        assert!(bridge.host_work_reconciling(&rids[i]), "{i}");
+    }
+    let r = receipt(&bridge, gone);
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (ReceiptState::OutcomeUnknown, Some(DETAIL_AGENT_EXITED))
+    );
+    let r = receipt(&bridge, unjournaled);
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (ReceiptState::OutcomeUnknown, Some(DETAIL_UNRECONCILED))
+    );
+    assert!(!bridge.host_work_reconciling(&rids[gone]));
+    assert!(!bridge.host_work_reconciling(&rids[unjournaled]));
+    {
+        let mut cx = super::Cx {
+            client: &app.astation_client,
+            sessions: &mut sessions,
+        };
+        // No turn state yet: the turn check refuses, nothing moves.
+        assert_eq!(
+            bridge.host_interrupt(ids[running].as_str(), &rids[running], &mut cx),
+            Interrupted::Refused(HostInterrupt::NotCurrentTurn)
+        );
+    }
+    // Passes go by: still waiting for the chat.
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    assert!(bridge.host_work_reconciling(&rids[running]));
+
+    // The chats arrive.
+    for i in [running, ended, unjournaled] {
+        let snapshot = snapshots.remove(&i).unwrap();
+        snapshot_arrives(sessions.get_mut(&ids[i]).unwrap(), snapshot);
+    }
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    for i in [running, ended] {
+        assert!(!bridge.host_work_reconciling(&rids[i]), "{i}");
+    }
+    // Ended: completed with its outcome and its turn.
+    let r = receipt(&bridge, ended);
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (ReceiptState::Completed, Some(DETAIL_TURN_DONE))
+    );
+    let result = r.result.expect("its turn");
+    assert_eq!(
+        (result.turn_id.as_str(), result.user_message_id.as_str()),
+        ("turn-1", "user-1")
+    );
+    // Running: still executing, its turn rebound.
+    assert_eq!(receipt(&bridge, running).state, ReceiptState::Executing);
+    assert_eq!(
+        sessions[&ids[running]].chat.current_request_id(),
+        Some(rids[running].as_str())
+    );
+    // The unjournaled one stays as it was.
+    assert_eq!(
+        receipt(&bridge, unjournaled).state,
+        ReceiptState::OutcomeUnknown
+    );
+
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    // The host interrupt: written once on the running turn, nothing on the
+    // others.
+    assert_eq!(
+        bridge.host_interrupt(ids[running].as_str(), &rids[running], &mut cx),
+        Interrupted::Written
+    );
+    for i in [ended, gone, unjournaled] {
+        assert_eq!(
+            bridge.host_interrupt(ids[i].as_str(), &rids[i], &mut cx),
+            Interrupted::Refused(HostInterrupt::NotExecuting),
+            "{i}"
+        );
+    }
+    assert_eq!(
+        answered(&mut bridge, &ids[running], &mut cx).await,
+        [(rids[running].clone(), InterruptReport::Ok)]
+    );
+    assert_eq!(bridge.pending.len(), 0, "one write, answered");
+
+    // The turn ends: its receipt completes, with its turn.
+    let outs = cx.sessions.get_mut(&ids[running]).unwrap().chat.on_event(
+        AgentEvent::TurnEnded { at_ms: Some(20) },
+        20,
+        0,
+    );
+    bridge.chat_outs(ids[running].as_str(), outs, &mut cx);
+    let r = receipt(&bridge, running);
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (ReceiptState::Completed, Some(DETAIL_TURN_DONE))
+    );
+    let result = r.result.expect("its turn");
+    assert_eq!(
+        (result.turn_id.as_str(), result.user_message_id.as_str()),
+        ("turn-1", "user-1")
+    );
+    for id in &ids {
+        if let Some(session) = cx.sessions.get_mut(id) {
+            let _ = session.stop();
+        }
+    }
+}
+
+/// Host-work attempts on `ids`' sessions, each prompt accepted by the chat
+/// (its turn journaled, `turn-1`), `before(i, session)` then run on each
+/// session; the broker goes (no clean close) and the next one, over the
+/// same journal on `clock`, adopts the sessions (their chats not arrived)
+/// and runs its first pass. The new bridge, the request ids, and each
+/// session's chat as its worker's `chat_snapshot` carries it.
+async fn restarted(
+    dir: &Path,
+    app: &mut App,
+    sessions: &mut std::collections::BTreeMap<
+        crate::session::SessionId,
+        crate::runtime::broker::BrokerSession,
+    >,
+    ids: &[crate::session::SessionId],
+    clock: Clock,
+    before: impl Fn(usize, &mut crate::runtime::broker::BrokerSession),
+) -> (
+    super::HostBridge,
+    Vec<String>,
+    Vec<crate::chat::session::ChatSnapshot>,
+) {
+    let journal = dir.join("journal");
+    let mut bridge = super::HostBridge::open(&journal, None, clock.clone()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, app);
+    let mut rids = Vec::new();
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions,
+    };
+    for id in ids {
+        worker_caught_up(&mut cx, id).await;
+    }
+    for (i, id) in ids.iter().enumerate() {
+        let rid = host_work_attempt(&mut bridge, id, &mut cx);
+        accept_turn(&mut bridge, id, &mut cx, &rid);
+        assert!(bridge.host().recorded_turn(&rid).is_some());
+        before(i, cx.sessions.get_mut(id).unwrap());
+        rids.push(rid);
+    }
+    drop(bridge);
+    let mut snapshots = Vec::new();
+    for id in ids {
+        let session = sessions.get_mut(id).unwrap();
+        snapshots.push(worker_snapshot(session));
+        adopted(session);
+    }
+    let mut bridge = super::HostBridge::open(&journal, None, clock).unwrap();
+    bridge.features.delegated = true;
+    pass_with(&mut bridge, app, sessions);
+    (bridge, rids, snapshots)
+}
+
+/// Task 16a's review (M2): the reconciliation's other branches, end to
+/// end. The adopted chat shows another turn current (one typed at the
+/// terminal after the prompt's), or arrives without chat-v1 (withdrawn):
+/// `outcome_unknown`, `outcome could not be established`, and nothing is
+/// rebound; a turn that ended interrupted: `completed`, `interrupted`.
+#[tokio::test]
+async fn a_reconciled_turn_shown_as_another_or_without_chat_is_unknown_and_an_interrupted_one_completes_so()
+ {
+    use crate::chat::adapter::{LogItem, Outcome};
+    use crate::session_protocol::host::{DETAIL_TURN_INTERRUPTED, DETAIL_UNRECONCILED};
+    use crate::session_protocol::wire::ReceiptState;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let mut app = idle_app();
+    let mut sessions = std::collections::BTreeMap::new();
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let session = broker_session(dir.path()).await;
+        ids.push(session.id.clone());
+        sessions.insert(session.id.clone(), session);
+    }
+    let (another, withdrawn, interrupted) = (0, 1, 2);
+    let (mut bridge, rids, snapshots) = restarted(
+        dir.path(),
+        &mut app,
+        &mut sessions,
+        &ids,
+        Clock::default(),
+        |i, session| {
+            let item = match i {
+                // A turn typed at the terminal after the prompt's.
+                0 => LogItem::UserMessage {
+                    id: "user-2".into(),
+                    turn_id: "turn-2".into(),
+                    text: "typed here".into(),
+                    created_at_ms: 20,
+                },
+                2 => LogItem::TurnEnded {
+                    turn_id: "turn-1".into(),
+                    outcome: Outcome::Interrupted,
+                    at_ms: 20,
+                },
+                _ => return,
+            };
+            let _unread = session.chat.on_log(item, 20, 0);
+        },
+    )
+    .await;
+    for i in [another, withdrawn, interrupted] {
+        assert!(bridge.host_work_reconciling(&rids[i]), "{i}");
+    }
+    for (i, snapshot) in snapshots.into_iter().enumerate() {
+        let session = sessions.get_mut(&ids[i]).unwrap();
+        snapshot_arrives(session, snapshot);
+        if i == withdrawn {
+            session.chat_v1 = false;
+        }
+    }
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    let receipt = |i: usize| bridge.host().receipt(&rids[i]).unwrap();
+    for i in [another, withdrawn] {
+        let r = receipt(i);
+        assert_eq!(
+            (r.state, r.detail.as_deref()),
+            (ReceiptState::OutcomeUnknown, Some(DETAIL_UNRECONCILED)),
+            "{i}"
+        );
+        assert_eq!(sessions[&ids[i]].chat.current_request_id(), None, "{i}");
+        assert!(!bridge.host_work_reconciling(&rids[i]), "{i}");
+    }
+    assert_eq!(
+        sessions[&ids[another]].chat.current_turn_id(),
+        Some("turn-2")
+    );
+    let r = receipt(interrupted);
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (ReceiptState::Completed, Some(DETAIL_TURN_INTERRUPTED))
+    );
+    assert_eq!(r.result.expect("its turn").turn_id, "turn-1");
+    for id in &ids {
+        let _ = sessions.get_mut(id).unwrap().stop();
+    }
+}
+
+/// Task 16a's review (M1): an adopted worker whose chat never arrives
+/// holds the reconciliation `RECONCILE_MS` after the start's recovery at
+/// most (60 s, as §H's confirmation window): then `outcome_unknown`,
+/// `outcome could not be established`, no longer reconciling; a chat that
+/// arrives later changes nothing.
+#[tokio::test]
+async fn an_adopted_chat_that_never_arrives_settles_at_the_deadline() {
+    use crate::session_protocol::host::{DETAIL_UNRECONCILED, RECONCILE_MS};
+    use crate::session_protocol::wire::ReceiptState;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let mut app = idle_app();
+    let session = broker_session(dir.path()).await;
+    let ids = vec![session.id.clone()];
+    let mut sessions = std::collections::BTreeMap::from([(session.id.clone(), session)]);
+    // Moved only by the test: no margin against real time (PR 5 review I3).
+    let clock = Clock::manual();
+    let (mut bridge, rids, mut snapshots) = restarted(
+        dir.path(),
+        &mut app,
+        &mut sessions,
+        &ids,
+        clock.clone(),
+        |_, _| {},
+    )
+    .await;
+    let rid = &rids[0];
+    assert!(bridge.host_work_reconciling(rid));
+    // A millisecond short of the bound, then the bound.
+    clock.skip(RECONCILE_MS - 1);
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    assert!(bridge.host_work_reconciling(rid));
+    assert_eq!(
+        bridge.host().receipt(rid).unwrap().state,
+        ReceiptState::Executing
+    );
+    clock.skip(1);
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    assert!(!bridge.host_work_reconciling(rid));
+    let r = bridge.host().receipt(rid).unwrap();
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (ReceiptState::OutcomeUnknown, Some(DETAIL_UNRECONCILED))
+    );
+    // Late: nothing rebinds it.
+    snapshot_arrives(sessions.get_mut(&ids[0]).unwrap(), snapshots.remove(0));
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    assert_eq!(sessions[&ids[0]].chat.current_request_id(), None);
+    assert_eq!(
+        bridge.host().receipt(rid).unwrap().state,
+        ReceiptState::OutcomeUnknown
+    );
+    let _ = sessions.get_mut(&ids[0]).unwrap().stop();
+}
+
+// ── The drive hook (`ATEM_TEST_HOST_WORK_DRIVE`): host-work's side of the
+//    delegated fixtures, played through the bridge ──
+
+/// A chat started on `session` (ready for a prompt), as the worker's
+/// would be after the agent's SessionStart.
+#[cfg(debug_assertions)]
+fn chat_ready(session: &mut crate::runtime::broker::BrokerSession) {
+    use crate::chat::adapter::AgentEvent;
+    use crate::chat::session::ChatSession;
+    let mut chat = ChatSession::new(session.process_gen.clone(), 0);
+    let _ = chat.on_event(
+        AgentEvent::SessionStarted {
+            session_id: "fake-session".into(),
+            log_path: PathBuf::new(),
+            source: "startup".into(),
+            same_log: false,
+        },
+        1,
+        0,
+    );
+    session.chat = chat;
+    session.chat_v1 = true;
+    session.chat_offered = true;
+}
+
+/// The drive hook's commands, as the bridge performs them (the file layer
+/// is `test_hooks::parse_drive`'s): the verdict the start check gives, a
+/// submit through the normal dispatch (pasted, so the chat's acceptance
+/// journals the turn), a duplicate, a withdrawal, and the interrupt with
+/// host authority through the bridge entry, whose write's outcome comes as
+/// a report line. The hook is debug-only: release builds compile it out.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn the_drive_hook_plays_host_works_side_through_the_bridge() {
+    use crate::chat::adapter::{AgentEvent, LogItem};
+    use crate::runtime::test_hooks::{DriveAction, DriveAttempt, DriveCommand};
+    use crate::session_protocol::host::DETAIL_WITHDRAWN_BY_HOST;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let session = broker_session(dir.path()).await;
+    let mut app = idle_app();
+    let mut bridge =
+        super::HostBridge::open(&dir.path().join("journal"), None, Clock::default()).unwrap();
+    bridge.features.delegated = true;
+    pass(&mut bridge, &mut app);
+    bridge.install_drive_check();
+    let id = session.id.clone();
+    let sid = id.to_string();
+    let mut sessions = std::collections::BTreeMap::from([(id.clone(), session)]);
+    let mut cx = super::Cx {
+        client: &app.astation_client,
+        sessions: &mut sessions,
+    };
+    worker_caught_up(&mut cx, &id).await;
+    bridge.register(&id, &mut cx);
+    chat_ready(cx.sessions.get_mut(&id).unwrap());
+    let attempt = |rid: &str| DriveAttempt {
+        session_id: sid.clone(),
+        request_id: rid.into(),
+        task_id: uuid::Uuid::new_v4().to_string(),
+        sender: "member:dev-phone".into(),
+        text: "run the tests".into(),
+    };
+    let drive = |bridge: &mut super::HostBridge, cx: &mut super::Cx<'_>, file: &str, action| {
+        bridge.drive(
+            DriveCommand {
+                file: file.into(),
+                action,
+            },
+            cx,
+        )
+    };
+    let (r1, r2, r3) = (
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+    );
+
+    // Withdraw: the start check refuses, before any effect.
+    assert_eq!(
+        drive(
+            &mut bridge,
+            &mut cx,
+            "verdict.json",
+            DriveAction::Verdict(false)
+        ),
+        json!({"file": "verdict.json", "verdict": "withdraw"})
+    );
+    assert_eq!(
+        drive(
+            &mut bridge,
+            &mut cx,
+            "submit-1.json",
+            DriveAction::Submit(attempt(&r1))
+        ),
+        json!({"file": "submit-1.json", "state": "rejected", "detail": DETAIL_WITHDRAWN_BY_HOST})
+    );
+    assert!(bridge.prompts.is_empty(), "nothing pasted");
+    // Go: it runs through the normal dispatch.
+    drive(
+        &mut bridge,
+        &mut cx,
+        "verdict.json",
+        DriveAction::Verdict(true),
+    );
+    assert_eq!(
+        drive(
+            &mut bridge,
+            &mut cx,
+            "submit-2.json",
+            DriveAction::Submit(attempt(&r2))
+        ),
+        json!({"file": "submit-2.json", "state": "executing"})
+    );
+    assert_eq!(bridge.prompts.get(&r2), Some(&sid), "pasted");
+    // Its own duplicate: the recorded receipt.
+    assert_eq!(
+        drive(
+            &mut bridge,
+            &mut cx,
+            "submit-3.json",
+            DriveAction::Submit(attempt(&r2))
+        )["state"],
+        "executing"
+    );
+    assert_eq!(
+        drive(
+            &mut bridge,
+            &mut cx,
+            "withdraw-1.json",
+            DriveAction::Withdraw(attempt(&r3))
+        ),
+        json!({"file": "withdraw-1.json", "withdrawal": "listed"})
+    );
+    assert_eq!(
+        drive(
+            &mut bridge,
+            &mut cx,
+            "withdraw-2.json",
+            DriveAction::Withdraw(attempt(&r2))
+        ),
+        json!({"file": "withdraw-2.json", "withdrawal": "started"})
+    );
+    // No turn shown yet: the chat's half refuses.
+    let interrupt = |revoke_only| DriveAction::Interrupt {
+        session_id: sid.clone(),
+        request_id: r2.clone(),
+        revoke_only,
+    };
+    assert_eq!(
+        drive(&mut bridge, &mut cx, "interrupt-1.json", interrupt(false)),
+        json!({"file": "interrupt-1.json", "interrupt": "not_current_turn"})
+    );
+    // The agent takes the prompt: its turn is journaled.
+    let session = cx.sessions.get_mut(&id).unwrap();
+    let mut outs = session.chat.on_event(
+        AgentEvent::PromptSubmitted {
+            text: "run the tests".into(),
+            turn_id: None,
+            at_ms: None,
+        },
+        5,
+        0,
+    );
+    outs.extend(session.chat.on_log(
+        LogItem::UserMessage {
+            id: "user-1".into(),
+            turn_id: "turn-1".into(),
+            text: "run the tests".into(),
+            created_at_ms: i64::MAX / 2,
+        },
+        5,
+        0,
+    ));
+    bridge.chat_outs(&sid, outs, &mut cx);
+    assert_eq!(
+        bridge.host().recorded_turn(&r2).map(|t| t.turn_id.as_str()),
+        Some("turn-1")
+    );
+    assert_eq!(
+        drive(&mut bridge, &mut cx, "interrupt-2.json", interrupt(false)),
+        json!({"file": "interrupt-2.json", "interrupt": "written"})
+    );
+    assert_eq!(
+        drive(&mut bridge, &mut cx, "interrupt-3.json", interrupt(true)),
+        json!({"file": "interrupt-3.json", "interrupt": "revoked"})
+    );
+    // The write's outcome, once the worker answered it (the paste's answer
+    // may come in an earlier batch: PR 5 review M4).
+    tokio::time::timeout(WAIT, async {
+        while pending_interrupt(&bridge, &sid, &r2).is_some() {
+            let session = cx.sessions.get_mut(&id).unwrap();
+            session.pump();
+            for result in session.take_results() {
+                bridge.write_result(&sid, result, &mut cx);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        bridge.drive_reports(),
+        [json!({"report": r2, "outcome": "ok"})]
+    );
+    assert!(bridge.drive_reports().is_empty(), "once");
+    let unknown = drive(
+        &mut bridge,
+        &mut cx,
+        "submit-9.json",
+        DriveAction::Unreadable("expected value".into()),
+    );
+    assert_eq!(
+        unknown,
+        json!({"file": "submit-9.json", "error": "expected value"})
+    );
+    let _ = cx.sessions.get_mut(&id).unwrap().stop();
+}
+
+/// PR 5 review M10: the reconciliation reads only a live session of the
+/// prompt's own process. The same session id adopted under another
+/// `process_gen` (the agent process the prompt ran in is gone) is
+/// `outcome_unknown`, `agent exited`, whatever its chat shows.
+#[tokio::test]
+async fn a_reconciled_turn_of_another_process_is_agent_exited() {
+    use crate::session_protocol::host::DETAIL_AGENT_EXITED;
+    use crate::session_protocol::wire::ReceiptState;
+    let _profile = crate::test_profile::temp();
+    let dir = short_dir();
+    let mut app = idle_app();
+    let session = broker_session(dir.path()).await;
+    let ids = vec![session.id.clone()];
+    let mut sessions = std::collections::BTreeMap::from([(session.id.clone(), session)]);
+    let (mut bridge, rids, snapshots) = restarted(
+        dir.path(),
+        &mut app,
+        &mut sessions,
+        &ids,
+        Clock::manual(),
+        |_, session| session.process_gen = uuid::Uuid::new_v4().to_string(),
+    )
+    .await;
+    // Its chat even shows the journaled turn running.
+    for (i, snapshot) in snapshots.into_iter().enumerate() {
+        snapshot_arrives(sessions.get_mut(&ids[i]).unwrap(), snapshot);
+    }
+    pass_with(&mut bridge, &mut app, &mut sessions);
+    let r = bridge.host().receipt(&rids[0]).unwrap();
+    assert_eq!(
+        (r.state, r.detail.as_deref()),
+        (ReceiptState::OutcomeUnknown, Some(DETAIL_AGENT_EXITED))
+    );
+    assert!(!bridge.host_work_reconciling(&rids[0]));
+    assert_eq!(sessions[&ids[0]].chat.current_request_id(), None);
+    let _ = sessions.get_mut(&ids[0]).unwrap().stop();
 }
