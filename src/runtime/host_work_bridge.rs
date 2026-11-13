@@ -465,8 +465,10 @@ impl HostBridge {
     /// Who `principal` is to this host's tasks (Decision 13): delegated
     /// only on an open list ([`HostBridge::open_list`]) with
     /// `host.delegated` on; a service only while the control feeds cover
-    /// it (their committed state; none covered while they aren't loaded or
-    /// don't read: `NoFeeds`).
+    /// it (their committed state). While the feeds aren't loaded or don't
+    /// read, a service in effect on the list is `Unchecked` (its requests
+    /// `busy`, never v1: ruling T32b); natives, browser grants and `local`
+    /// don't depend on control records.
     pub(super) fn sender_class(&self, principal: &str) -> SenderClass {
         let Some(list) = self.open_list() else {
             return SenderClass::V1;
@@ -484,7 +486,20 @@ impl HostBridge {
         if let Feeds::Loaded(feeds) = &self.work.feeds {
             return classify(principal, list, feeds.as_ref(), self.features);
         }
+        if self.features.delegated
+            && self.controls_unchecked()
+            && crate::runtime::delegated::active_service(principal, list).is_some()
+        {
+            return SenderClass::Unchecked;
+        }
         classify(principal, list, &NoFeeds, self.features)
+    }
+
+    /// The host's control state can't be checked: the feeds aren't loaded
+    /// or don't read, and no stand-in replaces them. A service's revocation,
+    /// hold and coverage are unknown then (ruling T32b).
+    pub(super) fn controls_unchecked(&self) -> bool {
+        !matches!(self.work.feeds, Feeds::Loaded(_)) && !self.controls_stood_in()
     }
 
     /// Whether a stand-in drives the start view's standings in place of the
@@ -552,7 +567,11 @@ impl HostBridge {
                     "atem runtime: the stored control state doesn't read ({error:#}); no delegated task starts until it is repaired"
                 );
                 if !stood_in {
-                    self.start_view().controls_damaged = true;
+                    // Never an earlier state's standings in their place
+                    // (Task 32 review m5): services are unchecked meanwhile.
+                    let mut view = self.start_view();
+                    view.standings.clear();
+                    view.controls_damaged = true;
                 }
                 self.work.feeds = Feeds::Damaged;
             }
@@ -586,10 +605,7 @@ impl HostBridge {
     /// project), and a later task of the same project shares them.
     fn keep_task_projects(&mut self, projects: impl IntoIterator<Item = String>) {
         for project in projects {
-            let key = crate::runtime::project_scope::task_project_key(&project);
-            if self.projects.key_of(&key).is_none() {
-                self.projects.session(&key, Some(project));
-            }
+            keep_project(&mut self.projects, &project);
         }
     }
 
@@ -608,21 +624,30 @@ impl HostBridge {
     /// The admission record of a task `a` enqueues through `route_id` at
     /// `route_revision` to `session` (design I.4.1): only a delegated
     /// sender's ([`HostBridge::sender_class`]); none for `local` and every
-    /// v1 sender. With a `projects` scope, the entries the session's launch
-    /// project matched (what `work_allowed` compared) are frozen with it
-    /// (Task 20 review I1).
+    /// v1 sender; `busy` for a service while the control state can't be
+    /// checked (ruling T32b), before anything is stored. With a `projects`
+    /// scope, the entries the session's launch project matched (what
+    /// `work_allowed` compared) are frozen with it (Task 20 review I1).
     fn admission(
         &self,
         a: &Sender,
         route_id: &str,
         route_revision: u64,
         session: &str,
-    ) -> Option<Admission> {
-        let authority = a.remote()?;
-        let SenderClass::Delegated(sender) = self.sender_class(&authority.name()) else {
-            return None;
+    ) -> Result<Option<Admission>, &'static str> {
+        let Some(authority) = a.remote() else {
+            return Ok(None);
         };
-        let seq = self.open_list()?.head().seq;
+        let sender = match self.sender_class(&authority.name()) {
+            SenderClass::Delegated(sender) => sender,
+            SenderClass::V1 => return Ok(None),
+            // Its class can't be decided now (ruling T32b): nothing stored.
+            SenderClass::Unchecked => return Err("busy"),
+        };
+        let Some(list) = self.open_list() else {
+            return Ok(None);
+        };
+        let seq = list.head().seq;
         let matched = authority
             .scope
             .as_ref()
@@ -635,10 +660,10 @@ impl HostBridge {
                     .collect()
             })
             .unwrap_or_default();
-        Some(
+        Ok(Some(
             Admission::freeze(authority, sender, route_id, route_revision, seq)
                 .with_projects(matched),
-        )
+        ))
     }
 
     fn work_host(&self) -> HostTarget {
@@ -1026,8 +1051,12 @@ impl HostBridge {
         self.work.launches.clear();
         self.work.context_jobs.clear();
         self.work.recovered = false;
-        // The next store's own, loaded before its recovery.
+        // The next store's own, loaded before its recovery; nothing of this
+        // identity's shows meanwhile.
         self.work.feeds = Feeds::Unloaded;
+        if !self.controls_stood_in() {
+            self.start_view().standings.clear();
+        }
         let state = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
         let store = self.work.store.take().expect("checked above");
         let next = store.retire(host_now().wall_ms).and_then(|aside| {
@@ -1168,21 +1197,7 @@ impl HostBridge {
             // Its tasks compare their sender's control generation with this
             // one: it is kept from now on (`schedule_work` renews the set).
             self.host.keep_principal(&principal);
-            let reply = self.message_request(req, &a, cx)?;
-            // Its delegated tasks' launch projects, kept hashed (T20c).
-            if let ResultBody::Message { message } = &reply
-                && let Some(store) = self.work.store.as_ref()
-            {
-                let tasks: Vec<WorkRecord> = message
-                    .recipients
-                    .iter()
-                    .filter_map(|r| store.work(&r.recipient_id).ok().flatten())
-                    .collect();
-                for task in &tasks {
-                    self.keep_task_project(task);
-                }
-            }
-            return Ok(reply);
+            return Ok(self.message_request(req, &a, cx)?);
         }
         let store = self.work.store.as_ref().ok_or("busy")?;
         match req {
@@ -1344,7 +1359,13 @@ impl HostBridge {
                     // A delegated task's sender with current authority
                     // (design I.4.5), else v1's rule.
                     let allowed = match &old.delegated {
-                        Some(adm) => self.delegated_caller(&a, &old, adm) == Ok(Caller::Sender),
+                        Some(adm) => match self.delegated_caller(&a, &old, adm) {
+                            Ok(caller) => caller == Caller::Sender,
+                            Err(refused) if refused.code() == "busy" => {
+                                return Err("busy".into());
+                            }
+                            Err(_) => false,
+                        },
                         None => self.work_route_allowed(&old, &a),
                     };
                     if !allowed {
@@ -1363,7 +1384,7 @@ impl HostBridge {
                 // A delegated sender's task: its admission record, stored
                 // with it before the reply (design I.4.1).
                 record.delegated =
-                    self.admission(&a, route_id, *route_revision, &task.target.session_id);
+                    self.admission(&a, route_id, *route_revision, &task.target.session_id)?;
                 store.enqueue(&record).map_err(|_| "busy")?;
                 self.host.keep_principal(&record.principal);
                 self.keep_task_project(&record);
@@ -1385,9 +1406,16 @@ impl HostBridge {
                     // no route hiding it; the owner (Decision 15) only reads
                     // it.
                     Some(adm) => {
+                        // Its launch project kept hashed (T20c): a record
+                        // that closed before this run wasn't registered at
+                        // the start (Task 32 review m1); until its hash is
+                        // made the sender is `busy`.
+                        if adm.scope_at_admission.get("projects").is_some() {
+                            keep_project(&mut self.projects, &r.project);
+                        }
                         let caller = self
                             .delegated_caller(&a, &r, adm)
-                            .map_err(|_| "forbidden")?;
+                            .map_err(|refused| refused.code())?;
                         if caller == Caller::Owner
                             && matches!(req, Request::Cancel { .. } | Request::Complete { .. })
                         {
@@ -1521,7 +1549,7 @@ impl HostBridge {
     }
 
     fn message_request(
-        &self,
+        &mut self,
         req: &hw::Request,
         a: &Sender,
         cx: &Cx,
@@ -1578,11 +1606,11 @@ impl HostBridge {
                 }
             } else {
                 match self.delegated_message_caller(a, &delegated) {
-                    Some(Caller::Owner) if matches!(req, hw::Request::Publish { .. }) => {
+                    Ok(Caller::Owner) if matches!(req, hw::Request::Publish { .. }) => {
                         return Err("forbidden");
                     }
-                    Some(_) => {}
-                    None => return Err("forbidden"),
+                    Ok(_) => {}
+                    Err(refused) => return Err(refused.code()),
                 }
             }
             // By the digest recorded at acceptance, which stays when the
@@ -1684,7 +1712,7 @@ impl HostBridge {
                         route_id,
                         *route_revision,
                         &record.task.target.session_id,
-                    );
+                    )?;
                     tasks.push(record);
                     delivery
                 } else {
@@ -1711,6 +1739,10 @@ impl HostBridge {
             },
         };
         store.accept_message(&record, &tasks).map_err(|_| "busy")?;
+        // Its delegated tasks' launch projects, kept hashed (T20c).
+        for task in &tasks {
+            self.keep_task_project(task);
+        }
         Ok(ResultBody::Message {
             message: record.receipt,
         })
@@ -2300,6 +2332,16 @@ impl HostBridge {
     /// profile has another revision or project.
     fn work_route_changed(&self, a: &Accepted) -> bool {
         self.work.config.route_changed(a)
+    }
+}
+
+/// `project` (a delegated task's launch project) kept hashed under every
+/// kid in use ([`task_project_key`](crate::runtime::project_scope::task_project_key),
+/// ruling T20c); once.
+fn keep_project(projects: &mut ProjectScopes, project: &str) {
+    let key = crate::runtime::project_scope::task_project_key(project);
+    if projects.key_of(&key).is_none() {
+        projects.session(&key, Some(project.to_string()));
     }
 }
 

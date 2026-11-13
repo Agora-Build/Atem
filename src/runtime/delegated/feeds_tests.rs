@@ -207,12 +207,16 @@ struct Stored {
     pending_count: u64,
 }
 
-fn at(seq: u64) -> Option<FeedPos> {
-    Some(FeedPos {
+fn at(seq: u64) -> FeedPos {
+    at_feed(FEED, seq)
+}
+
+fn at_feed(feed_id: &str, seq: u64) -> FeedPos {
+    FeedPos {
         origin: ORIGIN.into(),
-        feed_id: FEED.into(),
+        feed_id: feed_id.into(),
         feed_seq: seq,
-    })
+    }
 }
 
 fn cursor_row(seq: u64) -> Vec<(String, String)> {
@@ -302,7 +306,6 @@ fn a_failed_transaction_loses_no_effect_and_reapplies_the_same() {
     let tx = rig.feeds.begin(&rig.store).unwrap();
     assert!(rig.feeds.apply(&tx, &revoke, &list, at(2), 0).is_err());
     drop(tx);
-    rig.feeds.discard();
     assert_eq!(rig.feeds.standings(), standings, "nothing adopted");
     assert_eq!(rig.stored(), before, "nothing written");
     rig.store
@@ -314,7 +317,6 @@ fn a_failed_transaction_loses_no_effect_and_reapplies_the_same() {
     let tx = rig.feeds.begin(&rig.store).unwrap();
     let first = rig.feeds.apply(&tx, &revoke, &list, at(2), 0).unwrap();
     drop(tx);
-    rig.feeds.discard();
     assert_eq!(rig.feeds.standings(), standings);
     assert_eq!(rig.stored(), before);
 
@@ -394,7 +396,7 @@ fn pending_records_are_reverified_after_each_device_list_advance() {
     let again = rig.reverify();
     assert_eq!(again.len(), 1);
     assert_eq!(again[0].record, hold);
-    assert_eq!(again[0].pos, at(1));
+    assert_eq!(again[0].pos, Some(at(1)));
     assert_eq!(again[0].applied.record_result, ApplicationResult::Applied);
     assert_eq!(
         again[0].applied.actions,
@@ -648,11 +650,7 @@ fn refused_and_conflicting_records_alert_at_most_hourly() {
 #[test]
 fn a_position_is_always_the_hosts_own_stations() {
     let mut rig = rig();
-    assert_eq!(rig.feeds.position(FEED, 7), {
-        let mut p = at(7);
-        p.as_mut().unwrap().feed_seq = 7;
-        p
-    });
+    assert_eq!(rig.feeds.position(FEED, 7), Some(at(7)));
     let cover = rig.bot(ControlAction::Cover);
     let list = serving(&rig.log);
     let before = rig.stored();
@@ -662,10 +660,7 @@ fn a_position_is_always_the_hosts_own_stations() {
         feed_seq: 1,
     };
     let tx = rig.feeds.begin(&rig.store).unwrap();
-    let err = rig
-        .feeds
-        .apply(&tx, &cover, &list, Some(other), 0)
-        .unwrap_err();
+    let err = rig.feeds.apply(&tx, &cover, &list, other, 0).unwrap_err();
     assert!(err.downcast_ref::<NotOwnStation>().is_some());
     rig.feeds.commit(tx).unwrap();
     assert_eq!(rig.stored(), before);
@@ -803,11 +798,189 @@ fn a_record_that_doesnt_parse_is_evidence_past_the_cursor() {
     let mut rig = rig();
     let tx = rig.feeds.begin(&rig.store).unwrap();
     rig.feeds
-        .unparsed(&tx, "{\"body\":{}}", "malformed", at(1).unwrap())
+        .unparsed(&tx, "{\"body\":{}}", "malformed", at(1))
         .unwrap();
     rig.feeds.commit(tx).unwrap();
     let stored = rig.stored();
     assert_eq!(stored.cursors, cursor_row(1));
     assert_eq!(stored.evidence, [1]);
     assert_eq!(rig.feeds.take_lines().len(), 1);
+}
+
+/// Task 32 review m6: a step that fails fails the whole transaction:
+/// `commit` rolls it back (what applied before the failure too), adopts
+/// nothing, and the records applied again give the same results.
+#[test]
+fn a_commit_after_a_failed_step_rolls_the_transaction_back() {
+    let mut rig = rig();
+    let cover = rig.bot(ControlAction::Cover);
+    let hold = rig.bot(ControlAction::Hold);
+    let list = serving(&rig.log);
+    let before = rig.stored();
+    // The cursor's second write fails (the first is an insert).
+    rig.store
+        .db
+        .execute_batch(
+            "CREATE TEMP TRIGGER fail_cursor BEFORE UPDATE ON control_feeds
+            BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        )
+        .unwrap();
+    let tx = rig.feeds.begin(&rig.store).unwrap();
+    let covered = rig.feeds.apply(&tx, &cover, &list, at(1), 0).unwrap();
+    assert!(rig.feeds.apply(&tx, &hold, &list, at(2), 0).is_err());
+    assert!(rig.feeds.commit(tx).is_err(), "rolled back, not committed");
+    assert_eq!(rig.stored(), before, "the cover's writes too");
+    assert_eq!(rig.feeds.standing(BOT), SenderStanding::default());
+    assert!(rig.feeds.take_lines().is_empty());
+    rig.store
+        .db
+        .execute_batch("DROP TRIGGER fail_cursor")
+        .unwrap();
+    assert_eq!(rig.apply_at(&cover, 1), covered);
+    assert_eq!(
+        rig.apply_at(&hold, 2).record_result,
+        ApplicationResult::Applied
+    );
+    assert!(rig.feeds.standing(BOT).held);
+}
+
+/// Task 32 review m6, design I.5.4 ("apply again after ... every revocation
+/// applied"): two records of a service the list doesn't hold yet wait, an
+/// `interrupt_running` before its `revoke`. After the advance one
+/// re-verification applies both: the interrupt, older, waits for the
+/// revoke (`not_revoked`) and applies once it did.
+#[test]
+fn a_revoke_that_applies_lets_a_waiting_interrupt_apply_in_the_same_reverify() {
+    let mut rig = rig();
+    rig.log
+        .keys
+        .insert_ed25519(auth("svc-new"), &secret("svc-new auth"));
+    let interrupt = rig.signed(
+        "svc-new",
+        "svc-new",
+        ControlAction::InterruptRunning { revoke_seq: None },
+        None,
+    );
+    let revoke = rig.signed(
+        "svc-new",
+        "svc-new",
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+        None,
+    );
+    assert_eq!(
+        rig.apply_at(&interrupt, 1).record_result,
+        ApplicationResult::Pending
+    );
+    assert_eq!(
+        rig.apply_at(&revoke, 2).record_result,
+        ApplicationResult::Pending
+    );
+    rig.log.add_service(
+        "svc-new",
+        &["host"],
+        None,
+        &["notify", "prompt", "view"],
+        expiry(),
+    );
+    let again = rig.reverify();
+    let records: Vec<&ControlRecord> = again.iter().map(|r| &r.record).collect();
+    assert_eq!(records, [&revoke, &interrupt]);
+    assert!(
+        again
+            .iter()
+            .all(|r| r.applied.record_result == ApplicationResult::Applied)
+    );
+    assert_eq!(
+        again[1].applied.actions,
+        [HostAction::Interrupt {
+            principal: "service:svc-new".into(),
+            revocation: revoke.record_id().into(),
+        }]
+    );
+    let standing = rig.feeds.mem.state.standing("service:svc-new");
+    assert!(standing.interrupted.contains(revoke.record_id()));
+    assert_eq!(rig.feeds.pending_len(), 0);
+    assert!(rig.stored().pending.is_empty());
+}
+
+/// Task 32 review m3: a transaction dropped before its commit leaves
+/// nothing staged, whatever the caller does next: its records are never
+/// adopted by a later commit, and nothing builds on them.
+#[test]
+fn a_dropped_transaction_leaves_nothing_staged() {
+    let mut rig = rig();
+    let hold = rig.bot(ControlAction::Hold);
+    let cover = rig.bot(ControlAction::Cover);
+    let list = serving(&rig.log);
+    let tx = rig.feeds.begin(&rig.store).unwrap();
+    rig.feeds.apply(&tx, &hold, &list, at(1), 0).unwrap();
+    drop(tx);
+    rig.feeds.tick(&rig.store).unwrap();
+    assert!(!rig.feeds.standing(BOT).held);
+    let tx = rig.feeds.begin(&rig.store).unwrap();
+    rig.feeds.apply(&tx, &cover, &list, at(1), 0).unwrap();
+    rig.feeds.commit(tx).unwrap();
+    assert!(
+        !rig.feeds.standing(BOT).held,
+        "the dropped hold never adopted"
+    );
+    assert_eq!(rig.feeds.standing(BOT).coverage, Some(bot_feed()));
+    assert_eq!(rig.stored().cursors, cursor_row(1));
+}
+
+/// Task 32 review m4: the store keeps one feed per origin, the one it
+/// read last (a reset's new feed replaces the old one's cursor, in the
+/// transaction that reads it): feeds minted by a carrier, even with
+/// records that don't parse, never add rows.
+#[test]
+fn one_feed_per_origin_is_kept() {
+    let mut rig = rig();
+    let cover = rig.bot(ControlAction::Cover);
+    rig.apply_at(&cover, 3);
+    let reset = "33333333-3333-4333-8333-333333333333";
+    let tx = rig.feeds.begin(&rig.store).unwrap();
+    rig.feeds.advance(&tx, at_feed(reset, 0)).unwrap();
+    rig.feeds.commit(tx).unwrap();
+    assert_eq!(
+        rig.stored().cursors,
+        [(format!("{ORIGIN} {reset}"), "0".to_string())]
+    );
+    assert_eq!(rig.feeds.cursor(ORIGIN, FEED), None);
+    assert_eq!(rig.feeds.cursor(ORIGIN, reset), Some(0));
+    for n in 0..5 {
+        let minted = uuid::Uuid::new_v4().to_string();
+        let tx = rig.feeds.begin(&rig.store).unwrap();
+        rig.feeds
+            .unparsed(&tx, "not a record", "not_strict_json", at_feed(&minted, n))
+            .unwrap();
+        rig.feeds.commit(tx).unwrap();
+        assert_eq!(rig.stored().cursors.len(), 1);
+    }
+    let again = load(&rig.store, &rig.log, &rig.clock);
+    assert_eq!(again.mem.cursors.len(), 1);
+    assert_eq!(rig.feeds.mem.cursors.len(), 1);
+}
+
+/// Task 32 review m8: the `control_*` tables come with the feeds (their
+/// first load), never with the store: with the hook off, as on main, a
+/// store has none.
+#[test]
+fn the_control_tables_come_with_the_feeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let tables = |store: &Store| -> u32 {
+        store
+            .db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'control%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(tables(&store), 0);
+    FeedStore::load(&store, &list().log).unwrap();
+    assert_eq!(tables(&store), 5);
 }

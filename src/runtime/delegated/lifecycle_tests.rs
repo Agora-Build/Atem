@@ -716,12 +716,12 @@ fn narrowing_fails_only_uncovered_unstarted_tasks() {
         assert_eq!(
             rig.bridge
                 .delegated_message_caller(&as_bot, std::slice::from_ref(&covered)),
-            Some(Caller::Sender)
+            Ok(Caller::Sender)
         );
         assert_eq!(
             rig.bridge
                 .delegated_message_caller(&as_bot, &[covered, left_out]),
-            None
+            Err(crate::runtime::delegated::authority::Refused::NotCovered)
         );
         assert_eq!(settled(&rig, &phones).0, WorkState::Blocked);
         rig.bridge.start_view().gates.open_own_station(ORIGIN);
@@ -1653,7 +1653,7 @@ fn commit_bot_records(
             (ORIGIN, FEED_ID),
             host_now().wall_ms + i as u64,
         );
-        let pos = feeds.position(FEED_ID, i as u64 + 1);
+        let pos = feeds.position(FEED_ID, i as u64 + 1).unwrap();
         feeds.apply(&tx, &rec, &list, pos, 0).unwrap();
     }
     feeds.commit(tx).unwrap();
@@ -1696,7 +1696,7 @@ fn the_feeds_cover_a_service_and_reach_the_start_view_at_commit() {
             };
             feeds.set_own_origin(Some(ORIGIN.into()));
             let tx = feeds.begin(store).unwrap();
-            let pos = feeds.position(FEED_ID, seq);
+            let pos = feeds.position(FEED_ID, seq).unwrap();
             feeds.apply(&tx, &rec, &list, pos, 0).unwrap();
             feeds.commit(tx).unwrap();
         };
@@ -1721,6 +1721,90 @@ fn the_feeds_cover_a_service_and_reach_the_start_view_at_commit() {
         run(&mut rig, &task, "COVERED_BY_A_RECORD").await;
         apply(&mut rig, ControlAction::Hold, 2);
         assert!(rig.bridge.start_view().standings[BOT].held);
+
+        // A store whose state doesn't read, loaded as after a new identity
+        // (Task 32 review m5, I1): the standings shown so far go, the bot
+        // is unchecked (never v1), and nothing delegated starts.
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute(
+                "INSERT INTO control_principals(principal,part) VALUES('service:svc-x','{damaged')",
+                [],
+            )
+            .unwrap();
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        rig.bridge.ensure_feeds();
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Damaged));
+        assert!(rig.bridge.start_view().standings.is_empty());
+        assert!(rig.bridge.start_view().controls_damaged);
+        assert_eq!(rig.bridge.sender_class(BOT), SenderClass::Unchecked);
+        assert!(matches!(
+            rig.bridge.sender_class(PHONE),
+            SenderClass::Delegated(crate::runtime::delegated::DelegatedSender::Native { .. })
+        ));
+    });
+}
+
+/// Task 32 review m1 (ruling T20c): a task whose launch project was never
+/// hashed in this run (its record closed before a restart: only open
+/// records are registered at the start) is registered when its sender asks
+/// about it; while that hash isn't made the sender gets `busy`, never a
+/// `forbidden` that would stand, and then reads it.
+#[test]
+fn a_task_whose_project_isnt_hashed_yet_is_busy_until_it_is() {
+    const NEW_KID: &str = "0e0f0a0c";
+    const NEW_PROJECT: &str =
+        "h1.0e0f0a0c.4444444444444444444444444444444444444444444444444444444444444444";
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let agent = TableAgent::new(true);
+        let mut s =
+            with_project_bot(&mut rig, root, &os, start + 3 * HOUR, &[PROJECT], &agent).await;
+        let task = bot_task(&mut rig, &s, "PROJECTS_NOT_HASHED", start + HOUR);
+        run(&mut rig, &task, "PROJECTS_NOT_HASHED").await;
+        // As a restart finds it once its record closed: not registered.
+        rig.bridge
+            .projects
+            .forget(&crate::runtime::project_scope::task_project_key(
+                RIG_PROJECT,
+            ));
+        let session = rig.sessions.remove(&rig.sid).unwrap();
+        let _ = session.stop();
+        passes(&mut rig, 3);
+        agent
+            .table
+            .lock()
+            .unwrap()
+            .insert((RIG_PROJECT.into(), NEW_KID.into()), NEW_PROJECT.into());
+        let change = s.log.set_service(
+            "svc-bot",
+            &ServiceScope::new(["host"])
+                .projects(Some([NEW_PROJECT]))
+                .ops(["message", "notify", "prompt", "stop"]),
+            start + 3 * HOUR,
+        );
+        carry(&mut rig, &s.log, change);
+        let bot = s.bot.clone();
+        assert_eq!(
+            ask(&mut rig, &bot, Q::Query(&task)),
+            busy(),
+            "not yet hashed"
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut asked = ask(&mut rig, &bot, Q::Query(&task));
+        while asked.is_err() && Instant::now() < deadline {
+            assert_eq!(asked, busy(), "busy until hashed, never forbidden");
+            passes(&mut rig, 1);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            asked = ask(&mut rig, &bot, Q::Query(&task));
+        }
+        assert_eq!(status(asked).state, WorkState::AwaitingResult);
     });
 }
 

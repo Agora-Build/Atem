@@ -68,6 +68,13 @@ pub enum SenderClass {
     /// Host-work v1's (§4): browser grants, services no feed covers,
     /// `local`, and everyone while `host.delegated` is off.
     V1,
+    /// A service in effect on the list while the host's control state
+    /// can't be read (`feeds::Feeds` damaged or not loaded): whether a feed
+    /// covers it, revoked it or holds it isn't known, so its requests are
+    /// `busy` and nothing is stored; never v1, which a revoke or hold
+    /// wouldn't stop (ruling T32b: damage loosens nothing). `classify`
+    /// never gives it: the bridge does (`HostBridge::sender_class`).
+    Unchecked,
 }
 
 /// What the host's control state says of a principal: revoked (by which
@@ -86,8 +93,9 @@ pub trait ControlView {
 }
 
 /// The view while the host's control feeds aren't loaded, or don't read
-/// ([`feeds::Feeds`]): nobody is revoked, held or covered (the start check
-/// then lets no delegated task start: `StartView::controls_damaged`).
+/// ([`feeds::Feeds`]): nobody is revoked, held or covered. The bridge never
+/// lets that loosen anything: a service is `SenderClass::Unchecked` then
+/// (`busy`), and no delegated task starts (`StartView::controls_damaged`).
 pub struct NoFeeds;
 
 impl ControlView for NoFeeds {
@@ -252,8 +260,7 @@ pub fn classify(
             device_id: device_id.to_owned(),
         });
     }
-    if let Some(device_id) = principal.strip_prefix("service:")
-        && matches!(kind(device_id), Some(MemberKind::Service { .. }))
+    if let Some(device_id) = active_service(principal, list)
         && let Some(feed) = controls.standing(principal).coverage
     {
         return SenderClass::Delegated(DelegatedSender::Service {
@@ -262,6 +269,16 @@ pub fn classify(
         });
     }
     SenderClass::V1
+}
+
+/// The device id of `principal` when it is `service:<id>` and a service in
+/// effect on `list`: whom a feed may cover (`classify`'s service test).
+pub fn active_service<'p>(principal: &'p str, list: &Membership) -> Option<&'p str> {
+    let device_id = principal.strip_prefix("service:")?;
+    list.member(device_id)
+        .filter(|m| m.status == MemberStatus::Active)
+        .filter(|m| matches!(m.member.kind, MemberKind::Service { .. }))
+        .map(|_| device_id)
 }
 
 /// What the bridge answers a `host.delegated` or `host.alerts` op that

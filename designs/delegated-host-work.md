@@ -780,7 +780,10 @@ identity, `account_id` and `genesis_hash` (R9.2), carried as push hints carry th
 a count, plus the 32 most recent of each, persisted at most once a minute. Alerts for failed or conflicting records are
 rate-limited to one an hour per source, with the count: per origin for a feed, and per carrying principal for records
 that arrive over a channel (II.3.1), which have no origin. A Station or a carrier can't fill a host's storage or
-flood the owner with alerts this way.
+flood the owner with alerts this way. **Atem's reading (step 4, ruling T32a):** "at most once a minute" is for
+evidence, which has no effect. A pending record is written in the transaction that applies it, with the cursor
+(I.5.5): it is a deferred effect past the cursor, and a crash before a later write would lose a stop the feed never
+serves again. Its 32-row bound still caps storage, and the cursor's write already costs the transaction.
 
 ### I.5.5 Applying a record on the host
 

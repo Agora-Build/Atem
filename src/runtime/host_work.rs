@@ -1088,21 +1088,7 @@ impl Store {
                 \"end\" TEXT, counted INTEGER NOT NULL, created_ms INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id);
             CREATE UNIQUE INDEX IF NOT EXISTS attempts_live ON attempts(task_id)
-                WHERE \"end\" IS NULL;
-            CREATE TABLE IF NOT EXISTS control_feeds (
-                origin TEXT NOT NULL, feed_id TEXT NOT NULL, cursor INTEGER NOT NULL,
-                PRIMARY KEY(origin, feed_id)) WITHOUT ROWID;
-            CREATE TABLE IF NOT EXISTS control_principals (
-                principal TEXT PRIMARY KEY, part TEXT NOT NULL) WITHOUT ROWID;
-            CREATE TABLE IF NOT EXISTS control_pending (
-                n INTEGER PRIMARY KEY, principal TEXT NOT NULL, record_id TEXT NOT NULL,
-                record TEXT NOT NULL, pos TEXT, source TEXT NOT NULL, reason TEXT NOT NULL,
-                at_ms INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS control_evidence (
-                n INTEGER PRIMARY KEY, source TEXT NOT NULL, record TEXT NOT NULL,
-                reason TEXT NOT NULL, at_ms INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS control_counts (
-                kind TEXT PRIMARY KEY, count INTEGER NOT NULL) WITHOUT ROWID;")?;
+                WHERE \"end\" IS NULL;")?;
         track_open_records(&db)?;
         track_waits(&db)?;
         std::fs::File::open(state)?.sync_all()?;
@@ -2453,6 +2439,67 @@ mod tests {
         // Nothing more is due: nothing is written.
         assert_eq!(store.settle_overdue(1_999, |_| None).unwrap(), 0);
         assert_eq!(store.settle_overdue(2_000, |_| None).unwrap(), 1);
+    }
+
+    /// Ruling T20c (Task 32 review m1): the launch projects hashed for
+    /// delegated tasks at a start are those of every delegated task with a
+    /// `projects` scope whose record is open: settled ones too, until their
+    /// payloads (the reply among them) are dropped and the record closes.
+    #[test]
+    fn delegated_projects_include_settled_tasks_until_their_payloads_drop() {
+        use crate::runtime::delegated::{Admission, DelegatedSender, FeedRef};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.bind(&host()).unwrap();
+        let put = |project: &str, state: WorkState, scope: Option<serde_json::Value>| {
+            let mut r = task();
+            r.project = project.into();
+            r.status.state = state;
+            r.delegated = scope.map(|scope| Admission {
+                principal: "service:bot".into(),
+                principal_key: "ab".repeat(32),
+                sender: DelegatedSender::Service {
+                    device_id: "bot".into(),
+                    feed: FeedRef {
+                        origin: "https://s.test".into(),
+                        feed_id: "f".into(),
+                    },
+                },
+                feed: None,
+                route_id: "backend".into(),
+                route_revision: 1,
+                ops_at_admission: vec!["notify".into(), "prompt".into()],
+                scope_at_admission: scope,
+                grant_expires_at: Some(100),
+                device_list_seq: 3,
+                projects_matched: vec![],
+            });
+            store
+                .db
+                .execute(
+                    "INSERT INTO work(id,record,state) VALUES(?1,?2,?3)",
+                    params![
+                        r.task.task_id,
+                        serde_json::to_string(&r).unwrap(),
+                        serde_json::to_value(state).unwrap().as_str().unwrap()
+                    ],
+                )
+                .unwrap();
+        };
+        let projects =
+            serde_json::json!({"ops": ["notify"], "hosts": ["host"], "projects": ["h1.k.aa"]});
+        let hosts = serde_json::json!({"ops": ["notify"], "hosts": ["host"]});
+        put("local:open", WorkState::Queued, Some(projects.clone()));
+        put("local:done", WorkState::Completed, Some(projects));
+        put("local:unscoped", WorkState::Queued, Some(hosts));
+        put("local:v1", WorkState::Queued, None);
+        let want = |p: &[&str]| p.iter().map(|p| p.to_string()).collect::<BTreeSet<_>>();
+        assert_eq!(
+            store.delegated_projects().unwrap(),
+            want(&["local:done", "local:open"])
+        );
+        store.drop_payloads(100 + PAYLOAD_RETENTION_MS).unwrap();
+        assert_eq!(store.delegated_projects().unwrap(), want(&["local:open"]));
     }
 
     /// A task awaiting its result, delegated or not, due at `expires_at`

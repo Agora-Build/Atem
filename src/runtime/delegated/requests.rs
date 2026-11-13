@@ -29,6 +29,8 @@ impl HostBridge {
 
     /// Who `a` is to the delegated task `r`, admitted as `adm` (design
     /// I.4.5, Decision 15): its sender with current authority, or the owner.
+    /// A service sender is `Refused::Unchecked` (`busy`) while the control
+    /// state can't be read (ruling T32b); the owner still reads.
     /// Read on the host's device list while it is open and serving, the
     /// sender's control standing, and a grant's expiry against the later of
     /// the wall clock (what resolved the caller's channel authority) and the
@@ -62,6 +64,8 @@ impl HostBridge {
             &Grounds {
                 list,
                 standing: &standing,
+                // A service's standing can't be checked (ruling T32b).
+                unchecked: self.controls_unchecked(),
                 host_id: &host_id,
                 now_ms: host_now().wall_ms.max(now_d),
                 // The session's hash, else the task's launch project's
@@ -80,22 +84,22 @@ impl HostBridge {
     /// Who `a` is to a message whose agent recipients include delegated
     /// tasks (`tasks`, each with its admission), for `message_query` and a
     /// `message_publish` retry: the tasks' caller rule, every one of them
-    /// (the owner, or the sender with current authority over each); `None`
-    /// when it may not.
+    /// (the owner, or the sender with current authority over each); why
+    /// not when it may not (the first task's reason).
     pub(super) fn delegated_message_caller(
         &self,
         a: &Sender,
         tasks: &[WorkRecord],
-    ) -> Option<Caller> {
+    ) -> Result<Caller, Refused> {
         let mut caller = Caller::Sender;
         for t in tasks {
-            let adm = t.delegated.as_ref()?;
-            match self.delegated_caller(a, t, adm).ok()? {
+            let adm = t.delegated.as_ref().ok_or(Refused::NotTheSender)?;
+            match self.delegated_caller(a, t, adm)? {
                 Caller::Owner => caller = Caller::Owner,
                 Caller::Sender => {}
             }
         }
-        Some(caller)
+        Ok(caller)
     }
 
     /// `work_cancel` of the delegated task `r` by its sender (design I.4.5,

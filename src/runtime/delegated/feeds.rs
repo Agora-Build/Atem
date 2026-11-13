@@ -7,20 +7,27 @@
 //!
 //! - **One transaction.** A record is verified and applied
 //!   ([`ControlState::apply`]) against the device list as it commits, and
-//!   what it changes is written in the caller's `BEGIN IMMEDIATE`
-//!   transaction ([`FeedStore::begin`]): the touched principals' parts (one
+//!   what it changes is written in the store's own `BEGIN IMMEDIATE`
+//!   transaction ([`FeedStore::begin`] gives a [`FeedTx`], the only
+//!   transaction records apply in): the touched principals' parts (one
 //!   `control_principals` row each), the feed's cursor (`control_feeds`),
 //!   a record kept pending, and evidence when it is due. The caller writes
-//!   the record's effects (Task 35) in the same transaction. The next state
-//!   is adopted only by [`FeedStore::commit`], once the transaction
-//!   committed: a transaction that fails, or is dropped, loses no effect,
-//!   and the record applied again to the state kept gives the same results
-//!   and actions. Nothing applies while the device list is frozen, held,
-//!   faulted or gone ([`ListNotServing`]): the record isn't consumed.
+//!   the record's effects (Task 35) in the same transaction (a `FeedTx`
+//!   derefs to it). The next state is adopted only by [`FeedStore::commit`],
+//!   once the transaction committed: a transaction in which a step failed
+//!   is rolled back by it, one dropped forgets what it staged, and either
+//!   loses no effect: the record applied again to the state kept gives the
+//!   same results and actions. Nothing applies while the device list is
+//!   frozen, held, faulted or gone ([`ListNotServing`]): the record isn't
+//!   consumed.
 //! - **Positions.** A record read from a feed is at the host's own
 //!   configured Station's origin, always ([`FeedStore::position`]): never
 //!   one taken from a page or a record (§11.1's host rule, which bounds a
 //!   part's `order`). Any other position is refused ([`NotOwnStation`]).
+//!   One feed per origin is kept: another feed of the origin (a reset's
+//!   new one, or one a carrier minted) replaces the old one's cursor in the
+//!   transaction that reads it. Records carried over a channel
+//!   ([`FeedStore::apply_carried`]) have no position.
 //! - **Loading** ([`FeedStore::load`]) reads the parts of the host's pinned
 //!   device list ([`ControlState::from_parts`]): the parts of an earlier
 //!   list are logged and their rows deleted; a part of the current list
@@ -28,6 +35,9 @@
 //!   stopped (never an empty state in its place: [`Feeds::Damaged`]). A
 //!   store starts empty only when it is new, which a new host identity (a
 //!   new pairing or verification) makes it: the old one is moved aside.
+//!   The `control_*` tables are made by the first load: a store whose
+//!   feeds never load (the hook off, no delegated task) has none, as on
+//!   main.
 //! - **Pending records** (I.5.4) wait, written with the record's
 //!   transaction (a stop past the cursor survives a crash), and are applied
 //!   again by [`FeedStore::reverify_pending`] after every device-list
@@ -58,6 +68,8 @@ use atem_client::membership::{HostNow, Membership};
 use rusqlite::{Connection, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Pending records and evidence each keep a count and this many of the
 /// most recent (design I.5.4, as R9.3 bounds device-list evidence).
@@ -71,6 +83,24 @@ pub const ALERT_EVERY_MS: u64 = 3_600_000;
 const MAX_PART_BYTES: usize = 1 << 20;
 /// A record kept as evidence keeps at most this much of its text.
 const MAX_KEPT_TEXT: usize = 16 * 1024;
+/// The feeds' tables, made by their first load (Task 32 review m8): a
+/// store whose feeds never load (the hook off, no delegated task: main)
+/// has none. Additive, as every host-work table.
+const TABLES: &str = "
+    CREATE TABLE IF NOT EXISTS control_feeds (
+        origin TEXT NOT NULL, feed_id TEXT NOT NULL, cursor INTEGER NOT NULL,
+        PRIMARY KEY(origin, feed_id)) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS control_principals (
+        principal TEXT PRIMARY KEY, part TEXT NOT NULL) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS control_pending (
+        n INTEGER PRIMARY KEY, principal TEXT NOT NULL, record_id TEXT NOT NULL,
+        record TEXT NOT NULL, pos TEXT, source TEXT NOT NULL, reason TEXT NOT NULL,
+        at_ms INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS control_evidence (
+        n INTEGER PRIMARY KEY, source TEXT NOT NULL, record TEXT NOT NULL,
+        reason TEXT NOT NULL, at_ms INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS control_counts (
+        kind TEXT PRIMARY KEY, count INTEGER NOT NULL) WITHOUT ROWID;";
 
 /// Where the start view's standings go when what they show commits
 /// (Decision 16).
@@ -250,6 +280,39 @@ fn alert_line(alert: &Alertable, n: u64) -> String {
     )
 }
 
+/// A feed store's transaction ([`FeedStore::begin`]): a `BEGIN IMMEDIATE`
+/// transaction on the store, the only one its records apply in. What the
+/// caller writes with them (a record's effects) goes in the same
+/// transaction (it derefs to it). Committed by [`FeedStore::commit`];
+/// dropped, it rolls back, and the store forgets what it staged (nothing
+/// builds on it).
+pub struct FeedTx<'s> {
+    tx: Option<Transaction<'s>>,
+    /// Which of the store's transactions it is.
+    generation: u64,
+    /// The store's open transaction's generation (0: none).
+    open: Arc<AtomicU64>,
+}
+
+impl<'s> std::ops::Deref for FeedTx<'s> {
+    type Target = Transaction<'s>;
+    fn deref(&self) -> &Transaction<'s> {
+        self.tx
+            .as_ref()
+            .expect("a feed transaction is open until its commit")
+    }
+}
+
+impl Drop for FeedTx<'_> {
+    fn drop(&mut self) {
+        // No longer the store's open transaction: what it staged is
+        // forgotten at the store's next step.
+        let _ = self
+            .open
+            .compare_exchange(self.generation, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+}
+
 /// The host's control feeds (the module docs give the rules).
 pub struct FeedStore {
     /// As committed.
@@ -259,6 +322,10 @@ pub struct FeedStore {
     /// Something failed in the open transaction: it is rolled back, never
     /// committed.
     failed: bool,
+    /// The latest transaction's generation, and the open one's (shared
+    /// with its [`FeedTx`]; 0 once it committed or was dropped).
+    generation: u64,
+    open: Arc<AtomicU64>,
     /// The host's own configured Station's origin.
     own: Option<String>,
     alerts: Alerts,
@@ -275,6 +342,7 @@ impl FeedStore {
     /// error: the caller keeps delegated work stopped.
     pub fn load(store: &Store, list: &Membership) -> Result<FeedStore> {
         let db = &store.db;
+        db.execute_batch(TABLES)?;
         let rows: Vec<(String, String)> = {
             let mut st = db.prepare("SELECT principal, part FROM control_principals")?;
             st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -365,6 +433,8 @@ impl FeedStore {
             mem,
             staged: None,
             failed: false,
+            generation: 0,
+            open: Arc::new(AtomicU64::new(0)),
             own: None,
             alerts: Alerts::default(),
             lines,
@@ -373,42 +443,48 @@ impl FeedStore {
         })
     }
 
-    /// A `BEGIN IMMEDIATE` transaction on `store` for records to apply in;
-    /// whatever an earlier transaction left uncommitted is discarded.
-    pub fn begin<'s>(&mut self, store: &'s Store) -> Result<Transaction<'s>> {
-        self.discard();
-        store.immediate()
+    /// A `BEGIN IMMEDIATE` transaction on `store` for records to apply in
+    /// ([`FeedTx`]); whatever an earlier one left uncommitted is forgotten.
+    /// One at a time: another can't begin while one is open.
+    pub fn begin<'s>(&mut self, store: &'s Store) -> Result<FeedTx<'s>> {
+        let tx = store.immediate()?;
+        self.generation += 1;
+        self.open.store(self.generation, Ordering::SeqCst);
+        self.staged = None;
+        self.failed = false;
+        Ok(FeedTx {
+            tx: Some(tx),
+            generation: self.generation,
+            open: self.open.clone(),
+        })
     }
 
-    /// Applies `rec`, read at `pos` of the host's own Station's feed
-    /// (`None`: no position, a channel), in `tx`, verified against `list`
-    /// as it is now; `applied_seq` is host-work's applied device-list
-    /// `seq`. Writes the touched parts, the cursor, a pending record and
-    /// evidence when due; adopted at [`FeedStore::commit`]. After a record
-    /// whose revocation applied, call [`FeedStore::reverify_pending`]
-    /// (`interrupt`s may wait for it). Refused, with nothing written:
-    /// [`ListNotServing`], [`NotOwnStation`]. Any other error leaves `tx`
-    /// to be rolled back.
+    /// Applies `rec`, read at `pos` of the host's own Station's feed, in
+    /// `tx`, verified against `list` as it is now; `applied_seq` is
+    /// host-work's applied device-list `seq`. Writes the touched parts, the
+    /// cursor, a pending record and evidence when due; adopted at
+    /// [`FeedStore::commit`]. After a record whose revocation applied, call
+    /// [`FeedStore::reverify_pending`] (`interrupt`s may wait for it).
+    /// Refused, with nothing written: [`ListNotServing`],
+    /// [`NotOwnStation`]. Any other error fails `tx` (its commit rolls it
+    /// back).
     pub fn apply(
         &mut self,
-        tx: &Transaction,
+        tx: &FeedTx,
         rec: &ControlRecord,
         list: &ListState,
-        pos: Option<FeedPos>,
+        pos: FeedPos,
         applied_seq: u64,
     ) -> Result<Applied> {
-        let source = match &pos {
-            Some(p) => Source::Feed(p.origin.clone()),
-            None => Source::Carrier("a channel".into()),
-        };
-        self.apply_from(tx, rec, list, pos, source, applied_seq)
+        let source = Source::Feed(pos.origin.clone());
+        self.apply_from(tx, rec, list, Some(pos), source, applied_seq)
     }
 
     /// [`FeedStore::apply`] for a record `carrier` brought over a channel
     /// (no position): its alerts are rate-limited per carrier.
     pub fn apply_carried(
         &mut self,
-        tx: &Transaction,
+        tx: &FeedTx,
         rec: &ControlRecord,
         list: &ListState,
         carrier: &str,
@@ -426,13 +502,14 @@ impl FeedStore {
 
     fn apply_from(
         &mut self,
-        tx: &Transaction,
+        tx: &FeedTx,
         rec: &ControlRecord,
         list: &ListState,
         pos: Option<FeedPos>,
         source: Source,
         applied_seq: u64,
     ) -> Result<Applied> {
+        self.ours(tx)?;
         serving(list)?;
         if let Some(p) = &pos {
             self.own_position(p)?;
@@ -443,15 +520,21 @@ impl FeedStore {
         self.stage(mem, out)
     }
 
+    /// The host's own Station's feed `pos.feed_id` is read up to
+    /// `pos.feed_seq` (a page with no record, a reset's empty feed), in
+    /// `tx`.
+    pub fn advance(&mut self, tx: &FeedTx, pos: FeedPos) -> Result<()> {
+        self.ours(tx)?;
+        self.own_position(&pos)?;
+        let mut mem = self.staged.take().unwrap_or_else(|| self.mem.clone());
+        let out = mem.advance(tx, &pos);
+        self.stage(mem, out)
+    }
+
     /// A record of the feed at `pos` that doesn't parse (`code`, the
     /// parse's): kept as evidence, the cursor past it, in `tx`.
-    pub fn unparsed(
-        &mut self,
-        tx: &Transaction,
-        text: &str,
-        code: &str,
-        pos: FeedPos,
-    ) -> Result<()> {
+    pub fn unparsed(&mut self, tx: &FeedTx, text: &str, code: &str, pos: FeedPos) -> Result<()> {
+        self.ours(tx)?;
         self.own_position(&pos)?;
         let now = (self.clock)();
         let mut mem = self.staged.take().unwrap_or_else(|| self.mem.clone());
@@ -470,10 +553,11 @@ impl FeedStore {
     /// returned with what they did. Nothing while the list doesn't serve.
     pub fn reverify_pending(
         &mut self,
-        tx: &Transaction,
+        tx: &FeedTx,
         list: &ListState,
         applied_seq: u64,
     ) -> Result<Vec<Reapplied>> {
+        self.ours(tx)?;
         if serving(list).is_err() {
             return Ok(Vec::new());
         }
@@ -487,13 +571,16 @@ impl FeedStore {
     /// publishes the standings. A transaction in which something failed is
     /// rolled back instead (an error), as is one whose commit fails: the
     /// state applied on is kept.
-    pub fn commit(&mut self, tx: Transaction) -> Result<()> {
+    pub fn commit(&mut self, mut tx: FeedTx) -> Result<()> {
+        self.ours(&tx)?;
+        let inner = tx.tx.take().expect("open until its commit");
+        drop(tx);
         if self.failed {
-            drop(tx);
+            drop(inner);
             self.discard();
             bail!("a control record's transaction failed; rolled back");
         }
-        if let Err(e) = tx.commit() {
+        if let Err(e) = inner.commit() {
             self.discard();
             return Err(e.into());
         }
@@ -511,9 +598,25 @@ impl FeedStore {
 
     /// Forgets what the open transaction applied (it was rolled back or
     /// dropped).
-    pub fn discard(&mut self) {
+    fn discard(&mut self) {
         self.staged = None;
         self.failed = false;
+    }
+
+    /// `tx` is this store's open transaction, its latest: what is staged
+    /// is its own. Anything else is refused, nothing done.
+    fn ours(&mut self, tx: &FeedTx) -> Result<()> {
+        if self.open.load(Ordering::SeqCst) != self.generation {
+            // The latest transaction is gone (dropped): nothing of it stays.
+            self.discard();
+        }
+        if !Arc::ptr_eq(&tx.open, &self.open)
+            || tx.generation != self.generation
+            || self.open.load(Ordering::SeqCst) != tx.generation
+        {
+            bail!("not this feed store's open transaction");
+        }
+        Ok(())
     }
 
     /// What is due outside a record's transaction: evidence counted in
@@ -521,6 +624,9 @@ impl FeedStore {
     /// its own transaction); an alert line for a source whose hour passed
     /// with records counted.
     pub fn tick(&mut self, store: &Store) -> Result<()> {
+        if self.open.load(Ordering::SeqCst) != self.generation {
+            self.discard();
+        }
         let now = (self.clock)();
         if !self.mem.evidence.unwritten.is_empty() && self.mem.evidence.due(&now) {
             let mut evidence = self.mem.evidence.clone();
@@ -726,13 +832,22 @@ impl Mem {
         }
     }
 
-    /// The feed's cursor past `pos` (it never goes back).
+    /// The feed's cursor past `pos` (it never goes back). One feed per
+    /// origin is kept (Task 32 review m4): another feed of the origin (the
+    /// one a reset replaced, or one a carrier minted) goes in the same
+    /// transaction, so feed ids never add rows.
     fn advance(&mut self, tx: &Connection, pos: &FeedPos) -> Result<()> {
         let key = (pos.origin.clone(), pos.feed_id.clone());
         let cursor = self
             .cursors
             .get(&key)
             .map_or(pos.feed_seq, |c| (*c).max(pos.feed_seq));
+        tx.execute(
+            "DELETE FROM control_feeds WHERE origin=?1 AND feed_id<>?2",
+            params![pos.origin, pos.feed_id],
+        )?;
+        self.cursors
+            .retain(|(origin, feed_id), _| *origin != pos.origin || *feed_id == pos.feed_id);
         tx.execute(
             "INSERT INTO control_feeds(origin,feed_id,cursor) VALUES(?1,?2,?3)
             ON CONFLICT(origin,feed_id) DO UPDATE SET cursor=excluded.cursor",

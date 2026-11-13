@@ -1180,6 +1180,21 @@ or `order`, `after_revoke`, `not_newer`, `possible_replay`), or kept as
 evidence (`collision`, `possible_replay`): `Applied.why`, the host's for its
 pending store, evidence and alerts.
 
+**On the host (Atem's reading, step 4, rulings T32a and T32b).** A pending
+record is written in the transaction that applies it, with the cursor
+(design I.5.4's "at most once a minute" is evidence's). While the host's
+device list is frozen, held after a write fault, faulted or gone, a record
+is neither applied nor kept pending: it isn't consumed, the cursor stays,
+and the feed is read on from it once the list serves (a frozen list never
+serves again in place: a re-pair is a new host identity and a new store).
+So a host stores no `list_frozen` record; the reason stays the reference
+state's for a caller that keeps one. One feed per origin is kept: a reset's
+new feed replaces the old one's cursor. A stored control state that
+doesn't read stops every delegated task (`revocations not yet checked`),
+and a service sender is answered `busy` until it reads (its admission, its
+own tasks' queries and completion; the owner still reads): never as
+uncovered, which a revoke or hold wouldn't stop.
+
 **Resets** (**Atem's proposal, agreed with Astation (2026-11-11, #120
 comment 6810116314) and Auth/Portal (2026-11-12, #147 comment 6813332550)**: design I.5.2's snapshot re-issues "the latest revoke, hold or
 release and interrupt state" and names no cover). A reset's snapshot is
