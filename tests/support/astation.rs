@@ -46,6 +46,27 @@ pub struct FakeAstation {
     pub auth: Arc<Mutex<AuthReply>>,
     /// The command channel of each connection, by number.
     links: Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<Cmd>>>>,
+    /// Where the host's Station calls go once a fake Station took them.
+    station: StationTap,
+}
+
+/// The host's Station calls (host-work-v1 §11.4: `control_sync`,
+/// `control_ack`, `membership_fetch`) once a fake Station took them
+/// ([`FakeAstation::station_calls`]): each with its link, as the bytes Atem
+/// sent, instead of an `Event::Message`.
+type StationTap = Arc<Mutex<Option<mpsc::Sender<(u64, String)>>>>;
+
+/// Sends on a fake's links, as [`FakeAstation::send`] does, without
+/// borrowing the fake (a fake Station keeps one).
+#[derive(Clone)]
+pub struct LinkSender(Arc<Mutex<HashMap<u64, tokio::sync::mpsc::UnboundedSender<Cmd>>>>);
+
+impl LinkSender {
+    pub fn send(&self, link: u64, text: String) {
+        if let Some(tx) = self.0.lock().unwrap().get(&link) {
+            let _ = tx.send(Cmd::Send(text));
+        }
+    }
 }
 
 impl FakeAstation {
@@ -57,6 +78,8 @@ impl FakeAstation {
         let shared = links.clone();
         let auth: Arc<Mutex<AuthReply>> = Arc::default();
         let answers = auth.clone();
+        let station: StationTap = Arc::default();
+        let tap = station.clone();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -77,7 +100,8 @@ impl FakeAstation {
                     let events = events_tx.clone();
                     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
                     shared.lock().unwrap().insert(n, cmd_tx);
-                    tokio::spawn(link(n, stream, events, cmd_rx, answers.clone()));
+                    let link = link(n, stream, events, cmd_rx, answers.clone(), tap.clone());
+                    tokio::spawn(link);
                 }
             });
         });
@@ -87,13 +111,28 @@ impl FakeAstation {
             events,
             auth,
             links,
+            station,
         }
     }
 
     pub fn send(&self, link: u64, text: String) {
-        if let Some(tx) = self.links.lock().unwrap().get(&link) {
-            let _ = tx.send(Cmd::Send(text));
-        }
+        self.sender().send(link, text);
+    }
+
+    /// A sender on this fake's links.
+    pub fn sender(&self) -> LinkSender {
+        LinkSender(self.links.clone())
+    }
+
+    /// From now on the host's Station calls on every link of this fake go
+    /// to the returned receiver, each with its link and as the bytes Atem
+    /// sent, and no longer arrive as `Event::Message` (a fake Station reads
+    /// them: tests/support/station.rs). One taker: a later call takes them
+    /// over. Once the receiver is dropped they arrive as events again.
+    pub fn station_calls(&self) -> mpsc::Receiver<(u64, String)> {
+        let (tx, rx) = mpsc::channel();
+        *self.station.lock().unwrap() = Some(tx);
+        rx
     }
 
     pub fn close(&self, link: u64) {
@@ -110,6 +149,7 @@ async fn link(
     events: mpsc::Sender<Event>,
     commands: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
     auth: Arc<Mutex<AuthReply>>,
+    tap: StationTap,
 ) {
     let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
         return;
@@ -121,7 +161,7 @@ async fn link(
     {
         return;
     }
-    serve(n, socket, events, commands, auth).await;
+    serve(n, socket, events, commands, auth, tap).await;
 }
 
 /// Astation's `auth_required` for a link over `transport`.
@@ -139,6 +179,7 @@ async fn serve(
     events: mpsc::Sender<Event>,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
     auth: Arc<Mutex<AuthReply>>,
+    tap: StationTap,
 ) {
     loop {
         tokio::select! {
@@ -151,7 +192,7 @@ async fn serve(
                         return;
                     }
                 } else {
-                    let _ = events.send(Event::Message(n, value));
+                    deliver(n, &text, value, &events, &tap);
                 }
             }
             command = commands.recv() => match command {
@@ -171,6 +212,29 @@ async fn serve(
 
 fn is_auth(value: &Value) -> bool {
     value["type"] == "statusUpdate" && value["data"]["status"] == "auth"
+}
+
+/// One of Atem's messages on link `n` (`text` as sent, `value` parsed),
+/// not an `auth`: a Station call to the fake Station's tap when one took
+/// them; anything else, or with no tap, an `Event::Message`.
+fn deliver(n: u64, text: &str, value: Value, events: &mpsc::Sender<Event>, tap: &StationTap) {
+    use atem_client::control::relay::op;
+    let call = value["type"] == "relay"
+        && matches!(
+            value["op"].as_str(),
+            Some(op::CONTROL_SYNC | op::CONTROL_ACK | op::MEMBERSHIP_FETCH)
+        );
+    if call {
+        let mut slot = tap.lock().unwrap();
+        if let Some(calls) = slot.as_ref() {
+            if calls.send((n, text.to_owned())).is_ok() {
+                return;
+            }
+            // The fake Station is gone: events again.
+            *slot = None;
+        }
+    }
+    let _ = events.send(Event::Message(n, value));
 }
 
 /// Every relay host connection's query (`code`, `atem_id`, …) in this test
@@ -332,6 +396,8 @@ impl FakeAstation {
         let shared = links.clone();
         let auth: Arc<Mutex<AuthReply>> = Arc::default();
         let answers = auth.clone();
+        let station: StationTap = Arc::default();
+        let tap = station.clone();
         let plan = Arc::new(plan);
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -366,7 +432,7 @@ impl FakeAstation {
                         events_tx.clone(),
                         relay_tx.clone(),
                         cmd_rx,
-                        answers.clone(),
+                        (answers.clone(), tap.clone()),
                     ));
                 }
             });
@@ -378,6 +444,7 @@ impl FakeAstation {
                 events,
                 auth,
                 links,
+                station,
             },
             relay,
         )
@@ -436,7 +503,7 @@ async fn relay_link(
     events: mpsc::Sender<Event>,
     relay: mpsc::Sender<RelayEvent>,
     commands: tokio::sync::mpsc::UnboundedReceiver<Cmd>,
-    auth: Arc<Mutex<AuthReply>>,
+    (auth, tap): (Arc<Mutex<AuthReply>>, StationTap),
 ) {
     let mut query = String::new();
     let callback = |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
@@ -476,7 +543,7 @@ async fn relay_link(
         return;
     }
     if let Reply::Serve = reply {
-        serve(n, socket, events, commands, auth).await;
+        serve(n, socket, events, commands, auth, tap).await;
         let _ = relay.send(RelayEvent::Closed(n));
         return;
     }
@@ -488,7 +555,7 @@ async fn relay_link(
             room,
             challenge.nonce,
             (ok, reply_first),
-            (events, relay, commands, auth),
+            (events, relay, commands, auth, tap),
         )
         .await;
         return;
@@ -504,7 +571,7 @@ async fn relay_link(
             break Some(text);
         }
         if let Ok(value) = serde_json::from_str::<Value>(&text) {
-            let _ = events.send(Event::Message(n, value));
+            deliver(n, &text, value, &events, &tap);
         }
     };
     let Some(message) = proof else {
@@ -549,7 +616,7 @@ async fn relay_link(
         Reply::Unsolicited { .. } | Reply::Nothing | Reply::AstationFirst { .. } | Reply::Serve => {
         }
     }
-    serve(n, socket, events, commands, auth).await;
+    serve(n, socket, events, commands, auth, tap).await;
     let _ = relay.send(RelayEvent::Closed(n));
 }
 
@@ -563,11 +630,12 @@ async fn astation_first(
     room: String,
     nonce: [u8; 32],
     (ok, reply_first): (Option<(String, Value)>, bool),
-    (events, relay, commands, auth): (
+    (events, relay, commands, auth, tap): (
         mpsc::Sender<Event>,
         mpsc::Sender<RelayEvent>,
         tokio::sync::mpsc::UnboundedReceiver<Cmd>,
         Arc<Mutex<AuthReply>>,
+        StationTap,
     ),
 ) {
     if socket
@@ -606,7 +674,7 @@ async fn astation_first(
         } else if is_auth(&value) {
             pending_auth = Some(value);
         } else {
-            let _ = events.send(Event::Message(n, value));
+            deliver(n, &text, value, &events, &tap);
         }
         // Astation answers at once without a verdict to order; else once
         // the proof and the `auth` both arrived, in the planned order.
@@ -626,6 +694,6 @@ async fn astation_first(
             answered = true;
         }
     }
-    serve(n, socket, events, commands, auth).await;
+    serve(n, socket, events, commands, auth, tap).await;
     let _ = relay.send(RelayEvent::Closed(n));
 }
