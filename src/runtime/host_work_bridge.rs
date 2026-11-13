@@ -1347,6 +1347,12 @@ impl HostBridge {
                 {
                     return Err("busy".into());
                 }
+                let permit = Arc::new(AtomicBool::new(true));
+                // A delegated sender's: checked at the spawn boundary
+                // (design I.4.3, "Launches"); `busy` for a service whose
+                // class can't be decided now (ruling T32b), before
+                // anything is stored.
+                let delegated = self.delegated_launch(&a, &p, *expires_at, &permit)?;
                 let status = LaunchStatus {
                     request_id: request_id.clone(),
                     session_id: SessionId::new().to_string(),
@@ -1363,10 +1369,6 @@ impl HostBridge {
                         status: status.clone(),
                     })
                     .map_err(|_| "busy")?;
-                let permit = Arc::new(AtomicBool::new(true));
-                // A delegated sender's: checked at the spawn boundary
-                // (design I.4.3, "Launches").
-                let delegated = self.delegated_launch(&a, &p, *expires_at, &permit);
                 let (guard, check, delegated) = match delegated {
                     Some((launch, guard, check)) => (guard, Some(check), Some(launch)),
                     None => {

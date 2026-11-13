@@ -58,10 +58,12 @@ impl ControlView for CoversBot {
 }
 
 /// How the bot's grant is scoped: the rig's session and [`OTHER_SESSION`],
-/// or these `projects` entries.
+/// these `projects` entries, or the whole host (what a launch needs: no
+/// `sessions`).
 enum BotScope<'a> {
     Sessions,
     Projects(&'a [&'a str]),
+    Host,
 }
 
 /// The rig as a delegated host (`host.delegated` on, the delegated clock on
@@ -160,6 +162,7 @@ fn delegated_host(
         BotScope::Projects(projects) => {
             log.add_service_projects("svc-bot", &["host"], Some(projects), None, ops, bot_expiry)
         }
+        BotScope::Host => log.add_service("svc-bot", &["host"], None, ops, bot_expiry),
     };
     let pairing = crate::profile::Sources::in_dir(&root.join("profile"))
         .paths

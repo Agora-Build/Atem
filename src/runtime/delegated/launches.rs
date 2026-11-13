@@ -79,22 +79,25 @@ impl HostBridge {
     /// permit `permit`: none unless `a` is a delegated sender (its
     /// admission record, [`HostBridge::admission`], against the profile's
     /// scope key); else its record, the guard that fences it after the
-    /// spawn and its check at the spawn boundary.
+    /// spawn and its check at the spawn boundary. `busy` for a service
+    /// whose class can't be decided now (the control state doesn't read,
+    /// ruling T32b): never a v1 launch in its place, and the caller stores
+    /// nothing.
     pub(super) fn delegated_launch(
         &self,
         a: &Sender,
         profile: &Profile,
         expires_at: u64,
         permit: &Arc<AtomicBool>,
-    ) -> Option<(StartLaunch, SpawnGuard, PreSpawnCheck)> {
+    ) -> Result<Option<(StartLaunch, SpawnGuard, PreSpawnCheck)>, &'static str> {
         // With the hook off nobody is delegated: every launch is v1's.
         if !self.features.delegated {
-            return None;
+            return Ok(None);
         }
-        // A launch has no route: the profile stands for it. (PR 10's
-        // `busy` for a service whose class can't be decided yet is
-        // answered by the interaction fix after this merge.)
-        let admission = self.admission(a, "", 0, &profile.scope_key()).ok()??;
+        // A launch has no route: the profile stands for it.
+        let Some(admission) = self.admission(a, "", 0, &profile.scope_key())? else {
+            return Ok(None);
+        };
         let launch = StartLaunch {
             admission,
             profile: profile.clone(),
@@ -169,7 +172,7 @@ impl HostBridge {
                 LaunchVerdict::Go => PreSpawn::Go,
             }
         });
-        Some((launch, guard, check))
+        Ok(Some((launch, guard, check)))
     }
 
     /// `handout` is a delegated sender's launch, its record `launch`:
