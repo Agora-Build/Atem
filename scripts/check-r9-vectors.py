@@ -1185,12 +1185,43 @@ def check_push_hint(file, data, report, context):
             case.check(not delegated_task(case_["facts"]), "not a delegated sender's UUID v4 task")
 
 
+# R9.2's table of actions, in its order: the eleven of version 1 (v0.8.2 to
+# v0.8.5's rules), then delegated host work's five. A verifier of version 2
+# knows exactly these (R9.2 "How a verifier reports itself"; Atem's
+# proposal, for Astation's agreement).
+R9_2_ACTIONS = (
+    "genesis", "add", "remove", "set_roles", "add_host", "remove_host", "recovery_add",
+    "set_recovery_key", "recovery_approve", "recovery_veto", "k_backup",
+    "project_set", "project_remove", "host_sender_revoke", "host_sender_readmit", "host_enc_key",
+)
+VERIFIER_ACTION = r"[a-z][a-z0-9_]{0,31}"
+
+
+def verifier_ok(v):
+    """A welcome's `verifier` as R9.2 and R9.8 write it: exactly version (1 to
+    2^32 - 1) and actions (1-64 names of the grammar, sorted by bytes, each
+    once); a name nobody knows is no refusal."""
+    if not isinstance(v, dict) or sorted(v) != ["actions", "version"]:
+        return False
+    version, actions = v["version"], v["actions"]
+    if not (isinstance(version, int) and not isinstance(version, bool) and 1 <= version < 2**32):
+        return False
+    if not isinstance(actions, list) or not 1 <= len(actions) <= 64:
+        return False
+    if not all(isinstance(a, str) and re.fullmatch(VERIFIER_ACTION, a) is not None for a in actions):
+        return False
+    names = [a.encode() for a in actions]
+    return all(a < b for a, b in zip(names, names[1:]))
+
+
 def check_delegated_wire(file, data, report, context):
     """Delegated host work's session-v1 shapes (R9.14): host_enc_key_get, its
-    host_enc_key answer, and receipts with and without provenance. Each case's
-    verdict is recomputed here from the rules as R9.14 writes them, and the
-    valid answer's enc_sig is verified with host-a's host_key of log L over
-    the enc() input built here."""
+    host_enc_key answer, and receipts with and without provenance; and the r9
+    welcome's optional verifier (R9.2, R9.8; Atem's proposal). Each case's
+    verdict is recomputed here from the rules as R9.14, R9.8 and R9.2 write
+    them, the valid answer's enc_sig is verified with host-a's host_key of log
+    L over the enc() input built here, and the release's own verifier is
+    R9.2's sixteen actions at version 2."""
     ID = r"[A-Za-z0-9._:-]{1,128}"
 
     def whole(case):
@@ -1251,12 +1282,61 @@ def check_delegated_wire(file, data, report, context):
             and re.fullmatch(r"(member|service|host):" + ID, sender) is not None
         )
 
-    for section, rule in (("host_enc_key_get", get_ok), ("host_enc_key", key_ok), ("receipt", receipt_ok)):
+    def nat(v):
+        return isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 2**53
+
+    def welcome_ok(case):
+        # R9.8's welcome as a client reads it: its fields (unknown ones
+        # ignored), and `verifier` either absent or exactly as R9.2 says.
+        data_ = session_data(whole(case), None)
+        if data_ is None or data_.get("op") != "welcome" or data_.get("v") != 1:
+            return False
+        strings = ("id", "account_id", "atem_device_id", "runtime_gen", "controller_session", "attachment_gen", "principal", "channel_id")
+        if not all(isinstance(data_.get(k), str) for k in strings) or "re" in data_ and not isinstance(data_["re"], str):
+            return False
+        if not all(nat(data_.get(k)) for k in ("host_trust_gen", "authorization_ms_left", "server_time", "revision")):
+            return False
+        head = data_.get("head")
+        if (
+            data_.get("client_kind") not in ("native", "service", "browser")
+            or not isinstance(data_.get("permissions"), list) or not all(p in ("view", "control") for p in data_["permissions"])
+            or not isinstance(data_.get("features"), list) or not all(isinstance(f, str) for f in data_["features"])
+            or not isinstance(data_.get("pending_recovery"), list)
+            # Head::from_json: exactly seq (from 1) and hash (64 lowercase hex).
+            or not isinstance(head, dict) or sorted(head) != ["hash", "seq"]
+            or not nat(head["seq"]) or head["seq"] < 1
+            or not isinstance(head["hash"], str) or re.fullmatch(r"[0-9a-f]{64}", head["hash"]) is None
+        ):
+            return False
+        return "verifier" not in data_ or verifier_ok(data_["verifier"])
+
+    with report.case(file, "verifier") as case:
+        actions = sorted(R9_2_ACTIONS, key=str.encode)
+        case.equal(data["verifier"], {"version": 2, "actions": actions}, "this release's verifier: version 2, R9.2's sixteen actions")
+        logged = context["membership_log"]
+        seen = {v["entry"]["body"].get("action") for v in logged["log"] + logged["others"]}
+        case.equal(sorted(seen, key=str.encode), actions, "every action of r9-vectors-membership-log, and only those")
+        case.check(verifier_ok(data["verifier"]), "reported by the welcome's rules")
+    with report.case(file, "welcome verifier") as case:
+        valid = [c for c in data["welcome"] if c["valid"] and "message" in c]
+        case.check(any("verifier" not in c["message"]["data"] for c in valid), "a welcome without verifier")
+        case.check(any(c["message"]["data"].get("verifier") == data["verifier"] for c in valid), "a welcome with this release's")
+        case.check(
+            any(set(c["message"]["data"].get("verifier", {}).get("actions", [])) - set(R9_2_ACTIONS) for c in valid),
+            "a welcome naming an action this release doesn't know, read",
+        )
+
+    for section, rule, rules in (
+        ("host_enc_key_get", get_ok, "R9.14's"),
+        ("host_enc_key", key_ok, "R9.14's"),
+        ("receipt", receipt_ok, "R9.14's"),
+        ("welcome", welcome_ok, "R9.8's and R9.2's"),
+    ):
         with report.case(file, section) as case:
             cases = data[section]
             case.check(any(c["valid"] for c in cases) and any(not c["valid"] for c in cases), "valid and refused cases")
             for c in cases:
-                case.equal(rule(c), c["valid"], f"{c['name']}: {'valid' if c['valid'] else 'refused'} by R9.14's rules")
+                case.equal(rule(c), c["valid"], f"{c['name']}: {'valid' if c['valid'] else 'refused'} by {rules} rules")
 
     keys = context["keys"]
     mlog = context["membership_log"]

@@ -378,6 +378,10 @@ pub struct DeviceListStatus {
     /// How long the oldest of them has waited (ms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_oldest_ms: Option<u64>,
+    /// The runtime's device-list verifier version (R9.2 "How a verifier
+    /// reports itself"; `None` from a runtime that doesn't say).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_version: Option<u32>,
 }
 
 /// A recovery waiting on this host's clock (§R9.5).

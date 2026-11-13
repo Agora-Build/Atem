@@ -583,6 +583,50 @@ fn a_phone_a_bot_and_a_browser_are_admitted_on_one_link() {
     assert_eq!(rig.list("ch-browser"), vec![SID.to_string()]);
 }
 
+/// Every welcome names the host's device-list verifier (R9.2 "How a
+/// verifier reports itself", R9.8; Atem's proposal, for Astation's
+/// agreement): its
+/// version and the actions it knows, the shared core's own, for a native
+/// member, a service and a browser alike. It is no feature: the features
+/// are what they were.
+#[test]
+fn welcome_names_the_verifier_inventory() {
+    use atem_client::membership::{VERIFIER_VERSION, VerifierInventory, known_actions};
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("ch-phone", phone());
+    rig.advance(1000);
+    rig.connect("ch-bot", bot());
+    rig.advance(1000);
+    let wall = rig.now.host.wall_ms;
+    let (grant, key) = rig.log.grant(
+        "dev-phone",
+        "aaaaaaaa-1111-4111-8111-000000000002",
+        HOST,
+        1,
+        Some(SID),
+        &["view"],
+        wall,
+        wall + 600_000,
+    );
+    rig.connect("ch-browser", Identity::browser(grant, key).unwrap());
+    for handle in ["ch-phone", "ch-bot", "ch-browser"] {
+        let w = welcome(&mut rig, handle);
+        let verifier = w
+            .verifier()
+            .unwrap_or_else(|| panic!("{handle}: no verifier"));
+        assert_eq!(verifier, &VerifierInventory::ours(), "{handle}");
+        assert_eq!(verifier.version(), VERIFIER_VERSION);
+        assert_eq!(verifier.version(), 2);
+        assert_eq!(verifier.actions(), known_actions());
+        assert!(
+            !w.features.iter().any(|f| f.contains("verifier")),
+            "{handle}"
+        );
+        assert_eq!(w.to_json()["data"]["verifier"], verifier.to_json());
+    }
+}
+
 /// Step 3 teaches the host the new device-list entries (project grants,
 /// host-sender revocation, host encryption keys) and advertises nothing: a
 /// welcome after the host carried them lists the features it listed before,

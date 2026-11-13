@@ -81,6 +81,7 @@ async function main() {
   const scope = JSON.parse(welcome.scopeJson);
   console.log(`WELCOME ${welcome.principal} ${welcome.clientKind} ${[...welcome.permissions].sort().join(",")} ${welcome.revision} ${welcome.head.seq} ${scope.ops.join(",")}`);
   expect(welcome.authorizationMsLeft <= grant.expiresAt - Number(wallBase), "authorization bounded by the expiry");
+  expect(welcome.verifier == null, "a host that reports no verifier: none in the welcome");
 
   async function exchange(frame, done) {
     wire.send(frame);
