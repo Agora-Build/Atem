@@ -732,13 +732,23 @@ impl HostBridge {
             self.take_reading();
         }
         let identity = self.work_host();
+        // A stop always wins (ruling T27a): while hosting is paused the r9
+        // engine still takes `work_interrupt`, when it can be served.
+        let stops = self.stops_while_paused(&identity);
+        self.r9.enable_host_work_stops(stops);
         // An unverified host has no identity to keep records under yet.
         if !self.hosting_enabled() || identity.account_id == UNPAIRED {
             for request in self.r9.take_host_work() {
+                let reply = if stops && matches!(request.request, hw::Request::WorkInterrupt { .. })
+                {
+                    self.work_request(&request.attachment, &request.request, cx)
+                } else {
+                    Err("busy".into())
+                };
                 self.r9.host_work_reply(
                     &request.attachment,
                     &request.request,
-                    Err("busy".into()),
+                    reply,
                     self.clock.now(),
                 );
             }

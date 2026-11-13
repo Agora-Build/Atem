@@ -1529,3 +1529,78 @@ fn work_interrupt_over_the_senders_channel() {
     assert_eq!(escs(&rig), 1);
     assert_eq!(input(&rig).matches("CHANNEL_INTERRUPT").count(), 1);
 }
+
+/// Ruling T27a (2): `work_interrupt` is a stop, so it is served while
+/// hosting is paused (`runtime.toml` stops loading), as the deadline's
+/// interrupt is (T26a). The phone's channel, admitted before the pause,
+/// sends it: the result is the task's status, and one Esc reaches the
+/// agent. Its other host-work requests stay `busy` meanwhile, and a second
+/// `work_interrupt` of the same turn writes nothing (one Esc per attempt
+/// and turn). The turn ends interrupted; the task's record waits for the
+/// file to load again, then reads `turn interrupted`.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn work_interrupt_is_served_while_hosting_is_paused() {
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_controls(gate_open());
+    rig.dump = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let t = task(&launch, "PAUSED_INTERRUPT", HOUR);
+    let tid = &t["task_id"];
+    enqueue(&mut phone, &mut r, &t);
+    in_turn(&rig, tid, "PAUSED_INTERRUPT");
+    let attempt = stored(&rig, tid)["receipt_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // `runtime.toml` stops loading: hosting is paused.
+    let file = rig.sandbox.config().join("runtime.toml");
+    let valid = std::fs::read_to_string(&file).unwrap();
+    replace(&file, "this is not a runtime.toml");
+    let log = rig.sandbox.dir.path().join("runtime.log");
+    within("hosting paused", || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("agent hosting is off until it is fixed")
+    });
+    let query = work(&mut phone, &mut r, tid);
+    assert_eq!(query["code"], "busy", "{query}");
+    let reply = interrupt(&mut phone, &mut r, tid);
+    let work_status = &reply["result"]["work"];
+    assert_eq!(
+        (&work_status["state"], &work_status["detail"]),
+        (&json!("submitted"), &json!("in the agent's turn")),
+        "{reply}"
+    );
+    within("the Esc while paused", || escs(&rig) == 1);
+    assert_eq!(interrupt_writes(&rig), 1);
+    // Reported and taken in, then asked again: nothing written.
+    work_passes(&rig, 2);
+    let again = interrupt(&mut phone, &mut r, tid);
+    assert_eq!(again["result"]["work"]["state"], "submitted", "{again}");
+    work_passes(&rig, 3);
+    assert_eq!(interrupt_writes(&rig), 1, "one Esc per turn");
+    assert_eq!(escs(&rig), 1);
+    assert!(intents(&rig, tid).is_empty(), "no intent");
+    // The turn ends interrupted, still paused; the record waits.
+    std::fs::write(rig.fake.join("interrupt"), "").unwrap();
+    within("the turn's interrupted end", || {
+        receipt(&rig, &attempt)["state"] == "completed"
+    });
+    assert_eq!(receipt(&rig, &attempt)["detail"], "interrupted");
+    assert_eq!(
+        stored(&rig, tid)["state"],
+        "submitted",
+        "untouched while paused"
+    );
+    replace(&file, &valid);
+    wait_stored(&rig, tid, "awaiting_result", "turn interrupted");
+    assert_eq!(escs(&rig), 1);
+}

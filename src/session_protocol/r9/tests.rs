@@ -3464,6 +3464,76 @@ mod delegated_work_ops {
         assert_eq!(rig.engine.take_host_work().len(), 1);
     }
 
+    /// Ruling T27a: `work_interrupt` is a stop, so while hosting is paused
+    /// (host work off) the engine still takes it and queues it for the
+    /// runtime, but only while the runtime says it can serve it
+    /// (`enable_host_work_stops`: the hook on, its store recovered, no
+    /// receipt-database fault). Nothing else is taken (`work_resolve`,
+    /// `alert_list`, `work_query` stay `busy`), and no welcome lists more.
+    /// With the hook off, the stops change nothing.
+    #[test]
+    fn work_interrupt_is_taken_while_hosting_is_paused() {
+        let take = |rig: &mut Rig, handle: &str, op: &str| {
+            let plain = message(rig, handle, op);
+            let (att, authority) = match &rig.engine.chans[handle].phase {
+                Phase::Open(a) => (a.attachment.clone(), a.authority.clone()),
+                _ => panic!("open"),
+            };
+            rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
+            rig.pump();
+        };
+        let mut rig = Rig::new();
+        rig.engine.set_delegated_features(true, true);
+        rig.engine.enable_host_work(true);
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        // Paused, the runtime unable to serve a stop: refused as before.
+        rig.engine.enable_host_work(false);
+        assert_eq!(
+            refusal(&mut rig, "ch-phone", "work_interrupt"),
+            not_advertised("work_interrupt")
+        );
+        // It can serve it: queued, unanswered until it answers.
+        rig.engine.enable_host_work_stops(true);
+        take(&mut rig, "ch-phone", "work_interrupt");
+        assert!(rig.events("ch-phone").is_empty(), "queued, not answered");
+        let queued: Vec<_> = rig
+            .engine
+            .take_host_work()
+            .into_iter()
+            .map(|q| {
+                matches!(
+                    q.request,
+                    atem_client::session::host_work::Request::WorkInterrupt { .. }
+                )
+            })
+            .collect();
+        assert_eq!(queued, [true], "work_interrupt, once");
+        for op in ["work_resolve", "alert_list"] {
+            assert_eq!(
+                refusal(&mut rig, "ch-phone", op),
+                not_advertised(op),
+                "{op}"
+            );
+        }
+        assert!(rig.engine.take_host_work().is_empty());
+        // A new channel's welcome lists no host-work feature meanwhile.
+        rig.advance(1000);
+        rig.connect("ch-new", phone());
+        let features = welcome(&mut rig, "ch-new").features;
+        for feature in ["host.work", DELEGATED_FEATURE, ALERTS_FEATURE] {
+            assert!(!features.iter().any(|f| f == feature), "{feature}");
+        }
+        // The hook off: nothing is taken, whatever the runtime says.
+        rig.engine.set_delegated_features(false, false);
+        assert_eq!(
+            refusal(&mut rig, "ch-phone", "work_interrupt"),
+            not_advertised("work_interrupt")
+        );
+        assert!(rig.engine.take_host_work().is_empty());
+        assert!(rig.relay.is_empty());
+    }
+
     /// Step 4, Decision 10: the runtime hands the engine the hook's
     /// features (`HostFeatures`, read once when it starts). `host.delegated`
     /// and `host.alerts` are listed only when the hook turns them on, and

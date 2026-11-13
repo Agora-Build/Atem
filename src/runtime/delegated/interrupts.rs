@@ -35,7 +35,9 @@
 //!   deadline interrupt only takes execution away (a stop always wins,
 //!   ruling T4d), and the turn's own lease goes on renewing meanwhile.
 //!   Nothing else of the scheduling pass runs: nothing is dispatched,
-//!   reconciled, settled or launched, so nothing new starts. Two residuals:
+//!   reconciled, settled or launched, so nothing new starts. The one
+//!   request served meanwhile is `work_interrupt`, a stop too (ruling
+//!   T27a, `stops_while_paused`). Two residuals:
 //!   - a **receipt-database fault** holds the intents in that database
 //!     until the restart it asks for (`atem runtime restart`); recovery's
 //!     step 3 and the first pass's deadline sweep carry them out then;
@@ -52,8 +54,11 @@
 //!   owner, interrupts a delegated task's turn while it is the session's
 //!   current turn, through the same entries and the same record of this
 //!   run's writes (`Runs`), so a turn gets one Esc from it and a pending
-//!   intent together. A one-shot request: no intent, nothing repeated, and
-//!   the turn it ends reads `turn interrupted`.
+//!   intent together (ruling T27a: one Esc per attempt and turn, from any
+//!   source). A one-shot request: no intent, nothing repeated, and the
+//!   turn it ends reads `turn interrupted`. A stop, so it is served while
+//!   hosting is paused too (`stops_while_paused`), except after a
+//!   receipt-database fault or with the session journal halted (`busy`).
 use super::*;
 use crate::runtime::delegated::attempts::{AttemptEnd, SessionAnswer, attempt_end};
 use crate::runtime::delegated::authority::interrupter;
@@ -96,6 +101,20 @@ impl HostBridge {
             return Ok(());
         };
         work.intents.reported(store, &reports, now)
+    }
+
+    /// Whether a stop requested while hosting is paused (`work_interrupt`,
+    /// ruling T27a) is served now: `host.delegated` on, the store open,
+    /// recovered and without a receipt-database fault, on a paired host.
+    /// The r9 engine takes `work_interrupt` while paused only then
+    /// (`R9Host::enable_host_work_stops`), and the paused pass hands it to
+    /// the bridge; everything else stays `busy` until hosting is back.
+    pub(super) fn stops_while_paused(&self, identity: &HostTarget) -> bool {
+        self.features.delegated
+            && identity.account_id != UNPAIRED
+            && !self.work.error
+            && self.work.recovered
+            && self.work.store.is_some()
     }
 
     /// Ruling T26a: hosting is paused (`runtime.toml` doesn't load, or
@@ -210,6 +229,13 @@ impl HostBridge {
                 break;
             }
         }
+        // `work_interrupt`'s record of a turn goes once its attempt no
+        // longer executes (ruling T27a: one Esc per attempt and turn).
+        runs.prune(&mut |task, attempt| {
+            self.host
+                .attempt_receipt(attempt, task)
+                .is_some_and(|rc| rc.state == ReceiptState::Executing)
+        });
         self.work.intents = runs;
         result.map(|()| looked)
     }
@@ -313,14 +339,17 @@ impl HostBridge {
     /// current turn (`attempt_state`'s `Running`: executing, rebound, and
     /// shown running by the chat), the turn is interrupted with host
     /// authority after the session host's `advance`: the bridge's
-    /// `host_interrupt`, whose turn check runs again, or, when this run's
-    /// writes say the turn already got its interrupt or one is in flight
-    /// (`Runs::running`, shared with the intents), only the revocation of
-    /// another controller's lease. The result is the task's status as it
-    /// stood before (§11.2). A write goes into this run's writes
-    /// (`Runs::requested`): a pending intent of the attempt only revokes
-    /// while it is in flight and counts it as its delivery once reported
-    /// written, so the turn gets one Esc from both.
+    /// `host_interrupt`, whose turn check runs again. The result is the
+    /// task's status as it stood before (§11.2). One Esc per attempt and
+    /// turn, from any source (ruling T27a): the write goes into this run's
+    /// record (`Runs::requested`), shared with the intents, and when that
+    /// record says the turn already got its interrupt, or one is in flight
+    /// (`Runs::running`), nothing is written: only another controller's
+    /// lease is revoked, once, and the result is the task's status as it
+    /// is (its own detail: the turn is current, so not `not running`).
+    ///
+    /// Served while hosting is paused too, as a stop (ruling T27a, like
+    /// T26a's deadline step): see `stops_while_paused`.
     ///
     /// Otherwise (queued, an attempt not executing, its turn not shown
     /// running or still being reconciled after a restart, or ended) nothing
@@ -367,7 +396,7 @@ impl HostBridge {
         };
         match done {
             Interrupted::Written => {
-                self.work.intents.requested(&attempt, &turn);
+                self.work.intents.requested(task_id, &attempt, &turn);
                 Ok(ResultBody::Work { work: status })
             }
             Interrupted::Revoked => Ok(ResultBody::Work { work: status }),

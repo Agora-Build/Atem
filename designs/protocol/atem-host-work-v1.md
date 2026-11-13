@@ -1265,14 +1265,34 @@ not name is `forbidden`, as for `work_query`.
   restart (that says nothing of the turn), or a turn that ended.
 - **A halted session journal** is `busy`, not `not running`: the turn may
   still be current, and nothing is written until the restart.
-- **One Esc per turn with the deadline's interrupt** (§11.6). The request
-  is one-shot: no intent, nothing repeated on later passes. It shares the
-  host's record of this run's interrupt writes with a pending intent of
-  the same attempt. While either's write waits for the worker's answer, or
-  once the turn got its interrupt, the other writes nothing (it only
-  revokes another controller's lease), and the request's result is still
-  the task's status. A turn the request's interrupt ended reads `turn
-  interrupted`, never `interrupted at deadline`. **Atem's choice.**
+- **One Esc per attempt and turn, from any source** (§11.6's deadline
+  interrupt included). The request is one-shot: no intent, nothing
+  repeated on later passes. Every interrupt written to an attempt's turn,
+  by a request or by an intent, is recorded. While that write waits for
+  the worker's answer, or once the turn got its interrupt, a later request
+  or intent in that turn writes nothing (it only revokes another
+  controller's lease). Such a request's result is the task's status as it
+  is: its own `detail`, not `not running`, since the turn is current.
+  - **Where it is kept.** In memory for the turn, with or without an
+    intent. Where the attempt has a pending intent, it is also stored with
+    that intent, marked as the request's.
+  - **The detail.** A turn the request's interrupt ended reads `turn
+    interrupted`, never `interrupted at deadline`.
+  - **Residual.** The record lives for one run. After a restart, a turn
+    still current (rebound) can get one more Esc, from a request as from a
+    pending intent (R9.14 item 5's restart rule).
+  - **Atem's choice.**
+- **While hosting is paused** (`runtime.toml` doesn't load, or `enabled =
+  false`), `work_interrupt` is still served: a stop always wins, as for
+  the deadline's interrupt (§11.6). **Atem's reading, for Astation to
+  confirm.**
+  - **Which channels.** One welcomed before the pause. A welcome during
+    the pause lists no host-work feature, so the client core sends
+    nothing.
+  - **What else.** Every other host-work request stays `busy`.
+  - **Still `busy`:** after a receipt-database fault, before the store is
+    recovered (a runtime started while paused), and with a halted session
+    journal.
 
 **Client core.** `Attached::send` refuses both unless `welcome.features`
 lists `host.delegated` (`host feature not available`). A result answers

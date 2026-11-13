@@ -346,8 +346,9 @@ fn a_pending_intent_and_work_interrupt_give_one_esc() {
 /// Task 26 review M1, notes for Task 27: a turn that `work_interrupt`'s Esc
 /// ended reads `turn interrupted`, never `interrupted at deadline`, even
 /// with the deadline's intent pending for it (the request's write counted
-/// as that intent's delivery, so no second Esc, but the turn isn't the
-/// deadline's). The task then expires at its deadline as any other.
+/// as that intent's delivery, so no second Esc, and stored on it as the
+/// request's, ruling T27a: the turn isn't the deadline's). The task then
+/// expires at its deadline as any other.
 #[test]
 fn a_turn_ended_by_work_interrupt_reads_turn_interrupted() {
     use crate::runtime::host_work::EXPIRED_AWAITING;
@@ -372,7 +373,9 @@ fn a_turn_ended_by_work_interrupt_reads_turn_interrupted() {
         );
         let all = intents(&rig, &task);
         assert!(all[0].done_ms.is_some(), "the turn ended: {all:?}");
-        assert_eq!(all[0].delivered_turn, None, "not the deadline's Esc");
+        // Ruling T27a: stored on the intent, as the request's delivery.
+        assert!(all[0].delivered_turn.is_some(), "{all:?}");
+        assert!(all[0].delivered_by_request, "not the deadline's Esc");
         passes(&mut rig, 1);
         assert_eq!(
             settled(&rig, &task),
@@ -413,5 +416,140 @@ fn a_halted_journal_is_busy() {
         assert_eq!(stored_record(&rig, &task).status, before);
         settle(&mut rig).await;
         assert_eq!(escs(&rig), 0);
+    });
+}
+
+/// Ruling T27a, case 1: `work_interrupt`'s Esc reaches the turn before any
+/// intent exists; the deadline then comes while the same turn still runs
+/// (the agent hasn't stopped), and its intent writes nothing: the turn had
+/// its interrupt (this run's record, kept with no intent). One Esc. The
+/// turn the request ended reads `turn interrupted`, then expires.
+#[test]
+fn a_request_then_the_deadline_in_one_turn_give_one_esc() {
+    use crate::runtime::host_work::EXPIRED_AWAITING;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, true);
+        let task = running_until_deadline(&mut rig, &phone, "REQUEST_THEN_DEADLINE", start).await;
+        let attempt = stored_record(&rig, &task).status.receipt_id;
+        assert_eq!(
+            status(ask(&mut rig, &phone, Q::Interrupt(&task))).state,
+            WorkState::Submitted
+        );
+        assert!(intents(&rig, &task).is_empty(), "no intent yet");
+        // Reported written, and taken in by a pass.
+        settle(&mut rig).await;
+        passes(&mut rig, 2);
+        assert_eq!(escs(&rig), 1);
+        os.pass(10 * MIN);
+        for _ in 0..10 {
+            passes(&mut rig, 1);
+            assert_eq!(pending_write(&rig, &attempt), None, "one Esc per turn");
+        }
+        settle(&mut rig).await;
+        assert_eq!(escs(&rig), 1, "one Esc per turn");
+        let pending = intents(&rig, &task);
+        assert_eq!(pending.len(), 1, "the deadline's: {pending:?}");
+        assert_eq!(pending[0].done_ms, None, "pending while the turn runs");
+        hold_host_work(&mut rig);
+        turn_interrupted(&mut rig, &task).await;
+        passes(&mut rig, 1);
+        assert_eq!(
+            settled(&rig, &task),
+            (WorkState::AwaitingResult, TURN_INTERRUPTED.into())
+        );
+        passes(&mut rig, 1);
+        assert_eq!(
+            settled(&rig, &task),
+            (WorkState::Expired, EXPIRED_AWAITING.into())
+        );
+        assert_eq!(escs(&rig), 1);
+    });
+}
+
+/// Ruling T27a, case 2: repeated `work_interrupt`s of one turn, with no
+/// intent, write one Esc. Every later request, while the first's write is
+/// in flight and after it was reported written, writes nothing and
+/// answers the task's status as it is (its own detail, not `not running`:
+/// the turn is current). The record goes with the attempt's turn: the
+/// session's next task's turn gets its own Esc.
+#[test]
+fn repeated_work_interrupts_of_one_turn_give_one_esc() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, true);
+        let task = phone_task(&mut rig, &phone, "REPEATED_INTERRUPT", start + HOUR);
+        let next = phone_task(&mut rig, &phone, "REPEATED_NEXT", start + HOUR);
+        turn_journaled(&mut rig, &task, "REPEATED_INTERRUPT").await;
+        let attempt = stored_record(&rig, &task).status.receipt_id;
+        let before = stored_record(&rig, &task).status;
+        assert_eq!(status(ask(&mut rig, &phone, Q::Interrupt(&task))), before);
+        let seq = pending_write(&rig, &attempt).expect("written");
+        assert_eq!(status(ask(&mut rig, &phone, Q::Interrupt(&task))), before);
+        assert_eq!(pending_write(&rig, &attempt), Some(seq), "in flight");
+        settle(&mut rig).await;
+        passes(&mut rig, 2);
+        for _ in 0..3 {
+            let now = stored_record(&rig, &task).status;
+            assert_eq!(
+                status(ask(&mut rig, &phone, Q::Interrupt(&task))),
+                now,
+                "the status as it is"
+            );
+            assert_ne!(now.detail, details::NOT_RUNNING);
+            assert_eq!(pending_write(&rig, &attempt), None, "nothing written");
+            passes(&mut rig, 1);
+        }
+        settle(&mut rig).await;
+        assert_eq!(escs(&rig), 1, "one Esc per turn");
+        assert!(intents(&rig, &task).is_empty());
+        // The turn ends; the next task's turn is another.
+        turn_interrupted(&mut rig, &task).await;
+        turn_journaled(&mut rig, &next, "REPEATED_NEXT").await;
+        assert_eq!(
+            status(ask(&mut rig, &phone, Q::Interrupt(&next))).state,
+            WorkState::Submitted
+        );
+        settle(&mut rig).await;
+        assert_eq!(escs(&rig), 2, "its own Esc");
+        assert!(
+            !rig.bridge.work.intents.knows(&attempt),
+            "the ended turn's record went"
+        );
+    });
+}
+
+/// Ruling T27a (2): a stop is served while hosting is paused when it can
+/// be: `host.delegated` on, the store recovered, no receipt-database fault,
+/// a paired host. Otherwise, as before, `busy`.
+#[test]
+fn stops_are_served_while_paused_only_when_they_can_be() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        delegated(&mut rig, root, &os, true);
+        passes(&mut rig, 1);
+        let identity = rig.bridge.work_host();
+        // `runtime.toml` stops loading (hosting off, as `work_config`
+        // leaves it).
+        drop(std::mem::take(&mut rig.bridge.work.config));
+        rig.bridge.work.config_problem = Some("expected a table".into());
+        assert!(!rig.bridge.hosting_enabled());
+        assert!(rig.bridge.stops_while_paused(&identity));
+        rig.bridge.work.error = true;
+        assert!(
+            !rig.bridge.stops_while_paused(&identity),
+            "a receipt-database fault"
+        );
+        rig.bridge.work.error = false;
+        rig.bridge.work.recovered = false;
+        assert!(!rig.bridge.stops_while_paused(&identity), "not recovered");
+        rig.bridge.work.recovered = true;
+        rig.bridge.features = HostFeatures::default();
+        assert!(!rig.bridge.stops_while_paused(&identity), "the hook off");
     });
 }

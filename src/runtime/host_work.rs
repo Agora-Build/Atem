@@ -1099,6 +1099,7 @@ impl Store {
                 WHERE done_ms IS NULL;")?;
         track_open_records(&db)?;
         track_waits(&db)?;
+        crate::runtime::delegated::intents::track_delivered_by(&db)?;
         std::fs::File::open(state)?.sync_all()?;
         Ok(Self {
             db,
