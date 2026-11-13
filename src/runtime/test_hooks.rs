@@ -122,12 +122,28 @@
 //!   in the order written, and `verdict.json` reuses its name.
 //!   `RuntimeClient` never passes it on (as every `ATEM_TEST_*`); release
 //!   builds compile it out.
+//! - `ATEM_TEST_HOST_CONTROLS=<file>` (the delegated binary tests, with
+//!   `host.delegated` on): a stand-in for the control feeds a delegated
+//!   host syncs (PR 10 builds them), read at every pass and every
+//!   classification, `{"own"?: origin, "open"?: [origin…], "standings"?:
+//!   {principal: {"coverage"?: {"origin", "feed_id"}, "revoked"?: id,
+//!   "held"?: bool}}}`: the host's own Station's origin (a native member's
+//!   gate), the origins whose revocation gate is open, and the senders'
+//!   standings (a service its `coverage` names is a delegated sender). The
+//!   start's recovery closes every gate (design I.6.2 step 7); the next
+//!   pass reads the file again, as a feed's sync would open it. A missing
+//!   file is no feed; one that doesn't parse too, with a runtime.log line.
+//!   Write it to a temporary name and rename it into place.
+//! - `<ATEM_TEST_PTY_FAULTS dir>/crash_after_attempt_commit`: the runtime
+//!   kills itself (`SIGKILL`) right after the next delegated attempt's row
+//!   committed, before its submit (VII.A test 7).
 //!
-//! Like the other hooks, both are read from the process environment once:
-//! a unit-test process started with either set sees it in every
-//! `HostBridge` it opens (`ATEM_TEST_HOST_FEATURES` turns host-work on in
-//! them; the drive hook would take and answer files in that directory), so
-//! run the bin's tests without them (PR 5 review M11).
+//! Like the other hooks, these are read from the process environment once:
+//! a unit-test process started with one set sees it in every `HostBridge`
+//! it opens (`ATEM_TEST_HOST_FEATURES` turns host-work on in them; the
+//! drive hook would take and answer files in that directory;
+//! `ATEM_TEST_HOST_CONTROLS` would cover and gate senders), so run the
+//! bin's tests without them (PR 5 review M11).
 
 /// The delegated host-work features this runtime runs (session-v1 R9.14,
 /// host-work-v1 §11.6): off unless the debug-only hook turns them on
@@ -451,6 +467,29 @@ mod imp {
         })
     }
 
+    /// The stand-in for the control feeds (`ATEM_TEST_HOST_CONTROLS`), read
+    /// at each call; none while the file is missing or unreadable (one line
+    /// per new reason it doesn't parse).
+    pub fn host_controls() -> Option<super::HostControls> {
+        static CELL: OnceLock<Option<PathBuf>> = OnceLock::new();
+        static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let path = env_path("ATEM_TEST_HOST_CONTROLS", &CELL)?;
+        let text = std::fs::read_to_string(path).ok()?;
+        match super::HostControls::parse(&text) {
+            Ok(controls) => Some(controls),
+            Err(error) => {
+                let mut last = LAST
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if last.as_deref() != Some(error.as_str()) {
+                    eprintln!("atem runtime: ATEM_TEST_HOST_CONTROLS ignored ({error})");
+                    *last = Some(error);
+                }
+                None
+            }
+        }
+    }
+
     fn drive_dir() -> Option<&'static PathBuf> {
         static CELL: OnceLock<Option<PathBuf>> = OnceLock::new();
         env_path("ATEM_TEST_HOST_WORK_DRIVE", &CELL)
@@ -604,6 +643,92 @@ pub fn fail_next_partial() -> bool {
     return imp::take_fault("fail_next_partial");
     #[cfg(not(debug_assertions))]
     false
+}
+
+/// The runtime kills itself right after the next delegated attempt's
+/// commit, before its submit (`<ATEM_TEST_PTY_FAULTS dir>/
+/// crash_after_attempt_commit`, once).
+#[cfg_attr(test, allow(dead_code))]
+pub fn crash_after_attempt_commit() -> bool {
+    #[cfg(debug_assertions)]
+    return imp::take_fault("crash_after_attempt_commit");
+    #[cfg(not(debug_assertions))]
+    false
+}
+
+/// The debug-only stand-in for the control feeds a delegated host syncs
+/// (`ATEM_TEST_HOST_CONTROLS`; PR 10 builds the feeds): the host's own
+/// Station's origin, the origins whose revocation gate is open, and the
+/// senders' standings (the feed covering a service, a revocation, a hold).
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostControls {
+    pub own: Option<String>,
+    pub open: std::collections::BTreeSet<String>,
+    pub standings: std::collections::BTreeMap<String, crate::runtime::delegated::SenderStanding>,
+}
+
+#[cfg(debug_assertions)]
+impl HostControls {
+    /// The hook's file: `{"own"?: origin, "open"?: [origin…], "standings"?:
+    /// {principal: {"coverage"?: {"origin", "feed_id"}, "revoked"?: id,
+    /// "held"?: bool}}}`, no other field.
+    pub fn parse(text: &str) -> Result<HostControls, String> {
+        use crate::runtime::delegated::{FeedRef, SenderStanding};
+        use std::collections::{BTreeMap, BTreeSet};
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct File {
+            #[serde(default)]
+            own: Option<String>,
+            #[serde(default)]
+            open: BTreeSet<String>,
+            #[serde(default)]
+            standings: BTreeMap<String, Standing>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Standing {
+            #[serde(default)]
+            coverage: Option<FeedRef>,
+            #[serde(default)]
+            revoked: Option<String>,
+            #[serde(default)]
+            held: bool,
+        }
+        let file: File = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        Ok(HostControls {
+            own: file.own,
+            open: file.open,
+            standings: file
+                .standings
+                .into_iter()
+                .map(|(principal, s)| {
+                    let standing = SenderStanding {
+                        revoked: s.revoked,
+                        held: s.held,
+                        coverage: s.coverage,
+                    };
+                    (principal, standing)
+                })
+                .collect(),
+        })
+    }
+}
+
+#[cfg(debug_assertions)]
+impl crate::runtime::delegated::ControlView for HostControls {
+    fn standing(&self, principal: &str) -> crate::runtime::delegated::SenderStanding {
+        self.standings.get(principal).cloned().unwrap_or_default()
+    }
+}
+
+/// The stand-in for the control feeds (`ATEM_TEST_HOST_CONTROLS`), as its
+/// file says now: none without the hook, or while the file is missing or
+/// doesn't parse (no feeds, as in a release build).
+#[cfg(debug_assertions)]
+pub fn host_controls() -> Option<HostControls> {
+    imp::host_controls()
 }
 
 /// The next device-list write fault (`<file>:<step>`), once.

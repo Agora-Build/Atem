@@ -47,7 +47,7 @@ use crate::session_protocol::host::{
 };
 
 /// A task that waits for its first attempt (host-work v1's text).
-const WAITING_FOR_A_READY_AGENT: &str = "waiting for a ready agent";
+pub(super) const WAITING_FOR_A_READY_AGENT: &str = "waiting for a ready agent";
 /// The dispatch intent is durable (host-work v1's text).
 const DISPATCH_INTENT: &str = "dispatch intent persisted";
 
@@ -89,14 +89,7 @@ impl HostBridge {
         match r.status.state {
             // Its last attempt started: the task follows that receipt.
             WorkState::Submitting | WorkState::Submitted => {
-                let before = (r.status.clone(), r.turn_id.clone());
-                if r.turn_id.is_none() {
-                    r.turn_id = self.collab_task_turn(r, cx.sessions);
-                }
-                self.reconcile_work(r)?;
-                if (&r.status, &r.turn_id) != (&before.0, &before.1) {
-                    self.work.store.as_ref().unwrap().save_work(r)?;
-                }
+                self.follow_receipt(r, cx)?;
                 if matches!(
                     r.status.state,
                     WorkState::Submitting | WorkState::Submitted | WorkState::OutcomeUnknown
@@ -110,6 +103,20 @@ impl HostBridge {
             }
             _ => Ok(()),
         }
+    }
+
+    /// `r`'s last attempt started: the task follows that receipt (the turn
+    /// its prompt became, stored once known), written when it changed.
+    pub(super) fn follow_receipt(&mut self, r: &mut WorkRecord, cx: &Cx) -> anyhow::Result<()> {
+        let before = (r.status.clone(), r.turn_id.clone());
+        if r.turn_id.is_none() {
+            r.turn_id = self.collab_task_turn(r, cx.sessions);
+        }
+        self.reconcile_work(r)?;
+        if (&r.status, &r.turn_id) != (&before.0, &before.1) {
+            self.work.store.as_ref().unwrap().save_work(r)?;
+        }
+        Ok(())
     }
 
     /// A waiting delegated task: an attempt when conditions 1 to 6 hold.
@@ -229,6 +236,16 @@ impl HostBridge {
             *r = fresh;
             attempt
         };
+        // Debug builds: the runtime is killed here, the attempt committed
+        // and not submitted (VII.A test 7's first crash point).
+        #[cfg(not(test))]
+        if crate::runtime::test_hooks::crash_after_attempt_commit() {
+            eprintln!(
+                "atem runtime: test hook: killed after an attempt's commit, before its submit"
+            );
+            // SAFETY: signals this process; nothing after it runs.
+            unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+        }
         // The start check may be asked about it from here on.
         self.start_view().register(&attempt.attempt_id, task);
         if let Err((detail, error)) = self.record_prompt_pause(&sid, &attempt.attempt_id, &tag) {
@@ -337,15 +354,7 @@ impl HostBridge {
             return Ok(true);
         };
         if end == AttemptEnd::Started {
-            let mut next = r.clone();
-            self.reconcile_work(&mut next)?;
-            let store = self.work.store.as_ref().unwrap();
-            let tx = store.immediate()?;
-            store.save_work(&next)?;
-            store.end_attempt(&tx, &r.task.task_id, &a.attempt_id, end)?;
-            tx.commit()?;
-            *r = next;
-            self.start_view().forget(&a.attempt_id);
+            self.end_started(r, a)?;
             return Ok(false);
         }
         // A proof of no effect: the task's next state.
@@ -367,6 +376,23 @@ impl HostBridge {
         };
         self.end_attempt(r, a, end, next)?;
         Ok(false)
+    }
+
+    /// The live attempt `a` of `r` started (its receipt `executing` or past
+    /// it): the task's attempts are over, and it follows that receipt. One
+    /// `BEGIN IMMEDIATE` transaction writes the reconciled task and ends the
+    /// attempt `started`.
+    pub(super) fn end_started(&mut self, r: &mut WorkRecord, a: &Attempt) -> anyhow::Result<()> {
+        let mut next = r.clone();
+        self.reconcile_work(&mut next)?;
+        let store = self.work.store.as_ref().unwrap();
+        let tx = store.immediate()?;
+        store.save_work(&next)?;
+        store.end_attempt(&tx, &r.task.task_id, &a.attempt_id, AttemptEnd::Started)?;
+        tx.commit()?;
+        *r = next;
+        self.start_view().forget(&a.attempt_id);
+        Ok(())
     }
 
     /// The live attempt `a` of `r` waits `accepted` (unstarted, design
@@ -486,7 +512,7 @@ impl HostBridge {
     }
 
     /// `r` settles, `state` with `detail` (cancelled, failed, expired).
-    fn settle_task(
+    pub(super) fn settle_task(
         &self,
         r: &mut WorkRecord,
         state: WorkState,

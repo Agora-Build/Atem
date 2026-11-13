@@ -1600,6 +1600,36 @@ impl Store {
         self.settle(due)
     }
 
+    /// Delegated tasks awaiting their result whose deadline `D` reached
+    /// (design I.6.2 step 6, at a start's recovery): expired, as
+    /// `settle_due` expires them, through the delegated rows' due index.
+    /// The tasks it expired.
+    pub fn settle_awaiting_delegated(&self, d: u64) -> Result<Vec<String>> {
+        let mut q = self.db.prepare(
+            "SELECT id,expires_at,authorization_expires_at FROM work_waits
+            WHERE delegated=1 AND due_ms<=?1 AND state='awaiting_result'",
+        )?;
+        let rows = q.query_map([d], |r| {
+            Ok((r.get::<_, String>(0)?, vec![r.get(1)?, r.get(2)?]))
+        })?;
+        let mut due = Vec::new();
+        for row in rows {
+            let (id, values) = row?;
+            match waiting(values) {
+                None => due.push((id, Some(RECORD_UNREADABLE))),
+                Some((deadline, _)) if d >= deadline => due.push((id, None)),
+                Some(_) => {}
+            }
+        }
+        let expired = due
+            .iter()
+            .filter(|(_, why)| why.is_none())
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.settle(due)?;
+        Ok(expired)
+    }
+
     /// Whether an open task is a delegated sender's: the store then needs
     /// the delegated clock, whatever the hook says now (step 4, Decision
     /// 10). Read through `open_records`, so closed records cost nothing.
@@ -1908,7 +1938,10 @@ impl Store {
     /// live) or of unknown outcome, and a task found submitting is of unknown
     /// outcome; neither is ever retried. Identities stay for the life of
     /// the database (`drop_payloads` drops payloads only), so a retry is
-    /// always answered from its record, never turned into new work.
+    /// always answered from its record, never turned into new work. A
+    /// delegated task (one with an admission record) is left to its own
+    /// recovery, by its attempt's receipt (design I.6.3, the bridge's
+    /// `recover_delegated`): its attempt may be proven never run.
     pub fn recover(
         &self,
         sessions: &BTreeMap<crate::session::SessionId, super::broker::BrokerSession>,
@@ -1930,6 +1963,9 @@ impl Store {
             self.save_launch(&record)?;
         }
         for mut record in self.tasks_in(WorkState::Submitting)? {
+            if record.delegated.is_some() {
+                continue;
+            }
             record.status.state = WorkState::OutcomeUnknown;
             record.status.detail =
                 "submission interrupted; recover its receipt before any further action".into();

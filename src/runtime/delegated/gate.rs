@@ -52,6 +52,29 @@ impl Gates {
         self.caught_up = natives;
     }
 
+    /// Every Station's gate closed (design I.6.2 step 7, at a start's
+    /// recovery): a delegated sender's remote tasks wait until its feed is
+    /// synced again. The natives' caught-up channels stay: each one's
+    /// carriage was applied in this run.
+    pub fn close_stations(&mut self) {
+        self.open.clear();
+    }
+
+    /// Whether any Station's gate is open.
+    #[cfg(test)]
+    pub fn any_station_open(&self) -> bool {
+        !self.open.is_empty()
+    }
+
+    /// The Station gates as the debug-only stand-in for the feeds says
+    /// (`ATEM_TEST_HOST_CONTROLS`): the host's own Station's origin and the
+    /// origins whose gate is open.
+    #[cfg(debug_assertions)]
+    pub fn set_stations(&mut self, own: Option<String>, open: BTreeSet<String>) {
+        self.own = own;
+        self.open = open;
+    }
+
     /// Tests: `origin`'s gate is open, and it is the host's own Station's
     /// (what the feeds will make it, PR 10).
     #[cfg(test)]
@@ -120,5 +143,14 @@ mod tests {
         assert!(gates.open_for(&native("dev-tablet")));
         assert!(gates.open_for(&service(ORIGIN)));
         assert!(!gates.open_for(&service("https://other.example")));
+
+        // A start's recovery closes every Station's gate; a native's own
+        // caught-up channel still opens its own.
+        gates.set_caught_up(BTreeSet::from(["member:dev-phone".to_string()]));
+        gates.close_stations();
+        assert!(!gates.any_station_open());
+        assert!(!gates.open_for(&native("dev-tablet")));
+        assert!(!gates.open_for(&service(ORIGIN)));
+        assert!(gates.open_for(&native("dev-phone")));
     }
 }

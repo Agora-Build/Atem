@@ -52,6 +52,8 @@ mod collab_bridge;
 mod collab_launch_bridge;
 #[path = "delegated/dispatch.rs"]
 mod delegated_dispatch;
+#[path = "delegated/recovery.rs"]
+mod delegated_recovery;
 #[path = "delegated/requests.rs"]
 mod delegated_requests;
 
@@ -190,6 +192,10 @@ pub(super) struct State {
     /// `NoFeeds` (a feed covering a service, as PR 10's will).
     #[cfg(test)]
     controls: Option<Box<dyn crate::runtime::delegated::ControlView + Send + Sync>>,
+    /// Tests: the steps the start's recovery of delegated tasks took
+    /// (`recover_delegated`), in their order.
+    #[cfg(test)]
+    recovery: Vec<delegated_recovery::RecoveryStep>,
 }
 
 impl State {
@@ -227,6 +233,8 @@ impl State {
             read_due: Instant::now(),
             #[cfg(test)]
             controls: None,
+            #[cfg(test)]
+            recovery: Vec::new(),
         }
     }
 }
@@ -459,6 +467,11 @@ impl HostBridge {
         if let Some(controls) = &self.work.controls {
             return classify(principal, list, controls.as_ref(), self.features);
         }
+        // Debug builds: the stand-in for the feeds (`ATEM_TEST_HOST_CONTROLS`).
+        #[cfg(debug_assertions)]
+        if let Some(controls) = crate::runtime::test_hooks::host_controls() {
+            return classify(principal, list, &controls, self.features);
+        }
         classify(principal, list, &NoFeeds, self.features)
     }
 
@@ -675,6 +688,13 @@ impl HostBridge {
         // As `work_config` gave it when it loaded (a pass runs only with a
         // file that loaded and hosting on).
         view.config = config;
+        // Debug builds: the stand-in for the feeds (`ATEM_TEST_HOST_CONTROLS`)
+        // gives the standings and the Station gates, as a sync would.
+        #[cfg(debug_assertions)]
+        if let Some(controls) = crate::runtime::test_hooks::host_controls() {
+            view.standings = controls.standings;
+            view.gates.set_stations(controls.own, controls.open);
+        }
     }
 
     /// At an orderly stop: the delegated clock's last reading, written.
@@ -718,6 +738,12 @@ impl HostBridge {
             return;
         }
         if !self.work.recovered {
+            // Delegated tasks are recovered after the session journal (design
+            // I.6.2 step 2: `SessionHost::recover`, run in this pass before
+            // this one), which withdrew host-work's `accepted` attempts.
+            if self.may_hold_delegated() && !self.recovered {
+                return;
+            }
             if self
                 .work
                 .store
@@ -732,6 +758,11 @@ impl HostBridge {
             let reconciled = (|| -> anyhow::Result<()> {
                 let store = self.work.store.as_ref().unwrap();
                 for mut record in store.tasks_in(WorkState::OutcomeUnknown)? {
+                    // Kept unresolved (design I.6.3); `recover_delegated`
+                    // reconciles the rest of the delegated tasks.
+                    if record.delegated.is_some() {
+                        continue;
+                    }
                     self.reconcile_work(&mut record)?;
                     store.save_work(&record)?;
                 }
@@ -740,6 +771,20 @@ impl HostBridge {
             if reconciled.is_err() {
                 self.work_fail();
                 return;
+            }
+            // Delegated tasks, in design I.6.2's order (only where there may
+            // be any: with the hook off and none stored, as on main).
+            if self.may_hold_delegated() {
+                match self.recover_delegated(cx) {
+                    #[cfg(test)]
+                    Ok(steps) => self.work.recovery = steps,
+                    #[cfg(not(test))]
+                    Ok(_) => {}
+                    Err(_) => {
+                        self.work_fail();
+                        return;
+                    }
+                }
             }
             self.work.recovered = true;
         }
@@ -1988,6 +2033,19 @@ impl HostBridge {
             r.status.detail = detail.clone();
             return Ok(());
         }
+        // A delegated task of unknown outcome says why, as its receipt does
+        // (`agent exited`, `outcome could not be established`, session-v1
+        // R9.14 item 6): the reason the owner's alert names (`host.alerts`).
+        if let (true, ReceiptState::OutcomeUnknown, Some(detail)) =
+            (r.delegated.is_some(), receipt.state, &receipt.detail)
+        {
+            r.status.detail = detail.clone();
+            if let Some(reply) = self.collab_reply_of(&r.task.task_id) {
+                collab_bridge::apply_reply(r, &reply);
+            }
+            self.collab_early_end(r)?;
+            return Ok(());
+        }
         r.status.detail = if r.status.state == WorkState::Submitted && r.turn_id.is_some() {
             collab_bridge::IN_TURN
         } else if turn_interrupted(&receipt) {
@@ -2099,6 +2157,7 @@ mod local_tests {
         use super::*;
         include!("delegated/dispatch_tests.rs");
         include!("delegated/lifecycle_tests.rs");
+        include!("delegated/recovery_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};
