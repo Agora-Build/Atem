@@ -31,12 +31,13 @@ const READ_EVERY: Duration = Duration::from_millis(100);
 /// are pruned (counters also at each counted send).
 const CLEANUP_EVERY: Duration = Duration::from_secs(60);
 
-/// A task whose sender's authority changed since it was accepted: its
-/// principal's control generation moved on (a fence: a removal, any change
-/// of a service's grant, a renewal too, a revoked grant, a device-list
-/// freeze or fault, `local` losing the host's authority). Nothing of it
-/// goes on under the new authority, and no later grant revives it.
-const AUTHORITY_CHANGED: &str = "sender's authority changed";
+// A task whose sender's authority changed since it was accepted: its
+// principal's control generation moved on (a fence: a removal, any change
+// of a service's grant, a renewal too, a revoked grant, a device-list
+// freeze or fault, `local` losing the host's authority). Nothing of it
+// goes on under the new authority, and no later grant revives it.
+// (host-work-v1's text; §11.6 names it too, so it has one definition.)
+use crate::runtime::delegated::details::AUTHORITY_CHANGED;
 
 /// A submitted task whose session receipt the session host no longer has
 /// (evicted or lost): its outcome can't be known any more.

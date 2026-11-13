@@ -20,9 +20,8 @@ pub mod start;
 use crate::runtime::test_hooks::HostFeatures;
 use crate::session_protocol::r9::HostWorkError;
 use atem_client::membership::entry::MemberKind;
-use atem_client::membership::{MemberStatus, Membership};
+use atem_client::membership::{MemberStatus, Membership, service_key_fingerprint};
 use atem_client::principal::{Authority, Need, Op, op_names};
-use atem_client::session::host_work::digest;
 use atem_client::session::host_work::{ALERTS_FEATURE, DELEGATED_FEATURE, Request, ResultBody};
 use atem_client::session::wire::is_delegated_sender;
 use serde::{Deserialize, Serialize};
@@ -165,7 +164,10 @@ impl Admission {
         });
         Admission {
             principal: authority.name(),
-            principal_key: digest(authority.key.as_bytes()),
+            // `r9_svc`'s one definition. An auth key is P-256 or Ed25519
+            // (the device list's verifier); any other gives no fingerprint,
+            // which no caller's key ever matches (fail closed).
+            principal_key: service_key_fingerprint(&authority.key).unwrap_or_default(),
             sender,
             feed,
             route_id: route_id.to_owned(),
@@ -545,6 +547,43 @@ mod tests {
         // Stored with the task, and read back the same.
         let text = serde_json::to_string(&a).unwrap();
         assert_eq!(serde_json::from_str::<Admission>(&text).unwrap(), a);
+        // The sender check (`authority::interaction`) compares the raw
+        // key's digest with it: the same value.
+        assert_eq!(
+            hw::digest(bot.key.as_bytes()),
+            a.principal_key,
+            "one definition of the key's fingerprint"
+        );
+    }
+
+    /// An admission stored before `projects_matched` existed (as e1bb860
+    /// wrote it) reads with none, and one with none is written as before
+    /// (no field): records of either build read the same.
+    #[test]
+    fn an_admission_without_projects_matched_reads_and_writes_as_before() {
+        let old = serde_json::json!({
+            "principal": "service:svc-bot",
+            "principal_key": "ab".repeat(32),
+            "sender": {"kind": "service", "device_id": "svc-bot",
+                "feed": {"origin": "https://station-dev.agora.build", "feed_id": "feed-1"}},
+            "feed": {"origin": "https://station-dev.agora.build", "feed_id": "feed-1"},
+            "route_id": "r",
+            "route_revision": 1,
+            "ops_at_admission": ["notify", "prompt", "view"],
+            "scope_at_admission": {"ops": ["notify", "prompt", "view"], "hosts": [HOST]},
+            "grant_expires_at": 1_800_000_000_000_u64,
+            "device_list_seq": 6,
+        });
+        let a: Admission = serde_json::from_value(old.clone()).unwrap();
+        assert!(a.projects_matched.is_empty());
+        assert_eq!(
+            a.sender,
+            DelegatedSender::Service {
+                device_id: "svc-bot".into(),
+                feed: feed(),
+            }
+        );
+        assert_eq!(serde_json::to_value(&a).unwrap(), old);
     }
 
     /// With the hook off the delegated ops that reach the bridge are

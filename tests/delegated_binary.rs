@@ -236,11 +236,20 @@ principals = {principals}
         child.wait().unwrap();
     }
 
-    /// The runtime killed itself (a crash hook): it exited on `SIGKILL`.
+    /// The runtime killed itself (a crash hook): it exited on `SIGKILL`
+    /// (within [`within`]'s bound: a hook that never fired fails the test,
+    /// never hangs it).
     fn died(&mut self) {
         use std::os::unix::process::ExitStatusExt;
         self.sandbox.track();
-        let status = self.runtime.take().unwrap().wait().unwrap();
+        let child = self.runtime.as_mut().unwrap();
+        let mut status = None;
+        within("the runtime to die", || {
+            status = child.try_wait().unwrap();
+            status.is_some()
+        });
+        self.runtime = None;
+        let status = status.unwrap();
         assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
     }
 }

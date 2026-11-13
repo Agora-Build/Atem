@@ -143,7 +143,10 @@
 //!   are still answered and the start's recovery still runs, but no task is
 //!   dispatched, settled or withdrawn by host-work, so what the session
 //!   host does meanwhile (the start check at `executing`, VII.A test 17) is
-//!   seen before host-work processes it.
+//!   seen before host-work processes it. The start view's standings, gates
+//!   and scopes stay as last read (the scheduling pass refreshes them; the
+//!   device list and `runtime.toml` still reach it when they change), while
+//!   `D` and the journal's halt are still read every 100 ms.
 //!
 //! Like the other hooks, these are read from the process environment once:
 //! a unit-test process started with one set sees it in every `HostBridge`

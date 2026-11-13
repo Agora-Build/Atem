@@ -69,9 +69,11 @@ pub struct Grounds<'a> {
     /// The time a grant's expiry is compared with: the host's wall clock,
     /// or the delegated clock's `D` when that is later.
     pub now_ms: u64,
-    /// Whether the task's session is in a `projects` scope entry: none
-    /// while that can't be compared (a locked cred agent), which leaves it
-    /// out of scope.
+    /// Whether the task's session is in a `projects` scope entry, for a
+    /// kid the admission didn't see (an entry it matched at admission
+    /// decides without it, `Admission::project_matches`): none while that
+    /// can't be compared (a locked cred agent), which leaves it out of
+    /// scope.
     pub projects: &'a dyn Fn(&str) -> Option<bool>,
 }
 

@@ -322,9 +322,10 @@ impl Store {
             .optional()?)
     }
 
-    /// Whether `attempt_id` may be submitted (or sent again: the session
-    /// host answers a duplicate with its receipt): only the live attempt
-    /// of `task_id`. Never one that ended, whatever ended it.
+    /// Whether `attempt_id` may be submitted: only the live attempt of
+    /// `task_id`, asked within this run, after its row's commit. Never one
+    /// that ended, whatever ended it. At recovery a live attempt is
+    /// reconciled from its receipt, never resent.
     pub fn may_submit(&self, task_id: &str, attempt_id: &str) -> Result<bool> {
         Ok(self.db.query_row(
             r#"SELECT EXISTS(SELECT 1 FROM attempts

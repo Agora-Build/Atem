@@ -35,9 +35,10 @@ const SILENT: &str = "turn ended without a reply";
 /// The silent-turn report of a turn that ended interrupted: both facts.
 const SILENT_INTERRUPTED: &str = "turn interrupted without a reply";
 
-/// A task whose target route or profile approval changed since it was
-/// accepted: it can never be dispatched, or its result delivered, under it.
-pub(super) const ROUTE_CHANGED: &str = "route changed";
+// A task whose target route or profile approval changed since it was
+// accepted: it can never be dispatched, or its result delivered, under it
+// (host-work-v1's text; §11.6 names it too, so it has one definition).
+pub(super) use crate::runtime::delegated::details::ROUTE_CHANGED;
 
 /// A reply's text fits the task that carries it to its sender.
 const MAX_REPLY_TEXT: usize = atem_client::session::host_work::MAX_REPLY_TEXT_BYTES;
