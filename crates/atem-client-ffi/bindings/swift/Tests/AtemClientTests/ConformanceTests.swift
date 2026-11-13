@@ -1253,21 +1253,39 @@ final class ConformanceTests: XCTestCase {
             let station = o(o(ctl["stations"])["A"])
             let origin = s(station["origin"])
             let feed = s(station["feed_id"])
-            try eq(try relayDecodeToStation(message: relayControlSync(origin: origin, feedId: feed, after: 7)), .controlSync(origin: origin, feedId: feed, after: 7))
-            try eq(try relayDecodeToStation(message: relayControlSync(origin: origin, feedId: nil, after: 0)), .controlSync(origin: origin, feedId: nil, after: 0))
-            try throwsCode("malformed") { _ = try relayControlSync(origin: origin, feedId: nil, after: 5) }
+            // Correlation: the call's id is the caller's, a lowercase UUID v4.
+            let request = "5d0e9a3c-2b1f-4c8d-9e7a-6b5c4d3e2f10"
+            try eq(try relayDecodeToStation(message: relayControlSync(requestId: request, origin: origin, feedId: feed, after: 7)), .controlSync(requestId: request, origin: origin, feedId: feed, after: 7))
+            try eq(try relayDecodeToStation(message: relayControlSync(requestId: request, origin: origin, feedId: nil, after: 0)), .controlSync(requestId: request, origin: origin, feedId: nil, after: 0))
+            try throwsCode("malformed") { _ = try relayControlSync(requestId: request, origin: origin, feedId: nil, after: 5) }
+            try throwsCode("malformed") { _ = try relayControlSync(requestId: request.uppercased(), origin: origin, feedId: feed, after: 7) }
             let page = ["S1_cover", "S4_revoke", "M1_revoke"].enumerated().map {
                 RelayFeedRecord(feedSeq: UInt64($0.offset + 1), recordJson: ctlRecord($0.element))
             }
-            guard case let .controlSyncResult(_, _, _, _, records) = try relayDecodeToHost(message: relayControlSyncResult(origin: origin, feedId: feed, head: 3, stationTime: 1_793_620_940_000, records: page)) else {
+            func result(_ after: UInt64, _ head: UInt64, _ records: [RelayFeedRecord]) throws -> String {
+                try relayControlSyncResult(requestId: request, origin: origin, feedId: feed, after: after, head: head, stationTime: 1_793_620_940_000, records: records)
+            }
+            let built = try result(0, 3, page)
+            guard case let .controlSyncResult(requestId, _, _, after, _, _, records) = try relayDecodeToHost(message: built) else {
                 throw Failure(description: "not a page")
             }
+            try eq(requestId, request)
+            try eq(after, 0)
             try eq(try records.map { try canonicalJson(json: $0.recordJson) }, try page.map { try canonicalJson(json: $0.recordJson) })
+            try eq(try relayControlSyncAnswers(call: relayControlSync(requestId: request, origin: origin, feedId: feed, after: 0), result: built), .answers)
+            try eq(try relayControlSyncAnswers(call: relayControlSync(requestId: request, origin: origin, feedId: feed, after: 1), result: built), .after)
             var refusedPage = page
             refusedPage[1] = RelayFeedRecord(feedSeq: 2, recordJson: ctlRecord("P4_unknown_field"))
-            try throwsCode("unknown_field") { _ = try relayControlSyncResult(origin: origin, feedId: feed, head: 3, stationTime: 0, records: refusedPage) }
-            try throwsCode("malformed") { _ = try relayControlSyncResult(origin: origin, feedId: feed, head: 2, stationTime: 0, records: page) }
-            try throwsCode("malformed") { _ = try relayControlSyncResult(origin: origin, feedId: feed, head: 3, stationTime: 0, records: [page[1], page[0]]) }
+            try throwsCode("unknown_field") { _ = try result(0, 3, refusedPage) }
+            try throwsCode("malformed") { _ = try result(0, 2, page) }
+            try throwsCode("malformed") { _ = try result(0, 3, [page[1], page[0]]) }
+            // Strictly after the echoed after; a head below after holds no record.
+            try throwsCode("malformed") { _ = try result(1, 3, page) }
+            guard case let .controlSyncResult(_, _, _, _, _, _, emptyPage) = try relayDecodeToHost(message: result(9, 3, [])) else {
+                throw Failure(description: "not a page")
+            }
+            try eq(emptyPage.count, 0)
+            try throwsCode("malformed") { _ = try result(9, 3, [page[2]]) }
             let heads = [RelayFeedHead(origin: origin, feedId: feed, head: 3, stationTime: 1_793_620_940_000)]
             let hm = try relayHeads(feeds: heads, membership: mlogHead)
             try eq(try relayDecodeToHost(message: hm), .heads(feeds: heads, membership: mlogHead))
@@ -1281,7 +1299,7 @@ final class ConformanceTests: XCTestCase {
             }
             try eq(fetchedHead, mlogHead)
             try eq(try fetched.map { try canonicalJson(json: $0) }, try entries.map { try canonicalJson(json: $0) })
-            try throwsCode("wrong_message") { _ = try relayDecodeToHost(message: relayControlSync(origin: origin, feedId: nil, after: 0)) }
+            try throwsCode("wrong_message") { _ = try relayDecodeToHost(message: relayControlSync(requestId: request, origin: origin, feedId: nil, after: 0)) }
             try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: "{\"type\":\"relay\",\"op\":\"push_hint\",\"hints\":[]}") }
             try throwsCode("not_strict") { _ = try relayDecodeToStation(message: "{") }
         }
@@ -1368,14 +1386,17 @@ final class ConformanceTests: XCTestCase {
                 switch op {
                 case "control_sync":
                     let feed = f["feed_id"] as? String
-                    try eq(try relayControlSync(origin: s(f["origin"]), feedId: feed, after: u(f["after"])), wire, name)
+                    try eq(try relayControlSync(requestId: s(f["request_id"]), origin: s(f["origin"]), feedId: feed, after: u(f["after"])), wire, name)
                     try throwsCode("wrong_message") { _ = try relayDecodeToHost(message: wire) }
-                    try eq(try relayDecodeToStation(message: wire), .controlSync(origin: s(f["origin"]), feedId: feed, after: u(f["after"])), name)
+                    try eq(try relayDecodeToStation(message: wire), .controlSync(requestId: s(f["request_id"]), origin: s(f["origin"]), feedId: feed, after: u(f["after"])), name)
                 case "control_sync_result":
                     let items = a(f["records"]).map(o)
                     let records = items.map { RelayFeedRecord(feedSeq: u($0["feed_seq"]), recordJson: js($0["record"]!)) }
                     let judged = a(c["judged"]).map(o)
-                    let build = { try relayControlSyncResult(origin: s(f["origin"]), feedId: s(f["feed_id"]), head: u(f["head"]), stationTime: u(f["station_time"]), records: records) }
+                    let build = {
+                        try relayControlSyncResult(requestId: s(f["request_id"]), origin: s(f["origin"]), feedId: s(f["feed_id"]), after: u(f["after"]),
+                                                   head: u(f["head"]), stationTime: u(f["station_time"]), records: records)
+                    }
                     let handAssembled = (c["hand_assembled"] as? Bool) ?? false
                     try eq(judged.contains(where: { ($0["parses"] as! Bool) == false }), handAssembled, "\(name) hand_assembled")
                     if let refused = judged.first(where: { ($0["parses"] as! Bool) == false }) {
@@ -1384,11 +1405,13 @@ final class ConformanceTests: XCTestCase {
                         try eq(try build(), wire, name)
                     }
                     try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: wire) }
-                    guard case let .controlSyncResult(origin, feedId, pageHead, stationTime, read) = try relayDecodeToHost(message: wire) else {
+                    guard case let .controlSyncResult(requestId, origin, feedId, after, pageHead, stationTime, read) = try relayDecodeToHost(message: wire) else {
                         throw Failure(description: "\(name): not a page")
                     }
+                    try eq(requestId, s(f["request_id"]), name)
                     try eq(origin, s(f["origin"]), name)
                     try eq(feedId, s(f["feed_id"]), name)
+                    try eq(after, u(f["after"]), name)
                     try eq(pageHead, u(f["head"]), name)
                     try eq(stationTime, u(f["station_time"]), name)
                     try eq(read.count, items.count, "\(name) records")
@@ -1483,7 +1506,7 @@ final class ConformanceTests: XCTestCase {
                 let name = s(c["name"])
                 try eq(wire.utf8.count, 262144, "\(name) bytes")
                 switch try relayDecodeToHost(message: wire) {
-                case let .controlSyncResult(_, _, pageHead, _, records):
+                case let .controlSyncResult(_, _, _, _, pageHead, _, records):
                     try eq(pageHead, u(accepts["head"]), "\(name) head")
                     try eq(records.count, Int(u(accepts["records"])), "\(name) records")
                     for (r, want) in zip(records, a(accepts["records_parse"])) {
@@ -1506,6 +1529,37 @@ final class ConformanceTests: XCTestCase {
                     try throwsCode(code) { _ = try relayDecodeToStation(message: wire) }
                 }
             }
+        }
+        check("Station calls: correlation, each matching case's verdict through relayControlSyncAnswers") {
+            func verdict(_ v: RelaySyncVerdict) -> String {
+                switch v {
+                case .answers: return "answers"
+                case .requestId: return "request_id"
+                case .origin: return "origin"
+                case .feedId: return "feed_id"
+                case .after: return "after"
+                }
+            }
+            let cases = a(stationCalls["matching"]).map(o)
+            try eq(cases.count >= 9, true, "matching cases")
+            var seen = Set<String>()
+            for c in cases {
+                let calls = a(c["calls"]).map(s)
+                let verdicts = a(c["verdicts"]).map(s)
+                try eq(calls.count, verdicts.count, "\(s(c["name"])) verdicts")
+                for (i, call) in calls.enumerated() {
+                    let got = verdict(try relayControlSyncAnswers(call: call, result: s(c["result"])))
+                    try eq(got, verdicts[i], "\(s(c["name"])) call \(i)")
+                    seen.insert(got)
+                }
+            }
+            try eq(seen.sorted(), ["after", "answers", "feed_id", "origin", "request_id"], "every verdict")
+            let first = cases[0]
+            let firstCall = s(a(first["calls"])[0])
+            let firstResult = s(first["result"])
+            try throwsCode("wrong_message") { _ = try relayControlSyncAnswers(call: firstResult, result: firstResult) }
+            try throwsCode("wrong_message") { _ = try relayControlSyncAnswers(call: firstCall, result: firstCall) }
+            try throwsCode("wrong_message") { _ = try relayControlSyncAnswers(call: firstCall, result: relayControlSyncRefused(code: .forbidden)) }
         }
         check("Station: the Portal's statuses in their classes") {
             let want: [(UInt16, String)] = [(200, "confirm"), (401, "retry"), (408, "retry"), (429, "retry"), (500, "retry"), (503, "retry"),

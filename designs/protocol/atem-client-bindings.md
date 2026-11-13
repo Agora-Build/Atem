@@ -617,10 +617,14 @@ for a service or a host sender. Production exports for Station builders:
 `relay_decode_to_station`, `relay_decode_to_host`, the relay builders
 (`relay_control_sync`, `relay_control_sync_result`, `relay_heads`,
 `relay_control_ack`, `relay_membership_fetch`,
-`relay_membership_fetch_result`), `AckLedgerHandle` (whose calls return an
-`AckTransition`) and `report_answer`: a Station's side of its hosts' feed
-calls and acknowledgments, and its reports to the Portal. Production
-exports for Station builders: §9. An app (Astation) uses none of them.
+`relay_membership_fetch_result`), `relay_control_sync_answers` (whether a
+`control_sync_result` answers a `control_sync`), `AckLedgerHandle` (whose
+calls return an `AckTransition`) and `report_answer`: a Station's side of
+its hosts' feed calls and acknowledgments, and its reports to the Portal.
+Production exports for Station builders: §9. An app (Astation) uses none of
+them, but for its `:8080` proxy, which matches a feed result to the call it
+forwarded with `relay_control_sync_answers` (correlation, §9 "Station
+calls").
 
 ### Mail between hosts (delegated host work; planned, host role)
 
@@ -1358,19 +1362,38 @@ reply to an ack `ack` refuses for its association on the link
 ack gets a reply. A refusal is an authorization failure on that link,
 never an empty successful page or an application acknowledgment: it
 advances no cursor, membership head, clock floor or ledger evidence, opens
-no gate, carries no request id and must not complete or correlate a
-request. The host keeps that link's synchronization gates closed while it
-repairs the association and resynchronizes; the transport may still fence
-or close an invalid or superseded link.
+no gate, carries no request id or cursor (correlation leaves the three
+unchanged: a refusal names a call kind, never a request) and must not
+complete or correlate a request. The host keeps that link's synchronization
+gates closed while it repairs the association and resynchronizes; the
+transport may still fence or close an invalid or superseded link.
+
+**Correlation** (**amended in place on Astation's request, #164 comment
+6858189009**; unshipped, so no new version and no fallback). A
+`control_sync` carries `request_id`, a lowercase UUID v4 that the host makes
+fresh for every call (a retry after a timeout and a call on a new link
+generation included, even at the same cursor); answer it with the same
+`request_id` and its `after` echoed, on the feed it named (a call that names
+no feed asks from 0 for the account's current feed), with records strictly
+after that `after`. A named feed that is stale (pre-reset) is refused
+`control_sync_refused`, never answered on the new feed. The host and
+Astation's `:8080` proxy decide whether a result answers a call with the one
+shared helper, `relay_control_sync_answers` (below): the same `request_id`,
+origin, feed (when the call named one) and `after`. The link generation, the
+account and the genesis captured with the call are the caller's to compare,
+and an id is a correlation value, never authorization: a result for a
+retired, timed-out or old-generation call, or for no call, advances nothing
+and opens no gate.
 
 | call | what it does |
 |---|---|
-| `relay_decode_to_station(message)` | reads a host's call strictly (at most 256 KiB as received, one strict I-JSON parse, exact fields, never `null`): `ControlSync{origin, feed_id?, after}`, `ControlAck{ack}` or `MembershipFetch{after}`. Another relay message on the link (`push_hint`, `push_seen`, …) is `Invalid{wrong_message}`: dispatch it elsewhere. The calling host is never a field: take it from the link's verified association (below). An ack's `ControlEffectResult.why` (O5, **for Astation's sign-off**, amended for step 4; host-work-v1 §11.4 wire rule 10; the vocabulary is `control_why_codes()`, JS `controlWhyCodes()`) is why an effect `pending` or `refused` isn't in force, as the host wrote it, or `None` (JS `null`): read it as information only, never as a count or a request to re-sign, and treat a code you don't know as unrecognized (a later version's; the result stands). A reason that is `null`, not a text, empty, over 64 bytes, outside `[a-z0-9_]` or beside `applied` or `duplicate` refuses the whole ack, `Invalid{malformed}` |
-| `relay_control_sync_result(origin, feed_id, head, station_time, records)` | the page after the host's `after`: at most 64 `RelayFeedRecord{feed_seq, record_json}`, ascending, each `feed_seq` in `1..=head`, 256 KiB in all. Each record goes through the control parser first: one it refuses is `Invalid{code}` with its parse code, and the page isn't written. Serve only records you validated at intake and stored |
+| `relay_decode_to_station(message)` | reads a host's call strictly (at most 256 KiB as received, one strict I-JSON parse, exact fields, never `null`): `ControlSync{request_id, origin, feed_id?, after}` (answer with its `request_id` and `after`), `ControlAck{ack}` or `MembershipFetch{after}`. Another relay message on the link (`push_hint`, `push_seen`, …) is `Invalid{wrong_message}`: dispatch it elsewhere. The calling host is never a field: take it from the link's verified association (below). An ack's `ControlEffectResult.why` (O5, **for Astation's sign-off**, amended for step 4; host-work-v1 §11.4 wire rule 10; the vocabulary is `control_why_codes()`, JS `controlWhyCodes()`) is why an effect `pending` or `refused` isn't in force, as the host wrote it, or `None` (JS `null`): read it as information only, never as a count or a request to re-sign, and treat a code you don't know as unrecognized (a later version's; the result stands). A reason that is `null`, not a text, empty, over 64 bytes, outside `[a-z0-9_]` or beside `applied` or `duplicate` refuses the whole ack, `Invalid{malformed}` |
+| `relay_control_sync_result(request_id, origin, feed_id, after, head, station_time, records)` | the answer to the call `request_id` names, its `after` echoed, on the feed it named (or, for a call that named none, the account's current feed): at most 64 `RelayFeedRecord{feed_seq, record_json}`, ascending, each `feed_seq` strictly after `after` and at most `head` (gaps are legal; a `head` below `after`, a feed that went back under the same id, takes no record: the host rescans), 256 KiB in all. Never leave out earlier stored records to fill a page with later ones. Each record goes through the control parser first: one it refuses is `Invalid{code}` with its parse code, and the page isn't written. Serve only records you validated at intake and stored |
+| `relay_control_sync_answers(call, result)` | whether the `control_sync_result` text `result` answers the `control_sync` text `call` (each read strictly; `Invalid{code}` if either isn't one): `RelaySyncVerdict::Answers`, else the first field that differs, `RequestId`, `Origin`, `FeedId` or `After`. The shared matching decision of the host and the `:8080` proxy; the caller compares the link generation, account and genesis it captured with the call |
 | `relay_heads(feeds, membership)` | each covering feed's `RelayFeedHead{origin, feed_id, head, station_time}` (at most 64, a feed once) and the device list's `LogHead`. Send it on every (re)connection, every 30 seconds and at once when a record is stored. `membership` is the stored log's `LogHead` exactly: the host compares `seq` and hash (**Atem's reading, for Astation**, step 4, 2026-11-13; host-work-v1 §11.4, "The gate") |
 | `relay_membership_fetch_result(head, entries)` | the device list's head and the entries after the host's `after` (signed objects' JSON), at most 64: an R9.3 carriage |
 | `relay_control_sync_refused(code)`, `relay_membership_fetch_refused(code)`, `relay_control_ack_refused(code)` | a refusal of that call on this link (`code`: `RelayRefusalCode::Forbidden`, the only one); never send an empty page or an ack instead. `relay_decode_to_host` reads them as `ControlSyncRefused{code}`, `MembershipFetchRefused{code}`, `ControlAckRefused{code}` |
-| `relay_control_sync(origin, feed_id, after)`, `relay_control_ack(ack)`, `relay_membership_fetch(after)`, `relay_decode_to_host(message)` | the host's side, for tests and other hosts |
+| `relay_control_sync(request_id, origin, feed_id, after)`, `relay_control_ack(ack)`, `relay_membership_fetch(after)`, `relay_decode_to_host(message)` | the host's side, for tests and other hosts (`request_id`: the caller's, a fresh lowercase UUID v4 for every call; `relay_decode_to_host` reads a page as `ControlSyncResult{request_id, origin, feed_id, after, head, station_time, records}`) |
 
 **Known answers.** `fixtures/r9-vectors-station-calls.json` holds every
 message of the six calls and the three refusals as the exact text these
@@ -1379,7 +1402,15 @@ the control parser's verdict on each page record, and the invalid texts each
 reader refuses with its code (an unknown field, a `null`, a duplicate key,
 an unknown refusal code, a count of 65, and each refused form of a
 typed reason: `null`, not a text, empty, over 64 bytes, outside
-`[a-z0-9_]`, beside `applied` or `duplicate`, a duplicate `why` key)
+`[a-z0-9_]`, beside `applied` or `duplicate`, a duplicate `why` key; and
+each refused form of correlation: a call's or a result's `request_id`
+missing, `null`, upper case or not a v4 UUID, a result without its `after`,
+a record at or below `after`, and a `head` below `after` with records),
+the `matching` cases (a result read against one or more calls by
+`relay_control_sync_answers`: a match, a discovery answered on the current
+feed, a feed gone back, mismatches on the id, the origin, the feed and the
+`after`, two calls at the same cursor that differ only by their ids, and a
+retired call's late reply, each with its verdict),
 and the byte bound for each call
 that can carry a large page (a text of exactly 262,144 bytes read, one of
 262,145 and one of 300,000 refused, for `control_sync_result` and
@@ -1400,8 +1431,9 @@ accepts; a value out of its grammar is `Invalid{code}` (`too_large`,
 Station sent it, of any JSON type: a record the control parser refuses
 costs only itself, never the page. JS: `relayDecodeToStation(message)`,
 `relayDecodeToHost(message)` (plain objects, `{type: "control_sync" | "control_ack" | …, …}`, camelCase),
-`relayControlSync(origin, feedId?, after)`,
-`relayControlSyncResult(origin, feedId, head, stationTime, [{feedSeq, recordJson}])`,
+`relayControlSync(requestId, origin, feedId?, after)`,
+`relayControlSyncResult(requestId, origin, feedId, after, head, stationTime, [{feedSeq, recordJson}])`,
+`relayControlSyncAnswers(call, result)` (`"answers"`, `"request_id"`, `"origin"`, `"feed_id"` or `"after"`),
 `relayHeads([{origin, feedId, head, stationTime}], {seq, hash})`,
 `relayControlAck({accountId, genesisHash, hostId, hostTrustGen, origin, feedId, cursor, results})`
 (each result `{type: "record", recordId, effects}` or `{type: "entry", seq,

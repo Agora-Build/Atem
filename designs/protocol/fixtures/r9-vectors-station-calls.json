@@ -14,10 +14,10 @@
       "op": "control_sync_result",
       "wire_fill": {
         "bytes": 262144,
-        "count": 261932,
+        "count": 261870,
         "fill": "x",
-        "prefix": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":\"",
-        "suffix": "\"}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+        "prefix": "{\"after\":0,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":\"",
+        "suffix": "\"}],\"request_id\":\"a2cdc978-e746-4c9d-ab7b-7dca7673c7c8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
       }
     },
     {
@@ -47,60 +47,66 @@
       "fields": {
         "after": 2,
         "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-        "origin": "https://station-dev.agora.build"
+        "origin": "https://station-dev.agora.build",
+        "request_id": "87b0db11-7508-437c-82de-658f0edace06"
       },
       "name": "control_sync_with_feed_id",
-      "note": "the host knows the feed: read it after position 2, the last it read",
+      "note": "the host knows the feed: read it after position 2, the last it read; request_id names this call (a fresh lowercase UUID v4 for every call)",
       "op": "control_sync",
-      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
     },
     {
       "direction": "to_station",
       "fields": {
         "after": 0,
-        "origin": "https://station-dev.agora.build"
+        "origin": "https://station-dev.agora.build",
+        "request_id": "caee7840-20ce-4276-8f08-65c9cf57a6a8"
       },
       "name": "control_sync_without_feed_id",
-      "note": "the host doesn't know the feed yet: no feed_id, and a cursor belongs to a feed, so after is 0",
+      "note": "the host doesn't know the feed yet (initial discovery): no feed_id, and a cursor belongs to a feed, so after is 0; the result names the account's current feed",
       "op": "control_sync",
-      "wire": "{\"after\":0,\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"type\":\"relay\"}"
     },
     {
       "direction": "to_station",
       "fields": {
         "after": 9007199254740991,
         "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-        "origin": "https://station-dev.agora.build"
+        "origin": "https://station-dev.agora.build",
+        "request_id": "d1529b7f-b923-461b-9be0-141fb7b87913"
       },
       "name": "control_sync_at_the_largest_position",
       "note": "after at 2^53 - 1, the largest integer",
       "op": "control_sync",
-      "wire": "{\"after\":9007199254740991,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":9007199254740991,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"d1529b7f-b923-461b-9be0-141fb7b87913\",\"type\":\"relay\"}"
     },
     {
       "direction": "to_host",
       "fields": {
+        "after": 0,
         "feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
         "head": 0,
         "origin": "https://station-dev.agora.build",
         "records": [],
+        "request_id": "caee7840-20ce-4276-8f08-65c9cf57a6a8",
         "station_time": 1793620940000
       },
       "judged": [],
       "name": "control_sync_result_empty_feed",
-      "note": "a feed with no record: head 0, no records",
+      "note": "the answer to control_sync_without_feed_id (its request_id, its after 0): the account's current feed at this Station, here A2, with no record yet: head 0, no records",
       "op": "control_sync_result",
-      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "direction": "to_host",
       "fields": {
+        "after": 2,
         "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-        "head": 3,
+        "head": 5,
         "origin": "https://station-dev.agora.build",
         "records": [
           {
-            "feed_seq": 1,
+            "feed_seq": 3,
             "record": {
               "body": {
                 "about": {
@@ -124,7 +130,7 @@
             }
           },
           {
-            "feed_seq": 2,
+            "feed_seq": 4,
             "record": {
               "body": {
                 "about": {
@@ -149,7 +155,7 @@
             }
           },
           {
-            "feed_seq": 3,
+            "feed_seq": 5,
             "record": {
               "body": {
                 "about": {
@@ -174,39 +180,58 @@
             }
           }
         ],
+        "request_id": "87b0db11-7508-437c-82de-658f0edace06",
         "station_time": 1793620940000
       },
       "judged": [
         {
-          "feed_seq": 1,
+          "feed_seq": 3,
           "parses": true,
           "record_id": "00000000-0000-4000-8000-000000000001"
         },
         {
-          "feed_seq": 2,
+          "feed_seq": 4,
           "parses": true,
           "record_id": "00000000-0000-4000-8000-000000000004"
         },
         {
-          "feed_seq": 3,
+          "feed_seq": 5,
           "parses": true,
           "record_id": "00000000-0000-4000-8000-000000000014"
         }
       ],
       "name": "control_sync_result_with_records",
-      "note": "three records of the control vectors, ascending, the last at the head",
+      "note": "the answer to control_sync_with_feed_id (its request_id, the feed it named, its after 2): three records of the control vectors strictly after position 2, ascending, the last at the head",
       "op": "control_sync_result",
-      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":3,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":2,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "direction": "to_host",
       "fields": {
+        "after": 9007199254740991,
         "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
-        "head": 9,
+        "head": 5,
+        "origin": "https://station-dev.agora.build",
+        "records": [],
+        "request_id": "d1529b7f-b923-461b-9be0-141fb7b87913",
+        "station_time": 1793620940000
+      },
+      "judged": [],
+      "name": "control_sync_result_head_below_after",
+      "note": "the answer to control_sync_at_the_largest_position on the same feed, whose head (5) is below the call's after: no records (any would be above the head). The feed went back under the same id: the host rescans it from 0 and never moves its cursor on this page",
+      "op": "control_sync_result",
+      "wire": "{\"after\":9007199254740991,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"request_id\":\"d1529b7f-b923-461b-9be0-141fb7b87913\",\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_host",
+      "fields": {
+        "after": 5,
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "head": 11,
         "origin": "https://station-dev.agora.build",
         "records": [
           {
-            "feed_seq": 4,
+            "feed_seq": 6,
             "record": {
               "body": {
                 "about": {
@@ -231,7 +256,7 @@
             }
           },
           {
-            "feed_seq": 5,
+            "feed_seq": 7,
             "record": {
               "body": {
                 "about": {
@@ -256,15 +281,15 @@
             }
           },
           {
-            "feed_seq": 6,
+            "feed_seq": 8,
             "record": "not a record"
           },
           {
-            "feed_seq": 7,
+            "feed_seq": 9,
             "record": null
           },
           {
-            "feed_seq": 9,
+            "feed_seq": 11,
             "record": {
               "body": {
                 "about": {
@@ -288,40 +313,41 @@
             }
           }
         ],
+        "request_id": "de21a88d-6b76-4570-ac2e-074e26d3b673",
         "station_time": 1793620940000
       },
       "hand_assembled": true,
       "judged": [
         {
-          "feed_seq": 4,
+          "feed_seq": 6,
           "parses": true,
           "record_id": "00000000-0000-4000-8000-000000000005"
         },
         {
           "error": "unknown_field",
-          "feed_seq": 5,
-          "parses": false
-        },
-        {
-          "error": "malformed",
-          "feed_seq": 6,
-          "parses": false
-        },
-        {
-          "error": "malformed",
           "feed_seq": 7,
           "parses": false
         },
         {
+          "error": "malformed",
+          "feed_seq": 8,
+          "parses": false
+        },
+        {
+          "error": "malformed",
           "feed_seq": 9,
+          "parses": false
+        },
+        {
+          "feed_seq": 11,
           "parses": true,
           "record_id": "00000000-0000-4000-8000-000000000006"
         }
       ],
       "name": "control_sync_result_with_records_that_do_not_parse",
-      "note": "a page is read whole and each record judged on its own: one with an unknown field, a string and a null don't parse, and the page, the feed's position and the records after them stand (gaps in the positions are allowed)",
+      "note": "the next call's page (after 5): a page is read whole and each record judged on its own: one with an unknown field, a string and a null don't parse, and the page, the feed's position and the records after them stand (gaps in the positions are allowed)",
       "op": "control_sync_result",
-      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":9,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793620905000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000005\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"75A_hJab2d9VwfDdyVFD0L0D71RqDV1Nl22CkfLlA4RiqB81V_q87d6cqbtRjmea1ahSS7NzDkmgMUX9Po8tAA\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620951000,\"note\":\"x\",\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000036\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"D3X_oz7YbqH6tPWBCXi3p2AKGpHhuE_ivaQOpxslVPfEnk9nR5d3VuJhDnl_k2KoddLaJnjq1o7-qKQmjD2RDA\"}},{\"feed_seq\":6,\"record\":\"not a record\"},{\"feed_seq\":7,\"record\":null},{\"feed_seq\":9,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"interrupt_running\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620906000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000006\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"TiIp0SnQhEjUz6msZGtC-4o998qImuwQz5Mbx7u-83redjza-RWg5y2wuf4lxdtKqowU2Y6Sea922hEBYeqACQ\"}}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":11,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":6,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793620905000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000005\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"75A_hJab2d9VwfDdyVFD0L0D71RqDV1Nl22CkfLlA4RiqB81V_q87d6cqbtRjmea1ahSS7NzDkmgMUX9Po8tAA\"}},{\"feed_seq\":7,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620951000,\"note\":\"x\",\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000036\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"D3X_oz7YbqH6tPWBCXi3p2AKGpHhuE_ivaQOpxslVPfEnk9nR5d3VuJhDnl_k2KoddLaJnjq1o7-qKQmjD2RDA\"}},{\"feed_seq\":8,\"record\":\"not a record\"},{\"feed_seq\":9,\"record\":null},{\"feed_seq\":11,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"interrupt_running\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620906000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000006\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"TiIp0SnQhEjUz6msZGtC-4o998qImuwQz5Mbx7u-83redjza-RWg5y2wuf4lxdtKqowU2Y6Sea922hEBYeqACQ\"}}],\"request_id\":\"de21a88d-6b76-4570-ac2e-074e26d3b673\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "direction": "to_host",
@@ -1927,112 +1953,168 @@
       "name": "control_sync_unknown_field",
       "op": "control_sync",
       "reader": "to_station",
-      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"mailbox\":1,\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"mailbox\":1,\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_feed_id_null",
       "op": "control_sync",
       "reader": "to_station",
-      "wire": "{\"after\":2,\"feed_id\":null,\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":2,\"feed_id\":null,\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
     },
     {
       "code": "not_strict",
       "name": "control_sync_duplicate_key",
       "op": "control_sync",
       "reader": "to_station",
-      "wire": "{\"after\":2,\"after\":3,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":2,\"after\":3,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_after_without_a_feed_id",
       "op": "control_sync",
       "reader": "to_station",
-      "wire": "{\"after\":5,\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":5,\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_origin_with_a_path",
       "op": "control_sync",
       "reader": "to_station",
-      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build/\",\"type\":\"relay\"}"
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build/\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_origin_not_lowercase",
       "op": "control_sync",
       "reader": "to_station",
-      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://Station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://Station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_origin_plain_http",
       "op": "control_sync",
       "reader": "to_station",
-      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"http://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"http://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_feed_id_not_uuid_v4",
       "op": "control_sync",
       "reader": "to_station",
-      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-5f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-5f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_feed_id_not_lowercase",
       "op": "control_sync",
       "reader": "to_station",
-      "wire": "{\"after\":2,\"feed_id\":\"6F1C2B3A-4D5E-4F60-8A7B-9C0D1E2F3A4B\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":2,\"feed_id\":\"6F1C2B3A-4D5E-4F60-8A7B-9C0D1E2F3A4B\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
     },
     {
       "code": "not_strict",
       "name": "control_sync_after_a_fraction",
       "op": "control_sync",
       "reader": "to_station",
-      "wire": "{\"after\":1.5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":1.5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
     },
     {
       "code": "not_strict",
       "name": "control_sync_after_an_unsafe_integer",
       "op": "control_sync",
       "reader": "to_station",
-      "wire": "{\"after\":9007199254740992,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":9007199254740992,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_after_negative",
       "op": "control_sync",
       "reader": "to_station",
-      "wire": "{\"after\":-1,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":-1,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_after_missing",
       "op": "control_sync",
       "reader": "to_station",
-      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_after_as_text",
       "op": "control_sync",
       "reader": "to_station",
-      "wire": "{\"after\":\"2\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":\"2\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_request_id_missing",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_request_id_null",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":null,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_request_id_upper_case",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87B0DB11-7508-437C-82DE-658F0EDACE06\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_request_id_not_uuid_v4",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-537c-82de-658f0edace06\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_request_id_missing",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_request_id_null",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":null,\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_request_id_upper_case",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"87B0DB11-7508-437C-82DE-658F0EDACE06\",\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_request_id_not_uuid_v4",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"87b0db11-7508-537c-82de-658f0edace06\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "wrong_message",
       "name": "control_sync_not_a_relay_message",
       "op": "control_sync",
       "reader": "to_station",
-      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"session\"}"
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"session\"}"
     },
     {
       "code": "wrong_message",
       "name": "a_call_read_as_a_stations_message",
       "op": "control_sync",
       "reader": "to_host",
-      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
     },
     {
       "code": "wrong_message",
@@ -2074,126 +2156,161 @@
       "name": "control_sync_result_unknown_field",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"more\":true,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"more\":true,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "unknown_field",
       "name": "control_sync_result_item_unknown_field",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"extra\":1,\"feed_seq\":1,\"record\":0}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"extra\":1,\"feed_seq\":1,\"record\":0}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_result_item_without_a_record",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "too_large",
       "name": "control_sync_result_65_records",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":65,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":0},{\"feed_seq\":2,\"record\":0},{\"feed_seq\":3,\"record\":0},{\"feed_seq\":4,\"record\":0},{\"feed_seq\":5,\"record\":0},{\"feed_seq\":6,\"record\":0},{\"feed_seq\":7,\"record\":0},{\"feed_seq\":8,\"record\":0},{\"feed_seq\":9,\"record\":0},{\"feed_seq\":10,\"record\":0},{\"feed_seq\":11,\"record\":0},{\"feed_seq\":12,\"record\":0},{\"feed_seq\":13,\"record\":0},{\"feed_seq\":14,\"record\":0},{\"feed_seq\":15,\"record\":0},{\"feed_seq\":16,\"record\":0},{\"feed_seq\":17,\"record\":0},{\"feed_seq\":18,\"record\":0},{\"feed_seq\":19,\"record\":0},{\"feed_seq\":20,\"record\":0},{\"feed_seq\":21,\"record\":0},{\"feed_seq\":22,\"record\":0},{\"feed_seq\":23,\"record\":0},{\"feed_seq\":24,\"record\":0},{\"feed_seq\":25,\"record\":0},{\"feed_seq\":26,\"record\":0},{\"feed_seq\":27,\"record\":0},{\"feed_seq\":28,\"record\":0},{\"feed_seq\":29,\"record\":0},{\"feed_seq\":30,\"record\":0},{\"feed_seq\":31,\"record\":0},{\"feed_seq\":32,\"record\":0},{\"feed_seq\":33,\"record\":0},{\"feed_seq\":34,\"record\":0},{\"feed_seq\":35,\"record\":0},{\"feed_seq\":36,\"record\":0},{\"feed_seq\":37,\"record\":0},{\"feed_seq\":38,\"record\":0},{\"feed_seq\":39,\"record\":0},{\"feed_seq\":40,\"record\":0},{\"feed_seq\":41,\"record\":0},{\"feed_seq\":42,\"record\":0},{\"feed_seq\":43,\"record\":0},{\"feed_seq\":44,\"record\":0},{\"feed_seq\":45,\"record\":0},{\"feed_seq\":46,\"record\":0},{\"feed_seq\":47,\"record\":0},{\"feed_seq\":48,\"record\":0},{\"feed_seq\":49,\"record\":0},{\"feed_seq\":50,\"record\":0},{\"feed_seq\":51,\"record\":0},{\"feed_seq\":52,\"record\":0},{\"feed_seq\":53,\"record\":0},{\"feed_seq\":54,\"record\":0},{\"feed_seq\":55,\"record\":0},{\"feed_seq\":56,\"record\":0},{\"feed_seq\":57,\"record\":0},{\"feed_seq\":58,\"record\":0},{\"feed_seq\":59,\"record\":0},{\"feed_seq\":60,\"record\":0},{\"feed_seq\":61,\"record\":0},{\"feed_seq\":62,\"record\":0},{\"feed_seq\":63,\"record\":0},{\"feed_seq\":64,\"record\":0},{\"feed_seq\":65,\"record\":0}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":65,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":0},{\"feed_seq\":2,\"record\":0},{\"feed_seq\":3,\"record\":0},{\"feed_seq\":4,\"record\":0},{\"feed_seq\":5,\"record\":0},{\"feed_seq\":6,\"record\":0},{\"feed_seq\":7,\"record\":0},{\"feed_seq\":8,\"record\":0},{\"feed_seq\":9,\"record\":0},{\"feed_seq\":10,\"record\":0},{\"feed_seq\":11,\"record\":0},{\"feed_seq\":12,\"record\":0},{\"feed_seq\":13,\"record\":0},{\"feed_seq\":14,\"record\":0},{\"feed_seq\":15,\"record\":0},{\"feed_seq\":16,\"record\":0},{\"feed_seq\":17,\"record\":0},{\"feed_seq\":18,\"record\":0},{\"feed_seq\":19,\"record\":0},{\"feed_seq\":20,\"record\":0},{\"feed_seq\":21,\"record\":0},{\"feed_seq\":22,\"record\":0},{\"feed_seq\":23,\"record\":0},{\"feed_seq\":24,\"record\":0},{\"feed_seq\":25,\"record\":0},{\"feed_seq\":26,\"record\":0},{\"feed_seq\":27,\"record\":0},{\"feed_seq\":28,\"record\":0},{\"feed_seq\":29,\"record\":0},{\"feed_seq\":30,\"record\":0},{\"feed_seq\":31,\"record\":0},{\"feed_seq\":32,\"record\":0},{\"feed_seq\":33,\"record\":0},{\"feed_seq\":34,\"record\":0},{\"feed_seq\":35,\"record\":0},{\"feed_seq\":36,\"record\":0},{\"feed_seq\":37,\"record\":0},{\"feed_seq\":38,\"record\":0},{\"feed_seq\":39,\"record\":0},{\"feed_seq\":40,\"record\":0},{\"feed_seq\":41,\"record\":0},{\"feed_seq\":42,\"record\":0},{\"feed_seq\":43,\"record\":0},{\"feed_seq\":44,\"record\":0},{\"feed_seq\":45,\"record\":0},{\"feed_seq\":46,\"record\":0},{\"feed_seq\":47,\"record\":0},{\"feed_seq\":48,\"record\":0},{\"feed_seq\":49,\"record\":0},{\"feed_seq\":50,\"record\":0},{\"feed_seq\":51,\"record\":0},{\"feed_seq\":52,\"record\":0},{\"feed_seq\":53,\"record\":0},{\"feed_seq\":54,\"record\":0},{\"feed_seq\":55,\"record\":0},{\"feed_seq\":56,\"record\":0},{\"feed_seq\":57,\"record\":0},{\"feed_seq\":58,\"record\":0},{\"feed_seq\":59,\"record\":0},{\"feed_seq\":60,\"record\":0},{\"feed_seq\":61,\"record\":0},{\"feed_seq\":62,\"record\":0},{\"feed_seq\":63,\"record\":0},{\"feed_seq\":64,\"record\":0},{\"feed_seq\":65,\"record\":0}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_result_feed_seq_above_the_head",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":2,\"record\":0}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":2,\"record\":0}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_result_feed_seq_not_ascending",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":2,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":2,\"record\":0},{\"feed_seq\":1,\"record\":0}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":2,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":2,\"record\":0},{\"feed_seq\":1,\"record\":0}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_result_feed_seq_twice",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":2,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":0},{\"feed_seq\":1,\"record\":0}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":2,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":0},{\"feed_seq\":1,\"record\":0}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_result_feed_seq_zero",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":0,\"record\":0}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":0,\"record\":0}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_result_head_as_text",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":\"0\",\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":\"0\",\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_result_origin_with_a_path",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build/\",\"records\":[],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build/\",\"records\":[],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_result_feed_id_not_uuid_v4",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"not-a-feed\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"not-a-feed\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_result_station_time_missing",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"type\":\"relay\"}"
     },
     {
       "code": "malformed",
       "name": "control_sync_result_records_not_an_array",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":{},\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":{},\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_after_missing",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_after_null",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"after\":null,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_record_at_after",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"after\":1,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":2,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":0},{\"feed_seq\":2,\"record\":0}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_record_below_after",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"after\":2,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":3,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":0},{\"feed_seq\":3,\"record\":0}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_head_below_after_with_records",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"after\":5,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":3,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":6,\"record\":0}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "not_strict",
       "name": "control_sync_result_duplicate_key_inside_a_record",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":{\"a\":1,\"a\":2}}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":{\"a\":1,\"a\":2}}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "not_strict",
       "name": "control_sync_result_fraction_inside_a_record",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":{\"a\":1.5}}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":{\"a\":1.5}}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "not_strict",
       "name": "control_sync_result_unsafe_integer_inside_a_record",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":{\"a\":9007199254740992}}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":{\"a\":9007199254740992}}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "not_strict",
       "name": "control_sync_result_lone_surrogate_inside_a_record",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":\"\\ud800\"}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":\"\\ud800\"}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "not_strict",
       "name": "control_sync_result_record_nested_past_the_depth_bound",
       "op": "control_sync_result",
       "reader": "to_host",
-      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      "wire": "{\"after\":0,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "code": "too_large",
@@ -2202,10 +2319,10 @@
       "reader": "to_host",
       "wire_fill": {
         "bytes": 262145,
-        "count": 261933,
+        "count": 261871,
         "fill": "x",
-        "prefix": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":\"",
-        "suffix": "\"}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+        "prefix": "{\"after\":0,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":\"",
+        "suffix": "\"}],\"request_id\":\"a2cdc978-e746-4c9d-ab7b-7dca7673c7c8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
       }
     },
     {
@@ -2215,10 +2332,10 @@
       "reader": "to_host",
       "wire_fill": {
         "bytes": 300000,
-        "count": 299788,
+        "count": 299726,
         "fill": "x",
-        "prefix": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":\"",
-        "suffix": "\"}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+        "prefix": "{\"after\":0,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":\"",
+        "suffix": "\"}],\"request_id\":\"a2cdc978-e746-4c9d-ab7b-7dca7673c7c8\",\"station_time\":1793620940000,\"type\":\"relay\"}"
       }
     },
     {
@@ -2725,9 +2842,123 @@
     }
   ],
   "kind": "vectors",
+  "matching": [
+    {
+      "calls": [
+        "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
+      ],
+      "name": "the_answer_to_its_call",
+      "note": "control_sync_result_with_records answers control_sync_with_feed_id: the same request_id, origin, feed and after",
+      "result": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"station_time\":1793620940000,\"type\":\"relay\"}",
+      "verdicts": [
+        "answers"
+      ]
+    },
+    {
+      "calls": [
+        "{\"after\":0,\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"type\":\"relay\"}"
+      ],
+      "name": "discovery_answered_on_the_current_feed",
+      "note": "a call that named no feed (initial discovery, after 0) is answered on whichever feed the result names: the account's current one (here A2)",
+      "result": "{\"after\":0,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}",
+      "verdicts": [
+        "answers"
+      ]
+    },
+    {
+      "calls": [
+        "{\"after\":9007199254740991,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"d1529b7f-b923-461b-9be0-141fb7b87913\",\"type\":\"relay\"}"
+      ],
+      "name": "a_feed_gone_back_answers_its_call",
+      "note": "a page whose head is below the call's after on the same feed answers its call: it is empty, and the host rescans the feed from 0 instead of moving its cursor",
+      "result": "{\"after\":9007199254740991,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"request_id\":\"d1529b7f-b923-461b-9be0-141fb7b87913\",\"station_time\":1793620940000,\"type\":\"relay\"}",
+      "verdicts": [
+        "answers"
+      ]
+    },
+    {
+      "calls": [
+        "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
+      ],
+      "name": "another_calls_id",
+      "note": "the same page under another request_id answers no call this host made: it advances nothing",
+      "result": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"0eacc693-3d1d-4705-aeab-934dafaf0eb1\",\"station_time\":1793620940000,\"type\":\"relay\"}",
+      "verdicts": [
+        "request_id"
+      ]
+    },
+    {
+      "calls": [
+        "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
+      ],
+      "name": "another_origin",
+      "note": "the same page from another Station (B's origin): no answer",
+      "result": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-b.example.com\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"station_time\":1793620940000,\"type\":\"relay\"}",
+      "verdicts": [
+        "origin"
+      ]
+    },
+    {
+      "calls": [
+        "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
+      ],
+      "name": "another_feed",
+      "note": "a call that named a feed (A) is answered only on that feed: a result on another feed (A2) answers nothing, even under the call's id (a named feed gone stale is control_sync_refused)",
+      "result": "{\"after\":2,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"station_time\":1793620940000,\"type\":\"relay\"}",
+      "verdicts": [
+        "feed_id"
+      ]
+    },
+    {
+      "calls": [
+        "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}"
+      ],
+      "name": "another_after",
+      "note": "the call's id on a page that echoes another after (1, not 2): no answer",
+      "result": "{\"after\":1,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"station_time\":1793620940000,\"type\":\"relay\"}",
+      "verdicts": [
+        "after"
+      ]
+    },
+    {
+      "calls": [
+        "{\"after\":0,\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"type\":\"relay\"}"
+      ],
+      "name": "a_discovery_call_is_answered_from_the_start_only",
+      "note": "a call that named no feed asked from 0: a page that echoes another after answers it on no feed",
+      "result": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"caee7840-20ce-4276-8f08-65c9cf57a6a8\",\"station_time\":1793620940000,\"type\":\"relay\"}",
+      "verdicts": [
+        "after"
+      ]
+    },
+    {
+      "calls": [
+        "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"type\":\"relay\"}",
+        "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"baf4a48a-c93d-4eb9-aae5-84e6f198b33f\",\"type\":\"relay\"}"
+      ],
+      "name": "two_calls_at_the_same_cursor",
+      "note": "two calls at the same cursor (after 2 on feed A: the first and a retry after its timeout, or a new link generation's call) differ only by their request_id, so a page answers exactly one of them: here the retry",
+      "result": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"baf4a48a-c93d-4eb9-aae5-84e6f198b33f\",\"station_time\":1793620940000,\"type\":\"relay\"}",
+      "verdicts": [
+        "request_id",
+        "answers"
+      ]
+    },
+    {
+      "calls": [
+        "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"baf4a48a-c93d-4eb9-aae5-84e6f198b33f\",\"type\":\"relay\"}"
+      ],
+      "name": "a_late_reply_to_a_retired_call",
+      "note": "the first call (control_sync_with_feed_id) timed out and was retired, and the host asked again at the same cursor with a fresh id: the first call's late page (control_sync_result_with_records) doesn't answer the live call, so it advances nothing and opens no gate",
+      "result": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"station_time\":1793620940000,\"type\":\"relay\"}",
+      "verdicts": [
+        "request_id"
+      ]
+    }
+  ],
   "max_message_bytes": 262144,
   "name": "r9-vectors-station-calls",
-  "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", agreed with Astation on 2026-11-13, #120 comment 6848326392: a strict-JSON page may hold individually invalid records, whose evidence is kept, which aren't applied, and whose delivery is no application evidence). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. `why_codes` is the shared vocabulary of typed reasons (O5, host-work-v1 §11.4 wire rule 10, for Astation's sign-off), in the core's order: a well-formed reason outside it is a later version's, read as unrecognized. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
+  "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", agreed with Astation on 2026-11-13, #120 comment 6848326392: a strict-JSON page may hold individually invalid records, whose evidence is kept, which aren't applied, and whose delivery is no application evidence). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. `why_codes` is the shared vocabulary of typed reasons (O5, host-work-v1 §11.4 wire rule 10, for Astation's sign-off), in the core's order: a well-formed reason outside it is a later version's, read as unrecognized. Correlation (amended in place on Astation's request, #164 comment 6858189009; unshipped, so no new version): a `control_sync` carries `request_id`, a lowercase UUID v4 the host makes fresh for every call (a timeout's retry and a new link generation's call included; here test ids), and its `control_sync_result` carries the same `request_id` and echoes the call's `after`; a page's records are strictly after its `after`, ascending and none above `head` (gaps legal), so a page whose `head` is below its `after` (the feed went back on the same id: the host rescans) holds none. `matching`: whether a result answers a call, by the shared helper (`ControlSyncResult::answers`, the bindings' `relay_control_sync_answers`) `{name, note, calls, result, verdicts}`: `calls` are call texts, `result` a result text (each a builder's), and `verdicts`, parallel to `calls`, is the helper's verdict on the result for each: `answers` (the same `request_id`, origin, feed when the call named one, and `after`), else the first field that differs, in that order (`request_id`, `origin`, `feed_id`, `after`). The link generation, account and genesis the host captured with its call are the caller's to compare, and only its one live call counts: a retired call's late page answers nothing live. The three refusals stay metadata-free: no id, no cursor. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
   "requires": "r9",
   "why_codes": [
     "principal_unknown",

@@ -6964,8 +6964,8 @@ fn delegated_wire() {
 use atem_client::control::{
     AckResult, ApplicationResult, CallRefused, ControlAck, ControlSync, ControlSyncResult,
     EffectKind, EffectResult, EffectWhy, EntryRef, FeedEntry, FeedHead, Heads, MAX_WHY_BYTES,
-    MembershipFetch, MembershipFetchResult, RefusalCode, RefusedCall, RelayError, ToHost,
-    ToStation, Why,
+    MembershipFetch, MembershipFetchResult, RefusalCode, RefusedCall, RelayError, SyncMismatch,
+    ToHost, ToStation, Why,
 };
 
 const STATION_CALLS: &str = "r9-vectors-station-calls";
@@ -7056,6 +7056,7 @@ fn build_call(case: &Value) -> String {
     let f = &case["fields"];
     let message = match s(case, "op") {
         "control_sync" => ControlSync {
+            request_id: s(f, "request_id").into(),
             origin: s(f, "origin").into(),
             feed_id: f.get("feed_id").map(|v| v.as_str().unwrap().to_owned()),
             after: f["after"].as_u64().unwrap(),
@@ -7068,8 +7069,10 @@ fn build_call(case: &Value) -> String {
                     .unwrap();
             let records = f["records"].as_array().unwrap();
             let page = ControlSyncResult {
+                request_id: s(f, "request_id").into(),
                 origin: s(f, "origin").into(),
                 feed_id: s(f, "feed_id").into(),
+                after: f["after"].as_u64().unwrap(),
                 head: f["head"].as_u64().unwrap(),
                 station_time: f["station_time"].as_u64().unwrap(),
                 records: records
@@ -7170,7 +7173,8 @@ fn describe_to_station(message: &ToStation) -> Value {
     use serde_json::json;
     match message {
         ToStation::ControlSync(sync) => {
-            let mut f = json!({"origin": sync.origin, "after": sync.after});
+            let mut f =
+                json!({"request_id": sync.request_id, "origin": sync.origin, "after": sync.after});
             if let Some(feed_id) = &sync.feed_id {
                 f["feed_id"] = json!(feed_id);
             }
@@ -7203,8 +7207,10 @@ fn describe_to_host(message: &ToHost) -> Value {
     use serde_json::json;
     match message {
         ToHost::ControlSyncResult(page) => json!({
+            "request_id": page.request_id,
             "origin": page.origin,
             "feed_id": page.feed_id,
+            "after": page.after,
             "head": page.head,
             "station_time": page.station_time,
             "records": page.records.iter()
@@ -7293,6 +7299,7 @@ fn station_calls_build_byte_for_byte() {
     assert_eq!(run.get("max_message_bytes"), RELAY_MAX_BYTES);
     run.get("why_codes");
     run.get("invalid");
+    run.get("matching");
     for case in run.get("at_the_bound").as_array().unwrap() {
         let name = s(case, "name");
         assert_eq!(
@@ -7336,6 +7343,7 @@ fn station_calls_decode_to_their_fields() {
     run.get("max_message_bytes");
     run.get("why_codes");
     run.get("invalid");
+    run.get("matching");
     // A text of exactly the bound is read (the same bound for every call
     // that can carry a large page), and gives back what `accepts` says.
     for case in run.get("at_the_bound").as_array().unwrap() {
@@ -7489,6 +7497,7 @@ fn station_calls_refuse_the_invalid_variants() {
     run.get("why_codes");
     run.get("calls");
     run.get("at_the_bound");
+    run.get("matching");
     let invalid = run.get("invalid");
     let mut codes = BTreeSet::new();
     let mut sized = BTreeSet::new();
@@ -7534,6 +7543,92 @@ fn station_calls_refuse_the_invalid_variants() {
         .collect(),
         "every refusal code the readers give"
     );
+    // Correlation (#164 comment 6858189009): each refused form of the
+    // call's id and the result's echo has its text.
+    let names: BTreeSet<&str> = invalid
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| s(c, "name"))
+        .collect();
+    for name in CORRELATION_REFUSALS {
+        assert!(names.contains(name), "no invalid text {name}");
+    }
+    run.finish();
+}
+
+/// The refused forms of correlation the file must hold: a missing, upper
+/// case or non-v4 `request_id` on a call and on a result, a result without
+/// its `after`, a record at or below `after`, and `head` below `after` with
+/// records. (A result on another feed than its call's is a matching case:
+/// no reader sees the call.)
+const CORRELATION_REFUSALS: [&str; 10] = [
+    "control_sync_request_id_missing",
+    "control_sync_request_id_upper_case",
+    "control_sync_request_id_not_uuid_v4",
+    "control_sync_result_request_id_missing",
+    "control_sync_result_request_id_upper_case",
+    "control_sync_result_request_id_not_uuid_v4",
+    "control_sync_result_after_missing",
+    "control_sync_result_record_at_after",
+    "control_sync_result_record_below_after",
+    "control_sync_result_head_below_after_with_records",
+];
+
+/// Correlation: each `matching` case's calls and result, read by their own
+/// readers, and `ControlSyncResult::answers`'s verdict on the result for
+/// each call (`answers`, or the first field that differs), as the file
+/// says; every verdict is covered.
+#[test]
+fn station_calls_match_results_to_their_calls() {
+    let mut run = station_calls_file();
+    run.get("max_message_bytes");
+    run.get("why_codes");
+    run.get("calls");
+    run.get("at_the_bound");
+    run.get("invalid");
+    let matching = run.get("matching");
+    let mut seen = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for case in matching.as_array().unwrap() {
+        let name = s(case, "name");
+        assert!(names.insert(name.to_owned()), "{name}: a name of its own");
+        let result = ControlSyncResult::decode(s(case, "result").as_bytes())
+            .unwrap_or_else(|e| panic!("{name}: the result: {e}"));
+        let calls = case["calls"].as_array().unwrap();
+        let verdicts = case["verdicts"].as_array().unwrap();
+        assert_eq!(calls.len(), verdicts.len(), "{name}: a verdict per call");
+        assert!(!calls.is_empty(), "{name}");
+        for (i, (call, verdict)) in calls.iter().zip(verdicts).enumerate() {
+            let call = ControlSync::decode(call.as_str().unwrap().as_bytes())
+                .unwrap_or_else(|e| panic!("{name}: call {i}: {e}"));
+            let got = match result.answers(&call) {
+                Ok(()) => "answers",
+                Err(m) => m.code(),
+            };
+            assert_eq!(got, verdict.as_str().unwrap(), "{name}: call {i}");
+            if got != "answers" {
+                assert_eq!(SyncMismatch::from_code(got).map(|m| m.code()), Some(got));
+            }
+            seen.insert(got.to_owned());
+        }
+        run.pass(format!("{name}: matched"));
+    }
+    assert_eq!(
+        seen,
+        ["answers", "request_id", "origin", "feed_id", "after"]
+            .iter()
+            .map(|v| v.to_string())
+            .collect(),
+        "every verdict"
+    );
+    for name in [
+        "two_calls_at_the_same_cursor",
+        "a_late_reply_to_a_retired_call",
+        "discovery_answered_on_the_current_feed",
+    ] {
+        assert!(names.contains(name), "no matching case {name}");
+    }
     run.finish();
 }
 
@@ -7639,8 +7734,21 @@ fn station_call_vectors() -> Value {
     };
 
     // ------------------------------------------------------- control_sync
-    let sync = |feed_id: Option<&str>, after: u64| {
+    // Correlation (amended in place on Astation's request, #164 comment
+    // 6858189009): every call names itself with a fresh `request_id`, a
+    // lowercase UUID v4 (here a test id of its own, `mail_uuid`), and its
+    // result carries the same id and echoes its `after`.
+    let request = |label: &str| mail_uuid(&format!("station-calls {label}"), 4);
+    let r_known = request("a known feed after 2");
+    let r_first = request("discovery");
+    let r_largest = request("the largest position");
+    let r_next = request("the next page after 5");
+    let r_bound = request("a page at the bound");
+    let r_retry = request("a retry after 2");
+    let r_other = request("another call");
+    let sync = |request_id: &str, feed_id: Option<&str>, after: u64| {
         ControlSync {
+            request_id: request_id.to_owned(),
             origin: origin.clone(),
             feed_id: feed_id.map(str::to_owned),
             after,
@@ -7652,32 +7760,34 @@ fn station_call_vectors() -> Value {
         "control_sync_with_feed_id",
         "control_sync",
         "to_station",
-        "the host knows the feed: read it after position 2, the last it read",
-        json!({"origin": origin, "feed_id": feed, "after": 2}),
-        sync(Some(&feed), 2),
+        "the host knows the feed: read it after position 2, the last it read; request_id names this call (a fresh lowercase UUID v4 for every call)",
+        json!({"request_id": r_known, "origin": origin, "feed_id": feed, "after": 2}),
+        sync(&r_known, Some(&feed), 2),
     );
     g.valid(
         "control_sync_without_feed_id",
         "control_sync",
         "to_station",
-        "the host doesn't know the feed yet: no feed_id, and a cursor belongs to a feed, so after is 0",
-        json!({"origin": origin, "after": 0}),
-        sync(None, 0),
+        "the host doesn't know the feed yet (initial discovery): no feed_id, and a cursor belongs to a feed, so after is 0; the result names the account's current feed",
+        json!({"request_id": r_first, "origin": origin, "after": 0}),
+        sync(&r_first, None, 0),
     );
     g.valid(
         "control_sync_at_the_largest_position",
         "control_sync",
         "to_station",
         "after at 2^53 - 1, the largest integer",
-        json!({"origin": origin, "feed_id": feed, "after": 9_007_199_254_740_991u64}),
-        sync(Some(&feed), 9_007_199_254_740_991),
+        json!({"request_id": r_largest, "origin": origin, "feed_id": feed, "after": 9_007_199_254_740_991u64}),
+        sync(&r_largest, Some(&feed), 9_007_199_254_740_991),
     );
 
     // ------------------------------------------------ control_sync_result
-    let page = |feed_id: &str, head: u64, records: Vec<FeedEntry>| {
+    let page = |request_id: &str, feed_id: &str, after: u64, head: u64, records: Vec<FeedEntry>| {
         ControlSyncResult {
+            request_id: request_id.to_owned(),
             origin: origin.clone(),
             feed_id: feed_id.to_owned(),
+            after,
             head,
             station_time: STATION_TIME,
             records,
@@ -7691,26 +7801,39 @@ fn station_call_vectors() -> Value {
         "control_sync_result_empty_feed",
         "control_sync_result",
         "to_host",
-        "a feed with no record: head 0, no records",
-        json!({"origin": origin, "feed_id": feed_a2, "head": 0, "station_time": STATION_TIME, "records": []}),
-        page(&feed_a2, 0, vec![]),
+        "the answer to control_sync_without_feed_id (its request_id, its after 0): the account's current feed at this Station, here A2, with no record yet: head 0, no records",
+        json!({"request_id": r_first, "origin": origin, "feed_id": feed_a2, "after": 0, "head": 0,
+            "station_time": STATION_TIME, "records": []}),
+        page(&r_first, &feed_a2, 0, 0, vec![]),
     );
     g.valid(
         "control_sync_result_with_records",
         "control_sync_result",
         "to_host",
-        "three records of the control vectors, ascending, the last at the head",
-        json!({"origin": origin, "feed_id": feed, "head": 3, "station_time": STATION_TIME,
-            "records": [wire_record(1, "S1_cover"), wire_record(2, "S4_revoke"), wire_record(3, "M1_revoke")]}),
+        "the answer to control_sync_with_feed_id (its request_id, the feed it named, its after 2): three records of the control vectors strictly after position 2, ascending, the last at the head",
+        json!({"request_id": r_known, "origin": origin, "feed_id": feed, "after": 2, "head": 5,
+            "station_time": STATION_TIME,
+            "records": [wire_record(3, "S1_cover"), wire_record(4, "S4_revoke"), wire_record(5, "M1_revoke")]}),
         page(
+            &r_known,
             &feed,
-            3,
+            2,
+            5,
             vec![
-                feed_entry(1, "S1_cover"),
-                feed_entry(2, "S4_revoke"),
-                feed_entry(3, "M1_revoke"),
+                feed_entry(3, "S1_cover"),
+                feed_entry(4, "S4_revoke"),
+                feed_entry(5, "M1_revoke"),
             ],
         ),
+    );
+    g.valid(
+        "control_sync_result_head_below_after",
+        "control_sync_result",
+        "to_host",
+        "the answer to control_sync_at_the_largest_position on the same feed, whose head (5) is below the call's after: no records (any would be above the head). The feed went back under the same id: the host rescans it from 0 and never moves its cursor on this page",
+        json!({"request_id": r_largest, "origin": origin, "feed_id": feed,
+            "after": 9_007_199_254_740_991u64, "head": 5, "station_time": STATION_TIME, "records": []}),
+        page(&r_largest, &feed, 9_007_199_254_740_991, 5, vec![]),
     );
     // A page whose records the control parser judges one at a time: a record
     // with an unknown field, a string, a null (a record may be any JSON
@@ -7721,11 +7844,11 @@ fn station_call_vectors() -> Value {
         let stand_in =
             ControlRecord::parse(control_record("S1_cover").to_string().as_bytes()).unwrap();
         let slots: Vec<(u64, Value)> = vec![
-            (4, control_record("S5_revoke_interrupt")),
-            (5, control_record("P4_unknown_field")),
-            (6, json!("not a record")),
-            (7, Value::Null),
-            (9, control_record("S6_interrupt")),
+            (6, control_record("S5_revoke_interrupt")),
+            (7, control_record("P4_unknown_field")),
+            (8, json!("not a record")),
+            (9, Value::Null),
+            (11, control_record("S6_interrupt")),
         ];
         let entries = slots
             .iter()
@@ -7736,19 +7859,20 @@ fn station_call_vectors() -> Value {
                 },
             )
             .collect();
-        let mut message = page(&feed, 9, entries);
+        let mut message = page(&r_next, &feed, 5, 11, entries);
         for (slot, (_, record)) in slots.iter().enumerate() {
             if ControlRecord::parse(record.to_string().as_bytes()).is_err() {
                 message["records"][slot]["record"] = record.clone();
             }
         }
-        let fields = json!({"origin": origin, "feed_id": feed, "head": 9, "station_time": STATION_TIME,
+        let fields = json!({"request_id": r_next, "origin": origin, "feed_id": feed, "after": 5,
+            "head": 11, "station_time": STATION_TIME,
             "records": slots.iter().map(|(seq, record)| json!({"feed_seq": seq, "record": record})).collect::<Vec<_>>()});
         g.valid(
             "control_sync_result_with_records_that_do_not_parse",
             "control_sync_result",
             "to_host",
-            "a page is read whole and each record judged on its own: one with an unknown field, a string and a null don't parse, and the page, the feed's position and the records after them stand (gaps in the positions are allowed)",
+            "the next call's page (after 5): a page is read whole and each record judged on its own: one with an unknown field, a string and a null don't parse, and the page, the feed's position and the records after them stand (gaps in the positions are allowed)",
             fields,
             message,
         );
@@ -8163,7 +8287,7 @@ fn station_call_vectors() -> Value {
     // ============================================================ invalid
     let sync_wire = |after: &str| {
         format!(
-            r#"{{"after":{after},"feed_id":"{feed}","op":"control_sync","origin":"{origin}","type":"relay"}}"#
+            r#"{{"after":{after},"feed_id":"{feed}","op":"control_sync","origin":"{origin}","request_id":"{r_known}","type":"relay"}}"#
         )
     };
     g.bad_edit(
@@ -8184,7 +8308,7 @@ fn station_call_vectors() -> Value {
         "to_station",
         "not_strict",
         format!(
-            r#"{{"after":2,"after":3,"feed_id":"{feed}","op":"control_sync","origin":"{origin}","type":"relay"}}"#
+            r#"{{"after":2,"after":3,"feed_id":"{feed}","op":"control_sync","origin":"{origin}","request_id":"{r_known}","type":"relay"}}"#
         ),
     );
     g.bad_edit(
@@ -8258,6 +8382,38 @@ fn station_call_vectors() -> Value {
         "malformed",
         |v| v["after"] = json!("2"),
     );
+    // Correlation: the call's id is required, a lowercase UUID v4.
+    // (`r_known` with its version nibble made 5.)
+    let not_v4 = format!("{}5{}", &r_known[..14], &r_known[15..]);
+    assert!(!atem_client::session::wire::is_uuid_v4(&not_v4));
+    for (name, from) in [
+        ("control_sync", "control_sync_with_feed_id"),
+        ("control_sync_result", "control_sync_result_with_records"),
+    ] {
+        g.bad_edit(
+            &format!("{name}_request_id_missing"),
+            from,
+            "malformed",
+            |v| {
+                v.as_object_mut().unwrap().remove("request_id");
+            },
+        );
+        g.bad_edit(&format!("{name}_request_id_null"), from, "malformed", |v| {
+            v["request_id"] = Value::Null
+        });
+        g.bad_edit(
+            &format!("{name}_request_id_upper_case"),
+            from,
+            "malformed",
+            |v| v["request_id"] = json!(r_known.to_uppercase()),
+        );
+        g.bad_edit(
+            &format!("{name}_request_id_not_uuid_v4"),
+            from,
+            "malformed",
+            |v| v["request_id"] = json!(not_v4),
+        );
+    }
     g.bad_edit(
         "control_sync_not_a_relay_message",
         "control_sync_with_feed_id",
@@ -8307,7 +8463,7 @@ fn station_call_vectors() -> Value {
     // control_sync_result
     let result_wire = |head: u64, records: &str| {
         format!(
-            r#"{{"feed_id":"{feed}","head":{head},"op":"control_sync_result","origin":"{origin}","records":{records},"station_time":{STATION_TIME},"type":"relay"}}"#
+            r#"{{"after":0,"feed_id":"{feed}","head":{head},"op":"control_sync_result","origin":"{origin}","records":{records},"request_id":"{r_first}","station_time":{STATION_TIME},"type":"relay"}}"#
         )
     };
     // A page of one record that is no record (any JSON value is read), for the
@@ -8414,6 +8570,52 @@ fn station_call_vectors() -> Value {
         "malformed",
         |v| v["records"] = json!({}),
     );
+    // Correlation: the echoed `after` is required, and the records are
+    // strictly after it; a page whose head is below its after holds none.
+    g.bad_edit(
+        "control_sync_result_after_missing",
+        "control_sync_result_with_records",
+        "malformed",
+        |v| {
+            v.as_object_mut().unwrap().remove("after");
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_after_null",
+        "control_sync_result_with_records",
+        "malformed",
+        |v| v["after"] = Value::Null,
+    );
+    g.bad_edit(
+        "control_sync_result_record_at_after",
+        base,
+        "malformed",
+        |v| {
+            v["after"] = json!(1);
+            v["head"] = json!(2);
+            v["records"] = json!([{"feed_seq": 1, "record": 0}, {"feed_seq": 2, "record": 0}]);
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_record_below_after",
+        base,
+        "malformed",
+        |v| {
+            v["after"] = json!(2);
+            v["head"] = json!(3);
+            v["records"] = json!([{"feed_seq": 1, "record": 0}, {"feed_seq": 3, "record": 0}]);
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_head_below_after_with_records",
+        base,
+        "malformed",
+        |v| {
+            v["after"] = json!(5);
+            v["head"] = json!(3);
+            v["records"] = json!([{"feed_seq": 6, "record": 0}]);
+        },
+    );
     g.bad(
         "control_sync_result_duplicate_key_inside_a_record",
         "control_sync_result",
@@ -8465,9 +8667,11 @@ fn station_call_vectors() -> Value {
     // their counts and grammars well below it.
     let at_bound = {
         let page_prefix = format!(
-            r#"{{"feed_id":"{feed}","head":1,"op":"control_sync_result","origin":"{origin}","records":[{{"feed_seq":1,"record":""#
+            r#"{{"after":0,"feed_id":"{feed}","head":1,"op":"control_sync_result","origin":"{origin}","records":[{{"feed_seq":1,"record":""#
         );
-        let page_suffix = format!(r#""}}],"station_time":{STATION_TIME},"type":"relay"}}"#);
+        let page_suffix = format!(
+            r#""}}],"request_id":"{r_bound}","station_time":{STATION_TIME},"type":"relay"}}"#
+        );
         let fetch_entry = |label: &str| {
             let e = entry(label)["entry"].clone();
             let prefix = format!(
@@ -8789,11 +8993,105 @@ fn station_call_vectors() -> Value {
         );
     }
 
+    // ============================================================ matching
+    // Whether a page answers a call (`ControlSyncResult::answers`): the same
+    // request_id, origin, feed (when the call named one) and after. Each
+    // case's result read against each of its calls: `answers`, or the first
+    // field that differs. Every text is a builder's: a changed golden is
+    // read and written again.
+    let rebuilt = |name: &str, edit: &dyn Fn(&mut Value)| -> String {
+        let mut v = g.parsed(name);
+        edit(&mut v);
+        ControlSyncResult::decode(v.to_string().as_bytes())
+            .unwrap()
+            .to_json()
+            .unwrap()
+            .to_string()
+    };
+    let call = |name: &str| json!(g.wires[name]);
+    let answer = |name: &str| json!(g.wires[name]);
+    let retry = json!(sync(&r_retry, Some(&feed), 2).to_string());
+    let known = "control_sync_with_feed_id";
+    let records = "control_sync_result_with_records";
+    let matching = |name: &str, note: &str, calls: Vec<Value>, result: Value, verdicts: &[&str]| json!({"name": name, "note": note, "calls": calls, "result": result, "verdicts": verdicts});
+    let matching = vec![
+        matching(
+            "the_answer_to_its_call",
+            "control_sync_result_with_records answers control_sync_with_feed_id: the same request_id, origin, feed and after",
+            vec![call(known)],
+            answer(records),
+            &["answers"],
+        ),
+        matching(
+            "discovery_answered_on_the_current_feed",
+            "a call that named no feed (initial discovery, after 0) is answered on whichever feed the result names: the account's current one (here A2)",
+            vec![call("control_sync_without_feed_id")],
+            answer("control_sync_result_empty_feed"),
+            &["answers"],
+        ),
+        matching(
+            "a_feed_gone_back_answers_its_call",
+            "a page whose head is below the call's after on the same feed answers its call: it is empty, and the host rescans the feed from 0 instead of moving its cursor",
+            vec![call("control_sync_at_the_largest_position")],
+            answer("control_sync_result_head_below_after"),
+            &["answers"],
+        ),
+        matching(
+            "another_calls_id",
+            "the same page under another request_id answers no call this host made: it advances nothing",
+            vec![call(known)],
+            json!(rebuilt(records, &|v| v["request_id"] = json!(r_other))),
+            &["request_id"],
+        ),
+        matching(
+            "another_origin",
+            "the same page from another Station (B's origin): no answer",
+            vec![call(known)],
+            json!(rebuilt(records, &|v| v["origin"] = json!(origin_b))),
+            &["origin"],
+        ),
+        matching(
+            "another_feed",
+            "a call that named a feed (A) is answered only on that feed: a result on another feed (A2) answers nothing, even under the call's id (a named feed gone stale is control_sync_refused)",
+            vec![call(known)],
+            json!(rebuilt(records, &|v| v["feed_id"] = json!(feed_a2))),
+            &["feed_id"],
+        ),
+        matching(
+            "another_after",
+            "the call's id on a page that echoes another after (1, not 2): no answer",
+            vec![call(known)],
+            json!(rebuilt(records, &|v| v["after"] = json!(1))),
+            &["after"],
+        ),
+        matching(
+            "a_discovery_call_is_answered_from_the_start_only",
+            "a call that named no feed asked from 0: a page that echoes another after answers it on no feed",
+            vec![call("control_sync_without_feed_id")],
+            json!(rebuilt(records, &|v| v["request_id"] = json!(r_first))),
+            &["after"],
+        ),
+        matching(
+            "two_calls_at_the_same_cursor",
+            "two calls at the same cursor (after 2 on feed A: the first and a retry after its timeout, or a new link generation's call) differ only by their request_id, so a page answers exactly one of them: here the retry",
+            vec![call(known), retry.clone()],
+            json!(rebuilt(records, &|v| v["request_id"] = json!(r_retry))),
+            &["request_id", "answers"],
+        ),
+        matching(
+            "a_late_reply_to_a_retired_call",
+            "the first call (control_sync_with_feed_id) timed out and was retired, and the host asked again at the same cursor with a fresh id: the first call's late page (control_sync_result_with_records) doesn't answer the live call, so it advances nothing and opens no gate",
+            vec![retry],
+            answer(records),
+            &["request_id"],
+        ),
+    ];
+
     json!({
         "name": STATION_CALLS,
         "kind": "vectors",
         "requires": "r9",
-        "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", agreed with Astation on 2026-11-13, #120 comment 6848326392: a strict-JSON page may hold individually invalid records, whose evidence is kept, which aren't applied, and whose delivery is no application evidence). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. `why_codes` is the shared vocabulary of typed reasons (O5, host-work-v1 §11.4 wire rule 10, for Astation's sign-off), in the core's order: a well-formed reason outside it is a later version's, read as unrecognized. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
+        "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", agreed with Astation on 2026-11-13, #120 comment 6848326392: a strict-JSON page may hold individually invalid records, whose evidence is kept, which aren't applied, and whose delivery is no application evidence). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. `why_codes` is the shared vocabulary of typed reasons (O5, host-work-v1 §11.4 wire rule 10, for Astation's sign-off), in the core's order: a well-formed reason outside it is a later version's, read as unrecognized. Correlation (amended in place on Astation's request, #164 comment 6858189009; unshipped, so no new version): a `control_sync` carries `request_id`, a lowercase UUID v4 the host makes fresh for every call (a timeout's retry and a new link generation's call included; here test ids), and its `control_sync_result` carries the same `request_id` and echoes the call's `after`; a page's records are strictly after its `after`, ascending and none above `head` (gaps legal), so a page whose `head` is below its `after` (the feed went back on the same id: the host rescans) holds none. `matching`: whether a result answers a call, by the shared helper (`ControlSyncResult::answers`, the bindings' `relay_control_sync_answers`) `{name, note, calls, result, verdicts}`: `calls` are call texts, `result` a result text (each a builder's), and `verdicts`, parallel to `calls`, is the helper's verdict on the result for each: `answers` (the same `request_id`, origin, feed when the call named one, and `after`), else the first field that differs, in that order (`request_id`, `origin`, `feed_id`, `after`). The link generation, account and genesis the host captured with its call are the caller's to compare, and only its one live call counts: a retired call's late page answers nothing live. The three refusals stay metadata-free: no id, no cursor. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
         "max_message_bytes": RELAY_MAX_BYTES,
         // The shared vocabulary of reasons (O5), written out by hand in the
         // core's order; the runner holds it equal to `Why::vocabulary`.
@@ -8807,6 +9105,7 @@ fn station_call_vectors() -> Value {
         "calls": g.calls,
         "at_the_bound": at_bound,
         "invalid": g.invalid,
+        "matching": matching,
     })
 }
 

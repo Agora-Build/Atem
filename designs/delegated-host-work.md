@@ -860,8 +860,10 @@ restart; interrupting a turn that has already ended does nothing.
 - **Retention.** It keeps records for at least 30 days, and each principal's latest state for as long as the
   principal exists (I.5.2).
 - **Transport.** Atem has one outbound link: the relay, or Astation's local `:8080`.
-  - **On the relay**, the host calls `control_sync{origin, feed_id?, after}` over its own authenticated relay
-    connection, and gets `{origin, feed_id, head, station_time, records}`.
+  - **On the relay**, the host calls `control_sync{request_id, origin, feed_id?, after}` over its own authenticated
+    relay connection, and gets `{request_id, origin, feed_id, after, head, station_time, records}`. **Amended in
+    place on Astation's request (#164 comment 6858189009):** `request_id` (a fresh UUID v4 for every call) and the
+    echoed `after` let the host match each result to its live call (host-work-v1 §11.4, wire rule 11).
   - **On `:8080`**, Astation proxies the same calls and announcements to the Station unchanged. Records are signed,
     and Astation is a native manager. **New rule:** the host's own device-list fetch (below) and the mailbox calls
     (II.4.3) are proxied the same way.

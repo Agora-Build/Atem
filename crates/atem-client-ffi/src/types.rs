@@ -1230,7 +1230,10 @@ record! {
 data_enum! {
     /// A host's call to its Station, as `relay_decode_to_station` reads it.
     pub enum RelayToStation {
+        /// `request_id` names the call: answer it with the same id and
+        /// its `after` (`relay_control_sync_result`).
         ControlSync {
+            request_id: String,
             origin: String,
             feed_id: Option<String>,
             after: u64,
@@ -1257,9 +1260,13 @@ data_enum! {
     /// correlate no request, and keep the link's synchronization gates
     /// closed while the association is repaired and resynchronized.
     pub enum RelayToHost {
+        /// The answer to the call `request_id` names, echoing its `after`
+        /// (whether it answers a given call: `relay_control_sync_answers`).
         ControlSyncResult {
+            request_id: String,
             origin: String,
             feed_id: String,
+            after: u64,
             head: u64,
             station_time: u64,
             records: Vec<RelayFeedRecord>,
@@ -1279,5 +1286,26 @@ data_enum! {
         MembershipFetchRefused { code: RelayRefusalCode },
         /// `control_ack_refused`.
         ControlAckRefused { code: RelayRefusalCode },
+    }
+}
+
+unit_enum! {
+    /// Whether a `control_sync_result` answers a `control_sync`
+    /// (`relay_control_sync_answers`): `Answers`, or the first field that
+    /// differs, in this order.
+    pub enum RelaySyncVerdict {
+        /// The same `request_id`, origin, feed (when the call named one) and
+        /// `after`. With `head` below `after` (no records), the feed went
+        /// back: rescan from 0, never move the cursor.
+        Answers,
+        /// Another call's id: a retired, timed-out or old generation's call,
+        /// or none.
+        RequestId,
+        /// Another Station's.
+        Origin,
+        /// Another feed than the one the call named.
+        FeedId,
+        /// Another `after` than the call's.
+        After,
     }
 }

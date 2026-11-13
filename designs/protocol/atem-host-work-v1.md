@@ -1700,8 +1700,8 @@ Each is `{"type":"relay","op":…}` on Atem's one link, like `push_hint`
 
 | `op` | Direction | Fields |
 |---|---|---|
-| `control_sync` | host → Station | `origin`, `feed_id?`, `after`: read the feed `(origin, feed_id)` after position `after`, the last position the host read (0: none) |
-| `control_sync_result` | Station → host | `origin`, `feed_id`, `head` (the feed's last position, 0 for an empty feed), `station_time` (ms, I.6.5), `records: [{feed_seq, record}]` (the records after `after`, ascending) |
+| `control_sync` | host → Station | `request_id` (this call's id: a lowercase UUID v4, fresh for every call; wire rule 11), `origin`, `feed_id?`, `after`: read the feed `(origin, feed_id)` after position `after`, the last position the host read (0: none) |
+| `control_sync_result` | Station → host | `request_id` and `after` (the call's, echoed; wire rule 11), `origin`, `feed_id`, `head` (the feed's last position, 0 for an empty feed), `station_time` (ms, I.6.5), `records: [{feed_seq, record}]` (the records strictly after `after`, ascending) |
 | `heads` | Station → host | `feeds: [{origin, feed_id, head, station_time}]` (each feed covering a principal with work on this host) and `membership: {seq, hash}` (the device list's head); stage 3 adds the host's mailbox head (II.5), an unknown field until then |
 | `control_ack` | host → Station | `account_id`, `genesis_hash`, `host_id`, `host_trust_gen` (the host's claim, below), `origin`, `feed_id`, `cursor` (the host's scan cursor in that feed), `results` |
 | `membership_fetch` | host → Station | `after`: the head `seq` the host holds (design I.5.8, "the host fetches the device list itself"; R9.3 allows it, and it gets no more trust than any carrier) |
@@ -1709,10 +1709,11 @@ Each is `{"type":"relay","op":…}` on Atem's one link, like `push_hint`
 | `control_sync_refused`, `membership_fetch_refused`, `control_ack_refused` | Station → host | `code`, exactly `forbidden`: the Station refused that call on this link ("Refusals" below) |
 
 ```json
-{"type":"relay","op":"control_sync","origin":"https://station-dev.agora.build",
- "feed_id":"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b","after":2}
-{"type":"relay","op":"control_sync_result","origin":"https://station-dev.agora.build",
- "feed_id":"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b","head":3,"station_time":1793620940000,
+{"type":"relay","op":"control_sync","request_id":"87b0db11-7508-437c-82de-658f0edace06",
+ "origin":"https://station-dev.agora.build","feed_id":"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b","after":2}
+{"type":"relay","op":"control_sync_result","request_id":"87b0db11-7508-437c-82de-658f0edace06",
+ "origin":"https://station-dev.agora.build","feed_id":"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+ "after":2,"head":3,"station_time":1793620940000,
  "records":[{"feed_seq":3,"record":{"body":{…},"sig":"…"}}]}
 {"type":"relay","op":"control_ack","account_id":"acct-test-1","genesis_hash":"<hex>",
  "host_id":"host-b","host_trust_gen":1,"origin":"https://station-dev.agora.build",
@@ -1738,8 +1739,9 @@ messages, not these rules):
 1. At most 64 records in a `control_sync_result`, 64 results in a
    `control_ack`, 64 feeds in a `heads` and 64 entries in a
    `membership_fetch_result` (R9.3's carriage).
-2. A `control_sync` without `feed_id` (the host doesn't know the feed yet)
-   asks from the start: its `after` is 0. A cursor belongs to a feed.
+2. A `control_sync` without `feed_id` (the host doesn't know the feed yet:
+   initial discovery) asks from the start: its `after` is 0. A cursor
+   belongs to a feed. Its result names the account's current feed (rule 11).
 3. A result's `effects` are exactly the set its record carries, each once,
    in this order: `cover`; `revocation`; `revocation`, `interrupt` (a revoke
    with `interrupt_running: true`); `hold`; `release`; `interrupt` (an
@@ -1756,7 +1758,8 @@ messages, not these rules):
    behind it only `pending` or `refused`.
 6. Nothing twice: a `record_id` or an entry `seq` in one ack, an
    `(origin, feed_id)` in one `heads`.
-7. `feed_seq` ascends, each within `1..=head`; gaps are allowed (whether a
+7. `feed_seq` ascends, each strictly after the result's echoed `after` and
+   at most `head` (`after + 1..=head`, rule 11); gaps are allowed (whether a
    gap is a hole the cursor waits at is the host's).
 8. `membership_fetch_result` carries no echo of `after` and no `more`: the
    host compares the new head with `head`, applies the entries as any
@@ -1807,6 +1810,52 @@ messages, not these rules):
     - **Unchanged:** the step-3 refusals (`control_sync_refused`,
       `membership_fetch_refused`, `control_ack_refused`) stay exactly as
       agreed, byte for byte; a `control_records_result` carries no reason.
+11. **Correlation** (**amended in place on Astation's request, #164 comment
+    6858189009**; the shapes were unshipped, so there is no new endpoint
+    version and no compatibility fallback). Cursor echoes alone can't tell
+    two calls at the same cursor apart (a retry after a timeout, a call
+    before and after a re-authentication), so a call names itself:
+    - **The call.** `control_sync` carries `request_id`, required, a
+      lowercase UUID v4. The host makes a fresh one for every call: a retry
+      after a timeout and a call on a new authenticated link generation get
+      new ids, even at the same cursor. The builders take it from the
+      caller.
+    - **The result.** `control_sync_result` carries the call's `request_id`
+      and echoes its `after`, both required. A call that named a feed is
+      answered on that feed: a successful result's `feed_id` is the call's.
+      Only initial discovery omits `feed_id`, with `after: 0`, and its
+      result names the account's current feed. A named feed that is stale
+      (pre-reset) is refused `control_sync_refused`, never answered on the
+      new feed (#164).
+    - **Records.** Strictly after the echoed `after`, ascending, none above
+      `head` (rule 7); legal gaps stay legal, and a Station never leaves out
+      earlier stored records to fill a page with later ones. A result on the
+      same feed whose `head` is below its `after` (the feed went back under
+      the same id) has no records: the host rescans the feed from 0, and
+      never moves its cursor on that page.
+    - **Reader.** A missing or malformed `request_id` (not a text, upper
+      case, not a v4 UUID), a missing `after`, a record at or below `after`
+      and a `head` below `after` with records are `malformed`, the strict
+      readers' code for a missing or bad field.
+    - **Matching.** One helper decides whether a result answers a call,
+      shared by the host and Astation's `:8080` proxy
+      (`ControlSyncResult::answers`; the bindings'
+      `relay_control_sync_answers`): the same `request_id`, origin, feed
+      (when the call named one) and `after`, else the first of those that
+      differs. The host matches a result on the id plus what it captured
+      with its live call: its authenticated link generation, origin, feed
+      and `after` (the account and the genesis too; the helper compares the
+      two messages only, and leaves the generation, account and genesis to
+      the caller). It keeps at most one live call per link generation. An
+      id is a correlation value, never authorization: a retired, timed-out,
+      unsolicited or old-generation result advances nothing and can't
+      reopen the gate. **Until this amendment is built and jointly tested,
+      the host keeps the existing one-owed-call-per-physical-socket rule**
+      (one `control_sync` owed per socket, never dropped while its answer
+      may still come) and fails closed; it never retries uncorrelated.
+    - **Unchanged:** the three refusals stay metadata-free, with no id and
+      no cursor. A refusal names a call kind, never a request: it answers
+      and correlates no call.
 
 **On the host** (**Atem's reading of "checked before any parse", for
 Astation's information**, step 4, 2026-11-13: no tree is built before the
@@ -1906,7 +1955,8 @@ host's call on the link with exactly one of:
 - A refusal is an authorization failure on that link, never an empty
   successful page or an application acknowledgment. It advances no cursor,
   membership head, clock floor or ledger evidence and opens no gate. It
-  carries no request id and must not complete or correlate a request.
+  carries no request id (a `control_sync`'s `request_id` is never echoed in
+  one: wire rule 11) and must not complete or correlate a request.
   (**Atem's reading, for Astation's agreement**, step 4, 2026-11-13: a
   refusal names a call kind, not a request: it completes and matches none;
   on that kind the host backs off (its device-list fetch 30 s, ended by the
@@ -2388,7 +2438,8 @@ a custom Station and Astation's `:8080` proxy have known answers: every
 message of the six calls and the three refusals as the shared core's
 builders write it (compact, keys in RFC 8785 order, no whitespace), with its
 decoded fields: `control_sync` with and without `feed_id`,
-`control_sync_result` with records and with records the control parser
+`control_sync_result` answering each (a page whose `head` is below its
+call's `after` among them), with records and with records the control parser
 refuses (each record judged on its own, the page standing; that page is
 marked `hand_assembled`, since a Station never serves such a record and its
 builder refuses them; a `null` or a string record kept as evidence is
@@ -2408,7 +2459,19 @@ refused form of a reason, `control_ack_why_*`: `null`, not a text, empty,
 over 64 bytes, upper case, outside `[a-z0-9_]`, beside `applied`, beside
 `duplicate`, a duplicate `why` key (`not_strict`), and another field beside
 an effect (`unknown_field`); and `why_codes`, the vocabulary. The
-checker's reader takes the same rules.) The 256 KiB bound is pinned for each call
+checker's reader takes the same rules.) (**Amended in place on Astation's
+request, #164 comment 6858189009**, correlation, wire rule 11: every
+`control_sync` and its result carry `request_id`, the result its call's
+`after`; each refused form of correlation, `malformed`: a call's or a
+result's `request_id` missing, `null`, upper case or not a v4 UUID, a
+result's `after` missing or `null`, a record at or below `after`, a `head`
+below `after` with records; and `matching`, results read against calls by
+the shared helper with each verdict: a match, discovery answered on the
+current feed, a feed gone back, a mismatch on the id, the origin, the feed
+and the `after`, a discovery call answered from 0 only, two calls at the
+same cursor that differ only by their ids, and a retired call's late reply.
+The checker reads the new fields with its own reader and matches each case
+with its own matcher.) The 256 KiB bound is pinned for each call
 that can carry a large page, `control_sync_result` and
 `membership_fetch_result`: a text of exactly 262,144 bytes is read, and one
 of 262,145 and one of 300,000 bytes are `too_large` (no 512 KiB exemption
