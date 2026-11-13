@@ -85,8 +85,11 @@ signed and appended. Atem applies it the next time any trusted device connects
 attachments are fenced and its queued work is rejected (r8 §H, `control_gen`).
 Atem keeps its head durably, so it never goes back to an older list. There are
 no revocation acknowledgements.
-**Not implemented:** Atem fetching the log from the relay itself (§R9.3 allows
-it; only a debug-build test hook carries entries that way).
+**Updated in step 4 (2026-11-13; delegated host-work IX.1 Q7):** Atem also
+fetches the log from its Station itself, over its one link (§R9.3, delegated
+host-work I.5.8), behind `host.delegated` until that is activated; until
+then a host gets entries only from devices that connect (and, in debug
+builds, a test hook).
 
 ### 3.5 Freshness and forks (user decision, 2026-10-19)
 

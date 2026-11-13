@@ -14,14 +14,17 @@
 //! complete it ([`authority`], I.4.5, Decision 15), the interrupt intents
 //! that stop its attempt at its deadline ([`intents`], I.4.4, I.5.7), which
 //! `work_interrupt` shares (§11.2; the bridge serves it), what the bridge
-//! answers the delegated ops it doesn't serve yet ([`request`]), and
-//! §11.6's detail texts ([`details`]).
+//! answers the delegated ops it doesn't serve yet ([`request`]), §11.6's
+//! detail texts ([`details`]), and the host's Station link with its own
+//! device-list fetch ([`station`], [`fetch`], I.5.8).
 pub mod attempts;
 pub mod authority;
 pub mod details;
+pub mod fetch;
 pub mod gate;
 pub mod intents;
 pub mod start;
+pub mod station;
 
 use crate::runtime::test_hooks::HostFeatures;
 use crate::session_protocol::r9::HostWorkError;

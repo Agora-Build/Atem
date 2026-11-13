@@ -732,7 +732,11 @@ impl HostBridge {
         #[cfg(debug_assertions)]
         if let Some(controls) = crate::runtime::test_hooks::host_controls() {
             view.standings = controls.standings;
-            view.gates.set_stations(controls.own, controls.open);
+            view.gates.set_stations(
+                controls.own,
+                controls.open,
+                !controls.device_list_from_fetch,
+            );
         }
     }
 

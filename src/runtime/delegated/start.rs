@@ -5,15 +5,17 @@
 //! - **The view** ([`StartView`]) holds what the check reads: the device
 //!   list's state (frozen, held, faulted, deferred, its head and members),
 //!   the senders' standings (revoked, held, coverage), the routes of the
-//!   `runtime.toml` that loaded, the gates, the project-scope hashes, the
-//!   journal's halt and the delegated clock's last reading. It sits behind
-//!   `Arc<Mutex<_>>`, and what it shows is updated at the moment it commits
-//!   (step 4's Decision 16): the device list tells it at each change, before
-//!   any fence the change brings reaches the session host
-//!   (`MembershipHost::set_publisher`), `runtime.toml` when it loads, the
-//!   gates after each r9 call. So the check, asked inside the session host's
-//!   `accepted` → `executing` step, sees a freeze committed earlier in the
-//!   same call chain.
+//!   `runtime.toml` that loaded, the gates and the host's own device-list
+//!   fetch (their device-list part, [`StartView::fetched`]), the
+//!   project-scope hashes, the journal's halt and the delegated clock's
+//!   last reading. It sits behind `Arc<Mutex<_>>`, and what it shows is
+//!   updated at the moment it commits (step 4's Decision 16): the device
+//!   list tells it at each change, before any fence the change brings
+//!   reaches the session host (`MembershipHost::set_publisher`),
+//!   `runtime.toml` when it loads, the gates after each r9 call, the fetch
+//!   after each of the Station's messages. So the check, asked inside the
+//!   session host's `accepted` → `executing` step, sees a freeze committed
+//!   earlier in the same call chain.
 //! - **The check** ([`may_start`]) is conditions 2, 2a, 3, 4 and 5, and the
 //!   deadline on the delegated clock. It answers the event that stops the
 //!   task, if any ([`Event`]), whose state the task takes
@@ -31,6 +33,7 @@
 //!   rest. The check only locks the view: nothing that holds the view's lock
 //!   calls into the session host.
 use super::details;
+use super::fetch::ListPart;
 use super::gate::{GateView, Gates};
 use super::{Admission, DelegatedSender, SenderStanding};
 use crate::runtime::host_work::{Accepted, Config, Profile, WorkRecord};
@@ -153,6 +156,16 @@ impl ScopeHashes {
     }
 }
 
+/// The host's own device-list fetch on its Station link, as the
+/// revocation gate reads it (design I.5.8): the gate's device-list part.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StationFetch {
+    /// The link's Station (`StationLink::origin`): none when the selection
+    /// can't be read, and then no Station's gate has this part.
+    pub origin: Option<String>,
+    pub part: ListPart,
+}
+
 /// What the start check reads (see the module doc).
 pub struct StartView {
     /// The device list as it committed; none without one that opened
@@ -166,6 +179,9 @@ pub struct StartView {
     /// The `runtime.toml` that last loaded.
     pub config: Config,
     pub gates: Gates,
+    /// The host's own device-list fetch on its Station link (none without
+    /// one): set when the link changes and after each of its messages.
+    pub fetch: Option<StationFetch>,
     pub scopes: ScopeHashes,
     /// This host's id (a service scope's `hosts`).
     pub host_id: String,
@@ -188,12 +204,29 @@ impl StartView {
             standings: BTreeMap::new(),
             config: Config::default(),
             gates: Gates::closed_until_feeds(),
+            fetch: None,
             scopes: ScopeHashes::default(),
             host_id: host_id.to_string(),
             now_d_ms: None,
             live: HashMap::new(),
             refused: HashMap::new(),
         }
+    }
+
+    /// The Station whose gate has its device-list part now (design I.5.8:
+    /// "fetched the device list up to its head, or up to a deferred
+    /// entry"), against `list` as it committed: the host's own Station,
+    /// while its fetch is up to the head it announced last or stopped at
+    /// the deferred entry `list` still defers ([`ListPart::holds`]). Read
+    /// at every check, so it follows the list at the moment it commits
+    /// (Decision 16).
+    pub fn fetched(&self, list: &ListState) -> Option<&str> {
+        let fetch = self.fetch.as_ref()?;
+        let deferred = list.deferred.map(|d| d.seq);
+        if !fetch.part.holds(&list.membership, deferred) {
+            return None;
+        }
+        fetch.origin.as_deref()
     }
 
     /// `attempt_id` is about to be submitted for `task` (after its row
@@ -379,7 +412,9 @@ fn waits(
     if sender.list.deferred.is_some() {
         return Err(Event::Deferred);
     }
-    // A service's gate is its current coverage's origin (Decision 14).
+    // A service's gate is its current coverage's origin (Decision 14); a
+    // Station's gate needs its device-list part too (I.5.8).
+    let fetched = view.fetched(sender.list);
     let gate_of = match &adm.sender {
         DelegatedSender::Native { .. } => Some(adm.sender.clone()),
         DelegatedSender::Service { device_id, .. } => {
@@ -393,7 +428,7 @@ fn waits(
                 })
         }
     };
-    if !gate_of.is_some_and(|sender| view.gates.open_for(&sender)) {
+    if !gate_of.is_some_and(|sender| view.gates.open_for(&sender, fetched)) {
         return Err(Event::GateClosed);
     }
     if scope_pending {

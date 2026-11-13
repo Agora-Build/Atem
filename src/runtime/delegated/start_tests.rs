@@ -1,6 +1,9 @@
 //! The start check: `may_start`'s conditions and their order, and
 //! `DelegatedStart` in the session host's `accepted` → `executing` step.
 use super::*;
+use crate::runtime::delegated::fetch::{
+    HEADS_PACE_MS as HEADS_PACE, STALL_PAUSE_MS as STALL_PAUSE,
+};
 use crate::runtime::delegated::{FeedRef, SenderClass, classify};
 use crate::runtime::test_hooks::HostFeatures;
 use crate::session_protocol::fake_runtime::{AUTHORIZATION_MS, FakeRuntime};
@@ -371,6 +374,128 @@ fn frozen_project_entries_decide_without_a_hash() {
         .hashes
         .insert((S1.into(), "0b0b0b0b".into()), THIRD.into());
     assert_eq!(may_start(&t, &bot, Some(0)), Ok(()));
+}
+
+/// Design I.5.8 ("the gate, per origin"), I.4.3: a Station's gate opens
+/// only with its device-list part, besides its feed part: the host's fetch
+/// on its link reached the head that Station announced last (the list holds
+/// that very entry, `(seq, hash)`: the same `seq` with another hash is a
+/// list that differs from the Station's), or stopped at a deferred entry
+/// the list still defers, under that same announced head. A result's lower
+/// head never stands for the announced one; a list ahead of the Station
+/// holding its head passes. The part is the link's Station's only, and a
+/// native's own caught-up channel needs no Station part.
+#[test]
+fn gate_device_list_part_needs_the_announced_head_or_a_deferred_stop() {
+    use crate::runtime::delegated::fetch::{DeviceListFetch, FetchApply};
+    use atem_client::control::{MembershipFetch, MembershipFetchResult};
+    use atem_client::encoding::Hash32;
+    use atem_client::membership::Head;
+    let log = log_with(|_| {});
+    let bot = task(&log, BOT, LATER);
+    let phone = task(&log, PHONE, LATER);
+    let head = log.log.head();
+    let mut v = view(&log);
+    // The feed part alone (the stand-in's, PR 10's feeds): closed.
+    v.gates = Gates::closed_until_feeds();
+    v.gates.open_feed(ORIGIN);
+    assert_eq!(may_start(&v, &bot, Some(0)), Err(Event::GateClosed));
+    assert_eq!(may_start(&v, &phone, Some(0)), Err(Event::GateClosed));
+    let on_link = |v: &mut StartView, f: &DeviceListFetch| {
+        v.fetch = Some(StationFetch {
+            origin: Some(ORIGIN.into()),
+            part: f.part(),
+        });
+    };
+    let list = |v: &StartView| v.list.clone().unwrap();
+    // A link, nothing announced yet: closed.
+    let mut f = DeviceListFetch::default();
+    on_link(&mut v, &f);
+    assert_eq!(may_start(&v, &bot, Some(0)), Err(Event::GateClosed));
+    // The Station announces the list's own head: fetched up to it.
+    assert_eq!(f.on_heads(&head, &head, None), None);
+    on_link(&mut v, &f);
+    assert_eq!(v.fetched(&list(&v)), Some(ORIGIN));
+    assert_eq!(may_start(&v, &bot, Some(0)), Ok(()));
+    assert_eq!(may_start(&v, &phone, Some(0)), Ok(()), "the own Station's");
+    // Another Station's: the feed part open there, the part this link's.
+    v.fetch.as_mut().unwrap().origin = Some("https://other.example".into());
+    assert_eq!(may_start(&v, &bot, Some(0)), Err(Event::GateClosed));
+    on_link(&mut v, &f);
+
+    // A head beyond the list: behind it; the result's lower head, carried
+    // with nothing moved, doesn't stand for the announced one.
+    let beyond = Head {
+        seq: head.seq + 2,
+        hash: Hash32([9; 32]),
+    };
+    assert_eq!(
+        f.on_heads(&beyond, &head, None),
+        Some(MembershipFetch { after: head.seq })
+    );
+    let result = MembershipFetchResult {
+        head,
+        entries: Vec::new(),
+    };
+    assert!(matches!(f.on_result(result), FetchApply::Carry(_)));
+    assert_eq!(f.carried(&head, &head, None), None);
+    on_link(&mut v, &f);
+    assert_eq!(v.fetched(&list(&v)), None);
+    assert_eq!(may_start(&v, &bot, Some(0)), Err(Event::GateClosed));
+    // The same seq with another hash: the Station's list differs; closed.
+    let other = Head {
+        seq: head.seq,
+        hash: Hash32([7; 32]),
+    };
+    f.on_heads(&other, &head, None);
+    on_link(&mut v, &f);
+    assert_eq!(may_start(&v, &bot, Some(0)), Err(Event::GateClosed));
+    // A Station behind the host, its head an entry the list holds: open.
+    let earlier = log.log.entry(head.seq - 1).unwrap();
+    let earlier = Head {
+        seq: earlier.seq,
+        hash: earlier.hash(),
+    };
+    f.on_heads(&earlier, &head, None);
+    on_link(&mut v, &f);
+    assert_eq!(may_start(&v, &bot, Some(0)), Ok(()));
+
+    // The fetch for `beyond` stops at a deferred entry: the part holds
+    // while the list defers it (every delegated remote task waits anyway).
+    f.tick(STALL_PAUSE + HEADS_PACE, Some(&head), None);
+    assert_eq!(
+        f.on_heads(&beyond, &head, None),
+        Some(MembershipFetch { after: head.seq })
+    );
+    let result = MembershipFetchResult {
+        head: beyond,
+        entries: Vec::new(),
+    };
+    assert!(matches!(f.on_result(result), FetchApply::Carry(_)));
+    assert_eq!(f.carried(&head, &head, Some(head.seq + 1)), None);
+    on_link(&mut v, &f);
+    let deferral = |seq| DeferredStop {
+        seq,
+        until_ms: 0,
+        on: None,
+    };
+    v.list.as_mut().unwrap().deferred = Some(deferral(head.seq + 1));
+    assert_eq!(v.fetched(&list(&v)), Some(ORIGIN));
+    assert_eq!(may_start(&v, &bot, Some(0)), Err(Event::Deferred));
+    // A deferral elsewhere isn't the fetch's stop.
+    v.list.as_mut().unwrap().deferred = Some(deferral(head.seq + 2));
+    assert_eq!(v.fetched(&list(&v)), None);
+    // The deferral ends: the list is behind the announced head again.
+    v.list.as_mut().unwrap().deferred = None;
+    assert_eq!(v.fetched(&list(&v)), None);
+    assert_eq!(may_start(&v, &bot, Some(0)), Err(Event::GateClosed));
+    assert_eq!(may_start(&v, &phone, Some(0)), Err(Event::GateClosed));
+    // The phone's own caught-up channel: no Station part needed.
+    v.gates.set_caught_up(BTreeSet::from([PHONE.to_string()]));
+    assert_eq!(may_start(&v, &phone, Some(0)), Ok(()));
+    // No link: no part.
+    v.fetch = None;
+    assert_eq!(may_start(&v, &bot, Some(0)), Err(Event::GateClosed));
 }
 
 // ── At the start (the session host's `accepted` → `executing` step) ──
