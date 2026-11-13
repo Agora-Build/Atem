@@ -1,0 +1,256 @@
+//! The bridge's side of interrupt intents (design I.4.4, I.5.7, I.6.2 step
+//! 3; session-v1 R9.14 item 5): the deadline's intent is written, and every
+//! pending intent's decision ([`intents_pass`]) is carried out through the
+//! bridge's own entries, so the chat's half of the turn check always runs
+//! (Task 15's rulings T15a, T15c).
+//!
+//! - **The deadline** (I.4.4): a delegated task whose attempt waits to start
+//!   or runs (`submitting`, `submitted`) when the delegated clock's `D`
+//!   reaches its deadline gets an intent with reason `deadline` for its
+//!   current attempt, committed in its own `BEGIN IMMEDIATE` transaction
+//!   before the pass carries it out.
+//! - **Each scheduling pass** (after the task loop, so the records it acts
+//!   on are fresh) and the start's recovery, step 3, carry out the pending
+//!   intents, after the session host's `advance` (a lease past its deadline
+//!   ends `expired`, not `revoked`) and after the start's reconciliation of
+//!   host-work's prompts (`reconcile_host_work`, which runs earlier in the
+//!   same tick):
+//!   - `Deliver`: the bridge's `host_interrupt` (the whole turn check, the
+//!     input epoch, another controller's lease revoked, the Esc); a write
+//!     is remembered until its report comes;
+//!   - `RevokeOnly`: `host_interrupt_revoke_lease`, nothing written;
+//!   - `Withdraw`: the attempt is withdrawn in the session host (`accepted`)
+//!     or ended from its receipt (`rejected`) or its absence (never
+//!     admitted), and the task takes the intent's state (`expired before
+//!     submission`, or `sender revoked`) in one `BEGIN IMMEDIATE`
+//!     transaction with the attempt's end; a withdrawal that found it
+//!     started, or couldn't be recorded (the journal halted), leaves the
+//!     intent pending;
+//!   - `Done`: `done_ms` written; `Wait`: nothing.
+//! - **The reports** of host interrupt writes are taken every scheduling
+//!   pass (`host_interrupt_reports`), so the stream never grows; the drive
+//!   hook reads a copy of its own (Task 16b review m7).
+use super::*;
+use crate::runtime::delegated::attempts::{AttemptEnd, SessionAnswer, attempt_end};
+use crate::runtime::delegated::intents::{
+    AttemptNow, Decision, Intent, IntentReason, intents_pass,
+};
+use crate::session_protocol::host::{Immutable, Provenance, Withdrawal};
+
+impl HostBridge {
+    /// Design I.4.4: the delegated task `r`, unstarted or running
+    /// (`submitting`, `submitted`), reached its deadline on `D`: an
+    /// interrupt intent with reason `deadline` for its current attempt
+    /// (`receipt_id`), committed before anything acts on it. Once per
+    /// attempt (a read first, so a pass after it writes nothing).
+    pub(super) fn deadline_intent(&self, r: &WorkRecord) -> anyhow::Result<()> {
+        let store = self.work.store.as_ref().unwrap();
+        let (task, attempt) = (&r.task.task_id, &r.status.receipt_id);
+        if store.has_intent(task, attempt, &IntentReason::Deadline)? {
+            return Ok(());
+        }
+        let tx = store.immediate()?;
+        store.write_intent(&tx, task, attempt, IntentReason::Deadline)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// One pass of the pending interrupt intents (see the module doc): the
+    /// task ids of the intents it looked at, oldest first. The reports of
+    /// host interrupt writes are taken whatever the store holds; with
+    /// nothing delegated possible (`may_hold_delegated`) nothing else is
+    /// read, as on main.
+    pub(super) fn carry_out_intents(&mut self, cx: &mut Cx) -> anyhow::Result<Vec<String>> {
+        let reports = self.host_interrupt_reports();
+        if !self.may_hold_delegated() {
+            return Ok(Vec::new());
+        }
+        let now = self.clock.now();
+        let mut runs = std::mem::take(&mut self.work.intents);
+        let decided = {
+            let store = self.work.store.as_ref().unwrap();
+            let mut failed = None;
+            let decided = intents_pass(
+                store,
+                &mut |i| match self.attempt_now(i, cx) {
+                    Ok(now) => now,
+                    Err(e) => {
+                        failed.get_or_insert(e);
+                        AttemptNow::NotShown
+                    }
+                },
+                &reports,
+                &mut runs,
+                now,
+            );
+            match (decided, failed) {
+                (Ok(decided), None) => Ok(decided),
+                (Err(e), _) | (_, Some(e)) => Err(e),
+            }
+        };
+        let decided = match decided {
+            Ok(decided) => decided,
+            Err(e) => {
+                self.work.intents = runs;
+                return Err(e);
+            }
+        };
+        // What acts on the session host runs after its `advance` (Task 15
+        // review M6: a lease past its deadline ends `expired`, not
+        // `revoked`); each action checks the turn again itself.
+        if decided.iter().any(|(_, d)| {
+            matches!(
+                d,
+                Decision::Deliver { .. } | Decision::RevokeOnly | Decision::Withdraw
+            )
+        }) {
+            let effects = self.host.advance(self.clock.now());
+            self.exec(effects, cx);
+        }
+        let mut looked = Vec::new();
+        let mut result = Ok(());
+        for (intent, decision) in decided {
+            looked.push(intent.task_id.clone());
+            if let Err(e) = self.carry_out(&intent, decision, &mut runs, cx) {
+                result = Err(e);
+                break;
+            }
+        }
+        self.work.intents = runs;
+        result.map(|()| looked)
+    }
+
+    /// Carries out `decision` for `intent`.
+    fn carry_out(
+        &mut self,
+        intent: &Intent,
+        decision: Decision,
+        runs: &mut crate::runtime::delegated::intents::Runs,
+        cx: &mut Cx,
+    ) -> anyhow::Result<()> {
+        let attempt = intent.attempt_id.as_str();
+        match decision {
+            Decision::Wait => {}
+            Decision::Done => {
+                self.work.store.as_ref().unwrap().intent_done(intent.id)?;
+                runs.forget(attempt);
+            }
+            Decision::Deliver { turn } => {
+                if let Some(sid) = self.intent_session(intent)
+                    && self.host_interrupt(&sid, attempt, cx) == Interrupted::Written
+                {
+                    runs.written(attempt, &turn);
+                }
+            }
+            Decision::RevokeOnly => {
+                if let Some(sid) = self.intent_session(intent) {
+                    let _ = self.host_interrupt_revoke_lease(&sid, attempt, cx);
+                }
+            }
+            Decision::Withdraw => {
+                if self.withdraw_for_intent(intent, cx)? {
+                    self.work.store.as_ref().unwrap().intent_done(intent.id)?;
+                    runs.forget(attempt);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The session of `intent`'s attempt, as its receipt names it.
+    fn intent_session(&self, intent: &Intent) -> Option<String> {
+        self.host
+            .attempt_receipt(&intent.attempt_id, &intent.task_id)
+            .map(|r| r.target.session_id)
+    }
+
+    /// What `intent`'s attempt is now: its receipt (host-work's request for
+    /// that task only), its row's end, and, while it executes, the start's
+    /// reconciliation and the chat's half of the turn check
+    /// (`running_request`: today's Esc rule and the chat's current request).
+    fn attempt_now(&self, intent: &Intent, cx: &mut Cx) -> anyhow::Result<AttemptNow> {
+        let store = self.work.store.as_ref().unwrap();
+        let (task, attempt) = (intent.task_id.as_str(), intent.attempt_id.as_str());
+        let Some(receipt) = self.host.attempt_receipt(attempt, task) else {
+            return Ok(AttemptNow::Absent {
+                live: store.may_submit(task, attempt)?,
+            });
+        };
+        Ok(match receipt.state {
+            ReceiptState::Accepted => AttemptNow::Unstarted,
+            ReceiptState::Rejected => AttemptNow::Rejected {
+                live: store.may_submit(task, attempt)?,
+            },
+            ReceiptState::Completed | ReceiptState::OutcomeUnknown => AttemptNow::Ended,
+            ReceiptState::Executing if self.host_work_reconciling(attempt) => {
+                AttemptNow::Reconciling
+            }
+            ReceiptState::Executing => {
+                let sid = receipt.target.session_id.as_str();
+                if running_request(cx, sid).as_deref() == Some(attempt) {
+                    // Shown running: the chat's current turn is the attempt's.
+                    let turn = session_of(cx, sid)
+                        .and_then(|s| s.chat.current_turn_id().map(str::to_string))
+                        .unwrap_or_else(|| attempt.to_string());
+                    AttemptNow::Running { turn }
+                } else {
+                    AttemptNow::NotShown
+                }
+            }
+        })
+    }
+
+    /// Withdraws `intent`'s unstarted attempt (design I.5.7): an `accepted`
+    /// one in the session host (`withdrawn by the host`); a `rejected` one
+    /// ends from its receipt; one absent from the recovered journal was
+    /// never admitted. The task takes the intent's state with the attempt's
+    /// end (`end_attempt`: one `BEGIN IMMEDIATE` transaction, the state
+    /// first). True when the intent is done: the attempt ended (here or
+    /// already); false when the withdrawal found it started (the next pass
+    /// interrupts it) or couldn't be recorded (the journal halted: nothing
+    /// starts until the restart, which withdraws it).
+    fn withdraw_for_intent(&mut self, intent: &Intent, cx: &mut Cx) -> anyhow::Result<bool> {
+        let store = self.work.store.as_ref().unwrap();
+        let (task, attempt) = (intent.task_id.as_str(), intent.attempt_id.as_str());
+        let Some(mut r) = store.work(task)? else {
+            return Ok(true);
+        };
+        let Some(a) = store
+            .live_attempt(task)?
+            .filter(|a| a.attempt_id == attempt)
+        else {
+            return Ok(true);
+        };
+        let end = match self.host.attempt_receipt(attempt, task) {
+            // Absent from the recovered journal: never admitted (I.6.3).
+            None => AttemptEnd::NotAdmitted,
+            Some(rc) if rc.state == ReceiptState::Rejected => attempt_end(
+                SessionAnswer::Receipt(rc.state, rc.detail.as_deref()),
+                false,
+            )
+            .unwrap_or(AttemptEnd::Rejected),
+            Some(_) => {
+                // In the journal (`accepted`): the withdrawal finds it by
+                // its id, so these values go nowhere.
+                let immutable = Immutable {
+                    target: r.task.target.clone(),
+                    payload_digest: String::new(),
+                    provenance: Provenance {
+                        task_id: task.to_string(),
+                        sender: r.principal.clone(),
+                    },
+                };
+                let withdrawal = self.host.withdraw(attempt, &immutable);
+                let effects = self.host.take_effects();
+                self.exec(effects, cx);
+                match withdrawal {
+                    Withdrawal::Started | Withdrawal::Halted => return Ok(false),
+                    w => attempt_end(SessionAnswer::Withdrawal(w), false)
+                        .unwrap_or(AttemptEnd::Withdrawn { counted: true }),
+                }
+            }
+        };
+        self.end_attempt(&mut r, &a, end, intent.reason.withdrawn())?;
+        Ok(true)
+    }
+}

@@ -1252,3 +1252,126 @@ fn sigkill_after_attempt_commit_and_after_accepted_runs_once() {
     assert_eq!(all[0], (accepted, Some("withdrawn".into())));
     assert_eq!(all[1].1.as_deref(), Some("started"));
 }
+
+/// The bare Esc bytes the rig's agent was given (a bracketed paste's
+/// `ESC [` doesn't count).
+fn escs(rig: &Rig) -> usize {
+    let text = input(rig);
+    text.matches('\x1b').count() - text.matches("\x1b[").count()
+}
+
+/// One interrupt intent as `runtime/host-work.sqlite` stores it.
+#[derive(Debug)]
+struct Intent {
+    attempt_id: String,
+    reason: String,
+    done: bool,
+    delivered_turn: Option<String>,
+}
+
+/// Task `tid`'s interrupt intents, oldest first.
+fn intents(rig: &Rig, tid: &Value) -> Vec<Intent> {
+    let db =
+        rusqlite::Connection::open(rig.sandbox.config().join("runtime/host-work.sqlite")).unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    let mut q = db
+        .prepare(
+            "SELECT attempt_id,reason,done_ms IS NOT NULL,delivered_turn FROM intents
+            WHERE task_id=?1 ORDER BY rowid",
+        )
+        .unwrap();
+    q.query_map([tid.as_str().unwrap()], |r| {
+        Ok(Intent {
+            attempt_id: r.get(0)?,
+            reason: r.get(1)?,
+            done: r.get(2)?,
+            delivered_turn: r.get(3)?,
+        })
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// VII.A test 12 (design I.4.4, I.5.7; session-v1 R9.14 item 5): a
+/// delegated turn still running when the delegated clock reaches its task's
+/// deadline is interrupted on the host's authority: an intent with reason
+/// `deadline` is stored for its attempt, the Esc is written once (no blind
+/// second one while the turn goes on), and the turn it reached recorded.
+/// The turn ends interrupted (its receipt `completed`, `interrupted`), and
+/// the task, after `awaiting_result` (`interrupted at deadline`), expires
+/// as today (`expired awaiting a result`); the intent is done. The clock
+/// moves only on the debug host clock (its boot-time counter), never by
+/// waiting.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_turn_running_at_its_deadline_is_interrupted_and_expires() {
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_controls(gate_open());
+    rig.with_clock();
+    rig.dump = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let t = task_until(&launch, "DEADLINE_TURN", rig.clock().wall() + 10 * MIN);
+    let tid = &t["task_id"];
+    enqueue(&mut phone, &mut r, &t);
+    in_turn(&rig, tid, "DEADLINE_TURN");
+    let attempt = stored(&rig, tid)["receipt_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(intents(&rig, tid).is_empty(), "nothing before the deadline");
+    assert_eq!(escs(&rig), 0);
+    // The boot-time counter passes the deadline (the wall clock where it
+    // is): `D` reaches it.
+    rig.clock().set(0, 10 * MIN);
+    within("the deadline's interrupt", || {
+        intents(&rig, tid)
+            .first()
+            .is_some_and(|i| i.delivered_turn.is_some())
+    });
+    let stored_intents = intents(&rig, tid);
+    let [intent] = stored_intents.as_slice() else {
+        panic!("one intent: {stored_intents:?}");
+    };
+    assert_eq!(
+        (
+            intent.attempt_id.as_str(),
+            intent.reason.as_str(),
+            intent.done
+        ),
+        (attempt.as_str(), "deadline", false)
+    );
+    assert_eq!(escs(&rig), 1);
+    // The turn goes on (the fake agent ignores the Esc): only the lease
+    // revocation repeats, nothing is written again.
+    two_passes(&rig);
+    two_passes(&rig);
+    assert_eq!(escs(&rig), 1, "once per turn");
+    assert_eq!(stored(&rig, tid)["state"], "submitted");
+    // The agent's turn ends interrupted, as after an Esc.
+    std::fs::write(rig.fake.join("interrupt"), "").unwrap();
+    wait_stored(&rig, tid, "expired", "expired awaiting a result");
+    let rc = receipt(&rig, &attempt);
+    assert_eq!(
+        (&rc["state"], &rc["detail"]),
+        (&json!("completed"), &json!("interrupted")),
+        "{rc}"
+    );
+    let stored_intents = intents(&rig, tid);
+    let [intent] = stored_intents.as_slice() else {
+        panic!("one intent: {stored_intents:?}");
+    };
+    assert!(intent.done, "{intent:?}");
+    assert_eq!(escs(&rig), 1);
+    assert_eq!(input(&rig).matches("DEADLINE_TURN").count(), 1);
+    assert_eq!(ends(&rig, tid), [Some("started".to_string())]);
+    let status = work(&mut phone, &mut r, tid);
+    assert_eq!(status["result"]["work"]["state"], "expired", "{status}");
+}

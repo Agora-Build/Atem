@@ -53,6 +53,8 @@ mod collab_bridge;
 mod collab_launch_bridge;
 #[path = "delegated/dispatch.rs"]
 mod delegated_dispatch;
+#[path = "delegated/interrupts.rs"]
+mod delegated_interrupts;
 #[path = "delegated/recovery.rs"]
 mod delegated_recovery;
 #[path = "delegated/requests.rs"]
@@ -189,6 +191,9 @@ pub(super) struct State {
     /// When the next reading of `D` is due outside the scheduling pass
     /// (`take_reading`).
     read_due: Instant,
+    /// What this run delivered of the interrupt intents (memory only: a
+    /// restart delivers once more to a turn still current; design I.5.7).
+    intents: crate::runtime::delegated::intents::Runs,
     /// Tests: the control view senders are classified on in place of
     /// `NoFeeds` (a feed covering a service, as PR 10's will).
     #[cfg(test)]
@@ -232,6 +237,7 @@ impl State {
             clock_due: Instant::now(),
             clock_checked: false,
             read_due: Instant::now(),
+            intents: Default::default(),
             #[cfg(test)]
             controls: None,
             #[cfg(test)]
@@ -1881,6 +1887,9 @@ impl HostBridge {
             };
             self.work.store.as_ref().unwrap().save_work(&r)?;
         }
+        // The interrupt intents (design I.5.7), after every task's record
+        // was settled above: what they change, they read fresh.
+        self.carry_out_intents(cx)?;
         Ok(())
     }
 
@@ -2058,9 +2067,13 @@ impl HostBridge {
             self.collab_early_end(r)?;
             return Ok(());
         }
+        let interrupted = turn_interrupted(&receipt);
         r.status.detail = if r.status.state == WorkState::Submitted && r.turn_id.is_some() {
             collab_bridge::IN_TURN
-        } else if turn_interrupted(&receipt) {
+        } else if interrupted && self.interrupted_at_deadline(r)? {
+            // Design I.4.4: the deadline's intent interrupted it.
+            details::INTERRUPTED_AT_DEADLINE
+        } else if interrupted {
             TURN_INTERRUPTED
         } else {
             "agent submission receipt reconciled; task completion requires an explicit result"
@@ -2071,6 +2084,19 @@ impl HostBridge {
         }
         self.collab_early_end(r)?;
         Ok(())
+    }
+
+    /// A delegated task's attempt has the deadline's interrupt intent
+    /// (design I.4.4): its turn, ended interrupted, was the deadline's.
+    fn interrupted_at_deadline(&self, r: &WorkRecord) -> anyhow::Result<bool> {
+        if r.delegated.is_none() {
+            return Ok(false);
+        }
+        self.work.store.as_ref().unwrap().has_intent(
+            &r.task.task_id,
+            &r.status.receipt_id,
+            &crate::runtime::delegated::intents::IntentReason::Deadline,
+        )
     }
 
     /// The task's prompt turn ended interrupted (its receipt's journaled
@@ -2170,6 +2196,7 @@ mod local_tests {
         include!("delegated/dispatch_tests.rs");
         include!("delegated/lifecycle_tests.rs");
         include!("delegated/recovery_tests.rs");
+        include!("delegated/intents_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};

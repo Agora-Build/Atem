@@ -9,12 +9,15 @@
 //! the admission record a delegated sender's task gets ([`Admission`],
 //! I.4.1), its attempts ([`attempts`], I.6.4), the start check and the
 //! gates ([`start`], [`gate`], I.4.3, I.5.8), who may query, cancel or
-//! complete it ([`authority`], I.4.5, Decision 15), what the bridge answers
-//! the delegated ops ([`request`]), and §11.6's detail texts ([`details`]).
+//! complete it ([`authority`], I.4.5, Decision 15), the interrupt intents
+//! that stop its attempt at its deadline ([`intents`], I.4.4, I.5.7), what
+//! the bridge answers the delegated ops ([`request`]), and §11.6's detail
+//! texts ([`details`]).
 pub mod attempts;
 pub mod authority;
 pub mod details;
 pub mod gate;
+pub mod intents;
 pub mod start;
 
 use crate::runtime::test_hooks::HostFeatures;

@@ -37,8 +37,6 @@ pub const TOO_MANY_ATTEMPTS: &str = "too many attempts";
 pub const EXPIRED_BEFORE_THE_SPAWN: &str = "expired before the spawn";
 /// `awaiting_result`: a running turn interrupted at the task's deadline
 /// (then `expired`, as in v1).
-// Used by Task 26: the deadline interrupt.
-#[allow(dead_code)]
 pub const INTERRUPTED_AT_DEADLINE: &str = "interrupted at deadline";
 /// `outcome_unknown`: its deadline passed unresolved.
 // Used by Task 23: unresolved outcomes.

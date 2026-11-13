@@ -1088,7 +1088,15 @@ impl Store {
                 \"end\" TEXT, counted INTEGER NOT NULL, created_ms INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id);
             CREATE UNIQUE INDEX IF NOT EXISTS attempts_live ON attempts(task_id)
-                WHERE \"end\" IS NULL;")?;
+                WHERE \"end\" IS NULL;
+            CREATE TABLE IF NOT EXISTS intents (
+                task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, reason TEXT NOT NULL,
+                revocation TEXT, created_ms INTEGER NOT NULL, done_ms INTEGER,
+                delivered_turn TEXT);
+            CREATE UNIQUE INDEX IF NOT EXISTS intents_one
+                ON intents(attempt_id, reason, ifnull(revocation, ''));
+            CREATE INDEX IF NOT EXISTS intents_pending ON intents(task_id)
+                WHERE done_ms IS NULL;")?;
         track_open_records(&db)?;
         track_waits(&db)?;
         std::fs::File::open(state)?.sync_all()?;
