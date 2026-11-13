@@ -57,6 +57,7 @@ mod collab_launch_bridge;
 mod delegated_dispatch;
 #[path = "delegated/feed_pass.rs"]
 mod delegated_feed_pass;
+pub(super) use delegated_feed_pass::sync_clocks;
 #[path = "delegated/recovery.rs"]
 mod delegated_recovery;
 #[path = "delegated/requests.rs"]
@@ -201,6 +202,9 @@ pub(super) struct State {
     /// were last applied again at (`feeds_reverify`): none since the feeds
     /// loaded, so once at start.
     reverified: Option<(u64, atem_client::encoding::Hash32)>,
+    /// Pending control records a re-verification applied, kept for Task 35
+    /// (`keep_reapplied`).
+    reapplied: Vec<crate::runtime::delegated::feeds::Reapplied>,
     /// Tests: the control view senders are classified on in place of the
     /// feeds (a feed covering a service, standings the test sets).
     #[cfg(test)]
@@ -246,6 +250,7 @@ impl State {
             read_due: Instant::now(),
             feeds: crate::runtime::delegated::feeds::Feeds::Unloaded,
             reverified: None,
+            reapplied: Vec::new(),
             #[cfg(test)]
             controls: None,
             #[cfg(test)]

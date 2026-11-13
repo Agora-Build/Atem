@@ -1506,7 +1506,7 @@ impl HostBridge {
         );
         // The gate follows the link and the time (60 s without `heads`)
         // at every pass, whatever the Station sends.
-        self.feed_advance(host_now().mono_ms);
+        self.feed_advance(host_work_bridge::sync_clocks());
         self.refresh_fetch_view();
     }
 
@@ -1550,7 +1550,7 @@ impl HostBridge {
             .into_iter()
             .map(StationCall::Fetch)
             .collect();
-        calls.extend(self.feed_tick(now));
+        calls.extend(self.feed_tick(host_work_bridge::sync_clocks()));
         for text in messages {
             let applied = self.membership.as_ref().map(MembershipHost::head);
             let deferred = self.list_deferral();

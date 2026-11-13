@@ -3721,4 +3721,15 @@ fn a_station_page_that_isnt_strict_still_reaches_the_station_link() {
         rig.engine.relay_message(text);
     }
     assert_eq!(rig.engine.take_station_messages(), pages);
+    // Task 33 review m2: nesting past serde's depth, and a duplicate `op`
+    // key, reach it too.
+    let deep = format!(
+        r#"{{"type":"relay","op":"control_sync_result","records":[{{"record":{}1{}}}]}}"#,
+        "[".repeat(300),
+        "]".repeat(300)
+    );
+    let twice = r#"{"type":"relay","op":"push_ack","op":"control_sync_result"}"#;
+    rig.engine.relay_message(&deep);
+    rig.engine.relay_message(twice);
+    assert_eq!(rig.engine.take_station_messages(), [deep.as_str(), twice]);
 }

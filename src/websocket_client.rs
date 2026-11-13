@@ -102,10 +102,18 @@ pub(crate) fn is_relay_message(text: &str) -> bool {
         #[serde(rename = "type")]
         kind: Option<String>,
     }
-    serde_json::from_str::<Peek>(text)
-        .ok()
-        .and_then(|p| p.kind)
-        .is_some_and(|kind| kind == "relay")
+    match serde_json::from_str::<Peek>(text) {
+        Ok(peek) => peek.kind.is_some_and(|kind| kind == "relay"),
+        // One the peek can't read (a duplicate key, a message cut short) is
+        // a relay message only when its top-level names say it is a
+        // Station's to this host: it goes to the Station link, whose strict
+        // reader answers it as a Station fault (host-work-v1 §11.4; Task 33
+        // review m2). Any other stays dropped, as before.
+        Err(_) => crate::session_protocol::r9::peek::relay_op(
+            text,
+            crate::session_protocol::r9::is_station_message,
+        ),
+    }
 }
 
 /// Message types removed in atem-session r6 (§0): no compatibility, but
@@ -2796,6 +2804,27 @@ mod tests {
         assert!(!is_relay_message(r#"{"type":"session","data":{"op":"relay"}}"#));
         assert!(!is_relay_message(r#"{"op":"push_ack"}"#));
         assert!(!is_relay_message("not json"));
+        // Task 33 review m2: nesting past serde's depth is still a relay
+        // message (its top-level `type` read with no recursion), so a
+        // Station page nested that deep reaches the Station link's reader.
+        let deep = format!(
+            r#"{{"type":"relay","op":"control_sync_result","records":{}1{}}}"#,
+            "[".repeat(300),
+            "]".repeat(300)
+        );
+        assert!(is_relay_message(&deep));
+        // A Station page cut short (or with a duplicate key) still goes to
+        // the Station link; another relay message that doesn't read doesn't.
+        assert!(is_relay_message(
+            r#"{"type":"relay","op":"control_sync_result","records":[{"#
+        ));
+        assert!(is_relay_message(
+            r#"{"type":"relay","type":"relay","op":"heads","feeds":[]}"#
+        ));
+        assert!(!is_relay_message(
+            r#"{"type":"relay","type":"relay","op":"push_ack","acks":[]}"#
+        ));
+        assert!(!is_relay_message(&format!(r#"{{"type":"session","x":{}1{}}}"#, "[".repeat(300), "]".repeat(300))));
         assert_eq!(session_family(r#"{"type":"relay","op":"push_ack"}"#), None);
     }
 

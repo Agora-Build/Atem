@@ -32,6 +32,9 @@ struct Rig {
     clock: HostClock,
     os: Arc<Mutex<OsReading>>,
     sync: FeedSync,
+    /// The host's monotonic clock (ms): apart from the boot-time counter
+    /// (`os.boot_ns`), which also counts a suspend.
+    mono_ms: u64,
     issued: u64,
     minted: u64,
 }
@@ -132,6 +135,7 @@ fn rig() -> Rig {
         clock,
         os,
         sync,
+        mono_ms: 3 * HOUR,
         issued: 1_700_000_000_000,
         minted: 0,
     };
@@ -140,23 +144,39 @@ fn rig() -> Rig {
 }
 
 impl Rig {
-    fn mono(&self) -> u64 {
-        self.os.lock().unwrap().boot_ns / 1_000_000
+    /// The pass's clocks: the monotonic one and the boot-time counter.
+    fn clocks(&self) -> Clocks {
+        Clocks {
+            mono_ms: self.mono_ms,
+            boot_ms: Some(self.os.lock().unwrap().boot_ns / 1_000_000),
+        }
+    }
+
+    /// A suspend of `ms` (Linux: `CLOCK_MONOTONIC` stops, the boot-time
+    /// counter and the wall clock go on), then the pass's tick.
+    fn suspend(&mut self, ms: u64) -> Vec<ControlSync> {
+        {
+            let mut r = self.os.lock().unwrap();
+            r.wall_ms += ms;
+            r.boot_ns += ms * 1_000_000;
+        }
+        self.sync.tick(self.clocks(), Some(&self.feeds))
     }
 
     fn wall(&self) -> u64 {
         self.os.lock().unwrap().wall_ms
     }
 
-    /// Time passes (wall and monotonic): the pass's tick, its calls.
+    /// Time passes (wall, monotonic and boot time): the pass's tick, its
+    /// calls.
     fn pass(&mut self, ms: u64) -> Vec<ControlSync> {
         {
             let mut r = self.os.lock().unwrap();
             r.wall_ms += ms;
             r.boot_ns += ms * 1_000_000;
         }
-        let now = self.mono();
-        self.sync.tick(now, Some(&self.feeds))
+        self.mono_ms += ms;
+        self.sync.tick(self.clocks(), Some(&self.feeds))
     }
 
     /// `heads` announcing `feeds` (origin, feed, head) at the Station's
@@ -784,4 +804,202 @@ fn a_refused_stale_feed_is_read_anew_after_the_backoff() {
     rig.page(FEED_2, 1, &[(1, &cover)]);
     assert!(rig.open(&native()));
     assert_eq!(rig.cursor(), Some((FEED_2.to_string(), 1)));
+}
+
+/// Task 33 review I1: a page that applied nothing (the feed store had no
+/// own Station's origin to place it: the pass that sets it skipped, a
+/// pause) is no read. A reset's read keeps the reset (the gate closed, the
+/// old cursor where it was, the read from 0 asked again after the pause);
+/// a refusal's resynchronization keeps the refusal's closure.
+#[test]
+fn a_page_that_applied_nothing_keeps_the_reset_and_the_gate_closed() {
+    let mut rig = rig();
+    rig.opened();
+    // The feed rolled back under the same id.
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 1), [sync_call(FEED, 0)]);
+    assert_eq!(rig.sync.closed(), Some(Closed::Reset));
+    rig.feeds.set_own_origin(None);
+    let cover = rig.record(FEED, ControlAction::Cover);
+    let synced = rig.page(FEED, 1, &[(1, &cover)]);
+    assert!(synced.applied.is_empty() && synced.next.is_none());
+    assert_eq!(rig.sync.closed(), Some(Closed::Reset), "no read");
+    assert!(!rig.open(&native()));
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
+    // Asked again (from 0) once the pause passed, and read then.
+    assert_eq!(rig.pass(SEC), Vec::new(), "paused");
+    rig.feeds.set_own_origin(Some(ORIGIN.into()));
+    assert_eq!(rig.pass(STALL_PAUSE_MS), [sync_call(FEED, 0)]);
+    rig.page(FEED, 1, &[(1, &cover)]);
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 1)));
+    assert!(rig.open(&native()));
+
+    // A refusal's resynchronization: a page that applied nothing doesn't
+    // end it.
+    rig.sync.on_refused(RefusedCall::MembershipFetch);
+    rig.pass(REFUSAL_BACKOFF_MS);
+    assert_eq!(rig.heads(FEED, 1), [sync_call(FEED, 1)]);
+    rig.feeds.set_own_origin(None);
+    rig.page(FEED, 1, &[]);
+    assert_eq!(rig.sync.closed(), Some(Closed::Refused));
+    assert!(!rig.open(&native()));
+}
+
+/// Task 33 review I2 (I.6.5: the delegated lifecycle's elapsed time is boot
+/// time, which counts a suspend): the 60 s without `heads` are measured on
+/// the larger of the monotonic and the boot-time elapsed times, never
+/// shorter than either. A Linux host that slept (the boot-time counter on,
+/// the monotonic clock still) finds its gate closed at once on waking.
+#[test]
+fn sixty_seconds_without_heads_count_a_suspend() {
+    let mut rig = rig();
+    rig.opened();
+    rig.suspend(2 * HOUR);
+    assert_eq!(rig.sync.closed(), Some(Closed::HeadsLate));
+    assert!(!rig.open(&native()));
+    assert_eq!(rig.heads(FEED, 2), Vec::new());
+    assert!(rig.open(&native()));
+    // Short of 60 s on both: open; at 60 s on the boot-time counter alone
+    // (a suspend of the rest): closed.
+    rig.pass(NO_HEADS_MS - 2 * SEC);
+    assert!(rig.open(&native()));
+    rig.suspend(2 * SEC);
+    assert_eq!(rig.sync.closed(), Some(Closed::HeadsLate));
+    // The monotonic clock alone counts too (no boot-time reading).
+    assert_eq!(rig.heads(FEED, 2), Vec::new());
+    rig.mono_ms += NO_HEADS_MS;
+    rig.sync.tick(
+        Clocks {
+            mono_ms: rig.mono_ms,
+            boot_ms: None,
+        },
+        Some(&rig.feeds),
+    );
+    assert_eq!(rig.sync.closed(), Some(Closed::HeadsLate));
+}
+
+/// Task 33 review m3: a cursor above the announced head of the same feed
+/// is a reset wherever it is found, not only at the `heads`: here the
+/// `heads` came while the feeds weren't loaded, and the load finds it. A
+/// page whose head is above the announced one raises the announcement
+/// (the gate needs that much read), never a false reset.
+#[test]
+fn a_cursor_above_the_announced_head_is_a_reset_once_the_feeds_load() {
+    let mut rig = rig();
+    rig.opened();
+    rig.pass(SEC);
+    // The feeds unloaded: a heads naming a head below the cursor.
+    rig.sync.tick(rig.clocks(), None);
+    let heads = Heads {
+        feeds: vec![FeedHead {
+            origin: ORIGIN.into(),
+            feed_id: FEED.into(),
+            head: 1,
+            station_time: rig.wall(),
+        }],
+        membership: rig.log.log.head(),
+    };
+    assert_eq!(
+        rig.sync
+            .on_heads(&heads, Some((&mut rig.clock, &rig.store)), None),
+        Vec::new()
+    );
+    assert_eq!(rig.sync.closed(), Some(Closed::Unloaded));
+    // Loaded again: a reset, read from 0.
+    assert_eq!(rig.pass(SEC), [sync_call(FEED, 0)]);
+    assert_eq!(rig.sync.closed(), Some(Closed::Reset));
+    let cover = rig.record(FEED, ControlAction::Cover);
+    let hold = rig.record(FEED, ControlAction::Hold);
+    let release = rig.record(FEED, ControlAction::Release);
+    // The read from 0 finds the feed grown past the announcement.
+    rig.page(FEED, 3, &[(1, &cover), (2, &hold), (3, &release)]);
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 3)));
+    assert_eq!(rig.sync.closed(), None);
+    assert_eq!(rig.pass(SEC), Vec::new(), "no false reset");
+    assert_eq!(rig.sync.closed(), None);
+}
+
+/// Task 33 review m5: the start's recovery (design I.6.2 step 7) closes
+/// the gate until a page asked from then reads, even with the cursor at the
+/// announced head; a `heads` alone doesn't reopen it.
+#[test]
+fn the_recoverys_restart_waits_for_a_fresh_page() {
+    let mut rig = rig();
+    rig.opened();
+    rig.sync.restart();
+    assert_eq!(rig.sync.closed(), Some(Closed::Restarted));
+    assert!(!rig.open(&native()));
+    assert_eq!(rig.pass(SEC), [sync_call(FEED, 2)], "asked at once");
+    assert_eq!(rig.heads(FEED, 2), Vec::new(), "one in flight");
+    assert!(!rig.open(&native()), "a heads doesn't reopen it");
+    rig.page(FEED, 2, &[]);
+    assert!(rig.open(&native()));
+}
+
+/// Task 33 review m5: a `station_time` the delegated clock can't record
+/// (here no clock at all) counts as no `station_time`: the gate closes until
+/// a `heads` whose time is recorded within the cap.
+#[test]
+fn an_unrecorded_station_time_closes_the_gate() {
+    let mut rig = rig();
+    rig.opened();
+    rig.pass(SEC);
+    let heads = Heads {
+        feeds: vec![FeedHead {
+            origin: ORIGIN.into(),
+            feed_id: FEED.into(),
+            head: 2,
+            station_time: rig.wall(),
+        }],
+        membership: rig.log.log.head(),
+    };
+    assert_eq!(
+        rig.sync.on_heads(&heads, None, Some(&rig.feeds)),
+        Vec::new()
+    );
+    assert_eq!(rig.sync.closed(), Some(Closed::ClockUnrecorded));
+    assert!(!rig.open(&native()));
+    assert_eq!(rig.heads(FEED, 2), Vec::new());
+    assert!(rig.open(&native()));
+}
+
+/// Task 33 review m5: a page that names another origin than the host's own
+/// Station's is a Station fault (nothing applies, the gate closes); a page
+/// that arrives while the feeds aren't loaded applies nothing, and the
+/// feed is asked again once they are.
+#[test]
+fn a_page_of_another_origin_or_without_the_feeds_applies_nothing() {
+    let mut rig = rig();
+    rig.opened();
+    rig.sync.take_lines();
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    let release = rig.record(FEED, ControlAction::Release);
+    let mut page = rig
+        .page_of(FEED, 3, vec![(3, release.object().to_json())])
+        .unwrap();
+    page.origin = OTHER.into();
+    let synced = rig.on_page(Ok(page));
+    assert!(synced.applied.is_empty());
+    assert!(rig.feeds.standing(BOT).held);
+    assert_eq!(rig.sync.closed(), Some(Closed::Fault("another_origin")));
+    assert_eq!(rig.sync.take_lines().len(), 1);
+    // Asked again after the pause; its page comes while the feeds aren't
+    // loaded.
+    assert_eq!(rig.pass(STALL_PAUSE_MS), [sync_call(FEED, 2)]);
+    let page = rig.page_of(FEED, 3, vec![(3, release.object().to_json())]);
+    let synced = rig
+        .sync
+        .on_page(page, Some((&mut rig.clock, &rig.store)), None)
+        .unwrap();
+    assert!(synced.applied.is_empty() && !synced.read);
+    assert!(rig.feeds.standing(BOT).held);
+    assert!(!rig.open(&native()));
+    // Loaded again: asked after the pause (at the next heads: the last
+    // came 60 s ago), read.
+    assert_eq!(rig.pass(STALL_PAUSE_MS), Vec::new());
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    rig.page(FEED, 3, &[(3, &release)]);
+    assert!(!rig.feeds.standing(BOT).held);
+    assert!(rig.open(&native()));
 }

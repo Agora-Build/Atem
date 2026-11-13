@@ -95,6 +95,18 @@ pub struct DelegatedNow {
 /// Where readings come from: `None` while the debug hook's file has none.
 type Reader = Arc<dyn Fn() -> Option<OsReading> + Send + Sync>;
 
+/// The delegated clock's boot-time counter now, in ms (§11.6: it counts a
+/// suspend; the Linux composition, `mach_continuous_time` on macOS), the
+/// debug hook's when it is set (none while its file has no reading). Only
+/// the counter, read at every call: the Station sync's 60 s without
+/// `heads` (Task 33 review I2).
+pub fn boot_ms() -> Option<u64> {
+    match crate::runtime::test_hooks::host_clock_reading() {
+        Some(hook) => hook.map(|r| r.boot_ns / 1_000_000),
+        None => Some(os::boot_ns() / 1_000_000),
+    }
+}
+
 /// The OS's reading, or the debug hook's (`ATEM_TEST_HOST_CLOCK`).
 fn system_reading() -> Option<OsReading> {
     match crate::runtime::test_hooks::host_clock_reading() {
@@ -335,10 +347,10 @@ impl HostClock {
     }
 
     /// A Station's `station_time` from `origin`'s heads, observed with a
-    /// reading: taken into the floor up to `H` + 10 minutes. Written before
-    /// it counts, whatever the cap said (the reading's effects are in it):
-    /// false when beyond the cap (the origin's gate closes) and when the
-    /// write failed. While the record is damaged, one within the cap of the
+    /// reading: taken into the floor up to `H` + 10 minutes. A raise of the
+    /// floor is written before it counts; one that raises nothing is written
+    /// as a reading is, when due (Task 33 review m6): false when beyond the
+    /// cap (the origin's gate closes) and when the write failed. While the record is damaged, one within the cap of the
     /// reading starts the clock afresh from it (`ClockState::station_afresh`)
     /// and counts once written; one beyond keeps it waiting (false).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -370,9 +382,11 @@ impl HostClock {
             self.last = Some(r);
             return StationTime::Unrecorded;
         }
+        let mark = self.state.mark();
         let StationStep {
             next,
             within_cap,
+            raised,
             events,
         } = match aside {
             Some(true) => self.state.station_afresh(origin, station_time_ms, &r),
@@ -386,7 +400,17 @@ impl HostClock {
             (_, false) => StationTime::Ahead,
             (false, true) => StationTime::Unrecorded,
         };
+        // Written before it counts when it raised the floor; otherwise as a
+        // reading is (an event, the mark, a failed write, the minute's
+        // write): a `heads` a pass that raises nothing writes no row
+        // (Task 33 review m6).
+        let due = raised
+            || !events.is_empty()
+            || mark != self.state.mark()
+            || self.unsaved
+            || self.persist_due(&r);
         match aside {
+            None if !due => verdict(true),
             None => verdict(self.persist(store, &r)),
             Some(true) if within_cap => {
                 self.damaged = None;

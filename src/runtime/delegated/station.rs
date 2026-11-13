@@ -297,19 +297,15 @@ impl Station {
     }
 }
 
-/// Whether `bytes` is a `control_sync_result`, read leniently (any `op`
-/// of a JSON object with one text `op`, whatever else it holds: a lone
-/// surrogate, a fraction, a duplicate key elsewhere), so a page the strict
-/// reader refuses is still known as a page (Task 30 review 5).
+/// Whether `bytes` is a `control_sync_result`, its top-level names read
+/// with no tree (`peek`: any `op` occurrence, whatever else it holds: a
+/// lone surrogate, a fraction, a duplicate key, nesting past a parser's
+/// depth, a page cut short), so a page the strict reader refuses is still
+/// known as a page (Task 30 review 5, Task 33 review m2).
 fn is_page(bytes: &str) -> bool {
-    #[derive(serde::Deserialize)]
-    struct Peek {
-        op: Option<String>,
-    }
-    serde_json::from_str::<Peek>(bytes)
-        .ok()
-        .and_then(|p| p.op)
-        .is_some_and(|op| op == atem_client::control::relay::op::CONTROL_SYNC_RESULT)
+    crate::session_protocol::r9::peek::top_level_strings(bytes, "op")
+        .iter()
+        .any(|op| op == atem_client::control::relay::op::CONTROL_SYNC_RESULT)
 }
 
 #[cfg(test)]
@@ -543,6 +539,21 @@ mod tests {
             r#"{"type":"relay","op":"control_sync_result","origin":"https://s.test","origin":"https://s.test","feed_id":"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b","head":0,"station_time":1,"records":[]}"#,
             r#"{"type":"relay","op":"control_sync_result","origin":"https://s.test","feed_id":"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b","head":0.5,"station_time":1,"records":[]}"#,
         ] {
+            assert_eq!(
+                s.receive(bytes, Some(head(3)), None),
+                Inbound::Page(Err(RelayError::NotStrict)),
+                "{bytes}"
+            );
+        }
+        // Task 33 review m2: nesting past the parsers' depth, and a
+        // duplicate `op` key, are pages too.
+        let deep = format!(
+            r#"{{"type":"relay","op":"control_sync_result","records":[{{"feed_seq":1,"record":{}1{}}}]}}"#,
+            "[".repeat(300),
+            "]".repeat(300)
+        );
+        let twice = r#"{"type":"relay","op":"heads","op":"control_sync_result","records":[]}"#;
+        for bytes in [deep.as_str(), twice] {
             assert_eq!(
                 s.receive(bytes, Some(head(3)), None),
                 Inbound::Page(Err(RelayError::NotStrict)),

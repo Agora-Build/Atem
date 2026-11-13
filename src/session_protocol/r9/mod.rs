@@ -34,6 +34,7 @@ mod fixtures_tests;
 pub mod host_policy;
 #[cfg(test)]
 mod host_policy_host_tests;
+pub mod peek;
 pub mod push;
 #[cfg(test)]
 mod push_tests;
@@ -468,7 +469,7 @@ impl LineLimit {
 }
 
 /// A Station's message to a host (host-work-v1 §11.4), by its `op`.
-fn is_station_message(op: &str) -> bool {
+pub(crate) fn is_station_message(op: &str) -> bool {
     use atem_client::control::relay::op;
     [
         op::CONTROL_SYNC_RESULT,
@@ -2389,8 +2390,13 @@ impl R9Host {
         struct Peek {
             op: Option<String>,
         }
-        let op = serde_json::from_str::<Peek>(text).ok().and_then(|p| p.op);
-        if op.as_deref().is_some_and(is_station_message) {
+        // One that peek can't read (a duplicate `op` key, a page cut short):
+        // its top-level names, scanned (`peek`, Task 33 review m2).
+        let station = match serde_json::from_str::<Peek>(text) {
+            Ok(Peek { op }) => op.as_deref().is_some_and(is_station_message),
+            Err(_) => peek::relay_op(text, is_station_message),
+        };
+        if station {
             // At most the App's relay messages of a pass (`RELAY_LIMIT`).
             self.station_inbox.push(text.to_owned());
             return;

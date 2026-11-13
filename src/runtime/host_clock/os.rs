@@ -158,18 +158,18 @@ fn clock_ns(id: libc::clockid_t) -> u64 {
 }
 
 #[cfg(target_os = "linux")]
-fn boot_ns() -> u64 {
+pub(crate) fn boot_ns() -> u64 {
     compose(&LinuxClocks).0
 }
 
 #[cfg(target_os = "macos")]
-fn boot_ns() -> u64 {
+pub(crate) fn boot_ns() -> u64 {
     continuous_ns()
 }
 
 /// Elsewhere no counter that counts suspend is known: `CLOCK_MONOTONIC`.
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn boot_ns() -> u64 {
+pub(crate) fn boot_ns() -> u64 {
     clock_ns(libc::CLOCK_MONOTONIC)
 }
 

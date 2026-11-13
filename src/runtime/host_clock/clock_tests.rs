@@ -1157,3 +1157,36 @@ fn without_a_reading_now_never_reads_the_os() {
         None
     );
 }
+
+/// Task 33 review m6: a Station's time is written before it counts when it
+/// raises the floor (or an event, the mark, a failed write or the minute's
+/// write is due); one that raises nothing (a `heads` a pass, the same
+/// Station time again) writes no row, and the minute's write takes what it
+/// changed.
+#[test]
+fn a_station_time_that_raises_nothing_writes_no_row() {
+    let (_dir, store) = open_store();
+    let os = Os::new(T, 100 * SEC, "boot-a", Synced::Yes);
+    let mut clock = HostClock::with_reader(&store, os.reader());
+    clock.tick(&store);
+    // The first floor: a raise, written.
+    assert!(clock.station(ORIGIN, os.wall(), &store));
+    let written = stored(&store);
+    assert_eq!(written, clock.state);
+    // Behind the floor's prediction, again and again: no write.
+    for _ in 0..3 {
+        os.pass(5 * SEC);
+        assert!(clock.station(ORIGIN, os.wall() - 3 * SEC, &store));
+        assert_eq!(stored(&store), written, "no write");
+    }
+    // A raise: written before it counts.
+    os.pass(SEC);
+    assert!(clock.station(ORIGIN, os.wall() + 2 * MIN, &store));
+    let raised = stored(&store);
+    assert_eq!(raised, clock.state);
+    assert_ne!(raised, written);
+    // A minute on: the minute's write.
+    os.pass(MIN);
+    assert!(clock.station(ORIGIN, os.wall(), &store));
+    assert_eq!(stored(&store), clock.state);
+}

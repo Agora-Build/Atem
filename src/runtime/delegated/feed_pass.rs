@@ -22,46 +22,90 @@
 //!   record's own (the sync does it). Host-work's applied device-list
 //!   `seq` is 0 in step 4: no host sender's revoke entry is applied here
 //!   (`host.senders` isn't served), so a host principal's interrupt waits.
+//! - **What the feed store sees** (Task 33 review I1). The sync runs
+//!   whether or not host-work's pass does (a pause skips it), so each step
+//!   gives the store the Station link's own origin itself (positions name
+//!   it only), and takes the store only while it was loaded for the device
+//!   list that committed (a re-pin the pass hasn't moved the store aside for
+//!   yet takes nothing).
 //! - **Never with the start view locked.** A commit publishes the
 //!   standings, which locks the view: the list is copied out first.
 use super::*;
+use crate::runtime::delegated::feeds::Reapplied;
 use crate::runtime::delegated::station::Call;
-use crate::runtime::delegated::sync::{Closed, PageCx};
+use crate::runtime::delegated::sync::{Clocks, Closed, PageCx};
+use crate::session_protocol::membership::ListState;
 use atem_client::control::{ControlSyncResult, Heads, RelayError};
 
 /// Host-work's applied device-list `seq` in step 4 (see the module docs).
 const APPLIED_SEQ: u64 = 0;
 
-/// The feed store when its records may be read and applied: loaded, the
-/// receipt database healthy.
-fn loaded(work: &State) -> Option<&FeedStore> {
-    match (&work.feeds, &work.store, work.error) {
-        (Feeds::Loaded(feeds), Some(_), false) => Some(feeds),
+/// The re-verified records kept for Task 35 at most (`keep_reapplied`).
+pub(crate) const KEPT_REAPPLIED: usize = 64;
+
+/// The feed store when its records may be read and applied: loaded for
+/// the device list that committed (`list`: the start view's; feeds of
+/// another list, a re-pin the pass hasn't moved the store aside for yet,
+/// take nothing), the receipt database healthy.
+fn loaded<'a>(work: &'a State, list: Option<&ListState>) -> Option<&'a FeedStore> {
+    match (&work.feeds, &work.store, work.error, list) {
+        (Feeds::Loaded(feeds), Some(_), false, Some(list)) if feeds.for_list(&list.membership) => {
+            Some(feeds)
+        }
         _ => None,
     }
 }
 
+/// The host's elapsed-time clocks now: the monotonic one (the pacing's) and
+/// the delegated clock's boot-time counter (I.6.5; Task 33 review I2).
+pub(crate) fn sync_clocks() -> Clocks {
+    Clocks {
+        mono_ms: host_now().mono_ms,
+        boot_ms: crate::runtime::host_clock::boot_ms(),
+    }
+}
+
 impl HostBridge {
-    /// The pass's monotonic time: the gate follows it (60 s without
-    /// `heads`) with no call; the start view gets the change.
-    pub(crate) fn feed_advance(&mut self, now_mono: u64) {
-        let feeds = loaded(&self.work);
+    /// The committed device list (copied out of the start view), and the
+    /// feed store given the Station link's own origin: positions name it
+    /// only, and the sync hands the store pages and `heads` whether or not
+    /// host-work's pass ran (a pause skips it; Task 33 review I1).
+    fn sync_list(&mut self) -> Option<ListState> {
+        let own = self
+            .station
+            .as_ref()
+            .and_then(|station| station.link())
+            .and_then(|link| link.origin.clone());
+        if let Feeds::Loaded(feeds) = &mut self.work.feeds
+            && feeds.own_origin() != own.as_deref()
+        {
+            feeds.set_own_origin(own);
+        }
+        self.start_view().list.clone()
+    }
+
+    /// The pass's clocks: the gate follows them (60 s without `heads`)
+    /// with no call; the start view gets the change.
+    pub(crate) fn feed_advance(&mut self, now: Clocks) {
+        let list = self.sync_list();
+        let feeds = loaded(&self.work, list.as_ref());
         if let Some(station) = self.station.as_mut() {
-            station.feed.advance(now_mono, feeds);
+            station.feed.advance(now, feeds);
         }
         self.publish_feed_gates();
     }
 
     /// The sync's calls due at the pass (a timeout, a feed that needs a
     /// page while a recent `heads` announced it).
-    pub(crate) fn feed_tick(&mut self, now_mono: u64) -> Vec<Call> {
-        let feeds = loaded(&self.work);
+    pub(crate) fn feed_tick(&mut self, now: Clocks) -> Vec<Call> {
+        let list = self.sync_list();
+        let feeds = loaded(&self.work, list.as_ref());
         let Some(station) = self.station.as_mut() else {
             return Vec::new();
         };
         station
             .feed
-            .tick(now_mono, feeds)
+            .tick(now, feeds)
             .into_iter()
             .map(Call::Sync)
             .collect()
@@ -69,6 +113,8 @@ impl HostBridge {
 
     /// The Station's `heads`: the sync's calls.
     pub(crate) fn feed_heads(&mut self, heads: &Heads) -> Vec<Call> {
+        let list = self.sync_list();
+        let fits = loaded(&self.work, list.as_ref()).is_some();
         let State {
             feeds,
             store,
@@ -76,8 +122,8 @@ impl HostBridge {
             error,
             ..
         } = &mut self.work;
-        let feeds = match (&*feeds, store.as_ref(), *error) {
-            (Feeds::Loaded(feeds), Some(_), false) => Some(feeds.as_ref()),
+        let feeds = match &*feeds {
+            Feeds::Loaded(feeds) if fits => Some(feeds.as_ref()),
             _ => None,
         };
         let clock = match (clock.as_mut(), store.as_ref(), *error) {
@@ -101,7 +147,8 @@ impl HostBridge {
     /// page, when it asks one at once.
     pub(crate) fn feed_page(&mut self, page: Result<ControlSyncResult, RelayError>) -> Vec<Call> {
         // Copied out: a commit publishes the standings into the view.
-        let list = self.start_view().list.clone();
+        let list = self.sync_list();
+        let fits = loaded(&self.work, list.as_ref()).is_some();
         let State {
             feeds,
             store,
@@ -111,7 +158,7 @@ impl HostBridge {
         } = &mut self.work;
         let healthy = !*error;
         let cx = match (feeds, store.as_ref(), list.as_ref()) {
-            (Feeds::Loaded(feeds), Some(store), Some(list)) if healthy => Some(PageCx {
+            (Feeds::Loaded(feeds), Some(store), Some(list)) if fits => Some(PageCx {
                 store,
                 feeds: feeds.as_mut(),
                 list,
@@ -159,27 +206,44 @@ impl HostBridge {
         if self.work.reverified == Some(key) {
             return;
         }
+        if loaded(&self.work, Some(&list)).is_none() {
+            return;
+        }
         let State {
             feeds: Feeds::Loaded(feeds),
             store: Some(store),
-            error: false,
             ..
         } = &mut self.work
         else {
             return;
         };
         if feeds.pending_len() > 0 {
-            let again = (|| -> anyhow::Result<usize> {
+            let again = (|| -> anyhow::Result<Vec<Reapplied>> {
                 let tx = feeds.begin(store)?;
                 let again = feeds.reverify_pending(&tx, &list, APPLIED_SEQ)?;
                 feeds.commit(tx)?;
-                Ok(again.len())
+                Ok(again)
             })();
-            if again.is_err() {
+            let Ok(again) = again else {
                 return;
-            }
+            };
+            self.keep_reapplied(again);
         }
         self.work.reverified = Some(key);
+    }
+
+    /// Records a re-verification applied (Task 33 review m4): kept for
+    /// Task 35, which acts on them (their effects and intents, in their
+    /// record's transaction), at most [`KEPT_REAPPLIED`], the oldest dropped
+    /// first. Nothing reads them yet: until then a record that applied here
+    /// changes the standings only (as one a page applies).
+    fn keep_reapplied(&mut self, again: Vec<Reapplied>) {
+        let kept = &mut self.work.reapplied;
+        kept.extend(again);
+        if kept.len() > KEPT_REAPPLIED {
+            let excess = kept.len() - KEPT_REAPPLIED;
+            kept.drain(..excess);
+        }
     }
 
     /// The gate's feed part into the start view when it changed, and the
@@ -248,17 +312,30 @@ impl HostBridge {
                 station.feed.own().unwrap_or_default()
             )
         };
-        let counts = loaded(&self.work).map(|feeds| {
+        let counts = loaded(&self.work, list).map(|feeds| {
             format!(
                 "; {} kept as evidence, {} pending",
                 feeds.evidence_count(),
                 feeds.pending_len()
             )
         });
-        // The hourly alerts' summary: how many came in this run, the latest.
-        let alerts = match station.feed.alerts() {
+        // Every control alert's summary (Task 33 review m7): the link's
+        // (the sync's, the refusals', the Station clock ahead) and the feed
+        // store's (records kept as evidence), how many in this run, the
+        // latest.
+        let (link_n, link_latest) = station.feed.alerts();
+        let (store_n, store_latest) = loaded(&self.work, list)
+            .map(FeedStore::alerts)
+            .unwrap_or((0, None));
+        let latest = match (link_latest, store_latest) {
+            (Some(a), Some(b)) => Some(if b.1 > a.1 { b } else { a }),
+            (a, b) => a.or(b),
+        };
+        let alerts = match (link_n + store_n, latest) {
             (0, _) | (_, None) => String::new(),
-            (n, Some(latest)) => format!("; {n} alert(s) since the start, the latest: {latest}"),
+            (n, Some((latest, _))) => {
+                format!("; {n} alert(s) since the start, the latest: {latest}")
+            }
         };
         Some(format!("{gate}{}{alerts}", counts.unwrap_or_default()))
     }

@@ -10,8 +10,10 @@
 //!   ignored, counted and alerted (hourly); its gate is never opened. The
 //!   own origin's `heads` must name exactly one feed ("One feed per
 //!   account", §11.4): none, or more than one, keeps the gate closed.
-//! - **Heads** (I.5.8). Each `heads` refreshes the 60-second window and
-//!   announces the feed's head. Its `station_time` goes through the
+//! - **Heads** (I.5.8). Each `heads` refreshes the 60-second window
+//!   (measured on the larger of the monotonic and the boot-time elapsed
+//!   times, [`Clocks`]: a suspend counts, I.6.5) and announces the feed's
+//!   head. Its `station_time` goes through the
 //!   delegated clock's cap ([`HostClock::station_time`], I.6.5): one beyond
 //!   `H` + 10 minutes (or one the clock couldn't record) moves no floor and
 //!   closes the origin's gate until a `heads` within the cap; a page's
@@ -20,11 +22,15 @@
 //! - **Resets** (I.5.2, §11.4). The announced feed isn't the one the host
 //!   read (an unknown `feed_id` for a known origin), or its head is below
 //!   the host's cursor (the feed rolled back under the same id), or a page
-//!   names a head below the cursor: a reset. The gate stays closed until
+//!   names a head below the cursor: a reset, wherever it is found (at a
+//!   `heads`, a page, or when the feeds load). The gate stays closed until
 //!   the feed is read again from position 0, and that read's first page
 //!   replaces the origin's old cursor in its own transaction
-//!   ([`FeedStore::restart`]), only then. A feed the host never read is read
-//!   from 0 too (no reset counted).
+//!   ([`FeedStore::restart`]), only then. Only a page read to its end ends
+//!   a reset (or a refusal's, a fault's or the recovery's
+//!   resynchronization): one that applied nothing, as with no own Station
+//!   to place it at, ends none ([`Synced::read`]). A feed the host never
+//!   read is read from 0 too (no reset counted).
 //! - **Only the announced feed is synced.** `control_sync` names the feed
 //!   the last `heads` announced, and a page is taken only for the call in
 //!   flight, whose `(origin, feed_id)` it must carry: positions come only
@@ -87,8 +93,21 @@ use atem_client::control::{
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
-/// The gate closes when no `heads` came for this long (I.5.8).
+/// The gate closes when no `heads` came for this long (I.5.8), on the
+/// larger of the monotonic and the boot-time elapsed times ([`Clocks`]).
 pub const NO_HEADS_MS: u64 = 60_000;
+
+/// The host's elapsed-time clocks at a pass, in ms: `CLOCK_MONOTONIC`
+/// (`host_now().mono_ms`, the pacing's clock) and the delegated clock's
+/// boot-time counter (I.6.5: it counts a suspend, which Linux's monotonic
+/// clock doesn't; `None` when it can't be read). The 60 s without `heads`
+/// are measured on both, and end on whichever passes them first, so a host
+/// that slept finds its gate closed when it wakes (Task 33 review I2).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Clocks {
+    pub mono_ms: u64,
+    pub boot_ms: Option<u64>,
+}
 /// A `control_sync` unanswered this long is asked again.
 pub const SYNC_TIMEOUT_MS: u64 = 30_000;
 /// One alert line an hour per kind (Decision 12, as I.5.4's alerts).
@@ -199,6 +218,12 @@ pub struct Synced {
     pub reapplied: Vec<Reapplied>,
     /// The next page, asked at once: the feed is still ahead.
     pub next: Option<ControlSync>,
+    /// The page was read to its end (every record past the cursor handled,
+    /// or an empty page's head taken): only then does it end a reset, a
+    /// refusal's or a fault's resynchronization (Task 33 review I1). False
+    /// for a page that applied nothing or stopped part way (a list that
+    /// doesn't serve, no position).
+    pub read: bool,
 }
 
 /// What a page is applied against.
@@ -235,10 +260,12 @@ pub struct FeedSync {
     /// The link generation and its Station's origin (none: no link).
     link_gen: Option<u64>,
     own: Option<String>,
-    /// The host's monotonic clock at the last tick (ms).
+    /// The host's monotonic clock at the last tick (ms): the pacing's.
     now: u64,
-    /// The last `heads` on this link generation (monotonic ms).
-    heads_at: Option<u64>,
+    /// The boot-time counter at the last tick (ms), if it read.
+    boot: Option<u64>,
+    /// The last `heads` on this link generation, on both clocks.
+    heads_at: Option<Clocks>,
     announced: Option<Announced>,
     /// How many feeds of the host's own Station the last `heads` named.
     own_feeds: usize,
@@ -266,7 +293,7 @@ pub struct FeedSync {
     /// The sync's alerts in this run, and the latest's text (`atem
     /// status`).
     alerts_in_run: u64,
-    last_alert: Option<String>,
+    last_alert: Option<(String, std::time::Instant)>,
     /// What the start view was last given: the own origin and whether its
     /// feed part is open.
     published: (Option<String>, bool),
@@ -293,6 +320,7 @@ impl FeedSync {
             link_gen: None,
             own: None,
             now: 0,
+            boot: None,
             heads_at: None,
             announced: None,
             own_feeds: 0,
@@ -368,10 +396,10 @@ impl FeedSync {
     /// a `control_sync` due now (one unanswered too long, or one the feed
     /// needs while a recent `heads` announced it), and the hourly alert
     /// counts due.
-    pub fn tick(&mut self, now_mono: u64, feeds: Option<&FeedStore>) -> Vec<ControlSync> {
-        self.advance(now_mono, feeds);
+    pub fn tick(&mut self, now: Clocks, feeds: Option<&FeedStore>) -> Vec<ControlSync> {
+        self.advance(now, feeds);
         if let Some(ask) = &self.in_flight
-            && now_mono >= ask.sent_at.saturating_add(SYNC_TIMEOUT_MS)
+            && self.now >= ask.sent_at.saturating_add(SYNC_TIMEOUT_MS)
         {
             self.in_flight = None;
             return self.ask(false).into_iter().collect();
@@ -388,8 +416,9 @@ impl FeedSync {
     /// The monotonic time and the feed store (`None`: not loaded) as they
     /// are now, with no call: what the gate reads (60 s without `heads`),
     /// and the hourly alert counts due.
-    pub fn advance(&mut self, now_mono: u64, feeds: Option<&FeedStore>) {
-        self.now = now_mono;
+    pub fn advance(&mut self, now: Clocks, feeds: Option<&FeedStore>) {
+        self.now = now.mono_ms;
+        self.boot = now.boot_ms;
         self.observe(feeds);
         self.alerts_due();
     }
@@ -416,7 +445,10 @@ impl FeedSync {
             return Vec::new();
         }
         self.heads += 1;
-        self.heads_at = Some(self.now);
+        self.heads_at = Some(Clocks {
+            mono_ms: self.now,
+            boot_ms: self.boot,
+        });
         self.wait_heads = false;
         let Some(own) = self.own.clone() else {
             return Vec::new();
@@ -455,10 +487,13 @@ impl FeedSync {
                 Some((clock, store)) => clock.station_time(&own, one.station_time, store),
                 None => StationTime::Unrecorded,
             };
+            if verdict == StationTime::Ahead && self.clock != Some(StationTime::Ahead) {
+                // The clock writes its own hourly line.
+                self.note_alert("Station clock ahead of this host".into());
+            }
             self.clock = (verdict != StationTime::Within).then_some(verdict);
         }
         self.observe(feeds);
-        self.note_reset_at_heads();
         self.ask(true).into_iter().collect()
     }
 
@@ -538,7 +573,22 @@ impl FeedSync {
         let before = self.synced.clone();
         let mut synced = apply_page(&page, &ask, cx.store, cx.feeds, cx.list, cx.applied_seq)?;
         self.pages += 1;
+        // The page's head is the Station's word as fresh as a `heads`': the
+        // gate needs that much read (never lowered: below is a reset).
+        if let Some(announced) = self
+            .announced
+            .as_mut()
+            .filter(|a| a.feed_id == page.feed_id)
+        {
+            announced.head = announced.head.max(page.head);
+        }
         self.observe(Some(cx.feeds));
+        if !synced.read {
+            // Not read to its end: whatever waits for a read (a reset, a
+            // resynchronization) still does; asked again after the pause.
+            self.stalled_at = Some(self.now);
+            return Ok(synced);
+        }
         if ask.restart {
             self.reset = false;
         }
@@ -561,6 +611,7 @@ impl FeedSync {
             return;
         }
         self.refusals += 1;
+        self.note_alert(REFUSED_STATUS.into());
         self.resync = Some(Resync::Refused);
         self.refused_at = Some(self.now);
         self.in_flight = None;
@@ -602,10 +653,10 @@ impl FeedSync {
         if !self.loaded {
             return Some(Closed::Unloaded);
         }
-        let Some(at) = self.heads_at else {
+        if self.heads_at.is_none() {
             return Some(Closed::NoHeads);
-        };
-        if self.now >= at.saturating_add(NO_HEADS_MS) {
+        }
+        if !self.heads_fresh() {
             return Some(Closed::HeadsLate);
         }
         match self.clock {
@@ -640,10 +691,17 @@ impl FeedSync {
         self.own.as_deref()
     }
 
-    /// The sync's alerts in this run (the runtime.log lines are at most
-    /// one an hour per kind) and the latest one's text.
-    pub fn alerts(&self) -> (u64, Option<&str>) {
-        (self.alerts_in_run, self.last_alert.as_deref())
+    /// The alerts on the link in this run (the runtime.log lines are at
+    /// most one an hour per kind: the sync's own, the refusals' and the
+    /// clock's "Station clock ahead") and the latest one (its text, when).
+    pub fn alerts(&self) -> (u64, Option<&(String, std::time::Instant)>) {
+        (self.alerts_in_run, self.last_alert.as_ref())
+    }
+
+    /// An alert counted for `atem status` (its line is whoever raised it).
+    fn note_alert(&mut self, text: String) {
+        self.alerts_in_run += 1;
+        self.last_alert = Some((text, std::time::Instant::now()));
     }
 
     /// The `runtime.log` lines not taken yet (alerts).
@@ -673,22 +731,35 @@ impl FeedSync {
 
     // ------------------------------------------------------------ inside
 
-    /// The feed store's committed feed of the own origin, as it is now.
+    /// The feed store's committed feed of the own origin, as it is now,
+    /// against the announcement (a reset, wherever it is found: Task 33
+    /// review m3).
     fn observe(&mut self, feeds: Option<&FeedStore>) {
         self.loaded = feeds.is_some();
         self.synced = match (feeds, &self.own) {
             (Some(feeds), Some(own)) => feeds.current_feed(own),
             _ => None,
         };
+        self.check_reset();
     }
 
+    /// A `heads` came within 60 s on both clocks (each elapsed time
+    /// measured on its own; a boot-time reading missing at either end
+    /// leaves the monotonic one alone).
     fn heads_fresh(&self) -> bool {
-        self.heads_at
-            .is_some_and(|at| self.now < at.saturating_add(NO_HEADS_MS))
+        self.heads_at.is_some_and(|at| {
+            let mono = self.now.saturating_sub(at.mono_ms);
+            let boot = at
+                .boot_ms
+                .zip(self.boot)
+                .map_or(0, |(then, now)| now.saturating_sub(then));
+            mono.max(boot) < NO_HEADS_MS
+        })
     }
 
-    /// At a `heads`: the announced feed against the one read (a reset).
-    fn note_reset_at_heads(&mut self) {
+    /// The announced feed against the one read: another feed, or a cursor
+    /// above the announced head of the same one, is a reset.
+    fn check_reset(&mut self) {
         let (Some(announced), Some((feed_id, cursor))) = (&self.announced, &self.synced) else {
             return;
         };
@@ -785,8 +856,7 @@ impl FeedSync {
     /// One line now for `kind` when its hour passed, else counted (the
     /// latest kept for the line at the hour's end).
     fn alert(&mut self, kind: Alert, text: String) {
-        self.alerts_in_run += 1;
-        self.last_alert = Some(text.clone());
+        self.note_alert(text.clone());
         let h = &mut self.alerts[kind as usize];
         let due = h
             .last
@@ -863,6 +933,11 @@ fn apply_page(
     applied_seq: u64,
 ) -> anyhow::Result<Synced> {
     let pos = |feeds: &FeedStore, seq: u64| feeds.position(&page.feed_id, seq);
+    // No position can be formed (the store has no own Station's origin):
+    // nothing applies, and the page isn't read (Task 33 review I1).
+    if pos(feeds, 0).is_none() {
+        return Ok(Synced::default());
+    }
     let tx = feeds.begin(store)?;
     if ask.restart {
         let Some(start) = pos(feeds, 0) else {
@@ -899,17 +974,18 @@ fn apply_page(
             },
         }
     }
-    if !stopped
-        && page.records.iter().all(|e| e.feed_seq <= ask.after)
-        && let Some(head) = pos(feeds, page.head.max(ask.after))
-    {
-        feeds.advance(&tx, head)?;
+    if !stopped && page.records.iter().all(|e| e.feed_seq <= ask.after) {
+        match pos(feeds, page.head.max(ask.after)) {
+            Some(head) => feeds.advance(&tx, head)?,
+            None => stopped = true,
+        }
     }
     feeds.commit(tx)?;
     Ok(Synced {
         applied,
         reapplied,
         next: None,
+        read: !stopped,
     })
 }
 

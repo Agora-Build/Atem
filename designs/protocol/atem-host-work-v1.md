@@ -1975,15 +1975,23 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
   same announced head, stopping at an entry its list still defers.)
 
 **On the host (Atem's readings, step 4, Task 33, for Astation's
-information; nothing on the wire changes).** The host syncs only its own
-Station's feed (step 4's Decision 14):
+information unless marked; nothing on the wire changes).** The host syncs
+only its own Station's feed (step 4's Decision 14):
 
-- **What a `heads` announces.** Its feed of the host's own Station's origin
-  must be named exactly once ("One feed per account"): none, or more than
-  one, keeps that origin's gate closed (with an hourly `runtime.log` line
-  for more than one). A feed of another origin is ignored, counted and
-  logged at most hourly; its gate never opens. Each `heads` restarts the
-  60-second window.
+- **What a `heads` announces** (**for Astation's agreement**: it narrows
+  the table's "each feed covering a principal with work on this host").
+  The account's feed at the host's own Station must be named exactly
+  once, empty or not, even when it covers no principal ("One feed per
+  account"): none (`feeds: []`), or more than one, keeps that origin's gate
+  closed (with an hourly `runtime.log` line for more than one), so a
+  native member without a caught-up channel of its own never runs on a
+  host whose Station announces no feed. A feed of another origin is
+  ignored, counted and logged at most hourly; its gate never opens.
+- **The 60-second window.** Each `heads` restarts it. It is measured on
+  the larger of the host's monotonic elapsed time and the delegated
+  clock's boot-time elapsed time (design I.6.5: it counts a suspend, which
+  Linux's monotonic clock doesn't), never shorter than either, so a host
+  that slept finds its gate closed when it wakes.
 - **Station time.** A `heads`' `station_time` (of the own feed) and a
   page's both go through the cap (design I.6.5: both carry it): one
   beyond `H` + 10 minutes, or one the host clock couldn't record, moves no
@@ -1999,21 +2007,34 @@ Station's feed (step 4's Decision 14):
   asks nothing more until the next `heads`: so either answer to that
   question works.
 - **Resets.** The announced `feed_id` isn't the one the host read, or the
-  announced head (or a page's `head`) is below the cursor: the feed is
+  announced head (or a page's `head`) is below the cursor, found at a
+  `heads`, at a page, or when the feeds load after a `heads`: the feed is
   read again from position 0 (`after: 0`, the same `feed_id` too after a
   rollback), and that read's first page replaces the origin's old cursor
-  in its own transaction, only then (it may lower it). A feed the host
-  never read is read from 0 the same way.
+  in its own transaction, only then (it may lower it). A reset ends only
+  when that read is applied to its end: a page that applied nothing (no
+  own Station to place it at) or stopped part way ends no reset and no
+  resynchronization. A feed the host never read is read from 0 the same
+  way. A page's `head` above the last announced one raises the
+  announcement (the gate needs that much read), never lowers it.
 - **Pages.** A page with no record after the cursor reads the feed up to
   its `head` (positions left out are gaps, rule 7); otherwise the cursor
   goes to the page's last record and the rest is asked at once. A page
   stops at a record while the device list doesn't serve, and the cursor
   stays there. A page that doesn't read as a whole (any reader refusal,
-  not only non-strict JSON) is the fault above; the message is recognized
-  as a page by its `op` alone, so a page with a lone surrogate elsewhere is
-  still one. A message that isn't JSON at all is dropped before any
-  reader, as on every family of the link; the call it answered is asked
-  again after 30 seconds unanswered.
+  not only non-strict JSON) is the fault above. The message is recognized
+  as a page by its top-level `type` and `op` alone, scanned with no tree
+  and no recursion, so a lone surrogate, a duplicate key (`op`'s
+  included), nesting past a parser's depth, or a page cut short after
+  its `op` still make it a page, and its fault alert goes.
+- **What stays dropped unread** (**Atem's reading, for Astation**): a
+  frame over 256 KiB (dropped and counted at the link, as every relay
+  message), and a frame whose top-level `type` and `op` can't be read at
+  all (not a JSON object, or broken before its `op`): nothing tells it is
+  the Station's, so it is dropped before any reader, as a broken frame of
+  every family on the link is, with no fault alert. Either way the call it
+  answered is asked again after 30 seconds unanswered, and the gate stays
+  closed meanwhile.
 - **Pacing** (as the device-list fetch's). The calls a `heads` or the
   host's pass start are at most one a second, none for 30 seconds after a
   page that moved nothing or was refused; one unanswered for 30 seconds is

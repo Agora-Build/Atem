@@ -330,7 +330,13 @@ pub struct FeedStore {
     open: Arc<AtomicU64>,
     /// The host's own configured Station's origin.
     own: Option<String>,
+    /// The device list it was loaded for: its account and genesis.
+    list: (String, atem_client::encoding::Hash32),
     alerts: Alerts,
+    /// The alerts raised in this run (their lines are hourly), and the
+    /// latest's text with when it came (`atem status`, Task 33 review m7).
+    alerts_in_run: u64,
+    last_alert: Option<(String, std::time::Instant)>,
     /// `runtime.log` lines not taken yet.
     lines: Vec<String>,
     publisher: Option<StandingsPublisher>,
@@ -433,7 +439,10 @@ impl FeedStore {
             generation: 0,
             open: Arc::new(AtomicU64::new(0)),
             own: None,
+            list: (list.account_id().to_string(), list.genesis_hash()),
             alerts: Alerts::default(),
+            alerts_in_run: 0,
+            last_alert: None,
             lines,
             publisher: None,
             clock: Box::new(crate::session_protocol::membership::host_now),
@@ -600,6 +609,15 @@ impl FeedStore {
             self.mem = mem;
             let now = (self.clock)().mono_ms;
             for alert in alerts {
+                self.alerts_in_run += 1;
+                self.last_alert = Some((
+                    format!(
+                        "a control record from {} kept as evidence ({})",
+                        alert.source.label(),
+                        alert.what
+                    ),
+                    std::time::Instant::now(),
+                ));
                 self.alerts.note(alert, now, &mut self.lines);
             }
             self.publish();
@@ -686,6 +704,18 @@ impl FeedStore {
         of.next().is_none().then_some(one)
     }
 
+    /// Whether it was loaded for `list` (its account and genesis): the
+    /// feeds of another list (a re-pin the host's pass hasn't moved the
+    /// store aside for yet) take no record.
+    pub fn for_list(&self, list: &Membership) -> bool {
+        self.list.0 == list.account_id() && self.list.1 == list.genesis_hash()
+    }
+
+    /// The host's own Station's origin, as set.
+    pub fn own_origin(&self) -> Option<&str> {
+        self.own.as_deref()
+    }
+
     /// Whether a record may apply against `list` now: it serves (not
     /// frozen, held, faulted or gone).
     pub fn serves(list: &ListState) -> bool {
@@ -725,6 +755,11 @@ impl FeedStore {
         if let Some(publisher) = self.publisher.as_mut() {
             publisher(standings);
         }
+    }
+
+    /// The alerts raised in this run and the latest one (its text, when).
+    pub fn alerts(&self) -> (u64, Option<&(String, std::time::Instant)>) {
+        (self.alerts_in_run, self.last_alert.as_ref())
     }
 
     /// Records kept as evidence, ever (this list's store).
