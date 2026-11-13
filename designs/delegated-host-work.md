@@ -3204,13 +3204,18 @@ forced binding; the rooms the migration can't resolve are refused until claimed 
 7. Settle account-trust §3.4 and session-v1 R9.5 on the host's own relay fetch of the device list (V.3).
    **Answered in step 4 (2026-11-13).** The host fetches the device list itself over its one link
    (`membership_fetch`, host-work-v1 §11.4), behind `host.delegated` until activation; account-trust §3.4 says so in
-   place of "not implemented". It fetches when its Station's `heads` (every (re)connection, every 30 s, at once on a
-   new entry) name a head beyond its own, which takes the place of R9.5's 15-minute schedule (a Station that withholds
-   `heads` could withhold the entries as well), and again at once when a deferral it stopped at ends on this host.
-   A fetch that stops at a deferred entry asks nothing more while the deferral holds and the announced head is the
-   same, and counts as fetched up to that entry for the gate (I.5.8); "the announced head" is the last `heads`'
-   device-list head, which the host's list must hold as that entry, `seq` and hash (a list that differs from the
-   Station's keeps the gate closed). R9.3 and R9.5 each gain one sentence, marked for Astation's agreement.
+   place of "not implemented". It fetches when its Station's `heads` (every (re)connection, every 30 s, and at once
+   when the Station stores a control record) name a head beyond its own, which takes the place of R9.5's 15-minute
+   schedule (a Station that withholds `heads` could withhold the entries as well), and again at once when a deferral
+   it stopped at ends on this host (after a refusal's backoff, at the next `heads`). A fetch that stops at a deferred
+   entry asks nothing more while the deferral holds and the announced head is the same, and counts as fetched up to
+   that entry for the gate (I.5.8). "The announced head" is the last `heads`' device-list head, which the host's list
+   must hold as that very entry, `seq` and hash; a list that differs from the Station's keeps the gate closed
+   (host-work-v1 §11.4, "The gate", Atem's reading for Astation): the host's own fetch, `after` its head `seq`,
+   can't reveal a fork at or below that `seq`, a device's diverged window does (R9.3, R9.4), and a window fetch would
+   be a later wire item. The residual is I.5.8's accepted one: after a deferral's wait ends, a stale announced head
+   can let a task start before the deferred entry is carried again. R9.3 and R9.5 each gain one sentence, marked for
+   Astation's agreement (R9.5's as a changed agreed meaning).
 
 ### IX.2 Astation
 

@@ -229,7 +229,9 @@ pub enum AstationMessage {
     /// the reader before anything else reads it: after the two scans every
     /// message gets (a channel envelope? a session family?), its length,
     /// then a scan of its `type` that builds no tree. Only its size is
-    /// passed on (counted), never its text.
+    /// passed on (counted while the link carries r9), never its text. One
+    /// over the link's 2 MiB bound never gets here: it is dropped from its
+    /// first bytes, and logged.
     #[serde(skip)]
     RelayTooLarge(usize),
 

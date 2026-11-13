@@ -1556,8 +1556,10 @@ A host reads each Station's control feed, acknowledges what it applied and
 fetches its own device list over its one link; the Station counts the
 acknowledgments and reports revocations to the Portal (design I.5.8,
 "Transport", "Which host is calling", "Heads", "Acknowledgment" and
-"Delivery progress is not application"; I.6.5). **Planned:** the host
-makes none of these calls in this version. They are relay messages, not
+"Delivery progress is not application"; I.6.5). **Planned:** release
+builds make none of these calls in this version (**updated in step 4,
+2026-11-13:** behind the debug-only `host.delegated` hook the host makes
+`membership_fetch`). They are relay messages, not
 session ops, so no welcome feature gates them; they arrive with
 `host.senders` and delegated work. Types: `atem_client::control::relay`
 (every message, its reader and builder) and `atem_client::control::ledger`
@@ -1603,13 +1605,7 @@ a count over its bound refused before any item is read; the grammars of the
 signed objects (an `origin` exact as `station_route::normalize_relay`
 writes it, `feed_id` and `record_id` UUID v4, ids of 1 to 128 characters of
 `[A-Za-z0-9._:-]`, lowercase hex hashes). A builder checks what the reader
-checks. On the host, the link's reader drops a relay message over 262,144
-bytes before anything else reads it: past the two scans every message on
-the link gets (is it a channel envelope, a session family), the length comes
-first, then a scan of the top-level `type` that builds no tree. Such a
-message reaches no other check (not even `host_challenge`'s), no route
-check, no reader and no Station link; it is dropped, and counted while the
-link carries r9. The wire rules below are **Atem's proposal, agreed
+checks. The wire rules below are **Atem's proposal, agreed
 with Astation (2026-11-11, #120 comment 6810116314)** (the design names the
 messages, not these rules):
 
@@ -1643,6 +1639,17 @@ messages, not these rules):
    are all entry results or results for records bound to no feed (a host
    principal's `interrupt_running`): it names the host's own Station feed
    (the feed of the Station its link reaches) and its cursor there.
+
+**On the host** (**Atem's reading of "checked before any parse", for
+Astation's information**, step 4, 2026-11-13: no tree is built before the
+bound), the link's reader drops a relay message over 262,144 bytes before
+anything else reads it: past the two scans every message on the link gets
+(is it a channel envelope, a session family), the length comes first, then
+a scan of the top-level `type` that builds no tree. Such a message reaches
+no other check (not even `host_challenge`'s), no route check, no reader and
+no Station link; it is dropped, and counted while the link carries r9 (one
+over the link's 2 MiB bound is dropped earlier, from its first bytes, and
+logged).
 
 **Real budgets.** The 256 KiB bound counts the whole message, so a Station
 fills a page below it: 64 records of the largest size (a 4,096-byte body
@@ -1698,6 +1705,12 @@ feed at this Station) is refused, `forbidden`, and nothing of another
 account is served: no principal, `integration_id`, `about.by`, record id or
 revocation time of another account reaches the link. The refusal is
 `control_sync_refused` or `membership_fetch_refused` ("Refusals" below).
+**Open (needs Astation's answer; step 4, 2026-11-13):** what a
+`control_sync` naming the account's own feed from before a reset (a
+`feed_id` the account had at this Station) gets: `control_sync_refused`, the
+literal "not its account's feed at this Station" (Atem's default reading),
+or the account's current feed from position 0, the result's `feed_id` then
+the only in-band reset signal. Atem's host handles both.
 
 **Refusals** (**agreed with Astation on 2026-11-11**, #120 comment
 6810116314, and confirmed against the implementation on 2026-11-12, #148
@@ -1726,6 +1739,11 @@ host's call on the link with exactly one of:
   successful page or an application acknowledgment. It advances no cursor,
   membership head, clock floor or ledger evidence and opens no gate. It
   carries no request id and must not complete or correlate a request.
+  (**Atem's reading, for Astation's agreement**, step 4, 2026-11-13: a
+  refusal names a call kind, not a request: it completes and matches none;
+  on that kind the host backs off (its device-list fetch 30 s, ended by the
+  link's next generation) and drops what it had in flight on the link, so a
+  later result is unasked.)
 - The host keeps that link's synchronization gates closed while it repairs
   the association and resynchronizes. The transport may still fence or
   close an invalid or superseded link; a refusal creates no authority for
@@ -1776,7 +1794,17 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
   mailbox up to its head. It closes on any disconnect, on a reset, and when
   no head arrived for 60 seconds. While it is closed no unstarted remote
   task of a principal that feed covers starts (`blocked`, `revocations not
-  yet checked`).
+  yet checked`). (**Atem's reading, for Astation**, step 4, 2026-11-13:
+  "up to its head" is the host's list holding the device-list head the
+  last `heads` announced as that very entry, `seq` and hash, never a
+  `membership_fetch_result`'s `head`; so `heads.membership` must be exactly
+  the Station's stored log head, the bindings' `LogHead` (R9.3), or that
+  Station's gate stays closed. A host list that differs from the Station's
+  keeps the gate closed until a carrier brings the difference (R9.3's
+  diverged window, R9.4): the host's own fetch, `after` its head `seq`,
+  can't reveal a fork at or below that `seq`, and a window fetch would be a
+  later wire item. "Up to a deferred entry" is the host's fetch, under that
+  same announced head, stopping at an entry its list still defers.)
 
 #### Acknowledgments
 
