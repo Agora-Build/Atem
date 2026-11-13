@@ -558,7 +558,11 @@ fn record(object: &atem_client::SignedObject) -> ControlRecord {
 }
 
 fn effect(effect: EffectKind, result: ApplicationResult) -> EffectResult {
-    EffectResult { effect, result }
+    EffectResult {
+        effect,
+        result,
+        why: None,
+    }
 }
 
 #[test]
