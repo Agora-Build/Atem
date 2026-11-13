@@ -3842,7 +3842,8 @@ it has neither `state` nor `session_id`, `process_gen` or `approval_id`:
   - its sender: a delegated sender, `member:<id>`, `service:<id>` or
     `host:<id>`, as host-work-v1 §11.3's alert names it;
   - why the outcome is unknown: 1-256 bytes, not blank (something besides
-    White_Space; **for Astation**, amended for step 4), no control or Cf
+    White_Space; amended for step 4, **agreed with Astation
+    (2026-11-13, #120 comment 6848326392)**), no control or Cf
     character.
 
   Only a delegated sender's task raises an alert. A task of `local`, a
@@ -4181,9 +4182,12 @@ suites, which run the host-envelope and Station-calls checks too. Of
 alone (the evicted ids, the floor, the final order and every possible
 replay) and checks that each step's `why` is a code of its result's kind,
 present exactly when due; the exact code among codes of one kind is pinned
-by the Rust runner and the suites. (**For Astation**, amended for step 4:
-this paragraph's Station-calls checker and the control vectors' bound and
-`why` checks.) Scenarios
+by the Rust runner and the suites. It also derives each release's O1
+verdict from the steps' signed times (the hold time kept per principal) and
+reads the acknowledgments' typed reasons (O5). (Amended for step 4: the
+Station-calls checker and the control vectors' bound and `why` checks are
+**agreed with Astation (2026-11-13, #120 comment 6848326392)**; the O1 and O5 checks
+are **for Astation's sign-off**.) Scenarios
 (`kind: "scenario"`): chain (`valid-suffix`, `rollback`,
 `removed-signer-conflict`, `current-manager-conflict`, `unknown-carrier`,
 `honest-concurrent-appends`, `relay-cas-failure`, `signature-retry`,

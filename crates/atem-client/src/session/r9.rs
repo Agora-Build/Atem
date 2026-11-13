@@ -1497,8 +1497,6 @@ mod tests {
             }
         }
 
-        /// The result's words are the four results and the five effects,
-        /// exact; a result is exactly the fields of the form.
         /// A host builds a record's result from what the state applied: its
         /// reasons (O5) are the acknowledgment's, not this wire's, so the
         /// result carries none and equals its own decoded copy. A result
@@ -1547,6 +1545,8 @@ mod tests {
             control_records_result(RE, ID, &[result]);
         }
 
+        /// The result's words are the four results and the five effects,
+        /// exact; a result is exactly the fields of the form.
         #[test]
         fn result_vocabulary_strict() {
             let sent = records(2);

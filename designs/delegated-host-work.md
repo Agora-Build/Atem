@@ -1778,8 +1778,8 @@ devices' keys):
 every one, the private key is `pairing/host_enc_key`, 0600, plain like `host_channel_key`, so a host whose cred agent
 is locked can still open its mail. The host makes it at pairing and at `atem pair verify`, with a new
 `host_channel_key`, and, on a host paired earlier, at the first start of a build that knows it when the file is
-missing. `atem unpair` deletes it, as it deletes `host_channel_key` (R9.3). **Amended for step 4, for Astation's
-review.** The host records the `enc_kid` of every key it makes durably, before `host_enc_key_get` returns the key, and
+missing. `atem unpair` deletes it, as it deletes `host_channel_key` (R9.3). **Amended for step 4, agreed with
+Astation (2026-11-13, #120 comment 6848326392).** The host records the `enc_kid` of every key it makes durably, before `host_enc_key_get` returns the key, and
 keeps the record for that trust generation. It passes the record to II.4.2's receiver (`generated`, host-work-v1
 §11.5); a key it accepts counts as made, listed there or not. A lost record is rebuilt from the private keys the host
 still holds for that generation; mail sealed to
