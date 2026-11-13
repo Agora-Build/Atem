@@ -189,9 +189,10 @@ pub struct Reply {
 
 impl Reply {
     /// Drops its text and context a day after its task settled past its
-    /// deadline (`Store::drop_payloads`): its binding and the ids, versions
-    /// and digests of its references and snapshots stay, and its row's
-    /// digest still identifies it.
+    /// deadline (`Store::drop_payloads`), or, a delegated task's, 30 days
+    /// after the task settled (`Store::drop_kept_replies`, design I.4.7):
+    /// its binding and the ids, versions and digests of its references and
+    /// snapshots stay, and its row's digest still identifies it.
     pub fn drop_payload(&mut self) {
         self.text.clear();
         for reference in &mut self.references {
@@ -199,6 +200,22 @@ impl Reply {
         }
         crate::runtime::host_work::drop_context(&mut self.context);
         self.dropped = true;
+    }
+
+    /// The bytes of what `drop_payload` drops (its text, its memory
+    /// references' text, its snapshots' text): a kept reply's share of the
+    /// kept replies' budget (`Store::drop_kept_replies`).
+    pub fn payload_bytes(&self) -> u64 {
+        let references: usize = self
+            .references
+            .iter()
+            .map(|spec| match spec {
+                ContextSpec::Memory { memory } => memory.content.len(),
+                ContextSpec::Vault { .. } => 0,
+            })
+            .sum();
+        let context: usize = self.context.iter().map(|c| c.text.len()).sum();
+        (self.text.len() + references + context) as u64
     }
 
     /// Identifies a reply: its text and references. An identical retry

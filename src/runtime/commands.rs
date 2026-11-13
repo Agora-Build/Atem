@@ -16,9 +16,19 @@ const REPLY_WAIT: Duration = Duration::from_secs(10);
 async fn reply<T>(
     client: &mut RuntimeClient,
     op: &str,
+    pick: impl FnMut(RuntimeMsg) -> Option<T>,
+) -> Result<T> {
+    reply_within(client, op, REPLY_WAIT, pick).await
+}
+
+/// [`reply`], waiting at most `wait`.
+async fn reply_within<T>(
+    client: &mut RuntimeClient,
+    op: &str,
+    wait: Duration,
     mut pick: impl FnMut(RuntimeMsg) -> Option<T>,
 ) -> Result<T> {
-    tokio::time::timeout(REPLY_WAIT, async {
+    tokio::time::timeout(wait, async {
         loop {
             match client.recv().await? {
                 None => bail!("the atem runtime closed the connection"),
@@ -179,6 +189,86 @@ pub async fn message(command: crate::cli::MessageCommands) -> Result<()> {
         _ => unreachable!(),
     }
     Ok(())
+}
+
+/// How long `atem task resolve` waits: a `done` publishes its snapshot and
+/// reads it back first (at most 10 s, as a reply's).
+const RESOLVE_WAIT: Duration = Duration::from_secs(30);
+
+/// `atem task list --unknown` and `atem task resolve` (host-work-v1 §11.6
+/// "On the host"): the owner's, from a terminal outside any agent session.
+/// Like `atem message …` they only connect to a running runtime: never
+/// started, never replaced.
+pub async fn task(command: crate::cli::TaskCommands) -> Result<()> {
+    use super::protocol::LocalResolution;
+    use crate::cli::{ResolveCommands, TaskCommands};
+    crate::auth::require_pairing("delegated tasks")?;
+    let mut client = RuntimeClient::connect_existing_with(NO_RUNTIME_FOR_TASKS).await?;
+    match command {
+        TaskCommands::List { unknown } => {
+            client.send(&ClientMsg::TaskList { unknown }).await?;
+            let tasks = reply(&mut client, "task_list", |m| match m {
+                RuntimeMsg::TaskList { tasks } => Some(tasks),
+                _ => None,
+            })
+            .await?;
+            for task in &tasks {
+                println!("{}", unknown_line(task, crate::status::local_datetime));
+            }
+        }
+        TaskCommands::Resolve {
+            task_id,
+            resolution,
+        } => {
+            let resolution = match resolution {
+                ResolveCommands::Failed { detail } => LocalResolution::Failed { detail },
+                ResolveCommands::Done { memory, vault } => LocalResolution::Done { memory, vault },
+            };
+            client
+                .send(&ClientMsg::TaskResolve {
+                    task_id,
+                    resolution,
+                })
+                .await?;
+            let (task_id, state, by) =
+                reply_within(&mut client, "task_resolve", RESOLVE_WAIT, |m| match m {
+                    RuntimeMsg::TaskResolved {
+                        task_id, state, by, ..
+                    } => Some((task_id, state, by)),
+                    _ => None,
+                })
+                .await?;
+            println!("{}", resolved_line(&task_id, &state, &by));
+        }
+    }
+    Ok(())
+}
+
+/// Why `atem task` found nothing to talk to.
+const NO_RUNTIME_FOR_TASKS: &str = "no Atem runtime is running; delegated tasks are listed and resolved through it (`atem runtime start`)";
+
+/// One line of `atem task list --unknown`: the task, its session, its
+/// sender, the reason and when (`when` formats the host's Unix ms).
+pub fn unknown_line(task: &super::protocol::UnknownTask, when: impl Fn(u64) -> String) -> String {
+    format!(
+        "{}  {}  {}  {}  {}",
+        task.task_id,
+        task.session_id,
+        task.sender,
+        task.reason,
+        when(task.at_ms)
+    )
+}
+
+/// What `atem task resolve` prints: `<task>: resolved as failed|done`, and
+/// who resolved it when the same resolution came first from someone else.
+pub fn resolved_line(task_id: &str, state: &str, by: &str) -> String {
+    let how = if state == "completed" { "done" } else { state };
+    if by == "local" {
+        format!("{task_id}: resolved as {how}")
+    } else {
+        format!("{task_id}: resolved as {how} (by {by})")
+    }
 }
 
 /// A reply's text as `atem message status` shows it.

@@ -3911,6 +3911,25 @@ it has neither `state` nor `session_id`, `process_gen` or `approval_id`:
   for an alert: nothing cancels a stage, and an alert's own state is read
   with `alert_list` (it lasts until its task is resolved). The daily reminder
   is Astation's. **Atem's choice, for Astation to confirm.**
+- **When Atem makes and sends it** (**Atem's choices, for Astation to
+  confirm**):
+  - The host makes an alert's hints once, when the alert is committed. Their
+    `created_at` is the alert's, and their window is exactly 900 000 ms.
+  - It resends them until acknowledged or until `expires_at + 300 000`. The
+    host applies no guard of its own; an approval's opens stop at `expires_at
+    − 15 000`, and the relay's guard still bounds every provider send.
+  - It signs them, and sends them the first time, only while its welcome
+    lists `host.alerts` (hosting on, and the feature on), and never while
+    push is suppressed. Hints already made are resent until acknowledged,
+    the alert ends, push is suppressed or `expires_at + 300 000`, whatever
+    the welcome lists then.
+  - A hint is never made again for an alert:
+    - raised while push was suppressed or `host.alerts` wasn't listed;
+    - raised before a broker restart;
+    - whose hint first reached the relay more than 120 000 ms after its
+      `created_at` (refused `skew`).
+  - For such an alert, `alert_list` and Astation's daily reminder are the
+    backstop.
 - **Collapse id.** An alert's notifications collapse on its `alert_id`
   (collapse id / FCM tag = `alert_id`), as an approval's do on its
   `approval_id`. So the hints of one alert to one device replace each other,

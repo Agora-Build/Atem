@@ -303,7 +303,9 @@ impl RelayPublisher {
 
 /// Debug builds (`ATEM_TEST_CONTEXT_DIR`): the snapshot published for `key`
 /// is `<sha256(key)>.json` in that directory (none: the relay is
-/// unreachable); while `<sha256(key)>.hold` exists the publication waits.
+/// unreachable); while `<sha256(key)>.hold` exists the publication waits,
+/// and says so first with `<sha256(key)>.held` (a test acts once a
+/// publication is parked, never after a fixed wait).
 async fn test_snapshot(key: &str) -> Option<Result<ContextSnapshot>> {
     let dir = super::test_hooks::context_dir()?;
     let name = hw::digest(key.as_bytes());
@@ -311,6 +313,9 @@ async fn test_snapshot(key: &str) -> Option<Result<ContextSnapshot>> {
     let hold = dir.join(format!("{name}.hold"));
     Some(
         async {
+            if tokio::fs::try_exists(&hold).await.unwrap_or(false) {
+                let _ = tokio::fs::write(dir.join(format!("{name}.held")), b"").await;
+            }
             while tokio::fs::try_exists(&hold).await.unwrap_or(false) {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }

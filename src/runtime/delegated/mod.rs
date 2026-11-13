@@ -14,15 +14,19 @@
 //! complete it ([`authority`], I.4.5, Decision 15), the interrupt intents
 //! that stop its attempt at its deadline ([`intents`], I.4.4, I.5.7), which
 //! `work_interrupt` shares (§11.2; the bridge serves it), what the bridge
-//! answers the delegated ops it doesn't serve yet ([`request`]), §11.6's
+//! answers the delegated ops it doesn't serve ([`request`]), the owner's
+//! alerts and the capacity limits on unknown outcomes ([`alerts`], I.4.6),
+//! the resolution of an unknown outcome ([`resolve`], I.4.6), §11.6's
 //! detail texts ([`details`]), and the host's Station link with its own
 //! device-list fetch ([`station`], [`fetch`], I.5.8).
+pub mod alerts;
 pub mod attempts;
 pub mod authority;
 pub mod details;
 pub mod fetch;
 pub mod gate;
 pub mod intents;
+pub mod resolve;
 pub mod start;
 pub mod station;
 
@@ -31,7 +35,7 @@ use crate::session_protocol::r9::HostWorkError;
 use atem_client::membership::entry::MemberKind;
 use atem_client::membership::{MemberStatus, Membership, service_key_fingerprint};
 use atem_client::principal::{Authority, Need, Op, op_names};
-use atem_client::session::host_work::{ALERTS_FEATURE, DELEGATED_FEATURE, Request, ResultBody};
+use atem_client::session::host_work::{DELEGATED_FEATURE, Request, ResultBody};
 use atem_client::session::wire::is_delegated_sender;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -40,8 +44,6 @@ use serde_json::{Value, json};
 /// serve yet (`busy`, host-work-v1 §7: a request it can't take now). Not a
 /// §11.6 detail: it names no task's state.
 pub const DELEGATED_NOT_SERVED: &str = "host.delegated is not served yet";
-/// [`DELEGATED_NOT_SERVED`] for `host.alerts` (`alert_list`).
-pub const ALERTS_NOT_SERVED: &str = "host.alerts is not served yet";
 
 /// The Station feed that covers a service (design I.5.2): the Station's
 /// origin and the feed's id.
@@ -270,18 +272,14 @@ pub fn classify(
 /// doesn't serve it, after the checks every host-work request has. With its
 /// feature off: `busy` and nothing else, as before the hook existed (the
 /// channel refuses the op while the feature isn't listed, so none gets here
-/// then; one that did is never half-served). With it on: `busy`, saying the
-/// feature isn't served yet, until its handlers exist. `work_interrupt`
-/// with `host.delegated` on never comes here: the bridge serves it.
+/// then; one that did is never half-served). `host.delegated`'s ops with it
+/// on: `busy`, saying the feature isn't served yet ([`DELEGATED_NOT_SERVED`]);
+/// none comes here now: the bridge serves `work_resolve` and
+/// `work_interrupt` with `host.delegated` on ([`resolve`], [`intents`]), and
+/// `alert_list` with `host.alerts` on ([`alerts`]).
 pub fn request(features: HostFeatures, req: &Request) -> Result<ResultBody, HostWorkError> {
-    let feature = req.feature();
-    let detail = if feature == DELEGATED_FEATURE && features.delegated {
-        Some(DELEGATED_NOT_SERVED)
-    } else if feature == ALERTS_FEATURE && features.delegated && features.alerts {
-        Some(ALERTS_NOT_SERVED)
-    } else {
-        None
-    };
+    let detail =
+        (req.feature() == DELEGATED_FEATURE && features.delegated).then_some(DELEGATED_NOT_SERVED);
     Err(HostWorkError {
         code: "busy",
         detail,
@@ -617,32 +615,30 @@ mod tests {
         );
     }
 
-    /// With the hook on, the ops reach `delegated` and are `busy` (§7: a
-    /// request the host can't take now), saying their feature isn't served
-    /// yet: the handlers come with later tasks.
+    /// With the hook on, `host.delegated`'s ops that reach `delegated` are
+    /// `busy` (§7: a request the host can't take now), saying their feature
+    /// isn't served yet. None does: `work_resolve` (Task 23) and
+    /// `work_interrupt` (Task 27) are the bridge's, and never come here with
+    /// the hook on. `alert_list` is the bridge's (Task 22): here, whatever
+    /// the hook, it is `busy` with no detail, as before the hook existed.
     #[test]
     fn hooked_delegated_ops_are_busy_until_served() {
         let both = HostFeatures::parse("host.delegated,host.alerts").unwrap();
         let [interrupt, resolve, alerts] = ops();
-        for (req, detail) in [
-            (&interrupt, DELEGATED_NOT_SERVED),
-            (&resolve, DELEGATED_NOT_SERVED),
-            (&alerts, ALERTS_NOT_SERVED),
-        ] {
+        for req in [&interrupt, &resolve] {
             assert_eq!(
                 request(both, req),
                 Err(HostWorkError {
                     code: "busy",
-                    detail: Some(detail),
+                    detail: Some(DELEGATED_NOT_SERVED),
                 }),
                 "{req:?}"
             );
         }
+        assert_eq!(request(both, &alerts), busy());
         assert!(DELEGATED_NOT_SERVED.starts_with(hw::DELEGATED_FEATURE));
-        assert!(ALERTS_NOT_SERVED.starts_with(hw::ALERTS_FEATURE));
         // Not a detail of §11.6's table: it says nothing about a task.
         assert!(!details::ALL.contains(&DELEGATED_NOT_SERVED));
-        assert!(!details::ALL.contains(&ALERTS_NOT_SERVED));
     }
 
     /// Release builds compile the hook out (step 4, Decision 10): with the
