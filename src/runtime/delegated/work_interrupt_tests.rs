@@ -48,7 +48,7 @@ fn work_interrupt_by_the_sender_with_interrupt() {
         assert_eq!(status(ask(&mut rig, &s.bot, Q::Interrupt(&task))), before);
         assert!(pending_write(&rig, &attempt).is_some(), "written at once");
         settle(&mut rig).await;
-        assert_eq!(escs(&rig), 1);
+        rig.until(|r| escs(r) == 1).await;
         passes(&mut rig, 5);
         settle(&mut rig).await;
         assert_eq!(escs(&rig), 1, "one-shot: nothing repeats it");
@@ -99,7 +99,7 @@ fn work_interrupt_by_the_owner() {
         assert_eq!(status(ask(&mut rig, &s.phone, Q::Interrupt(&task))), before);
         assert_eq!(pending_write(&rig, &attempt), Some(seq), "no second write");
         settle(&mut rig).await;
-        assert_eq!(escs(&rig), 1);
+        rig.until(|r| escs(r) == 1).await;
         turn_interrupted(&mut rig, &task).await;
         rig.until(|r| stored_record(r, &task).status.state == WorkState::AwaitingResult)
             .await;
@@ -168,7 +168,7 @@ fn not_running_detail_is_not_stored() {
             before
         );
         settle(&mut rig).await;
-        assert_eq!(escs(&rig), 1);
+        rig.until(|r| escs(r) == 1).await;
         // Its turn ended: not running.
         complete(&mut rig, &running).await;
         not_running(&mut rig, &phone, &running);
@@ -225,7 +225,7 @@ fn the_result_is_the_status_before_the_interrupt() {
         );
         assert_eq!(settled(&rig, &task).1, TURN_INTERRUPTED);
         settle(&mut rig).await;
-        assert_eq!(escs(&rig), 1);
+        rig.until(|r| escs(r) == 1).await;
     });
 }
 
@@ -258,7 +258,7 @@ fn a_sender_without_interrupt_is_forbidden() {
             WorkState::Submitted
         );
         settle(&mut rig).await;
-        assert_eq!(escs(&rig), 1);
+        rig.until(|r| escs(r) == 1).await;
     });
 }
 
@@ -294,7 +294,7 @@ fn a_pending_intent_and_work_interrupt_give_one_esc() {
             passes(&mut rig, 1);
         }
         settle(&mut rig).await;
-        assert_eq!(escs(&rig), 1);
+        rig.until(|r| escs(r) == 1).await;
         for _ in 0..5 {
             passes(&mut rig, 1);
             assert_eq!(pending_write(&rig, &attempt), None, "one Esc per turn");
@@ -317,7 +317,7 @@ fn a_pending_intent_and_work_interrupt_give_one_esc() {
                 .is_some_and(|i| i.delivered_turn.is_some())
         })
         .await;
-        assert_eq!(escs(&rig), 2);
+        rig.until(|r| escs(r) == 2).await;
         assert_eq!(
             status(ask(&mut rig, &phone, Q::Interrupt(&next))).state,
             WorkState::Submitted
@@ -382,7 +382,7 @@ fn a_turn_ended_by_work_interrupt_reads_turn_interrupted() {
             (WorkState::Expired, EXPIRED_AWAITING.into())
         );
         settle(&mut rig).await;
-        assert_eq!(escs(&rig), 1);
+        rig.until(|r| escs(r) == 1).await;
     });
 }
 
@@ -442,7 +442,7 @@ fn a_request_then_the_deadline_in_one_turn_give_one_esc() {
         // Reported written, and taken in by a pass.
         settle(&mut rig).await;
         passes(&mut rig, 2);
-        assert_eq!(escs(&rig), 1);
+        rig.until(|r| escs(r) == 1).await;
         os.pass(10 * MIN);
         for _ in 0..10 {
             passes(&mut rig, 1);
@@ -505,7 +505,7 @@ fn repeated_work_interrupts_of_one_turn_give_one_esc() {
             passes(&mut rig, 1);
         }
         settle(&mut rig).await;
-        assert_eq!(escs(&rig), 1, "one Esc per turn");
+        rig.until(|r| escs(r) == 1).await;
         assert!(intents(&rig, &task).is_empty());
         // The turn ends; the next task's turn is another.
         turn_interrupted(&mut rig, &task).await;
@@ -515,7 +515,7 @@ fn repeated_work_interrupts_of_one_turn_give_one_esc() {
             WorkState::Submitted
         );
         settle(&mut rig).await;
-        assert_eq!(escs(&rig), 2, "its own Esc");
+        rig.until(|r| escs(r) == 2).await;
         assert!(
             !rig.bridge.work.intents.knows(&attempt),
             "the ended turn's record went"
@@ -551,5 +551,161 @@ fn stops_are_served_while_paused_only_when_they_can_be() {
         rig.bridge.work.recovered = true;
         rig.bridge.features = HostFeatures::default();
         assert!(!rig.bridge.stops_while_paused(&identity), "the hook off");
+    });
+}
+
+/// `client` (an attached r9 client of channel `handle`) sends the session
+/// request `data` (`v` and a fresh `id` added) to the rig's engine, which
+/// queues a host-work request for the next work pass: its id.
+fn send_on(
+    rig: &mut LocalRig,
+    client: &mut atem_client::connect::Attached,
+    handle: &str,
+    mut data: Value,
+) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    data["v"] = json!(1);
+    data["id"] = json!(id);
+    // The client's clock as `channel` started it (1 ms), a moment on.
+    let frame = client
+        .send(&json!({"type": "session", "data": data}), 2)
+        .unwrap();
+    envelope_in(rig, &envelope::frame(handle, &frame));
+    id
+}
+
+/// What `client` got on `handle` since the last call: each reply's data
+/// (a result, or an error's) by the request id it answers.
+fn replies_on(
+    rig: &mut LocalRig,
+    client: &mut atem_client::connect::Attached,
+    handle: &str,
+) -> BTreeMap<String, Value> {
+    use atem_client::connect::Event;
+    let mut out = BTreeMap::new();
+    for frame in frames_for(rig, handle) {
+        for event in client.on_frame(&frame, 3).unwrap() {
+            let data = match event {
+                Event::Family(f) => f.data,
+                Event::Error(e) => {
+                    Some(serde_json::from_slice::<Value>(&e.to_bytes()).unwrap()["data"].clone())
+                }
+                _ => None,
+            };
+            if let Some(data) = data
+                && let Some(re) = data["re"].as_str()
+            {
+                out.insert(re.to_string(), data);
+            }
+        }
+    }
+    out
+}
+
+/// Task 27 review m1 (ruling T27a): requests queued while hosting was on
+/// reach the work pass where the pause begins. There only `work_interrupt`
+/// is served (a stop); every other host-work request is `busy`, as before.
+/// Through the phone's real r9 channel: a `work_query` and a
+/// `work_interrupt` queued, `runtime.toml` stops loading, one pass.
+#[test]
+fn the_paused_pass_serves_only_work_interrupt() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, log) = delegated(&mut rig, root, &os, true);
+        let task = phone_task(&mut rig, &phone, "PAUSED_PASS", start + HOUR);
+        turn_journaled(&mut rig, &task, "PAUSED_PASS").await;
+        let attempt = stored_record(&rig, &task).status.receipt_id;
+        // The engine lists host work and `host.delegated` (hosting on).
+        rig.bridge.r9.set_delegated_features(true, false);
+        rig.bridge.r9.enable_host_work(true);
+        r9_link_up(&mut rig);
+        let mut client = channel(&mut rig, &log, "ph-paused", "dev-phone");
+        let host = serde_json::to_value(rig.bridge.work_host()).unwrap();
+        let query = send_on(
+            &mut rig,
+            &mut client,
+            "ph-paused",
+            json!({"op": "work_query", "host": host, "task_id": task}),
+        );
+        let interrupt = send_on(
+            &mut rig,
+            &mut client,
+            "ph-paused",
+            json!({"op": "work_interrupt", "host": host, "task_id": task}),
+        );
+        // `runtime.toml` stops loading before the pass takes them.
+        drop(std::mem::take(&mut rig.bridge.work.config));
+        rig.bridge.work.config_problem = Some("expected a table".into());
+        passes(&mut rig, 1);
+        let replies = replies_on(&mut rig, &mut client, "ph-paused");
+        assert_eq!(replies[&query]["code"], "busy", "{replies:?}");
+        assert_eq!(
+            replies[&interrupt]["result"]["work"]["state"], "submitted",
+            "{replies:?}"
+        );
+        assert!(pending_write(&rig, &attempt).is_some(), "the Esc written");
+        rig.until(|r| escs(r) == 1).await;
+    });
+}
+
+/// Task 27 review m3: a write the worker reported as having written nothing
+/// (`consumed`, as on Codex when the Esc only handed a waiting approval to
+/// its dialog) frees the turn at once: a retry before any pass took that
+/// report in is written, not lost as a revoke-only answer.
+#[test]
+fn a_retry_after_a_write_that_wrote_nothing_is_written() {
+    use crate::runtime::broker::WriteOutcome;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, true);
+        let task = phone_task(&mut rig, &phone, "RETRY_CONSUMED", start + HOUR);
+        turn_journaled(&mut rig, &task, "RETRY_CONSUMED").await;
+        let attempt = stored_record(&rig, &task).status.receipt_id;
+        status(ask(&mut rig, &phone, Q::Interrupt(&task)));
+        let seq = pending_write(&rig, &attempt).expect("written");
+        // The worker's answer, replaced by `consumed` (no pass runs).
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut others = Vec::new();
+        loop {
+            let session = rig.sessions.get_mut(&rig.sid).unwrap();
+            session.pump();
+            let results = session.take_results();
+            let found = results.iter().any(|r| r.seq == seq);
+            others.extend(results.into_iter().filter(|r| r.seq != seq));
+            if found {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the worker answers the write");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let sid = rig.sid.to_string();
+        let consumed = WriteOutcome {
+            seq,
+            ok: false,
+            dropped: false,
+            no_effect: true,
+            consumed: true,
+            error: None,
+        };
+        let mut cx = Cx {
+            client: &rig.app.astation_client,
+            sessions: &mut rig.sessions,
+        };
+        for result in others.into_iter().chain([consumed]) {
+            rig.bridge.write_result(&sid, result, &mut cx);
+        }
+        assert!(pending_write(&rig, &attempt).is_none());
+        assert_eq!(
+            status(ask(&mut rig, &phone, Q::Interrupt(&task))).state,
+            WorkState::Submitted
+        );
+        assert!(
+            pending_write(&rig, &attempt).is_some(),
+            "the retry is written"
+        );
     });
 }

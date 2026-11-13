@@ -53,6 +53,13 @@
 //!   refuses a row whose reason this build can't read (a receipt-database
 //!   fault), so adding a reason means a downgrade stops at it (no shims,
 //!   by the owner's rule).
+//! - **The `delivered_by` column** (ruling T27a): a step-4 build before it
+//!   ignores the column (every query names its columns), but its
+//!   `intent_delivered` doesn't clear a request's marker, so after going
+//!   back to a newer build a turn that build's deadline Esc ended reads
+//!   `turn interrupted`. Only unreleased dev builds are affected: v0.8.x
+//!   has no `intents` table, and going back to it already needs the file
+//!   moved aside.
 //!
 //! [`pending_intents`]: Store::pending_intents
 use crate::runtime::delegated::details;

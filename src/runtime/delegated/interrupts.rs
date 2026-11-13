@@ -46,8 +46,9 @@
 //!     wait for that.
 //! - **The reports** of host interrupt writes are taken at the start of
 //!   every scheduling pass (`take_interrupt_reports`, so a turn the Esc
-//!   ended reads `interrupted at deadline` in the pass that reconciles it)
-//!   and again by `carry_out_intents`: the stream never grows. The drive
+//!   ended reads `interrupted at deadline` in the pass that reconciles it),
+//!   again by `carry_out_intents`, and by `work_interrupt` before it
+//!   decides (Task 27 review m3): the stream never grows. The drive
 //!   hook reads a copy of its own (Task 16b review m7).
 //! - **`work_interrupt`** (feature `host.delegated`; design I.4.5;
 //!   host-work-v1 §11.2): the task's sender holding `interrupt`, or the
@@ -344,9 +345,12 @@ impl HostBridge {
     /// turn, from any source (ruling T27a): the write goes into this run's
     /// record (`Runs::requested`), shared with the intents, and when that
     /// record says the turn already got its interrupt, or one is in flight
-    /// (`Runs::running`), nothing is written: only another controller's
-    /// lease is revoked, once, and the result is the task's status as it
-    /// is (its own detail: the turn is current, so not `not running`).
+    /// (`Runs::running`, after the reports that came since the last pass
+    /// are taken in: Task 27 review m3), nothing is written: only another
+    /// controller's lease is revoked, once, and the result is the task's
+    /// status as it is (its own detail: the turn is current, so not `not
+    /// running`). A report that can't be taken in is a receipt-database
+    /// fault: `busy`.
     ///
     /// Served while hosting is paused too, as a stop (ruling T27a, like
     /// T26a's deadline step): see `stops_while_paused`.
@@ -387,6 +391,13 @@ impl HostBridge {
         ) else {
             return Ok(not_running(status));
         };
+        // The reports that came since the last pass first (Task 27 review
+        // m3): a write that wrote nothing frees the turn now, so this
+        // request isn't lost as a revoke-only answer.
+        if self.take_interrupt_reports().is_err() {
+            self.work_fail();
+            return Err("busy".into());
+        }
         // Task 15 review M6: a lease past its deadline ends `expired`.
         let effects = self.host.advance(self.clock.now());
         self.exec(effects, cx);

@@ -1278,6 +1278,17 @@ not name is `forbidden`, as for `work_query`.
     that intent, marked as the request's.
   - **The detail.** A turn the request's interrupt ended reads `turn
     interrupted`, never `interrupted at deadline`.
+  - **An error after queueing** (R9.14 item 5) counts as the turn's
+    interrupt, but it may not have reached the terminal: a request or
+    intent 10 s later, the turn still current, writes it again. That is
+    item 5's own exception, now shared by requests.
+  - **A write that wrote nothing** (`consumed`: on Codex the Esc only
+    handed a waiting approval to its own dialog; `dropped`; `no_effect`)
+    leaves the turn without its interrupt. A request isn't repeated (an
+    intent is, on its next pass), and its result, given before the write's
+    outcome, doesn't say so. The caller sees the turn go on in later
+    queries and may ask again; a request takes the outcomes reported so far
+    into account first, so asking again right away is written.
   - **Residual.** The record lives for one run. After a restart, a turn
     still current (rebound) can get one more Esc, from a request as from a
     pending intent (R9.14 item 5's restart rule).
