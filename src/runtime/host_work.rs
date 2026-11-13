@@ -852,6 +852,9 @@ pub(super) fn kept_table_scans(db: &Connection, sql: &str) -> (Vec<String>, Vec<
 pub struct Store {
     pub(super) db: Connection,
     pub(super) state: PathBuf,
+    /// What the alerts' push hints still have to look at, in memory for
+    /// this store's run (`delegated::alerts::HintWatch`).
+    pub(super) hints: crate::runtime::delegated::alerts::HintWatch,
 }
 
 /// How many damaged clock records `clock_aside` keeps (the latest).
@@ -1157,9 +1160,11 @@ impl Store {
         track_open_records(&db)?;
         track_waits(&db)?;
         std::fs::File::open(state)?.sync_all()?;
+        let hints = crate::runtime::delegated::alerts::HintWatch::open(&db)?;
         Ok(Self {
             db,
             state: state.to_path_buf(),
+            hints,
         })
     }
 
@@ -1284,7 +1289,7 @@ impl Store {
     /// so none of its records can be honored again. A hard link, so an
     /// existing file is never replaced.
     pub fn retire(self, at_ms: u64) -> Result<PathBuf> {
-        let Self { db, state } = self;
+        let Self { db, state, .. } = self;
         db.close().map_err(|(_, e)| e)?;
         let path = state.join("host-work.sqlite");
         let aside = state.join(format!("host-work.sqlite.retired-{at_ms}"));

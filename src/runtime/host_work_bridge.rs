@@ -53,6 +53,8 @@ mod collab_bridge;
 mod collab_launch_bridge;
 #[path = "delegated/dispatch.rs"]
 mod delegated_dispatch;
+#[path = "delegated/hints.rs"]
+mod delegated_hints;
 #[path = "delegated/recovery.rs"]
 mod delegated_recovery;
 #[path = "delegated/requests.rs"]

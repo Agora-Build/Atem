@@ -1003,3 +1003,554 @@ fn make_room_takes_finished_then_unpublished_never_published() {
         assert_eq!(push.unhinted(), 1);
     }
 }
+
+// ── `outcome_unknown` hints (`host.alerts`; delegated host-work I.4.6) ──
+
+use atem_client::push::{AlertHint, AlertKey, AlertPlain, MAX_HINT_LIFETIME_MS};
+use atem_client::session::alerts::{Alert, AlertKind};
+
+/// The rig with `host.delegated` and `host.alerts` on, as the runtime's
+/// debug-only hook turns them on.
+fn alert_rig() -> Rig {
+    let mut rig = Rig::new();
+    rig.engine.set_delegated_features(true, true);
+    rig
+}
+
+/// The `n`th alert, raised now on the host clock: the phone's task on
+/// `SID` became `outcome_unknown` (`agent exited`).
+fn alert_now(rig: &Rig, n: u64) -> Alert {
+    Alert {
+        alert_id: uuid::Uuid::new_v4().to_string(),
+        seq: n,
+        kind: AlertKind::OutcomeUnknown,
+        host_id: super::tests::HOST.into(),
+        session_id: SID.into(),
+        task_id: uuid::Uuid::new_v4().to_string(),
+        sender: "member:dev-phone".into(),
+        reason: "agent exited".into(),
+        created_at: rig.now.host.wall_ms,
+    }
+}
+
+/// The alert's row is committed: the bridge hands it to the engine.
+fn raise(rig: &mut Rig, alert: &Alert) {
+    rig.with_parts(|e, p| e.alert_opened(alert, p));
+}
+
+/// A new alert, raised now and handed over.
+fn raise_new(rig: &mut Rig, n: u64) -> Alert {
+    let alert = alert_now(rig, n);
+    raise(rig, &alert);
+    alert
+}
+
+/// The `outcome_unknown` hints of a `push_hint`, verified as a client does.
+fn alert_hints(rig: &Rig, message: &Value) -> Vec<AlertHint> {
+    assert_eq!(message["type"], "relay", "{message}");
+    assert_eq!(message["op"], "push_hint", "{message}");
+    message["hints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            AlertHint::verify(
+                &object(h),
+                &rig.log.log,
+                rig.now.host.wall_ms,
+                Verifier::Client,
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+fn alert_key(rig: &Rig, alert: &Alert) -> AlertKey {
+    AlertKey::new(&rig.log.log, super::tests::HOST, 1, &alert.alert_id)
+}
+
+/// What a recipient opens: the alert's facts.
+fn facts(alert: &Alert) -> AlertPlain {
+    AlertPlain {
+        task_id: alert.task_id.clone(),
+        session_id: alert.session_id.clone(),
+        sender: alert.sender.clone(),
+        reason: alert.reason.clone(),
+    }
+}
+
+/// Session-v1 R9.9 ("`outcome_unknown` hint", delivery as an open hint's):
+/// an alert's hints, one per native member with `control` (the Mac and the
+/// phone), its `created_at` the alert's and its window the longest a hint
+/// has, are resent with the same bytes every 10 s and at a reconnect until
+/// the relay acknowledges each, the alert ends, or `expires_at + 300 s`
+/// passes (past the guard: nothing cancels an alert's hint, and its ack is
+/// still wanted). Handed over again, an alert signs nothing new; an ack
+/// naming another alert or trust generation ends nothing.
+#[test]
+fn a_hint_is_resent_until_push_ack_or_its_expiry() {
+    let mut rig = alert_rig();
+    rig.link_up();
+    let a = alert_now(&rig, 1);
+    raise(&mut rig, &a);
+    let first = rig.relay_out();
+    assert_eq!(first.len(), 1, "{first:?}");
+    let hs = alert_hints(&rig, &first[0]);
+    let devices: Vec<&str> = hs.iter().map(AlertHint::device_id).collect();
+    assert_eq!(devices, [MAC, "dev-phone"]);
+    for h in &hs {
+        assert_eq!(h.key(), &alert_key(&rig, &a));
+        assert_eq!(h.created_at(), a.created_at);
+        assert_eq!(h.expires_at(), a.created_at + MAX_HINT_LIFETIME_MS);
+    }
+    rig.advance(9_000);
+    assert!(rig.relay_out().is_empty(), "not before 10 s");
+    rig.advance(1_000);
+    assert_eq!(rig.relay_out(), first, "the same bytes");
+    // Handed over again (another pass): nothing new is signed.
+    raise(&mut rig, &a);
+    assert!(rig.relay_out().is_empty());
+    // Acks naming another alert, or another trust generation, end nothing.
+    let mut other = hs[1].key().clone();
+    other.alert_id = uuid::Uuid::new_v4().to_string();
+    let mut gen2 = hs[1].key().clone();
+    gen2.host_trust_gen = 2;
+    rig.relay_in(&ack(&[
+        Identity::Alert {
+            key: other,
+            device_id: "dev-phone".into(),
+        },
+        Identity::Alert {
+            key: gen2,
+            device_id: "dev-phone".into(),
+        },
+    ]));
+    assert_eq!(rig.engine.push_status(rig.now.host.wall_ms).pending, 2);
+    // The phone's is acknowledged: the Mac's goes on alone.
+    rig.relay_in(&ack(&[hs[1].identity()]));
+    rig.advance(10_000);
+    let again = rig.relay_out();
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0]["hints"], json!([first[0]["hints"][0]]));
+    rig.relay_in(&ack(&[hs[0].identity()]));
+    rig.advance(10_000);
+    assert!(rig.relay_out().is_empty(), "both acknowledged");
+    assert_eq!(rig.engine.push_status(rig.now.host.wall_ms).pending, 0);
+    assert!(!rig.engine.push.tracks_alert(&a.alert_id));
+
+    // Never acknowledged: raised while the link is down, it goes at the
+    // reconnect, then every 10 s, past the guard, until `expires_at + 300 s`.
+    rig.link_down();
+    let b = alert_now(&rig, 2);
+    raise(&mut rig, &b);
+    rig.advance(5_000);
+    assert!(rig.relay_out().is_empty(), "no link");
+    rig.link_up();
+    let out = rig.relay_out();
+    assert_eq!(out.len(), 1);
+    assert!(
+        alert_hints(&rig, &out[0])
+            .iter()
+            .all(|h| h.key().alert_id == b.alert_id)
+    );
+    let live_until = b.created_at + MAX_HINT_LIFETIME_MS + 300_000;
+    rig.advance(live_until - 1 - rig.now.host.wall_ms);
+    assert_eq!(rig.relay_out(), out, "resent at its expiry + 299.999 s");
+    rig.advance(1);
+    assert!(rig.relay_out().is_empty(), "not at expires_at + 300 s");
+    assert_eq!(rig.engine.push_status(rig.now.host.wall_ms).pending, 0);
+    assert!(!rig.engine.push.tracks_alert(&b.alert_id));
+
+    // The alert ends (its task resolved, or a reply moved it): its hints
+    // are not sent again.
+    let c = alert_now(&rig, 3);
+    raise(&mut rig, &c);
+    assert_eq!(rig.relay_out().len(), 1);
+    assert_eq!(rig.engine.hinted_alerts(), [c.alert_id.as_str()]);
+    rig.engine.alert_ended(&c.alert_id);
+    rig.advance(10_000);
+    assert!(rig.relay_out().is_empty(), "ended");
+    assert_eq!(rig.engine.push_status(rig.now.host.wall_ms).pending, 0);
+    assert!(rig.engine.hinted_alerts().is_empty());
+}
+
+/// Session-v1 R9.9 with R9.3, R9.4 and r8 §I: no alert hint is signed or
+/// sent while the device list is held, frozen or faulted, or the session
+/// journal halted; what was queued is dropped when it starts.
+#[test]
+fn no_hint_while_the_list_is_held_frozen_or_faulted_or_the_journal_halted() {
+    // Held at start (a recorded fault).
+    let mut rig = alert_rig();
+    std::fs::write(
+        &rig.pairing.fault,
+        br#"{"v":1,"runtime_epoch":1,"file":"membership.json","at":1}"#,
+    )
+    .unwrap();
+    let mut fences = crate::session_protocol::membership::HostFences::new(&mut rig.rt.host);
+    let (m, _) = MembershipHost::open(&rig.pairing, &rig.journal, 2, &rig.now.host, &mut fences)
+        .unwrap()
+        .unwrap();
+    assert!(m.held().is_some());
+    rig.m = Some(m);
+    rig.link_up();
+    let a = alert_now(&rig, 1);
+    raise(&mut rig, &a);
+    rig.advance(10_000);
+    assert!(rig.relay_out().is_empty(), "held");
+    let status = rig.engine.push_status(rig.now.host.wall_ms);
+    assert_eq!(
+        (status.pending, status.suppressed),
+        (0, Some("device list held"))
+    );
+
+    // Frozen while an alert's hints wait: dropped, nothing after.
+    let mut rig = alert_rig();
+    rig.link_up();
+    rig.connect(
+        "mac",
+        atem_client::connect::Identity::native(MAC, r9log::auth(MAC)),
+    );
+    raise_new(&mut rig, 1);
+    assert_eq!(rig.relay_out().len(), 1);
+    let conflict = rig.log.conflicting_add("dev-x");
+    carry(&mut rig, "mac", &conflict);
+    assert!(rig.m.as_ref().unwrap().is_frozen());
+    rig.advance(10_000);
+    assert!(rig.relay_out().is_empty(), "frozen: no resend");
+    raise_new(&mut rig, 2);
+    rig.advance(10_000);
+    assert!(rig.relay_out().is_empty(), "frozen: nothing new");
+    let status = rig.engine.push_status(rig.now.host.wall_ms);
+    assert_eq!(
+        (status.pending, status.suppressed),
+        (0, Some("device list frozen"))
+    );
+
+    // Faulted: a device-list write fails while an alert's hints wait (the
+    // journal halts with it).
+    let mut rig = alert_rig();
+    rig.link_up();
+    rig.connect(
+        "mac",
+        atem_client::connect::Identity::native(MAC, r9log::auth(MAC)),
+    );
+    raise_new(&mut rig, 1);
+    assert_eq!(rig.relay_out().len(), 1);
+    rig.m.as_mut().unwrap().store_mut().inject(
+        crate::session_protocol::membership::store::Injected {
+            file: crate::session_protocol::membership::store::DlFile::Applied,
+            step: crate::session_protocol::membership::store::Step::TempWrite,
+        },
+    );
+    let added = rig.log.add_native("dev-tab", &["control", "view"]);
+    carry(&mut rig, "mac", &added);
+    assert!(rig.m.as_ref().unwrap().faulted().is_some());
+    rig.advance(10_000);
+    assert!(rig.relay_out().is_empty(), "faulted: no resend");
+    raise_new(&mut rig, 2);
+    rig.advance(10_000);
+    assert!(rig.relay_out().is_empty(), "faulted: nothing new");
+    let status = rig.engine.push_status(rig.now.host.wall_ms);
+    assert_eq!(status.pending, 0);
+    assert!(status.suppressed.is_some());
+
+    // The journal halts (a failed write) while an alert's hints wait.
+    let mut rig = alert_rig();
+    rig.link_up();
+    rig.connect("phone", phone());
+    let ap = open(&mut rig, SID, PGEN);
+    raise_new(&mut rig, 1);
+    assert_eq!(rig.relay_out().len(), 2, "the approval's and the alert's");
+    let b = rig.binding("phone", SID);
+    use crate::session_protocol::fake_runtime::FailFsync;
+    rig.rt.host.journal_mut().fail_next_fsync();
+    rig.send(
+        "phone",
+        &json!({"type": "session", "data": {"v": 1, "op": "submit", "id": uuid::Uuid::new_v4().to_string(),
+            "binding": b, "kind": "approval", "request_id": uuid::Uuid::new_v4().to_string(),
+            "payload": {"approval_id": ap, "decision": "allow_once"}}}),
+    );
+    assert!(rig.rt.host.journal_halted());
+    rig.advance(10_000);
+    assert!(rig.relay_out().is_empty(), "halted: no resend");
+    raise_new(&mut rig, 2);
+    rig.advance(10_000);
+    assert!(rig.relay_out().is_empty(), "halted: nothing new");
+    let status = rig.engine.push_status(rig.now.host.wall_ms);
+    assert_eq!(
+        (status.pending, status.suppressed),
+        (0, Some("journal halted"))
+    );
+}
+
+/// The relay's side (the shared core's reference `RelayLedger`, which
+/// verifies as the relay does): every alert hint the host sends is
+/// accepted under its identity (`kind` `outcome_unknown`, the alert id and
+/// the device), a resend is idempotent, the relay's `push_ack` of those
+/// identities ends the resends, and the schedule runs from the signed
+/// `created_at` with the alert id as its collapse id. Each recipient opens
+/// only its own sealed part: the task, session, sender and reason. A hint
+/// the relay first gets more than 120 s after its `created_at` is refused
+/// `skew`, and its acknowledgment (it names the identity) ends its resends
+/// too.
+#[test]
+fn hints_verify_with_the_relay_ledger() {
+    use atem_client::push::{DeviceClass, Push, RecipientInfo, Refusal, RelayLedger, Verdict};
+    let mut rig = alert_rig();
+    rig.link_up();
+    let a = alert_now(&rig, 1);
+    raise(&mut rig, &a);
+    let out = rig.relay_out();
+    assert_eq!(out.len(), 1);
+    let mut ledger = RelayLedger::new();
+    let now = rig.now.host.wall_ms;
+    let mut acks = Vec::new();
+    for h in out[0]["hints"].as_array().unwrap() {
+        let (verdict, identity) = ledger.receive_hint(&object(h), &rig.log.log, now);
+        assert_eq!(verdict, Verdict::Accepted, "{h}");
+        acks.push(identity.expect("named"));
+    }
+    for (identity, device) in acks.iter().zip([MAC, "dev-phone"]) {
+        assert_eq!(
+            identity,
+            &Identity::Alert {
+                key: alert_key(&rig, &a),
+                device_id: device.into(),
+            }
+        );
+        let entry = identity.to_ack();
+        assert_eq!(entry["kind"], "outcome_unknown");
+        assert_eq!(entry.as_object().unwrap().len(), 7, "{entry}");
+    }
+    // The schedule, from the signed `created_at`: the Mac (a desktop with
+    // no Astation connected) at once, the phone at + 60 s; collapsed on the
+    // alert id.
+    let device = |d: &str| RecipientInfo {
+        class: if d == MAC {
+            DeviceClass::Desktop
+        } else {
+            DeviceClass::Mobile
+        },
+        connected: false,
+        immediate_mobile: false,
+    };
+    assert_eq!(
+        ledger.due(now, &device),
+        [Push {
+            device_id: MAC.into(),
+            kind: "desktop_os",
+            due_at: a.created_at,
+            collapse_id: a.alert_id.clone(),
+        }]
+    );
+    assert_eq!(
+        ledger.due(a.created_at + 60_000, &device),
+        [Push {
+            device_id: "dev-phone".into(),
+            kind: "mobile",
+            due_at: a.created_at + 60_000,
+            collapse_id: a.alert_id.clone(),
+        }]
+    );
+    // Each device opens its own part only: the alert's facts.
+    let hs = alert_hints(&rig, &out[0]);
+    let keys = &rig.log.keys;
+    assert_eq!(hs[0].open(keys, &enc(MAC), MAC).unwrap(), facts(&a));
+    assert_eq!(
+        hs[1].open(keys, &enc("dev-phone"), "dev-phone").unwrap(),
+        facts(&a)
+    );
+    assert!(hs[0].open(keys, &enc("dev-phone"), "dev-phone").is_err());
+    let text = out[0].to_string();
+    for clear in [&a.task_id, &a.sender, &a.reason, &a.session_id] {
+        assert!(!text.contains(clear.as_str()), "{clear} in clear: {text}");
+    }
+    // A lost ack: the resend is idempotent; the relay's `push_ack` ends it.
+    rig.advance(10_000);
+    let again = rig.relay_out();
+    assert_eq!(again, out);
+    for h in again[0]["hints"].as_array().unwrap() {
+        let (verdict, _) = ledger.receive_hint(&object(h), &rig.log.log, rig.now.host.wall_ms);
+        assert_eq!(verdict, Verdict::Idempotent);
+    }
+    rig.relay_in(&ack(&acks));
+    rig.advance(10_000);
+    assert!(rig.relay_out().is_empty());
+    assert_eq!(rig.engine.push_status(rig.now.host.wall_ms).pending, 0);
+
+    // First received 121 s after its `created_at` (the link was down):
+    // refused `skew`, named, and that ack ends the resends.
+    rig.link_down();
+    let b = alert_now(&rig, 2);
+    raise(&mut rig, &b);
+    rig.advance(121_000);
+    rig.link_up();
+    let late = rig.relay_out();
+    assert_eq!(late.len(), 1);
+    let mut acks = Vec::new();
+    for h in late[0]["hints"].as_array().unwrap() {
+        let (verdict, identity) =
+            ledger.receive_hint(&object(h), &rig.log.log, rig.now.host.wall_ms);
+        assert_eq!(verdict, Verdict::Refused(Refusal::Skew));
+        acks.push(identity.expect("named"));
+    }
+    rig.relay_in(&ack(&acks));
+    rig.advance(10_000);
+    assert!(rig.relay_out().is_empty());
+    assert_eq!(rig.engine.push_status(rig.now.host.wall_ms).pending, 0);
+}
+
+/// Session-v1 R9.9 / R9.6: an alert hint not yet acknowledged whose device
+/// is removed, or demoted below `control`, is never sent again (the Mac's
+/// goes on); an alert left with none ends its tracking; a device added with
+/// `control` afterwards gets none of an alert raised before.
+#[test]
+fn an_alert_hint_follows_the_recipients_at_the_head() {
+    let mut rig = Rig::with(|log| {
+        log.add_native("dev-tab", &["control", "view"]);
+    });
+    rig.engine.set_delegated_features(true, true);
+    rig.link_up();
+    rig.connect(
+        "mac",
+        atem_client::connect::Identity::native(MAC, r9log::auth(MAC)),
+    );
+    let a = raise_new(&mut rig, 1);
+    let first = rig.relay_out();
+    let devices: Vec<String> = alert_hints(&rig, &first[0])
+        .iter()
+        .map(|h| h.device_id().to_string())
+        .collect();
+    assert_eq!(devices, [MAC, "dev-phone", "dev-tab"]);
+    let removal = rig.log.remove("dev-phone");
+    carry(&mut rig, "mac", &removal);
+    let demotion = rig.log.set_native_roles("dev-tab", &["view"]);
+    carry(&mut rig, "mac", &demotion);
+    assert_eq!(rig.engine.push_status(rig.now.host.wall_ms).pending, 1);
+    let added = rig.log.add_native("dev-new", &["control", "view"]);
+    carry(&mut rig, "mac", &added);
+    rig.advance(10_000);
+    let out = rig.relay_out();
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        out[0]["hints"],
+        json!([first[0]["hints"][0]]),
+        "the Mac's only"
+    );
+    rig.link_down();
+    rig.link_up();
+    let out = rig.relay_out();
+    assert_eq!(out[0]["hints"], json!([first[0]["hints"][0]]));
+    // The Mac's acknowledged: nothing left of the alert.
+    let mac = alert_hints(&rig, &first[0]).remove(0);
+    rig.relay_in(&ack(&[mac.identity()]));
+    assert!(!rig.engine.push.tracks_alert(&a.alert_id));
+}
+
+/// Bounded apart from the approvals: at most `MAX_ALERTS` alerts tracked; a
+/// published one is never forgotten for room (a newer alert goes unhinted,
+/// counted), an acknowledged one frees its place at once, an unpublished one
+/// (the link was down) makes room for a newer; a full set of alerts takes
+/// nothing from the approvals; a reconnect resends every tracked alert's
+/// hints, each message under the 256 KiB bound; a re-pin drops them.
+#[test]
+fn alert_hints_are_bounded_and_a_published_alert_is_never_forgotten() {
+    use super::push::{MAX_ALERTS, MAX_MESSAGE_BYTES};
+    let rig = alert_rig();
+    let wall = rig.now.host.wall_ms;
+    let m = rig.m.as_ref().unwrap();
+    let signer = || Signer {
+        log: m.membership(),
+        key: &rig.key,
+    };
+    let key = |n: usize| {
+        AlertKey::new(
+            m.membership(),
+            super::tests::HOST,
+            1,
+            &format!("8c3e9d6b-1f40-4b52-8dae-{n:012x}"),
+        )
+    };
+    let facts = facts(&alert_now(&rig, 1));
+    let mut push = HostPush::default();
+    push.link_up(None, wall);
+    for n in 0..MAX_ALERTS + 3 {
+        push.alert_opened(key(n), wall, &facts, Some(signer()), wall);
+    }
+    assert_eq!(push.status(wall).pending, MAX_ALERTS * 2);
+    assert!(push.tracks_alert(&key(0).alert_id));
+    assert!(!push.tracks_alert(&key(MAX_ALERTS).alert_id));
+    assert_eq!(push.unhinted_alerts(), 3);
+    // An approval still gets its hints.
+    let approval = ApprovalKey::new(
+        m.membership(),
+        super::tests::HOST,
+        1,
+        SID,
+        PGEN,
+        "8c3e9d6b-1f40-4b52-8dae-ffffffffffff",
+    );
+    push.opened(
+        approval.clone(),
+        wall,
+        wall + WAIT_MS,
+        &plain(),
+        Some(signer()),
+        wall,
+    );
+    assert!(push.tracks(&approval.approval_id));
+    // Alert 0 acknowledged: its place goes to the next.
+    let acks: Vec<Identity> = [MAC, "dev-phone"]
+        .iter()
+        .map(|d| Identity::Alert {
+            key: key(0),
+            device_id: d.to_string(),
+        })
+        .collect();
+    assert_eq!(push.ack(&ack(&acks)), 2);
+    assert!(!push.tracks_alert(&key(0).alert_id));
+    push.alert_opened(key(100), wall, &facts, Some(signer()), wall);
+    assert!(push.tracks_alert(&key(100).alert_id));
+    // A reconnect resends every tracked alert's hints, in bounded messages.
+    push.link_down();
+    push.link_up(None, wall + 1);
+    let mut sent = Vec::new();
+    push.flush(&mut |text| {
+        sent.push(text);
+        true
+    });
+    let mut hints = 0;
+    for text in &sent {
+        assert!(text.len() <= MAX_MESSAGE_BYTES, "{}", text.len());
+        let v: Value = serde_json::from_str(text).unwrap();
+        hints += v["hints"].as_array().unwrap().len();
+    }
+    assert_eq!(hints, MAX_ALERTS * 2 + 2, "the alerts' and the approval's");
+    push.reset();
+    assert_eq!(push.status(wall).pending, 0);
+    assert!(!push.tracks_alert(&key(1).alert_id));
+
+    // Unpublished (the link down): the oldest makes room for a newer one.
+    let mut push = HostPush::default();
+    push.link_up(None, wall);
+    push.link_down();
+    for n in 0..MAX_ALERTS + 1 {
+        push.alert_opened(key(n), wall, &facts, Some(signer()), wall);
+    }
+    assert!(
+        !push.tracks_alert(&key(0).alert_id),
+        "the oldest unpublished"
+    );
+    assert!(push.tracks_alert(&key(MAX_ALERTS).alert_id));
+    assert_eq!(push.unhinted_alerts(), 0);
+    // Raised within 15 s of its window's end: no hint.
+    push.reset();
+    push.alert_opened(
+        key(1),
+        wall,
+        &facts,
+        Some(signer()),
+        wall + MAX_HINT_LIFETIME_MS - 15_000,
+    );
+    assert_eq!(push.status(wall).pending, 0);
+}

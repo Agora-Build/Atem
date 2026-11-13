@@ -8,7 +8,7 @@
 //! - **Raised** when the task becomes `outcome_unknown`, in the
 //!   transaction that writes that state ([`Store::save_work`] calls
 //!   [`Store::track_alert`]), so it is durable before anything shows it
-//!   (`alert_list`, and the push hint of Task 24). A task reaches
+//!   (`alert_list`, and its push hints). A task reaches
 //!   `outcome_unknown` once: no task gets a second alert. A v1 task
 //!   (`local`, a browser grant, a service no feed covers) never gets one.
 //! - **Kept past the deadline.** A delegated task of unknown outcome doesn't
@@ -27,6 +27,11 @@
 //!   [`PER_SENDER`] from one sender, or [`PER_HOST`] on the host, a remote
 //!   sender's request that would make a new task is refused `busy`, `too
 //!   many unresolved outcomes` ([`Store::over_capacity`]); `local` never is.
+//! - **Hinted** (session-v1 R9.9, `host.alerts` only): an alert raised in
+//!   this run of the store is handed to the push hints once its row is
+//!   committed, and one that ended stops its hints
+//!   ([`Store::alert_changes`], read by the bridge's pass only after a
+//!   raise or an end, [`HintWatch`]).
 use crate::runtime::delegated::details;
 use crate::runtime::host_work::{Store, WorkRecord};
 use crate::session_protocol::membership::host_now;
@@ -36,7 +41,8 @@ use atem_client::session::alerts::{
     Alert, AlertKind, MAX_PAGE, MAX_REASON_BYTES, page, valid_reason,
 };
 use atem_client::session::host_work::WorkState;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 /// At this many unresolved outcomes on the host, a new alert's reason says
@@ -73,6 +79,53 @@ const UNRESOLVED_BY_SENDER: &str =
 /// The unresolved alerts, in the host's order.
 const UNRESOLVED_ALERTS: &str = "SELECT alert_id,seq,session_id,task_id,sender,reason,created_ms
     FROM alerts WHERE ended_ms IS NULL ORDER BY seq";
+
+/// The unresolved alerts raised after a `seq`, in the host's order (the
+/// partial index `alerts_unresolved`).
+const UNRESOLVED_AFTER: &str = "SELECT alert_id,seq,session_id,task_id,sender,reason,created_ms
+    FROM alerts WHERE ended_ms IS NULL AND seq > ?1 ORDER BY seq";
+/// Whether an alert is still unresolved (its primary key).
+const STILL_UNRESOLVED: &str =
+    "SELECT EXISTS(SELECT 1 FROM alerts WHERE alert_id=?1 AND ended_ms IS NULL)";
+
+/// What the alerts' push hints (session-v1 R9.9) still have to
+/// look at, in memory for one run of the store: an alert raised in it is
+/// handed to the hints once its row is committed (durable before
+/// visible), and one that ended stops its hints. Alerts raised before the
+/// store opened get no hint: a broker restart ends the resends, as it ends
+/// the approvals' (R9.9), and `alert_list` still lists them. Nothing is
+/// read while nothing was raised or ended, so an idle pass costs no query.
+#[derive(Debug, Default)]
+pub struct HintWatch {
+    /// An alert was raised or ended since the last look (perhaps in a
+    /// transaction that rolled back: the look reads committed rows only).
+    changed: Cell<bool>,
+    /// Alerts up to this `seq` were looked at: the counter when the store
+    /// opened, then at each look.
+    through: Cell<u64>,
+}
+
+impl HintWatch {
+    /// The watch of a store just opened: alerts raised from now on.
+    pub(crate) fn open(db: &Connection) -> Result<Self> {
+        let through: Option<u64> = db
+            .query_row("SELECT seq FROM alert_seq WHERE id=1", [], |r| r.get(0))
+            .optional()?;
+        Ok(Self {
+            changed: Cell::new(false),
+            through: Cell::new(through.unwrap_or(0)),
+        })
+    }
+}
+
+/// What changed for the alerts' push hints since the last look.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AlertChanges {
+    /// Alerts raised since, still unresolved, in the host's order.
+    pub raised: Vec<Alert>,
+    /// Of the alerts whose hints are tracked, those no longer unresolved.
+    pub ended: Vec<String>,
+}
 
 /// Why [`Store::alert_page`] gives no page.
 #[derive(Debug)]
@@ -144,6 +197,7 @@ impl Store {
         if !checked.valid() {
             bail!("task {}: no valid alert for it", task.task.task_id);
         }
+        self.hints.changed.set(true);
         tx.execute(
             "INSERT INTO alerts(alert_id,seq,task_id,session_id,sender,reason,created_ms)
             VALUES(?1,?2,?3,?4,?5,?6,?7)",
@@ -164,10 +218,62 @@ impl Store {
     /// transaction that resolves the task or moves it on): it is no longer
     /// listed or counted, and its row stays. Whether one ended.
     pub fn end_alert(&self, tx: &Connection, task_id: &str) -> Result<bool> {
-        Ok(tx.execute(
+        let ended = tx.execute(
             "UPDATE alerts SET ended_ms=?2 WHERE task_id=?1 AND ended_ms IS NULL",
             params![task_id, host_now().wall_ms],
-        )? == 1)
+        )? == 1;
+        if ended {
+            self.hints.changed.set(true);
+        }
+        Ok(ended)
+    }
+
+    /// What the alerts' push hints have to know since the last look
+    /// ([`HintWatch`]): the alerts raised since, still unresolved, and which
+    /// of `tracked` (the alerts whose hints wait for the relay) ended.
+    /// Nothing is read unless an alert was raised or ended since. Committed
+    /// rows only: a raise in a transaction that rolled back shows nothing.
+    /// After a failed read the next look tries again.
+    pub fn alert_changes(&self, tracked: &[String]) -> Result<AlertChanges> {
+        if !self.hints.changed.get() {
+            return Ok(AlertChanges::default());
+        }
+        let host_id = self.bound()?.map(|h| h.atem_device_id).unwrap_or_default();
+        let counter: u64 = self
+            .db
+            .query_row("SELECT seq FROM alert_seq WHERE id=1", [], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0);
+        let mut q = self.db.prepare(UNRESOLVED_AFTER)?;
+        let raised = q
+            .query_map([self.hints.through.get()], |r| {
+                Ok(Alert {
+                    alert_id: r.get(0)?,
+                    seq: r.get(1)?,
+                    kind: AlertKind::OutcomeUnknown,
+                    host_id: host_id.clone(),
+                    session_id: r.get(2)?,
+                    task_id: r.get(3)?,
+                    sender: r.get(4)?,
+                    reason: r.get(5)?,
+                    created_at: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut ended = Vec::new();
+        for id in tracked {
+            let live: bool = self.db.query_row(STILL_UNRESOLVED, [id], |r| r.get(0))?;
+            if !live {
+                ended.push(id.clone());
+            }
+        }
+        let through = raised
+            .iter()
+            .map(|a| a.seq)
+            .fold(counter.max(self.hints.through.get()), u64::max);
+        self.hints.through.set(through);
+        self.hints.changed.set(false);
+        Ok(AlertChanges { raised, ended })
     }
 
     /// Keeps the alert of the task `record` in step with the record being

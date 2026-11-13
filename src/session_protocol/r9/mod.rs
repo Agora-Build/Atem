@@ -2358,6 +2358,48 @@ impl R9Host {
             .resolved(approval_id, &reason, signer_of(&parts.list), wall);
     }
 
+    /// An alert was raised (host-work-v1 §11.3; the bridge hands it over
+    /// once its row is committed, so it is durable before any hint shows
+    /// it): its `outcome_unknown` hints, one per native member holding
+    /// `control` at the head, the task, session, sender and the alert's own
+    /// reason sealed to each (R9.9). Only with `host.alerts` on (no host
+    /// sends one while the feature is off: R9.9 "Compatibility"), and never
+    /// while push is suppressed (`push_suppressed`).
+    pub fn alert_opened<J: Journal>(
+        &mut self,
+        alert: &atem_client::session::alerts::Alert,
+        parts: &mut Parts<'_, J>,
+    ) {
+        if !self.alerts {
+            return;
+        }
+        self.push.suppress(push_suppressed(parts));
+        let wall = parts.now.host.wall_ms;
+        let Some(key) = alert_push_key(&parts.list, &alert.alert_id) else {
+            return;
+        };
+        let plain = atem_client::push::AlertPlain {
+            task_id: alert.task_id.clone(),
+            session_id: alert.session_id.clone(),
+            sender: alert.sender.clone(),
+            reason: alert.reason.clone(),
+        };
+        self.push
+            .alert_opened(key, alert.created_at, &plain, signer_of(&parts.list), wall);
+    }
+
+    /// An alert ended (its task resolved, or a reply moved it): its hints
+    /// are not sent again (an alert has no resolved hint, R9.9).
+    pub fn alert_ended(&mut self, alert_id: &str) {
+        self.push.alert_ended(alert_id);
+    }
+
+    /// The alerts whose hints still wait for the relay (what the bridge
+    /// asks the store about: one that ended stops its hints).
+    pub fn hinted_alerts(&self) -> Vec<String> {
+        self.push.alert_ids()
+    }
+
     /// A relay message on Atem's link (`{"type":"relay",…}`): a `push_ack`
     /// ends the resends of what it names.
     pub fn relay_message(&mut self, text: &str) {
@@ -3020,6 +3062,22 @@ fn approval_key(
         &request.session_id,
         &request.process_gen,
         &request.approval_id,
+    ))
+}
+
+/// An alert's push identity on this host (R9.9, "`outcome_unknown` hint"):
+/// the pinned list's account and genesis, this host and its trust
+/// generation, the alert's id.
+fn alert_push_key(list: &DeviceList<'_>, alert_id: &str) -> Option<atem_client::push::AlertKey> {
+    let DeviceList::Open { m, .. } = list else {
+        return None;
+    };
+    let pin = m.pin_of();
+    Some(atem_client::push::AlertKey::new(
+        m.membership(),
+        &pin.host_id,
+        pin.host_trust_gen,
+        alert_id,
     ))
 }
 

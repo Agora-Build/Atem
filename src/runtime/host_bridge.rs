@@ -1852,6 +1852,9 @@ impl HostBridge {
         if !adopting {
             self.work_pass(&mut cx);
         }
+        // §R9.9: the alerts committed by now get their `outcome_unknown`
+        // hints before this pass's relay flush (`host.alerts` only).
+        self.alert_hint_pass();
         self.drain_remote(&mut cx);
         self.view_pause_pass(&cx);
         self.frames(&mut cx);

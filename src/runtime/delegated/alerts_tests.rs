@@ -6,9 +6,11 @@
 // and a viewer. Included beside the dispatch's and the lifecycle's tests,
 // whose helpers and imports it shares.
 
-/// `host.delegated` and `host.alerts` on, as the hook turns them on.
+/// `host.delegated` and `host.alerts` on, as the hook turns them on (and
+/// on the r9 side, as the runtime's `work_config` hands them over).
 fn alerts_on(rig: &mut LocalRig) {
     rig.bridge.features = HostFeatures::parse("host.delegated,host.alerts").unwrap();
+    rig.bridge.r9.set_delegated_features(true, true);
 }
 
 /// `alert_list` (after `after`), as `who`'s channel hands it to the bridge.
@@ -585,5 +587,211 @@ fn two_fifty_six_refuse_every_remote_sender_not_local() {
             ask_req(&mut rig, &s.phone, &next),
             Ok(ResultBody::Work { .. })
         ));
+    });
+}
+
+// ── The push hints of alerts (Task 24; session-v1 R9.9) ──
+
+/// The relay link is up on the r9 side (the rig has no Astation link, so
+/// nothing is flushed to one: [`relay_out`] takes what waits).
+fn relay_up(rig: &mut LocalRig) {
+    rig.bridge.r9_call(|r9, parts| r9.link_up(1, parts));
+}
+
+/// What the r9 side would send the relay now.
+fn relay_out(rig: &mut LocalRig) -> Vec<Value> {
+    let mut out = Vec::new();
+    rig.bridge.r9.flush_relay(&mut |text| {
+        out.push(serde_json::from_str(&text).unwrap());
+        true
+    });
+    out
+}
+
+/// The `outcome_unknown` hints among `messages`, verified as a client does
+/// against `log`, the host's device list.
+fn alert_hints_in(log: &TestLog, messages: &[Value]) -> Vec<atem_client::push::AlertHint> {
+    messages
+        .iter()
+        .filter(|m| m["op"] == "push_hint")
+        .flat_map(|m| m["hints"].as_array().unwrap().clone())
+        .map(|h| {
+            let object = atem_client::SignedObject::parse(h.to_string().as_bytes()).unwrap();
+            atem_client::push::AlertHint::verify(
+                &object,
+                &log.log,
+                host_now().wall_ms,
+                atem_client::push::Verifier::Client,
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+/// Unacknowledged hints and seens waiting for the relay.
+fn hints_pending(rig: &LocalRig) -> usize {
+    rig.bridge.r9.push_status(host_now().wall_ms).pending
+}
+
+/// Design I.4.6 ("Transport"), host-work-v1 §11.3 ("The push hint"),
+/// session-v1 R9.9: the phone's task runs and its agent exits; the task
+/// becomes `outcome_unknown`, its alert is committed, and then the host
+/// sends one `outcome_unknown` hint per native member holding `control` (the
+/// Mac and the phone; never the viewer or the bot), signed with the host
+/// channel key, its identity the alert's, its `created_at` the alert's;
+/// each device opens its own sealed part: the task, the session, the sender
+/// and the alert's reason (the receipt's, `agent exited`), none of them in
+/// clear on the wire. Later passes send no other hint (a resend has the same
+/// bytes). A covered service's task gets its alert hinted to the same two.
+/// Once an alert ends (the owner resolves its task), its hints are no
+/// longer sent.
+#[test]
+fn outcome_unknown_raises_one_hint_per_native_control_member() {
+    use crate::session_protocol::membership::r9log::enc;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        alerts_on(&mut rig);
+        relay_up(&mut rig);
+        let task = phone_task(&mut rig, &s.phone, "HINT_EXITED", start + HOUR);
+        rig.until(|r| input(r).contains("HINT_EXITED")).await;
+        passes(&mut rig, 1);
+        assert!(relay_out(&mut rig).is_empty(), "nothing while it runs");
+        std::fs::write(rig.fake.join("exit"), "").unwrap();
+        rig.until(|r| settled(r, &task).0 == WorkState::OutcomeUnknown)
+            .await;
+        passes(&mut rig, 1);
+        let (alerts, _) = page_for(&mut rig, &s.phone, None);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        let alert = alerts[0].clone();
+        let out = relay_out(&mut rig);
+        assert_eq!(out.len(), 1, "{out:?}");
+        let text = out[0].to_string();
+        for clear in [
+            task.as_str(),
+            rig.sid.as_str(),
+            PHONE,
+            details::AGENT_EXITED,
+        ] {
+            assert!(!text.contains(clear), "{clear} in clear: {text}");
+        }
+        let hints = alert_hints_in(&s.log, &out);
+        let devices: Vec<&str> = hints.iter().map(|h| h.device_id()).collect();
+        assert_eq!(devices, [MAC, "dev-phone"]);
+        let key = atem_client::push::AlertKey::new(&s.log.log, "host", 1, &alert.alert_id);
+        let facts = atem_client::push::AlertPlain {
+            task_id: task.clone(),
+            session_id: rig.sid.to_string(),
+            sender: PHONE.into(),
+            reason: details::AGENT_EXITED.into(),
+        };
+        for h in &hints {
+            assert_eq!(h.key(), &key);
+            assert_eq!(h.created_at(), alert.created_at);
+            assert_eq!(
+                h.expires_at(),
+                alert.created_at + atem_client::push::MAX_HINT_LIFETIME_MS
+            );
+            assert_eq!(
+                h.open(&s.log.keys, &enc(h.device_id()), h.device_id())
+                    .unwrap(),
+                facts
+            );
+        }
+        assert_eq!(hints_pending(&rig), 2);
+        // More passes and a rewrite of the task: no other hint (a resend, if
+        // one fell due, has the first one's bytes).
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        store.save_work(&stored_record(&rig, &task)).unwrap();
+        passes(&mut rig, 3);
+        let sent: Vec<Value> = out[0]["hints"].as_array().unwrap().clone();
+        for m in relay_out(&mut rig) {
+            for h in m["hints"].as_array().unwrap() {
+                assert!(sent.contains(h), "a new hint: {h}");
+            }
+        }
+        assert_eq!(hints_pending(&rig), 2);
+        // A covered service's task: hinted to the Mac and the phone, never
+        // to the bot.
+        let template = stored_record(&rig, &task);
+        let bot_task = unknown_outcomes(&rig, &template, BOT, 1).remove(0);
+        passes(&mut rig, 1);
+        let out = relay_out(&mut rig);
+        let hints: Vec<_> = alert_hints_in(&s.log, &out)
+            .into_iter()
+            .filter(|h| h.key().alert_id != alert.alert_id)
+            .collect();
+        let devices: Vec<&str> = hints.iter().map(|h| h.device_id()).collect();
+        assert_eq!(devices, [MAC, "dev-phone"]);
+        let opened = hints[1]
+            .open(&s.log.keys, &enc("dev-phone"), "dev-phone")
+            .unwrap();
+        assert_eq!((opened.sender.as_str(), opened.task_id), (BOT, bot_task));
+        assert_eq!(hints_pending(&rig), 4);
+        // The owner resolves the phone's task: its alert ends, and so do
+        // its hints' resends; the bot's go on.
+        let (req, reply) = resolve_by(&mut rig, &s.mac, &task, &failure("resolved by the owner"));
+        assert_eq!(resolved_status(&req, reply).state, WorkState::Failed);
+        passes(&mut rig, 1);
+        assert_eq!(hints_pending(&rig), 2);
+        assert!(
+            rig.bridge
+                .r9
+                .hinted_alerts()
+                .iter()
+                .all(|a| *a != alert.alert_id)
+        );
+    });
+}
+
+/// Step 4's constraints (hook off = main; `host.alerts`, session-v1 R9.9
+/// "Compatibility"): with `host.delegated` on and `host.alerts` off, a
+/// delegated task's unknown outcome keeps its alert (internal state) but
+/// nothing is hinted, even handed to the engine directly; with the hook off
+/// entirely a task's unknown outcome raises no alert and sends nothing.
+#[test]
+fn no_hint_without_host_alerts() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        // `host.delegated` alone, on the r9 side too (as `work_config`
+        // hands the hook's features over).
+        rig.bridge.r9.set_delegated_features(true, false);
+        relay_up(&mut rig);
+        let tasks = phone_unknowns(&mut rig, &s, 2, start + HOUR);
+        passes(&mut rig, 2);
+        assert_eq!(alert_rows(&rig).len(), 2, "the alerts are kept");
+        assert!(relay_out(&mut rig).is_empty());
+        assert_eq!(hints_pending(&rig), 0);
+        // Handed to the engine itself: `host.alerts` is off there too.
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let (alerts, _) = store.alert_page(None, 64).unwrap();
+        assert_eq!(alerts.len(), 2);
+        rig.bridge
+            .r9_call(|r9, parts| r9.alert_opened(&alerts[0], parts));
+        assert!(relay_out(&mut rig).is_empty());
+        assert_eq!(hints_pending(&rig), 0);
+        // The hook off (main): a task of unknown outcome raises nothing and
+        // sends nothing.
+        rig.bridge.features = HostFeatures::default();
+        let template = stored_record(&rig, &tasks[0]);
+        let mut v1 = template.clone();
+        v1.delegated = None;
+        let id = uuid::Uuid::new_v4().to_string();
+        v1.task.task_id = id.clone();
+        v1.status.task_id = id;
+        v1.status.state = WorkState::Queued;
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        assert!(store.enqueue(&v1).unwrap());
+        v1.status.state = WorkState::OutcomeUnknown;
+        store.save_work(&v1).unwrap();
+        passes(&mut rig, 2);
+        assert_eq!(alert_rows(&rig).len(), 2);
+        assert!(relay_out(&mut rig).is_empty());
+        assert_eq!(hints_pending(&rig), 0);
     });
 }
