@@ -686,13 +686,20 @@ pub struct HostControls {
     pub own: Option<String>,
     pub open: std::collections::BTreeSet<String>,
     pub standings: std::collections::BTreeMap<String, crate::runtime::delegated::SenderStanding>,
+    /// The device-list part of the `open` origins' gates is the host's own
+    /// fetch's (design I.5.8); otherwise the stand-in opens their whole
+    /// gate.
+    pub device_list_from_fetch: bool,
 }
 
 #[cfg(debug_assertions)]
 impl HostControls {
     /// The hook's file: `{"own"?: origin, "open"?: [origin…], "standings"?:
     /// {principal: {"coverage"?: {"origin", "feed_id"}, "revoked"?: id,
-    /// "held"?: bool}}}`, no other field.
+    /// "held"?: bool}}, "device_list_from_fetch"?: bool}`, no other field.
+    /// `open` opens those origins' whole gate, or with
+    /// `device_list_from_fetch` their feed part only, the device-list part
+    /// then the host's own fetch's.
     pub fn parse(text: &str) -> Result<HostControls, String> {
         use crate::runtime::delegated::{FeedRef, SenderStanding};
         use std::collections::{BTreeMap, BTreeSet};
@@ -705,6 +712,8 @@ impl HostControls {
             open: BTreeSet<String>,
             #[serde(default)]
             standings: BTreeMap<String, Standing>,
+            #[serde(default)]
+            device_list_from_fetch: bool,
         }
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -720,6 +729,7 @@ impl HostControls {
         Ok(HostControls {
             own: file.own,
             open: file.open,
+            device_list_from_fetch: file.device_list_from_fetch,
             standings: file
                 .standings
                 .into_iter()

@@ -303,6 +303,16 @@ pub struct CarriageResult {
 }
 
 impl CarriageResult {
+    /// The `seq` of the deferred entry this carriage stopped at (design
+    /// I.4.3; §R9.3 step 2), if its evaluation stopped at one.
+    pub fn deferred_at(&self) -> Option<u64> {
+        let eval = self.evaluation.as_ref()?;
+        match eval.stop.as_ref()? {
+            Stop::Deferred { index, .. } => eval.carried.get(*index).map(|entry| entry.seq),
+            _ => None,
+        }
+    }
+
     fn plain(carried: Carried) -> Self {
         CarriageResult {
             carried,
@@ -967,8 +977,8 @@ impl MembershipHost {
     /// Where the host's last carriage stopped at a deferred entry, while
     /// the wait it depends on lasts and no later carriage committed past it
     /// (design I.4.3, "Deferred entries"): every unstarted delegated remote
-    /// task waits meanwhile. The start view reads it in `list_state`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// task waits meanwhile. The start view reads it in `list_state`, the
+    /// host's own fetch at every pass.
     pub fn deferred_stop(&self) -> Option<DeferredStop> {
         self.deferred
     }
