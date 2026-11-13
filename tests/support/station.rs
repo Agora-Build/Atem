@@ -6,7 +6,9 @@
 //! the host sends is read by its strict reader, from the bytes the host
 //! sent; the fake writes no wire JSON of its own.
 //!
-//! The test drives it, nothing runs in the background. Make it before the
+//! The test drives it: the `FakeStation` itself runs nothing in the
+//! background ([`Pump`] puts it online on a thread of its own, when a test
+//! asks). Make it before the
 //! runtime starts (it takes the host's calls from then on:
 //! [`FakeAstation::station_calls`]), then [`FakeStation::serve`] the
 //! host's link: on a link it hasn't served it announces `heads` (as on

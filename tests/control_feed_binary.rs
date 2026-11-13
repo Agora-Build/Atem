@@ -16,7 +16,7 @@
 #![cfg(target_os = "linux")]
 mod support;
 
-use atem_client::connect::{Attached, Event as ClientEvent, Identity};
+use atem_client::connect::{Event as ClientEvent, Identity};
 use atem_client::control::relay::MAX_RELAY_MESSAGE_BYTES;
 use atem_client::control::{
     CallRefused, ControlAction, ControlSync, ControlSyncResult, FeedEntry, MembershipFetch,
@@ -25,7 +25,6 @@ use atem_client::control::{
 use atem_client::membership::ServiceScope;
 use serde_json::{Value, json};
 use std::cell::Cell;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
@@ -33,8 +32,13 @@ use std::time::{Duration, Instant};
 use support::astation::{
     ASTATION, AuthReply, Event, FakeAstation, RelayEvent, Reply, write_verified_pairing,
 };
+use support::delegated::WAIT;
+use support::delegated::{
+    Dev, HostIds, HostRig, complete_turn, enqueue, enqueue_data, host_db, hosting_toml, in_turn,
+    never_ran, private, record, replace, stored, task, wait_stored,
+};
 use support::host_clock::HostClock;
-use support::r9::{Out, Router, client_ms, write_pin};
+use support::r9::{Router, write_pin};
 use support::r9log::{self, MAC, TestLog, auth, secret};
 use support::station::{FakeStation, OTHER_ACCOUNT, Pump, StaleFeed};
 use support::{Sandbox, within};
@@ -48,8 +52,6 @@ const SVC: &str = "svc-work";
 /// The local link's relay setting (refused: the link is Astation's
 /// `:8080`); the selected Station's origin is this, normalized.
 const NO_RELAY: &str = "http://127.0.0.1:1";
-/// The longest a "wait until" helper waits; it only bounds a failure.
-const WAIT: Duration = Duration::from_secs(60);
 const MIN: u64 = 60_000;
 const HOUR: u64 = 60 * MIN;
 /// What a delegated task waits with while its sender's gate is closed.
@@ -68,6 +70,11 @@ const CONTRADICTS: &str =
     "Station sent a page that contradicts its call (a record at or below the position asked after)";
 /// The stored control state that doesn't read (`HostBridge::feeds_status`).
 const DAMAGED: &str = "the stored control state doesn't read; no delegated task starts. Restore ";
+/// The host the clients name.
+const IDS: HostIds = HostIds {
+    account: ACCOUNT,
+    host: HOST,
+};
 
 /// How the host reaches its Station.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,23 +95,6 @@ impl Via {
             Via::Routed => "routed",
         }
     }
-}
-
-fn uuid() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
-fn private(path: &Path, text: &str) {
-    std::fs::write(path, text).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
-}
-
-/// `text` into `path`, renamed into place (a runtime reading it never sees
-/// half of it).
-fn replace(path: &Path, text: &str) {
-    let tmp = path.with_extension("tmp");
-    private(&tmp, text);
-    std::fs::rename(&tmp, path).unwrap();
 }
 
 struct Rig {
@@ -171,9 +161,14 @@ impl Rig {
             &env_file,
             &json!({"CLAUDE_CLI_BIN": bin, "FAKE_DIR": fake}).to_string(),
         );
+        let principals = [
+            format!("member:{MAC}"),
+            format!("member:{PHONE}"),
+            format!("service:{SVC}"),
+        ];
         private(
             &sandbox.config().join("runtime.toml"),
-            &hosting_toml(&sandbox.home, &env_file),
+            &hosting_toml(&sandbox.home, &env_file, &principals),
         );
         let head = log.log.head();
         let head = json!({"seq": head.seq, "hash": head.hash.to_hex()});
@@ -528,12 +523,16 @@ impl Rig {
         last
     }
 
+    /// `atem status` has no `Control feeds:` line (the hook off: as main).
+    fn status_feeds_absent(&self) {
+        let (out, err, _) = self.sandbox.atem(&["status"]);
+        assert!(out.contains("Local agents:"), "{out}{err}");
+        assert!(!out.contains("Control feeds:"), "{out}");
+    }
+
     /// The host-work store (`runtime/host-work.sqlite`).
     fn db(&self) -> rusqlite::Connection {
-        let db = rusqlite::Connection::open(self.sandbox.config().join("runtime/host-work.sqlite"))
-            .unwrap();
-        db.busy_timeout(Duration::from_secs(5)).unwrap();
-        db
+        host_db(self)
     }
 
     /// `principal`'s stored control part (`control_principals`).
@@ -642,6 +641,16 @@ struct Unmoved {
     resets: Vec<(String, String)>,
 }
 
+impl HostRig for Rig {
+    fn config_dir(&self) -> PathBuf {
+        self.sandbox.config()
+    }
+
+    fn fake_dir(&self) -> PathBuf {
+        self.fake.clone()
+    }
+}
+
 impl Drop for Rig {
     fn drop(&mut self) {
         drop(self.pump.get_mut().unwrap().take());
@@ -651,36 +660,6 @@ impl Drop for Rig {
             let _ = child.wait();
         }
     }
-}
-
-/// `runtime.toml` with agent hosting on: the profile `backend` (the fake
-/// Claude, its environment from `env_file`) and its route of the same
-/// name, for the Mac, the phone and [`SVC`].
-fn hosting_toml(home: &Path, env_file: &Path) -> String {
-    let principals = format!(r#"["member:{MAC}", "member:{PHONE}", "service:{SVC}"]"#);
-    format!(
-        r#"
-version = 1
-enabled = true
-[[profiles]]
-id = "backend"
-revision = 1
-label = "Backend"
-provider = "claude"
-cwd = {cwd:?}
-project = "local:home"
-principals = {principals}
-env_names = ["CLAUDE_CLI_BIN", "FAKE_DIR"]
-env_file = {env_file:?}
-[[routes]]
-id = "backend"
-revision = 1
-profile_id = "backend"
-principals = {principals}
-"#,
-        cwd = home.to_str().unwrap(),
-        env_file = env_file.to_str().unwrap()
-    )
 }
 
 /// The head `seq` of the device list pinned in `config`, as written.
@@ -721,143 +700,6 @@ fn reauthenticate(rig: &Rig, n: u8) {
 
 // ── r9 clients and their tasks ──
 
-fn host() -> Value {
-    json!({"account_id":ACCOUNT,"atem_device_id":HOST,"host_trust_gen":1})
-}
-
-/// An r9 client of the host.
-struct Dev {
-    handle: String,
-    a: Attached,
-    backlog: Vec<Value>,
-}
-
-impl Dev {
-    fn new(r: &mut Router, log: &TestLog, id: &str, service: bool) -> Dev {
-        let identity = if service {
-            Identity::service(id, auth(id))
-        } else {
-            Identity::native(id, auth(id))
-        };
-        let handle = uuid();
-        let a = r
-            .connect(&handle, log, HOST, &identity)
-            .unwrap_or_else(|e| panic!("admission failed: {e:?}"));
-        Dev {
-            handle,
-            a,
-            backlog: Vec::new(),
-        }
-    }
-
-    fn request(&mut self, r: &mut Router, data: Value) -> Value {
-        let id = self.send(r, data);
-        self.wait(r, |v| v["re"] == id.as_str())
-    }
-
-    /// Sends a session request; its id.
-    fn send(&mut self, r: &mut Router, mut data: Value) -> String {
-        let id = uuid();
-        data["v"] = json!(1);
-        data["id"] = json!(id);
-        let frame = self
-            .a
-            .send(&json!({"type":"session","data":data}), client_ms())
-            .unwrap();
-        r.frame(&self.handle, &frame);
-        id
-    }
-
-    /// The first message (in the backlog, or arriving) `matches` takes.
-    fn wait(&mut self, r: &mut Router, matches: impl Fn(&Value) -> bool) -> Value {
-        let deadline = Instant::now() + WAIT;
-        loop {
-            if let Some(at) = self.backlog.iter().position(&matches) {
-                return self.backlog.remove(at);
-            }
-            assert!(
-                Instant::now() < deadline,
-                "nothing matched in time: {:?}",
-                self.backlog
-            );
-            match r.next(&self.handle) {
-                Out::Close(reason) => panic!("channel closed: {reason:?}"),
-                Out::Frame(frame) => {
-                    for e in self.a.on_frame(&frame, client_ms()).unwrap() {
-                        let value = match e {
-                            ClientEvent::Family(f) => f.data,
-                            ClientEvent::Session(m) => Some(
-                                atem_client::session::wire::to_value(
-                                    &atem_client::session::wire::Envelope::Session(m),
-                                )["data"]
-                                    .clone(),
-                            ),
-                            ClientEvent::Error(e) => Some(
-                                serde_json::from_slice::<Value>(&e.to_bytes()).unwrap()["data"]
-                                    .clone(),
-                            ),
-                            _ => None,
-                        };
-                        if let Some(v) = value {
-                            self.backlog.push(v);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// The client goes: its channel closed.
-    fn close(self, r: &mut Router) {
-        r.close(&self.handle);
-    }
-
-    /// A session it launches on profile `backend`: its `launch` (session
-    /// id and process generation).
-    fn session(&mut self, r: &mut Router) -> Value {
-        let rid = uuid();
-        let launch = self.request(
-            r,
-            json!({"op":"host_launch","host":host(),"request_id":rid,
-                "profile_id":"backend","profile_revision":1,
-                "expires_at":r9log::host_now().wall_ms + 60_000}),
-        );
-        assert!(launch["result"].is_object(), "{launch}");
-        let deadline = Instant::now() + WAIT;
-        loop {
-            let value = self.request(
-                r,
-                json!({"op":"host_launch_query","host":host(),"request_id":rid}),
-            );
-            if value["result"]["launch"]["state"] == "started" {
-                return value["result"]["launch"].clone();
-            }
-            assert!(Instant::now() < deadline, "launch failed: {value}");
-            std::thread::sleep(Duration::from_millis(40));
-        }
-    }
-}
-
-/// A task of `text` for `launch`'s session, its deadline `ms` from now.
-fn task(launch: &Value, text: &str, ms: u64) -> Value {
-    let mut target = host();
-    target["session_id"] = launch["session_id"].clone();
-    target["process_gen"] = launch["process_gen"].clone();
-    json!({"task_id":uuid(),"workflow_id":uuid(),"target":target,
-        "expires_at":r9log::host_now().wall_ms + ms,"prompt":text,"context":[]})
-}
-
-fn enqueue_data(task: &Value) -> Value {
-    json!({"op":"work_enqueue","host":host(),"route_id":"backend","route_revision":1,"task":task})
-}
-
-/// `dev` enqueues `task`: the reply's `work`.
-fn enqueue(dev: &mut Dev, r: &mut Router, task: &Value) -> Value {
-    let reply = dev.request(r, enqueue_data(task));
-    assert!(reply["result"]["work"].is_object(), "{reply}");
-    reply["result"]["work"].clone()
-}
-
 /// Whether the store holds task `tid`.
 fn stored_at_all(rig: &Rig, tid: &Value) -> bool {
     rig.db()
@@ -870,89 +712,9 @@ fn stored_at_all(rig: &Rig, tid: &Value) -> bool {
         > 0
 }
 
-/// Task `tid`'s record as `runtime/host-work.sqlite` stores it.
-fn record(rig: &Rig, tid: &Value) -> Value {
-    let record: String = rig
-        .db()
-        .query_row(
-            "SELECT record FROM work WHERE id=?1",
-            [tid.as_str().unwrap()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    serde_json::from_str(&record).unwrap()
-}
-
-/// Task `tid`'s status as stored.
-fn stored(rig: &Rig, tid: &Value) -> Value {
-    record(rig, tid)["status"].clone()
-}
-
-#[track_caller]
-fn wait_stored(rig: &Rig, tid: &Value, state: &str, detail: &str) {
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let status = stored(rig, tid);
-        if status["state"] == state && status["detail"] == detail {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "expected {state} ({detail}): {status}"
-        );
-        std::thread::sleep(Duration::from_millis(40));
-    }
-}
-
-/// Task `tid`'s attempts: (id, end), in order.
-fn attempts(rig: &Rig, tid: &Value) -> Vec<(String, Option<String>)> {
-    let db = rig.db();
-    let mut q = db
-        .prepare(r#"SELECT attempt_id,"end" FROM attempts WHERE task_id=?1 ORDER BY n"#)
-        .unwrap();
-    q.query_map([tid.as_str().unwrap()], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect()
-}
-
 /// Task `tid`'s admission record (`None`: v1).
 fn admission(rig: &Rig, tid: &Value) -> Value {
     record(rig, tid)["delegated"].clone()
-}
-
-/// What the agent of the rig's sessions was given, in order.
-fn input(rig: &Rig) -> String {
-    std::fs::read_to_string(rig.fake.join("input")).unwrap_or_default()
-}
-
-/// Task `tid` (of prompt `text`) is in its agent's turn.
-#[track_caller]
-fn in_turn(rig: &Rig, tid: &Value, text: &str) {
-    within("the task's prompt", || input(rig).contains(text));
-    wait_stored(rig, tid, "submitted", "in the agent's turn");
-}
-
-/// The rig's agent ends its turn: task `tid` awaits its result.
-#[track_caller]
-fn complete_turn(rig: &Rig, tid: &Value) {
-    std::fs::write(rig.fake.join("complete"), "").unwrap();
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let status = stored(rig, tid);
-        if status["state"] == "awaiting_result" {
-            return;
-        }
-        assert!(Instant::now() < deadline, "the turn never ended: {status}");
-        std::thread::sleep(Duration::from_millis(40));
-    }
-}
-
-/// Task `tid` never ran: no attempt, its prompt never written.
-#[track_caller]
-fn never_ran(rig: &Rig, tid: &Value, text: &str) {
-    assert!(attempts(rig, tid).is_empty(), "{:?}", attempts(rig, tid));
-    assert!(!input(rig).contains(text));
 }
 
 // ── The host's own device-list fetch (Task 30) ──
@@ -1217,15 +979,31 @@ fn no_station_call_without_host_delegated() {
         assert_eq!(rig.head(), 3);
         assert!(rig.dump()["station"].is_null(), "no Station state");
         rig.status_feeds_absent();
-    }
-}
-
-impl Rig {
-    /// `atem status` has no `Control feeds:` line (the hook off: as main).
-    fn status_feeds_absent(&self) {
-        let (out, err, _) = self.sandbox.atem(&["status"]);
-        assert!(out.contains("Local agents:"), "{out}{err}");
-        assert!(!out.contains("Control feeds:"), "{out}");
+        // No new table, row or log line (Task 34 review m1): the store has
+        // no control table and no delegated clock, and runtime.log no line
+        // of the Station link's.
+        let db = rig.db();
+        let tables: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name LIKE 'control%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0, "{via:?}: no control tables");
+        let rows: i64 = db
+            .query_row("SELECT count(*) FROM clock", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "{via:?}: no clock row");
+        let log = rig.runtime_log();
+        for line in [
+            "Station",
+            "control feed",
+            "control_sync",
+            "membership_fetch",
+        ] {
+            assert!(!log.contains(line), "{via:?}: {line:?} in {log}");
+        }
     }
 }
 
@@ -1238,8 +1016,11 @@ impl Rig {
 /// feed named as the vectors name it): the first read of a feed it never
 /// read (`after: 0`), a continuation (`after: 2`), and the read from 0
 /// after the Station rolled the feed back under the same `feed_id` (§11.4
-/// "Resets": `after: 0`, the same `feed_id`), unpaced once its mark is
-/// written. The vectors' origin is the dev Station's, never contacted
+/// "Resets": `after: 0`, the same `feed_id`). Only the calls' bytes are
+/// pinned here: that the read from 0 goes unpaced once its mark is written
+/// is pinned by `sync_tests` (the host clock can't be frozen here, so a
+/// call held back by the 1 s pace would still arrive within the wait). The
+/// vectors' origin is the dev Station's, never contacted
 /// here: the host's own (the rig's relay setting) takes its place, every
 /// other byte the vectors'. `control_sync_without_feed_id` is a call the
 /// host never makes (it names the announced feed, §11.4 "Only the
@@ -1299,7 +1080,8 @@ fn the_hosts_station_calls_match_the_goldens() {
     rig.clock.add_mono(1_000);
     rig.announce();
     rig.serve_until("the feed read to 3", |rig| rig.cursor() == Some(3));
-    // Rolled back under the same feed_id: read again from 0, at once.
+    // Rolled back under the same feed_id: read again from 0 (unpaced, as
+    // `sync_tests` pins; here only its bytes).
     rig.station().truncate(1);
     rig.announce();
     rig.serve_until("the read from 0", |rig| {
@@ -1347,15 +1129,15 @@ fn a_remote_task_waits_revocations_not_yet_checked_until_the_gate_opens() {
     let mut r = Router::on(&rig.astation, rig.link());
     // No feed covers the service yet: v1, it launches the session and keeps
     // it busy.
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let busy = task(&launch, "GATE_BUSY", HOUR);
+    let busy = task(IDS, &launch, "GATE_BUSY", HOUR);
     enqueue(&mut svc, &mut r, &busy);
     assert!(admission(&rig, &busy["task_id"]).is_null(), "v1");
     in_turn(&rig, &busy["task_id"], "GATE_BUSY");
     // The phone's task (a native member: delegated); the phone goes.
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let native = task(&launch, "GATE_NATIVE", HOUR);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let native = task(IDS, &launch, "GATE_NATIVE", HOUR);
     enqueue(&mut phone, &mut r, &native);
     assert_eq!(
         admission(&rig, &native["task_id"])["principal"],
@@ -1394,7 +1176,7 @@ fn a_remote_task_waits_revocations_not_yet_checked_until_the_gate_opens() {
     // No heads for 60 s on the host's clock: the gate closes.
     rig.clock.add_mono(61_000);
     rig.until_feed("60 s without heads", |f| f["closed"] == NO_HEADS_60S);
-    let covered = task(&launch, "GATE_SERVICE", HOUR);
+    let covered = task(IDS, &launch, "GATE_SERVICE", HOUR);
     enqueue(&mut svc, &mut r, &covered);
     let admitted = admission(&rig, &covered["task_id"]);
     assert_eq!(
@@ -1433,7 +1215,7 @@ fn another_accounts_records_apply_nothing() {
     let rig = Rig::full(Via::Local);
     let mut r = Router::on(&rig.astation, rig.link());
     rig.cover_and_open();
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     let principal = format!("service:{SVC}");
     let part = rig.part(&principal).expect("the cover's part");
@@ -1489,7 +1271,7 @@ fn another_accounts_records_apply_nothing() {
             .exists()
     );
     // The gate stays closed: the service's task waits, never cancelled.
-    let t = task(&launch, "OTHER_ACCOUNT_REVOKE", HOUR);
+    let t = task(IDS, &launch, "OTHER_ACCOUNT_REVOKE", HOUR);
     enqueue(&mut svc, &mut r, &t);
     wait_stored(&rig, &t["task_id"], "blocked", GATE_CLOSED);
     assert!(!rig.gate_open());
@@ -1630,10 +1412,10 @@ fn a_routed_host_syncs_the_feed_and_opens_the_gate() {
     assert_eq!(station["link"]["origin"], rig.origin(), "{station}");
     assert_eq!(rig.cursor(), Some(1));
     rig.status_feeds(&format!("revocations checked ({})", rig.origin()));
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let first = task(&launch, "ROUTED_FIRST", HOUR);
-    let second = task(&launch, "ROUTED_SECOND", HOUR);
+    let first = task(IDS, &launch, "ROUTED_FIRST", HOUR);
+    let second = task(IDS, &launch, "ROUTED_SECOND", HOUR);
     for t in [&first, &second] {
         enqueue(&mut svc, &mut r, t);
         assert_eq!(
@@ -1677,7 +1459,7 @@ fn a_station_clock_a_year_ahead_closes_the_gate_alerts_once_and_expires_nothing(
     let rig = Rig::full(Via::Local);
     let mut r = Router::on(&rig.astation, rig.link());
     rig.cover_and_open();
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     let floor = rig.floor_offset();
     let wall = r9log::host_now().wall_ms;
@@ -1691,7 +1473,7 @@ fn a_station_clock_a_year_ahead_closes_the_gate_alerts_once_and_expires_nothing(
     rig.announce();
     rig.until_feed("the clock beyond the cap", |f| f["closed"] == CLOCK_AHEAD);
     assert!(rig.floor_offset() <= floor, "the floor doesn't move");
-    let t = task(&launch, "A_YEAR_AHEAD", HOUR);
+    let t = task(IDS, &launch, "A_YEAR_AHEAD", HOUR);
     enqueue(&mut svc, &mut r, &t);
     wait_stored(&rig, &t["task_id"], "blocked", GATE_CLOSED);
     // A page a year ahead: its record applies; and heads again.
@@ -1761,14 +1543,14 @@ fn restored_from_backup(mode: StaleFeed) {
     let link = rig.link();
     let mut r = Router::on(&rig.astation, link);
     rig.cover_and_open();
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     // A hold: the service's task waits, paused.
     rig.append(SVC, ControlAction::Hold);
     rig.clock.add_mono(1_000);
     rig.announce();
     rig.serve_until("the hold read", |rig| rig.cursor() == Some(2));
-    let held_task = task(&launch, "HELD_THROUGH_THE_RESTORE", HOUR);
+    let held_task = task(IDS, &launch, "HELD_THROUGH_THE_RESTORE", HOUR);
     enqueue(&mut svc, &mut r, &held_task);
     wait_stored(&rig, &held_task["task_id"], "blocked", PAUSED);
     // A record more: the host's call for it in flight when the Station is
@@ -1855,7 +1637,7 @@ fn rolled_back_across_a_crash() {
         let link = rig.link();
         let mut r = Router::on(&rig.astation, link);
         rig.cover_and_open();
-        let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+        let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
         let launch = svc.session(&mut r);
         rig.append(SVC, ControlAction::Hold);
         rig.append(SVC, ControlAction::Release);
@@ -1874,7 +1656,7 @@ fn rolled_back_across_a_crash() {
         };
         assert_eq!(call.call(), Ok(ToStation::ControlSync(rig.sync(0))));
         assert_eq!(rig.reset_marks(), [(NO_RELAY.to_string(), String::new())]);
-        t = task(&launch, "AFTER_THE_ROLLBACK", HOUR);
+        t = task(IDS, &launch, "AFTER_THE_ROLLBACK", HOUR);
         enqueue(&mut svc, &mut r, &t);
         wait_stored(&rig, &t["task_id"], "blocked", GATE_CLOSED);
         // Killed with its read from 0 unanswered.
@@ -1937,7 +1719,7 @@ fn a_damaged_control_part_keeps_a_services_requests_busy_until_repaired() {
     let launch = {
         let mut r = Router::on(&rig.astation, rig.link());
         rig.cover_and_open();
-        let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+        let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
         svc.session(&mut r)
     };
     let part = rig.part(&principal).expect("the cover's part");
@@ -1951,9 +1733,9 @@ fn a_damaged_control_part_keeps_a_services_requests_busy_until_repaired() {
                 .contains("the stored control state doesn't read")
         });
         rig.announce();
-        let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
-        let t = task(&launch, "WHILE_DAMAGED", HOUR);
-        let reply = svc.request(&mut r, enqueue_data(&t));
+        let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+        let t = task(IDS, &launch, "WHILE_DAMAGED", HOUR);
+        let reply = svc.request(&mut r, enqueue_data(IDS, &t));
         assert_eq!(reply["code"], "busy", "{reply}");
         assert!(!stored_at_all(&rig, &t["task_id"]), "nothing stored");
         let line = rig.status_feeds(DAMAGED);
@@ -1967,8 +1749,8 @@ fn a_damaged_control_part_keeps_a_services_requests_busy_until_repaired() {
     rig.start_again();
     let mut r = Router::on(&rig.astation, rig.link());
     rig.open_gate();
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
-    let t = task(&launch, "AFTER_THE_REPAIR", HOUR);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    let t = task(IDS, &launch, "AFTER_THE_REPAIR", HOUR);
     enqueue(&mut svc, &mut r, &t);
     let admitted = admission(&rig, &t["task_id"]);
     assert_eq!(admitted["principal"], principal, "{admitted}");
@@ -2131,7 +1913,7 @@ fn a_reauthentication_mid_read_never_reads_past_a_revoke() {
         let link = rig.link();
         let mut r = Router::on(&rig.astation, link);
         rig.cover_and_open();
-        let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+        let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
         let launch = svc.session(&mut r);
         for n in 0..128 {
             rig.append(&format!("svc-filler-{n}"), ControlAction::Cover);
@@ -2153,7 +1935,7 @@ fn a_reauthentication_mid_read_never_reads_past_a_revoke() {
         rig.station().answer_held(first).unwrap();
         let owed = rig.station().hold_call(link);
         assert_eq!(owed.call(), Ok(ToStation::ControlSync(rig.sync(65))));
-        let t = task(&launch, "PAST_THE_REVOKE", HOUR);
+        let t = task(IDS, &launch, "PAST_THE_REVOKE", HOUR);
         enqueue(&mut svc, &mut r, &t);
         wait_stored(&rig, &t["task_id"], "blocked", GATE_CLOSED);
         // Re-authenticated mid-read; the new generation's heads ask nothing.
@@ -2183,7 +1965,7 @@ fn a_reauthentication_mid_read_never_reads_past_a_revoke() {
         let link = rig.link();
         let mut r = Router::on(&rig.astation, link);
         rig.cover_and_open();
-        let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+        let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
         let launch = svc.session(&mut r);
         rig.append("svc-other", ControlAction::Cover);
         rig.append("svc-third", ControlAction::Cover);
@@ -2199,7 +1981,7 @@ fn a_reauthentication_mid_read_never_reads_past_a_revoke() {
             station.hold_call(link)
         };
         assert_eq!(owed.call(), Ok(ToStation::ControlSync(rig.sync(3))));
-        let t = task(&launch, "PAST_THE_ROLLBACK", HOUR);
+        let t = task(IDS, &launch, "PAST_THE_ROLLBACK", HOUR);
         enqueue(&mut svc, &mut r, &t);
         wait_stored(&rig, &t["task_id"], "blocked", GATE_CLOSED);
         // The Station rolls back to 1; re-authenticated (the service's
@@ -2252,7 +2034,7 @@ fn a_page_contradicting_its_call_applies_nothing_and_keeps_the_gate_closed() {
     let link = rig.link();
     let mut r = Router::on(&rig.astation, link);
     rig.cover_and_open();
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     let principal = format!("service:{SVC}");
     let covered = rig.part(&principal).unwrap();
@@ -2300,7 +2082,7 @@ fn a_page_contradicting_its_call_applies_nothing_and_keeps_the_gate_closed() {
     within("the fault alert", || {
         rig.runtime_log().contains(CONTRADICTS)
     });
-    let t = task(&launch, "BEHIND_A_FAULT", HOUR);
+    let t = task(IDS, &launch, "BEHIND_A_FAULT", HOUR);
     enqueue(&mut svc, &mut r, &t);
     wait_stored(&rig, &t["task_id"], "blocked", GATE_CLOSED);
     // Past the pause: asked again, the revoke applies.

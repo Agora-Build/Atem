@@ -10,24 +10,25 @@
 #![cfg(target_os = "linux")]
 mod support;
 
-use atem_client::connect::{Attached, Event, Identity};
+use atem_client::connect::Identity;
 use atem_client::control::{ControlAction, MembershipFetch, RelayError, ToStation};
 use atem_client::membership::ServiceScope;
 use serde_json::{Value, json};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use support::astation::{FakeAstation, write_verified_pairing};
+use support::delegated::{
+    Dev, HostIds, HostRig, WAIT, attempts, complete_turn, enqueue, enqueue_data, hosting_toml,
+    in_turn, input, private, record, replace, stored, task, task_until, uuid, wait_stored,
+};
 use support::host_clock::HostClock;
-use support::r9::{Out, Router, client_ms, write_pin};
+use support::r9::{Router, write_pin};
 use support::r9log::{self, MAC, TestLog, auth, secret};
 use support::station::{FakeStation, Pump};
 use support::{Sandbox, within};
 
-/// The longest a "wait until" helper waits; it only bounds a failure.
-const WAIT: Duration = Duration::from_secs(60);
 const HOST: &str = "host-delegated";
 const ACCOUNT: &str = "acct-delegated";
 /// A native member holding `control`: a delegated sender.
@@ -49,23 +50,11 @@ const HOUR: u64 = 60 * MIN;
 /// What a delegated task waits with while its sender's gate is closed.
 const GATE_CLOSED: &str = "revocations not yet checked";
 const BEHIND: &str = "waiting for an earlier task on this session";
-
-fn uuid() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
-fn private(path: &Path, text: &str) {
-    std::fs::write(path, text).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
-}
-
-/// `text` into `path`, renamed into place (a runtime reading it never
-/// sees half of it).
-fn replace(path: &Path, text: &str) {
-    let tmp = path.with_extension("tmp");
-    private(&tmp, text);
-    std::fs::rename(&tmp, path).unwrap();
-}
+/// The host the clients name.
+const IDS: HostIds = HostIds {
+    account: ACCOUNT,
+    host: HOST,
+};
 
 struct Rig {
     sandbox: Sandbox,
@@ -117,31 +106,13 @@ impl Rig {
             &env_file,
             &json!({"CLAUDE_CLI_BIN": bin, "FAKE_DIR": fake}).to_string(),
         );
-        let principals =
-            format!(r#"["member:{MAC}", "member:{PHONE}", "service:{SVC}", "browser:{GRANT}"]"#);
-        let mut toml = format!(
-            r#"
-version = 1
-enabled = true
-[[profiles]]
-id = "backend"
-revision = 1
-label = "Backend"
-provider = "claude"
-cwd = {cwd:?}
-project = "local:home"
-principals = {principals}
-env_names = ["CLAUDE_CLI_BIN", "FAKE_DIR"]
-env_file = {env_file:?}
-[[routes]]
-id = "backend"
-revision = 1
-profile_id = "backend"
-principals = {principals}
-"#,
-            cwd = sandbox.home.to_str().unwrap(),
-            env_file = env_file.to_str().unwrap()
-        );
+        let principals = [
+            format!("member:{MAC}"),
+            format!("member:{PHONE}"),
+            format!("service:{SVC}"),
+            format!("browser:{GRANT}"),
+        ];
+        let mut toml = hosting_toml(&sandbox.home, &env_file, &principals);
         if collab {
             toml.push_str(
                 "[[routes]]\nid = \"peer\"\nrevision = 1\nprofile_id = \"backend\"\n\
@@ -304,6 +275,16 @@ principals = {principals}
     }
 }
 
+impl HostRig for Rig {
+    fn config_dir(&self) -> PathBuf {
+        self.sandbox.config()
+    }
+
+    fn fake_dir(&self) -> PathBuf {
+        self.fake.clone()
+    }
+}
+
 impl Drop for Rig {
     fn drop(&mut self) {
         drop(self.pump.get_mut().unwrap().take());
@@ -315,203 +296,8 @@ impl Drop for Rig {
     }
 }
 
-/// An r9 client of the host.
-struct Dev {
-    handle: String,
-    a: Attached,
-    backlog: Vec<Value>,
-}
-
-impl Dev {
-    fn new(r: &mut Router, log: &TestLog, id: &str, service: bool) -> Dev {
-        Dev::new_via(r, "relay", log, id, service)
-    }
-
-    /// Admitted on a channel the router labels `transport` (`relay`, or
-    /// `direct`: Astation's :8080 on the local network).
-    fn new_via(r: &mut Router, transport: &str, log: &TestLog, id: &str, service: bool) -> Dev {
-        let identity = if service {
-            Identity::service(id, auth(id))
-        } else {
-            Identity::native(id, auth(id))
-        };
-        Dev::admitted(r, transport, log, &identity)
-    }
-
-    fn admitted(r: &mut Router, transport: &str, log: &TestLog, identity: &Identity) -> Dev {
-        let handle = uuid();
-        let a = r
-            .connect_via(&handle, transport, log, HOST, identity)
-            .unwrap_or_else(|e| panic!("admission failed: {e:?}"));
-        Dev {
-            handle,
-            a,
-            backlog: Vec::new(),
-        }
-    }
-
-    fn request(&mut self, r: &mut Router, data: Value) -> Value {
-        let id = self.send(r, data);
-        self.wait(r, |v| v["re"] == id.as_str())
-    }
-
-    /// Sends a session request; its id.
-    fn send(&mut self, r: &mut Router, mut data: Value) -> String {
-        let id = uuid();
-        data["v"] = json!(1);
-        data["id"] = json!(id);
-        let frame = self
-            .a
-            .send(&json!({"type":"session","data":data}), client_ms())
-            .unwrap();
-        r.frame(&self.handle, &frame);
-        id
-    }
-
-    /// The first message (in the backlog, or arriving) `matches` takes.
-    fn wait(&mut self, r: &mut Router, matches: impl Fn(&Value) -> bool) -> Value {
-        let deadline = Instant::now() + WAIT;
-        loop {
-            if let Some(at) = self.backlog.iter().position(&matches) {
-                return self.backlog.remove(at);
-            }
-            assert!(
-                Instant::now() < deadline,
-                "nothing matched in time: {:?}",
-                self.backlog
-            );
-            match r.next(&self.handle) {
-                Out::Close(reason) => panic!("channel closed: {reason:?}"),
-                Out::Frame(frame) => {
-                    for e in self.a.on_frame(&frame, client_ms()).unwrap() {
-                        let value = match e {
-                            Event::Family(f) => f.data,
-                            Event::Session(m) => Some(
-                                atem_client::session::wire::to_value(
-                                    &atem_client::session::wire::Envelope::Session(m),
-                                )["data"]
-                                    .clone(),
-                            ),
-                            Event::Error(e) => Some(
-                                serde_json::from_slice::<Value>(&e.to_bytes()).unwrap()["data"]
-                                    .clone(),
-                            ),
-                            _ => None,
-                        };
-                        if let Some(v) = value {
-                            self.backlog.push(v);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// The read binding of `sid` (after `list`).
-    fn read(&self, sid: &str) -> Value {
-        json!({"target": self.a.target(sid).expect("listed"),
-               "attachment_gen": self.a.welcome().attachment_gen})
-    }
-
-    /// Lists the sessions until `sid` is among them.
-    fn list(&mut self, r: &mut Router, sid: &str) {
-        let deadline = Instant::now() + WAIT;
-        loop {
-            self.send(r, json!({"op":"list"}));
-            let sessions = self.wait(r, |v| v["op"] == "sessions");
-            if sessions["sessions"]
-                .as_array()
-                .is_some_and(|all| all.iter().any(|d| d["session_id"] == sid))
-            {
-                return;
-            }
-            assert!(Instant::now() < deadline, "{sid} never listed: {sessions}");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    /// The client goes: its channel closed.
-    fn close(self, r: &mut Router) {
-        r.close(&self.handle);
-    }
-
-    /// A session it launches on profile `backend`: its `launch` (session
-    /// id and process generation).
-    fn session(&mut self, r: &mut Router) -> Value {
-        let rid = uuid();
-        let launch = self.request(
-            r,
-            json!({"op":"host_launch","host":host(),"request_id":rid,
-                "profile_id":"backend","profile_revision":1,
-                "expires_at":r9log::host_now().wall_ms + 60_000}),
-        );
-        assert!(launch["result"].is_object(), "{launch}");
-        let deadline = Instant::now() + WAIT;
-        loop {
-            let value = self.request(
-                r,
-                json!({"op":"host_launch_query","host":host(),"request_id":rid}),
-            );
-            if value["result"]["launch"]["state"] == "started" {
-                return value["result"]["launch"].clone();
-            }
-            assert!(Instant::now() < deadline, "launch failed: {value}");
-            std::thread::sleep(Duration::from_millis(40));
-        }
-    }
-
-    /// Carries `entries` on its channel (the `membership` op) and waits for
-    /// the host's head in answer.
-    fn carry(&mut self, r: &mut Router, entries: &[Value]) {
-        let signed: Vec<_> = entries
-            .iter()
-            .map(|e| atem_client::SignedObject::parse(e.to_string().as_bytes()).unwrap())
-            .collect();
-        let (id, frame) = self.a.send_membership(&signed, client_ms()).unwrap();
-        r.frame(&self.handle, &frame);
-        loop {
-            let Out::Frame(frame) = r.next(&self.handle) else {
-                panic!("membership channel closed");
-            };
-            let events = self.a.on_frame(&frame, client_ms()).unwrap();
-            if events
-                .iter()
-                .any(|e| matches!(e, Event::MembershipHead { re: Some(re), .. } if re == &id))
-            {
-                return;
-            }
-        }
-    }
-}
-
 fn host() -> Value {
-    json!({"account_id":ACCOUNT,"atem_device_id":HOST,"host_trust_gen":1})
-}
-
-/// A task of `text` for `launch`'s session, its deadline at host time
-/// `expires_at`.
-fn task_until(launch: &Value, text: &str, expires_at: u64) -> Value {
-    let mut target = host();
-    target["session_id"] = launch["session_id"].clone();
-    target["process_gen"] = launch["process_gen"].clone();
-    json!({"task_id":uuid(),"workflow_id":uuid(),"target":target,"expires_at":expires_at,
-        "prompt":text,"context":[]})
-}
-
-/// [`task_until`], its deadline `ms` from now.
-fn task(launch: &Value, text: &str, ms: u64) -> Value {
-    task_until(launch, text, r9log::host_now().wall_ms + ms)
-}
-
-fn enqueue_data(task: &Value) -> Value {
-    json!({"op":"work_enqueue","host":host(),"route_id":"backend","route_revision":1,"task":task})
-}
-
-/// `dev` enqueues `task`: the reply's `work`.
-fn enqueue(dev: &mut Dev, r: &mut Router, task: &Value) -> Value {
-    let reply = dev.request(r, enqueue_data(task));
-    assert!(reply["result"]["work"].is_object(), "{reply}");
-    reply["result"]["work"].clone()
+    IDS.json()
 }
 
 fn work(dev: &mut Dev, r: &mut Router, tid: &Value) -> Value {
@@ -522,55 +308,6 @@ fn reply_query(dev: &mut Dev, r: &mut Router, tid: &Value) -> Value {
     dev.request(r, json!({"op":"reply_query","host":host(),"task_id":tid}))
 }
 
-/// Task `tid`'s record as `runtime/host-work.sqlite` stores it.
-fn record(rig: &Rig, tid: &Value) -> Value {
-    let db =
-        rusqlite::Connection::open(rig.sandbox.config().join("runtime/host-work.sqlite")).unwrap();
-    db.busy_timeout(Duration::from_secs(5)).unwrap();
-    let record: String = db
-        .query_row(
-            "SELECT record FROM work WHERE id=?1",
-            [tid.as_str().unwrap()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    serde_json::from_str(&record).unwrap()
-}
-
-/// Task `tid`'s status as stored (whatever its sender may read).
-fn stored(rig: &Rig, tid: &Value) -> Value {
-    record(rig, tid)["status"].clone()
-}
-
-fn wait_stored(rig: &Rig, tid: &Value, state: &str, detail: &str) {
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let status = stored(rig, tid);
-        if status["state"] == state && status["detail"] == detail {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "expected {state} ({detail}): {status}"
-        );
-        std::thread::sleep(Duration::from_millis(40));
-    }
-}
-
-/// Task `tid`'s attempts: (id, end), in order.
-fn attempts(rig: &Rig, tid: &Value) -> Vec<(String, Option<String>)> {
-    let db =
-        rusqlite::Connection::open(rig.sandbox.config().join("runtime/host-work.sqlite")).unwrap();
-    db.busy_timeout(Duration::from_secs(5)).unwrap();
-    let mut q = db
-        .prepare(r#"SELECT attempt_id,"end" FROM attempts WHERE task_id=?1 ORDER BY n"#)
-        .unwrap();
-    q.query_map([tid.as_str().unwrap()], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect()
-}
-
 /// The ends of task `tid`'s attempts, in order.
 fn ends(rig: &Rig, tid: &Value) -> Vec<Option<String>> {
     attempts(rig, tid).into_iter().map(|(_, end)| end).collect()
@@ -578,32 +315,6 @@ fn ends(rig: &Rig, tid: &Value) -> Vec<Option<String>> {
 
 fn delegated(rig: &Rig, tid: &Value) -> bool {
     record(rig, tid)["delegated"].is_object()
-}
-
-/// What the agent of the rig's sessions was given, in order.
-fn input(rig: &Rig) -> String {
-    std::fs::read_to_string(rig.fake.join("input")).unwrap_or_default()
-}
-
-/// Task `tid` (of prompt `text`) is in its agent's turn: pasted once, the
-/// turn its prompt became stored.
-fn in_turn(rig: &Rig, tid: &Value, text: &str) {
-    within("the task's prompt", || input(rig).contains(text));
-    wait_stored(rig, tid, "submitted", "in the agent's turn");
-}
-
-/// The rig's agent ends its turn: task `tid` awaits its result.
-fn complete_turn(rig: &Rig, tid: &Value) {
-    std::fs::write(rig.fake.join("complete"), "").unwrap();
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let status = stored(rig, tid);
-        if status["state"] == "awaiting_result" {
-            return;
-        }
-        assert!(Instant::now() < deadline, "the turn never ended: {status}");
-        std::thread::sleep(Duration::from_millis(40));
-    }
 }
 
 /// `argv` run by the fake agent of `fake` as its own child (`run-<n>.json`).
@@ -647,11 +358,11 @@ fn sender_disconnects_and_later_reads_both_replies() {
     rig.start();
     let mut r = Router::new(&rig.astation);
     rig.station_online(false);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let first = task(&launch, "OFFLINE_FIRST", HOUR);
-    let second = task(&launch, "OFFLINE_SECOND", HOUR);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let first = task(IDS, &launch, "OFFLINE_FIRST", HOUR);
+    let second = task(IDS, &launch, "OFFLINE_SECOND", HOUR);
     for t in [&first, &second] {
         assert_eq!(enqueue(&mut phone, &mut r, t)["state"], "queued");
         assert!(delegated(&rig, &t["task_id"]), "a delegated task");
@@ -665,7 +376,7 @@ fn sender_disconnects_and_later_reads_both_replies() {
     reply(&rig, 2, "ANSWER_SECOND");
     complete_turn(&rig, &second["task_id"]);
     // Later, the phone reads both.
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
     for (t, answer) in [(&first, "ANSWER_FIRST"), (&second, "ANSWER_SECOND")] {
         let status = work(&mut phone, &mut r, &t["task_id"]);
         assert_eq!(
@@ -701,10 +412,10 @@ fn an_expired_grants_task_still_runs_and_nothing_runs_twice() {
     rig.start();
     let mut r = Router::new(&rig.astation);
     rig.station_online(true);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let first = task(&launch, "EXPIRY_FIRST", 2 * HOUR);
-    let second = task(&launch, "EXPIRY_SECOND", 2 * HOUR);
+    let first = task(IDS, &launch, "EXPIRY_FIRST", 2 * HOUR);
+    let second = task(IDS, &launch, "EXPIRY_SECOND", 2 * HOUR);
     for t in [&first, &second] {
         enqueue(&mut svc, &mut r, t);
         let admission = record(&rig, &t["task_id"])["delegated"].clone();
@@ -735,11 +446,11 @@ fn an_expired_grants_task_still_runs_and_nothing_runs_twice() {
         ("unauthorized".to_string(), Some("expired".to_string()))
     );
     // The Mac renews it.
-    let mut mac = Dev::new(&mut r, &rig.log, MAC, false);
+    let mut mac = Dev::new(&mut r, IDS, &rig.log, MAC, false);
     let until = rig.clock().wall() + 3 * HOUR;
     let renewal = rig.log.renew_service(SVC, until);
     mac.carry(&mut r, &[renewal]);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     for (t, answer) in [(&first, "ANSWER_FIRST"), (&second, "ANSWER_SECOND")] {
         let status = work(&mut svc, &mut r, &t["task_id"]);
         assert_eq!(
@@ -772,10 +483,10 @@ fn browser_and_uncovered_service_keep_v1() {
     rig.with_clock();
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     // The session is busy with a task of the service's.
-    let busy = task(&launch, "V1_BUSY", 2 * HOUR);
+    let busy = task(IDS, &launch, "V1_BUSY", 2 * HOUR);
     enqueue(&mut svc, &mut r, &busy);
     in_turn(&rig, &busy["task_id"], "V1_BUSY");
     let wall = rig.clock().wall();
@@ -792,11 +503,12 @@ fn browser_and_uncovered_service_keep_v1() {
     let mut browser = Dev::admitted(
         &mut r,
         "relay",
+        IDS,
         &rig.log,
         &Identity::browser(grant, key).unwrap(),
     );
-    let from_svc = task(&launch, "V1_SERVICE", 2 * HOUR);
-    let from_browser = task(&launch, "V1_BROWSER", 2 * HOUR);
+    let from_svc = task(IDS, &launch, "V1_SERVICE", 2 * HOUR);
+    let from_browser = task(IDS, &launch, "V1_BROWSER", 2 * HOUR);
     enqueue(&mut svc, &mut r, &from_svc);
     enqueue(&mut browser, &mut r, &from_browser);
     for t in [&busy, &from_svc, &from_browser] {
@@ -903,13 +615,13 @@ fn local_tasks_never_wait_for_a_gate() {
     let mut rig = Rig::prepared(4 * HOUR, true);
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let busy = task(&launch, "GATE_BUSY", HOUR);
+    let busy = task(IDS, &launch, "GATE_BUSY", HOUR);
     enqueue(&mut svc, &mut r, &busy);
     in_turn(&rig, &busy["task_id"], "GATE_BUSY");
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let gated = task(&launch, "GATE_PHONE", HOUR);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let gated = task(IDS, &launch, "GATE_PHONE", HOUR);
     enqueue(&mut phone, &mut r, &gated);
     assert!(delegated(&rig, &gated["task_id"]));
     phone.close(&mut r);
@@ -996,18 +708,18 @@ fn a_freeze_at_the_start_fails_the_attempt() {
     rig.start();
     let mut r = Router::new(&rig.astation);
     rig.station_online(false);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     let sid = launch["session_id"].as_str().unwrap().to_string();
-    let mut mac = Dev::new(&mut r, &rig.log, MAC, false);
+    let mut mac = Dev::new(&mut r, IDS, &rig.log, MAC, false);
     mac.list(&mut r, &sid);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
     let hold_host_work = rig.faults().join("hold_host_work");
     let hold_dispatch = rig.faults().join("hold_dispatch");
     private(&hold_host_work, "");
     private(&hold_dispatch, "");
     two_passes(&rig);
-    let held = task(&launch, "FROZEN_AT_START", HOUR);
+    let held = task(IDS, &launch, "FROZEN_AT_START", HOUR);
     assert_eq!(enqueue(&mut phone, &mut r, &held)["state"], "queued");
     // The Mac's prompt is accepted first; the Mac gives the lease back.
     let accepted = mac.request(
@@ -1106,12 +818,12 @@ fn native_on_a_lan_runs_after_its_carriage() {
     let mut rig = Rig::prepared(4 * HOUR, false);
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new_via(&mut r, "direct", &rig.log, SVC, true);
+    let mut svc = Dev::new_via(&mut r, "direct", IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     // The phone's list is a head ahead of the host's.
     rig.log.add_native("dev-tablet", &["view"]);
-    let mut phone = Dev::new_via(&mut r, "direct", &rig.log, PHONE, false);
-    let first = task(&launch, "LAN_FIRST", HOUR);
+    let mut phone = Dev::new_via(&mut r, "direct", IDS, &rig.log, PHONE, false);
+    let first = task(IDS, &launch, "LAN_FIRST", HOUR);
     enqueue(&mut phone, &mut r, &first);
     in_turn(&rig, &first["task_id"], "LAN_FIRST");
     complete_turn(&rig, &first["task_id"]);
@@ -1131,7 +843,7 @@ fn native_on_a_lan_runs_after_its_carriage() {
         .object()
         .to_json();
     phone.carry(&mut r, &[recovery, deferred]);
-    let second = task(&launch, "LAN_SECOND", HOUR);
+    let second = task(IDS, &launch, "LAN_SECOND", HOUR);
     enqueue(&mut phone, &mut r, &second);
     wait_stored(
         &rig,
@@ -1147,7 +859,7 @@ fn native_on_a_lan_runs_after_its_carriage() {
             target: recovery_hash,
         },
     );
-    let mut mac = Dev::new_via(&mut r, "direct", &rig.log, MAC, false);
+    let mut mac = Dev::new_via(&mut r, "direct", IDS, &rig.log, MAC, false);
     mac.carry(&mut r, std::slice::from_ref(&approve));
     wait_stored(&rig, &second["task_id"], "blocked", GATE_CLOSED);
     assert!(!input(&rig).contains("LAN_SECOND"));
@@ -1178,13 +890,13 @@ fn clock_set_back_never_runs_an_expired_task() {
     rig.start();
     let mut r = Router::new(&rig.astation);
     rig.station_online(false);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
     let wall = rig.clock().wall();
-    let running = task_until(&launch, "BACK_RUNNING", wall + 3 * HOUR);
-    let soon = task_until(&launch, "BACK_SOON", wall + 10 * MIN);
-    let later = task_until(&launch, "BACK_LATER", wall + 20 * MIN);
+    let running = task_until(IDS, &launch, "BACK_RUNNING", wall + 3 * HOUR);
+    let soon = task_until(IDS, &launch, "BACK_SOON", wall + 10 * MIN);
+    let later = task_until(IDS, &launch, "BACK_LATER", wall + 20 * MIN);
     for t in [&running, &soon, &later] {
         enqueue(&mut phone, &mut r, t);
     }
@@ -1205,8 +917,8 @@ fn clock_set_back_never_runs_an_expired_task() {
     let mut r = Router::new(&rig.astation);
     wait_stored(&rig, &later["task_id"], "expired", EXPIRED);
     complete_turn(&rig, &running["task_id"]);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let next = task_until(&launch, "BACK_NEXT", rig.clock().wall() + 3 * HOUR);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let next = task_until(IDS, &launch, "BACK_NEXT", rig.clock().wall() + 3 * HOUR);
     enqueue(&mut phone, &mut r, &next);
     in_turn(&rig, &next["task_id"], "BACK_NEXT");
     let text = input(&rig);
@@ -1235,15 +947,15 @@ fn sigkill_after_attempt_commit_and_after_accepted_runs_once() {
     rig.start();
     let mut r = Router::new(&rig.astation);
     rig.station_online(false);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
 
     // Killed after the attempt's commit, before its submit.
     private(&rig.faults().join("crash_after_attempt_commit"), "");
-    let first = task(&launch, "KILLED_AT_COMMIT", HOUR);
+    let first = task(IDS, &launch, "KILLED_AT_COMMIT", HOUR);
     // Its reply may never be sent: the runtime dies in the same pass.
-    phone.send(&mut r, enqueue_data(&first));
+    phone.send(&mut r, enqueue_data(IDS, &first));
     drop((r, svc, phone));
     rig.died();
     let committed = attempts(&rig, &first["task_id"]);
@@ -1268,8 +980,8 @@ fn sigkill_after_attempt_commit_and_after_accepted_runs_once() {
 
     // Killed after the session `accepted` the attempt.
     private(&rig.faults().join("hold_dispatch"), "");
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let second = task(&launch, "KILLED_AFTER_ACCEPTED", HOUR);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let second = task(IDS, &launch, "KILLED_AFTER_ACCEPTED", HOUR);
     enqueue(&mut phone, &mut r, &second);
     let deadline = Instant::now() + WAIT;
     while !(stored(&rig, &second["task_id"])["state"] == "submitted"
@@ -1396,9 +1108,9 @@ fn a_fetch_stopping_at_a_deferred_entry_marks_device_list_update_pending() {
     rig.start();
     let mut r = Router::new(&rig.astation);
     let link = r.link;
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
     let pinned = list_head(&rig);
     // The Station's list: a pending recovery, then an entry its subject
     // signed.
@@ -1424,7 +1136,12 @@ fn a_fetch_stopping_at_a_deferred_entry_marks_device_list_update_pending() {
             .is_file()
     );
 
-    let t = task_until(&launch, "DEFERRED_BY_THE_FETCH", rig.clock().wall() + HOUR);
+    let t = task_until(
+        IDS,
+        &launch,
+        "DEFERRED_BY_THE_FETCH",
+        rig.clock().wall() + HOUR,
+    );
     enqueue(&mut phone, &mut r, &t);
     wait_stored(&rig, &t["task_id"], "blocked", "device list update pending");
 
@@ -1467,7 +1184,7 @@ fn the_deferral_ends_with_the_recovery_wait_and_tasks_are_checked_again() {
     rig.start();
     let mut r = Router::new(&rig.astation);
     let link = r.link;
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     let pinned = list_head(&rig);
     // The recovery reaches the host by its fetch: its wait starts now on
@@ -1499,12 +1216,12 @@ fn the_deferral_ends_with_the_recovery_wait_and_tasks_are_checked_again() {
     });
 
     // The phone's task and two of the Mac's, one due in two minutes.
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let mut mac = Dev::new(&mut r, &rig.log, MAC, false);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let mut mac = Dev::new(&mut r, IDS, &rig.log, MAC, false);
     let wall = rig.clock().wall();
-    let removed = task_until(&launch, "BY_THE_REMOVED_PHONE", wall + HOUR);
-    let runs = task_until(&launch, "BY_THE_MAC", wall + HOUR);
-    let due = task_until(&launch, "DUE_DURING_THE_WAIT", wall + 2 * MIN);
+    let removed = task_until(IDS, &launch, "BY_THE_REMOVED_PHONE", wall + HOUR);
+    let runs = task_until(IDS, &launch, "BY_THE_MAC", wall + HOUR);
+    let due = task_until(IDS, &launch, "DUE_DURING_THE_WAIT", wall + 2 * MIN);
     enqueue(&mut phone, &mut r, &removed);
     enqueue(&mut mac, &mut r, &runs);
     enqueue(&mut mac, &mut r, &due);
