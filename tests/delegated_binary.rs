@@ -17,14 +17,13 @@ use serde_json::{Value, json};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use support::astation::{FakeAstation, write_verified_pairing};
 use support::host_clock::HostClock;
 use support::r9::{Out, Router, client_ms, write_pin};
 use support::r9log::{self, MAC, TestLog, auth, secret};
-use support::station::FakeStation;
+use support::station::{FakeStation, Pump};
 use support::{Sandbox, within};
 
 /// The longest a "wait until" helper waits; it only bounds a failure.
@@ -85,7 +84,7 @@ struct Rig {
     /// The fake Station on the link ([`Rig::with_station`]).
     station: Option<Arc<Mutex<FakeStation>>>,
     /// The thread serving it while it is online ([`Rig::station_online`]).
-    pump: Mutex<Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>>,
+    pump: Mutex<Option<Pump>>,
 }
 
 impl Rig {
@@ -200,23 +199,7 @@ principals = {principals}
             station.silence_heads(false);
         }
         let station = self.station.clone().expect("the fake Station");
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = stop.clone();
-        let pump = std::thread::spawn(move || {
-            let mut last = Instant::now();
-            while !stopped.load(Ordering::SeqCst) {
-                {
-                    let mut station = station.lock().unwrap();
-                    station.serve_latest();
-                    if last.elapsed() >= Duration::from_secs(1) {
-                        station.heads_now();
-                        last = Instant::now();
-                    }
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        });
-        *self.pump.lock().unwrap() = Some((stop, pump));
+        *self.pump.lock().unwrap() = Some(Pump::start(station));
         self.gate_open();
     }
 
@@ -323,10 +306,7 @@ principals = {principals}
 
 impl Drop for Rig {
     fn drop(&mut self) {
-        if let Some((stop, pump)) = self.pump.get_mut().unwrap().take() {
-            stop.store(true, Ordering::SeqCst);
-            let _ = pump.join();
-        }
+        drop(self.pump.get_mut().unwrap().take());
         self.sandbox.track();
         if let Some(mut child) = self.runtime.take() {
             let _ = child.kill();
