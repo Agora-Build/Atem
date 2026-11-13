@@ -218,6 +218,12 @@ fn sender_authority(
     if !grant.allows(Need::Op(Op::Notify)) || !grant.allows(Need::Op(Op::Prompt)) {
         return Err(Refused::NotCovered);
     }
+    // Decided on the device list alone, like the ops above: before a
+    // comparison that may still be pending (PR 11), so it is never a `busy`
+    // that turns into `forbidden`.
+    if interrupt && !grant.allows(Need::Op(Op::Interrupt)) {
+        return Err(Refused::NoInterrupt);
+    }
     if !grant.session_in_scope(at.host_id, session_id, &projects) {
         // In scope if every comparison still pending matched: not yet
         // decided, never narrowed (as the start check's `waiting for
@@ -229,9 +235,6 @@ fn sender_authority(
         } else {
             Refused::NotCovered
         });
-    }
-    if interrupt && !grant.allows(Need::Op(Op::Interrupt)) {
-        return Err(Refused::NoInterrupt);
     }
     Ok(())
 }
@@ -734,6 +737,50 @@ mod tests {
             interrupter("service:svc-bot", &key(&log, "svc-bot"), &bot, S1, &at),
             Err(Refused::Revoked)
         );
+    }
+
+    /// PR 11 (PR 8's `interrupter` with PR 10's `ProjectPending`): a sender
+    /// asking `work_interrupt` without `interrupt` in its grant is refused
+    /// for good (`forbidden`) even while a `projects` comparison of its task
+    /// is still pending: the missing op is decided on the device list alone,
+    /// so it is checked before the comparison, as `notify` and `prompt` are,
+    /// never a `busy` that turns into `forbidden` once the hash is made. Its
+    /// other requests still wait for the comparison (`busy`).
+    #[test]
+    fn a_missing_interrupt_is_forbidden_before_a_pending_project() {
+        const ENTRY: &str =
+            "h1.0a0b0c0d.8888888888888888888888888888888888888888888888888888888888888888";
+        let mut log = log(later());
+        log.add_service_projects(
+            "svc-proj",
+            &[HOST],
+            Some(&[ENTRY]),
+            None,
+            &["message", "notify", "prompt", "view"],
+            later(),
+        );
+        let task = admitted(&log, "service:svc-proj");
+        let none = SenderStanding::default();
+        let at = Grounds {
+            list: &log.log,
+            standing: &none,
+            unchecked: false,
+            host_id: HOST,
+            now_ms: 0,
+            // The comparison can't be made yet (a hash not made).
+            projects: &|_| None,
+        };
+        let key = key(&log, "svc-proj");
+        assert_eq!(
+            interaction("service:svc-proj", &key, &task, S1, &at).map_err(Refused::code),
+            Err("busy"),
+            "its other requests wait"
+        );
+        assert_eq!(
+            interrupter("service:svc-proj", &key, &task, S1, &at),
+            Err(Refused::NoInterrupt)
+        );
+        assert_eq!(Refused::NoInterrupt.code(), "forbidden");
     }
 
     /// Task 20 review I1: the `projects` entries the task's project matched
