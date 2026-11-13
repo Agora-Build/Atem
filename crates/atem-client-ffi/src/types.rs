@@ -994,6 +994,58 @@ record! {
         /// verification, or it reuses a `record_id` of the same principal
         /// with another body (a stop still applies then; see `effects`).
         pub evidence: bool,
+        /// Why it is `pending` or `refused`, or kept as evidence: set
+        /// exactly then (a colliding record is `collision`, whatever its
+        /// result), `None` (JS `null`) for a record that counted without
+        /// question. The verifier's reason (`principal_unknown`,
+        /// `signer_unknown`, `revoke_not_in_list`; `wrong_account`,
+        /// `bad_signature`, `key_mismatch`, `signer_not_allowed`,
+        /// `removed_manager`, `host_key_signed`, `not_a_service`,
+        /// `not_a_revoke`), or the state's: `list_frozen`, `not_revoked`,
+        /// `revoke_not_applied`, `order`, `after_revoke`, `collision`,
+        /// `not_newer`, `possible_replay` (host-work-v1 §11.1).
+        pub why: Option<String>,
+    }
+}
+
+record! {
+    /// What a control state has in force for one principal
+    /// (`ControlStateHandle::standing`; I.5.5). A principal the state holds
+    /// nothing for has nothing in force.
+    pub struct ControlStanding {
+        /// A service's revocation: the `record_id` of the revoke that
+        /// revoked it. Always `None` for a host principal, whose
+        /// revocation is a device-list entry.
+        pub revoked: Option<String>,
+        /// The revocations whose interrupt a record put in force, as
+        /// `ControlHostAction::Interrupt` names them (a service's revoking
+        /// `record_id`, a host principal's `revoke_seq` in decimal), sorted
+        /// as text (`"10"` before `"9"`).
+        pub interrupted: Vec<String>,
+        /// A hold is in force.
+        pub held: bool,
+        /// The covering feed: its future tasks are delegated, under that
+        /// origin's gate. `None`: not covered.
+        pub coverage: Option<ControlCoverage>,
+    }
+}
+
+record! {
+    /// A covering feed: its Station's exact origin and current `feed_id`.
+    pub struct ControlCoverage {
+        pub origin: String,
+        pub feed_id: String,
+    }
+}
+
+record! {
+    /// One principal's part of a control state, as `ControlStateHandle::part`
+    /// writes it (canonical JSON), for a store that keeps one row per
+    /// principal (`control_state_from_parts`).
+    pub struct ControlStatePart {
+        /// `service:<id>` or `host:<host_id>`.
+        pub principal: String,
+        pub part_json: String,
     }
 }
 
@@ -1001,7 +1053,9 @@ record! {
     /// Where a record was read: its feed's Station `origin` and `feed_id`,
     /// and its position (`feed_seq`). None over a channel. A record counts
     /// as read at its own feed's position only when its body names the
-    /// same `origin` and `feed_id`.
+    /// same `origin` and `feed_id`. `origin` is always the Station origin
+    /// you sync the feed from (a host's own configured Station), never one
+    /// taken from a page or the record: that bounds a part's `order`.
     pub struct ControlFeedPos {
         pub origin: String,
         pub feed_id: String,

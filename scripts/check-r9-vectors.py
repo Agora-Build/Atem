@@ -702,6 +702,14 @@ def check_membership_log(file, data, report, context):
 # ------------------------------------------- r9-vectors-host-work-control
 
 LOG_L = ["E1", "E2", "E3", "E4", "E5", "E6"]
+# The most counted record ids a principal's part keeps (ControlState, decision 19).
+MAX_RECORD_IDS = 256
+# The control vectors' records by label, for the sequence checks.
+CONTROL_BY_LABEL = {}
+
+
+def by_label_of(label):
+    return CONTROL_BY_LABEL[label]
 
 
 def signer_key_in(replay, signer):
@@ -806,6 +814,70 @@ def check_host_work_control(file, data, report, context):
             if "parse_error" in vector:
                 case.check(True, f"refused at parse ({vector['parse_error']}; not derived here)")
 
+    CONTROL_BY_LABEL.clear()
+    CONTROL_BY_LABEL.update(by_label)
+
+    def check_state(case, state, fill, what):
+        """A state (v2: one part per principal): its account, each part's
+        device list (the file's account and genesis), its records (one to
+        256 [record_id, digest, issued_at] triples, each id once, the
+        revocation's record and the coverage's cover among them), an
+        evicted floor only with the records full, one feed per origin in
+        `order`, and each record: the SHA-256 of a record body of that
+        principal with that id and its issued_at, or, for an id no record of
+        the file has, of the record `fill`'s body under that id."""
+        case.equal(state["v"], 2, f"{what}: v 2")
+        case.equal((state["account_id"], state["genesis_hash"]), (data["account_id"], data["genesis_hash"]), f"{what}: the account")
+        for principal, part in state["principals"].items():
+            case.equal((part["account_id"], part["genesis_hash"]), (data["account_id"], data["genesis_hash"]), f"{what} {principal}: its device list")
+            records = part["records"]
+            ids = [record[0] for record in records]
+            case.check(
+                1 <= len(records) <= MAX_RECORD_IDS and len(set(ids)) == len(ids) and all(len(r) == 3 for r in records),
+                f"{what} {principal}: 1 to {MAX_RECORD_IDS} [record_id, digest, issued_at], each id once",
+            )
+            for pin in [part.get("revoked_by"), part.get("coverage", {}).get("cover", {}).get("record_id")]:
+                case.check(pin is None or pin in ids, f"{what} {principal}: its revocation's and cover's records kept")
+            if "evicted_floor" in part:
+                case.equal(len(records), MAX_RECORD_IDS, f"{what} {principal}: an evicted floor, its records full")
+            case.check(all(len(feeds) == 1 for feeds in part.get("order", {}).values()), f"{what} {principal}: one feed per origin in order")
+            copies, wrong = 0, []
+            for record_id, digest, issued_at in records:
+                texts = jcs_by_record_id.get((principal, record_id), set())
+                if texts:
+                    bodies = {sha256(t.encode()).hex(): json.loads(t) for t in texts}
+                    case.check(
+                        digest in bodies and bodies[digest]["issued_at"] == issued_at,
+                        f"{what} {principal} {record_id[-4:]}: the SHA-256 and issued_at of a record body of that principal with that id",
+                    )
+                    continue
+                body = dict(by_label[fill]["record"]["body"]) if fill in by_label else {}
+                body["record_id"] = record_id
+                copies += 1
+                if body.get("principal") != principal or sha256(jcs(body).encode()).hex() != digest or body.get("issued_at") != issued_at:
+                    wrong.append(record_id)
+            if copies:
+                case.check(
+                    not wrong,
+                    f"{what} {principal}: {copies} ids no record of the file has, each the SHA-256 and issued_at of {fill}'s body under that id"
+                    + (f" (not: {', '.join(wrong)})" if wrong else ""),
+                )
+
+    def standing_of(state, principal):
+        """What the state's part of `principal` has in force, as a step's
+        `standing` writes it."""
+        part = state["principals"].get(principal, {})
+        if principal.startswith("host:"):
+            interrupted = sorted(str(seq) for seq in part.get("interrupted", []))
+        else:
+            interrupted = [part["revoked_by"]] if part.get("interrupted") else []
+        out = {"held": part.get("held", False), "interrupted": interrupted}
+        if "revoked_by" in part:
+            out["revoked"] = part["revoked_by"]
+        if "coverage" in part:
+            out["coverage"] = {"origin": part["coverage"]["origin"], "feed_id": part["coverage"]["feed_id"]}
+        return out
+
     for sequence in data["sequences"]:
         with report.case(file, sequence["label"]) as case:
             for step in sequence["steps"]:
@@ -814,15 +886,159 @@ def check_host_work_control(file, data, report, context):
                     pos = step["pos"]
                     case.equal(sorted(pos), ["feed_id", "feed_seq", "origin"], "a position {origin, feed_id, feed_seq}")
                     case.check((pos["origin"], pos["feed_id"]) in stations, "a position in a station's feed")
-            state = sequence["state"]
-            case.equal((state["account_id"], state["genesis_hash"]), (data["account_id"], data["genesis_hash"]), "the state's account")
-            for principal, digests in state["records"].items():
-                for record_id, digest in digests.items():
-                    texts = jcs_by_record_id.get((principal, record_id), set())
-                    case.check(
-                        digest in {sha256(t.encode()).hex() for t in texts},
-                        f"{principal} {record_id[-4:]}: the SHA-256 of a record body of that principal with that id",
-                    )
+                standing = step["standing"]
+                case.check(
+                    {"held", "interrupted"} <= set(standing) <= {"held", "interrupted", "revoked", "coverage"},
+                    "a standing {held, interrupted, revoked?, coverage?}",
+                )
+            fill = sequence.get("fill")
+            if "initial" in sequence:
+                case.check(fill in by_label, f"fill {fill} is a record of the file")
+                check_state(case, sequence["initial"], fill, "initial")
+                full = [len(part["records"]) for part in sequence["initial"]["principals"].values()]
+                case.check(MAX_RECORD_IDS in full, "initial: a principal's records full")
+            else:
+                case.check(fill is None, "no fill without an initial state")
+            check_state(case, sequence["state"], fill, "state")
+            last = sequence["steps"][-1]
+            principal = by_label[last["record"]]["record"]["body"]["principal"]
+            case.equal(last["standing"], standing_of(sequence["state"], principal), "the last step's standing is the state's")
+            check_why(case, sequence)
+            derive_bound(case, sequence)
+
+
+# Applied::why's codes (host-work-v1 §11.1), by what they explain.
+WHY_PENDING = {"principal_unknown", "signer_unknown", "revoke_not_in_list", "list_frozen", "not_revoked", "revoke_not_applied"}
+WHY_VERIFIER_REFUSED = {
+    "wrong_account", "bad_signature", "key_mismatch", "signer_not_allowed",
+    "removed_manager", "host_key_signed", "not_a_service", "not_a_revoke",
+}
+WHY_STATE_REFUSED = {"order", "after_revoke", "not_newer"}
+WHY_EVIDENCE = WHY_VERIFIER_REFUSED | {"collision", "possible_replay"}
+WHY_CODES = WHY_PENDING | WHY_VERIFIER_REFUSED | WHY_STATE_REFUSED | {"collision", "possible_replay"}
+
+
+def check_why(case, sequence):
+    """Each step's `expect.why`: one of the codes, present exactly when the
+    record is pending or refused or kept as evidence, and of the kind its
+    result says (pending: a wait; refused as evidence: the verifier's
+    reason, a collision or a possible replay; refused otherwise: order,
+    after a revoke, not newer, or a list of another account; counted as
+    evidence: a collision)."""
+    bad = []
+    for i, step in enumerate(sequence["steps"], 1):
+        expect = step["expect"]
+        result, evidence, why = expect["result"], expect["evidence"], expect.get("why")
+        explains = result in ("pending", "refused") or evidence
+        if (why is not None) != explains or (why is not None and why not in WHY_CODES):
+            bad.append(i)
+        elif result == "pending" and why not in WHY_PENDING:
+            bad.append(i)
+        elif result == "refused" and evidence and why not in WHY_EVIDENCE:
+            bad.append(i)
+        elif result == "refused" and not evidence and why not in WHY_STATE_REFUSED | {"wrong_account"}:
+            bad.append(i)
+        elif result in ("applied", "duplicate") and evidence and why != "collision":
+            bad.append(i)
+    case.check(
+        not bad,
+        "every step's why: a code of its kind, present exactly when pending, refused or evidence"
+        + (f" (not: steps {bad})" if bad else ""),
+    )
+
+
+def pins_of(part):
+    """The record ids a part never evicts: its revocation's, its cover's."""
+    return {part.get("revoked_by"), part.get("coverage", {}).get("cover", {}).get("record_id")} - {None}
+
+
+def derive_bound(case, sequence):
+    """The bound, derived from the file alone (no state machine): per
+    principal, the counted ids start as `initial`'s and gain each step's id
+    that counted (`applied` or `duplicate`, not evidence) and wasn't counted
+    yet, in step order; past MAX_RECORD_IDS the oldest id that isn't pinned
+    (the revocation's record, the coverage's cover, at the start or the
+    end) is evicted and raises the evicted floor to its issued_at. The final
+    records (in order) and `evicted_floor` must be what that gives, the
+    ids gone (initial + counted) - final, and a cover or release of a
+    principal not revoked, its id not counted then and issued no later than
+    the floor then, must be `refused` as evidence with `why`
+    `possible_replay`, and only those.
+
+    Its limits: the pins are static (the initial and final states'
+    revocation and cover records, not the ones in force at each step,
+    which only matters were a pin to change during an eviction), and it
+    takes each step's result as written: which records verification
+    refuses or keeps pending, and that a frozen list or a failed
+    verification comes before the floor, are outside it (the Rust runner
+    and the suites check those)."""
+    initial = sequence.get("initial", {}).get("principals", {})
+    final = sequence["state"]["principals"]
+    ids, issued, floor, revoked, pins, evicted = {}, {}, {}, {}, {}, {}
+
+    def start(principal):
+        part = initial.get(principal, {})
+        ids[principal] = [r[0] for r in part.get("records", [])]
+        for r in part.get("records", []):
+            issued[(principal, r[0])] = r[2]
+        floor[principal] = part.get("evicted_floor")
+        revoked[principal] = "revoked_by" in part
+        pins[principal] = pins_of(part) | pins_of(final.get(principal, {}))
+        evicted[principal] = []
+
+    for principal in set(initial) | set(final):
+        start(principal)
+    wrong = []
+    for i, step in enumerate(sequence["steps"], 1):
+        body = by_label_of(step["record"])["record"]["body"]
+        principal, rid, expect = body["principal"], body["record_id"], step["expect"]
+        if principal not in ids:
+            start(principal)
+        guarded = (
+            body["action"] in ("cover", "release")
+            and not revoked[principal]
+            and rid not in ids[principal]
+            and floor[principal] is not None
+            and body["issued_at"] <= floor[principal]
+        )
+        replay = expect.get("why") == "possible_replay"
+        if guarded != replay or (guarded and (expect["result"], expect["evidence"]) != ("refused", True)):
+            wrong.append(i)
+        counted = expect["result"] in ("applied", "duplicate") and not expect["evidence"]
+        if counted and body["action"] == "revoke":
+            revoked[principal] = True
+        if counted and rid not in ids[principal]:
+            ids[principal].append(rid)
+            issued[(principal, rid)] = body["issued_at"]
+            if len(ids[principal]) > MAX_RECORD_IDS:
+                victim = next(x for x in ids[principal] if x not in pins[principal])
+                ids[principal].remove(victim)
+                evicted[principal].append(victim)
+                at = issued[(principal, victim)]
+                floor[principal] = at if floor[principal] is None else max(floor[principal], at)
+    case.check(
+        not wrong,
+        "each guarded step (an unrevoked principal's cover or release, its id not counted, issued no later than the floor) "
+        "is refused as evidence with why possible_replay, and only those" + (f" (not: steps {wrong})" if wrong else ""),
+    )
+    for principal, want in sorted(ids.items()):
+        part = final.get(principal, {})
+        got = [r[0] for r in part.get("records", [])]
+        # This equality is what asserts each eviction took the oldest id not
+        # pinned: `want` was built by evicting exactly those.
+        case.equal(got, want, f"{principal}: the final records, oldest first, as the steps count and evict (oldest unpinned first)")
+        case.equal(part.get("evicted_floor"), floor[principal], f"{principal}: evicted_floor, the newest issued_at evicted")
+        begin = [r[0] for r in initial.get(principal, {}).get("records", [])]
+        added = [
+            by_label_of(st["record"])["record"]["body"]["record_id"]
+            for st in sequence["steps"]
+            if by_label_of(st["record"])["record"]["body"]["principal"] == principal
+            and st["expect"]["result"] in ("applied", "duplicate")
+            and not st["expect"]["evidence"]
+        ]
+        # An id evicted and counted again is in the final records.
+        gone = set(evicted[principal]) - set(got)
+        case.equal(sorted(set(begin + added) - set(got)), sorted(gone), f"{principal}: the ids gone are (initial + counted) - final")
 
 
 # ------------------------------------------------ r9-control-ack-* fixtures
@@ -1535,9 +1751,11 @@ class MailList:
                 self.senders[body["host_id"]] = ("authorized", seq)
 
 
-def mail_verdict(wire, call, hosts, receiver_keys, receiver, now, outbox):
+def mail_verdict(wire, call, hosts, receiver_keys, generated, receiver, now, outbox):
     """The receiver's verdict on a mailbox object (II.4.2 checks 1 to 6, and
-    for a result II.4.4's), from the spec: (verdict, opened plaintext)."""
+    for a result II.4.4's), from the spec: (verdict, opened plaintext).
+    `receiver_keys` maps each kid it accepts to its secret; `generated` is
+    every kid it made at its generation."""
     body = wire.get("body")
     envelope = call == "open_envelope"
 
@@ -1545,7 +1763,14 @@ def mail_verdict(wire, call, hosts, receiver_keys, receiver, now, outbox):
         return {"verdict": "refused", "reason": reason, "evidence": mail_evidence(wire)}, None
 
     def authenticated(reason):
-        return {"verdict": "refused_authenticated", "object_id": body["id"], "reason": reason}, None
+        # The claim is the sender's whose newest add_host key verified the
+        # copy: (host_id, that add_host's generation).
+        return {
+            "verdict": "refused_authenticated",
+            "object_id": body["id"],
+            "reason": reason,
+            "sender": {"host_id": sid, "host_trust_gen": newest},
+        }, None
 
     # 1. Strict parse and pin.
     if not mail_well_formed(wire):
@@ -1560,8 +1785,8 @@ def mail_verdict(wire, call, hosts, receiver_keys, receiver, now, outbox):
         return refused("not_for_this_host")
     if recipient["host_trust_gen"] != receiver["host_trust_gen"]:
         return refused("recipient_generation_not_current")
-    # The key part waits when the head is beyond this host's: its own new
-    # host_enc_key may be in the entries it lacks.
+    # The key part waits when the head is beyond this host's and the key is
+    # one it made: its own new host_enc_key may be in the entries it lacks.
     head = body["signed_at_head"]
     ahead = head["seq"] > hosts.head
     secret = receiver_keys.get(recipient["enc_kid"])
@@ -1587,6 +1812,10 @@ def mail_verdict(wire, call, hosts, receiver_keys, receiver, now, outbox):
             return refused("bad_signature")
         if key is not None and sha256(enc([b64u_decode(wire["enc"]), b64u_decode(wire["ct"])])).hex() != body["sealed_hash"]:
             return refused("sealed_hash_mismatch")
+        # Every host_enc_key entry for this host carries its own enc_sig, so
+        # a key it never made can never become one it accepts: no wait.
+        if secret is None and recipient["enc_kid"] not in generated:
+            return refused("enc_key_not_accepted")
         return {"verdict": "pending", "host_id": sid, "host_trust_gen": sgen}, None
 
     removed = sid not in hosts.current
@@ -1681,9 +1910,10 @@ def check_host_envelope(file, data, report, context):
     nobody over a body changed after signing), `info` from the body's fields,
     `sealed_hash`, the open with the recipient key, the plaintext and its
     bounds, the seal again from ikmE to the same enc and ct, and the object's
-    size on the wire. Each check: the verdict and reason recomputed from the
-    bytes, the device list (L + chain) and the receiver, written here from
-    the spec, and the plaintext an open gives."""
+    size on the wire. Each check: the verdict and reason (and an
+    authenticated refusal's sender) recomputed from the bytes, the device
+    list (L + chain) and the receiver (the keys it accepts and every key it
+    made), written here from the spec, and the plaintext an open gives."""
     keys = context["keys"]
     mlog = context["membership_log"]
     log_l = mlog["log"]
@@ -1786,8 +2016,9 @@ def check_host_envelope(file, data, report, context):
             hosts = MailList(account_id, genesis, chain_of(check["chain"]))
             receiver = check["receiver"]
             receiver_keys = {enc_kid(keys.public(name, "enc")): unhex(keys.keys[name]["enc"]["secret_hex"]) for name in receiver["keys"]}
+            generated = {enc_kid(keys.public(name, "enc")) for name in receiver["generated"]}
             wire = objects[check["object"]]["object"]
-            got, plain = mail_verdict(wire, check["call"], hosts, receiver_keys, receiver, check["now"], check.get("outbox"))
+            got, plain = mail_verdict(wire, check["call"], hosts, receiver_keys, generated, receiver, check["now"], check.get("outbox"))
             case.equal(got, check["expect"], f"{check['call']} on L + {len(check['chain'])}: {got['verdict']} {got.get('reason', '')}")
             if plain is not None:
                 case.equal(plain, plaintexts.get(check["object"]), "the plaintext the object sealed")
@@ -1796,6 +2027,541 @@ def check_host_envelope(file, data, report, context):
         verdicts = {c["expect"]["verdict"] for c in data["checks"]}
         case.equal(verdicts, {"open", "pending", "refused", "refused_authenticated", "accepted", "not_delivered"}, "every verdict")
         case.check(len(reasons) >= 30, f"{len(reasons)} reasons")
+
+
+# ------------------------------------------------ r9-vectors-station-calls
+
+# The Station calls of host-work-v1 §11.4 (design I.5.8): a reader written
+# from the spec's "Every message is read strictly" rules, the grammars and
+# bounds of the wire rules 1 to 9, and the refusals. No code of this
+# repository: the file's every text is read by it, valid and refused.
+RELAY_MAX_BYTES = 262144  # R9.9: every relay message, as sent, before any parse
+RELAY_MAX_ITEMS = 64  # records, results, feeds and entries (wire rule 1)
+RELAY_MAX_DEPTH = 128  # the strict parser's nesting bound
+SAFE_MAX = 2**53 - 1
+RELAY_ID = r"[A-Za-z0-9._:-]{1,128}"
+RELAY_EFFECTS = ["revocation", "interrupt", "hold", "release", "cover"]
+RELAY_RESULTS = ["applied", "duplicate", "pending", "refused"]
+# Wire rule 3 and 4: the effects a record's result names, in this order; a
+# host sender's revoke entry's.
+RECORD_EFFECT_SETS = [["cover"], ["revocation"], ["revocation", "interrupt"], ["hold"], ["release"], ["interrupt"]]
+ENTRY_EFFECT_SETS = [["revocation"], ["revocation", "interrupt"]]
+STATION_TO_HOST_OPS = ["control_sync_result", "heads", "membership_fetch_result", "control_sync_refused", "membership_fetch_refused", "control_ack_refused"]
+HOST_TO_STATION_OPS = ["control_sync", "control_ack", "membership_fetch"]
+
+
+class Refused(Exception):
+    """A reader's refusal, with the code it gives."""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+def relay_parse(text):
+    """One strict I-JSON parse: no duplicate key, integers only and at most
+    2^53 - 1, no lone surrogate, nesting within the bound."""
+
+    def safe_int(digits):
+        n = int(digits)
+        if abs(n) > SAFE_MAX:
+            raise NotStrict(f"unsafe integer {digits}")
+        return n
+
+    value = json.loads(
+        text,
+        object_pairs_hook=_no_duplicates,
+        parse_float=_no_float,
+        parse_int=safe_int,
+        parse_constant=_no_constant,
+    )
+
+    def walk(v):
+        if isinstance(v, str):
+            if any(0xD800 <= ord(ch) <= 0xDFFF for ch in v):
+                raise NotStrict("lone surrogate")
+        elif isinstance(v, list):
+            for item in v:
+                walk(item)
+        elif isinstance(v, dict):
+            for key, item in v.items():
+                walk(key)
+                walk(item)
+
+    # Nesting counts containers: the message's own object is the first.
+    def container_depth(v):
+        if isinstance(v, list):
+            return 1 + max((container_depth(i) for i in v), default=0)
+        if isinstance(v, dict):
+            return 1 + max((container_depth(i) for i in v.values()), default=0)
+        return 0
+
+    if container_depth(value) > RELAY_MAX_DEPTH:
+        raise NotStrict("nesting too deep")
+    walk(value)
+    return value
+
+
+def relay_origin_ok(origin):
+    """An origin exact as station_route::normalize_relay writes it: https, or
+    http on a loopback IP literal; a lowercase host; a port only when it
+    isn't the scheme's default; no credentials, path, query or fragment."""
+    if not isinstance(origin, str) or not origin.isascii() or len(origin) > 1024:
+        return False
+    m = re.fullmatch(r"(https|http)://(\[::1\]|[0-9]{1,3}(?:\.[0-9]{1,3}){3}|[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*)(?::([0-9]{1,5}))?", origin)
+    if m is None:
+        return False
+    scheme, host, port = m.groups()
+    if port is not None:
+        if port.startswith("0") or not 1 <= int(port) <= 65535 or int(port) == {"https": 443, "http": 80}[scheme]:
+            return False
+    if scheme == "http":
+        return host == "[::1]" or (re.fullmatch(r"127(?:\.[0-9]{1,3}){3}", host) is not None and all(int(p) <= 255 for p in host.split(".")))
+    return True
+
+
+def _relay_exact(obj, allowed):
+    """An object with only the fields `allowed` names (its absent ones are the caller's)."""
+    if not isinstance(obj, dict):
+        raise Refused("malformed")
+    if any(key not in allowed for key in obj):
+        raise Refused("unknown_field")
+    return obj
+
+
+def _relay_text(obj, key):
+    value = obj.get(key)
+    if not isinstance(value, str):
+        raise Refused("malformed")
+    return value
+
+
+def _relay_uint(obj, key):
+    value = obj.get(key)
+    if type(value) is not int or value < 0:
+        raise Refused("malformed")
+    return value
+
+
+def _relay_array(obj, key, most):
+    items = obj.get(key)
+    if not isinstance(items, list):
+        raise Refused("malformed")
+    if len(items) > most:
+        raise Refused("too_large")
+    return items
+
+
+def _relay_hex32(text):
+    if re.fullmatch(HEX64, text) is None:
+        raise Refused("malformed")
+    return text
+
+
+def _relay_head(value):
+    head = _relay_exact(value, ["seq", "hash"])
+    seq = _relay_uint(head, "seq")
+    _relay_hex32(_relay_text(head, "hash"))
+    if seq < 1:
+        raise Refused("malformed")
+    return head
+
+
+def _relay_origin(text):
+    if not relay_origin_ok(text):
+        raise Refused("malformed")
+
+
+def _relay_uuid4(text):
+    if re.fullmatch(UUID_V4, text) is None:
+        raise Refused("malformed")
+
+
+def _read_control_sync(v):
+    _relay_exact(v, ["type", "op", "origin", "feed_id", "after"])
+    origin = _relay_text(v, "origin")
+    feed = v.get("feed_id") if "feed_id" in v else None
+    if "feed_id" in v and not isinstance(feed, str):
+        raise Refused("malformed")  # an optional field is omitted, never null
+    after = _relay_uint(v, "after")
+    _relay_origin(origin)
+    if feed is not None:
+        _relay_uuid4(feed)
+    elif after != 0:
+        raise Refused("malformed")  # wire rule 2: a cursor belongs to a feed
+
+
+def _read_control_sync_result(v):
+    _relay_exact(v, ["type", "op", "origin", "feed_id", "head", "station_time", "records"])
+    items = _relay_array(v, "records", RELAY_MAX_ITEMS)
+    seqs = []
+    for item in items:
+        _relay_exact(item, ["feed_seq", "record"])
+        if "record" not in item:
+            raise Refused("malformed")  # of any JSON type, but there
+        seqs.append(_relay_uint(item, "feed_seq"))
+    origin, feed = _relay_text(v, "origin"), _relay_text(v, "feed_id")
+    head = _relay_uint(v, "head")
+    _relay_uint(v, "station_time")
+    _relay_origin(origin)
+    _relay_uuid4(feed)
+    previous = 0
+    for seq in seqs:  # wire rule 7: ascending, each in 1..=head
+        if seq <= previous or seq > head:
+            raise Refused("malformed")
+        previous = seq
+
+
+def _read_heads(v):
+    _relay_exact(v, ["type", "op", "feeds", "membership"])
+    feeds = []
+    for item in _relay_array(v, "feeds", RELAY_MAX_ITEMS):
+        _relay_exact(item, ["origin", "feed_id", "head", "station_time"])
+        origin, feed = _relay_text(item, "origin"), _relay_text(item, "feed_id")
+        _relay_uint(item, "head")
+        _relay_uint(item, "station_time")
+        _relay_origin(origin)
+        _relay_uuid4(feed)
+        feeds.append((origin, feed))
+    if "membership" not in v:
+        raise Refused("malformed")
+    _relay_head(v["membership"])
+    if len(set(feeds)) != len(feeds):
+        raise Refused("malformed")  # wire rule 6: an (origin, feed_id) once
+
+
+def _relay_effects(result):
+    items = result.get("effects")
+    if not isinstance(items, list) or not 1 <= len(items) <= 2:
+        raise Refused("malformed")
+    out = []
+    for item in items:
+        _relay_exact(item, ["effect", "result"])
+        effect, outcome = _relay_text(item, "effect"), _relay_text(item, "result")
+        if effect not in RELAY_EFFECTS or outcome not in RELAY_RESULTS:
+            raise Refused("malformed")
+        out.append((effect, outcome))
+    return out
+
+
+def _read_control_ack(v):
+    _relay_exact(v, ["type", "op", "account_id", "genesis_hash", "host_id", "host_trust_gen", "origin", "feed_id", "cursor", "results"])
+    parsed = []
+    for result in _relay_array(v, "results", RELAY_MAX_ITEMS):
+        if not isinstance(result, dict):
+            raise Refused("malformed")
+        has_record, has_entry = "record_id" in result, "entry" in result
+        if has_record == has_entry:
+            raise Refused("malformed")  # wire rule 4: exactly one of two forms
+        if has_record:
+            _relay_exact(result, ["record_id", "effects"])
+            record_id, effects = _relay_text(result, "record_id"), _relay_effects(result)
+            parsed.append(("record", record_id, None, None, effects))
+        else:
+            _relay_exact(result, ["entry", "applied_seq", "effects"])
+            entry = _relay_exact(result["entry"], ["seq", "entry_hash"])
+            seq = _relay_uint(entry, "seq")
+            _relay_hex32(_relay_text(entry, "entry_hash"))
+            parsed.append(("entry", None, seq, _relay_uint(result, "applied_seq"), _relay_effects(result)))
+    account_id = _relay_text(v, "account_id")
+    _relay_hex32(_relay_text(v, "genesis_hash"))
+    host_id = _relay_text(v, "host_id")
+    gen = _relay_uint(v, "host_trust_gen")
+    origin, feed = _relay_text(v, "origin"), _relay_text(v, "feed_id")
+    _relay_uint(v, "cursor")
+    if not 1 <= len(account_id.encode()) <= 128 or re.fullmatch(RELAY_ID, host_id) is None or gen < 1:
+        raise Refused("malformed")
+    _relay_origin(origin)
+    _relay_uuid4(feed)
+    records, entries = set(), set()
+    for kind, record_id, seq, applied_seq, effects in parsed:
+        names = [e for e, _ in effects]
+        if kind == "record":
+            _relay_uuid4(record_id)
+            if names not in RECORD_EFFECT_SETS:
+                raise Refused("malformed")  # wire rule 3
+            fresh = record_id not in records
+            records.add(record_id)
+        else:
+            if seq < 1 or names not in ENTRY_EFFECT_SETS:
+                raise Refused("malformed")
+            # wire rule 5: applied or duplicate only once applied_seq reached seq
+            if any(o in ("applied", "duplicate") for _, o in effects) and applied_seq < seq:
+                raise Refused("malformed")
+            fresh = seq not in entries
+            entries.add(seq)
+        if not fresh:
+            raise Refused("malformed")  # wire rule 6: nothing twice
+
+
+def _read_membership_fetch(v):
+    _relay_exact(v, ["type", "op", "after"])
+    _relay_uint(v, "after")
+
+
+def _read_membership_fetch_result(v):
+    _relay_exact(v, ["type", "op", "head", "entries"])
+    for entry in _relay_array(v, "entries", RELAY_MAX_ITEMS):
+        # A signed object: {body, sig}; its body is the device-list checks' (R9.3).
+        if not isinstance(entry, dict) or not isinstance(entry.get("body"), dict) or not isinstance(entry.get("sig"), str):
+            raise Refused("malformed")
+    if "head" not in v:
+        raise Refused("malformed")
+    _relay_head(v["head"])
+
+
+def _read_refusal(v):
+    _relay_exact(v, ["type", "op", "code"])
+    if _relay_text(v, "code") != "forbidden":
+        raise Refused("malformed")  # exactly `forbidden` in this version
+
+
+RELAY_READERS = {
+    "to_station": {
+        "control_sync": _read_control_sync,
+        "control_ack": _read_control_ack,
+        "membership_fetch": _read_membership_fetch,
+    },
+    "to_host": {
+        "control_sync_result": _read_control_sync_result,
+        "heads": _read_heads,
+        "membership_fetch_result": _read_membership_fetch_result,
+        "control_sync_refused": _read_refusal,
+        "membership_fetch_refused": _read_refusal,
+        "control_ack_refused": _read_refusal,
+    },
+}
+
+
+def read_relay(text, reader):
+    """(message, None) if the reader (`to_station`: a host's calls, `to_host`:
+    a Station's messages) reads `text` as sent, else (None, the code it
+    refuses it with): the size bound before any parse, one strict parse, a
+    relay message of an op this reader reads, then that message's rules."""
+    try:
+        if len(text.encode("utf-8")) > RELAY_MAX_BYTES:
+            raise Refused("too_large")
+        try:
+            value = relay_parse(text)
+        except (NotStrict, ValueError, RecursionError):
+            raise Refused("not_strict")
+        op = value.get("op") if isinstance(value, dict) and value.get("type") == "relay" else None
+        reader_for = RELAY_READERS[reader].get(op) if isinstance(op, str) else None
+        if reader_for is None:
+            raise Refused("wrong_message")
+        reader_for(value)
+        return value, None
+    except Refused as refused:
+        return None, refused.code
+
+
+def compact_ijson(value):
+    """RFC 8785's compact text of a message: keys in UTF-16 order, no
+    whitespace, integers and strings as the check's `jcs`, and `null` where a
+    record is any JSON value."""
+    if value is None:
+        return "null"
+    if isinstance(value, list):
+        return "[" + ",".join(compact_ijson(v) for v in value) + "]"
+    if isinstance(value, dict):
+        keys = sorted(value, key=lambda k: k.encode("utf-16-be"))
+        return "{" + ",".join(_jcs_string(k) + ":" + compact_ijson(value[k]) for k in keys) + "}"
+    return jcs(value)
+
+
+def check_station_calls(file, data, report, context):
+    """The Station calls' goldens (host-work-v1 §11.4). Every valid text is
+    strict I-JSON whose compact form in RFC 8785 key order is the text; this
+    file's own reader (written here from the spec) reads it as its direction
+    says, its fields are the text's and the other direction refuses it; what
+    the text names is the other vectors': a feed of the control vectors'
+    stations, records, device-list entries and heads of log L, effects as each
+    record's action carries them (wire rule 3), each page record's parse
+    verdict as the control vectors list it. Every invalid text is refused by
+    that reader with the code the file says, a bounded text (`wire_fill`) is
+    built here to its size: exactly the bound (`at_the_bound`) is read, one
+    byte over and 300,000 bytes are `too_large`, for each call that can carry
+    a large page (a page's record, a fetch result's entry), so a reader that
+    allowed more for either (the 512 KiB of stage 3's mailbox calls is no
+    exemption for `membership_fetch_result`) fails. A record that is not a
+    JSON object is `malformed` to the signed-object parse (R9.1: a signed
+    object is an object), derived here. The builders' exact bytes are the
+    Rust runner's (`station_calls_build_byte_for_byte`) and the binding
+    suites'."""
+    mlog = context["membership_log"]
+    control = context["host_work_control"]
+    with report.case(file, "bound") as case:
+        case.equal(data["max_message_bytes"], RELAY_MAX_BYTES, "R9.9's 262,144 bytes for every relay message")
+        case.equal(sorted(data), ["at_the_bound", "calls", "invalid", "kind", "max_message_bytes", "name", "note", "requires"], "fields")
+
+    stations = {(s["origin"], s["feed_id"]) for s in control["stations"].values()}
+    records = {compact_ijson(v["record"]): v for v in control["records"]}
+    entries = {e["label"]: e for e in mlog["log"] + mlog["others"]}
+    log_entries = mlog["log"]
+    head = mlog["head"]
+
+    def record_effects(body):
+        action = body["action"]
+        if action == "revoke":
+            return ["revocation", "interrupt"] if body.get("interrupt_running") else ["revocation"]
+        return {"cover": ["cover"], "hold": ["hold"], "release": ["release"], "interrupt_running": ["interrupt"]}[action]
+
+    names = set()
+    ops = {}
+    fetch_after = None
+    for call in data["calls"]:
+        name, op, direction = call["name"], call["op"], call["direction"]
+        with report.case(file, f"call {name}") as case:
+            case.check(name not in names and re.fullmatch(r"[a-z0-9_]+", name) is not None, "a name of its own")
+            names.add(name)
+            wire = call["wire"]
+            case.equal(sorted(k for k in call if k not in ("judged", "hand_assembled")), ["direction", "fields", "name", "note", "op", "wire"], "case fields")
+            # A page with a record the parser refuses is a builder's page with
+            # the records put in their slots, and says so (exactly then).
+            case.equal(
+                call.get("hand_assembled", False),
+                op == "control_sync_result" and any(not j["parses"] for j in call["judged"]),
+                "hand_assembled exactly when a page record doesn't parse",
+            )
+            case.equal(direction, "to_host" if op in STATION_TO_HOST_OPS else "to_station", "its direction")
+            case.check(len(wire.encode()) <= RELAY_MAX_BYTES, "within 262,144 bytes")
+            message, code = read_relay(wire, direction)
+            case.equal(code, None, "read by its side's reader")
+            if message is None:
+                continue
+            ops.setdefault(op, []).append(name)
+            case.equal(message["op"], op, "its op")
+            case.equal(compact_ijson(message), wire, "compact RFC 8785 text of its own parse")
+            case.equal({k: v for k, v in message.items() if k not in ("type", "op")}, call["fields"], "fields are the text's")
+            other = "to_host" if direction == "to_station" else "to_station"
+            case.equal(read_relay(wire, other)[1], "wrong_message", "the other side refuses it")
+            f = call["fields"]
+            if op in ("control_sync", "control_sync_result", "control_ack"):
+                case.check(
+                    (f["origin"], f.get("feed_id")) in stations or (op == "control_sync" and "feed_id" not in f and any(f["origin"] == o for o, _ in stations)),
+                    "a feed of the control vectors' stations",
+                )
+            if op == "control_sync_result":
+                judged = call["judged"]
+                case.equal([j["feed_seq"] for j in judged], [r["feed_seq"] for r in f["records"]], "judged parallel to the records")
+                for r, j in zip(f["records"], judged):
+                    vector = records.get(compact_ijson(r["record"]))
+                    if vector is not None:
+                        parses = "parse_error" not in vector
+                        case.equal(j["parses"], parses, f"record {r['feed_seq']} ({vector['label']}) parses as the control vectors say")
+                        if parses:
+                            case.equal(j["record_id"], vector["record"]["body"]["record_id"], f"record {r['feed_seq']}: its record_id")
+                        else:
+                            case.equal(j["error"], vector["parse_error"], f"record {r['feed_seq']}: its parse error")
+                    elif not isinstance(r["record"], dict):
+                        # Not a JSON object: the signed-object parse refuses it as malformed.
+                        case.equal({k: v for k, v in j.items() if k != "feed_seq"}, {"parses": False, "error": "malformed"}, f"record {r['feed_seq']}: not an object, malformed")
+                    else:
+                        case.check(j["parses"] is False and isinstance(j.get("error"), str) and j["error"] != "", f"record {r['feed_seq']}: not a vectors' record, no record")
+            if op == "heads":
+                case.equal(f["membership"], head, "the device list's head: log L's")
+                case.check(all(isinstance(x["head"], int) for x in f["feeds"]), "feeds with heads")
+            if op == "control_ack":
+                case.equal((f["account_id"], f["genesis_hash"]), (mlog["account_id"], mlog["genesis_hash"]), "log L's account and genesis")
+                # A record_id names one record, but the vectors reuse some on
+                # purpose (the conflicting-id records): the effects are those
+                # of a record that carries the id.
+                by_id = {}
+                for v in control["records"]:
+                    if "parse_error" not in v:
+                        by_id.setdefault(v["record"]["body"]["record_id"], []).append(v["record"]["body"])
+                for result in f["results"]:
+                    effects = [e["effect"] for e in result["effects"]]
+                    if "record_id" in result:
+                        bodies = by_id.get(result["record_id"])
+                        if bodies is not None:
+                            case.check(effects in [record_effects(b) for b in bodies], f"{result['record_id'][-4:]}: the effects its {bodies[0]['action']} carries", f"got {effects}")
+                    else:
+                        entry = next((e for e in entries.values() if e["entry_hash"] == result["entry"]["entry_hash"]), None)
+                        case.check(entry is not None, "an entry of the device-list vectors")
+                        if entry is not None:
+                            body = entry["entry"]["body"]
+                            case.equal((body["seq"], body["action"]), (result["entry"]["seq"], "host_sender_revoke"), "its seq and a host sender's revoke")
+                            case.equal(effects, ["revocation", "interrupt"] if body["interrupt_running"] else ["revocation"], "the effects its revoke carries")
+            if op == "membership_fetch":
+                fetch_after = f["after"]
+            if op == "membership_fetch_result":
+                top = f["head"]["seq"]
+                case.equal(f["head"], head, "the Station's head: log L's")
+                case.equal(f["head"]["hash"], log_entries[top - 1]["entry_hash"], "its hash is the head entry's")
+                want = [e["entry"] for e in log_entries[(fetch_after if name == "membership_fetch_result" else top):top]]
+                case.equal(f["entries"], want, "the entries after the host's seq: log L's")
+            if op.endswith("_refused"):
+                case.equal(wire, '{"code":"forbidden","op":"%s","type":"relay"}' % op, "exactly the agreed refusal")
+    with report.case(file, "calls: coverage") as case:
+        case.equal(sorted(ops), sorted(HOST_TO_STATION_OPS + STATION_TO_HOST_OPS), "all six calls and all three refusals")
+        case.check(len(ops["control_ack"]) >= 5 and len(ops["control_sync_result"]) >= 3, "ack and page forms")
+
+    # Exactly the bound is read: the reader that refuses it is a byte too
+    # strict, and the one that allows more than the bound for a fetch result
+    # is refused by the invalid texts below.
+    seen_bound = set()
+    with report.case(file, "at the bound") as case:
+        log_bodies = [e["entry"]["body"] for e in log_entries]
+        for bound in data["at_the_bound"]:
+            name = bound["name"]
+            case.equal(sorted(bound), ["accepts", "direction", "name", "note", "op", "wire_fill"], f"{name}: case fields")
+            fill = bound["wire_fill"]
+            wire = fill["prefix"] + fill["fill"] * fill["count"] + fill["suffix"]
+            case.equal((len(wire.encode()), fill["bytes"]), (RELAY_MAX_BYTES, RELAY_MAX_BYTES), f"{name}: built to exactly 262,144 bytes")
+            case.check(name not in names, f"{name}: a name of its own")
+            message, code = read_relay(wire, bound["direction"])
+            case.equal(code, None, f"{name}: read")
+            if message is not None:
+                accepts = bound["accepts"]
+                if bound["op"] == "control_sync_result":
+                    case.equal((message["head"], len(message["records"])), (accepts["head"], accepts["records"]), f"{name}: head and records")
+                    # Not a JSON object: not a record (the page stands).
+                    case.equal([isinstance(r["record"], dict) for r in message["records"]], accepts["records_parse"], f"{name}: which records can parse")
+                else:
+                    case.equal((message["head"], len(message["entries"])), (accepts["head"], accepts["entries"]), f"{name}: head and entries")
+                    case.equal(message["head"], head, f"{name}: log L's head")
+                    entry = message["entries"][0]
+                    case.check(entry["body"] in log_bodies, f"{name}: the entry's body is log L's")
+                    case.check(any(entry["sig"].startswith(e["entry"]["sig"]) for e in log_entries), f"{name}: its signature is log L's, padded")
+                case.equal(read_relay(wire, "to_station")[1], "wrong_message", f"{name}: the other side refuses it")
+            seen_bound.add(bound["op"])
+        case.equal(seen_bound, {"control_sync_result", "membership_fetch_result"}, "a text at the bound for each call that can carry a large page")
+
+    by_op = {}
+    for bad in data["invalid"]:
+        by_op.setdefault(bad["op"], []).append(bad)
+    codes = set()
+    seen = set()
+    for op in HOST_TO_STATION_OPS + STATION_TO_HOST_OPS:
+        with report.case(file, f"invalid {op}") as case:
+            for bad in by_op.get(op, []):
+                name = bad["name"]
+                case.check(name not in seen and name not in names, f"{name}: a name of its own")
+                seen.add(name)
+                if "wire_fill" in bad:
+                    fill = bad["wire_fill"]
+                    wire = fill["prefix"] + fill["fill"] * fill["count"] + fill["suffix"]
+                    case.equal(len(wire.encode()), fill["bytes"], f"{name}: built to its size")
+                    case.check(fill["bytes"] in (RELAY_MAX_BYTES + 1, 300000), f"{name}: one byte over the bound, or 300,000 bytes")
+                else:
+                    wire = bad["wire"]
+                case.equal(sorted(k for k in bad if k not in ("wire", "wire_fill")), ["code", "name", "op", "reader"], f"{name}: case fields")
+                case.equal(read_relay(wire, bad["reader"])[1], bad["code"], f"{name}: refused {bad['code']}")
+                codes.add(bad["code"])
+            case.check(by_op.get(op), "refused variants")
+    with report.case(file, "invalid: coverage") as case:
+        case.equal(sorted(by_op), sorted(HOST_TO_STATION_OPS + STATION_TO_HOST_OPS), "every call and refusal has refused variants")
+        case.equal(codes, {"too_large", "not_strict", "wrong_message", "unknown_field", "malformed"}, "every refusal code")
+        sized = {(b["op"], b["wire_fill"]["bytes"]) for b in data["invalid"] if "wire_fill" in b}
+        case.equal(
+            sized,
+            {(op, n) for op in ("control_sync_result", "membership_fetch_result") for n in (RELAY_MAX_BYTES + 1, 300000)},
+            "the byte bound refused one byte over and at 300,000, for a page and a fetch result",
+        )
+        case.equal(sum("wire_fill" in b for b in data["invalid"]), 4, "four texts over the byte bound")
+        counts = {b["name"] for b in data["invalid"] if b["code"] == "too_large"}
+        case.check({"control_sync_result_65_records", "heads_65_feeds", "control_ack_65_results", "membership_fetch_result_65_entries"} <= counts, "65 records, feeds, results and entries")
 
 
 # ---------------------------------------------------------------------- main
@@ -1808,6 +2574,7 @@ CHECKERS = [
     ("r9-vectors-push-hint", check_push_hint),
     ("r9-vectors-delegated-wire", check_delegated_wire),
     ("r9-vectors-host-envelope", check_host_envelope),
+    ("r9-vectors-station-calls", check_station_calls),
 ]
 
 

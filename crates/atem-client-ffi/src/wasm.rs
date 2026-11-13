@@ -974,12 +974,30 @@ impl ControlStateHandle {
     pub fn to_json(&self) -> String {
         self.0.to_json()
     }
+    /// Every principal the state has a part for, sorted.
+    pub fn principals(&self) -> Vec<String> {
+        self.0.principals()
+    }
+    /// `principal`'s part (canonical JSON), or `undefined`: what a store
+    /// keeping one row per principal writes for each principal a
+    /// transition `touched`.
+    pub fn part(&self, principal: String) -> Option<String> {
+        self.0.part(principal)
+    }
+    /// What is in force for `principal`: `{revoked, interrupted, held,
+    /// coverage}` (`revoked` and `coverage`, `{origin, feedId}`, `null`
+    /// when there are none).
+    pub fn standing(&self, principal: String) -> JsResult<JsValue> {
+        to_js(&self.0.standing(principal))
+    }
     /// Applies a record to this state (`pos`: `{origin, feedId, feedSeq}`,
     /// or `null`/`undefined` over a channel) and returns a
     /// `ControlTransition`: `applied` (`{result, effects: [{effect,
-    /// result}], actions: [{type, principal, …}], evidence}`) and `next`,
-    /// the state after it. This handle doesn't change: use `next` once
-    /// your transaction storing `next.toJson()` committed.
+    /// result}], actions: [{type, principal, …}], evidence, why}`) and `next`,
+    /// the state after it, and `touched`, the principals whose part it
+    /// changed. This handle doesn't change: use `next` once your
+    /// transaction storing `next.toJson()` (or the touched parts)
+    /// committed.
     pub fn apply(
         &self,
         record_json: String,
@@ -1012,7 +1030,66 @@ impl ControlStateHandle {
         Ok(ControlTransition {
             applied: to_js(&transition.applied)?,
             next: transition.next,
+            touched: transition.touched,
         })
+    }
+}
+
+/// The state of `log`'s device list made of the stored parts that name it
+/// (`control_state_from_parts`): `parts` is an array of `{principal,
+/// partJson}`, in any order. Returns a `ControlLoadedParts`: `state` (a
+/// `ControlStateHandle`) and `foreign`, the principals whose parts name
+/// another account or genesis, skipped: delete their rows.
+#[wasm_bindgen(js_name = controlStateFromParts)]
+pub fn control_state_from_parts(
+    log: &MembershipLog,
+    parts: JsValue,
+) -> JsResult<ControlLoadedParts> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct P {
+        principal: String,
+        part_json: String,
+    }
+    let parts = items::<P>(
+        &parts,
+        &["principal", "partJson"],
+        "parts [{principal, partJson}]",
+    )?
+    .into_iter()
+    .map(|p| crate::types::ControlStatePart {
+        principal: p.principal,
+        part_json: p.part_json,
+    })
+    .collect();
+    let loaded = err(crate::control::control_state_from_parts(
+        log.0.clone(),
+        parts,
+    ))?;
+    Ok(ControlLoadedParts {
+        state: loaded.state,
+        foreign: loaded.foreign,
+    })
+}
+
+/// What `controlStateFromParts` gives (`crate::control::ControlLoadedParts`).
+#[wasm_bindgen]
+pub struct ControlLoadedParts {
+    state: Arc<crate::control::ControlStateHandle>,
+    foreign: Vec<String>,
+}
+
+#[wasm_bindgen]
+impl ControlLoadedParts {
+    /// The state of the device list, made of its own parts.
+    #[wasm_bindgen(getter)]
+    pub fn state(&self) -> ControlStateHandle {
+        ControlStateHandle(self.state.clone())
+    }
+    /// The principals whose parts name another list (sorted): delete them.
+    #[wasm_bindgen(getter)]
+    pub fn foreign(&self) -> Vec<String> {
+        self.foreign.clone()
     }
 }
 
@@ -1021,11 +1098,13 @@ impl ControlStateHandle {
 pub struct ControlTransition {
     applied: JsValue,
     next: Arc<crate::control::ControlStateHandle>,
+    touched: Vec<String>,
 }
 
 #[wasm_bindgen]
 impl ControlTransition {
-    /// What the record did: `{result, effects, actions, evidence}`.
+    /// What the record did: `{result, effects, actions, evidence, why}`
+    /// (`why` `null` when the record counted without question).
     #[wasm_bindgen(getter)]
     pub fn applied(&self) -> JsValue {
         self.applied.clone()
@@ -1036,6 +1115,11 @@ impl ControlTransition {
     #[wasm_bindgen(getter)]
     pub fn next(&self) -> ControlStateHandle {
         ControlStateHandle(self.next.clone())
+    }
+    /// The principals whose part `next` changed: the record's, or none.
+    #[wasm_bindgen(getter)]
+    pub fn touched(&self) -> Vec<String> {
+        self.touched.clone()
     }
 }
 
@@ -2543,7 +2627,7 @@ fn mail_fields(v: JsValue) -> JsResult<crate::host_mail::MailFieldsData> {
     })
 }
 
-/// `{hostId, hostTrustGen, keys: [{keyId, encKid}]}`.
+/// `{hostId, hostTrustGen, keys: [{keyId, encKid}], generated: [encKid]}`.
 #[cfg(all(feature = "software-keys", feature = "host"))]
 fn mail_recipient(v: JsValue) -> JsResult<crate::host_mail::MailRecipientData> {
     #[derive(Deserialize)]
@@ -2558,10 +2642,16 @@ fn mail_recipient(v: JsValue) -> JsResult<crate::host_mail::MailRecipientData> {
         host_id: String,
         host_trust_gen: f64,
         keys: Vec<K>,
+        generated: Vec<String>,
     }
-    mail_keys_only(&v, &["hostId", "hostTrustGen", "keys"], "recipient")?;
-    let r: R = serde_wasm_bindgen::from_value(v)
-        .map_err(|_| bad("recipient {hostId, hostTrustGen, keys: [{keyId, encKid}]}"))?;
+    mail_keys_only(
+        &v,
+        &["hostId", "hostTrustGen", "keys", "generated"],
+        "recipient",
+    )?;
+    let r: R = serde_wasm_bindgen::from_value(v).map_err(|_| {
+        bad("recipient {hostId, hostTrustGen, keys: [{keyId, encKid}], generated: [encKid]}")
+    })?;
     Ok(crate::host_mail::MailRecipientData {
         host_id: r.host_id,
         host_trust_gen: ms(r.host_trust_gen)?,
@@ -2573,6 +2663,7 @@ fn mail_recipient(v: JsValue) -> JsResult<crate::host_mail::MailRecipientData> {
                 enc_kid: k.enc_kid,
             })
             .collect(),
+        generated: r.generated,
     })
 }
 
@@ -2688,7 +2779,8 @@ pub fn seal_result_with_ikm(
 /// Host role: the receiver's checks 1 to 6 (`open_envelope`): `{type:
 /// "open", plainJson, sender}`, `{type: "pending", hostId, hostTrustGen}`,
 /// `{type: "refused", reason, evidence}`, `{type: "refused_authenticated",
-/// objectId, reason}` or `{type: "unavailable", code, detail}`.
+/// objectId, reason, senderHost: {hostId, hostTrustGen}}` or `{type:
+/// "unavailable", code, detail}`.
 #[cfg(all(feature = "software-keys", feature = "host"))]
 #[wasm_bindgen(js_name = openEnvelope)]
 pub fn open_envelope(

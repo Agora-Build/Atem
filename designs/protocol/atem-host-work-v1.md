@@ -1036,7 +1036,11 @@ record, a re-signed copy, a revoke of a revoked principal, an interrupt for
 a revocation already interrupted), `pending` (not in force yet, and it can
 be later), `refused` (not in force, and never from this record). The
 record's `result` is `applied` when any effect is, `duplicate` when every
-effect is, else `pending` when any effect is, else `refused`. **Consumers
+effect is, else `pending` when any effect is, else `refused`
+(`ApplicationResult::of_effects`; **for Astation**, amended for step 4: a
+`control_records_result` whose record `result` doesn't follow from its
+`effects` this way is malformed, and the client core refuses it).
+**Consumers
 read `effects`, not only `result`**: a revoke that adds `interrupt_running:
 true` to one already applied is `applied` for its interrupt and `duplicate`
 for its revocation. For the revocation, `duplicate` means "already in force
@@ -1062,7 +1066,38 @@ The rules:
    and alerted, and the first body keeps the id; a stop (`hold`, `revoke`,
    `interrupt_running`) still applies its effects (a stop only ever adds),
    while a `cover` or `release` is `refused`. A record kept pending or
-   refused takes no `record_id`.
+   refused takes no `record_id`. **Bounded** (**Atem's proposal, for
+   Astation's agreement**; plan decision 19, rulings T4a and T4d): a host
+   keeps at most 256 counted record ids per principal (`MAX_RECORD_IDS`),
+   and the next evicts the oldest, never the record that revoked the
+   principal nor the coverage's cover; the principal's **evicted floor**
+   is the newest `issued_at` among the records evicted. **An evicted
+   record that comes back grants nothing.** `feed_seq` isn't signed, so
+   whoever serves the host the covering feed's pages (the Station, which
+   holds the key, or a carrier that rewrites them, such as the `:8080`
+   proxy, a native manager that never signs a release, or an impostor on
+   127.0.0.1:8080) could otherwise re-serve an evicted `release` at a
+   fresh position and lift a hold in force. So the floor guards what can
+   grant or lift, and only that: a `cover` or `release` of a principal
+   that isn't revoked, under a `record_id` it doesn't count and issued no
+   later than its evicted floor, is `refused` as a possible replay
+   (`possible_replay`) and kept as evidence, whatever its position. A
+   cover or release applies when it was issued after every evicted record
+   of that principal, which a Station meets for every record it signed
+   itself when each cover or release it signs for the principal is issued
+   after every record it signed for it before (its duty below). A stop
+   never meets the floor (a stop always wins): a `hold` applies as any
+   hold, so an evicted hold replayed holds again, which grants nothing;
+   a `revoke` or an `interrupt_running` replayed is a `duplicate` (a
+   revocation and its interrupts are final, the revoking record pinned),
+   and a new one is a stop. A revoked principal's cover and release are
+   inert already (rule 7). **The residual:** a Station whose clock lags
+   the floor (after a switch to it, or after another Station's record
+   issued ahead of its clock was evicted) has its covers and releases
+   refused as possible replays until its `issued_at` passes the floor.
+   That fails safe: holds stay, and nothing new starts. An evicted manager's copy
+   whose signer was removed since comes back `refused` as evidence
+   (verified against today's list) and changes nothing.
 2. **Verification** (above): `pending` waits for every effect; `refused` is
    evidence. A list of another account or genesis applies nothing.
 3. **A revoke is final**, from any feed or from none.
@@ -1100,6 +1135,51 @@ The rules:
 7. **After a revoke**, `cover`, `hold` and `release` change nothing: a
    `duplicate` when they ask for what is recorded, else `refused`.
 
+**The state, per principal** (planned with the feeds; for Astation's
+agreement with the bound above). A host's control state is one part per
+principal (`ControlState::part`, `from_parts`; the bindings'
+`ControlStateHandle::{principals, part}` and `control_state_from_parts`), and a record changes
+at most its own principal's: the transition names it (`touched`), and the
+host writes only that part in the record's transaction (one row per
+principal), never the whole state. **Every part names its device list**
+(`account_id`, `genesis_hash`; ruling T4c). `from_parts` loads the parts
+of the list it is given (the host's pinned device list, never inferred
+from the parts) and **skips every part of another account or genesis,
+reporting its principal for the host to delete** (ruling T4e): an earlier
+pairing's leftovers never load, so a service id that recurs in the new list
+inherits no revoke, hold or coverage, while the current list's parts beside
+them (a live re-pair whose old rows weren't deleted yet) load with their
+stops. A part of the current list that fails strict reading, or one whose
+device list can't be read, still fails the load; nothing is skipped
+unless it names another list. At a live re-pair the host deletes the old
+list's rows in the transaction that adopts the new list's empty state.
+A whole state (`from_json`) is one list's: a part of another list in it
+is refused. A part keeps its records that counted oldest
+first, `[record_id, digest, issued_at]` triples, its evicted floor, and
+what is in force for the principal; the order a release follows keeps
+**one feed per Station origin** (ruling T4b): another feed of the origin
+replaces it, never the covering feed's, the only one a release reads (a
+reset's new feed starts after its cover). **Host rule:** a position's
+`origin` is the host's own configured Station origin, the feed it syncs,
+never one taken from a page or a record; that is what bounds `order` (a
+record whose body names another origin is read at no position). A part is so at most 256 records
+of some 125 bytes (about 32 KB), one order entry per origin the
+principal's holds and releases were read from (one, for a host syncing its
+own Station), and a few hundred bytes more. The whole state (`to_json`,
+`"v": 2`) is the parts by principal under the device list's account and
+genesis. `standing(principal)` is what is in force: its
+revocation (the revoking record's `record_id`; a host principal's
+revocation is a device-list entry, never here), the revocations whose
+interrupt a record put in force (a service's revoking `record_id`, a host
+principal's `revoke_seq` in decimal), the hold, and the covering feed
+`{origin, feed_id}`. Each application also says why a record is `pending`
+(the verifier's reason, or `list_frozen`, `not_revoked`: a service's
+interrupt before its revocation, `revoke_not_applied`: a host principal's
+before host-work applied its revoke) or `refused` (the verifier's reason,
+or `order`, `after_revoke`, `not_newer`, `possible_replay`), or kept as
+evidence (`collision`, `possible_replay`): `Applied.why`, the host's for its
+pending store, evidence and alerts.
+
 **Resets** (**Atem's proposal, agreed with Astation (2026-11-11, #120
 comment 6810116314) and Auth/Portal (2026-11-12, #147 comment 6813332550)**: design I.5.2's snapshot re-issues "the latest revoke, hold or
 release and interrupt state" and names no cover). A reset's snapshot is
@@ -1128,7 +1208,16 @@ ordering can't stop a key holder. The Station's duties:
 - A Station's covers' `issued_at` only rises: each cover it signs for a
   principal is newer, by `(issued_at, record_id)`, than any cover issued
   for that principal before, a handed-over integration's included (the
-  handover carries the last cover's `issued_at`).
+  handover carries the last cover's `issued_at`). **Its releases' too**
+  (with the bound of rule 1; **needs Astation's agreement**; **for
+  Astation**, amended for step 4): each cover or release a Station signs
+  for a principal is issued after every record it signed for that
+  principal before, its holds included, since
+  a cover or release issued no later than a record a host evicted is
+  refused there as a possible replay; a snapshot's covers and releases
+  signed anew are issued now, never with an old `issued_at`, and a
+  handover carries the newest `issued_at` of any record signed for the
+  principal. Holds need no such duty: the floor never refuses a stop.
 - A Station re-issues covers only for principals it currently covers.
 - A Station that hands an integration over stops signing for it, and the
   key leaves with it (or the integration is created again as a new
@@ -1163,17 +1252,43 @@ hold from a Station whose cover wasn't newer and after a reset whose cover
 isn't newer (applied, its release refused), a service's interrupt waiting
 for its revocation, holds and releases out of order in one feed, a hold
 with no coverage, the old Station's cover replayed after a move, an
-`issued_at` tie broken by `record_id`, record ids per principal, and
-another body under a counted id: a stop applies, a release or cover is
-refused). Each step's position is `{origin, feed_id, feed_seq}`; a state
-keeps the records that counted by principal, then `record_id`.
+`issued_at` tie broken by `record_id`, record ids per principal, another
+body under a counted id: a stop applies, a release or cover is refused,
+and the bound: from an `initial` state whose principal's records are full
+(those not in the file copies of the record `fill` under other ids), an
+evicted release re-served at a fresh position of the covering feed and a
+cover issued before the evicted floor are refused as possible replays
+while a release issued after it applies, an evicted hold replayed holds
+again, and an evicted revoke replayed is still a duplicate), each step
+with the `standing` of its record's principal after
+it. Each step's position is `{origin, feed_id, feed_seq}`; a state (v2)
+keeps one part per principal, naming its device list, its records the
+`[record_id, digest, issued_at]` triples that counted, oldest first. Each
+step's `expect.why` is `Applied::why`'s code, present exactly when the
+record is pending or refused or kept as evidence (the bindings'
+`ControlApplied.why`). (**For Astation**, amended for step 4: every
+sequence's `state` is v2, each step carries its `standing` and `why`, two
+sequences and three records are new in the file, and the checker's checks
+of parts, `why` and the bound below are new; its steps' other fields are as
+they were.)
 They run in `crates/atem-client/tests/vectors.rs`, in the bindings'
 `tests/control.rs` and in the Swift, Kotlin and WASM conformance suites;
 `scripts/check-r9-vectors.py` recomputes their cryptographic values
 (`jcs`, signing inputs, every signature by the key its chain names, the
-`r9Svc` values, the record digests a state keeps, each a body of that
-principal with that `record_id`, and each step's position against the
-stations) and derives no verdict.
+`r9Svc` values, the record digests and `issued_at`s a state keeps, each a
+body of that principal with that `record_id` or, for an id no record of the
+file has, the `fill` record's body under it, each part's device list, its
+256-id bound with its revocation's and cover's records among them, an
+evicted floor only with full records, one feed per origin in `order`, each
+step's position against the stations, and the last step's `standing`
+against the state), checks each `why` is a code of its result's kind,
+present exactly when it should be (the exact code among codes of one kind
+is pinned by the Rust runner and the suites), and derives the bound from the steps
+alone: the ids each step counts and the oldest unpinned ones evicted past
+256, the final records in order, `evicted_floor` as the newest `issued_at`
+evicted, and every possible replay (an unrevoked principal's cover or
+release, its id not counted, issued no later than the floor then) refused
+as evidence with `why` `possible_replay`. It derives no other verdict.
 Every SDK package's checksum manifest lists the file.
 
 ### 11.2 `work_interrupt` and `work_resolve`
@@ -1338,7 +1453,7 @@ alerts.)
 | `session_id` | the task's target session (`ses-` and 12 characters) |
 | `task_id` | the task: a UUID v4 (a delegated task's id) |
 | `sender` | the delegated sender that enqueued the task: `member:<id>`, `service:<id>` or `host:<id>` (an id of 1-128 bytes of `[A-Za-z0-9._:-]`), as a receipt's provenance names it (session-v1 R9.14). Never `local` or `browser:` |
-| `reason` | why the outcome is unknown, for people: 1-256 bytes, no control or Cf character (`agent exited`, `write interrupted`, `deadline passed; outcome unknown`) |
+| `reason` | why the outcome is unknown, for people: 1-256 bytes, not blank (something besides White_Space; **for Astation**, amended for step 4), no control or Cf character (`agent exited`, `write interrupted`, `deadline passed; outcome unknown`) |
 | `created_at` | Unix ms on the host's wall clock: when the task became `outcome_unknown`. For people only: it orders nothing |
 | `more` | `true` when alerts follow this page; then the page isn't empty |
 
@@ -1365,7 +1480,11 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
     `alert_id` it read, until `more` is `false`. The cursor stays the
     `alert_id`; the host finds it and lists what follows it in `seq`. A page
     never carries its `after`.
-  - `atem_client::session::alerts::page` is the host's reference.
+  - `atem_client::session::alerts::page` is the host's reference
+    (**for Astation**, amended for step 4, with no effect on the wire): it
+    returns `invalid_request` for a limit outside 1 to 64, since a page of
+    no alert with `more` true, or of more than 64, is a result no reader
+    takes. The host passes 64, and no request carries a limit.
 - **An unknown cursor.** An `after` the host has no alert for (the alert
   ended, or never was) is `stale_target`, detail `unknown alert`; the caller
   lists again from the start (**Atem's choice of code, for Astation to
@@ -1424,8 +1543,9 @@ Vectors:
 - `fixtures/host-work/requests-v1.json`: the requests, valid and invalid,
   and the `alerts` results. These are an empty page, a page, every delegated
   sender and the bounds, a later alert with an earlier `created_at` (valid:
-  the order is `seq`'s), and each refusal, `local`, a browser grant and a
-  UUID v5 task among them.
+  the order is `seq`'s), and each refusal, `local`, a browser grant, a
+  UUID v5 task and, **for Astation** (amended for step 4), a blank `reason`
+  among them.
 - `fixtures/r9-vectors-push-hint.json`: the hints, and
   `outcome_unknown_invalid_facts` (a `local` and a browser grant's task,
   refused at open).
@@ -1932,6 +2052,37 @@ bindings' `tests/station.rs` and in the Swift, Kotlin and WASM conformance
 suites through `AckLedgerHandle`; `scripts/check-r9-vectors.py` recomputes
 every `reportId` in them. Every SDK package's checksum manifest lists them.
 
+(**For Astation's acceptance**, new in step 4.)
+`fixtures/r9-vectors-station-calls.json` (`kind: "vectors"`, schema in
+`fixtures/schema.md`) holds the messages themselves as exact text, so that
+a custom Station and Astation's `:8080` proxy have known answers: every
+message of the six calls and the three refusals as the shared core's
+builders write it (compact, keys in RFC 8785 order, no whitespace), with its
+decoded fields: `control_sync` with and without `feed_id`,
+`control_sync_result` with records and with records the control parser
+refuses (each record judged on its own, the page standing; that page is
+marked `hand_assembled`, since a Station never serves such a record and its
+builder refuses them; a `null` or a string record kept as evidence is
+**Atem's reading of "any JSON type", for Astation's agreement**), `heads`,
+`control_ack` with both result forms, `membership_fetch` and its result, and
+the three refusals; and the invalid variants a reader refuses, each with its
+code (an unknown field, a `null`, a duplicate key, an unknown refusal code
+and a count over 64 among them). The 256 KiB bound is pinned for each call
+that can carry a large page, `control_sync_result` and
+`membership_fetch_result`: a text of exactly 262,144 bytes is read, and one
+of 262,145 and one of 300,000 bytes are `too_large` (no 512 KiB exemption
+for `membership_fetch_result`; only stage 3's mailbox calls get it). They run in
+`crates/atem-client/tests/vectors.rs` (every text built byte for byte from
+its fields, read back to them, refused by the other side's reader, and every
+invalid text refused with its code), in the bindings' `tests/station.rs` and
+in the Swift, Kotlin and WASM conformance suites through the `relay_*`
+exports. `scripts/check-r9-vectors.py` reads every text with a reader
+written from the rules above: strict I-JSON, the compact form in RFC 8785
+key order, each valid message's fields and what it names (feeds of the
+control vectors, device-list entries and heads of log L, the effects each
+record's action carries, wire rule 3), and every invalid text's code. Every
+SDK package's checksum manifest lists the file.
+
 ### 11.5 Envelopes and results (planned)
 
 A **host sender** (`host:<host_id>`, delegated host-work design II.2.1)
@@ -2056,11 +2207,16 @@ names its reason; the reasons are stable and snake_case.
    `enc_kid` names one of the keys it accepts now (`enc_key_not_accepted`;
    "The recipient's keys" below). The key part waits when
    `signed_at_head.seq` is beyond this host's head (Pending, below): this
-   host's own new `host_enc_key` may be among the entries it lacks. **Agreed with Astation (2026-11-11, #120 comment
-   6810116314).** The current trust generation is the host's own, from its
-   pairing (`pairing/trust_gen`), never one read from its device list, which
-   may lag behind its own new `add_host` after `atem pair verify` (every
-   mail to its new generation would then be refused for good).
+   host's own new `host_enc_key` may be among the entries it lacks.
+   **Agreed with Astation (2026-11-11, #120 comment 6810116314).** The
+   current trust generation is the host's own, from its pairing
+   (`pairing/trust_gen`), never one read from its device list, which may
+   lag behind its own new `add_host` after `atem pair verify` (every mail
+   to its new generation would then be refused for good). Only a key this
+   host made waits (**for Astation**, amended for step 4): a key id it
+   never made is refused `enc_key_not_accepted` beyond its head too, after
+   the checks that settle at any head, step 5's times and, for a claimed
+   pair this list holds, step 4's check.
 3. **The sender.** For a result: the host, at the generation, the outbox row
    went to (`not_the_recipient`). Then, when `signed_at_head.seq` is not
    beyond this host's head, this list settles it, in this order: a host no
@@ -2117,8 +2273,13 @@ storage and its receipts are the host's.
   generation it last held (`removed_sender`, after the body's times when the
   head is beyond this host's): no entry this host lacks can bring that
   generation back. A removed host's result at that generation still waits,
-  to be kept as data. **Within this host's list** (`signed_at_head.seq` at
-  or below its head), a generation the list doesn't hold there is refused
+  to be kept as data. A key id this host never made (**for Astation**,
+  amended for step 4) is settled at any head too, `enc_key_not_accepted`:
+  every `host_enc_key` entry for this host carries this host's own
+  `enc_sig`, so no entry it lacks can make that key one it accepts. It comes
+  last, after the body's times and the check of the copy below. **Within
+  this host's list** (`signed_at_head.seq` at or below its head), a
+  generation the list doesn't hold there is refused
   `generation_ahead`, and a key it doesn't accept `enc_key_not_accepted`,
   never pending: the list the sender signed at is the one this host holds. A
   pending object is judged again after each device-list advance and each
@@ -2143,8 +2304,8 @@ storage and its receipts are the host's.
 |---|---|---|
 | `Open{plain, sender}` | checks 1 to 6 passed; `sender` is `host:<host_id>` | step 7 |
 | `Pending{host_id, host_trust_gen}` | above | keeps it, not done; judges it again |
-| `Refused{reason, evidence}` | before the copy is shown to be the sender's: steps 1 to 4 (step 2's key part only at a head this host holds), and step 5 on an object signed beyond this host's head | marks it done under `evidence = SHA-256(enc([jcs(body), sig, enc, ct]))` (`enc` and `ct` empty when absent); claims no id; tells nobody |
-| `RefusedAuthenticated{object_id, reason}` | steps 5 and 6, once step 4 showed the copy to be the sender's, intact | marks it done; it claims the object's id; reports it to the sender as `{"kind":"status","object_id":<id>,"refused":"invalid_request"}`, whatever the reason (for a result, nothing is reported back) |
+| `Refused{reason, evidence}` | before the copy is shown to be the sender's: steps 1 to 4 (step 2's key part at a head this host holds, or for a key id this host never made (**for Astation**, amended for step 4)), and step 5 on an object signed beyond this host's head | marks it done under `evidence = SHA-256(enc([jcs(body), sig, enc, ct]))` (`enc` and `ct` empty when absent); claims no id; tells nobody |
+| `RefusedAuthenticated{object_id, reason, sender}` | steps 5 and 6, once step 4 showed the copy to be the sender's, intact; `sender` is `{host_id, host_trust_gen}`: the host, and the generation whose `add_host` key verified the copy (**for Astation**, amended for step 4) | marks it done; it claims `(sender.host_id, object_id)`; reports it to the sender as `{"kind":"status","object_id":<id>,"refused":"invalid_request"}`, whatever the reason (for a result, nothing is reported back) |
 | `Unavailable{error}` | a local failure: the key provider failed (the key missing, or not the one its kid names) | decides nothing; judges it again later |
 
 A seal that doesn't open under the key is `open_failed`, the sender's
@@ -2157,7 +2318,11 @@ comment 6810116314)**; design II.4.2,
 "Duplicates"). A claim is the authenticated sender's: `(sender.host_id,
 id)`, the key of the Station's puts (design II.4.3). Only a copy whose signature
 verified and whose sealed part its `sealed_hash` names (step 4) claims that
-pair: its verdict is Open, RefusedAuthenticated, Accepted or NotDelivered. A
+pair: its verdict is Open, RefusedAuthenticated, Accepted or NotDelivered,
+and each names that sender (**for Astation**, amended for step 4:
+RefusedAuthenticated as `sender{host_id, host_trust_gen}`, where
+`host_trust_gen` only says which `add_host` key verified the copy and is no
+part of the claim; the others as `host:<host_id>`). A
 later object from that sender with that `id` and the same `sealed_hash` (the
 body's field, so the sender may re-sign the same sealed part at a newer
 head) is a duplicate, acknowledged with the first verdict; one with another
@@ -2229,8 +2394,19 @@ applied yet: a sender whose list already has the entry seals to it, and the
 mail then opens at once, instead of waiting until this host's list reaches
 the head the sender signed at (Pending). A host judges a pending object
 again after each device-list advance and each change of the keys it accepts.
-Mail to any other key is refused `enc_key_not_accepted` once this host's
-head is at or beyond the head the object names.
+Mail to any other key it made is refused `enc_key_not_accepted` once this
+host's head is at or beyond the head the object names. **For Astation**
+(amended for step 4): the host also passes the id of every key it made in
+its current trust generation (`generated`), from its own record, never
+from its device list; a key it accepts counts as made, listed there or
+not. It writes
+each id to that record durably before `host_enc_key_get` hands the key
+out, and keeps it for the generation; a lost record is rebuilt from the
+private keys it still holds for that generation (design II.4.1). Every
+`host_enc_key` entry for a host carries the host's own `enc_sig`, so no
+other key id can ever become one it accepts: mail sealed to one is refused
+`enc_key_not_accepted` at any head and never waits. So a key whose id the
+record lacks has its mail refused for good.
 
 **Open items** (left open by Astation's review, 2026-11-11, #120 comment
 6810116314: it signed off the objects above without them, they don't prevent

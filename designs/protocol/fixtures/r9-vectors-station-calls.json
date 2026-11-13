@@ -1,0 +1,2505 @@
+{
+  "at_the_bound": [
+    {
+      "accepts": {
+        "head": 1,
+        "records": 1,
+        "records_parse": [
+          false
+        ]
+      },
+      "direction": "to_host",
+      "name": "control_sync_result_at_262144_bytes",
+      "note": "exactly the bound: a page of one record that is a string of 'x' (not a record: it doesn't parse, the page standing); the one byte longer text is control_sync_result_over_262144_bytes",
+      "op": "control_sync_result",
+      "wire_fill": {
+        "bytes": 262144,
+        "count": 261932,
+        "fill": "x",
+        "prefix": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":\"",
+        "suffix": "\"}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      }
+    },
+    {
+      "accepts": {
+        "entries": 1,
+        "head": {
+          "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 6
+        }
+      },
+      "direction": "to_host",
+      "name": "membership_fetch_result_at_262144_bytes",
+      "note": "exactly the bound, the same bound as every other relay message (no 512 KiB exemption: only stage 3's mailbox calls get that): one entry of log L (E4) whose signature is padded with 'A', so it is read as a message but its signature would not verify; the one byte longer text is membership_fetch_result_over_262144_bytes",
+      "op": "membership_fetch_result",
+      "wire_fill": {
+        "bytes": 262144,
+        "count": 261308,
+        "fill": "A",
+        "prefix": "{\"entries\":[{\"body\":{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"p256\",\"pub\":\"BD8UXpprH3CBh945lGGLF4Yko4Z5KbKYeHXByOecSEuLXtZm-AR4BMDHLbp_hfBUC63FDri68xBldtBzjuXzabs\"},\"device_id\":\"dev-ipad\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"TRl4_gy_dBKDDLNsUlk-Qsei_CJeOJrqlQpcayyR_08\"},\"kind\":\"native\",\"roles\":[\"control\",\"manage\",\"view\"]},\"prev_hash\":\"c342f9fa13c5a0707efe755a2d16f8a6089dfa8afaf16fde1858772c71c878a0\",\"seq\":4,\"signed_at\":1792400003000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1},\"sig\":\"fzspVSv3gm_mY7PRN2NwfB9xWKAIyw6DEhxExE31vCsUExx018VAhrYQaFO9a0YxfHTHTwxkgiPrXsvHmamlmQ",
+        "suffix": "\"}],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"membership_fetch_result\",\"type\":\"relay\"}"
+      }
+    }
+  ],
+  "calls": [
+    {
+      "direction": "to_station",
+      "fields": {
+        "after": 2,
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "origin": "https://station-dev.agora.build"
+      },
+      "name": "control_sync_with_feed_id",
+      "note": "the host knows the feed: read it after position 2, the last it read",
+      "op": "control_sync",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_station",
+      "fields": {
+        "after": 0,
+        "origin": "https://station-dev.agora.build"
+      },
+      "name": "control_sync_without_feed_id",
+      "note": "the host doesn't know the feed yet: no feed_id, and a cursor belongs to a feed, so after is 0",
+      "op": "control_sync",
+      "wire": "{\"after\":0,\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_station",
+      "fields": {
+        "after": 9007199254740991,
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "origin": "https://station-dev.agora.build"
+      },
+      "name": "control_sync_at_the_largest_position",
+      "note": "after at 2^53 - 1, the largest integer",
+      "op": "control_sync",
+      "wire": "{\"after\":9007199254740991,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_host",
+      "fields": {
+        "feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+        "head": 0,
+        "origin": "https://station-dev.agora.build",
+        "records": [],
+        "station_time": 1793620940000
+      },
+      "judged": [],
+      "name": "control_sync_result_empty_feed",
+      "note": "a feed with no record: head 0, no records",
+      "op": "control_sync_result",
+      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_host",
+      "fields": {
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "head": 3,
+        "origin": "https://station-dev.agora.build",
+        "records": [
+          {
+            "feed_seq": 1,
+            "record": {
+              "body": {
+                "about": {
+                  "by": "station",
+                  "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+                },
+                "account_id": "acct-test-1",
+                "action": "cover",
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+                "issued_at": 1793620901000,
+                "origin": "https://station-dev.agora.build",
+                "principal": "service:svc-discord",
+                "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+                "record_id": "00000000-0000-4000-8000-000000000001",
+                "signer": "service:svc-discord",
+                "type": "atem-host-work-control",
+                "v": 1
+              },
+              "sig": "rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw"
+            }
+          },
+          {
+            "feed_seq": 2,
+            "record": {
+              "body": {
+                "about": {
+                  "by": "owner",
+                  "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+                },
+                "account_id": "acct-test-1",
+                "action": "revoke",
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+                "interrupt_running": false,
+                "issued_at": 1793620904000,
+                "origin": "https://station-dev.agora.build",
+                "principal": "service:svc-discord",
+                "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+                "record_id": "00000000-0000-4000-8000-000000000004",
+                "signer": "service:svc-discord",
+                "type": "atem-host-work-control",
+                "v": 1
+              },
+              "sig": "5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ"
+            }
+          },
+          {
+            "feed_seq": 3,
+            "record": {
+              "body": {
+                "about": {
+                  "by": "owner",
+                  "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+                },
+                "account_id": "acct-test-1",
+                "action": "revoke",
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+                "interrupt_running": false,
+                "issued_at": 1793620920000,
+                "origin": "https://station-dev.agora.build",
+                "principal": "service:svc-discord",
+                "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+                "record_id": "00000000-0000-4000-8000-000000000014",
+                "signer": "member:dev-mac",
+                "type": "atem-host-work-control",
+                "v": 1
+              },
+              "sig": "wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ"
+            }
+          }
+        ],
+        "station_time": 1793620940000
+      },
+      "judged": [
+        {
+          "feed_seq": 1,
+          "parses": true,
+          "record_id": "00000000-0000-4000-8000-000000000001"
+        },
+        {
+          "feed_seq": 2,
+          "parses": true,
+          "record_id": "00000000-0000-4000-8000-000000000004"
+        },
+        {
+          "feed_seq": 3,
+          "parses": true,
+          "record_id": "00000000-0000-4000-8000-000000000014"
+        }
+      ],
+      "name": "control_sync_result_with_records",
+      "note": "three records of the control vectors, ascending, the last at the head",
+      "op": "control_sync_result",
+      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":3,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":2,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_host",
+      "fields": {
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "head": 9,
+        "origin": "https://station-dev.agora.build",
+        "records": [
+          {
+            "feed_seq": 4,
+            "record": {
+              "body": {
+                "about": {
+                  "by": "owner",
+                  "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+                },
+                "account_id": "acct-test-1",
+                "action": "revoke",
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+                "interrupt_running": true,
+                "issued_at": 1793620905000,
+                "origin": "https://station-dev.agora.build",
+                "principal": "service:svc-discord",
+                "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+                "record_id": "00000000-0000-4000-8000-000000000005",
+                "signer": "service:svc-discord",
+                "type": "atem-host-work-control",
+                "v": 1
+              },
+              "sig": "75A_hJab2d9VwfDdyVFD0L0D71RqDV1Nl22CkfLlA4RiqB81V_q87d6cqbtRjmea1ahSS7NzDkmgMUX9Po8tAA"
+            }
+          },
+          {
+            "feed_seq": 5,
+            "record": {
+              "body": {
+                "about": {
+                  "by": "station",
+                  "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+                },
+                "account_id": "acct-test-1",
+                "action": "cover",
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+                "issued_at": 1793620951000,
+                "note": "x",
+                "origin": "https://station-dev.agora.build",
+                "principal": "service:svc-discord",
+                "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+                "record_id": "00000000-0000-4000-8000-000000000036",
+                "signer": "service:svc-discord",
+                "type": "atem-host-work-control",
+                "v": 1
+              },
+              "sig": "D3X_oz7YbqH6tPWBCXi3p2AKGpHhuE_ivaQOpxslVPfEnk9nR5d3VuJhDnl_k2KoddLaJnjq1o7-qKQmjD2RDA"
+            }
+          },
+          {
+            "feed_seq": 6,
+            "record": "not a record"
+          },
+          {
+            "feed_seq": 7,
+            "record": null
+          },
+          {
+            "feed_seq": 9,
+            "record": {
+              "body": {
+                "about": {
+                  "by": "owner",
+                  "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+                },
+                "account_id": "acct-test-1",
+                "action": "interrupt_running",
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+                "issued_at": 1793620906000,
+                "origin": "https://station-dev.agora.build",
+                "principal": "service:svc-discord",
+                "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+                "record_id": "00000000-0000-4000-8000-000000000006",
+                "signer": "service:svc-discord",
+                "type": "atem-host-work-control",
+                "v": 1
+              },
+              "sig": "TiIp0SnQhEjUz6msZGtC-4o998qImuwQz5Mbx7u-83redjza-RWg5y2wuf4lxdtKqowU2Y6Sea922hEBYeqACQ"
+            }
+          }
+        ],
+        "station_time": 1793620940000
+      },
+      "hand_assembled": true,
+      "judged": [
+        {
+          "feed_seq": 4,
+          "parses": true,
+          "record_id": "00000000-0000-4000-8000-000000000005"
+        },
+        {
+          "error": "unknown_field",
+          "feed_seq": 5,
+          "parses": false
+        },
+        {
+          "error": "malformed",
+          "feed_seq": 6,
+          "parses": false
+        },
+        {
+          "error": "malformed",
+          "feed_seq": 7,
+          "parses": false
+        },
+        {
+          "feed_seq": 9,
+          "parses": true,
+          "record_id": "00000000-0000-4000-8000-000000000006"
+        }
+      ],
+      "name": "control_sync_result_with_records_that_do_not_parse",
+      "note": "a page is read whole and each record judged on its own: one with an unknown field, a string and a null don't parse, and the page, the feed's position and the records after them stand (gaps in the positions are allowed)",
+      "op": "control_sync_result",
+      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":9,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":true,\"issued_at\":1793620905000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000005\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"75A_hJab2d9VwfDdyVFD0L0D71RqDV1Nl22CkfLlA4RiqB81V_q87d6cqbtRjmea1ahSS7NzDkmgMUX9Po8tAA\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620951000,\"note\":\"x\",\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000036\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"D3X_oz7YbqH6tPWBCXi3p2AKGpHhuE_ivaQOpxslVPfEnk9nR5d3VuJhDnl_k2KoddLaJnjq1o7-qKQmjD2RDA\"}},{\"feed_seq\":6,\"record\":\"not a record\"},{\"feed_seq\":7,\"record\":null},{\"feed_seq\":9,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"interrupt_running\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620906000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000006\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"TiIp0SnQhEjUz6msZGtC-4o998qImuwQz5Mbx7u-83redjza-RWg5y2wuf4lxdtKqowU2Y6Sea922hEBYeqACQ\"}}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_host",
+      "fields": {
+        "feeds": [
+          {
+            "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+            "head": 3,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a",
+            "head": 12,
+            "origin": "https://station-b.example.com",
+            "station_time": 1793620939500
+          }
+        ],
+        "membership": {
+          "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 6
+        }
+      },
+      "name": "heads_two_stations",
+      "note": "two feeds, each of another Station, and the device list's head (log L's)",
+      "op": "heads",
+      "wire": "{\"feeds\":[{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":3,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a\",\"head\":12,\"origin\":\"https://station-b.example.com\",\"station_time\":1793620939500}],\"membership\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"heads\",\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_host",
+      "fields": {
+        "feeds": [],
+        "membership": {
+          "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 6
+        }
+      },
+      "name": "heads_without_feeds",
+      "note": "no feed covers a principal with work on this host: only the device list's head",
+      "op": "heads",
+      "wire": "{\"feeds\":[],\"membership\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"heads\",\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_host",
+      "fields": {
+        "feeds": [
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000001",
+            "head": 1,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000002",
+            "head": 2,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000003",
+            "head": 3,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000004",
+            "head": 4,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000005",
+            "head": 5,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000006",
+            "head": 6,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000007",
+            "head": 7,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000008",
+            "head": 8,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000009",
+            "head": 9,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000000a",
+            "head": 10,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000000b",
+            "head": 11,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000000c",
+            "head": 12,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000000d",
+            "head": 13,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000000e",
+            "head": 14,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000000f",
+            "head": 15,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000010",
+            "head": 16,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000011",
+            "head": 17,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000012",
+            "head": 18,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000013",
+            "head": 19,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000014",
+            "head": 20,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000015",
+            "head": 21,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000016",
+            "head": 22,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000017",
+            "head": 23,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000018",
+            "head": 24,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000019",
+            "head": 25,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000001a",
+            "head": 26,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000001b",
+            "head": 27,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000001c",
+            "head": 28,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000001d",
+            "head": 29,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000001e",
+            "head": 30,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000001f",
+            "head": 31,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000020",
+            "head": 32,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000021",
+            "head": 33,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000022",
+            "head": 34,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000023",
+            "head": 35,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000024",
+            "head": 36,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000025",
+            "head": 37,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000026",
+            "head": 38,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000027",
+            "head": 39,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000028",
+            "head": 40,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000029",
+            "head": 41,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000002a",
+            "head": 42,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000002b",
+            "head": 43,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000002c",
+            "head": 44,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000002d",
+            "head": 45,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000002e",
+            "head": 46,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000002f",
+            "head": 47,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000030",
+            "head": 48,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000031",
+            "head": 49,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000032",
+            "head": 50,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000033",
+            "head": 51,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000034",
+            "head": 52,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000035",
+            "head": 53,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000036",
+            "head": 54,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000037",
+            "head": 55,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000038",
+            "head": 56,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000039",
+            "head": 57,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000003a",
+            "head": 58,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000003b",
+            "head": 59,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000003c",
+            "head": 60,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000003d",
+            "head": 61,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000003e",
+            "head": 62,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-00000000003f",
+            "head": 63,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          },
+          {
+            "feed_id": "00000000-0000-4000-8000-000000000040",
+            "head": 64,
+            "origin": "https://station-dev.agora.build",
+            "station_time": 1793620940000
+          }
+        ],
+        "membership": {
+          "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 6
+        }
+      },
+      "name": "heads_64_feeds",
+      "note": "the most feeds one heads announces: 64, each once",
+      "op": "heads",
+      "wire": "{\"feeds\":[{\"feed_id\":\"00000000-0000-4000-8000-000000000001\",\"head\":1,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000002\",\"head\":2,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000003\",\"head\":3,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000004\",\"head\":4,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000005\",\"head\":5,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000006\",\"head\":6,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000007\",\"head\":7,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000008\",\"head\":8,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000009\",\"head\":9,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000000a\",\"head\":10,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000000b\",\"head\":11,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000000c\",\"head\":12,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000000d\",\"head\":13,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000000e\",\"head\":14,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000000f\",\"head\":15,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000010\",\"head\":16,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000011\",\"head\":17,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000012\",\"head\":18,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000013\",\"head\":19,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000014\",\"head\":20,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000015\",\"head\":21,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000016\",\"head\":22,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000017\",\"head\":23,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000018\",\"head\":24,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000019\",\"head\":25,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000001a\",\"head\":26,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000001b\",\"head\":27,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000001c\",\"head\":28,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000001d\",\"head\":29,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000001e\",\"head\":30,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000001f\",\"head\":31,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000020\",\"head\":32,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000021\",\"head\":33,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000022\",\"head\":34,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000023\",\"head\":35,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000024\",\"head\":36,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000025\",\"head\":37,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000026\",\"head\":38,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000027\",\"head\":39,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000028\",\"head\":40,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000029\",\"head\":41,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000002a\",\"head\":42,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000002b\",\"head\":43,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000002c\",\"head\":44,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000002d\",\"head\":45,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000002e\",\"head\":46,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000002f\",\"head\":47,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000030\",\"head\":48,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000031\",\"head\":49,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000032\",\"head\":50,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000033\",\"head\":51,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000034\",\"head\":52,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000035\",\"head\":53,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000036\",\"head\":54,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000037\",\"head\":55,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000038\",\"head\":56,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000039\",\"head\":57,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000003a\",\"head\":58,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000003b\",\"head\":59,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000003c\",\"head\":60,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000003d\",\"head\":61,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000003e\",\"head\":62,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-00000000003f\",\"head\":63,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"00000000-0000-4000-8000-000000000040\",\"head\":64,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000}],\"membership\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"heads\",\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_station",
+      "fields": {
+        "account_id": "acct-test-1",
+        "cursor": 5,
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "results": []
+      },
+      "name": "control_ack_cursor_only",
+      "note": "the host read the feed to position 5 and has applied nothing to report: the cursor says only how far it read",
+      "op": "control_ack",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[],\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_station",
+      "fields": {
+        "account_id": "acct-test-1",
+        "cursor": 3,
+        "feed_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "results": [
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-00000000000e"
+          },
+          {
+            "effects": [
+              {
+                "effect": "hold",
+                "result": "pending"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-00000000000f"
+          },
+          {
+            "effects": [
+              {
+                "effect": "release",
+                "result": "refused"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-000000000010"
+          }
+        ]
+      },
+      "name": "control_ack_record_results",
+      "note": "results of the reset feed's snapshot, by record_id, each with the effect its record carries: a cover applied, a hold pending, a release refused",
+      "op": "control_ack",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":3,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-00000000000e\"},{\"effects\":[{\"effect\":\"hold\",\"result\":\"pending\"}],\"record_id\":\"00000000-0000-4000-8000-00000000000f\"},{\"effects\":[{\"effect\":\"release\",\"result\":\"refused\"}],\"record_id\":\"00000000-0000-4000-8000-000000000010\"}],\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_station",
+      "fields": {
+        "account_id": "acct-test-1",
+        "cursor": 6,
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "results": [
+          {
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-000000000004"
+          },
+          {
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "duplicate"
+              },
+              {
+                "effect": "interrupt",
+                "result": "applied"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-000000000005"
+          },
+          {
+            "effects": [
+              {
+                "effect": "interrupt",
+                "result": "applied"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-000000000006"
+          }
+        ]
+      },
+      "name": "control_ack_revoke_results",
+      "note": "a revoke (its revocation), a revoke with interrupt_running (revocation already in force, interrupt applied) and a later interrupt_running (its interrupt)",
+      "op": "control_ack",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":6,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000004\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"effects\":[{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000006\"}],\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_station",
+      "fields": {
+        "account_id": "acct-test-1",
+        "cursor": 5,
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "results": [
+          {
+            "applied_seq": 7,
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              }
+            ],
+            "entry": {
+              "entry_hash": "c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3",
+              "seq": 7
+            }
+          }
+        ]
+      },
+      "name": "control_ack_entry_result",
+      "note": "the result of a host sender's device-list revoke, by {seq, entry_hash}: applied once applied_seq has reached its seq",
+      "op": "control_ack",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"applied_seq\":7,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":7}}],\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_station",
+      "fields": {
+        "account_id": "acct-test-1",
+        "cursor": 5,
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "results": [
+          {
+            "applied_seq": 6,
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "pending"
+              }
+            ],
+            "entry": {
+              "entry_hash": "c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3",
+              "seq": 7
+            }
+          }
+        ]
+      },
+      "name": "control_ack_entry_pending",
+      "note": "the same entry while the host's applied device-list seq is behind it: only pending or refused may be said",
+      "op": "control_ack",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"applied_seq\":6,\"effects\":[{\"effect\":\"revocation\",\"result\":\"pending\"}],\"entry\":{\"entry_hash\":\"c67a263830fa86740b515f200cfad113ac5242a4fb924753ae92f2695e9fb1b3\",\"seq\":7}}],\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_station",
+      "fields": {
+        "account_id": "acct-test-1",
+        "cursor": 5,
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "results": [
+          {
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "duplicate"
+              },
+              {
+                "effect": "interrupt",
+                "result": "applied"
+              }
+            ],
+            "record_id": "00000000-0000-4000-8000-000000000005"
+          },
+          {
+            "applied_seq": 12,
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              },
+              {
+                "effect": "interrupt",
+                "result": "applied"
+              }
+            ],
+            "entry": {
+              "entry_hash": "addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb",
+              "seq": 12
+            }
+          }
+        ]
+      },
+      "name": "control_ack_both_result_forms",
+      "note": "both result forms in one ack: a record's and an entry's (a host sender's revoke that asked for an interrupt: revocation and interrupt)",
+      "op": "control_ack",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_station",
+      "fields": {
+        "account_id": "acct-test-1",
+        "cursor": 64,
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "results": [
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000001"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000002"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000003"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000004"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000005"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000006"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000007"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000008"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000009"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000000a"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000000b"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000000c"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000000d"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000000e"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000000f"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000010"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000011"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000012"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000013"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000014"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000015"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000016"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000017"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000018"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000019"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000001a"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000001b"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000001c"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000001d"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000001e"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000001f"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000020"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000021"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000022"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000023"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000024"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000025"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000026"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000027"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000028"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000029"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000002a"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000002b"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000002c"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000002d"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000002e"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000002f"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000030"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000031"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000032"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000033"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000034"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000035"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000036"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000037"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000038"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000039"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000003a"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000003b"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000003c"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000003d"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000003e"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-00000000003f"
+          },
+          {
+            "effects": [
+              {
+                "effect": "cover",
+                "result": "applied"
+              }
+            ],
+            "record_id": "11111111-1111-4111-8111-000000000040"
+          }
+        ]
+      },
+      "name": "control_ack_64_results",
+      "note": "the most results one ack carries: 64, each record once (ids of no vectors record)",
+      "op": "control_ack",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":64,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000001\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000002\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000003\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000004\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000005\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000006\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000007\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000008\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000009\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000000a\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000000b\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000000c\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000000d\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000000e\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000000f\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000010\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000011\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000012\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000013\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000014\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000015\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000016\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000017\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000018\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000019\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000001a\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000001b\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000001c\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000001d\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000001e\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000001f\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000020\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000021\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000022\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000023\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000024\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000025\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000026\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000027\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000028\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000029\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000002a\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000002b\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000002c\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000002d\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000002e\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000002f\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000030\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000031\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000032\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000033\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000034\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000035\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000036\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000037\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000038\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000039\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000003a\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000003b\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000003c\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000003d\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000003e\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-00000000003f\"},{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"}],\"record_id\":\"11111111-1111-4111-8111-000000000040\"}],\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_station",
+      "fields": {
+        "after": 2
+      },
+      "name": "membership_fetch",
+      "note": "the host holds the device list to seq 2",
+      "op": "membership_fetch",
+      "wire": "{\"after\":2,\"op\":\"membership_fetch\",\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_host",
+      "fields": {
+        "entries": [
+          {
+            "body": {
+              "account_id": "acct-test-1",
+              "action": "add",
+              "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+              "member": {
+                "auth_key": {
+                  "alg": "p256",
+                  "pub": "BGV5Ov3b43EjUrJGejYvqwfQljq9X4Tx0Rd1aYDInE29tmNy-IIhgIH0hY-cheON0bvA_O0yEeah0yUbXnxO5SQ"
+                },
+                "device_id": "dev-phone",
+                "enc_key": {
+                  "alg": "x25519",
+                  "pub": "oJkn3Pr5ZonLiInBeyLi4eNyIcHkLMRz0EmmHE-ZiXY"
+                },
+                "kind": "native",
+                "roles": [
+                  "control",
+                  "manage",
+                  "view"
+                ]
+              },
+              "prev_hash": "7cc348b5991f0995cb2a7b9300202dc8323733484fc49bfd264800447a2d4e3d",
+              "seq": 3,
+              "signed_at": 1792400002000,
+              "signer": "dev-mac",
+              "type": "atem-membership-entry",
+              "v": 1
+            },
+            "sig": "MBHa-kF4XZ-i_xhlzkTzV_-FEUhWH0EXwCaTn7v9NZkvz3c86ZpZgmDabg4RVRwhLDB5l-jd8rvWuXPezTKDWw"
+          },
+          {
+            "body": {
+              "account_id": "acct-test-1",
+              "action": "add",
+              "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+              "member": {
+                "auth_key": {
+                  "alg": "p256",
+                  "pub": "BD8UXpprH3CBh945lGGLF4Yko4Z5KbKYeHXByOecSEuLXtZm-AR4BMDHLbp_hfBUC63FDri68xBldtBzjuXzabs"
+                },
+                "device_id": "dev-ipad",
+                "enc_key": {
+                  "alg": "x25519",
+                  "pub": "TRl4_gy_dBKDDLNsUlk-Qsei_CJeOJrqlQpcayyR_08"
+                },
+                "kind": "native",
+                "roles": [
+                  "control",
+                  "manage",
+                  "view"
+                ]
+              },
+              "prev_hash": "c342f9fa13c5a0707efe755a2d16f8a6089dfa8afaf16fde1858772c71c878a0",
+              "seq": 4,
+              "signed_at": 1792400003000,
+              "signer": "dev-mac",
+              "type": "atem-membership-entry",
+              "v": 1
+            },
+            "sig": "fzspVSv3gm_mY7PRN2NwfB9xWKAIyw6DEhxExE31vCsUExx018VAhrYQaFO9a0YxfHTHTwxkgiPrXsvHmamlmQ"
+          },
+          {
+            "body": {
+              "account_id": "acct-test-1",
+              "action": "add",
+              "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+              "member": {
+                "auth_key": {
+                  "alg": "ed25519",
+                  "pub": "QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE"
+                },
+                "device_id": "svc-discord",
+                "expires_at": 1794992004000,
+                "kind": "service",
+                "roles": [
+                  "service"
+                ],
+                "scope": {
+                  "hosts": [
+                    "host-a"
+                  ],
+                  "ops": [
+                    "interrupt",
+                    "prompt",
+                    "view"
+                  ],
+                  "projects": [
+                    "h1.b982533d.abababababababababababababababababababababababababababababababab"
+                  ]
+                }
+              },
+              "prev_hash": "f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a",
+              "seq": 5,
+              "signed_at": 1792400004000,
+              "signer": "dev-phone",
+              "type": "atem-membership-entry",
+              "v": 1
+            },
+            "sig": "y_DQsbGlIpfBs0B6P7US_rnHmp3eD57EUV8FtmJq6FwTGW10FJq5Rvd1rq1yiUUQJRDh408dEfKdpwSeKGI04Q"
+          },
+          {
+            "body": {
+              "account_id": "acct-test-1",
+              "action": "remove",
+              "device_id": "dev-ipad",
+              "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+              "prev_hash": "54c0f64f7fd1a3677a91650d40079ebffd03a6da8d78b91278c421d862337cf9",
+              "seq": 6,
+              "signed_at": 1792400005000,
+              "signer": "dev-mac",
+              "type": "atem-membership-entry",
+              "v": 1
+            },
+            "sig": "n855P1SB0hla2L6NPbGrO_NKNRvIBVtpmj5ijREJW00zgPVe1vIdIOHcptzm5oA8Idb0cdreG3z6KW777KiWpQ"
+          }
+        ],
+        "head": {
+          "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 6
+        }
+      },
+      "name": "membership_fetch_result",
+      "note": "the entries after seq 2 (log L's E3 to E6, an R9.3 carriage) and the Station's head; no echo of after, no more",
+      "op": "membership_fetch_result",
+      "wire": "{\"entries\":[{\"body\":{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"p256\",\"pub\":\"BGV5Ov3b43EjUrJGejYvqwfQljq9X4Tx0Rd1aYDInE29tmNy-IIhgIH0hY-cheON0bvA_O0yEeah0yUbXnxO5SQ\"},\"device_id\":\"dev-phone\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"oJkn3Pr5ZonLiInBeyLi4eNyIcHkLMRz0EmmHE-ZiXY\"},\"kind\":\"native\",\"roles\":[\"control\",\"manage\",\"view\"]},\"prev_hash\":\"7cc348b5991f0995cb2a7b9300202dc8323733484fc49bfd264800447a2d4e3d\",\"seq\":3,\"signed_at\":1792400002000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1},\"sig\":\"MBHa-kF4XZ-i_xhlzkTzV_-FEUhWH0EXwCaTn7v9NZkvz3c86ZpZgmDabg4RVRwhLDB5l-jd8rvWuXPezTKDWw\"},{\"body\":{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"p256\",\"pub\":\"BD8UXpprH3CBh945lGGLF4Yko4Z5KbKYeHXByOecSEuLXtZm-AR4BMDHLbp_hfBUC63FDri68xBldtBzjuXzabs\"},\"device_id\":\"dev-ipad\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"TRl4_gy_dBKDDLNsUlk-Qsei_CJeOJrqlQpcayyR_08\"},\"kind\":\"native\",\"roles\":[\"control\",\"manage\",\"view\"]},\"prev_hash\":\"c342f9fa13c5a0707efe755a2d16f8a6089dfa8afaf16fde1858772c71c878a0\",\"seq\":4,\"signed_at\":1792400003000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1},\"sig\":\"fzspVSv3gm_mY7PRN2NwfB9xWKAIyw6DEhxExE31vCsUExx018VAhrYQaFO9a0YxfHTHTwxkgiPrXsvHmamlmQ\"},{\"body\":{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"ed25519\",\"pub\":\"QKPlIgIXELeqtF4uMR1Wc_Pqwo0liLRYokICq7I_aNE\"},\"device_id\":\"svc-discord\",\"expires_at\":1794992004000,\"kind\":\"service\",\"roles\":[\"service\"],\"scope\":{\"hosts\":[\"host-a\"],\"ops\":[\"interrupt\",\"prompt\",\"view\"],\"projects\":[\"h1.b982533d.abababababababababababababababababababababababababababababababab\"]}},\"prev_hash\":\"f511f4dc7890054bcbf4483af2303bc61561e1f967263ce22b68d407c3e1836a\",\"seq\":5,\"signed_at\":1792400004000,\"signer\":\"dev-phone\",\"type\":\"atem-membership-entry\",\"v\":1},\"sig\":\"y_DQsbGlIpfBs0B6P7US_rnHmp3eD57EUV8FtmJq6FwTGW10FJq5Rvd1rq1yiUUQJRDh408dEfKdpwSeKGI04Q\"},{\"body\":{\"account_id\":\"acct-test-1\",\"action\":\"remove\",\"device_id\":\"dev-ipad\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"prev_hash\":\"54c0f64f7fd1a3677a91650d40079ebffd03a6da8d78b91278c421d862337cf9\",\"seq\":6,\"signed_at\":1792400005000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1},\"sig\":\"n855P1SB0hla2L6NPbGrO_NKNRvIBVtpmj5ijREJW00zgPVe1vIdIOHcptzm5oA8Idb0cdreG3z6KW777KiWpQ\"}],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"membership_fetch_result\",\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_host",
+      "fields": {
+        "entries": [],
+        "head": {
+          "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+          "seq": 6
+        }
+      },
+      "name": "membership_fetch_result_no_entries",
+      "note": "the host is current: the head and no entries",
+      "op": "membership_fetch_result",
+      "wire": "{\"entries\":[],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"membership_fetch_result\",\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_host",
+      "fields": {
+        "code": "forbidden"
+      },
+      "name": "control_sync_refused",
+      "note": "the Station refuses the call on this link (agreed with Astation, 2026-11-11): exactly this, naming nothing",
+      "op": "control_sync_refused",
+      "wire": "{\"code\":\"forbidden\",\"op\":\"control_sync_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_host",
+      "fields": {
+        "code": "forbidden"
+      },
+      "name": "membership_fetch_refused",
+      "note": "the Station refuses the call on this link (agreed with Astation, 2026-11-11): exactly this, naming nothing",
+      "op": "membership_fetch_refused",
+      "wire": "{\"code\":\"forbidden\",\"op\":\"membership_fetch_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_host",
+      "fields": {
+        "code": "forbidden"
+      },
+      "name": "control_ack_refused",
+      "note": "the Station refuses the call on this link (agreed with Astation, 2026-11-11): exactly this, naming nothing",
+      "op": "control_ack_refused",
+      "wire": "{\"code\":\"forbidden\",\"op\":\"control_ack_refused\",\"type\":\"relay\"}"
+    }
+  ],
+  "invalid": [
+    {
+      "code": "unknown_field",
+      "name": "control_sync_unknown_field",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"mailbox\":1,\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_feed_id_null",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":2,\"feed_id\":null,\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "not_strict",
+      "name": "control_sync_duplicate_key",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":2,\"after\":3,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_after_without_a_feed_id",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":5,\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_origin_with_a_path",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build/\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_origin_not_lowercase",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://Station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_origin_plain_http",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"http://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_feed_id_not_uuid_v4",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-5f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_feed_id_not_lowercase",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":2,\"feed_id\":\"6F1C2B3A-4D5E-4F60-8A7B-9C0D1E2F3A4B\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "not_strict",
+      "name": "control_sync_after_a_fraction",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":1.5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "not_strict",
+      "name": "control_sync_after_an_unsafe_integer",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":9007199254740992,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_after_negative",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":-1,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_after_missing",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_after_as_text",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":\"2\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "wrong_message",
+      "name": "control_sync_not_a_relay_message",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"session\"}"
+    },
+    {
+      "code": "wrong_message",
+      "name": "a_call_read_as_a_stations_message",
+      "op": "control_sync",
+      "reader": "to_host",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "wrong_message",
+      "name": "a_stations_message_read_as_a_call",
+      "op": "heads",
+      "reader": "to_station",
+      "wire": "{\"feeds\":[{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":3,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a\",\"head\":12,\"origin\":\"https://station-b.example.com\",\"station_time\":1793620939500}],\"membership\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"heads\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "wrong_message",
+      "name": "a_json_array",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "[]"
+    },
+    {
+      "code": "not_strict",
+      "name": "not_json",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{"
+    },
+    {
+      "code": "wrong_message",
+      "name": "another_relay_message_to_a_station",
+      "op": "control_sync",
+      "reader": "to_station",
+      "wire": "{\"hints\":[],\"op\":\"push_hint\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "wrong_message",
+      "name": "another_relay_message_to_a_host",
+      "op": "heads",
+      "reader": "to_host",
+      "wire": "{\"hints\":[],\"op\":\"push_hint\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "unknown_field",
+      "name": "control_sync_result_unknown_field",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"more\":true,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "unknown_field",
+      "name": "control_sync_result_item_unknown_field",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"extra\":1,\"feed_seq\":1,\"record\":0}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_item_without_a_record",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "too_large",
+      "name": "control_sync_result_65_records",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":65,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":0},{\"feed_seq\":2,\"record\":0},{\"feed_seq\":3,\"record\":0},{\"feed_seq\":4,\"record\":0},{\"feed_seq\":5,\"record\":0},{\"feed_seq\":6,\"record\":0},{\"feed_seq\":7,\"record\":0},{\"feed_seq\":8,\"record\":0},{\"feed_seq\":9,\"record\":0},{\"feed_seq\":10,\"record\":0},{\"feed_seq\":11,\"record\":0},{\"feed_seq\":12,\"record\":0},{\"feed_seq\":13,\"record\":0},{\"feed_seq\":14,\"record\":0},{\"feed_seq\":15,\"record\":0},{\"feed_seq\":16,\"record\":0},{\"feed_seq\":17,\"record\":0},{\"feed_seq\":18,\"record\":0},{\"feed_seq\":19,\"record\":0},{\"feed_seq\":20,\"record\":0},{\"feed_seq\":21,\"record\":0},{\"feed_seq\":22,\"record\":0},{\"feed_seq\":23,\"record\":0},{\"feed_seq\":24,\"record\":0},{\"feed_seq\":25,\"record\":0},{\"feed_seq\":26,\"record\":0},{\"feed_seq\":27,\"record\":0},{\"feed_seq\":28,\"record\":0},{\"feed_seq\":29,\"record\":0},{\"feed_seq\":30,\"record\":0},{\"feed_seq\":31,\"record\":0},{\"feed_seq\":32,\"record\":0},{\"feed_seq\":33,\"record\":0},{\"feed_seq\":34,\"record\":0},{\"feed_seq\":35,\"record\":0},{\"feed_seq\":36,\"record\":0},{\"feed_seq\":37,\"record\":0},{\"feed_seq\":38,\"record\":0},{\"feed_seq\":39,\"record\":0},{\"feed_seq\":40,\"record\":0},{\"feed_seq\":41,\"record\":0},{\"feed_seq\":42,\"record\":0},{\"feed_seq\":43,\"record\":0},{\"feed_seq\":44,\"record\":0},{\"feed_seq\":45,\"record\":0},{\"feed_seq\":46,\"record\":0},{\"feed_seq\":47,\"record\":0},{\"feed_seq\":48,\"record\":0},{\"feed_seq\":49,\"record\":0},{\"feed_seq\":50,\"record\":0},{\"feed_seq\":51,\"record\":0},{\"feed_seq\":52,\"record\":0},{\"feed_seq\":53,\"record\":0},{\"feed_seq\":54,\"record\":0},{\"feed_seq\":55,\"record\":0},{\"feed_seq\":56,\"record\":0},{\"feed_seq\":57,\"record\":0},{\"feed_seq\":58,\"record\":0},{\"feed_seq\":59,\"record\":0},{\"feed_seq\":60,\"record\":0},{\"feed_seq\":61,\"record\":0},{\"feed_seq\":62,\"record\":0},{\"feed_seq\":63,\"record\":0},{\"feed_seq\":64,\"record\":0},{\"feed_seq\":65,\"record\":0}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_feed_seq_above_the_head",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":2,\"record\":0}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_feed_seq_not_ascending",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":2,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":2,\"record\":0},{\"feed_seq\":1,\"record\":0}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_feed_seq_twice",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":2,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":0},{\"feed_seq\":1,\"record\":0}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_feed_seq_zero",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":0,\"record\":0}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_head_as_text",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":\"0\",\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_origin_with_a_path",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build/\",\"records\":[],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_feed_id_not_uuid_v4",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"not-a-feed\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_station_time_missing",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_result_records_not_an_array",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":{},\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "not_strict",
+      "name": "control_sync_result_duplicate_key_inside_a_record",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":{\"a\":1,\"a\":2}}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "not_strict",
+      "name": "control_sync_result_fraction_inside_a_record",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":{\"a\":1.5}}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "not_strict",
+      "name": "control_sync_result_unsafe_integer_inside_a_record",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":{\"a\":9007199254740992}}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "not_strict",
+      "name": "control_sync_result_lone_surrogate_inside_a_record",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":\"\\ud800\"}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "not_strict",
+      "name": "control_sync_result_record_nested_past_the_depth_bound",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "code": "too_large",
+      "name": "control_sync_result_over_262144_bytes",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire_fill": {
+        "bytes": 262145,
+        "count": 261933,
+        "fill": "x",
+        "prefix": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":\"",
+        "suffix": "\"}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      }
+    },
+    {
+      "code": "too_large",
+      "name": "control_sync_result_300000_bytes",
+      "op": "control_sync_result",
+      "reader": "to_host",
+      "wire_fill": {
+        "bytes": 300000,
+        "count": 299788,
+        "fill": "x",
+        "prefix": "{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":1,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":1,\"record\":\"",
+        "suffix": "\"}],\"station_time\":1793620940000,\"type\":\"relay\"}"
+      }
+    },
+    {
+      "code": "too_large",
+      "name": "membership_fetch_result_over_262144_bytes",
+      "op": "membership_fetch_result",
+      "reader": "to_host",
+      "wire_fill": {
+        "bytes": 262145,
+        "count": 261309,
+        "fill": "A",
+        "prefix": "{\"entries\":[{\"body\":{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"p256\",\"pub\":\"BD8UXpprH3CBh945lGGLF4Yko4Z5KbKYeHXByOecSEuLXtZm-AR4BMDHLbp_hfBUC63FDri68xBldtBzjuXzabs\"},\"device_id\":\"dev-ipad\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"TRl4_gy_dBKDDLNsUlk-Qsei_CJeOJrqlQpcayyR_08\"},\"kind\":\"native\",\"roles\":[\"control\",\"manage\",\"view\"]},\"prev_hash\":\"c342f9fa13c5a0707efe755a2d16f8a6089dfa8afaf16fde1858772c71c878a0\",\"seq\":4,\"signed_at\":1792400003000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1},\"sig\":\"fzspVSv3gm_mY7PRN2NwfB9xWKAIyw6DEhxExE31vCsUExx018VAhrYQaFO9a0YxfHTHTwxkgiPrXsvHmamlmQ",
+        "suffix": "\"}],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"membership_fetch_result\",\"type\":\"relay\"}"
+      }
+    },
+    {
+      "code": "too_large",
+      "name": "membership_fetch_result_300000_bytes",
+      "op": "membership_fetch_result",
+      "reader": "to_host",
+      "wire_fill": {
+        "bytes": 300000,
+        "count": 299164,
+        "fill": "A",
+        "prefix": "{\"entries\":[{\"body\":{\"account_id\":\"acct-test-1\",\"action\":\"add\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"member\":{\"auth_key\":{\"alg\":\"p256\",\"pub\":\"BD8UXpprH3CBh945lGGLF4Yko4Z5KbKYeHXByOecSEuLXtZm-AR4BMDHLbp_hfBUC63FDri68xBldtBzjuXzabs\"},\"device_id\":\"dev-ipad\",\"enc_key\":{\"alg\":\"x25519\",\"pub\":\"TRl4_gy_dBKDDLNsUlk-Qsei_CJeOJrqlQpcayyR_08\"},\"kind\":\"native\",\"roles\":[\"control\",\"manage\",\"view\"]},\"prev_hash\":\"c342f9fa13c5a0707efe755a2d16f8a6089dfa8afaf16fde1858772c71c878a0\",\"seq\":4,\"signed_at\":1792400003000,\"signer\":\"dev-mac\",\"type\":\"atem-membership-entry\",\"v\":1},\"sig\":\"fzspVSv3gm_mY7PRN2NwfB9xWKAIyw6DEhxExE31vCsUExx018VAhrYQaFO9a0YxfHTHTwxkgiPrXsvHmamlmQ",
+        "suffix": "\"}],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"membership_fetch_result\",\"type\":\"relay\"}"
+      }
+    },
+    {
+      "code": "unknown_field",
+      "name": "heads_unknown_mailbox_field",
+      "op": "heads",
+      "reader": "to_host",
+      "wire": "{\"feeds\":[{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":3,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a\",\"head\":12,\"origin\":\"https://station-b.example.com\",\"station_time\":1793620939500}],\"mailbox\":{\"head\":1,\"mailbox_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\"},\"membership\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"heads\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "heads_a_feed_twice",
+      "op": "heads",
+      "reader": "to_host",
+      "wire": "{\"feeds\":[{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":3,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":3,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000}],\"membership\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"heads\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "too_large",
+      "name": "heads_65_feeds",
+      "op": "heads",
+      "reader": "to_host",
+      "wire": "{\"feeds\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],\"membership\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"heads\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "heads_membership_seq_zero",
+      "op": "heads",
+      "reader": "to_host",
+      "wire": "{\"feeds\":[{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":3,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a\",\"head\":12,\"origin\":\"https://station-b.example.com\",\"station_time\":1793620939500}],\"membership\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":0},\"op\":\"heads\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "heads_membership_hash_not_lowercase",
+      "op": "heads",
+      "reader": "to_host",
+      "wire": "{\"feeds\":[{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":3,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a\",\"head\":12,\"origin\":\"https://station-b.example.com\",\"station_time\":1793620939500}],\"membership\":{\"hash\":\"BEB18469B583C1AA981B09DA8ED461538EA6171693D345F63105C5AB5D0AEA79\",\"seq\":6},\"op\":\"heads\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "unknown_field",
+      "name": "heads_membership_unknown_field",
+      "op": "heads",
+      "reader": "to_host",
+      "wire": "{\"feeds\":[{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":3,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a\",\"head\":12,\"origin\":\"https://station-b.example.com\",\"station_time\":1793620939500}],\"membership\":{\"extra\":1,\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"heads\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "heads_membership_missing",
+      "op": "heads",
+      "reader": "to_host",
+      "wire": "{\"feeds\":[{\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":3,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a\",\"head\":12,\"origin\":\"https://station-b.example.com\",\"station_time\":1793620939500}],\"op\":\"heads\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "heads_feeds_missing",
+      "op": "heads",
+      "reader": "to_host",
+      "wire": "{\"membership\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"heads\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "unknown_field",
+      "name": "heads_feed_unknown_field",
+      "op": "heads",
+      "reader": "to_host",
+      "wire": "{\"feeds\":[{\"extra\":1,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":3,\"origin\":\"https://station-dev.agora.build\",\"station_time\":1793620940000},{\"feed_id\":\"1d2c3b4a-5f6e-4d7c-b8a9-0f1e2d3c4b5a\",\"head\":12,\"origin\":\"https://station-b.example.com\",\"station_time\":1793620939500}],\"membership\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"heads\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "unknown_field",
+      "name": "control_ack_unknown_field",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"extra\":1,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "too_large",
+      "name": "control_ack_65_results",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_a_record_twice",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_an_entry_twice",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_effects_out_of_order",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"interrupt\",\"result\":\"applied\"},{\"effect\":\"revocation\",\"result\":\"duplicate\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_effects_no_record_carries",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"cover\",\"result\":\"applied\"},{\"effect\":\"revocation\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_effects_empty",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_effects_three",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"},{\"effect\":\"hold\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_a_result_of_both_forms",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12},\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_a_result_of_neither_form",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}]},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_an_unknown_result",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"maybe\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_host_trust_gen_zero",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":0,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_entry_applied_behind_applied_seq",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":11,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_genesis_hash_not_lowercase",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542F5F9F4A7CE3D08F79E267D4D80DF3F8E35AE852F47216E3CC559CD89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_cursor_missing",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "unknown_field",
+      "name": "control_ack_result_unknown_field",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"extra\":1,\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_account_id_empty",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"\",\"cursor\":5,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_feed_id_missing",
+      "op": "control_ack",
+      "reader": "to_station",
+      "wire": "{\"account_id\":\"acct-test-1\",\"cursor\":5,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"host_id\":\"host-b\",\"host_trust_gen\":1,\"op\":\"control_ack\",\"origin\":\"https://station-dev.agora.build\",\"results\":[{\"effects\":[{\"effect\":\"revocation\",\"result\":\"duplicate\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"record_id\":\"00000000-0000-4000-8000-000000000005\"},{\"applied_seq\":12,\"effects\":[{\"effect\":\"revocation\",\"result\":\"applied\"},{\"effect\":\"interrupt\",\"result\":\"applied\"}],\"entry\":{\"entry_hash\":\"addf0619866a9722fafbdcc56dec88463be173b00b1454a0e3fb999c385f10cb\",\"seq\":12}}],\"type\":\"relay\"}"
+    },
+    {
+      "code": "unknown_field",
+      "name": "membership_fetch_unknown_field",
+      "op": "membership_fetch",
+      "reader": "to_station",
+      "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"membership_fetch\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "membership_fetch_after_null",
+      "op": "membership_fetch",
+      "reader": "to_station",
+      "wire": "{\"after\":null,\"op\":\"membership_fetch\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "membership_fetch_after_missing",
+      "op": "membership_fetch",
+      "reader": "to_station",
+      "wire": "{\"op\":\"membership_fetch\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "too_large",
+      "name": "membership_fetch_result_65_entries",
+      "op": "membership_fetch_result",
+      "reader": "to_host",
+      "wire": "{\"entries\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"membership_fetch_result\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "membership_fetch_result_an_entry_that_is_not_an_object",
+      "op": "membership_fetch_result",
+      "reader": "to_host",
+      "wire": "{\"entries\":[0],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"membership_fetch_result\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "membership_fetch_result_head_seq_zero",
+      "op": "membership_fetch_result",
+      "reader": "to_host",
+      "wire": "{\"entries\":[],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":0},\"op\":\"membership_fetch_result\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "membership_fetch_result_head_hash_not_hex",
+      "op": "membership_fetch_result",
+      "reader": "to_host",
+      "wire": "{\"entries\":[],\"head\":{\"hash\":\"beb1\",\"seq\":6},\"op\":\"membership_fetch_result\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "unknown_field",
+      "name": "membership_fetch_result_echoes_after",
+      "op": "membership_fetch_result",
+      "reader": "to_host",
+      "wire": "{\"after\":2,\"entries\":[],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"membership_fetch_result\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "unknown_field",
+      "name": "membership_fetch_result_carries_more",
+      "op": "membership_fetch_result",
+      "reader": "to_host",
+      "wire": "{\"entries\":[],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"more\":false,\"op\":\"membership_fetch_result\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "membership_fetch_result_entries_missing",
+      "op": "membership_fetch_result",
+      "reader": "to_host",
+      "wire": "{\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"op\":\"membership_fetch_result\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_refused_unknown_code",
+      "op": "control_sync_refused",
+      "reader": "to_host",
+      "wire": "{\"code\":\"not_found\",\"op\":\"control_sync_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_refused_code_null",
+      "op": "control_sync_refused",
+      "reader": "to_host",
+      "wire": "{\"code\":null,\"op\":\"control_sync_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_refused_code_missing",
+      "op": "control_sync_refused",
+      "reader": "to_host",
+      "wire": "{\"op\":\"control_sync_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_sync_refused_code_not_lowercase",
+      "op": "control_sync_refused",
+      "reader": "to_host",
+      "wire": "{\"code\":\"Forbidden\",\"op\":\"control_sync_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "unknown_field",
+      "name": "control_sync_refused_names_a_feed",
+      "op": "control_sync_refused",
+      "reader": "to_host",
+      "wire": "{\"code\":\"forbidden\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "not_strict",
+      "name": "control_sync_refused_duplicate_key",
+      "op": "control_sync_refused",
+      "reader": "to_host",
+      "wire": "{\"code\":\"forbidden\",\"code\":\"forbidden\",\"op\":\"control_sync_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "wrong_message",
+      "name": "control_sync_refused_read_as_a_call",
+      "op": "control_sync_refused",
+      "reader": "to_station",
+      "wire": "{\"code\":\"forbidden\",\"op\":\"control_sync_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "membership_fetch_refused_unknown_code",
+      "op": "membership_fetch_refused",
+      "reader": "to_host",
+      "wire": "{\"code\":\"not_found\",\"op\":\"membership_fetch_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "membership_fetch_refused_code_null",
+      "op": "membership_fetch_refused",
+      "reader": "to_host",
+      "wire": "{\"code\":null,\"op\":\"membership_fetch_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "membership_fetch_refused_code_missing",
+      "op": "membership_fetch_refused",
+      "reader": "to_host",
+      "wire": "{\"op\":\"membership_fetch_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "membership_fetch_refused_code_not_lowercase",
+      "op": "membership_fetch_refused",
+      "reader": "to_host",
+      "wire": "{\"code\":\"Forbidden\",\"op\":\"membership_fetch_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "unknown_field",
+      "name": "membership_fetch_refused_names_a_feed",
+      "op": "membership_fetch_refused",
+      "reader": "to_host",
+      "wire": "{\"code\":\"forbidden\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"membership_fetch_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "not_strict",
+      "name": "membership_fetch_refused_duplicate_key",
+      "op": "membership_fetch_refused",
+      "reader": "to_host",
+      "wire": "{\"code\":\"forbidden\",\"code\":\"forbidden\",\"op\":\"membership_fetch_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "wrong_message",
+      "name": "membership_fetch_refused_read_as_a_call",
+      "op": "membership_fetch_refused",
+      "reader": "to_station",
+      "wire": "{\"code\":\"forbidden\",\"op\":\"membership_fetch_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_refused_unknown_code",
+      "op": "control_ack_refused",
+      "reader": "to_host",
+      "wire": "{\"code\":\"not_found\",\"op\":\"control_ack_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_refused_code_null",
+      "op": "control_ack_refused",
+      "reader": "to_host",
+      "wire": "{\"code\":null,\"op\":\"control_ack_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_refused_code_missing",
+      "op": "control_ack_refused",
+      "reader": "to_host",
+      "wire": "{\"op\":\"control_ack_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "malformed",
+      "name": "control_ack_refused_code_not_lowercase",
+      "op": "control_ack_refused",
+      "reader": "to_host",
+      "wire": "{\"code\":\"Forbidden\",\"op\":\"control_ack_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "unknown_field",
+      "name": "control_ack_refused_names_a_feed",
+      "op": "control_ack_refused",
+      "reader": "to_host",
+      "wire": "{\"code\":\"forbidden\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_ack_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "not_strict",
+      "name": "control_ack_refused_duplicate_key",
+      "op": "control_ack_refused",
+      "reader": "to_host",
+      "wire": "{\"code\":\"forbidden\",\"code\":\"forbidden\",\"op\":\"control_ack_refused\",\"type\":\"relay\"}"
+    },
+    {
+      "code": "wrong_message",
+      "name": "control_ack_refused_read_as_a_call",
+      "op": "control_ack_refused",
+      "reader": "to_station",
+      "wire": "{\"code\":\"forbidden\",\"op\":\"control_ack_refused\",\"type\":\"relay\"}"
+    }
+  ],
+  "kind": "vectors",
+  "max_message_bytes": 262144,
+  "name": "r9-vectors-station-calls",
+  "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", for Astation's agreement). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
+  "requires": "r9"
+}

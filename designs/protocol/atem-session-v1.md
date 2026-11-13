@@ -3872,7 +3872,9 @@ it has neither `state` nor `session_id`, `process_gen` or `approval_id`:
   - its session id;
   - its sender: a delegated sender, `member:<id>`, `service:<id>` or
     `host:<id>`, as host-work-v1 §11.3's alert names it;
-  - why the outcome is unknown: 1-256 bytes, no control or Cf character.
+  - why the outcome is unknown: 1-256 bytes, not blank (something besides
+    White_Space; **for Astation**, amended for step 4), no control or Cf
+    character.
 
   Only a delegated sender's task raises an alert. A task of `local`, a
   browser grant or a service no feed covers keeps v1 (its unknown outcome
@@ -4192,13 +4194,27 @@ signatures, each object's `jcs`, signing input, signature, seal `info`,
 `sealed_hash`, the open with the recipient key, the seal again from the
 ephemeral to the same bytes, the plaintext's bounds and the object's size
 on the wire, with RFC 9180 written there from the `cryptography`
-package's X25519, HKDF and ChaCha20-Poly1305), and exits non-zero on a
-mismatch; it grows a checker per file. It derives no verdict, but those of
-`r9-vectors-host-envelope`, which it recomputes from the bytes, the device
-list and the receiver (host-work-v1 §11.5's checks, written there from the
-text): every other `expect` and each refusal's `reason` are checked by the
-Rust runner (`crates/atem-client/tests/vectors.rs`) and the binding
-conformance suites, which run the host-envelope checks too. Scenarios
+package's X25519, HKDF and ChaCha20-Poly1305), and of
+`r9-vectors-station-calls` (each message of the Station calls and their
+refusals as strict I-JSON whose compact form in RFC 8785 key order is its
+text, its fields, and what it names in the control vectors and log L), and
+exits non-zero on a mismatch; it grows a checker per file. It derives no
+verdict, but those of `r9-vectors-host-envelope`, which it recomputes from
+the bytes, the device list and the receiver (host-work-v1 §11.5's checks,
+written there from the text), and of `r9-vectors-station-calls`, whose
+every text, valid or refused, it reads with a reader written there from
+host-work-v1 §11.4 (the size bound before any parse, the strict parse, the
+fields and grammars, the wire rules) and whose refusal codes it derives:
+every other `expect` and each refusal's `reason` are checked by the Rust
+runner (`crates/atem-client/tests/vectors.rs`) and the binding conformance
+suites, which run the host-envelope and Station-calls checks too. Of
+`r9-vectors-host-work-control` it also derives the bound from the steps
+alone (the evicted ids, the floor, the final order and every possible
+replay) and checks that each step's `why` is a code of its result's kind,
+present exactly when due; the exact code among codes of one kind is pinned
+by the Rust runner and the suites. (**For Astation**, amended for step 4:
+this paragraph's Station-calls checker and the control vectors' bound and
+`why` checks.) Scenarios
 (`kind: "scenario"`): chain (`valid-suffix`, `rollback`,
 `removed-signer-conflict`, `current-manager-conflict`, `unknown-carrier`,
 `honest-concurrent-appends`, `relay-cas-failure`, `signature-retry`,

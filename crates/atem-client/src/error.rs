@@ -43,7 +43,9 @@ pub enum Error {
     /// A Recovery Kit whose tag doesn't match its contents ("damaged or
     /// mistyped"; the restore fixtures' `kit_tag_mismatch`).
     KitTagMismatch,
-    /// A log whose genesis isn't the kit's (§R9.5 restore step 2).
+    /// A log whose genesis isn't the kit's (§R9.5 restore step 2), or a
+    /// part of another device list in a whole control state
+    /// (`ControlState::from_json`).
     GenesisMismatch,
     /// The key provider has no key by that id.
     UnknownKey,

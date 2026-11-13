@@ -465,9 +465,11 @@ check("device-list actions: verifyHostEncSig binds every field of a host's enc_s
 // its chains as `checks` says (or its parse refuses it, `parse_error`); the
 // builders reproduce it byte for byte (a software store, or the signing
 // input and a signature: a Station's KMS or WebCrypto); every sequence runs
-// through a ControlStateHandle with each step's per-effect results and the
-// state it leaves, which loads again only for its own device list; and a
-// handle never changes, so a failed commit loses no effect.
+// through a ControlStateHandle (from its `initial` state when it has one)
+// with each step's per-effect results, the standing of its record's
+// principal and the parts it touched, and the state it leaves, which loads
+// again, whole or from its parts per principal, only for its own device
+// list; and a handle never changes, so a failed commit loses no effect.
 const ctl = load("r9-vectors-host-work-control");
 const ctlByLabel = Object.fromEntries(ctl.records.map((r) => [r.label, r]));
 const CONTROL_FIELDS = ["type", "v", "account_id", "genesis_hash", "origin", "feed_id", "principal", "principal_key", "signer", "action", "interrupt_running", "revoke_seq", "record_id", "issued_at", "about"];
@@ -565,25 +567,78 @@ check("control records: the builders reproduce every record; a body the parse re
   throwsCode(() => m.controlRecordSigningInput({ ...controlBodyOf(ctl.records[0].record.body), feed_id: "x" }), "malformed");
 });
 const controlActionOut = ({ feedId, ...rest }) => (feedId === undefined ? rest : { ...rest, feed_id: feedId });
+// An applied object as the vectors write it: `why` only when there is one.
+const controlAppliedOut = ({ why, actions, ...rest }) => ({
+  ...rest,
+  actions: actions.map(controlActionOut),
+  ...(why === null || why === undefined ? {} : { why }),
+});
 const ctlPos = (pos) => (pos === undefined ? null : { origin: pos.origin, feedId: pos.feed_id, feedSeq: pos.feed_seq });
-check("control records: every sequence's per-effect results and its state through ControlStateHandle", () => {
+// A standing as the vectors write it: `revoked` and `coverage` only when there are.
+const controlStandingOf = ({ revoked, interrupted, held, coverage }) => ({
+  held,
+  interrupted,
+  ...(revoked === null ? {} : { revoked }),
+  ...(coverage === null ? {} : { coverage: { origin: coverage.origin, feed_id: coverage.feedId } }),
+});
+const controlPartsOf = (state) => state.principals().map((principal) => ({ principal, partJson: state.part(principal) }));
+check("control records: every sequence's per-effect results, standing and state through ControlStateHandle", () => {
   for (const q of ctl.sequences) {
-    let state = new m.ControlStateHandle(logL());
+    let state = q.initial === undefined ? new m.ControlStateHandle(logL()) : m.ControlStateHandle.fromJson(logL(), m.canonicalJson(str(q.initial)));
     q.steps.forEach((step, i) => {
+      const principal = ctlByLabel[step.record].record.body.principal;
       const t = state.apply(str(ctlByLabel[step.record].record), logAfter(step.chain), ctlPos(step.pos), step.host_applied_seq);
       const got = t.applied;
-      same({ ...got, actions: got.actions.map(controlActionOut) }, step.expect, `${q.label} step ${i + 1}`);
+      same(controlAppliedOut(got), step.expect, `${q.label} step ${i + 1}`);
+      same(controlStandingOf(t.next.standing(principal)), step.standing, `${q.label} step ${i + 1} standing`);
+      const changed = state.part(principal) !== t.next.part(principal);
+      same(t.touched, changed ? [principal] : [], `${q.label} step ${i + 1} touched`);
       state = t.next;
     });
     const text = m.canonicalJson(str(q.state));
     eq(state.toJson(), text, q.label);
     eq(m.ControlStateHandle.fromJson(logL(), text).toJson(), text, q.label);
+    eq(m.controlStateFromParts(logL(), controlPartsOf(state)).state.toJson(), text, `${q.label} from its parts`);
   }
   // Only its own device list's state, exactly as written.
   const text = m.canonicalJson(str(ctl.sequences[0].state));
   throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace('"acct-test-1"', '"acct-other"')), "account_mismatch");
-  throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace('"v":1', '"v":2')), "unsupported_version");
+  throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace('"v":2', '"v":1')), "unsupported_version");
+  // A header the state can't read names no list: malformed, never another
+  // list's (whose code would let a host start empty).
+  throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace(/"genesis_hash":"[0-9a-f]+",/, "")), "malformed");
+  throwsCode(() => m.ControlStateHandle.fromJson(logL(), text.replace('"account_id":"acct-test-1",', '"account_id":7,')), "malformed");
   throwsCode(() => m.ControlStateHandle.fromJson(logL(), "["), "malformed");
+});
+check("control records: a state's parts per principal load in any order, only as written", () => {
+  const q = ctl.sequences.find((x) => x.label === "Q17_record_ids_per_principal");
+  const state = m.ControlStateHandle.fromJson(logL(), m.canonicalJson(str(q.state)));
+  const parts = controlPartsOf(state);
+  same(parts.map((p) => p.principal), ["host:host-a", "service:svc-discord"]);
+  for (const part of parts) eq(part.partJson, m.canonicalJson(str(q.state.principals[part.principal])), part.principal);
+  eq(m.controlStateFromParts(logL(), [...parts].reverse()).state.toJson(), state.toJson(), "any order");
+  eq(m.controlStateFromParts(logL(), []).state.toJson(), new m.ControlStateHandle(logL()).toJson(), "none");
+  eq(state.part("service:svc-other"), undefined);
+  same(controlStandingOf(state.standing("member:dev-mac")), { held: false, interrupted: [] });
+  throwsCode(() => m.controlStateFromParts(logL(), [parts[1], parts[1]]), "stored_invalid");
+  throwsCode(() => m.controlStateFromParts(logL(), [{ principal: "service:svc-discord", partJson: "{" }]), "malformed");
+  throwsCode(() => m.controlStateFromParts(logL(), [{ principal: "service:svc-discord", partJson: parts[0].partJson }]), "stored_invalid");
+  throwsCode(() => m.controlStateFromParts(logL(), [{ principal: "svc-discord", partJson: parts[1].partJson }]), "stored_invalid");
+  // A part names exactly its two fields.
+  throwsCode(() => m.controlStateFromParts(logL(), [{ ...parts[1], part_json: parts[1].partJson }]), "malformed");
+  // A part whose device list can't be read might be this list's: it fails.
+  throwsCode(() => m.controlStateFromParts(logL(), [{ principal: "host:host-a", partJson: parts[0].partJson.replace(ctl.genesis_hash, "zz") }]), "stored_invalid");
+  // Each part names its device list: another list's (an earlier pairing's
+  // leftovers) is skipped and reported for deletion, this list's loads.
+  const otherAccount = { principal: "service:svc-discord", partJson: parts[1].partJson.replace('"acct-test-1"', '"acct-other"') };
+  const otherGenesis = { principal: "host:host-a", partJson: parts[0].partJson.replace(ctl.genesis_hash, "11".repeat(32)) };
+  const mixed = m.controlStateFromParts(logL(), [otherGenesis, parts[1]]);
+  same(mixed.foreign, ["host:host-a"]);
+  same(mixed.state.principals(), ["service:svc-discord"]);
+  eq(mixed.state.part("service:svc-discord"), parts[1].partJson);
+  const foreign = m.controlStateFromParts(logL(), [otherAccount, otherGenesis]);
+  same(foreign.foreign, ["host:host-a", "service:svc-discord"]);
+  eq(foreign.state.toJson(), new m.ControlStateHandle(logL()).toJson());
 });
 check("control records: a failed commit loses no effect (apply leaves its handle as it was)", () => {
   const state = new m.ControlStateHandle(logL());
@@ -833,6 +888,123 @@ check("Station calls: the three refusals exactly and read strictly; a stale-asso
   }
   eq(l.ack({ ...link, hostTrustGen: 1 }, ack, nowMs).made.length, 2);
 });
+// r9-vectors-station-calls (host-work-v1 §11.4): every message of the six
+// Station calls and the three refusals as the builders write it, byte for
+// byte from its fields (an ack is written again from what it decoded to), read
+// back to those fields (each page record judged by parseControlRecord as the
+// file says), refused by the other side's reader, and every invalid text
+// refused with its code. A page record the control parser refuses can't be
+// built: a Station serves only what it validated at intake.
+const calls = load("r9-vectors-station-calls");
+check("Station calls: the byte goldens build exactly, read back to their fields and are refused by the other side; every invalid variant is refused with its code", () => {
+  const camel = (feed) => ({ origin: feed.origin, feedId: feed.feed_id, head: feed.head, stationTime: feed.station_time });
+  const judge = (recordJson) => {
+    try {
+      return { parses: true, record_id: m.parseControlRecord(recordJson).recordId };
+    } catch (e) {
+      return { parses: false, error: e.code };
+    }
+  };
+  eq(calls.max_message_bytes, 262144);
+  eq(calls.calls.length >= 20, true, "goldens");
+  for (const c of calls.calls) {
+    const f = c.fields;
+    const wire = c.wire;
+    const name = c.name;
+    const decode = c.direction === "to_host" ? m.relayDecodeToHost : m.relayDecodeToStation;
+    const other = c.direction === "to_host" ? m.relayDecodeToStation : m.relayDecodeToHost;
+    throwsCode(() => other(wire), "wrong_message");
+    const read = decode(wire);
+    eq(read.type, c.op, `${name} type`);
+    switch (c.op) {
+      case "control_sync":
+        eq(m.relayControlSync(f.origin, f.feed_id, f.after), wire, name);
+        eq([read.origin, read.feedId ?? null, read.after], [f.origin, f.feed_id ?? null, f.after], name);
+        break;
+      case "control_sync_result": {
+        const records = f.records.map((r) => ({ feedSeq: r.feed_seq, recordJson: str(r.record) }));
+        const refused = c.judged.find((j) => !j.parses);
+        eq(refused !== undefined, c.hand_assembled === true, `${name} hand_assembled`);
+        const build = () => m.relayControlSyncResult(f.origin, f.feed_id, f.head, f.station_time, records);
+        if (refused === undefined) eq(build(), wire, name);
+        else throwsCode(build, refused.error);
+        eq([read.origin, read.feedId, read.head, read.stationTime], [f.origin, f.feed_id, f.head, f.station_time], name);
+        eq(read.records.length, f.records.length, `${name} records`);
+        read.records.forEach((r, i) => {
+          eq(r.feedSeq, f.records[i].feed_seq, `${name} feed_seq`);
+          same(JSON.parse(r.recordJson), f.records[i].record, `${name} record ${i}`);
+          const { feed_seq: _seq, ...want } = c.judged[i];
+          eq(c.judged[i].feed_seq, r.feedSeq, `${name} judged`);
+          same(judge(r.recordJson), want, `${name} record ${i} judged`);
+        });
+        break;
+      }
+      case "heads":
+        eq(m.relayHeads(f.feeds.map(camel), head(f.membership)), wire, name);
+        same(read.feeds, f.feeds.map(camel), `${name} feeds`);
+        same(read.membership, f.membership, `${name} membership`);
+        break;
+      case "control_ack":
+        eq(m.relayControlAck(read.ack), wire, `${name} written again`);
+        // What it decoded to, field by field, against the golden's fields (a
+        // mapping wrong both ways round wouldn't show in the re-encoding).
+        same(
+          {
+            account_id: read.ack.accountId,
+            cursor: read.ack.cursor,
+            feed_id: read.ack.feedId,
+            genesis_hash: read.ack.genesisHash,
+            host_id: read.ack.hostId,
+            host_trust_gen: read.ack.hostTrustGen,
+            origin: read.ack.origin,
+            results: read.ack.results.map((r) =>
+              r.type === "entry"
+                ? { applied_seq: r.appliedSeq, effects: r.effects, entry: { entry_hash: r.entryHash, seq: r.seq } }
+                : { effects: r.effects, record_id: r.recordId },
+            ),
+          },
+          f,
+          `${name} decoded`,
+        );
+        break;
+      case "membership_fetch":
+        eq(m.relayMembershipFetch(f.after), wire, name);
+        eq(read.after, f.after, name);
+        break;
+      case "membership_fetch_result":
+        eq(m.relayMembershipFetchResult(head(f.head), f.entries.map(str)), wire, name);
+        same(read.head, f.head, `${name} head`);
+        same(read.entries.map((e) => JSON.parse(e)), f.entries, `${name} entries`);
+        break;
+      default: {
+        const refuse = { control_sync_refused: m.relayControlSyncRefused, membership_fetch_refused: m.relayMembershipFetchRefused, control_ack_refused: m.relayControlAckRefused }[c.op];
+        eq(refuse(f.code), wire, name);
+        eq(read, { type: c.op, code: f.code }, name);
+      }
+    }
+  }
+  const textOf = (c) => c.wire ?? c.wire_fill.prefix + c.wire_fill.fill.repeat(c.wire_fill.count) + c.wire_fill.suffix;
+  // Exactly the bound is read, the same bound for every call that can carry a
+  // large page; `accepts` is what it gives back.
+  for (const c of calls.at_the_bound) {
+    const wire = textOf(c);
+    eq(Buffer.byteLength(wire), 262144, `${c.name} bytes`);
+    const read = m.relayDecodeToHost(wire);
+    eq(read.type, c.op, c.name);
+    same(read.head, c.accepts.head, `${c.name} head`);
+    if (c.op === "control_sync_result") {
+      eq(read.head, c.accepts.head, `${c.name} head`);
+      eq(read.records.length, c.accepts.records, `${c.name} records`);
+      eq(read.records.map((r) => judge(r.recordJson).parses), c.accepts.records_parse, `${c.name} parse`);
+    } else {
+      eq(read.entries.length, c.accepts.entries, `${c.name} entries`);
+    }
+    throwsCode(() => m.relayDecodeToStation(wire), "wrong_message");
+  }
+  for (const bad of calls.invalid) {
+    throwsCode(() => (bad.reader === "to_host" ? m.relayDecodeToHost : m.relayDecodeToStation)(textOf(bad)), bad.code);
+  }
+});
 check("Station: the Portal's statuses in their classes", () => {
   const want = { 200: "confirm", 401: "retry", 408: "retry", 429: "retry", 500: "retry", 503: "retry", 400: "refuse", 404: "refuse", 409: "refuse", 413: "refuse", 415: "refuse", 204: "refuse", 302: "refuse", 403: "stop_reporting" };
   for (const [status, answer] of Object.entries(want)) eq(m.reportAnswer(Number(status)), answer, status);
@@ -874,14 +1046,21 @@ const mailFields = (b) => ({
   expiresAt: b.expires_at,
   signedAtHead: { seq: b.signed_at_head.seq, hash: b.signed_at_head.hash },
 });
-const mailRecipient = (r) => ({ ...mailHost(r), keys: r.keys.map((name) => ({ keyId: name, encKid: m.encKid(encRaw(name)) })) });
+// The keys it accepts, and every key it made (`generated`), by their key ids.
+const mailRecipient = (r) => ({
+  ...mailHost(r),
+  keys: r.keys.map((name) => ({ keyId: name, encKid: m.encKid(encRaw(name)) })),
+  generated: r.generated.map((name) => m.encKid(encRaw(name))),
+});
 const mailOutbox = (o) => ({ recipient: mailHost(o.recipient), messageId: o.message_id, cancelCompleteIds: o.cancel_complete_ids, taskIds: o.task_ids });
 // A verdict as `expect` writes it; an open's plaintext against the object's.
 const mailExpect = (c, got) => {
-  const { type, plainJson, hostId, hostTrustGen, objectId, ...rest } = got;
+  const { type, plainJson, hostId, hostTrustGen, objectId, senderHost, ...rest } = got;
   const v = { verdict: type, ...rest };
   if (hostId !== undefined) Object.assign(v, { host_id: hostId, host_trust_gen: hostTrustGen });
   if (objectId !== undefined) v.object_id = objectId;
+  // An authenticated refusal's sender host is a record: {hostId, hostTrustGen}.
+  if (senderHost !== undefined) v.sender = { host_id: senderHost.hostId, host_trust_gen: senderHost.hostTrustGen };
   same(v, c.expect, c.label);
   const sealed = mailObject[c.object].sealed;
   if (plainJson === undefined) return;
@@ -905,7 +1084,7 @@ check("host mail: the builders reproduce every built object; a fresh seal opens;
   }
   if (built < 20) throw new Error(`${built} built`);
   const B = ["M7_add_host_b", "M8_enc_a", "M9_enc_b", "M10_add_host_evil"];
-  const toB = mailRecipient({ host_id: "host-b", host_trust_gen: 1, keys: ["host-b-enc-1"] });
+  const toB = mailRecipient({ host_id: "host-b", host_trust_gen: 1, keys: ["host-b-enc-1"], generated: ["host-b-enc-1"] });
   const req = mailObject.request;
   const fresh = m.sealEnvelope(store, "host-a", mailFields(req.object.body), req.sealed.plaintext, encRaw("host-b-enc-1"));
   eq(m.openEnvelope(fresh, mailList(B), toB, store, mail.now), { type: "open", plainJson: req.sealed.plaintext, sender: "host:host-a" });
@@ -915,7 +1094,7 @@ check("host mail: the builders reproduce every built object; a fresh seal opens;
   eq(m.openEnvelope(canonical, mailList(B), toB, store, mail.now).plainJson, m.canonicalJson(loose.sealed.plaintext));
   const status = mailObject.status;
   const freshResult = m.sealResult(store, "host-b", mailFields(status.object.body), status.sealed.plaintext, encRaw("host-a-enc-1"));
-  const toA = mailRecipient({ host_id: "host-a", host_trust_gen: 1, keys: ["host-a-enc-1"] });
+  const toA = mailRecipient({ host_id: "host-a", host_trust_gen: 1, keys: ["host-a-enc-1"], generated: ["host-a-enc-1"] });
   const row = mailOutbox(mail.checks.find((c) => c.label === "status_accepted").outbox);
   eq(m.acceptResult(freshResult, mailList(B), toA, row, store, mail.now).type, "accepted");
   throwsCode(() => m.sealEnvelope(store, "host-a", mailFields(mailObject.plaintext_null.object.body), mailObject.plaintext_null.sealed.plaintext, encRaw("host-b-enc-1")), "null_value");
