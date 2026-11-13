@@ -4553,6 +4553,84 @@ fn a_frozen_host_answers_no_host_challenge() {
     );
 }
 
+/// Task 17 review M4 (design I.1.3, Decision 13): at the call site a
+/// native member is delegated only while the host's device list is open
+/// and serving (pinned, not held, frozen or faulted), and only with
+/// `host.delegated` on; otherwise it is v1, whatever the list says of it.
+#[test]
+fn a_native_member_is_v1_unless_the_device_list_is_open() {
+    use crate::runtime::delegated::{DelegatedSender, SenderClass};
+    use crate::runtime::test_hooks::HostFeatures;
+    use crate::session_protocol::membership::r9log::{TestLog, secret};
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    let on = HostFeatures::parse("host.delegated").unwrap();
+    let native = SenderClass::Delegated(DelegatedSender::Native {
+        device_id: "dev-phone".into(),
+    });
+    let class = |sources: &crate::profile::Sources, journal: &Path, features| {
+        let mut bridge = super::HostBridge::open(journal, Some(sources), Clock::default()).unwrap();
+        bridge.features = features;
+        bridge.sender_class("member:dev-phone")
+    };
+    // A profile with this host's list pinned, a native phone on it.
+    let pinned = |dir: &tempfile::TempDir| {
+        let sources = crate::profile::Sources::in_dir(&dir.path().join("profile"));
+        let journal = dir.path().join("journal");
+        let mut log = TestLog::genesis(ACCOUNT, &secret("bridge astation"));
+        log.add_host(DEVICE, TRUST_GEN, &secret("bridge host"));
+        log.add_native("dev-phone", &["control", "view"]);
+        let pin = HostPin {
+            host_id: DEVICE.into(),
+            host_trust_gen: TRUST_GEN,
+        };
+        MembershipHost::pin(
+            &sources.paths.pairing,
+            &journal,
+            &pin,
+            &log.log,
+            &secret("bridge host"),
+        )
+        .unwrap();
+        (sources, journal)
+    };
+
+    // No device list.
+    let dir = short_dir();
+    let sources = crate::profile::Sources::in_dir(&dir.path().join("profile"));
+    assert_eq!(
+        class(&sources, &dir.path().join("journal"), on),
+        SenderClass::V1
+    );
+
+    // Pinned and serving: delegated with the hook, v1 without it.
+    let dir = short_dir();
+    let (sources, journal) = pinned(&dir);
+    assert_eq!(class(&sources, &journal, on), native);
+    assert_eq!(
+        class(&sources, &journal, HostFeatures::default()),
+        SenderClass::V1
+    );
+
+    // Held (a fault record).
+    crate::paths::write_test_file(
+        &sources.paths.pairing.fault,
+        json!({"v": 1, "runtime_epoch": 1}).to_string(),
+    );
+    assert_eq!(class(&sources, &journal, on), SenderClass::V1);
+
+    // Frozen (a freeze file that can't be read: frozen, fail closed).
+    let dir = short_dir();
+    let (sources, journal) = pinned(&dir);
+    crate::paths::write_test_file(&sources.paths.pairing.freeze, b"{damaged");
+    assert_eq!(class(&sources, &journal, on), SenderClass::V1);
+
+    // Damaged (fails to open).
+    let dir = short_dir();
+    let (sources, journal) = pinned(&dir);
+    crate::paths::write_test_file(&sources.paths.pairing.membership, b"{damaged");
+    assert_eq!(class(&sources, &journal, on), SenderClass::V1);
+}
+
 // ── The `host-work` principal (session-v1 R9.14 item 1) ──
 
 /// An App with no Astation link that never reconnects: passes run only the

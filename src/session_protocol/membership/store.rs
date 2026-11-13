@@ -50,6 +50,11 @@ pub enum DlFile {
     FaultMirror,
     /// `<journal>/membership_applied`.
     Applied,
+    /// `<journal>/membership_deferred`: where the last carriage stopped at a
+    /// deferred entry (beside `membership_applied`; host-work's start check,
+    /// design I.4.3). Not a leftover: a stale one names no pending entry of
+    /// a new list and is dropped when it opens.
+    Deferred,
     /// `frozen_genesis`.
     FrozenGenesis,
     /// `<journal>/frozen_genesis`: `frozen_genesis`'s mirror, in another
@@ -73,6 +78,7 @@ impl DlFile {
             DlFile::Fault => "membership.fault",
             DlFile::FaultMirror => "membership_fault",
             DlFile::Applied => "membership_applied",
+            DlFile::Deferred => "membership_deferred",
             DlFile::FrozenGenesis => "frozen_genesis",
             DlFile::FrozenGenesisMirror => "journal frozen_genesis",
             DlFile::HostChannelKey => "host_channel_key",
@@ -309,6 +315,7 @@ impl Store {
             DlFile::Fault => self.pairing.fault.clone(),
             DlFile::FaultMirror => self.journal_dir.join("membership_fault"),
             DlFile::Applied => self.journal_dir.join("membership_applied"),
+            DlFile::Deferred => self.journal_dir.join("membership_deferred"),
             DlFile::FrozenGenesis => self.pairing.frozen_genesis.clone(),
             DlFile::FrozenGenesisMirror => self.journal_dir.join("frozen_genesis"),
             DlFile::HostChannelKey => self.pairing.host_channel_key.clone(),
@@ -319,9 +326,10 @@ impl Store {
 
     fn dir_of(&self, file: DlFile) -> PathBuf {
         match file {
-            DlFile::Applied | DlFile::FaultMirror | DlFile::FrozenGenesisMirror => {
-                self.journal_dir.clone()
-            }
+            DlFile::Applied
+            | DlFile::Deferred
+            | DlFile::FaultMirror
+            | DlFile::FrozenGenesisMirror => self.journal_dir.clone(),
             _ => self.pairing.dir().to_path_buf(),
         }
     }

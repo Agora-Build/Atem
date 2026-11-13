@@ -85,7 +85,7 @@ use atem_client::membership::entry::{Action, Member, MemberKind, Role};
 use atem_client::membership::stored::{freeze_to_json, parse_freeze};
 use atem_client::membership::{
     Admission, Capacity, CapacityLevel, Effect as Change, Evaluation, Head, HostNow, Membership,
-    RecoveryState,
+    RECOVERY_WAIT_MS, RecoveryState, Stop,
 };
 use serde_json::{Map, Value, json};
 use std::path::Path;
@@ -382,6 +382,45 @@ pub enum Held {
     IntentMismatch(Head),
 }
 
+/// Where the host's last carriage stopped at a deferred entry (design
+/// I.4.3, "Deferred entries"; step 4): the entry the carriage stopped
+/// before, and when the wait it depends on ends on this host, as
+/// estimated then (R9.5). While there is one, every unstarted delegated
+/// remote task waits (`device list update pending`). The host stores no
+/// deferred entry, so this names none: only where it stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeferredStop {
+    /// The deferred entry's `seq`.
+    pub seq: u64,
+    /// When the pending entry's wait ends (wall ms, as estimated when the
+    /// carriage stopped).
+    pub until_ms: u64,
+    /// The pending entry it waits for; none when a record that named it
+    /// couldn't be read (then any pending entry's end clears it).
+    pub on: Option<Hash32>,
+}
+
+/// The device list as host-work's start check reads it (step 4, Decision
+/// 16: the views update when what they show commits): the committed list
+/// and its state, told to the publisher at every change, before any fence
+/// it brings reaches the session host.
+#[derive(Debug, Clone)]
+pub struct ListState {
+    pub membership: std::sync::Arc<Membership>,
+    pub frozen: bool,
+    /// Held after a recorded fault or a carriage record that can't be
+    /// reconciled (§R9.3).
+    pub held: bool,
+    /// A write fault in this run.
+    pub faulted: bool,
+    /// The list was removed (`atem unpair`) while the runtime ran.
+    pub unpaired: bool,
+    pub deferred: Option<DeferredStop>,
+}
+
+/// Where [`MembershipHost`] tells its [`ListState`].
+pub type Publisher = Box<dyn FnMut(ListState) + Send>;
+
 pub struct MembershipHost {
     store: Store,
     m: Membership,
@@ -400,6 +439,18 @@ pub struct MembershipHost {
     previous_checkpoint: Option<u64>,
     /// `membership.json` disappeared (`atem unpair`): this host stops.
     unpaired: bool,
+    /// Where the last carriage stopped at a deferred entry (see
+    /// [`DeferredStop`]).
+    deferred: Option<DeferredStop>,
+    /// The deferral is kept in `membership_deferred`, and its changes
+    /// logged (only with `host.delegated` on:
+    /// [`MembershipHost::set_persist_deferred`]).
+    persist_deferred: bool,
+    /// `membership_deferred` couldn't be read at the start (why): logged
+    /// once deferrals are kept.
+    deferred_unreadable: Option<String>,
+    /// Host-work's start view of the list (Decision 16).
+    publisher: Option<Publisher>,
     #[cfg(test)]
     crash_after_commit: bool,
 }
@@ -432,6 +483,15 @@ fn parse_json(bytes: &[u8]) -> Option<Value> {
 
 fn log(line: &str) {
     eprintln!("atem runtime: device list: {line}");
+    #[cfg(test)]
+    LOGGED.with(|l| l.borrow_mut().push(line.to_string()));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The lines written on this thread (tests read them).
+    pub(super) static LOGGED: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The device list's use of its limits for `atem status` (D23): `N/1024
@@ -625,6 +685,9 @@ impl MembershipHost {
         for file in LEFTOVERS {
             store.remove(file).map_err(|e| e.to_string())?;
         }
+        // An earlier list's deferral names nothing of this one (and is
+        // dropped when it opens anyway).
+        let _ = store.remove(DlFile::Deferred);
         store
             .replace(DlFile::HostChannelKey, &host_key_bytes(host_seed))
             .map_err(|e| e.to_string())?;
@@ -755,9 +818,14 @@ impl MembershipHost {
             checkpoint_at: now.mono_ms,
             previous_checkpoint,
             unpaired: false,
+            deferred: None,
+            persist_deferred: false,
+            deferred_unreadable: None,
+            publisher: None,
             #[cfg(test)]
             crash_after_commit: false,
         };
+        host.deferred = host.read_deferred();
         // The first clock reading of this run: time before it isn't counted.
         host.m.checkpoint(now);
 
@@ -859,6 +927,7 @@ impl MembershipHost {
         if let Some(line) = capacity_at_open(&host.m.capacity()) {
             log(&line);
         }
+        host.settle_deferred();
         Ok(Some((host, fenced)))
     }
 
@@ -893,6 +962,175 @@ impl MembershipHost {
 
     pub fn pin_of(&self) -> &HostPin {
         &self.pin
+    }
+
+    /// Where the host's last carriage stopped at a deferred entry, while
+    /// the wait it depends on lasts and no later carriage committed past it
+    /// (design I.4.3, "Deferred entries"): every unstarted delegated remote
+    /// task waits meanwhile. The start view reads it in `list_state`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn deferred_stop(&self) -> Option<DeferredStop> {
+        self.deferred
+    }
+
+    /// The deferral is kept in `membership_deferred`, beside
+    /// `membership_applied`, from now on (the runtime turns it on with
+    /// `host.delegated`; without it the deferral stays in memory, so a host
+    /// without the hook writes nothing main doesn't).
+    pub fn set_persist_deferred(&mut self, persist: bool) {
+        let turned_on = persist && !self.persist_deferred;
+        self.persist_deferred = persist;
+        if turned_on {
+            if let Some(why) = self.deferred_unreadable.take() {
+                log(&format!(
+                    "{} can't be read ({why}); delegated remote tasks wait until a pending entry's wait ends or a carriage commits past the head",
+                    self.store.path(DlFile::Deferred).display()
+                ));
+            }
+            self.write_deferred();
+        }
+    }
+
+    /// Host-work's start view of the list (step 4, Decision 16): told the
+    /// list's state now, and again at every change, before any fence the
+    /// change brings reaches the session host.
+    pub fn set_publisher(&mut self, publisher: Publisher) {
+        self.publisher = Some(publisher);
+        self.publish();
+    }
+
+    pub fn has_publisher(&self) -> bool {
+        self.publisher.is_some()
+    }
+
+    /// The list as host-work's start check reads it.
+    pub fn list_state(&self) -> ListState {
+        ListState {
+            membership: std::sync::Arc::new(self.m.clone()),
+            frozen: self.is_frozen(),
+            held: self.held.is_some(),
+            faulted: self.faulted.is_some(),
+            unpaired: self.unpaired,
+            deferred: self.deferred,
+        }
+    }
+
+    fn publish(&mut self) {
+        if self.publisher.is_some() {
+            let state = self.list_state();
+            if let Some(publisher) = self.publisher.as_mut() {
+                publisher(state);
+            }
+        }
+    }
+
+    /// The deferral `membership_deferred` keeps (none without the file). One
+    /// that can't be read holds delegated work as a deferral at the next
+    /// `seq` naming no pending entry (fail closed), until a pending entry's
+    /// wait ends or a carriage commits past it.
+    fn read_deferred(&mut self) -> Option<DeferredStop> {
+        let why = match self.store.read(DlFile::Deferred) {
+            Ok(None) => return None,
+            Ok(Some(bytes)) => match parse_deferred(&bytes) {
+                Some(d) => return Some(d),
+                None => "damaged".to_string(),
+            },
+            Err(e) => e.to_string(),
+        };
+        // Logged once the hook keeps deferrals (`set_persist_deferred`): the
+        // file exists only if a run with it wrote one.
+        self.deferred_unreadable = Some(why);
+        Some(DeferredStop {
+            seq: self.m.head().seq.saturating_add(1),
+            until_ms: 0,
+            on: None,
+        })
+    }
+
+    /// `membership_deferred` as the deferral is, when it is kept (a failed
+    /// write is logged: the deferral holds in memory for this run, and the
+    /// next carriage that stops there records it again).
+    fn write_deferred(&mut self) {
+        if !self.persist_deferred {
+            return;
+        }
+        let written = match self.deferred {
+            Some(d) => self.store.replace(DlFile::Deferred, &deferred_bytes(&d)),
+            None => self.store.remove(DlFile::Deferred),
+        };
+        if let Err(e) = written {
+            log(&format!("cannot record the deferral: {e}"));
+        }
+    }
+
+    /// Where the deferral stands now. Only a change of where it stopped
+    /// (`seq`, `on`) counts: the estimated end moves with every carriage's
+    /// clocks (each read to the millisecond on its own) and is kept as first
+    /// estimated. A change is logged and kept on disk only with
+    /// `host.delegated` on (`persist_deferred`): without it the host logs
+    /// and writes nothing main doesn't (Task 19 review I1).
+    fn set_deferred(&mut self, next: Option<DeferredStop>) {
+        let at = |d: &Option<DeferredStop>| d.map(|d| (d.seq, d.on));
+        if at(&next) == at(&self.deferred) {
+            return;
+        }
+        if self.persist_deferred {
+            match (&self.deferred, &next) {
+                (_, Some(d)) => log(&format!(
+                    "a carriage stopped at a deferred entry (seq {}); delegated remote tasks wait until its wait ends",
+                    d.seq
+                )),
+                (Some(_), None) => log("the deferral ended; delegated remote tasks go on"),
+                (None, None) => {}
+            }
+        }
+        self.deferred = next;
+        self.write_deferred();
+    }
+
+    /// A carriage's evaluation, once `self.m` is what it committed: a stop
+    /// at a deferred entry is recorded (its `seq`, and when the pending
+    /// entry it waits for ends), and a deferral it carried past ends.
+    fn note_stop(&mut self, eval: &Evaluation, now: &HostNow) {
+        if let Some(Stop::Deferred { index, on }) = &eval.stop
+            && let Some(entry) = eval.carried.get(*index)
+        {
+            let until_ms = self.m.record(on).map_or_else(
+                || now.wall_ms.saturating_add(RECOVERY_WAIT_MS),
+                |r| r.clock.effective_at(now),
+            );
+            self.set_deferred(Some(DeferredStop {
+                seq: entry.seq,
+                until_ms,
+                on: Some(*on),
+            }));
+        }
+        self.settle_deferred();
+    }
+
+    /// Whether an evaluation that changed nothing else still moves the
+    /// deferral (a carriage that stops at a deferred entry and appends
+    /// nothing).
+    fn deferred_changes(&self, eval: &Evaluation) -> bool {
+        matches!(eval.stop, Some(Stop::Deferred { .. })) || self.deferred.is_some()
+    }
+
+    /// The deferral ends when a later carriage committed past it, or when
+    /// the wait it depends on ended (approved, vetoed or elapsed: R9.5).
+    fn settle_deferred(&mut self) {
+        let Some(d) = self.deferred else {
+            return;
+        };
+        let pending =
+            |r: &atem_client::membership::RecoveryRecord| r.state() == RecoveryState::Pending;
+        let past = self.m.head().seq >= d.seq;
+        let waited = match &d.on {
+            Some(on) => self.m.record(on).is_none_or(|r| !pending(r)),
+            None => !self.m.records().iter().any(pending),
+        };
+        if past || waited {
+            self.set_deferred(None);
+        }
     }
 
     /// Frozen: durably, in memory after a failed freeze write, or by a
@@ -961,6 +1199,7 @@ impl MembershipHost {
         if !self.unpaired && !store::present(&self.store.path(DlFile::State)) {
             log("the device list was removed (atem unpair); remote membership stops");
             self.unpaired = true;
+            self.publish();
         }
         !self.unpaired
     }
@@ -983,6 +1222,7 @@ impl MembershipHost {
         if !self.unpaired && !self.same_pin() {
             log("the device list was removed or re-pinned; this host no longer writes it");
             self.unpaired = true;
+            self.publish();
         }
         Ok((!self.unpaired).then_some(lock))
     }
@@ -1174,6 +1414,10 @@ impl MembershipHost {
         }
         if !eval.changed(&self.m) {
             self.remove_leftover(DlFile::Carriage);
+            if self.deferred_changes(&eval) {
+                self.note_stop(&eval, now);
+                self.publish();
+            }
             return CarriageResult {
                 carried: Carried::Unchanged,
                 evaluation: Some(eval),
@@ -1196,6 +1440,8 @@ impl MembershipHost {
             // Counted in memory (and runtime.log) until the next write.
             log("ignored conflicting history (evidence counted in memory)");
             self.m = eval.next.clone();
+            self.note_stop(&eval, now);
+            self.publish();
             self.evidence_dirty = true;
             self.remove_leftover(DlFile::Carriage);
             return CarriageResult {
@@ -1242,6 +1488,10 @@ impl MembershipHost {
             log(&line);
         }
         self.m = eval.next.clone();
+        // Host-work's start check sees the committed list before any of its
+        // fences reaches the session host (Decision 16).
+        self.note_stop(&eval, now);
+        self.publish();
         if self.crash_now() {
             return CarriageResult {
                 carried: Carried::Crashed,
@@ -1257,8 +1507,12 @@ impl MembershipHost {
         }
         self.write_applied(now, fences, &mut fenced);
         if head_moves {
+            let held = self.held.clone();
             self.satisfy_intent();
             self.remove_leftover(DlFile::Intent);
+            if self.held != held {
+                self.publish();
+            }
         }
         self.remove_leftover(DlFile::Carriage);
         let announce = head_moves
@@ -1305,8 +1559,10 @@ impl MembershipHost {
                 self.store
                     .replace(DlFile::State, &state_bytes(&eval.next, &self.pin, None))
             });
-        // In memory at once, whatever the disk says.
+        // In memory at once, whatever the disk says, and in host-work's
+        // start view before any fence (Decision 16).
         self.m = eval.next.clone();
+        self.publish();
         if let Err(e) = written {
             log(&format!("cannot record the freeze: {e}"));
             self.fail(e, Scope::all(FenceReason::Frozen), now, fences, &mut fenced);
@@ -1583,9 +1839,11 @@ impl MembershipHost {
     ) {
         let list = scope.fences(self, fences, false);
         let principals: Vec<String> = list.iter().map(|f| f.principal.clone()).collect();
+        // Host-work's start view sees the fault before any fence (Decision 16).
+        self.faulted = Some(error.to_string());
+        self.publish();
         fences.fault(Some(&principals));
         fenced.extend(list);
-        self.faulted = Some(error.to_string());
         log(&format!(
             "write failed ({error}); remote admission, dispatch and remote input stop until Atem restarts"
         ));
@@ -1703,6 +1961,7 @@ impl MembershipHost {
             self.m.head().seq
         ));
         self.held = None;
+        self.publish();
         true
     }
 
@@ -1762,6 +2021,8 @@ impl MembershipHost {
                 return Vec::new();
             }
             self.m = next;
+            self.settle_deferred();
+            self.publish();
             self.checkpoint_at = now.mono_ms;
             self.evidence_dirty = false;
             return changes;
@@ -1907,6 +2168,31 @@ fn parse_carriage(value: &Value) -> Option<Vec<StrictValue>> {
         .iter()
         .map(|v| StrictValue::parse(v.to_string().as_bytes(), usize::MAX).ok())
         .collect()
+}
+
+/// `membership_deferred`: `{"v":1,"seq":n,"until_ms":t,"on":"<hex>"}`.
+fn deferred_bytes(d: &DeferredStop) -> Vec<u8> {
+    let mut v = json!({"v": 1, "seq": d.seq, "until_ms": d.until_ms});
+    if let Some(on) = &d.on {
+        v["on"] = json!(on.to_hex());
+    }
+    v.to_string().into_bytes()
+}
+
+fn parse_deferred(bytes: &[u8]) -> Option<DeferredStop> {
+    let v = parse_json(bytes)?;
+    if v.get("v")?.as_u64()? != 1 {
+        return None;
+    }
+    let on = match v.get("on") {
+        None => None,
+        Some(on) => Some(Hash32::from_hex(on.as_str()?).ok()?),
+    };
+    Some(DeferredStop {
+        seq: v.get("seq")?.as_u64()?,
+        until_ms: v.get("until_ms")?.as_u64()?,
+        on,
+    })
 }
 
 fn applied_bytes(applied: &Applied) -> Vec<u8> {
@@ -2186,6 +2472,8 @@ pub fn forget_leftovers(pairing: &PairingPaths) -> Result<(), String> {
     for file in LEFTOVERS {
         store.remove(file).map_err(|e| e.to_string())?;
     }
+    // Not a leftover (a stale one is dropped when a list opens): best effort.
+    let _ = store.remove(DlFile::Deferred);
     Ok(())
 }
 

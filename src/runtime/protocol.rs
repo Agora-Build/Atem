@@ -432,6 +432,11 @@ pub struct RuntimeStatus {
     /// The r9 device list, when the runtime has one (open or not).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_list: Option<DeviceListStatus>,
+    /// The delegated clock's line (host-work-v1 §11.6,
+    /// `HostClock::status_line`): while it holds deadlines back, while its
+    /// record is damaged, and for a day after a repair or a lowering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -2388,6 +2388,8 @@ exact.
 | `blocked` | `revocations not yet checked` | the revocation gate (or, for a host sender, the mailbox gate) is closed |
 | `blocked` | `device list update pending` | the last carriage or fetch stopped at a deferred entry |
 | `blocked` | `waiting for unlock` | a locked cred agent leaves the project scope pending |
+| `blocked` | `journal halted; restart Atem` | (**Atem's addition, for Astation**) the session journal halted with the device list usable (no fault): the task waits until the restart; session-v1 §I's own text |
+| `blocked` | `host.delegated is off` | (**Atem's addition, for Astation**) a task accepted while `host.delegated` was on, not started, after a restart without it: it is never dispatched, and expires at its deadline (on the clock below) |
 | `cancelled` | `sender revoked` | a `revoke` record, an R9 removal, or a host sender's `host_sender_revoke`, `remove_host` or new membership epoch |
 | `failed` | `sender's authorization narrowed` | the current grant (or a host sender's projects) no longer covers the task |
 | `failed` | `route changed` | the route's revision, principals or profile changed |
@@ -2396,6 +2398,7 @@ exact.
 | `failed` | `expired before the spawn` | a launch still waiting at the spawn boundary at its expiry |
 | `awaiting_result` | `interrupted at deadline` | a running turn interrupted at the task's deadline (then `expired` as today) |
 | `outcome_unknown` | `deadline passed; outcome unknown` | its deadline passed unresolved |
+| `outcome_unknown` | `agent exited`, `outcome could not be established`, `write interrupted` | (**Atem's addition, for Astation**) why, as its attempt's receipt says (session-v1 R9.14 item 6; design I.6.3: "the task follows"): its agent exited; no turn state proves its turn ran or is current (a restart's reconciliation); a write failed after it may have reached the agent. The reason the owner's alert names (§11.3) |
 | (a `work_interrupt` result) | `not running` | the task's turn isn't the session's current turn (§11.2) |
 | (an error) | `too many unresolved outcomes` | `busy`, the 64 or 256 limit |
 | (a receipt) | `withdrawn by the host`, `withdrawn at recovery` | session-v1 R9.14 items 3, 4 and 6; the task's state follows the event |

@@ -34,13 +34,21 @@
 //!
 //!   A marker is removed when it is used, and its name appended to
 //!   `<dir>/used`.
-//! - `ATEM_TEST_HOST_CLOCK=<file>` (`<wall_ms> <mono_ms> <boot_id>`): the
-//!   device list's host clock (§R9.5) instead of the system's wall clock,
-//!   `CLOCK_MONOTONIC` and boot id, so a test can simulate a reboot. Or
-//!   `offsets <wall_ms> <mono_ms> <boot_id>`: the system's wall clock and
-//!   `CLOCK_MONOTONIC` plus those offsets (the wall's may be negative), at
-//!   every read, so a test moves the clocks with one write and they go on
-//!   between writes.
+//! - `ATEM_TEST_HOST_CLOCK=<file>` (`<wall_ms> <mono_ms> <boot_id>[ <boot_ms>
+//!   <synced 1|0|-> <machine-hex> <timens_boot_ms>]`): the device list's
+//!   host clock (§R9.5) instead of the system's wall clock, `CLOCK_MONOTONIC`
+//!   and boot id, so a test can simulate a reboot; and the delegated clock's
+//!   readings (host-work-v1 §11.6, `host_clock::HostClock`). The optional
+//!   fields are the delegated clock's own, each defaulting when it and the
+//!   ones after it are left out: its boot-time counter (`mono_ms`), the OS's
+//!   sync report (`1` synchronized, the default; `0` not; `-` no report),
+//!   the machine identity (32 lowercase hex digits; `TEST_MACHINE`) and the
+//!   boot-time namespace offset in ms (0). Or `offsets <wall_ms> <mono_ms>
+//!   <boot_id>[ <boot_ms> …]`: the system's wall clock and `CLOCK_MONOTONIC`
+//!   plus those offsets (the wall's may be negative), and the boot-time
+//!   counter `CLOCK_MONOTONIC` plus `<boot_ms>` (default `<mono_ms>`; it may
+//!   be negative), at every read, so a test moves the clocks with one write
+//!   and they go on between writes; the other optional fields as given.
 //! - `ATEM_TEST_BUILD=<id>`: this process reports `<id>` as its build
 //!   (`cred_agent::build_id`), so a binary test can run a runtime that looks
 //!   like another atem build.
@@ -114,12 +122,38 @@
 //!   in the order written, and `verdict.json` reuses its name.
 //!   `RuntimeClient` never passes it on (as every `ATEM_TEST_*`); release
 //!   builds compile it out.
+//! - `ATEM_TEST_HOST_CONTROLS=<file>` (the delegated binary tests, with
+//!   `host.delegated` on): a stand-in for the control feeds a delegated
+//!   host syncs (PR 10 builds them), read at every pass and every
+//!   classification, `{"own"?: origin, "open"?: [origin…], "standings"?:
+//!   {principal: {"coverage"?: {"origin", "feed_id"}, "revoked"?: id,
+//!   "held"?: bool}}}`: the host's own Station's origin (a native member's
+//!   gate), the origins whose revocation gate is open, and the senders'
+//!   standings (a service its `coverage` names is a delegated sender). The
+//!   start's recovery closes every gate (design I.6.2 step 7); the next
+//!   pass reads the file again, as a feed's sync would open it. A missing
+//!   file is no feed (no standing, every Station gate closed, also in the
+//!   start view); one that doesn't parse too, with a runtime.log line.
+//!   Write it to a temporary name and rename it into place.
+//! - `<ATEM_TEST_PTY_FAULTS dir>/crash_after_attempt_commit`: the runtime
+//!   kills itself (`SIGKILL`) right after the next delegated attempt's row
+//!   committed, before its submit (VII.A test 7).
+//! - `<ATEM_TEST_PTY_FAULTS dir>/hold_host_work`: while it exists,
+//!   host-work's scheduling pass (`schedule_work`) doesn't run: requests
+//!   are still answered and the start's recovery still runs, but no task is
+//!   dispatched, settled or withdrawn by host-work, so what the session
+//!   host does meanwhile (the start check at `executing`, VII.A test 17) is
+//!   seen before host-work processes it. The start view's standings, gates
+//!   and scopes stay as last read (the scheduling pass refreshes them; the
+//!   device list and `runtime.toml` still reach it when they change), while
+//!   `D` and the journal's halt are still read every 100 ms.
 //!
-//! Like the other hooks, both are read from the process environment once:
-//! a unit-test process started with either set sees it in every
-//! `HostBridge` it opens (`ATEM_TEST_HOST_FEATURES` turns host-work on in
-//! them; the drive hook would take and answer files in that directory), so
-//! run the bin's tests without them (PR 5 review M11).
+//! Like the other hooks, these are read from the process environment once:
+//! a unit-test process started with one set sees it in every `HostBridge`
+//! it opens (`ATEM_TEST_HOST_FEATURES` turns host-work on in them; the
+//! drive hook would take and answer files in that directory;
+//! `ATEM_TEST_HOST_CONTROLS` would cover and gate senders), so run the
+//! bin's tests without them (PR 5 review M11).
 
 /// The delegated host-work features this runtime runs (session-v1 R9.14,
 /// host-work-v1 §11.6): off unless the debug-only hook turns them on
@@ -360,35 +394,29 @@ mod imp {
         }
     }
 
-    pub fn host_clock() -> Option<(u64, u64, String)> {
+    /// `None` when the hook isn't set; `Some(None)` while its file has no
+    /// reading (missing, or not in the hook's format).
+    pub fn host_clock_full() -> Option<Option<super::HookClock>> {
         static CELL: OnceLock<Option<PathBuf>> = OnceLock::new();
         let file = env_path("ATEM_TEST_HOST_CLOCK", &CELL)?;
-        let text = std::fs::read_to_string(file).ok()?;
-        let mut parts = text.split_whitespace();
-        let first = parts.next()?;
-        let (wall, mono) = if first == "offsets" {
-            let wall: i64 = parts.next()?.parse().ok()?;
-            let mono: u64 = parts.next()?.parse().ok()?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_millis() as i64;
-            let mut ts = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            // SAFETY: `ts` is a valid timespec for the call to fill.
-            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-            let real_mono = ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000;
-            (
-                u64::try_from(now.checked_add(wall)?).ok()?,
-                real_mono.checked_add(mono)?,
-            )
-        } else {
-            (first.parse().ok()?, parts.next()?.parse().ok()?)
+        let Ok(text) = std::fs::read_to_string(file) else {
+            return Some(None);
         };
-        let boot = parts.next()?.to_string();
-        Some((wall, mono, boot))
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid timespec for the call to fill.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        let real_mono = ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000;
+        Some(super::parse_host_clock(&text, now, real_mono))
+    }
+
+    pub fn host_clock() -> Option<(u64, u64, String)> {
+        host_clock_full()?.map(|h| (h.wall_ms, h.mono_ms, h.boot_id))
     }
 
     pub fn hold_dispatch() -> Option<bool> {
@@ -397,6 +425,16 @@ mod imp {
 
     pub fn launches_held() -> bool {
         faults_dir().is_some_and(|dir| dir.join("hold_launches").exists())
+    }
+
+    pub fn host_work_held() -> bool {
+        faults_dir().is_some_and(|dir| dir.join("hold_host_work").exists())
+    }
+
+    /// The stand-in for the feeds is named (whatever its file holds).
+    pub fn host_controls_named() -> bool {
+        static CELL: OnceLock<Option<PathBuf>> = OnceLock::new();
+        env_path("ATEM_TEST_HOST_CONTROLS", &CELL).is_some()
     }
 
     pub fn no_init_limit() -> bool {
@@ -447,6 +485,29 @@ mod imp {
                 }
             }
         })
+    }
+
+    /// The stand-in for the control feeds (`ATEM_TEST_HOST_CONTROLS`), read
+    /// at each call; none while the file is missing or unreadable (one line
+    /// per new reason it doesn't parse).
+    pub fn host_controls() -> Option<super::HostControls> {
+        static CELL: OnceLock<Option<PathBuf>> = OnceLock::new();
+        static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let path = env_path("ATEM_TEST_HOST_CONTROLS", &CELL)?;
+        let text = std::fs::read_to_string(path).ok()?;
+        match super::HostControls::parse(&text) {
+            Ok(controls) => Some(controls),
+            Err(error) => {
+                let mut last = LAST
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if last.as_deref() != Some(error.as_str()) {
+                    eprintln!("atem runtime: ATEM_TEST_HOST_CONTROLS ignored ({error})");
+                    *last = Some(error);
+                }
+                None
+            }
+        }
     }
 
     fn drive_dir() -> Option<&'static PathBuf> {
@@ -604,6 +665,96 @@ pub fn fail_next_partial() -> bool {
     false
 }
 
+/// The runtime kills itself right after the next delegated attempt's
+/// commit, before its submit (`<ATEM_TEST_PTY_FAULTS dir>/
+/// crash_after_attempt_commit`, once).
+#[cfg_attr(test, allow(dead_code))]
+pub fn crash_after_attempt_commit() -> bool {
+    #[cfg(debug_assertions)]
+    return imp::take_fault("crash_after_attempt_commit");
+    #[cfg(not(debug_assertions))]
+    false
+}
+
+/// The debug-only stand-in for the control feeds a delegated host syncs
+/// (`ATEM_TEST_HOST_CONTROLS`; PR 10 builds the feeds): the host's own
+/// Station's origin, the origins whose revocation gate is open, and the
+/// senders' standings (the feed covering a service, a revocation, a hold).
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostControls {
+    pub own: Option<String>,
+    pub open: std::collections::BTreeSet<String>,
+    pub standings: std::collections::BTreeMap<String, crate::runtime::delegated::SenderStanding>,
+}
+
+#[cfg(debug_assertions)]
+impl HostControls {
+    /// The hook's file: `{"own"?: origin, "open"?: [origin…], "standings"?:
+    /// {principal: {"coverage"?: {"origin", "feed_id"}, "revoked"?: id,
+    /// "held"?: bool}}}`, no other field.
+    pub fn parse(text: &str) -> Result<HostControls, String> {
+        use crate::runtime::delegated::{FeedRef, SenderStanding};
+        use std::collections::{BTreeMap, BTreeSet};
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct File {
+            #[serde(default)]
+            own: Option<String>,
+            #[serde(default)]
+            open: BTreeSet<String>,
+            #[serde(default)]
+            standings: BTreeMap<String, Standing>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Standing {
+            #[serde(default)]
+            coverage: Option<FeedRef>,
+            #[serde(default)]
+            revoked: Option<String>,
+            #[serde(default)]
+            held: bool,
+        }
+        let file: File = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        Ok(HostControls {
+            own: file.own,
+            open: file.open,
+            standings: file
+                .standings
+                .into_iter()
+                .map(|(principal, s)| {
+                    let standing = SenderStanding {
+                        revoked: s.revoked,
+                        held: s.held,
+                        coverage: s.coverage,
+                    };
+                    (principal, standing)
+                })
+                .collect(),
+        })
+    }
+}
+
+#[cfg(debug_assertions)]
+impl crate::runtime::delegated::ControlView for HostControls {
+    fn standing(&self, principal: &str) -> crate::runtime::delegated::SenderStanding {
+        self.standings.get(principal).cloned().unwrap_or_default()
+    }
+}
+
+/// The stand-in for the control feeds (`ATEM_TEST_HOST_CONTROLS`), as its
+/// file says now: none without the hook; with it, the empty stand-in (no
+/// feed: no standing, every Station gate closed) while the file is missing
+/// or doesn't parse.
+#[cfg(debug_assertions)]
+pub fn host_controls() -> Option<HostControls> {
+    if !imp::host_controls_named() {
+        return None;
+    }
+    Some(imp::host_controls().unwrap_or_default())
+}
+
 /// The next device-list write fault (`<file>:<step>`), once.
 pub fn membership_fault() -> Option<String> {
     #[cfg(debug_assertions)]
@@ -653,6 +804,111 @@ pub fn host_clock() -> Option<(u64, u64, String)> {
     None
 }
 
+/// The delegated clock's test reading (`ATEM_TEST_HOST_CLOCK`): `None` when
+/// the hook isn't set (always, in release builds), `Some(None)` while its
+/// file has no reading.
+pub fn host_clock_reading() -> Option<Option<crate::runtime::host_clock::os::OsReading>> {
+    #[cfg(debug_assertions)]
+    return imp::host_clock_full().map(|h| h.map(HookClock::reading));
+    #[cfg(not(debug_assertions))]
+    None
+}
+
+/// The machine identity of the hook's readings when its file names none:
+/// one fixed machine, not `os::unknown_machine` (whose boot changes carry
+/// no boot time).
+#[cfg(any(debug_assertions, test))]
+pub(crate) const TEST_MACHINE: [u8; 16] = *b"atem-test-host-1";
+
+/// One reading of `ATEM_TEST_HOST_CLOCK`'s file.
+#[cfg(any(debug_assertions, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HookClock {
+    pub wall_ms: u64,
+    pub mono_ms: u64,
+    pub boot_id: String,
+    /// The delegated clock's boot-time counter, in ms.
+    pub boot_ms: u64,
+    pub synced: crate::runtime::host_clock::os::Synced,
+    pub machine: [u8; 16],
+    pub timens_boot_ms: i64,
+}
+
+#[cfg(any(debug_assertions, test))]
+impl HookClock {
+    /// As the delegated clock reads it.
+    pub fn reading(self) -> crate::runtime::host_clock::os::OsReading {
+        crate::runtime::host_clock::os::OsReading {
+            wall_ms: self.wall_ms,
+            boot_ns: self.boot_ms.saturating_mul(1_000_000),
+            boot_id: self.boot_id,
+            machine: self.machine,
+            timens_boot_ns: self.timens_boot_ms.saturating_mul(1_000_000),
+            synced: self.synced,
+        }
+    }
+}
+
+/// `ATEM_TEST_HOST_CLOCK`'s file (see the module doc), read at the system's
+/// `real_wall_ms` and `real_mono_ms` (`CLOCK_MONOTONIC`). Fields left out at
+/// the end default; anything else that doesn't read is no reading.
+#[cfg(any(debug_assertions, test))]
+pub(crate) fn parse_host_clock(
+    text: &str,
+    real_wall_ms: u64,
+    real_mono_ms: u64,
+) -> Option<HookClock> {
+    use crate::runtime::host_clock::os::Synced;
+    let mut parts = text.split_whitespace();
+    let first = parts.next()?;
+    let offsets = first == "offsets";
+    let (wall_ms, mono_ms) = if offsets {
+        let wall: i64 = parts.next()?.parse().ok()?;
+        let mono: u64 = parts.next()?.parse().ok()?;
+        (
+            u64::try_from(i64::try_from(real_wall_ms).ok()?.checked_add(wall)?).ok()?,
+            real_mono_ms.checked_add(mono)?,
+        )
+    } else {
+        (first.parse().ok()?, parts.next()?.parse().ok()?)
+    };
+    let boot_id = parts.next()?.to_string();
+    let boot_ms = match parts.next() {
+        None => mono_ms,
+        Some(field) if offsets => {
+            let offset: i64 = field.parse().ok()?;
+            u64::try_from((i128::from(real_mono_ms) + i128::from(offset)).max(0)).ok()?
+        }
+        Some(field) => field.parse().ok()?,
+    };
+    let synced = match parts.next() {
+        None | Some("1") => Synced::Yes,
+        Some("0") => Synced::No,
+        Some("-") => Synced::Unknown,
+        Some(_) => return None,
+    };
+    let machine = match parts.next() {
+        None => TEST_MACHINE,
+        Some(hex) => atem_client::encoding::hex_decode_array(hex).ok()?,
+    };
+    let timens_boot_ms = match parts.next() {
+        None => 0,
+        Some(field) => field.parse().ok()?,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(HookClock {
+        wall_ms,
+        mono_ms,
+        boot_id,
+        boot_ms,
+        synced,
+        machine,
+        timens_boot_ms,
+    })
+}
+
 /// The device-list hooks are set (`ATEM_TEST_MEMBERSHIP_FAULTS`).
 pub fn membership_hooks() -> bool {
     #[cfg(debug_assertions)]
@@ -675,6 +931,16 @@ pub fn hold_dispatch() -> Option<bool> {
 #[cfg(debug_assertions)]
 pub fn launches_held() -> bool {
     imp::launches_held()
+}
+
+/// Host-work's scheduling pass waits (`<pty faults>/hold_host_work`):
+/// requests are still answered and the start's recovery still runs, but no
+/// task is dispatched, settled or withdrawn by it. Release builds: never.
+pub fn host_work_held() -> bool {
+    #[cfg(debug_assertions)]
+    return imp::host_work_held();
+    #[cfg(not(debug_assertions))]
+    false
 }
 
 /// `init`s aren't rate-limited per link (`ATEM_TEST_NO_INIT_LIMIT`).
@@ -864,8 +1130,9 @@ mod tests {
     #[cfg(not(debug_assertions))]
     #[test]
     fn host_features_are_off_in_release() {
-        // SAFETY: no other test reads or writes this variable, and release
-        // builds never read it at all.
+        // SAFETY: the tests that write this variable (this one and
+        // `delegated::tests::release_builds_never_turn_on_host_features`)
+        // write this one value, and release builds never read it at all.
         unsafe { std::env::set_var("ATEM_TEST_HOST_FEATURES", "host.delegated,host.alerts") };
         assert_eq!(host_features(), HostFeatures::default());
         assert!(!host_features().delegated && !host_features().alerts);
