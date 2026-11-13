@@ -1393,9 +1393,12 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
 
 **The push hint.** The host signs an `outcome_unknown` hint per recipient
 when an alert is raised: a body of `atem-push-hint` with a `kind`, the task,
-session, sender and reason sealed to the recipient's `enc_key`. Session-v1
-R9.9 specifies it; the shared vectors are `r9-vectors-push-hint`
-(`outcome_unknown*`).
+session, sender and reason sealed to the recipient's `enc_key`. The host
+makes it once, when the alert is committed. It sends it only while its welcome
+lists `host.alerts`, the condition under which it answers `alert_list`. An
+alert that got no hint is still listed. Session-v1 R9.9 specifies the hint,
+its delivery and what loses it (**Atem's choices, for Astation to confirm**).
+The shared vectors are `r9-vectors-push-hint` (`outcome_unknown*`).
 
 **Client core.** `Attached::send` refuses `alert_list` unless
 `welcome.features` lists `host.alerts` (`host feature not available`),

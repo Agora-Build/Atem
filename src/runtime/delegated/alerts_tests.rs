@@ -7,10 +7,12 @@
 // whose helpers and imports it shares.
 
 /// `host.delegated` and `host.alerts` on, as the hook turns them on (and
-/// on the r9 side, as the runtime's `work_config` hands them over).
+/// on the r9 side with hosting on, as the runtime's `work_config` hands
+/// them over: the welcome lists `host.alerts`).
 fn alerts_on(rig: &mut LocalRig) {
     rig.bridge.features = HostFeatures::parse("host.delegated,host.alerts").unwrap();
     rig.bridge.r9.set_delegated_features(true, true);
+    rig.bridge.r9.enable_host_work(true);
 }
 
 /// `alert_list` (after `after`), as `who`'s channel hands it to the bridge.
@@ -761,6 +763,7 @@ fn no_hint_without_host_alerts() {
         // `host.delegated` alone, on the r9 side too (as `work_config`
         // hands the hook's features over).
         rig.bridge.r9.set_delegated_features(true, false);
+        rig.bridge.r9.enable_host_work(true);
         relay_up(&mut rig);
         let tasks = phone_unknowns(&mut rig, &s, 2, start + HOUR);
         passes(&mut rig, 2);
@@ -793,5 +796,40 @@ fn no_hint_without_host_alerts() {
         assert_eq!(alert_rows(&rig).len(), 2);
         assert!(relay_out(&mut rig).is_empty());
         assert_eq!(hints_pending(&rig), 0);
+    });
+}
+
+/// Host-work-v1 §11.3 ("only behind `host.alerts`"), in the bridge: with
+/// the hook's features on but hosting off on the r9 side (its welcome lists
+/// no `host.alerts`, as after a receipt-database fault), an unknown
+/// outcome's alert is kept and listed later, but nothing is hinted, then or
+/// once hosting is back; an alert raised with hosting on is hinted.
+#[test]
+fn an_alert_raised_while_hosting_is_off_is_never_hinted() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        alerts_on(&mut rig);
+        rig.bridge.r9.enable_host_work(false);
+        relay_up(&mut rig);
+        let off = phone_unknowns(&mut rig, &s, 1, start + HOUR).remove(0);
+        passes(&mut rig, 2);
+        assert_eq!(alert_rows(&rig).len(), 1);
+        assert!(relay_out(&mut rig).is_empty(), "hosting off: no hint");
+        assert_eq!(hints_pending(&rig), 0);
+        rig.bridge.r9.enable_host_work(true);
+        passes(&mut rig, 2);
+        assert!(relay_out(&mut rig).is_empty(), "never hinted later");
+        let template = stored_record(&rig, &off);
+        let on = unknown_outcomes(&rig, &template, PHONE, 1).remove(0);
+        passes(&mut rig, 1);
+        let hints = alert_hints_in(&s.log, &relay_out(&mut rig));
+        assert_eq!(hints.len(), 2);
+        let (alerts, _) = page_for(&mut rig, &s.phone, None);
+        let on_alert = alerts.iter().find(|a| a.task_id == on).unwrap();
+        assert!(alerts.iter().any(|a| a.task_id == off), "listed");
+        assert!(hints.iter().all(|h| h.key().alert_id == on_alert.alert_id));
     });
 }

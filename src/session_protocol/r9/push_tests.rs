@@ -1010,10 +1010,12 @@ use atem_client::push::{AlertHint, AlertKey, AlertPlain, MAX_HINT_LIFETIME_MS};
 use atem_client::session::alerts::{Alert, AlertKind};
 
 /// The rig with `host.delegated` and `host.alerts` on, as the runtime's
-/// debug-only hook turns them on.
+/// debug-only hook turns them on, and hosting on: its welcome lists
+/// `host.alerts`.
 fn alert_rig() -> Rig {
     let mut rig = Rig::new();
     rig.engine.set_delegated_features(true, true);
+    rig.engine.enable_host_work(true);
     rig
 }
 
@@ -1250,9 +1252,14 @@ fn no_hint_while_the_list_is_held_frozen_or_faulted_or_the_journal_halted() {
     raise_new(&mut rig, 2);
     rig.advance(10_000);
     assert!(rig.relay_out().is_empty(), "faulted: nothing new");
+    // The write fault halts the journal too, and `push_suppressed` names
+    // the halt first: for this host the faulted list and the halted
+    // journal are one path.
     let status = rig.engine.push_status(rig.now.host.wall_ms);
-    assert_eq!(status.pending, 0);
-    assert!(status.suppressed.is_some());
+    assert_eq!(
+        (status.pending, status.suppressed),
+        (0, Some("journal halted"))
+    );
 
     // The journal halts (a failed write) while an alert's hints wait.
     let mut rig = alert_rig();
@@ -1410,6 +1417,7 @@ fn an_alert_hint_follows_the_recipients_at_the_head() {
         log.add_native("dev-tab", &["control", "view"]);
     });
     rig.engine.set_delegated_features(true, true);
+    rig.engine.enable_host_work(true);
     rig.link_up();
     rig.connect(
         "mac",
@@ -1553,4 +1561,77 @@ fn alert_hints_are_bounded_and_a_published_alert_is_never_forgotten() {
         wall + MAX_HINT_LIFETIME_MS - 15_000,
     );
     assert_eq!(push.status(wall).pending, 0);
+}
+
+/// Host-work-v1 §11.3 ("Compatibility", "Not advertised yet"): a hint is
+/// sent only behind `host.alerts` as the welcome lists it. With the hook's
+/// features on and hosting off the welcome lists no `host.alerts`, and an
+/// alert raised then signs and sends nothing; with hosting on again the
+/// welcome lists it and a new alert is hinted (the bridge never hands the
+/// earlier one over again: `an_alert_raised_while_hosting_is_off_is_never_hinted`).
+#[test]
+fn no_hint_while_hosting_is_off() {
+    let alerts = atem_client::session::host_work::ALERTS_FEATURE;
+    let mut rig = alert_rig();
+    rig.engine.enable_host_work(false);
+    rig.link_up();
+    assert!(!rig.engine.advertised_features().iter().any(|f| f == alerts));
+    let a = raise_new(&mut rig, 1);
+    rig.advance(10_000);
+    assert!(rig.relay_out().is_empty(), "hosting off: no hint");
+    assert_eq!(rig.engine.push_status(rig.now.host.wall_ms).pending, 0);
+    assert!(!rig.engine.push.tracks_alert(&a.alert_id));
+    rig.engine.enable_host_work(true);
+    assert!(rig.engine.advertised_features().iter().any(|f| f == alerts));
+    let b = raise_new(&mut rig, 2);
+    let out = rig.relay_out();
+    assert_eq!(out.len(), 1, "{out:?}");
+    let hs = alert_hints(&rig, &out[0]);
+    assert_eq!(hs.len(), 2);
+    assert!(hs.iter().all(|h| h.key().alert_id == b.alert_id));
+}
+
+/// An alert that ends in the pass its resend fell due: the resend already
+/// queued for the link is taken back (it is not sent again), and another
+/// alert's queued resend goes as it was.
+#[test]
+fn an_ended_alerts_queued_resend_is_not_sent() {
+    let rig = alert_rig();
+    let wall = rig.now.host.wall_ms;
+    let m = rig.m.as_ref().unwrap();
+    let signer = || Signer {
+        log: m.membership(),
+        key: &rig.key,
+    };
+    let key = |n: usize| {
+        AlertKey::new(
+            m.membership(),
+            super::tests::HOST,
+            1,
+            &format!("8c3e9d6b-1f40-4b52-8dae-{n:012x}"),
+        )
+    };
+    let facts = facts(&alert_now(&rig, 1));
+    let mut push = HostPush::default();
+    push.link_up(None, wall);
+    push.alert_opened(key(1), wall, &facts, Some(signer()), wall);
+    push.alert_opened(key(2), wall, &facts, Some(signer()), wall);
+    let flushed = |push: &mut HostPush| {
+        let mut ids = Vec::new();
+        push.flush(&mut |text| {
+            let v: Value = serde_json::from_str(&text).unwrap();
+            for h in v["hints"].as_array().unwrap() {
+                ids.push(h["body"]["alert_id"].as_str().unwrap().to_string());
+            }
+            true
+        });
+        ids
+    };
+    assert_eq!(flushed(&mut push).len(), 4);
+    // The resend falls due (queued), then alert 1 ends in the same pass.
+    push.tick(None, wall + 10_000);
+    push.alert_ended(&key(1).alert_id);
+    let sent = flushed(&mut push);
+    assert_eq!(sent, [key(2).alert_id.clone(), key(2).alert_id.clone()]);
+    assert_eq!(push.status(wall).pending, 2);
 }

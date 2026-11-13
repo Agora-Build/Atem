@@ -539,6 +539,14 @@ impl R9Host {
         self.alerts = alerts && delegated;
     }
 
+    /// Whether this host's welcome lists `host.alerts`: hosting on, and the
+    /// hook's `host.delegated` and `host.alerts`. The one rule for both the
+    /// welcome and the `outcome_unknown` hints (host-work-v1 §11.3: "only
+    /// behind `host.alerts`"), so the two can't disagree.
+    fn alerts_advertised(&self) -> bool {
+        self.host_work_enabled && self.delegated && self.alerts
+    }
+
     /// The features a welcome lists: the one source of what this host takes
     /// (an op of a feature not listed here is `unsupported_version`,
     /// session-v1 §A). `host.delegated` and `host.alerts` only as the
@@ -562,7 +570,7 @@ impl R9Host {
             if self.delegated {
                 features.push(atem_client::session::host_work::DELEGATED_FEATURE.to_owned());
             }
-            if self.alerts {
+            if self.alerts_advertised() {
                 features.push(atem_client::session::host_work::ALERTS_FEATURE.to_owned());
             }
         }
@@ -2362,15 +2370,17 @@ impl R9Host {
     /// once its row is committed, so it is durable before any hint shows
     /// it): its `outcome_unknown` hints, one per native member holding
     /// `control` at the head, the task, session, sender and the alert's own
-    /// reason sealed to each (R9.9). Only with `host.alerts` on (no host
-    /// sends one while the feature is off: R9.9 "Compatibility"), and never
-    /// while push is suppressed (`push_suppressed`).
+    /// reason sealed to each (R9.9). Only while the welcome lists
+    /// `host.alerts` ([`R9Host::alerts_advertised`]: hosting on, the
+    /// hook's features on; host-work-v1 §11.3 "Compatibility"), and never
+    /// while push is suppressed (`push_suppressed`). An alert raised while
+    /// either holds is never hinted later.
     pub fn alert_opened<J: Journal>(
         &mut self,
         alert: &atem_client::session::alerts::Alert,
         parts: &mut Parts<'_, J>,
     ) {
-        if !self.alerts {
+        if !self.alerts_advertised() {
             return;
         }
         self.push.suppress(push_suppressed(parts));

@@ -44,21 +44,22 @@
 //!
 //! **`outcome_unknown` hints** (§R9.9, feature `host.alerts`; delegated
 //! host-work I.4.6, host-work-v1 §11.3): for each alert the bridge hands
-//! over once its row is committed ([`HostPush::alert_opened`]), one hint
-//! per recipient (the same recipients), the task, session, sender and
-//! reason sealed to each one's `enc_key`, its `created_at` the alert's and
-//! its window [`ALERT_HINT_LIFETIME_MS`]. Kept apart from the approvals (by
+//! over once its row is committed ([`HostPush::alert_opened`]), one hint per
+//! recipient (the same recipients), the task, session, sender and reason
+//! sealed to each one's `enc_key`, its `created_at` the alert's and its
+//! window [`ALERT_HINT_LIFETIME_MS`]. Kept apart from the approvals (by
 //! alert id: their own acks, recipients, expiry and room) and delivered as
 //! an open hint is: the same bytes every 10 s and at each reconnect until
 //! the relay acknowledges each, the alert ends ([`HostPush::alert_ended`]:
 //! an alert has no resolved hint and no seen), or `expires_at + 300 s`
-//! passes; no guard on Atem's side (nothing cancels an alert's hint, and
-//! its ack is still wanted). The same suppression and the same message
-//! bounds; at most [`MAX_ALERTS`] alerts tracked, a published alert never
-//! forgotten for room (a new alert finding none gets no hint, a counted
-//! runtime.log line; `alert_list` still lists it). A broker restart ends
-//! them, as it ends the approvals': alerts raised before it get no hint
-//! again.
+//! passes (a resend already queued for the link is taken back when the alert
+//! ends); no guard on Atem's side (nothing cancels an alert's hint, and its
+//! ack is still wanted). Only while the welcome lists `host.alerts`
+//! (`R9Host` checks it). The same suppression and the same message bounds;
+//! at most [`MAX_ALERTS`] alerts tracked, a published alert never forgotten
+//! for room (a new alert finding none gets no hint, a counted runtime.log
+//! line; `alert_list` still lists it). A broker restart ends them, as it
+//! ends the approvals': alerts raised before it get no hint again.
 use super::HostKey;
 use atem_client::membership::Membership;
 use atem_client::push::{
@@ -492,6 +493,7 @@ impl HostPush {
                 "alert {alert_id}: ended; its hints are not sent again"
             ));
             self.forget_alert(alert_id);
+            self.unqueue_alert(alert_id);
         }
     }
 
@@ -668,10 +670,16 @@ impl HostPush {
     /// alert's hints belong to the old identity and are dropped.
     pub fn reset(&mut self) {
         if !self.approvals.is_empty() || !self.alerts.is_empty() {
+            // Main's line while no alert is tracked (always, with the hook
+            // off).
+            let alerts = if self.alerts.is_empty() {
+                String::new()
+            } else {
+                format!(" and {} alert(s)", self.alerts.len())
+            };
             log(&format!(
-                "{} approval(s) and {} alert(s) dropped (the device list changed)",
-                self.approvals.len(),
-                self.alerts.len()
+                "{} approval(s){alerts} dropped (the device list changed)",
+                self.approvals.len()
             ));
         }
         let link = self.link;
@@ -826,6 +834,42 @@ impl HostPush {
         ));
         self.forget_alert(&victim);
         true
+    }
+
+    /// Takes `alert_id`'s hints out of what waits for the link (a resend
+    /// queued earlier in this pass), leaving every other message as it was
+    /// queued; a message left with no hint goes.
+    fn unqueue_alert(&mut self, alert_id: &str) {
+        if self.out.is_empty() {
+            return;
+        }
+        let of_alert = |h: &serde_json::Value| {
+            h["body"]["kind"] == push::ALERT_KIND && h["body"]["alert_id"] == alert_id
+        };
+        let mut kept = VecDeque::new();
+        let mut bytes = 0;
+        for text in std::mem::take(&mut self.out) {
+            let text = match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(mut m)
+                    if m["op"] == "push_hint"
+                        && m["hints"]
+                            .as_array()
+                            .is_some_and(|hs| hs.iter().any(&of_alert)) =>
+                {
+                    let hints = m["hints"].as_array_mut().expect("an array");
+                    hints.retain(|h| !of_alert(h));
+                    if hints.is_empty() {
+                        continue;
+                    }
+                    m.to_string()
+                }
+                _ => text,
+            };
+            bytes += text.len();
+            kept.push_back(text);
+        }
+        self.out = kept;
+        self.out_bytes = bytes;
     }
 
     /// Drops an alert's hints and everything of them still waiting.
