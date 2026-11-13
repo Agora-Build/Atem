@@ -1088,7 +1088,21 @@ impl Store {
                 \"end\" TEXT, counted INTEGER NOT NULL, created_ms INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id);
             CREATE UNIQUE INDEX IF NOT EXISTS attempts_live ON attempts(task_id)
-                WHERE \"end\" IS NULL;")?;
+                WHERE \"end\" IS NULL;
+            CREATE TABLE IF NOT EXISTS control_feeds (
+                origin TEXT NOT NULL, feed_id TEXT NOT NULL, cursor INTEGER NOT NULL,
+                PRIMARY KEY(origin, feed_id)) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS control_principals (
+                principal TEXT PRIMARY KEY, part TEXT NOT NULL) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS control_pending (
+                n INTEGER PRIMARY KEY, principal TEXT NOT NULL, record_id TEXT NOT NULL,
+                record TEXT NOT NULL, pos TEXT, source TEXT NOT NULL, reason TEXT NOT NULL,
+                at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS control_evidence (
+                n INTEGER PRIMARY KEY, source TEXT NOT NULL, record TEXT NOT NULL,
+                reason TEXT NOT NULL, at_ms INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS control_counts (
+                kind TEXT PRIMARY KEY, count INTEGER NOT NULL) WITHOUT ROWID;")?;
         track_open_records(&db)?;
         track_waits(&db)?;
         std::fs::File::open(state)?.sync_all()?;
@@ -1640,6 +1654,25 @@ impl Store {
             [],
             |r| r.get(0),
         )?)
+    }
+
+    /// The launch projects (`project`, host-private) of the open delegated
+    /// tasks admitted under a `projects` scope (ruling T20c): what the
+    /// bridge has hashed under every kid in use, whatever became of their
+    /// sessions. Read through `open_records`, so closed records cost
+    /// nothing.
+    pub fn delegated_projects(&self) -> Result<BTreeSet<String>> {
+        let mut st = self.db.prepare(
+            "SELECT DISTINCT json_extract(w.record,'$.project') FROM open_records o
+            CROSS JOIN work w ON w.id=o.id
+            WHERE o.kind='work'
+            AND json_type(w.record,'$.delegated.scope_at_admission.projects')='array'",
+        )?;
+        let projects = st
+            .query_map([], |r| r.get::<_, Option<String>>(0))?
+            .filter_map(|p| p.transpose())
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(projects)
     }
 
     /// Before its deadline, a task awaiting its result or of unknown

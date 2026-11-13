@@ -736,3 +736,91 @@ fn with_the_hook_off_a_withdrawn_attempts_task_is_blocked_never_run() {
         assert_eq!(attempts(&rig, &waiting).len(), 1);
     });
 }
+
+/// PR 10 (Task 21 review m8; design I.6.2 step 4): the control state the
+/// feeds committed before a crash is read into the start view before the
+/// start's recovery: the bot, revoked by a record applied while its task
+/// waited for its gate, has that task cancelled `sender revoked` at the
+/// recovery, never back to `queued`, and it never runs.
+#[test]
+fn the_stored_control_state_is_read_before_the_recovery() {
+    use atem_client::control::ControlAction;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        let task = bot_task(&mut rig, &s, "REVOKED_BEFORE_THE_CRASH", start + 2 * HOUR);
+        blocked(&mut rig, &task, details::REVOCATIONS_NOT_YET_CHECKED).await;
+        commit_bot_records(
+            &rig,
+            &s.log,
+            &[
+                ControlAction::Cover,
+                ControlAction::Revoke {
+                    interrupt_running: false,
+                },
+            ],
+        );
+        let steps = restart(&mut rig, root, &os, false, true);
+        let cancelled = Some((WorkState::Cancelled, details::SENDER_REVOKED.to_string()));
+        assert_eq!(reconciled(&steps, &task), cancelled);
+        assert!(rig.bridge.start_view().standings[BOT].revoked.is_some());
+        rig.bridge.start_view().gates.open_own_station(ORIGIN);
+        passes(&mut rig, 3);
+        assert_eq!(settled(&rig, &task), outcome(Event::Revoked));
+        assert!(!input(&rig).contains("REVOKED_BEFORE_THE_CRASH"));
+    });
+}
+
+/// Bindings §9 step 3 (ruling PR2b), PR 10's ruling: a part of the current
+/// list's control state that doesn't read stops every delegated task,
+/// fail closed (`revocations not yet checked`, the gate open or not), never
+/// an empty state in its place; once the store is repaired, the next start
+/// runs it.
+#[test]
+fn a_control_state_that_doesnt_read_starts_no_delegated_task() {
+    use crate::runtime::delegated::feeds::Feeds;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, false);
+        let task = phone_task(&mut rig, &phone, "DAMAGED_CONTROLS", start + 3 * HOUR);
+        blocked(&mut rig, &task, details::REVOCATIONS_NOT_YET_CHECKED).await;
+        let db = |rig: &LocalRig, sql: &str| {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .execute(sql, [])
+                .unwrap();
+        };
+        db(
+            &rig,
+            "INSERT INTO control_principals(principal,part) VALUES('service:svc-x','{damaged')",
+        );
+        restart(&mut rig, root, &os, false, true);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Damaged));
+        assert!(rig.bridge.start_view().controls_damaged);
+        rig.bridge.start_view().gates.open_own_station(ORIGIN);
+        passes(&mut rig, 5);
+        assert_eq!(settled(&rig, &task), outcome(Event::GateClosed));
+        assert!(attempts(&rig, &task).is_empty());
+        assert!(!input(&rig).contains("DAMAGED_CONTROLS"));
+
+        // Repaired (the row removed), the next start runs it.
+        db(
+            &rig,
+            "DELETE FROM control_principals WHERE principal='service:svc-x'",
+        );
+        restart(&mut rig, root, &os, false, true);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
+        assert!(!rig.bridge.start_view().controls_damaged);
+        rig.bridge.start_view().gates.open_own_station(ORIGIN);
+        rig.until(|r| input(r).contains("DAMAGED_CONTROLS")).await;
+    });
+}

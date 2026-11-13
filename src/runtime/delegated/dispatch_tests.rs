@@ -62,6 +62,10 @@ fn delegated(rig: &mut LocalRig, root: &Path, os: &ManualOs, gate: bool) -> (Aut
     rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
     let (log, phone) = pin_phone_log(rig, root);
     manual_clock(rig, os);
+    // The control feeds load as at a runtime's first pass, before any
+    // request: what a test sets in the view later stands for records
+    // they committed.
+    rig.bridge.ensure_feeds();
     if gate {
         rig.bridge.start_view().gates.open_own_station(ORIGIN);
     }

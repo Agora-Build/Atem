@@ -136,12 +136,17 @@ pub struct ScopeHashes {
 }
 
 impl ScopeHashes {
-    /// Whether `session` is in `entry`'s project: `None` while pending.
-    fn matches(&self, session: &str, entry: &str) -> Option<bool> {
+    /// Whether a task on `session`, whose launch project is `project` (its
+    /// record's, host-private), is in `entry`'s project: the session's hash
+    /// under the entry's kid, else the task's project's (ruling T20c: it
+    /// outlives the session); `None` while pending.
+    fn matches(&self, session: &str, project: &str, entry: &str) -> Option<bool> {
         let Some(kid) = crate::runtime::project_scope::kid_of(entry) else {
             return Some(false);
         };
-        match self.hashes.get(&(session.to_string(), kid.to_string())) {
+        let task = crate::runtime::project_scope::task_project_key(project);
+        let hash = |key: &str| self.hashes.get(&(key.to_string(), kid.to_string()));
+        match hash(session).or_else(|| hash(&task)) {
             Some(hash) => Some(hash == entry),
             None if self.pending.contains(kid) => None,
             // No launch project recorded: never in a `projects` scope.
@@ -167,9 +172,15 @@ pub struct StartView {
     pub list: Option<ListState>,
     /// The session journal halted.
     pub halted: bool,
-    /// The senders' standings by principal: none until the host syncs
-    /// feeds (`NoFeeds`; PR 10 fills them as records apply).
+    /// The senders' standings by principal, as the control feeds
+    /// committed them (`FeedStore`'s publisher, Decision 16; the
+    /// debug-only stand-in `ATEM_TEST_HOST_CONTROLS` replaces them).
     pub standings: BTreeMap<String, SenderStanding>,
+    /// The stored control state couldn't be read (`Feeds::Damaged`): no
+    /// sender's revocations can be checked, so no delegated task starts,
+    /// `revocations not yet checked`, a native's caught-up channel
+    /// included (fail closed, never an empty state in its place).
+    pub controls_damaged: bool,
     /// The `runtime.toml` that last loaded.
     pub config: Config,
     pub gates: Gates,
@@ -196,6 +207,7 @@ impl StartView {
             list: None,
             halted: false,
             standings: BTreeMap::new(),
+            controls_damaged: false,
             config: Config::default(),
             gates: Gates::closed_until_feeds(),
             fetch: None,
@@ -260,8 +272,9 @@ impl StartView {
 ///    then revoked: `cancelled`, `sender revoked` (2);
 /// 3. the route or profile changed (4), the grant narrowed (3): `failed`;
 /// 4. the deadline passed: `expired`;
-/// 5. the journal halted (2a), the sender held (2), a deferred entry (2),
-///    the gate closed (5), a project scope pending (3): `blocked`.
+/// 5. the journal halted (2a), a control state that doesn't read (5), the
+///    sender held (2), a deferred entry (2), the gate closed (5), a
+///    project scope pending (3): `blocked`.
 ///
 /// Expiry alone is ignored: a lapsed grant is judged as it stood (3).
 pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> Result<(), Event> {
@@ -324,7 +337,8 @@ pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> R
     let session = &task.target.session_id;
     // An entry the task's project matched at admission decides without a
     // hash (Task 20 review I1); the hashes only for a kid it didn't see.
-    let live = |entry: &str| view.scopes.matches(session, entry);
+    let project = &task.accepted.project;
+    let live = |entry: &str| view.scopes.matches(session, project, entry);
     let scope_pending = !authority.session_in_scope(&view.host_id, session, &|entry| {
         adm.project_matches(entry, &live)
     });
@@ -343,6 +357,10 @@ pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> R
     }
     if view.halted {
         return Err(Event::Halted);
+    }
+    // No sender's revocations can be checked (fail closed).
+    if view.controls_damaged {
+        return Err(Event::GateClosed);
     }
     if standing.held {
         return Err(Event::Held);

@@ -64,7 +64,15 @@ impl HostBridge {
                 standing: &standing,
                 host_id: &host_id,
                 now_ms: host_now().wall_ms.max(now_d),
-                projects: &|entry| self.projects.matches(session, entry),
+                // The session's hash, else the task's launch project's
+                // (ruling T20c: kept host-private with its record, hashed
+                // under a new kid without the session).
+                projects: &|entry| {
+                    let task = crate::runtime::project_scope::task_project_key(&r.project);
+                    self.projects
+                        .matches(session, entry)
+                        .or_else(|| self.projects.matches(&task, entry))
+                },
             },
         )
     }

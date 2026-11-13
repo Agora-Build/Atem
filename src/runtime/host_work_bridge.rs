@@ -1,6 +1,8 @@
 //! Opt-in host operations. Work reaches agents only through session-v1 receipts.
 use super::*;
 use crate::runtime::delegated::authority::Caller;
+use crate::runtime::delegated::feeds::{FeedStore, Feeds, StandingsPublisher};
+use crate::runtime::delegated::start::StartView;
 use crate::runtime::delegated::{Admission, NoFeeds, SenderClass, classify, details};
 use crate::runtime::host_clock::HostClock;
 use crate::runtime::host_work::{
@@ -189,8 +191,12 @@ pub(super) struct State {
     /// When the next reading of `D` is due outside the scheduling pass
     /// (`take_reading`).
     read_due: Instant,
-    /// Tests: the control view senders are classified on in place of
-    /// `NoFeeds` (a feed covering a service, as PR 10's will).
+    /// The host's control feeds (design I.5.5): loaded from the store for
+    /// the pinned device list before the start's recovery and any
+    /// dispatch.
+    pub(super) feeds: crate::runtime::delegated::feeds::Feeds,
+    /// Tests: the control view senders are classified on in place of the
+    /// feeds (a feed covering a service, standings the test sets).
     #[cfg(test)]
     controls: Option<Box<dyn crate::runtime::delegated::ControlView + Send + Sync>>,
     /// Tests: the steps the start's recovery of delegated tasks took
@@ -232,6 +238,7 @@ impl State {
             clock_due: Instant::now(),
             clock_checked: false,
             read_due: Instant::now(),
+            feeds: crate::runtime::delegated::feeds::Feeds::Unloaded,
             #[cfg(test)]
             controls: None,
             #[cfg(test)]
@@ -457,13 +464,14 @@ impl HostBridge {
 
     /// Who `principal` is to this host's tasks (Decision 13): delegated
     /// only on an open list ([`HostBridge::open_list`]) with
-    /// `host.delegated` on; until the host syncs feeds (PR 10) no service
-    /// is covered (`NoFeeds`).
+    /// `host.delegated` on; a service only while the control feeds cover
+    /// it (their committed state; none covered while they aren't loaded or
+    /// don't read: `NoFeeds`).
     pub(super) fn sender_class(&self, principal: &str) -> SenderClass {
         let Some(list) = self.open_list() else {
             return SenderClass::V1;
         };
-        // Tests: a control view covering a service, as PR 10's feeds will.
+        // Tests: a control view covering a service, in place of the feeds.
         #[cfg(test)]
         if let Some(controls) = &self.work.controls {
             return classify(principal, list, controls.as_ref(), self.features);
@@ -473,7 +481,128 @@ impl HostBridge {
         if let Some(controls) = crate::runtime::test_hooks::host_controls() {
             return classify(principal, list, &controls, self.features);
         }
+        if let Feeds::Loaded(feeds) = &self.work.feeds {
+            return classify(principal, list, feeds.as_ref(), self.features);
+        }
         classify(principal, list, &NoFeeds, self.features)
+    }
+
+    /// Whether a stand-in drives the start view's standings in place of the
+    /// control feeds: the tests' control view, or the debug-only
+    /// `ATEM_TEST_HOST_CONTROLS`. The feeds still load then, but don't
+    /// publish their load or tell the view they don't read.
+    fn controls_stood_in(&self) -> bool {
+        #[cfg(test)]
+        if self.work.controls.is_some() {
+            return true;
+        }
+        #[cfg(debug_assertions)]
+        if crate::runtime::test_hooks::host_controls().is_some() {
+            return true;
+        }
+        false
+    }
+
+    /// The host's control feeds (design I.5.5; Task 21 review m8), where
+    /// the store may hold delegated tasks ([`HostBridge::may_hold_delegated`]):
+    /// loaded from the bound store for the pinned device list before the
+    /// start's recovery and any dispatch, their standings published into
+    /// the start view then and at each commit (Decision 16); their own
+    /// Station's origin kept current (the link's: positions name it only).
+    /// A stored control state that doesn't read leaves them damaged: no
+    /// delegated task starts (fail closed) until a start reads it. A new
+    /// host identity moves the store aside, and the next store loads empty.
+    fn ensure_feeds(&mut self) {
+        if !self.may_hold_delegated() {
+            return;
+        }
+        let own = self
+            .station
+            .as_ref()
+            .and_then(|station| station.link())
+            .and_then(|link| link.origin.clone());
+        match &mut self.work.feeds {
+            Feeds::Loaded(feeds) => {
+                feeds.set_own_origin(own);
+                return;
+            }
+            Feeds::Damaged => return,
+            Feeds::Unloaded => {}
+        }
+        let (Some(store), Some(m)) = (self.work.store.as_ref(), self.membership.as_ref()) else {
+            return;
+        };
+        let loaded = FeedStore::load(store, m.membership());
+        let stood_in = self.controls_stood_in();
+        match loaded {
+            Ok(mut feeds) => {
+                for line in feeds.take_lines() {
+                    eprintln!("{line}");
+                }
+                feeds.set_own_origin(own);
+                feeds.set_publisher(standings_publisher(&self.start_view));
+                if !stood_in {
+                    feeds.publish();
+                    self.start_view().controls_damaged = false;
+                }
+                self.work.feeds = Feeds::Loaded(Box::new(feeds));
+            }
+            Err(error) => {
+                eprintln!(
+                    "atem runtime: the stored control state doesn't read ({error:#}); no delegated task starts until it is repaired"
+                );
+                if !stood_in {
+                    self.start_view().controls_damaged = true;
+                }
+                self.work.feeds = Feeds::Damaged;
+            }
+        }
+    }
+
+    /// The control feeds' due work outside a record's transaction
+    /// (evidence counted in memory, written once a minute; hourly alert
+    /// lines), and their `runtime.log` lines.
+    fn feeds_tick(&mut self) {
+        let State {
+            feeds: Feeds::Loaded(feeds),
+            store: Some(store),
+            ..
+        } = &mut self.work
+        else {
+            return;
+        };
+        // A write that fails is tried again at the next pass; the evidence
+        // stays counted in memory meanwhile.
+        let _ = feeds.tick(store);
+        for line in feeds.take_lines() {
+            eprintln!("{line}");
+        }
+    }
+
+    /// The launch projects of open delegated tasks admitted under a
+    /// `projects` scope, hashed under every kid in use whatever becomes of
+    /// their sessions (ruling T20c): registered at the start's recovery and
+    /// at each admission. Never removed: they are few (one per profile
+    /// project), and a later task of the same project shares them.
+    fn keep_task_projects(&mut self, projects: impl IntoIterator<Item = String>) {
+        for project in projects {
+            let key = crate::runtime::project_scope::task_project_key(&project);
+            if self.projects.key_of(&key).is_none() {
+                self.projects.session(&key, Some(project));
+            }
+        }
+    }
+
+    /// `record`'s launch project, kept hashed when its admission has a
+    /// `projects` scope ([`HostBridge::keep_task_projects`]).
+    fn keep_task_project(&mut self, record: &WorkRecord) {
+        let scoped = record
+            .delegated
+            .as_ref()
+            .is_some_and(|a| a.scope_at_admission.get("projects").is_some());
+        if scoped {
+            self.keep_task_projects([record.project.clone()]);
+        }
     }
 
     /// The admission record of a task `a` enqueues through `route_id` at
@@ -742,6 +871,9 @@ impl HostBridge {
             self.work_fail();
             return;
         }
+        // The control feeds into the start view before the recovery reads
+        // it and before any dispatch (Task 21 review m8).
+        self.ensure_feeds();
         if !self.work.recovered {
             // Delegated tasks are recovered after the session journal (design
             // I.6.2 step 2: `SessionHost::recover`, run in this pass before
@@ -780,6 +912,13 @@ impl HostBridge {
             // Delegated tasks, in design I.6.2's order (only where there may
             // be any: with the hook off and none stored, as on main).
             if self.may_hold_delegated() {
+                match self.work.store.as_ref().unwrap().delegated_projects() {
+                    Ok(projects) => self.keep_task_projects(projects),
+                    Err(_) => {
+                        self.work_fail();
+                        return;
+                    }
+                }
                 match self.recover_delegated(cx) {
                     #[cfg(test)]
                     Ok(steps) => self.work.recovery = steps,
@@ -793,6 +932,7 @@ impl HostBridge {
             }
             self.work.recovered = true;
         }
+        self.feeds_tick();
         for request in self.r9.take_host_work() {
             let reply = self.work_request(&request.attachment, &request.request, cx);
             self.r9.host_work_reply(
@@ -886,6 +1026,8 @@ impl HostBridge {
         self.work.launches.clear();
         self.work.context_jobs.clear();
         self.work.recovered = false;
+        // The next store's own, loaded before its recovery.
+        self.work.feeds = Feeds::Unloaded;
         let state = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
         let store = self.work.store.take().expect("checked above");
         let next = store.retire(host_now().wall_ms).and_then(|aside| {
@@ -1026,7 +1168,21 @@ impl HostBridge {
             // Its tasks compare their sender's control generation with this
             // one: it is kept from now on (`schedule_work` renews the set).
             self.host.keep_principal(&principal);
-            return Ok(self.message_request(req, &a, cx)?);
+            let reply = self.message_request(req, &a, cx)?;
+            // Its delegated tasks' launch projects, kept hashed (T20c).
+            if let ResultBody::Message { message } = &reply
+                && let Some(store) = self.work.store.as_ref()
+            {
+                let tasks: Vec<WorkRecord> = message
+                    .recipients
+                    .iter()
+                    .filter_map(|r| store.work(&r.recipient_id).ok().flatten())
+                    .collect();
+                for task in &tasks {
+                    self.keep_task_project(task);
+                }
+            }
+            return Ok(reply);
         }
         let store = self.work.store.as_ref().ok_or("busy")?;
         match req {
@@ -1210,6 +1366,7 @@ impl HostBridge {
                     self.admission(&a, route_id, *route_revision, &task.target.session_id);
                 store.enqueue(&record).map_err(|_| "busy")?;
                 self.host.keep_principal(&record.principal);
+                self.keep_task_project(&record);
                 Ok(ResultBody::Work {
                     work: record.status,
                 })
@@ -2144,6 +2301,17 @@ impl HostBridge {
     fn work_route_changed(&self, a: &Accepted) -> bool {
         self.work.config.route_changed(a)
     }
+}
+
+/// The control feeds' publisher into the start view (Decision 16): the
+/// standings as each record's transaction committed.
+fn standings_publisher(view: &std::sync::Arc<std::sync::Mutex<StartView>>) -> StandingsPublisher {
+    let view = view.clone();
+    Box::new(move |standings| {
+        view.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .standings = standings;
+    })
 }
 
 /// A prompt receipt completed with the outcome `interrupted` (journaled as

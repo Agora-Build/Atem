@@ -10,12 +10,15 @@
 //! I.4.1), its attempts ([`attempts`], I.6.4), the start check and the
 //! gates ([`start`], [`gate`], I.4.3, I.5.8), who may query, cancel or
 //! complete it ([`authority`], I.4.5, Decision 15), what the bridge answers
-//! the delegated ops ([`request`]), §11.6's detail texts ([`details`]), and
-//! the host's Station link with its own device-list fetch ([`station`],
-//! [`fetch`], I.5.8).
+//! the delegated ops ([`request`]), §11.6's detail texts ([`details`]), the
+//! host's Station link with its own device-list fetch ([`station`],
+//! [`fetch`], I.5.8), and the control feed store ([`feeds`], I.5.4, I.5.5:
+//! records applied with the cursor in one transaction, the senders'
+//! standings).
 pub mod attempts;
 pub mod authority;
 pub mod details;
+pub mod feeds;
 pub mod fetch;
 pub mod gate;
 pub mod start;
@@ -82,8 +85,9 @@ pub trait ControlView {
     fn standing(&self, principal: &str) -> SenderStanding;
 }
 
-/// The view while the host syncs no feed (until the feeds exist): nobody is
-/// revoked, held or covered.
+/// The view while the host's control feeds aren't loaded, or don't read
+/// ([`feeds::Feeds`]): nobody is revoked, held or covered (the start check
+/// then lets no delegated task start: `StartView::controls_damaged`).
 pub struct NoFeeds;
 
 impl ControlView for NoFeeds {

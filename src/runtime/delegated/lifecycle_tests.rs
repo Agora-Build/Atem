@@ -179,6 +179,9 @@ fn delegated_host(
             });
     }
     manual_clock(rig, os);
+    // The control feeds load as at a runtime's first pass (the tests'
+    // control view stands in for them).
+    rig.bridge.ensure_feeds();
     rig.bridge.start_view().gates.open_own_station(ORIGIN);
     rig.bridge.start_view().standings.insert(
         BOT.into(),
@@ -1617,6 +1620,161 @@ fn a_narrowing_that_drops_the_project_is_forbidden() {
         assert_eq!(
             status(ask(&mut rig, &mac, Q::Query(&first))).state,
             WorkState::AwaitingResult
+        );
+    });
+}
+
+/// The feed the control feeds' tests sign records in: the host's own
+/// Station's.
+const FEED_ID: &str = "22222222-2222-4222-8222-222222222222";
+
+/// The bot's records with `actions`, signed with its key as its Station
+/// issues them, applied by a feed store over the rig's store (as a sync
+/// applies them) in one transaction, at positions 1, 2, …, and committed.
+/// The bridge's own feed store doesn't see them until it loads again.
+fn commit_bot_records(
+    rig: &LocalRig,
+    log: &TestLog,
+    actions: &[atem_client::control::ControlAction],
+) {
+    use crate::runtime::delegated::feeds::{FeedStore, signed_record};
+    let store = rig.bridge.work.store.as_ref().unwrap();
+    let mut feeds = FeedStore::load(store, &log.log).unwrap();
+    feeds.set_own_origin(Some(ORIGIN.into()));
+    let list = rig.bridge.membership.as_ref().unwrap().list_state();
+    let tx = feeds.begin(store).unwrap();
+    for (i, action) in actions.iter().enumerate() {
+        let rec = signed_record(
+            log,
+            "svc-bot",
+            "svc-bot",
+            *action,
+            uuid::Uuid::new_v4().to_string(),
+            (ORIGIN, FEED_ID),
+            host_now().wall_ms + i as u64,
+        );
+        let pos = feeds.position(FEED_ID, i as u64 + 1);
+        feeds.apply(&tx, &rec, &list, pos, 0).unwrap();
+    }
+    feeds.commit(tx).unwrap();
+}
+
+/// Decisions 13 and 16 with the control feeds (PR 10): the bridge's feed
+/// store loads with the device list; a service is delegated once a cover
+/// record covers it (`sender_class` reads the feeds, not `NoFeeds`); and
+/// what a record commits is in the start view at its commit, with no pass
+/// of host-work's in between (a pause included).
+#[test]
+fn the_feeds_cover_a_service_and_reach_the_start_view_at_commit() {
+    use crate::runtime::delegated::feeds::{Feeds, signed_record};
+    use atem_client::control::ControlAction;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        // The feeds, not the tests' stand-in.
+        rig.bridge.work.controls = None;
+        rig.bridge.start_view().standings.clear();
+        passes(&mut rig, 1);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
+        assert_eq!(rig.bridge.sender_class(BOT), SenderClass::V1, "not covered");
+        let list = rig.bridge.membership.as_ref().unwrap().list_state();
+        let apply = |rig: &mut LocalRig, action: ControlAction, seq: u64| {
+            let rec = signed_record(
+                &s.log,
+                "svc-bot",
+                "svc-bot",
+                action,
+                uuid::Uuid::new_v4().to_string(),
+                (ORIGIN, FEED_ID),
+                start + seq,
+            );
+            let State { feeds, store, .. } = &mut rig.bridge.work;
+            let (Feeds::Loaded(feeds), Some(store)) = (feeds, store.as_ref()) else {
+                panic!("the feeds loaded");
+            };
+            feeds.set_own_origin(Some(ORIGIN.into()));
+            let tx = feeds.begin(store).unwrap();
+            let pos = feeds.position(FEED_ID, seq);
+            feeds.apply(&tx, &rec, &list, pos, 0).unwrap();
+            feeds.commit(tx).unwrap();
+        };
+        apply(&mut rig, ControlAction::Cover, 1);
+        let feed = FeedRef {
+            origin: ORIGIN.into(),
+            feed_id: FEED_ID.into(),
+        };
+        assert_eq!(
+            rig.bridge.start_view().standings[BOT].coverage,
+            Some(feed.clone()),
+            "at the commit"
+        );
+        assert_eq!(
+            rig.bridge.sender_class(BOT),
+            SenderClass::Delegated(crate::runtime::delegated::DelegatedSender::Service {
+                device_id: "svc-bot".into(),
+                feed,
+            })
+        );
+        let task = bot_task(&mut rig, &s, "COVERED_BY_A_RECORD", start + HOUR);
+        run(&mut rig, &task, "COVERED_BY_A_RECORD").await;
+        apply(&mut rig, ControlAction::Hold, 2);
+        assert!(rig.bridge.start_view().standings[BOT].held);
+    });
+}
+
+/// Task 20 re-review M1, ruling T20c (the first PR that covers services):
+/// the bot's grant is re-issued under a kid its task's admission didn't
+/// see (a K rotation) after the task's session stopped. Its task stays
+/// readable and completable by the bot: the task's launch project
+/// (host-private, kept with its record) is hashed under the new kid through
+/// the cred agent, without the session.
+#[test]
+fn a_projects_scoped_task_is_compared_under_a_new_kid_without_its_session() {
+    const NEW_KID: &str = "0e0f0a0b";
+    const NEW_PROJECT: &str =
+        "h1.0e0f0a0b.3333333333333333333333333333333333333333333333333333333333333333";
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let agent = TableAgent::new(true);
+        let mut s =
+            with_project_bot(&mut rig, root, &os, start + 3 * HOUR, &[PROJECT], &agent).await;
+        let task = bot_task(&mut rig, &s, "PROJECTS_NEW_KID", start + HOUR);
+        run(&mut rig, &task, "PROJECTS_NEW_KID").await;
+        // The session stops: its hashes leave with it.
+        let session = rig.sessions.remove(&rig.sid).unwrap();
+        let _ = session.stop();
+        passes(&mut rig, 3);
+        assert_eq!(rig.bridge.projects.matches(rig.sid.as_str(), PROJECT), None);
+        // A K rotation: the grant re-issued under the new kid.
+        agent
+            .table
+            .lock()
+            .unwrap()
+            .insert((RIG_PROJECT.into(), NEW_KID.into()), NEW_PROJECT.into());
+        let change = s.log.set_service(
+            "svc-bot",
+            &ServiceScope::new(["host"])
+                .projects(Some([NEW_PROJECT]))
+                .ops(["message", "notify", "prompt", "stop"]),
+            start + 3 * HOUR,
+        );
+        carry(&mut rig, &s.log, change);
+        let bot = s.bot.clone();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut asked = ask(&mut rig, &bot, Q::Query(&task));
+        while asked.is_err() && Instant::now() < deadline {
+            passes(&mut rig, 1);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            asked = ask(&mut rig, &bot, Q::Query(&task));
+        }
+        assert_eq!(status(asked).state, WorkState::AwaitingResult);
+        assert_eq!(
+            status(ask(&mut rig, &bot, Q::Complete(&task, "done"))).state,
+            WorkState::Completed
         );
     });
 }
