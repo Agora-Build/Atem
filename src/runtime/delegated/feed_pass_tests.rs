@@ -703,3 +703,32 @@ fn an_unanswered_sync_names_the_way_out_in_the_status_line() {
         );
     });
 }
+
+/// Task 34 (found by `control_feed_binary` under load): in a pass the
+/// Station link's messages come before host-work's pass, which builds the
+/// delegated clock (`ensure_clock`); after a restart, the passes adopting
+/// surviving workers skip both, so a `heads` that came meanwhile is handled
+/// in the first pass that isn't adopting, before the clock exists. Its
+/// `station_time` still goes through the clock, built for it: never taken
+/// as one the clock couldn't record (that closes the gate until the
+/// Station's next `heads`, up to its 30-second heartbeat, and `atem status`
+/// would blame the host clock).
+#[test]
+fn a_heads_before_host_works_pass_finds_the_delegated_clock() {
+    use crate::runtime::delegated::sync::Closed;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        // A restart's first pass: the store open, the clock not built yet.
+        rig.bridge.work.clock = None;
+        let head = s.log.log.head();
+        bridge_heads(&mut rig, 0, head);
+        let closed = |rig: &LocalRig| rig.bridge.station.as_ref().unwrap().feed.closed();
+        assert_ne!(closed(&rig), Some(Closed::ClockUnrecorded));
+        assert!(rig.bridge.work.clock.is_some(), "built for the heads");
+        // The feed (empty) read: open.
+        bridge_page(&mut rig, 0, &[]);
+        assert_eq!(closed(&rig), None);
+    });
+}

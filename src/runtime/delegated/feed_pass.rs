@@ -152,6 +152,14 @@ impl HostBridge {
 
     /// The Station's `heads`: the sync's calls.
     pub(crate) fn feed_heads(&mut self, heads: &Heads) -> Vec<Call> {
+        // The delegated clock its `station_time` goes through, built now if
+        // it isn't yet, as host-work's pass builds it: the Station's messages
+        // come first in a pass, and after a restart the passes adopting
+        // surviving workers skip both, so a `heads` that came meanwhile is
+        // handled before host-work's first pass. Without the clock its time
+        // would be one the clock couldn't record, closing the gate until the
+        // Station's next `heads` (Task 34).
+        self.ensure_clock();
         let list = self.sync_list();
         let fits = loaded(&self.work, list.as_ref()).is_some();
         let State {
@@ -187,6 +195,8 @@ impl HostBridge {
     /// PR 11's (Task 35); here the standings follow at its commit. The next
     /// page, when it asks one at once.
     pub(crate) fn feed_page(&mut self, page: Result<ControlSyncResult, RelayError>) -> Vec<Call> {
+        // Its `station_time` too (`feed_heads`).
+        self.ensure_clock();
         // Copied out: a commit publishes the standings into the view.
         let list = self.sync_list();
         let fits = loaded(&self.work, list.as_ref()).is_some();
