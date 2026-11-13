@@ -11,11 +11,15 @@
 //!   (`alert_list`, and the push hint of Task 24). A task reaches
 //!   `outcome_unknown` once: no task gets a second alert. A v1 task
 //!   (`local`, a browser grant, a service no feed covers) never gets one.
+//! - **Kept past the deadline.** A delegated task of unknown outcome doesn't
+//!   expire: at its deadline it stops holding its session and keeps its
+//!   alert, its reason the one it was raised with (`Store::settle_due`).
 //! - **Ended** when its task is resolved (`work_resolve`, or the host's own
-//!   command: Task 23 calls [`Store::end_alert`] in its transaction) or a
-//!   reply moves it to `awaiting_result`; any other write that takes the
-//!   task out of `outcome_unknown` ends it too, in the same transaction. An
-//!   ended alert is kept (its row and sequence number), never listed again.
+//!   command: [`crate::runtime::delegated::resolve::resolve`] calls
+//!   [`Store::end_alert`] in its transaction) or a reply moves it to
+//!   `awaiting_result`; any other write that takes the task out of
+//!   `outcome_unknown` ends it too, in the same transaction. An ended alert
+//!   is kept (its row and sequence number), never listed again.
 //! - **Listed** for native members holding `control` (`alert_list`,
 //!   [`Store::alert_page`]) in the host's order, by `seq`.
 //! - **Counted** ([`Store::unresolved`]) for the limits: at [`NOTE_AT`]
@@ -326,6 +330,7 @@ mod tests {
             turn_id: None,
             authorization_expires_at: None,
             message: None,
+            deadline_passed: false,
             delegated: Some(Admission {
                 principal: sender.into(),
                 principal_key: "ab".repeat(32),

@@ -399,6 +399,7 @@ mod tests {
             turn_id: None,
             authorization_expires_at: None,
             message: None,
+            deadline_passed: false,
             delegated: delegated.then(|| Admission {
                 principal: "member:dev-phone".into(),
                 principal_key: "ab".repeat(32),

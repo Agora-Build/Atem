@@ -39,8 +39,9 @@
 //! 6. **Deadlines**, on a fresh reading of the delegated clock (none: none
 //!    compared, as the dispatch waits): an unstarted task past its deadline
 //!    expires (`expired before submission`), and so does one awaiting its
-//!    result. A task of unknown outcome is left as it is (design: it stays
-//!    unresolved; PR 7 keeps `settle_due` from expiring it).
+//!    result. A task of unknown outcome is left as it is (design I.4.6: it
+//!    stays unresolved; past its deadline `settle_due` only stops it
+//!    holding its session).
 //! 7. **Gates closed**: every Station's revocation gate. A native's own
 //!    caught-up channel was carried in this run, so it still opens its own.
 //!

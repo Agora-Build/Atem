@@ -11,13 +11,15 @@
 //! gates ([`start`], [`gate`], I.4.3, I.5.8), who may query, cancel or
 //! complete it ([`authority`], I.4.5, Decision 15), what the bridge answers
 //! the delegated ops it doesn't serve yet ([`request`]), the owner's alerts
-//! and the capacity limits on unknown outcomes ([`alerts`], I.4.6), and
-//! §11.6's detail texts ([`details`]).
+//! and the capacity limits on unknown outcomes ([`alerts`], I.4.6), the
+//! resolution of an unknown outcome ([`resolve`], I.4.6), and §11.6's
+//! detail texts ([`details`]).
 pub mod alerts;
 pub mod attempts;
 pub mod authority;
 pub mod details;
 pub mod gate;
+pub mod resolve;
 pub mod start;
 
 use crate::runtime::test_hooks::HostFeatures;
@@ -264,8 +266,9 @@ pub fn classify(
 /// channel refuses the op while the feature isn't listed, so none gets here
 /// then; one that did is never half-served). `host.delegated`'s ops with it
 /// on: `busy`, saying the feature isn't served yet, until their handlers
-/// exist. `alert_list` with `host.alerts` on never comes here: the bridge
-/// serves it ([`alerts`]).
+/// exist. `work_resolve` with `host.delegated` on and `alert_list` with
+/// `host.alerts` on never come here: the bridge serves them ([`resolve`],
+/// [`alerts`]).
 pub fn request(features: HostFeatures, req: &Request) -> Result<ResultBody, HostWorkError> {
     let detail =
         (req.feature() == DELEGATED_FEATURE && features.delegated).then_some(DELEGATED_NOT_SERVED);
@@ -604,11 +607,13 @@ mod tests {
         );
     }
 
-    /// With the hook on, `host.delegated`'s ops reach `delegated` and are
+    /// With the hook on, `host.delegated`'s ops that reach `delegated` are
     /// `busy` (§7: a request the host can't take now), saying their feature
-    /// isn't served yet: the handlers come with later tasks. `alert_list` is
-    /// the bridge's (Task 22): here, whatever the hook, it is `busy` with no
-    /// detail, as before the hook existed.
+    /// isn't served yet: `work_interrupt`'s handler comes with a later task
+    /// (`work_resolve` is the bridge's since Task 23, and never comes here
+    /// with the hook on). `alert_list` is the bridge's (Task 22): here,
+    /// whatever the hook, it is `busy` with no detail, as before the hook
+    /// existed.
     #[test]
     fn hooked_delegated_ops_are_busy_until_served() {
         let both = HostFeatures::parse("host.delegated,host.alerts").unwrap();

@@ -49,17 +49,36 @@ const GRANTS_PER_PASS: i64 = 256;
 
 /// What a task's reply does to it: a submitted reply proves its prompt
 /// arrived (an unknown outcome becomes awaiting its result), and the detail
-/// says how the reply stands. A reply never completes its task.
+/// says how the reply stands. A reply never completes its task, and a
+/// settled task (a delegated one resolved `failed` among them, design
+/// I.4.6) stays as it is. A delegated task of unknown outcome past its
+/// deadline keeps saying so until a submitted reply moves it.
 pub(super) fn apply_reply(task: &mut WorkRecord, reply: &ResultRow) {
     if reply.state == ReplyState::Submitted && task.status.state == WorkState::OutcomeUnknown {
         task.status.state = WorkState::AwaitingResult;
     }
+    let past_deadline = task.status.state == WorkState::OutcomeUnknown && task.deadline_passed;
     if matches!(
         task.status.state,
         WorkState::Submitted | WorkState::AwaitingResult | WorkState::OutcomeUnknown
-    ) {
+    ) && !past_deadline
+    {
         task.status.detail = reply.task_detail();
     }
+}
+
+/// Whether `task` takes its agent's reply (spec section 10): in its turn,
+/// awaiting its result or of unknown outcome; and a delegated task resolved
+/// `failed` (design I.4.6: the reply is stored, the task stays `failed`),
+/// named with `--task` as its prompt says (a reply without it goes to a
+/// task still waiting for one, `collab_reply_task`).
+fn takes_reply(task: &WorkRecord) -> bool {
+    matches!(
+        task.status.state,
+        WorkState::Submitted | WorkState::AwaitingResult | WorkState::OutcomeUnknown
+    ) || (task.status.state == WorkState::Failed
+        && task.delegated.is_some()
+        && task.status.resolved.is_some())
 }
 
 /// A task state as `atem message status` names it.
@@ -199,7 +218,9 @@ impl HostBridge {
 
     /// `atem message reply`: the calling session's reply to a task sent to
     /// it, by any sender, while the task is in its turn, awaits its result
-    /// or its outcome is unknown (spec section 10). The reply is committed,
+    /// or its outcome is unknown (spec section 10), or, a delegated
+    /// sender's, once it was resolved `failed` (`takes_reply`; design
+    /// I.4.6: stored, the task stays `failed`). The reply is committed,
     /// bound to the task, session, process and the task's own turn, before
     /// this returns; its context is published, and it is delivered to a
     /// local sender, later and only outside a pause. A pause refuses new
@@ -288,10 +309,7 @@ impl HostBridge {
         {
             return Ok(old);
         }
-        if !matches!(
-            task.status.state,
-            WorkState::Submitted | WorkState::AwaitingResult | WorkState::OutcomeUnknown
-        ) {
+        if !takes_reply(&task) {
             let why = match task.status.state {
                 WorkState::Failed | WorkState::Expired | WorkState::Cancelled => {
                     format!(" ({})", task.status.detail)
@@ -567,6 +585,7 @@ impl HostBridge {
             }
             store.enqueue(&WorkRecord {
                 delegated: None,
+                deadline_passed: false,
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
                 control_gen: grant.origin.control_gen,
@@ -1520,6 +1539,7 @@ impl HostBridge {
             let task = local_task(message, &r.task_id, target);
             let record = WorkRecord {
                 delegated: None,
+                deadline_passed: false,
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
                 control_gen: self.host.control_gen("local"),

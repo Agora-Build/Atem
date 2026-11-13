@@ -14,6 +14,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use super::adopt::SpawnRequest;
+use super::delegated::details::DEADLINE_PASSED_OUTCOME_UNKNOWN;
 use super::protocol::LaunchEnv;
 
 pub const CONFIG_FILE: &str = "runtime.toml";
@@ -31,6 +32,9 @@ const UNFINISHED: &str =
 pub const EXPIRED_AWAITING: &str = "expired awaiting a result";
 /// The detail of a task whose outcome was still unknown at its deadline.
 pub const EXPIRED_UNKNOWN: &str = "expired with its outcome unknown";
+/// The detail of a task completed with an explicit result: its sender's
+/// `work_complete`, or a `done` resolution (`work_resolve`, design I.4.6).
+pub const RESULT_PUBLISHED: &str = "explicit correlated result published";
 /// A task whose sender's authorization (a service or browser grant) expired
 /// since it was accepted: a renewal or a new grant never revives it.
 pub const AUTHORIZATION_EXPIRED: &str = "sender's authorization expired";
@@ -579,6 +583,14 @@ pub struct WorkRecord {
     /// sender while `host.delegated` is off), whose record is as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegated: Option<crate::runtime::delegated::Admission>,
+    /// A delegated task of unknown outcome whose deadline passed
+    /// unresolved (design I.4.6, host-work-v1 §11.6 "Unknown outcomes"):
+    /// it stays `outcome_unknown`, with its alert, until it is resolved or
+    /// a reply moves it, and no longer holds its session (`work_waits` has
+    /// no row for it, so no pass reads it again). Set once, by
+    /// `Store::settle_due`; never on a v1 task, whose record is as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deadline_passed: bool,
 }
 
 /// What a message's task renders around its text: the message's id and
@@ -705,9 +717,13 @@ const OPEN_COUNT: &str = "SELECT count(*) FROM open_records WHERE kind=?1";
 /// Settled tasks past the cutoff whose reply is no longer publishing and
 /// whose reply's carrier (the task delivering it to its local sender), if
 /// any, settled too. A record that isn't JSON is due at once (it is closed
-/// as it is, `Store::fail_unreadable`).
+/// as it is, `Store::fail_unreadable`). A delegated task of unknown outcome
+/// counts as settled here (design I.4.6, "Capacity"): unresolved, it never
+/// expires, and drops its payloads a day after its deadline all the same.
 const DUE_TASKS: &str = "SELECT w.id FROM open_records o CROSS JOIN work w ON w.id=o.id
-    WHERE o.kind='work' AND w.state IN ('completed','failed','cancelled','expired')
+    WHERE o.kind='work' AND (w.state IN ('completed','failed','cancelled','expired')
+        OR w.state='outcome_unknown' AND json_valid(w.record)
+        AND json_extract(w.record,'$.delegated') IS NOT NULL)
     AND CASE WHEN json_valid(w.record) THEN json_extract(w.record,'$.task.expires_at')
         ELSE 0 END<=?1
     AND NOT EXISTS(SELECT 1 FROM results r LEFT JOIN work c ON c.id=r.work_id
@@ -715,13 +731,16 @@ const DUE_TASKS: &str = "SELECT w.id FROM open_records o CROSS JOIN work w ON w.
         OR c.state NOT IN ('completed','failed','cancelled','expired')))
     ORDER BY w.rowid";
 
-/// Messages past the cutoff whose tasks all settled.
+/// Messages past the cutoff whose tasks all settled (a delegated task of
+/// unknown outcome counting as settled, as in `DUE_TASKS`).
 const DUE_MESSAGES: &str = "SELECT m.id FROM open_records o CROSS JOIN messages m ON m.id=o.id
     WHERE o.kind='messages' AND json_extract(m.record,'$.message.expires_at')<=?1
     AND NOT EXISTS(SELECT 1 FROM json_each(m.record,'$.receipt.recipients') r
         JOIN work w ON w.id=json_extract(r.value,'$.recipient_id')
         WHERE json_extract(r.value,'$.delivery.state')='work'
-        AND w.state NOT IN ('completed','failed','cancelled','expired'))
+        AND w.state NOT IN ('completed','failed','cancelled','expired')
+        AND NOT (w.state='outcome_unknown' AND json_valid(w.record)
+            AND json_extract(w.record,'$.delegated') IS NOT NULL))
     ORDER BY m.rowid";
 
 /// Local sends never accepted (refused or expired) past the cutoff.
@@ -737,6 +756,17 @@ const DUE_LAUNCHES: &str = "SELECT l.id FROM open_records o CROSS JOIN launches 
     WHERE o.kind='launches' AND json_extract(l.record,'$.status.state')!='starting'
     AND json_extract(l.record,'$.expires_at')<=?1
     ORDER BY l.rowid";
+
+/// `work_waits` rows due by the wall clock (`Store::settle_due`), through
+/// the due index.
+const DUE_BY_WALL: &str = "SELECT id,expires_at,authorization_expires_at,delegated,state
+    FROM work_waits WHERE due_ms<=?1";
+
+/// Delegated `work_waits` rows due between the wall clock and `D`
+/// (`Store::settle_due`), through the delegated rows' due index.
+const DUE_BY_D: &str =
+    "SELECT id,expires_at,authorization_expires_at,delegated,state FROM work_waits
+    WHERE delegated=1 AND due_ms>?1 AND due_ms<=?2";
 
 /// The open launches and tasks (`Store::open_launches`, `open_tasks`).
 const OPEN_LAUNCHES: &str = "SELECT l.record FROM open_records o
@@ -960,6 +990,12 @@ fn waiting(values: Vec<rusqlite::types::Value>) -> Option<(u64, Accepted)> {
 /// table without it gets it (`ALTER TABLE … ADD COLUMN`, guarded by
 /// `pragma table_info`), the two triggers that fill rows are made again
 /// with it, and the rows are filled again from the records once.
+///
+/// A delegated task of unknown outcome whose deadline passed
+/// (`WorkRecord::deadline_passed`, design I.4.6) has no row: it is due for
+/// nothing and holds no session, so no pass reads it again. Triggers made
+/// before that rule ([`WAITS_RULE`] not in their text) are made again the
+/// same way, once.
 fn track_waits(db: &Connection) -> Result<()> {
     let tracked: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_waits')",
@@ -969,21 +1005,23 @@ fn track_waits(db: &Connection) -> Result<()> {
     let waiting = "('awaiting_result','outcome_unknown')";
     let checked = "(SELECT CASE WHEN json_valid(NEW.record) THEN NEW.record ELSE '{}' END AS r)";
     let new = wait_columns("NEW", "r");
-    let existing = wait_columns(
-        "w",
-        "(CASE WHEN json_valid(w.record) THEN w.record ELSE '{}' END)",
-    );
+    let existing_record = "(CASE WHEN json_valid(w.record) THEN w.record ELSE '{}' END)";
+    let existing = wait_columns("w", existing_record);
+    let held_new = holds_a_wait("NEW.state", "r");
+    let held_existing = holds_a_wait("w.state", existing_record);
     let fills = format!(
         "CREATE TRIGGER work_waits_opened AFTER INSERT ON work
             WHEN NEW.state IN {waiting} BEGIN
-            INSERT OR REPLACE INTO work_waits SELECT {new} FROM {checked};
+            INSERT OR REPLACE INTO work_waits SELECT {new} FROM {checked} WHERE {held_new};
         END;
         CREATE TRIGGER work_waits_changed AFTER UPDATE ON work BEGIN
             DELETE FROM work_waits WHERE id=OLD.id;
-            INSERT INTO work_waits SELECT {new} FROM {checked} WHERE NEW.state IN {waiting};
+            INSERT INTO work_waits SELECT {new} FROM {checked}
+                WHERE NEW.state IN {waiting} AND {held_new};
         END;
-        CREATE INDEX work_waits_delegated ON work_waits(delegated, due_ms);
-        INSERT INTO work_waits SELECT {existing} FROM work w WHERE w.state IN {waiting};"
+        CREATE INDEX IF NOT EXISTS work_waits_delegated ON work_waits(delegated, due_ms);
+        INSERT INTO work_waits SELECT {existing} FROM work w
+            WHERE w.state IN {waiting} AND {held_existing};"
     );
     if tracked {
         let delegated: bool = db.query_row(
@@ -991,12 +1029,23 @@ fn track_waits(db: &Connection) -> Result<()> {
             [],
             |r| r.get(0),
         )?;
-        if delegated {
+        let current: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger'
+                AND name='work_waits_changed' AND instr(sql,?1)>0)",
+            [WAITS_RULE],
+            |r| r.get(0),
+        )?;
+        if delegated && current {
             return Ok(());
         }
+        let column = if delegated {
+            ""
+        } else {
+            "ALTER TABLE work_waits ADD COLUMN delegated INTEGER NOT NULL DEFAULT 0;"
+        };
         let tx = db.unchecked_transaction()?;
         tx.execute_batch(&format!(
-            "ALTER TABLE work_waits ADD COLUMN delegated INTEGER NOT NULL DEFAULT 0;
+            "{column}
             DROP TRIGGER IF EXISTS work_waits_opened;
             DROP TRIGGER IF EXISTS work_waits_changed;
             DELETE FROM work_waits;
@@ -1021,6 +1070,18 @@ fn track_waits(db: &Connection) -> Result<()> {
     ))?;
     tx.commit()?;
     Ok(())
+}
+
+/// The record field that keeps a task out of `work_waits`
+/// (`WorkRecord::deadline_passed`), as the triggers name it: their text
+/// says whether they know the rule ([`track_waits`]).
+const WAITS_RULE: &str = "$.deadline_passed";
+
+/// Whether a task in `state` (a column) with the record `r` (JSON) has a
+/// `work_waits` row, given its state is one that waits: not a delegated
+/// task of unknown outcome whose deadline passed (design I.4.6).
+fn holds_a_wait(state: &str, r: &str) -> String {
+    format!("NOT ({state}='outcome_unknown' AND json_extract({r},'{WAITS_RULE}') IS 1)")
 }
 
 impl Store {
@@ -1462,7 +1523,8 @@ impl Store {
     }
 
     /// A task of unknown outcome holds `session_id`'s queue (until it
-    /// expires or a reply proves its turn ran), through `work_waits`.
+    /// expires or a reply proves its turn ran; a delegated one until its
+    /// deadline, design I.4.6), through `work_waits`.
     pub fn holds_unknown_outcome(&self, session_id: &str) -> Result<bool> {
         Ok(self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM work_waits WHERE session_id=?1 AND state='outcome_unknown')",
@@ -1551,7 +1613,12 @@ impl Store {
     /// stops new requests only). v1 rows are read by the wall clock and
     /// delegated ones by `D`, each through an index on its due time
     /// (`work_waits.delegated`), so a pass with `D` ahead reads no v1 row
-    /// before its time.
+    /// before its time. A delegated task of unknown outcome doesn't expire
+    /// (design I.4.6, §11.6 "Unknown outcomes"): at its deadline it stops
+    /// holding its session, its detail `deadline passed; outcome unknown`,
+    /// and stays `outcome_unknown`, unresolved, with its alert, until it is
+    /// resolved or a reply moves it (`deadline_passed`: its `work_waits` row
+    /// goes, so no pass reads it again).
     pub fn settle_due(&self, now: u64, now_d: Option<u64>) -> Result<usize> {
         let d = now_d.unwrap_or(now);
         let mut due = Vec::new();
@@ -1562,15 +1629,17 @@ impl Store {
                     r.get::<_, String>(0)?,
                     vec![r.get(1)?, r.get(2)?],
                     r.get::<_, bool>(3)?,
+                    r.get::<_, String>(4)?,
                 ))
             })?;
             for row in rows {
-                let (id, values, delegated) = row?;
+                let (id, values, delegated, state) = row?;
                 match waiting(values) {
                     None => due.push((id, Some(RECORD_UNREADABLE))),
                     Some((deadline, _)) if delegated => {
                         if d >= deadline {
-                            due.push((id, None));
+                            let unknown = state == "outcome_unknown";
+                            due.push((id, unknown.then_some(DEADLINE_PASSED_OUTCOME_UNKNOWN)));
                         }
                     }
                     Some((deadline, _)) if now >= deadline => due.push((id, None)),
@@ -1588,17 +1657,11 @@ impl Store {
         };
         // Due by the wall clock: v1's rows, and delegated ones `D` (never
         // behind the wall clock) settles too.
-        take(
-            "SELECT id,expires_at,authorization_expires_at,delegated FROM work_waits WHERE due_ms<=?1",
-            &[&now],
-        )?;
+        take(DUE_BY_WALL, &[&now])?;
         // Delegated rows due by `D` only, through their own index: no v1 row
         // due between the wall clock and `D` is read.
         if d > now {
-            take(
-                "SELECT id,expires_at,authorization_expires_at,delegated FROM work_waits WHERE delegated=1 AND due_ms>?1 AND due_ms<=?2",
-                &[&now, &d],
-            )?;
+            take(DUE_BY_D, &[&now, &d])?;
         }
         self.settle(due)
     }
@@ -1703,7 +1766,11 @@ impl Store {
     /// Expires each of `due` (no reason) or fails it with its reason; an
     /// open return grant ends with an expired task, an open or consumed one
     /// with a failed task; a record that can't be read is settled as such
-    /// (`fail_unreadable`). Writes only what is due; returns how many.
+    /// (`fail_unreadable`). A delegated task of unknown outcome at its
+    /// deadline (`DEADLINE_PASSED_OUTCOME_UNKNOWN`) settles nothing: it
+    /// stops holding its session, with that detail, and stays
+    /// `outcome_unknown` with its alert (design I.4.6). Writes only what is
+    /// due; returns how many.
     fn settle(&self, due: Vec<(String, Option<&'static str>)>) -> Result<usize> {
         if due.is_empty() {
             return Ok(0);
@@ -1717,6 +1784,12 @@ impl Store {
             let Some(mut record) = self.readable_work(id)? else {
                 continue;
             };
+            if *why == Some(DEADLINE_PASSED_OUTCOME_UNKNOWN) {
+                record.deadline_passed = true;
+                record.status.detail = DEADLINE_PASSED_OUTCOME_UNKNOWN.into();
+                self.save_work(&record)?;
+                continue;
+            }
             let end = match why {
                 Some(why) => {
                     record.status.state = WorkState::Failed;
@@ -2167,6 +2240,7 @@ mod tests {
         let task_id = uuid::Uuid::new_v4().to_string();
         WorkRecord {
             delegated: None,
+            deadline_passed: false,
             principal: "member:phone".into(),
             attachment_owner: String::new(),
             control_gen: 1,
@@ -2440,15 +2514,11 @@ mod tests {
         assert_eq!(store.settle_overdue(2_000, |_| None).unwrap(), 1);
     }
 
-    /// A task awaiting its result, delegated or not, due at `expires_at`
-    /// (its authorization expiring at `auth`), written directly.
-    fn waiting_task(store: &Store, delegated: bool, expires_at: u64, auth: Option<u64>) -> String {
+    /// The admission record of a task of [`task`]'s sender, a native
+    /// member: a delegated sender's.
+    fn admission() -> crate::runtime::delegated::Admission {
         use crate::runtime::delegated::{Admission, DelegatedSender};
-        let mut r = task();
-        r.task.expires_at = expires_at;
-        r.authorization_expires_at = auth;
-        r.status.state = WorkState::AwaitingResult;
-        r.delegated = delegated.then(|| Admission {
+        Admission {
             principal: "member:phone".into(),
             principal_key: "ab".repeat(32),
             sender: DelegatedSender::Native {
@@ -2462,7 +2532,17 @@ mod tests {
             grant_expires_at: None,
             device_list_seq: 3,
             projects_matched: vec![],
-        });
+        }
+    }
+
+    /// A task awaiting its result, delegated or not, due at `expires_at`
+    /// (its authorization expiring at `auth`), written directly.
+    fn waiting_task(store: &Store, delegated: bool, expires_at: u64, auth: Option<u64>) -> String {
+        let mut r = task();
+        r.task.expires_at = expires_at;
+        r.authorization_expires_at = auth;
+        r.status.state = WorkState::AwaitingResult;
+        r.delegated = delegated.then(admission);
         store
             .db
             .execute(
@@ -2504,10 +2584,7 @@ mod tests {
             assert_eq!(flag == 1, id == delegated, "{id}");
         }
         // Both statements read through an index, never the whole table.
-        for sql in [
-            "SELECT id,expires_at,authorization_expires_at,delegated FROM work_waits WHERE due_ms<=?1",
-            "SELECT id,expires_at,authorization_expires_at,delegated FROM work_waits WHERE delegated=1 AND due_ms>?1 AND due_ms<=?2",
-        ] {
+        for sql in [DUE_BY_WALL, DUE_BY_D] {
             let plan: Vec<String> = store
                 .db
                 .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
@@ -2612,6 +2689,269 @@ mod tests {
             )
             .unwrap();
         assert_eq!(grant, "ended");
+    }
+
+    /// A delegated task (or a v1 one) of unknown outcome on `session`, its
+    /// deadline `expires_at`, its detail `write interrupted`: its id.
+    fn unknown_on(store: &Store, session: &str, delegated: bool, expires_at: u64) -> String {
+        let mut r = task();
+        r.task.target.session_id = session.into();
+        r.task.expires_at = expires_at;
+        r.delegated = delegated.then(admission);
+        assert!(store.enqueue(&r).unwrap());
+        r.status.state = WorkState::OutcomeUnknown;
+        r.status.detail = "write interrupted".into();
+        store.save_work(&r).unwrap();
+        r.task.task_id
+    }
+
+    /// The ids `work_waits` has a row for.
+    fn wait_rows(store: &Store) -> Vec<String> {
+        let mut q = store
+            .db
+            .prepare("SELECT id FROM work_waits ORDER BY id")
+            .unwrap();
+        q.query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Design I.4.6, host-work-v1 §11.6 ("Unknown outcomes"): at its
+    /// deadline on the delegated clock, a delegated task of unknown outcome
+    /// doesn't expire: it stops holding its session (`work_waits` has no row
+    /// for it any more), its detail `deadline passed; outcome unknown`,
+    /// written once; no later pass reads or writes it. A v1 task of unknown
+    /// outcome on the same session expires at its deadline on the wall
+    /// clock, as before.
+    #[test]
+    fn a_delegated_unknown_outcome_stops_holding_at_its_deadline_a_v1_one_expires() {
+        use crate::runtime::delegated::details::DEADLINE_PASSED_OUTCOME_UNKNOWN;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let session = crate::session::SessionId::new().to_string();
+        let delegated = unknown_on(&store, &session, true, 1_500);
+        let v1 = unknown_on(&store, &session, false, 1_500);
+        let state = |id: &str| {
+            let r = store.work(id).unwrap().unwrap();
+            (r.status.state, r.status.detail)
+        };
+        let mut both = vec![delegated.clone(), v1.clone()];
+        both.sort();
+        assert_eq!(wait_rows(&store), both);
+        assert!(store.holds_unknown_outcome(&session).unwrap());
+        // `D` reaches the deadline, the wall clock doesn't.
+        assert_eq!(store.settle_due(1_000, Some(1_500)).unwrap(), 1);
+        assert_eq!(
+            state(&delegated),
+            (
+                WorkState::OutcomeUnknown,
+                DEADLINE_PASSED_OUTCOME_UNKNOWN.into()
+            )
+        );
+        assert!(store.work(&delegated).unwrap().unwrap().deadline_passed);
+        assert_eq!(
+            state(&v1),
+            (WorkState::OutcomeUnknown, "write interrupted".into())
+        );
+        assert_eq!(wait_rows(&store), vec![v1.clone()]);
+        assert!(store.holds_unknown_outcome(&session).unwrap(), "the v1 one");
+        // The wall clock reaches it: the v1 one expires; the delegated one
+        // isn't read again.
+        let before: String = store
+            .db
+            .query_row("SELECT record FROM work WHERE id=?1", [&delegated], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(store.settle_due(1_500, Some(9_000)).unwrap(), 1);
+        assert_eq!(state(&v1), (WorkState::Expired, EXPIRED_UNKNOWN.into()));
+        assert!(!store.holds_unknown_outcome(&session).unwrap());
+        assert!(wait_rows(&store).is_empty());
+        assert_eq!(store.settle_due(9_000, Some(9_000)).unwrap(), 0);
+        let after: String = store
+            .db
+            .query_row("SELECT record FROM work WHERE id=?1", [&delegated], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(after, before);
+        // A v1 record is written as before: no new field.
+        assert!(!after.is_empty());
+        let v1_record: String = store
+            .db
+            .query_row("SELECT record FROM work WHERE id=?1", [&v1], |r| r.get(0))
+            .unwrap();
+        assert!(!v1_record.contains("deadline_passed"), "{v1_record}");
+    }
+
+    /// `work_waits`' triggers change additively too: a store whose triggers
+    /// keep a row for a delegated task of unknown outcome past its deadline
+    /// (this branch before Task 23) gets them made again when it opens, and
+    /// its rows refilled from the records, once.
+    #[test]
+    fn work_waits_triggers_without_the_deadline_rule_are_made_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let session = crate::session::SessionId::new().to_string();
+        let id = unknown_on(&store, &session, true, 1_500);
+        assert_eq!(store.settle_due(1_000, Some(1_500)).unwrap(), 1);
+        assert!(wait_rows(&store).is_empty());
+        // The update trigger as it was: every task awaiting its result or of
+        // unknown outcome gets a row.
+        store
+            .db
+            .execute_batch(
+                "DROP TRIGGER work_waits_changed;
+                CREATE TRIGGER work_waits_changed AFTER UPDATE ON work BEGIN
+                    DELETE FROM work_waits WHERE id=OLD.id;
+                    INSERT INTO work_waits(id,state,due_ms,session_id,delegated)
+                    SELECT NEW.id,NEW.state,1500,json_extract(NEW.record,'$.task.target.session_id'),1
+                    WHERE NEW.state IN ('awaiting_result','outcome_unknown');
+                END;",
+            )
+            .unwrap();
+        store.save_work(&store.work(&id).unwrap().unwrap()).unwrap();
+        assert_eq!(wait_rows(&store), vec![id.clone()]);
+        assert!(store.holds_unknown_outcome(&session).unwrap());
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert!(wait_rows(&store).is_empty());
+        assert!(!store.holds_unknown_outcome(&session).unwrap());
+        store.save_work(&store.work(&id).unwrap().unwrap()).unwrap();
+        assert!(wait_rows(&store).is_empty());
+        // Opened again: nothing to make again.
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert!(wait_rows(&store).is_empty());
+    }
+
+    /// Design I.4.6 ("Capacity"), host-work-v1 §11.6: a delegated task of
+    /// unknown outcome that nobody resolved drops its prompt and context a
+    /// day after its deadline, with the upload only it names, and stops
+    /// being an open record (it no longer counts toward `MAX_RECORDS`). It
+    /// stays `outcome_unknown`, unresolved, with its alert, and can still be
+    /// resolved. A day less a millisecond after it, nothing goes.
+    #[test]
+    fn an_unresolved_task_drops_payloads_a_day_after_its_deadline_and_keeps_its_alert() {
+        use crate::runtime::delegated::details;
+        use crate::runtime::delegated::resolve::resolve;
+        use atem_client::session::attachments::Attachment;
+        use atem_client::session::host_work::Resolution;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let owner = digest(b"phone");
+        let upload = Attachment {
+            attachment_id: uuid::Uuid::new_v4().to_string(),
+            digest: digest(b"png"),
+            size: 68,
+            media_type: "image/png".into(),
+        };
+        let mut r = task();
+        r.delegated = Some(admission());
+        r.attachment_owner = owner.clone();
+        r.task.attachments = vec![upload.clone()];
+        r.task.expires_at = 1_000;
+        assert!(store.enqueue(&r).unwrap());
+        store
+            .db
+            .execute(
+                "INSERT INTO attachments(owner,id,descriptor,size,bytes) VALUES(?1,?2,?3,68,x'00')",
+                params![
+                    owner,
+                    upload.attachment_id,
+                    serde_json::to_string(&upload).unwrap()
+                ],
+            )
+            .unwrap();
+        r.status.state = WorkState::OutcomeUnknown;
+        r.status.detail = details::AGENT_EXITED.into();
+        store.save_work(&r).unwrap();
+        let id = r.task.task_id.clone();
+        let unresolved = (
+            WorkState::OutcomeUnknown,
+            details::DEADLINE_PASSED_OUTCOME_UNKNOWN.to_string(),
+            None,
+        );
+        let now = |store: &Store| {
+            let w = store.work(&id).unwrap().unwrap();
+            (w.status.state, w.status.detail, w.status.resolved)
+        };
+        let uploads = |store: &Store| -> u32 {
+            store
+                .db
+                .query_row("SELECT count(*) FROM attachments", [], |r| r.get(0))
+                .unwrap()
+        };
+        // Its deadline, on the delegated clock: unresolved, holding nothing.
+        assert_eq!(store.settle_due(900, Some(1_000)).unwrap(), 1);
+        assert_eq!(now(&store), unresolved);
+        // A day after it, less a millisecond: nothing goes.
+        assert_eq!(
+            store
+                .drop_payloads(1_000 + PAYLOAD_RETENTION_MS - 1)
+                .unwrap(),
+            Dropped::default()
+        );
+        assert_eq!(store.work(&id).unwrap().unwrap().task.prompt, "build API");
+        assert_eq!(open_records(&store.db, "work").unwrap(), 1);
+        // A day after it.
+        assert_eq!(
+            store.drop_payloads(1_000 + PAYLOAD_RETENTION_MS).unwrap(),
+            Dropped {
+                tasks: 1,
+                messages: 0,
+                uploads: 1,
+            }
+        );
+        let kept = store.work(&id).unwrap().unwrap();
+        assert_eq!(kept.task.prompt, "");
+        assert_eq!(kept.task.context[0].text, "");
+        assert_eq!(kept.task.context[0].digest, digest(b"API"));
+        assert_eq!(kept.task.attachments, vec![upload]);
+        assert_eq!(uploads(&store), 0);
+        assert_eq!(open_records(&store.db, "work").unwrap(), 0);
+        assert_eq!(now(&store), unresolved);
+        // Its alert stays, with its reason.
+        assert_eq!(
+            store.unresolved().unwrap(),
+            (1, BTreeMap::from([("member:phone".to_string(), 1)]))
+        );
+        let (alerts, more) = store.alert_page(None, 64).unwrap();
+        assert!(!more);
+        assert_eq!(
+            alerts
+                .iter()
+                .map(|a| (a.task_id.as_str(), a.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [(id.as_str(), details::AGENT_EXITED)]
+        );
+        // Later passes leave it so.
+        assert_eq!(
+            store.drop_payloads(5 * PAYLOAD_RETENTION_MS).unwrap(),
+            Dropped::default()
+        );
+        assert_eq!(store.settle_due(5 * PAYLOAD_RETENTION_MS, None).unwrap(), 0);
+        assert_eq!(now(&store), unresolved);
+        // It can still be resolved, which ends its alert.
+        let tx = store.immediate().unwrap();
+        let resolved = resolve(
+            &store,
+            &tx,
+            &id,
+            "member:phone",
+            &Resolution::Failed {
+                detail: "given up".into(),
+            },
+            2_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            (resolved.state, resolved.detail.as_str()),
+            (WorkState::Failed, "given up")
+        );
+        assert_eq!(store.unresolved().unwrap().0, 0);
     }
 
     /// A task whose record this build can't read never fails a pass: it is

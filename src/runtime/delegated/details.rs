@@ -41,8 +41,6 @@ pub const EXPIRED_BEFORE_THE_SPAWN: &str = "expired before the spawn";
 #[allow(dead_code)]
 pub const INTERRUPTED_AT_DEADLINE: &str = "interrupted at deadline";
 /// `outcome_unknown`: its deadline passed unresolved.
-// Used by Task 23: unresolved outcomes.
-#[allow(dead_code)]
 pub const DEADLINE_PASSED_OUTCOME_UNKNOWN: &str = "deadline passed; outcome unknown";
 /// `outcome_unknown`, as its attempt's receipt says (session-v1 R9.14
 /// item 6, design I.6.3; Atem's addition): its agent exited; no turn state
