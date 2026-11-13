@@ -3524,6 +3524,17 @@ mod delegated_work_ops {
         for feature in ["host.work", DELEGATED_FEATURE, ALERTS_FEATURE] {
             assert!(!features.iter().any(|f| f == feature), "{feature}");
         }
+        // Task 27 review I1: that channel wasn't offered `host.delegated`,
+        // so its `work_interrupt` (sent raw, as a client ignoring its
+        // welcome would) is refused, the stops on or not; the channel
+        // welcomed before the pause still gets its own taken.
+        assert_eq!(
+            refusal(&mut rig, "ch-new", "work_interrupt"),
+            not_advertised("work_interrupt")
+        );
+        assert!(rig.engine.take_host_work().is_empty());
+        take(&mut rig, "ch-phone", "work_interrupt");
+        assert_eq!(rig.engine.take_host_work().len(), 1);
         // The hook off: nothing is taken, whatever the runtime says.
         rig.engine.set_delegated_features(false, false);
         assert_eq!(

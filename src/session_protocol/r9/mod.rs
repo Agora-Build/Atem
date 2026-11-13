@@ -255,6 +255,11 @@ struct Attached {
     /// I.5.8, "Native senders"): its delegated tasks pass the revocation
     /// gate while this channel is open.
     caught_up: bool,
+    /// Its welcome listed `host.delegated`: while hosting is paused only
+    /// such a channel may still send `work_interrupt` (ruling T27a, Task
+    /// 27 review I1). The engine never takes an op of a feature the channel
+    /// wasn't offered.
+    offered_delegated: bool,
 }
 
 enum Phase {
@@ -538,9 +543,20 @@ impl R9Host {
     /// taken and queued for the runtime: a stop always wins (ruling T27a,
     /// like the deadline's interrupt, T26a). The runtime says so only while
     /// it can serve it (its store recovered, no receipt-database fault).
-    /// Nothing else is taken, and no welcome lists more for it.
+    /// Only from a channel whose welcome listed `host.delegated` (one
+    /// welcomed before the pause; Task 27 review I1). Nothing else is
+    /// taken, and no welcome lists more for it.
     pub fn enable_host_work_stops(&mut self, enabled: bool) {
         self.host_work_stops = enabled;
+    }
+
+    /// The open channel of `attachment` was offered `host.delegated` in its
+    /// welcome.
+    fn offered_delegated(&self, attachment: &str) -> bool {
+        self.by_attachment
+            .get(attachment)
+            .and_then(|handle| self.chans.get(handle))
+            .is_some_and(|c| matches!(&c.phase, Phase::Open(a) if a.offered_delegated))
     }
 
     /// The delegated features the runtime runs (`host.delegated`,
@@ -1567,6 +1583,9 @@ impl R9Host {
         effects.extend(parts.host.take_effects());
         let ctx = parts.host.context().clone();
         let features = self.advertised_features();
+        let offered_delegated = features
+            .iter()
+            .any(|f| f == atem_client::session::host_work::DELEGATED_FEATURE);
         let welcome = Welcome {
             id: new_id(),
             re: re.clone(),
@@ -1618,6 +1637,7 @@ impl R9Host {
             authority,
             grant: hello.grant.clone(),
             caught_up,
+            offered_delegated,
         }));
         self.by_attachment.insert(attachment, handle.to_string());
         effects
@@ -1779,7 +1799,8 @@ impl R9Host {
             let stop_while_paused = !self.host_work_enabled
                 && self.host_work_stops
                 && self.delegated
-                && data.get("op").and_then(Value::as_str) == Some("work_interrupt");
+                && data.get("op").and_then(Value::as_str) == Some("work_interrupt")
+                && self.offered_delegated(att);
             let unadvertised = data
                 .get("op")
                 .and_then(Value::as_str)

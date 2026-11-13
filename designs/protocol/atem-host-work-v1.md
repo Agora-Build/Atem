@@ -1288,7 +1288,9 @@ not name is `forbidden`, as for `work_query`.
   confirm.**
   - **Which channels.** One welcomed before the pause. A welcome during
     the pause lists no host-work feature, so the client core sends
-    nothing.
+    nothing, and the host refuses it from such a channel (`busy`,
+    `host.delegated is not advertised`): it never takes an op of a feature
+    the channel's welcome didn't list.
   - **What else.** Every other host-work request stays `busy`.
   - **Still `busy`:** after a receipt-database fault, before the store is
     recovered (a runtime started while paused), and with a halted session
