@@ -3514,7 +3514,9 @@ mod delegated_work_ops {
     /// only while hosting is on (they are host-work features: a host lists
     /// those only then, §1); `host.senders` never. Listed, their ops are
     /// taken: decoded, queued for the runtime, and answered with what it
-    /// says (`busy` until their handlers exist, with its detail).
+    /// says (`host.delegated`'s `busy` until their handlers exist, with its
+    /// detail; `alert_list` here with `delegated::request`'s plain `busy`:
+    /// the bridge serves it, and its tests are the bridge's).
     #[test]
     fn welcome_lists_delegated_and_alerts_only_with_the_hook() {
         use crate::runtime::test_hooks::HostFeatures;
@@ -3592,12 +3594,11 @@ mod delegated_work_ops {
                 .host_work_reply(&q.attachment, &q.request, reply, mono);
             rig.pump();
             let events = rig.events("ch-2");
+            let detail = (q.request.feature() == DELEGATED_FEATURE)
+                .then(|| format!("{} is not served yet", q.request.feature()));
             assert_eq!(
                 Rig::last_error(&events),
-                Some((
-                    "busy".into(),
-                    Some(format!("{} is not served yet", q.request.feature()))
-                )),
+                Some(("busy".into(), detail)),
                 "{events:?}"
             );
         }

@@ -49,17 +49,45 @@ const GRANTS_PER_PASS: i64 = 256;
 
 /// What a task's reply does to it: a submitted reply proves its prompt
 /// arrived (an unknown outcome becomes awaiting its result), and the detail
-/// says how the reply stands. A reply never completes its task.
+/// says how the reply stands. A reply never completes its task, and a
+/// settled task (a delegated one resolved `failed` among them, design
+/// I.4.6) stays as it is. A delegated task of unknown outcome past its
+/// deadline is moved by no reply: it stays `outcome_unknown` until it is
+/// resolved (design I.4.6, host-work-v1 §11.3; an `awaiting_result` past
+/// its deadline would only expire). A delegated task that stays
+/// `outcome_unknown` keeps its reason as its detail (`agent exited`, …, or
+/// the deadline's), the one its alert names (§11.6 Details; PR 7 review
+/// I1): a reply publishing or refused shows in `reply_query`, not there. A
+/// v1 task's detail says how its reply stands, as before.
 pub(super) fn apply_reply(task: &mut WorkRecord, reply: &ResultRow) {
-    if reply.state == ReplyState::Submitted && task.status.state == WorkState::OutcomeUnknown {
+    if reply.state == ReplyState::Submitted
+        && task.status.state == WorkState::OutcomeUnknown
+        && !task.deadline_passed
+    {
         task.status.state = WorkState::AwaitingResult;
     }
+    let keeps_reason = task.delegated.is_some() && task.status.state == WorkState::OutcomeUnknown;
     if matches!(
         task.status.state,
         WorkState::Submitted | WorkState::AwaitingResult | WorkState::OutcomeUnknown
-    ) {
+    ) && !keeps_reason
+    {
         task.status.detail = reply.task_detail();
     }
+}
+
+/// Whether `task` takes its agent's reply (spec section 10): in its turn,
+/// awaiting its result or of unknown outcome; and a delegated task resolved
+/// `failed` (design I.4.6: the reply is stored, the task stays `failed`),
+/// named with `--task` as its prompt says (a reply without it goes to a
+/// task still waiting for one, `collab_reply_task`).
+fn takes_reply(task: &WorkRecord) -> bool {
+    matches!(
+        task.status.state,
+        WorkState::Submitted | WorkState::AwaitingResult | WorkState::OutcomeUnknown
+    ) || (task.status.state == WorkState::Failed
+        && task.delegated.is_some()
+        && task.status.resolved.is_some())
 }
 
 /// A task state as `atem message status` names it.
@@ -199,7 +227,9 @@ impl HostBridge {
 
     /// `atem message reply`: the calling session's reply to a task sent to
     /// it, by any sender, while the task is in its turn, awaits its result
-    /// or its outcome is unknown (spec section 10). The reply is committed,
+    /// or its outcome is unknown (spec section 10), or, a delegated
+    /// sender's, once it was resolved `failed` (`takes_reply`; design
+    /// I.4.6: stored, the task stays `failed`). The reply is committed,
     /// bound to the task, session, process and the task's own turn, before
     /// this returns; its context is published, and it is delivered to a
     /// local sender, later and only outside a pause. A pause refuses new
@@ -288,10 +318,7 @@ impl HostBridge {
         {
             return Ok(old);
         }
-        if !matches!(
-            task.status.state,
-            WorkState::Submitted | WorkState::AwaitingResult | WorkState::OutcomeUnknown
-        ) {
+        if !takes_reply(&task) {
             let why = match task.status.state {
                 WorkState::Failed | WorkState::Expired | WorkState::Cancelled => {
                     format!(" ({})", task.status.detail)
@@ -304,7 +331,7 @@ impl HostBridge {
             );
         }
         let now = host_now().wall_ms;
-        if now >= task.task.expires_at {
+        if self.reply_past_deadline(&task, now, &mut None) {
             bail!("task {id} expired");
         }
         let Some(turn) = self.collab_task_turn(&task, sessions) else {
@@ -432,13 +459,16 @@ impl HostBridge {
         let now = host_now().wall_ms;
         let due =
             results::publishing_due(&self.work.store.as_ref().unwrap().db, now, !local_waits)?;
+        // The delegated clock's `D`, read once a pass if a delegated task's
+        // reply needs it.
+        let mut d = None;
         for (row, attempts) in due {
             let store = self.work.store.as_ref().unwrap();
             let task_id = row.task_id().to_string();
             let Some(task) = store.work(&task_id)? else {
                 continue;
             };
-            if now >= task.task.expires_at {
+            if self.reply_past_deadline(&task, now, &mut d) {
                 self.work.context_jobs.remove(&row.result_id);
                 self.collab_reply_refused(&task_id, results::EXPIRED)?;
                 continue;
@@ -505,6 +535,31 @@ impl HostBridge {
         Ok(())
     }
 
+    /// Whether `task`'s deadline passed for a reply to it, at wall time
+    /// `wall`: a v1 task's on the wall clock, as always; a delegated
+    /// sender's on the delegated clock `D` (step 4's clock rule; `d` keeps
+    /// the reading taken for it, one a pass; without one, the wall clock,
+    /// which `D` never trails), or once it was marked past it
+    /// (`deadline_passed`). A reply then is refused, `expired`, whatever the
+    /// task's state, so a task of unknown outcome past its deadline stays
+    /// so until it is resolved (design I.4.4, I.4.6).
+    fn reply_past_deadline(&self, task: &WorkRecord, wall: u64, d: &mut Option<u64>) -> bool {
+        if task.delegated.is_none() {
+            return wall >= task.task.expires_at;
+        }
+        let now = *d.get_or_insert_with(|| {
+            let d = self
+                .work
+                .clock
+                .as_ref()
+                .filter(|c| !c.damaged())
+                .and_then(|c| c.reading())
+                .map_or(0, |n| n.d_ms);
+            wall.max(d)
+        });
+        task.deadline_passed || now >= task.task.expires_at
+    }
+
     /// Publishes `specs` in the background (at most two at a time); the
     /// pass collects the snapshots under `key`.
     fn collab_publish_job(&mut self, key: String, specs: Vec<ContextSpec>) {
@@ -567,6 +622,7 @@ impl HostBridge {
             }
             store.enqueue(&WorkRecord {
                 delegated: None,
+                deadline_passed: false,
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
                 control_gen: grant.origin.control_gen,
@@ -1520,6 +1576,7 @@ impl HostBridge {
             let task = local_task(message, &r.task_id, target);
             let record = WorkRecord {
                 delegated: None,
+                deadline_passed: false,
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
                 control_gen: self.host.control_gen("local"),

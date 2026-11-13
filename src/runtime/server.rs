@@ -170,6 +170,16 @@ struct Server {
     op_calls: mpsc::UnboundedSender<OpCall>,
     /// The running operation waits for the link to come up.
     op_waiting: Option<OpWaiting>,
+    /// `atem task resolve … done` snapshots published off the pass.
+    owner_done: mpsc::UnboundedSender<OwnerDonePublished>,
+}
+
+/// An `atem task resolve … done` whose snapshot was published and read
+/// back (or not): resolved on the pass, if its client is still there.
+struct OwnerDonePublished {
+    client: u64,
+    task_id: String,
+    snapshot: anyhow::Result<atem_client::session::host_work::ContextSnapshot>,
 }
 
 /// A running operation waits for the link: (encryption, credentials, reply).
@@ -253,6 +263,7 @@ pub async fn serve(
         },
     );
     let (op_calls, mut op_called) = mpsc::unbounded_channel::<OpCall>();
+    let (owner_done, mut owner_published) = mpsc::unbounded_channel::<OwnerDonePublished>();
     let mut server = Server {
         app,
         options,
@@ -274,6 +285,7 @@ pub async fn serve(
         op: None,
         op_calls,
         op_waiting: None,
+        owner_done,
     };
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -297,6 +309,7 @@ pub async fn serve(
                 server.app.route_reconnect_due(op_running, admitting);
             }
             Some(call) = op_called.recv() => server.op_call(call),
+            Some(done) = owner_published.recv() => server.owner_done_published(done),
             Some(stream) = accepted.recv() => server.add_client(stream),
             Some(done) = launched.recv() => server.launched(done),
             adoption = adoptions.recv(), if server.adopting => match adoption {
@@ -329,6 +342,11 @@ pub async fn serve(
 /// Refuses a peer whose process can't be verified.
 const UNVERIFIED: &str =
     "the calling process could not be verified (it ended or was replaced); run the command again";
+
+/// Refuses the owner's own commands (`atem task …`) inside an agent
+/// session.
+const INSIDE_A_SESSION: &str =
+    "atem task runs from the owner's terminal, not inside an Atem session";
 
 /// Who calls over the local socket.
 #[derive(Debug, PartialEq, Eq)]
@@ -394,6 +412,8 @@ fn waits_for_adoption(incoming: &Incoming) -> bool {
                 | ClientMsg::MessageStatus { .. }
                 | ClientMsg::MessageCancel { .. }
                 | ClientMsg::MessageDirectory { .. }
+                | ClientMsg::TaskList { .. }
+                | ClientMsg::TaskResolve { .. }
         ) | Incoming::Bad(DecodeError::Version(_))
     )
 }
@@ -603,6 +623,76 @@ impl Server {
                 Err(())
             }
         }
+    }
+
+    /// The owner at a terminal outside any session, for the owner's own
+    /// commands (`atem task …`; step 4's open question 2): inside an agent
+    /// session they are refused, as is an unverified peer. Same-user: a
+    /// correctness guard, not a security boundary.
+    fn owner_only(&self, client: u64, op: &str) -> bool {
+        match self.caller(client) {
+            Caller::Owner => true,
+            Caller::Session(_) => {
+                self.error(client, INSIDE_A_SESSION, op);
+                false
+            }
+            Caller::Unverified => {
+                self.error(client, UNVERIFIED, op);
+                false
+            }
+        }
+    }
+
+    /// `atem task resolve`'s answer: the task as resolved, or why not.
+    fn task_resolved(
+        &self,
+        client: u64,
+        task_id: String,
+        result: anyhow::Result<atem_client::session::host_work::WorkStatus>,
+    ) {
+        match result {
+            Ok(work) => self.send(
+                client,
+                &RuntimeMsg::TaskResolved {
+                    task_id,
+                    state: serde_json::to_value(work.state)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default(),
+                    detail: work.detail,
+                    by: work.resolved.map(|r| r.by).unwrap_or_default(),
+                },
+            ),
+            Err(e) => self.error(client, e.to_string(), "task_resolve"),
+        }
+    }
+
+    /// A `done` snapshot is back: the task is resolved with it (committed
+    /// before the answer), unless its client went away meanwhile. Then
+    /// nothing is resolved (the same command again does it, publishing
+    /// again) and runtime.log says so, since a memory may already be on the
+    /// relay: unlike `atem message reply`, which commits its reply before it
+    /// answers, `done` keeps nothing until it resolves.
+    fn owner_done_published(&mut self, done: OwnerDonePublished) {
+        if !self.clients.contains_key(&done.client) {
+            eprintln!(
+                "atem runtime: task {}: `atem task resolve … done` ended before its snapshot was read back; nothing was resolved (a memory may already be on the relay)",
+                done.task_id
+            );
+            return;
+        }
+        let result = done.snapshot.and_then(|result| {
+            self.bridge
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
+                .and_then(|b| {
+                    b.owner_resolve(
+                        &done.task_id,
+                        &atem_client::session::host_work::Resolution::Done { result },
+                    )
+                })
+        });
+        self.task_resolved(done.client, done.task_id, result);
     }
 
     fn detach(&mut self, sid: &SessionId) {
@@ -950,6 +1040,7 @@ impl Server {
                 | ClientMsg::MessageReply { .. }
                 | ClientMsg::MessageComplete { .. }
                 | ClientMsg::MessageCancel { .. }
+                | ClientMsg::TaskResolve { .. }
                 | ClientMsg::AstationOp { .. }
                 | ClientMsg::Attach { .. }
                 | ClientMsg::Restart => return self.error(id, RESTARTING_NOW, message.op()),
@@ -1329,6 +1420,72 @@ impl Server {
                     Err(e) => self.error(id, e.to_string(), "message_directory"),
                 }
             }
+            ClientMsg::TaskList { unknown } => {
+                if !self.owner_only(id, "task_list") {
+                    return;
+                }
+                if !unknown {
+                    return self.error(
+                        id,
+                        "only `atem task list --unknown` lists tasks",
+                        "task_list",
+                    );
+                }
+                let result = self
+                    .bridge
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("session host unavailable"))
+                    .and_then(HostBridge::owner_unknown_tasks);
+                match result {
+                    Ok(tasks) => self.send(id, &RuntimeMsg::TaskList { tasks }),
+                    Err(e) => self.error(id, e.to_string(), "task_list"),
+                }
+            }
+            ClientMsg::TaskResolve {
+                task_id,
+                resolution,
+            } => {
+                use super::protocol::LocalResolution;
+                if !self.owner_only(id, "task_resolve") {
+                    return;
+                }
+                let Some(bridge) = self.bridge.as_mut() else {
+                    return self.error(id, "session host unavailable", "task_resolve");
+                };
+                match resolution {
+                    LocalResolution::Failed { detail } => {
+                        let detail = detail.unwrap_or_else(|| {
+                            crate::runtime::delegated::details::RESOLVED_AS_FAILED_ON_THE_HOST
+                                .to_string()
+                        });
+                        let result = bridge.owner_resolve(
+                            &task_id,
+                            &atem_client::session::host_work::Resolution::Failed { detail },
+                        );
+                        self.task_resolved(id, task_id, result);
+                    }
+                    LocalResolution::Done { memory, vault } => {
+                        use super::host_bridge::OwnerDone;
+                        match bridge.owner_done(&task_id, memory.as_deref(), vault.as_deref()) {
+                            Ok(OwnerDone::Recorded(work)) => {
+                                self.task_resolved(id, task_id, Ok(work));
+                            }
+                            Ok(OwnerDone::Publish(publication)) => {
+                                let tx = self.owner_done.clone();
+                                tokio::spawn(async move {
+                                    let snapshot = publication.publish().await;
+                                    let _ = tx.send(OwnerDonePublished {
+                                        client: id,
+                                        task_id,
+                                        snapshot,
+                                    });
+                                });
+                            }
+                            Err(e) => self.error(id, e.to_string(), "task_resolve"),
+                        }
+                    }
+                }
+            }
             ClientMsg::Stop { session_id } => {
                 let Some(sid) = self.find(&session_id) else {
                     return self.error(id, "No such live session", "stop");
@@ -1454,6 +1611,7 @@ impl Server {
                 .as_ref()
                 .and_then(HostBridge::device_list_status),
             clock: self.bridge.as_ref().and_then(HostBridge::clock_status),
+            delegated: self.bridge.as_ref().and_then(HostBridge::delegated_status),
         }
     }
 

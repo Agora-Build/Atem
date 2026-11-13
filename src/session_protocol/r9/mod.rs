@@ -556,6 +556,16 @@ impl R9Host {
         self.alerts = alerts && delegated;
     }
 
+    /// Whether this host's welcome lists `host.alerts`: hosting on, and the
+    /// hook's `host.delegated` and `host.alerts`. The one rule for both the
+    /// welcome and the making (signing and first send) of `outcome_unknown`
+    /// hints (host-work-v1 §11.3: "only behind `host.alerts`"), so the two
+    /// can't disagree; hints already made are resent whatever it says then
+    /// (session-v1 R9.9).
+    fn alerts_advertised(&self) -> bool {
+        self.host_work_enabled && self.delegated && self.alerts
+    }
+
     /// The features a welcome lists: the one source of what this host takes
     /// (an op of a feature not listed here is `unsupported_version`,
     /// session-v1 §A). `host.delegated` and `host.alerts` only as the
@@ -579,7 +589,7 @@ impl R9Host {
             if self.delegated {
                 features.push(atem_client::session::host_work::DELEGATED_FEATURE.to_owned());
             }
-            if self.alerts {
+            if self.alerts_advertised() {
                 features.push(atem_client::session::host_work::ALERTS_FEATURE.to_owned());
             }
         }
@@ -2380,6 +2390,50 @@ impl R9Host {
             .resolved(approval_id, &reason, signer_of(&parts.list), wall);
     }
 
+    /// An alert was raised (host-work-v1 §11.3; the bridge hands it over
+    /// once its row is committed, so it is durable before any hint shows
+    /// it): its `outcome_unknown` hints, one per native member holding
+    /// `control` at the head, the task, session, sender and the alert's own
+    /// reason sealed to each (R9.9). Only while the welcome lists
+    /// `host.alerts` ([`R9Host::alerts_advertised`]: hosting on, the
+    /// hook's features on; host-work-v1 §11.3 "Compatibility"), and never
+    /// while push is suppressed (`push_suppressed`). An alert raised while
+    /// either holds is never hinted later.
+    pub fn alert_opened<J: Journal>(
+        &mut self,
+        alert: &atem_client::session::alerts::Alert,
+        parts: &mut Parts<'_, J>,
+    ) {
+        if !self.alerts_advertised() {
+            return;
+        }
+        self.push.suppress(push_suppressed(parts));
+        let wall = parts.now.host.wall_ms;
+        let Some(key) = alert_push_key(&parts.list, &alert.alert_id) else {
+            return;
+        };
+        let plain = atem_client::push::AlertPlain {
+            task_id: alert.task_id.clone(),
+            session_id: alert.session_id.clone(),
+            sender: alert.sender.clone(),
+            reason: alert.reason.clone(),
+        };
+        self.push
+            .alert_opened(key, alert.created_at, &plain, signer_of(&parts.list), wall);
+    }
+
+    /// An alert ended (its task resolved, or a reply moved it): its hints
+    /// are not sent again (an alert has no resolved hint, R9.9).
+    pub fn alert_ended(&mut self, alert_id: &str) {
+        self.push.alert_ended(alert_id);
+    }
+
+    /// The alerts whose hints still wait for the relay (what the bridge
+    /// asks the store about: one that ended stops its hints).
+    pub fn hinted_alerts(&self) -> Vec<String> {
+        self.push.alert_ids()
+    }
+
     /// A relay message on Atem's link (`{"type":"relay",…}`): a `push_ack`
     /// ends the resends of what it names; a Station's message to this host
     /// (host-work-v1 §11.4) goes to the Station link, as received
@@ -3060,6 +3114,22 @@ fn approval_key(
         &request.session_id,
         &request.process_gen,
         &request.approval_id,
+    ))
+}
+
+/// An alert's push identity on this host (R9.9, "`outcome_unknown` hint"):
+/// the pinned list's account and genesis, this host and its trust
+/// generation, the alert's id.
+fn alert_push_key(list: &DeviceList<'_>, alert_id: &str) -> Option<atem_client::push::AlertKey> {
+    let DeviceList::Open { m, .. } = list else {
+        return None;
+    };
+    let pin = m.pin_of();
+    Some(atem_client::push::AlertKey::new(
+        m.membership(),
+        &pin.host_id,
+        pin.host_trust_gen,
+        alert_id,
     ))
 }
 

@@ -1338,7 +1338,7 @@ alerts.)
 | `session_id` | the task's target session (`ses-` and 12 characters) |
 | `task_id` | the task: a UUID v4 (a delegated task's id) |
 | `sender` | the delegated sender that enqueued the task: `member:<id>`, `service:<id>` or `host:<id>` (an id of 1-128 bytes of `[A-Za-z0-9._:-]`), as a receipt's provenance names it (session-v1 R9.14). Never `local` or `browser:` |
-| `reason` | why the outcome is unknown, for people: 1-256 bytes, no control or Cf character (`agent exited`, `write interrupted`, `deadline passed; outcome unknown`) |
+| `reason` | why the outcome is unknown, for people: 1-256 bytes, no control or Cf character. Atem gives one of §11.6's `outcome_unknown` reasons as the task's receipt says (`agent exited`, `outcome could not be established`, `write interrupted`), with the note below at 32. Kept as raised: the task's `detail` changes at its deadline, the alert's `reason` doesn't |
 | `created_at` | Unix ms on the host's wall clock: when the task became `outcome_unknown`. For people only: it orders nothing |
 | `more` | `true` when alerts follow this page; then the page isn't empty |
 
@@ -1357,10 +1357,11 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
     miss it (**Atem's choice, agreed with Astation (2026-11-11, #120
     comment 6810116314)**).
   - At most **64** alerts per result (**Atem's choice, agreed with
-    Astation (2026-11-11, #120 comment 6810116314)**). A host holds at
-    most 256 unresolved outcomes (design I.4.6), so a full list is four
-    pages. An alert is typically about 450 bytes, at most about 750, and
-    about 1 KB with escaping.
+    Astation (2026-11-11, #120 comment 6810116314)**). New remote tasks
+    stop at 256 unresolved outcomes (design I.4.6, §11.6 "Capacity"), but
+    tasks already accepted can still add to them, so a client pages until
+    `more` is `false`, never assuming four pages. An alert is typically
+    about 450 bytes, at most about 750, and about 1 KB with escaping.
   - A caller asks for the next page with `after` equal to the last
     `alert_id` it read, until `more` is `false`. The cursor stays the
     `alert_id`; the host finds it and lists what follows it in `seq`. A page
@@ -1375,10 +1376,11 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
   `outcome_unknown` and unresolved, one alert each. An alert ends when its
   task is resolved (`work_resolve`, or the host's command) or a reply
   moves it to `awaiting_result` (design I.4.6, "Ending"); an ended alert is
-  no longer listed. No other ending exists in this store: a delegated
-  task's `outcome_unknown` never expires (§11.6, "Unknown outcomes"), and a
-  new host identity moves the whole store aside, alerts included (design
-  I.3.3). A task reaches `outcome_unknown` once, so an alert is never raised
+  no longer listed. A delegated task's `outcome_unknown` never expires
+  (§11.6, "Unknown outcomes"). Two other endings exist: a task whose record
+  the host can't read any more is settled `failed` (`record unreadable`),
+  and its alert ends with it; and a new host identity moves the whole store
+  aside, alerts included (design I.3.3). A task reaches `outcome_unknown` once, so an alert is never raised
   twice for one. The host keeps an alert for every unresolved outcome; at 32
   unresolved on a host the `reason` of a new alert says so (for example
   `agent exited; 32 outcomes unresolved on this host`) within the 256 bytes
@@ -1393,9 +1395,16 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
 
 **The push hint.** The host signs an `outcome_unknown` hint per recipient
 when an alert is raised: a body of `atem-push-hint` with a `kind`, the task,
-session, sender and reason sealed to the recipient's `enc_key`. Session-v1
-R9.9 specifies it; the shared vectors are `r9-vectors-push-hint`
-(`outcome_unknown*`).
+session, sender and reason sealed to the recipient's `enc_key`. The host
+makes it once, when the alert is committed, and only while its welcome lists
+`host.alerts`, the condition under which it answers `alert_list`: the feature
+gates a hint's creation and first send. A hint already made goes on with its
+bounded resends (R9.9) after the feature is no longer advertised, as after
+hosting pauses (**amended 2026-11-13, #120 comment 6848463998**: it said the
+host "sends it only while" the welcome lists the feature). An alert that got
+no hint is still listed. Session-v1 R9.9 specifies the hint,
+its delivery and what loses it (**Atem's choices, for Astation to confirm**).
+The shared vectors are `r9-vectors-push-hint` (`outcome_unknown*`).
 
 **Client core.** `Attached::send` refuses `alert_list` unless
 `welcome.features` lists `host.alerts` (`host feature not available`),
@@ -2385,9 +2394,19 @@ The sender's channel and online status are not conditions.
   unknown`. It stays `outcome_unknown` until `work_resolve` (§11.2) or the
   host's own command (below) resolves it, which records the resolver and
   the time (`resolved`).
-- A reply its agent submits proves the turn ran: the task moves to
-  `awaiting_result` and still needs `work_complete`. A reply that arrives
-  after a `failed` resolution is stored, and the task stays `failed`.
+- A reply its agent submits before the task's deadline proves the turn
+  ran: the task moves to `awaiting_result` and still needs
+  `work_complete`. A reply that arrives after a `failed` resolution, before
+  the deadline, is stored, and the task stays `failed`. **Atem's reading,
+  for Astation:** after the task's deadline (on the delegated clock below),
+  as for every task, a reply is refused (`expired`) and nothing is stored.
+- **Atem's choice, for Astation:** while the task stays `outcome_unknown`
+  (its reply still publishing, or refused), its `detail` stays its reason
+  (the Details table's `outcome_unknown` rows: `agent exited`, `outcome
+  could not be established`, `write interrupted`, or the deadline's text);
+  `reply_query` shows the reply. A delegated task in its turn whose
+  attempt's receipt is gone (evicted or lost) says `outcome could not be
+  established`.
 - Each one raises an alert (§11.3); the alert ends when the task is
   resolved, or a reply moves it to `awaiting_result`.
 
@@ -2899,6 +2918,53 @@ actual sync flags, suspend, reboot and repairs still need step 4 tests.
   task: a task of `local`, a browser grant or a service no feed covers
   keeps v1, and its unknown outcome expires.
 
-Both commands are built in step 4, with the lifecycle. Their output, and
-how `done` takes its result snapshot and `failed` its detail, are
-step 4's.
+Both commands are built in step 4, with the lifecycle. The rest of this
+section is **Atem's choice** (step 4's open questions 2 and 3, approved by
+the owner), filling what the design leaves open. It is Atem-internal: no
+field or message changes, and the one text a client can see is `failed`'s
+default detail.
+
+- **`failed`'s detail (Atem's choice).** `atem task resolve <task_id>
+  failed [--detail TEXT]`: a detail given is kept byte for byte under
+  §11.2's rule (1–1024 bytes, not blank, no control or Cf character);
+  without one the task's `detail` is `resolved as failed on the host`,
+  which its sender reads with `work_query` like any other.
+- **`done`'s result (Atem's choice).** `atem task resolve <task_id> done`
+  takes exactly one `--memory ID` or `--vault ID:ENTRY@VERSION`, and no
+  free text. The snapshot is captured, published and read back as `atem
+  message reply` takes its context: vault context only while the account's
+  signed encryption mode is `on`, a vault reference names its entry, and an
+  entry the credential redactor would change is refused. Nothing is kept
+  until the task is resolved with it: a command abandoned while its
+  snapshot is being published resolves nothing (a memory may already be on
+  the relay, and `runtime.log` says so). A task already resolved publishes
+  nothing: the same snapshot again (the same memory with its text
+  unchanged, or the same vault entry and version) returns its recorded
+  status, and anything else is another resolution, refused.
+- **Who runs them (Atem's choice).** Both commands are the owner's, `list`
+  too since it shows every sender's tasks: they are refused inside an agent
+  session and for a process that can't be verified, by the verified
+  process-ancestry check `atem message status` uses. On the runtime's
+  same-user socket this is a correctness guard, not a security boundary.
+- **With `host.delegated` off (Atem's choice).** Both commands work
+  whether or not `host.delegated` is on: with it off nothing remote can
+  settle a delegated task of unknown outcome, so the owner's command is
+  the only way. `resolved` still reaches the wire only behind
+  `host.delegated` (§11.2, "Compatibility"). The commands need the
+  host-work records, which open once hosting is enabled in the runtime's
+  life; otherwise they say the records are unavailable.
+- **`atem status` (Atem's choice).** Its `Delegated:` line (`N unresolved
+  outcomes (atem task list --unknown)`, or `no unresolved outcomes`)
+  appears only while something is delegated: `host.delegated` on, a
+  delegated task open, or an outcome unresolved. Otherwise the status is
+  what it was before the line existed.
+- **Replies (design I.4.7; the budget is Atem's choice).** A delegated
+  task's reply text and context are kept 30 days after the task settles
+  (`completed`, `failed`, `cancelled` or `expired`; a reply stored after
+  its task settled counts from its storing), past the day after the
+  deadline when the task's own payloads go, without keeping the task an
+  open record. They have their own budget of 64 MiB per host: over it the
+  oldest go first, before their 30 days, and one `runtime.log` line says
+  how many went early. Then they drop as a v1 reply does: metadata, digest
+  and state stay. A task not settled (an unresolved unknown outcome) drops
+  its reply with its own payloads, as v1 does.
