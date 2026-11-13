@@ -397,7 +397,7 @@ they can only be interrupted.
 | Narrowing (less scope, fewer ops, other roles) | Per the new grant | Those no longer covered fail `sender's authorization narrowed` | Continue | Kept; completable within the new grant | Readable within the new grant |
 | Pause, admin pause, owner disabled (`hold` record) | Refused (Auth issues no tokens; the Station refuses) | Held: `blocked`, detail `paused`, until `release` or the deadline | Continue | Kept | Kept |
 | Resume, owner enabled (`release` record) | Allowed again | Run again, if before their deadline | n/a | Kept | Readable |
-| Revocation (`revoke` record), or R9 removal of the sender | Refused for good | Cancelled: `cancelled`, detail `sender revoked` | Continue, or are interrupted if the record asks | Kept; only the owner can complete or resolve them | Kept; readable by the owner, not the sender |
+| Revocation (`revoke` record), or R9 removal of the sender | Refused for good | Cancelled: `cancelled`, detail `sender revoked` | Continue, or are interrupted if the record asks | Kept; the owner can query them, interrupt their turn and resolve an `outcome_unknown` one (I.4.5); nobody completes them, so one `awaiting_result` expires at its deadline (**amended 2026-11-13, #120 comment 6848463998**: it said "only the owner can complete or resolve them", but I.4.5 gives the owner no `work_complete`) | Kept; readable by the owner, not the sender |
 | Route revision, principals or profile changed | Per the new route | Fail `route changed` | Continue | Kept | Readable |
 | Device list frozen or faulted | Refused | Fail `sender's authority changed` (as today) | Continue | Kept | Kept |
 | Host leaves the device list, or host trust changes | Refused | Fail (as today; a new host identity starts an empty store) | Per session-v1 | Moved aside with the old store | Moved aside with the old store |
@@ -561,6 +561,11 @@ R4 bounds accepted tasks by their original deadline (at most 24 h after admissio
   task, an unexpired grant that isn't revoked or removed, and `notify` and `prompt` in the current grant.
 - A changed `control_gen` no longer forbids these calls, so a renewed grant reads its own tasks again.
 - A route change doesn't hide a task or its reply from its sender.
+- **A cancel is confirmed only by its commit.** `work_cancel` answers `cancelled` once the task's cancellation and its
+  attempt's end commit together. A crash after the withdrawal but before that commit leaves the caller uncertain:
+  recovery may queue a fresh, authorized attempt. The client queries the task and may cancel again; it never shows a
+  cancellation as confirmed from the withdrawal alone. This version keeps no cancel intent (**added 2026-11-13, #120
+  comment 6848463998**).
 
 **The owner.** A native member holding `control` at the host's current device-list head is the owner's voice. It may
 `work_query`, `reply_query` and `work_resolve` any task, including those of a revoked sender.
