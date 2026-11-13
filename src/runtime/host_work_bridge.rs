@@ -1474,15 +1474,23 @@ impl HostBridge {
                         return Err("request_id_reused".into());
                     }
                     // A delegated task's sender with current authority
-                    // (design I.4.5), else v1's rule.
+                    // (design I.4.5), else v1's rule. Its launch project
+                    // registered first, as `work_query` registers it
+                    // (ruling T20c; T35a): the retry of a record that closed
+                    // before this run is `busy` only until it is hashed.
                     let allowed = match &old.delegated {
-                        Some(adm) => match self.delegated_caller(&a, &old, adm) {
-                            Ok(caller) => caller == Caller::Sender,
-                            Err(refused) if refused.code() == "busy" => {
-                                return Err("busy".into());
+                        Some(adm) => {
+                            if adm.scope_at_admission.get("projects").is_some() {
+                                keep_project(&mut self.projects, &old.project);
                             }
-                            Err(_) => false,
-                        },
+                            match self.delegated_caller(&a, &old, adm) {
+                                Ok(caller) => caller == Caller::Sender,
+                                Err(refused) if refused.code() == "busy" => {
+                                    return Err("busy".into());
+                                }
+                                Err(_) => false,
+                            }
+                        }
                         None => self.work_route_allowed(&old, &a),
                     };
                     if !allowed {

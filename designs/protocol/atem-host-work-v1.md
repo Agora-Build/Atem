@@ -3076,6 +3076,13 @@ As built in step 4:
 - **With `host.delegated` turned off after tasks were accepted** (the
   debug-only hook removed), a started task's turn is still interrupted at
   its deadline.
+- **A task of unknown outcome. Atem's reading, for Astation to confirm.**
+  It gets no deadline interrupt: the host can't identify its turn (design
+  I.6.3; its alert tells the owner, §11.3, "Unknown outcomes" below). So a
+  worker still alive whose chat arrives after the 60-second recovery
+  window (session-v1 R9.14 item 6) can run past the deadline, with only
+  the alert to show it. Interrupting such a turn would change that
+  recovery rule: an owner and Astation decision.
 
 #### Unknown outcomes
 

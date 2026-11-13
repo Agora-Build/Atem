@@ -302,7 +302,7 @@ pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> R
     if now_d_ms.is_some_and(|d| d >= task.deadline) {
         return Err(Event::Expired);
     }
-    waits(view, &sender, adm, scope_pending)
+    waits(view, &sender, adm, scope_pending, false)
 }
 
 /// A delegated sender as the committed device list and control state have
@@ -415,20 +415,25 @@ fn scope_pending(
     Ok(pending)
 }
 
-/// What makes it wait: the journal halted (2a), the sender held (2), a
-/// deferred entry (2), the gate closed (5), then a project scope pending
-/// (3).
+/// What makes it wait: the journal halted (2a), a control state that
+/// doesn't read (5), the sender held (2), a deferred entry (2), the gate
+/// closed (5), then a project scope pending (3). The control state that
+/// doesn't read holds every task (fail closed), but of launches (`launch`)
+/// a service's only: a native's authority is the device list's, never a
+/// control record's (ruling T35a).
 fn waits(
     view: &StartView,
     sender: &InEffect<'_>,
     adm: &Admission,
     scope_pending: bool,
+    launch: bool,
 ) -> Result<(), Event> {
     if view.halted {
         return Err(Event::Halted);
     }
     // No sender's revocations can be checked (fail closed).
-    if view.controls_damaged {
+    let native = matches!(adm.sender, DelegatedSender::Native { .. });
+    if view.controls_damaged && !(launch && native) {
         return Err(Event::GateClosed);
     }
     if sender.standing.held {
@@ -503,7 +508,10 @@ pub struct StartLaunch {
 /// The events and their order are [`may_start`]'s, condition 4 being the
 /// profile it was approved under and the deadline its expiry; what settles
 /// a task fails the launch with the event's detail, what blocks one makes it
-/// wait, and an expiry passed is `expired before the spawn`.
+/// wait, and an expiry passed is `expired before the spawn`. One
+/// difference: a control state that doesn't read makes a service's launch
+/// wait, never a native's (ruling T35a: a native's authority is the device
+/// list's).
 ///
 /// Hosting §5's fences come first and are its callers': a receipt-database
 /// fault, a halted session journal alone and hosting switched off fence a
@@ -543,7 +551,7 @@ fn launch_event(view: &StartView, launch: &StartLaunch, now_d_ms: u64) -> Result
     if now_d_ms >= launch.expires_at {
         return Err(Event::Expired);
     }
-    waits(view, &sender, adm, scope_pending)
+    waits(view, &sender, adm, scope_pending, true)
 }
 
 /// Host-work's start check in the session host (session-v1 R9.14 item 3):

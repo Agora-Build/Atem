@@ -869,3 +869,44 @@ fn the_launch_check_gives_may_starts_events_for_a_launch() {
         LaunchVerdict::Wait(details::DEVICE_LIST_UPDATE_PENDING)
     );
 }
+
+/// Ruling T35a (PR 11 setup review m1): a control state that doesn't read
+/// makes a service's launch wait at the spawn boundary (`revocations not
+/// yet checked`: its revocation and hold can't be checked), never a
+/// native's, whose authority is the device list's. Tasks are unchanged:
+/// every delegated task, a native's included, waits on it.
+#[test]
+fn a_damaged_control_state_holds_a_services_launch_not_a_natives() {
+    use crate::runtime::delegated::details;
+    let log = log_of(&["launch", "notify", "prompt", "view"], |_| {});
+    let profile = config(1).profile("p").unwrap().clone();
+    let key = profile.scope_key();
+    let launch = |principal: &str| StartLaunch {
+        admission: task(&log, principal, LATER).admission,
+        profile: profile.clone(),
+        expires_at: 1_000,
+    };
+    let (phone, bot) = (launch(PHONE), launch(BOT));
+    let mut v = view(&log);
+    v.scopes
+        .hashes
+        .insert((key.clone(), KID.into()), PROJECT.into());
+    v.scopes
+        .hashes
+        .insert((S1.into(), KID.into()), PROJECT.into());
+    assert_eq!(launch_check(&v, &phone, 0), LaunchVerdict::Go);
+    assert_eq!(launch_check(&v, &bot, 0), LaunchVerdict::Go);
+    v.controls_damaged = true;
+    assert_eq!(launch_check(&v, &phone, 0), LaunchVerdict::Go);
+    assert_eq!(
+        launch_check(&v, &bot, 0),
+        LaunchVerdict::Wait(details::REVOCATIONS_NOT_YET_CHECKED)
+    );
+    for principal in [PHONE, BOT] {
+        assert_eq!(
+            may_start(&v, &task(&log, principal, LATER), Some(0)),
+            Err(Event::GateClosed),
+            "{principal}'s task"
+        );
+    }
+}
