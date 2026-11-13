@@ -989,6 +989,16 @@ impl AstationClient {
         self.relay_origin.as_deref()
     }
 
+    /// The selected Station's origin (`station_route::destination`,
+    /// normalized by `normalize_relay`), whatever the link: the host's own
+    /// Station (the delegated host-work design I.5.8). `None` when the
+    /// selection can't be read.
+    pub(crate) fn selected_station_origin(&self) -> Option<String> {
+        let src = self.profile_sources().ok()?;
+        let (origin, _) = crate::station_route::destination(&src, &self.device_atem_id()).ok()?;
+        atem_client::station_route::normalize_relay(&origin).ok()
+    }
+
     pub(crate) fn selected_destination_current(&self) -> bool {
         self.profile_sources().and_then(|src| {
             let (origin, blocked) = crate::station_route::destination(&src, &self.device_atem_id())?;

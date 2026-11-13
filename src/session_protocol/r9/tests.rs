@@ -3671,3 +3671,34 @@ mod host_enc_key_get {
         assert!(rig.relay.is_empty());
     }
 }
+
+/// host-work-v1 §11.4: a Station's messages to this host go to the Station
+/// link as received, in order, and never to the push engine; a `push_ack`
+/// still goes to the push engine; anything else is neither.
+#[test]
+fn a_stations_messages_go_to_the_station_link() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    let station = [
+        r#"{"type":"relay","op":"heads","feeds":[],"membership":{"seq":3,"hash":"ab"}}"#,
+        r#"{ "type": "relay", "op": "membership_fetch_result", "head": {}, "entries": [] }"#,
+        r#"{"type":"relay","op":"control_sync_result"}"#,
+        r#"{"type":"relay","op":"control_sync_refused","code":"forbidden"}"#,
+        r#"{"type":"relay","op":"membership_fetch_refused","code":"forbidden"}"#,
+        r#"{"type":"relay","op":"control_ack_refused","code":"forbidden"}"#,
+    ];
+    for text in station {
+        rig.engine.relay_message(text);
+    }
+    // The host's own calls, a push_ack and other relay messages: not the
+    // Station's to this host.
+    for text in [
+        r#"{"type":"relay","op":"membership_fetch","after":3}"#,
+        r#"{"type":"relay","op":"push_ack","acks":[]}"#,
+        r#"{"type":"relay","op":"host_route_ok"}"#,
+    ] {
+        rig.engine.relay_message(text);
+    }
+    assert_eq!(rig.engine.take_station_messages(), station);
+    assert!(rig.engine.take_station_messages().is_empty());
+}

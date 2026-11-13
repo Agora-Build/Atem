@@ -380,6 +380,9 @@ pub struct R9Host {
     flush_cursor: Option<String>,
     /// Sealed push hints and seen for the relay (§R9.9).
     push: push::HostPush,
+    /// The Station's messages to this host (host-work-v1 §11.4), as
+    /// received, for the bridge's Station link (taken every pass).
+    station_inbox: Vec<String>,
     /// Lines driven by the router's or the relay's input, rate-limited.
     input_log: LineLimit,
     /// The latest monotonic time seen (for lines without a clock at hand).
@@ -462,6 +465,20 @@ impl LineLimit {
             self.suppressed += 1;
         }
     }
+}
+
+/// A Station's message to a host (host-work-v1 §11.4), by its `op`.
+fn is_station_message(op: &str) -> bool {
+    use atem_client::control::relay::op;
+    [
+        op::CONTROL_SYNC_RESULT,
+        op::HEADS,
+        op::MEMBERSHIP_FETCH_RESULT,
+        op::CONTROL_SYNC_REFUSED,
+        op::MEMBERSHIP_FETCH_REFUSED,
+        op::CONTROL_ACK_REFUSED,
+    ]
+    .contains(&op)
 }
 
 fn new_id() -> String {
@@ -697,6 +714,7 @@ impl R9Host {
             dead: Vec::new(),
             flush_cursor: None,
             push: push::HostPush::default(),
+            station_inbox: Vec::new(),
             input_log: LineLimit::default(),
             last_mono: 0,
             policy_paths: None,
@@ -2359,17 +2377,35 @@ impl R9Host {
     }
 
     /// A relay message on Atem's link (`{"type":"relay",…}`): a `push_ack`
-    /// ends the resends of what it names.
+    /// ends the resends of what it names; a Station's message to this host
+    /// (host-work-v1 §11.4) goes to the Station link, as received
+    /// ([`R9Host::take_station_messages`]).
     pub fn relay_message(&mut self, text: &str) {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             return;
         };
+        if value
+            .get("op")
+            .and_then(Value::as_str)
+            .is_some_and(is_station_message)
+        {
+            // At most the App's relay messages of a pass (`RELAY_LIMIT`).
+            self.station_inbox.push(text.to_owned());
+            return;
+        }
         let matched = self.push.ack(&value);
         if matched == 0 && value.get("op").and_then(Value::as_str) == Some("push_ack") {
             self.input_log.log(self.last_mono, || {
                 "a push_ack acknowledged nothing pending".into()
             });
         }
+    }
+
+    /// The Station's messages received since the last call, in order (the
+    /// bridge reads them with the shared reader, or drops them while
+    /// `host.delegated` is off).
+    pub fn take_station_messages(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.station_inbox)
     }
 
     /// The head may have moved: open hints of devices no longer recipients

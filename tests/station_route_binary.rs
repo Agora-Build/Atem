@@ -420,7 +420,6 @@ fn unavailable_selected_relay_has_no_direct_or_default_fallback() {
 // shared builders (`atem_client::control::relay`) and reads what the fake
 // sends as bytes.
 
-use atem_client::canonical::jcs;
 use atem_client::control::relay::MAX_RELAY_MESSAGE_BYTES;
 use atem_client::control::{
     AckResult, ApplicationResult, CallRefused, ControlAck, ControlAction, ControlCheck,
@@ -428,10 +427,7 @@ use atem_client::control::{
     EffectResult, FeedEntry, FeedHead, FeedPos, Heads, MembershipFetch, MembershipFetchResult,
     RefusalCode, RefusalReason, RefusedCall, ToHost, ToStation, verify_control,
 };
-use atem_client::membership::{
-    Entry, Head, Membership, ServiceScope, draft_on, service_add, sign_entry,
-};
-use atem_client::{Alg, PublicKey};
+use atem_client::membership::{Entry, ServiceScope};
 use support::station::{FakeStation, OTHER_ACCOUNT, StaleFeed};
 use tokio_tungstenite::tungstenite::{self, Message as WsMessage, stream::MaybeTlsStream};
 
@@ -737,102 +733,18 @@ fn fake_station_speaks_only_the_shared_builders() {
     assert_eq!(station.sent(), host.calls);
 }
 
-/// Ed25519 public key of `label`'s test secret.
-fn ed25519(label: &str) -> PublicKey {
-    let seed = secret(label);
-    let public = ed25519_dalek::SigningKey::from_bytes(&seed)
-        .verifying_key()
-        .to_bytes();
-    PublicKey::new(Alg::Ed25519, &public).unwrap()
-}
-
-/// `log` grown by the Mac's entries of `bodies` (each made from the head
-/// before it), chained by hand and the chain verified once at the end
-/// (`TestLog::append` verifies all of it at every entry: slow in debug for a
-/// long list).
-fn grow(log: &mut TestLog, mut body: impl FnMut(&TestLog, Head) -> Option<Value>) {
-    let mut head = log.log.head();
-    while let Some(draft) = body(log, head) {
-        let entry: Entry = sign_entry(&log.keys, &auth(MAC), draft).unwrap();
-        head = Head {
-            seq: entry.seq,
-            hash: entry.hash(),
-        };
-        log.entries.push(entry);
-    }
-    log.log = Membership::verify_chain(&log.account, &log.genesis_hash(), &log.entries, &log.now)
-        .unwrap()
-        .membership;
-}
-
-/// The Mac's `add` of service `id` with `scope`, on `head` (`None`: the
-/// builder refuses it, e.g. too large).
-fn service_body(log: &TestLog, head: Head, id: &str, scope: &ServiceScope) -> Option<Value> {
-    let now = support::r9log::host_now().wall_ms;
-    let action = service_add(id, ed25519(id), scope, now + 3_600_000, now).ok()?;
-    let body = draft_on(
-        &log.account,
-        &log.genesis_hash(),
-        head.seq + 1,
-        &head.hash,
-        MAC,
-        now,
-        &action,
-    );
-    (jcs(&body).unwrap().len() <= atem_client::signed::MAX_BODY_BYTES).then_some(body)
-}
-
-/// A service whose entry's body is as near the 4,096-byte bound as its
-/// scope gets: sixteen 128-character hosts, then project hashes, then
-/// session ids, each added while the body's `jcs` stays within it.
-fn near_max_service(log: &TestLog, head: Head, n: usize) -> Value {
-    let id = format!("svc-big-{n}");
-    let hosts: Vec<String> = (0..16)
-        .map(|j| format!("{:x<128}", format!("h{n}-{j}-")))
-        .collect();
-    let fits = |scope: &ServiceScope| service_body(log, head, &id, scope);
-    let project = |k: usize| format!("h1.0a0b0c0d.{:064x}", n * 100 + k);
-    let session = |k: usize| {
-        let digits = format!("{:012}", n * 100 + k);
-        let base32: String = digits
-            .bytes()
-            .map(|d| (b'a' + (d - b'0')) as char)
-            .collect();
-        format!("ses-{base32}")
-    };
-    let mut projects = 0;
-    let scope_of = |projects: usize, sessions: usize| {
-        let scope = ServiceScope::new(hosts.clone()).ops(["view"]);
-        let scope = scope.projects(Some((0..projects).map(project)));
-        if sessions == 0 {
-            scope
-        } else {
-            scope.sessions(Some((0..sessions).map(session)))
-        }
-    };
-    while projects < 64 && fits(&scope_of(projects + 1, 0)).is_some() {
-        projects += 1;
-    }
-    let mut sessions = 0;
-    while sessions < 64 && fits(&scope_of(projects, sessions + 1)).is_some() {
-        sessions += 1;
-    }
-    let body = fits(&scope_of(projects, sessions)).unwrap();
-    assert!(jcs(&body).unwrap().len() > 4000, "a near-max entry");
-    body
-}
-
 #[test]
 fn fake_station_pages_within_256_kib_and_64_items() {
     let astation = FakeAstation::start();
     let mut log = station_log();
     // 70 small entries in all.
     let mut n = 0;
-    grow(&mut log, |log, head| {
+    log.grow(|log, head| {
         n += 1;
         (n <= 67).then(|| {
             let scope = ServiceScope::new([FS_HOST]).ops(["view"]);
-            service_body(log, head, &format!("svc-small-{n}"), &scope).unwrap()
+            log.service_body(head, &format!("svc-small-{n}"), &scope)
+                .unwrap()
         })
     });
     assert_eq!(log.log.head().seq, 70);
@@ -880,9 +792,9 @@ fn fake_station_pages_within_256_kib_and_64_items() {
     // fewer than 64, and one more wouldn't fit; fetching from each new
     // head brings all of them, in order.
     let mut big = 0;
-    grow(&mut log, |log, head| {
+    log.grow(|log, head| {
         big += 1;
-        (big <= 70).then(|| near_max_service(log, head, big))
+        (big <= 70).then(|| log.near_max_service(head, big))
     });
     station.set_log(&log);
     let mut after = 70;
