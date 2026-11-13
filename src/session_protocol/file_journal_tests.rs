@@ -27,6 +27,7 @@ fn accepted(id: &str, sid: &str, text: &str) -> Record {
         updated_at: 1,
         principal: "astation:account-a:a1".into(),
         control_gen: 1,
+        provenance: None,
     }
 }
 
@@ -499,6 +500,7 @@ fn compaction_backs_off_as_the_live_state_grows() {
             updated_at: n,
             principal: "p1".into(),
             control_gen: 1,
+            provenance: None,
         })
         .unwrap();
     }
@@ -695,4 +697,358 @@ fn a_large_principals_file_is_read_whole() {
     assert_eq!(replayed.principals.len(), 2);
     assert_eq!(replayed.principals["member:dev-phone"].control_gen, 7);
     assert_eq!(replayed.principals["member:dev-phone"].fence_seq, 3);
+}
+
+/// A refusal-list entry of one size (ids of one length).
+fn refusal(n: u64, provenance: Option<Provenance>) -> Refusal {
+    Refusal {
+        request_id: format!("44444444-4444-4444-8444-{n:012}"),
+        target: target(S1),
+        kind: ReceiptKind::Prompt,
+        payload_digest: "0".repeat(64),
+        updated_at: 1,
+        detail: Some("withdrawn by the host".into()),
+        provenance,
+    }
+}
+
+/// The refusal list never grows past what `refusals` reads back (its JSON
+/// within `MAX_RECORD_BYTES`): the entry that would is refused `refusal
+/// list full` with nothing written, and the list at the bound is read
+/// whole, here and by a new process.
+#[test]
+fn the_refusal_list_never_grows_past_what_it_reads_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = sd(&dir);
+    let path = state.join(REFUSED);
+    let mut j = open(&state);
+    let size = |list: &[Refusal]| {
+        serde_json::to_vec(&RefusedFile {
+            refused: list.to_vec(),
+        })
+        .unwrap()
+        .len()
+    };
+    let empty = size(&[]);
+    let entry = size(&[refusal(0, None)]) - empty;
+    // The most entries whose list fits: `empty + n * entry + (n - 1)`.
+    let n = ((MAX_RECORD_BYTES - empty + 1) / (entry + 1)) as u64;
+    let mut list: Vec<Refusal> = (0..n - 1).map(|i| refusal(i, None)).collect();
+    let json = serde_json::to_vec(&RefusedFile {
+        refused: list.clone(),
+    })
+    .unwrap();
+    fs::write(&path, frame(&json)).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // The last one that fits is written: the list is at the bound.
+    j.record_refusal(refusal(n - 1, None)).unwrap();
+    list.push(refusal(n - 1, None));
+    let at_bound = fs::read(&path).unwrap();
+    let written = size(&list);
+    assert!(written <= MAX_RECORD_BYTES, "{written}");
+    assert!(written + entry + 1 > MAX_RECORD_BYTES, "{written}");
+    // One more is refused, and the file is left as it was.
+    let full = j.record_refusal(refusal(n, None)).unwrap_err();
+    assert!(full.refusal_list_full(), "{full:?}");
+    assert_eq!(full.0, "refusal list full");
+    assert_eq!(fs::read(&path).unwrap(), at_bound);
+    // Read whole, here and in a new process.
+    assert_eq!(j.refusals().unwrap().len(), n as usize);
+    drop(j);
+    let j = open(&state);
+    assert_eq!(j.refusals().unwrap(), list);
+}
+
+/// One entry per request id, never replaced: a refusal of an id already
+/// listed, by the same submitter or another, writes nothing, in both
+/// journals.
+#[test]
+fn a_listed_request_id_is_never_listed_again_or_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = sd(&dir);
+    let provenance = Provenance {
+        task_id: "5ba7b810-9dad-41d1-80b4-00c04fd430c8".into(),
+        sender: "member:phone-1".into(),
+    };
+    let first = refusal(1, Some(provenance));
+    let again = [
+        // The same submitter (a provenance names `host-work`), another detail.
+        Refusal {
+            detail: None,
+            ..first.clone()
+        },
+        // Another submitter (no provenance).
+        Refusal {
+            detail: None,
+            provenance: None,
+            ..first.clone()
+        },
+    ];
+    let mut j = open(&state);
+    j.record_refusal(first.clone()).unwrap();
+    let bytes = fs::read(state.join(REFUSED)).unwrap();
+    let mut m = MemJournal::default();
+    m.record_refusal(first.clone()).unwrap();
+    for r in again {
+        j.record_refusal(r.clone()).unwrap();
+        m.record_refusal(r).unwrap();
+    }
+    assert_eq!(fs::read(state.join(REFUSED)).unwrap(), bytes);
+    assert_eq!(j.refusals().unwrap(), vec![first.clone()]);
+    assert_eq!(m.refusals().unwrap(), vec![first]);
+}
+
+// ── Session-v1 R9.14: provenance coherence (Task 13's review, M3) and the
+//    turn a host-work prompt started (items 5, 6) ──
+
+const TASK: &str = "5ba7b810-9dad-41d1-80b4-00c04fd430c8";
+
+/// A `host-work` prompt's `accepted` record, with its provenance.
+fn host_work_accepted(id: &str) -> Record {
+    Record::Accepted {
+        request_id: id.into(),
+        target: target(S1),
+        kind: ReceiptKind::Prompt,
+        payload_digest: "0".repeat(64),
+        payload: json!({ "text": "run the tests" }),
+        updated_at: 1,
+        principal: wire::HOST_WORK_PRINCIPAL.into(),
+        control_gen: 1,
+        provenance: Some(Provenance {
+            task_id: TASK.into(),
+            sender: "member:phone-1".into(),
+        }),
+    }
+}
+
+fn turn_started(id: &str, turn: &str) -> Record {
+    Record::TurnStarted {
+        request_id: id.into(),
+        turn: journal::TurnIds {
+            turn_id: turn.into(),
+            user_message_id: format!("{turn}-u"),
+        },
+    }
+}
+
+/// What a journal replays to (`state`): its receipts and lease floors.
+type Replay = (BTreeMap<String, Stored>, Vec<(String, u64)>);
+
+/// `records` written as one session log in a fresh journal, then opened:
+/// the bytes written, the log's length after the open and what it replays
+/// to.
+fn reopen_log(records: &[Record]) -> (u64, u64, Replay) {
+    let dir = tempfile::tempdir().unwrap();
+    drop(open(&sd(&dir)));
+    let path = log(&sd(&dir), S1);
+    let mut bytes = Vec::new();
+    for (i, r) in records.iter().enumerate() {
+        bytes.extend(encode(5 + i as u64, r.clone()).unwrap());
+    }
+    fs::write(&path, &bytes).unwrap();
+    let j = open(&sd(&dir));
+    let len = fs::metadata(&path).map_or(0, |m| m.len());
+    (bytes.len() as u64, len, state(j.load().unwrap()))
+}
+
+/// The length of `records`' framed lines.
+fn framed(records: &[Record]) -> u64 {
+    records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| encode(5 + i as u64, r.clone()).unwrap().len() as u64)
+        .sum()
+}
+
+/// Task 13's review (M3): a provenance on anything but a `host-work`
+/// prompt (another principal's record, or another kind) is incoherent.
+/// `replay` refuses it, and the file journal truncates its log there, as
+/// for an invalid transition, so it can't fail the whole start.
+#[test]
+fn a_provenance_off_a_host_work_prompt_truncates_the_log() {
+    let good = [accepted("a", S1, "t")];
+    let mut other_principal = host_work_accepted("b");
+    if let Record::Accepted { principal, .. } = &mut other_principal {
+        *principal = "astation:account-a:a1".into();
+    }
+    let mut other_kind = host_work_accepted("b");
+    if let Record::Accepted { kind, .. } = &mut other_kind {
+        *kind = ReceiptKind::Interrupt;
+    }
+    for bad in [other_principal, other_kind] {
+        assert!(journal::replay(vec![bad.clone()]).is_err(), "{bad:?}");
+        let records = [
+            good[0].clone(),
+            bad.clone(),
+            to("a", ReceiptState::Executing, 2),
+        ];
+        let (written, len, replayed) = reopen_log(&records);
+        assert!(len < written);
+        assert_eq!(len, framed(&good), "{bad:?}");
+        assert_eq!(replayed, mem_state(&good));
+    }
+    // A host-work prompt's is coherent.
+    let records = [host_work_accepted("b")];
+    let (written, len, replayed) = reopen_log(&records);
+    assert_eq!(len, written);
+    assert_eq!(replayed, mem_state(&records));
+}
+
+/// A turn result off a completed prompt is mirrored the same way: the log
+/// is truncated there (`replay` refuses it,
+/// `a_turn_result_off_a_completed_prompt_is_not_trusted`).
+#[test]
+fn a_turn_result_off_a_completed_prompt_truncates_the_log() {
+    let mut executing = to("a", ReceiptState::Executing, 2);
+    if let Record::Transition { result, .. } = &mut executing {
+        *result = Some(journal::TurnIds {
+            turn_id: "t".into(),
+            user_message_id: "u".into(),
+        });
+    }
+    let good = [accepted("a", S1, "x")];
+    let (_, len, replayed) = reopen_log(&[good[0].clone(), executing]);
+    assert_eq!(len, framed(&good));
+    assert_eq!(replayed, mem_state(&good));
+}
+
+/// R9.14 items 5, 6: `turn_started` is coherent once, on an `executing`
+/// prompt of the `host-work` principal, with opaque ids. Anything else is
+/// refused by `replay` and truncates the log there.
+#[test]
+fn a_turn_started_record_is_trusted_only_on_an_executing_host_work_prompt() {
+    use ReceiptState::*;
+    let base = [
+        host_work_accepted("h"),
+        to("h", Executing, 2),
+        turn_started("h", "turn-1"),
+    ];
+    assert!(journal::replay(base.to_vec()).is_ok());
+    // (Opening compacts a log whose payload is stale: compare states.)
+    let (_, _, replayed) = reopen_log(&base);
+    assert_eq!(replayed, mem_state(&base));
+    assert_eq!(
+        replayed.0["h"].turn,
+        Some(journal::TurnIds {
+            turn_id: "turn-1".into(),
+            user_message_id: "turn-1-u".into(),
+        })
+    );
+
+    let cases: Vec<(Vec<Record>, Vec<Record>)> = vec![
+        // Before `executing`.
+        (
+            vec![host_work_accepted("h")],
+            vec![turn_started("h", "turn-1")],
+        ),
+        // Another principal's prompt.
+        (
+            vec![accepted("a", S1, "x"), to("a", Executing, 2)],
+            vec![turn_started("a", "turn-1")],
+        ),
+        // Twice.
+        (base.to_vec(), vec![turn_started("h", "turn-2")]),
+        // After the receipt settled.
+        (
+            vec![
+                host_work_accepted("h"),
+                to("h", Executing, 2),
+                to("h", OutcomeUnknown, 3),
+            ],
+            vec![turn_started("h", "turn-1")],
+        ),
+        // Not an opaque id.
+        (
+            vec![host_work_accepted("h"), to("h", Executing, 2)],
+            vec![turn_started("h", "turn 1")],
+        ),
+        // An unknown request.
+        (vec![], vec![turn_started("h", "turn-1")]),
+    ];
+    for (good, bad) in cases {
+        let all: Vec<Record> = good.iter().chain(&bad).cloned().collect();
+        assert!(journal::replay(all.clone()).is_err(), "{bad:?}");
+        let (_, _, replayed) = reopen_log(&all);
+        assert_eq!(replayed, mem_state(&good), "{bad:?}");
+    }
+}
+
+/// The turn survives a reload and every compaction, while the receipt
+/// executes and once it settled.
+#[test]
+fn a_turn_started_survives_reload_and_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut j = open(&sd(&dir));
+    let records = [
+        host_work_accepted("h"),
+        to("h", ReceiptState::Executing, 2),
+        turn_started("h", "turn-1"),
+    ];
+    for r in &records {
+        j.append(r.clone()).unwrap();
+    }
+    assert_eq!(state(j.load().unwrap()), mem_state(&records));
+    j.compact_all().unwrap();
+    drop(j);
+    let mut j = open(&sd(&dir));
+    assert_eq!(state(j.load().unwrap()), mem_state(&records));
+    let settled = to("h", ReceiptState::OutcomeUnknown, 4);
+    j.append(settled.clone()).unwrap();
+    j.compact_all().unwrap();
+    drop(j);
+    let j = open(&sd(&dir));
+    let mut all = records.to_vec();
+    all.push(settled);
+    assert_eq!(state(j.load().unwrap()), mem_state(&all));
+    let text = text(&log(&sd(&dir), S1));
+    assert!(!text.contains("run the tests"), "{text}");
+}
+
+/// Task 16a's review (M2): compaction keeps the turn on the other settled
+/// states too: a prompt `completed` with its result (the common path:
+/// `executing`, `turn_started`, `completed{result}`), and one `rejected`
+/// after `executing` (its turn written between the two, so it replays).
+#[test]
+fn compaction_keeps_the_turn_of_a_completed_and_a_rejected_prompt() {
+    use crate::session_protocol::journal::TurnIds;
+    let dir = tempfile::tempdir().unwrap();
+    let mut j = open(&sd(&dir));
+    let records = vec![
+        host_work_accepted("c"),
+        to("c", ReceiptState::Executing, 2),
+        turn_started("c", "turn-1"),
+        Record::Transition {
+            request_id: "c".into(),
+            state: ReceiptState::Completed,
+            detail: Some("done".into()),
+            updated_at: 3,
+            result: Some(TurnIds {
+                turn_id: "turn-1".into(),
+                user_message_id: "turn-1-u".into(),
+            }),
+        },
+        host_work_accepted("r"),
+        to("r", ReceiptState::Executing, 4),
+        turn_started("r", "turn-2"),
+        to("r", ReceiptState::Rejected, 5),
+    ];
+    for r in &records {
+        j.append(r.clone()).unwrap();
+    }
+    j.compact_all().unwrap();
+    drop(j);
+    let j = open(&sd(&dir));
+    let state = state(j.load().unwrap());
+    assert_eq!(state, mem_state(&records));
+    for (id, turn) in [("c", "turn-1"), ("r", "turn-2")] {
+        assert_eq!(
+            state.0[id].turn.as_ref().map(|t| t.turn_id.as_str()),
+            Some(turn),
+            "{id}"
+        );
+    }
+    assert_eq!(state.0["c"].state, ReceiptState::Completed);
+    assert_eq!(state.0["r"].state, ReceiptState::Rejected);
+    assert!(state.0["c"].result.is_some());
 }

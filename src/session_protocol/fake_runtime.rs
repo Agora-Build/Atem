@@ -14,13 +14,24 @@
 //! (`chat_history`, `chat_message`, `chat_evict`, `chat_turn`,
 //! `worker_gap`) and chat-v1 conversations served by `chat::history`, the
 //! code the runtime serves them with.
+//!
+//! Delegated host work (session-v1 R9.14; the r9 runner,
+//! `membership::fixtures_tests`): with `agent_turns` on, the fake agent
+//! takes each pasted prompt as a turn `turn-<n>` (as the real runtime's
+//! fake agent does), whose acceptance journals a host-work prompt's turn;
+//! the harness plays host-work's side (`host_work_connect` and the
+//! `host_work_*` events, answered in `host_work_result` with the drive
+//! hook's result shapes), and a host-work prompt `executing` at a restart
+//! is reconciled with the session host's table (`reconcile_turn`) once the
+//! adopted chat arrives (`adopted_chat`), at most `RECONCILE_MS` after.
 
-use super::fixtures::{HostEvent, HostUnderTest, Setup};
+use super::fixtures::{HostEvent, HostUnderTest, HostWorkAttempt, Setup};
 use super::host::{
-    Attach, ChatReply, DispatchReport, Effect, HostConfig, HostContext, Origin, SessionHost,
-    SessionSpec, random_ids,
+    AdoptedChat, Attach, ChatReply, DispatchReport, Effect, HostConfig, HostContext, HostInterrupt,
+    Immutable, Origin, Provenance, RECONCILE_MS, Reconciled, SessionHost, SessionSpec, StartCheck,
+    StartRequest, StartVerdict, random_ids, reconcile_turn,
 };
-use super::journal::{Journal, MemJournal};
+use super::journal::{Journal, MemJournal, TurnIds};
 use super::revision::{FEATURES, REVISION};
 use super::wire::{
     self, ApprovalCloseReason, ApprovalDecision, Binding, ClientKind, DecodeError, Envelope, Op,
@@ -32,6 +43,8 @@ use crate::chat::session::{ChatMessage, ChatSession, Origin as ChatOrigin, Out, 
 use crate::chat::wire::{self as chat_wire, ChatEnvelope};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The authenticated link's authorization in the fixtures (24 h).
 pub const AUTHORIZATION_MS: u64 = 24 * 60 * 60 * 1000;
@@ -64,6 +77,9 @@ pub struct Pty {
     pub pushes: Vec<Value>,
     /// Session rules the runtime was asked to revoke, in order.
     pub rule_revokes: Vec<String>,
+    /// Interrupts written on the host's own authority (R9.14 item 5): the
+    /// request ids of their attempts, in order.
+    pub host_interrupts: Vec<String>,
 }
 
 impl Default for Pty {
@@ -83,6 +99,7 @@ impl Default for Pty {
             approvals_released: 0,
             pushes: Vec::new(),
             rule_revokes: Vec::new(),
+            host_interrupts: Vec::new(),
         }
     }
 }
@@ -186,6 +203,85 @@ pub struct FakeRuntime<J: Journal = MemJournal> {
     chat_submitters: HashMap<String, (String, String)>,
     chat_opens: u64,
     chat_closes: u64,
+    /// The fake agent takes each pasted prompt as a turn (`AgentTurns`):
+    /// the r9 runner's model of the real runtime's fake agent.
+    pub agent_turns: bool,
+    /// session_id → its agent's turns.
+    agents: HashMap<String, AgentTurns>,
+    /// Host-work's prompts `executing` at a start, waiting for the adopted
+    /// chat: request id → (session, process, its turn, since).
+    reconciling: BTreeMap<String, (String, String, TurnIds, u64)>,
+    /// Host-work's internal attachment, when the harness plays host-work.
+    host_work: Option<String>,
+    /// Host-work's start check's verdict (go at each start).
+    host_work_go: Arc<AtomicBool>,
+    /// What the last `host_work_*` event did, as the drive hook's result
+    /// line says it (without its file).
+    pub host_work_result: Option<Value>,
+    /// The outcomes of host interrupt writes, as the drive hook reports
+    /// them (the fake PTY writes at once: `ok`).
+    pub host_work_reports: Vec<Value>,
+}
+
+/// The fake agent's turns in a session (`agent_turns`).
+#[derive(Debug, Clone)]
+struct AgentTurns {
+    /// Prompts its process took (`turn-<n>`, user message `u-<n>`).
+    prompts: u64,
+    /// The current turn, its user message, and the request that began it
+    /// (none for one the harness names, or after a restart until the
+    /// reconciliation rebinds it).
+    current: Option<(String, String, Option<String>)>,
+    /// The turn that ended last, and how (`None`: not known).
+    last_completed: Option<(String, Option<Outcome>)>,
+    /// This runtime has the agent's chat (false after a restart until
+    /// `adopted_chat`).
+    arrived: bool,
+    /// The chat has turn state (chat-v1).
+    chat: bool,
+}
+
+impl AgentTurns {
+    fn new(chat: bool) -> Self {
+        Self {
+            prompts: 0,
+            current: None,
+            last_completed: None,
+            arrived: true,
+            chat,
+        }
+    }
+
+    /// The request whose turn runs, as the runtime's chat would show it
+    /// (`running_request`): the chat arrived, has turn state, and the
+    /// current turn, begun by that request, hasn't ended.
+    fn running(&self) -> Option<String> {
+        if !self.arrived || !self.chat {
+            return None;
+        }
+        let (turn, _, request) = self.current.as_ref()?;
+        if self
+            .last_completed
+            .as_ref()
+            .is_some_and(|(done, _)| done == turn)
+        {
+            return None;
+        }
+        request.clone()
+    }
+}
+
+/// Host-work's start check as the harness plays it: `host_work_go`.
+struct HostWorkCheck(Arc<AtomicBool>);
+
+impl StartCheck for HostWorkCheck {
+    fn check(&self, _req: &StartRequest<'_>) -> StartVerdict {
+        if self.0.load(Ordering::SeqCst) {
+            StartVerdict::Go
+        } else {
+            StartVerdict::Withdraw
+        }
+    }
 }
 
 struct FakeChat {
@@ -333,6 +429,13 @@ impl<J: Journal> FakeRuntime<J> {
             chat_submitters: HashMap::new(),
             chat_opens: 0,
             chat_closes: 0,
+            agent_turns: false,
+            agents: HashMap::new(),
+            reconciling: BTreeMap::new(),
+            host_work: None,
+            host_work_go: Arc::new(AtomicBool::new(true)),
+            host_work_result: None,
+            host_work_reports: Vec::new(),
         };
         for s in &setup.sessions {
             let fx = rt.host.add_session(SessionSpec {
@@ -346,6 +449,8 @@ impl<J: Journal> FakeRuntime<J> {
             })?;
             rt.apply(fx);
             rt.sessions.push(s.session_id.clone());
+            rt.agents
+                .insert(s.session_id.clone(), AgentTurns::new(s.chat));
             if s.chat {
                 rt.chats.insert(
                     s.session_id.clone(),
@@ -639,6 +744,7 @@ impl<J: Journal> FakeRuntime<J> {
                             self.pty.wrote(n);
                             self.turns
                                 .insert(target.session_id.clone(), request_id.clone());
+                            self.agent_takes(&target.session_id, &request_id);
                         }
                         if kind == ReceiptKind::ApprovalRuleRevoke {
                             // The worker drops the rule at once: it answers,
@@ -706,6 +812,9 @@ impl<J: Journal> FakeRuntime<J> {
                     }
                 }
                 Effect::ApprovalReleased { .. } => self.pty.approvals_released += 1,
+                Effect::HostInterrupt { request_id, .. } => {
+                    self.pty.host_interrupts.push(request_id)
+                }
                 Effect::PushApproval { request } => {
                     self.pty
                         .pushes
@@ -726,6 +835,18 @@ impl<J: Journal> FakeRuntime<J> {
                         approval_id,
                         reason,
                     });
+                }
+                // R9.14 items 5, 6: host-work's prompt is decided from the
+                // adopted chat, with the runtime's table.
+                Effect::Reconcile {
+                    request_id,
+                    target,
+                    kind: ReceiptKind::Prompt,
+                    turn: Some(turn),
+                } => {
+                    let entry = (target.session_id, target.process_gen, turn, self.now);
+                    self.reconciling.insert(request_id, entry);
+                    work.extend(self.reconcile_host_work());
                 }
                 Effect::Reconcile { request_id, .. } => {
                     let answer = self.reconcile_answer.clone();
@@ -1131,6 +1252,10 @@ impl<J: Journal> FakeRuntime<J> {
             let fx = self.host.advance(now);
             self.apply(fx);
         }
+        // A reconciliation past its bound (`RECONCILE_MS`).
+        let fx = self.reconcile_host_work();
+        self.apply(fx);
+        self.host_work_release();
     }
 
     /// `client` sends `json` on its current attachment.
@@ -1184,11 +1309,191 @@ impl<J: Journal + FailFsync> FakeRuntime<J> {
             c.conversations = Conversations::default();
         }
         self.history_key = HistoryKey::random();
+        // The new broker has none of the adopted agents' chats yet.
+        for agent in self.agents.values_mut() {
+            agent.arrived = false;
+            if let Some((_, _, request)) = agent.current.as_mut() {
+                *request = None;
+            }
+        }
+        self.reconciling.clear();
+        let host_work = self.host_work.take().is_some();
         let fx = self
             .host
             .restart_at(runtime_gen, epoch, self.now, orderly)?;
         self.apply(fx);
+        // As the runtime does after its recovery: host-work's attachment
+        // again, its start check saying go.
+        if host_work {
+            self.host_work_connect();
+        }
         Ok(())
+    }
+}
+
+impl<J: Journal> FakeRuntime<J> {
+    // ── Delegated host work (session-v1 R9.14) ──
+
+    /// The fake agent takes the prompt `request_id` pasted on `sid` as its
+    /// next turn; the chat's acceptance journals it for a host-work prompt
+    /// (nothing for any other).
+    fn agent_takes(&mut self, sid: &str, request_id: &str) {
+        if !self.agent_turns {
+            return;
+        }
+        let agent = self
+            .agents
+            .entry(sid.to_string())
+            .or_insert_with(|| AgentTurns::new(true));
+        agent.prompts += 1;
+        let turn = TurnIds {
+            turn_id: format!("turn-{}", agent.prompts),
+            user_message_id: format!("u-{}", agent.prompts),
+        };
+        agent.current = Some((
+            turn.turn_id.clone(),
+            turn.user_message_id.clone(),
+            Some(request_id.to_string()),
+        ));
+        let _ = self.host.turn_started(request_id, turn);
+    }
+
+    /// As the runtime's pass does (`HostBridge::renew_host_work_leases`):
+    /// host-work releases each lease whose turn ended (no request of it on
+    /// that session `accepted` or `executing`). Its renewals aren't played:
+    /// the delegated fixtures keep a turn under the 15 s lease.
+    fn host_work_release(&mut self) {
+        let Some(att) = self.host_work.clone() else {
+            return;
+        };
+        for sid in self.host.leases_of(&att) {
+            if !self.host.has_open_request(wire::HOST_WORK_PRINCIPAL, &sid) {
+                let _ = self.host.release(&att, &sid, self.now);
+            }
+        }
+        let fx = self.host.take_effects();
+        self.apply(fx);
+    }
+
+    /// The harness plays host-work: its internal attachment, connected and
+    /// welcomed as the runtime makes it, with a start check that says go
+    /// until `HostWorkVerdict` says otherwise.
+    pub fn host_work_connect(&mut self) {
+        let att = uuid::Uuid::new_v4().to_string();
+        self.connect_only(
+            wire::HOST_WORK_PRINCIPAL,
+            &att,
+            vec![Permission::View, Permission::Control],
+            AUTHORIZATION_MS,
+        );
+        let now = self.now;
+        self.host
+            .welcome_r9(&att, now)
+            .expect("host-work is welcomed");
+        let fx = self.host.take_effects();
+        self.apply(fx);
+        self.host_work_go.store(true, Ordering::SeqCst);
+        let check = HostWorkCheck(self.host_work_go.clone());
+        self.host.set_start_check(Box::new(check));
+        self.host_work = Some(att);
+    }
+
+    /// Host-work's prompts `executing` at the start, decided by the session
+    /// host's table from the adopted chat (or past `RECONCILE_MS`): the
+    /// effects of those it settled.
+    fn reconcile_host_work(&mut self) -> Vec<Effect> {
+        let mut fx = Vec::new();
+        let ids: Vec<String> = self.reconciling.keys().cloned().collect();
+        for rid in ids {
+            let executing = self
+                .host
+                .receipt(&rid)
+                .is_some_and(|r| r.state == wire::ReceiptState::Executing);
+            if !executing {
+                self.reconciling.remove(&rid);
+                continue;
+            }
+            let (sid, process_gen, turn, since) = self.reconciling[&rid].clone();
+            let live = self.host.descriptor_of(&sid).is_some_and(|d| {
+                d.state == wire::SessionState::Running && d.process_gen == process_gen
+            });
+            let agent = self.agents.get(&sid);
+            let chat = AdoptedChat {
+                live,
+                arrived: agent.is_some_and(|a| a.arrived),
+                chat: agent.is_some_and(|a| a.chat),
+                current_turn: agent.and_then(|a| a.current.as_ref().map(|(t, _, _)| t.as_str())),
+                last_completed: agent
+                    .and_then(|a| a.last_completed.as_ref().map(|(t, _)| t.as_str())),
+                last_outcome: agent.and_then(|a| a.last_completed.as_ref().and_then(|(_, o)| *o)),
+            };
+            let expired = self.now >= since.saturating_add(RECONCILE_MS);
+            match reconcile_turn(&turn, &chat, expired) {
+                Reconciled::Wait => {}
+                Reconciled::Running => {
+                    self.reconciling.remove(&rid);
+                    if let Some((_, user, request)) =
+                        self.agents.get_mut(&sid).and_then(|a| a.current.as_mut())
+                    {
+                        *user = turn.user_message_id.clone();
+                        *request = Some(rid.clone());
+                    }
+                    self.turns.insert(sid, rid);
+                }
+                Reconciled::Report(report) => {
+                    self.reconciling.remove(&rid);
+                    fx.extend(self.host.dispatch_report(&rid, report));
+                }
+            }
+        }
+        fx
+    }
+
+    /// The attempt's immutable values (§6): the session's current target,
+    /// its prompt's digest, its provenance.
+    fn host_work_immutable(&self, a: &HostWorkAttempt) -> Immutable {
+        Immutable {
+            target: self.target(&a.session_id),
+            payload_digest: super::canonical::payload_digest(&json!({"text": a.text}))
+                .expect("a prompt digests"),
+            provenance: Provenance {
+                task_id: a.task_id.clone(),
+                sender: a.sender.clone(),
+            },
+        }
+    }
+
+    /// Host-work submits the attempt's prompt, acquiring the lease: the
+    /// refusal it heard, else its receipt after the step.
+    fn host_work_submit(&mut self, a: &HostWorkAttempt) -> Result<Value, String> {
+        let att = self.host_work.clone().ok_or("host-work isn't connected")?;
+        let immutable = self.host_work_immutable(a);
+        let id = uuid::Uuid::new_v4().to_string();
+        let data = json!({"v": 1, "op": "submit", "id": id,
+            "binding": {"target": immutable.target, "attachment_gen": att},
+            "request_id": a.request_id, "kind": "prompt", "payload": {"text": a.text},
+            "acquire": true});
+        let fx = self.host.submit_host_work(&att, data, immutable.provenance);
+        self.apply(fx);
+        let heard = self.take(wire::HOST_WORK_PRINCIPAL);
+        let refused = heard
+            .iter()
+            .map(|m| &m["data"])
+            .find(|d| d["re"] == json!(id) && d["op"] == "error");
+        if let Some(e) = refused {
+            let mut r = json!({"code": e["code"]});
+            if let Some(d) = e.get("detail") {
+                r["detail"] = d.clone();
+            }
+            return Ok(r);
+        }
+        // The receipt after the step (a listed request's too, in the run).
+        let receipt = self.host.receipt(&a.request_id).ok_or("no receipt")?;
+        let mut r = json!({"state": receipt.state});
+        if let Some(d) = receipt.detail {
+            r["detail"] = json!(d);
+        }
+        Ok(r)
     }
 }
 
@@ -1301,6 +1606,9 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
                 process_gen,
             } => {
                 self.turns.remove(session_id);
+                if let Some(a) = self.agents.get_mut(session_id) {
+                    *a = AgentTurns::new(a.chat);
+                }
                 if let Some(c) = self.chats.get_mut(session_id) {
                     c.chat = ChatSession::new(process_gen.clone(), 0);
                     c.conversations = Conversations::default();
@@ -1320,17 +1628,38 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
             HostEvent::TurnComplete {
                 session_id,
                 turn_id,
+                interrupted,
             } => {
                 let rid = self.turns.remove(session_id).ok_or("no running turn")?;
+                let outcome = if *interrupted {
+                    Outcome::Interrupted
+                } else {
+                    Outcome::Done
+                };
+                let agent = self.agents.get_mut(session_id);
+                // The agent's own user message of its turn, when it took it.
+                let own = agent.and_then(|a| {
+                    a.last_completed = Some((turn_id.clone(), Some(outcome)));
+                    a.current
+                        .as_ref()
+                        .filter(|(t, _, _)| t == turn_id)
+                        .map(|(_, u, _)| u.clone())
+                });
                 // A prompt's completion names its turn's outcome (§6) and,
                 // r8 §D, its user message in the chat history.
                 let user_message_id = self
                     .chats
                     .get(session_id)
                     .and_then(|c| c.chat.user_message_of(&rid))
-                    .map(str::to_string);
+                    .map(str::to_string)
+                    .or(own);
+                let detail = if *interrupted {
+                    super::host::DETAIL_TURN_INTERRUPTED
+                } else {
+                    super::host::DETAIL_TURN_DONE
+                };
                 let report = DispatchReport::Completed {
-                    detail: Some(super::host::DETAIL_TURN_DONE.into()),
+                    detail: Some(detail.into()),
                     turn_id: Some(turn_id.clone()),
                     user_message_id,
                 };
@@ -1341,11 +1670,92 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
                 let complete = Out::Complete {
                     turn_id: turn_id.clone(),
                     request_id: Some(rid),
-                    outcome: Outcome::Done,
+                    outcome,
                 };
                 self.apply(fx);
                 self.broadcast(session_id, &complete, except.as_deref(), false);
                 Vec::new()
+            }
+            HostEvent::HostWorkSubmit(a) => {
+                let result = self.host_work_submit(a)?;
+                self.host_work_result = Some(result);
+                Vec::new()
+            }
+            HostEvent::HostWorkVerdict { go } => {
+                self.host_work_go.store(*go, Ordering::SeqCst);
+                let verdict = if *go { "go" } else { "withdraw" };
+                self.host_work_result = Some(json!({"verdict": verdict}));
+                Vec::new()
+            }
+            HostEvent::HostWorkWithdraw(a) => {
+                let immutable = self.host_work_immutable(a);
+                let withdrawal = self.host.withdraw(&a.request_id, &immutable);
+                self.host_work_result = Some(json!({"withdrawal": withdrawal.as_str()}));
+                self.host.take_effects()
+            }
+            HostEvent::HostWorkInterrupt {
+                session_id,
+                request_id,
+                revoke_only,
+            } => {
+                // The chat's half of the turn check, as the runtime's bridge
+                // reads it from the session's chat.
+                let running = self.agents.get(session_id).and_then(AgentTurns::running);
+                let outcome = if *revoke_only {
+                    self.host.host_interrupt_revoke_lease(
+                        session_id,
+                        request_id,
+                        running.as_deref(),
+                    )
+                } else {
+                    self.host
+                        .host_interrupt(session_id, request_id, running.as_deref())
+                };
+                self.host_work_result = Some(json!({"interrupt": outcome.as_str()}));
+                match outcome {
+                    HostInterrupt::Written(fx) => {
+                        // The fake PTY writes at once.
+                        self.host_work_reports
+                            .push(json!({"report": request_id, "outcome": "ok"}));
+                        fx
+                    }
+                    HostInterrupt::Revoked(fx) => fx,
+                    _ => Vec::new(),
+                }
+            }
+            HostEvent::AdoptedChat {
+                session_id,
+                chat,
+                current_turn,
+                last_completed,
+                interrupted,
+            } => {
+                let agent = self
+                    .agents
+                    .entry(session_id.clone())
+                    .or_insert_with(|| AgentTurns::new(*chat));
+                agent.arrived = true;
+                agent.chat = *chat;
+                let user = |turn: &str| {
+                    agent
+                        .current
+                        .as_ref()
+                        .filter(|(t, _, _)| t == turn)
+                        .map_or_else(|| format!("{turn}-u"), |(_, u, _)| u.clone())
+                };
+                // A worker's chat never names the requests a broker
+                // submitted.
+                let current = current_turn.as_ref().map(|t| (t.clone(), user(t), None));
+                agent.current = current;
+                let outcome = interrupted.map(|i| {
+                    if i {
+                        Outcome::Interrupted
+                    } else {
+                        Outcome::Done
+                    }
+                });
+                agent.last_completed = last_completed.as_ref().map(|t| (t.clone(), outcome));
+                self.reconcile_host_work()
             }
             HostEvent::HoldPtyWrites => {
                 self.hold_writes = true;
@@ -1434,6 +1844,7 @@ impl<J: Journal + FailFsync> HostUnderTest for FakeRuntime<J> {
             }
         };
         self.apply(fx);
+        self.host_work_release();
         Ok(())
     }
 

@@ -2590,6 +2590,143 @@ fn a_browser_whose_issuer_is_in_a_later_window_is_membership_incomplete() {
     assert_eq!(rig.m.as_ref().unwrap().head(), client_log.head());
 }
 
+/// Design I.5.8 ("Native senders"), VII.A test 20: a native member holds
+/// a caught-up channel while its `hello` carriage left this host holding
+/// the native's own head (the host there already, or brought there), and
+/// only on that open channel, with its own key: a service never counts, a
+/// carriage the window cut short (`more`) doesn't, and a closed channel
+/// stops counting.
+#[test]
+fn a_native_is_caught_up_while_its_channel_carried_the_host_to_its_head() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    let key = |rig: &Rig, id: &str| {
+        rig.log
+            .log
+            .member(id)
+            .unwrap()
+            .member
+            .auth_key
+            .as_bytes()
+            .to_vec()
+    };
+    let phone_key = key(&rig, "dev-phone");
+    assert!(!rig.engine.native_caught_up("member:dev-phone", &phone_key));
+    // Its head is the host's.
+    rig.connect("ph", phone());
+    rig.attached("ph");
+    assert!(rig.engine.native_caught_up("member:dev-phone", &phone_key));
+    assert!(
+        !rig.engine
+            .native_caught_up("member:dev-phone", b"another key")
+    );
+    assert_eq!(
+        rig.engine.caught_up_natives(),
+        vec![("member:dev-phone".to_string(), phone_key.clone())]
+    );
+    // A service is no native, whatever its carriage (one `init` a second).
+    rig.advance(1000);
+    rig.connect("bot", bot());
+    rig.attached("bot");
+    assert!(
+        !rig.engine
+            .native_caught_up("service:svc-bot", &key(&rig, "svc-bot"))
+    );
+    // The channel closes: no longer.
+    rig.envelope_in(&envelope::close("ph", None));
+    assert!(!rig.engine.native_caught_up("member:dev-phone", &phone_key));
+    // A phone 65 entries ahead: its first carriage brings the host 64 of
+    // them (`more`), not to its head; the next one does.
+    for n in 0..65 {
+        rig.log
+            .add_native(&format!("dev-n{n:02}"), &["control", "view"]);
+    }
+    let client_log = rig.log.log.clone();
+    rig.advance(1000);
+    rig.connect_with("ph2", phone(), Some(&client_log));
+    rig.attached("ph2");
+    assert_ne!(rig.m.as_ref().unwrap().head(), client_log.head());
+    assert!(!rig.engine.native_caught_up("member:dev-phone", &phone_key));
+    rig.advance(1000);
+    rig.connect_with("ph3", phone(), Some(&client_log));
+    rig.attached("ph3");
+    assert_eq!(rig.m.as_ref().unwrap().head(), client_log.head());
+    assert!(rig.engine.native_caught_up("member:dev-phone", &phone_key));
+}
+
+/// Design I.5.8 ("whose carriage"), Task 19 review M2: a native's
+/// `membership` op updates its channel's caught-up standing as its `hello`
+/// did. Its carriage stops at a deferred entry: not caught up (the host
+/// doesn't hold what it carried last), and still not after the wait ends
+/// by another carrier's approval; once it carries the head the host holds,
+/// caught up again. An empty carriage changes nothing.
+#[test]
+fn a_membership_op_updates_the_natives_caught_up_standing() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    let phone_key = rig
+        .log
+        .log
+        .member("dev-phone")
+        .unwrap()
+        .member
+        .auth_key
+        .as_bytes()
+        .to_vec();
+    let caught_up = |rig: &Rig| rig.engine.native_caught_up("member:dev-phone", &phone_key);
+    rig.connect("ph", phone());
+    rig.attached("ph");
+    assert!(caught_up(&rig));
+    let op = |entries: Vec<Value>| {
+        json!({"type": "session", "data": {"v": 1, "op": "membership",
+            "id": new_id(), "entries": entries}})
+    };
+    // A pending `recovery_add`, and an entry its subject signed: deferred.
+    let recovery = rig.log.recovery_add("dev-new");
+    let recovery_hash = rig.log.entries.last().unwrap().hash();
+    let body = rig.log.log.draft(
+        "dev-new",
+        rig.now.host.wall_ms,
+        &atem_client::membership::entry::Action::Remove {
+            device_id: "dev-phone".into(),
+        },
+    );
+    let deferred =
+        atem_client::membership::sign_entry(&rig.log.keys, &r9log::auth("dev-new"), body)
+            .unwrap()
+            .object()
+            .to_json();
+    rig.send("ph", &op(vec![recovery, deferred]));
+    assert!(rig.m.as_ref().unwrap().deferred_stop().is_some());
+    assert!(
+        !caught_up(&rig),
+        "the host doesn't hold what it carried last"
+    );
+    // An empty carriage changes nothing.
+    rig.send("ph", &op(vec![]));
+    assert!(!caught_up(&rig));
+    // The wait ends by the Mac's approval, carried by another device: the
+    // phone carried nothing since, so it stays not caught up.
+    let approve = rig.log.append(
+        r9log::MAC,
+        atem_client::membership::entry::Action::RecoveryApprove {
+            target: recovery_hash,
+        },
+    );
+    let entry = StrictValue::parse(approve.to_string().as_bytes(), usize::MAX).unwrap();
+    {
+        let now = rig.now.host.clone();
+        let m = rig.m.as_mut().unwrap();
+        let mut fences = HostFences::new(&mut rig.rt.host);
+        m.apply_carriage(&[entry], &now, &mut fences);
+    }
+    assert_eq!(rig.m.as_ref().unwrap().deferred_stop(), None);
+    assert!(!caught_up(&rig), "no re-carry, no standing");
+    // It carries the head the host holds now: caught up again.
+    rig.send("ph", &op(vec![approve]));
+    assert!(caught_up(&rig));
+}
+
 /// Re-review N1a: a grant revoked while it isn't live and the wall clock
 /// is behind the high-water mark is kept for the window after the host's
 /// trusted time (`max(wall, high_water)`), not after the rolled-back wall
@@ -3329,6 +3466,136 @@ mod delegated_work_ops {
         rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
         assert_eq!(rig.engine.take_host_work().len(), 1);
     }
+
+    /// Step 4, Decision 10: the runtime hands the engine the hook's
+    /// features (`HostFeatures`, read once when it starts). `host.delegated`
+    /// and `host.alerts` are listed only when the hook turns them on, and
+    /// only while hosting is on (they are host-work features: a host lists
+    /// those only then, §1); `host.senders` never. Listed, their ops are
+    /// taken: decoded, queued for the runtime, and answered with what it
+    /// says (`busy` until their handlers exist, with its detail).
+    #[test]
+    fn welcome_lists_delegated_and_alerts_only_with_the_hook() {
+        use crate::runtime::test_hooks::HostFeatures;
+        fn lists(rig: &mut Rig, handle: &str) -> [bool; 3] {
+            let features = welcome(rig, handle).features;
+            [DELEGATED_FEATURE, ALERTS_FEATURE, SENDERS_FEATURE]
+                .map(|feature| features.iter().any(|f| f == feature))
+        }
+        let both = HostFeatures::parse("host.delegated,host.alerts").unwrap();
+        let mut rig = Rig::new();
+        rig.link_up();
+        let cases = [
+            (None, true, [false, false, false]),
+            (Some("host.delegated"), true, [true, false, false]),
+            (
+                Some("host.delegated,host.alerts"),
+                true,
+                [true, true, false],
+            ),
+            (
+                Some("host.delegated,host.alerts"),
+                false,
+                [false, false, false],
+            ),
+        ];
+        for (n, (hook, hosting, listed)) in cases.into_iter().enumerate() {
+            let features =
+                hook.map_or_else(HostFeatures::default, |v| HostFeatures::parse(v).unwrap());
+            rig.engine
+                .set_delegated_features(features.delegated, features.alerts);
+            rig.engine.enable_host_work(hosting);
+            let handle = format!("ch-{n}");
+            rig.advance(1000);
+            rig.connect(&handle, phone());
+            assert_eq!(
+                lists(&mut rig, &handle),
+                listed,
+                "hook {hook:?}, hosting {hosting}"
+            );
+            assert_eq!(
+                welcome(&mut rig, &handle)
+                    .features
+                    .iter()
+                    .any(|f| f == "host.work"),
+                hosting
+            );
+        }
+        // The hook on, hosting on: each op is queued for the runtime, and
+        // nothing is answered before it answers.
+        rig.engine
+            .set_delegated_features(both.delegated, both.alerts);
+        rig.engine.enable_host_work(true);
+        for op in OPS {
+            let plain = message(&mut rig, "ch-2", op);
+            let (att, authority) = match &rig.engine.chans["ch-2"].phase {
+                Phase::Open(a) => (a.attachment.clone(), a.authority.clone()),
+                _ => panic!("open"),
+            };
+            rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
+        }
+        rig.pump();
+        assert!(rig.events("ch-2").is_empty(), "queued, not answered");
+        let queued = rig.engine.take_host_work();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|q| q.request.feature())
+                .collect::<Vec<_>>(),
+            [DELEGATED_FEATURE, DELEGATED_FEATURE, ALERTS_FEATURE]
+        );
+        for q in queued {
+            let reply = crate::runtime::delegated::request(both, &q.request);
+            let mono = rig.now.mono;
+            rig.engine
+                .host_work_reply(&q.attachment, &q.request, reply, mono);
+            rig.pump();
+            let events = rig.events("ch-2");
+            assert_eq!(
+                Rig::last_error(&events),
+                Some((
+                    "busy".into(),
+                    Some(format!("{} is not served yet", q.request.feature()))
+                )),
+                "{events:?}"
+            );
+        }
+        assert!(rig.relay.is_empty());
+    }
+
+    /// `host.alerts` without `host.delegated` is ignored (Decision 10): the
+    /// hook's value turns nothing on, and an engine handed it anyway lists
+    /// neither feature and takes none of the ops.
+    #[test]
+    fn host_alerts_without_host_delegated_is_ignored() {
+        use crate::runtime::test_hooks::HostFeatures;
+        assert_eq!(
+            HostFeatures::parse("host.alerts"),
+            Ok(HostFeatures::default())
+        );
+        let mut rig = Rig::new();
+        rig.engine.enable_host_work(true);
+        rig.engine.set_delegated_features(false, true);
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        let features = welcome(&mut rig, "ch-phone").features;
+        assert!(
+            features.iter().any(|f| f == "host.work"),
+            "hosting is on: {features:?}"
+        );
+        for feature in [DELEGATED_FEATURE, ALERTS_FEATURE, SENDERS_FEATURE] {
+            assert!(!features.iter().any(|f| f == feature), "{feature}");
+        }
+        for op in OPS {
+            assert_eq!(
+                refusal(&mut rig, "ch-phone", op),
+                not_advertised(op),
+                "{op}"
+            );
+        }
+        assert!(rig.engine.take_host_work().is_empty());
+        assert!(rig.relay.is_empty());
+    }
 }
 
 /// `host_enc_key_get` (delegated host-work design II.4.1, feature
@@ -3702,4 +3969,35 @@ mod channel_end {
             assert_eq!(close_reason(&other), "closed", "{other:?}");
         }
     }
+}
+
+/// host-work-v1 §11.4: a Station's messages to this host go to the Station
+/// link as received, in order, and never to the push engine; a `push_ack`
+/// still goes to the push engine; anything else is neither.
+#[test]
+fn a_stations_messages_go_to_the_station_link() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    let station = [
+        r#"{"type":"relay","op":"heads","feeds":[],"membership":{"seq":3,"hash":"ab"}}"#,
+        r#"{ "type": "relay", "op": "membership_fetch_result", "head": {}, "entries": [] }"#,
+        r#"{"type":"relay","op":"control_sync_result"}"#,
+        r#"{"type":"relay","op":"control_sync_refused","code":"forbidden"}"#,
+        r#"{"type":"relay","op":"membership_fetch_refused","code":"forbidden"}"#,
+        r#"{"type":"relay","op":"control_ack_refused","code":"forbidden"}"#,
+    ];
+    for text in station {
+        rig.engine.relay_message(text);
+    }
+    // The host's own calls, a push_ack and other relay messages: not the
+    // Station's to this host.
+    for text in [
+        r#"{"type":"relay","op":"membership_fetch","after":3}"#,
+        r#"{"type":"relay","op":"push_ack","acks":[]}"#,
+        r#"{"type":"relay","op":"host_route_ok"}"#,
+    ] {
+        rig.engine.relay_message(text);
+    }
+    assert_eq!(rig.engine.take_station_messages(), station);
+    assert!(rig.engine.take_station_messages().is_empty());
 }

@@ -569,3 +569,32 @@ async fn a_reload_takes_the_workers_cut_turn() {
     assert_eq!(turn_coverage(&session.chat, "t2"), Coverage::Complete);
     session.stop().unwrap();
 }
+
+/// A launched session's chat is the worker's from the start; an adopted
+/// one's only once its worker's `chat_snapshot` arrived (the line a
+/// host-work prompt's reconciliation at a start waits for, session-v1
+/// R9.14 items 5, 6; Task 16a's review, M1).
+#[tokio::test]
+async fn the_workers_chat_snapshot_marks_the_chat_synced() {
+    let Setup { mut session, _dir } = launch("exec cat").await;
+    assert!(session.chat_synced, "launched");
+    settle(&mut session).await;
+    // As a new broker adopts it.
+    session.chat_synced = false;
+    let mut pumped = Pumped::default();
+    let mut snapshot = ChatSession::new("x".into(), 0).snapshot(0, 0);
+    snapshot.current_turn = Some("turn-1".into());
+    session.apply(
+        WorkerMsg::ChatSnapshot {
+            snapshot,
+            input_count: 0,
+            chat_v1: true,
+            reason: None,
+            unavailable: Vec::new(),
+        },
+        &mut pumped,
+    );
+    assert!(session.chat_synced);
+    assert_eq!(session.chat.current_turn_id(), Some("turn-1"));
+    session.stop().unwrap();
+}
