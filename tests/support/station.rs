@@ -15,13 +15,28 @@
 //! seconds passed (the heartbeat). [`FakeStation::next_call`] waits for
 //! the host's next call and answers it.
 //!
+//! The heartbeat runs on the real clock, whenever `serve` or `next_call`
+//! is called: a test that reads the link message by message (a slow
+//! runner can take 30 s between two steps) silences it
+//! ([`FakeStation::silence_heads`]) or reads past `heads` to the message
+//! it wants.
+//!
 //! What it answers (§11.4):
 //! - `control_sync`: the records after `after` of the account's one feed at
 //!   this Station, ascending, as many as fit in one message (at most 64,
 //!   and the whole message within 256 KiB: the builder's own bounds), with
 //!   the feed's head and the Station's time. A call for a feed that isn't
-//!   the account's at this Station (another origin, an unknown `feed_id`,
-//!   the feed before a reset) is refused, `control_sync_refused`.
+//!   the account's at this Station (another origin, a `feed_id` the
+//!   account never had here) is refused, `control_sync_refused` ("One feed
+//!   per account").
+//! - A `control_sync` naming the account's feed from before a reset: §11.4
+//!   doesn't say. Two readings, chosen with [`FakeStation::stale_feed`]:
+//!   [`StaleFeed::Refuse`] (the default), `control_sync_refused`, the
+//!   literal reading of "not its account's feed at this Station": **Atem's
+//!   reading, not confirmed with Astation**; or [`StaleFeed::ServeCurrent`],
+//!   the account's current feed from position 0, as for a call without a
+//!   `feed_id` (the result's `feed_id` is then the only in-band reset
+//!   signal the wire has). A host must handle both until Astation answers.
 //! - `membership_fetch`: the device list's entries after `after`, as many
 //!   as fit (at most 64, within 256 KiB), and its head.
 //! - `control_ack`: no answer when the reference [`AckLedger`] counts it;
@@ -36,6 +51,15 @@
 //!   device list, as if the link were that account's.
 //! - Bytes the shared reader refuses get no answer (kept in
 //!   [`FakeStation::sent`]).
+//!
+//! What a well-behaved Station never does, for the host's defences:
+//! [`FakeStation::heads_with`] (heads naming any feeds, another origin's
+//! included), [`FakeStation::append_gap`] (positions left out, which §11.4
+//! allows) and [`FakeStation::truncate`] (the feed rolled back under the
+//! same `feed_id`: a head below the host's cursor). Messages outside the
+//! contract (over 256 KiB, not strict JSON, a record the parser refuses)
+//! the builders can't make: a test sends those bytes itself
+//! ([`FakeAstation::send`]).
 #![allow(dead_code)]
 
 use super::astation::{FakeAstation, LinkSender};
@@ -64,6 +88,20 @@ const HEARTBEAT: Duration = Duration::from_secs(30);
 /// The longest [`FakeStation::next_call`] waits; it only bounds a failure.
 const WAIT: Duration = Duration::from_secs(60);
 
+/// What a `control_sync` naming the account's feed from before a reset
+/// gets: §11.4 doesn't say (the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleFeed {
+    /// `control_sync_refused`: the literal "not its account's feed at this
+    /// Station" (Atem's reading, not confirmed with Astation).
+    Refuse,
+    /// The account's current feed from position 0 (`after` ignored: a
+    /// cursor belongs to a feed), as for a call with no `feed_id`. The
+    /// result's `feed_id` is then the only in-band reset signal the wire
+    /// has.
+    ServeCurrent,
+}
+
 /// One account at this Station: its device list and its one control feed
 /// (§11.4, "One feed per account").
 struct Account {
@@ -72,11 +110,14 @@ struct Account {
     /// The device list from its genesis (`seq` n is `entries[n - 1]`).
     entries: Vec<SignedObject>,
     head: Head,
-    /// How many feeds the account had here (a reset mints the next).
+    /// How many feeds the account had here (a reset mints the next): its
+    /// `n`th `feed_id` is `feed_id(origin, account, n)`.
     feeds: u64,
     feed_id: String,
-    /// The feed's records: `feed_seq` n is `records[n - 1]`.
-    records: Vec<ControlRecord>,
+    /// The feed's records with their `feed_seq`, ascending.
+    records: Vec<(u64, ControlRecord)>,
+    /// Positions left out before the next record ([`FakeStation::append_gap`]).
+    gap: u64,
 }
 
 impl Account {
@@ -90,7 +131,13 @@ impl Account {
             head: log.log.head(),
             feeds: 1,
             records: Vec::new(),
+            gap: 0,
         }
+    }
+
+    /// The feed's head: its last record's position (0: none).
+    fn feed_head(&self) -> u64 {
+        self.records.last().map_or(0, |(seq, _)| *seq)
     }
 }
 
@@ -177,6 +224,7 @@ pub struct FakeStation {
     ledger: AckLedger,
     ack_refusals: Vec<AckRefusal>,
     refusing: [bool; 3],
+    stale: StaleFeed,
     silent: bool,
     /// The Station's clock (ms): fixed by the test, else the wall clock.
     time: Option<u64>,
@@ -219,6 +267,7 @@ impl FakeStation {
             ledger,
             ack_refusals: Vec::new(),
             refusing: [false; 3],
+            stale: StaleFeed::Refuse,
             silent: false,
             time: None,
             link: None,
@@ -237,9 +286,14 @@ impl FakeStation {
         &self.served().feed_id
     }
 
-    /// The served account's feed, in `feed_seq` order.
-    pub fn records(&self) -> &[ControlRecord] {
-        &self.served().records
+    /// The served account's feed: each record with its `feed_seq`,
+    /// ascending.
+    pub fn records(&self) -> Vec<(u64, &ControlRecord)> {
+        self.served()
+            .records
+            .iter()
+            .map(|(seq, record)| (*seq, record))
+            .collect()
     }
 
     /// The reference ledger of the host's account at this Station: what it
@@ -253,7 +307,13 @@ impl FakeStation {
         &self.ack_refusals
     }
 
-    /// Every Station call the host sent, as the bytes it sent, in order.
+    /// Every Station call the fake has read so far (by
+    /// [`FakeStation::serve`] or [`FakeStation::next_call`]), as the bytes
+    /// the host sent, in order: a call that arrived but wasn't served yet
+    /// isn't here, so serve before comparing. What reaches the fake is a
+    /// text frame the fake Astation reads as JSON, or one that names a
+    /// Station call (`"control_sync"`, `"control_ack"`,
+    /// `"membership_fetch"`); a binary frame never does.
     pub fn sent(&self) -> Vec<String> {
         self.sent.clone()
     }
@@ -306,21 +366,42 @@ impl FakeStation {
         }
     }
 
-    /// Stores `record` at the end of the served account's feed: the
-    /// reference ledger sees it first (for the host's account), then the
-    /// feed serves it and `heads` go at once (unless silenced). Its
-    /// `feed_seq`. The fake stores what the test hands it: a record the
-    /// ledger refuses at intake (another account's or Station's, a reused
-    /// `record_id`) is served untracked, as by a Station that skipped its
-    /// intake checks; one the control parser refuses can't be served (the
-    /// shared builder takes only a parsed record).
+    /// Stores `record` at the next position of the served account's feed
+    /// (after any [`FakeStation::append_gap`]): the reference ledger sees
+    /// it first (for the host's account), then the feed serves it and
+    /// `heads` go at once (unless silenced). Its `feed_seq`. The fake
+    /// stores what the test hands it: a record the ledger refuses at intake
+    /// (another account's or Station's, a reused `record_id`) is served
+    /// untracked, as by a Station that skipped its intake checks; one the
+    /// control parser refuses can't be served (the shared builder takes
+    /// only a parsed record).
     pub fn append(&mut self, record: SignedObject) -> u64 {
         let record = ControlRecord::from_signed(record).expect("a control record");
         self.store(record);
         if !self.silent {
             self.send_heads();
         }
-        self.served().records.len() as u64
+        self.served().feed_head()
+    }
+
+    /// The next `n` positions of the served feed hold no record: the next
+    /// [`FakeStation::append`] is `n` past the head (§11.4 rule 7 allows
+    /// gaps; whether one is a hole the cursor waits at is the host's).
+    pub fn append_gap(&mut self, n: u64) {
+        self.served_mut().gap += n;
+    }
+
+    /// The served feed rolled back to its records at or before position
+    /// `n`, under the same `feed_id` (a Station fault: a restore mints a
+    /// new `feed_id`, I.5.2), then `heads` at once (unless silenced). A host
+    /// whose cursor passed the new head reads it as a reset.
+    pub fn truncate(&mut self, n: u64) {
+        let served = self.served_mut();
+        served.records.retain(|(seq, _)| *seq <= n);
+        served.gap = 0;
+        if !self.silent {
+            self.send_heads();
+        }
     }
 
     /// A record of the served account's feed about `service:<service>`,
@@ -355,13 +436,35 @@ impl FakeStation {
 
     /// `heads` on the served link now (silenced or not).
     pub fn heads_now(&mut self) {
-        assert!(self.link.is_some(), "serve the host's link first");
-        self.send_heads();
+        let served = self.served();
+        let feed = FeedHead {
+            origin: self.origin.clone(),
+            feed_id: served.feed_id.clone(),
+            head: served.feed_head(),
+            station_time: self.now(),
+        };
+        self.heads_with(vec![feed]);
+    }
+
+    /// `heads` naming exactly `feeds` (any origins and feeds, none
+    /// included) and the served device list's head, on the served link
+    /// now (silenced or not). The builder's bounds apply (64 feeds, a feed
+    /// once).
+    pub fn heads_with(&mut self, feeds: Vec<FeedHead>) {
+        let link = self.link.expect("serve the host's link first");
+        let heads = Heads {
+            feeds,
+            membership: self.served().head,
+        };
+        let heads = heads.to_json().expect("heads within the builder's bounds");
+        self.out.send(link, heads.to_string());
+        self.last_heads = Some(Instant::now());
     }
 
     /// No `heads` of its own while on: none for a new link, a stored
-    /// record, a reset or the heartbeat (the host's 60 s without heads).
-    /// [`FakeStation::heads_now`] still announces.
+    /// record, a reset, a truncation or the heartbeat (the host's 60 s
+    /// without heads). [`FakeStation::heads_now`] and
+    /// [`FakeStation::heads_with`] still announce.
     pub fn silence_heads(&mut self, on: bool) {
         self.silent = on;
     }
@@ -375,11 +478,16 @@ impl FakeStation {
     /// key (newer than the old ones), then its `revoke` and
     /// `interrupt_running` records as they are. A record the Station can't
     /// sign anew (a host principal's, a key that isn't [`TestLog`]'s) is
-    /// carried as it is.
+    /// carried as it is. A `control_sync` naming the old feed gets what
+    /// [`FakeStation::stale_feed`] says.
     pub fn reset(&mut self) {
         let origin = self.origin.clone();
         let served = self.served_mut();
-        let old = std::mem::take(&mut served.records);
+        let old: Vec<ControlRecord> = std::mem::take(&mut served.records)
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect();
+        served.gap = 0;
         served.feeds += 1;
         served.feed_id = feed_id(&origin, &served.account_id, served.feeds);
         for record in self.snapshot(&old) {
@@ -388,6 +496,12 @@ impl FakeStation {
         if !self.silent {
             self.send_heads();
         }
+    }
+
+    /// What a `control_sync` naming the account's feed from before a reset
+    /// gets from now on (the default [`StaleFeed::Refuse`]).
+    pub fn stale_feed(&mut self, mode: StaleFeed) {
+        self.stale = mode;
     }
 
     /// The Station's clock from now on, `ms` (`station_time` in heads and
@@ -461,21 +575,11 @@ impl FakeStation {
         }
     }
 
+    /// The Station's own `heads`, on the served link if there is one.
     fn send_heads(&mut self) {
-        let Some(link) = self.link else { return };
-        let served = self.served();
-        let heads = Heads {
-            feeds: vec![FeedHead {
-                origin: self.origin.clone(),
-                feed_id: served.feed_id.clone(),
-                head: served.records.len() as u64,
-                station_time: self.now(),
-            }],
-            membership: served.head,
-        };
-        let heads = heads.to_json().expect("heads within the builder's bounds");
-        self.out.send(link, heads.to_string());
-        self.last_heads = Some(Instant::now());
+        if self.link.is_some() {
+            self.heads_now();
+        }
     }
 
     /// The reference ledger sees a record of the host's account before the
@@ -489,7 +593,10 @@ impl FakeStation {
                 self.ledger = t.next;
             }
         }
-        self.served_mut().records.push(record);
+        let served = self.served_mut();
+        let seq = served.feed_head() + served.gap + 1;
+        served.gap = 0;
+        served.records.push((seq, record));
     }
 
     fn snapshot(&mut self, old: &[ControlRecord]) -> Vec<ControlRecord> {
@@ -569,23 +676,33 @@ impl FakeStation {
 
     fn page(&self, sync: &ControlSync) -> Value {
         let served = self.served();
-        let ours = sync.origin == self.origin
-            && sync.feed_id.as_ref().is_none_or(|id| *id == served.feed_id);
-        if self.refusing[slot(RefusedCall::ControlSync)] || !ours {
+        let current = sync.feed_id.as_ref().is_none_or(|id| *id == served.feed_id);
+        // The account's feed before a reset (an unknown id stays refused:
+        // it may be another account's).
+        let stale = sync.feed_id.as_ref().is_some_and(|id| {
+            (1..served.feeds).any(|n| feed_id(&self.origin, &served.account_id, n) == *id)
+        });
+        let serve_current = stale && self.stale == StaleFeed::ServeCurrent;
+        if self.refusing[slot(RefusedCall::ControlSync)]
+            || sync.origin != self.origin
+            || !(current || serve_current)
+        {
             return refusal(RefusedCall::ControlSync);
         }
-        let from = usize::try_from(sync.after)
-            .unwrap_or(usize::MAX)
-            .min(served.records.len());
-        let entries: Vec<FeedEntry> = (from..served.records.len())
-            .map(|i| FeedEntry::new(i as u64 + 1, &served.records[i]))
+        // A cursor belongs to a feed: another feed's is no position here.
+        let after = if current { sync.after } else { 0 };
+        let entries: Vec<FeedEntry> = served
+            .records
+            .iter()
+            .filter(|(seq, _)| *seq > after)
+            .map(|(seq, record)| FeedEntry::new(*seq, record))
             .collect();
         let now = self.now();
         fit(entries.len().min(MAX_FEED_RECORDS), |n| {
             ControlSyncResult {
                 origin: self.origin.clone(),
                 feed_id: served.feed_id.clone(),
-                head: served.records.len() as u64,
+                head: served.feed_head(),
                 station_time: now,
                 records: entries[..n].to_vec(),
             }

@@ -186,13 +186,13 @@ async fn serve(
             frame = socket.next() => {
                 let Some(Ok(frame)) = frame else { return };
                 let Message::Text(text) = frame else { continue };
-                let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
-                if is_auth(&value) {
-                    if !answer_auth(n, &mut socket, &events, &auth, value).await {
-                        return;
+                match serde_json::from_str::<Value>(&text) {
+                    Ok(value) if is_auth(&value) => {
+                        if !answer_auth(n, &mut socket, &events, &auth, value).await {
+                            return;
+                        }
                     }
-                } else {
-                    deliver(n, &text, value, &events, &tap);
+                    value => deliver(n, &text, value.ok(), &events, &tap),
                 }
             }
             command = commands.recv() => match command {
@@ -214,16 +214,27 @@ fn is_auth(value: &Value) -> bool {
     value["type"] == "statusUpdate" && value["data"]["status"] == "auth"
 }
 
-/// One of Atem's messages on link `n` (`text` as sent, `value` parsed),
-/// not an `auth`: a Station call to the fake Station's tap when one took
-/// them; anything else, or with no tap, an `Event::Message`.
-fn deliver(n: u64, text: &str, value: Value, events: &mpsc::Sender<Event>, tap: &StationTap) {
+/// One of Atem's text messages on link `n` (`text` as sent, `value` it
+/// parsed as JSON, if it did), not an `auth`: a Station call to the fake
+/// Station's tap when one took them; any other JSON, or with no tap, an
+/// `Event::Message`; any other text is dropped.
+fn deliver(
+    n: u64,
+    text: &str,
+    value: Option<Value>,
+    events: &mpsc::Sender<Event>,
+    tap: &StationTap,
+) {
     use atem_client::control::relay::op;
-    let call = value["type"] == "relay"
-        && matches!(
-            value["op"].as_str(),
-            Some(op::CONTROL_SYNC | op::CONTROL_ACK | op::MEMBERSHIP_FETCH)
-        );
+    const CALLS: [&str; 3] = [op::CONTROL_SYNC, op::CONTROL_ACK, op::MEMBERSHIP_FETCH];
+    let call = match &value {
+        Some(value) => {
+            value["type"] == "relay" && value["op"].as_str().is_some_and(|op| CALLS.contains(&op))
+        }
+        // Not JSON, but naming a call: its bytes reach the fake Station
+        // (whose strict reader refuses them), for the goldens.
+        None => CALLS.iter().any(|op| text.contains(&format!("\"{op}\""))),
+    };
     if call {
         let mut slot = tap.lock().unwrap();
         if let Some(calls) = slot.as_ref() {
@@ -234,7 +245,9 @@ fn deliver(n: u64, text: &str, value: Value, events: &mpsc::Sender<Event>, tap: 
             *slot = None;
         }
     }
-    let _ = events.send(Event::Message(n, value));
+    if let Some(value) = value {
+        let _ = events.send(Event::Message(n, value));
+    }
 }
 
 /// Every relay host connection's query (`code`, `atem_id`, …) in this test
@@ -570,9 +583,8 @@ async fn relay_link(
         if text.contains("\"host_route\"") {
             break Some(text);
         }
-        if let Ok(value) = serde_json::from_str::<Value>(&text) {
-            deliver(n, &text, value, &events, &tap);
-        }
+        let value = serde_json::from_str::<Value>(&text).ok();
+        deliver(n, &text, value, &events, &tap);
     };
     let Some(message) = proof else {
         let _ = socket.close(None).await;
@@ -660,6 +672,7 @@ async fn astation_first(
         };
         let Message::Text(text) = frame else { continue };
         let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            deliver(n, &text, None, &events, &tap);
             continue;
         };
         if value["op"] == "host_route" {
@@ -674,7 +687,7 @@ async fn astation_first(
         } else if is_auth(&value) {
             pending_auth = Some(value);
         } else {
-            deliver(n, &text, value, &events, &tap);
+            deliver(n, &text, Some(value), &events, &tap);
         }
         // Astation answers at once without a verdict to order; else once
         // the proof and the `auth` both arrived, in the planned order.

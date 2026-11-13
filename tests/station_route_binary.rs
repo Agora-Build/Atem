@@ -432,7 +432,7 @@ use atem_client::membership::{
     Entry, Head, Membership, ServiceScope, draft_on, service_add, sign_entry,
 };
 use atem_client::{Alg, PublicKey};
-use support::station::{FakeStation, OTHER_ACCOUNT};
+use support::station::{FakeStation, OTHER_ACCOUNT, StaleFeed};
 use tokio_tungstenite::tungstenite::{self, Message as WsMessage, stream::MaybeTlsStream};
 
 const FS_ACCOUNT: &str = "acct-fake-station";
@@ -686,8 +686,22 @@ fn fake_station_speaks_only_the_shared_builders() {
         ToHost::ControlAckRefused(RefusalCode::Forbidden)
     );
     assert_eq!(station.acks(), &ledger);
+    // An ack about another Station's feed (its claim the link's): refused
+    // too. (`other_account` can't arise here: the link is the host's, in
+    // the ledger's account.)
+    let elsewhere = ControlAck {
+        origin: "https://other.test".into(),
+        ..ack.clone()
+    };
+    host.call(elsewhere.to_json().unwrap());
+    station.next_call(host.link).unwrap();
+    assert_eq!(
+        host.next().1,
+        ToHost::ControlAckRefused(RefusalCode::Forbidden)
+    );
+    assert_eq!(station.acks(), &ledger);
     let codes: Vec<_> = station.ack_refusals().iter().map(|r| r.code()).collect();
-    assert_eq!(codes, ["not_the_link"]);
+    assert_eq!(codes, ["not_the_link", "other_station"]);
 
     // Each call refused when the test says so: its typed refusal, nothing
     // served or counted.
@@ -847,7 +861,7 @@ fn fake_station_pages_within_256_kib_and_64_items() {
     assert_eq!(seqs, (65..=70).collect::<Vec<_>>());
     assert_eq!(
         rest.records[5].raw(),
-        &station.records()[69].object().to_json()
+        &station.records()[69].1.object().to_json()
     );
 
     // A device list of 70 small entries: 64 entries in a fetch.
@@ -1080,11 +1094,152 @@ fn fake_station_reset_mints_a_feed_and_snapshots_each_principals_state() {
         seen = again.next;
     }
 
-    // The old feed is no feed of this account's any more.
+    // A call naming the old feed: §11.4 doesn't say. Refused by default
+    // (Atem's literal reading) ...
     host.call(sync(Some(&old_feed), 3));
     station.next_call(host.link).unwrap();
     assert_eq!(
         host.next().1,
         ToHost::ControlSyncRefused(RefusalCode::Forbidden)
     );
+    // ... or, in the other reading, the current feed from position 0 (the
+    // old cursor is no position in it): the new `feed_id` tells the host.
+    station.stale_feed(StaleFeed::ServeCurrent);
+    host.call(sync(Some(&old_feed), 3));
+    station.next_call(host.link).unwrap();
+    let served = page(&mut host);
+    assert_eq!(
+        (served.feed_id.as_str(), served.head),
+        (new_feed.as_str(), 3)
+    );
+    let objects: Vec<_> = served
+        .records
+        .iter()
+        .map(|e| e.parse_record().unwrap().object().clone())
+        .collect();
+    let snapshot: Vec<_> = snapshot.iter().map(|r| r.object().clone()).collect();
+    assert_eq!(objects, snapshot);
+    // A `feed_id` the account never had is refused in either reading.
+    for mode in [StaleFeed::ServeCurrent, StaleFeed::Refuse] {
+        station.stale_feed(mode);
+        host.call(sync(Some("6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b"), 0));
+        station.next_call(host.link).unwrap();
+        assert_eq!(
+            host.next().1,
+            ToHost::ControlSyncRefused(RefusalCode::Forbidden)
+        );
+    }
+}
+
+#[test]
+fn fake_station_announces_any_heads_leaves_gaps_and_rolls_back() {
+    let astation = FakeAstation::start();
+    let log = station_log();
+    let mut station = FakeStation::new(&astation, FS_ORIGIN, &log, FS_HOST, 1);
+    station.station_time(T0);
+    station.silence_heads(true);
+    let mut host = HostSide::connect(&astation);
+    station.serve(host.link);
+    let feed_id = station.feed_id().to_owned();
+
+    // Heads naming any feeds: another origin's beside this one.
+    let feeds = vec![
+        FeedHead {
+            origin: "https://other.test".into(),
+            feed_id: "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b".into(),
+            head: 7,
+            station_time: T0,
+        },
+        FeedHead {
+            origin: FS_ORIGIN.into(),
+            feed_id: feed_id.clone(),
+            head: 0,
+            station_time: T0,
+        },
+    ];
+    station.heads_with(feeds.clone());
+    assert_eq!(
+        host.next().1,
+        ToHost::Heads(Heads {
+            feeds,
+            membership: log.log.head()
+        })
+    );
+
+    // Positions left out: records at 1 and 4.
+    let hold = station.record_for(FS_SVC, ControlAction::Hold);
+    assert_eq!(station.append(hold), 1);
+    station.append_gap(2);
+    let release = station.record_for(FS_SVC, ControlAction::Release);
+    assert_eq!(station.append(release), 4);
+    host.call(sync(Some(&feed_id), 0));
+    station.next_call(host.link).unwrap();
+    let served = page(&mut host);
+    let seqs: Vec<u64> = served.records.iter().map(|e| e.feed_seq).collect();
+    assert_eq!((served.head, seqs), (4, vec![1, 4]));
+
+    // Rolled back under the same feed: the head below a cursor at 4.
+    station.truncate(1);
+    station.heads_now();
+    let ToHost::Heads(heads) = host.next().1 else {
+        panic!("heads")
+    };
+    assert_eq!(
+        (heads.feeds[0].feed_id.as_str(), heads.feeds[0].head),
+        (feed_id.as_str(), 1)
+    );
+    host.call(sync(Some(&feed_id), 4));
+    station.next_call(host.link).unwrap();
+    let served = page(&mut host);
+    assert_eq!((served.head, served.records.len()), (1, 0));
+    let cover = station.record_for(FS_SVC, ControlAction::Cover);
+    assert_eq!(station.append(cover), 2);
+}
+
+#[test]
+fn fake_station_keeps_the_hosts_exact_bytes() {
+    let astation = FakeAstation::start();
+    let log = station_log();
+    let mut station = FakeStation::new(&astation, FS_ORIGIN, &log, FS_HOST, 1);
+    station.station_time(T0);
+    station.silence_heads(true);
+    let mut host = HostSide::connect(&astation);
+    station.serve(host.link);
+
+    // Whitespace and escapes the strict reader accepts: read, answered,
+    // and kept byte for byte.
+    let spaced = r#"{ "type": "relay", "op": "control_syn\u0063",
+        "origin": "https://station.tes\u0074", "after": 0 }"#;
+    host.ws.send(WsMessage::Text(spaced.into())).unwrap();
+    assert_eq!(
+        station.next_call(host.link),
+        Ok(ToStation::ControlSync(ControlSync {
+            origin: FS_ORIGIN.into(),
+            feed_id: None,
+            after: 0,
+        }))
+    );
+    assert!(matches!(page(&mut host).records[..], []));
+
+    // Text that isn't JSON but names a call: kept, refused by the reader,
+    // not answered (the next thing the host reads answers the next call).
+    let broken = r#"{"type":"relay","op":"membership_fetch","after":"#;
+    host.ws.send(WsMessage::Text(broken.into())).unwrap();
+    assert_eq!(
+        station.next_call(host.link),
+        Err(atem_client::control::RelayError::NotStrict)
+    );
+    host.call(fetch(2));
+    station.next_call(host.link).unwrap();
+    assert_eq!(
+        fetched(&mut host).1.entries,
+        log.entries[2..]
+            .iter()
+            .map(|e| e.object().clone())
+            .collect::<Vec<_>>()
+    );
+
+    let mut expected = vec![spaced.to_owned(), broken.to_owned()];
+    expected.extend(host.calls.iter().cloned());
+    assert_eq!(station.sent(), expected);
 }
