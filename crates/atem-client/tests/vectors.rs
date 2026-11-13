@@ -25,7 +25,7 @@ use atem_client::channel::{
 use atem_client::control::{
     Applied as ControlApplied, ControlAbout, ControlAction, ControlBody, ControlCheck,
     ControlError, ControlFeed, ControlPrincipal, ControlRecord, ControlSigner, ControlState,
-    FeedPos, HostAction, Transition, VerifiedSigner, build_control, principal_key_of,
+    FeedPos, HostAction, MAX_RECORD_IDS, Standing, VerifiedSigner, build_control, principal_key_of,
     verify_control,
 };
 use atem_client::domain::{SignLabel, SigningInput};
@@ -257,6 +257,7 @@ fn every_vectors_file_has_a_runner() {
             "r9-vectors-pairing.json",
             "r9-vectors-push-hint.json",
             "r9-vectors-recovery.json",
+            "r9-vectors-station-calls.json",
         ],
         "a new vectors file needs a runner below"
     );
@@ -2574,8 +2575,80 @@ fn check_outcome_unknown(run: &mut Run, book: &Book) {
             s(case, "reason")
         ));
     }
+    // The deferred blank-reason case (Astation's review of PR 2, #120
+    // comment 6848326392: before phone hint support is accepted): a
+    // delegated sender's UUID v4 task whose reason is blank, nothing but
+    // White_Space, is refused at open like the others.
+    use atem_client::session::alerts::{valid_reason, valid_sender, valid_task_id};
+    use atem_client::session::framing::is_format;
+    let blank = run
+        .get("outcome_unknown_invalid_facts")
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| {
+            let facts = &case["facts"];
+            let reason = s(facts, "reason");
+            // Refused by the blank rule alone: no control or format
+            // character a reader might refuse it for instead.
+            valid_task_id(s(facts, "task_id"))
+                && valid_sender(s(facts, "sender"))
+                && !reason.is_empty()
+                && reason.trim().is_empty()
+                && !reason.chars().any(|c| c.is_control() || is_format(c))
+                && !valid_reason(reason)
+        })
+        .count();
+    assert_eq!(
+        blank, 1,
+        "a delegated task's blank reason, with no control or format character"
+    );
+    run.pass("outcome_unknown_invalid_facts: a delegated task's blank reason among them");
     // The key type is the one the builder makes.
     let _: &AlertKey = first[0].key();
+}
+
+/// The independent checker writes out General_Category Cf (`CF_RANGES` in
+/// `scripts/check-r9-vectors.py`) so its reason rule doesn't follow
+/// Python's own Unicode version: it must be exactly the set the core's
+/// `framing::is_format` gives (Unicode 18.0.0), and its Cc rule
+/// `char::is_control`.
+#[test]
+fn checker_format_ranges_are_the_framing_modules() {
+    use atem_client::session::framing::is_format;
+    let script = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/check-r9-vectors.py"),
+    )
+    .unwrap();
+    let start = script
+        .find("CF_RANGES = [")
+        .expect("CF_RANGES in the checker");
+    let end = start + script[start..].find("\n]").unwrap();
+    let hex = |t: &str| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).unwrap();
+    let theirs: Vec<(u32, u32)> = script[start..end]
+        .split('(')
+        .skip(1)
+        .map(|pair| {
+            let pair = pair.split(')').next().unwrap();
+            let (a, b) = pair.split_once(',').unwrap();
+            (hex(a), hex(b))
+        })
+        .collect();
+    let mut ours: Vec<(u32, u32)> = Vec::new();
+    for cp in 0..=0x10FFFFu32 {
+        let Some(c) = char::from_u32(cp) else {
+            continue;
+        };
+        if is_format(c) {
+            match ours.last_mut() {
+                Some(r) if r.1 + 1 == cp => r.1 = cp,
+                _ => ours.push((cp, cp)),
+            }
+        }
+        let checker_cc = cp <= 0x1F || (0x7F..=0x9F).contains(&cp);
+        assert_eq!(c.is_control(), checker_cc, "{cp:#x}");
+    }
+    assert_eq!(theirs, ours, "the checker's CF_RANGES");
 }
 
 /// The `outcome_unknown` entries of `r9-vectors-push-hint` (kept apart from
@@ -2810,6 +2883,16 @@ fn outcome_unknown_vectors(book: &Book) -> BTreeMap<&'static str, Value> {
             }),
             "a browser grant's task: browser grants keep v1 and raise no alert",
         ),
+        (
+            "ae6fb035-7182-4dac-b50d-4b2ca31e6f78",
+            json!({
+                "task_id": "c4d9e8f7-1a2b-4c3d-8e5f-6a7b8c9d0e1f",
+                "session_id": "ses-aaaaaaaaaaaa",
+                "sender": "service:svc-discord",
+                "reason": " \u{a0}\u{3000}",
+            }),
+            "a delegated sender's task whose reason is blank (nothing but White_Space: a space, a no-break space and an ideographic space, none a control or format character, so only the blank rule refuses it): refused at open (Astation's review of PR 2, #120 comment 6848326392: the deferred blank-reason vector, before phone hint support is accepted)",
+        ),
     ] {
         let device = "dev-phone";
         let template = Alert {
@@ -2867,7 +2950,7 @@ fn outcome_unknown_vectors(book: &Book) -> BTreeMap<&'static str, Value> {
         (
             "outcome_unknown_note",
             json!(
-                "Hints of kind outcome_unknown (delegated host-work I.4.6): the body's type is atem-push-hint and its label atem-push-hint-v1 like an approval hint's, told apart by `kind` (no `state`, no session_id, process_gen or approval_id; `alert_id` instead). The task, session, sender and reason are only in the sealed part, jcs of {reason, sender, session_id, task_id}. info = enc([\"atem-push-seal-v1\", account_id, genesis_hash, host_id, u64(host_trust_gen), \"outcome_unknown\", alert_id, u64(created_at), u64(expires_at), device_id, enc_kid]) (11 fields; an approval's has 12). ikmE_hex = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Entries 0 and 1 are one alert for two recipients; entry 2 is another alert at the bounds. Only a delegated sender's (member:, service: or host:) UUID v4 task raises an alert. outcome_unknown_acks are the push_ack entries, one per hint. Each outcome_unknown_invalid carries the first hint's sealed envelope (except bad_sealed's, which is the point) so only its code refuses it; the runner checks the code with both verifiers. Each outcome_unknown_invalid_facts is well signed and well sealed (both verifiers take it, and its sealed_hash names its sealed part), but its sealed facts aren't a delegated task's: the recipient refuses it at open (malformed)."
+                "Hints of kind outcome_unknown (delegated host-work I.4.6): the body's type is atem-push-hint and its label atem-push-hint-v1 like an approval hint's, told apart by `kind` (no `state`, no session_id, process_gen or approval_id; `alert_id` instead). The task, session, sender and reason are only in the sealed part, jcs of {reason, sender, session_id, task_id}. info = enc([\"atem-push-seal-v1\", account_id, genesis_hash, host_id, u64(host_trust_gen), \"outcome_unknown\", alert_id, u64(created_at), u64(expires_at), device_id, enc_kid]) (11 fields; an approval's has 12). ikmE_hex = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Entries 0 and 1 are one alert for two recipients; entry 2 is another alert at the bounds. Only a delegated sender's (member:, service: or host:) UUID v4 task raises an alert. outcome_unknown_acks are the push_ack entries, one per hint. Each outcome_unknown_invalid carries the first hint's sealed envelope (except bad_sealed's, which is the point) so only its code refuses it; the runner checks the code with both verifiers. Each outcome_unknown_invalid_facts is well signed and well sealed (both verifiers take it, and its sealed_hash names its sealed part), but its sealed facts aren't a delegated task's, or its reason is blank (nothing but White_Space; for Astation, amended for step 4: the deferred blank-reason case, Astation's review of PR 2): the recipient refuses it at open (malformed)."
             ),
         ),
     ])
@@ -4881,20 +4964,247 @@ impl<'a> ControlGen<'a> {
     /// A sequence: its steps applied to a new state of L, and the state
     /// they leave (`ControlState::to_json`, the form a host persists).
     fn sequence(&self, label: &str, note: &str, steps: Vec<Value>) -> Value {
-        let mut state = ControlState::new(&self.ctx.chain(&[]));
-        for step in &steps {
+        self.sequence_on(label, note, None, steps)
+    }
+
+    /// A sequence from `initial` (a new state of L when `None`), each step
+    /// with `standing`: its record principal's after the step
+    /// (`ControlState::standing`). `initial` is written with `fill`, the
+    /// record whose body, under other record ids, its records of
+    /// svc-discord that aren't the file's are.
+    fn sequence_on(
+        &self,
+        label: &str,
+        note: &str,
+        initial: Option<(&ControlState, &str)>,
+        mut steps: Vec<Value>,
+    ) -> Value {
+        let mut state = initial.map_or_else(
+            || ControlState::new(&self.ctx.chain(&[])),
+            |(initial, _)| initial.clone(),
+        );
+        for step in &mut steps {
             let chain = chain_labels(step);
+            let rec = self.record(s(step, "record"));
             state = state
                 .apply(
-                    &self.record(s(step, "record")),
+                    &rec,
                     &self.ctx.chain(&chain),
                     feed_pos(step),
                     step["host_applied_seq"].as_u64().unwrap(),
                 )
                 .next;
+            step["standing"] = standing_json(&state.standing(&rec.principal().name()));
         }
-        serde_json::json!({"label": label, "note": note, "steps": steps, "state": state.to_json()})
+        // Each step's `why`, from the hand-written list: exactly the steps
+        // pending, refused or kept as evidence have one.
+        for (i, step) in steps.iter_mut().enumerate() {
+            let why = CONTROL_WHY
+                .iter()
+                .find(|(q, n, _)| *q == label && *n == i + 1)
+                .map(|(_, _, why)| *why);
+            let expect = &step["expect"];
+            let explains =
+                matches!(s(expect, "result"), "pending" | "refused") || expect["evidence"] == true;
+            assert_eq!(why.is_some(), explains, "{label} step {}: why", i + 1);
+            if let Some(why) = why {
+                step["expect"]["why"] = why.into();
+                // Each effect not in force says why too (O5).
+                for e in step["expect"]["effects"].as_array_mut().unwrap() {
+                    if matches!(e["result"].as_str(), Some("pending" | "refused")) {
+                        e["why"] = why.into();
+                    }
+                }
+            }
+        }
+        let mut v = serde_json::json!({"label": label, "note": note, "steps": steps, "state": state.to_json()});
+        if let Some((initial, fill)) = initial {
+            v["initial"] = initial.to_json();
+            v["fill"] = fill.into();
+        }
+        v
     }
+
+    /// A state of L after the file's records `first` (each read at its
+    /// position, every one counting), then `count` copies of the record
+    /// `fill`'s body under the record ids `control_rid(0x1000 + i)`, signed
+    /// by `signed_with` and read at no position, each counting: the start
+    /// of an eviction sequence, svc-discord's records full.
+    fn filled(
+        &self,
+        first: &[(&str, Option<(Feed, u64)>)],
+        fill: &str,
+        signed_with: &str,
+        count: u64,
+    ) -> ControlState {
+        let l = self.ctx.chain(&[]);
+        let counts = |state: &ControlState, rec: &ControlRecord, pos: Option<FeedPos>| {
+            let t = state.apply(rec, &l, pos, 6);
+            assert!(
+                matches!(
+                    t.applied.record_result,
+                    ApplicationResult::Applied | ApplicationResult::Duplicate
+                ),
+                "{} counts",
+                rec.record_id()
+            );
+            t.next
+        };
+        let mut state = ControlState::new(&l);
+        for (label, pos) in first {
+            let pos = pos.map(|(feed, feed_seq)| FeedPos {
+                origin: feed.0.into(),
+                feed_id: feed.1.into(),
+                feed_seq,
+            });
+            state = counts(&state, &self.record(label), pos);
+        }
+        let template = self.record(fill).body().clone();
+        for i in 0..count {
+            let mut body = template.clone();
+            body.record_id = control_rid(0x1000 + i);
+            let object =
+                build_control(&self.book.provider, &self.book.signer(signed_with), &body).unwrap();
+            state = counts(&state, &ControlRecord::from_signed(object).unwrap(), None);
+        }
+        let ids = state.part(SVC).unwrap()["records"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert_eq!(ids, MAX_RECORD_IDS, "svc-discord's records full");
+        state
+    }
+}
+
+/// Why each step of a control sequence is pending or refused, or kept as
+/// evidence (`Applied::why`, host-work-v1 §11.1), by sequence and step
+/// (from 1): written out by hand, as `expect` is. A step not listed has
+/// none; the generator checks the list against each step's `expect`.
+const CONTROL_WHY: &[(&str, usize, &str)] = &[
+    ("Q1_service_on_one_feed", 10, "after_revoke"),
+    ("Q2_removed_manager_then_resigned", 1, "removed_manager"),
+    ("Q2_removed_manager_then_resigned", 3, "removed_manager"),
+    ("Q3_pending_signer", 1, "signer_unknown"),
+    ("Q3_pending_signer", 2, "signer_unknown"),
+    ("Q4_cover_from_another_station", 3, "not_newer"),
+    ("Q4_cover_from_another_station", 4, "order"),
+    ("Q4_cover_from_another_station", 7, "order"),
+    ("Q5_feed_reset", 5, "order"),
+    ("Q6_feed_reset_on_a_new_host", 4, "order"),
+    ("Q7_host_interrupt", 1, "revoke_not_in_list"),
+    ("Q7_host_interrupt", 2, "revoke_not_applied"),
+    ("Q7_host_interrupt", 6, "not_a_revoke"),
+    ("Q7_host_interrupt", 7, "host_key_signed"),
+    ("Q8_refused_and_kept_as_evidence", 2, "collision"),
+    ("Q8_refused_and_kept_as_evidence", 3, "bad_signature"),
+    ("Q8_refused_and_kept_as_evidence", 4, "wrong_account"),
+    ("Q8_refused_and_kept_as_evidence", 5, "key_mismatch"),
+    ("Q8_refused_and_kept_as_evidence", 6, "signer_not_allowed"),
+    ("Q8_refused_and_kept_as_evidence", 7, "not_a_service"),
+    ("Q8_refused_and_kept_as_evidence", 8, "principal_unknown"),
+    (
+        "Q10_hold_from_a_station_that_lost_the_takeover",
+        2,
+        "not_newer",
+    ),
+    ("Q10_hold_from_a_station_that_lost_the_takeover", 4, "order"),
+    (
+        "Q10_hold_from_a_station_that_lost_the_takeover",
+        5,
+        "not_after_hold",
+    ),
+    ("Q11_reset_cover_not_newer", 4, "order"),
+    ("Q11_reset_cover_not_newer", 5, "not_after_hold"),
+    ("Q12_service_interrupt_waits", 1, "not_revoked"),
+    ("Q13_out_of_order_in_one_feed", 5, "order"),
+    ("Q14_hold_with_no_coverage", 2, "order"),
+    ("Q15_old_cover_replayed_after_a_move", 5, "order"),
+    ("Q16_issued_at_tie", 2, "not_newer"),
+    ("Q18_colliding_record_ids", 4, "collision"),
+    ("Q18_colliding_record_ids", 5, "collision"),
+    ("Q18_colliding_record_ids", 6, "collision"),
+    ("Q18_colliding_record_ids", 7, "collision"),
+    ("Q18_colliding_record_ids", 8, "collision"),
+    (
+        "Q19_evicted_records_replayed_are_refused",
+        3,
+        "possible_replay",
+    ),
+    (
+        "Q19_evicted_records_replayed_are_refused",
+        6,
+        "possible_replay",
+    ),
+    ("Q20_evicted_revoke_still_duplicate", 5, "after_revoke"),
+    ("Q21_release_issued_before_a_newer_hold", 3, "order"),
+    (
+        "Q21_release_issued_before_a_newer_hold",
+        6,
+        "not_after_hold",
+    ),
+    (
+        "Q21_release_issued_before_a_newer_hold",
+        7,
+        "not_after_hold",
+    ),
+    ("Q22_release_at_the_holds_time", 3, "not_after_hold"),
+    ("Q23_newer_hold_while_held", 4, "not_after_hold"),
+    (
+        "Q24_holds_from_another_feed_no_position_or_a_colliding_id",
+        5,
+        "not_after_hold",
+    ),
+    (
+        "Q24_holds_from_another_feed_no_position_or_a_colliding_id",
+        7,
+        "not_after_hold",
+    ),
+    (
+        "Q24_holds_from_another_feed_no_position_or_a_colliding_id",
+        8,
+        "collision",
+    ),
+    (
+        "Q24_holds_from_another_feed_no_position_or_a_colliding_id",
+        9,
+        "not_after_hold",
+    ),
+    (
+        "Q25_hold_time_kept_across_restart_and_eviction",
+        1,
+        "not_after_hold",
+    ),
+    (
+        "Q25_hold_time_kept_across_restart_and_eviction",
+        3,
+        "not_after_hold",
+    ),
+    (
+        "Q26_hold_time_kept_across_reset_and_coverage_change",
+        4,
+        "not_after_hold",
+    ),
+    (
+        "Q26_hold_time_kept_across_reset_and_coverage_change",
+        6,
+        "not_after_hold",
+    ),
+    ("Q27_no_release_after_a_revoke", 4, "after_revoke"),
+    ("Q27_no_release_after_a_revoke", 5, "after_revoke"),
+];
+
+/// What a principal has in force as the vectors write it
+/// (`ControlState::standing`): `held`, `interrupted` (sorted), and
+/// `revoked`, `coverage` `{origin, feed_id}` when there are.
+fn standing_json(standing: &Standing) -> Value {
+    let mut v = serde_json::json!({"held": standing.held, "interrupted": standing.interrupted});
+    if let Some(by) = &standing.revoked {
+        v["revoked"] = by.as_str().into();
+    }
+    if let Some(c) = &standing.coverage {
+        v["coverage"] = serde_json::json!({"origin": c.origin, "feed_id": c.feed_id});
+    }
+    v
 }
 
 /// A step's feed position.
@@ -5410,6 +5720,96 @@ fn control_vectors(book: &Book) -> Value {
         vec![(l, own_())],
     );
 
+    // ---- records issued after the evicted floor (decision 19, ruling T4a)
+    for (n, label, action, note) in [
+        (
+            80,
+            "F1_hold",
+            C::Hold,
+            "a pause issued after every record the bound evicted: it applies",
+        ),
+        (
+            81,
+            "F2_hold",
+            C::Hold,
+            "another pause issued after them, while one is in force: a duplicate",
+        ),
+        (
+            82,
+            "F3_release",
+            C::Release,
+            "a resume issued after them: it applies",
+        ),
+    ] {
+        let body = g.svc(n, SVC, action, FEED_A, "owner");
+        g.push(label, note, "svc-discord", &body, vec![(l, own_())]);
+    }
+
+    // ---- releases by the time they were signed (O1, Astation's review of
+    // PR 2): a release lifts only holds issued before it
+    for (n, label, feed, issued_at, note) in [
+        (
+            90,
+            "W1_release_withheld",
+            FEED_A,
+            control_issued(61) - 500,
+            "a resume issued half a second before S9_hold: a carrier that withheld it serves it after that hold",
+        ),
+        (
+            91,
+            "W2_release_refused_before",
+            FEED_A,
+            control_issued(61) - 250,
+            "a resume issued a quarter second before S9_hold, refused once (out of feed order) and served again after it",
+        ),
+        (
+            92,
+            "W3_release_newer",
+            FEED_A,
+            control_issued(92),
+            "a resume issued after every hold of the file: it lifts them",
+        ),
+        (
+            93,
+            "W4_release_tie",
+            FEED_A,
+            control_issued(2),
+            "a resume issued in the same millisecond as S2_hold",
+        ),
+        (
+            94,
+            "W5_release_after_tie",
+            FEED_A,
+            control_issued(2) + 1,
+            "a resume issued one millisecond after S2_hold",
+        ),
+        (
+            95,
+            "W6_release_before_b4",
+            FEED_A,
+            control_issued(12) - 500,
+            "a resume issued half a second before B4_hold",
+        ),
+        (
+            96,
+            "W7_release_before_x2",
+            FEED_A,
+            control_issued(68) - 500,
+            "a resume issued half a second before X2_hold_under_s3_id",
+        ),
+        (
+            97,
+            "W8_b_release_newer",
+            FEED_B,
+            control_issued(97),
+            "station-b's resume issued after every hold of the file",
+        ),
+    ] {
+        let mut body = g.svc(n, SVC, C::Release, feed, "owner");
+        body.issued_at = issued_at;
+        g.push(label, note, "svc-discord", &body, vec![(l, own_())]);
+    }
+
     // ---- sequences: one host's control state, step by step
     let a = |n| Some((FEED_A, n));
     let b = |n| Some((FEED_B, n));
@@ -5560,25 +5960,27 @@ fn control_vectors(book: &Book) -> Value {
         ),
         g.sequence(
             "Q10_hold_from_a_station_that_lost_the_takeover",
-            "a stop always wins: the hold of a Station whose cover wasn't newer applies; its release is refused, the covering feed's release lifts the hold, and the hold replayed is a duplicate",
+            "a stop always wins: the hold of a Station whose cover wasn't newer applies; its release is refused; the covering feed's release issued before that hold leaves it (amended for O1), the covering feed's release issued after it lifts it, and the hold replayed is a duplicate",
             vec![
                 step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
                 step("B1_cover_stale", b(1), applied("refused", &[("cover", "refused")], none.clone(), false)),
                 step("B4_hold", b(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
                 step("B5_release", b(3), applied("refused", &[("release", "refused")], none.clone(), false)),
-                step("S3_release", a(2), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+                step("S3_release", a(2), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W3_release_newer", a(3), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
                 step("B4_hold", b(2), applied("duplicate", &[("hold", "duplicate")], none.clone(), false)),
             ],
         ),
         g.sequence(
             "Q11_reset_cover_not_newer",
-            "a reset whose snapshot cover isn't newer leaves the coverage on the old feed: the new feed's hold applies, its release is refused, and the old feed's release lifts the hold",
+            "a reset whose snapshot cover isn't newer leaves the coverage on the old feed: the new feed's hold applies, its release is refused, the old feed's release issued before that hold leaves it (amended for O1), and the old feed's release issued after it lifts it",
             vec![
                 step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
                 step("A2_cover_not_newer", a2(1), applied("duplicate", &[("cover", "duplicate")], none.clone(), false)),
                 step("A2_hold", a2(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
                 step("A2_release", a2(3), applied("refused", &[("release", "refused")], none.clone(), false)),
-                step("S3_release", a(2), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+                step("S3_release", a(2), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W3_release_newer", a(3), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
             ],
         ),
         g.sequence(
@@ -5688,6 +6090,142 @@ fn control_vectors(book: &Book) -> Value {
                 step("S1_cover", a(1), applied("duplicate", &[("cover", "duplicate")], none.clone(), false)),
             ],
         ),
+        g.sequence_on(
+            "Q19_evicted_records_replayed_are_refused",
+            "a principal keeps at most 256 counted record ids, oldest first, never evicting the coverage's cover, and its evicted floor is the newest issued_at evicted (decision 19, rulings T4a and T4d, agreed with Astation on 2026-11-13, #120 comment 6848326392): from svc-discord covered, held, released and full (S1_cover, S2_hold, S3_release, then 253 copies of S3_release), F1_hold holds and evicts S2_hold, F2_hold evicts S3_release; S3_release re-served at a fresh position of the covering feed is a possible replay, refused and kept as evidence, so the hold stays (feed_seq isn't signed: a carrier that controls positions could otherwise lift it); F3_release, issued after the floor, lifts it; S2_hold replayed holds again, since the floor guards only covers and releases (a stop always wins, and a hold grants nothing); B1_cover_stale, issued before the floor, is refused as a possible replay",
+            Some((
+                &g.filled(
+                    &[("S1_cover", a(1)), ("S2_hold", a(2)), ("S3_release", a(3))],
+                    "S3_release",
+                    "svc-discord",
+                    253,
+                ),
+                "S3_release",
+            )),
+            vec![
+                step("F1_hold", a(4), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("F2_hold", a(5), applied("duplicate", &[("hold", "duplicate")], none.clone(), false)),
+                step("S3_release", a(6), applied("refused", &[("release", "refused")], none.clone(), true)),
+                step("F3_release", a(7), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+                step("S2_hold", a(8), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("B1_cover_stale", b(1), applied("refused", &[("cover", "refused")], none.clone(), true)),
+            ],
+        ),
+        g.sequence_on(
+            "Q20_evicted_revoke_still_duplicate",
+            "the record that revoked a principal is never evicted; another revoke evicted and replayed is verified again and is still a duplicate, since no evicted floor applies to a revoke or an interrupt (a replay of one is a duplicate, a new one a stop): from svc-discord revoked and full (S4_revoke, M1_revoke, then 254 copies of S4_revoke), S5_revoke_interrupt adds the interrupt and evicts M1_revoke, which comes back a duplicate, as S4_revoke (pinned) and a later interrupt do; a hold issued before the floor is ignored by rule 7 (refused, no evidence), not taken for a replay",
+            Some((
+                &g.filled(&[("S4_revoke", a(4)), ("M1_revoke", a(5))], "S4_revoke", "svc-discord", 254),
+                "S4_revoke",
+            )),
+            vec![
+                step(
+                    "S5_revoke_interrupt",
+                    a(6),
+                    applied(
+                        "applied",
+                        &[("revocation", "duplicate"), ("interrupt", "applied")],
+                        vec![act_interrupt(SVC, &control_rid(4))],
+                        false,
+                    ),
+                ),
+                step("M1_revoke", a(7), applied("duplicate", &[("revocation", "duplicate")], none.clone(), false)),
+                step("S4_revoke", a(4), applied("duplicate", &[("revocation", "duplicate")], none.clone(), false)),
+                step("M2_interrupt", a(8), applied("duplicate", &[("interrupt", "duplicate")], none.clone(), false)),
+                step("S7_hold_after_revoke", a(9), applied("refused", &[("hold", "refused")], none.clone(), false)),
+            ],
+        ),
+        // O1 (Astation's review of PR 2, #120 comment 6848326392): a
+        // release lifts only holds issued before it.
+        g.sequence(
+            "Q21_release_issued_before_a_newer_hold",
+            "a release lifts a hold only when issued strictly after every hold verified for the principal (O1): a release a carrier withheld, and one refused before (out of feed order), each served in feed order after a newer hold, are refused and leave the hold; neither takes a position in the feed's order; a release issued after the hold lifts it",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("W2_release_refused_before", a(2), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("S3_release", a(3), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+                step("S9_hold", a(4), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("W1_release_withheld", a(5), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W2_release_refused_before", a(6), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W3_release_newer", a(7), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q22_release_at_the_holds_time",
+            "the tie rule is conservative: a release issued in the same millisecond as the hold leaves it; one issued a millisecond later lifts it",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("W4_release_tie", a(3), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W5_release_after_tie", a(4), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q23_newer_hold_while_held",
+            "a newer hold while held is a duplicate, yet its time is kept: a release issued after the hold in force but before the newer one leaves the principal held",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("S9_hold", a(3), applied("duplicate", &[("hold", "duplicate")], none.clone(), false)),
+                step("S3_release", a(4), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W3_release_newer", a(5), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q24_holds_from_another_feed_no_position_or_a_colliding_id",
+            "every verified hold's time counts, wherever it was read: station-b's hold (a feed that doesn't cover), a hold over a channel (no position) and a hold under a counted record id (evidence, applied as a stop); a release of the covering feed issued before each is refused, one issued after them all lifts the hold",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("S3_release", a(3), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+                step("B4_hold", b(1), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("W6_release_before_b4", a(4), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("S9_hold", None, applied("duplicate", &[("hold", "duplicate")], none.clone(), false)),
+                step("W1_release_withheld", a(4), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("X2_hold_under_s3_id", a(5), applied("duplicate", &[("hold", "duplicate")], none.clone(), true)),
+                step("W7_release_before_x2", a(6), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W3_release_newer", a(6), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence_on(
+            "Q25_hold_time_kept_across_restart_and_eviction",
+            "the hold's time is part of the stored state (hold_issued_at) and no restart or eviction erases it: from svc-discord covered, held and full (S1_cover, S2_hold, then 254 copies of S9_hold), read as a host reads its stored state, S3_release is refused (issued before the copies' hold); F1_hold evicts S2_hold, so the evicted floor is S2_hold's time, below W1_release_withheld's: the floor can't stop that release, the hold's time does; W3_release_newer lifts the hold",
+            Some((
+                &g.filled(&[("S1_cover", a(1)), ("S2_hold", a(2))], "S9_hold", "svc-discord", 254),
+                "S9_hold",
+            )),
+            vec![
+                step("S3_release", a(3), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("F1_hold", a(4), applied("duplicate", &[("hold", "duplicate")], none.clone(), false)),
+                step("W1_release_withheld", a(5), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W3_release_newer", a(5), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q26_hold_time_kept_across_reset_and_coverage_change",
+            "no reset or coverage change erases the hold's time: after a reset (A2_cover moves the order to the new feed) the new feed's release issued before the hold is refused; after another Station takes the coverage over, its release issued before the hold is refused too; its release issued after the hold lifts it",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("S9_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("A2_cover", a2(1), applied("duplicate", &[("cover", "duplicate")], vec![act_cover(FEED_A2)], false)),
+                step("A2_release", a2(2), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("T2_cover_tie", b(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_B)], false)),
+                step("B5_release", b(2), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("W8_b_release_newer", b(3), applied("applied", &[("release", "applied")], vec![act("release", SVC)], false)),
+            ],
+        ),
+        g.sequence(
+            "Q27_no_release_after_a_revoke",
+            "a revoke stays final: no release, however new, lifts the hold, and the hold stays in force",
+            vec![
+                step("S1_cover", a(1), applied("applied", &[("cover", "applied")], vec![act_cover(FEED_A)], false)),
+                step("S2_hold", a(2), applied("applied", &[("hold", "applied")], vec![act("hold", SVC)], false)),
+                step("S4_revoke", a(3), applied("applied", &[("revocation", "applied")], vec![act("revoke", SVC)], false)),
+                step("W3_release_newer", a(4), applied("refused", &[("release", "refused")], none.clone(), false)),
+                step("S3_release", a(5), applied("refused", &[("release", "refused")], none.clone(), false)),
+            ],
+        ),
     ];
 
     let svc_key = book.signer_public("svc-discord");
@@ -5695,7 +6233,7 @@ fn control_vectors(book: &Book) -> Value {
         "name": "r9-vectors-host-work-control",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (the records that counted kept by principal, then record_id). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused).",
+        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part names its device list, account_id and genesis_hash, and its `records` are the [record_id, digest, issued_at] triples that counted, oldest first; `order` holds one feed per Station origin). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). Its `expect.why` is Applied::why's code (host-work-v1 §11.1: the verifier's pending or refusal reason, or list_frozen, not_revoked, revoke_not_applied, order, after_revoke, collision, not_newer, possible_replay, not_after_hold), present exactly when the record is pending or refused or kept as evidence. A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover, and raises the part's `evicted_floor` to the newest issued_at evicted; a cover or release of a principal not revoked, under an id not counted and issued no later than the floor, is refused as a possible replay and kept as evidence; a hold, revoke or interrupt never is (decision 19, rulings T4a and T4d, agreed with Astation on 2026-11-13, #120 comment 6848326392). A service's part keeps `hold_issued_at`, the newest issued_at of every hold verified while it wasn't revoked (one that held or found it held, read out of order, from another feed, at no position or under a counted id), never lowered or cleared; a release taken in feed order while held lifts the hold only when issued strictly after it, else it is refused with why not_after_hold (no evidence) and takes no position in the feed's order (O1, requested in Astation's review of PR 2, #120 comment 6848326392; for Astation's sign-off). Each effect pending or refused in `expect` carries the step's why (O5, for Astation's sign-off).",
         "account_id": "acct-test-1",
         "genesis_hash": genesis_hash().to_hex(),
         "stations": {
@@ -5740,7 +6278,16 @@ fn applied_of(a: &ControlApplied) -> Value {
         .iter()
         .map(|e| (e.effect.code(), e.result.code()))
         .collect();
-    applied(a.record_result.code(), &effects, actions, a.evidence)
+    let mut v = applied(a.record_result.code(), &effects, actions, a.evidence);
+    if let Some(why) = a.why {
+        v["why"] = why.code().into();
+    }
+    for (i, e) in a.effects.iter().enumerate() {
+        if let Some(why) = &e.why {
+            v["effects"][i]["why"] = why.code().into();
+        }
+    }
+    v
 }
 
 /// A verdict as the vectors write it.
@@ -5911,24 +6458,49 @@ fn host_work_control() {
         sequences, made["sequences"],
         "sequences: as control_vectors makes them"
     );
+    let mut evicting = 0;
     for q in sequences.as_array().unwrap() {
         let label = s(q, "label");
-        let mut state = ControlState::new(&l);
+        // From `initial` (read as a host reads its stored state), else new.
+        let mut state = match q.get("initial") {
+            Some(initial) => {
+                let state = ControlState::from_json(&strict(initial).into_value()).unwrap();
+                assert_eq!(state.to_json(), *initial, "{label}: initial");
+                let full = initial["principals"][SVC]["records"].as_array().unwrap();
+                assert_eq!(full.len(), MAX_RECORD_IDS, "{label}: svc-discord full");
+                assert!(q["fill"].is_string(), "{label}: fill");
+                evicting += 1;
+                state
+            }
+            None => ControlState::new(&l),
+        };
         for (i, step) in q["steps"].as_array().unwrap().iter().enumerate() {
             let chain = chain_labels(step);
-            let Transition { applied, next } = state.apply(
-                &by_label[s(step, "record")],
+            let rec = &by_label[s(step, "record")];
+            let principal = rec.principal().name();
+            let t = state.apply(
+                rec,
                 &ctx.chain(&chain),
                 feed_pos(step),
                 step["host_applied_seq"].as_u64().unwrap(),
             );
             assert_eq!(
-                applied_of(&applied),
+                applied_of(&t.applied),
                 step["expect"],
                 "{label} step {}",
                 i + 1
             );
-            state = next;
+            assert_eq!(
+                standing_json(&t.next.standing(&principal)),
+                step["standing"],
+                "{label} step {}: standing",
+                i + 1
+            );
+            // Touched: the record's principal exactly when its part changed.
+            let changed = state.part(&principal) != t.next.part(&principal);
+            let touched = if changed { vec![principal] } else { vec![] };
+            assert_eq!(t.touched(), touched, "{label} step {}: touched", i + 1);
+            state = t.next;
         }
         assert_eq!(state.to_json(), q["state"], "{label}: state");
         let text = jcs(&q["state"]).unwrap();
@@ -5939,10 +6511,31 @@ fn host_work_control() {
             text,
             "{label}: to_json(from_json) is the same text"
         );
+        // Split into its parts and recombined, the same state.
+        let parts: Vec<(String, Value)> = state
+            .principals()
+            .into_iter()
+            .map(|p| {
+                let part = state.part(&p).unwrap();
+                assert_eq!(part, q["state"]["principals"][&p], "{label}: {p}'s part");
+                (p, part)
+            })
+            .collect();
+        assert_eq!(
+            parts.len(),
+            q["state"]["principals"].as_object().unwrap().len()
+        );
+        let loaded = ControlState::from_parts(&l, parts).unwrap();
+        assert_eq!(loaded.state, state, "{label}: from_parts");
+        assert!(
+            loaded.foreign.is_empty(),
+            "{label}: no part of another list"
+        );
         run.pass(format!(
-            "{label}: every step's results, the state and its round trip"
+            "{label}: every step's results, standing and touched, the state, its round trip and its parts"
         ));
     }
+    assert_eq!(evicting, 3, "the three eviction sequences");
     run.finish();
 }
 
@@ -6351,6 +6944,2180 @@ fn delegated_wire() {
     );
 }
 
+// ------------------------------------------- the Station calls' byte goldens
+//
+// `r9-vectors-station-calls` (delegated host-work design I.5.8; host-work-v1
+// §11.4): the six Station calls and the three refusals as the shared core's
+// own builders write them, each as its exact text, with its decoded fields,
+// and the invalid variants a reader refuses, each with its code. Custom
+// Stations and Astation's `:8080` proxy read these as the known answers.
+// `write_station_calls_vectors` (ignored) writes the file from
+// `station_call_vectors`; `station_calls_build_byte_for_byte` checks the
+// builders reproduce every `wire` from its `fields` (and that the file is
+// what the generator makes now), `station_calls_decode_to_their_fields` that
+// the readers give those fields back and judge every page record as the file
+// says, and `station_calls_refuse_the_invalid_variants` that each invalid
+// text is refused with its code. `scripts/check-r9-vectors.py` checks the
+// texts independently: strict I-JSON, the compact form in RFC 8785 key
+// order, and a reader written from the spec for every case.
+
+use atem_client::control::{
+    AckResult, ApplicationResult, CallRefused, ControlAck, ControlSync, ControlSyncResult,
+    EffectKind, EffectResult, EffectWhy, EntryRef, FeedEntry, FeedHead, Heads, MAX_WHY_BYTES,
+    MembershipFetch, MembershipFetchResult, RefusalCode, RefusedCall, RelayError, SyncMismatch,
+    ToHost, ToStation, Why,
+};
+
+const STATION_CALLS: &str = "r9-vectors-station-calls";
+
+/// R9.9's bound for every relay message, in bytes as sent.
+const RELAY_MAX_BYTES: usize = 256 * 1024;
+
+/// The file, with its name, kind and requirement checked.
+fn station_calls_file() -> Run {
+    Run::new(STATION_CALLS)
+}
+
+/// A case's text: `wire` as written, or built from its `wire_fill` recipe
+/// (`prefix`, `count` times `fill`, `suffix`).
+fn call_wire(case: &Value) -> String {
+    if let Some(text) = case.get("wire") {
+        return text.as_str().unwrap().to_owned();
+    }
+    let fill = &case["wire_fill"];
+    let count = fill["count"].as_u64().unwrap() as usize;
+    format!(
+        "{}{}{}",
+        s(fill, "prefix"),
+        s(fill, "fill").repeat(count),
+        s(fill, "suffix")
+    )
+}
+
+fn call_head(value: &Value) -> Head {
+    Head {
+        seq: value["seq"].as_u64().unwrap(),
+        hash: Hash32::from_hex(s(value, "hash")).unwrap(),
+    }
+}
+
+fn call_effects(value: &Value) -> Vec<EffectResult> {
+    value
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| EffectResult {
+            effect: EffectKind::from_code(s(e, "effect")).unwrap(),
+            result: ApplicationResult::from_code(s(e, "result")).unwrap(),
+            why: e
+                .get("why")
+                .map(|why| EffectWhy::read(why.as_str().unwrap()).unwrap()),
+        })
+        .collect()
+}
+
+fn call_ack(f: &Value) -> ControlAck {
+    ControlAck {
+        account_id: s(f, "account_id").into(),
+        genesis_hash: Hash32::from_hex(s(f, "genesis_hash")).unwrap(),
+        host_id: s(f, "host_id").into(),
+        host_trust_gen: f["host_trust_gen"].as_u64().unwrap(),
+        origin: s(f, "origin").into(),
+        feed_id: s(f, "feed_id").into(),
+        cursor: f["cursor"].as_u64().unwrap(),
+        results: f["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| match r.get("entry") {
+                Some(entry) => AckResult::Entry {
+                    entry: EntryRef {
+                        seq: entry["seq"].as_u64().unwrap(),
+                        entry_hash: Hash32::from_hex(s(entry, "entry_hash")).unwrap(),
+                    },
+                    applied_seq: r["applied_seq"].as_u64().unwrap(),
+                    effects: call_effects(&r["effects"]),
+                },
+                None => AckResult::Record {
+                    record_id: s(r, "record_id").into(),
+                    effects: call_effects(&r["effects"]),
+                },
+            })
+            .collect(),
+    }
+}
+
+/// A case's message as the core's builders write it, from its `fields`
+/// alone. A page record the control parser refuses can't be given to
+/// `FeedEntry::new` (a Station serves only what it stored): its slot is
+/// built with a record that parses and the record the case names is put in
+/// its place, as a Station's fault would.
+fn build_call(case: &Value) -> String {
+    let f = &case["fields"];
+    let message = match s(case, "op") {
+        "control_sync" => ControlSync {
+            request_id: s(f, "request_id").into(),
+            origin: s(f, "origin").into(),
+            feed_id: f.get("feed_id").map(|v| v.as_str().unwrap().to_owned()),
+            after: f["after"].as_u64().unwrap(),
+        }
+        .to_json(),
+        "control_sync_result" => {
+            let control = load("r9-vectors-host-work-control");
+            let stand_in =
+                ControlRecord::parse(control["records"][0]["record"].to_string().as_bytes())
+                    .unwrap();
+            let records = f["records"].as_array().unwrap();
+            let page = ControlSyncResult {
+                request_id: s(f, "request_id").into(),
+                origin: s(f, "origin").into(),
+                feed_id: s(f, "feed_id").into(),
+                after: f["after"].as_u64().unwrap(),
+                head: f["head"].as_u64().unwrap(),
+                station_time: f["station_time"].as_u64().unwrap(),
+                records: records
+                    .iter()
+                    .map(|r| {
+                        let record = ControlRecord::parse(r["record"].to_string().as_bytes())
+                            .unwrap_or_else(|_| stand_in.clone());
+                        FeedEntry::new(r["feed_seq"].as_u64().unwrap(), &record)
+                    })
+                    .collect(),
+            };
+            let mut unparsed = false;
+            let built = page.to_json().map(|mut value| {
+                for (slot, r) in records.iter().enumerate() {
+                    if ControlRecord::parse(r["record"].to_string().as_bytes()).is_err() {
+                        value["records"][slot]["record"] = r["record"].clone();
+                        unparsed = true;
+                    }
+                }
+                value
+            });
+            // Such a page is marked in its case, and only such a page.
+            assert_eq!(
+                case.get("hand_assembled") == Some(&serde_json::json!(true)),
+                unparsed,
+                "{}: hand_assembled",
+                s(case, "name")
+            );
+            built
+        }
+        "heads" => Heads {
+            feeds: f["feeds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|feed| FeedHead {
+                    origin: s(feed, "origin").into(),
+                    feed_id: s(feed, "feed_id").into(),
+                    head: feed["head"].as_u64().unwrap(),
+                    station_time: feed["station_time"].as_u64().unwrap(),
+                })
+                .collect(),
+            membership: call_head(&f["membership"]),
+        }
+        .to_json(),
+        "control_ack" => call_ack(f).to_json(),
+        "membership_fetch" => MembershipFetch {
+            after: f["after"].as_u64().unwrap(),
+        }
+        .to_json(),
+        "membership_fetch_result" => MembershipFetchResult {
+            head: call_head(&f["head"]),
+            entries: f["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| SignedObject::from_strict(&strict(e)).unwrap())
+                .collect(),
+        }
+        .to_json(),
+        op => {
+            let call = [
+                RefusedCall::ControlSync,
+                RefusedCall::MembershipFetch,
+                RefusedCall::ControlAck,
+            ]
+            .into_iter()
+            .find(|c| c.op() == op)
+            .unwrap_or_else(|| panic!("no builder for {op}"));
+            CallRefused {
+                call,
+                code: RefusalCode::from_code(s(f, "code")).unwrap(),
+            }
+            .to_json()
+        }
+    };
+    message.unwrap().to_string()
+}
+
+fn describe_effects(effects: &[EffectResult]) -> Value {
+    Value::Array(
+        effects
+            .iter()
+            .map(|e| {
+                let mut v =
+                    serde_json::json!({"effect": e.effect.code(), "result": e.result.code()});
+                if let Some(why) = &e.why {
+                    v["why"] = why.code().into();
+                }
+                v
+            })
+            .collect(),
+    )
+}
+
+/// What a host's call decodes to, as the file's `fields` write it.
+fn describe_to_station(message: &ToStation) -> Value {
+    use serde_json::json;
+    match message {
+        ToStation::ControlSync(sync) => {
+            let mut f =
+                json!({"request_id": sync.request_id, "origin": sync.origin, "after": sync.after});
+            if let Some(feed_id) = &sync.feed_id {
+                f["feed_id"] = json!(feed_id);
+            }
+            f
+        }
+        ToStation::ControlAck(ack) => json!({
+            "account_id": ack.account_id,
+            "genesis_hash": ack.genesis_hash.to_hex(),
+            "host_id": ack.host_id,
+            "host_trust_gen": ack.host_trust_gen,
+            "origin": ack.origin,
+            "feed_id": ack.feed_id,
+            "cursor": ack.cursor,
+            "results": ack.results.iter().map(|r| match r {
+                AckResult::Record { record_id, effects } =>
+                    json!({"record_id": record_id, "effects": describe_effects(effects)}),
+                AckResult::Entry { entry, applied_seq, effects } => json!({
+                    "entry": {"seq": entry.seq, "entry_hash": entry.entry_hash.to_hex()},
+                    "applied_seq": applied_seq,
+                    "effects": describe_effects(effects),
+                }),
+            }).collect::<Vec<_>>(),
+        }),
+        ToStation::MembershipFetch(fetch) => json!({"after": fetch.after}),
+    }
+}
+
+/// What a Station's message decodes to, as the file's `fields` write it.
+fn describe_to_host(message: &ToHost) -> Value {
+    use serde_json::json;
+    match message {
+        ToHost::ControlSyncResult(page) => json!({
+            "request_id": page.request_id,
+            "origin": page.origin,
+            "feed_id": page.feed_id,
+            "after": page.after,
+            "head": page.head,
+            "station_time": page.station_time,
+            "records": page.records.iter()
+                .map(|e| json!({"feed_seq": e.feed_seq, "record": e.raw()}))
+                .collect::<Vec<_>>(),
+        }),
+        ToHost::Heads(heads) => json!({
+            "feeds": heads.feeds.iter().map(|f| json!({
+                "origin": f.origin, "feed_id": f.feed_id, "head": f.head,
+                "station_time": f.station_time,
+            })).collect::<Vec<_>>(),
+            "membership": heads.membership.to_json(),
+        }),
+        ToHost::MembershipFetchResult(result) => json!({
+            "head": result.head.to_json(),
+            "entries": result.entries.iter().map(SignedObject::to_json).collect::<Vec<_>>(),
+        }),
+        ToHost::ControlSyncRefused(code)
+        | ToHost::MembershipFetchRefused(code)
+        | ToHost::ControlAckRefused(code) => json!({"code": code.code()}),
+    }
+}
+
+/// The control parser's verdict on each record of a page, parallel to its
+/// records (`judged` in the file): `parses` with the `record_id`, or not
+/// with the parse's code.
+fn judged_records(page: &ControlSyncResult) -> Value {
+    use serde_json::json;
+    Value::Array(
+        page.records
+            .iter()
+            .map(|entry| match entry.parse_record() {
+                Ok(record) => json!({"feed_seq": entry.feed_seq, "parses": true,
+                    "record_id": record.body().record_id}),
+                Err(e) => json!({"feed_seq": entry.feed_seq, "parses": false, "error": e.code()}),
+            })
+            .collect(),
+    )
+}
+
+/// The reader `direction` names: `to_station` reads a host's calls,
+/// `to_host` a Station's messages.
+fn read_call(direction: &str, bytes: &[u8]) -> Result<(Value, Option<Value>), RelayError> {
+    match direction {
+        "to_station" => ToStation::decode(bytes).map(|m| (describe_to_station(&m), None)),
+        "to_host" => ToHost::decode(bytes).map(|m| {
+            let judged = match &m {
+                ToHost::ControlSyncResult(page) => Some(judged_records(page)),
+                _ => None,
+            };
+            (describe_to_host(&m), judged)
+        }),
+        other => panic!("no reader {other}"),
+    }
+}
+
+/// The message's own type's reader, for an `op` it reads.
+fn read_typed(op: &str, bytes: &[u8]) -> Result<(), RelayError> {
+    match op {
+        "control_sync" => ControlSync::decode(bytes).map(drop),
+        "control_sync_result" => ControlSyncResult::decode(bytes).map(drop),
+        "heads" => Heads::decode(bytes).map(drop),
+        "control_ack" => ControlAck::decode(bytes).map(drop),
+        "membership_fetch" => MembershipFetch::decode(bytes).map(drop),
+        "membership_fetch_result" => MembershipFetchResult::decode(bytes).map(drop),
+        refused => CallRefused::decode(bytes).map(|r| assert_eq!(r.call.op(), refused)),
+    }
+}
+
+const STATION_CALL_OPS: [&str; 9] = [
+    "control_sync",
+    "control_sync_result",
+    "heads",
+    "control_ack",
+    "membership_fetch",
+    "membership_fetch_result",
+    "control_sync_refused",
+    "membership_fetch_refused",
+    "control_ack_refused",
+];
+
+/// Every valid message, byte for byte from its fields.
+#[test]
+fn station_calls_build_byte_for_byte() {
+    let mut run = station_calls_file();
+    assert_eq!(run.get("max_message_bytes"), RELAY_MAX_BYTES);
+    run.get("why_codes");
+    run.get("invalid");
+    run.get("matching");
+    for case in run.get("at_the_bound").as_array().unwrap() {
+        let name = s(case, "name");
+        assert_eq!(
+            call_wire(case).len(),
+            RELAY_MAX_BYTES,
+            "{name}: exactly the bound"
+        );
+        assert_eq!(case["wire_fill"]["bytes"], RELAY_MAX_BYTES, "{name}");
+        run.pass(format!("{name}: exactly 262,144 bytes"));
+    }
+    let calls = run.get("calls");
+    let mut ops = BTreeSet::new();
+    for case in calls.as_array().unwrap() {
+        let name = s(case, "name");
+        let wire = s(case, "wire");
+        assert_eq!(build_call(case), wire, "{name}");
+        assert!(wire.len() <= RELAY_MAX_BYTES, "{name}: within the bound");
+        ops.insert(s(case, "op").to_owned());
+        run.pass(format!("{name}: built byte for byte"));
+    }
+    assert_eq!(
+        ops,
+        STATION_CALL_OPS.iter().map(|op| op.to_string()).collect(),
+        "every call and every refusal has a golden"
+    );
+    // The fixture is the crate's own output.
+    assert_eq!(
+        station_call_vectors(),
+        run.file.clone(),
+        "regenerate with write_station_calls_vectors"
+    );
+    run.finish();
+}
+
+/// Every valid message, read by its side's reader, gives back its fields
+/// (and the control parser's verdict on each page record); the other side's
+/// reader refuses it as another message.
+#[test]
+fn station_calls_decode_to_their_fields() {
+    let mut run = station_calls_file();
+    run.get("max_message_bytes");
+    run.get("why_codes");
+    run.get("invalid");
+    run.get("matching");
+    // A text of exactly the bound is read (the same bound for every call
+    // that can carry a large page), and gives back what `accepts` says.
+    for case in run.get("at_the_bound").as_array().unwrap() {
+        let name = s(case, "name");
+        let wire = call_wire(case);
+        assert_eq!(wire.len(), RELAY_MAX_BYTES, "{name}");
+        let (fields, judged) = read_call(s(case, "direction"), wire.as_bytes()).unwrap();
+        let accepts = &case["accepts"];
+        assert_eq!(fields["head"], accepts["head"], "{name}: head");
+        let held = fields.get("records").or_else(|| fields.get("entries"));
+        let key = if fields.get("records").is_some() {
+            "records"
+        } else {
+            "entries"
+        };
+        assert_eq!(
+            held.unwrap().as_array().unwrap().len() as u64,
+            accepts[key].as_u64().unwrap(),
+            "{name}: {key}"
+        );
+        let parses = judged.map(|j| {
+            Value::Array(
+                j.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v["parses"].clone())
+                    .collect(),
+            )
+        });
+        assert_eq!(
+            parses.as_ref(),
+            accepts.get("records_parse"),
+            "{name}: records"
+        );
+        read_typed(s(case, "op"), wire.as_bytes()).unwrap();
+        let other = read_call("to_station", wire.as_bytes()).unwrap_err();
+        assert_eq!(
+            other.code(),
+            "wrong_message",
+            "{name}: read by the other side"
+        );
+        run.pass(format!("{name}: read"));
+    }
+    let calls = run.get("calls");
+    for case in calls.as_array().unwrap() {
+        let name = s(case, "name");
+        let wire = s(case, "wire");
+        let direction = s(case, "direction");
+        let (fields, judged) = read_call(direction, wire.as_bytes()).unwrap();
+        assert_eq!(fields, case["fields"], "{name}: decoded fields");
+        assert_eq!(
+            judged.as_ref(),
+            case.get("judged"),
+            "{name}: judged records"
+        );
+        read_typed(s(case, "op"), wire.as_bytes()).unwrap();
+        // The compact text in key order: parsed and written again, the same.
+        let parsed: Value = serde_json::from_str(wire).unwrap();
+        assert_eq!(parsed.to_string(), wire, "{name}: compact, keys in order");
+        // The other side's reader doesn't read it.
+        let other = match direction {
+            "to_station" => "to_host",
+            _ => "to_station",
+        };
+        assert_eq!(
+            read_call(other, wire.as_bytes()).unwrap_err().code(),
+            "wrong_message",
+            "{name}: read by the other side"
+        );
+        run.pass(format!("{name}: decoded"));
+    }
+    run.finish();
+}
+
+/// Typed reasons (O5): the goldens' reasons decode as the vocabulary's
+/// codes, and those of a later version as unrecognized, their results
+/// unchanged; every reason sits beside an effect not in force.
+#[test]
+fn station_call_reasons_are_known_or_unrecognized() {
+    let file = load(STATION_CALLS);
+    let case = |name: &str| {
+        let c = file["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no golden {name}"));
+        ControlAck::decode(s(c, "wire").as_bytes()).unwrap()
+    };
+    let whys = |ack: &ControlAck| -> Vec<(ApplicationResult, Option<EffectWhy>)> {
+        ack.results
+            .iter()
+            .flat_map(|r| match r {
+                AckResult::Record { effects, .. } | AckResult::Entry { effects, .. } => {
+                    effects.clone()
+                }
+            })
+            .map(|e| (e.result, e.why))
+            .collect()
+    };
+    let known = whys(&case("control_ack_with_reasons"));
+    assert!(known.iter().any(|(r, _)| *r == ApplicationResult::Applied));
+    for (result, why) in &known {
+        let not_in_force = matches!(
+            result,
+            ApplicationResult::Pending | ApplicationResult::Refused
+        );
+        assert_eq!(why.is_some(), not_in_force, "{result:?}");
+        assert!(
+            why.as_ref()
+                .is_none_or(|w| matches!(w, EffectWhy::Known(_)))
+        );
+    }
+    // The vocabulary, as the file lists it: exactly the core's, in its
+    // order, and each code a reason's form.
+    let codes: Vec<String> = file["why_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        codes,
+        Why::vocabulary()
+            .iter()
+            .map(|w| w.code().to_owned())
+            .collect::<Vec<_>>()
+    );
+    assert!(codes.iter().all(|c| EffectWhy::well_formed(c)));
+    let later = whys(&case("control_ack_with_unrecognized_reasons"));
+    assert_eq!(
+        later
+            .iter()
+            .map(|(r, w)| (*r, matches!(w, Some(EffectWhy::Unrecognized(_)))))
+            .collect::<Vec<_>>(),
+        [
+            (ApplicationResult::Refused, true),
+            (ApplicationResult::Refused, true),
+            (ApplicationResult::Pending, false),
+        ]
+    );
+    assert_eq!(later[1].1.as_ref().unwrap().code().len(), MAX_WHY_BYTES);
+}
+
+/// Every invalid variant is refused, with its code, by its side's reader and
+/// by the message's own type's.
+#[test]
+fn station_calls_refuse_the_invalid_variants() {
+    let mut run = station_calls_file();
+    run.get("max_message_bytes");
+    run.get("why_codes");
+    run.get("calls");
+    run.get("at_the_bound");
+    run.get("matching");
+    let invalid = run.get("invalid");
+    let mut codes = BTreeSet::new();
+    let mut sized = BTreeSet::new();
+    for case in invalid.as_array().unwrap() {
+        let name = s(case, "name");
+        let wire = call_wire(case);
+        if let Some(fill) = case.get("wire_fill") {
+            assert_eq!(wire.len() as u64, fill["bytes"].as_u64().unwrap(), "{name}");
+            sized.insert((s(case, "op").to_owned(), wire.len()));
+        }
+        let code = s(case, "code");
+        let error = read_call(s(case, "reader"), wire.as_bytes()).unwrap_err();
+        assert_eq!(error.code(), code, "{name}");
+        if code != "wrong_message" {
+            let typed = read_typed(s(case, "op"), wire.as_bytes()).unwrap_err();
+            assert_eq!(typed.code(), code, "{name}: the message's own reader");
+        }
+        codes.insert(code.to_owned());
+        run.pass(format!("{name}: refused {code}"));
+    }
+    // The byte bound is refused one byte over and well over, for each call
+    // that can carry a large page: `membership_fetch_result` included (no
+    // 512 KiB exemption outside stage 3's mailbox calls).
+    assert_eq!(
+        sized,
+        ["control_sync_result", "membership_fetch_result"]
+            .iter()
+            .flat_map(|op| [RELAY_MAX_BYTES + 1, 300_000].map(|n| (op.to_string(), n)))
+            .collect(),
+        "the byte bound's texts"
+    );
+    assert_eq!(
+        codes,
+        [
+            "malformed",
+            "not_strict",
+            "too_large",
+            "unknown_field",
+            "wrong_message"
+        ]
+        .iter()
+        .map(|c| c.to_string())
+        .collect(),
+        "every refusal code the readers give"
+    );
+    // Correlation (#164 comment 6858189009): each refused form of the
+    // call's id and the result's echo has its text.
+    let names: BTreeSet<&str> = invalid
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| s(c, "name"))
+        .collect();
+    for name in CORRELATION_REFUSALS {
+        assert!(names.contains(name), "no invalid text {name}");
+    }
+    run.finish();
+}
+
+/// The refused forms of correlation the file must hold: a missing, upper
+/// case or non-v4 `request_id` on a call and on a result, a result without
+/// its `after`, a record at or below `after`, and `head` below `after` with
+/// records. (A result on another feed than its call's is a matching case:
+/// no reader sees the call.)
+const CORRELATION_REFUSALS: [&str; 10] = [
+    "control_sync_request_id_missing",
+    "control_sync_request_id_upper_case",
+    "control_sync_request_id_not_uuid_v4",
+    "control_sync_result_request_id_missing",
+    "control_sync_result_request_id_upper_case",
+    "control_sync_result_request_id_not_uuid_v4",
+    "control_sync_result_after_missing",
+    "control_sync_result_record_at_after",
+    "control_sync_result_record_below_after",
+    "control_sync_result_head_below_after_with_records",
+];
+
+/// Correlation: each `matching` case's calls and result, read by their own
+/// readers, and `ControlSyncResult::answers`'s verdict on the result for
+/// each call (`answers`, or the first field that differs), as the file
+/// says; every verdict is covered.
+#[test]
+fn station_calls_match_results_to_their_calls() {
+    let mut run = station_calls_file();
+    run.get("max_message_bytes");
+    run.get("why_codes");
+    run.get("calls");
+    run.get("at_the_bound");
+    run.get("invalid");
+    let matching = run.get("matching");
+    let mut seen = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    for case in matching.as_array().unwrap() {
+        let name = s(case, "name");
+        assert!(names.insert(name.to_owned()), "{name}: a name of its own");
+        let result = ControlSyncResult::decode(s(case, "result").as_bytes())
+            .unwrap_or_else(|e| panic!("{name}: the result: {e}"));
+        let calls = case["calls"].as_array().unwrap();
+        let verdicts = case["verdicts"].as_array().unwrap();
+        assert_eq!(calls.len(), verdicts.len(), "{name}: a verdict per call");
+        assert!(!calls.is_empty(), "{name}");
+        for (i, (call, verdict)) in calls.iter().zip(verdicts).enumerate() {
+            let call = ControlSync::decode(call.as_str().unwrap().as_bytes())
+                .unwrap_or_else(|e| panic!("{name}: call {i}: {e}"));
+            let got = match result.answers(&call) {
+                Ok(()) => "answers",
+                Err(m) => m.code(),
+            };
+            assert_eq!(got, verdict.as_str().unwrap(), "{name}: call {i}");
+            if got != "answers" {
+                assert_eq!(SyncMismatch::from_code(got).map(|m| m.code()), Some(got));
+            }
+            seen.insert(got.to_owned());
+        }
+        run.pass(format!("{name}: matched"));
+    }
+    assert_eq!(
+        seen,
+        ["answers", "request_id", "origin", "feed_id", "after"]
+            .iter()
+            .map(|v| v.to_string())
+            .collect(),
+        "every verdict"
+    );
+    for name in [
+        "two_calls_at_the_same_cursor",
+        "a_late_reply_to_a_retired_call",
+        "discovery_answered_on_the_current_feed",
+    ] {
+        assert!(names.contains(name), "no matching case {name}");
+    }
+    run.finish();
+}
+
+/// The golden file's calls and invalid variants as they are written.
+struct CallBook {
+    calls: Vec<Value>,
+    invalid: Vec<Value>,
+    wires: BTreeMap<String, String>,
+}
+
+impl CallBook {
+    /// A message the builders wrote, with its decoded fields.
+    fn valid(
+        &mut self,
+        name: &str,
+        op: &str,
+        direction: &str,
+        note: &str,
+        fields: Value,
+        message: Value,
+    ) {
+        let wire = message.to_string();
+        self.wires.insert(name.to_owned(), wire.clone());
+        self.calls.push(serde_json::json!({
+            "name": name, "op": op, "direction": direction, "note": note,
+            "fields": fields, "wire": wire,
+        }));
+    }
+
+    /// The text of a valid message, parsed, for an invalid variant to change.
+    fn parsed(&self, name: &str) -> Value {
+        serde_json::from_str(&self.wires[name]).unwrap()
+    }
+
+    /// A text a reader refuses, with the code it refuses it with.
+    fn bad(&mut self, name: &str, op: &str, reader: &str, code: &str, wire: impl Into<String>) {
+        self.invalid.push(serde_json::json!({
+            "name": name, "op": op, "reader": reader, "code": code, "wire": wire.into(),
+        }));
+    }
+
+    /// `valid`'s message with `edit` applied, refused.
+    fn bad_edit(&mut self, name: &str, from: &str, code: &str, edit: impl FnOnce(&mut Value)) {
+        let mut message = self.parsed(from);
+        edit(&mut message);
+        let op = message["op"].as_str().unwrap().to_owned();
+        let reader = if ["control_sync", "control_ack", "membership_fetch"].contains(&op.as_str()) {
+            "to_station"
+        } else {
+            "to_host"
+        };
+        self.bad(name, &op, reader, code, message.to_string());
+    }
+}
+
+/// `r9-vectors-station-calls`, as the shared core's builders make it now.
+fn station_call_vectors() -> Value {
+    use serde_json::json;
+    const STATION_TIME: u64 = 1_793_620_940_000;
+    let control = load("r9-vectors-host-work-control");
+    let mlog = load("r9-vectors-membership-log");
+    let station = |name: &str| {
+        let st = &control["stations"][name];
+        (s(st, "origin").to_owned(), s(st, "feed_id").to_owned())
+    };
+    let (origin, feed) = station("A");
+    let (origin_b, feed_b) = station("B");
+    let (_, feed_a2) = station("A2");
+    let account = s(&control, "account_id").to_owned();
+    let genesis = Hash32::from_hex(s(&control, "genesis_hash")).unwrap();
+    let control_record = |label: &str| -> Value {
+        control["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["label"] == label)
+            .unwrap_or_else(|| panic!("no control record {label}"))["record"]
+            .clone()
+    };
+    let record_id = |label: &str| s(&control_record(label)["body"], "record_id").to_owned();
+    let entry = |label: &str| -> Value {
+        mlog["log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(mlog["others"].as_array().unwrap())
+            .find(|e| e["label"] == label)
+            .unwrap_or_else(|| panic!("no entry {label}"))
+            .clone()
+    };
+    let feed_entry = |seq: u64, label: &str| {
+        let record = ControlRecord::parse(control_record(label).to_string().as_bytes()).unwrap();
+        FeedEntry::new(seq, &record)
+    };
+    let log_head = Head {
+        seq: mlog["head"]["seq"].as_u64().unwrap(),
+        hash: Hash32::from_hex(s(&mlog["head"], "hash")).unwrap(),
+    };
+    let mut g = CallBook {
+        calls: Vec::new(),
+        invalid: Vec::new(),
+        wires: BTreeMap::new(),
+    };
+
+    // ------------------------------------------------------- control_sync
+    // Correlation (amended in place on Astation's request, #164 comment
+    // 6858189009): every call names itself with a fresh `request_id`, a
+    // lowercase UUID v4 (here a test id of its own, `mail_uuid`), and its
+    // result carries the same id and echoes its `after`.
+    let request = |label: &str| mail_uuid(&format!("station-calls {label}"), 4);
+    let r_known = request("a known feed after 2");
+    let r_first = request("discovery");
+    let r_largest = request("the largest position");
+    let r_next = request("the next page after 5");
+    let r_bound = request("a page at the bound");
+    let r_retry = request("a retry after 2");
+    let r_other = request("another call");
+    let sync = |request_id: &str, feed_id: Option<&str>, after: u64| {
+        ControlSync {
+            request_id: request_id.to_owned(),
+            origin: origin.clone(),
+            feed_id: feed_id.map(str::to_owned),
+            after,
+        }
+        .to_json()
+        .unwrap()
+    };
+    g.valid(
+        "control_sync_with_feed_id",
+        "control_sync",
+        "to_station",
+        "the host knows the feed: read it after position 2, the last it read; request_id names this call (a fresh lowercase UUID v4 for every call)",
+        json!({"request_id": r_known, "origin": origin, "feed_id": feed, "after": 2}),
+        sync(&r_known, Some(&feed), 2),
+    );
+    g.valid(
+        "control_sync_without_feed_id",
+        "control_sync",
+        "to_station",
+        "the host doesn't know the feed yet (initial discovery): no feed_id, and a cursor belongs to a feed, so after is 0; the result names the account's current feed",
+        json!({"request_id": r_first, "origin": origin, "after": 0}),
+        sync(&r_first, None, 0),
+    );
+    g.valid(
+        "control_sync_at_the_largest_position",
+        "control_sync",
+        "to_station",
+        "after at 2^53 - 1, the largest integer",
+        json!({"request_id": r_largest, "origin": origin, "feed_id": feed, "after": 9_007_199_254_740_991u64}),
+        sync(&r_largest, Some(&feed), 9_007_199_254_740_991),
+    );
+
+    // ------------------------------------------------ control_sync_result
+    let page = |request_id: &str, feed_id: &str, after: u64, head: u64, records: Vec<FeedEntry>| {
+        ControlSyncResult {
+            request_id: request_id.to_owned(),
+            origin: origin.clone(),
+            feed_id: feed_id.to_owned(),
+            after,
+            head,
+            station_time: STATION_TIME,
+            records,
+        }
+        .to_json()
+        .unwrap()
+    };
+    let wire_record =
+        |seq: u64, label: &str| json!({"feed_seq": seq, "record": control_record(label)});
+    g.valid(
+        "control_sync_result_empty_feed",
+        "control_sync_result",
+        "to_host",
+        "the answer to control_sync_without_feed_id (its request_id, its after 0): the account's current feed at this Station, here A2, with no record yet: head 0, no records",
+        json!({"request_id": r_first, "origin": origin, "feed_id": feed_a2, "after": 0, "head": 0,
+            "station_time": STATION_TIME, "records": []}),
+        page(&r_first, &feed_a2, 0, 0, vec![]),
+    );
+    g.valid(
+        "control_sync_result_with_records",
+        "control_sync_result",
+        "to_host",
+        "the answer to control_sync_with_feed_id (its request_id, the feed it named, its after 2): three records of the control vectors strictly after position 2, ascending, the last at the head",
+        json!({"request_id": r_known, "origin": origin, "feed_id": feed, "after": 2, "head": 5,
+            "station_time": STATION_TIME,
+            "records": [wire_record(3, "S1_cover"), wire_record(4, "S4_revoke"), wire_record(5, "M1_revoke")]}),
+        page(
+            &r_known,
+            &feed,
+            2,
+            5,
+            vec![
+                feed_entry(3, "S1_cover"),
+                feed_entry(4, "S4_revoke"),
+                feed_entry(5, "M1_revoke"),
+            ],
+        ),
+    );
+    g.valid(
+        "control_sync_result_head_below_after",
+        "control_sync_result",
+        "to_host",
+        "the answer to control_sync_at_the_largest_position on the same feed, whose head (5) is below the call's after: no records (any would be above the head). The feed went back under the same id: the host rescans it from 0 and never moves its cursor on this page",
+        json!({"request_id": r_largest, "origin": origin, "feed_id": feed,
+            "after": 9_007_199_254_740_991u64, "head": 5, "station_time": STATION_TIME, "records": []}),
+        page(&r_largest, &feed, 9_007_199_254_740_991, 5, vec![]),
+    );
+    // A page whose records the control parser judges one at a time: a record
+    // with an unknown field, a string, a null (a record may be any JSON
+    // value) and a gap in the positions. The builder can't write a record it
+    // doesn't parse (a Station serves only what it stored): their slots are
+    // built with a record that parses and the value is put in its place.
+    {
+        let stand_in =
+            ControlRecord::parse(control_record("S1_cover").to_string().as_bytes()).unwrap();
+        let slots: Vec<(u64, Value)> = vec![
+            (6, control_record("S5_revoke_interrupt")),
+            (7, control_record("P4_unknown_field")),
+            (8, json!("not a record")),
+            (9, Value::Null),
+            (11, control_record("S6_interrupt")),
+        ];
+        let entries = slots
+            .iter()
+            .map(
+                |(seq, record)| match ControlRecord::parse(record.to_string().as_bytes()) {
+                    Ok(record) => FeedEntry::new(*seq, &record),
+                    Err(_) => FeedEntry::new(*seq, &stand_in),
+                },
+            )
+            .collect();
+        let mut message = page(&r_next, &feed, 5, 11, entries);
+        for (slot, (_, record)) in slots.iter().enumerate() {
+            if ControlRecord::parse(record.to_string().as_bytes()).is_err() {
+                message["records"][slot]["record"] = record.clone();
+            }
+        }
+        let fields = json!({"request_id": r_next, "origin": origin, "feed_id": feed, "after": 5,
+            "head": 11, "station_time": STATION_TIME,
+            "records": slots.iter().map(|(seq, record)| json!({"feed_seq": seq, "record": record})).collect::<Vec<_>>()});
+        g.valid(
+            "control_sync_result_with_records_that_do_not_parse",
+            "control_sync_result",
+            "to_host",
+            "the next call's page (after 5): a page is read whole and each record judged on its own: one with an unknown field, a string and a null don't parse, and the page, the feed's position and the records after them stand (gaps in the positions are allowed)",
+            fields,
+            message,
+        );
+    }
+    // The page built with records put in their slots is marked in its case.
+    g.calls
+        .iter_mut()
+        .find(|c| c["name"] == "control_sync_result_with_records_that_do_not_parse")
+        .unwrap()["hand_assembled"] = json!(true);
+    // `judged` on every page: the control parser's verdict on each record.
+    for case in g
+        .calls
+        .iter_mut()
+        .filter(|c| c["op"] == "control_sync_result")
+    {
+        let page = ControlSyncResult::decode(s(case, "wire").as_bytes()).unwrap();
+        case["judged"] = judged_records(&page);
+    }
+
+    // -------------------------------------------------------------- heads
+    let feed_head = |origin: &str, feed_id: &str, head: u64, station_time: u64| FeedHead {
+        origin: origin.to_owned(),
+        feed_id: feed_id.to_owned(),
+        head,
+        station_time,
+    };
+    let feed_json = |origin: &str, feed_id: &str, head: u64, station_time: u64| json!({"origin": origin, "feed_id": feed_id, "head": head, "station_time": station_time});
+    g.valid(
+        "heads_two_stations",
+        "heads",
+        "to_host",
+        "two feeds, each of another Station, and the device list's head (log L's)",
+        json!({"feeds": [feed_json(&origin, &feed, 3, STATION_TIME), feed_json(&origin_b, &feed_b, 12, STATION_TIME - 500)],
+            "membership": log_head.to_json()}),
+        Heads {
+            feeds: vec![
+                feed_head(&origin, &feed, 3, STATION_TIME),
+                feed_head(&origin_b, &feed_b, 12, STATION_TIME - 500),
+            ],
+            membership: log_head,
+        }
+        .to_json()
+        .unwrap(),
+    );
+    g.valid(
+        "heads_without_feeds",
+        "heads",
+        "to_host",
+        "no feed covers a principal with work on this host: only the device list's head",
+        json!({"feeds": [], "membership": log_head.to_json()}),
+        Heads {
+            feeds: vec![],
+            membership: log_head,
+        }
+        .to_json()
+        .unwrap(),
+    );
+    let many = |n: u64| -> Vec<(String, u64)> {
+        (1..=n)
+            .map(|i| (format!("00000000-0000-4000-8000-{i:012x}"), i))
+            .collect()
+    };
+    g.valid(
+        "heads_64_feeds",
+        "heads",
+        "to_host",
+        "the most feeds one heads announces: 64, each once",
+        json!({"feeds": many(64).iter().map(|(f, i)| feed_json(&origin, f, *i, STATION_TIME)).collect::<Vec<_>>(),
+            "membership": log_head.to_json()}),
+        Heads {
+            feeds: many(64).iter().map(|(f, i)| feed_head(&origin, f, *i, STATION_TIME)).collect(),
+            membership: log_head,
+        }
+        .to_json()
+        .unwrap(),
+    );
+
+    // -------------------------------------------------------- control_ack
+    // Each effect `(effect, result, why)`: a reason (O5) only where the
+    // effect isn't in force.
+    let effects_why = |codes: &[(&str, &str, Option<&str>)]| -> Vec<EffectResult> {
+        codes
+            .iter()
+            .map(|(e, r, why)| EffectResult {
+                effect: EffectKind::from_code(e).unwrap(),
+                result: ApplicationResult::from_code(r).unwrap(),
+                why: why.map(|why| EffectWhy::read(why).unwrap()),
+            })
+            .collect()
+    };
+    let effects_why_json = |codes: &[(&str, &str, Option<&str>)]| -> Value {
+        Value::Array(
+            codes
+                .iter()
+                .map(|(e, r, why)| match why {
+                    Some(why) => json!({"effect": e, "result": r, "why": why}),
+                    None => json!({"effect": e, "result": r}),
+                })
+                .collect(),
+        )
+    };
+    let effects = |codes: &[(&str, &str)]| -> Vec<EffectResult> {
+        codes
+            .iter()
+            .map(|(e, r)| EffectResult {
+                effect: EffectKind::from_code(e).unwrap(),
+                result: ApplicationResult::from_code(r).unwrap(),
+                why: None,
+            })
+            .collect()
+    };
+    let effects_json = |codes: &[(&str, &str)]| -> Value {
+        Value::Array(
+            codes
+                .iter()
+                .map(|(e, r)| json!({"effect": e, "result": r}))
+                .collect(),
+        )
+    };
+    let record_result = |id: &str, codes: &[(&str, &str)]| {
+        (
+            AckResult::Record {
+                record_id: id.to_owned(),
+                effects: effects(codes),
+            },
+            json!({"record_id": id, "effects": effects_json(codes)}),
+        )
+    };
+    let record_why = |id: &str, codes: &[(&str, &str, Option<&str>)]| {
+        (
+            AckResult::Record {
+                record_id: id.to_owned(),
+                effects: effects_why(codes),
+            },
+            json!({"record_id": id, "effects": effects_why_json(codes)}),
+        )
+    };
+    let entry_why = |label: &str, applied_seq: u64, codes: &[(&str, &str, Option<&str>)]| {
+        let e = entry(label);
+        let seq = e["entry"]["body"]["seq"].as_u64().unwrap();
+        let hash = s(&e, "entry_hash").to_owned();
+        (
+            AckResult::Entry {
+                entry: EntryRef {
+                    seq,
+                    entry_hash: Hash32::from_hex(&hash).unwrap(),
+                },
+                applied_seq,
+                effects: effects_why(codes),
+            },
+            json!({"entry": {"seq": seq, "entry_hash": hash}, "applied_seq": applied_seq,
+                "effects": effects_why_json(codes)}),
+        )
+    };
+    let entry_result = |label: &str, applied_seq: u64, codes: &[(&str, &str)]| {
+        let e = entry(label);
+        let seq = e["entry"]["body"]["seq"].as_u64().unwrap();
+        let hash = s(&e, "entry_hash").to_owned();
+        (
+            AckResult::Entry {
+                entry: EntryRef {
+                    seq,
+                    entry_hash: Hash32::from_hex(&hash).unwrap(),
+                },
+                applied_seq,
+                effects: effects(codes),
+            },
+            json!({"entry": {"seq": seq, "entry_hash": hash}, "applied_seq": applied_seq,
+                "effects": effects_json(codes)}),
+        )
+    };
+    let ack = |name: &str,
+               note: &str,
+               feed_id: &str,
+               cursor: u64,
+               results: Vec<(AckResult, Value)>,
+               g: &mut CallBook| {
+        let (typed, shown): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+        let message = ControlAck {
+            account_id: account.clone(),
+            genesis_hash: genesis,
+            host_id: "host-b".into(),
+            host_trust_gen: 1,
+            origin: origin.clone(),
+            feed_id: feed_id.to_owned(),
+            cursor,
+            results: typed,
+        }
+        .to_json()
+        .unwrap();
+        g.valid(
+            name,
+            "control_ack",
+            "to_station",
+            note,
+            json!({"account_id": account, "genesis_hash": genesis.to_hex(), "host_id": "host-b",
+                "host_trust_gen": 1, "origin": origin, "feed_id": feed_id, "cursor": cursor,
+                "results": shown}),
+            message,
+        );
+    };
+    ack(
+        "control_ack_cursor_only",
+        "the host read the feed to position 5 and has applied nothing to report: the cursor says only how far it read",
+        &feed,
+        5,
+        vec![],
+        &mut g,
+    );
+    ack(
+        "control_ack_record_results",
+        "results of the reset feed's snapshot, by record_id, each with the effect its record carries: a cover applied, a hold pending, a release refused",
+        &feed_a2,
+        3,
+        vec![
+            record_result(&record_id("A2_cover"), &[("cover", "applied")]),
+            record_result(&record_id("A2_hold"), &[("hold", "pending")]),
+            record_result(&record_id("A2_release"), &[("release", "refused")]),
+        ],
+        &mut g,
+    );
+    ack(
+        "control_ack_revoke_results",
+        "a revoke (its revocation), a revoke with interrupt_running (revocation already in force, interrupt applied) and a later interrupt_running (its interrupt)",
+        &feed,
+        6,
+        vec![
+            record_result(&record_id("S4_revoke"), &[("revocation", "applied")]),
+            record_result(
+                &record_id("S5_revoke_interrupt"),
+                &[("revocation", "duplicate"), ("interrupt", "applied")],
+            ),
+            record_result(&record_id("S6_interrupt"), &[("interrupt", "applied")]),
+        ],
+        &mut g,
+    );
+    ack(
+        "control_ack_entry_result",
+        "the result of a host sender's device-list revoke, by {seq, entry_hash}: applied once applied_seq has reached its seq",
+        &feed,
+        5,
+        vec![entry_result("HS7_revoke", 7, &[("revocation", "applied")])],
+        &mut g,
+    );
+    ack(
+        "control_ack_entry_pending",
+        "the same entry while the host's applied device-list seq is behind it: only pending or refused may be said",
+        &feed,
+        5,
+        vec![entry_result("HS7_revoke", 6, &[("revocation", "pending")])],
+        &mut g,
+    );
+    ack(
+        "control_ack_both_result_forms",
+        "both result forms in one ack: a record's and an entry's (a host sender's revoke that asked for an interrupt: revocation and interrupt)",
+        &feed,
+        5,
+        vec![
+            record_result(
+                &record_id("S5_revoke_interrupt"),
+                &[("revocation", "duplicate"), ("interrupt", "applied")],
+            ),
+            entry_result(
+                "HS12_revoke_interrupt",
+                12,
+                &[("revocation", "applied"), ("interrupt", "applied")],
+            ),
+        ],
+        &mut g,
+    );
+    ack(
+        "control_ack_64_results",
+        "the most results one ack carries: 64, each record once (ids of no vectors record)",
+        &feed,
+        64,
+        many(64)
+            .iter()
+            .map(|(id, _)| {
+                record_result(
+                    &id.replace("00000000-0000-4000-8000", "11111111-1111-4111-8111"),
+                    &[("cover", "applied")],
+                )
+            })
+            .collect(),
+        &mut g,
+    );
+    // Typed reasons (O5, Astation's review of PR 2, #120 comment
+    // 6848326392): each effect not in force says why; information only.
+    ack(
+        "control_ack_with_reasons",
+        "partial effects with typed reasons (O5): each effect pending or refused says why, a code of the shared why vocabulary (a release issued before the hold in force, an interrupt waiting for its revocation, a stop signed by a removed manager on both its effects, a release that may be an evicted one replayed, a principal the list doesn't hold yet, an entry host-work hasn't applied); the effects in force beside them say nothing. A reason never changes a result and counts nothing",
+        &feed,
+        9,
+        vec![
+            record_why(
+                &record_id("W1_release_withheld"),
+                &[("release", "refused", Some("not_after_hold"))],
+            ),
+            record_why(
+                &record_id("S6_interrupt"),
+                &[("interrupt", "pending", Some("not_revoked"))],
+            ),
+            record_why(&record_id("S1_cover"), &[("cover", "applied", None)]),
+            record_why(
+                &record_id("S5_revoke_interrupt"),
+                &[
+                    ("revocation", "duplicate", None),
+                    ("interrupt", "applied", None),
+                ],
+            ),
+            record_why(
+                &record_id("M3_revoke_by_removed_manager"),
+                &[
+                    ("revocation", "refused", Some("removed_manager")),
+                    ("interrupt", "refused", Some("removed_manager")),
+                ],
+            ),
+            record_why(
+                &record_id("S3_release"),
+                &[("release", "refused", Some("possible_replay"))],
+            ),
+            record_why(
+                &record_id("V5_principal_unknown"),
+                &[("revocation", "pending", Some("principal_unknown"))],
+            ),
+            entry_why(
+                "HS7_revoke",
+                6,
+                &[("revocation", "pending", Some("revoke_not_applied"))],
+            ),
+        ],
+        &mut g,
+    );
+    let longest = format!("a_later_reason_{}", "z".repeat(MAX_WHY_BYTES - 15));
+    assert_eq!(longest.len(), MAX_WHY_BYTES);
+    ack(
+        "control_ack_with_unrecognized_reasons",
+        "reasons this reader doesn't know (a later version's), one at the 64-byte bound: well formed (1 to 64 bytes of [a-z0-9_]), so read as unrecognized, information only; each result is unchanged and the reason is written back as it came",
+        &feed,
+        9,
+        vec![
+            record_why(
+                &record_id("W1_release_withheld"),
+                &[("release", "refused", Some("a_later_reason"))],
+            ),
+            record_why(
+                &record_id("W2_release_refused_before"),
+                &[("release", "refused", Some(&longest))],
+            ),
+            record_why(
+                &record_id("S6_interrupt"),
+                &[("interrupt", "pending", Some("not_revoked"))],
+            ),
+        ],
+        &mut g,
+    );
+
+    // ------------------------------------------------ the device-list fetch
+    g.valid(
+        "membership_fetch",
+        "membership_fetch",
+        "to_station",
+        "the host holds the device list to seq 2",
+        json!({"after": 2}),
+        MembershipFetch { after: 2 }.to_json().unwrap(),
+    );
+    let labels = ["E3", "E4", "E5", "E6"];
+    let entries: Vec<Value> = labels.iter().map(|l| entry(l)["entry"].clone()).collect();
+    g.valid(
+        "membership_fetch_result",
+        "membership_fetch_result",
+        "to_host",
+        "the entries after seq 2 (log L's E3 to E6, an R9.3 carriage) and the Station's head; no echo of after, no more",
+        json!({"head": log_head.to_json(), "entries": entries}),
+        MembershipFetchResult {
+            head: log_head,
+            entries: entries.iter().map(|e| SignedObject::from_strict(&strict(e)).unwrap()).collect(),
+        }
+        .to_json()
+        .unwrap(),
+    );
+    g.valid(
+        "membership_fetch_result_no_entries",
+        "membership_fetch_result",
+        "to_host",
+        "the host is current: the head and no entries",
+        json!({"head": log_head.to_json(), "entries": []}),
+        MembershipFetchResult {
+            head: log_head,
+            entries: vec![],
+        }
+        .to_json()
+        .unwrap(),
+    );
+
+    // ---------------------------------------------------------- refusals
+    for call in [
+        RefusedCall::ControlSync,
+        RefusedCall::MembershipFetch,
+        RefusedCall::ControlAck,
+    ] {
+        g.valid(
+            call.op(),
+            call.op(),
+            "to_host",
+            "the Station refuses the call on this link (agreed with Astation, 2026-11-11): exactly this, naming nothing",
+            json!({"code": "forbidden"}),
+            CallRefused { call, code: RefusalCode::Forbidden }.to_json().unwrap(),
+        );
+    }
+
+    // ============================================================ invalid
+    let sync_wire = |after: &str| {
+        format!(
+            r#"{{"after":{after},"feed_id":"{feed}","op":"control_sync","origin":"{origin}","request_id":"{r_known}","type":"relay"}}"#
+        )
+    };
+    g.bad_edit(
+        "control_sync_unknown_field",
+        "control_sync_with_feed_id",
+        "unknown_field",
+        |v| v["mailbox"] = json!(1),
+    );
+    g.bad_edit(
+        "control_sync_feed_id_null",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| v["feed_id"] = Value::Null,
+    );
+    g.bad(
+        "control_sync_duplicate_key",
+        "control_sync",
+        "to_station",
+        "not_strict",
+        format!(
+            r#"{{"after":2,"after":3,"feed_id":"{feed}","op":"control_sync","origin":"{origin}","request_id":"{r_known}","type":"relay"}}"#
+        ),
+    );
+    g.bad_edit(
+        "control_sync_after_without_a_feed_id",
+        "control_sync_without_feed_id",
+        "malformed",
+        |v| v["after"] = json!(5),
+    );
+    g.bad_edit(
+        "control_sync_origin_with_a_path",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| v["origin"] = json!(format!("{origin}/")),
+    );
+    g.bad_edit(
+        "control_sync_origin_not_lowercase",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| v["origin"] = json!("https://Station-dev.agora.build"),
+    );
+    g.bad_edit(
+        "control_sync_origin_plain_http",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| v["origin"] = json!("http://station-dev.agora.build"),
+    );
+    g.bad_edit(
+        "control_sync_feed_id_not_uuid_v4",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| v["feed_id"] = json!("6f1c2b3a-4d5e-5f60-8a7b-9c0d1e2f3a4b"),
+    );
+    g.bad_edit(
+        "control_sync_feed_id_not_lowercase",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| v["feed_id"] = json!(feed.to_uppercase()),
+    );
+    g.bad(
+        "control_sync_after_a_fraction",
+        "control_sync",
+        "to_station",
+        "not_strict",
+        sync_wire("1.5"),
+    );
+    g.bad(
+        "control_sync_after_an_unsafe_integer",
+        "control_sync",
+        "to_station",
+        "not_strict",
+        sync_wire("9007199254740992"),
+    );
+    g.bad(
+        "control_sync_after_negative",
+        "control_sync",
+        "to_station",
+        "malformed",
+        sync_wire("-1"),
+    );
+    g.bad_edit(
+        "control_sync_after_missing",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| {
+            v.as_object_mut().unwrap().remove("after");
+        },
+    );
+    g.bad_edit(
+        "control_sync_after_as_text",
+        "control_sync_with_feed_id",
+        "malformed",
+        |v| v["after"] = json!("2"),
+    );
+    // Correlation: the call's id is required, a lowercase UUID v4.
+    // (`r_known` with its version nibble made 5.)
+    let not_v4 = format!("{}5{}", &r_known[..14], &r_known[15..]);
+    assert!(!atem_client::session::wire::is_uuid_v4(&not_v4));
+    for (name, from) in [
+        ("control_sync", "control_sync_with_feed_id"),
+        ("control_sync_result", "control_sync_result_with_records"),
+    ] {
+        g.bad_edit(
+            &format!("{name}_request_id_missing"),
+            from,
+            "malformed",
+            |v| {
+                v.as_object_mut().unwrap().remove("request_id");
+            },
+        );
+        g.bad_edit(&format!("{name}_request_id_null"), from, "malformed", |v| {
+            v["request_id"] = Value::Null
+        });
+        g.bad_edit(
+            &format!("{name}_request_id_upper_case"),
+            from,
+            "malformed",
+            |v| v["request_id"] = json!(r_known.to_uppercase()),
+        );
+        g.bad_edit(
+            &format!("{name}_request_id_not_uuid_v4"),
+            from,
+            "malformed",
+            |v| v["request_id"] = json!(not_v4),
+        );
+    }
+    g.bad_edit(
+        "control_sync_not_a_relay_message",
+        "control_sync_with_feed_id",
+        "wrong_message",
+        |v| v["type"] = json!("session"),
+    );
+    let wire = g.wires["control_sync_with_feed_id"].clone();
+    g.bad(
+        "a_call_read_as_a_stations_message",
+        "control_sync",
+        "to_host",
+        "wrong_message",
+        wire,
+    );
+    let wire = g.wires["heads_two_stations"].clone();
+    g.bad(
+        "a_stations_message_read_as_a_call",
+        "heads",
+        "to_station",
+        "wrong_message",
+        wire,
+    );
+    g.bad(
+        "a_json_array",
+        "control_sync",
+        "to_station",
+        "wrong_message",
+        "[]",
+    );
+    g.bad("not_json", "control_sync", "to_station", "not_strict", "{");
+    let push = r#"{"hints":[],"op":"push_hint","type":"relay"}"#;
+    g.bad(
+        "another_relay_message_to_a_station",
+        "control_sync",
+        "to_station",
+        "wrong_message",
+        push,
+    );
+    g.bad(
+        "another_relay_message_to_a_host",
+        "heads",
+        "to_host",
+        "wrong_message",
+        push,
+    );
+
+    // control_sync_result
+    let result_wire = |head: u64, records: &str| {
+        format!(
+            r#"{{"after":0,"feed_id":"{feed}","head":{head},"op":"control_sync_result","origin":"{origin}","records":{records},"request_id":"{r_first}","station_time":{STATION_TIME},"type":"relay"}}"#
+        )
+    };
+    // A page of one record that is no record (any JSON value is read), for the
+    // variants of a page's structure to change.
+    let base = "control_sync_result_empty_feed";
+    let one = |v: &mut Value| {
+        v["head"] = json!(1);
+        v["records"] = json!([{"feed_seq": 1, "record": 0}]);
+    };
+    g.bad_edit(
+        "control_sync_result_unknown_field",
+        base,
+        "unknown_field",
+        |v| v["more"] = json!(true),
+    );
+    g.bad_edit(
+        "control_sync_result_item_unknown_field",
+        base,
+        "unknown_field",
+        |v| {
+            one(v);
+            v["records"][0]["extra"] = json!(1)
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_item_without_a_record",
+        base,
+        "malformed",
+        |v| {
+            one(v);
+            v["records"][0].as_object_mut().unwrap().remove("record");
+        },
+    );
+    g.bad_edit("control_sync_result_65_records", base, "too_large", |v| {
+        v["head"] = json!(65);
+        v["records"] = Value::Array(
+            (1..=65)
+                .map(|i| json!({"feed_seq": i, "record": 0}))
+                .collect(),
+        );
+    });
+    g.bad_edit(
+        "control_sync_result_feed_seq_above_the_head",
+        base,
+        "malformed",
+        |v| {
+            one(v);
+            v["records"][0]["feed_seq"] = json!(2)
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_feed_seq_not_ascending",
+        base,
+        "malformed",
+        |v| {
+            v["head"] = json!(2);
+            v["records"] = json!([{"feed_seq": 2, "record": 0}, {"feed_seq": 1, "record": 0}]);
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_feed_seq_twice",
+        base,
+        "malformed",
+        |v| {
+            v["head"] = json!(2);
+            v["records"] = json!([{"feed_seq": 1, "record": 0}, {"feed_seq": 1, "record": 0}]);
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_feed_seq_zero",
+        base,
+        "malformed",
+        |v| {
+            one(v);
+            v["records"][0]["feed_seq"] = json!(0)
+        },
+    );
+    g.bad_edit("control_sync_result_head_as_text", base, "malformed", |v| {
+        v["head"] = json!("0")
+    });
+    g.bad_edit(
+        "control_sync_result_origin_with_a_path",
+        base,
+        "malformed",
+        |v| v["origin"] = json!(format!("{origin}/")),
+    );
+    g.bad_edit(
+        "control_sync_result_feed_id_not_uuid_v4",
+        base,
+        "malformed",
+        |v| v["feed_id"] = json!("not-a-feed"),
+    );
+    g.bad_edit(
+        "control_sync_result_station_time_missing",
+        base,
+        "malformed",
+        |v| {
+            v.as_object_mut().unwrap().remove("station_time");
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_records_not_an_array",
+        base,
+        "malformed",
+        |v| v["records"] = json!({}),
+    );
+    // Correlation: the echoed `after` is required, and the records are
+    // strictly after it; a page whose head is below its after holds none.
+    g.bad_edit(
+        "control_sync_result_after_missing",
+        "control_sync_result_with_records",
+        "malformed",
+        |v| {
+            v.as_object_mut().unwrap().remove("after");
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_after_null",
+        "control_sync_result_with_records",
+        "malformed",
+        |v| v["after"] = Value::Null,
+    );
+    g.bad_edit(
+        "control_sync_result_record_at_after",
+        base,
+        "malformed",
+        |v| {
+            v["after"] = json!(1);
+            v["head"] = json!(2);
+            v["records"] = json!([{"feed_seq": 1, "record": 0}, {"feed_seq": 2, "record": 0}]);
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_record_below_after",
+        base,
+        "malformed",
+        |v| {
+            v["after"] = json!(2);
+            v["head"] = json!(3);
+            v["records"] = json!([{"feed_seq": 1, "record": 0}, {"feed_seq": 3, "record": 0}]);
+        },
+    );
+    g.bad_edit(
+        "control_sync_result_head_below_after_with_records",
+        base,
+        "malformed",
+        |v| {
+            v["after"] = json!(5);
+            v["head"] = json!(3);
+            v["records"] = json!([{"feed_seq": 6, "record": 0}]);
+        },
+    );
+    g.bad(
+        "control_sync_result_duplicate_key_inside_a_record",
+        "control_sync_result",
+        "to_host",
+        "not_strict",
+        result_wire(1, r#"[{"feed_seq":1,"record":{"a":1,"a":2}}]"#),
+    );
+    g.bad(
+        "control_sync_result_fraction_inside_a_record",
+        "control_sync_result",
+        "to_host",
+        "not_strict",
+        result_wire(1, r#"[{"feed_seq":1,"record":{"a":1.5}}]"#),
+    );
+    g.bad(
+        "control_sync_result_unsafe_integer_inside_a_record",
+        "control_sync_result",
+        "to_host",
+        "not_strict",
+        result_wire(1, r#"[{"feed_seq":1,"record":{"a":9007199254740992}}]"#),
+    );
+    g.bad(
+        "control_sync_result_lone_surrogate_inside_a_record",
+        "control_sync_result",
+        "to_host",
+        "not_strict",
+        result_wire(1, r#"[{"feed_seq":1,"record":"\ud800"}]"#),
+    );
+    g.bad(
+        "control_sync_result_record_nested_past_the_depth_bound",
+        "control_sync_result",
+        "to_host",
+        "not_strict",
+        result_wire(
+            1,
+            &format!(
+                r#"[{{"feed_seq":1,"record":{}{}}}]"#,
+                "[".repeat(200),
+                "]".repeat(200)
+            ),
+        ),
+    );
+    // The byte bound (R9.9: 262,144 bytes as sent, before any parse) for each
+    // call that can carry a large page: a page's record (any JSON value, here
+    // one long string) and a fetch result's entry (here a signed object of
+    // log L whose signature is padded). A text at the bound is read, one byte
+    // over (and well over, 300,000) is `too_large`; the pair share a prefix and
+    // a suffix and differ in the fill by one. The other calls are bounded by
+    // their counts and grammars well below it.
+    let at_bound = {
+        let page_prefix = format!(
+            r#"{{"after":0,"feed_id":"{feed}","head":1,"op":"control_sync_result","origin":"{origin}","records":[{{"feed_seq":1,"record":""#
+        );
+        let page_suffix = format!(
+            r#""}}],"request_id":"{r_bound}","station_time":{STATION_TIME},"type":"relay"}}"#
+        );
+        let fetch_entry = |label: &str| {
+            let e = entry(label)["entry"].clone();
+            let prefix = format!(
+                r#"{{"entries":[{{"body":{},"sig":"{}"#,
+                e["body"],
+                s(&e, "sig")
+            );
+            (prefix, s(&e, "sig").len())
+        };
+        let fetch_suffix = format!(
+            r#""}}],"head":{{"hash":"{}","seq":{}}},"op":"membership_fetch_result","type":"relay"}}"#,
+            log_head.hash.to_hex(),
+            log_head.seq
+        );
+        let recipe = |prefix: &str, fill: &str, suffix: &str, bytes: usize| {
+            json!({"prefix": prefix, "fill": fill, "count": bytes - prefix.len() - suffix.len(),
+                "suffix": suffix, "bytes": bytes})
+        };
+        // The first entry of log L whose padded signature is still base64url
+        // at the bound (a length of 1 mod 4 can't be).
+        let (label, fetch_prefix) = ["E3", "E4", "E5", "E6"]
+            .into_iter()
+            .map(|label| (label, fetch_entry(label)))
+            .find(|(_, (prefix, sig_len))| {
+                (sig_len + RELAY_MAX_BYTES - prefix.len() - fetch_suffix.len()) % 4 != 1
+            })
+            .map(|(label, (prefix, _))| (label, prefix))
+            .unwrap();
+        let fetch_at_bound = recipe(&fetch_prefix, "A", &fetch_suffix, RELAY_MAX_BYTES);
+        for (op, prefix, fill, suffix) in [
+            ("control_sync_result", &page_prefix, "x", &page_suffix),
+            ("membership_fetch_result", &fetch_prefix, "A", &fetch_suffix),
+        ] {
+            for (what, bytes) in [
+                ("over_262144_bytes", RELAY_MAX_BYTES + 1),
+                ("300000_bytes", 300_000),
+            ] {
+                g.invalid.push(json!({
+                    "name": format!("{op}_{what}"),
+                    "op": op, "reader": "to_host", "code": "too_large",
+                    "wire_fill": recipe(prefix, fill, suffix, bytes),
+                }));
+            }
+        }
+        json!([
+            {
+                "name": "control_sync_result_at_262144_bytes",
+                "op": "control_sync_result", "direction": "to_host",
+                "note": "exactly the bound: a page of one record that is a string of 'x' (not a record: it doesn't parse, the page standing); the one byte longer text is control_sync_result_over_262144_bytes",
+                "wire_fill": recipe(&page_prefix, "x", &page_suffix, RELAY_MAX_BYTES),
+                "accepts": {"head": 1, "records": 1, "records_parse": [false]},
+            },
+            {
+                "name": "membership_fetch_result_at_262144_bytes",
+                "op": "membership_fetch_result", "direction": "to_host",
+                "note": format!("exactly the bound, the same bound as every other relay message (no 512 KiB exemption: only stage 3's mailbox calls get that): one entry of log L ({label}) whose signature is padded with 'A', so it is read as a message but its signature would not verify; the one byte longer text is membership_fetch_result_over_262144_bytes"),
+                "wire_fill": fetch_at_bound,
+                "accepts": {"head": log_head.to_json(), "entries": 1},
+            },
+        ])
+    };
+
+    // heads
+    let h = "heads_two_stations";
+    g.bad_edit("heads_unknown_mailbox_field", h, "unknown_field", |v| {
+        v["mailbox"] = json!({"head": 1, "mailbox_id": feed})
+    });
+    g.bad_edit("heads_a_feed_twice", h, "malformed", |v| {
+        v["feeds"][1] = v["feeds"][0].clone()
+    });
+    g.bad_edit("heads_65_feeds", h, "too_large", |v| {
+        v["feeds"] = Value::Array((0..65).map(|_| json!(0)).collect())
+    });
+    g.bad_edit("heads_membership_seq_zero", h, "malformed", |v| {
+        v["membership"]["seq"] = json!(0)
+    });
+    g.bad_edit("heads_membership_hash_not_lowercase", h, "malformed", |v| {
+        v["membership"]["hash"] = json!(log_head.hash.to_hex().to_uppercase())
+    });
+    g.bad_edit("heads_membership_unknown_field", h, "unknown_field", |v| {
+        v["membership"]["extra"] = json!(1)
+    });
+    g.bad_edit("heads_membership_missing", h, "malformed", |v| {
+        v.as_object_mut().unwrap().remove("membership");
+    });
+    g.bad_edit("heads_feeds_missing", h, "malformed", |v| {
+        v.as_object_mut().unwrap().remove("feeds");
+    });
+    g.bad_edit("heads_feed_unknown_field", h, "unknown_field", |v| {
+        v["feeds"][0]["extra"] = json!(1)
+    });
+
+    // control_ack
+    let a = "control_ack_both_result_forms";
+    g.bad_edit("control_ack_unknown_field", a, "unknown_field", |v| {
+        v["extra"] = json!(1)
+    });
+    g.bad_edit("control_ack_65_results", a, "too_large", |v| {
+        v["results"] = Value::Array((0..65).map(|_| json!(0)).collect())
+    });
+    g.bad_edit("control_ack_a_record_twice", a, "malformed", |v| {
+        v["results"] = json!([v["results"][0].clone(), v["results"][0].clone()])
+    });
+    g.bad_edit("control_ack_an_entry_twice", a, "malformed", |v| {
+        v["results"] = json!([v["results"][1].clone(), v["results"][1].clone()])
+    });
+    g.bad_edit("control_ack_effects_out_of_order", a, "malformed", |v| {
+        v["results"][0]["effects"] = json!([
+            {"effect": "interrupt", "result": "applied"},
+            {"effect": "revocation", "result": "duplicate"}
+        ])
+    });
+    g.bad_edit(
+        "control_ack_effects_no_record_carries",
+        a,
+        "malformed",
+        |v| {
+            v["results"][0]["effects"] = json!([
+                {"effect": "cover", "result": "applied"},
+                {"effect": "revocation", "result": "applied"}
+            ])
+        },
+    );
+    g.bad_edit("control_ack_effects_empty", a, "malformed", |v| {
+        v["results"][0]["effects"] = json!([])
+    });
+    g.bad_edit("control_ack_effects_three", a, "malformed", |v| {
+        v["results"][0]["effects"] = json!([
+            {"effect": "revocation", "result": "applied"},
+            {"effect": "interrupt", "result": "applied"},
+            {"effect": "hold", "result": "applied"}
+        ])
+    });
+    g.bad_edit("control_ack_a_result_of_both_forms", a, "malformed", |v| {
+        v["results"][0]["entry"] = v["results"][1]["entry"].clone()
+    });
+    g.bad_edit(
+        "control_ack_a_result_of_neither_form",
+        a,
+        "malformed",
+        |v| {
+            v["results"][0].as_object_mut().unwrap().remove("record_id");
+        },
+    );
+    g.bad_edit("control_ack_an_unknown_result", a, "malformed", |v| {
+        v["results"][0]["effects"][0]["result"] = json!("maybe")
+    });
+    g.bad_edit("control_ack_host_trust_gen_zero", a, "malformed", |v| {
+        v["host_trust_gen"] = json!(0)
+    });
+    g.bad_edit(
+        "control_ack_entry_applied_behind_applied_seq",
+        a,
+        "malformed",
+        |v| v["results"][1]["applied_seq"] = json!(11),
+    );
+    g.bad_edit(
+        "control_ack_genesis_hash_not_lowercase",
+        a,
+        "malformed",
+        |v| v["genesis_hash"] = json!(genesis.to_hex().to_uppercase()),
+    );
+    g.bad_edit("control_ack_cursor_missing", a, "malformed", |v| {
+        v.as_object_mut().unwrap().remove("cursor");
+    });
+    g.bad_edit(
+        "control_ack_result_unknown_field",
+        a,
+        "unknown_field",
+        |v| v["results"][0]["extra"] = json!(1),
+    );
+    g.bad_edit("control_ack_account_id_empty", a, "malformed", |v| {
+        v["account_id"] = json!("")
+    });
+    g.bad_edit("control_ack_feed_id_missing", a, "malformed", |v| {
+        v.as_object_mut().unwrap().remove("feed_id");
+    });
+    // Typed reasons (O5): `why` refuses the whole ack when it isn't a
+    // well-formed reason beside an effect not in force.
+    let r = "control_ack_with_reasons";
+    for (name, why) in [
+        ("control_ack_why_null", Value::Null),
+        ("control_ack_why_not_a_string", json!(7)),
+        ("control_ack_why_empty", json!("")),
+        (
+            "control_ack_why_over_64_bytes",
+            json!("z".repeat(MAX_WHY_BYTES + 1)),
+        ),
+        ("control_ack_why_upper_case", json!("Not_after_hold")),
+        (
+            "control_ack_why_outside_the_characters",
+            json!("not-after-hold"),
+        ),
+    ] {
+        g.bad_edit(name, r, "malformed", |v| {
+            v["results"][0]["effects"][0]["why"] = why
+        });
+    }
+    g.bad_edit("control_ack_why_beside_applied", r, "malformed", |v| {
+        v["results"][2]["effects"][0]["why"] = json!("order")
+    });
+    g.bad_edit("control_ack_why_beside_duplicate", r, "malformed", |v| {
+        v["results"][3]["effects"][0]["why"] = json!("order")
+    });
+    g.bad_edit(
+        "control_ack_effect_unknown_field",
+        r,
+        "unknown_field",
+        |v| v["results"][0]["effects"][0]["reason"] = json!("not_after_hold"),
+    );
+    let wire = g.wires[r].clone();
+    let doubled = wire.replacen(
+        r#""why":"not_after_hold""#,
+        r#""why":"order","why":"not_after_hold""#,
+        1,
+    );
+    assert_ne!(doubled, wire);
+    g.bad(
+        "control_ack_why_duplicate_key",
+        "control_ack",
+        "to_station",
+        "not_strict",
+        doubled,
+    );
+
+    // membership_fetch
+    let f = "membership_fetch";
+    g.bad_edit("membership_fetch_unknown_field", f, "unknown_field", |v| {
+        v["feed_id"] = json!(feed)
+    });
+    g.bad_edit("membership_fetch_after_null", f, "malformed", |v| {
+        v["after"] = Value::Null
+    });
+    g.bad_edit("membership_fetch_after_missing", f, "malformed", |v| {
+        v.as_object_mut().unwrap().remove("after");
+    });
+
+    // membership_fetch_result
+    let r = "membership_fetch_result_no_entries";
+    g.bad_edit("membership_fetch_result_65_entries", r, "too_large", |v| {
+        v["entries"] = Value::Array((0..65).map(|_| json!(0)).collect())
+    });
+    g.bad_edit(
+        "membership_fetch_result_an_entry_that_is_not_an_object",
+        r,
+        "malformed",
+        |v| v["entries"] = json!([0]),
+    );
+    g.bad_edit(
+        "membership_fetch_result_head_seq_zero",
+        r,
+        "malformed",
+        |v| v["head"]["seq"] = json!(0),
+    );
+    g.bad_edit(
+        "membership_fetch_result_head_hash_not_hex",
+        r,
+        "malformed",
+        |v| v["head"]["hash"] = json!("beb1"),
+    );
+    g.bad_edit(
+        "membership_fetch_result_echoes_after",
+        r,
+        "unknown_field",
+        |v| v["after"] = json!(2),
+    );
+    g.bad_edit(
+        "membership_fetch_result_carries_more",
+        r,
+        "unknown_field",
+        |v| v["more"] = json!(false),
+    );
+    g.bad_edit(
+        "membership_fetch_result_entries_missing",
+        r,
+        "malformed",
+        |v| {
+            v.as_object_mut().unwrap().remove("entries");
+        },
+    );
+
+    // the three refusals
+    for call in [
+        RefusedCall::ControlSync,
+        RefusedCall::MembershipFetch,
+        RefusedCall::ControlAck,
+    ] {
+        let op = call.op();
+        let name = |what: &str| format!("{op}_{what}");
+        g.bad_edit(&name("unknown_code"), op, "malformed", |v| {
+            v["code"] = json!("not_found")
+        });
+        g.bad_edit(&name("code_null"), op, "malformed", |v| {
+            v["code"] = Value::Null
+        });
+        g.bad_edit(&name("code_missing"), op, "malformed", |v| {
+            v.as_object_mut().unwrap().remove("code");
+        });
+        g.bad_edit(&name("code_not_lowercase"), op, "malformed", |v| {
+            v["code"] = json!("Forbidden")
+        });
+        g.bad_edit(&name("names_a_feed"), op, "unknown_field", |v| {
+            v["feed_id"] = json!(feed)
+        });
+        g.bad(
+            &name("duplicate_key"),
+            op,
+            "to_host",
+            "not_strict",
+            format!(r#"{{"code":"forbidden","code":"forbidden","op":"{op}","type":"relay"}}"#),
+        );
+        let wire = g.wires[op].clone();
+        g.bad(
+            &name("read_as_a_call"),
+            op,
+            "to_station",
+            "wrong_message",
+            wire,
+        );
+    }
+
+    // ============================================================ matching
+    // Whether a page answers a call (`ControlSyncResult::answers`): the same
+    // request_id, origin, feed (when the call named one) and after. Each
+    // case's result read against each of its calls: `answers`, or the first
+    // field that differs. Every text is a builder's: a changed golden is
+    // read and written again.
+    let rebuilt = |name: &str, edit: &dyn Fn(&mut Value)| -> String {
+        let mut v = g.parsed(name);
+        edit(&mut v);
+        ControlSyncResult::decode(v.to_string().as_bytes())
+            .unwrap()
+            .to_json()
+            .unwrap()
+            .to_string()
+    };
+    let call = |name: &str| json!(g.wires[name]);
+    let answer = |name: &str| json!(g.wires[name]);
+    let retry = json!(sync(&r_retry, Some(&feed), 2).to_string());
+    let known = "control_sync_with_feed_id";
+    let records = "control_sync_result_with_records";
+    let matching = |name: &str, note: &str, calls: Vec<Value>, result: Value, verdicts: &[&str]| json!({"name": name, "note": note, "calls": calls, "result": result, "verdicts": verdicts});
+    let matching = vec![
+        matching(
+            "the_answer_to_its_call",
+            "control_sync_result_with_records answers control_sync_with_feed_id: the same request_id, origin, feed and after",
+            vec![call(known)],
+            answer(records),
+            &["answers"],
+        ),
+        matching(
+            "discovery_answered_on_the_current_feed",
+            "a call that named no feed (initial discovery, after 0) is answered on whichever feed the result names: the account's current one (here A2)",
+            vec![call("control_sync_without_feed_id")],
+            answer("control_sync_result_empty_feed"),
+            &["answers"],
+        ),
+        matching(
+            "a_feed_gone_back_answers_its_call",
+            "a page whose head is below the call's after on the same feed answers its call: it is empty, and the host rescans the feed from 0 instead of moving its cursor",
+            vec![call("control_sync_at_the_largest_position")],
+            answer("control_sync_result_head_below_after"),
+            &["answers"],
+        ),
+        matching(
+            "another_calls_id",
+            "the same page under another request_id answers no call this host made: it advances nothing",
+            vec![call(known)],
+            json!(rebuilt(records, &|v| v["request_id"] = json!(r_other))),
+            &["request_id"],
+        ),
+        matching(
+            "another_origin",
+            "the same page from another Station (B's origin): no answer",
+            vec![call(known)],
+            json!(rebuilt(records, &|v| v["origin"] = json!(origin_b))),
+            &["origin"],
+        ),
+        matching(
+            "another_feed",
+            "a call that named a feed (A) is answered only on that feed: a result on another feed (A2) answers nothing, even under the call's id (a named feed gone stale is control_sync_refused)",
+            vec![call(known)],
+            json!(rebuilt(records, &|v| v["feed_id"] = json!(feed_a2))),
+            &["feed_id"],
+        ),
+        matching(
+            "another_after",
+            "the call's id on a page that echoes another after (1, not 2): no answer",
+            vec![call(known)],
+            json!(rebuilt(records, &|v| v["after"] = json!(1))),
+            &["after"],
+        ),
+        matching(
+            "a_discovery_call_is_answered_from_the_start_only",
+            "a call that named no feed asked from 0: a page that echoes another after answers it on no feed",
+            vec![call("control_sync_without_feed_id")],
+            json!(rebuilt(records, &|v| v["request_id"] = json!(r_first))),
+            &["after"],
+        ),
+        matching(
+            "two_calls_at_the_same_cursor",
+            "two calls at the same cursor (after 2 on feed A: the first and a retry after its timeout, or a new link generation's call) differ only by their request_id, so a page answers exactly one of them: here the retry",
+            vec![call(known), retry.clone()],
+            json!(rebuilt(records, &|v| v["request_id"] = json!(r_retry))),
+            &["request_id", "answers"],
+        ),
+        matching(
+            "a_late_reply_to_a_retired_call",
+            "the first call (control_sync_with_feed_id) timed out and was retired, and the host asked again at the same cursor with a fresh id: the first call's late page (control_sync_result_with_records) doesn't answer the live call, so it advances nothing and opens no gate",
+            vec![retry],
+            answer(records),
+            &["request_id"],
+        ),
+    ];
+
+    json!({
+        "name": STATION_CALLS,
+        "kind": "vectors",
+        "requires": "r9",
+        "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", agreed with Astation on 2026-11-13, #120 comment 6848326392: a strict-JSON page may hold individually invalid records, whose evidence is kept, which aren't applied, and whose delivery is no application evidence). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. `why_codes` is the shared vocabulary of typed reasons (O5, host-work-v1 §11.4 wire rule 10, for Astation's sign-off), in the core's order: a well-formed reason outside it is a later version's, read as unrecognized. Correlation (amended in place on Astation's request, #164 comment 6858189009; unshipped, so no new version): a `control_sync` carries `request_id`, a lowercase UUID v4 the host makes fresh for every call (a timeout's retry and a new link generation's call included; here test ids), and its `control_sync_result` carries the same `request_id` and echoes the call's `after`; a page's records are strictly after its `after`, ascending and none above `head` (gaps legal), so a page whose `head` is below its `after` (the feed went back on the same id: the host rescans) holds none. `matching`: whether a result answers a call, by the shared helper (`ControlSyncResult::answers`, the bindings' `relay_control_sync_answers`) `{name, note, calls, result, verdicts}`: `calls` are call texts, `result` a result text (each a builder's), and `verdicts`, parallel to `calls`, is the helper's verdict on the result for each: `answers` (the same `request_id`, origin, feed when the call named one, and `after`), else the first field that differs, in that order (`request_id`, `origin`, `feed_id`, `after`). The link generation, account and genesis the host captured with its call are the caller's to compare, and only its one live call counts: a retired call's late page answers nothing live. The three refusals stay metadata-free: no id, no cursor. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
+        "max_message_bytes": RELAY_MAX_BYTES,
+        // The shared vocabulary of reasons (O5), written out by hand in the
+        // core's order; the runner holds it equal to `Why::vocabulary`.
+        "why_codes": [
+            "principal_unknown", "signer_unknown", "revoke_not_in_list", "list_frozen",
+            "not_revoked", "revoke_not_applied", "wrong_account", "bad_signature",
+            "key_mismatch", "signer_not_allowed", "removed_manager", "host_key_signed",
+            "not_a_service", "not_a_revoke", "order", "after_revoke", "collision", "not_newer",
+            "possible_replay", "not_after_hold",
+        ],
+        "calls": g.calls,
+        "at_the_bound": at_bound,
+        "invalid": g.invalid,
+        "matching": matching,
+    })
+}
+
+/// Writes `r9-vectors-station-calls` from `station_call_vectors`.
+#[test]
+#[ignore = "writes the Station call goldens"]
+fn write_station_calls_vectors() {
+    let mut text = serde_json::to_string_pretty(&station_call_vectors()).unwrap();
+    text.push('\n');
+    std::fs::write(fixtures_dir().join("r9-vectors-station-calls.json"), text).unwrap();
+}
+
 // ------------------------- delegated host work: envelopes and results (mail)
 
 // `r9-vectors-host-envelope` (delegated host-work design II.4.2, II.4.4,
@@ -6416,6 +9183,16 @@ const MAIL_B2: MailHost = MailHost("host-b", 2);
 const MAIL_EVIL: MailHost = MailHost("host-evil", 1);
 
 impl MailHost {
+    /// Every host encryption key it made at its generation (r9-vectors-keys
+    /// names): host-a and host-b made both of theirs at generation 1.
+    fn generated(self) -> &'static [&'static str] {
+        match (self.0, self.1) {
+            ("host-a", 1) => &["host-a-enc-1", "host-a-enc-2"],
+            ("host-b", 1) => &["host-b-enc-1", "host-b-enc-2"],
+            _ => &[],
+        }
+    }
+
     fn host_ref(self) -> HostRef {
         HostRef {
             host_id: self.0.into(),
@@ -6728,7 +9505,8 @@ impl<'a> MailVectors<'a> {
 
     /// A check of `object`: the verdict `expect` of `open_envelope` (no
     /// `outbox`) or `accept_result`, on L + `chain`, by the receiver
-    /// `(host, its keys)`, at `now`.
+    /// `(host, its keys)`, which made every key [`MailHost::generated`]
+    /// names, at `now`.
     #[allow(clippy::too_many_arguments)]
     fn check(
         &mut self,
@@ -6737,6 +9515,26 @@ impl<'a> MailVectors<'a> {
         object: &str,
         chain: &[&str],
         receiver: (MailHost, &[&str]),
+        now: u64,
+        outbox: Option<Value>,
+        expect: Value,
+    ) {
+        let generated = receiver.0.generated();
+        self.check_made(
+            label, note, object, chain, receiver, generated, now, outbox, expect,
+        );
+    }
+
+    /// [`Self::check`] by a receiver that made only the keys `generated`.
+    #[allow(clippy::too_many_arguments)]
+    fn check_made(
+        &mut self,
+        label: &str,
+        note: &str,
+        object: &str,
+        chain: &[&str],
+        receiver: (MailHost, &[&str]),
+        generated: &[&str],
         now: u64,
         outbox: Option<Value>,
         expect: Value,
@@ -6752,6 +9550,7 @@ impl<'a> MailVectors<'a> {
                 "host_id": receiver.0.0,
                 "host_trust_gen": receiver.0.1,
                 "keys": receiver.1,
+                "generated": generated,
             },
             "now": now,
             "expect": expect,
@@ -6770,11 +9569,18 @@ impl<'a> MailVectors<'a> {
         })
     }
 
+    /// Refused after step 4: the claim is the body's sender's, whose key
+    /// verified the copy.
     fn refused_authenticated(&self, object: &str, reason: &str) -> Value {
+        let body = self.objects[object].body();
         serde_json::json!({
             "verdict": "refused_authenticated",
-            "object_id": s(self.objects[object].body(), "id"),
+            "object_id": s(body, "id"),
             "reason": reason,
+            "sender": {
+                "host_id": s(&body["sender"], "host_id"),
+                "host_trust_gen": body["sender"]["host_trust_gen"],
+            },
         })
     }
 }
@@ -7202,6 +10008,20 @@ fn host_envelope_vectors(book: &Book) -> Value {
         "host-b-enc-1",
     );
     let f = g.fields(
+        "evil_cancel_to_new_key",
+        MAIL_EVIL,
+        MAIL_B1,
+        "host-b-enc-2",
+        &on_b(&["M11_rotate_b"]),
+    );
+    g.seal(
+        "evil_cancel_to_new_key",
+        "a cancel from host-evil to host-b sealed to host-b-enc-2, signed at the head of B + M11_rotate_b (seq 11)",
+        f,
+        MailPlain::Envelope(cancel(&task)),
+        "host-b-enc-2",
+    );
+    let f = g.fields(
         "evil_at_head_9",
         MAIL_EVIL,
         MAIL_B1,
@@ -7248,6 +10068,13 @@ fn host_envelope_vectors(book: &Book) -> Value {
         "head_ahead_bad_signature",
         "head_ahead's body signed by host-b's key: host-a's at generation 1 is known, so the signature is checked before waiting",
         "head_ahead",
+        MAIL_B1,
+        |_| {},
+    );
+    g.resign(
+        "cancel_to_new_key_bad_signature",
+        "cancel_to_new_key's body signed by host-b's key: host-a's at generation 1 is known, so the signature is checked before the key",
+        "cancel_to_new_key",
         MAIL_B1,
         |_| {},
     );
@@ -7363,6 +10190,20 @@ fn host_envelope_vectors(book: &Book) -> Value {
         f,
         MailPlain::Result(status()),
         "host-a-enc-1",
+    );
+    let f = g.fields(
+        "status_to_new_key",
+        MAIL_B1,
+        MAIL_A1,
+        "host-a-enc-2",
+        &on_b(&["M11_rotate_a"]),
+    );
+    g.seal(
+        "status_to_new_key",
+        "host-b's receipt for the request, sealed to host-a's new key host-a-enc-2, signed at the head of B + M11_rotate_a (seq 11), where host-b's list has the rotation",
+        f,
+        MailPlain::Result(status()),
+        "host-a-enc-2",
     );
     let f = ba(&g, "dropped_reply");
     let text = jcs(&serde_json::json!({
@@ -7632,7 +10473,52 @@ fn host_envelope_vectors(book: &Book) -> Value {
         "cancel_to_new_key",
         &b,
         mail_pending(MAIL_A1),
-        "sealed to a key host-b handed out but hasn't applied (its host_enc_key is beyond its head): it waits",
+        "sealed to a key host-b made and handed out but hasn't applied (its host_enc_key is beyond its head; the key is in generated): it waits",
+    );
+    let e = g.refused("cancel_to_new_key_bad_signature", "bad_signature");
+    at(
+        &mut g,
+        "new_key_head_ahead_bad_signature",
+        "cancel_to_new_key_bad_signature",
+        &b,
+        e,
+        "the same key, from a known generation: the signature is checked before waiting",
+    );
+    let e = g.refused("cancel_to_new_key", "enc_key_not_accepted");
+    g.check_made(
+        "never_generated_key_head_ahead",
+        "sealed to a key host-b never made (not in generated): refused even beyond its head, with no wait, since no entry it lacks can make that key one it accepts",
+        "cancel_to_new_key",
+        &b,
+        to_b,
+        &["host-b-enc-1"],
+        MAIL_NOW,
+        None,
+        e,
+    );
+    let e = g.refused("cancel_to_new_key_bad_signature", "bad_signature");
+    g.check_made(
+        "never_generated_key_head_ahead_bad_signature",
+        "the same, from a known generation: the signature is checked before the key",
+        "cancel_to_new_key_bad_signature",
+        &b,
+        to_b,
+        &["host-b-enc-1"],
+        MAIL_NOW,
+        None,
+        e,
+    );
+    let e = g.refused("cancel_to_new_key", "expired");
+    g.check_made(
+        "never_generated_key_head_ahead_times_first",
+        "the same at its expires_at: the body's times come before the key",
+        "cancel_to_new_key",
+        &b,
+        to_b,
+        &["host-b-enc-1"],
+        MAIL_EXPIRES,
+        None,
+        e,
     );
     g.check(
         "new_key_opens",
@@ -7685,6 +10571,41 @@ fn host_envelope_vectors(book: &Book) -> Value {
         &b,
         mail_pending(MAIL_A1),
         "signed at a head beyond B, the signature verified first: pending",
+    );
+    g.check_made(
+        "listed_key_not_generated_head_ahead_pending",
+        "the same, by a receiver whose generated lists nothing: a key it accepts now waits whatever generated says (only a key in neither is refused)",
+        "head_ahead",
+        &b,
+        to_b,
+        &[],
+        MAIL_NOW,
+        None,
+        mail_pending(MAIL_A1),
+    );
+    let e = g.refused("evil_cancel_to_new_key", "enc_key_not_accepted");
+    g.check_made(
+        "unverifiable_never_generated_key_head_ahead",
+        "an unknown sender signed beyond the receiver's head (its copy can't be verified yet), sealed to a key host-b never made: refused, unauthenticated, with no wait",
+        "evil_cancel_to_new_key",
+        &b[..3],
+        to_b,
+        &["host-b-enc-1"],
+        MAIL_NOW,
+        None,
+        e,
+    );
+    let e = g.refused("evil_cancel_to_new_key", "expired");
+    g.check_made(
+        "unverifiable_never_generated_key_head_ahead_times_first",
+        "the same at its expires_at: the body's times come before the key",
+        "evil_cancel_to_new_key",
+        &b[..3],
+        to_b,
+        &["host-b-enc-1"],
+        MAIL_EXPIRES,
+        None,
+        e,
     );
     at(
         &mut g,
@@ -7900,11 +10821,54 @@ fn host_envelope_vectors(book: &Book) -> Value {
         e,
     );
     g.check(
+        "result_new_key_head_ahead_pending",
+        "a result sealed to a key host-a made and handed out but hasn't applied: it waits",
+        "status_to_new_key",
+        &b,
+        to_a,
+        MAIL_NOW,
+        Some(outbox(&request_id)),
+        mail_pending(MAIL_B1),
+    );
+    g.check(
+        "result_new_key_accepted",
+        "once host-a applies the rotation and lists the key, it is accepted",
+        "status_to_new_key",
+        &on_b(&["M11_rotate_a"]),
+        (MAIL_A1, &["host-a-enc-2", "host-a-enc-1"]),
+        MAIL_NOW,
+        Some(outbox(&request_id)),
+        accepted.clone(),
+    );
+    let e = g.refused("status_to_new_key", "enc_key_not_accepted");
+    g.check_made(
+        "result_never_generated_key_head_ahead",
+        "a result sealed to a key host-a never made: refused even beyond its head",
+        "status_to_new_key",
+        &b,
+        to_a,
+        &["host-a-enc-1"],
+        MAIL_NOW,
+        Some(outbox(&request_id)),
+        e,
+    );
+    g.check(
         "removed_result_head_ahead_pending",
         "a removed host's result signed beyond the receiver's head waits (its signature checked first), to be kept as data",
         "status_head_ahead",
         &on_b(&["M11_remove_b"]),
         to_a,
+        MAIL_NOW,
+        Some(outbox(&request_id)),
+        mail_pending(MAIL_B1),
+    );
+    g.check_made(
+        "result_listed_key_not_generated_head_ahead_pending",
+        "a result signed beyond the receiver's head, sealed to a key it accepts now, by a receiver whose generated lists nothing: it waits",
+        "status_head_ahead",
+        &b,
+        to_a,
+        &[],
         MAIL_NOW,
         Some(outbox(&request_id)),
         mail_pending(MAIL_B1),
@@ -7973,7 +10937,7 @@ fn host_envelope_vectors(book: &Book) -> Value {
         "name": "r9-vectors-host-envelope",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Envelopes and results between hosts (delegated host-work II.4.2, II.4.4; host-work-v1 §11.5). Each object is {body, sig, enc, ct}: the body signed by the sender's host_key (Ed25519) over enc([\"atem-envelope-v1\" or \"atem-result-v1\", jcs(body)]); the plaintext sealed with RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, to the recipient's host encryption key, info = enc([\"atem-envelope-seal-v1\" or \"atem-result-seal-v1\", account_id, genesis_hash (32 bytes), sender.host_id, u64(sender.host_trust_gen), recipient.host_id, u64(recipient.host_trust_gen), enc_kid, id, u64(created_at), u64(expires_at)]); sealed_hash = SHA-256(enc([enc, ct])). The sender's ephemeral is DeriveKeyPair(ikmE), ikmE = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Device lists: log L of r9-vectors-membership-log followed by `chain`, labels of `entries` (signed by dev-mac); the objects are signed at B = L + M7..M10 (head 10) unless their signed_at_head says otherwise. Objects: `signed_with` names the r9-vectors-keys host key whose signature `sig` is; `built` objects are what seal_envelope / seal_result make from the body's fields, `sealed.plaintext` and ikmE; `sealed` gives the seal's inputs and outputs (`plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB); `sealed_from` names the object whose sealed part it carries, `edited_from` the object it is after a change made after signing. Checks: `call` (open_envelope, or accept_result with `outbox`, the sending host's row) on L + `chain`, by `receiver` (its host_id, current host_trust_gen and the keys it accepts, r9-vectors-keys names), at `now`; `expect` is the verdict: open or accepted (with `sender`; the plaintext is the object's), not_delivered (with `sender` and the return grant's detail as `reason`), pending (the claimed host_id and host_trust_gen), refused (before the copy is shown to be the sender's, signed and intact (step 4): `reason` and `evidence` = SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent; it claims no id) or refused_authenticated (after it: the object's id and `reason`; it claims the id for its authenticated sender, (sender.host_id, id)).",
+        "note": "Envelopes and results between hosts (delegated host-work II.4.2, II.4.4; host-work-v1 §11.5). Each object is {body, sig, enc, ct}: the body signed by the sender's host_key (Ed25519) over enc([\"atem-envelope-v1\" or \"atem-result-v1\", jcs(body)]); the plaintext sealed with RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, to the recipient's host encryption key, info = enc([\"atem-envelope-seal-v1\" or \"atem-result-seal-v1\", account_id, genesis_hash (32 bytes), sender.host_id, u64(sender.host_trust_gen), recipient.host_id, u64(recipient.host_trust_gen), enc_kid, id, u64(created_at), u64(expires_at)]); sealed_hash = SHA-256(enc([enc, ct])). The sender's ephemeral is DeriveKeyPair(ikmE), ikmE = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Device lists: log L of r9-vectors-membership-log followed by `chain`, labels of `entries` (signed by dev-mac); the objects are signed at B = L + M7..M10 (head 10) unless their signed_at_head says otherwise. Objects: `signed_with` names the r9-vectors-keys host key whose signature `sig` is; `built` objects are what seal_envelope / seal_result make from the body's fields, `sealed.plaintext` and ikmE; `sealed` gives the seal's inputs and outputs (`plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB); `sealed_from` names the object whose sealed part it carries, `edited_from` the object it is after a change made after signing. Checks: `call` (open_envelope, or accept_result with `outbox`, the sending host's row) on L + `chain`, by `receiver` (its host_id, current host_trust_gen, the keys it accepts and every key it made at that generation, `generated`; r9-vectors-keys names), at `now`; `expect` is the verdict: open or accepted (with `sender`; the plaintext is the object's), not_delivered (with `sender` and the return grant's detail as `reason`), pending (the claimed host_id and host_trust_gen), refused (before the copy is shown to be the sender's, signed and intact (step 4): `reason` and `evidence` = SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent; it claims no id) or refused_authenticated (after it: the object's id, `reason` and `sender`, the {host_id, host_trust_gen} whose key verified it; it claims the id for that sender, (sender.host_id, id)). A key in neither `keys` nor `generated` is refused enc_key_not_accepted even beyond the receiver's head, after the checks that settle at any head, the times and a known generation's signature; one in `generated` only waits there.",
         "account_id": "acct-test-1",
         "genesis_hash": g.genesis.to_hex(),
         "now": MAIL_NOW,
@@ -8001,8 +10965,17 @@ fn mail_verdict(verdict: EnvelopeVerdict) -> (Value, Option<Vec<u8>>) {
             serde_json::json!({"verdict": "refused", "reason": reason, "evidence": evidence.to_hex()}),
             None,
         ),
-        EnvelopeVerdict::RefusedAuthenticated { object_id, reason } => (
-            serde_json::json!({"verdict": "refused_authenticated", "object_id": object_id, "reason": reason}),
+        EnvelopeVerdict::RefusedAuthenticated {
+            object_id,
+            reason,
+            sender,
+        } => (
+            serde_json::json!({
+                "verdict": "refused_authenticated",
+                "object_id": object_id,
+                "reason": reason,
+                "sender": {"host_id": sender.host_id, "host_trust_gen": sender.host_trust_gen},
+            }),
             None,
         ),
         EnvelopeVerdict::Unavailable { error } => panic!("unavailable: {error}"),
@@ -8034,9 +11007,15 @@ fn mail_result_verdict(verdict: ResultVerdict) -> (Value, Option<Vec<u8>>) {
         ResultVerdict::Refused { reason, evidence } => {
             mail_verdict(EnvelopeVerdict::Refused { reason, evidence })
         }
-        ResultVerdict::RefusedAuthenticated { object_id, reason } => {
-            mail_verdict(EnvelopeVerdict::RefusedAuthenticated { object_id, reason })
-        }
+        ResultVerdict::RefusedAuthenticated {
+            object_id,
+            reason,
+            sender,
+        } => mail_verdict(EnvelopeVerdict::RefusedAuthenticated {
+            object_id,
+            reason,
+            sender,
+        }),
         ResultVerdict::Unavailable { error } => panic!("unavailable: {error}"),
     }
 }
@@ -8196,22 +11175,25 @@ fn host_envelope() {
         let label = s(c, "label");
         let list = g.list(&chain_labels(c));
         let receiver = &c["receiver"];
-        let me = MailRecipient {
-            host_id: s(receiver, "host_id").into(),
-            host_trust_gen: receiver["host_trust_gen"].as_u64().unwrap(),
-            keys: receiver["keys"]
+        let kid = |name: &str| {
+            atem_client::keys::enc_kid_bytes(&book.public(&format!("{name}/enc"))).unwrap()
+        };
+        let names = |field: &str| -> Vec<&str> {
+            receiver[field]
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|k| {
-                    let name = k.as_str().unwrap();
-                    let key = book.public(&format!("{name}/enc"));
-                    (
-                        KeyId::new(format!("{name}/enc")),
-                        atem_client::keys::enc_kid_bytes(&key).unwrap(),
-                    )
-                })
+                .map(|k| k.as_str().unwrap())
+                .collect()
+        };
+        let me = MailRecipient {
+            host_id: s(receiver, "host_id").into(),
+            host_trust_gen: receiver["host_trust_gen"].as_u64().unwrap(),
+            keys: names("keys")
+                .into_iter()
+                .map(|name| (KeyId::new(format!("{name}/enc")), kid(name)))
                 .collect(),
+            generated: names("generated").into_iter().map(kid).collect(),
         };
         let object_label = s(c, "object");
         let object = SignedObject::from_strict(&strict(&objects[object_label]["object"])).unwrap();

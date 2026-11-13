@@ -71,8 +71,11 @@ Every production SDK artifact includes
 `atem-client-<version>-r9-vectors-host-work-control.json`,
 `atem-client-<version>-r9-vectors-push-hint.json`,
 `atem-client-<version>-r9-vectors-delegated-wire.json`,
-`atem-client-<version>-r9-vectors-host-envelope.json` and the five
-`atem-client-<version>-r9-control-ack-*.json` in its SHA-256
+`atem-client-<version>-r9-vectors-host-envelope.json`,
+`atem-client-<version>-r9-vectors-station-calls.json` (amended for step 4,
+**agreed with Astation (2026-11-13, #120 comment 6848326392)**: a new file in the manifest) and the six
+`atem-client-<version>-r9-control-ack-*.json` (amended for step 4: the
+sixth, `r9-control-ack-reasons`, is O5's, **for Astation's sign-off**) in its SHA-256
 manifest. These are the shared positive/negative request vectors from
 `fixtures/host-work/requests-v1.json`, the prompt framing's vectors from
 `fixtures/host-work/prompt-framing-v1.json` (tags, escaping, rendered prompts
@@ -84,13 +87,15 @@ from `fixtures/r9-vectors-push-hint.json` (approvals and `outcome_unknown`
 alerts, R9.9), the delegated wire shapes from
 `fixtures/r9-vectors-delegated-wire.json` (session-v1 R9.14), the
 envelopes' and results' vectors from `fixtures/r9-vectors-host-envelope.json`
-(host-work-v1 §11.5; planned, host role) and the Station's acknowledgment
-fixtures `fixtures/r9-control-ack-*.json` (§9, delegated host-work test 48).
+(host-work-v1 §11.5; planned, host role), the Station calls' byte goldens
+from `fixtures/r9-vectors-station-calls.json` (host-work-v1 §11.4, §9) and
+the Station's acknowledgment fixtures `fixtures/r9-control-ack-*.json` (§9,
+delegated host-work test 48).
 The Rust core's tests run all of them; the Swift, Kotlin and WASM
 conformance suites run the framing vectors through the exports of
 [Prompt framing](#prompt-framing-delegated-host-work-design-iii2) (VII.C test
-40), the control records', the push hints' and the envelopes' and results'
-vectors and the acknowledgment fixtures, and
+40), the control records', the push hints', the envelopes' and results' and
+the Station calls' vectors and the acknowledgment fixtures, and
 `scripts/check-atem-client-packages.sh` runs the framing vectors through the
 packaged WASM build. They are fixture data, not a live integration test: the
 host renders every prompt (`session::framing`); a client never does.
@@ -476,8 +481,15 @@ A phone receiving a hint (APNs/FCM payload):
    provider; refused for another device or `enc_key` before anything is
    opened). Facts that aren't a delegated sender's UUID v4 task are refused
    `malformed` at open (`r9-vectors-push-hint`'s
-   `outcome_unknown_invalid_facts`). A locked device shows a generic hint
-   instead.
+   `outcome_unknown_invalid_facts`). A `reason` that is blank (nothing but
+   White_Space) or carries a control or Cf character is refused `malformed`
+   at open too, and one over 256 bytes is refused (amended for step 4,
+   **agreed with Astation (2026-11-13, #120 comment 6848326392)**: a blank one is new; `outcome_unknown_invalid_facts`
+   carries one, a delegated task's reason of a space, a no-break space
+   and an ideographic space, with no control or format character, so
+   only the blank rule refuses it: the deferred vector Astation asked
+   for). A
+   locked device shows a generic hint instead.
 
 `verify_push_hint` takes both kinds of hint (the body's `kind`, which only
 the planned `outcome_unknown` hint of `host.alerts` has, tells them apart;
@@ -605,10 +617,14 @@ for a service or a host sender. Production exports for Station builders:
 `relay_decode_to_station`, `relay_decode_to_host`, the relay builders
 (`relay_control_sync`, `relay_control_sync_result`, `relay_heads`,
 `relay_control_ack`, `relay_membership_fetch`,
-`relay_membership_fetch_result`), `AckLedgerHandle` (whose calls return an
-`AckTransition`) and `report_answer`: a Station's side of its hosts' feed
-calls and acknowledgments, and its reports to the Portal. Production
-exports for Station builders: §9. An app (Astation) uses none of them.
+`relay_membership_fetch_result`), `relay_control_sync_answers` (whether a
+`control_sync_result` answers a `control_sync`), `AckLedgerHandle` (whose
+calls return an `AckTransition`) and `report_answer`: a Station's side of
+its hosts' feed calls and acknowledgments, and its reports to the Portal.
+Production exports for Station builders: §9. An app (Astation) uses none of
+them, but for its `:8080` proxy, which matches a feed result to the call it
+forwarded with `relay_control_sync_answers` (correlation, §9 "Station
+calls").
 
 ### Mail between hosts (delegated host work; planned, host role)
 
@@ -625,7 +641,7 @@ The bindings carry them so the Swift, Kotlin and WASM suites run
 |---|---|
 | `seal_envelope(provider, host_key_id, fields, plain_json, recipient_enc)`, `seal_result(…)` | the object's wire JSON (canonical): `plain_json` (one plaintext shape, read by the receiver's own strict parse: no `null`, exactly its fields; its canonical form is what is sealed; within its bound) sealed to the recipient host's X25519 encryption key, whose `enc_kid` must be `fields.enc_kid` (`malformed` otherwise), and the body signed with the Ed25519 `host_key_id` (purpose `HostSigning`). `fields` is `MailFieldsData{account_id, genesis_hash, sender, recipient, enc_kid, id, created_at, expires_at, signed_at_head}`, its `sender` and `recipient` each a `MailHostData{host_id, host_trust_gen}` |
 | `seal_envelope_with_ikm(…, ikm_e)`, `seal_result_with_ikm(…, ikm_e)` | the same with the ephemeral `DeriveKeyPair(ikm_e)`: the vectors' objects byte for byte (feature `test-vectors`) |
-| `open_envelope(object_json, log, me, provider, now_ms)` | the receiver's checks 1 to 6 against its device list: `EnvelopeVerdictInfo` `Open{plain_json, sender}`, `Pending{host_id, host_trust_gen}`, `Refused{reason, evidence}`, `RefusedAuthenticated{object_id, reason}` or `Unavailable{code, detail}`. `Pending` may also mean the object is sealed to a key this host hasn't applied yet (signed at a head beyond its own): judge it again after each device-list advance and each change of `me.keys`. `Refused` (any refusal before the copy is shown to be the sender's, signed and intact: steps 1 to 4, for example a bad signature or a sealed part its `sealed_hash` doesn't name) claims no id and is never reported; the ids `Open` and `RefusedAuthenticated` claim are the authenticated sender's, `(sender.host_id, id)`. `me` is `MailRecipientData{host_id, host_trust_gen, keys}`: the host's own trust generation from its pairing (never one read from its device list) and the keys it accepts now (`MailKeyData{key_id, enc_kid}`) |
+| `open_envelope(object_json, log, me, provider, now_ms)` | the receiver's checks 1 to 6 against its device list (amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: `RefusedAuthenticated` gains `sender_host`, `MailRecipientData` gains `generated`, and `Pending` is for a key this host made but hasn't applied): `EnvelopeVerdictInfo` `Open{plain_json, sender}`, `Pending{host_id, host_trust_gen}`, `Refused{reason, evidence}`, `RefusedAuthenticated{object_id, reason, sender_host}` or `Unavailable{code, detail}`. `Pending` may also mean the object is sealed to a key this host made but hasn't applied yet (signed at a head beyond its own): judge it again after each device-list advance and each change of `me.keys`. `Refused` (any refusal before the copy is shown to be the sender's, signed and intact: steps 1 to 4, for example a bad signature or a sealed part its `sealed_hash` doesn't name) claims no id and is never reported; the ids `Open` and `RefusedAuthenticated` claim are the authenticated sender's, `(sender_host.host_id, id)`, and `RefusedAuthenticated.sender_host` is that sender, a `MailHostData{host_id, host_trust_gen}` (its `host_trust_gen` says which `add_host` key verified the copy; it is no part of the claim; named apart from `Open`'s `sender`, the principal string, so one field name has one type; the `sender` of host-work-v1 §11.5 and of the host-envelope vectors' `expect` is this field). `me` is `MailRecipientData{host_id, host_trust_gen, keys, generated}`: the host's own trust generation from its pairing (never one read from its device list), the keys it accepts now (`MailKeyData{key_id, enc_kid}`) and the `enc_kid` (16 hex) of every key it made in that generation, from its own record, each written durably before the key was handed out (design II.4.1); a key in `keys` counts as made, listed here or not (a key id in neither is refused `enc_key_not_accepted` even beyond its head, for good; one only in `generated` waits there) |
 | `accept_result(object_json, log, me, outbox, provider, now_ms)` | the sending host's check of a result against its row `MailOutboxData{recipient, message_id, cancel_complete_ids, task_ids}`: `ResultVerdictInfo` `Accepted`, `NotDelivered{plain_json, sender, reason}` (a revoked or removed sender's result, kept as data), and the same `Pending`, `Refused`, `RefusedAuthenticated`, `Unavailable` |
 
 The verdict functions throw only for bytes that don't parse as a signed
@@ -639,7 +655,11 @@ those bytes too, under the SHA-256 of the bytes as fetched (host-work-v1
 §11.5). Anything about a signed object's content is a verdict. JS: `sealEnvelope`, `sealResult`,
 `sealEnvelopeWithIkm`, `sealResultWithIkm`, `openEnvelope`, `acceptResult`
 with a `SoftwareKeyStore` (builds with `software-keys` and `host`), the
-fields and records as camelCase objects, the verdicts as `{type, …}`.
+fields and records as camelCase objects (the receiver `{hostId,
+hostTrustGen, keys: [{keyId, encKid}], generated: [encKid]}`), the verdicts
+as `{type, …}` (an authenticated refusal's `senderHost` as `{hostId,
+hostTrustGen}`; amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: `generated`
+and `senderHost`).
 
 ### Encoding helpers
 
@@ -821,7 +841,7 @@ errors: ProviderError.Cancelled{reason} | UnknownKey | OpenFailed | Failed{reaso
 | `Restore{code, detail}` | `kit_tag_mismatch`, `genesis_mismatch`, `membership_invalid`, `no_host_reachable`, `log_behind_host`, `kit_not_current`, `no_backup`, `backup_hash_mismatch`, `backup_invalid` |
 | `Publish{code, detail}` | `outstanding` (also: another publisher or writer of this device holds a prepared body), `not_on_head`, `nothing_prepared`, `sign` |
 | `Push{code, detail}` | `malformed`, `binding`, `bad_signature`, `invalid_times`, `skew`, `stale`, `bad_sealed`, `duplicate` |
-| `Stored{code, detail}` | a stored snapshot didn't load. `MembershipLog::from_stored`: `too_large` (over 16 MiB), `malformed` (not strict JSON, not an object, no `v`, no `account_id`/`genesis_hash`), `unsupported_version` (a `v` other than 1), `account_mismatch`, `genesis_mismatch` (the snapshot's are not the caller's anchors), `stored_invalid` (the shared verifier refused it, or it isn't exactly `stored_json()`'s form); a malformed anchor argument is `Invalid`. `ControlStateHandle::from_json` (§9): `too_large` (over 64 MiB), `malformed` (not strict JSON, not an object, no `v`), `unsupported_version` (a `v` other than 1), `account_mismatch`, `genesis_mismatch` (the state is another device list's), `stored_invalid` (the state's own rules refuse it, or it isn't exactly `to_json()`'s form) |
+| `Stored{code, detail}` | a stored snapshot didn't load. `MembershipLog::from_stored`: `too_large` (over 16 MiB), `malformed` (not strict JSON, not an object, no `v`, no `account_id`/`genesis_hash`), `unsupported_version` (a `v` other than 1), `account_mismatch`, `genesis_mismatch` (the snapshot's are not the caller's anchors), `stored_invalid` (the shared verifier refused it, or it isn't exactly `stored_json()`'s form); a malformed anchor argument is `Invalid`. `ControlStateHandle::from_json` (§9): `too_large` (over 64 MiB), `malformed` (not strict JSON, not an object, no `v`, an `account_id` or `genesis_hash` missing or not readable: such a header names no list; amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**), `unsupported_version` (a `v` other than 2: amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**), `account_mismatch`, `genesis_mismatch` (a well-formed header naming another device list: delete the state and start with `new`), `stored_invalid` (the state's own rules refuse it, or it isn't exactly `to_json()`'s form). `control_state_from_parts` (§9; amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: new): `too_large` (over 64 MiB in all), `malformed` (a part that isn't strict JSON), `stored_invalid` (a principal given twice; a part of this list its rules refuse, that isn't exactly `part()`'s form, or whose principal is no principal; a part whose device list can't be read); never `account_mismatch` or `genesis_mismatch` (another list's parts are reported in `foreign`) |
 | `State{detail}` | `state` (a call out of order: `already started`, `not waiting for accept`, `no signature pending`, …; or the object changed while the provider was signing) |
 
 `detail` is for logs and may change; branch on the variant and `code`.
@@ -979,7 +999,7 @@ jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (68 checks in JS, 70 in Kotlin and in Swift: the same 68
+- **Conformance** (70 checks in JS, 72 in Kotlin and in Swift: the same 70
   in each language, plus two in Kotlin and Swift, whose provider sees the
   signing request and so the purposes of the five device-list actions and
   of control records; over `designs/protocol/fixtures/r9-vectors-*.json`,
@@ -994,18 +1014,19 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   open), `bindings/js/conformance.mjs`, `bindings/swift/Tests/AtemClientTests/ConformanceTests.swift`
   (with a CryptoKit `AppKeyProvider`).
 - **Host mail** (planned, host role; four conformance checks per language,
-  of the 68 and 70 above): every entry of `r9-vectors-host-envelope`
+  of the 70 and 72 above): every entry of `r9-vectors-host-envelope`
   extends log L to its hash, the builders reproduce every `built` object
   byte for byte (a fresh seal opens, a builder refuses a plaintext with
   `null`, a dropped reply and a key that isn't the `enc_kid`'s, and seals a
   plaintext's canonical form only), and every check's verdict and reason
-  through `open_envelope` and `accept_result`, with the plaintext an open
-  gives (the largest by its length and SHA-256). Kotlin and Swift also open
-  the request and the re-signed copy through their own platform providers
-  (`JdkKeys`, `CryptoKitKeys`), whose failed open is
+  through `open_envelope` and `accept_result` (with each receiver's
+  `generated` key ids and each authenticated refusal's `sender`), with the
+  plaintext an open gives (the largest by its length and SHA-256). Kotlin
+  and Swift also open the request and the re-signed copy through their own
+  platform providers (`JdkKeys`, `CryptoKitKeys`), whose failed open is
   `ProviderError.OpenFailed` (§3): the same verdicts.
 - **Device-list actions** (`tests/host_actions.rs`, Rust; four conformance
-  checks in JS, five in Kotlin and Swift, of the 68 and 70 above): every
+  checks in JS, five in Kotlin and Swift, of the 70 and 72 above): every
   `P*`/`EK*`/`HS*` vector of
   `r9-vectors-membership-log` through the queries (`expect`) and the
   refusals (`reason`), the builders against the vectors' `jcs` and
@@ -1014,24 +1035,29 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   be a key, a generation or an algorithm), and a manager signing each
   action through a recording provider under its own purpose and publishing
   it (the verifier takes the entry).
-- **Control records** (`tests/control.rs`, Rust; four conformance checks
-  in JS, five in Kotlin and Swift, of the 68 and 70 above): every record of
+- **Control records** (`tests/control.rs`, Rust; five conformance checks
+  in JS, six in Kotlin and Swift, of the 70 and 72 above): every record of
   `r9-vectors-host-work-control` parsed (or refused by the parse with its
   code) and verified on each of its chains as `checks` says, the builders
   reproducing it byte for byte (a software store, and the signing input
   plus the vector's signature; a body the parse refuses is refused, nothing
-  signed), every sequence through a `ControlStateHandle` with each step's
-  per-effect results and the state it leaves (each step applied to the
-  next state the step before returned), the state loading only for its
-  own device list and exactly as written, a failed commit losing no effect
+  signed), every sequence through a `ControlStateHandle` (from its
+  `initial` state when it has one) with each step's per-effect results,
+  the `standing` of its record's principal and the parts it `touched`
+  (exactly the parts that changed), and the state it leaves (each step
+  applied to the next state the step before returned), the state loading
+  only for its own device list and exactly as written, whole and from its
+  parts per principal (in any order; a principal given twice, a part that
+  isn't strict JSON or not of its principal's kind refused), a failed
+  commit losing no effect
   (the handle `apply` was called on unchanged, the record applied again
   giving the same results and actions, and a duplicate once the next
   state is adopted), and (Kotlin and Swift) the
   provider asked under `ServiceControl` (no confirmation) for the
   integration's own key and `ControlRecord` (a fresh confirmation of the
   body) for a native manager.
-- **The Station's side** (`tests/station.rs`, Rust; nine conformance
-  checks per language, of the 68 and 70 above): every acknowledgment
+- **The Station's side** (`tests/station.rs`, Rust; ten conformance
+  checks per language, of the 70 and 72 above): every acknowledgment
   fixture (`r9-control-ack-*`, one check each) through `AckLedgerHandle` as
   a Station persists it (each call's next state committed before the
   reports go and adopted after, restarts from the committed state, two
@@ -1045,9 +1071,16 @@ Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
   3, another direction's message); the three refusals exactly and read
   strictly (unknown codes, fields, nulls, duplicate keys), and an ack
   refused for its stale association with nothing counted or disclosed;
-  and the Portal's statuses in their classes.
+  the Portal's statuses in their classes; and the byte goldens of
+  `r9-vectors-station-calls` (`goldens_round_trip_through_the_bindings`):
+  every message of the six calls and the three refusals built byte for byte
+  from its fields (an ack written again from what it decoded to; a page with
+  a record the control parser refuses is refused by the builder with that
+  parse code), read back to its fields with each page record judged by
+  `parse_control_record` as the file says, refused by the other side's
+  reader as `wrong_message`, and every invalid text refused with its code.
 - **Durable log** (`tests/stored_log.rs`, Rust; two conformance checks per
-  language, of the 68 and 70 above): a partly elapsed wait across a same-boot restart and a reboot,
+  language, of the 70 and 72 above): a partly elapsed wait across a same-boot restart and a reboot,
   the wall clock set back after restore, a wait-ended decision at its chain
   position (with the entry that relies on it), pending, approved and vetoed
   recovery and key-replacement records, a frozen log, corrupted, oversize,
@@ -1097,9 +1130,12 @@ acknowledgments").
 |---|---|
 | `build_control_record(provider, key_id, body)` (Swift, Kotlin) | signs `body` (a `ControlRecordBody`) with `key_id` through the provider and returns the record's wire JSON (canonical). The body is checked first exactly as a host's parse checks it: one it refuses is `Invalid{code}` and nothing is signed. The provider sees purpose `ServiceControl` when `signer` is the principal itself (the integration's service key: no owner confirmation) and `ControlRecord` for `member:<device_id>` (a fresh confirmation, §3) |
 | `control_record_signing_input(body)`, then `control_record_with_signature(body, signer_key, signature)` (all three; JS `controlRecordSigningInput(body)`, `controlRecordWithSignature(body, signerAlg, signerRaw, signature)`) | the same in two steps, for a key that signs elsewhere (a KMS, an HSM, WebCrypto): the bytes to sign, `enc(["atem-host-work-control-v1", jcs(body)])`, then the record. The signature (P-256 64-byte `r‖s`, either S, normalized to low S; Ed25519) is verified under `signer_key` before the record is returned (`bad_signature`; an X25519 key is `wrong_alg`) |
-| `parse_control_record(record_json)` | the body, field by field (strict JSON, at most 16 KiB, exactly the body's fields); no signature check |
+| `parse_control_record(record_json)` | the body, field by field (strict JSON, at most 16 KiB, exactly the body's fields); no signature check. For a record text over 16 KiB this call and the page reader (`FeedEntry::parse_record`, a `control_sync_result`'s records) give different codes (`not_strict_json` here, `malformed` there), though both refuse the same records: compare whether it parses, not the code |
+| `control_why_codes()` | the shared vocabulary of reasons, every code once in a fixed order (JS `controlWhyCodes()`; **for Astation's sign-off**, amended for step 4, O5): the codes `ControlApplied.why` and `ControlEffectResult.why` take in this version. A well-formed reason outside it, read from a `control_ack`, is a later version's: treat it as unrecognized, information only. `r9-vectors-station-calls`'s `why_codes` pins it |
 | `verify_control_record(log, record_json)` | against a verified `MembershipLog`: `Valid{signer, key_seq, head}` (`signer` `service:<id>` for the principal's own key, from the entry at `key_seq`; `member:<id>` for a current native manager), `Pending{reason}` (`principal_unknown`, `signer_unknown`, `revoke_not_in_list`: verify again after the list advances) or `Refused{reason}` (`wrong_account`, `bad_signature`, `key_mismatch`, `signer_not_allowed`, `removed_manager`, `host_key_signed`, `not_a_service`, `not_a_revoke`: keep it as evidence). A record the parse refuses is `Invalid{code}` |
-| `ControlStateHandle::new(log)`, `from_json(log, state_json)`, `to_json()`, `apply(record_json, log, pos, host_applied_seq)` | the reference control state of one device list, as a host keeps it. A handle never changes: `apply` verifies the record against `log` (the device list at the head of this transaction) and returns `ControlTransition{applied, next}`, `applied` being `ControlApplied{result, effects, actions, evidence}` and `next` the state after the record, a new handle. `pos` is `ControlFeedPos{origin, feed_id, feed_seq}`, where the record was read; a record whose body names another `origin` or `feed_id` counts as read at no position (its hold still applies, its cover and release don't) |
+| `ControlStateHandle::new(log)`, `from_json(log, state_json)`, `to_json()`, `apply(record_json, log, pos, host_applied_seq)` | the reference control state of one device list, as a host keeps it. A handle never changes: `apply` verifies the record against `log` (the device list at the head of this transaction) and returns `ControlTransition{applied, next, touched}`, `applied` being `ControlApplied{result, effects, actions, evidence, why}` (`why`, amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: `Applied::why`'s code, host-work-v1 §11.1, set exactly when the record is pending or refused or kept as evidence, else `None`; JS `null`; and each effect's `ControlEffectResult.why`, O5, **for Astation's sign-off**, the record's `why` exactly on an effect `pending` or `refused`, what a host writes in its `control_ack`), `next` the state after the record, a new handle, and `touched` the principals whose part it changed (the record's, or none). `pos` is `ControlFeedPos{origin, feed_id, feed_seq}`, where the record was read: its `origin` is always the Station origin you sync the feed from (a host's own configured Station), never one taken from a page or the record, which is what bounds a part's `order`; a record whose body names another `origin` or `feed_id` counts as read at no position (its hold still applies, its cover and release don't). Amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: `touched`, and the rule that `pos`'s `origin` is the host's own configured Station origin, are new |
+| `principals()`, `part(principal)`, `control_state_from_parts(log, parts)` | the state one part per principal (amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: new), for a store that keeps a row per principal: `part` is a principal's canonical JSON (`None` when the state has none); `control_state_from_parts` (JS `controlStateFromParts`) loads `ControlStatePart{principal, part_json}`s in any order, read as strictly as `from_json`, and returns `ControlLoadedParts{state, foreign}`. Every part names its device list (`account_id`, `genesis_hash`): one of another list (an earlier pairing's leftover) is skipped, never loaded, and its principal listed in `foreign`: delete those rows. The list loaded is always `log`, never inferred from the parts. Write the parts a transition `touched` (a touched principal always has a part in `next`); no other part changed |
+| `standing(principal)` | what is in force for `service:<id>` or `host:<host_id>` (amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: new): `ControlStanding{revoked, interrupted, held, coverage}`: the revoking record's `record_id` (never for a host principal, whose revocation is a device-list entry), the revocations whose interrupt a record put in force (a service's revoking `record_id`, a host principal's `revoke_seq` in decimal; sorted as text, so `"10"` before `"9"`), the hold, and `ControlCoverage{origin, feed_id}`, the covering feed. A principal the state holds nothing for has nothing in force |
 
 JS takes a body as a plain object with `ControlRecordBody`'s fields in
 camelCase (`accountId`, `genesisHash`, `origin`, `feedId`, `principal`,
@@ -1107,8 +1143,15 @@ camelCase (`accountId`, `genesisHash`, `origin`, `feedId`, `principal`,
 `recordId`, `issuedAt`, `integrationId`, `by`), absent ones omitted, `null`
 or `undefined`; any other key is refused (`malformed`), never dropped.
 `apply`'s `pos` is `{origin, feedId, feedSeq}` or `null`, and it returns a
-`ControlTransition` with the getters `applied` (a plain object) and `next`
-(a `ControlStateHandle`). Only bots and tests get
+`ControlTransition` with the getters `applied` (a plain object), `next`
+(a `ControlStateHandle`) and `touched` (an array of principals). JS's
+`controlStateFromParts(log, parts)` takes `[{principal, partJson}]` (any
+other key is refused) and returns a `ControlLoadedParts` with the getters
+`state` and `foreign`; `part` returns `undefined` for a principal with none, and
+`standing` a plain object whose `revoked` and `coverage` (`{origin,
+feedId}`) are `null` when there are none (amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**:
+`touched`, `controlStateFromParts`, `part` and `standing`). Only
+bots and tests get
 `buildControlRecord(store, keyId, body)` (feature `software-keys`).
 
 **The body** (`atem-host-work-control`, host-work-v1 §11.1). A service's
@@ -1133,27 +1176,90 @@ synchronized clock: it orders covers (below).
 2. If you keep a control state (to predict what hosts report, or to know
    what a reset's snapshot must re-issue), `apply` the record at its
    position (`{origin, feed_id, feed_seq}` in your own feed) and store the
-   transition's `next.to_json()` in the same transaction as the feed row.
+   transition's `next.to_json()` (or `next.part(p)` for each principal it
+   `touched`, one row per principal; amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**)
+   in the same transaction as the feed row.
    Use `next` from then on only once that transaction committed. If it
    fails, keep the handle you applied on: `apply` didn't change it, and
    applying the record again gives the same results and actions, so no
    effect is lost. Never rebuild a state by re-applying stored records: a
    record that verified then may not verify against today's list, and
    idempotency is by the records the state keeps.
-3. At start, load it with `from_json(log, state_json)`, the log being the
-   same account's and genesis's. A state that doesn't load is
-   `Stored{code}` (`too_large`, `malformed`, `unsupported_version`,
-   `account_mismatch`, `genesis_mismatch`, `stored_invalid`).
-   `genesis_mismatch` after a re-pair means the stored state is the old
-   device list's: the new list starts with `new`. On any other code stop
-   the work it guards and never start again from an empty state.
+3. At start, load it with `from_json(log, state_json)` (or
+   `control_state_from_parts(log, parts)`), the log being your pinned
+   device list. A whole state that doesn't load is `Stored{code}`
+   (`too_large`, `malformed`, `unsupported_version`, `account_mismatch`,
+   `genesis_mismatch`, `stored_invalid`). `account_mismatch` or
+   `genesis_mismatch` (a well-formed header naming another device list)
+   means the stored state is another device list's, after a re-pair to
+   this account or another: delete it and start with `new`, as for
+   foreign parts. Start with `new` only when your own pairing changed;
+   otherwise treat a mismatch as damage and keep the work stopped (a
+   well-formed but damaged header reads like another list's). A header
+   that can't be read is `malformed`: it names no list, so nothing may
+   start empty. Parts name their device list, so a store of parts
+   loads the current list's parts and skips the others, reporting them
+   in `foreign` (delete those rows): an old list's leftovers never load,
+   so a service id that recurs in the new list inherits no revoke, hold or
+   coverage, and the current list's stops beside them stay in force. At a
+   live re-pair, delete the old list's rows in the transaction that adopts
+   `new`. Parts never give `account_mismatch` or `genesis_mismatch`: a
+   part of the current list that fails, or one whose device list can't be
+   read, is `stored_invalid`, a part that isn't strict JSON `malformed`,
+   and parts over 64 MiB in all `too_large`. Store each `part_json` byte
+   for byte: anything but `part()`'s exact form is `stored_invalid`. On
+   any code but a whole state's `account_mismatch` or `genesis_mismatch`,
+   stop the work it guards and never start again from an empty state. A
+   `v` 1 state, the format before parts per principal, is
+   `unsupported_version`: this version reads `v` 2 only. (Amended for
+   step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**: everything in this step about parts, `foreign` and
+   `v` 2. Only a pairing change you established yourself permits a fresh
+   state or deleting another list's rows; an unexpected mismatch under the
+   same pairing is damage: stop the work.)
 
-**Its size.** The state keeps every record that counted (about 110 bytes
-each) and is read whole: `from_json` takes at most 64 MiB, some 600,000
-records, and refuses a larger one `too_large`. Pruning records that can no
-longer come again is planned (neither this state nor the acknowledgment
-ledger prunes in this version); until then a long-lived Station sizes its
-state against that bound.
+**Its size.** Each principal keeps at most 256 counted record ids (about
+125 bytes each, `MAX_RECORD_IDS`), the next evicting its oldest but never
+its revocation's record or the coverage's cover, and the order a release
+follows keeps one feed per Station origin: a part is about 32 KB at most,
+plus one order entry per origin (**Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392)**: stops are
+never blocked by the bound, and the floor complements O1, never replaces
+it; host-work-v1 §11.1 rule 1 and "The state, per principal").
+**An evicted record that comes back grants nothing:** `feed_seq` isn't
+signed, so whoever serves a host the covering feed (you, or a carrier
+that rewrites your pages, such as Astation's `:8080` proxy) could
+otherwise re-serve an evicted release at a fresh position and lift a
+hold. So the floor guards only what can grant or lift: a `cover` or
+`release` of a principal that isn't revoked, under an id the state no
+longer counts and issued no later than the newest record evicted (the
+part's `evicted_floor`), is `refused` as a possible replay and kept as
+evidence. A cover or release applies when it was issued after every
+evicted record of that principal, which you meet for every record you
+signed yourself when each record you sign for a principal, holds
+included, is issued after every record you signed for it before (your
+signing duty below). A stop
+never meets the floor: a hold applies as any hold (an evicted one
+replayed holds again, which grants nothing), and revokes and interrupts
+replayed are duplicates. The residual: a Station whose clock lags the
+floor (after a host switches to it, or after another Station's record
+issued ahead of its clock was evicted) has its covers and releases
+refused as possible replays until its `issued_at` passes the floor; it
+fails safe (holds stay, nothing new starts).
+
+**A release lifts only holds issued before it** (O1, requested by
+Astation, 2026-11-13; **for Astation's sign-off**, amended for step 4; host-work-v1
+§11.1 rule 6). Each service part keeps `hold_issued_at`, the newest
+`issued_at` of every hold the state verified for it (one that found it
+held, read out of order, from another feed or none, or under a counted id
+included), and a release taken in feed order while held lifts the hold
+only when issued strictly after it; one issued no later, the same
+millisecond included, is `refused` with `why` `not_after_hold`, no
+evidence, and takes no position in the feed's order. No eviction, reset,
+coverage change or restart erases it. A stored `v` 2 part without
+`hold_issued_at` loads only while it holds nothing; a held one without it
+is `stored_invalid`.
+Only principals of the device list count records, so a state stays far
+under the 64 MiB that `from_json` and `control_state_from_parts` read (a larger one is
+`too_large`). The acknowledgment ledger doesn't prune in this version.
 
 **Reading results.** `apply` gives the record's `result` and one result per
 effect it carries (`revocation`, `interrupt`, `hold`, `release`, `cover`).
@@ -1161,9 +1267,10 @@ Read `effects`, not only `result`: a revoke that adds `interrupt_running:
 true` to one already applied is `applied` for its interrupt and
 `duplicate` for its revocation. For the revocation, `duplicate` means
 "already in force on this host" and counts as done (decision 8).
-`pending` waits (apply the record again once the device list or
-host-work's applied `seq` advanced); `refused` never applies from this
-record; `evidence` means keep the record and alert: it failed
+`pending` waits (apply the record again once the device list,
+host-work's applied `seq` or (amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**) the
+principal's revocation advanced);
+`refused` never applies from this record; `evidence` means keep the record and alert: it failed
 verification, or it reuses a `record_id` of the same principal with
 another body (a stop, `hold`, `revoke` or `interrupt_running`, still
 applies its effects then; a `cover` or `release` is refused). Record ids
@@ -1177,7 +1284,29 @@ trust model"):
 
 - Covers are ordered by `(issued_at, record_id)`: another Station's cover
   takes coverage only when strictly newer, and a cover never releases a
-  hold. Your covers' `issued_at` only rises: each cover you sign for a
+  hold.
+- **Your signing duty** (**agreed with Astation, 2026-11-13, #120 comment
+  6848326392**; amended for step 4; host-work-v1 §11.1, "Stations: the
+  trust model"): every record you sign for a principal, **holds
+  included**, is issued strictly after every record you signed for it
+  before. Serialize signing per account, genesis and principal; keep the
+  greatest `issued_at` you signed durably **before** publishing any signed
+  output; carry it at handover and keep it across a restart and a
+  snapshot's generation (a snapshot's records signed anew are issued
+  now); and when your clock can't safely give a later time, wait: never
+  sign at or below the mark, never bypass it. Why: a `cover` or `release`
+  issued no later than a record a host evicted is refused there as a
+  possible replay (rule 1), and a release lifts only holds issued before
+  it (O1, rule 6), so a hold you sign with an older time than a release
+  you already signed could be lifted by that release served late. What
+  it can't close: a hold another signer (another Station, a native
+  manager's device) issued with a clock behind your release can still be
+  lifted by it, within that clock skew (no regression: before O1 any
+  release in feed order could); and your release is refused
+  `not_after_hold` while your clock is behind another signer's hold,
+  until it passes it (fails safe; the ack's reason says so).
+- Your covers' `issued_at` only
+  rises: each cover you sign for a
   principal is newer than any cover issued for it before, a handed-over
   integration's included (the handover carries the last cover's
   `issued_at`). A cover that isn't newer than the coverage's takes
@@ -1231,19 +1360,68 @@ reply to an ack `ack` refuses for its association on the link
 ack gets a reply. A refusal is an authorization failure on that link,
 never an empty successful page or an application acknowledgment: it
 advances no cursor, membership head, clock floor or ledger evidence, opens
-no gate, carries no request id and must not complete or correlate a
-request. The host keeps that link's synchronization gates closed while it
-repairs the association and resynchronizes; the transport may still fence
-or close an invalid or superseded link.
+no gate, carries no request id or cursor (correlation leaves the three
+unchanged: a refusal names a call kind, never a request) and must not
+complete or correlate a request. The host keeps that link's synchronization
+gates closed while it repairs the association and resynchronizes; the
+transport may still fence or close an invalid or superseded link.
+
+**Correlation** (**amended in place on Astation's request, #164 comment
+6858189009**; unshipped, so no new version and no fallback). A
+`control_sync` carries `request_id`, a lowercase UUID v4 that the host makes
+fresh for every call (a retry after a timeout and a call on a new link
+generation included, even at the same cursor); answer it with the same
+`request_id` and its `after` echoed, on the feed it named (a call that names
+no feed asks from 0 for the account's current feed), with records strictly
+after that `after`. A named feed that is stale (pre-reset) is refused
+`control_sync_refused`, never answered on the new feed. The host and
+Astation's `:8080` proxy decide whether a result answers a call with the one
+shared helper, `relay_control_sync_answers` (below): the same `request_id`,
+origin, feed (when the call named one) and `after`. The link generation, the
+account and the genesis captured with the call are the caller's to compare,
+and an id is a correlation value, never authorization: a result for a
+retired, timed-out or old-generation call, or for no call, advances nothing
+and opens no gate.
 
 | call | what it does |
 |---|---|
-| `relay_decode_to_station(message)` | reads a host's call strictly (at most 256 KiB as received, one strict I-JSON parse, exact fields, never `null`): `ControlSync{origin, feed_id?, after}`, `ControlAck{ack}` or `MembershipFetch{after}`. Another relay message on the link (`push_hint`, `push_seen`, …) is `Invalid{wrong_message}`: dispatch it elsewhere. The calling host is never a field: take it from the link's verified association (below) |
-| `relay_control_sync_result(origin, feed_id, head, station_time, records)` | the page after the host's `after`: at most 64 `RelayFeedRecord{feed_seq, record_json}`, ascending, each `feed_seq` in `1..=head`, 256 KiB in all. Each record goes through the control parser first: one it refuses is `Invalid{code}` with its parse code, and the page isn't written. Serve only records you validated at intake and stored |
+| `relay_decode_to_station(message)` | reads a host's call strictly (at most 256 KiB as received, one strict I-JSON parse, exact fields, never `null`): `ControlSync{request_id, origin, feed_id?, after}` (answer with its `request_id` and `after`), `ControlAck{ack}` or `MembershipFetch{after}`. Another relay message on the link (`push_hint`, `push_seen`, …) is `Invalid{wrong_message}`: dispatch it elsewhere. The calling host is never a field: take it from the link's verified association (below). An ack's `ControlEffectResult.why` (O5, **for Astation's sign-off**, amended for step 4; host-work-v1 §11.4 wire rule 10; the vocabulary is `control_why_codes()`, JS `controlWhyCodes()`) is why an effect `pending` or `refused` isn't in force, as the host wrote it, or `None` (JS `null`): read it as information only, never as a count or a request to re-sign, and treat a code you don't know as unrecognized (a later version's; the result stands). A reason that is `null`, not a text, empty, over 64 bytes, outside `[a-z0-9_]` or beside `applied` or `duplicate` refuses the whole ack, `Invalid{malformed}` |
+| `relay_control_sync_result(request_id, origin, feed_id, after, head, station_time, records)` | the answer to the call `request_id` names, its `after` echoed, on the feed it named (or, for a call that named none, the account's current feed): at most 64 `RelayFeedRecord{feed_seq, record_json}`, ascending, each `feed_seq` strictly after `after` and at most `head` (gaps are legal; a `head` below `after`, a feed that went back under the same id, takes no record: the host rescans), 256 KiB in all. Never leave out earlier stored records to fill a page with later ones. Each record goes through the control parser first: one it refuses is `Invalid{code}` with its parse code, and the page isn't written. Serve only records you validated at intake and stored |
+| `relay_control_sync_answers(call, result)` | whether the `control_sync_result` text `result` answers the `control_sync` text `call` (each read strictly; `Invalid{code}` if either isn't one): `RelaySyncVerdict::Answers`, else the first field that differs, `RequestId`, `Origin`, `FeedId` or `After`. The shared matching decision of the host and the `:8080` proxy; the caller compares the link generation, account and genesis it captured with the call |
 | `relay_heads(feeds, membership)` | each covering feed's `RelayFeedHead{origin, feed_id, head, station_time}` (at most 64, a feed once) and the device list's `LogHead`. Send it on every (re)connection, every 30 seconds and at once when a record is stored |
 | `relay_membership_fetch_result(head, entries)` | the device list's head and the entries after the host's `after` (signed objects' JSON), at most 64: an R9.3 carriage |
 | `relay_control_sync_refused(code)`, `relay_membership_fetch_refused(code)`, `relay_control_ack_refused(code)` | a refusal of that call on this link (`code`: `RelayRefusalCode::Forbidden`, the only one); never send an empty page or an ack instead. `relay_decode_to_host` reads them as `ControlSyncRefused{code}`, `MembershipFetchRefused{code}`, `ControlAckRefused{code}` |
-| `relay_control_sync(origin, feed_id, after)`, `relay_control_ack(ack)`, `relay_membership_fetch(after)`, `relay_decode_to_host(message)` | the host's side, for tests and other hosts |
+| `relay_control_sync(request_id, origin, feed_id, after)`, `relay_control_ack(ack)`, `relay_membership_fetch(after)`, `relay_decode_to_host(message)` | the host's side, for tests and other hosts (`request_id`: the caller's, a fresh lowercase UUID v4 for every call; `relay_decode_to_host` reads a page as `ControlSyncResult{request_id, origin, feed_id, after, head, station_time, records}`) |
+
+**Known answers.** `fixtures/r9-vectors-station-calls.json` holds every
+message of the six calls and the three refusals as the exact text these
+builders write (compact, keys in RFC 8785 order), with its decoded fields,
+the control parser's verdict on each page record, and the invalid texts each
+reader refuses with its code (an unknown field, a `null`, a duplicate key,
+an unknown refusal code, a count of 65, and each refused form of a
+typed reason: `null`, not a text, empty, over 64 bytes, outside
+`[a-z0-9_]`, beside `applied` or `duplicate`, a duplicate `why` key; and
+each refused form of correlation: a call's or a result's `request_id`
+missing, `null`, upper case or not a v4 UUID, a result without its `after`,
+a record at or below `after`, and a `head` below `after` with records),
+the `matching` cases (a result read against one or more calls by
+`relay_control_sync_answers`: a match, a discovery answered on the current
+feed, a feed gone back, mismatches on the id, the origin, the feed and the
+`after`, two calls at the same cursor that differ only by their ids, and a
+retired call's late reply, each with its verdict),
+and the byte bound for each call
+that can carry a large page (a text of exactly 262,144 bytes read, one of
+262,145 and one of 300,000 refused, for `control_sync_result` and
+`membership_fetch_result` alike): a Station that writes or reads the same
+bytes and gives the same codes agrees with Atem's host, and `scripts/check-r9-vectors.py` confirms them with a
+reader written from host-work-v1 §11.4. A page whose records the control
+parser refuses is a builder's page with those values put in their slots
+(`hand_assembled: true` in its case): a Station serves only what it
+validated at intake, so its builder refuses them, and a `null` or a string
+record kept as evidence with the page standing is Atem's reading of "any
+JSON type", agreed with Astation (2026-11-13, #120 comment 6848326392): keep such records' evidence, apply none of them, and
+never take their delivery for application evidence; a page that isn't
+strict JSON keeps the gate closed.
 
 Each builder checks what the reader checks, so what it writes the reader
 accepts; a value out of its grammar is `Invalid{code}` (`too_large`,
@@ -1251,8 +1429,9 @@ accepts; a value out of its grammar is `Invalid{code}` (`too_large`,
 Station sent it, of any JSON type: a record the control parser refuses
 costs only itself, never the page. JS: `relayDecodeToStation(message)`,
 `relayDecodeToHost(message)` (plain objects, `{type: "control_sync" | "control_ack" | …, …}`, camelCase),
-`relayControlSync(origin, feedId?, after)`,
-`relayControlSyncResult(origin, feedId, head, stationTime, [{feedSeq, recordJson}])`,
+`relayControlSync(requestId, origin, feedId?, after)`,
+`relayControlSyncResult(requestId, origin, feedId, after, head, stationTime, [{feedSeq, recordJson}])`,
+`relayControlSyncAnswers(call, result)` (`"answers"`, `"request_id"`, `"origin"`, `"feed_id"` or `"after"`),
 `relayHeads([{origin, feedId, head, stationTime}], {seq, hash})`,
 `relayControlAck({accountId, genesisHash, hostId, hostTrustGen, origin, feedId, cursor, results})`
 (each result `{type: "record", recordId, effects}` or `{type: "entry", seq,

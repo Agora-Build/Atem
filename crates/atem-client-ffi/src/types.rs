@@ -948,6 +948,16 @@ record! {
     pub struct ControlEffectResult {
         pub effect: ControlEffectKind,
         pub result: ControlResultKind,
+        /// Why the effect isn't in force (O5; **for Astation**, amended for
+        /// step 4): set exactly when `result` is `pending` or `refused`,
+        /// else `None` (JS `null`). Information only: it never changes
+        /// `result` and counts nothing. A code of the shared vocabulary
+        /// (`ControlApplied.why`'s), or, read from a `control_ack`, a
+        /// well-formed one this build doesn't know (1 to 64 bytes of
+        /// `[a-z0-9_]`), given as it came: a code outside
+        /// `control_why_codes()` is unrecognized. A builder refuses one beside `applied` or
+        /// `duplicate`, or one that isn't well formed (`malformed`).
+        pub why: Option<String>,
     }
 }
 
@@ -994,6 +1004,59 @@ record! {
         /// verification, or it reuses a `record_id` of the same principal
         /// with another body (a stop still applies then; see `effects`).
         pub evidence: bool,
+        /// Why it is `pending` or `refused`, or kept as evidence: set
+        /// exactly then (a colliding record is `collision`, whatever its
+        /// result), `None` (JS `null`) for a record that counted without
+        /// question. The verifier's reason (`principal_unknown`,
+        /// `signer_unknown`, `revoke_not_in_list`; `wrong_account`,
+        /// `bad_signature`, `key_mismatch`, `signer_not_allowed`,
+        /// `removed_manager`, `host_key_signed`, `not_a_service`,
+        /// `not_a_revoke`), or the state's: `list_frozen`, `not_revoked`,
+        /// `revoke_not_applied`, `order`, `after_revoke`, `collision`,
+        /// `not_newer`, `possible_replay`, `not_after_hold` (host-work-v1
+        /// §11.1).
+        pub why: Option<String>,
+    }
+}
+
+record! {
+    /// What a control state has in force for one principal
+    /// (`ControlStateHandle::standing`; I.5.5). A principal the state holds
+    /// nothing for has nothing in force.
+    pub struct ControlStanding {
+        /// A service's revocation: the `record_id` of the revoke that
+        /// revoked it. Always `None` for a host principal, whose
+        /// revocation is a device-list entry.
+        pub revoked: Option<String>,
+        /// The revocations whose interrupt a record put in force, as
+        /// `ControlHostAction::Interrupt` names them (a service's revoking
+        /// `record_id`, a host principal's `revoke_seq` in decimal), sorted
+        /// as text (`"10"` before `"9"`).
+        pub interrupted: Vec<String>,
+        /// A hold is in force.
+        pub held: bool,
+        /// The covering feed: its future tasks are delegated, under that
+        /// origin's gate. `None`: not covered.
+        pub coverage: Option<ControlCoverage>,
+    }
+}
+
+record! {
+    /// A covering feed: its Station's exact origin and current `feed_id`.
+    pub struct ControlCoverage {
+        pub origin: String,
+        pub feed_id: String,
+    }
+}
+
+record! {
+    /// One principal's part of a control state, as `ControlStateHandle::part`
+    /// writes it (canonical JSON), for a store that keeps one row per
+    /// principal (`control_state_from_parts`).
+    pub struct ControlStatePart {
+        /// `service:<id>` or `host:<host_id>`.
+        pub principal: String,
+        pub part_json: String,
     }
 }
 
@@ -1001,7 +1064,9 @@ record! {
     /// Where a record was read: its feed's Station `origin` and `feed_id`,
     /// and its position (`feed_seq`). None over a channel. A record counts
     /// as read at its own feed's position only when its body names the
-    /// same `origin` and `feed_id`.
+    /// same `origin` and `feed_id`. `origin` is always the Station origin
+    /// you sync the feed from (a host's own configured Station), never one
+    /// taken from a page or the record: that bounds a part's `order`.
     pub struct ControlFeedPos {
         pub origin: String,
         pub feed_id: String,
@@ -1165,7 +1230,10 @@ record! {
 data_enum! {
     /// A host's call to its Station, as `relay_decode_to_station` reads it.
     pub enum RelayToStation {
+        /// `request_id` names the call: answer it with the same id and
+        /// its `after` (`relay_control_sync_result`).
         ControlSync {
+            request_id: String,
             origin: String,
             feed_id: Option<String>,
             after: u64,
@@ -1192,9 +1260,13 @@ data_enum! {
     /// correlate no request, and keep the link's synchronization gates
     /// closed while the association is repaired and resynchronized.
     pub enum RelayToHost {
+        /// The answer to the call `request_id` names, echoing its `after`
+        /// (whether it answers a given call: `relay_control_sync_answers`).
         ControlSyncResult {
+            request_id: String,
             origin: String,
             feed_id: String,
+            after: u64,
             head: u64,
             station_time: u64,
             records: Vec<RelayFeedRecord>,
@@ -1214,5 +1286,26 @@ data_enum! {
         MembershipFetchRefused { code: RelayRefusalCode },
         /// `control_ack_refused`.
         ControlAckRefused { code: RelayRefusalCode },
+    }
+}
+
+unit_enum! {
+    /// Whether a `control_sync_result` answers a `control_sync`
+    /// (`relay_control_sync_answers`): `Answers`, or the first field that
+    /// differs, in this order.
+    pub enum RelaySyncVerdict {
+        /// The same `request_id`, origin, feed (when the call named one) and
+        /// `after`. With `head` below `after` (no records), the feed went
+        /// back: rescan from 0, never move the cursor.
+        Answers,
+        /// Another call's id: a retired, timed-out or old generation's call,
+        /// or none.
+        RequestId,
+        /// Another Station's.
+        Origin,
+        /// Another feed than the one the call named.
+        FeedId,
+        /// Another `after` than the call's.
+        After,
     }
 }

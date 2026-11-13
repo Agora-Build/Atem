@@ -3234,6 +3234,74 @@
       }
     },
     {
+      "name": "alert_reason_all_blank",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "seq": 1,
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000002",
+              "sender": "service:svc-1",
+              "reason": "   ",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
+      "name": "alert_reason_all_unicode_space",
+      "valid": false,
+      "result": {
+        "v": 1,
+        "op": "host_work_result",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "re": "11111111-1111-4111-8111-111111111111",
+        "host": {
+          "account_id": "account",
+          "atem_device_id": "host",
+          "host_trust_gen": 1
+        },
+        "attachment_gen": "44444444-4444-4444-8444-444444444444",
+        "channel_id": "channel-1",
+        "result": {
+          "kind": "alerts",
+          "alerts": [
+            {
+              "alert_id": "aaaaaaaa-0000-4000-8000-000000000002",
+              "seq": 1,
+              "kind": "outcome_unknown",
+              "host_id": "host",
+              "session_id": "ses-aaaaaaaaaaaa",
+              "task_id": "bbbbbbbb-0000-4000-8000-000000000002",
+              "sender": "service:svc-1",
+              "reason": "\u00a0\u2003\u3000",
+              "created_at": 1
+            }
+          ],
+          "more": false
+        }
+      }
+    },
+    {
       "name": "alert_sender_is_a_principal",
       "valid": false,
       "result": {

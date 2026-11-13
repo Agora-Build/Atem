@@ -1014,8 +1014,11 @@ mod tests {
             ("alerts_by_seq_even_when_time_ascends", false),
             ("alert_seq_from_one", false),
             ("alert_needs_a_seq", false),
-            // No Cf character in a reason.
+            // No Cf character in a reason, and not a reason of white space
+            // only (ASCII, or Unicode's: no-break, em, ideographic).
             ("alert_reason_without_cf", false),
+            ("alert_reason_all_blank", false),
+            ("alert_reason_all_unicode_space", false),
         ] {
             assert!(
                 cases

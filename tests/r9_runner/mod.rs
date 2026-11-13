@@ -110,6 +110,9 @@ pub fn not_expressible(scenario: &Value) -> Option<String> {
         (Some("vectors"), _) if name == "r9-envelope-vectors" => {
             "known-answer envelope vectors (exact bytes), no host process: src/session_protocol/r9/envelope.rs tests".into()
         }
+        (Some("vectors"), _) if name == "r9-vectors-station-calls" => {
+            "known-answer Station call messages (exact bytes between a host and its Station), no host process: crates/atem-client/tests/vectors.rs (the shared builders and readers) and scripts/check-r9-vectors.py".into()
+        }
         (Some("vectors"), _) => "known-answer vectors (exact bytes), no host process: crates/atem-client/tests/vectors.rs (and channel_fixtures.rs for the handshake)".into(),
         (_, Some("client")) if name == "r9-handshake-wrong-head" => {
             "the client refusing an accept with the wrong head: no host acts in it (crates/atem-client/tests/channel_fixtures.rs)".into()

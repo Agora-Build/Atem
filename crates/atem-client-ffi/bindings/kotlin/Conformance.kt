@@ -604,10 +604,12 @@ fun main(args: Array<String>) {
     // of its chains as `checks` says (or its parse refuses it,
     // `parse_error`); the builders reproduce it byte for byte (a software
     // store, or the signing input and a signature); every sequence runs
-    // through a ControlStateHandle with each step's per-effect results and
-    // the state it leaves (a handle never changes, so a failed commit loses
-    // no effect); and a provider is asked under the purpose the record's
-    // signer gives.
+    // through a ControlStateHandle (from its `initial` state when it has
+    // one) with each step's per-effect results, the standing of its
+    // record's principal and the parts it touched, and the state it leaves,
+    // whole and in parts per principal (a handle never changes, so a failed
+    // commit loses no effect); and a provider is asked under the purpose
+    // the record's signer gives.
     val ctl = load("r9-vectors-host-work-control")
     val ctlRecords = ctl["records"].arr()
     val ctlByLabel = ctlRecords.associateBy { it["label"].s() }
@@ -714,32 +716,87 @@ fun main(args: Array<String>) {
         is ControlHostAction.Interrupt -> mapOf("type" to "interrupt", "principal" to a.principal, "revocation" to a.revocation)
         is ControlHostAction.Cover -> mapOf("type" to "cover", "principal" to a.principal, "origin" to a.origin, "feed_id" to a.feedId)
     }
-    fun controlAppliedOf(a: ControlApplied): Map<String, Any?> = mapOf(
-        "result" to a.result.name.lowercase(),
-        "effects" to a.effects.map { mapOf("effect" to it.effect.name.lowercase(), "result" to it.result.name.lowercase()) },
-        "actions" to a.actions.map(::controlActionOf),
-        "evidence" to a.evidence)
+    // An effect as the vectors write it: `why` (O5) only when there is one.
+    fun controlEffectOf(e: ControlEffectResult): Map<String, Any?> {
+        val m = linkedMapOf<String, Any?>("effect" to e.effect.name.lowercase(), "result" to e.result.name.lowercase())
+        e.why?.let { m["why"] = it }
+        return m
+    }
+    fun controlAppliedOf(a: ControlApplied): Map<String, Any?> {
+        val m = linkedMapOf<String, Any?>(
+            "result" to a.result.name.lowercase(),
+            "effects" to a.effects.map(::controlEffectOf),
+            "actions" to a.actions.map(::controlActionOf),
+            "evidence" to a.evidence)
+        // Why it is pending, refused or evidence: present exactly then.
+        a.why?.let { m["why"] = it }
+        return m
+    }
     fun ctlPos(p: Any?): ControlFeedPos? =
         p?.let { ControlFeedPos(it["origin"].s(), it["feed_id"].s(), it["feed_seq"].l().toULong()) }
-    check("control records: every sequence's per-effect results and its state through ControlStateHandle") {
+    fun controlStandingOf(s: ControlStanding): Map<String, Any?> {
+        val m = linkedMapOf<String, Any?>("held" to s.held, "interrupted" to s.interrupted)
+        s.revoked?.let { m["revoked"] = it }
+        s.coverage?.let { m["coverage"] = mapOf("origin" to it.origin, "feed_id" to it.feedId) }
+        return m
+    }
+    fun controlPartsOf(state: ControlStateHandle): List<ControlStatePart> =
+        state.principals().map { ControlStatePart(it, state.part(it)!!) }
+    check("control records: every sequence's per-effect results, standing and state through ControlStateHandle") {
         for (q in ctl["sequences"].arr()) {
             val label = q["label"].s()
-            var state = ControlStateHandle(logL())
+            val initial = q.obj()["initial"]
+            var state = if (initial == null) ControlStateHandle(logL())
+                else ControlStateHandle.fromJson(logL(), canonicalJson(Json.write(initial)))
             q["steps"].arr().forEachIndexed { i, step ->
-                val record = Json.write(ctlByLabel.getValue(step["record"].s())["record"])
+                val r = ctlByLabel.getValue(step["record"].s())
+                val principal = r["record"]["body"]["principal"].s()
+                val record = Json.write(r["record"])
                 val t = state.apply(record, logAfter(strs(step["chain"])), ctlPos(step.obj()["pos"]), step["host_applied_seq"].l().toULong())
                 eq(controlAppliedOf(t.applied), step["expect"].obj(), "$label step ${i + 1}")
+                eq(controlStandingOf(t.next.standing(principal)), step["standing"].obj(), "$label step ${i + 1} standing")
+                val changed = state.part(principal) != t.next.part(principal)
+                eq(t.touched, if (changed) listOf(principal) else emptyList(), "$label step ${i + 1} touched")
                 state = t.next
             }
             val text = canonicalJson(Json.write(q["state"]))
             eq(state.toJson(), text, label)
             eq(ControlStateHandle.fromJson(logL(), text).toJson(), text, label)
+            eq(controlStateFromParts(logL(), controlPartsOf(state)).state.toJson(), text, "$label from its parts")
         }
         // Only its own device list's state, exactly as written.
         val text = canonicalJson(Json.write(ctl["sequences"][0]["state"]))
         throwsCode("account_mismatch") { ControlStateHandle.fromJson(logL(), text.replace("\"acct-test-1\"", "\"acct-other\"")) }
-        throwsCode("unsupported_version") { ControlStateHandle.fromJson(logL(), text.replace("\"v\":1", "\"v\":2")) }
+        throwsCode("unsupported_version") { ControlStateHandle.fromJson(logL(), text.replace("\"v\":2", "\"v\":1")) }
         throwsCode("malformed") { ControlStateHandle.fromJson(logL(), "[") }
+    }
+    check("control records: a state's parts per principal load in any order, only as written") {
+        val q = ctl["sequences"].arr().first { it["label"].s() == "Q17_record_ids_per_principal" }
+        val state = ControlStateHandle.fromJson(logL(), canonicalJson(Json.write(q["state"])))
+        val parts = controlPartsOf(state)
+        eq(parts.map { it.principal }, listOf("host:host-a", "service:svc-discord"))
+        for (part in parts) eq(part.partJson, canonicalJson(Json.write(q["state"]["principals"][part.principal])), part.principal)
+        eq(controlStateFromParts(logL(), parts.reversed()).state.toJson(), state.toJson(), "any order")
+        eq(controlStateFromParts(logL(), emptyList()).state.toJson(), ControlStateHandle(logL()).toJson(), "none")
+        eq(state.part("service:svc-other"), null)
+        eq(controlStandingOf(state.standing("member:dev-mac")), mapOf("held" to false, "interrupted" to emptyList<String>()))
+        throwsCode("stored_invalid") { controlStateFromParts(logL(), listOf(parts[1], parts[1])) }
+        throwsCode("malformed") { controlStateFromParts(logL(), listOf(ControlStatePart("service:svc-discord", "{"))) }
+        throwsCode("stored_invalid") { controlStateFromParts(logL(), listOf(ControlStatePart("service:svc-discord", parts[0].partJson))) }
+        throwsCode("stored_invalid") { controlStateFromParts(logL(), listOf(ControlStatePart("svc-discord", parts[1].partJson))) }
+        // A part whose device list can't be read might be this list's: it fails.
+        throwsCode("stored_invalid") { controlStateFromParts(logL(), listOf(ControlStatePart("host:host-a", parts[0].partJson.replace(ctl["genesis_hash"].s(), "zz")))) }
+        // Each part names its device list: another list's (an earlier pairing's
+        // leftovers) is skipped and reported for deletion, this list's loads.
+        val otherAccount = ControlStatePart("service:svc-discord", parts[1].partJson.replace("\"acct-test-1\"", "\"acct-other\""))
+        val otherGenesis = ControlStatePart("host:host-a", parts[0].partJson.replace(ctl["genesis_hash"].s(), "11".repeat(32)))
+        val mixed = controlStateFromParts(logL(), listOf(otherGenesis, parts[1]))
+        eq(mixed.foreign, listOf("host:host-a"))
+        eq(mixed.state.principals(), listOf("service:svc-discord"))
+        eq(mixed.state.part("service:svc-discord"), parts[1].partJson)
+        val foreign = controlStateFromParts(logL(), listOf(otherAccount, otherGenesis))
+        eq(foreign.foreign, listOf("host:host-a", "service:svc-discord"))
+        eq(foreign.state.toJson(), ControlStateHandle(logL()).toJson())
     }
     check("control records: a failed commit loses no effect (apply leaves its handle as it was)") {
         val state = ControlStateHandle(logL())
@@ -814,7 +871,7 @@ fun main(args: Array<String>) {
     val ackNames = dir.list()!!.filter { it.startsWith("r9-control-ack-") && it.endsWith(".json") }
         .map { it.removeSuffix(".json") }.sorted()
     for (name in ackNames) check("Station acks: $name through AckLedgerHandle") {
-        eq(ackNames.size, 5, "the acknowledgment fixtures")
+        eq(ackNames.size, 6, "the acknowledgment fixtures")
         val f = load(name)
         val setup = f["setup"]
         val st = setup["station"]
@@ -966,16 +1023,29 @@ fun main(args: Array<String>) {
         val a = ctl["stations"]["A"]
         val origin = a["origin"].s()
         val feed = a["feed_id"].s()
-        eq(relayDecodeToStation(relayControlSync(origin, feed, 7uL)), RelayToStation.ControlSync(origin, feed, 7uL))
-        eq(relayDecodeToStation(relayControlSync(origin, null, 0uL)), RelayToStation.ControlSync(origin, null, 0uL))
-        throwsCode("malformed") { relayControlSync(origin, null, 5uL) }
+        // Correlation: the call's id is the caller's, a lowercase UUID v4.
+        val request = "5d0e9a3c-2b1f-4c8d-9e7a-6b5c4d3e2f10"
+        eq(relayDecodeToStation(relayControlSync(request, origin, feed, 7uL)), RelayToStation.ControlSync(request, origin, feed, 7uL))
+        eq(relayDecodeToStation(relayControlSync(request, origin, null, 0uL)), RelayToStation.ControlSync(request, origin, null, 0uL))
+        throwsCode("malformed") { relayControlSync(request, origin, null, 5uL) }
+        throwsCode("malformed") { relayControlSync(request.uppercase(), origin, feed, 7uL) }
         val page = listOf("S1_cover", "S4_revoke", "M1_revoke").mapIndexed { i, label -> RelayFeedRecord((i + 1).toULong(), ctlRecord(label)) }
-        val read = relayDecodeToHost(relayControlSyncResult(origin, feed, 3uL, 1793620940000uL, page)) as RelayToHost.ControlSyncResult
+        fun result(after: ULong, head: ULong, records: List<RelayFeedRecord>) =
+            relayControlSyncResult(request, origin, feed, after, head, 1793620940000uL, records)
+        val built = result(0uL, 3uL, page)
+        val read = relayDecodeToHost(built) as RelayToHost.ControlSyncResult
+        eq(listOf(read.requestId, read.after), listOf<Any>(request, 0uL))
         eq(read.records.map { canonicalJson(it.recordJson) }, page.map { canonicalJson(it.recordJson) })
+        eq(relayControlSyncAnswers(relayControlSync(request, origin, feed, 0uL), built), RelaySyncVerdict.ANSWERS)
+        eq(relayControlSyncAnswers(relayControlSync(request, origin, feed, 1uL), built), RelaySyncVerdict.AFTER)
         val refusedPage = page.mapIndexed { i, r -> if (i == 1) RelayFeedRecord(r.feedSeq, ctlRecord("P4_unknown_field")) else r }
-        throwsCode("unknown_field") { relayControlSyncResult(origin, feed, 3uL, 0uL, refusedPage) }
-        throwsCode("malformed") { relayControlSyncResult(origin, feed, 2uL, 0uL, page) }
-        throwsCode("malformed") { relayControlSyncResult(origin, feed, 3uL, 0uL, listOf(page[1], page[0])) }
+        throwsCode("unknown_field") { result(0uL, 3uL, refusedPage) }
+        throwsCode("malformed") { result(0uL, 2uL, page) }
+        throwsCode("malformed") { result(0uL, 3uL, listOf(page[1], page[0])) }
+        // Strictly after the echoed after; a head below after holds no record.
+        throwsCode("malformed") { result(1uL, 3uL, page) }
+        eq((relayDecodeToHost(result(9uL, 3uL, emptyList())) as RelayToHost.ControlSyncResult).records.size, 0)
+        throwsCode("malformed") { result(9uL, 3uL, listOf(page[2])) }
         val heads = listOf(RelayFeedHead(origin, feed, 3uL, 1793620940000uL))
         val hm = relayHeads(heads, mlogHead)
         eq(relayDecodeToHost(hm), RelayToHost.Heads(heads, mlogHead))
@@ -986,7 +1056,7 @@ fun main(args: Array<String>) {
         val fetched = relayDecodeToHost(relayMembershipFetchResult(mlogHead, entries)) as RelayToHost.MembershipFetchResult
         eq(fetched.head, mlogHead)
         eq(fetched.entries.map(::canonicalJson), entries.map(::canonicalJson))
-        throwsCode("wrong_message") { relayDecodeToHost(relayControlSync(origin, null, 0uL)) }
+        throwsCode("wrong_message") { relayDecodeToHost(relayControlSync(request, origin, null, 0uL)) }
         throwsCode("wrong_message") { relayDecodeToStation("{\"type\":\"relay\",\"op\":\"push_hint\",\"hints\":[]}") }
         throwsCode("not_strict") { relayDecodeToStation("{") }
     }
@@ -1024,6 +1094,186 @@ fun main(args: Array<String>) {
             if (reply.contains(secret)) throw AssertionError("the refusal names $secret")
         }
         eq(l.ack(link.copy(hostTrustGen = 1uL), ack, nowMs).made.size, 2)
+    }
+    // r9-vectors-station-calls (host-work-v1 §11.4): every message of the six
+    // Station calls and the three refusals as the builders write it, byte for
+    // byte from its fields (an ack is written again from what it decoded to),
+    // read back to those fields (each page record judged by
+    // parseControlRecord as the file says), refused by the other side's
+    // reader, and every invalid text refused with its code. A page record the
+    // control parser refuses can't be built: a Station serves only what it
+    // validated at intake.
+    val stationCalls = load("r9-vectors-station-calls")
+    check("Station calls: the byte goldens build exactly, read back to their fields and are refused by the other side; every invalid variant is refused with its code") {
+        fun head(h: Any?) = LogHead(h["seq"].l().toULong(), h["hash"].s())
+        fun feedHead(f: Any?) = RelayFeedHead(f["origin"].s(), f["feed_id"].s(), f["head"].l().toULong(), f["station_time"].l().toULong())
+        fun judge(recordJson: String): Map<String, Any?> = try {
+            mapOf("parses" to true, "record_id" to parseControlRecord(recordJson).recordId)
+        } catch (e: AtemException) {
+            mapOf("parses" to false, "error" to e.codeOf())
+        }
+        eq(stationCalls["max_message_bytes"].l(), 262144L)
+        eq(stationCalls["calls"].arr().size >= 20, true, "goldens")
+        // The shared vocabulary of reasons (O5), exported: a reason outside
+        // it is a later version's, unrecognized.
+        val vocabulary = controlWhyCodes()
+        eq(vocabulary, stationCalls["why_codes"].arr().map { it.s() }, "the vocabulary of reasons")
+        fun reasonsOf(name: String): List<String> =
+            stationCalls["calls"].arr().first { it["name"].s() == name }["fields"]["results"].arr()
+                .flatMap { it["effects"].arr() }.mapNotNull { it.obj()["why"] as String? }
+        eq(reasonsOf("control_ack_with_reasons").all { it in vocabulary }, true, "known reasons")
+        eq(reasonsOf("control_ack_with_unrecognized_reasons").count { it !in vocabulary }, 2, "unrecognized reasons")
+        for (c in stationCalls["calls"].arr()) {
+            val f = c["fields"]
+            val wire = c["wire"].s()
+            val name = c["name"].s()
+            when (val op = c["op"].s()) {
+                "control_sync" -> {
+                    val feed = f.obj()["feed_id"] as String?
+                    val after = f["after"].l().toULong()
+                    eq(relayControlSync(f["request_id"].s(), f["origin"].s(), feed, after), wire, name)
+                    throwsCode("wrong_message") { relayDecodeToHost(wire) }
+                    eq(relayDecodeToStation(wire), RelayToStation.ControlSync(f["request_id"].s(), f["origin"].s(), feed, after), name)
+                }
+                "control_sync_result" -> {
+                    val items = f["records"].arr()
+                    val records = items.map { RelayFeedRecord(it["feed_seq"].l().toULong(), Json.write(it["record"])) }
+                    val judged = c["judged"].arr()
+                    val refused = judged.firstOrNull { it["parses"] == false }
+                    eq(refused != null, c.obj()["hand_assembled"] == true, "$name hand_assembled")
+                    val build = {
+                        relayControlSyncResult(f["request_id"].s(), f["origin"].s(), f["feed_id"].s(), f["after"].l().toULong(),
+                            f["head"].l().toULong(), f["station_time"].l().toULong(), records)
+                    }
+                    if (refused == null) eq(build(), wire, name) else throwsCode(refused["error"].s()) { build() }
+                    throwsCode("wrong_message") { relayDecodeToStation(wire) }
+                    val read = relayDecodeToHost(wire) as RelayToHost.ControlSyncResult
+                    eq(listOf(read.requestId, read.origin, read.feedId, read.after, read.head, read.stationTime),
+                        listOf(f["request_id"].s(), f["origin"].s(), f["feed_id"].s(), f["after"].l().toULong(),
+                            f["head"].l().toULong(), f["station_time"].l().toULong()), name)
+                    eq(read.records.size, items.size, "$name records")
+                    read.records.forEachIndexed { i, r ->
+                        eq(r.feedSeq, items[i]["feed_seq"].l().toULong(), "$name feed_seq")
+                        eq(Json.parse(r.recordJson), items[i]["record"], "$name record $i")
+                        eq(judge(r.recordJson), judged[i].obj().filterKeys { it != "feed_seq" }, "$name record $i judged")
+                    }
+                }
+                "heads" -> {
+                    val feeds = f["feeds"].arr().map(::feedHead)
+                    eq(relayHeads(feeds, head(f["membership"])), wire, name)
+                    throwsCode("wrong_message") { relayDecodeToStation(wire) }
+                    eq(relayDecodeToHost(wire), RelayToHost.Heads(feeds, head(f["membership"])), name)
+                }
+                "control_ack" -> {
+                    throwsCode("wrong_message") { relayDecodeToHost(wire) }
+                    val read = relayDecodeToStation(wire) as RelayToStation.ControlAck
+                    eq(relayControlAck(read.ack), wire, "$name written again")
+                    // What it decoded to, field by field, against the golden's fields
+                    // (a mapping wrong both ways round wouldn't show in the re-encoding).
+                    fun effectsOf(e: List<ControlEffectResult>) = e.map(::controlEffectOf)
+                    val ack = read.ack
+                    val decoded = mapOf(
+                        "account_id" to ack.accountId, "cursor" to ack.cursor.toLong(), "feed_id" to ack.feedId,
+                        "genesis_hash" to ack.genesisHash, "host_id" to ack.hostId,
+                        "host_trust_gen" to ack.hostTrustGen.toLong(), "origin" to ack.origin,
+                        "results" to ack.results.map { r ->
+                            when (r) {
+                                is RelayAckResult.Record -> mapOf("effects" to effectsOf(r.effects), "record_id" to r.recordId)
+                                is RelayAckResult.Entry -> mapOf(
+                                    "applied_seq" to r.appliedSeq.toLong(), "effects" to effectsOf(r.effects),
+                                    "entry" to mapOf("entry_hash" to r.entryHash, "seq" to r.seq.toLong()))
+                            }
+                        })
+                    eq(decoded, f.obj(), "$name decoded")
+                }
+                "membership_fetch" -> {
+                    val after = f["after"].l().toULong()
+                    eq(relayMembershipFetch(after), wire, name)
+                    throwsCode("wrong_message") { relayDecodeToHost(wire) }
+                    eq(relayDecodeToStation(wire), RelayToStation.MembershipFetch(after), name)
+                }
+                "membership_fetch_result" -> {
+                    val entries = f["entries"].arr().map { Json.write(it) }
+                    eq(relayMembershipFetchResult(head(f["head"]), entries), wire, name)
+                    throwsCode("wrong_message") { relayDecodeToStation(wire) }
+                    val read = relayDecodeToHost(wire) as RelayToHost.MembershipFetchResult
+                    eq(read.head, head(f["head"]), name)
+                    eq(read.entries.map { Json.parse(it) }, f["entries"].arr(), "$name entries")
+                }
+                else -> {
+                    val built = when (op) {
+                        "control_sync_refused" -> relayControlSyncRefused(RelayRefusalCode.FORBIDDEN)
+                        "membership_fetch_refused" -> relayMembershipFetchRefused(RelayRefusalCode.FORBIDDEN)
+                        else -> relayControlAckRefused(RelayRefusalCode.FORBIDDEN)
+                    }
+                    val want = when (op) {
+                        "control_sync_refused" -> RelayToHost.ControlSyncRefused(RelayRefusalCode.FORBIDDEN)
+                        "membership_fetch_refused" -> RelayToHost.MembershipFetchRefused(RelayRefusalCode.FORBIDDEN)
+                        else -> RelayToHost.ControlAckRefused(RelayRefusalCode.FORBIDDEN)
+                    }
+                    eq(built, wire, name)
+                    throwsCode("wrong_message") { relayDecodeToStation(wire) }
+                    eq(relayDecodeToHost(wire), want, name)
+                }
+            }
+        }
+        fun textOf(c: Any?): String {
+            val fill = c.obj()["wire_fill"]
+            return if (fill == null) c["wire"].s()
+                else fill["prefix"].s() + fill["fill"].s().repeat(fill["count"].l().toInt()) + fill["suffix"].s()
+        }
+        // Exactly the bound is read, the same bound for every call that can carry
+        // a large page; `accepts` is what it gives back.
+        for (c in stationCalls["at_the_bound"].arr()) {
+            val wire = textOf(c)
+            val accepts = c["accepts"]
+            eq(wire.toByteArray(Charsets.UTF_8).size, 262144, "${c["name"]} bytes")
+            when (val read = relayDecodeToHost(wire)) {
+                is RelayToHost.ControlSyncResult -> {
+                    eq(read.head, accepts["head"].l().toULong(), "${c["name"]} head")
+                    eq(read.records.size, accepts["records"].l().toInt(), "${c["name"]} records")
+                    eq(read.records.map { judge(it.recordJson)["parses"] }, accepts["records_parse"].arr(), "${c["name"]} parse")
+                }
+                is RelayToHost.MembershipFetchResult -> {
+                    eq(read.head, head(accepts["head"]), "${c["name"]} head")
+                    eq(read.entries.size, accepts["entries"].l().toInt(), "${c["name"]} entries")
+                }
+                else -> throw AssertionError("${c["name"]}: not a page or a fetch result")
+            }
+            throwsCode("wrong_message") { relayDecodeToStation(wire) }
+        }
+        for (bad in stationCalls["invalid"].arr()) {
+            val wire = textOf(bad)
+            if (bad["reader"].s() == "to_host") throwsCode(bad["code"].s()) { relayDecodeToHost(wire) }
+            else throwsCode(bad["code"].s()) { relayDecodeToStation(wire) }
+        }
+    }
+    check("Station calls: correlation, each matching case's verdict through relayControlSyncAnswers") {
+        fun verdict(v: RelaySyncVerdict) = when (v) {
+            RelaySyncVerdict.ANSWERS -> "answers"
+            RelaySyncVerdict.REQUEST_ID -> "request_id"
+            RelaySyncVerdict.ORIGIN -> "origin"
+            RelaySyncVerdict.FEED_ID -> "feed_id"
+            RelaySyncVerdict.AFTER -> "after"
+        }
+        val cases = stationCalls["matching"].arr()
+        eq(cases.size >= 9, true, "matching cases")
+        val seen = mutableSetOf<String>()
+        for (c in cases) {
+            val calls = c["calls"].arr()
+            val verdicts = c["verdicts"].arr()
+            eq(calls.size, verdicts.size, "${c["name"]} verdicts")
+            calls.forEachIndexed { i, call ->
+                val got = verdict(relayControlSyncAnswers(call.s(), c["result"].s()))
+                eq(got, verdicts[i].s(), "${c["name"]} call $i")
+                seen.add(got)
+            }
+        }
+        eq(seen.sorted(), listOf("after", "answers", "feed_id", "origin", "request_id"), "every verdict")
+        val first = cases[0]
+        throwsCode("wrong_message") { relayControlSyncAnswers(first["result"].s(), first["result"].s()) }
+        throwsCode("wrong_message") { relayControlSyncAnswers(first["calls"][0].s(), first["calls"][0].s()) }
+        throwsCode("wrong_message") { relayControlSyncAnswers(first["calls"][0].s(), relayControlSyncRefused(RelayRefusalCode.FORBIDDEN)) }
     }
     check("Station: the Portal's statuses in their classes") {
         for ((status, want) in listOf(200 to "confirm", 401 to "retry", 408 to "retry", 429 to "retry", 500 to "retry", 503 to "retry",
@@ -1065,8 +1315,10 @@ fun main(args: Array<String>) {
         b["account_id"].s(), b["genesis_hash"].s(), mailHost(b["sender"]), mailHost(b["recipient"]),
         b["recipient"]["enc_kid"].s(), b["id"].s(), b["created_at"].l().toULong(), b["expires_at"].l().toULong(),
         LogHead(b["signed_at_head"]["seq"].l().toULong(), b["signed_at_head"]["hash"].s()))
+    // The keys it accepts, and every key it made (`generated`), by their key ids.
     fun mailRecipient(r: Any?) = MailRecipientData(
-        r["host_id"].s(), r["host_trust_gen"].l().toULong(), r["keys"].arr().map { MailKeyData(it.s(), encKid(encKey(it.s()))) })
+        r["host_id"].s(), r["host_trust_gen"].l().toULong(), r["keys"].arr().map { MailKeyData(it.s(), encKid(encKey(it.s()))) },
+        r["generated"].arr().map { encKid(encKey(it.s())) })
     fun mailOutbox(o: Any?) = MailOutboxData(
         mailHost(o["recipient"]), o["message_id"].s(), o["cancel_complete_ids"].arr().map { it.s() }, o["task_ids"].arr().map { it.s() })
     fun sha256(text: String) = hex(java.security.MessageDigest.getInstance("SHA-256").digest(utf8(text)))
@@ -1079,11 +1331,13 @@ fun main(args: Array<String>) {
         if (sealed.obj().containsKey("plaintext")) eq(plain, sealed["plaintext"], label)
         else eq(listOf(utf8(plain).size.toLong(), sha256(plain)), listOf(sealed["plaintext_bytes"], sealed["plaintext_sha256"]), label)
     }
+    fun mailSender(h: MailHostData) = mapOf("host_id" to h.hostId, "host_trust_gen" to h.hostTrustGen.toLong())
     fun envelopeVerdict(got: EnvelopeVerdictInfo): Pair<Map<String, Any?>, String?> = when (got) {
         is EnvelopeVerdictInfo.Open -> mapOf("verdict" to "open", "sender" to got.sender) to got.plainJson
         is EnvelopeVerdictInfo.Pending -> mapOf("verdict" to "pending", "host_id" to got.hostId, "host_trust_gen" to got.hostTrustGen.toLong()) to null
         is EnvelopeVerdictInfo.Refused -> mapOf("verdict" to "refused", "reason" to got.reason, "evidence" to got.evidence) to null
-        is EnvelopeVerdictInfo.RefusedAuthenticated -> mapOf("verdict" to "refused_authenticated", "object_id" to got.objectId, "reason" to got.reason) to null
+        is EnvelopeVerdictInfo.RefusedAuthenticated ->
+            mapOf("verdict" to "refused_authenticated", "object_id" to got.objectId, "reason" to got.reason, "sender" to mailSender(got.senderHost)) to null
         is EnvelopeVerdictInfo.Unavailable -> mapOf("verdict" to "unavailable", "code" to got.code, "detail" to got.detail) to null
     }
     fun resultVerdict(got: ResultVerdictInfo): Pair<Map<String, Any?>, String?> = when (got) {
@@ -1091,7 +1345,8 @@ fun main(args: Array<String>) {
         is ResultVerdictInfo.NotDelivered -> mapOf("verdict" to "not_delivered", "sender" to got.sender, "reason" to got.reason) to got.plainJson
         is ResultVerdictInfo.Pending -> mapOf("verdict" to "pending", "host_id" to got.hostId, "host_trust_gen" to got.hostTrustGen.toLong()) to null
         is ResultVerdictInfo.Refused -> mapOf("verdict" to "refused", "reason" to got.reason, "evidence" to got.evidence) to null
-        is ResultVerdictInfo.RefusedAuthenticated -> mapOf("verdict" to "refused_authenticated", "object_id" to got.objectId, "reason" to got.reason) to null
+        is ResultVerdictInfo.RefusedAuthenticated ->
+            mapOf("verdict" to "refused_authenticated", "object_id" to got.objectId, "reason" to got.reason, "sender" to mailSender(got.senderHost)) to null
         is ResultVerdictInfo.Unavailable -> mapOf("verdict" to "unavailable", "code" to got.code, "detail" to got.detail) to null
     }
     check("host mail: the entries extend log L to their hashes") {
@@ -1117,7 +1372,7 @@ fun main(args: Array<String>) {
         }
         check(built >= 20) { "$built built" }
         val b = listOf("M7_add_host_b", "M8_enc_a", "M9_enc_b", "M10_add_host_evil")
-        val toB = MailRecipientData("host-b", 1uL, listOf(MailKeyData("host-b-enc-1", encKid(encKey("host-b-enc-1")))))
+        val toB = MailRecipientData("host-b", 1uL, listOf(MailKeyData("host-b-enc-1", encKid(encKey("host-b-enc-1")))), listOf(encKid(encKey("host-b-enc-1"))))
         val req = mailObject.getValue("request")
         val plain = req["sealed"]["plaintext"].s()
         val fresh = sealEnvelope(store, "host-a", mailFields(req["object"]["body"]), plain, encKey("host-b-enc-1"))
@@ -1128,7 +1383,7 @@ fun main(args: Array<String>) {
         eq((openEnvelope(canonical, mailList(b), toB, store, mailNow) as EnvelopeVerdictInfo.Open).plainJson, canonicalJson(loose["sealed"]["plaintext"].s()))
         val status = mailObject.getValue("status")
         val freshResult = sealResult(store, "host-b", mailFields(status["object"]["body"]), status["sealed"]["plaintext"].s(), encKey("host-a-enc-1"))
-        val toA = MailRecipientData("host-a", 1uL, listOf(MailKeyData("host-a-enc-1", encKid(encKey("host-a-enc-1")))))
+        val toA = MailRecipientData("host-a", 1uL, listOf(MailKeyData("host-a-enc-1", encKid(encKey("host-a-enc-1")))), listOf(encKid(encKey("host-a-enc-1"))))
         val row = mailOutbox(mail["checks"].arr().first { it["label"] == "status_accepted" }["outbox"])
         check(acceptResult(freshResult, mailList(b), toA, row, store, mailNow) is ResultVerdictInfo.Accepted) { "a fresh result is accepted" }
         val nul = mailObject.getValue("plaintext_null")
@@ -1337,7 +1592,8 @@ fun main(args: Array<String>) {
         keysJdk.addX25519("enc", unhex(push["recipient_secrets"]["dev-phone"].s()), unhex(keys["dev-phone"]["enc"]["pub_hex"].s()))
         throwsCode("open_failed") { swapped.open(keysJdk, "enc", "dev-phone") }
         // Well signed and well sealed, but the sealed facts aren't a
-        // delegated sender's UUID v4 task: verified and kept, refused at open.
+        // delegated sender's UUID v4 task, or the reason is blank: verified
+        // and kept, refused at open.
         for (c in push["outcome_unknown_invalid_facts"].arr()) {
             for (verifier in listOf(PushVerifier.CLIENT, PushVerifier.RELAY)) {
                 verifyPushHint(Json.write(c["hint"]), logL(), nowP, verifier)

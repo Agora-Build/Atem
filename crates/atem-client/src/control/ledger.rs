@@ -63,7 +63,8 @@
 //! **What counts** (I.5.8; plan decision 8).
 //! - Only an effect result of `applied` or `duplicate` counts: both say the
 //!   effect is in force on that host. The scan cursor never counts, nor do
-//!   `pending` and `refused`.
+//!   `pending` and `refused`, nor an effect's reason (`why`, O5): it is
+//!   information for the Station, never evidence and never a re-sign.
 //! - Counts are per host and per effect of a principal: its revocation, and
 //!   the interrupt for that revocation (for a host principal, per
 //!   `revoke_seq`), each once per host, through whichever record first said
@@ -1832,7 +1833,8 @@ mod ack_ledger_tests {
     use crate::control::relay::{
         AckResult, CallRefused, ControlAck, EntryRef, RefusalCode, RefusedCall, RelayError,
     };
-    use crate::control::state::{ApplicationResult, EffectKind, EffectResult};
+    use crate::control::state::{ApplicationResult, EffectKind, EffectResult, EffectWhy, Why};
+    use crate::control::verify::{PendingReason, RefusalReason};
     use crate::membership::entry::id_ok;
     use crate::provider::KeyId;
     use crate::software::SoftwareKeys;
@@ -1984,7 +1986,29 @@ mod ack_ledger_tests {
             record_id: record.record_id().into(),
             effects: effects
                 .iter()
-                .map(|&(effect, result)| EffectResult { effect, result })
+                .map(|&(effect, result)| EffectResult {
+                    effect,
+                    result,
+                    why: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// [`res`] with each effect's reason (`None` for one in force).
+    fn res_why(
+        record: &ControlRecord,
+        effects: &[(EffectKind, ApplicationResult, Option<EffectWhy>)],
+    ) -> AckResult {
+        AckResult::Record {
+            record_id: record.record_id().into(),
+            effects: effects
+                .iter()
+                .map(|(effect, result, why)| EffectResult {
+                    effect: *effect,
+                    result: *result,
+                    why: why.clone(),
+                })
                 .collect(),
         }
     }
@@ -2115,6 +2139,78 @@ mod ack_ledger_tests {
         // Only `applied` or `duplicate` counts.
         let a = l.ack_by("a", vec![res(&s, &[(E::Revocation, R::Duplicate)])], T0 + 2);
         assert_eq!(reports(&a), vec![applied("a", &s)]);
+    }
+
+    /// O5: a reason beside an effect not in force is information only. The
+    /// same ack with and without reasons, known or unrecognized, gives the
+    /// same next ledger, the same reports and the same alerts: nothing
+    /// counts, nothing is re-signed, and the re-sign alert stays.
+    #[test]
+    fn reasons_count_nothing_and_change_no_alert() {
+        let (mut l, s) = revoked_ledger();
+        let n = interrupt(By::Native, 2);
+        l.rec(&n, T0, &["a", "b"]);
+        assert_eq!(l.resign_alerts(), vec![rid(2)]);
+        let known = |why: Why| Some(EffectWhy::Known(why));
+        let removed = known(Why::Refused(RefusalReason::RemovedManager));
+        let cases = [
+            (
+                vec![
+                    res(&s, &[(E::Revocation, R::Refused)]),
+                    res(&n, &[(E::Interrupt, R::Pending)]),
+                ],
+                vec![
+                    res_why(
+                        &s,
+                        &[(
+                            E::Revocation,
+                            R::Refused,
+                            Some(EffectWhy::Known(Why::Order)),
+                        )],
+                    ),
+                    res_why(
+                        &n,
+                        &[(
+                            E::Interrupt,
+                            R::Pending,
+                            known(Why::Pending(PendingReason::NotRevoked)),
+                        )],
+                    ),
+                ],
+            ),
+            (
+                vec![
+                    res(&s, &[(E::Revocation, R::Applied)]),
+                    res(&n, &[(E::Interrupt, R::Refused)]),
+                ],
+                vec![
+                    res_why(&s, &[(E::Revocation, R::Applied, None)]),
+                    res_why(&n, &[(E::Interrupt, R::Refused, removed.clone())]),
+                ],
+            ),
+            (
+                vec![res(&n, &[(E::Interrupt, R::Refused)])],
+                vec![res_why(
+                    &n,
+                    &[(
+                        E::Interrupt,
+                        R::Refused,
+                        Some(EffectWhy::Unrecognized("a_later_reason".into())),
+                    )],
+                )],
+            ),
+        ];
+        for (plain, reasoned) in cases {
+            let without = l.ack(&link("a"), &ack("a", plain), T0 + 1).unwrap();
+            let with = l.ack(&link("a"), &ack("a", reasoned), T0 + 1).unwrap();
+            assert_eq!(with, without);
+            assert_eq!(with.next.resign_alerts(), vec![rid(2)]);
+            assert_eq!(with.next.to_json(), without.next.to_json());
+        }
+        // Reasons alone count nothing: the ledger is as it was.
+        let only = vec![res_why(&n, &[(E::Interrupt, R::Refused, removed)])];
+        let t = l.ack(&link("b"), &ack("b", only), T0 + 1).unwrap();
+        assert_eq!((t.next, t.made, t.alerts), (l.clone(), vec![], vec![]));
     }
 
     /// Decision 8: a host that applied the revocation through another
@@ -2256,6 +2352,7 @@ mod ack_ledger_tests {
             effects: vec![EffectResult {
                 effect: E::Revocation,
                 result: R::Applied,
+                why: None,
             }],
         };
         let t = l
@@ -3180,6 +3277,7 @@ mod ack_ledger_tests {
                 .map(|effect| EffectResult {
                     effect,
                     result: R::Applied,
+                    why: None,
                 })
                 .collect();
             let a = ack(

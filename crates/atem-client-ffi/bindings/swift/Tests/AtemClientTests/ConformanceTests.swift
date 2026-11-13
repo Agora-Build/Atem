@@ -786,10 +786,12 @@ final class ConformanceTests: XCTestCase {
         // each of its chains as `checks` says (or its parse refuses it,
         // `parse_error`); the builders reproduce it byte for byte (a software
         // store, or the signing input and a signature); every sequence runs
-        // through a ControlStateHandle with each step's per-effect results and
-        // the state it leaves (a handle never changes, so a failed commit
-        // loses no effect); and a provider is asked under the purpose the
-        // record's signer gives.
+        // through a ControlStateHandle (from its `initial` state when it has
+        // one) with each step's per-effect results, the standing of its
+        // record's principal and the parts it touched, and the state it
+        // leaves, whole and in parts per principal (a handle never changes,
+        // so a failed commit loses no effect); and a provider is asked under
+        // the purpose the record's signer gives.
         let ctl = try load("r9-vectors-host-work-control")
         let ctlRecords = a(ctl["records"]).map(o)
         var ctlByLabel: [String: [String: Any]] = [:]
@@ -919,32 +921,89 @@ final class ConformanceTests: XCTestCase {
             }
         }
         func controlAppliedOf(_ applied: ControlApplied) -> [String: Any] {
-            let effects: [[String: Any]] = applied.effects.map { ["effect": effectCode($0.effect), "result": resultCode($0.result)] }
-            return ["result": resultCode(applied.result), "effects": effects, "actions": applied.actions.map(controlActionOf), "evidence": applied.evidence]
+            // Each effect: `why` (O5) only when there is one.
+            let effects: [[String: Any]] = applied.effects.map { e in
+                var m: [String: Any] = ["effect": effectCode(e.effect), "result": resultCode(e.result)]
+                if let why = e.why { m["why"] = why }
+                return m
+            }
+            var out: [String: Any] = ["result": resultCode(applied.result), "effects": effects, "actions": applied.actions.map(controlActionOf), "evidence": applied.evidence]
+            // Why it is pending, refused or evidence: present exactly then.
+            if let why = applied.why { out["why"] = why }
+            return out
         }
         func ctlPos(_ v: Any?) -> ControlFeedPos? {
             guard let p = v as? [String: Any] else { return nil }
             return ControlFeedPos(origin: s(p["origin"]), feedId: s(p["feed_id"]), feedSeq: u(p["feed_seq"]))
         }
-        check("control records: every sequence's per-effect results and its state through ControlStateHandle") {
+        // A standing as the vectors write it: `revoked` and `coverage` only when there are.
+        func controlStandingOf(_ standing: ControlStanding) -> [String: Any] {
+            var out: [String: Any] = ["held": standing.held, "interrupted": standing.interrupted]
+            if let revoked = standing.revoked { out["revoked"] = revoked }
+            if let coverage = standing.coverage { out["coverage"] = ["origin": coverage.origin, "feed_id": coverage.feedId] }
+            return out
+        }
+        func controlPartsOf(_ state: ControlStateHandle) -> [ControlStatePart] {
+            state.principals().map { ControlStatePart(principal: $0, partJson: state.part(principal: $0)!) }
+        }
+        check("control records: every sequence's per-effect results, standing and state through ControlStateHandle") {
             for q in a(ctl["sequences"]).map(o) {
                 let label = s(q["label"])
                 var state = ControlStateHandle(log: try logL())
+                if let initial = q["initial"] {
+                    state = try ControlStateHandle.fromJson(log: try logL(), stateJson: try canonicalJson(json: js(initial)))
+                }
                 for (i, step) in a(q["steps"]).map(o).enumerated() {
-                    let record = js(ctlByLabel[s(step["record"])]!["record"]!)
+                    let r = ctlByLabel[s(step["record"])]!
+                    let principal = s(o(o(r["record"])["body"])["principal"])
+                    let record = js(r["record"]!)
                     let t = try state.apply(recordJson: record, log: try logAfter(a(step["chain"]).map(s)), pos: ctlPos(step["pos"]), hostAppliedSeq: u(step["host_applied_seq"]))
                     try eq(canon(controlAppliedOf(t.applied)), canon(o(step["expect"])), "\(label) step \(i + 1)")
+                    try eq(canon(controlStandingOf(t.next.standing(principal: principal))), canon(o(step["standing"])), "\(label) step \(i + 1) standing")
+                    let changed = state.part(principal: principal) != t.next.part(principal: principal)
+                    try eq(t.touched, changed ? [principal] : [], "\(label) step \(i + 1) touched")
                     state = t.next
                 }
                 let text = try canonicalJson(json: js(q["state"]!))
                 try eq(state.toJson(), text, label)
                 try eq(try ControlStateHandle.fromJson(log: try logL(), stateJson: text).toJson(), text, label)
+                try eq(try controlStateFromParts(log: try logL(), parts: controlPartsOf(state)).state.toJson(), text, "\(label) from its parts")
             }
             // Only its own device list's state, exactly as written.
             let text = try canonicalJson(json: js(o(a(ctl["sequences"])[0])["state"]!))
             try throwsCode("account_mismatch") { _ = try ControlStateHandle.fromJson(log: try logL(), stateJson: text.replacingOccurrences(of: "\"acct-test-1\"", with: "\"acct-other\"")) }
-            try throwsCode("unsupported_version") { _ = try ControlStateHandle.fromJson(log: try logL(), stateJson: text.replacingOccurrences(of: "\"v\":1", with: "\"v\":2")) }
+            try throwsCode("unsupported_version") { _ = try ControlStateHandle.fromJson(log: try logL(), stateJson: text.replacingOccurrences(of: "\"v\":2", with: "\"v\":1")) }
             try throwsCode("malformed") { _ = try ControlStateHandle.fromJson(log: try logL(), stateJson: "[") }
+        }
+        check("control records: a state's parts per principal load in any order, only as written") {
+            let q = a(ctl["sequences"]).map(o).first { s($0["label"]) == "Q17_record_ids_per_principal" }!
+            let state = try ControlStateHandle.fromJson(log: try logL(), stateJson: try canonicalJson(json: js(q["state"]!)))
+            let parts = controlPartsOf(state)
+            try eq(parts.map { $0.principal }, ["host:host-a", "service:svc-discord"])
+            for part in parts {
+                try eq(part.partJson, try canonicalJson(json: js(o(o(q["state"])["principals"])[part.principal]!)), part.principal)
+            }
+            try eq(try controlStateFromParts(log: try logL(), parts: parts.reversed()).state.toJson(), state.toJson(), "any order")
+            try eq(try controlStateFromParts(log: try logL(), parts: []).state.toJson(), ControlStateHandle(log: try logL()).toJson(), "none")
+            try eq(state.part(principal: "service:svc-other"), nil)
+            try eq(canon(controlStandingOf(state.standing(principal: "member:dev-mac"))), canon(["held": false, "interrupted": [String]()] as [String: Any]))
+            try throwsCode("stored_invalid") { _ = try controlStateFromParts(log: try logL(), parts: [parts[1], parts[1]]) }
+            try throwsCode("malformed") { _ = try controlStateFromParts(log: try logL(), parts: [ControlStatePart(principal: "service:svc-discord", partJson: "{")]) }
+            try throwsCode("stored_invalid") { _ = try controlStateFromParts(log: try logL(), parts: [ControlStatePart(principal: "service:svc-discord", partJson: parts[0].partJson)]) }
+            try throwsCode("stored_invalid") { _ = try controlStateFromParts(log: try logL(), parts: [ControlStatePart(principal: "svc-discord", partJson: parts[1].partJson)]) }
+            // A part whose device list can't be read might be this list's: it fails.
+            try throwsCode("stored_invalid") { _ = try controlStateFromParts(log: try logL(), parts: [ControlStatePart(principal: "host:host-a", partJson: parts[0].partJson.replacingOccurrences(of: s(ctl["genesis_hash"]), with: "zz"))]) }
+            // Each part names its device list: another list's (an earlier pairing's
+            // leftovers) is skipped and reported for deletion, this list's loads.
+            let otherAccount = ControlStatePart(principal: "service:svc-discord", partJson: parts[1].partJson.replacingOccurrences(of: "\"acct-test-1\"", with: "\"acct-other\""))
+            let otherGenesis = ControlStatePart(principal: "host:host-a", partJson: parts[0].partJson.replacingOccurrences(of: s(ctl["genesis_hash"]), with: String(repeating: "11", count: 32)))
+            let mixed = try controlStateFromParts(log: try logL(), parts: [otherGenesis, parts[1]])
+            try eq(mixed.foreign, ["host:host-a"])
+            try eq(mixed.state.principals(), ["service:svc-discord"])
+            try eq(mixed.state.part(principal: "service:svc-discord"), parts[1].partJson)
+            let foreign = try controlStateFromParts(log: try logL(), parts: [otherAccount, otherGenesis])
+            try eq(foreign.foreign, ["host:host-a", "service:svc-discord"])
+            try eq(foreign.state.toJson(), ControlStateHandle(log: try logL()).toJson())
         }
         check("control records: a failed commit loses no effect (apply leaves its handle as it was)") {
             let state = ControlStateHandle(log: try logL())
@@ -1033,7 +1092,7 @@ final class ConformanceTests: XCTestCase {
             .sorted()
         for name in ackNames {
             check("Station acks: \(name) through AckLedgerHandle") {
-                try eq(ackNames.count, 5, "the acknowledgment fixtures")
+                try eq(ackNames.count, 6, "the acknowledgment fixtures")
                 let f = try load(name)
                 let setup = o(f["setup"])
                 let st = o(setup["station"])
@@ -1194,21 +1253,39 @@ final class ConformanceTests: XCTestCase {
             let station = o(o(ctl["stations"])["A"])
             let origin = s(station["origin"])
             let feed = s(station["feed_id"])
-            try eq(try relayDecodeToStation(message: relayControlSync(origin: origin, feedId: feed, after: 7)), .controlSync(origin: origin, feedId: feed, after: 7))
-            try eq(try relayDecodeToStation(message: relayControlSync(origin: origin, feedId: nil, after: 0)), .controlSync(origin: origin, feedId: nil, after: 0))
-            try throwsCode("malformed") { _ = try relayControlSync(origin: origin, feedId: nil, after: 5) }
+            // Correlation: the call's id is the caller's, a lowercase UUID v4.
+            let request = "5d0e9a3c-2b1f-4c8d-9e7a-6b5c4d3e2f10"
+            try eq(try relayDecodeToStation(message: relayControlSync(requestId: request, origin: origin, feedId: feed, after: 7)), .controlSync(requestId: request, origin: origin, feedId: feed, after: 7))
+            try eq(try relayDecodeToStation(message: relayControlSync(requestId: request, origin: origin, feedId: nil, after: 0)), .controlSync(requestId: request, origin: origin, feedId: nil, after: 0))
+            try throwsCode("malformed") { _ = try relayControlSync(requestId: request, origin: origin, feedId: nil, after: 5) }
+            try throwsCode("malformed") { _ = try relayControlSync(requestId: request.uppercased(), origin: origin, feedId: feed, after: 7) }
             let page = ["S1_cover", "S4_revoke", "M1_revoke"].enumerated().map {
                 RelayFeedRecord(feedSeq: UInt64($0.offset + 1), recordJson: ctlRecord($0.element))
             }
-            guard case let .controlSyncResult(_, _, _, _, records) = try relayDecodeToHost(message: relayControlSyncResult(origin: origin, feedId: feed, head: 3, stationTime: 1_793_620_940_000, records: page)) else {
+            func result(_ after: UInt64, _ head: UInt64, _ records: [RelayFeedRecord]) throws -> String {
+                try relayControlSyncResult(requestId: request, origin: origin, feedId: feed, after: after, head: head, stationTime: 1_793_620_940_000, records: records)
+            }
+            let built = try result(0, 3, page)
+            guard case let .controlSyncResult(requestId, _, _, after, _, _, records) = try relayDecodeToHost(message: built) else {
                 throw Failure(description: "not a page")
             }
+            try eq(requestId, request)
+            try eq(after, 0)
             try eq(try records.map { try canonicalJson(json: $0.recordJson) }, try page.map { try canonicalJson(json: $0.recordJson) })
+            try eq(try relayControlSyncAnswers(call: relayControlSync(requestId: request, origin: origin, feedId: feed, after: 0), result: built), .answers)
+            try eq(try relayControlSyncAnswers(call: relayControlSync(requestId: request, origin: origin, feedId: feed, after: 1), result: built), .after)
             var refusedPage = page
             refusedPage[1] = RelayFeedRecord(feedSeq: 2, recordJson: ctlRecord("P4_unknown_field"))
-            try throwsCode("unknown_field") { _ = try relayControlSyncResult(origin: origin, feedId: feed, head: 3, stationTime: 0, records: refusedPage) }
-            try throwsCode("malformed") { _ = try relayControlSyncResult(origin: origin, feedId: feed, head: 2, stationTime: 0, records: page) }
-            try throwsCode("malformed") { _ = try relayControlSyncResult(origin: origin, feedId: feed, head: 3, stationTime: 0, records: [page[1], page[0]]) }
+            try throwsCode("unknown_field") { _ = try result(0, 3, refusedPage) }
+            try throwsCode("malformed") { _ = try result(0, 2, page) }
+            try throwsCode("malformed") { _ = try result(0, 3, [page[1], page[0]]) }
+            // Strictly after the echoed after; a head below after holds no record.
+            try throwsCode("malformed") { _ = try result(1, 3, page) }
+            guard case let .controlSyncResult(_, _, _, _, _, _, emptyPage) = try relayDecodeToHost(message: result(9, 3, [])) else {
+                throw Failure(description: "not a page")
+            }
+            try eq(emptyPage.count, 0)
+            try throwsCode("malformed") { _ = try result(9, 3, [page[2]]) }
             let heads = [RelayFeedHead(origin: origin, feedId: feed, head: 3, stationTime: 1_793_620_940_000)]
             let hm = try relayHeads(feeds: heads, membership: mlogHead)
             try eq(try relayDecodeToHost(message: hm), .heads(feeds: heads, membership: mlogHead))
@@ -1222,7 +1299,7 @@ final class ConformanceTests: XCTestCase {
             }
             try eq(fetchedHead, mlogHead)
             try eq(try fetched.map { try canonicalJson(json: $0) }, try entries.map { try canonicalJson(json: $0) })
-            try throwsCode("wrong_message") { _ = try relayDecodeToHost(message: relayControlSync(origin: origin, feedId: nil, after: 0)) }
+            try throwsCode("wrong_message") { _ = try relayDecodeToHost(message: relayControlSync(requestId: request, origin: origin, feedId: nil, after: 0)) }
             try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: "{\"type\":\"relay\",\"op\":\"push_hint\",\"hints\":[]}") }
             try throwsCode("not_strict") { _ = try relayDecodeToStation(message: "{") }
         }
@@ -1270,6 +1347,220 @@ final class ConformanceTests: XCTestCase {
             link.hostTrustGen = 1
             try eq(try l.ack(link: link, ackJson: ack, nowMs: nowMs).made.count, 2)
         }
+        // r9-vectors-station-calls (host-work-v1 §11.4): every message of the six
+        // Station calls and the three refusals as the builders write it, byte for
+        // byte from its fields (an ack is written again from what it decoded to),
+        // read back to those fields (each page record judged by
+        // parseControlRecord as the file says), refused by the other side's
+        // reader, and every invalid text refused with its code. A page record the
+        // control parser refuses can't be built: a Station serves only what it
+        // validated at intake.
+        let stationCalls = try load("r9-vectors-station-calls")
+        check("Station calls: the byte goldens build exactly, read back to their fields and are refused by the other side; every invalid variant is refused with its code") {
+            func logHead(_ h: Any?) -> LogHead { LogHead(seq: u(o(h)["seq"]), hash: s(o(h)["hash"])) }
+            func judge(_ recordJson: String) throws -> [String: Any] {
+                do {
+                    return ["parses": true, "record_id": try parseControlRecord(recordJson: recordJson).recordId]
+                } catch let e as AtemError {
+                    return ["parses": false, "error": codeOf(e).0]
+                }
+            }
+            try eq(u(stationCalls["max_message_bytes"]), 262144)
+            try eq(a(stationCalls["calls"]).count >= 20, true, "goldens")
+            // The shared vocabulary of reasons (O5), exported: a reason
+            // outside it is a later version's, unrecognized.
+            let vocabulary = controlWhyCodes()
+            try eq(vocabulary, a(stationCalls["why_codes"]).map(s), "the vocabulary of reasons")
+            func reasonsOf(_ name: String) -> [String] {
+                let golden = a(stationCalls["calls"]).map(o).first { s($0["name"]) == name }!
+                let results = a(o(golden["fields"])["results"]).map(o)
+                return results.flatMap { a($0["effects"]).map(o) }.compactMap { $0["why"] as? String }
+            }
+            try eq(reasonsOf("control_ack_with_reasons").allSatisfy { vocabulary.contains($0) }, true, "known reasons")
+            try eq(reasonsOf("control_ack_with_unrecognized_reasons").filter { !vocabulary.contains($0) }.count, 2, "unrecognized reasons")
+            for c in a(stationCalls["calls"]).map(o) {
+                let f = o(c["fields"])
+                let wire = s(c["wire"])
+                let name = s(c["name"])
+                let op = s(c["op"])
+                switch op {
+                case "control_sync":
+                    let feed = f["feed_id"] as? String
+                    try eq(try relayControlSync(requestId: s(f["request_id"]), origin: s(f["origin"]), feedId: feed, after: u(f["after"])), wire, name)
+                    try throwsCode("wrong_message") { _ = try relayDecodeToHost(message: wire) }
+                    try eq(try relayDecodeToStation(message: wire), .controlSync(requestId: s(f["request_id"]), origin: s(f["origin"]), feedId: feed, after: u(f["after"])), name)
+                case "control_sync_result":
+                    let items = a(f["records"]).map(o)
+                    let records = items.map { RelayFeedRecord(feedSeq: u($0["feed_seq"]), recordJson: js($0["record"]!)) }
+                    let judged = a(c["judged"]).map(o)
+                    let build = {
+                        try relayControlSyncResult(requestId: s(f["request_id"]), origin: s(f["origin"]), feedId: s(f["feed_id"]), after: u(f["after"]),
+                                                   head: u(f["head"]), stationTime: u(f["station_time"]), records: records)
+                    }
+                    let handAssembled = (c["hand_assembled"] as? Bool) ?? false
+                    try eq(judged.contains(where: { ($0["parses"] as! Bool) == false }), handAssembled, "\(name) hand_assembled")
+                    if let refused = judged.first(where: { ($0["parses"] as! Bool) == false }) {
+                        try throwsCode(s(refused["error"])) { _ = try build() }
+                    } else {
+                        try eq(try build(), wire, name)
+                    }
+                    try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: wire) }
+                    guard case let .controlSyncResult(requestId, origin, feedId, after, pageHead, stationTime, read) = try relayDecodeToHost(message: wire) else {
+                        throw Failure(description: "\(name): not a page")
+                    }
+                    try eq(requestId, s(f["request_id"]), name)
+                    try eq(origin, s(f["origin"]), name)
+                    try eq(feedId, s(f["feed_id"]), name)
+                    try eq(after, u(f["after"]), name)
+                    try eq(pageHead, u(f["head"]), name)
+                    try eq(stationTime, u(f["station_time"]), name)
+                    try eq(read.count, items.count, "\(name) records")
+                    for (i, r) in read.enumerated() {
+                        try eq(r.feedSeq, u(items[i]["feed_seq"]), "\(name) feed_seq")
+                        let sent = try JSONSerialization.jsonObject(with: Data(r.recordJson.utf8), options: [.fragmentsAllowed])
+                        try eq(canon(sent), canon(items[i]["record"]!), "\(name) record \(i)")
+                        var want = judged[i]
+                        want["feed_seq"] = nil
+                        try eq(canon(try judge(r.recordJson)), canon(want), "\(name) record \(i) judged")
+                    }
+                case "heads":
+                    let feeds = a(f["feeds"]).map(o).map {
+                        RelayFeedHead(origin: s($0["origin"]), feedId: s($0["feed_id"]), head: u($0["head"]), stationTime: u($0["station_time"]))
+                    }
+                    try eq(try relayHeads(feeds: feeds, membership: logHead(f["membership"])), wire, name)
+                    try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: wire) }
+                    try eq(try relayDecodeToHost(message: wire), .heads(feeds: feeds, membership: logHead(f["membership"])), name)
+                case "control_ack":
+                    try throwsCode("wrong_message") { _ = try relayDecodeToHost(message: wire) }
+                    guard case let .controlAck(ack) = try relayDecodeToStation(message: wire) else {
+                        throw Failure(description: "\(name): not an ack")
+                    }
+                    try eq(try relayControlAck(ack: ack), wire, "\(name) written again")
+                    // What it decoded to, field by field, against the golden's fields
+                    // (a mapping wrong both ways round wouldn't show in the re-encoding).
+                    func effectsOf(_ e: [ControlEffectResult]) -> [[String: Any]] {
+                        e.map { effect in
+                            var m: [String: Any] = ["effect": effectCode(effect.effect), "result": resultCode(effect.result)]
+                            if let why = effect.why { m["why"] = why }
+                            return m
+                        }
+                    }
+                    let results: [[String: Any]] = ack.results.map { r in
+                        switch r {
+                        case let .record(recordId, effects):
+                            return ["effects": effectsOf(effects), "record_id": recordId]
+                        case let .entry(seq, entryHash, appliedSeq, effects):
+                            return ["applied_seq": appliedSeq, "effects": effectsOf(effects), "entry": ["entry_hash": entryHash, "seq": seq] as [String: Any]]
+                        }
+                    }
+                    let decoded: [String: Any] = [
+                        "account_id": ack.accountId, "cursor": ack.cursor, "feed_id": ack.feedId,
+                        "genesis_hash": ack.genesisHash, "host_id": ack.hostId,
+                        "host_trust_gen": ack.hostTrustGen, "origin": ack.origin, "results": results,
+                    ]
+                    try eq(canon(decoded), canon(f), "\(name) decoded")
+                case "membership_fetch":
+                    try eq(try relayMembershipFetch(after: u(f["after"])), wire, name)
+                    try throwsCode("wrong_message") { _ = try relayDecodeToHost(message: wire) }
+                    try eq(try relayDecodeToStation(message: wire), .membershipFetch(after: u(f["after"])), name)
+                case "membership_fetch_result":
+                    let entries = a(f["entries"]).map { js($0) }
+                    try eq(try relayMembershipFetchResult(head: logHead(f["head"]), entries: entries), wire, name)
+                    try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: wire) }
+                    guard case let .membershipFetchResult(fetchedHead, fetched) = try relayDecodeToHost(message: wire) else {
+                        throw Failure(description: "\(name): not a fetch result")
+                    }
+                    try eq(fetchedHead, logHead(f["head"]), name)
+                    try eq(try fetched.map { try canonicalJson(json: $0) }, try entries.map { try canonicalJson(json: $0) }, "\(name) entries")
+                default:
+                    let built: String
+                    let want: RelayToHost
+                    switch op {
+                    case "control_sync_refused":
+                        built = try relayControlSyncRefused(code: .forbidden)
+                        want = .controlSyncRefused(code: .forbidden)
+                    case "membership_fetch_refused":
+                        built = try relayMembershipFetchRefused(code: .forbidden)
+                        want = .membershipFetchRefused(code: .forbidden)
+                    default:
+                        built = try relayControlAckRefused(code: .forbidden)
+                        want = .controlAckRefused(code: .forbidden)
+                    }
+                    try eq(built, wire, name)
+                    try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: wire) }
+                    try eq(try relayDecodeToHost(message: wire), want, name)
+                }
+            }
+            func textOf(_ c: [String: Any]) -> String {
+                if let fill = c["wire_fill"] {
+                    let w = o(fill)
+                    return s(w["prefix"]) + String(repeating: s(w["fill"]), count: Int(u(w["count"]))) + s(w["suffix"])
+                }
+                return s(c["wire"])
+            }
+            // Exactly the bound is read, the same bound for every call that can carry
+            // a large page; `accepts` is what it gives back.
+            for c in a(stationCalls["at_the_bound"]).map(o) {
+                let wire = textOf(c)
+                let accepts = o(c["accepts"])
+                let name = s(c["name"])
+                try eq(wire.utf8.count, 262144, "\(name) bytes")
+                switch try relayDecodeToHost(message: wire) {
+                case let .controlSyncResult(_, _, _, _, pageHead, _, records):
+                    try eq(pageHead, u(accepts["head"]), "\(name) head")
+                    try eq(records.count, Int(u(accepts["records"])), "\(name) records")
+                    for (r, want) in zip(records, a(accepts["records_parse"])) {
+                        try eq(try judge(r.recordJson)["parses"] as! Bool, want as! Bool, "\(name) parse")
+                    }
+                case let .membershipFetchResult(fetchedHead, fetched):
+                    try eq(fetchedHead, logHead(accepts["head"]), "\(name) head")
+                    try eq(fetched.count, Int(u(accepts["entries"])), "\(name) entries")
+                default:
+                    throw Failure(description: "\(name): not a page or a fetch result")
+                }
+                try throwsCode("wrong_message") { _ = try relayDecodeToStation(message: wire) }
+            }
+            for bad in a(stationCalls["invalid"]).map(o) {
+                let wire = textOf(bad)
+                let code = s(bad["code"])
+                if s(bad["reader"]) == "to_host" {
+                    try throwsCode(code) { _ = try relayDecodeToHost(message: wire) }
+                } else {
+                    try throwsCode(code) { _ = try relayDecodeToStation(message: wire) }
+                }
+            }
+        }
+        check("Station calls: correlation, each matching case's verdict through relayControlSyncAnswers") {
+            func verdict(_ v: RelaySyncVerdict) -> String {
+                switch v {
+                case .answers: return "answers"
+                case .requestId: return "request_id"
+                case .origin: return "origin"
+                case .feedId: return "feed_id"
+                case .after: return "after"
+                }
+            }
+            let cases = a(stationCalls["matching"]).map(o)
+            try eq(cases.count >= 9, true, "matching cases")
+            var seen = Set<String>()
+            for c in cases {
+                let calls = a(c["calls"]).map(s)
+                let verdicts = a(c["verdicts"]).map(s)
+                try eq(calls.count, verdicts.count, "\(s(c["name"])) verdicts")
+                for (i, call) in calls.enumerated() {
+                    let got = verdict(try relayControlSyncAnswers(call: call, result: s(c["result"])))
+                    try eq(got, verdicts[i], "\(s(c["name"])) call \(i)")
+                    seen.insert(got)
+                }
+            }
+            try eq(seen.sorted(), ["after", "answers", "feed_id", "origin", "request_id"], "every verdict")
+            let first = cases[0]
+            let firstCall = s(a(first["calls"])[0])
+            let firstResult = s(first["result"])
+            try throwsCode("wrong_message") { _ = try relayControlSyncAnswers(call: firstResult, result: firstResult) }
+            try throwsCode("wrong_message") { _ = try relayControlSyncAnswers(call: firstCall, result: firstCall) }
+            try throwsCode("wrong_message") { _ = try relayControlSyncAnswers(call: firstCall, result: relayControlSyncRefused(code: .forbidden)) }
+        }
         check("Station: the Portal's statuses in their classes") {
             let want: [(UInt16, String)] = [(200, "confirm"), (401, "retry"), (408, "retry"), (429, "retry"), (500, "retry"), (503, "retry"),
                                             (400, "refuse"), (404, "refuse"), (409, "refuse"), (413, "refuse"), (415, "refuse"),
@@ -1315,10 +1606,12 @@ final class ConformanceTests: XCTestCase {
                 encKid: s(o(b["recipient"])["enc_kid"]), id: s(b["id"]), createdAt: u(b["created_at"]), expiresAt: u(b["expires_at"]),
                 signedAtHead: LogHead(seq: u(head["seq"]), hash: s(head["hash"])))
         }
+        // The keys it accepts, and every key it made (`generated`), by their key ids.
         func mailRecipient(_ r: Any?) throws -> MailRecipientData {
             let x = o(r)
             let keyRefs = try a(x["keys"]).map { MailKeyData(keyId: s($0), encKid: try encKid(encKey: encKey(s($0)))) }
-            return MailRecipientData(hostId: s(x["host_id"]), hostTrustGen: u(x["host_trust_gen"]), keys: keyRefs)
+            let generated = try a(x["generated"]).map { try encKid(encKey: encKey(s($0))) }
+            return MailRecipientData(hostId: s(x["host_id"]), hostTrustGen: u(x["host_trust_gen"]), keys: keyRefs, generated: generated)
         }
         func mailOutbox(_ v: Any?) -> MailOutboxData {
             let x = o(v)
@@ -1338,12 +1631,14 @@ final class ConformanceTests: XCTestCase {
                 try eq(sha256Hex(plain), s(sealed["plaintext_sha256"]), label)
             }
         }
+        func mailSender(_ h: MailHostData) -> [String: Any] { ["host_id": h.hostId, "host_trust_gen": h.hostTrustGen] }
         func envelopeVerdict(_ got: EnvelopeVerdictInfo) -> ([String: Any], String?) {
             switch got {
             case let .open(plainJson, sender): return (["verdict": "open", "sender": sender], plainJson)
             case let .pending(hostId, hostTrustGen): return (["verdict": "pending", "host_id": hostId, "host_trust_gen": hostTrustGen], nil)
             case let .refused(reason, evidence): return (["verdict": "refused", "reason": reason, "evidence": evidence], nil)
-            case let .refusedAuthenticated(objectId, reason): return (["verdict": "refused_authenticated", "object_id": objectId, "reason": reason], nil)
+            case let .refusedAuthenticated(objectId, reason, sender):
+                return (["verdict": "refused_authenticated", "object_id": objectId, "reason": reason, "sender": mailSender(sender)], nil)
             case let .unavailable(code, detail): return (["verdict": "unavailable", "code": code, "detail": detail], nil)
             }
         }
@@ -1353,7 +1648,8 @@ final class ConformanceTests: XCTestCase {
             case let .notDelivered(plainJson, sender, reason): return (["verdict": "not_delivered", "sender": sender, "reason": reason], plainJson)
             case let .pending(hostId, hostTrustGen): return (["verdict": "pending", "host_id": hostId, "host_trust_gen": hostTrustGen], nil)
             case let .refused(reason, evidence): return (["verdict": "refused", "reason": reason, "evidence": evidence], nil)
-            case let .refusedAuthenticated(objectId, reason): return (["verdict": "refused_authenticated", "object_id": objectId, "reason": reason], nil)
+            case let .refusedAuthenticated(objectId, reason, sender):
+                return (["verdict": "refused_authenticated", "object_id": objectId, "reason": reason, "sender": mailSender(sender)], nil)
             case let .unavailable(code, detail): return (["verdict": "unavailable", "code": code, "detail": detail], nil)
             }
         }
@@ -1385,7 +1681,9 @@ final class ConformanceTests: XCTestCase {
             }
             if built < 20 { throw Failure(description: "\(built) built") }
             let b = ["M7_add_host_b", "M8_enc_a", "M9_enc_b", "M10_add_host_evil"]
-            let toB = MailRecipientData(hostId: "host-b", hostTrustGen: 1, keys: [MailKeyData(keyId: "host-b-enc-1", encKid: try encKid(encKey: encKey("host-b-enc-1")))])
+            let toB = MailRecipientData(
+                hostId: "host-b", hostTrustGen: 1, keys: [MailKeyData(keyId: "host-b-enc-1", encKid: try encKid(encKey: encKey("host-b-enc-1")))],
+                generated: [try encKid(encKey: encKey("host-b-enc-1"))])
             let req = mailObject["request"]!
             let reqPlain = s(o(req["sealed"])["plaintext"])
             let fresh = try sealEnvelope(provider: store, hostKeyId: "host-a", fields: mailFields(o(req["object"])["body"]), plainJson: reqPlain, recipientEnc: encKey("host-b-enc-1"))
@@ -1400,7 +1698,9 @@ final class ConformanceTests: XCTestCase {
             try eq(openedJson, try canonicalJson(json: loosePlain))
             let status = mailObject["status"]!
             let freshResult = try sealResult(provider: store, hostKeyId: "host-b", fields: mailFields(o(status["object"])["body"]), plainJson: s(o(status["sealed"])["plaintext"]), recipientEnc: encKey("host-a-enc-1"))
-            let toA = MailRecipientData(hostId: "host-a", hostTrustGen: 1, keys: [MailKeyData(keyId: "host-a-enc-1", encKid: try encKid(encKey: encKey("host-a-enc-1")))])
+            let toA = MailRecipientData(
+                hostId: "host-a", hostTrustGen: 1, keys: [MailKeyData(keyId: "host-a-enc-1", encKid: try encKid(encKey: encKey("host-a-enc-1")))],
+                generated: [try encKid(encKey: encKey("host-a-enc-1"))])
             let row = mailOutbox(mailChecks.first { s($0["label"]) == "status_accepted" }!["outbox"])
             guard case .accepted(_, _) = try acceptResult(objectJson: freshResult, log: try mailList(b), me: toA, outbox: row, provider: store, nowMs: mailNow) else {
                 throw Failure(description: "a fresh result isn't accepted")
@@ -1646,7 +1946,8 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("bad_sealed") { _ = try PushHintBook().offer(hint: swapped) }
             try throwsCode("open_failed") { _ = try swapped.open(provider: providerFor("dev-phone"), encKeyId: "enc", deviceId: "dev-phone") }
             // Well signed and well sealed, but the sealed facts aren't a
-            // delegated sender's UUID v4 task: verified and kept, refused at open.
+            // delegated sender's UUID v4 task, or the reason is blank:
+            // verified and kept, refused at open.
             for c in a(push["outcome_unknown_invalid_facts"]).map(o) {
                 for verifier in [PushVerifier.client, PushVerifier.relay] {
                     _ = try verifyPushHint(hintJson: js(c["hint"]!), log: logL(), nowMs: nowP, verifier: verifier)
@@ -1886,6 +2187,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 70)
+        XCTAssertEqual(passed, 74)
     }
 }

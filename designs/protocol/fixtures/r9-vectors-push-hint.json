@@ -774,9 +774,44 @@
       "ikm_label": "alert-9d5eaf24-6071-4c9b-a4fc-3a1b920d5e67-dev-phone-facts",
       "info_hex": "000000116174656d2d707573682d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d610000000800000000000000010000000f6f7574636f6d655f756e6b6e6f776e0000002439643565616632342d363037312d346339622d613466632d33613162393230643565363700000008000001a186dd337000000008000001a186e65b30000000096465762d70686f6e650000001030376236396533656531386431363935",
       "reason": "a browser grant's task: browser grants keep v1 and raise no alert"
+    },
+    {
+      "code": "malformed",
+      "device_id": "dev-phone",
+      "facts": {
+        "reason": "  　",
+        "sender": "service:svc-discord",
+        "session_id": "ses-aaaaaaaaaaaa",
+        "task_id": "c4d9e8f7-1a2b-4c3d-8e5f-6a7b8c9d0e1f"
+      },
+      "hint": {
+        "body": {
+          "account_id": "acct-test-1",
+          "alert_id": "ae6fb035-7182-4dac-b50d-4b2ca31e6f78",
+          "created_at": 1793264006000,
+          "expires_at": 1793264606000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "host_id": "host-a",
+          "host_trust_gen": 1,
+          "kind": "outcome_unknown",
+          "recipient": {
+            "device_id": "dev-phone",
+            "enc_kid": "07b69e3ee18d1695"
+          },
+          "sealed_hash": "94b7afa33063f98ce418cb576b51e82b76d6eec89b8d76ec1ec61a5757ea81d1",
+          "type": "atem-push-hint",
+          "v": 1
+        },
+        "ct": "4tMHF_rTw7_hJpTT_ZbvdhQqrioo9mUj1qmbEjMCFhleKpCudZkA_X5YN8tJvQJ9_lzpTmdKCBtuMA2Vz0GyJdx-iR8ZEscqZLQH7ln0s_AN8oro5Vg6NcCZTQKqeY-K8yx_DK1LhXK1OGF2uG4Dvrr9OYNc-rdXapXAVsBGDbILwj0BZCRg8CTMyPgWb1xq-GlM",
+        "enc": "fzoSrP2YJ-HNgiBgpIF-in0a0L4DV2EUDg874npRPnk",
+        "sig": "VJP3qrpeRFAKnSchgNjcU34yDhywpo2igzOhWjLnew0xrlSibfnnQkmhlDedym0obOE29jmC1LXTCJH5zL00Aw"
+      },
+      "ikm_label": "alert-ae6fb035-7182-4dac-b50d-4b2ca31e6f78-dev-phone-facts",
+      "info_hex": "000000116174656d2d707573682d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d610000000800000000000000010000000f6f7574636f6d655f756e6b6e6f776e0000002461653666623033352d373138322d346461632d623530642d34623263613331653666373800000008000001a186dd337000000008000001a186e65b30000000096465762d70686f6e650000001030376236396533656531386431363935",
+      "reason": "a delegated sender's task whose reason is blank (nothing but White_Space: a space, a no-break space and an ideographic space, none a control or format character, so only the blank rule refuses it): refused at open (Astation's review of PR 2, #120 comment 6848326392: the deferred blank-reason vector, before phone hint support is accepted)"
     }
   ],
-  "outcome_unknown_note": "Hints of kind outcome_unknown (delegated host-work I.4.6): the body's type is atem-push-hint and its label atem-push-hint-v1 like an approval hint's, told apart by `kind` (no `state`, no session_id, process_gen or approval_id; `alert_id` instead). The task, session, sender and reason are only in the sealed part, jcs of {reason, sender, session_id, task_id}. info = enc([\"atem-push-seal-v1\", account_id, genesis_hash, host_id, u64(host_trust_gen), \"outcome_unknown\", alert_id, u64(created_at), u64(expires_at), device_id, enc_kid]) (11 fields; an approval's has 12). ikmE_hex = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Entries 0 and 1 are one alert for two recipients; entry 2 is another alert at the bounds. Only a delegated sender's (member:, service: or host:) UUID v4 task raises an alert. outcome_unknown_acks are the push_ack entries, one per hint. Each outcome_unknown_invalid carries the first hint's sealed envelope (except bad_sealed's, which is the point) so only its code refuses it; the runner checks the code with both verifiers. Each outcome_unknown_invalid_facts is well signed and well sealed (both verifiers take it, and its sealed_hash names its sealed part), but its sealed facts aren't a delegated task's: the recipient refuses it at open (malformed).",
+  "outcome_unknown_note": "Hints of kind outcome_unknown (delegated host-work I.4.6): the body's type is atem-push-hint and its label atem-push-hint-v1 like an approval hint's, told apart by `kind` (no `state`, no session_id, process_gen or approval_id; `alert_id` instead). The task, session, sender and reason are only in the sealed part, jcs of {reason, sender, session_id, task_id}. info = enc([\"atem-push-seal-v1\", account_id, genesis_hash, host_id, u64(host_trust_gen), \"outcome_unknown\", alert_id, u64(created_at), u64(expires_at), device_id, enc_kid]) (11 fields; an approval's has 12). ikmE_hex = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Entries 0 and 1 are one alert for two recipients; entry 2 is another alert at the bounds. Only a delegated sender's (member:, service: or host:) UUID v4 task raises an alert. outcome_unknown_acks are the push_ack entries, one per hint. Each outcome_unknown_invalid carries the first hint's sealed envelope (except bad_sealed's, which is the point) so only its code refuses it; the runner checks the code with both verifiers. Each outcome_unknown_invalid_facts is well signed and well sealed (both verifiers take it, and its sealed_hash names its sealed part), but its sealed facts aren't a delegated task's, or its reason is blank (nothing but White_Space; for Astation, amended for step 4: the deferred blank-reason case, Astation's review of PR 2): the recipient refuses it at open (malformed).",
   "recipient_secrets": {
     "dev-mac": "bfa0664fde3222947767b3a54bc886cee232dc7a498dfdb7006862df10f6bd55",
     "dev-phone": "e813b00518eedc5f85e1b036f168917ef9dc935806a410c2f73e624dbf0e0c1b"
