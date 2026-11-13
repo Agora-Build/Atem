@@ -935,3 +935,83 @@ fn a_damaged_control_state_never_makes_a_service_v1() {
         assert_eq!(ask(&mut rig, &s.bot, Q::Query(&task)), forbidden());
     });
 }
+
+/// PR 11 (PRs 7 and 8 merged into PR 10; the Task 32 review's notes for
+/// Task 35): `work_resolve` (PR 7) and `work_interrupt` (PR 8) take their
+/// caller rule on the grounds every delegated request has, so ruling
+/// T32b's guard holds for them too. While the control state doesn't read,
+/// the bot (a covered service whose grant holds `interrupt`) is answered
+/// `busy` for both, as for its other requests: never a `forbidden` that
+/// might not stand. Nothing changes: its unknown outcome stays unresolved,
+/// and no Esc reaches its running turn. The owner still resolves.
+#[test]
+fn a_damaged_control_state_answers_a_services_resolve_and_interrupt_busy() {
+    use crate::runtime::delegated::feeds::Feeds;
+    use atem_client::session::host_work::Resolution;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot_ops(
+            &mut rig,
+            root,
+            &os,
+            start + 3 * HOUR,
+            &["interrupt", "message", "notify", "prompt", "stop", "view"],
+        );
+        let running = bot_task(&mut rig, &s, "BOT_IN_ITS_TURN", start + HOUR);
+        rig.until(|r| input(r).contains("BOT_IN_ITS_TURN")).await;
+        // A task of the bot's whose outcome is unknown, never started.
+        rig.bridge.start_view().gates = Gates::default();
+        let template = bot_task(&mut rig, &s, "BOT_TEMPLATE", start + HOUR);
+        let template = stored_record(&rig, &template);
+        let [unknown] = unknown_outcomes(&rig, &template, BOT, 1)
+            .try_into()
+            .unwrap();
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute(
+                "INSERT INTO control_principals(principal,part) VALUES('service:svc-x','{damaged')",
+                [],
+            )
+            .unwrap();
+        restart(&mut rig, root, &os, false, true);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Damaged));
+        let escs = |rig: &LocalRig| input(rig).matches('\x1b').count();
+        let before = escs(&rig);
+        let given_up = Resolution::Failed {
+            detail: "given up".into(),
+        };
+        let resolve = |rig: &LocalRig| hw::Request::WorkResolve {
+            v: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            host: rig.bridge.work_host(),
+            task_id: unknown.clone(),
+            resolution: given_up.clone(),
+        };
+        let req = resolve(&rig);
+        assert_eq!(ask_req(&mut rig, &s.bot, &req), busy(), "work_resolve");
+        assert_eq!(
+            ask(&mut rig, &s.bot, Q::Interrupt(&running)),
+            busy(),
+            "work_interrupt"
+        );
+        passes(&mut rig, 3);
+        assert_eq!(escs(&rig), before, "no Esc");
+        let r = stored_record(&rig, &unknown);
+        assert_eq!(
+            (r.status.state, r.status.resolved),
+            (WorkState::OutcomeUnknown, None)
+        );
+        // The owner still resolves it.
+        let req = resolve(&rig);
+        assert_eq!(
+            status(ask_req(&mut rig, &s.mac, &req)).state,
+            WorkState::Failed
+        );
+    });
+}

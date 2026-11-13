@@ -212,11 +212,16 @@ impl HostBridge {
     /// may name, the task's sender with current authority or the owner (the
     /// interaction rule, `delegated_caller`), else `forbidden`: a v1 task,
     /// one the host doesn't have, `local` (the host's own command is not
-    /// this op). Then [`resolve`]'s rule, in one `BEGIN IMMEDIATE`
+    /// this op); `busy` while the rule can't be decided yet (a service while
+    /// the control state doesn't read, ruling T32b; a `projects` comparison
+    /// not made yet), as for the task's other requests. Its launch project
+    /// is registered first, as `work_query` registers it (ruling T20c): an
+    /// unresolved task's record closes a day after its deadline, so a start
+    /// doesn't. Then [`resolve`]'s rule, in one `BEGIN IMMEDIATE`
     /// transaction committed before the answer: the task and its alert's
     /// end are durable before anything shows them.
     pub(super) fn work_resolve(
-        &self,
+        &mut self,
         a: &Sender,
         req: &hw::Request,
         task_id: &str,
@@ -225,13 +230,18 @@ impl HostBridge {
         if !self.features.delegated {
             return crate::runtime::delegated::request(self.features, req);
         }
-        let store = self.work.store.as_ref().ok_or("busy")?;
-        let r = store
+        let r = self
+            .work
+            .store
+            .as_ref()
+            .ok_or("busy")?
             .work(task_id)
             .map_err(|_| "busy")?
             .ok_or("forbidden")?;
         let adm = r.delegated.as_ref().ok_or("forbidden")?;
-        self.delegated_caller(a, &r, adm).map_err(|_| "forbidden")?;
+        self.keep_task_project(&r);
+        self.delegated_caller(a, &r, adm).map_err(Refused::code)?;
+        let store = self.work.store.as_ref().ok_or("busy")?;
         let tx = store.immediate().map_err(|_| "busy")?;
         let work = resolve(
             store,
