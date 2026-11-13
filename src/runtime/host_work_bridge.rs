@@ -270,7 +270,10 @@ impl HostBridge {
             host,
             message: message.clone(),
         };
-        match self.message_request(&request, &Sender::Local, cx)? {
+        match self
+            .message_request(&request, &Sender::Local, cx)
+            .map_err(|e| e.code)?
+        {
             ResultBody::Message { message } => Ok(message),
             _ => Err("invalid_request"),
         }
@@ -1022,7 +1025,7 @@ impl HostBridge {
             // Its tasks compare their sender's control generation with this
             // one: it is kept from now on (`schedule_work` renews the set).
             self.host.keep_principal(&principal);
-            return Ok(self.message_request(req, &a, cx)?);
+            return self.message_request(req, &a, cx);
         }
         let store = self.work.store.as_ref().ok_or("busy")?;
         match req {
@@ -1200,6 +1203,9 @@ impl HostBridge {
                 {
                     return Err("invalid_request".into());
                 }
+                // Too many unresolved outcomes (design I.4.6): a new task
+                // is refused, nothing recorded.
+                self.unresolved_capacity(&a)?;
                 // A delegated sender's task: its admission record, stored
                 // with it before the reply (design I.4.1).
                 record.delegated =
@@ -1288,14 +1294,16 @@ impl HostBridge {
                 store.save_work(&r).map_err(|_| "busy")?;
                 Ok(ResultBody::Work { work: r.status })
             }
-            // `host.delegated`'s and `host.alerts`' ops: the channel takes
-            // them only while the host advertises the feature (the debug-only
-            // hook, step 4's Decision 10), and `delegated` answers them; one
-            // that got here otherwise is refused as before, never
-            // half-served.
-            Request::WorkInterrupt { .. }
-            | Request::WorkResolve { .. }
-            | Request::AlertList { .. } => crate::runtime::delegated::request(self.features, req),
+            // `host.alerts`' op (design I.4.6, §11.3): the unresolved
+            // alerts, for native members holding `control`.
+            Request::AlertList { after, .. } => self.alert_list(&a, req, after.as_deref()),
+            // `host.delegated`'s ops: the channel takes them only while the
+            // host advertises the feature (the debug-only hook, step 4's
+            // Decision 10), and `delegated` answers them; one that got here
+            // otherwise is refused as before, never half-served.
+            Request::WorkInterrupt { .. } | Request::WorkResolve { .. } => {
+                crate::runtime::delegated::request(self.features, req)
+            }
             Request::Publish { .. }
             | Request::MessageQuery { .. }
             | Request::AttachmentPut { .. } => unreachable!(),
@@ -1364,13 +1372,13 @@ impl HostBridge {
         req: &hw::Request,
         a: &Sender,
         cx: &Cx,
-    ) -> Result<ResultBody, &'static str> {
+    ) -> Result<ResultBody, HostWorkError> {
         use crate::runtime::host_work::MessageRecord;
         use atem_client::session::messages::{
             Delivery, Destination, MessageReceipt, RecipientReceipt,
         };
         if !a.allows(Need::Op(Op::Message)) || a.is_browser() {
-            return Err("forbidden");
+            return Err("forbidden".into());
         }
         let store = self.work.store.as_ref().ok_or("busy")?;
         let message_id = match req {
@@ -1382,15 +1390,15 @@ impl HostBridge {
                     || a.remote().is_some()
                         && (message.from_session.is_some() || message.reply_to.is_some())
                 {
-                    return Err("unsupported_version");
+                    return Err("unsupported_version".into());
                 }
                 if message.sender != a.name() {
-                    return Err("forbidden");
+                    return Err("forbidden".into());
                 }
                 &message.message_id
             }
             hw::Request::MessageQuery { message_id, .. } => message_id,
-            _ => return Err("invalid_request"),
+            _ => return Err("invalid_request".into()),
         };
         if let Some(old) = store.message(message_id).map_err(|_| "busy")? {
             // Its delegated tasks (a delegated sender's agent recipients):
@@ -1413,15 +1421,15 @@ impl HostBridge {
             };
             if delegated.is_empty() {
                 if old.message.sender != a.name() || old.sender_key != a.key_json() {
-                    return Err("forbidden");
+                    return Err("forbidden".into());
                 }
             } else {
                 match self.delegated_message_caller(a, &delegated) {
                     Some(Caller::Owner) if matches!(req, hw::Request::Publish { .. }) => {
-                        return Err("forbidden");
+                        return Err("forbidden".into());
                     }
                     Some(_) => {}
-                    None => return Err("forbidden"),
+                    None => return Err("forbidden".into()),
                 }
             }
             // By the digest recorded at acceptance, which stays when the
@@ -1429,7 +1437,7 @@ impl HostBridge {
             if let hw::Request::Publish { message, .. } = req
                 && old.receipt.digest != message.digest()
             {
-                return Err("request_id_reused");
+                return Err("request_id_reused".into());
             }
             // A delegated sender's message is judged wholly by its tasks'
             // rule (above), its notices too: a route change hides nothing
@@ -1445,7 +1453,7 @@ impl HostBridge {
                         && !matches!(p.delivery, Delivery::Refused { .. })
                 });
                 if accepted && !self.message_scope(r, a) {
-                    return Err("forbidden");
+                    return Err("forbidden".into());
                 }
             }
             return Ok(ResultBody::Message {
@@ -1453,11 +1461,11 @@ impl HostBridge {
             });
         }
         let hw::Request::Publish { message, .. } = req else {
-            return Err("forbidden");
+            return Err("forbidden".into());
         };
         let now = host_now().wall_ms;
         if message.created_at > now.saturating_add(60_000) || message.expires_at <= now {
-            return Err("invalid_request");
+            return Err("invalid_request".into());
         }
         let digest = message.digest();
         let mut tasks = Vec::new();
@@ -1538,6 +1546,12 @@ impl HostBridge {
                 recipient_id: r.recipient_id.clone(),
                 delivery,
             });
+        }
+        // Too many unresolved outcomes (design I.4.6): a message that would
+        // make a new task is refused whole, nothing recorded; one with none
+        // (notices only) never is.
+        if !tasks.is_empty() {
+            self.unresolved_capacity(a)?;
         }
         let record = MessageRecord {
             sender_key: a.key_json(),
@@ -2170,6 +2184,7 @@ mod local_tests {
         include!("delegated/dispatch_tests.rs");
         include!("delegated/lifecycle_tests.rs");
         include!("delegated/recovery_tests.rs");
+        include!("delegated/alerts_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};
@@ -3438,13 +3453,16 @@ principals = ["local"]
         });
     }
 
-    /// With the hook on (step 4, Decision 10) the bridge hands the ops to
-    /// `delegated`, after the checks every request has (the host triple,
-    /// the caller's authority): `busy`, saying the feature isn't served
-    /// yet, until their handlers exist; `alert_list` needs `host.alerts`.
+    /// With the hook on (step 4, Decision 10) the bridge hands
+    /// `host.delegated`'s ops to `delegated`, after the checks every request
+    /// has (the host triple, the caller's authority): `busy`, saying the
+    /// feature isn't served yet, until their handlers exist. `alert_list`
+    /// needs `host.alerts`, and then answers native members holding
+    /// `control` only: `local` is `forbidden` (the alerts' own tests are in
+    /// `delegated/alerts_tests.rs`).
     #[test]
     fn delegated_ops_with_the_hook_are_handed_to_delegated() {
-        use crate::runtime::delegated::{ALERTS_NOT_SERVED, DELEGATED_NOT_SERVED};
+        use crate::runtime::delegated::DELEGATED_NOT_SERVED;
         use crate::runtime::test_hooks::HostFeatures;
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
@@ -3472,7 +3490,7 @@ principals = ["local"]
             assert_eq!(ask(&mut rig, &resolve), busy(Some(DELEGATED_NOT_SERVED)));
             assert_eq!(ask(&mut rig, &alerts), busy(None), "host.alerts is off");
             rig.bridge.features = HostFeatures::parse("host.delegated,host.alerts").unwrap();
-            assert_eq!(ask(&mut rig, &alerts), busy(Some(ALERTS_NOT_SERVED)));
+            assert_eq!(ask(&mut rig, &alerts), Err("forbidden".into()), "local");
             // The checks every request has come first.
             let mut other = host.clone();
             other.host_trust_gen += 1;

@@ -1089,6 +1089,7 @@ impl Store {
             CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id);
             CREATE UNIQUE INDEX IF NOT EXISTS attempts_live ON attempts(task_id)
                 WHERE \"end\" IS NULL;")?;
+        db.execute_batch(crate::runtime::delegated::alerts::SCHEMA)?;
         track_open_records(&db)?;
         track_waits(&db)?;
         std::fs::File::open(state)?.sync_all()?;
@@ -1408,6 +1409,8 @@ impl Store {
                 "UPDATE return_grants SET state='ended' WHERE task_id=?1 AND state IN ('open','consumed')",
                 [id],
             )?;
+            // A delegated task's alert ends with it (`failed`).
+            self.end_alert(&self.db, id)?;
         }
         self.db
             .execute("DELETE FROM grant_dues WHERE task_id=?1", [id])?;
@@ -1909,7 +1912,22 @@ impl Store {
     /// concern (open or consumed, or ended while the task waits for its
     /// result), is due at once (`grant_dues`: `collab_result_pass` takes it
     /// on its next pass), so no pass has to read grants nothing happened to.
+    /// A delegated task's alert follows its state in the same transaction
+    /// (`track_alert`: raised when it becomes `outcome_unknown`, ended when
+    /// it leaves it or is resolved; host-work-v1 §11.3), in the caller's
+    /// transaction or, without one, in its own.
     pub fn save_work(&self, record: &WorkRecord) -> Result<()> {
+        let tx = (record.delegated.is_some() && self.db.is_autocommit())
+            .then(|| self.db.unchecked_transaction())
+            .transpose()?;
+        self.write_work(record)?;
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    fn write_work(&self, record: &WorkRecord) -> Result<()> {
         let state = serde_json::to_value(record.status.state)?;
         if self.db.execute(
             "UPDATE work SET record=?2,state=?3 WHERE id=?1",
@@ -1931,7 +1949,7 @@ impl Store {
             WHERE task_id=?1 AND (state IN ('open','consumed') OR ?2)",
             params![record.task.task_id, waits],
         )?;
-        Ok(())
+        self.track_alert(&self.db, record)
     }
 
     /// At a start: a launch still starting is started (its worker is

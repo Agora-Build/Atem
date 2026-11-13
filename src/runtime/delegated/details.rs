@@ -65,6 +65,15 @@ pub const NOT_RUNNING: &str = "not running";
 // Used by Task 22: the capacity limits.
 #[allow(dead_code)]
 pub const TOO_MANY_UNRESOLVED_OUTCOMES: &str = "too many unresolved outcomes";
+/// `alert_list`'s `stale_target` for an `after` the host has no unresolved
+/// alert for (host-work-v1 §11.3, "An unknown cursor"). Not a row of
+/// §11.6's table: it names no task's state.
+pub const UNKNOWN_ALERT: &str = "unknown alert";
+/// The note a new alert's reason ends with at 32 unresolved outcomes on the
+/// host, after `; <count> ` (host-work-v1 §11.3's example, `agent exited;
+/// 32 outcomes unresolved on this host`). Not a row of §11.6's table: it
+/// is part of an alert's reason, no task's detail.
+pub const OUTCOMES_UNRESOLVED_ON_THIS_HOST: &str = "outcomes unresolved on this host";
 /// A receipt (session-v1 R9.14 item 6): an `accepted` attempt found at
 /// recovery; the session host's own text.
 pub use crate::session_protocol::host::DETAIL_WITHDRAWN_AT_RECOVERY as WITHDRAWN_AT_RECOVERY;
@@ -175,5 +184,30 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), ALL.len(), "no text twice");
+    }
+
+    /// The alerts' own texts are §11.3's, byte for byte: the unknown
+    /// cursor's detail and the 32-on-host note (its example), and neither
+    /// is a row of §11.6's table.
+    #[test]
+    fn alert_texts_match_section_11_3() {
+        let (_, section) = CONTRACT
+            .split_once("\n### 11.3 `alert_list` (`host.alerts`)\n")
+            .expect("§11.3");
+        let section = section.split("\n### ").next().unwrap();
+        let text = section.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            text.contains(&format!("is `stale_target`, detail `{UNKNOWN_ALERT}`")),
+            "{UNKNOWN_ALERT}"
+        );
+        assert!(
+            text.contains(&format!(
+                "`agent exited; 32 {OUTCOMES_UNRESOLVED_ON_THIS_HOST}`"
+            )),
+            "{OUTCOMES_UNRESOLVED_ON_THIS_HOST}"
+        );
+        for text in [UNKNOWN_ALERT, OUTCOMES_UNRESOLVED_ON_THIS_HOST] {
+            assert!(!ALL.contains(&text), "{text}");
+        }
     }
 }

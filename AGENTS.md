@@ -90,16 +90,17 @@ src/
 │   ├── host_clock/      #   the delegated lifecycle's clock (host-work-v1 §11.6): os.rs (boot-time counter, boot id, machine, time namespace, sync report), state.rs (sans-I/O `wall_hw`, floor, anchor, mark, guards), mod.rs (`HostClock`: the store's `clock` row, `atem status` line, `ATEM_TEST_HOST_CLOCK` readings in debug builds); *_tests.rs
 │   │                    #   built only with `host.delegated` on or delegated tasks in the store (otherwise inert: no row, line or status); real-OS checks: `scripts/clock-real-os.py`, `.github/workflows/clock-real-os.yml`
 │   ├── delegated/       #   delegated host work (design Part I, host-work-v1 §11.6), behind the debug-only hook (`ATEM_TEST_HOST_FEATURES`; advertised nowhere otherwise):
-│   │   ├── mod.rs       #     who is delegated (`classify`: a native member, a service a feed covers), the admission record (`Admission`), the `host.delegated`/`host.alerts` ops not served yet
+│   │   ├── mod.rs       #     who is delegated (`classify`: a native member, a service a feed covers), the admission record (`Admission`), the `host.delegated` ops not served yet
+│   │   ├── alerts.rs    #     owner alerts (I.4.6, §11.3): one per unresolved delegated `outcome_unknown`, raised and ended with the task's state in `save_work`'s transaction (`alerts`, `alert_seq`), `alert_page` by `seq`, the 32-on-host note, `over_capacity` (64 per sender, 256 per host)
 │   │   ├── attempts.rs  #     attempts (I.6.4): a fresh id committed before each submit, one live, at most 8 counted, `attempt_end` maps every session-host answer to an end
 │   │   ├── authority.rs #     who may query, cancel or complete a delegated task (I.4.5, Decision 15): its sender with current authority, or the owner (a native holding `control`)
 │   │   ├── details.rs   #     §11.6's detail texts, compared with the table by a test
 │   │   ├── gate.rs      #     the revocation gates (I.5.8): every Station's closed until the feeds exist (PR 10); a native's own caught-up channel opens its own
 │   │   ├── start.rs     #     the start check (I.4.3, Decision 16): `StartView` (what the host committed), `may_start` (conditions 2 to 5, the deadline on `D`), `DelegatedStart` (the session host's check at `executing`)
 │   │   ├── dispatch.rs  #     (`impl HostBridge`) dispatch under `host-work`: an attempt per start, settled from its receipt, withdrawn for a settling event while it waits `accepted`
-│   │   ├── requests.rs  #     (`impl HostBridge`) the delegated rules of `work_query`/`reply_query`/`work_cancel`/`work_complete` and `message_query`
+│   │   ├── requests.rs  #     (`impl HostBridge`) the delegated rules of `work_query`/`reply_query`/`work_cancel`/`work_complete` and `message_query`; `alert_list` (native members holding `control`) and the capacity refusal of new remote tasks (`busy`, `too many unresolved outcomes`; never `local`)
 │   │   ├── recovery.rs  #     (`impl HostBridge`) the start's recovery in I.6.2's order (identity, session journal, intents, reconcile by attempt per I.6.3, routes, deadlines on a fresh `D`, gates closed); `RecoveryStep` is its log
-│   │   └── *_tests.rs   #     (test-only) the start check; the dispatch, the lifecycle and the recovery in the bridge (in-process workers, the delegated clock on a manual OS)
+│   │   └── *_tests.rs   #     (test-only) the start check; the dispatch, the lifecycle, the recovery and the alerts in the bridge (in-process workers, the delegated clock on a manual OS)
 │   ├── collab.rs        #   local selectors, fixed resolutions, durable outbox/message counters/scoped status; collab_results.rs stores narrow return grants and one reply per task (`reply_query` reads it)
 │   ├── collab_context.rs #  publish/read-back exact Memory/Vault snapshots before delivery (background jobs with durable retries)
 │   ├── collab_bridge.rs #   internal attachment, sending/replying/completing, workflow inheritance, pauses, correlated results, return grants that end early (the task goes on; the reply is kept, not delivered) and automatic status reports

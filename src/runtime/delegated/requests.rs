@@ -181,4 +181,58 @@ impl HostBridge {
         .map_err(|_| "busy")?;
         Ok(r.status)
     }
+
+    /// `alert_list` (feature `host.alerts`; design I.4.6, host-work-v1
+    /// §11.3) from `a`: the page of unresolved alerts after `after`. Only
+    /// with `host.alerts` on (with it off, `busy` as before the hook:
+    /// [`crate::runtime::delegated::request`]). It answers native members
+    /// holding `control` at the host's head, the members that get approval
+    /// hints: the channel refuses everyone else before decoding
+    /// (`Need::Alerts`), and so does this, `local` included (the owner's
+    /// own view is the host's command, not this op). An `after` the host has
+    /// no unresolved alert for is `stale_target`, `unknown alert`. Read
+    /// only: it records nothing.
+    pub(super) fn alert_list(
+        &self,
+        a: &Sender,
+        req: &hw::Request,
+        after: Option<&str>,
+    ) -> Result<ResultBody, HostWorkError> {
+        if !(self.features.delegated && self.features.alerts) {
+            return crate::runtime::delegated::request(self.features, req);
+        }
+        if !a.remote().is_some_and(|a| a.allows(Need::Alerts)) {
+            return Err("forbidden".into());
+        }
+        let store = self.work.store.as_ref().ok_or("busy")?;
+        let (alerts, more) = store
+            .alert_page(after, atem_client::session::alerts::MAX_PAGE)
+            .map_err(|refused| refused.error())?;
+        Ok(ResultBody::Alerts { alerts, more })
+    }
+
+    /// The capacity limits on unresolved outcomes (design I.4.6,
+    /// host-work-v1 §11.6 "Capacity"), for a request of `a` that would make
+    /// a new task (`work_enqueue`, `message_publish` with an agent
+    /// recipient): at 64 of its own unresolved, or 256 on the host, a remote
+    /// sender is refused `busy`, `too many unresolved outcomes`, until the
+    /// owner resolves some. `local` never is. Only with `host.delegated`
+    /// on: with it off nothing is counted, as on main.
+    pub(super) fn unresolved_capacity(&self, a: &Sender) -> Result<(), HostWorkError> {
+        let Some(sender) = a.remote() else {
+            return Ok(());
+        };
+        if !self.features.delegated {
+            return Ok(());
+        }
+        let store = self.work.store.as_ref().ok_or("busy")?;
+        match store.over_capacity(&sender.name()) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(HostWorkError {
+                code: "busy",
+                detail: Some(details::TOO_MANY_UNRESOLVED_OUTCOMES),
+            }),
+            Err(_) => Err("busy".into()),
+        }
+    }
 }
