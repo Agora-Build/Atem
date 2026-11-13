@@ -2689,17 +2689,7 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&runtime).unwrap();
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let exe = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("atem");
-        assert!(
-            exe.exists(),
-            "atem binary missing or stale at {}: run `cargo build` first",
-            exe.display()
-        );
+        let exe = atem_binary();
         let socket = sock(&runtime);
         let pid = Arc::new(Mutex::new(None));
         let launcher = {
@@ -3126,21 +3116,22 @@ mod tests {
         );
     }
 
-    /// The atem binary next to the test binary (built because integration
-    /// tests exist).
+    /// The atem binary in the profile directory above the test binary
+    /// (built because integration tests exist): the test binary is in
+    /// `<profile>/deps/` before Cargo 1.100, `<profile>/build/atem/<hash>/out/`
+    /// since.
     pub(super) fn atem_binary() -> PathBuf {
-        let exe = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .join("atem");
-        assert!(
-            exe.exists(),
-            "atem binary missing or stale at {}: run `cargo build` first",
-            exe.display()
-        );
-        exe
+        let test = std::env::current_exe().unwrap();
+        test.ancestors()
+            .skip(1)
+            .map(|dir| dir.join("atem"))
+            .find(|exe| exe.is_file())
+            .unwrap_or_else(|| {
+                panic!(
+                    "no atem binary above {}: run `cargo build` first",
+                    test.display()
+                )
+            })
     }
 
     /// Kills the child when the test ends, however it ends.
