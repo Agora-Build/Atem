@@ -1365,6 +1365,8 @@ fn a_turn_running_at_its_deadline_is_interrupted_and_expires() {
         ),
         (attempt.as_str(), "deadline", false)
     );
+    // The fake agent appends what it read on its own poll.
+    within("the Esc", || escs(&rig) == 1);
     assert_eq!(escs(&rig), 1);
     assert_eq!(interrupt_writes(&rig), 1);
     // The turn goes on (the fake agent ignores the Esc): only the lease
@@ -1442,6 +1444,7 @@ fn a_paused_host_still_interrupts_a_turn_at_its_deadline() {
     });
     work_passes(&rig, 3);
     assert_eq!(interrupt_writes(&rig), 1, "once per turn");
+    within("the Esc while paused", || escs(&rig) == 1);
     assert_eq!(escs(&rig), 1);
     assert_eq!(intents(&rig, tid)[0].attempt_id, attempt);
     // The turn ends interrupted, still paused.
@@ -1615,15 +1618,16 @@ fn svc_standing(standing: Value) -> Value {
     json!({"own": ORIGIN, "open": [ORIGIN], "standings": {format!("service:{SVC}"): svc}})
 }
 
-/// `dev`'s `host_launch` of profile `backend`, expiring in a minute: its
-/// request id and session id (the reply says `starting`).
+/// `dev`'s `host_launch` of profile `backend`, expiring in ten minutes
+/// (room for a slow runner): its request id and session id (the reply
+/// says `starting`).
 fn launch_backend(dev: &mut Dev, r: &mut Router) -> (String, String) {
     let rid = uuid();
     let reply = dev.request(
         r,
         json!({"op":"host_launch","host":host(),"request_id":rid,
             "profile_id":"backend","profile_revision":1,
-            "expires_at":r9log::host_now().wall_ms + MIN}),
+            "expires_at":r9log::host_now().wall_ms + 10 * MIN}),
     );
     let launch = &reply["result"]["launch"];
     assert_eq!(launch["state"], "starting", "{reply}");

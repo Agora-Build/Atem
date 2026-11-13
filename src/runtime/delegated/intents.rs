@@ -37,7 +37,8 @@
 //!   ([`Runs`]), so a turn still current after the start's reconciliation
 //!   gets the interrupt once more. `delivered_turn` records, durably, the
 //!   turn that last got it.
-//! - **One Esc per (attempt, turn), from any source** (ruling T27a):
+//! - **One Esc per (attempt, turn), from host-work's own sources**
+//!   (`work_interrupt` and the intents; ruling T27a):
 //!   `work_interrupt` (host-work-v1 §11.2), a one-shot request with no
 //!   intent of its own, shares [`Runs`] with the intents ([`Runs::running`],
 //!   [`Runs::requested`]). Every interrupt written to an attempt's turn is
@@ -48,7 +49,10 @@
 //!   `delivered_by` `work_interrupt`: a turn it ended still reads `turn
 //!   interrupted`, never `interrupted at deadline`. Across a restart this
 //!   run's record is gone, so a turn still current can get one more Esc,
-//!   from a request as from a pending intent (the residual).
+//!   from a request as from a pending intent (the residual). An Esc
+//!   host-work didn't write isn't counted: a principal holding `control`
+//!   (a takeover, then its own session-v1 `interrupt`) or the person at the
+//!   terminal can still send its own, as the session host allows today.
 //! - **A newer build's reason** (none is planned): [`pending_intents`]
 //!   refuses a row whose reason this build can't read (a receipt-database
 //!   fault), so adding a reason means a downgrade stops at it (no shims,
@@ -1036,7 +1040,8 @@ mod tests {
         );
     }
 
-    /// Ruling T27a: one Esc per attempt and turn, from any source.
+    /// Ruling T27a: one Esc per attempt and turn, from host-work's own
+    /// sources (`work_interrupt` and the intents).
     /// `work_interrupt`'s write (host-work-v1 §11.2) and the intents share
     /// `Runs`. While the request's write is in flight, and once it is
     /// reported written, the turn has had its interrupt: a pending intent

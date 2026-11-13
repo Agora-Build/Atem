@@ -1265,8 +1265,9 @@ not name is `forbidden`, as for `work_query`.
   restart (that says nothing of the turn), or a turn that ended.
 - **A halted session journal** is `busy`, not `not running`: the turn may
   still be current, and nothing is written until the restart.
-- **One Esc per attempt and turn, from any source** (§11.6's deadline
-  interrupt included). The request is one-shot: no intent, nothing
+- **One Esc per attempt and turn, from host-work's own sources**
+  (`work_interrupt` and the intents, §11.6's deadline interrupt
+  included). The request is one-shot: no intent, nothing
   repeated on later passes. Every interrupt written to an attempt's turn,
   by a request or by an intent, is recorded. While that write waits for
   the worker's answer, or once the turn got its interrupt, a later request
@@ -1292,16 +1293,23 @@ not name is `forbidden`, as for `work_query`.
   - **Residual.** The record lives for one run. After a restart, a turn
     still current (rebound) can get one more Esc, from a request as from a
     pending intent (R9.14 item 5's restart rule).
+  - **Not counted.** An Esc host-work didn't write: a principal holding
+    `control` can still send its own (a takeover, then its session-v1
+    `interrupt`), and so can the person at the terminal, as the session
+    host allows today. With one of those in the same turn, the turn can
+    get two.
   - **Atem's choice.**
 - **While hosting is paused** (`runtime.toml` doesn't load, or `enabled =
   false`), `work_interrupt` is still served: a stop always wins, as for
   the deadline's interrupt (§11.6). **Atem's reading, for Astation to
   confirm.**
-  - **Which channels.** One welcomed before the pause. A welcome during
-    the pause lists no host-work feature, so the client core sends
+  - **Which channels.** While hosting is paused, the host takes
+    `work_interrupt` only from a channel whose welcome listed
+    `host.delegated`, that is one welcomed before the pause. A welcome
+    during the pause lists no host-work feature, so the client core sends
     nothing, and the host refuses it from such a channel (`busy`,
-    `host.delegated is not advertised`): it never takes an op of a feature
-    the channel's welcome didn't list.
+    `host.delegated is not advertised`). With hosting on, the host judges
+    every host-work op by its current features, as before.
   - **What else.** Every other host-work request stays `busy`.
   - **Still `busy`:** after a receipt-database fault, before the store is
     recovered (a runtime started while paused), and with a halted session
@@ -2431,8 +2439,12 @@ As built in step 4:
   The interrupt, and every pending intent, is carried out while hosting
   is paused (`runtime.toml` doesn't load, or `enabled = false`). A stop
   grants nothing, and the turn's own lease goes on renewing during a
-  pause. Nothing new starts, and the task's record waits for the pause to
-  end.
+  pause. Host-work dispatches nothing, and the task's record waits for
+  the pause to end, but for one stop: an attempt still waiting `accepted`
+  at its deadline is withdrawn, and its task expires (`expired before
+  submission`) at once, even while paused. An attempt already `accepted`
+  behind another turn follows the session host's queue and its start
+  check, which doesn't read the pause.
   - **Residuals.** A receipt-database fault holds the intents until the
     restart it asks for (recovery step 3 carries them out then). A runtime
     started while paused carries them out once hosting is on.

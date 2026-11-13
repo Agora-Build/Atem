@@ -15,6 +15,18 @@ fn escs(rig: &LocalRig) -> usize {
     text.matches('\x1b').count() - text.matches("\x1b[").count()
 }
 
+/// Waits, without a pass, until the fake agent has appended `n` Escs: it
+/// appends what it read on its own poll, ordered after neither the
+/// worker's answer nor the pass that records the delivery (the bound only
+/// limits a failure). The exact count is asserted after.
+async fn escs_reach(rig: &LocalRig, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while escs(rig) < n {
+        assert!(Instant::now() < deadline, "the agent got {n} Esc");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// The worker gets what was written and answers it (the passes alone never
 /// yield to it): a write no pass should have made shows as an Esc too.
 async fn settle(rig: &mut LocalRig) {
@@ -173,6 +185,7 @@ fn deadline_writes_an_intent_for_a_running_turn() {
         assert!(pending_write(&rig, &attempt).is_some(), "written this pass");
         rig.until(|r| intents(r, &task)[0].delivered_turn.is_some())
             .await;
+        escs_reach(&rig, 1).await;
         assert_eq!(escs(&rig), 1);
         for _ in 0..10 {
             passes(&mut rig, 1);
@@ -250,6 +263,59 @@ fn an_intent_withdraws_an_unstarted_attempt_and_the_task_expires() {
     });
 }
 
+/// Task 26 re-review N2, PR 8 review n2: withdrawing an attempt still
+/// waiting `accepted` at its task's deadline is a stop, so it is done while
+/// hosting is paused too (`runtime.toml` stopped loading), and its task is
+/// `expired` (`expired before submission`) at once: the one record change
+/// of a pause. Nothing is written, and the other task's turn goes on.
+#[test]
+fn a_paused_host_withdraws_an_accepted_attempt_and_the_task_expires() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, true);
+        let running = phone_task(&mut rig, &phone, "PAUSED_W_RUNNING", start + 3 * HOUR);
+        turn_journaled(&mut rig, &running, "PAUSED_W_RUNNING").await;
+        let waiting = phone_task(&mut rig, &phone, "PAUSED_W_WAITING", start + 10 * MIN);
+        blocked(
+            &mut rig,
+            &waiting,
+            "waiting for an earlier task on this session",
+        )
+        .await;
+        let attempt = attempt_behind_the_turn(&mut rig, &waiting, "PAUSED_W_WAITING");
+        passes(&mut rig, 3);
+        assert_eq!(attempts(&rig, &waiting), [(attempt.clone(), None, true)]);
+        // `runtime.toml` stops loading, then the deadline passes.
+        rig.bridge.work.config = Config::default();
+        rig.bridge.work.config_problem = Some("expected a table".into());
+        assert!(!rig.bridge.hosting_enabled());
+        os.pass(10 * MIN);
+        passes(&mut rig, 1);
+        let receipt = rig.bridge.host.attempt_receipt(&attempt, &waiting).unwrap();
+        assert_eq!(
+            (receipt.state, receipt.detail.as_deref()),
+            (
+                wire::ReceiptState::Rejected,
+                Some(details::WITHDRAWN_BY_THE_HOST)
+            )
+        );
+        assert_eq!(
+            attempts(&rig, &waiting),
+            [(attempt.clone(), Some("withdrawn".into()), true)]
+        );
+        assert_eq!(
+            settled(&rig, &waiting),
+            (WorkState::Expired, "expired before submission".into())
+        );
+        assert!(intents(&rig, &waiting)[0].done_ms.is_some());
+        assert_eq!(escs(&rig), 0, "nothing interrupted");
+        assert_eq!(settled(&rig, &running).0, WorkState::Submitted);
+        assert!(!input(&rig).contains("PAUSED_W_WAITING"));
+    });
+}
+
 /// Design I.4.4: the turn interrupted at its deadline ends `interrupted`
 /// (the attempt's prompt receipt completes so, R9.14 item 5): the task goes
 /// to `awaiting_result`, detail `interrupted at deadline` (§11.6), then
@@ -288,6 +354,7 @@ fn interrupted_at_deadline_then_expired() {
             (WorkState::Expired, EXPIRED_AWAITING.into())
         );
         passes(&mut rig, 3);
+        escs_reach(&rig, 1).await;
         assert_eq!(escs(&rig), 1);
         assert_eq!(input(&rig).matches("DEADLINE_INTERRUPTED").count(), 1);
     });
@@ -329,6 +396,7 @@ fn an_intent_survives_a_restart_and_is_carried_out() {
         rig.until(|r| intents(r, &task)[0].delivered_turn.is_some())
             .await;
         assert!(!rig.bridge.host_work_reconciling(&attempt));
+        escs_reach(&rig, 1).await;
         assert_eq!(escs(&rig), 1);
         for _ in 0..5 {
             passes(&mut rig, 1);
@@ -445,6 +513,7 @@ fn a_consumed_esc_is_written_again_next_pass() {
             assert!(Instant::now() < deadline, "the worker answers the write");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        escs_reach(&rig, 1).await;
         assert_eq!(escs(&rig), 1, "the worker wrote it");
         // Told `consumed` (nothing written) instead.
         let sid = rig.sid.to_string();
@@ -478,6 +547,7 @@ fn a_consumed_esc_is_written_again_next_pass() {
             assert_eq!(pending_write(&rig, &attempt), None, "no third");
         }
         settle(&mut rig).await;
+        escs_reach(&rig, 2).await;
         assert_eq!(escs(&rig), 2, "the consumed write and the delivered one");
     });
 }
@@ -527,6 +597,7 @@ fn an_intent_revokes_a_native_takeover_again() {
             Some(mac.as_str()),
             "the intent is done: the takeover stands"
         );
+        escs_reach(&rig, 1).await;
         assert_eq!(escs(&rig), 1);
     });
 }
@@ -535,8 +606,8 @@ fn an_intent_revokes_a_native_takeover_again() {
 /// `work_config` leaves it) while a delegated turn runs, and the delegated
 /// clock reaches its deadline. Design I.4.4 still holds (ruling T26a): the
 /// deadline's intent is written and the Esc delivered once, while paused.
-/// Nothing new starts during the pause: the next task of the session gets
-/// no attempt, even once the interrupted turn ended. When the file loads
+/// Host-work dispatches nothing during the pause: the next task of the
+/// session gets no attempt, even once the interrupted turn ended. When the file loads
 /// again, the task awaits its result, `interrupted at deadline`, then
 /// expires, and the next task runs.
 #[test]
@@ -576,8 +647,10 @@ fn a_paused_host_still_interrupts_a_turn_at_its_deadline() {
             assert_eq!(pending_write(&rig, &attempt), None, "once per turn");
         }
         settle(&mut rig).await;
+        escs_reach(&rig, 1).await;
         assert_eq!(escs(&rig), 1);
-        // The turn ends interrupted; nothing new starts while paused.
+        // The turn ends interrupted; host-work dispatches nothing while
+        // paused.
         turn_interrupted(&mut rig, &task).await;
         passes(&mut rig, 5);
         settle(&mut rig).await;
@@ -631,6 +704,7 @@ fn hosting_switched_off_still_interrupts_a_turn_at_its_deadline() {
             assert_eq!(pending_write(&rig, &attempt), None, "once per turn");
         }
         settle(&mut rig).await;
+        escs_reach(&rig, 1).await;
         assert_eq!(escs(&rig), 1);
         assert_eq!(settled(&rig, &task).0, WorkState::Submitted);
     });

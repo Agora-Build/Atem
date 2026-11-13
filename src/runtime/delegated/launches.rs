@@ -238,7 +238,12 @@ impl HostBridge {
                 Handout::Wait(reason) => Some(*reason),
                 _ => None,
             };
-            let Some(d) = self.work.pending.get_mut(id).and_then(|p| p.delegated.as_mut()) else {
+            let Some(d) = self
+                .work
+                .pending
+                .get_mut(id)
+                .and_then(|p| p.delegated.as_mut())
+            else {
                 continue;
             };
             if let Some(reason) = reason
@@ -294,7 +299,9 @@ impl HostBridge {
 
     /// A delegated launch failed before its spawn, nothing started
     /// (`detail`, §11.6): its record is `failed` (written before anything
-    /// says so), the reason kept for its local tasks' details and logged.
+    /// says so), and the reason logged. It has no local task, so it never
+    /// goes into `work.refused`, whose eviction would wipe a local task's
+    /// reason (PR 8 review, T28 m4).
     pub(super) fn launch_failed_before_spawn(&mut self, request_id: &str, detail: &'static str) {
         // Gone: fenced when the host's identity changed.
         if !self.work.pending.contains_key(request_id) {
@@ -304,12 +311,10 @@ impl HostBridge {
         if self.work.error {
             return;
         }
-        if self.work.refused.len() >= 256 {
-            self.work.refused.clear();
-        }
+        #[cfg(test)]
         self.work
-            .refused
-            .insert(request_id.to_string(), detail.to_string());
+            .failed_before_spawn
+            .insert(request_id.to_string(), detail);
         eprintln!("atem runtime: launch {request_id} failed before its spawn: {detail}");
     }
 }

@@ -110,7 +110,11 @@ fn handed(rig: &mut LocalRig) -> Vec<RemoteLaunch> {
 /// What the check says of pending launch `id` now, at the view's `D`.
 fn verdict(rig: &LocalRig, id: &str) -> LaunchVerdict {
     let view = rig.bridge.start_view();
-    let launch = &rig.bridge.work.pending[id].delegated.as_ref().unwrap().launch;
+    let launch = &rig.bridge.work.pending[id]
+        .delegated
+        .as_ref()
+        .unwrap()
+        .launch;
     launch_check(&view, launch, view.now_d_ms.unwrap())
 }
 
@@ -169,20 +173,18 @@ async fn spawn(rig: &mut LocalRig, root: &Path, launch: &RemoteLaunch) -> Option
 }
 
 /// Launch `id` ended `failed` before its spawn with `detail` (the reason
-/// kept and logged), forgotten, never `outcome_unknown`.
+/// logged; never among the local tasks' reasons), forgotten, never
+/// `outcome_unknown`.
 fn failed_with(rig: &LocalRig, id: &str, detail: &str) {
     assert_eq!(launch_state(rig, id), LaunchState::Failed, "{detail}");
     assert_eq!(
-        rig.bridge.work.refused.get(id).map(String::as_str),
+        rig.bridge.work.failed_before_spawn.get(id).copied(),
         Some(detail)
     );
+    assert!(!rig.bridge.work.refused.contains_key(id));
     assert!(!rig.bridge.work.pending.contains_key(id));
     assert!(
-        !rig.bridge
-            .work
-            .launches
-            .iter()
-            .any(|l| l.request_id == id),
+        !rig.bridge.work.launches.iter().any(|l| l.request_id == id),
         "not queued"
     );
 }
@@ -327,7 +329,9 @@ fn a_clearable_reason_waits_then_expired_before_the_spawn() {
             .start_view()
             .standings
             .insert(PHONE.into(), held.clone());
-        let error = spawn(&mut rig, root, &launches[0]).await.expect("not spawned");
+        let error = spawn(&mut rig, root, &launches[0])
+            .await
+            .expect("not spawned");
         assert_eq!(error.downcast_ref::<NotSpawned>(), Some(&NotSpawned::Wait));
         waits_for(&mut rig, &id, details::PAUSED);
         // Still held at its expiry on the delegated clock: `failed`,
@@ -404,7 +408,9 @@ fn an_unclearable_reason_fails_at_once_never_outcome_unknown() {
             .start_view()
             .standings
             .insert(PHONE.into(), revoked);
-        let error = spawn(&mut rig, root, &launches[0]).await.expect("not spawned");
+        let error = spawn(&mut rig, root, &launches[0])
+            .await
+            .expect("not spawned");
         assert_eq!(
             error.downcast_ref::<NotSpawned>(),
             Some(&NotSpawned::Fail(details::SENDER_REVOKED))
@@ -524,7 +530,9 @@ fn hosting_off_and_a_halted_journal_alone_still_fence_a_delegated_launch() {
         // Handed out, the file stops loading before the spawn: nothing is
         // spawned yet, so it waits there too, handed back.
         std::fs::write(root.join("runtime.toml"), "not = [valid").unwrap();
-        let error = spawn(&mut rig, root, &launches[0]).await.expect("not spawned");
+        let error = spawn(&mut rig, root, &launches[0])
+            .await
+            .expect("not spawned");
         assert_eq!(error.downcast_ref::<NotSpawned>(), Some(&NotSpawned::Wait));
         assert_eq!(launch_state(&rig, &id), LaunchState::Starting);
         configure(&mut rig, root, &phone_toml(root, 1));
@@ -617,8 +625,8 @@ fn v1_launches_unchanged() {
             ]
         );
         // The hook on: a local launch on message keeps its guard alone.
-        rig.bridge.features = crate::runtime::test_hooks::HostFeatures::parse("host.delegated")
-            .unwrap();
+        rig.bridge.features =
+            crate::runtime::test_hooks::HostFeatures::parse("host.delegated").unwrap();
         launch_route(&mut rig, root);
         send_q(&mut rig, true);
         let local = launch_records(&rig)
@@ -640,5 +648,114 @@ fn v1_launches_unchanged() {
             launch_state(&rig, &local.status.request_id),
             LaunchState::OutcomeUnknown
         );
+    });
+}
+
+/// The delegated clock, as one that reads nothing: no OS reading and no
+/// record (a store of its own, never written).
+fn no_reading(rig: &mut LocalRig, root: &Path) {
+    let dir = root.join("no-reading");
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Store::open(&dir).unwrap();
+    rig.bridge.work.clock = Some(HostClock::with_readings(&store, || None));
+}
+
+/// Design I.4.3 "As built" (Task 28 review m2(a)): with no reading of the
+/// delegated clock a launch's expiry can't be compared, so it waits, in
+/// the queue and at the spawn boundary (one already handed out is handed
+/// back), still `starting`, never fenced; once a reading comes back, both
+/// are handed out.
+#[test]
+fn a_launch_waits_without_a_reading_of_the_delegated_clock() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let (phone, _) = launch_host(&mut rig, root, &os, true);
+        let first = phone_launch(&mut rig, &phone, HOUR_MS);
+        let launches = handed(&mut rig);
+        assert_eq!(launches.len(), 1);
+        no_reading(&mut rig, root);
+        passes(&mut rig, 1);
+        assert_eq!(rig.bridge.start_view().now_d_ms, None, "no reading");
+        assert_eq!(launches[0].check.as_ref().unwrap()(), PreSpawn::Wait);
+        let error = spawn(&mut rig, root, &launches[0])
+            .await
+            .expect("not spawned");
+        assert_eq!(error.downcast_ref::<NotSpawned>(), Some(&NotSpawned::Wait));
+        let second = phone_launch(&mut rig, &phone, HOUR_MS);
+        for _ in 0..3 {
+            assert!(handed(&mut rig).is_empty(), "waits for a reading");
+        }
+        for id in [&first, &second] {
+            assert_eq!(launch_state(&rig, id), LaunchState::Starting);
+            assert!(rig.bridge.work.pending[id].permit.load(Ordering::SeqCst));
+        }
+        assert_eq!(rig.sessions.len(), 1, "nothing spawned");
+        // A reading again.
+        manual_clock(&mut rig, &os);
+        let mut ids: Vec<String> = handed(&mut rig).into_iter().map(|l| l.request_id).collect();
+        ids.sort();
+        let mut both = vec![first, second];
+        both.sort();
+        assert_eq!(ids, both);
+    });
+}
+
+/// Design I.4.3 "As built" (Task 28 review m2(b)): a launch waiting out a
+/// `runtime.toml` that doesn't load still fails at its expiry on the
+/// delegated clock, `expired before the spawn`: nothing spawned, never
+/// `outcome_unknown`.
+#[test]
+fn the_expiry_fails_a_launch_waiting_out_an_invalid_file() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let (phone, _) = launch_host(&mut rig, root, &os, true);
+        let id = phone_launch(&mut rig, &phone, 60_000);
+        rig.bridge.work.config = Config::default();
+        rig.bridge.work.config_problem = Some("expected a table".into());
+        for _ in 0..3 {
+            assert!(handed(&mut rig).is_empty(), "waits out the file");
+        }
+        assert_eq!(launch_state(&rig, &id), LaunchState::Starting);
+        os.pass(120_000);
+        assert!(handed(&mut rig).is_empty());
+        failed_with(&rig, &id, details::EXPIRED_BEFORE_THE_SPAWN);
+        assert_eq!(rig.sessions.len(), 1, "nothing spawned");
+    });
+}
+
+/// Task 28 review m4: a delegated launch's failure is only logged (its
+/// query reads `failed`). It never goes into `work.refused`, the reasons of
+/// local launch-on-message tasks, so a burst of them can't evict one there
+/// (that map clears itself when full).
+#[test]
+fn delegated_launch_failures_leave_local_reasons_alone() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let (phone, _) = launch_host(&mut rig, root, &os, true);
+        // One short of full: the next reason would clear the map.
+        for n in 0..255 {
+            rig.bridge.work.refused.insert(
+                format!("local-launch-{n}"),
+                "at most 16 sessions can run at once".into(),
+            );
+        }
+        let before = rig.bridge.work.refused.clone();
+        for _ in 0..3 {
+            let id = phone_launch(&mut rig, &phone, HOUR_MS);
+            rig.bridge.start_view().standings.insert(
+                PHONE.into(),
+                SenderStanding {
+                    revoked: Some("rec-revoke".into()),
+                    ..SenderStanding::default()
+                },
+            );
+            assert!(handed(&mut rig).is_empty());
+            failed_with(&rig, &id, details::SENDER_REVOKED);
+            rig.bridge.start_view().standings.remove(PHONE);
+        }
+        assert_eq!(rig.bridge.work.refused, before, "local reasons untouched");
     });
 }

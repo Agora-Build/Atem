@@ -659,7 +659,9 @@ fn the_launch_check_gives_may_starts_events_for_a_launch() {
         LaunchVerdict::Wait(details::WAITING_FOR_UNLOCK)
     );
     v.scopes.pending.clear();
-    v.scopes.hashes.insert((key.clone(), KID.into()), OTHER.into());
+    v.scopes
+        .hashes
+        .insert((key.clone(), KID.into()), OTHER.into());
     assert_eq!(
         launch_check(&v, &bot, 0),
         LaunchVerdict::Fail(details::AUTHORIZATION_NARROWED)

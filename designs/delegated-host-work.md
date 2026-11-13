@@ -568,7 +568,10 @@ R4 bounds accepted tasks by their original deadline (at most 24 h after admissio
   paused (`runtime.toml` doesn't load, or `enabled = false`), as are the intents already pending. A stop takes
   execution away and grants nothing, and the turn's own lease goes on renewing during a pause. Collaboration §10's
   pause rules ("nothing expires") are record rules, and the interrupt changes no record: the task's record follows the
-  turn's receipt once the pause ends. Nothing new starts during the pause.
+  turn's receipt once the pause ends. Host-work dispatches nothing during the pause. One record does change, because it
+  is a stop: an attempt still waiting `accepted` at its deadline is withdrawn, and its task expires (`expired before
+  submission`) at once, even while paused. An attempt already `accepted` behind another turn follows the session
+  host's queue and its start check, which doesn't read the pause (as a v1 receipt queued there does).
 - **Two residuals.**
   - A receipt-database fault holds the intents, which live in that database, until the restart it asks for. Recovery
     step 3 (I.6.2) and the first pass carry them out then.

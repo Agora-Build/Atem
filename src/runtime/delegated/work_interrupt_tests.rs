@@ -419,6 +419,29 @@ fn a_halted_journal_is_busy() {
     });
 }
 
+/// Task 27 re-review N2 (§11.2, "Still `busy`"): after a receipt-database
+/// fault `work_interrupt` is `busy` whoever asks and whatever the turn,
+/// with nothing written, also when the request reaches the bridge in the
+/// batch the fault happened in: this run's record of the turn's Esc may
+/// have lost a report then, so a write could be a second Esc.
+#[test]
+fn a_receipt_database_fault_makes_work_interrupt_busy() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, true);
+        let task = phone_task(&mut rig, &phone, "FAULT_TURN", start + HOUR);
+        turn_journaled(&mut rig, &task, "FAULT_TURN").await;
+        let attempt = stored_record(&rig, &task).status.receipt_id;
+        rig.bridge.work_fail();
+        assert_eq!(ask(&mut rig, &phone, Q::Interrupt(&task)), busy());
+        assert_eq!(pending_write(&rig, &attempt), None);
+        settle(&mut rig).await;
+        assert_eq!(escs(&rig), 0);
+    });
+}
+
 /// Ruling T27a, case 1: `work_interrupt`'s Esc reaches the turn before any
 /// intent exists; the deadline then comes while the same turn still runs
 /// (the agent hasn't stopped), and its intent writes nothing: the turn had

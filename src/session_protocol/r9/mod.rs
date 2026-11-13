@@ -255,10 +255,10 @@ struct Attached {
     /// I.5.8, "Native senders"): its delegated tasks pass the revocation
     /// gate while this channel is open.
     caught_up: bool,
-    /// Its welcome listed `host.delegated`: while hosting is paused only
-    /// such a channel may still send `work_interrupt` (ruling T27a, Task
-    /// 27 review I1). The engine never takes an op of a feature the channel
-    /// wasn't offered.
+    /// Its welcome listed `host.delegated`: while hosting is paused, the
+    /// host takes `work_interrupt` only from such a channel (ruling T27a,
+    /// Task 27 review I1). With hosting on, host-work ops are judged by the
+    /// host's current features, not the channel's welcome.
     offered_delegated: bool,
 }
 

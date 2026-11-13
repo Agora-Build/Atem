@@ -185,8 +185,7 @@ pub(super) struct State {
     /// kept (`SessionHost::keep_principals`).
     named: HashSet<String>,
     /// Why the runtime refused to start a launch it was handed (the
-    /// live-session limit, a restart; a delegated launch's check before
-    /// its spawn): the detail of its local tasks.
+    /// live-session limit, a restart): the detail of its local tasks.
     refused: HashMap<String, String>,
     /// The delegated clock (host-work-v1 §11.6), beside the store whose
     /// `clock` table holds its record: built with `host.delegated` on, or
@@ -217,6 +216,10 @@ pub(super) struct State {
     /// (`recover_delegated`), in their order.
     #[cfg(test)]
     recovery: Vec<delegated_recovery::RecoveryStep>,
+    /// Tests: the detail each delegated launch failed with before its
+    /// spawn (production only logs it).
+    #[cfg(test)]
+    failed_before_spawn: HashMap<String, &'static str>,
 }
 
 impl State {
@@ -259,6 +262,8 @@ impl State {
             controls: None,
             #[cfg(test)]
             recovery: Vec::new(),
+            #[cfg(test)]
+            failed_before_spawn: HashMap::new(),
         }
     }
 }
@@ -778,7 +783,8 @@ impl HostBridge {
                 self.work.scheduled = Instant::now() + Duration::from_millis(100);
                 self.pause_local_tasks();
                 // A stop always wins: the deadline's interrupt and every
-                // pending intent still run (ruling T26a); nothing starts.
+                // pending intent still run (ruling T26a); host-work
+                // dispatches nothing.
                 if identity.account_id != UNPAIRED {
                     self.paused_stops(cx);
                 }

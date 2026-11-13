@@ -35,7 +35,12 @@
 //!   deadline interrupt only takes execution away (a stop always wins,
 //!   ruling T4d), and the turn's own lease goes on renewing meanwhile.
 //!   Nothing else of the scheduling pass runs: nothing is dispatched,
-//!   reconciled, settled or launched, so nothing new starts. The one
+//!   reconciled, settled or launched, so host-work starts nothing new. The
+//!   one record a stop changes: an attempt still waiting `accepted` at its
+//!   deadline is withdrawn and its task expires (`expired before
+//!   submission`), paused or not. An attempt already `accepted` behind
+//!   another turn follows the session host's queue and its start check,
+//!   which doesn't read the pause (PR 8 review n2). The one
 //!   request served meanwhile is `work_interrupt`, a stop too (ruling
 //!   T27a, `stops_while_paused`). Two residuals:
 //!   - a **receipt-database fault** holds the intents in that database
@@ -342,7 +347,8 @@ impl HostBridge {
     /// authority after the session host's `advance`: the bridge's
     /// `host_interrupt`, whose turn check runs again. The result is the
     /// task's status as it stood before (§11.2). One Esc per attempt and
-    /// turn, from any source (ruling T27a): the write goes into this run's
+    /// turn, from host-work's own sources (`work_interrupt` and the
+    /// intents; ruling T27a): the write goes into this run's
     /// record (`Runs::requested`), shared with the intents, and when that
     /// record says the turn already got its interrupt, or one is in flight
     /// (`Runs::running`, after the reports that came since the last pass
@@ -350,7 +356,10 @@ impl HostBridge {
     /// controller's lease is revoked, once, and the result is the task's
     /// status as it is (its own detail: the turn is current, so not `not
     /// running`). A report that can't be taken in is a receipt-database
-    /// fault: `busy`.
+    /// fault: `busy`. An Esc host-work didn't write isn't counted: a
+    /// principal holding `control` (a takeover, then its own session-v1
+    /// `interrupt`) or the person at the terminal can still send its own, as
+    /// the session host allows today.
     ///
     /// Served while hosting is paused too, as a stop (ruling T27a, like
     /// T26a's deadline step): see `stops_while_paused`.
@@ -359,7 +368,8 @@ impl HostBridge {
     /// running or still being reconciled after a restart, or ended) nothing
     /// happens: the status as it is, with `detail` `not running` in this
     /// result only, never stored. A halted session journal is `busy`: the
-    /// turn may be current, and nothing passes until the restart.
+    /// turn may be current, and nothing passes until the restart. So is a
+    /// receipt-database fault, before anything is read.
     pub(super) fn work_interrupt(
         &mut self,
         a: &Sender,
@@ -369,6 +379,12 @@ impl HostBridge {
     ) -> Result<ResultBody, HostWorkError> {
         if !self.features.delegated {
             return crate::runtime::delegated::request(self.features, req);
+        }
+        // A receipt-database fault (§11.2, "Still `busy`"), also one earlier
+        // in the request batch: a report it lost could make this a second
+        // Esc (Task 27 re-review N2).
+        if self.work.error {
+            return Err("busy".into());
         }
         let store = self.work.store.as_ref().ok_or("busy")?;
         let r = store

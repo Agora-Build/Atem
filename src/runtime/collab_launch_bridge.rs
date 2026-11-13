@@ -260,6 +260,9 @@ impl HostBridge {
                     expires_at,
                     permit,
                     local_route: Some(route),
+                    // `local` is v1: no check at the spawn boundary. A
+                    // remote sender's launch on message would need one
+                    // (design I.4.3, "Launches", "As built in step 4").
                     delegated: None,
                 },
             );
@@ -269,6 +272,7 @@ impl HostBridge {
                 session_id: status.session_id,
                 process_gen: status.process_gen,
                 guard,
+                // See `delegated` above (design I.4.3 "As built").
                 check: None,
             });
         }
