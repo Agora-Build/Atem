@@ -34,8 +34,9 @@ use support::astation::{
 };
 use support::delegated::WAIT;
 use support::delegated::{
-    Dev, HostIds, HostRig, complete_turn, enqueue, enqueue_data, host_db, hosting_toml, in_turn,
-    never_ran, private, record, replace, stored, task, uuid, wait_stored,
+    Dev, HostIds, HostRig, all_intents, complete_turn, enqueue, enqueue_data, escs, host_db,
+    hosting_toml, in_turn, intents, never_ran, private, record, replace, stored, take_over, task,
+    uuid, wait_stored,
 };
 use support::host_clock::HostClock;
 use support::r9::{Router, write_pin};
@@ -637,7 +638,8 @@ impl Rig {
     }
 
     /// What no refusal may move (§11.4 "Refusals"): the feed's cursor, the
-    /// device list, the control state, its evidence and reset marks (the
+    /// device list, the control state, its evidence and reset marks, and the
+    /// records' effects (the tasks' states, the interrupt intents; the
     /// clock floor: [`Rig::floor_offset`]).
     fn unmoved(&self) -> Unmoved {
         let pinned: Value = serde_json::from_slice(
@@ -653,12 +655,22 @@ impl Rig {
             .unwrap()
             .map(Result::unwrap)
             .collect();
+        let mut q = db
+            .prepare("SELECT id, state FROM work ORDER BY rowid")
+            .unwrap();
+        let tasks = q
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
         Unmoved {
             synced: self.feed()["synced"].clone(),
             list: pinned["head"].clone(),
             parts,
             evidence: self.evidence(),
             resets: self.reset_marks(),
+            tasks,
+            intents: all_intents(self),
         }
     }
 }
@@ -701,6 +713,10 @@ struct Unmoved {
     parts: Vec<(String, String)>,
     evidence: Vec<String>,
     resets: Vec<(String, String)>,
+    /// The records' effects (design I.5.5): the tasks' states and the
+    /// interrupt intents.
+    tasks: Vec<(String, String)>,
+    intents: Vec<(String, String)>,
 }
 
 impl HostRig for Rig {
@@ -1519,13 +1535,152 @@ fn a_routed_host_syncs_the_feed_and_opens_the_gate() {
         },
     );
     wait_stored(&rig, &second["task_id"], "cancelled", REVOKED);
-    assert_eq!(rig.cursor(), Some(2));
+    // Cancelled in the record's own transaction, so the store may show it
+    // before the pass's state dump does the cursor.
+    within("the cursor past the revoke", || rig.cursor() == Some(2));
     assert_eq!(rig.dump()["station"]["link"]["kind"], "routed");
     // The running turn goes on (no interrupt) and ends on its own.
     assert_eq!(stored(&rig, &first["task_id"])["state"], "submitted");
     complete_turn(&rig, &first["task_id"]);
     never_ran(&rig, &second["task_id"], "ROUTED_SECOND");
     assert!(rig.syncs().iter().all(|s| s.origin == rig.origin()));
+}
+
+/// The routed rig with the service's session and its task of `prompt` in
+/// its turn, a second of its tasks behind it: the router, the service's
+/// client, the session's id, the two tasks.
+fn routed_turn<'r>(rig: &'r Rig, prompt: &str) -> (Router<'r>, Dev, String, Value, Value) {
+    let mut r = Router::on(&rig.astation, rig.link());
+    rig.append(SVC, ControlAction::Cover);
+    rig.online();
+    rig.until_station("the routed link", |s| s["link"]["kind"] == "routed");
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let sid = launch["session_id"].as_str().unwrap().to_string();
+    let first = task(IDS, &launch, prompt, HOUR);
+    let second = task(IDS, &launch, &format!("{prompt}_BEHIND"), HOUR);
+    for t in [&first, &second] {
+        enqueue(&mut svc, &mut r, t);
+    }
+    in_turn(rig, &first["task_id"], prompt);
+    wait_stored(rig, &second["task_id"], "blocked", BEHIND);
+    (r, svc, sid, first, second)
+}
+
+/// The phone, a native member holding `control`, has taken `sid`'s lease
+/// over: the host's interrupt revoked it (`lease_changed`, `revoked`).
+#[track_caller]
+fn takeover_revoked(phone: &mut Dev, r: &mut Router) {
+    let changed = phone.wait(r, |v| {
+        v["op"] == "lease_changed" && v["reason"] == "revoked"
+    });
+    assert_eq!(changed["reason"], "revoked", "{changed}");
+}
+
+/// VII.A test 3, its interrupt half (design I.5.5 step 3, I.5.7; Task 34
+/// review), on a routed host (VII.A test 16): the phone, a native member
+/// holding `control`, has taken the session's lease over from the service's
+/// running turn when the Station revokes the service with
+/// `interrupt_running: true`. The host cancels the service's queued task,
+/// writes an interrupt intent (reason `revoke`) for the running one,
+/// revokes the phone's takeover and writes the Esc on its own authority,
+/// once; a later `interrupt_running` record adds nothing. The turn, ended
+/// interrupted, reads `turn interrupted`.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_routed_hosts_revoke_with_interrupt_running_interrupts_the_turn_after_a_takeover() {
+    let rig = Rig::full(Via::Routed);
+    let (mut r, _svc, sid, first, second) = routed_turn(&rig, "INTERRUPTED_ROUTED");
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    take_over(&mut phone, &mut r, &sid);
+    assert_eq!(escs(&rig), 0);
+    rig.append(
+        SVC,
+        ControlAction::Revoke {
+            interrupt_running: true,
+        },
+    );
+    wait_stored(&rig, &second["task_id"], "cancelled", REVOKED);
+    let tid = &first["task_id"];
+    within("the revoke's interrupt", || {
+        intents(&rig, tid)
+            .first()
+            .is_some_and(|i| i.delivered_turn.is_some())
+    });
+    let stored_intents = intents(&rig, tid);
+    let [intent] = stored_intents.as_slice() else {
+        panic!("one intent: {stored_intents:?}");
+    };
+    assert_eq!(
+        (
+            intent.attempt_id.as_str(),
+            intent.reason.as_str(),
+            intent.revocation.is_some()
+        ),
+        (
+            stored(&rig, tid)["receipt_id"].as_str().unwrap(),
+            "revoke",
+            true
+        )
+    );
+    within("the Esc", || escs(&rig) == 1);
+    takeover_revoked(&mut phone, &mut r);
+    // A later `interrupt_running` record: nothing more.
+    let later = rig.append(SVC, ControlAction::InterruptRunning { revoke_seq: None });
+    within("the later record read", || rig.cursor() >= Some(later));
+    rig.two_passes();
+    assert_eq!(intents(&rig, tid).len(), 1);
+    assert_eq!(escs(&rig), 1);
+    std::fs::write(rig.fake.join("interrupt"), "").unwrap();
+    wait_stored(&rig, tid, "awaiting_result", "turn interrupted");
+    assert_eq!(escs(&rig), 1);
+    never_ran(&rig, &second["task_id"], "INTERRUPTED_ROUTED_BEHIND");
+    assert_eq!(rig.dump()["station"]["link"]["kind"], "routed");
+}
+
+/// VII.A test 3 (design I.5.5 step 3): on a routed host, the Station's
+/// revoke without `interrupt_running` leaves the service's running turn
+/// alone (no intent, no Esc); the phone takes the session's lease over;
+/// then the Station's later `interrupt_running` record writes the intent,
+/// revokes the takeover and interrupts the turn, once.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_later_interrupt_running_record_interrupts_a_routed_hosts_turn_after_a_takeover() {
+    let rig = Rig::full(Via::Routed);
+    let (mut r, _svc, sid, first, second) = routed_turn(&rig, "LATER_INTERRUPT_ROUTED");
+    rig.append(
+        SVC,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    wait_stored(&rig, &second["task_id"], "cancelled", REVOKED);
+    rig.two_passes();
+    let tid = &first["task_id"];
+    assert!(intents(&rig, tid).is_empty());
+    assert_eq!(escs(&rig), 0);
+    assert_eq!(stored(&rig, tid)["state"], "submitted");
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    take_over(&mut phone, &mut r, &sid);
+    rig.append(SVC, ControlAction::InterruptRunning { revoke_seq: None });
+    within("the later record's interrupt", || {
+        intents(&rig, tid)
+            .first()
+            .is_some_and(|i| i.reason == "revoke" && i.delivered_turn.is_some())
+    });
+    within("the Esc", || escs(&rig) == 1);
+    takeover_revoked(&mut phone, &mut r);
+    rig.two_passes();
+    assert_eq!(escs(&rig), 1);
+    std::fs::write(rig.fake.join("interrupt"), "").unwrap();
+    wait_stored(&rig, tid, "awaiting_result", "turn interrupted");
+    assert_eq!(intents(&rig, tid).len(), 1);
 }
 
 /// VII.A test 18 (design I.6.5, §11.4 "Station time"): a `heads` with a
@@ -2264,10 +2419,24 @@ fn mismatched_echoes_and_unsolicited_pages_apply_nothing() {
     let launch = svc.session(&mut r);
     let principal = format!("service:{SVC}");
     let covered = rig.part(&principal).unwrap();
+    // A turn of the service's runs: what the revoke's interrupt would stop
+    // (c1b review: no page that doesn't answer interrupts it).
+    let running = task(IDS, &launch, "RUNNING_PAST_A_MISMATCH", HOUR);
+    enqueue(&mut svc, &mut r, &running);
+    in_turn(&rig, &running["task_id"], "RUNNING_PAST_A_MISMATCH");
+    let nothing_interrupted = |rig: &Rig, what: &str| {
+        assert!(all_intents(rig).is_empty(), "{what}: no intent");
+        assert_eq!(escs(rig), 0, "{what}: no interrupt");
+        assert_eq!(
+            stored(rig, &running["task_id"])["state"],
+            "submitted",
+            "{what}"
+        );
+    };
     rig.append(
         SVC,
         ControlAction::Revoke {
-            interrupt_running: false,
+            interrupt_running: true,
         },
     );
     // The Station's page for the held call, as the builder writes it, then
@@ -2331,10 +2500,13 @@ fn mismatched_echoes_and_unsolicited_pages_apply_nothing() {
                 rig.runtime_log().contains(OTHER_AFTER)
             });
         }
+        nothing_interrupted(&rig, what);
         // The Station's own page for it, late: drained.
         rig.station().answer_held(held).unwrap();
         rig.until_feed(&format!("{what}: drained"), |f| f["drained"] == n);
         assert_eq!(rig.part(&principal), Some(covered.clone()), "{what}");
+        rig.two_passes();
+        nothing_interrupted(&rig, &format!("{what}: drained"));
     }
     // An id never sent: unsolicited; the live call kept.
     rig.clock.add_mono(30_000);
@@ -2350,10 +2522,15 @@ fn mismatched_echoes_and_unsolicited_pages_apply_nothing() {
     assert_eq!(rig.feed()["in_flight"]["after"], 1, "the live call kept");
     assert_eq!(rig.part(&principal), Some(covered));
     rig.status_feeds(&format!("{GATE_CLOSED} ({UNSOLICITED})"));
-    // Its own page: the revoke applies; a page asked after the fault opens
-    // the gate.
+    rig.two_passes();
+    nothing_interrupted(&rig, "unsolicited");
+    // Its own page: the revoke applies, with its interrupt; a page asked
+    // after the fault opens the gate.
     rig.station().answer_held(held).unwrap();
     wait_stored(&rig, &t["task_id"], "cancelled", REVOKED);
+    within("the revoke's interrupt", || escs(&rig) == 1);
+    let stored_intents = intents(&rig, &running["task_id"]);
+    assert_eq!(stored_intents.len(), 1, "{stored_intents:?}");
     rig.serve_until("open again", |rig| rig.gate_open());
     assert_eq!(rig.cursor(), Some(2));
     never_ran(&rig, &t["task_id"], "BEHIND_A_MISMATCH");

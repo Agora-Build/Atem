@@ -20,8 +20,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use support::astation::{FakeAstation, write_verified_pairing};
 use support::delegated::{
-    Dev, HostIds, HostRig, WAIT, attempts, complete_turn, enqueue, enqueue_data, hosting_toml,
-    in_turn, input, private, record, replace, stored, task, task_until, uuid, wait_stored,
+    Dev, HostIds, HostRig, WAIT, attempts, complete_turn, enqueue, enqueue_data, escs, host_db,
+    hosting_toml, in_turn, input, intents, private, record, refused_hello, replace, stored, task,
+    task_until, uuid, wait_stored,
 };
 use support::host_clock::HostClock;
 use support::r9::{Router, write_pin};
@@ -1581,46 +1582,6 @@ fn a_done_whose_client_goes_away_resolves_nothing_and_says_so() {
     assert_eq!(stored(&rig, &t["task_id"])["resolved"]["by"], "local");
 }
 
-/// The bare Esc bytes the rig's agent was given (a bracketed paste's
-/// `ESC [` doesn't count).
-fn escs(rig: &Rig) -> usize {
-    let text = input(rig);
-    text.matches('\x1b').count() - text.matches("\x1b[").count()
-}
-
-/// One interrupt intent as `runtime/host-work.sqlite` stores it.
-#[derive(Debug)]
-struct Intent {
-    attempt_id: String,
-    reason: String,
-    done: bool,
-    delivered_turn: Option<String>,
-}
-
-/// Task `tid`'s interrupt intents, oldest first.
-fn intents(rig: &Rig, tid: &Value) -> Vec<Intent> {
-    let db =
-        rusqlite::Connection::open(rig.sandbox.config().join("runtime/host-work.sqlite")).unwrap();
-    db.busy_timeout(Duration::from_secs(5)).unwrap();
-    let mut q = db
-        .prepare(
-            "SELECT attempt_id,reason,done_ms IS NOT NULL,delivered_turn FROM intents
-            WHERE task_id=?1 ORDER BY rowid",
-        )
-        .unwrap();
-    q.query_map([tid.as_str().unwrap()], |r| {
-        Ok(Intent {
-            attempt_id: r.get(0)?,
-            reason: r.get(1)?,
-            done: r.get(2)?,
-            delivered_turn: r.get(3)?,
-        })
-    })
-    .unwrap()
-    .map(Result::unwrap)
-    .collect()
-}
-
 /// The host interrupt writes the runtime handed to a worker so far (the
 /// state dump's count).
 fn interrupt_writes(rig: &Rig) -> u64 {
@@ -1987,9 +1948,13 @@ fn never_spawned(rig: &Rig, sid: &str) -> bool {
 /// §11.6): in the real runtime, a covered service's `host_launch` while the
 /// fake Station's feed holds it waits at the spawn boundary through
 /// host-work's passes: `starting`, no worker spawned, its reason in
-/// `runtime.log`. The feed's release lets it start. A launch after the
-/// feed revokes the service ends `failed` at once, nothing spawned, never
-/// `outcome_unknown`, the detail in `runtime.log`.
+/// `runtime.log`. The feed's release lets it start. Held again, a launch
+/// waits; the feed's revoke then ends it `failed` (`sender revoked`),
+/// nothing spawned, never `outcome_unknown`, read from the store and
+/// `runtime.log`: the revoke fenced the service's channel (design I.5.5
+/// step 2), and a new `hello` of it is refused (`unauthorized`, `revoked`),
+/// so no later request of it reaches the host (one that did would be
+/// `forbidden`: the bridge's tests).
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -2023,22 +1988,44 @@ fn a_held_senders_launch_waits_and_a_revoked_ones_fails() {
     within("the released launch started", || {
         launch_state(&mut svc, &mut r, &held) == "started"
     });
-    // Revoked: the next launch fails at once.
+    // Held again, a launch waits at the spawn boundary; revoked: it fails
+    // there, nothing spawned (its sender's channel is fenced by then: its
+    // state is the store's and runtime.log's).
+    control(&rig, ControlAction::Hold);
+    let (waiting, sid) = launch_backend(&mut svc, &mut r);
+    within("the second wait logged", || {
+        logged(&format!(
+            "launch {waiting} waits at the spawn boundary: paused"
+        ))
+    });
     control(
         &rig,
         ControlAction::Revoke {
             interrupt_running: false,
         },
     );
-    work_passes(&rig, 2);
-    let (revoked, sid) = launch_backend(&mut svc, &mut r);
-    within("the revoked launch failed", || {
-        let state = launch_state(&mut svc, &mut r, &revoked);
+    let state = |rig: &Rig| {
+        host_db(rig)
+            .query_row(
+                "SELECT record FROM launches WHERE id=?1",
+                [waiting.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|text| serde_json::from_str::<Value>(&text).unwrap()["status"]["state"].clone())
+            .unwrap()
+    };
+    within("the waiting launch failed", || {
+        let state = state(&rig);
         assert_ne!(state, "outcome_unknown");
         state == "failed"
     });
     assert!(never_spawned(&rig, &sid), "nothing spawned when revoked");
     assert!(logged(&format!(
-        "launch {revoked} failed before its spawn: sender revoked"
+        "launch {waiting} failed before its spawn: sender revoked"
     )));
+    // At the request: the revoked service can't come back.
+    assert_eq!(
+        refused_hello(&mut r, IDS, &rig.log, SVC, true),
+        ("unauthorized".to_string(), Some("revoked".to_string()))
+    );
 }

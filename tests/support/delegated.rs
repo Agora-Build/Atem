@@ -390,3 +390,89 @@ pub fn never_ran(rig: &impl HostRig, tid: &Value, text: &str) {
     assert!(attempts(rig, tid).is_empty(), "{:?}", attempts(rig, tid));
     assert!(!input(rig).contains(text));
 }
+
+/// The bare Esc bytes the rig's agent was given (a bracketed paste's
+/// `ESC [` doesn't count): the host interrupts it wrote.
+pub fn escs(rig: &impl HostRig) -> usize {
+    let text = input(rig);
+    text.matches('\x1b').count() - text.matches("\x1b[").count()
+}
+
+/// One interrupt intent as `runtime/host-work.sqlite` stores it.
+#[derive(Debug)]
+pub struct Intent {
+    pub attempt_id: String,
+    pub reason: String,
+    /// A revocation's record id (none for a deadline).
+    pub revocation: Option<String>,
+    pub done: bool,
+    pub delivered_turn: Option<String>,
+}
+
+/// Task `tid`'s interrupt intents, oldest first (none before the table
+/// exists).
+pub fn intents(rig: &impl HostRig, tid: &Value) -> Vec<Intent> {
+    let db = host_db(rig);
+    let Ok(mut q) = db.prepare(
+        "SELECT attempt_id,reason,revocation,done_ms IS NOT NULL,delivered_turn FROM intents
+        WHERE task_id=?1 ORDER BY rowid",
+    ) else {
+        return Vec::new();
+    };
+    q.query_map([tid.as_str().unwrap()], |r| {
+        Ok(Intent {
+            attempt_id: r.get(0)?,
+            reason: r.get(1)?,
+            revocation: r.get(2)?,
+            done: r.get(3)?,
+            delivered_turn: r.get(4)?,
+        })
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// Every interrupt intent of the store, as (task, reason) in order: what a
+/// page that applies nothing must leave as it was.
+pub fn all_intents(rig: &impl HostRig) -> Vec<(String, String)> {
+    let db = host_db(rig);
+    let Ok(mut q) = db.prepare("SELECT task_id,reason FROM intents ORDER BY rowid") else {
+        return Vec::new();
+    };
+    q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// `dev` (a native member holding `control`) takes session `sid`'s lease
+/// over (session-v1 `acquire` with `takeover`): granted.
+pub fn take_over(dev: &mut Dev, r: &mut Router, sid: &str) {
+    dev.list(r, sid);
+    let reply = dev.request(
+        r,
+        json!({"op":"acquire","binding":dev.read(sid),"takeover":true}),
+    );
+    assert_eq!(reply["op"], "lease", "{reply}");
+}
+
+/// A `hello` of `id` (a native member, or a service) on a fresh channel,
+/// expected refused: its code and detail.
+pub fn refused_hello(
+    r: &mut Router,
+    ids: HostIds,
+    log: &TestLog,
+    id: &str,
+    service: bool,
+) -> (String, Option<String>) {
+    let identity = if service {
+        Identity::service(id, auth(id))
+    } else {
+        Identity::native(id, auth(id))
+    };
+    match r.connect_via(&uuid(), "relay", log, ids.host, &identity) {
+        Ok(_) => panic!("{id} admitted"),
+        Err(refused) => refused,
+    }
+}
