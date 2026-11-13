@@ -5077,6 +5077,7 @@ pub(crate) fn device_list_status_of(
             head_seq: None,
             pending_recovery: Vec::new(),
             clients,
+            verifier_version: Some(atem_client::membership::VERIFIER_VERSION),
             ..Default::default()
         });
     }
@@ -5140,6 +5141,7 @@ pub(crate) fn device_list_status_of(
         head_seq,
         pending_recovery: pending,
         clients,
+        verifier_version: Some(atem_client::membership::VERIFIER_VERSION),
         ..Default::default()
     })
 }

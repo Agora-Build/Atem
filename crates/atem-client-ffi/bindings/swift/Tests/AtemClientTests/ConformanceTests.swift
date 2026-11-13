@@ -739,6 +739,31 @@ final class ConformanceTests: XCTestCase {
                        (v["reason"] as? String) != "bad_enc_sig", s(v["label"]))
             }
         }
+        // The verifier's own inventory: r9-vectors-delegated-wire's
+        // `verifier`, what this binding's verifier reports about itself
+        // (session-v1 R9.2 "How a verifier reports itself"; Atem's proposal,
+        // for Astation's agreement): version 2, the sixteen
+        // actions, sorted by bytes, each once; every action the
+        // membership-log vectors sign is one of them.
+        let wireShapes = try load("r9-vectors-delegated-wire")
+        check("verifier inventory: version and known actions (R9.2)") {
+            let ours = verifierInventory()
+            let pinned = o(wireShapes["verifier"])
+            try eq(UInt64(ours.version), u(pinned["version"]), "version")
+            try eq(ours.actions, a(pinned["actions"]).map(s), "actions")
+            try eq(ours.version, 2)
+            try eq(ours.actions.count, 16)
+            for (x, y) in zip(ours.actions, ours.actions.dropFirst()) where !Array(x.utf8).lexicographicallyPrecedes(Array(y.utf8)) {
+                throw Failure(description: "not sorted at \(y)")
+            }
+            for v in vectors {
+                let action = s(o(o(v["entry"])["body"])["action"])
+                if !ours.actions.contains(action) { throw Failure(description: "\(s(v["label"])): \(action) isn't listed") }
+            }
+            for x in ["project_set", "project_remove", "host_sender_revoke", "host_sender_readmit", "host_enc_key"] where !ours.actions.contains(x) {
+                throw Failure(description: "\(x) isn't listed")
+            }
+        }
         check("device-list actions: a manager signs each under a purpose that names it (R9.6 rule 4)") {
             #if canImport(CryptoKit)
             let mac = CryptoKitKeys()
@@ -1886,6 +1911,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 70)
+        XCTAssertEqual(passed, 71)
     }
 }

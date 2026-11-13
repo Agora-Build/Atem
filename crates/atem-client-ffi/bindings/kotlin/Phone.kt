@@ -80,6 +80,9 @@ private fun run(args: Array<String>) {
     val welcome = conn.onWelcome(wire.recv(), log, mono())
     println("WELCOME ${welcome.principal} ${welcome.clientKind} ${welcome.permissions.sorted().joinToString(",")} ${welcome.revision} ${welcome.head.seq}")
     expect(welcome.head == log.head() && conn.fetchTo(log) == null, "welcome head")
+    // The host's verifier inventory (R9.2, Atem's proposal): this test's
+    // host reports the shared core's, the same as this binding's own.
+    expect(welcome.verifier == verifierInventory() && welcome.verifier?.version == 2u, "welcome verifier")
 
     fun exchange(out: Outgoing, done: (List<ClientEvent>) -> Boolean): List<ClientEvent> {
         wire.send(out.frame)
