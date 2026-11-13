@@ -1849,10 +1849,16 @@ messages, not these rules):
       the caller). It keeps at most one live call per link generation. An
       id is a correlation value, never authorization: a retired, timed-out,
       unsolicited or old-generation result advances nothing and can't
-      reopen the gate. **Until this amendment is built and jointly tested,
-      the host keeps the existing one-owed-call-per-physical-socket rule**
-      (one `control_sync` owed per socket, never dropped while its answer
-      may still come) and fails closed; it never retries uncorrelated.
+      reopen the gate. **Built on the host (step 4, C1b; Atem's reading
+      of the transition, for Astation, #120):** Astation asked to keep the
+      one-owed-call-per-physical-socket rule until this amendment is built
+      and jointly tested, and never to retry uncorrelated. Every retry is
+      now correlated, and the Station cancels an old generation's jobs, so
+      the strict rule would stop the sync until a new socket after every
+      re-authentication. So the host retires a call by its id at its
+      30-second deadline and when the link generation changes, drains a
+      page with a retired id, and then asks again with a fresh id under its
+      pacing ("Matching a page to its call" below).
     - **Unchanged:** the three refusals stay metadata-free, with no id and
       no cursor. A refusal names a call kind, never a request: it answers
       and correlates no call.
@@ -1922,12 +1928,12 @@ feed at this Station) is refused, `forbidden`, and nothing of another
 account is served: no principal, `integration_id`, `about.by`, record id or
 revocation time of another account reaches the link. The refusal is
 `control_sync_refused` or `membership_fetch_refused` ("Refusals" below).
-**Open (needs Astation's answer; step 4, 2026-11-13):** what a
-`control_sync` naming the account's own feed from before a reset (a
-`feed_id` the account had at this Station) gets: `control_sync_refused`, the
-literal "not its account's feed at this Station" (Atem's default reading),
-or the account's current feed from position 0, the result's `feed_id` then
-the only in-band reset signal. Atem's host handles both.
+**Answered (Astation, #164; wire rule 11):** a `control_sync` naming the
+account's own feed from before a reset (a `feed_id` the account had at this
+Station) is refused, `control_sync_refused`, never answered on the new
+feed: the host learns the new feed from the next `heads`. A page that
+answers such a call on another feed doesn't answer it (a Station fault,
+"Matching a page to its call" below).
 
 **Refusals** (**agreed with Astation on 2026-11-11**, #120 comment
 6810116314, and confirmed against the implementation on 2026-11-12, #148
@@ -1957,12 +1963,13 @@ host's call on the link with exactly one of:
   membership head, clock floor or ledger evidence and opens no gate. It
   carries no request id (a `control_sync`'s `request_id` is never echoed in
   one: wire rule 11) and must not complete or correlate a request.
-  (**Atem's reading, for Astation's agreement**, step 4, 2026-11-13: a
-  refusal names a call kind, not a request: it completes and matches none;
-  on that kind the host backs off (its device-list fetch 30 s, ended by the
-  link's next generation) and drops what it had in flight of that kind on
-  the link, so a later result is unasked; a call of another kind stays in
-  flight, its answer owed (see "Matching a page to its call" below).)
+  (**Atem's reading, for Astation's agreement**, step 4, 2026-11-13; with
+  correlation, C1b: a refusal names a call kind, not a request: it
+  completes and matches none; on that kind the host backs off (its
+  device-list fetch 30 s, ended by the link's next generation) and retires
+  what it had live of that kind on the link, so a later result for it is
+  drained; a call of another kind stays live (see "Matching a page to its
+  call" below).)
 - The host keeps that link's synchronization gates closed while it repairs
   the association and resynchronizes. The transport may still fence or
   close an invalid or superseded link; a refusal creates no authority for
@@ -2050,13 +2057,11 @@ only its own Station's feed (step 4's Decision 14):
   opens it again. A page beyond the cap still applies its records (a stop
   is never held back).
 - **Only the announced feed.** `control_sync` names the feed the last
-  `heads` announced, one call in flight. A page is taken only as the
-  answer to that call and must carry its `(origin, feed_id)`; one nobody
-  asked for applies nothing. A page of another `feed_id` than the one
-  asked (a Station that serves its current feed for an old id: the open
-  question above) applies nothing either, reads as a reset, and the host
-  asks nothing more until the next `heads`: so either answer to that
-  question works.
+  `heads` announced (never a discovery call without `feed_id`), one call
+  live at a time. A page applies only as the answer to that call
+  ("Matching a page to its call"): one of another `feed_id` (a Station
+  that serves its current feed for an old id, which rule 11 forbids)
+  doesn't answer it, and applies nothing.
 - **Resets.** The announced `feed_id` isn't the one the host read, or the
   announced head (or a page's `head`) is below the cursor, found at a
   `heads`, at a page, or when the feeds load after a `heads`: the feed is
@@ -2077,11 +2082,9 @@ only its own Station's feed (step 4's Decision 14):
   page's last record and the rest is asked at once. A page stops at a
   record while the device list doesn't serve, and the cursor stays there.
   A page that doesn't read as a whole (any reader refusal, not only
-  non-strict JSON) is the fault above, and so is a page holding a record
-  at or below its call's `after` (**Atem's reading, for Astation**: a page
-  carries "the records after `after`", so such a page answers another
-  call, or none): nothing of it applies, the cursor stays, the gate stays
-  closed and the fault alert goes. The message is recognized
+  non-strict JSON; a record at or below its own `after` included, rule
+  11) is the fault above: nothing of it applies, the cursor stays, the
+  gate stays closed and the fault alert goes. The message is recognized
   as a page by its top-level `type` and `op` alone, scanned with no tree
   and no recursion, so a lone surrogate, a duplicate key (`op`'s
   included), nesting past a parser's depth, or a page cut short after
@@ -2094,8 +2097,8 @@ only its own Station's feed (step 4's Decision 14):
   the Station's, so it is dropped before any reader, as a broken frame of
   every family on the link is, with no fault alert. Either way the call it
   answered goes unanswered: the gate stays closed, and after 30 seconds
-  the sync stops until the link reconnects (see "Matching a page to its
-  call").
+  the call is retired and asked again with a fresh id (see "Matching a
+  page to its call").
 - **Pacing** (as the device-list fetch's). One `control_sync` in flight at
   a time. The calls a `heads` or the host's pass start are at most one a
   second, none for 30 seconds after a page that moved nothing or was
@@ -2105,50 +2108,60 @@ only its own Station's feed (step 4's Decision 14):
   bounded because one call is in flight at a time and a reset counts once
   until its read from 0 begins, so it costs at most one call per page the
   Station answers.
-- **Matching a page to its call** (**Atem's reading, for Astation**). A
-  `control_sync_result` carries no echo of its call, and gaps are legal
-  (rule 7), so a host can match a page to its call only by order: the one
-  call in flight. A host therefore has at most one `control_sync` owed per
-  socket, and never drops a call while its answer may still come:
-  - A `membership_fetch_refused` or `control_ack_refused` leaves the sync
-    in flight.
-  - So does a new link generation on the same socket: Astation
-    re-authenticating the link, or authenticating a routed one (R9.7b).
-    The Station still answers a call sent before it, on that socket, so
-    the new generation asks nothing until that answer comes, and takes it
-    as that call's answer: its own `after` and kind, so a continuation's
-    page never ends a reset.
-  - Only a new socket, where its answer can't come, drops the call.
-
-  A page holding a record at or below its call's `after` contradicts the
-  call: a Station fault ("Pages" above). A `control_sync` unanswered for
-  30 seconds (while the link is up) stops the sync: that origin's gate
-  stays closed, the host asks nothing more on that socket (a re-send could
-  bring two answers), and the Station-fault alert goes (hourly). Nothing
-  was asked after it, so a late answer on the same socket is still that
-  call's: it is applied as such, and the sync resumes. A call whose answer
-  never comes waits for a new socket. Atem has no safe way to ask for a
-  fresh relay link for this (dropping the link would close every r9
-  channel on it, and a Station that never answers would make it flap), so
-  it waits for the next one, and `atem status` names `atem runtime
-  restart` to reconnect now. An echo of `feed_id` and `after` in
-  `control_sync_result` would let a host match each page to its own call
-  in both cases, a timed-out call and a call sent before a
-  re-authentication on the same link, then drop a page that answers
-  another call and re-ask on the same link instead.
-- **Refusals.** Any of the three closes the gate. A `control_sync_refused`
-  ends the sync in flight, timed out or not (it is that call's answer); the
-  other two leave it in flight, and its page ends nothing. The next
-  `control_sync` goes at the first `heads` 30 seconds or more after the
-  refusal, or on the link's next generation, once no call is owed on the
-  socket ("Matching a page to its call"). On the same link generation the
-  gate opens only with a page asked for then (the resynchronization), even
-  when the cursor already held the head. A new link generation starts that
-  over: its gate opens as any generation's does, after a `heads` received
-  on it and the announced feed read up to its head (by the page still owed
-  from before the refusal, or with no page when the cursor already holds
-  that head). `atem status` says `Station refused feed access
-  (forbidden); retrying`.
+- **Matching a page to its call** (wire rule 11; **Atem's reading of the
+  transition, for Astation**, C1b, see rule 11's "Built on the host").
+  - **A fresh id per call.** Every `control_sync` gets a fresh lowercase
+    UUID v4 `request_id` from the host's CSPRNG: a retry and a new link
+    generation's call too, even at the same cursor. One call is live at a
+    time.
+  - **What applies.** A page applies only when it carries the live call's
+    id, `ControlSyncResult::answers` that call (the same origin, feed and
+    `after`), the link generation and socket are those captured with the
+    call, and so are the account and genesis (the device list the feeds
+    were loaded for). For a discovery call (no `feed_id`, `after: 0`; this
+    host never makes one) the page's feed must also be the own feed this
+    generation's `heads` announced.
+  - **Retired calls.** A call is retired by its id when its page comes,
+    when it goes unanswered for 30 seconds (the Station's deadline), when
+    the link generation changes (Astation re-authenticating the link, a
+    routed link's upgrade, the link dropping: the Station cancels the old
+    generation's jobs) and at a `control_sync_refused`. A page with a
+    retired id (bytes the Station wrote before the retirement reached it)
+    is drained: counted in the state dump, it advances nothing, opens no
+    gate and is no Station fault. Once a call is retired a new one, with a
+    fresh id, may go under the pacing: after a timeout, at once (an hourly
+    Station-fault alert goes, and `atem status` says `a control_sync went
+    unanswered for 30 s; asked again with a new request id` until a page
+    answers); on a new link generation, at its `heads`. A host keeps the
+    latest 256 retired ids; an older one reads as unsolicited.
+  - **Station faults.** A page with an id the host never sent is
+    unsolicited: a Station fault (the hourly alert, nothing advanced, the
+    gate closed); the live call stays live. A page with the live id that
+    doesn't answer it (another origin, feed or `after`) is a Station fault
+    too, as is a page the reader refuses (its id can't be read, so it is
+    taken as the live call's answer); either retires the live call. A
+    fault's gate opens only with a page asked after it.
+  - **A reset.** A page answering the live call whose `head` is below its
+    `after` (it has no records: the reader refuses any) says the feed went
+    back under the same id: the host writes its durable rescan mark
+    ("Resets"), never moves the cursor on that page, and reads the feed
+    from 0. The announced head stays the last `heads`' (a page never
+    lowers it), so the read is done once it reaches the head the next
+    `heads` announces.
+- **Refusals.** Any of the three closes the gate. A refusal names a call
+  kind, never a request: a `control_sync_refused` retires the live sync
+  call, whichever call it was meant for, so a late refusal costs liveness
+  only (the live call's page is then drained); the other two leave the
+  sync call live, its page applying but ending nothing (it was asked
+  before the refusal). The next `control_sync` goes at the first `heads` 30
+  seconds or more after the refusal, or on the link's next generation. On
+  the same link generation the gate opens only with a page asked for then
+  (the resynchronization), even when the cursor already held the head. A
+  new link generation starts that over: its gate opens as any
+  generation's does, after a `heads` received on it and the announced
+  feed read up to its head (with no page when the cursor already holds
+  that head). `atem status` says `Station refused feed access (forbidden);
+  retrying`.
 
 #### Acknowledgments
 
