@@ -1281,10 +1281,10 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("malformed") { _ = try result(0, 3, [page[1], page[0]]) }
             // Strictly after the echoed after; a head below after holds no record.
             try throwsCode("malformed") { _ = try result(1, 3, page) }
-            guard case let .controlSyncResult(_, _, _, _, _, _, none) = try relayDecodeToHost(message: result(9, 3, [])) else {
+            guard case let .controlSyncResult(_, _, _, _, _, _, emptyPage) = try relayDecodeToHost(message: result(9, 3, [])) else {
                 throw Failure(description: "not a page")
             }
-            try eq(none.count, 0)
+            try eq(emptyPage.count, 0)
             try throwsCode("malformed") { _ = try result(9, 3, [page[2]]) }
             let heads = [RelayFeedHead(origin: origin, feedId: feed, head: 3, stationTime: 1_793_620_940_000)]
             let hm = try relayHeads(feeds: heads, membership: mlogHead)
