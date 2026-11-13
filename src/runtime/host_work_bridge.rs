@@ -1310,12 +1310,13 @@ impl HostBridge {
             }
             // `host.delegated`'s and `host.alerts`' ops: the channel takes
             // them only while the host advertises the feature (the debug-only
-            // hook, step 4's Decision 10), and `delegated` answers them; one
-            // that got here otherwise is refused as before, never
-            // half-served.
-            Request::WorkInterrupt { .. }
-            | Request::WorkResolve { .. }
-            | Request::AlertList { .. } => crate::runtime::delegated::request(self.features, req),
+            // hook, step 4's Decision 10); one that got here otherwise is
+            // refused as before, never half-served. `work_interrupt` is
+            // served (design I.4.5); the others aren't yet.
+            Request::WorkInterrupt { task_id, .. } => self.work_interrupt(&a, req, task_id, cx),
+            Request::WorkResolve { .. } | Request::AlertList { .. } => {
+                crate::runtime::delegated::request(self.features, req)
+            }
             Request::Publish { .. }
             | Request::MessageQuery { .. }
             | Request::AttachmentPut { .. } => unreachable!(),
@@ -2228,6 +2229,7 @@ mod local_tests {
         include!("delegated/lifecycle_tests.rs");
         include!("delegated/recovery_tests.rs");
         include!("delegated/intents_tests.rs");
+        include!("delegated/work_interrupt_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};
@@ -3500,6 +3502,8 @@ principals = ["local"]
     /// `delegated`, after the checks every request has (the host triple,
     /// the caller's authority): `busy`, saying the feature isn't served
     /// yet, until their handlers exist; `alert_list` needs `host.alerts`.
+    /// `work_interrupt` is served (Task 27): `local` names no delegated
+    /// task, so `forbidden`.
     #[test]
     fn delegated_ops_with_the_hook_are_handed_to_delegated() {
         use crate::runtime::delegated::{ALERTS_NOT_SERVED, DELEGATED_NOT_SERVED};
@@ -3526,7 +3530,7 @@ principals = ["local"]
             };
             let [interrupt, resolve, alerts] = delegated_requests(&host);
             rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
-            assert_eq!(ask(&mut rig, &interrupt), busy(Some(DELEGATED_NOT_SERVED)));
+            assert_eq!(ask(&mut rig, &interrupt), Err("forbidden".into()));
             assert_eq!(ask(&mut rig, &resolve), busy(Some(DELEGATED_NOT_SERVED)));
             assert_eq!(ask(&mut rig, &alerts), busy(None), "host.alerts is off");
             rig.bridge.features = HostFeatures::parse("host.delegated,host.alerts").unwrap();

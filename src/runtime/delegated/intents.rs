@@ -37,6 +37,18 @@
 //!   ([`Runs`]), so a turn still current after the start's reconciliation
 //!   gets the interrupt once more. `delivered_turn` records, durably, the
 //!   turn that last got it.
+//! - **`work_interrupt`** (host-work-v1 §11.2) shares [`Runs`] with the
+//!   intents ([`Runs::running`], [`Runs::requested`]): a one-shot request,
+//!   no intent of its own, whose write a pending intent of the same attempt
+//!   counts as its delivery, so a turn gets one Esc whichever comes first.
+//!   It never becomes the intent's `delivered_turn`: a turn it ended reads
+//!   `turn interrupted`, never `interrupted at deadline`.
+//! - **A newer build's reason** (none is planned): [`pending_intents`]
+//!   refuses a row whose reason this build can't read (a receipt-database
+//!   fault), so adding a reason means a downgrade stops at it (no shims,
+//!   by the owner's rule).
+//!
+//! [`pending_intents`]: Store::pending_intents
 use crate::runtime::delegated::details;
 use crate::runtime::delegated::start::EXPIRED_BEFORE_SUBMISSION;
 use crate::runtime::host_bridge::InterruptReport;
@@ -227,6 +239,15 @@ impl Store {
         )?)
     }
 
+    /// Whether attempt `attempt_id` has an intent not done yet.
+    pub fn has_pending_intent(&self, attempt_id: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM intents WHERE attempt_id=?1 AND done_ms IS NULL)",
+            [attempt_id],
+            |r| r.get(0),
+        )?)
+    }
+
     /// The pending intents of `attempt_id` got their interrupt in `turn`.
     pub fn intent_delivered(&self, attempt_id: &str, turn: &str) -> Result<()> {
         self.db.execute(
@@ -309,14 +330,26 @@ pub enum Decision {
 }
 
 /// What this run knows of each attempt's interrupt (memory only: a
-/// restart delivers once more to a turn still current, R9.14 item 5).
+/// restart delivers once more to a turn still current, R9.14 item 5): the
+/// intents' writes, and `work_interrupt`'s (host-work-v1 §11.2), so a turn
+/// gets one Esc from both.
 #[derive(Debug, Default)]
 pub struct Runs {
-    /// Attempt → the turn of its write still waiting for the worker's
-    /// answer (one at a time).
-    writing: HashMap<String, String>,
+    /// Attempt → its write still waiting for the worker's answer (one at a
+    /// time).
+    writing: HashMap<String, Writing>,
     /// Attempt → its last delivery.
     delivered: HashMap<String, Delivered>,
+}
+
+/// A write waiting for the worker's answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Writing {
+    turn: String,
+    /// `work_interrupt`'s, not an intent's: once reported written it counts
+    /// for a pending intent of the attempt, in memory only (never its
+    /// `delivered_turn`), and for nothing without one.
+    requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -332,8 +365,55 @@ impl Runs {
     /// The bridge wrote the interrupt for `attempt_id`'s turn `turn`: its
     /// report comes in a later pass.
     pub fn written(&mut self, attempt_id: &str, turn: &str) {
-        self.writing
-            .insert(attempt_id.to_string(), turn.to_string());
+        self.writing.insert(
+            attempt_id.to_string(),
+            Writing {
+                turn: turn.to_string(),
+                requested: false,
+            },
+        );
+    }
+
+    /// `work_interrupt` (host-work-v1 §11.2) wrote the interrupt for
+    /// `attempt_id`'s turn `turn`. While its report is awaited a pending
+    /// intent of the attempt only revokes; once reported written it is that
+    /// intent's delivery for the turn (so no second Esc), kept in memory
+    /// only: the intent's `delivered_turn` stays as it was, and the turn,
+    /// if this ends it, reads `turn interrupted`. Without a pending intent
+    /// at the report nothing is kept.
+    pub fn requested(&mut self, attempt_id: &str, turn: &str) {
+        self.writing.insert(
+            attempt_id.to_string(),
+            Writing {
+                turn: turn.to_string(),
+                requested: true,
+            },
+        );
+    }
+
+    /// What an interrupt of `attempt_id`'s turn `turn`, shown running, does
+    /// now (`now_ms` on the bridge clock), an intent's or `work_interrupt`'s:
+    /// only the lease revocation ([`Decision::RevokeOnly`]) while a write is
+    /// in flight, or once this turn got its interrupt in this run (unless
+    /// that was an error after queueing [`REWRITE_AFTER_ERROR_MS`] ago);
+    /// else the interrupt ([`Decision::Deliver`]).
+    pub fn running(&self, attempt_id: &str, turn: &str, now_ms: u64) -> Decision {
+        if self.writing.contains_key(attempt_id) {
+            // One write in flight at a time.
+            return Decision::RevokeOnly;
+        }
+        match self.delivered.get(attempt_id) {
+            Some(d)
+                if d.turn == turn
+                    && !(d.uncertain
+                        && now_ms >= d.at_ms.saturating_add(REWRITE_AFTER_ERROR_MS)) =>
+            {
+                Decision::RevokeOnly
+            }
+            _ => Decision::Deliver {
+                turn: turn.to_string(),
+            },
+        }
     }
 
     /// `attempt_id` has no pending intent any more.
@@ -344,9 +424,11 @@ impl Runs {
 
     /// The reports of this run's writes (`reports`: the bridge's
     /// `host_interrupt_reports`, each write's once), at `now_ms` on the
-    /// bridge clock: `ok` and `error_after_queue` are deliveries (the turn
-    /// written durably as `delivered_turn`), the rest wrote nothing.
-    /// Reports of writes no intent made (the drive hook's) are ignored.
+    /// bridge clock: `ok` and `error_after_queue` are deliveries (an
+    /// intent's turn written durably as `delivered_turn`; `work_interrupt`'s
+    /// kept only for a pending intent of its attempt, never written), the
+    /// rest wrote nothing. Reports of writes neither made (the drive
+    /// hook's) are ignored.
     pub fn reported(
         &mut self,
         store: &Store,
@@ -354,7 +436,7 @@ impl Runs {
         now_ms: u64,
     ) -> Result<()> {
         for (attempt, report) in reports {
-            let Some(turn) = self.writing.remove(attempt) else {
+            let Some(Writing { turn, requested }) = self.writing.remove(attempt) else {
                 continue;
             };
             let uncertain = match report {
@@ -365,7 +447,11 @@ impl Runs {
                 | InterruptReport::Dropped
                 | InterruptReport::NoEffect => continue,
             };
-            store.intent_delivered(attempt, &turn)?;
+            if !requested {
+                store.intent_delivered(attempt, &turn)?;
+            } else if !store.has_pending_intent(attempt)? {
+                continue;
+            }
             self.delivered.insert(
                 attempt.clone(),
                 Delivered {
@@ -419,24 +505,7 @@ pub fn intents_pass(
             | AttemptNow::Rejected { live: false }
             | AttemptNow::Ended => Decision::Done,
             AttemptNow::Reconciling | AttemptNow::NotShown => Decision::Wait,
-            AttemptNow::Running { turn } => {
-                if runs.writing.contains_key(&attempt) {
-                    // One write in flight at a time.
-                    Decision::RevokeOnly
-                } else {
-                    match runs.delivered.get(&attempt) {
-                        Some(d)
-                            if d.turn == turn
-                                && !(d.uncertain
-                                    && now_ms
-                                        >= d.at_ms.saturating_add(REWRITE_AFTER_ERROR_MS)) =>
-                        {
-                            Decision::RevokeOnly
-                        }
-                        _ => Decision::Deliver { turn },
-                    }
-                }
-            }
+            AttemptNow::Running { turn } => runs.running(&attempt, &turn, now_ms),
         };
         decided.insert(attempt, decision.clone());
         out.push((intent, decision));
@@ -891,6 +960,61 @@ mod tests {
             pass(&store, AttemptNow::Ended, &[], &mut runs, 0),
             [Decision::Done, Decision::Done]
         );
+    }
+
+    /// `work_interrupt`'s write (Task 27; host-work-v1 §11.2) and the
+    /// intents share `Runs`. A pending intent only revokes while the
+    /// request's write is in flight, and once it is reported written counts
+    /// it as its delivery for that turn (no second Esc), without making it
+    /// its `delivered_turn`. The request decides as the intent would:
+    /// revoke-only once the turn got its interrupt. Without a pending intent
+    /// at the report nothing is kept; a request whose write wrote nothing
+    /// leaves the intent to write.
+    #[test]
+    fn a_requested_write_counts_for_a_pending_intent_only() {
+        let (_dir, store) = store();
+        let task = task(&store);
+        let attempt = uuid();
+        write(&store, &task, &attempt, IntentReason::Deadline);
+        let mut runs = Runs::default();
+        assert_eq!(runs.running(&attempt, "turn-1", 0), deliver("turn-1"));
+        runs.requested(&attempt, "turn-1");
+        assert_eq!(runs.running(&attempt, "turn-1", 0), Decision::RevokeOnly);
+        assert_eq!(
+            pass(&store, running("turn-1"), &[], &mut runs, 100),
+            [Decision::RevokeOnly],
+            "one write in flight"
+        );
+        let ok = [(attempt.clone(), InterruptReport::Ok)];
+        for at in [200, 60_000, 3_600_000] {
+            let reports: &[_] = if at == 200 { &ok } else { &[] };
+            assert_eq!(
+                pass(&store, running("turn-1"), reports, &mut runs, at),
+                [Decision::RevokeOnly],
+                "delivered by the request"
+            );
+        }
+        assert_eq!(runs.running(&attempt, "turn-1", 0), Decision::RevokeOnly);
+        assert_eq!(
+            store.pending_intents().unwrap()[0].delivered_turn,
+            None,
+            "not the intent's turn"
+        );
+        // Nothing written: the intent writes it itself.
+        let other = uuid();
+        write(&store, &task, &other, IntentReason::Deadline);
+        runs.requested(&other, "turn-9");
+        let consumed = [(other.clone(), InterruptReport::Consumed)];
+        runs.reported(&store, &consumed, 0).unwrap();
+        assert_eq!(runs.running(&other, "turn-9", 0), deliver("turn-9"));
+        // No pending intent when the report comes: nothing kept.
+        let alone = uuid();
+        runs.requested(&alone, "turn-5");
+        assert_eq!(runs.running(&alone, "turn-5", 0), Decision::RevokeOnly);
+        let ok = [(alone.clone(), InterruptReport::Ok)];
+        runs.reported(&store, &ok, 0).unwrap();
+        assert_eq!(runs.running(&alone, "turn-5", 0), deliver("turn-5"));
+        assert!(runs.writing.is_empty() && !runs.delivered.contains_key(&alone));
     }
 
     /// The task's state when its unstarted attempt is withdrawn: expired

@@ -1465,3 +1465,67 @@ fn a_paused_host_still_interrupts_a_turn_at_its_deadline() {
     assert_eq!(escs(&rig), 1);
     assert_eq!(input(&rig).matches("PAUSED_TURN").count(), 1);
 }
+
+/// `dev` asks `work_interrupt` of task `tid` (feature `host.delegated`).
+fn interrupt(dev: &mut Dev, r: &mut Router, tid: &Value) -> Value {
+    dev.request(
+        r,
+        json!({"op":"work_interrupt","host":host(),"task_id":tid}),
+    )
+}
+
+/// Design I.4.5, host-work-v1 §11.2, over a real channel: the phone (its
+/// task's sender, a native member holding `control`) sends `work_interrupt`
+/// while the task's turn runs. The client core takes the `work` result,
+/// the task's status before the interrupt (`submitted`, in the agent's
+/// turn); one Esc reaches the agent and no intent is stored (a one-shot
+/// request). The service, neither the sender nor the owner, is `forbidden`
+/// (its channel let the request through: it holds `notify`). The turn
+/// ends interrupted, the task awaits its result (`turn interrupted`), and
+/// the same request then answers that status with `not running`, which
+/// isn't stored.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_HOST_CONTROLS hooks"
+)]
+fn work_interrupt_over_the_senders_channel() {
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_controls(gate_open());
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let t = task(&launch, "CHANNEL_INTERRUPT", HOUR);
+    let tid = &t["task_id"];
+    enqueue(&mut phone, &mut r, &t);
+    in_turn(&rig, tid, "CHANNEL_INTERRUPT");
+    let refused = interrupt(&mut svc, &mut r, tid);
+    assert_eq!(refused["code"], "forbidden", "{refused}");
+    let reply = interrupt(&mut phone, &mut r, tid);
+    let work = &reply["result"]["work"];
+    assert_eq!(
+        (&work["state"], &work["detail"], &work["receipt_id"]),
+        (
+            &json!("submitted"),
+            &json!("in the agent's turn"),
+            &stored(&rig, tid)["receipt_id"]
+        ),
+        "{reply}"
+    );
+    within("the Esc", || escs(&rig) == 1);
+    assert!(intents(&rig, tid).is_empty(), "no intent");
+    std::fs::write(rig.fake.join("interrupt"), "").unwrap();
+    wait_stored(&rig, tid, "awaiting_result", "turn interrupted");
+    let again = interrupt(&mut phone, &mut r, tid);
+    let work = &again["result"]["work"];
+    assert_eq!(
+        (&work["state"], &work["detail"]),
+        (&json!("awaiting_result"), &json!("not running")),
+        "{again}"
+    );
+    assert_eq!(stored(&rig, tid)["detail"], "turn interrupted");
+    assert_eq!(escs(&rig), 1);
+    assert_eq!(input(&rig).matches("CHANNEL_INTERRUPT").count(), 1);
+}

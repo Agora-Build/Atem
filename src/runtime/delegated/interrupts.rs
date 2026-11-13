@@ -47,12 +47,20 @@
 //!   ended reads `interrupted at deadline` in the pass that reconciles it)
 //!   and again by `carry_out_intents`: the stream never grows. The drive
 //!   hook reads a copy of its own (Task 16b review m7).
+//! - **`work_interrupt`** (feature `host.delegated`; design I.4.5;
+//!   host-work-v1 §11.2): the task's sender holding `interrupt`, or the
+//!   owner, interrupts a delegated task's turn while it is the session's
+//!   current turn, through the same entries and the same record of this
+//!   run's writes (`Runs`), so a turn gets one Esc from it and a pending
+//!   intent together. A one-shot request: no intent, nothing repeated, and
+//!   the turn it ends reads `turn interrupted`.
 use super::*;
 use crate::runtime::delegated::attempts::{AttemptEnd, SessionAnswer, attempt_end};
+use crate::runtime::delegated::authority::interrupter;
 use crate::runtime::delegated::intents::{
     AttemptNow, Decision, Intent, IntentReason, intents_pass,
 };
-use crate::session_protocol::host::{Immutable, Provenance, Withdrawal};
+use crate::session_protocol::host::{HostInterrupt, Immutable, Provenance, Withdrawal};
 
 /// Design I.4.4: the delegated task `r` waits to start or runs
 /// (`submitting`, `submitted`: an attempt `accepted`, or its turn) at its
@@ -61,6 +69,14 @@ pub(super) fn past_deadline(r: &WorkRecord, now_d: Option<u64>) -> bool {
     r.delegated.is_some()
         && matches!(r.status.state, WorkState::Submitting | WorkState::Submitted)
         && now_d.is_some_and(|d| d >= r.task.expires_at)
+}
+
+/// Host-work-v1 §11.2: a `work_interrupt` that found the task's turn not
+/// the session's current turn answers the task's status as it is, `detail`
+/// `not running` in this one result (never stored).
+fn not_running(mut status: WorkStatus) -> ResultBody {
+    status.detail = details::NOT_RUNNING.into();
+    ResultBody::Work { work: status }
 }
 
 impl HostBridge {
@@ -242,13 +258,17 @@ impl HostBridge {
             .map(|r| r.target.session_id)
     }
 
-    /// What `intent`'s attempt is now: its receipt (host-work's request for
-    /// that task only), its row's end, and, while it executes, the start's
-    /// reconciliation and the chat's half of the turn check
-    /// (`running_request`: today's Esc rule and the chat's current request).
+    /// What `intent`'s attempt is now ([`HostBridge::attempt_state`]).
     fn attempt_now(&self, intent: &Intent, cx: &mut Cx) -> anyhow::Result<AttemptNow> {
+        self.attempt_state(&intent.task_id, &intent.attempt_id, cx)
+    }
+
+    /// What attempt `attempt` of `task` is now: its receipt (host-work's
+    /// request for that task only), its row's end, and, while it executes,
+    /// the start's reconciliation and the chat's half of the turn check
+    /// (`running_request`: today's Esc rule and the chat's current request).
+    fn attempt_state(&self, task: &str, attempt: &str, cx: &mut Cx) -> anyhow::Result<AttemptNow> {
         let store = self.work.store.as_ref().unwrap();
-        let (task, attempt) = (intent.task_id.as_str(), intent.attempt_id.as_str());
         let Some(receipt) = self.host.attempt_receipt(attempt, task) else {
             return Ok(AttemptNow::Absent {
                 live: store.may_submit(task, attempt)?,
@@ -279,6 +299,81 @@ impl HostBridge {
                 }
             }
         })
+    }
+
+    /// `work_interrupt` of `task_id` from `a` (feature `host.delegated`;
+    /// design I.4.5; host-work-v1 §11.2; session-v1 R9.14 item 5). Only with
+    /// `host.delegated` on (off: `busy`, as before the hook,
+    /// [`crate::runtime::delegated::request`]). Only a delegated task, and
+    /// only its sender holding `interrupt` with current authority or the
+    /// owner ([`interrupter`]): anything else is `forbidden` (a v1 task,
+    /// one the host doesn't have, `local`).
+    ///
+    /// When the task's current attempt (`receipt_id`) runs the session's
+    /// current turn (`attempt_state`'s `Running`: executing, rebound, and
+    /// shown running by the chat), the turn is interrupted with host
+    /// authority after the session host's `advance`: the bridge's
+    /// `host_interrupt`, whose turn check runs again, or, when this run's
+    /// writes say the turn already got its interrupt or one is in flight
+    /// (`Runs::running`, shared with the intents), only the revocation of
+    /// another controller's lease. The result is the task's status as it
+    /// stood before (§11.2). A write goes into this run's writes
+    /// (`Runs::requested`): a pending intent of the attempt only revokes
+    /// while it is in flight and counts it as its delivery once reported
+    /// written, so the turn gets one Esc from both.
+    ///
+    /// Otherwise (queued, an attempt not executing, its turn not shown
+    /// running or still being reconciled after a restart, or ended) nothing
+    /// happens: the status as it is, with `detail` `not running` in this
+    /// result only, never stored. A halted session journal is `busy`: the
+    /// turn may be current, and nothing passes until the restart.
+    pub(super) fn work_interrupt(
+        &mut self,
+        a: &Sender,
+        req: &hw::Request,
+        task_id: &str,
+        cx: &mut Cx,
+    ) -> Result<ResultBody, HostWorkError> {
+        if !self.features.delegated {
+            return crate::runtime::delegated::request(self.features, req);
+        }
+        let store = self.work.store.as_ref().ok_or("busy")?;
+        let r = store
+            .work(task_id)
+            .map_err(|_| "busy")?
+            .ok_or("forbidden")?;
+        let adm = r.delegated.as_ref().ok_or("forbidden")?;
+        self.delegated_caller_by(a, &r, adm, interrupter)
+            .map_err(|_| "forbidden")?;
+        let status = r.status;
+        let attempt = status.receipt_id.clone();
+        let now = self
+            .attempt_state(task_id, &attempt, cx)
+            .map_err(|_| "busy")?;
+        let (AttemptNow::Running { turn }, Some(sid)) = (
+            now,
+            self.host
+                .attempt_receipt(&attempt, task_id)
+                .map(|rc| rc.target.session_id),
+        ) else {
+            return Ok(not_running(status));
+        };
+        // Task 15 review M6: a lease past its deadline ends `expired`.
+        let effects = self.host.advance(self.clock.now());
+        self.exec(effects, cx);
+        let done = match self.work.intents.running(&attempt, &turn, self.clock.now()) {
+            Decision::Deliver { .. } => self.host_interrupt(&sid, &attempt, cx),
+            _ => self.host_interrupt_revoke_lease(&sid, &attempt, cx),
+        };
+        match done {
+            Interrupted::Written => {
+                self.work.intents.requested(&attempt, &turn);
+                Ok(ResultBody::Work { work: status })
+            }
+            Interrupted::Revoked => Ok(ResultBody::Work { work: status }),
+            Interrupted::Refused(HostInterrupt::Halted) => Err("busy".into()),
+            Interrupted::Refused(_) => Ok(not_running(status)),
+        }
     }
 
     /// Withdraws `intent`'s unstarted attempt (design I.5.7): an `accepted`

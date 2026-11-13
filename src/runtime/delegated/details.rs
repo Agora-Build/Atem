@@ -56,8 +56,6 @@ pub const UNKNOWN_OUTCOME_REASONS: [&str; 3] =
     [AGENT_EXITED, OUTCOME_NOT_ESTABLISHED, WRITE_INTERRUPTED];
 /// A `work_interrupt` result: the task's turn isn't the session's current
 /// turn (§11.2); that result only, never stored.
-// Used by Task 27: `work_interrupt`.
-#[allow(dead_code)]
 pub const NOT_RUNNING: &str = "not running";
 /// An error, `busy`: the 64 (per sender) or 256 (per host) limit.
 // Used by Task 22: the capacity limits.

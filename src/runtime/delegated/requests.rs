@@ -39,6 +39,18 @@ impl HostBridge {
         r: &WorkRecord,
         adm: &Admission,
     ) -> Result<Caller, Refused> {
+        self.delegated_caller_by(a, r, adm, interaction)
+    }
+
+    /// [`HostBridge::delegated_caller`] under `rule` ([`interaction`], or
+    /// `work_interrupt`'s `interrupter`), on the same grounds.
+    pub(super) fn delegated_caller_by(
+        &self,
+        a: &Sender,
+        r: &WorkRecord,
+        adm: &Admission,
+        rule: crate::runtime::delegated::authority::Rule,
+    ) -> Result<Caller, Refused> {
         let Some(authority) = a.remote() else {
             return Err(Refused::NotTheSender);
         };
@@ -54,7 +66,7 @@ impl HostBridge {
         let now_d = self.start_view().now_d_ms.unwrap_or(0);
         let host_id = self.host.context().atem_device_id.clone();
         let session = r.task.target.session_id.as_str();
-        interaction(
+        rule(
             &authority.name(),
             authority.key.as_bytes(),
             adm,

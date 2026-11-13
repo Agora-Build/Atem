@@ -1250,6 +1250,30 @@ not name is `forbidden`, as for `work_query`.
   `resolved`. A resolved task shows there only as its state and `detail`;
   `work_query` gives the resolver.
 
+**`work_interrupt`, as built in step 4** (behind the debug-only hook):
+- **Only a delegated task.** A task of a sender that isn't delegated
+  (`local`, a browser grant, a service no feed covers) is `forbidden`, to
+  its sender and to the owner, as for `work_resolve`: only a delegated
+  task's turn runs under the host's own principal, which is what the host
+  interrupts (session-v1 R9.14 item 5). **Atem's reading, for Astation to
+  confirm.**
+- **The session's current turn** is the task's current attempt
+  `executing`, its turn shown running by the session's chat (R9.14 item
+  5's turn check). Anything else answers `not running`: a queued task, an
+  attempt still waiting `accepted` (nothing is withdrawn: it stays
+  queued), a turn the start's reconciliation hasn't rebound yet after a
+  restart (that says nothing of the turn), or a turn that ended.
+- **A halted session journal** is `busy`, not `not running`: the turn may
+  still be current, and nothing is written until the restart.
+- **One Esc per turn with the deadline's interrupt** (§11.6). The request
+  is one-shot: no intent, nothing repeated on later passes. It shares the
+  host's record of this run's interrupt writes with a pending intent of
+  the same attempt. While either's write waits for the worker's answer, or
+  once the turn got its interrupt, the other writes nothing (it only
+  revokes another controller's lease), and the request's result is still
+  the task's status. A turn the request's interrupt ended reads `turn
+  interrupted`, never `interrupted at deadline`. **Atem's choice.**
+
 **Client core.** `Attached::send` refuses both unless `welcome.features`
 lists `host.delegated` (`host feature not available`). A result answers
 `work_interrupt` when it is that task's status; it answers `work_resolve`

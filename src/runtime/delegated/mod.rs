@@ -10,9 +10,10 @@
 //! I.4.1), its attempts ([`attempts`], I.6.4), the start check and the
 //! gates ([`start`], [`gate`], I.4.3, I.5.8), who may query, cancel or
 //! complete it ([`authority`], I.4.5, Decision 15), the interrupt intents
-//! that stop its attempt at its deadline ([`intents`], I.4.4, I.5.7), what
-//! the bridge answers the delegated ops ([`request`]), and §11.6's detail
-//! texts ([`details`]).
+//! that stop its attempt at its deadline ([`intents`], I.4.4, I.5.7), which
+//! `work_interrupt` shares (§11.2; the bridge serves it), what the bridge
+//! answers the delegated ops it doesn't serve yet ([`request`]), and
+//! §11.6's detail texts ([`details`]).
 pub mod attempts;
 pub mod authority;
 pub mod details;
@@ -260,12 +261,13 @@ pub fn classify(
 }
 
 /// What the bridge answers a `host.delegated` or `host.alerts` op that
-/// reached it (`work_interrupt`, `work_resolve`, `alert_list`), after the
-/// checks every host-work request has. With its feature off: `busy` and
-/// nothing else, as before the hook existed (the channel refuses the op
-/// while the feature isn't listed, so none gets here then; one that did is
-/// never half-served). With it on: `busy`, saying the feature isn't served
-/// yet, until its handlers exist.
+/// reached it (`work_interrupt`, `work_resolve`, `alert_list`) while it
+/// doesn't serve it, after the checks every host-work request has. With its
+/// feature off: `busy` and nothing else, as before the hook existed (the
+/// channel refuses the op while the feature isn't listed, so none gets here
+/// then; one that did is never half-served). With it on: `busy`, saying the
+/// feature isn't served yet, until its handlers exist. `work_interrupt`
+/// with `host.delegated` on never comes here: the bridge serves it.
 pub fn request(features: HostFeatures, req: &Request) -> Result<ResultBody, HostWorkError> {
     let feature = req.feature();
     let detail = if feature == DELEGATED_FEATURE && features.delegated {

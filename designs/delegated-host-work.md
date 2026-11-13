@@ -577,6 +577,10 @@ R4 bounds accepted tasks by their original deadline (at most 24 h after admissio
 them, as for every directed-work op (host-work-v1 §2 "Ops"); the host then checks `interrupt` for `work_interrupt`.
 The owner needs the `control` role, as for every `notify` request (host-work-v1 §2).
 
+**As built in step 4** (host-work-v1 §11.2, "`work_interrupt`, as built in step 4"): `work_interrupt` applies to
+delegated tasks only (a v1 task is `forbidden`, as for `work_resolve`), is one-shot (no intent), and shares the
+deadline intent's once-per-turn delivery, so a turn gets one Esc from both; a turn it ended reads `turn interrupted`.
+
 **Changed for host senders.** A host sender has no channel. Its interactions are signed envelopes (II.7): `cancel`
 and `complete`. Status and replies come back to it as signed, sealed objects; it never queries. It gets no
 `work_interrupt` or `work_resolve` in this version: the owner does both.

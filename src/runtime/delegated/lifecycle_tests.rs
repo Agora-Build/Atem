@@ -71,7 +71,21 @@ enum BotScope<'a> {
 /// expiring at `bot_expiry`), routes `rm` (the phone) and `rs` (the bot),
 /// and the bot covered by a feed of the host's own Station.
 fn with_bot(rig: &mut LocalRig, root: &Path, os: &ManualOs, bot_expiry: u64) -> Senders {
-    delegated_host(rig, root, os, bot_expiry, BotScope::Sessions)
+    delegated_host(rig, root, os, bot_expiry, BotScope::Sessions, &BOT_OPS)
+}
+
+/// The bot's ops in [`with_bot`]: no `interrupt`.
+const BOT_OPS: [&str; 5] = ["message", "notify", "prompt", "stop", "view"];
+
+/// [`with_bot`], the bot's grant holding `ops` instead.
+fn with_bot_ops(
+    rig: &mut LocalRig,
+    root: &Path,
+    os: &ManualOs,
+    bot_expiry: u64,
+    ops: &[&str],
+) -> Senders {
+    delegated_host(rig, root, os, bot_expiry, BotScope::Sessions, ops)
 }
 
 /// [`with_bot`], the bot's grant scoped to `projects` entries instead, and
@@ -102,7 +116,14 @@ async fn with_project_bot(
     rig.bridge
         .projects
         .session(&profile, Some(RIG_PROJECT.into()));
-    let s = delegated_host(rig, root, os, bot_expiry, BotScope::Projects(projects));
+    let s = delegated_host(
+        rig,
+        root,
+        os,
+        bot_expiry,
+        BotScope::Projects(projects),
+        &BOT_OPS,
+    );
     rig.until(|r| {
         r.bridge.projects.matches(r.sid.as_str(), PROJECT) == Some(true)
             && r.bridge.projects.matches(&profile, PROJECT) == Some(true)
@@ -117,6 +138,7 @@ fn delegated_host(
     os: &ManualOs,
     bot_expiry: u64,
     scope: BotScope<'_>,
+    ops: &[&str],
 ) -> Senders {
     use crate::session_protocol::membership::r9log::secret;
     use crate::session_protocol::membership::{HostPin, MembershipHost};
@@ -127,17 +149,16 @@ fn delegated_host(
     log.add_host("host", 1, &secret("delegated host"));
     log.add_native("dev-phone", &["control", "view"]);
     log.add_native("dev-viewer", &["view"]);
-    let ops = ["message", "notify", "prompt", "stop", "view"];
     match scope {
         BotScope::Sessions => log.add_service(
             "svc-bot",
             &["host"],
             Some(&[rig.sid.as_str(), OTHER_SESSION]),
-            &ops,
+            ops,
             bot_expiry,
         ),
         BotScope::Projects(projects) => {
-            log.add_service_projects("svc-bot", &["host"], Some(projects), None, &ops, bot_expiry)
+            log.add_service_projects("svc-bot", &["host"], Some(projects), None, ops, bot_expiry)
         }
     };
     let pairing = crate::profile::Sources::in_dir(&root.join("profile"))
@@ -221,6 +242,8 @@ enum Q<'a> {
     Complete(&'a str, &'a str),
     /// `message_query` of a `message_publish` request's message.
     Message(&'a hw::Request),
+    /// `work_interrupt` (`host.delegated`, host-work-v1 §11.2).
+    Interrupt(&'a str),
 }
 
 impl Q<'_> {
@@ -257,6 +280,12 @@ impl Q<'_> {
                     digest: hw::digest(text.as_bytes()),
                     text: text.into(),
                 },
+            },
+            Q::Interrupt(task) => hw::Request::WorkInterrupt {
+                v: 1,
+                id,
+                host,
+                task_id: task.into(),
             },
             Q::Message(publish) => {
                 let hw::Request::Publish { message, .. } = publish else {
