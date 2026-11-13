@@ -1352,6 +1352,18 @@ fn next_fetch(station: &mut FakeStation, link: u64) -> Result<ToStation, RelayEr
     }
 }
 
+/// The host's next feed sync on `link`, answered (its fetches on the way
+/// answered too): a Station answers each call at once, and an unanswered
+/// sync ends the sync on its link generation (ruling T33d), so a test
+/// answers it before it moves the host's clock past 30 s.
+fn next_sync(station: &mut FakeStation, link: u64) {
+    loop {
+        if matches!(station.next_call(link), Ok(ToStation::ControlSync(_))) {
+            return;
+        }
+    }
+}
+
 /// The device-list fetches the host sent so far (its feed syncs aside).
 fn fetches(station: &FakeStation) -> usize {
     station
@@ -1487,6 +1499,8 @@ fn the_deferral_ends_with_the_recovery_wait_and_tasks_are_checked_again() {
     station.serve(link);
     station.heads_now();
     assert_eq!(next_fetch(&mut station, link), fetch(pinned));
+    // The feed's sync answered before the host's clock moves on.
+    next_sync(&mut station, link);
     drop(station);
     within("the recovery", || list_head(&rig) == pinned + 1);
 

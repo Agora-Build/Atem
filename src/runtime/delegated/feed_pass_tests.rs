@@ -559,3 +559,67 @@ fn the_reset_mark_is_no_table_with_the_hook_off() {
         assert_eq!(tables, 0);
     });
 }
+
+/// Task 33 re-review 2, R2-2 (ruling T33d): the read from 0 a reset's mark
+/// lets go is asked at once, never dropped into a 30 s stall: after a mark
+/// write that failed (it is written again at the next pass), and for a
+/// reset found as the feeds load (the pass's first step finds it).
+#[test]
+fn the_read_a_mark_lets_go_is_asked_at_the_pass() {
+    use crate::runtime::delegated::feeds::Feeds;
+    use crate::runtime::delegated::station::Call;
+    use atem_client::control::{ControlAction, ControlSync};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        let head = s.log.log.head();
+        bridge_heads(&mut rig, 2, head);
+        let cover = own_record(&s.log, "svc-bot", ControlAction::Cover, 1);
+        let hold = own_record(&s.log, "svc-bot", ControlAction::Hold, 2);
+        bridge_page(&mut rig, 2, &[(1, &cover), (2, &hold)]);
+        let from_0 = Call::Sync(ControlSync {
+            origin: ORIGIN.into(),
+            feed_id: Some(OWN_FEED.into()),
+            after: 0,
+        });
+        // A rollback whose mark can't be written: nothing asked.
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute_batch(
+                "CREATE TRIGGER no_mark BEFORE INSERT ON control_resets
+                 BEGIN SELECT RAISE(ABORT, 'no mark'); END;",
+            )
+            .unwrap();
+        rig.bridge.feed_advance(clocks_after(2_000));
+        assert_eq!(bridge_heads(&mut rig, 1, head), []);
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute_batch("DROP TRIGGER no_mark;")
+            .unwrap();
+        // The next pass: its first step, then its tick, which asks.
+        rig.bridge.feed_advance(clocks_after(2_100));
+        assert_eq!(
+            rig.bridge.feed_tick(clocks_after(2_100)),
+            std::slice::from_ref(&from_0)
+        );
+
+        // A reset found as the feeds load: the feed rolled back while they
+        // weren't loaded.
+        bridge_page(&mut rig, 1, &[(1, &cover)]);
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        rig.bridge.feed_advance(clocks_after(4_000));
+        bridge_heads(&mut rig, 0, head);
+        rig.bridge.ensure_feeds();
+        rig.bridge.feed_advance(clocks_after(4_100));
+        assert_eq!(rig.bridge.feed_tick(clocks_after(4_100)), [from_0]);
+    });
+}

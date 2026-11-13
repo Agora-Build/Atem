@@ -786,12 +786,12 @@ fn syncs_are_paced_like_the_fetch() {
     let mut rig = rig();
     assert_eq!(rig.heads(FEED, 2), [sync_call(FEED, 0)]);
     assert_eq!(rig.heads(FEED, 2), Vec::new(), "one in flight");
-    assert_eq!(rig.pass(SYNC_TIMEOUT_MS - 1), Vec::new());
-    assert_eq!(rig.pass(1), [sync_call(FEED, 0)], "asked again");
-    // A page that moved nothing: a pause.
-    let beyond = rig.record(FEED, ControlAction::Cover);
+    // Read to 0 of 2: the rest asked at once.
     let page = rig.page_of(FEED, 0, vec![]);
-    assert!(rig.on_page(page).applied.is_empty(), "{beyond:?}");
+    assert_eq!(rig.on_page(page).next, Some(sync_call(FEED, 0)));
+    // A page that moved nothing: a pause.
+    let page = rig.page_of(FEED, 0, vec![]);
+    assert_eq!(rig.on_page(page).next, None);
     assert_eq!(rig.heads(FEED, 2), Vec::new());
     assert_eq!(rig.pass(STALL_PAUSE_MS - 1), Vec::new());
     assert_eq!(rig.heads(FEED, 2), Vec::new());
@@ -1142,4 +1142,150 @@ fn a_reset_asks_nothing_before_its_mark_is_written() {
     rig.store.db.execute_batch("DROP TRIGGER no_mark;").unwrap();
     assert_eq!(rig.pass(SEC), [sync_call(FEED, 0)]);
     assert_eq!(rig.mark_row().as_deref(), Some(""));
+}
+
+/// Task 33 re-review 2, R2-1 (ruling T33d): a page that isn't part of the
+/// read from 0 never clears a reset's mark. A continuation (after 3) is in
+/// flight; a `heads` reports a rollback under the same `feed_id` and the
+/// mark is written; the old call's answer then comes with the feed regrown
+/// past 3. It applies as the continuation it is, the mark stays, and the
+/// host asks the feed from 0, the gate closed until that read is done.
+#[test]
+fn a_continuation_in_flight_never_ends_a_reset() {
+    let mut rig = rig();
+    let cover = rig.record(FEED, ControlAction::Cover);
+    let hold = rig.record(FEED, ControlAction::Hold);
+    let release = rig.record(FEED, ControlAction::Release);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 0)]);
+    rig.page(FEED, 3, &[(1, &cover), (2, &hold), (3, &release)]);
+    // A continuation in flight.
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 3)]);
+    // The rollback found: marked, nothing asked (one in flight).
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 1), Vec::new());
+    assert_eq!(rig.mark_row().as_deref(), Some(""));
+    assert_eq!(rig.sync.closed(), Some(Closed::Reset));
+    // The old call's answer, the feed regrown past 3.
+    let x = rig.record(FEED, ControlAction::Hold);
+    let y = rig.record(FEED, ControlAction::Release);
+    let synced = rig.page(FEED, 5, &[(4, &x), (5, &y)]);
+    assert_eq!(synced.applied.len(), 2, "the continuation it is");
+    assert_eq!(rig.mark_row().as_deref(), Some(""), "the mark stays");
+    assert_eq!(rig.sync.closed(), Some(Closed::Reset));
+    assert!(!rig.open(&native()));
+    assert_eq!(synced.next, Some(sync_call(FEED, 0)), "from 0");
+    // The read from 0 finds a revoke below the old cursor.
+    let revoke = rig.record(
+        FEED,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    rig.page(
+        FEED,
+        5,
+        &[(1, &cover), (2, &revoke), (3, &release), (4, &x), (5, &y)],
+    );
+    assert!(rig.feeds.standing(BOT).revoked.is_some());
+    assert_eq!(rig.mark_row(), None);
+    assert!(rig.open(&native()));
+}
+
+/// Ruling T33d (matching after a timeout): a page carries no echo of its
+/// call, so a `control_sync` unanswered for 30 s poisons the link
+/// generation for the sync: the gate stays closed, nothing more is asked,
+/// a late page is dropped (nothing applied, the cursor unmoved), and the
+/// Station-fault alert goes. The next link generation syncs again, its
+/// gate opening only after a full read.
+#[test]
+fn an_unanswered_sync_waits_for_the_next_link_generation() {
+    let mut rig = rig();
+    rig.opened();
+    rig.sync.take_lines();
+    let release = rig.record(FEED, ControlAction::Release);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    assert_eq!(rig.pass(SYNC_TIMEOUT_MS - 1), Vec::new());
+    assert_eq!(rig.pass(1), Vec::new(), "no re-ask on this generation");
+    assert_eq!(rig.sync.closed(), Some(Closed::Unanswered));
+    assert!(!rig.open(&native()));
+    let lines = rig.sync.take_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("unanswered"), "{}", lines[0]);
+    assert_eq!(rig.heads(FEED, 3), Vec::new());
+    assert_eq!(rig.pass(STALL_PAUSE_MS), Vec::new());
+    // The late answer: dropped.
+    let synced = rig.page(FEED, 3, &[(3, &release)]);
+    assert!(synced.applied.is_empty());
+    assert!(rig.feeds.standing(BOT).held);
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
+    assert_eq!(rig.sync.closed(), Some(Closed::Unanswered));
+    // The next link generation: synced again, open only once read.
+    rig.sync.on_link(Some(&link(2, ORIGIN)));
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    assert!(!rig.open(&native()));
+    rig.page(FEED, 3, &[(3, &release)]);
+    assert!(!rig.feeds.standing(BOT).held);
+    assert!(rig.open(&native()));
+}
+
+/// Ruling T33d ("any other page that could be taken for the read from 0"):
+/// a refusal of another call than `control_sync` doesn't answer the sync in
+/// flight, so the call stays in flight (its answer would otherwise come
+/// after a later ask and be taken for its page). Its answer applies as what
+/// it is, but ends neither the refusal's resynchronization (it was asked
+/// before) nor a reset found meanwhile.
+#[test]
+fn a_refusal_of_another_call_keeps_the_sync_in_flight() {
+    let mut rig = rig();
+    let cover = rig.record(FEED, ControlAction::Cover);
+    let hold = rig.record(FEED, ControlAction::Hold);
+    let release = rig.record(FEED, ControlAction::Release);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 0)]);
+    rig.page(FEED, 3, &[(1, &cover), (2, &hold), (3, &release)]);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 3)]);
+    rig.sync.on_refused(RefusedCall::MembershipFetch);
+    assert_eq!(rig.sync.closed(), Some(Closed::Refused));
+    // The rollback found meanwhile, marked.
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 1), Vec::new());
+    // The call's answer: applied, nothing ended.
+    let x = rig.record(FEED, ControlAction::Hold);
+    let synced = rig.page(FEED, 4, &[(4, &x)]);
+    assert_eq!(synced.applied.len(), 1);
+    assert_eq!(synced.next, None, "the backoff");
+    assert_eq!(rig.sync.closed(), Some(Closed::Refused));
+    assert_eq!(rig.mark_row().as_deref(), Some(""));
+    // Past the backoff, at a heads: the read from 0, which ends both.
+    rig.pass(REFUSAL_BACKOFF_MS);
+    assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 0)]);
+    rig.page(FEED, 4, &[(1, &cover), (2, &hold), (3, &release), (4, &x)]);
+    assert_eq!(rig.mark_row(), None);
+    assert!(rig.open(&native()));
+}
+
+/// Ruling T33d: the start's restart keeps a call in flight (its answer is
+/// owed, and dropped it would be taken for the next call's page); that
+/// page applies but doesn't end the restart's resynchronization: a page
+/// asked after it does.
+#[test]
+fn the_restart_keeps_a_call_in_flight_and_its_page_ends_nothing() {
+    let mut rig = rig();
+    rig.opened();
+    let release = rig.record(FEED, ControlAction::Release);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    rig.sync.restart();
+    assert_eq!(rig.pass(SEC), Vec::new(), "one in flight");
+    let synced = rig.page(FEED, 3, &[(3, &release)]);
+    assert_eq!(synced.applied.len(), 1);
+    assert_eq!(rig.sync.closed(), Some(Closed::Restarted));
+    assert!(!rig.open(&native()));
+    // A page asked after the restart, at once.
+    assert_eq!(synced.next, Some(sync_call(FEED, 3)));
+    rig.page(FEED, 3, &[]);
+    assert!(rig.open(&native()));
 }

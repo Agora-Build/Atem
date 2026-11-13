@@ -1910,8 +1910,9 @@ host's call on the link with exactly one of:
   (**Atem's reading, for Astation's agreement**, step 4, 2026-11-13: a
   refusal names a call kind, not a request: it completes and matches none;
   on that kind the host backs off (its device-list fetch 30 s, ended by the
-  link's next generation) and drops what it had in flight on the link, so a
-  later result is unasked.)
+  link's next generation) and drops what it had in flight of that kind on
+  the link, so a later result is unasked; a call of another kind stays in
+  flight, its answer owed (see "Matching a page to its call" below).)
 - The host keeps that link's synchronization gates closed while it repairs
   the association and resynchronizes. The transport may still fence or
   close an invalid or superseded link; a refusal creates no authority for
@@ -2040,16 +2041,37 @@ only its own Station's feed (step 4's Decision 14):
   every family on the link is, with no fault alert. Either way the call it
   answered is asked again after 30 seconds unanswered, and the gate stays
   closed meanwhile.
-- **Pacing** (as the device-list fetch's). The calls a `heads` or the
-  host's pass start are at most one a second, none for 30 seconds after a
-  page that moved nothing or was refused; one unanswered for 30 seconds is
-  asked again.
-- **Refusals.** Any of the three closes the gate and ends the sync in
-  flight; the next `control_sync` goes at the first `heads` 30 seconds or
-  more after it, or on the link's next generation, and the gate opens only
-  with a page asked for then (the resynchronization), even when the
-  cursor already held the head. `atem status` says `Station refused feed
-  access (forbidden); retrying`.
+- **Pacing** (as the device-list fetch's). One `control_sync` in flight at
+  a time. The calls a `heads` or the host's pass start are at most one a
+  second, none for 30 seconds after a page that moved nothing or was
+  refused; a continuation after a page that moved the cursor goes at once.
+  So does a reset's first `control_sync{after: 0}`, unpaced, as soon as
+  its mark is written (nothing goes for a reset before it): it stays
+  bounded because one call is in flight at a time and a reset counts once
+  until its read from 0 begins, so it costs at most one call per page the
+  Station answers.
+- **Matching a page to its call** (**Atem's reading, for Astation**). A
+  `control_sync_result` carries no echo of its call, and gaps are legal
+  (rule 7), so a host can match a page to its call only by order: the one
+  call in flight. A call whose answer is owed is therefore never dropped
+  (a `membership_fetch_refused` or `control_ack_refused` leaves the sync
+  in flight), and a `control_sync` unanswered for 30 seconds ends the sync
+  on that link generation: that origin's gate stays closed, the host asks
+  nothing more on it (a re-send could bring two answers), any later page
+  on it is dropped unapplied with the cursor unmoved, and the Station-fault
+  alert goes (hourly). The sync resumes on the next link generation. Atem
+  has no safe way to ask for a fresh relay link for this (dropping the
+  link would close every r9 channel on it, and a Station that never
+  answers would make it flap), so it waits for the next one. An echo of
+  `feed_id` and `after` in `control_sync_result` would let a host drop a
+  page that answers another call and re-ask on the same link instead.
+- **Refusals.** Any of the three closes the gate. A `control_sync_refused`
+  ends the sync in flight (it is that call's answer); the other two leave
+  it in flight, and its page ends nothing. The next `control_sync` goes at
+  the first `heads` 30 seconds or more after the refusal, or on the link's
+  next generation, and the gate opens only with a page asked for then (the
+  resynchronization), even when the cursor already held the head. `atem
+  status` says `Station refused feed access (forbidden); retrying`.
 
 #### Acknowledgments
 

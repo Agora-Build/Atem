@@ -106,7 +106,7 @@ impl HostBridge {
         match station.feed.persist_mark(store, feeds) {
             Ok(ask) => ask.map(Call::Sync),
             Err(error) => {
-                if station.feed.failed() {
+                if station.feed.mark_failed() {
                     eprintln!(
                         "atem runtime: a control feed's reset couldn't be marked ({error:#}); nothing is asked of it until it is"
                     );
@@ -124,8 +124,9 @@ impl HostBridge {
         if let Some(station) = self.station.as_mut() {
             station.feed.advance(now, feeds);
         }
-        // The read from 0 a mark lets go is asked at the pass's tick.
-        let _ = self.persist_reset_mark(list.as_ref());
+        // No reset's mark is written here: the pass's tick (`feed_tick`, in
+        // the same pass) writes it and returns the read from 0 it lets go
+        // (Task 33 re-review 2, R2-2: a call asked here would be dropped).
         self.publish_feed_gates();
     }
 

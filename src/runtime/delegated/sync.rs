@@ -60,18 +60,29 @@
 //!   in flight at a time. Those a `heads` or the pass start are at most one
 //!   a second, and none for 30 seconds after a page that moved nothing or
 //!   was refused. After a page that moved the cursor while the feed is
-//!   still ahead, the next is asked at once (real records bound it). One
-//!   unanswered for 30 seconds is dropped, and asked again.
+//!   still ahead, the next is asked at once (real records bound it), and
+//!   so is a reset's read from 0 once its mark is written (one call in
+//!   flight, and a reset counts once until its read begins, so it stays
+//!   bounded by the pages).
+//! - **Matching** (ruling T33d). A page names no call (no echo of
+//!   `feed_id` and `after`; gaps are legal), so it is matched to the one
+//!   call in flight by order. A call is therefore never dropped while its
+//!   answer is owed, and one unanswered for 30 seconds ends the sync on
+//!   that link generation: its gate stays closed, nothing more is asked,
+//!   any later page is dropped unapplied, the Station-fault alert goes, and
+//!   the next generation syncs again (the host has no safe way to ask for a
+//!   fresh link: it waits for one).
 //! - **Refusals** (Decision 20). Any refusal on the link
 //!   (`control_sync_refused`, `membership_fetch_refused`,
 //!   `control_ack_refused`) closes every gate the link serves: nothing
-//!   advances (no cursor, announced head, clock floor or acknowledgment),
-//!   and the host's own wait on the link ends (the sync in flight is
-//!   dropped, so a page arriving after it is one nobody asked for). The
-//!   gate stays closed until a page asked for after a 30-second backoff
-//!   reads ("repairs the association and resynchronizes"), at a `heads` or
-//!   the pass, or on the next link generation. A refusal completes and
-//!   correlates nothing.
+//!   advances (no cursor, announced head, clock floor or acknowledgment).
+//!   A `control_sync_refused` ends the host's own wait for the sync in
+//!   flight (it is its answer, so a page arriving after it is one nobody
+//!   asked for); another call's refusal leaves the sync in flight (its
+//!   answer is owed) but its page ends nothing. The gate stays closed until
+//!   a page asked for after a 30-second backoff reads ("repairs the
+//!   association and resynchronizes"), at a `heads`, or on the next link
+//!   generation. A refusal completes and correlates nothing.
 //! - **The gate** (I.5.8). An origin's feed part is open while the link is
 //!   up, a `heads` came within 60 seconds, its `station_time` is within the
 //!   cap, no refusal, fault or reset waits, and the feed the last `heads`
@@ -132,6 +143,10 @@ pub enum Closed {
     HeadsLate,
     /// A refusal on the link (Decision 20).
     Refused,
+    /// A `control_sync` went unanswered for 30 s: pages can't be matched
+    /// to their calls after it, so the sync waits for the next link
+    /// generation (ruling T33d).
+    Unanswered,
     /// A page the reader refused as a whole (its code).
     Fault(&'static str),
     /// A `station_time` beyond the cap.
@@ -158,6 +173,7 @@ impl Closed {
             Closed::NoHeads => "waiting for the Station's heads".into(),
             Closed::HeadsLate => "no heads from the Station for 60 s".into(),
             Closed::Refused => REFUSED_STATUS.into(),
+            Closed::Unanswered => UNANSWERED.into(),
             Closed::Fault("not_strict") => NOT_STRICT.into(),
             Closed::Fault(code) => format!("Station sent a page the reader refused ({code})"),
             Closed::ClockAhead => "Station clock ahead of this host".into(),
@@ -181,6 +197,10 @@ impl Closed {
 
 /// Decision 20's `atem status` text.
 pub const REFUSED_STATUS: &str = "Station refused feed access (forbidden); retrying";
+/// The status of a sync that waits for the next link generation (ruling
+/// T33d).
+pub const UNANSWERED: &str = "a control_sync went unanswered; the sync waits for the next link";
+
 /// Decision 12's alert for a page that isn't strict JSON.
 pub const NOT_STRICT: &str = "Station sent a page that isn't strict JSON";
 
@@ -219,6 +239,9 @@ struct Ask {
     /// Read from the feed's start (a reset, or a feed never read): its page
     /// replaces the origin's cursor first.
     restart: bool,
+    /// The sync's epoch when it was asked: a page asked before the latest
+    /// refusal or restart ends no resynchronization.
+    epoch: u64,
 }
 
 /// What a page brought, committed. Its records' effects on tasks are PR
@@ -295,6 +318,14 @@ pub struct FeedSync {
     /// The last announcement is stale (the Station served another feed
     /// than it named): nothing is asked before the next `heads`.
     wait_heads: bool,
+    /// A `control_sync` of this link generation went unanswered for 30 s:
+    /// a page carries no echo of its call, so none can be matched to a
+    /// later call on this generation; the sync waits for the next one
+    /// (ruling T33d).
+    unanswered: bool,
+    /// Bumped at each refusal and at the start's restart: a page asked
+    /// before ends no resynchronization.
+    epoch: u64,
     /// The feed store's committed feed of the own origin, as last seen:
     /// `(feed_id, cursor)`.
     synced: Option<(String, u64)>,
@@ -323,6 +354,9 @@ pub struct FeedSync {
     resets: u64,
     other_origin: u64,
     failures: u64,
+    mark_failures: u64,
+    timeouts: u64,
+    late: u64,
 }
 
 impl Default for FeedSync {
@@ -345,6 +379,8 @@ impl FeedSync {
             resync: None,
             reset: None,
             wait_heads: false,
+            unanswered: false,
+            epoch: 0,
             synced: None,
             loaded: false,
             in_flight: None,
@@ -364,6 +400,9 @@ impl FeedSync {
             resets: 0,
             other_origin: 0,
             failures: 0,
+            mark_failures: 0,
+            timeouts: 0,
+            late: 0,
         }
     }
 
@@ -394,6 +433,7 @@ impl FeedSync {
     fn fresh_generation(&mut self) {
         self.heads_at = None;
         self.wait_heads = false;
+        self.unanswered = false;
         self.announced = None;
         self.own_feeds = 0;
         self.clock = None;
@@ -403,10 +443,12 @@ impl FeedSync {
     }
 
     /// The start's recovery (design I.6.2 step 7): the gate closes until a
-    /// page asked from now reads.
+    /// page asked from now reads. A call in flight stays (its answer is
+    /// owed: dropped, it would come after the next ask and be taken for its
+    /// page), and its page ends no resynchronization.
     pub fn restart(&mut self) {
         self.resync = Some(Resync::Restarted);
-        self.in_flight = None;
+        self.epoch += 1;
     }
 
     /// The pass's monotonic time and the feed store (`None`: not loaded):
@@ -418,8 +460,21 @@ impl FeedSync {
         if let Some(ask) = &self.in_flight
             && self.now >= ask.sent_at.saturating_add(SYNC_TIMEOUT_MS)
         {
+            // No page names its call (§11.4: no echo; gaps are legal), so
+            // after one that went unanswered no page of this generation can
+            // be matched to a call: the sync waits for the next generation
+            // (ruling T33d).
             self.in_flight = None;
-            return self.ask(false).into_iter().collect();
+            self.unanswered = true;
+            self.timeouts += 1;
+            let origin = self.own.clone().unwrap_or_default();
+            self.alert(
+                Alert::Page,
+                format!(
+                    "a control_sync to {origin} went unanswered for 30 s; its gate stays closed and the sync waits for the next link"
+                ),
+            );
+            return Vec::new();
         }
         // After a refusal, only a `heads` past the backoff asks again
         // (Decision 20); after a page of another feed, only a `heads`
@@ -438,6 +493,14 @@ impl FeedSync {
         self.boot = now.boot_ms;
         self.observe(feeds);
         self.alerts_due();
+    }
+
+    /// A reset's mark couldn't be written: whether to log it (the first,
+    /// then at powers of two). Nothing is asked meanwhile; it is written
+    /// again at the next step.
+    pub fn mark_failed(&mut self) -> bool {
+        self.mark_failures += 1;
+        self.mark_failures.is_power_of_two()
     }
 
     /// A page couldn't be applied (its transaction failed and rolled back:
@@ -526,6 +589,12 @@ impl FeedSync {
         clock: Option<(&mut HostClock, &Store)>,
         cx: Option<PageCx<'_>>,
     ) -> anyhow::Result<Synced> {
+        if self.unanswered {
+            // This generation's pages can't be matched to a call: dropped,
+            // nothing applied (ruling T33d).
+            self.late += 1;
+            return Ok(Synced::default());
+        }
         let Some(ask) = self.in_flight.take() else {
             self.unasked += 1;
             if let Err(e) = page {
@@ -593,8 +662,15 @@ impl FeedSync {
         }
         let before = self.synced.clone();
         // A reset is done with the commit that reads its feed from 0 up to
-        // the announced head (the page's own, if higher).
-        let complete_at = self.reset.as_ref().map(|_| {
+        // the announced head (the page's own, if higher): only a page of
+        // that read from 0, the one that begins it (`ask.restart`) or one
+        // after it on the feed it began on. Any other (a continuation that
+        // was in flight when the reset was found) applies as what it is and
+        // ends nothing (Task 33 re-review 2, R2-1).
+        let of_the_read = self.reset.as_ref().is_some_and(|reset| {
+            ask.restart || reset.begun.as_deref() == Some(page.feed_id.as_str())
+        });
+        let complete_at = of_the_read.then(|| {
             self.announced
                 .as_ref()
                 .filter(|a| a.feed_id == page.feed_id)
@@ -626,7 +702,11 @@ impl FeedSync {
             self.stalled_at = Some(self.now);
             return Ok(synced);
         }
-        self.resync = None;
+        // Only a page asked after the latest refusal or restart ends its
+        // resynchronization.
+        if ask.epoch == self.epoch {
+            self.resync = None;
+        }
         let moved = self.synced != before;
         synced.next = if moved {
             self.ask(false)
@@ -640,7 +720,7 @@ impl FeedSync {
     /// A refusal of `call` on the link (Decision 20): nothing advances,
     /// every gate the link serves closes, the host's own wait ends, and a
     /// page is asked again only after the backoff.
-    pub fn on_refused(&mut self, _call: RefusedCall) {
+    pub fn on_refused(&mut self, call: RefusedCall) {
         if self.link_gen.is_none() {
             return;
         }
@@ -648,7 +728,15 @@ impl FeedSync {
         self.note_alert(REFUSED_STATUS.into());
         self.resync = Some(Resync::Refused);
         self.refused_at = Some(self.now);
-        self.in_flight = None;
+        self.epoch += 1;
+        // A `control_sync_refused` answers the sync in flight: its wait
+        // ends. Another call's refusal doesn't: the sync's answer is still
+        // owed, so the call stays in flight (dropped, its answer would come
+        // after a later ask and be taken for that one's page); its page
+        // ends no resynchronization (ruling T33d).
+        if call == RefusedCall::ControlSync {
+            self.in_flight = None;
+        }
     }
 
     /// A reset found and not marked yet: its mark written in the feed
@@ -707,6 +795,9 @@ impl FeedSync {
     pub fn closed(&self) -> Option<Closed> {
         if self.link_gen.is_none() || self.own.is_none() {
             return Some(Closed::NoLink);
+        }
+        if self.unanswered {
+            return Some(Closed::Unanswered);
         }
         match self.resync {
             Some(Resync::Refused) => return Some(Closed::Refused),
@@ -788,6 +879,8 @@ impl FeedSync {
             "refusals": self.refusals,
             "faults": self.faults,
             "resets": self.resets,
+            "timeouts": self.timeouts,
+            "late": self.late,
             "reset": self.reset.as_ref().map(|r| json!({"begun": r.begun, "durable": r.durable})),
             "other_origin": self.other_origin,
         })
@@ -910,8 +1003,9 @@ impl FeedSync {
             return None;
         }
         // Nothing for a reset before its mark is written (ruling T33c), nor
-        // of a stale announcement before the next `heads`.
-        if self.reset.as_ref().is_some_and(|r| !r.durable) || self.wait_heads {
+        // of a stale announcement before the next `heads`, nor on a link
+        // generation whose sync went unanswered (ruling T33d).
+        if self.reset.as_ref().is_some_and(|r| !r.durable) || self.wait_heads || self.unanswered {
             return None;
         }
         if let Some(at) = self.refused_at {
@@ -948,6 +1042,7 @@ impl FeedSync {
             after,
             sent_at: self.now,
             restart,
+            epoch: self.epoch,
         });
         Some(ControlSync {
             origin: own,
