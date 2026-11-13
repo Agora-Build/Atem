@@ -137,7 +137,16 @@ impl App {
             hosted.relay.push_back((link, text));
             return;
         }
-        // Counted, never its content; rate-limited to powers of two.
+        self.relay_dropped(text.len());
+    }
+
+    /// A relay message dropped unread (over its bound, or past this pass's
+    /// count), `bytes` long: counted, never its content; logged at powers
+    /// of two.
+    pub(super) fn relay_dropped(&mut self, bytes: usize) {
+        let Some(hosted) = self.hosted.as_mut() else {
+            return;
+        };
         hosted.relay_dropped += 1;
         if hosted.relay_dropped.is_power_of_two() {
             eprintln!(
@@ -145,7 +154,7 @@ impl App {
                 hosted.relay_dropped,
                 RELAY_MESSAGE_BYTES / 1024,
                 RELAY_LIMIT,
-                text.len()
+                bytes
             );
         }
     }

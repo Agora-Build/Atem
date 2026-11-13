@@ -10,19 +10,27 @@
 //!   the head the Station named.
 //! - **A result is taken only for a fetch in flight** ([`FetchApply`]): a
 //!   Station can't make the host apply carriages it didn't ask for.
-//! - **Again while behind.** After a result's carriage, the host fetches
-//!   again from its new head while that is behind the Station's last named
-//!   head, as long as the carriage moved the head (a carriage that moved
-//!   nothing, a deferred or conflicting entry say, waits for the next
-//!   `heads`, so a Station can't spin the host).
+//! - **Again while behind.** After a result's carriage that moved the
+//!   head, the host fetches again at once from its new head while that is
+//!   behind the Station's last named head: real entries bound it (a list
+//!   holds at most 1,024).
+//! - **Paced at a `heads`.** A carriage is a durable write, so a Station
+//!   gets no more of them than any carrier: the fetches a `heads` starts
+//!   are at most one every [`HEADS_PACE_MS`] (a channel's init's pace), and
+//!   none for [`STALL_PAUSE_MS`] after a result whose carriage moved
+//!   nothing (a deferred, conflicting or junk carriage). So `heads` and
+//!   results in a burst carry at most once.
 //! - **A refusal** (`membership_fetch_refused`, step 4's Decision 20)
-//!   advances nothing (no head, nothing applied) and correlates no request:
-//!   the host forgets what it had in flight on the link, and fetches again
-//!   only at a `heads` at least [`REFUSAL_BACKOFF_MS`] later on its
-//!   monotonic clock, or on the next link generation (a new
-//!   [`DeviceListFetch`]).
+//!   advances nothing (no head, nothing applied) and is never taken as an
+//!   answer: it ends the host's own wait on the link (no fetch is in flight
+//!   any more, so a result arriving after it is one nobody asked for), and
+//!   the host fetches again only at a `heads` at least
+//!   [`REFUSAL_BACKOFF_MS`] later on its monotonic clock, or on the next
+//!   link generation (a new [`DeviceListFetch`]).
 //! - **A fetch with no answer** for [`FETCH_TIMEOUT_MS`] (lost, or its
-//!   result over 256 KiB, dropped unread: Decision 21) is sent again.
+//!   result over 256 KiB, dropped unread: Decision 21) is sent again, from
+//!   the list's head then; not once another carrier (a phone's channel)
+//!   brought the list to the named head.
 //!
 //! The clock is the host's monotonic clock, given at every pass
 //! ([`DeviceListFetch::tick`]).
@@ -35,6 +43,11 @@ use serde_json::{Value, json};
 pub const REFUSAL_BACKOFF_MS: u64 = 30_000;
 /// A fetch unanswered this long is sent again.
 pub const FETCH_TIMEOUT_MS: u64 = 30_000;
+/// The fetches a `heads` starts: at most one this often (I1).
+pub const HEADS_PACE_MS: u64 = 1_000;
+/// After a result whose carriage moved nothing, no fetch at a `heads` for
+/// this long (I1).
+pub const STALL_PAUSE_MS: u64 = 30_000;
 
 /// What to do with a `membership_fetch_result`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +77,10 @@ pub struct DeviceListFetch {
     in_flight: Option<InFlight>,
     /// The last refusal (monotonic ms).
     refused_at: Option<u64>,
+    /// The last fetch a `heads` started (monotonic ms).
+    heads_fetch_at: Option<u64>,
+    /// The last result whose carriage moved nothing (monotonic ms).
+    stalled_at: Option<u64>,
     /// Results taken.
     results: u64,
 }
@@ -82,7 +99,14 @@ impl DeviceListFetch {
             }
             self.refused_at = None;
         }
-        self.ask(applied)
+        let within =
+            |at: Option<u64>, ms: u64| at.is_some_and(|at| self.now < at.saturating_add(ms));
+        if within(self.heads_fetch_at, HEADS_PACE_MS) || within(self.stalled_at, STALL_PAUSE_MS) {
+            return None;
+        }
+        let call = self.ask(applied)?;
+        self.heads_fetch_at = Some(self.now);
+        Some(call)
     }
 
     /// A `membership_fetch_result` (read by the shared reader, within 256
@@ -97,32 +121,47 @@ impl DeviceListFetch {
     }
 
     /// A result's carriage was applied, the list's head going from `before`
-    /// to `after`: the next fetch while still behind, if it moved.
+    /// to `after`: the next fetch while still behind, if it moved; if it
+    /// moved nothing, a pause for the fetches a `heads` starts.
     pub fn carried(&mut self, before: &Head, after: &Head) -> Option<MembershipFetch> {
         if after.seq <= before.seq {
+            self.stalled_at = Some(self.now);
             return None;
         }
         self.ask(after)
     }
 
-    /// `membership_fetch_refused`: nothing advances; no fetch at a `heads`
-    /// before the backoff.
+    /// `membership_fetch_refused`: nothing advances, and it answers
+    /// nothing: the host's own wait ends; no fetch at a `heads` before the
+    /// backoff.
     pub fn on_refused(&mut self) {
         self.in_flight = None;
         self.refused_at = Some(self.now);
     }
 
-    /// The pass's monotonic time: a fetch unanswered too long, sent again.
-    pub fn tick(&mut self, now_mono: u64) -> Option<MembershipFetch> {
+    /// The pass's monotonic time, and the list's head (`None`: no list): a
+    /// fetch unanswered too long, sent again from the list's head; none
+    /// once the list reached the named head through another carrier.
+    pub fn tick(&mut self, now_mono: u64, applied: Option<&Head>) -> Option<MembershipFetch> {
         self.now = now_mono;
-        let in_flight = self.in_flight.as_mut()?;
+        let in_flight = self.in_flight?;
+        if self
+            .named
+            .zip(applied)
+            .is_some_and(|(named, applied)| applied.seq >= named.seq)
+        {
+            self.in_flight = None;
+            return None;
+        }
         if now_mono < in_flight.sent_at.saturating_add(FETCH_TIMEOUT_MS) {
             return None;
         }
-        in_flight.sent_at = now_mono;
-        Some(MembershipFetch {
-            after: in_flight.after,
-        })
+        let after = applied.map_or(in_flight.after, |h| h.seq.max(in_flight.after));
+        self.in_flight = Some(InFlight {
+            after,
+            sent_at: now_mono,
+        });
+        Some(MembershipFetch { after })
     }
 
     /// The fetch just asked for couldn't be handed to the link: none in
@@ -182,7 +221,7 @@ mod tests {
     #[test]
     fn fetch_when_the_named_head_is_beyond_the_list() {
         let mut f = DeviceListFetch::default();
-        f.tick(1_000);
+        f.tick(1_000, Some(&head(3)));
         assert_eq!(f.on_heads(&head(3), &head(3)), None);
         assert_eq!(f.on_heads(&head(2), &head(3)), None);
         assert_eq!(f.on_heads(&head(5), &head(3)), fetch(3));
@@ -200,63 +239,111 @@ mod tests {
     }
 
     /// R9.3's 64-entry carriage: after a carriage that moved the head, the
-    /// host fetches again while behind the named head; one that moved
-    /// nothing waits for the next `heads`.
+    /// host fetches again at once while behind the named head (real
+    /// entries bound it: a list holds at most 1,024).
     #[test]
     fn fetch_again_while_behind_the_announced_head() {
         let mut f = DeviceListFetch::default();
-        assert_eq!(f.on_heads(&head(80), &head(3)), fetch(3));
-        assert!(matches!(f.on_result(result(80)), FetchApply::Carry(_)));
+        f.tick(1_000, Some(&head(3)));
+        assert_eq!(f.on_heads(&head(200), &head(3)), fetch(3));
+        assert!(matches!(f.on_result(result(200)), FetchApply::Carry(_)));
         assert_eq!(f.carried(&head(3), &head(67)), fetch(67));
-        assert!(matches!(f.on_result(result(80)), FetchApply::Carry(_)));
-        assert_eq!(f.carried(&head(67), &head(80)), None, "caught up");
-
-        // A carriage that moved nothing (a deferred or conflicting entry).
-        assert_eq!(f.on_heads(&head(90), &head(80)), fetch(80));
-        assert!(matches!(f.on_result(result(90)), FetchApply::Carry(_)));
-        assert_eq!(f.carried(&head(80), &head(80)), None);
-        assert_eq!(
-            f.on_heads(&head(90), &head(80)),
-            fetch(80),
-            "at the next heads"
-        );
+        assert!(matches!(f.on_result(result(200)), FetchApply::Carry(_)));
+        assert_eq!(f.carried(&head(67), &head(131)), fetch(131), "not paced");
+        assert!(matches!(f.on_result(result(200)), FetchApply::Carry(_)));
+        assert_eq!(f.carried(&head(131), &head(200)), None, "caught up");
     }
 
-    /// Decision 20: a refusal advances nothing and ends what was in flight;
-    /// a `heads` within 30 s fetches nothing, one 30 s later does; a new
-    /// link generation (a new fetch) has no backoff.
+    /// I1: the fetches a `heads` starts are paced on the host's clock: at
+    /// most one a second, and none within 30 s of a result whose carriage
+    /// moved nothing (a deferred, conflicting or junk carriage), so a
+    /// Station can't make the host write a carriage per message.
+    #[test]
+    fn fetches_a_heads_starts_are_paced() {
+        let mut f = DeviceListFetch::default();
+        f.tick(10_000, Some(&head(3)));
+        assert_eq!(f.on_heads(&head(9), &head(3)), fetch(3));
+        assert!(matches!(f.on_result(result(9)), FetchApply::Carry(_)));
+        assert_eq!(f.carried(&head(3), &head(5)), fetch(5), "not paced");
+        assert!(matches!(f.on_result(result(9)), FetchApply::Carry(_)));
+        assert_eq!(f.carried(&head(5), &head(9)), None, "caught up");
+        // A heads within a second of the last a heads started: nothing.
+        f.tick(10_999, Some(&head(9)));
+        assert_eq!(f.on_heads(&head(12), &head(9)), None);
+        f.tick(11_000, Some(&head(9)));
+        assert_eq!(f.on_heads(&head(12), &head(9)), fetch(9));
+        // Its carriage moved nothing: no fetch at a heads for 30 s.
+        assert!(matches!(f.on_result(result(12)), FetchApply::Carry(_)));
+        assert_eq!(f.carried(&head(9), &head(9)), None);
+        f.tick(11_000 + STALL_PAUSE_MS - 1, Some(&head(9)));
+        assert_eq!(f.on_heads(&head(12), &head(9)), None);
+        f.tick(11_000 + STALL_PAUSE_MS, Some(&head(9)));
+        assert_eq!(f.on_heads(&head(12), &head(9)), fetch(9));
+    }
+
+    /// I1: many `heads` and junk results in one pass (the host's clock
+    /// still): at most one carriage.
+    #[test]
+    fn heads_and_junk_results_in_one_pass_carry_at_most_once() {
+        let mut f = DeviceListFetch::default();
+        f.tick(10_000, Some(&head(3)));
+        let mut carriages = 0;
+        for _ in 0..32 {
+            f.on_heads(&head(9), &head(3));
+            if let FetchApply::Carry(_) = f.on_result(result(9)) {
+                carriages += 1;
+                f.carried(&head(3), &head(3));
+            }
+        }
+        assert_eq!(carriages, 1);
+    }
+
+    /// Decision 20: a refusal advances nothing and ends the host's own
+    /// wait (never taken as an answer); a `heads` within 30 s fetches
+    /// nothing, one 30 s later does; a new link generation (a new fetch)
+    /// has no backoff.
     #[test]
     fn fetch_refused_advances_nothing_and_retries() {
         let mut f = DeviceListFetch::default();
-        f.tick(10_000);
+        f.tick(10_000, Some(&head(3)));
         assert_eq!(f.on_heads(&head(5), &head(3)), fetch(3));
         f.on_refused();
         assert_eq!(f.on_result(result(5)), FetchApply::Unasked, "nothing waits");
-        f.tick(10_000 + REFUSAL_BACKOFF_MS - 1);
+        f.tick(10_000 + REFUSAL_BACKOFF_MS - 1, Some(&head(3)));
         assert_eq!(f.on_heads(&head(5), &head(3)), None);
         assert_eq!(f.dump()["backoff"], true);
-        f.tick(10_000 + REFUSAL_BACKOFF_MS);
+        f.tick(10_000 + REFUSAL_BACKOFF_MS, Some(&head(3)));
         assert_eq!(f.on_heads(&head(5), &head(3)), fetch(3));
         assert_eq!(f.dump()["backoff"], false);
 
         f.on_refused();
         let mut next_link = DeviceListFetch::default();
-        next_link.tick(10_000 + REFUSAL_BACKOFF_MS);
+        next_link.tick(10_000 + REFUSAL_BACKOFF_MS, Some(&head(3)));
         assert_eq!(next_link.on_heads(&head(5), &head(3)), fetch(3));
     }
 
     /// Decision 21's drop, or a lost answer: the fetch is sent again after
-    /// 30 s; one that couldn't be handed to the link isn't in flight.
+    /// 30 s, from the list's head then; not once another carrier brought
+    /// the list to the named head; one that couldn't be handed to the link
+    /// isn't in flight.
     #[test]
     fn an_unanswered_fetch_is_sent_again() {
         let mut f = DeviceListFetch::default();
-        f.tick(1_000);
+        f.tick(1_000, Some(&head(3)));
         assert_eq!(f.on_heads(&head(5), &head(3)), fetch(3));
-        assert_eq!(f.tick(1_000 + FETCH_TIMEOUT_MS - 1), None);
-        assert_eq!(f.tick(1_000 + FETCH_TIMEOUT_MS), fetch(3));
-        assert_eq!(f.tick(1_000 + FETCH_TIMEOUT_MS + 1), None);
+        assert_eq!(f.tick(1_000 + FETCH_TIMEOUT_MS - 1, Some(&head(3))), None);
+        assert_eq!(f.tick(1_000 + FETCH_TIMEOUT_MS, Some(&head(3))), fetch(3));
+        assert_eq!(f.tick(1_000 + FETCH_TIMEOUT_MS + 1, Some(&head(3))), None);
+        // A phone's carriage moved the list meanwhile: from its head.
+        assert_eq!(
+            f.tick(1_000 + 2 * FETCH_TIMEOUT_MS, Some(&head(4))),
+            fetch(4)
+        );
+        // And to the named head: nothing more to fetch, nothing in flight.
+        assert_eq!(f.tick(1_000 + 3 * FETCH_TIMEOUT_MS, Some(&head(5))), None);
+        assert_eq!(f.dump()["in_flight"], Value::Null);
+        assert_eq!(f.on_heads(&head(6), &head(5)), fetch(5));
         f.unsent();
         assert_eq!(f.dump()["in_flight"], Value::Null);
-        assert_eq!(f.on_heads(&head(5), &head(3)), fetch(3));
     }
 }

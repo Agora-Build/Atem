@@ -639,6 +639,7 @@ impl App {
             match message {
                 AstationMessage::Channel(text) => self.channel_envelope(text),
                 AstationMessage::Relay(text) => self.relay_message(text),
+                AstationMessage::RelayTooLarge(bytes) => self.relay_dropped(bytes),
                 AstationMessage::ChannelTooLarge(handle) => self.channel_refused(
                     handle,
                     crate::session_protocol::r9::envelope::reason::TOO_LARGE,
@@ -748,6 +749,9 @@ impl App {
             }
             AstationMessage::Relay(text) => {
                 self.relay_message(text);
+            }
+            AstationMessage::RelayTooLarge(bytes) => {
+                self.relay_dropped(bytes);
             }
             AstationMessage::ChannelTooLarge(handle) => {
                 self.channel_refused(handle, crate::session_protocol::r9::envelope::reason::TOO_LARGE);

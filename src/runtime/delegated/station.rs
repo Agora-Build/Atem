@@ -133,7 +133,7 @@ impl Station {
                     origin: origin(),
                 });
                 self.fetch = DeviceListFetch::default();
-                self.fetch.tick(self.now);
+                self.fetch.tick(self.now, None);
             }
         }
     }
@@ -144,10 +144,11 @@ impl Station {
         self.link.as_ref()
     }
 
-    /// The pass's monotonic time: a call due again.
-    pub fn tick(&mut self, now_mono: u64) -> Option<MembershipFetch> {
+    /// The pass's monotonic time and the device list's head (`None`: no
+    /// list): a call due again.
+    pub fn tick(&mut self, now_mono: u64, applied: Option<Head>) -> Option<MembershipFetch> {
         self.now = now_mono;
-        self.fetch.tick(now_mono)
+        self.fetch.tick(now_mono, applied.as_ref())
     }
 
     /// A Station's message on the link (`bytes` as received); `applied`:
@@ -325,7 +326,7 @@ mod tests {
     fn refusals_are_counted_per_kind() {
         let mut s = Station::new();
         up(&mut s, 1);
-        s.tick(1_000);
+        s.tick(1_000, Some(head(3)));
         s.receive(&heads(5), Some(head(3)));
         for call in [
             RefusedCall::ControlSync,
@@ -343,9 +344,34 @@ mod tests {
         assert_eq!(dump["fetch"]["backoff"], true);
         // Logged once per kind within the hour, again after it.
         assert_eq!(s.logged, [Some(1_000); 3]);
-        s.tick(1_000 + REFUSAL_LOG_EVERY_MS);
+        s.tick(1_000 + REFUSAL_LOG_EVERY_MS, Some(head(3)));
         s.receive(&refused(RefusedCall::ControlAck), None);
         assert_eq!(s.logged[2], Some(1_000 + REFUSAL_LOG_EVERY_MS));
         assert_eq!(s.logged[0], Some(1_000));
+    }
+
+    /// I1: a Station that sends `heads` and junk results, many in one pass
+    /// (the host's clock still), gets at most one carriage applied.
+    #[test]
+    fn heads_and_junk_results_in_one_pass_carry_at_most_once() {
+        let mut s = Station::new();
+        up(&mut s, 1);
+        s.tick(5_000, Some(head(3)));
+        let junk = MembershipFetchResult {
+            head: head(9),
+            entries: Vec::new(),
+        }
+        .to_json()
+        .unwrap()
+        .to_string();
+        let mut carriages = 0;
+        for _ in 0..32 {
+            s.receive(&heads(9), Some(head(3)));
+            if let Inbound::Carry(_) = s.receive(&junk, Some(head(3))) {
+                carriages += 1;
+                s.fetch.carried(&head(3), &head(3));
+            }
+        }
+        assert_eq!(carriages, 1);
     }
 }

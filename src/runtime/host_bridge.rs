@@ -709,6 +709,9 @@ pub struct HostBridge {
     /// The host's Station link (its calls and the Station's messages,
     /// host-work-v1 §11.4): only with `host.delegated` (Decision 11).
     station: Option<Station>,
+    /// Fetch results not carried because an entry didn't read back (never
+    /// expected: they came from the strict reader).
+    unconverted_fetches: u64,
     /// The profile's pairing files (the device list is reopened from them).
     pairing: Option<crate::paths::PairingPaths>,
     /// The pinned host's `host_channel_key`; r9 can't serve without it.
@@ -933,6 +936,7 @@ impl HostBridge {
             r9_link: None,
             r9_socket: 0,
             station: None,
+            unconverted_fetches: 0,
             pairing,
             host_key,
             host_pub,
@@ -1511,8 +1515,11 @@ impl HostBridge {
         let Some(station) = self.station.as_mut() else {
             return;
         };
-        let mut calls: Vec<atem_client::control::MembershipFetch> =
-            station.tick(host_now().mono_ms).into_iter().collect();
+        let applied = self.membership.as_ref().map(MembershipHost::head);
+        let mut calls: Vec<atem_client::control::MembershipFetch> = station
+            .tick(host_now().mono_ms, applied)
+            .into_iter()
+            .collect();
         for text in messages {
             let applied = self.membership.as_ref().map(MembershipHost::head);
             let Some(station) = self.station.as_mut() else {
@@ -1522,15 +1529,28 @@ impl HostBridge {
                 StationInbound::Nothing => {}
                 StationInbound::Send(call) => calls.push(call),
                 StationInbound::Carry(entries) => {
-                    let carried: Vec<StrictValue> = entries
+                    // Every entry or none: a carriage is never shortened.
+                    let carried: Result<Vec<StrictValue>, _> = entries
                         .iter()
-                        .filter_map(|e| {
-                            StrictValue::parse(e.to_json().to_string().as_bytes(), usize::MAX).ok()
-                        })
+                        .map(|e| StrictValue::parse(e.to_json().to_string().as_bytes(), usize::MAX))
                         .collect();
-                    if let Some(result) = self.carry(&carried, cx) {
-                        let effects = self.r9_call(|r9, parts| r9.carried(&result, None, parts));
-                        self.r9_exec(effects, cx);
+                    match carried {
+                        Ok(carried) => {
+                            if let Some(result) = self.carry(&carried, cx) {
+                                let effects =
+                                    self.r9_call(|r9, parts| r9.carried(&result, None, parts));
+                                self.r9_exec(effects, cx);
+                            }
+                        }
+                        Err(_) => {
+                            self.unconverted_fetches += 1;
+                            if self.unconverted_fetches.is_power_of_two() {
+                                eprintln!(
+                                    "atem runtime: {} device-list fetch result(s) not carried (an entry didn't read back)",
+                                    self.unconverted_fetches
+                                );
+                            }
+                        }
                     }
                     let after = self.membership.as_ref().map(MembershipHost::head);
                     if let (Some(before), Some(after), Some(station)) =

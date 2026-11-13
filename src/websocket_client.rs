@@ -225,6 +225,11 @@ pub enum AstationMessage {
     /// as its raw JSON text, for the runtime's r9 push.
     #[serde(skip)]
     Relay(String),
+    /// A relay message over 256 KiB (§R9.9, host-work-v1 §11.4): told by
+    /// its `type` alone and dropped by the reader, only its size passed on
+    /// (counted), never its text.
+    #[serde(skip)]
+    RelayTooLarge(usize),
 
     /// The relay verified this link's host route proof (§R9.7b,
     /// `host_route_ok`, checked by the link's reader: this host, a head it
@@ -1300,6 +1305,11 @@ impl AstationClient {
                             }
                             // §R9.7b: the relay's reply to this link's proof,
                             // checked here (never passed on raw).
+                            // §R9.9, host-work-v1 §11.4: over 256 KiB, the
+                            // `type` peek is all that read it.
+                            None if is_relay_message(&text) && text.len() > crate::app::hosted::RELAY_MESSAGE_BYTES => {
+                                Some(AstationMessage::RelayTooLarge(text.len()))
+                            }
                             None if is_relay_message(&text) => match route.as_mut().map(|route| (route.on_reply(&text), atem_client::host_route::RelayReply::parse(text.as_bytes()).is_some())) {
                                 Some((Some(crate::session_protocol::r9::route::RouteResult::Routed { .. }), _)) => Some(AstationMessage::HostRouted),
                                 Some((Some(crate::session_protocol::r9::route::RouteResult::Refused(code)), _)) => Some(AstationMessage::HostRouteRefused(code)),
@@ -3049,6 +3059,46 @@ mod tests {
         assert!(matches!(&got[1], AstationMessage::SessionOversize { id: None, family } if family == "session"), "{got:?}");
         assert!(matches!(&got[2], AstationMessage::Channel(t) if t.contains("\"h2\"")), "{got:?}");
         assert_eq!(got.len(), 3, "nothing else was delivered: {got:?}");
+        server.abort();
+    }
+
+    /// §R9.9, host-work-v1 §11.4: a relay message over 256 KiB is told by
+    /// its `type` alone and dropped there, its size passed on for the
+    /// count, never its text (no route reply check, no Station reader); one
+    /// at the bound is passed on whole.
+    #[tokio::test]
+    async fn a_relay_message_over_256_kib_is_dropped_after_its_type_peek() {
+        use crate::app::hosted::RELAY_MESSAGE_BYTES;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // The builders' key order: `type` last, after the entries.
+        let relay = |total: usize| {
+            let head = r#"{"entries":[""#;
+            let tail = r#""],"op":"membership_fetch_result","type":"relay"}"#;
+            format!("{head}{}{tail}", "A".repeat(total - head.len() - tail.len()))
+        };
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async_with_config(socket, Some(super::link_ws_config())).await.unwrap();
+            socket.send(Message::Text(relay(RELAY_MESSAGE_BYTES + 1))).await.unwrap();
+            socket.send(Message::Text(relay(RELAY_MESSAGE_BYTES))).await.unwrap();
+            socket.send(Message::Text(r#"{"type":"channel","event":"open","channel":"h2","transport":"relay"}"#.into())).await.unwrap();
+            let _ = socket.next().await;
+        });
+        let mut client = AstationClient::new();
+        client.connect_raw(&format!("ws://{address}")).await.unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(WAIT, async {
+            while got.len() < 3 {
+                match client.recv_message() {
+                    Some(message) => got.push(message),
+                    None => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        }).await.expect("three messages");
+        assert!(matches!(&got[0], AstationMessage::RelayTooLarge(n) if *n == RELAY_MESSAGE_BYTES + 1), "{got:?}");
+        assert!(matches!(&got[1], AstationMessage::Relay(t) if t.len() == RELAY_MESSAGE_BYTES), "{:?}", got[1..].iter().map(|m| format!("{m:?}").len()).collect::<Vec<_>>());
+        assert!(matches!(&got[2], AstationMessage::Channel(t) if t.contains("\"h2\"")), "{got:?}");
         server.abort();
     }
 

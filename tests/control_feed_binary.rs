@@ -363,6 +363,8 @@ fn fetch_refused_advances_nothing_and_retries() {
     rig.log.add_native("dev-laptop", &["view"]);
     rig.station.set_log(&rig.log);
     rig.station.refuse(RefusedCall::MembershipFetch, true);
+    // The fetches a heads starts: at most one a second (I1).
+    rig.clock.add_mono(1_000);
     rig.station.heads_now();
     assert_eq!(rig.station.next_call(link), Ok(fetch(4)));
     rig.until_station("the second refusal", |s| {
@@ -465,6 +467,8 @@ fn a_fetch_result_over_256_kib_is_dropped_unread() {
     let station = rig.dump()["station"].clone();
     assert_eq!(station["fetch"]["in_flight"], 3, "still waiting: {station}");
     assert_eq!(station["fetch"]["results"], 0);
+    // Never read by the Station link: its reader would count it unread.
+    assert_eq!(station["unread"], 0, "{station}");
     assert_eq!(rig.head(), 3, "nothing applied");
 
     // The Station answers within the bound: applied, then the rest.
