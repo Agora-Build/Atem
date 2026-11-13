@@ -52,6 +52,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// delegated tasks keep (§11.6 adds none for it).
 pub const EXPIRED_BEFORE_SUBMISSION: &str = "expired before submission";
 
+/// A task that waits for its (next) attempt: host-work v1's text (§4).
+pub const WAITING_FOR_A_READY_AGENT: &str = "waiting for a ready agent";
+
 /// What stops a delegated task from starting now (design I.3.3, I.4.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {

@@ -219,9 +219,13 @@ pub(super) struct State {
     /// were last applied again at (`feeds_reverify`): none since the feeds
     /// loaded, so once at start.
     reverified: Option<(u64, atem_client::encoding::Hash32)>,
-    /// Pending control records a re-verification applied, kept for Task 35
+    /// Pending control records a re-verification applied, their effects
+    /// written with them, kept for Task 36's acknowledgments
     /// (`keep_reapplied`).
     reapplied: Vec<crate::runtime::delegated::feeds::Reapplied>,
+    /// What control records' effects asked of the bridge once their
+    /// transaction committed, not carried out yet (`effects_pass`).
+    followups: Vec<crate::runtime::delegated::effects::Followup>,
     /// The run's control-alert tally the feed stores count into (it
     /// outlives a store loaded again: ruling T33c, N3).
     alert_tally: crate::runtime::delegated::feeds::AlertTally,
@@ -282,6 +286,7 @@ impl State {
             feeds: crate::runtime::delegated::feeds::Feeds::Unloaded,
             reverified: None,
             reapplied: Vec::new(),
+            followups: Vec::new(),
             alert_tally: Default::default(),
             intents: Default::default(),
             #[cfg(debug_assertions)]
@@ -946,6 +951,9 @@ impl HostBridge {
                 );
             }
             self.work_fence_launches();
+            // A stop always wins: what control records' effects asked once
+            // they committed is carried out while paused too.
+            self.effects_pass(cx);
             if Instant::now() >= self.work.scheduled {
                 self.work.scheduled = Instant::now() + Duration::from_millis(100);
                 self.pause_local_tasks();
@@ -1026,6 +1034,9 @@ impl HostBridge {
             }
             self.work.recovered = true;
         }
+        // What control records' effects asked once they committed (design
+        // I.5.5), the store recovered.
+        self.effects_pass(cx);
         self.feeds_tick();
         for request in self.r9.take_host_work() {
             let reply = self.work_request(&request.attachment, &request.request, cx);
@@ -1121,8 +1132,13 @@ impl HostBridge {
         self.work.context_jobs.clear();
         self.work.recovered = false;
         // The next store's own, loaded before its recovery; nothing of this
-        // identity's shows meanwhile.
+        // identity's shows meanwhile. What its records applied, and asked of
+        // the bridge after, goes with it (Task 33 re-review N4): the new
+        // store's tasks are none of theirs.
         self.work.feeds = Feeds::Unloaded;
+        self.work.reapplied.clear();
+        self.work.followups.clear();
+        self.r9.set_revoked_services(HashSet::new());
         if !self.controls_stood_in() {
             self.start_view().standings.clear();
         }
@@ -1264,6 +1280,10 @@ impl HostBridge {
         cx: &mut Cx,
     ) -> Result<ResultBody, HostWorkError> {
         use hw::Request;
+        // A service whose control standing decides: `busy` while it can't
+        // be read, `forbidden` once revoked, whatever it asks (design I.5.5
+        // step 2, ruling T32b).
+        self.service_refused(&a)?;
         let principal = a.name();
         let wall = host_now().wall_ms;
         if let Request::AttachmentPut {
@@ -2610,6 +2630,7 @@ mod local_tests {
         include!("delegated/intents_tests.rs");
         include!("delegated/work_interrupt_tests.rs");
         include!("delegated/launch_tests.rs");
+        include!("delegated/effects_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};

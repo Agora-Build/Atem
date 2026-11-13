@@ -1649,6 +1649,9 @@ impl HostBridge {
         // The device list may have moved (a carriage): pending control
         // records are applied again.
         self.feeds_reverify();
+        // What the records' effects asked once they committed (design
+        // I.5.5): withdrawals, fences, intents.
+        self.effects_pass(cx);
         let Some(station) = self.station.as_mut() else {
             return;
         };

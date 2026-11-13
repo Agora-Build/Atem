@@ -1240,10 +1240,12 @@ So a host stores no `list_frozen` record; the reason stays the reference
 state's for a caller that keeps one. One feed per origin is kept: a reset's
 new feed replaces the old one's cursor. A stored control state that
 doesn't read stops every delegated task (`revocations not yet checked`),
-and a service sender is answered `busy` until it reads (its admission, its
-own tasks' queries and completion; the owner still reads): never as
-uncovered, which a revoke or hold wouldn't stop. (**Atem's reading**,
-step 4, Task 32 re-review N2.) Likewise a delegated sender's request about
+and a service sender is answered `busy` until it reads (every request it
+makes: its admission, its own tasks' queries and completion, a notice-only
+`message_publish`, `attachment_put`, `host_profiles`, `host_launch` and
+its query; the owner still reads): never as uncovered, which a revoke or
+hold wouldn't stop. (**Atem's reading**, step 4, Task 32 re-review N2;
+every request, PR 11.) Likewise a delegated sender's request about
 its own task (`work_query`, `reply_query`, `work_cancel`, `work_complete`,
 and `message_query` or a `message_publish` retry of its message) is `busy`
 while its current grant's `projects` comparison can't be made yet (a
@@ -1254,6 +1256,44 @@ answer as one: `forbidden` when any of them refuses, else `busy` when any
 can't be decided yet. A grant entry under a kid the host never hashes
 (one the cred agent no longer retains) keeps that `busy`, where v1 answers
 `forbidden`; such a grant can't be honoured either way.
+
+**The effects on tasks, as built in step 4 (Atem's reading, for
+Astation).** A record's effects are written in its transaction with the
+touched parts and the cursor (design I.5.5), a pending record's when it
+applies again; what needs the session host comes after that commit.
+- **`revoke`.** Every unstarted task of the service (`queued`, `blocked`,
+  held ones included) is `cancelled`, `sender revoked`. A task whose
+  attempt is live isn't settled in the record's transaction: the attempt is
+  withdrawn after the commit and the task settles from that withdrawal
+  (`cancelled` when it never ran, running when it reached `executing`), so
+  it never shows `cancelled` while its turn runs. Tasks awaiting their
+  result and of unknown outcome are kept as they are (design I.3.3: the
+  owner can query them, interrupt their turn and resolve an unknown one;
+  nobody completes them, so one awaiting its result expires at its
+  deadline). From the commit on, the host refuses every request of the
+  service, `forbidden` whatever it asks (`busy` instead while the control
+  state doesn't read), and session-v1's §H fence runs where it has
+  attachments: its `control_gen` is raised and each attachment closed after
+  `unauthorized`, `revoked`; its later `hello`s are refused the same way
+  (session-v1 R9.11). A v1 task the service had (admitted before its cover)
+  follows v1's rules, which the fence ends (`sender's authority changed`).
+- **The interrupt** (`interrupt_running: true` on the revoke, or a later
+  `interrupt_running` record) writes an intent (reason `revoke`) for each
+  task whose turn may run: one in its turn, or whose attempt is live (one
+  still `accepted` is withdrawn by it, and its task cancelled). A task
+  awaiting its result or of unknown outcome gets none: its turn ended, or
+  none can be tied to it (§11.6, "The deadline interrupt"). A turn the
+  revoke's interrupt ended reads `turn interrupted`, never `interrupted at
+  deadline`, whatever other intents its attempt has.
+- **`hold`** puts unstarted tasks in `blocked`, `paused`; a live attempt is
+  withdrawn after the commit (not counted), its task paused from it. A hold
+  lifted before that withdrawal asks nothing.
+- **`release`** puts the paused tasks back in `queued`; they get an attempt
+  through the start check before their deadline.
+- **`cover`** changes no task: the service's later tasks are delegated.
+- **While hosting is paused** the records still apply with their effects,
+  and the withdrawals and intents they ask for are carried out (a stop
+  always wins); before the start's recovery they wait for it.
 
 **Resets** (**Atem's proposal, agreed with Astation (2026-11-11, #120
 comment 6810116314) and Auth/Portal (2026-11-12, #147 comment 6813332550)**: design I.5.2's snapshot re-issues "the latest revoke, hold or

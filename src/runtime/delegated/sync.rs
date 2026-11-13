@@ -118,6 +118,7 @@
 //!   changes ([`FeedSync::take_gates`]), so the start check reads it at
 //!   once (Decision 16).
 use super::DelegatedSender;
+use super::effects::{Followup, act};
 use super::feeds::{FeedStore, ListNotServing, NotOwnStation, Reapplied};
 use super::fetch::{HEADS_PACE_MS, REFUSAL_BACKOFF_MS, STALL_PAUSE_MS};
 use super::gate::GateView;
@@ -360,17 +361,22 @@ struct Ask {
     epoch: u64,
 }
 
-/// What a page brought, committed. Its records' effects on tasks are PR
-/// 11's (Task 35: `applied` and `reapplied` carry their actions); the
-/// bridge reads only `next` until then.
+/// What a page brought, committed. Its records' effects on tasks were
+/// written in the page's transaction ([`super::effects::act`]); what they
+/// ask of the bridge after the commit is `followups`.
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub struct Synced {
-    /// The records applied, each with its position, in feed order.
+    /// The records applied, each with its position, in feed order (Task
+    /// 36's acknowledgments read their effects).
+    #[allow(dead_code)]
     pub applied: Vec<(FeedPos, Applied)>,
     /// Pending records applied again in the page's transaction (after a
     /// record whose revocation applied).
+    #[allow(dead_code)]
     pub reapplied: Vec<Reapplied>,
+    /// What the records' effects ask of the bridge now that the page
+    /// committed (withdrawals, fences, intents to carry out), in feed order.
+    pub followups: Vec<Followup>,
     /// The next page, asked at once: the feed is still ahead.
     pub next: Option<ControlSync>,
     /// The page was read to its end (every record past the cursor handled,
@@ -1352,13 +1358,15 @@ impl GateView for FeedSync {
 }
 
 /// A page's records in one transaction, its commit included: applied in
-/// order (a record that doesn't parse kept as evidence), the pending
-/// records re-verified after a record whose revocation applied; stopped at
-/// a record the list can't serve or a position that isn't the host's own
+/// order (a record that doesn't parse kept as evidence), each with its
+/// effects on the tasks (I.5.5, [`act`]), the pending records re-verified
+/// (with theirs) after a record whose revocation applied; stopped at a
+/// record the list can't serve or a position that isn't the host's own
 /// Station's (what applied before commits). Every record is after the
 /// call's `after` ([`FeedSync::on_page`] faults a page that isn't). A page
 /// with no record reads the feed up to its head. A reset's read
-/// (`ask.restart`) replaces the origin's cursor first.
+/// (`ask.restart`) replaces the origin's cursor first. What the effects ask
+/// of the bridge is returned only once the page committed.
 fn apply_page(
     page: &ControlSyncResult,
     ask: &Ask,
@@ -1386,6 +1394,7 @@ fn apply_page(
     let mut reached = if ask.restart { 0 } else { ask.call.after };
     let mut applied = Vec::new();
     let mut reapplied = Vec::new();
+    let mut followups = Vec::new();
     let mut stopped = false;
     for entry in &page.records {
         let Some(at) = pos(feeds, entry.feed_seq) else {
@@ -1401,9 +1410,13 @@ fn apply_page(
                         .actions
                         .iter()
                         .any(|action| matches!(action, HostAction::Revoke(_)));
+                    followups.extend(act(store, &tx, &a.actions)?);
                     applied.push((at, a));
                     if revoked {
-                        reapplied.extend(feeds.reverify_pending(&tx, list, applied_seq)?);
+                        for again in feeds.reverify_pending(&tx, list, applied_seq)? {
+                            followups.extend(act(store, &tx, &again.applied.actions)?);
+                            reapplied.push(again);
+                        }
                     }
                 }
                 Err(e) if e.is::<ListNotServing>() || e.is::<NotOwnStation>() => {
@@ -1436,6 +1449,7 @@ fn apply_page(
     Ok(Synced {
         applied,
         reapplied,
+        followups,
         next: None,
         read: !stopped,
     })

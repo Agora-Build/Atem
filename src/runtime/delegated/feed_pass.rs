@@ -31,6 +31,7 @@
 //! - **Never with the start view locked.** A commit publishes the
 //!   standings, which locks the view: the list is copied out first.
 use super::*;
+use crate::runtime::delegated::effects::{Followup, act};
 use crate::runtime::delegated::feeds::Reapplied;
 use crate::runtime::delegated::station::Call;
 use crate::runtime::delegated::sync::{Clocks, Closed, PageCx};
@@ -191,9 +192,10 @@ impl HostBridge {
     }
 
     /// A page (or a message that was one, refused by the reader): applied
-    /// against the device list as it committed. Its effects on tasks are
-    /// PR 11's (Task 35); here the standings follow at its commit. The next
-    /// page, when it asks one at once.
+    /// against the device list as it committed, its records' effects on
+    /// the tasks in its transaction (`effects::act`); the standings follow
+    /// at its commit, and what the effects ask after it waits for
+    /// `effects_pass`. The next page, when it asks one at once.
     pub(crate) fn feed_page(&mut self, page: Result<ControlSyncResult, RelayError>) -> Vec<Call> {
         // Its `station_time` too (`feed_heads`).
         self.ensure_clock();
@@ -225,7 +227,12 @@ impl HostBridge {
             return Vec::new();
         };
         let mut calls: Vec<Call> = match station.feed.on_page(page, clock, cx) {
-            Ok(synced) => synced.next.map(Call::Sync).into_iter().collect(),
+            Ok(synced) => {
+                // What its records' effects ask now that the page committed
+                // (`effects_pass` carries it out).
+                self.work.followups.extend(synced.followups);
+                synced.next.map(Call::Sync).into_iter().collect()
+            }
             Err(error) => {
                 if station.feed.failed() {
                     eprintln!(
@@ -271,25 +278,32 @@ impl HostBridge {
             return;
         };
         if feeds.pending_len() > 0 {
-            let again = (|| -> anyhow::Result<Vec<Reapplied>> {
+            // Each record applied again with its effects on the tasks, in
+            // the same transaction (I.5.5), what they ask of the bridge
+            // taken only once it committed.
+            let again = (|| -> anyhow::Result<(Vec<Reapplied>, Vec<Followup>)> {
                 let tx = feeds.begin(store)?;
                 let again = feeds.reverify_pending(&tx, &list, APPLIED_SEQ)?;
+                let mut followups = Vec::new();
+                for r in &again {
+                    followups.extend(act(store, &tx, &r.applied.actions)?);
+                }
                 feeds.commit(tx)?;
-                Ok(again)
+                Ok((again, followups))
             })();
-            let Ok(again) = again else {
+            let Ok((again, followups)) = again else {
                 return;
             };
+            self.work.followups.extend(followups);
             self.keep_reapplied(again);
         }
         self.work.reverified = Some(key);
     }
 
-    /// Records a re-verification applied (Task 33 review m4): kept for
-    /// Task 35, which acts on them (their effects and intents, in their
-    /// record's transaction), at most [`KEPT_REAPPLIED`], the oldest dropped
-    /// first. Nothing reads them yet: until then a record that applied here
-    /// changes the standings only (as one a page applies).
+    /// Records a re-verification applied (Task 33 review m4), their
+    /// effects written in their transaction (Task 35): kept for Task 36's
+    /// acknowledgments, at most [`KEPT_REAPPLIED`], the oldest dropped
+    /// first; dropped with the store when a new identity moves it aside.
     fn keep_reapplied(&mut self, again: Vec<Reapplied>) {
         let kept = &mut self.work.reapplied;
         kept.extend(again);
@@ -297,6 +311,179 @@ impl HostBridge {
             let excess = kept.len() - KEPT_REAPPLIED;
             kept.drain(..excess);
         }
+    }
+
+    /// What control records' effects asked of the bridge once their
+    /// transaction committed ([`Followup`], design I.5.5 to I.5.7), carried
+    /// out after the Station's messages and in host-work's pass, hosting
+    /// paused or not (a stop always wins), in their order:
+    /// - **a fence** at once: session-v1's §H fence of the revoked service
+    ///   where it has attachments, each closed after `unauthorized`,
+    ///   `revoked` (`R9Host::fence_revoked`);
+    /// - **a withdrawal and the intents** once the store was recovered
+    ///   (before that, the start's recovery withdraws every attempt still
+    ///   `accepted` and reconciles the rest, and they wait), with no
+    ///   receipt-database fault (then they go: the restart it asks for
+    ///   recovers the store): [`HostBridge::withdraw_for_record`], and the
+    ///   pending intents carried out (`carry_out_intents`, as every
+    ///   scheduling pass does).
+    ///
+    /// A store write that fails is a receipt-database fault (`work_fail`).
+    /// Before them, the r9 engine's revoked services follow the committed
+    /// standings ([`HostBridge::sync_revoked`]).
+    pub(in crate::runtime::host_bridge) fn effects_pass(&mut self, cx: &mut Cx) {
+        self.sync_revoked(cx);
+        if self.work.followups.is_empty() {
+            return;
+        }
+        let followups = std::mem::take(&mut self.work.followups);
+        let mut later = Vec::new();
+        let mut intents = false;
+        for followup in followups {
+            match followup {
+                Followup::Fence { principal } => {
+                    let effects = self.r9_call(|r9, parts| r9.fence_revoked(&principal, parts));
+                    self.r9_exec(effects, cx);
+                }
+                _ if self.work.error || self.work.store.is_none() => {}
+                f if !self.work.recovered => later.push(f),
+                Followup::Withdraw {
+                    task_id,
+                    attempt_id,
+                    then,
+                } => {
+                    if self
+                        .withdraw_for_record(&task_id, &attempt_id, then, cx)
+                        .is_err()
+                    {
+                        self.work_fail();
+                        return;
+                    }
+                }
+                Followup::Intents { .. } => intents = true,
+            }
+        }
+        self.work.followups = later;
+        if intents && self.carry_out_intents(cx).is_err() {
+            self.work_fail();
+        }
+    }
+
+    /// The r9 engine's revoked services (their `hello`s refused, design
+    /// I.5.5 step 2) as the committed standings have them, with the control
+    /// feeds loaded (damaged or not loaded yet, the last ones stay: a
+    /// revoke is final; a new host identity clears them with its store). A
+    /// service revoked whose channel is live already (admitted before the
+    /// feeds loaded at a start) is fenced at once.
+    fn sync_revoked(&mut self, cx: &mut Cx) {
+        if !matches!(self.work.feeds, Feeds::Loaded(_)) || self.controls_stood_in() {
+            return;
+        }
+        let revoked: HashSet<String> = self
+            .start_view()
+            .standings
+            .iter()
+            .filter(|(_, standing)| standing.revoked.is_some())
+            .map(|(principal, _)| principal.clone())
+            .collect();
+        if &revoked == self.r9.revoked_services() {
+            return;
+        }
+        let live: std::collections::BTreeSet<String> = self
+            .r9
+            .attachments()
+            .into_iter()
+            .map(|(_, principal)| principal)
+            .filter(|principal| revoked.contains(principal))
+            .collect();
+        self.r9.set_revoked_services(revoked);
+        for principal in live {
+            let effects = self.r9_call(|r9, parts| r9.fence_revoked(&principal, parts));
+            self.r9_exec(effects, cx);
+        }
+    }
+
+    /// [`Followup::Withdraw`] (design I.5.5, I.5.6): task `task_id`'s live
+    /// attempt `attempt_id` is withdrawn in the session host, and the task
+    /// settles from the withdrawal with the attempt's end, in one `BEGIN
+    /// IMMEDIATE` transaction (`end_attempt`): `then`'s state
+    /// (`Event::outcome`) when it never ran, a hold's withdrawal not
+    /// counted. Left to its receipt when it started (it runs: never
+    /// `cancelled` while its turn runs) or when the withdrawal can't be
+    /// recorded (the journal halted: nothing starts until the restart,
+    /// which withdraws it). A hold lifted since asks nothing (the attempt
+    /// goes on). An attempt no longer live (ended by the scheduling pass, a
+    /// cancel or an earlier followup) leaves the task as it is, but for a
+    /// revoke, which cancels it if it waits.
+    fn withdraw_for_record(
+        &mut self,
+        task_id: &str,
+        attempt_id: &str,
+        then: crate::runtime::delegated::start::Event,
+        cx: &mut Cx,
+    ) -> anyhow::Result<()> {
+        use crate::runtime::delegated::attempts::{AttemptEnd, SessionAnswer, attempt_end};
+        use crate::runtime::delegated::start::Event;
+        use crate::session_protocol::host::{Immutable, Provenance, Withdrawal};
+        let store = self.work.store.as_ref().unwrap();
+        let Some(mut r) = store.work(task_id)? else {
+            return Ok(());
+        };
+        let next = then.outcome();
+        let held = then == Event::Held;
+        if held
+            && !self
+                .start_view()
+                .standings
+                .get(&r.principal)
+                .is_some_and(|s| s.held)
+        {
+            return Ok(());
+        }
+        let Some(attempt) = store
+            .live_attempt(task_id)?
+            .filter(|a| a.attempt_id == attempt_id)
+        else {
+            if next.0.terminal() && matches!(r.status.state, WorkState::Queued | WorkState::Blocked)
+            {
+                self.settle_task(&mut r, next.0, next.1)?;
+            }
+            return Ok(());
+        };
+        let end = match self.host.attempt_receipt(attempt_id, task_id) {
+            // Absent from the journal: never admitted (I.6.3).
+            None => AttemptEnd::NotAdmitted,
+            Some(rc) => {
+                match attempt_end(SessionAnswer::Receipt(rc.state, rc.detail.as_deref()), held) {
+                    Some(AttemptEnd::Started) => return Ok(()),
+                    Some(end) => end,
+                    // `accepted`: withdrawn in the session host, which finds it
+                    // by its id (these values go nowhere).
+                    None => {
+                        if self.host.journal_halted() {
+                            return Ok(());
+                        }
+                        let immutable = Immutable {
+                            target: r.task.target.clone(),
+                            payload_digest: String::new(),
+                            provenance: Provenance {
+                                task_id: task_id.to_string(),
+                                sender: r.principal.clone(),
+                            },
+                        };
+                        let withdrawal = self.host.withdraw(attempt_id, &immutable);
+                        let effects = self.host.take_effects();
+                        self.exec(effects, cx);
+                        match withdrawal {
+                            Withdrawal::Started | Withdrawal::Halted => return Ok(()),
+                            w => attempt_end(SessionAnswer::Withdrawal(w), held)
+                                .unwrap_or(AttemptEnd::Withdrawn { counted: !held }),
+                        }
+                    }
+                }
+            }
+        };
+        self.end_attempt(&mut r, &attempt, end, next)
     }
 
     /// The gate's feed part into the start view when it changed, and the

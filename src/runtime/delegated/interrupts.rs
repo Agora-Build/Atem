@@ -265,7 +265,7 @@ impl HostBridge {
                 if let Some(sid) = self.intent_session(intent)
                     && self.host_interrupt(&sid, attempt, cx) == Interrupted::Written
                 {
-                    runs.written(attempt, &turn);
+                    runs.written(attempt, &turn, intent.id);
                 }
             }
             Decision::RevokeOnly => {

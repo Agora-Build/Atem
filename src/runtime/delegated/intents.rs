@@ -5,10 +5,13 @@
 //!
 //! - **Made by** a task's deadline (a delegated turn still running at it,
 //!   or an attempt still waiting `accepted`: [`IntentReason::Deadline`]),
-//!   and, once the feeds exist (PR 10), a `revoke` with `interrupt_running`
-//!   ([`IntentReason::Revoke`]). Written in a `BEGIN IMMEDIATE`
-//!   transaction (`Store::immediate`) and committed before it is carried
-//!   out; one per attempt and reason (and revocation).
+//!   and a `revoke` with `interrupt_running` or a later `interrupt_running`
+//!   record ([`IntentReason::Revoke`], written by the record's effects in
+//!   its own transaction, `effects::act`). Written in a `BEGIN IMMEDIATE`
+//!   transaction (`Store::immediate`, or the feed store's `FeedTx`) and
+//!   committed before it is carried out; one per attempt and reason (and
+//!   revocation). Only the intent that decided an interrupt records the
+//!   turn it reached (`intent_delivered`).
 //! - **Carried out each pass until done** ([`intents_pass`]: decisions only,
 //!   which the bridge carries out through its own entries, so the chat's
 //!   half of the turn check is never skipped; Task 15's ruling T15c):
@@ -281,13 +284,17 @@ impl Store {
         )?)
     }
 
-    /// The pending intents of `attempt_id` got their own interrupt in
-    /// `turn`.
-    pub fn intent_delivered(&self, attempt_id: &str, turn: &str) -> Result<()> {
+    /// The pending intent `id` got its own interrupt in `turn`. Only the
+    /// intent whose Esc was written records it (the first pending intent of
+    /// its attempt decides the interrupt, [`intents_pass`]): a turn a
+    /// revoke's Esc ended isn't read as the deadline's (`interrupted at
+    /// deadline`), whichever other intents its attempt has (Task 35's
+    /// ledger carry).
+    pub fn intent_delivered(&self, id: i64, turn: &str) -> Result<()> {
         self.db.execute(
             "UPDATE intents SET delivered_turn=?2, delivered_by=NULL
-            WHERE attempt_id=?1 AND done_ms IS NULL",
-            params![attempt_id, turn],
+            WHERE rowid=?1 AND done_ms IS NULL",
+            params![id, turn],
         )?;
         Ok(())
     }
@@ -393,9 +400,9 @@ pub struct Runs {
 /// Who wrote an attempt's interrupt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Writer {
-    /// A pending intent of it: the delivery is the intent's own
-    /// (`delivered_turn`).
-    Intent,
+    /// Its pending intent `id` (the one that decided the interrupt): the
+    /// delivery is that intent's own (`delivered_turn`).
+    Intent { id: i64 },
     /// `work_interrupt` for task `task_id`: kept whatever intents exist,
     /// until the attempt no longer executes ([`Runs::prune`]); stored on a
     /// pending intent as the request's delivery.
@@ -420,14 +427,15 @@ struct Delivered {
 }
 
 impl Runs {
-    /// The bridge wrote the interrupt for `attempt_id`'s turn `turn`: its
-    /// report comes in a later pass.
-    pub fn written(&mut self, attempt_id: &str, turn: &str) {
+    /// The bridge wrote the interrupt for `attempt_id`'s turn `turn`, its
+    /// pending intent `intent` deciding it: its report comes in a later
+    /// pass.
+    pub fn written(&mut self, attempt_id: &str, turn: &str, intent: i64) {
         self.writing.insert(
             attempt_id.to_string(),
             Writing {
                 turn: turn.to_string(),
-                by: Writer::Intent,
+                by: Writer::Intent { id: intent },
             },
         );
     }
@@ -464,7 +472,7 @@ impl Runs {
     /// An intent's record goes when the intent is done ([`Runs::forget`]).
     pub fn prune(&mut self, executing: &mut dyn FnMut(&str, &str) -> bool) {
         self.delivered.retain(|attempt, d| match &d.by {
-            Writer::Intent => true,
+            Writer::Intent { .. } => true,
             Writer::Request { task_id } => executing(task_id, attempt),
         });
     }
@@ -526,7 +534,7 @@ impl Runs {
                 | InterruptReport::NoEffect => continue,
             };
             match &by {
-                Writer::Intent => store.intent_delivered(attempt, &turn)?,
+                Writer::Intent { id } => store.intent_delivered(*id, &turn)?,
                 Writer::Request { .. } => store.intent_requested(attempt, &turn)?,
             }
             self.delivered.insert(
@@ -683,6 +691,11 @@ mod tests {
         written
     }
 
+    /// The first pending intent's row: the one that decides an interrupt.
+    fn first(store: &Store) -> i64 {
+        store.pending_intents().unwrap()[0].id
+    }
+
     fn revoke(id: &str) -> IntentReason {
         IntentReason::Revoke {
             revocation: id.into(),
@@ -760,7 +773,7 @@ mod tests {
                 .has_intent(&task, &uuid(), &IntentReason::Deadline)
                 .unwrap()
         );
-        store.intent_delivered(&attempt, "turn-1").unwrap();
+        store.intent_delivered(pending[0].id, "turn-1").unwrap();
         store.intent_done(pending[0].id).unwrap();
         let first = store.intent(pending[0].id).unwrap().unwrap();
         assert_eq!(first.delivered_turn.as_deref(), Some("turn-1"));
@@ -857,7 +870,7 @@ mod tests {
             pass(&store, running("turn-1"), &[], &mut runs, 0),
             [deliver("turn-1")]
         );
-        runs.written(&attempt, "turn-1");
+        runs.written(&attempt, "turn-1", first(&store));
         for _ in 0..3 {
             assert_eq!(
                 pass(&store, running("turn-1"), &[], &mut runs, 100),
@@ -913,7 +926,7 @@ mod tests {
                 pass(&store, running("turn-1"), &[], &mut runs, 0),
                 [deliver("turn-1")]
             );
-            runs.written(&attempt, "turn-1");
+            runs.written(&attempt, "turn-1", first(&store));
             assert_eq!(
                 pass(
                     &store,
@@ -940,7 +953,7 @@ mod tests {
         write(&store, &task, &attempt, IntentReason::Deadline);
         let mut runs = Runs::default();
         pass(&store, running("turn-1"), &[], &mut runs, 1_000);
-        runs.written(&attempt, "turn-1");
+        runs.written(&attempt, "turn-1", first(&store));
         let error = [(attempt.clone(), InterruptReport::ErrorAfterQueue)];
         assert_eq!(
             pass(&store, running("turn-1"), &error, &mut runs, 2_000),
@@ -997,7 +1010,7 @@ mod tests {
         write(&store, &task, &attempt, IntentReason::Deadline);
         let mut runs = Runs::default();
         pass(&store, running("turn-1"), &[], &mut runs, 0);
-        runs.written(&attempt, "turn-1");
+        runs.written(&attempt, "turn-1", first(&store));
         pass(
             &store,
             running("turn-1"),
@@ -1097,7 +1110,7 @@ mod tests {
             pass(&store, running("turn-2"), &[], &mut runs, 3_600_000),
             [deliver("turn-2")]
         );
-        runs.written(&attempt, "turn-2");
+        runs.written(&attempt, "turn-2", first(&store));
         let ok2 = [(attempt.clone(), InterruptReport::Ok)];
         pass(&store, running("turn-2"), &ok2, &mut runs, 3_600_000);
         let stored = &store.pending_intents().unwrap()[0];

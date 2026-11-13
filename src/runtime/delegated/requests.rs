@@ -29,6 +29,43 @@ impl HostBridge {
         self.features.delegated || self.work.clock.is_some()
     }
 
+    /// A service sender's requests while its control standing decides
+    /// them (design I.5.5 step 2, ruling T32b; only with `host.delegated`
+    /// on): `busy` while the control state can't be read (its revocation
+    /// and hold are unknown: I1's answer, before any other refusal), and
+    /// `forbidden` once a control record revoked it: the host refuses all
+    /// its future requests, whatever they ask (a new task or a notice, an
+    /// attachment, a launch or its query, the profiles, its own tasks),
+    /// from the standings committed (Decision 16). Natives, browser grants
+    /// and `local` don't depend on control records: nothing.
+    pub(super) fn service_refused(&self, a: &Sender) -> Result<(), HostWorkError> {
+        if !self.features.delegated {
+            return Ok(());
+        }
+        let Some(authority) = a.remote() else {
+            return Ok(());
+        };
+        let principal = authority.name();
+        let Some(list) = self.open_list() else {
+            return Ok(());
+        };
+        if crate::runtime::delegated::active_service(&principal, list).is_none() {
+            return Ok(());
+        }
+        if self.controls_unchecked() {
+            return Err("busy".into());
+        }
+        let revoked = self
+            .start_view()
+            .standings
+            .get(&principal)
+            .is_some_and(|standing| standing.revoked.is_some());
+        if revoked {
+            return Err("forbidden".into());
+        }
+        Ok(())
+    }
+
     /// Who `a` is to the delegated task `r`, admitted as `adm` (design
     /// I.4.5, Decision 15): its sender with current authority, or the owner.
     /// A service sender is `Refused::Unchecked` (`busy`) while the control

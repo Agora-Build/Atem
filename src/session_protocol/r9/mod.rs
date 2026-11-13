@@ -120,6 +120,10 @@ const DETAIL_REVOKED_UNREADABLE: &str = "revoked grants unreadable";
 /// `busy` for a browser while the host's wall clock is below the revoked
 /// grants' bound, `max(until, high_water)` (the clock went back).
 const DETAIL_CLOCK_BACK: &str = "host clock went back";
+/// `unauthorized` for a service a control record revoked on this host
+/// (delegated host-work design I.5.5 step 2; behind `host.delegated`): its
+/// fenced attachments get it before their close, and its later `hello`s.
+pub const DETAIL_REVOKED: &str = "revoked";
 
 /// What the pairing directory vouches for, for the revoked grants (§R9.6).
 pub struct PairingVouch {
@@ -382,6 +386,10 @@ pub struct R9Host {
     seen: HashSet<(String, String)>,
     /// The error a fenced principal's attachments get before their close.
     fence_errors: HashMap<String, SessionError>,
+    /// The services a control record revoked on this host (design I.5.5
+    /// step 2), as the runtime's committed control state has them (only
+    /// behind `host.delegated`): their `hello`s are refused.
+    revoked_services: HashSet<String>,
     /// Attachments whose channel Atem closed (overflow), for the session
     /// host to forget.
     dead: Vec<String>,
@@ -752,6 +760,7 @@ impl R9Host {
             quarantine_retry_at: 0,
             seen: HashSet::new(),
             fence_errors: HashMap::new(),
+            revoked_services: HashSet::new(),
             dead: Vec::new(),
             flush_cursor: None,
             push: push::HostPush::default(),
@@ -1442,6 +1451,20 @@ impl R9Host {
         let pin = m.pin_of().clone();
         let now = parts.now.host.clone();
         let wall = now.wall_ms;
+        // A service a control record revoked here (design I.5.5 step 2):
+        // the host refuses all its future requests, its `hello` first.
+        if let Principal::Service { device_id } = &hello.proof.principal
+            && self
+                .revoked_services
+                .contains(&format!("service:{device_id}"))
+        {
+            refuse(
+                self,
+                keyed,
+                error(code::UNAUTHORIZED, re.as_deref(), Some(DETAIL_REVOKED)),
+            );
+            return effects;
+        }
         // A `hello` that would lift a hold (a manager's reconciliation)
         // does so only after its `sig_c` is verified below: nothing of the
         // hold changes for an unauthenticated `finish`.
@@ -1751,6 +1774,38 @@ impl R9Host {
     /// noted for.
     pub fn end_pass(&mut self) {
         self.fence_errors.clear();
+    }
+
+    /// The services a control record revoked on this host, as the
+    /// runtime's committed control state has them (design I.5.5 step 2;
+    /// only behind `host.delegated`, so empty otherwise): their `hello`s are
+    /// refused `unauthorized`, `revoked`. A live one's attachments are
+    /// fenced by [`R9Host::fence_revoked`].
+    pub fn set_revoked_services(&mut self, revoked: HashSet<String>) {
+        self.revoked_services = revoked;
+    }
+
+    /// The services whose `hello`s are refused as revoked.
+    pub fn revoked_services(&self) -> &HashSet<String> {
+        &self.revoked_services
+    }
+
+    /// The service `principal` was revoked by a control record (design
+    /// I.5.5 step 2): session-v1's §H fence where it has attachments (its
+    /// `control_gen` raised, its leases revoked, its queued work rejected,
+    /// each attachment closed after `unauthorized`, `revoked`), and its
+    /// later `hello`s refused.
+    pub fn fence_revoked<J: Journal>(
+        &mut self,
+        principal: &str,
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        self.revoked_services.insert(principal.to_string());
+        self.fence_errors.insert(
+            principal.to_string(),
+            error(code::UNAUTHORIZED, None, Some(DETAIL_REVOKED)),
+        );
+        parts.host.fence_principal(principal, 0)
     }
 
     /// Every r9 attachment gets `membership_head` (the head moved, or a

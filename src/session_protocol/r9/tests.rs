@@ -1074,6 +1074,39 @@ fn attachments_are_fenced_alone_and_a_principal_together() {
     assert_eq!(rig.list("phone").len(), 2);
 }
 
+/// A service a control record revoked (delegated host-work design I.5.5
+/// step 2, the runtime's `effects`): its attachments are fenced through §H
+/// (`control_gen` raised, each closed after `unauthorized`, `revoked`), its
+/// later `hello`s refused the same way, while another principal stays; with
+/// nothing revoked (`set_revoked_services` empty, a new identity), it is
+/// admitted again.
+#[test]
+fn a_service_a_control_record_revoked_is_fenced_and_refused() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("bot-1", bot());
+    rig.advance(1000);
+    rig.connect("phone", phone());
+    rig.attached("bot-1");
+    rig.attached("phone");
+    let before = rig.rt.host.control_gen("service:svc-bot");
+    rig.run(|e, p| ((), e.fence_revoked("service:svc-bot", p)));
+    rig.pump();
+    assert_eq!(rig.refused("bot-1").0, "closed");
+    assert!(rig.rt.host.control_gen("service:svc-bot") > before);
+    assert_eq!(rig.engine.status().attachments, 1, "the phone stays");
+    rig.advance(1000);
+    rig.connect("bot-2", bot());
+    assert_eq!(
+        rig.refused("bot-2"),
+        ("unauthorized".into(), Some(DETAIL_REVOKED.into()))
+    );
+    rig.engine.set_revoked_services(HashSet::new());
+    rig.advance(1000);
+    rig.connect("bot-3", bot());
+    rig.attached("bot-3");
+}
+
 /// `revoke_grant` from the issuer: the browser is fenced ("grant revoked")
 /// and can't come back with that grant.
 #[test]

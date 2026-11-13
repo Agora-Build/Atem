@@ -1454,7 +1454,8 @@ impl<J: Journal> SessionHost<J> {
 
     /// r9 §R9.3 step 4: membership entry `seq` (a removal, `set_roles`,
     /// `remove_host` of this host, an expiry shortening; 0 for a freeze,
-    /// which names no entry) fences `principal` through §H: the
+    /// which names no entry, and for a service a control record revoked,
+    /// delegated host-work design I.5.5 step 2) fences `principal` through §H: the
     /// `control_revoked` fence (its raised `control_gen`, naming `seq`) is
     /// written, every attachment of the principal is fenced (view ones too),
     /// its leases revoked and its accepted work not yet executing rejected

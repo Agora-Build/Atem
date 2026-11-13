@@ -20,11 +20,13 @@
 //! detail texts ([`details`]), the host's Station link with its own
 //! device-list fetch ([`station`], [`fetch`], I.5.8), and the control feed
 //! store ([`feeds`], I.5.4, I.5.5: records applied with the cursor in one
-//! transaction, the senders' standings).
+//! transaction, the senders' standings), and what the records do to the
+//! tasks, in that transaction ([`effects`], I.5.5 to I.5.7).
 pub mod alerts;
 pub mod attempts;
 pub mod authority;
 pub mod details;
+pub mod effects;
 pub mod feeds;
 pub mod fetch;
 pub mod gate;
