@@ -1229,9 +1229,17 @@ fn the_deferral_ends_with_the_recovery_wait_and_tasks_are_checked_again() {
         wait_stored(&rig, &t["task_id"], "blocked", "device list update pending");
     }
     // The senders go: their gate is the host's own Station's now, with no
-    // caught-up channel of their own.
+    // caught-up channel of their own. A close reaches the host at one of its
+    // passes, maybe after the one that sees the clock below: wait until it
+    // has dropped both channels, or a native whose close is still on its
+    // way passes its gate by that channel (I.5.8, "Native senders") the
+    // moment the deferral ends.
+    let open = dumped(&rig)["channels"].as_u64().unwrap();
     phone.close(&mut r);
     mac.close(&mut r);
+    within("the senders' channels closed", || {
+        dumped(&rig)["channels"].as_u64() == Some(open - 2)
+    });
 
     // The wait ends on the host's clock (24 h and a minute since the host
     // first saw the recovery). Checked again before anything dispatches.
@@ -1254,6 +1262,9 @@ fn the_deferral_ends_with_the_recovery_wait_and_tasks_are_checked_again() {
     assert_eq!(next_fetch(&mut rig.station(), link), fetch(pinned + 1));
     within("the removal", || list_head(&rig) == pinned + 2);
     wait_stored(&rig, &removed["task_id"], "cancelled", "sender revoked");
+    // The dump is written at the end of a pass; the cancellation is in the
+    // store mid-pass.
+    two_passes(&rig);
     let s = dumped(&rig)["station"].clone();
     assert_eq!(s["heads"], heads, "no heads since: {s}");
     assert_eq!(s["list_part"], true, "{s}");
