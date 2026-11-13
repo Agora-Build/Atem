@@ -2868,6 +2868,53 @@ actual sync flags, suspend, reboot and repairs still need step 4 tests.
   task: a task of `local`, a browser grant or a service no feed covers
   keeps v1, and its unknown outcome expires.
 
-Both commands are built in step 4, with the lifecycle. Their output, and
-how `done` takes its result snapshot and `failed` its detail, are
-step 4's.
+Both commands are built in step 4, with the lifecycle. The rest of this
+section is **Atem's choice** (step 4's open questions 2 and 3, approved by
+the owner), filling what the design leaves open. It is Atem-internal: no
+field or message changes, and the one text a client can see is `failed`'s
+default detail.
+
+- **`failed`'s detail (Atem's choice).** `atem task resolve <task_id>
+  failed [--detail TEXT]`: a detail given is kept byte for byte under
+  §11.2's rule (1–1024 bytes, not blank, no control or Cf character);
+  without one the task's `detail` is `resolved as failed on the host`,
+  which its sender reads with `work_query` like any other.
+- **`done`'s result (Atem's choice).** `atem task resolve <task_id> done`
+  takes exactly one `--memory ID` or `--vault ID:ENTRY@VERSION`, and no
+  free text. The snapshot is captured, published and read back as `atem
+  message reply` takes its context: vault context only while the account's
+  signed encryption mode is `on`, a vault reference names its entry, and an
+  entry the credential redactor would change is refused. Nothing is kept
+  until the task is resolved with it: a command abandoned while its
+  snapshot is being published resolves nothing (a memory may already be on
+  the relay, and `runtime.log` says so). A task already resolved publishes
+  nothing: the same snapshot again (the same memory with its text
+  unchanged, or the same vault entry and version) returns its recorded
+  status, and anything else is another resolution, refused.
+- **Who runs them (Atem's choice).** Both commands are the owner's, `list`
+  too since it shows every sender's tasks: they are refused inside an agent
+  session and for a process that can't be verified, by the verified
+  process-ancestry check `atem message status` uses. On the runtime's
+  same-user socket this is a correctness guard, not a security boundary.
+- **With `host.delegated` off (Atem's choice).** Both commands work
+  whether or not `host.delegated` is on: with it off nothing remote can
+  settle a delegated task of unknown outcome, so the owner's command is
+  the only way. `resolved` still reaches the wire only behind
+  `host.delegated` (§11.2, "Compatibility"). The commands need the
+  host-work records, which open once hosting is enabled in the runtime's
+  life; otherwise they say the records are unavailable.
+- **`atem status` (Atem's choice).** Its `Delegated:` line (`N unresolved
+  outcomes (atem task list --unknown)`, or `no unresolved outcomes`)
+  appears only while something is delegated: `host.delegated` on, a
+  delegated task open, or an outcome unresolved. Otherwise the status is
+  what it was before the line existed.
+- **Replies (design I.4.7; the budget is Atem's choice).** A delegated
+  task's reply text and context are kept 30 days after the task settles
+  (`completed`, `failed`, `cancelled` or `expired`; a reply stored after
+  its task settled counts from its storing), past the day after the
+  deadline when the task's own payloads go, without keeping the task an
+  open record. They have their own budget of 64 MiB per host: over it the
+  oldest go first, before their 30 days, and one `runtime.log` line says
+  how many went early. Then they drop as a v1 reply does: metadata, digest
+  and state stay. A task not settled (an unresolved unknown outcome) drops
+  its reply with its own payloads, as v1 does.

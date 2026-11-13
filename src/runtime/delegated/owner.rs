@@ -30,19 +30,28 @@ use crate::runtime::collab_context::{self, ContextSpec, RelayPublisher, VaultRef
 use crate::runtime::delegated::resolve::{ResolveRefusal, resolve};
 use crate::runtime::protocol::{DelegatedStatus, UnknownTask};
 use anyhow::{Result, anyhow, bail};
-use hw::{ContextSnapshot, Resolution};
+use hw::{ContextKind, ContextSnapshot, Resolution};
 
 /// How long `done`'s publication may take (as a reply's).
 const PUBLISH_WAIT: Duration = Duration::from_secs(10);
 
+/// What a `done` resolution does next.
+pub enum OwnerDone {
+    /// The task was resolved `done` with this same snapshot before: its
+    /// status as recorded, and nothing to publish.
+    Recorded(WorkStatus),
+    /// Its snapshot, captured, to be published and read back first.
+    Publish(OwnerPublication),
+}
+
 /// A `done` resolution's snapshot, captured and waiting to be published:
-/// [`OwnerDone::publish`] runs off the runtime's pass.
-pub struct OwnerDone {
+/// [`OwnerPublication::publish`] runs off the runtime's pass.
+pub struct OwnerPublication {
     pub specs: Vec<ContextSpec>,
     publisher: RelayPublisher,
 }
 
-impl OwnerDone {
+impl OwnerPublication {
     /// Publishes the snapshot and reads it back (`collab_context::publish`,
     /// within [`PUBLISH_WAIT`]): the one snapshot, as a `done` takes it.
     pub async fn publish(self) -> Result<ContextSnapshot> {
@@ -106,15 +115,7 @@ impl HostBridge {
         let tx = store.immediate().map_err(|_| anyhow!(NOT_WRITTEN))?;
         let status = match resolve(store, &tx, task_id, LOCAL, resolution, host_now().wall_ms) {
             Ok(status) => status,
-            Err(ResolveRefusal::Reused) => bail!(
-                "task {task_id} was already resolved ({}, by {}); another resolution is refused",
-                state_word(record.status.state),
-                record
-                    .status
-                    .resolved
-                    .as_ref()
-                    .map_or("?", |r| r.by.as_str())
-            ),
+            Err(ResolveRefusal::Reused) => bail!(already_resolved(task_id, &record)),
             Err(ResolveRefusal::Forbidden) => bail!(
                 "task {task_id} is {}; only a task of unknown outcome is resolved",
                 state_word(record.status.state)
@@ -130,7 +131,11 @@ impl HostBridge {
     /// delegated task of unknown outcome, or one already resolved), and its
     /// one snapshot captured as a reply's (`collab_context::capture`: a
     /// memory as it is now, vault context only with the account's
-    /// encryption `on`), to be published off the pass.
+    /// encryption `on`), to be published off the pass. A task already
+    /// resolved publishes nothing (review M2): the same snapshot again (the
+    /// same memory with its text unchanged, read locally; the same vault
+    /// entry and version, whose text never changes) is the same resolution,
+    /// its recorded status; anything else is refused as another.
     pub fn owner_done(
         &mut self,
         task_id: &str,
@@ -138,7 +143,7 @@ impl HostBridge {
         vault: Option<&str>,
     ) -> Result<OwnerDone> {
         let store = self.owner_store()?;
-        owner_resolvable(store, task_id)?;
+        let record = owner_resolvable(store, task_id)?;
         let (memories, vaults): (Vec<String>, Vec<String>) = match (memory, vault) {
             (Some(m), None) => (vec![m.to_owned()], vec![]),
             (None, Some(v)) => {
@@ -153,11 +158,46 @@ impl HostBridge {
             _ => bail!("done needs one --memory or --vault"),
         };
         let host = self.work_host();
+        if record.status.resolved.is_some() {
+            let same = record
+                .status
+                .result
+                .as_ref()
+                .filter(|_| record.status.state == WorkState::Completed)
+                .is_some_and(|result| match (memory, vault) {
+                    (Some(_), None) => {
+                        collab_context::capture(&self.work.dir, &host.account_id, &memories, &[])
+                            .ok()
+                            .and_then(|mut specs| specs.pop())
+                            .is_some_and(|spec| match spec {
+                                ContextSpec::Memory { memory } => {
+                                    result.kind == ContextKind::Memory
+                                        && result.id == memory.id
+                                        && result.digest == hw::digest(memory.content.as_bytes())
+                                }
+                                ContextSpec::Vault { .. } => false,
+                            })
+                    }
+                    _ => vaults
+                        .first()
+                        .and_then(|v| VaultRef::parse(v).ok())
+                        .is_some_and(|r| {
+                            result.kind == ContextKind::Vault
+                                && r.entry
+                                    .is_some_and(|n| result.id == format!("{}:{n}", r.id))
+                                && result.version == u64::from(r.version)
+                        }),
+                });
+            if same {
+                return Ok(OwnerDone::Recorded(record.status));
+            }
+            bail!(already_resolved(task_id, &record));
+        }
         let specs = collab_context::capture(&self.work.dir, &host.account_id, &memories, &vaults)?;
-        Ok(OwnerDone {
+        Ok(OwnerDone::Publish(OwnerPublication {
             specs,
             publisher: RelayPublisher::new(self.work.dir.clone(), host),
-        })
+        }))
     }
 
     /// The host-work store, for the owner's commands: open, sound and bound
@@ -211,6 +251,19 @@ fn owner_resolvable(store: &Store, task_id: &str) -> Result<WorkRecord> {
         );
     }
     Ok(record)
+}
+
+/// Why a resolved task takes no other resolution.
+fn already_resolved(task_id: &str, record: &WorkRecord) -> String {
+    format!(
+        "task {task_id} was already resolved ({}, by {}); another resolution is refused",
+        state_word(record.status.state),
+        record
+            .status
+            .resolved
+            .as_ref()
+            .map_or("?", |r| r.by.as_str())
+    )
 }
 
 /// A task state as the wire names it (`outcome_unknown`, `failed`, …).

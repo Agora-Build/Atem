@@ -784,8 +784,9 @@ const DUE_LAUNCHES: &str = "SELECT l.id FROM open_records o CROSS JOIN launches 
 /// Kept replies whose 30 days passed.
 const KEPT_DUE: &str = "SELECT task_id,kept_bytes FROM results
     WHERE kept_bytes IS NOT NULL AND retain_until_ms<=?1 ORDER BY retain_until_ms";
-/// The bytes the kept replies hold (kept by a trigger).
-const KEPT_TOTAL: &str = "SELECT bytes FROM kept_replies WHERE id=1";
+/// The bytes the kept replies hold (kept by a trigger); a missing row
+/// (made again at the next open) reads as none, so it never fails a pass.
+const KEPT_TOTAL: &str = "SELECT coalesce((SELECT bytes FROM kept_replies WHERE id=1),0)";
 /// The oldest kept reply (the earliest settled).
 const KEPT_OLDEST: &str = "SELECT task_id,kept_bytes FROM results
     WHERE kept_bytes IS NOT NULL ORDER BY retain_until_ms,rowid LIMIT 1";
@@ -907,43 +908,35 @@ pub struct MessageRecord {
 /// past its task's payload drop (none: not kept, or dropped since). Its
 /// index holds the kept replies only, in the order they drop, and a trigger
 /// keeps their total in `kept_replies` (`Store::drop_kept_replies` reads
-/// one row, never the kept table). Additive: a table without them gets
-/// them (no reply of a database from before has either: a v1 reply never
-/// does), and the total starts at what is kept.
+/// one row, never the kept table). Additive and in one transaction: a table
+/// without them gets them (no reply of a database from before has either:
+/// a v1 reply never does), and every open makes the total's row if it is
+/// missing (at 0: nothing is kept before this build's first open ends).
 fn track_kept_replies(db: &Connection) -> Result<()> {
+    let tx = db.unchecked_transaction()?;
     for column in ["retain_until_ms", "kept_bytes"] {
-        let present: bool = db.query_row(
+        let present: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('results') WHERE name=?1)",
             [column],
             |r| r.get(0),
         )?;
         if !present {
-            db.execute_batch(&format!("ALTER TABLE results ADD COLUMN {column} INTEGER"))?;
+            tx.execute_batch(&format!("ALTER TABLE results ADD COLUMN {column} INTEGER"))?;
         }
     }
-    let counted: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='kept_replies')",
-        [],
-        |r| r.get(0),
-    )?;
-    db.execute_batch(
+    tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS result_kept ON results(retain_until_ms)
             WHERE kept_bytes IS NOT NULL;
         CREATE TABLE IF NOT EXISTS kept_replies (id INTEGER PRIMARY KEY CHECK (id = 1),
             bytes INTEGER NOT NULL);
+        INSERT OR IGNORE INTO kept_replies(id,bytes) VALUES(1,0);
         CREATE TRIGGER IF NOT EXISTS kept_replies_bytes AFTER UPDATE OF kept_bytes ON results
         BEGIN
             UPDATE kept_replies SET bytes=bytes-coalesce(OLD.kept_bytes,0)
                 +coalesce(NEW.kept_bytes,0) WHERE id=1;
         END;",
     )?;
-    if !counted {
-        db.execute(
-            "INSERT OR REPLACE INTO kept_replies(id,bytes) SELECT 1,coalesce(sum(kept_bytes),0)
-            FROM results WHERE kept_bytes IS NOT NULL",
-            [],
-        )?;
-    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -3447,6 +3440,81 @@ mod tests {
             let (steps, scans) = kept_table_scans(&store.db, sql);
             assert!(scans.is_empty(), "{sql}: {steps:?}");
         }
+    }
+
+    /// The kept replies' total (`kept_replies`, design I.4.7) as stored.
+    fn kept_total(store: &Store) -> Option<u64> {
+        store
+            .db
+            .query_row("SELECT bytes FROM kept_replies WHERE id=1", [], |r| {
+                r.get(0)
+            })
+            .optional()
+            .unwrap()
+    }
+
+    /// Ruling T25a (review I1): a database whose kept total row is missing
+    /// (a crash right after its table was made, on the first open of this
+    /// build) never fails a cleanup: the drop reads a missing total as
+    /// nothing kept, and the next open makes the row again.
+    #[test]
+    fn a_missing_kept_total_heals_and_never_fails_a_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(kept_total(&store), Some(0));
+        store.db.execute("DELETE FROM kept_replies", []).unwrap();
+        assert_eq!(
+            store
+                .drop_kept_replies(PAYLOAD_RETENTION_MS, KEPT_REPLY_BUDGET)
+                .unwrap(),
+            KeptDropped::default()
+        );
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(kept_total(&store), Some(0));
+        assert_eq!(
+            store
+                .drop_kept_replies(PAYLOAD_RETENTION_MS, KEPT_REPLY_BUDGET)
+                .unwrap(),
+            KeptDropped::default()
+        );
+    }
+
+    /// Review M5: the kept replies' total is the database's (a trigger keeps
+    /// it with every keep and drop), so it survives a restart: reopened, the
+    /// store has the same total and its budget drops as before.
+    #[test]
+    fn the_kept_total_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let text = |c: char| c.to_string().repeat(10_000);
+        let (a, b) = (
+            replied(&store, true, &text('a')),
+            replied(&store, true, &text('b')),
+        );
+        for id in [&a, &b] {
+            settle_as(&store, id, WorkState::Completed);
+        }
+        store.drop_payloads(1_000 + PAYLOAD_RETENTION_MS).unwrap();
+        let total = kept_total(&store).unwrap();
+        // Each: its text, its memory reference's and its context's.
+        assert_eq!(total, 2 * (10_000 + 17 + 19));
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(kept_total(&store), Some(total));
+        assert_eq!(
+            store
+                .drop_kept_replies(2 * PAYLOAD_RETENTION_MS, total - 1)
+                .unwrap(),
+            KeptDropped {
+                expired: 0,
+                early: 1
+            }
+        );
+        assert_eq!(kept_total(&store), Some(total / 2));
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(kept_total(&store), Some(total / 2));
     }
 
     /// A task whose record this build can't read never fails a pass: it is

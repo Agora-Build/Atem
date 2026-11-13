@@ -608,6 +608,8 @@ and `complete`. Status and replies come back to it as signed, sealed objects; it
   day after the task's deadline. A settled task's reply text and context are therefore kept for **30 days** after the
   task settles, in their own bytes budget, without keeping the task an open record. Then they drop as today: metadata,
   digest and state stay.
+  - **The budget (Atem's choice, owner-approved in step 4):** 64 MiB per host. Over it the oldest replies drop first,
+    before their 30 days, and one `runtime.log` line says how many went early (host-work-v1 §11.6, "On the host").
 - The owner can read the replies of their own hosts (I.4.5), including those of a revoked sender.
 - **Changed for host senders.** A host sender's reply travels back to it as an `atem-result` object through the
   mailbox (II.4.4), within the mailbox size bound. The reply is checked against that bound when the agent submits it

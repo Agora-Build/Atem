@@ -213,4 +213,40 @@ mod tests {
             assert!(!ALL.contains(&text), "{text}");
         }
     }
+
+    /// Ruling T25a (review I2): the owner's command's default `failed`
+    /// detail, which a sender reads with `work_query`, is §11.6 "On the
+    /// host"'s, byte for byte (not a row of the Details table: a
+    /// resolution's detail is the resolver's own, §11.2); so are the kept
+    /// replies' 30 days and 64 MiB (design I.4.7, which names them too).
+    #[test]
+    fn owner_texts_match_section_11_6_on_the_host() {
+        use crate::runtime::host_work::{KEPT_REPLY_BUDGET, KEPT_REPLY_MS, PAYLOAD_RETENTION_MS};
+        let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let (_, section) = CONTRACT
+            .split_once("\n#### On the host\n")
+            .expect("§11.6 On the host");
+        let section = words(section.split("\n## ").next().unwrap());
+        assert!(
+            section.contains(&format!(
+                "without one the task's `detail` is `{RESOLVED_AS_FAILED_ON_THE_HOST}`"
+            )),
+            "{RESOLVED_AS_FAILED_ON_THE_HOST}"
+        );
+        assert!(!ALL.contains(&RESOLVED_AS_FAILED_ON_THE_HOST));
+        let days = KEPT_REPLY_MS / PAYLOAD_RETENTION_MS;
+        let mib = KEPT_REPLY_BUDGET >> 20;
+        assert_eq!(KEPT_REPLY_BUDGET, mib << 20);
+        let kept = format!("kept {days} days after the task settles");
+        let budget = format!("{mib} MiB per host");
+        for text in [&kept, &budget] {
+            assert!(section.contains(text.as_str()), "§11.6: {text}");
+        }
+        let design = words(include_str!("../../../designs/delegated-host-work.md"));
+        let (_, replies) = design.split_once("### I.4.7 Replies").expect("I.4.7");
+        let replies = replies.split("## I.5").next().unwrap();
+        for text in [&format!("kept for **{days} days**"), &budget] {
+            assert!(replies.contains(text.as_str()), "I.4.7: {text}");
+        }
+    }
 }

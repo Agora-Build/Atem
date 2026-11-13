@@ -57,6 +57,7 @@ mod delegated_dispatch;
 mod delegated_hints;
 #[path = "delegated/owner.rs"]
 mod delegated_owner;
+pub use delegated_owner::OwnerDone;
 #[path = "delegated/recovery.rs"]
 mod delegated_recovery;
 #[path = "delegated/requests.rs"]

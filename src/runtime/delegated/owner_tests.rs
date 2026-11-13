@@ -8,6 +8,7 @@
 
 use crate::runtime::collab_context::{ContextPublisher, VaultRef};
 use crate::runtime::delegated::details::RESOLVED_AS_FAILED_ON_THE_HOST;
+use crate::runtime::host_bridge::OwnerDone;
 use crate::runtime::protocol::{DelegatedStatus, UnknownTask};
 
 /// Publishes a memory as the relay reads it back: its own text.
@@ -62,8 +63,12 @@ async fn owner_done_with(
     task: &str,
     memory: &str,
 ) -> anyhow::Result<WorkStatus> {
-    let done = rig.bridge.owner_done(task, Some(memory), None)?;
-    let mut snapshots = crate::runtime::collab_context::publish(&AsItIs, &done.specs).await?;
+    let publication = match rig.bridge.owner_done(task, Some(memory), None)? {
+        OwnerDone::Recorded(status) => return Ok(status),
+        OwnerDone::Publish(publication) => publication,
+    };
+    let mut snapshots =
+        crate::runtime::collab_context::publish(&AsItIs, &publication.specs).await?;
     assert_eq!(snapshots.len(), 1);
     rig.bridge.owner_resolve(
         task,
@@ -472,4 +477,96 @@ fn kept_replies_dropped_early_say_so_in_one_line() {
         kept_early_line(3),
         "the replies kept for delegated tasks are over their 64 MiB budget: dropped the text and context of 3 replies before their 30 days, oldest first (records kept)"
     );
+}
+
+/// Ruling T25a (review I1): a missing kept-replies total (a crash right
+/// after its table was made) never fails a cleanup, so it never fences
+/// hosting: the pass runs its cleanup and hosting goes on.
+#[test]
+fn a_missing_kept_total_never_fences_hosting() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        store.db.execute("DELETE FROM kept_replies", []).unwrap();
+        rig.bridge.work.cleanup = Instant::now();
+        passes(&mut rig, 2);
+        assert!(rig.bridge.work.cleanup > Instant::now(), "the cleanup ran");
+        assert!(!rig.bridge.work.error, "hosting was fenced");
+    });
+}
+
+/// Review M2: `done` checks a resolved task before it captures or
+/// publishes anything. The same snapshot again (the same memory, its text
+/// unchanged; the same vault entry and version, which never changes) is the
+/// same resolution: its recorded status, nothing published. Another memory,
+/// the memory's text changed, another version or a task resolved `failed`
+/// are refused at once, as another resolution.
+#[test]
+fn a_repeated_done_publishes_nothing() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        alerts_on(&mut rig);
+        let tasks = phone_unknowns(&mut rig, &s, 3, start + HOUR);
+        remembered(root, "mem_f00dbabe", "the change landed");
+        let done = owner_done_with(&mut rig, &tasks[0], "mem_f00dbabe")
+            .await
+            .unwrap();
+        let recorded = |rig: &mut LocalRig, task: &str, memory, vault| match rig
+            .bridge
+            .owner_done(task, memory, vault)
+        {
+            Ok(OwnerDone::Recorded(status)) => Ok(status),
+            Ok(OwnerDone::Publish(_)) => panic!("{task}: published again"),
+            Err(error) => Err(error.to_string()),
+        };
+        assert_eq!(
+            recorded(&mut rig, &tasks[0], Some("mem_f00dbabe"), None),
+            Ok(done.clone())
+        );
+        let completed = format!(
+            "task {} was already resolved (completed, by local); another resolution is refused",
+            tasks[0]
+        );
+        remembered(root, "mem_0abcdef0", "another fact");
+        for (memory, vault) in [(Some("mem_0abcdef0"), None), (None, Some("v-result:1@1"))] {
+            assert_eq!(
+                recorded(&mut rig, &tasks[0], memory, vault),
+                Err(completed.clone())
+            );
+        }
+        remembered(root, "mem_f00dbabe", "the change landed, then was reverted");
+        assert_eq!(
+            recorded(&mut rig, &tasks[0], Some("mem_f00dbabe"), None),
+            Err(completed)
+        );
+        // Resolved with a vault entry: the same entry and version again.
+        let by_vault = rig
+            .bridge
+            .owner_resolve(&tasks[1], &done_with("the vault's result", 1))
+            .unwrap();
+        assert_eq!(
+            recorded(&mut rig, &tasks[1], None, Some("v-result:1@1")),
+            Ok(by_vault)
+        );
+        assert_eq!(
+            recorded(&mut rig, &tasks[1], None, Some("v-result:1@2")),
+            Err(format!(
+                "task {} was already resolved (completed, by local); another resolution is refused",
+                tasks[1]
+            ))
+        );
+        // Resolved `failed`: refused before anything is captured.
+        owner_fails(&mut rig, &tasks[2], "gave up").unwrap();
+        assert_eq!(
+            recorded(&mut rig, &tasks[2], Some("mem_f00dbabe"), None),
+            Err(format!(
+                "task {} was already resolved (failed, by local); another resolution is refused",
+                tasks[2]
+            ))
+        );
+        assert_eq!(stored_record(&rig, &tasks[0]).status, done);
+    });
 }

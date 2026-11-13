@@ -668,10 +668,17 @@ impl Server {
     }
 
     /// A `done` snapshot is back: the task is resolved with it (committed
-    /// before the answer), unless its client went away meanwhile (nothing
-    /// is resolved then; the same command again does it).
+    /// before the answer), unless its client went away meanwhile. Then
+    /// nothing is resolved (the same command again does it, publishing
+    /// again) and runtime.log says so, since a memory may already be on the
+    /// relay: unlike `atem message reply`, which commits its reply before it
+    /// answers, `done` keeps nothing until it resolves.
     fn owner_done_published(&mut self, done: OwnerDonePublished) {
         if !self.clients.contains_key(&done.client) {
+            eprintln!(
+                "atem runtime: task {}: `atem task resolve … done` ended before its snapshot was read back; nothing was resolved (a memory may already be on the relay)",
+                done.task_id
+            );
             return;
         }
         let result = done.snapshot.and_then(|result| {
@@ -1458,11 +1465,15 @@ impl Server {
                         self.task_resolved(id, task_id, result);
                     }
                     LocalResolution::Done { memory, vault } => {
+                        use super::host_bridge::OwnerDone;
                         match bridge.owner_done(&task_id, memory.as_deref(), vault.as_deref()) {
-                            Ok(done) => {
+                            Ok(OwnerDone::Recorded(work)) => {
+                                self.task_resolved(id, task_id, Ok(work));
+                            }
+                            Ok(OwnerDone::Publish(publication)) => {
                                 let tx = self.owner_done.clone();
                                 tokio::spawn(async move {
-                                    let snapshot = done.publish().await;
+                                    let snapshot = publication.publish().await;
                                     let _ = tx.send(OwnerDonePublished {
                                         client: id,
                                         task_id,

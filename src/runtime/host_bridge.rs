@@ -106,6 +106,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[path = "host_work_bridge.rs"]
 mod host_work_bridge;
+pub use host_work_bridge::OwnerDone;
 
 /// `advance` runs this often.
 const ADVANCE_EVERY: u64 = 100;

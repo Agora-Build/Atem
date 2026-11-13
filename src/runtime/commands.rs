@@ -245,8 +245,7 @@ pub async fn task(command: crate::cli::TaskCommands) -> Result<()> {
 }
 
 /// Why `atem task` found nothing to talk to.
-const NO_RUNTIME_FOR_TASKS: &str =
-    "no Atem runtime is running; delegated tasks are listed and resolved through it";
+const NO_RUNTIME_FOR_TASKS: &str = "no Atem runtime is running; delegated tasks are listed and resolved through it (`atem runtime start`)";
 
 /// One line of `atem task list --unknown`: the task, its session, its
 /// sender, the reason and when (`when` formats the host's Unix ms).

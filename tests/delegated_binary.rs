@@ -1455,3 +1455,91 @@ fn the_owner_lists_and_resolves_unknown_outcomes_from_the_terminal() {
         format!("{one_id}: resolved as failed\n")
     );
 }
+
+/// Review M1 and M3 (ruling T25a). Without a runtime, the task commands say
+/// how to start one. A `done` whose client goes away while its snapshot is
+/// being published resolves nothing (the owner runs it again), and
+/// runtime.log says so, since its memory may already be on the relay. The
+/// same command run again resolves the task.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_CONTEXT_DIR hooks"
+)]
+fn a_done_whose_client_goes_away_resolves_nothing_and_says_so() {
+    use sha2::{Digest, Sha256};
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    support::astation::write_encryption_mode(&rig.sandbox.config(), "on");
+    let (out, err, ok) = rig.sandbox.atem(&["task", "list", "--unknown"]);
+    assert!(!ok, "{out}");
+    assert!(
+        err.contains(
+            "no Atem runtime is running; delegated tasks are listed and resolved through it (`atem runtime start`)"
+        ),
+        "{err}"
+    );
+    rig.with_controls(gate_open());
+    rig.context = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let t = task(&launch, "GOES_AWAY", HOUR);
+    enqueue(&mut phone, &mut r, &t);
+    in_turn(&rig, &t["task_id"], "GOES_AWAY");
+    private(&rig.fake.join("exit"), "");
+    wait_stored(&rig, &t["task_id"], "outcome_unknown", "agent exited");
+    let tid = t["task_id"].as_str().unwrap();
+    // The snapshot, held while it is published.
+    let context = rig.sandbox.dir.path().join("context");
+    let name = format!("{:x}", Sha256::digest(b"v-result:1@1"));
+    let text = "Checked by the owner.";
+    let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    private(
+        &context.join(format!("{name}.json")),
+        &json!({"kind":"vault","id":"v-result:1","version":1,"digest":digest,"text":text})
+            .to_string(),
+    );
+    private(&context.join(format!("{name}.hold")), "");
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_atem"))
+        .args(["task", "resolve", tid, "done", "--vault", "v-result:1@1"])
+        .env_clear()
+        .envs(rig.sandbox.env())
+        .current_dir(&rig.sandbox.home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // The runtime takes the request and starts the publication; the owner
+    // gives up (Ctrl-C) before it is read back.
+    std::thread::sleep(Duration::from_secs(2));
+    cli.kill().unwrap();
+    cli.wait().unwrap();
+    std::fs::remove_file(context.join(format!("{name}.hold"))).unwrap();
+    let log = rig.sandbox.dir.path().join("runtime.log");
+    let line = format!(
+        "atem runtime: task {tid}: `atem task resolve … done` ended before its snapshot was read back; nothing was resolved (a memory may already be on the relay)"
+    );
+    within("the discarded snapshot's line", || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains(&line)
+    });
+    let status = stored(&rig, &t["task_id"]);
+    assert_eq!(
+        (status["state"].as_str(), status.get("resolved")),
+        (Some("outcome_unknown"), None),
+        "{status}"
+    );
+    // Run again: resolved.
+    assert_eq!(
+        owner(
+            &rig,
+            &["task", "resolve", tid, "done", "--vault", "v-result:1@1"]
+        ),
+        format!("{tid}: resolved as done\n")
+    );
+    assert_eq!(stored(&rig, &t["task_id"])["resolved"]["by"], "local");
+}
