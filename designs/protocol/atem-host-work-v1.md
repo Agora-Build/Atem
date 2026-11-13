@@ -2091,9 +2091,13 @@ only its own Station's feed (step 4's Decision 14):
   other two leave it in flight, and its page ends nothing. The next
   `control_sync` goes at the first `heads` 30 seconds or more after the
   refusal, or on the link's next generation, once no call is owed on the
-  socket ("Matching a page to its call"), and the gate opens only with a
-  page asked for then (the resynchronization), even when the cursor
-  already held the head. `atem status` says `Station refused feed access
+  socket ("Matching a page to its call"). On the same link generation the
+  gate opens only with a page asked for then (the resynchronization), even
+  when the cursor already held the head. A new link generation starts that
+  over: its gate opens as any generation's does, after a `heads` received
+  on it and the announced feed read up to its head (by the page still owed
+  from before the refusal, or with no page when the cursor already holds
+  that head). `atem status` says `Station refused feed access
   (forbidden); retrying`.
 
 #### Acknowledgments
