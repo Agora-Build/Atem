@@ -206,19 +206,21 @@ fn settle() {
 
 // ───────────────────────── a real agent process ─────────────────────────
 
+/// The atem binary in the profile directory above the test binary: the test
+/// binary is in `<profile>/deps/` before Cargo 1.100,
+/// `<profile>/build/atem/<hash>/out/` since.
 fn atem_binary() -> PathBuf {
-    let exe = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .and_then(Path::parent)
-        .unwrap()
-        .join("atem");
-    assert!(
-        exe.exists(),
-        "build the release binary first: {}",
-        exe.display()
-    );
-    exe
+    let test = std::env::current_exe().unwrap();
+    test.ancestors()
+        .skip(1)
+        .map(|dir| dir.join("atem"))
+        .find(|exe| exe.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "build the release binary first: none above {}",
+                test.display()
+            )
+        })
 }
 
 fn short_dir() -> tempfile::TempDir {
