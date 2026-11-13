@@ -17,14 +17,16 @@ use std::sync::Arc;
 use atem_client_ffi::AtemError;
 use atem_client_ffi::station::{
     AckLedgerHandle, AckTransition, relay_control_ack, relay_control_ack_refused,
-    relay_control_sync, relay_control_sync_refused, relay_control_sync_result,
-    relay_decode_to_host, relay_decode_to_station, relay_heads, relay_membership_fetch,
-    relay_membership_fetch_refused, relay_membership_fetch_result, report_answer,
+    relay_control_sync, relay_control_sync_answers, relay_control_sync_refused,
+    relay_control_sync_result, relay_decode_to_host, relay_decode_to_station, relay_heads,
+    relay_membership_fetch, relay_membership_fetch_refused, relay_membership_fetch_result,
+    report_answer,
 };
 use atem_client_ffi::types::{
     ControlAckInfo, ControlEffectKind, ControlEffectResult, ControlResultKind, LedgerAlertInfo,
     LinkAssociationInfo, LogHead, RelayAckResult, RelayFeedHead, RelayFeedRecord, RelayRefusalCode,
-    RelayToHost, RelayToStation, ReportAnswerKind, ReportIntentInfo, StationReport,
+    RelaySyncVerdict, RelayToHost, RelayToStation, ReportAnswerKind, ReportIntentInfo,
+    StationReport,
 };
 use serde_json::{Value, json};
 use support::*;
@@ -462,13 +464,17 @@ fn relay_calls_round_trip_and_refuse_what_the_readers_refuse() {
     let a = &load("r9-vectors-host-work-control")["stations"]["A"];
     let (origin, feed) = (s(&a["origin"]), s(&a["feed_id"]));
 
-    // control_sync, with and without a feed.
+    // control_sync, with and without a feed; its id is the caller's, a
+    // lowercase UUID v4.
+    let request = "5d0e9a3c-2b1f-4c8d-9e7a-6b5c4d3e2f10".to_owned();
     for (feed_id, after) in [(Some(feed.clone()), 7), (None, 0)] {
-        let m = relay_control_sync(origin.clone(), feed_id.clone(), after).unwrap();
+        let m =
+            relay_control_sync(request.clone(), origin.clone(), feed_id.clone(), after).unwrap();
         let read = relay_decode_to_station(m).unwrap();
         assert_eq!(
             read,
             RelayToStation::ControlSync {
+                request_id: request.clone(),
                 origin: origin.clone(),
                 feed_id,
                 after
@@ -476,9 +482,19 @@ fn relay_calls_round_trip_and_refuse_what_the_readers_refuse() {
         );
     }
     assert_eq!(
-        code(relay_control_sync(origin.clone(), None, 5).unwrap_err()),
+        code(relay_control_sync(request.clone(), origin.clone(), None, 5).unwrap_err()),
         "malformed"
     );
+    for bad in [
+        request.to_uppercase(),
+        "5d0e9a3c-2b1f-5c8d-9e7a-6b5c4d3e2f10".to_owned(),
+        String::new(),
+    ] {
+        assert_eq!(
+            code(relay_control_sync(bad, origin.clone(), Some(feed.clone()), 7).unwrap_err()),
+            "malformed"
+        );
+    }
 
     // A feed page of the vectors' records, as a host reads it.
     let page: Vec<RelayFeedRecord> = ["S1_cover", "S4_revoke", "M1_revoke"]
@@ -489,23 +505,41 @@ fn relay_calls_round_trip_and_refuse_what_the_readers_refuse() {
             record_json: records[*l].to_string(),
         })
         .collect();
-    let m = relay_control_sync_result(
-        origin.clone(),
-        feed.clone(),
-        3,
-        1_793_620_940_000,
-        page.clone(),
-    )
-    .unwrap();
+    let result = |after: u64, head: u64, station_time: u64, records: Vec<RelayFeedRecord>| {
+        relay_control_sync_result(
+            request.clone(),
+            origin.clone(),
+            feed.clone(),
+            after,
+            head,
+            station_time,
+            records,
+        )
+    };
+    let m = result(0, 3, 1_793_620_940_000, page.clone()).unwrap();
     let RelayToHost::ControlSyncResult {
+        request_id,
+        after,
         records: read,
         head,
         ..
-    } = relay_decode_to_host(m).unwrap()
+    } = relay_decode_to_host(m.clone()).unwrap()
     else {
         panic!("not a page");
     };
-    assert_eq!(head, 3);
+    assert_eq!((request_id.as_str(), after, head), (request.as_str(), 0, 3));
+    // It answers the call it names (from the start of that feed), and no
+    // other: the shared matching helper.
+    let call = relay_control_sync(request.clone(), origin.clone(), Some(feed.clone()), 0).unwrap();
+    assert_eq!(
+        relay_control_sync_answers(call.clone(), m.clone()).unwrap(),
+        RelaySyncVerdict::Answers
+    );
+    let later = relay_control_sync(request.clone(), origin.clone(), Some(feed.clone()), 1).unwrap();
+    assert_eq!(
+        relay_control_sync_answers(later, m.clone()).unwrap(),
+        RelaySyncVerdict::After
+    );
     for (got, sent) in read.iter().zip(&page) {
         let got: Value = serde_json::from_str(&got.record_json).unwrap();
         let sent: Value = serde_json::from_str(&sent.record_json).unwrap();
@@ -515,15 +549,26 @@ fn relay_calls_round_trip_and_refuse_what_the_readers_refuse() {
     // head, or out of order, is refused.
     let mut bad = page.clone();
     bad[1].record_json = records["P4_unknown_field"].to_string();
-    let e = relay_control_sync_result(origin.clone(), feed.clone(), 3, 0, bad).unwrap_err();
-    assert_eq!(code(e), "unknown_field");
-    let e =
-        relay_control_sync_result(origin.clone(), feed.clone(), 2, 0, page.clone()).unwrap_err();
-    assert_eq!(code(e), "malformed");
+    assert_eq!(code(result(0, 3, 0, bad).unwrap_err()), "unknown_field");
+    assert_eq!(
+        code(result(0, 2, 0, page.clone()).unwrap_err()),
+        "malformed"
+    );
     let mut reordered = page.clone();
     reordered.swap(0, 1);
-    let e = relay_control_sync_result(origin.clone(), feed.clone(), 3, 0, reordered).unwrap_err();
-    assert_eq!(code(e), "malformed");
+    assert_eq!(code(result(0, 3, 0, reordered).unwrap_err()), "malformed");
+    // Strictly after the echoed `after`: a record at or below it is refused,
+    // and a page whose head is below its after holds none.
+    assert_eq!(
+        code(result(1, 3, 0, page.clone()).unwrap_err()),
+        "malformed"
+    );
+    assert!(result(1, 3, 0, page[1..].to_vec()).is_ok());
+    assert!(result(9, 3, 0, vec![]).is_ok());
+    assert_eq!(
+        code(result(9, 3, 0, page[2..].to_vec()).unwrap_err()),
+        "malformed"
+    );
 
     // heads; a mailbox head isn't read before stage 3.
     let v = Vectors::load();
@@ -584,7 +629,7 @@ fn relay_calls_round_trip_and_refuse_what_the_readers_refuse() {
     assert_eq!(read, sent);
 
     // Each side reads only its own direction, and nothing else on the link.
-    let page = relay_control_sync(origin, None, 0).unwrap();
+    let page = relay_control_sync(request.clone(), origin, None, 0).unwrap();
     assert_eq!(
         code(relay_decode_to_host(page).unwrap_err()),
         "wrong_message"
@@ -834,13 +879,16 @@ fn golden_build(op: &str, f: &Value) -> Result<String, AtemError> {
     };
     match op {
         "control_sync" => relay_control_sync(
+            s(&f["request_id"]),
             s(&f["origin"]),
             f.get("feed_id").map(s),
             f["after"].as_u64().unwrap(),
         ),
         "control_sync_result" => relay_control_sync_result(
+            s(&f["request_id"]),
             s(&f["origin"]),
             s(&f["feed_id"]),
+            f["after"].as_u64().unwrap(),
             f["head"].as_u64().unwrap(),
             f["station_time"].as_u64().unwrap(),
             f["records"]
@@ -891,11 +939,12 @@ fn golden_describe(direction: &str, wire: &str) -> Result<Value, AtemError> {
     Ok(match direction {
         "to_station" => match relay_decode_to_station(wire.to_owned())? {
             RelayToStation::ControlSync {
+                request_id,
                 origin,
                 feed_id,
                 after,
             } => {
-                let mut f = json!({"origin": origin, "after": after});
+                let mut f = json!({"request_id": request_id, "origin": origin, "after": after});
                 if let Some(feed_id) = feed_id {
                     f["feed_id"] = json!(feed_id);
                 }
@@ -906,13 +955,16 @@ fn golden_describe(direction: &str, wire: &str) -> Result<Value, AtemError> {
         },
         "to_host" => match relay_decode_to_host(wire.to_owned())? {
             RelayToHost::ControlSyncResult {
+                request_id,
                 origin,
                 feed_id,
+                after,
                 head,
                 station_time,
                 records,
             } => json!({
-                "origin": origin, "feed_id": feed_id, "head": head, "station_time": station_time,
+                "request_id": request_id, "origin": origin, "feed_id": feed_id, "after": after,
+                "head": head, "station_time": station_time,
                 "records": records.iter().map(|r| json!({
                     "feed_seq": r.feed_seq,
                     "record": serde_json::from_str::<Value>(&r.record_json).unwrap(),
@@ -1147,5 +1199,54 @@ fn goldens_round_trip_through_the_bindings() {
         let wire = golden_wire(case);
         let error = golden_describe(&s(&case["reader"]), &wire).unwrap_err();
         assert_eq!(code(error), s(&case["code"]), "{name}");
+    }
+}
+
+/// Correlation (#164 comment 6858189009) through the production exports:
+/// each `matching` case of `r9-vectors-station-calls`, its result read
+/// against each of its calls by `relay_control_sync_answers`, gives the
+/// file's verdict; a text that isn't the call or the result it should be is
+/// refused with the reader's code, never answered.
+#[test]
+fn matching_through_the_bindings() {
+    let file = load("r9-vectors-station-calls");
+    let verdict = |v: RelaySyncVerdict| match v {
+        RelaySyncVerdict::Answers => "answers",
+        RelaySyncVerdict::RequestId => "request_id",
+        RelaySyncVerdict::Origin => "origin",
+        RelaySyncVerdict::FeedId => "feed_id",
+        RelaySyncVerdict::After => "after",
+    };
+    let cases = file["matching"].as_array().unwrap();
+    assert!(cases.len() >= 9, "{} matching cases", cases.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for case in cases {
+        let name = s(&case["name"]);
+        let result = s(&case["result"]);
+        for (call, want) in case["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(case["verdicts"].as_array().unwrap())
+        {
+            let got = relay_control_sync_answers(s(call), result.clone()).unwrap();
+            assert_eq!(verdict(got), s(want), "{name}");
+            seen.insert(verdict(got));
+        }
+    }
+    assert_eq!(seen.len(), 5, "every verdict: {seen:?}");
+    // The texts each in its place, read strictly: a result as the call, a
+    // call as the result, a refusal, bytes that aren't JSON.
+    let case = &cases[0];
+    let (call, result) = (s(&case["calls"][0]), s(&case["result"]));
+    let refused = relay_control_sync_refused(RelayRefusalCode::Forbidden).unwrap();
+    for (c, r, want) in [
+        (result.clone(), result.clone(), "wrong_message"),
+        (call.clone(), call.clone(), "wrong_message"),
+        (call.clone(), refused, "wrong_message"),
+        ("{".to_owned(), result.clone(), "not_strict"),
+        (call.clone(), "{".to_owned(), "not_strict"),
+    ] {
+        assert_eq!(code(relay_control_sync_answers(c, r).unwrap_err()), want);
     }
 }

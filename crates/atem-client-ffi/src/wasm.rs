@@ -1187,35 +1187,50 @@ fn strict_head(v: JsValue) -> JsResult<crate::types::LogHead> {
 }
 
 /// A host's call to its Station, read strictly (`relay_decode_to_station`):
-/// `{type: "control_sync", origin, feedId?, after}`, `{type:
+/// `{type: "control_sync", requestId, origin, feedId?, after}`, `{type:
 /// "control_ack", ack: {…}}` or `{type: "membership_fetch", after}`.
 #[wasm_bindgen(js_name = relayDecodeToStation)]
 pub fn relay_decode_to_station(message: String) -> JsResult<JsValue> {
     ok(crate::station::relay_decode_to_station(message))
 }
 
-/// A Station's message to a host, read strictly (`relay_decode_to_host`).
+/// A Station's message to a host, read strictly (`relay_decode_to_host`):
+/// a page is `{type: "control_sync_result", requestId, origin, feedId,
+/// after, head, stationTime, records}`.
 #[wasm_bindgen(js_name = relayDecodeToHost)]
 pub fn relay_decode_to_host(message: String) -> JsResult<JsValue> {
     ok(crate::station::relay_decode_to_host(message))
 }
 
-/// `control_sync{origin, feed_id?, after}` (`relay_control_sync`).
+/// `control_sync{request_id, origin, feed_id?, after}`
+/// (`relay_control_sync`): `requestId` is the caller's, a fresh lowercase
+/// UUID v4 for every call (a timeout's retry and a new link generation's
+/// call included).
 #[wasm_bindgen(js_name = relayControlSync)]
-pub fn relay_control_sync(origin: String, feed_id: Option<String>, after: f64) -> JsResult<String> {
+pub fn relay_control_sync(
+    request_id: String,
+    origin: String,
+    feed_id: Option<String>,
+    after: f64,
+) -> JsResult<String> {
     err(crate::station::relay_control_sync(
+        request_id,
         origin,
         feed_id,
         ms(after)?,
     ))
 }
 
-/// `control_sync_result` (`relay_control_sync_result`): `records` is
-/// `[{feedSeq, recordJson}]`, each record one the control parser accepts.
+/// `control_sync_result` (`relay_control_sync_result`): the call's
+/// `requestId` and `after`; `records` is `[{feedSeq, recordJson}]`, each
+/// record one the control parser accepts, strictly after `after`.
 #[wasm_bindgen(js_name = relayControlSyncResult)]
+#[allow(clippy::too_many_arguments)]
 pub fn relay_control_sync_result(
+    request_id: String,
     origin: String,
     feed_id: String,
+    after: f64,
     head: f64,
     station_time: f64,
     records: JsValue,
@@ -1236,12 +1251,24 @@ pub fn relay_control_sync_result(
         })
         .collect::<JsResult<Vec<_>>>()?;
     err(crate::station::relay_control_sync_result(
+        request_id,
         origin,
         feed_id,
+        ms(after)?,
         ms(head)?,
         ms(station_time)?,
         records,
     ))
+}
+
+/// Whether the result text answers the call text
+/// (`relay_control_sync_answers`): `"answers"`, or the first field that
+/// differs, `"request_id"`, `"origin"`, `"feed_id"` or `"after"`. The
+/// caller compares the link generation, account and genesis it captured
+/// with the call, and keeps one live call per generation.
+#[wasm_bindgen(js_name = relayControlSyncAnswers)]
+pub fn relay_control_sync_answers(call: String, result: String) -> JsResult<JsValue> {
+    ok(crate::station::relay_control_sync_answers(call, result))
 }
 
 /// `heads{feeds, membership}` (`relay_heads`): `feeds` is `[{origin,

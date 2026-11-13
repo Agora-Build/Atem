@@ -2374,7 +2374,10 @@ def _relay_uuid4(text):
 
 
 def _read_control_sync(v):
-    _relay_exact(v, ["type", "op", "origin", "feed_id", "after"])
+    _relay_exact(v, ["type", "op", "request_id", "origin", "feed_id", "after"])
+    # Correlation (amended in place, #164 comment 6858189009): the call's id,
+    # required, a lowercase UUID v4.
+    _relay_uuid4(_relay_text(v, "request_id"))
     origin = _relay_text(v, "origin")
     feed = v.get("feed_id") if "feed_id" in v else None
     if "feed_id" in v and not isinstance(feed, str):
@@ -2388,7 +2391,7 @@ def _read_control_sync(v):
 
 
 def _read_control_sync_result(v):
-    _relay_exact(v, ["type", "op", "origin", "feed_id", "head", "station_time", "records"])
+    _relay_exact(v, ["type", "op", "request_id", "origin", "feed_id", "after", "head", "station_time", "records"])
     items = _relay_array(v, "records", RELAY_MAX_ITEMS)
     seqs = []
     for item in items:
@@ -2396,13 +2399,18 @@ def _read_control_sync_result(v):
         if "record" not in item:
             raise Refused("malformed")  # of any JSON type, but there
         seqs.append(_relay_uint(item, "feed_seq"))
+    # Correlation: the call's id as it sent it, and its `after`, echoed.
+    _relay_uuid4(_relay_text(v, "request_id"))
+    after = _relay_uint(v, "after")
     origin, feed = _relay_text(v, "origin"), _relay_text(v, "feed_id")
     head = _relay_uint(v, "head")
     _relay_uint(v, "station_time")
     _relay_origin(origin)
     _relay_uuid4(feed)
-    previous = 0
-    for seq in seqs:  # wire rule 7: ascending, each in 1..=head
+    # Wire rule 7: strictly after the echoed `after`, ascending, none above
+    # `head` (gaps legal); with `head` below `after`, no record at all.
+    previous = after
+    for seq in seqs:
         if seq <= previous or seq > head:
             raise Refused("malformed")
         previous = seq
@@ -2562,6 +2570,35 @@ def read_relay(text, reader):
         return None, refused.code
 
 
+def relay_sync_verdict(call, result):
+    """Whether the page `result` answers the call `call` (both read): the
+    same request_id, origin, feed when the call named one (a call that named
+    none, from 0, is answered on whichever feed the page names) and after;
+    else the first of those that differs. The link generation, account and
+    genesis are the caller's to compare."""
+    if result["request_id"] != call["request_id"]:
+        return "request_id"
+    if result["origin"] != call["origin"]:
+        return "origin"
+    if "feed_id" in call and result["feed_id"] != call["feed_id"]:
+        return "feed_id"
+    if result["after"] != call["after"]:
+        return "after"
+    return "answers"
+
+
+# The refused forms of correlation the file must hold (a result on another
+# feed than its call's is a matching case: no reader sees the call).
+CORRELATION_REFUSALS = {
+    "control_sync_request_id_missing", "control_sync_request_id_upper_case", "control_sync_request_id_not_uuid_v4",
+    "control_sync_result_request_id_missing", "control_sync_result_request_id_upper_case",
+    "control_sync_result_request_id_not_uuid_v4", "control_sync_result_after_missing",
+    "control_sync_result_record_at_after", "control_sync_result_record_below_after",
+    "control_sync_result_head_below_after_with_records",
+}
+SYNC_VERDICTS = {"answers", "request_id", "origin", "feed_id", "after"}
+
+
 def compact_ijson(value):
     """RFC 8785's compact text of a message: keys in UTF-16 order, no
     whitespace, integers and strings as the check's `jcs`, and `null` where a
@@ -2595,13 +2632,19 @@ def check_station_calls(file, data, report, context):
     object is an object), derived here. An effect's typed reason (O5) is
     read by the same rules as the Rust reader: absent, or 1 to 64 bytes of
     [a-z0-9_] beside `pending` or `refused`, a code outside the vocabulary
-    read as unrecognized. The builders' exact bytes are the Rust runner's
-    (`station_calls_build_byte_for_byte`) and the binding suites'."""
+    read as unrecognized. Correlation (#164 comment 6858189009): a call's
+    `request_id` and a result's echoed `request_id` and `after` are read by
+    the same rules (required, a lowercase UUID v4; a safe whole number), a
+    page's records strictly after its `after`; each `matching` case's
+    verdict is this file's own matcher's (the same id, origin, feed when the
+    call named one, and after; else the first that differs). The builders'
+    exact bytes are the Rust runner's (`station_calls_build_byte_for_byte`)
+    and the binding suites'."""
     mlog = context["membership_log"]
     control = context["host_work_control"]
     with report.case(file, "bound") as case:
         case.equal(data["max_message_bytes"], RELAY_MAX_BYTES, "R9.9's 262,144 bytes for every relay message")
-        case.equal(sorted(data), ["at_the_bound", "calls", "invalid", "kind", "max_message_bytes", "name", "note", "requires", "why_codes"], "fields")
+        case.equal(sorted(data), ["at_the_bound", "calls", "invalid", "kind", "matching", "max_message_bytes", "name", "note", "requires", "why_codes"], "fields")
         codes = data["why_codes"]
         case.check(len(set(codes)) == len(codes) and set(codes) == WHY_CODES, "why_codes: the vocabulary of reasons, each code once (O5)", f"got {codes}")
         case.check(all(re.fullmatch(RELAY_WHY, c) for c in codes), "each code a reason's form")
@@ -2621,6 +2664,7 @@ def check_station_calls(file, data, report, context):
     names = set()
     ops = {}
     fetch_after = None
+    sync_ids = []
     for call in data["calls"]:
         name, op, direction = call["name"], call["op"], call["direction"]
         with report.case(file, f"call {name}") as case:
@@ -2653,7 +2697,13 @@ def check_station_calls(file, data, report, context):
                     (f["origin"], f.get("feed_id")) in stations or (op == "control_sync" and "feed_id" not in f and any(f["origin"] == o for o, _ in stations)),
                     "a feed of the control vectors' stations",
                 )
+            if op == "control_sync":
+                sync_ids.append(f["request_id"])
             if op == "control_sync_result":
+                # Correlation: none of its records at or below its after.
+                case.check(all(r["feed_seq"] > f["after"] for r in f["records"]), "records strictly after the echoed after")
+                if f["head"] < f["after"]:
+                    case.equal(f["records"], [], "head below after: no record (the host rescans)")
                 judged = call["judged"]
                 case.equal([j["feed_seq"] for j in judged], [r["feed_seq"] for r in f["records"]], "judged parallel to the records")
                 for r, j in zip(f["records"], judged):
@@ -2715,6 +2765,54 @@ def check_station_calls(file, data, report, context):
     with report.case(file, "calls: coverage") as case:
         case.equal(sorted(ops), sorted(HOST_TO_STATION_OPS + STATION_TO_HOST_OPS), "all six calls and all three refusals")
         case.check(len(ops["control_ack"]) >= 5 and len(ops["control_sync_result"]) >= 3, "ack and page forms")
+        case.check(len(set(sync_ids)) == len(sync_ids), "each call's request_id its own (a fresh one for every call)")
+        case.check(
+            any(c["op"] == "control_sync_result" and c["fields"]["head"] < c["fields"]["after"] for c in data["calls"]),
+            "a page whose head is below its after (a feed gone back)",
+        )
+
+    # Correlation (amended in place on Astation's request, #164 comment
+    # 6858189009): each case's calls and result read by this file's readers,
+    # each a builder's compact text, and this file's own matcher's verdict on
+    # the result for each call, as the file says.
+    matched = set()
+    seen_verdicts = set()
+    for m in data["matching"]:
+        name = m["name"]
+        with report.case(file, f"matching {name}") as case:
+            case.equal(sorted(m), ["calls", "name", "note", "result", "verdicts"], "case fields")
+            case.check(name not in matched and name not in names and re.fullmatch(r"[a-z0-9_]+", name) is not None, "a name of its own")
+            matched.add(name)
+            result, code = read_relay(m["result"], "to_host")
+            case.equal((code, result and result["op"]), (None, "control_sync_result"), "the result: a control_sync_result")
+            case.equal(len(m["calls"]), len(m["verdicts"]), "a verdict for each call")
+            case.check(len(m["calls"]) >= 1, "at least one call")
+            if result is not None:
+                case.equal(compact_ijson(result), m["result"], "the result: its compact text")
+            for i, (text, verdict) in enumerate(zip(m["calls"], m["verdicts"])):
+                call, code = read_relay(text, "to_station")
+                case.equal((code, call and call["op"]), (None, "control_sync"), f"call {i}: a control_sync")
+                case.check(verdict in SYNC_VERDICTS, f"call {i}: a verdict", f"got {verdict}")
+                if call is None or result is None:
+                    continue
+                case.equal(compact_ijson(call), text, f"call {i}: its compact text")
+                case.equal(relay_sync_verdict(call, result), verdict, f"call {i}: the verdict")
+                seen_verdicts.add(verdict)
+    with report.case(file, "matching: coverage") as case:
+        case.equal(seen_verdicts, SYNC_VERDICTS, "every verdict: answers and each field that can differ")
+        case.check(
+            {"two_calls_at_the_same_cursor", "a_late_reply_to_a_retired_call", "discovery_answered_on_the_current_feed", "another_feed"} <= matched,
+            "two calls at one cursor, a retired call's late reply, discovery, a result on another feed",
+            f"got {sorted(matched)}",
+        )
+        same_cursor = [m for m in data["matching"] if m["name"] == "two_calls_at_the_same_cursor"]
+        if same_cursor:
+            calls = [read_relay(t, "to_station")[0] for t in same_cursor[0]["calls"]]
+            case.check(
+                len(calls) == 2 and all(calls) and calls[0]["request_id"] != calls[1]["request_id"]
+                and {k: v for k, v in calls[0].items() if k != "request_id"} == {k: v for k, v in calls[1].items() if k != "request_id"},
+                "two calls that differ only by their request_id",
+            )
 
     # Exactly the bound is read: the reader that refuses it is a byte too
     # strict, and the one that allows more than the bound for a fetch result
@@ -2785,6 +2883,7 @@ def check_station_calls(file, data, report, context):
             "control_ack_why_beside_applied", "control_ack_why_beside_duplicate", "control_ack_why_duplicate_key",
         }
         case.check(reasons <= seen, "every refused form of a reason (O5)", f"missing {sorted(reasons - seen)}")
+        case.check(CORRELATION_REFUSALS <= seen, "every refused form of correlation", f"missing {sorted(CORRELATION_REFUSALS - seen)}")
         case.check(
             {"control_ack_with_reasons", "control_ack_with_unrecognized_reasons"} <= names,
             "goldens with reasons and with a later version's reasons",

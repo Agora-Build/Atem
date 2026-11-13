@@ -825,19 +825,30 @@ check("Station calls: fixture acks read and write back; pages, heads and fetches
     }
   }
   const { origin, feed_id: feed } = ctl.stations.A;
-  const sync = m.relayDecodeToStation(m.relayControlSync(origin, feed, 7));
-  eq([sync.type, sync.origin, sync.feedId, sync.after], ["control_sync", origin, feed, 7]);
-  const first = m.relayDecodeToStation(m.relayControlSync(origin, undefined, 0));
+  // Correlation: the call's id is the caller's, a lowercase UUID v4.
+  const request = "5d0e9a3c-2b1f-4c8d-9e7a-6b5c4d3e2f10";
+  const sync = m.relayDecodeToStation(m.relayControlSync(request, origin, feed, 7));
+  eq([sync.type, sync.requestId, sync.origin, sync.feedId, sync.after], ["control_sync", request, origin, feed, 7]);
+  const first = m.relayDecodeToStation(m.relayControlSync(request, origin, undefined, 0));
   eq([first.type, first.feedId ?? null, first.after], ["control_sync", null, 0]);
-  throwsCode(() => m.relayControlSync(origin, undefined, 5), "malformed");
+  throwsCode(() => m.relayControlSync(request, origin, undefined, 5), "malformed");
+  throwsCode(() => m.relayControlSync(request.toUpperCase(), origin, feed, 7), "malformed");
   const page = ["S1_cover", "S4_revoke", "M1_revoke"].map((label, i) => ({ feedSeq: i + 1, recordJson: ctlRecord(label) }));
-  const read = m.relayDecodeToHost(m.relayControlSyncResult(origin, feed, 3, 1793620940000, page));
-  eq(read.type, "control_sync_result");
+  const result = (after, head, records) => m.relayControlSyncResult(request, origin, feed, after, head, 1793620940000, records);
+  const built = result(0, 3, page);
+  const read = m.relayDecodeToHost(built);
+  eq([read.type, read.requestId, read.after], ["control_sync_result", request, 0]);
   eq(read.records.map((r) => m.canonicalJson(r.recordJson)), page.map((r) => m.canonicalJson(r.recordJson)));
+  eq(m.relayControlSyncAnswers(m.relayControlSync(request, origin, feed, 0), built), "answers");
+  eq(m.relayControlSyncAnswers(m.relayControlSync(request, origin, feed, 1), built), "after");
   const refusedPage = page.map((r, i) => (i === 1 ? { ...r, recordJson: ctlRecord("P4_unknown_field") } : r));
-  throwsCode(() => m.relayControlSyncResult(origin, feed, 3, 0, refusedPage), "unknown_field");
-  throwsCode(() => m.relayControlSyncResult(origin, feed, 2, 0, page), "malformed");
-  throwsCode(() => m.relayControlSyncResult(origin, feed, 3, 0, [page[1], page[0]]), "malformed");
+  throwsCode(() => result(0, 3, refusedPage), "unknown_field");
+  throwsCode(() => result(0, 2, page), "malformed");
+  throwsCode(() => result(0, 3, [page[1], page[0]]), "malformed");
+  // Strictly after the echoed after; a head below after holds no record.
+  throwsCode(() => result(1, 3, page), "malformed");
+  eq(m.relayDecodeToHost(result(9, 3, [])).records.length, 0);
+  throwsCode(() => result(9, 3, [page[2]]), "malformed");
   const membership = { seq: mlog.head.seq, hash: mlog.head.hash };
   const feeds = [{ origin, feedId: feed, head: 3, stationTime: 1793620940000 }];
   const hm = m.relayHeads(feeds, membership);
@@ -850,7 +861,7 @@ check("Station calls: fixture acks read and write back; pages, heads and fetches
   const fetched = m.relayDecodeToHost(m.relayMembershipFetchResult(membership, entries));
   eq([fetched.type, fetched.head], ["membership_fetch_result", membership]);
   eq(fetched.entries.map((e) => m.canonicalJson(e)), entries.map((e) => m.canonicalJson(e)));
-  throwsCode(() => m.relayDecodeToHost(m.relayControlSync(origin, undefined, 0)), "wrong_message");
+  throwsCode(() => m.relayDecodeToHost(m.relayControlSync(request, origin, undefined, 0)), "wrong_message");
   throwsCode(() => m.relayDecodeToStation(str({ type: "relay", op: "push_hint", hints: [] })), "wrong_message");
   throwsCode(() => m.relayDecodeToStation("{"), "not_strict");
 });
@@ -932,17 +943,21 @@ check("Station calls: the byte goldens build exactly, read back to their fields 
     eq(read.type, c.op, `${name} type`);
     switch (c.op) {
       case "control_sync":
-        eq(m.relayControlSync(f.origin, f.feed_id, f.after), wire, name);
-        eq([read.origin, read.feedId ?? null, read.after], [f.origin, f.feed_id ?? null, f.after], name);
+        eq(m.relayControlSync(f.request_id, f.origin, f.feed_id, f.after), wire, name);
+        eq([read.requestId, read.origin, read.feedId ?? null, read.after], [f.request_id, f.origin, f.feed_id ?? null, f.after], name);
         break;
       case "control_sync_result": {
         const records = f.records.map((r) => ({ feedSeq: r.feed_seq, recordJson: str(r.record) }));
         const refused = c.judged.find((j) => !j.parses);
         eq(refused !== undefined, c.hand_assembled === true, `${name} hand_assembled`);
-        const build = () => m.relayControlSyncResult(f.origin, f.feed_id, f.head, f.station_time, records);
+        const build = () => m.relayControlSyncResult(f.request_id, f.origin, f.feed_id, f.after, f.head, f.station_time, records);
         if (refused === undefined) eq(build(), wire, name);
         else throwsCode(build, refused.error);
-        eq([read.origin, read.feedId, read.head, read.stationTime], [f.origin, f.feed_id, f.head, f.station_time], name);
+        eq(
+          [read.requestId, read.origin, read.feedId, read.after, read.head, read.stationTime],
+          [f.request_id, f.origin, f.feed_id, f.after, f.head, f.station_time],
+          name,
+        );
         eq(read.records.length, f.records.length, `${name} records`);
         read.records.forEach((r, i) => {
           eq(r.feedSeq, f.records[i].feed_seq, `${name} feed_seq`);
@@ -1018,6 +1033,23 @@ check("Station calls: the byte goldens build exactly, read back to their fields 
   for (const bad of calls.invalid) {
     throwsCode(() => (bad.reader === "to_host" ? m.relayDecodeToHost : m.relayDecodeToStation)(textOf(bad)), bad.code);
   }
+});
+check("Station calls: correlation, each matching case's verdict through relayControlSyncAnswers", () => {
+  const seen = new Set();
+  eq(calls.matching.length >= 9, true, "matching cases");
+  for (const c of calls.matching) {
+    eq(c.calls.length, c.verdicts.length, `${c.name} verdicts`);
+    c.calls.forEach((call, i) => {
+      const got = m.relayControlSyncAnswers(call, c.result);
+      eq(got, c.verdicts[i], `${c.name} call ${i}`);
+      seen.add(got);
+    });
+  }
+  same([...seen].sort(), ["after", "answers", "feed_id", "origin", "request_id"], "every verdict");
+  const [first] = calls.matching;
+  throwsCode(() => m.relayControlSyncAnswers(first.result, first.result), "wrong_message");
+  throwsCode(() => m.relayControlSyncAnswers(first.calls[0], first.calls[0]), "wrong_message");
+  throwsCode(() => m.relayControlSyncAnswers(first.calls[0], m.relayControlSyncRefused("forbidden")), "wrong_message");
 });
 check("Station: the Portal's statuses in their classes", () => {
   const want = { 200: "confirm", 401: "retry", 408: "retry", 429: "retry", 500: "retry", 503: "retry", 400: "refuse", 404: "refuse", 409: "refuse", 413: "refuse", 415: "refuse", 204: "refuse", 302: "refuse", 403: "stop_reporting" };

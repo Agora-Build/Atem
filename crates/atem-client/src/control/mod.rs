@@ -39,7 +39,7 @@ pub use record::{
 pub use relay::{
     AckResult, CallRefused, ControlAck, ControlSync, ControlSyncResult, EntryRef, FeedEntry,
     FeedHead, Heads, MembershipFetch, MembershipFetchResult, RefusalCode, RefusedCall, RelayError,
-    ToHost, ToStation,
+    SyncMismatch, ToHost, ToStation,
 };
 pub use state::{
     ApplicationResult, Applied, ControlState, Coverage, EffectKind, EffectResult, EffectWhy,

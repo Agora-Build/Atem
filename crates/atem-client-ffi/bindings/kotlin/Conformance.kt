@@ -1023,16 +1023,29 @@ fun main(args: Array<String>) {
         val a = ctl["stations"]["A"]
         val origin = a["origin"].s()
         val feed = a["feed_id"].s()
-        eq(relayDecodeToStation(relayControlSync(origin, feed, 7uL)), RelayToStation.ControlSync(origin, feed, 7uL))
-        eq(relayDecodeToStation(relayControlSync(origin, null, 0uL)), RelayToStation.ControlSync(origin, null, 0uL))
-        throwsCode("malformed") { relayControlSync(origin, null, 5uL) }
+        // Correlation: the call's id is the caller's, a lowercase UUID v4.
+        val request = "5d0e9a3c-2b1f-4c8d-9e7a-6b5c4d3e2f10"
+        eq(relayDecodeToStation(relayControlSync(request, origin, feed, 7uL)), RelayToStation.ControlSync(request, origin, feed, 7uL))
+        eq(relayDecodeToStation(relayControlSync(request, origin, null, 0uL)), RelayToStation.ControlSync(request, origin, null, 0uL))
+        throwsCode("malformed") { relayControlSync(request, origin, null, 5uL) }
+        throwsCode("malformed") { relayControlSync(request.uppercase(), origin, feed, 7uL) }
         val page = listOf("S1_cover", "S4_revoke", "M1_revoke").mapIndexed { i, label -> RelayFeedRecord((i + 1).toULong(), ctlRecord(label)) }
-        val read = relayDecodeToHost(relayControlSyncResult(origin, feed, 3uL, 1793620940000uL, page)) as RelayToHost.ControlSyncResult
+        fun result(after: ULong, head: ULong, records: List<RelayFeedRecord>) =
+            relayControlSyncResult(request, origin, feed, after, head, 1793620940000uL, records)
+        val built = result(0uL, 3uL, page)
+        val read = relayDecodeToHost(built) as RelayToHost.ControlSyncResult
+        eq(listOf(read.requestId, read.after), listOf<Any>(request, 0uL))
         eq(read.records.map { canonicalJson(it.recordJson) }, page.map { canonicalJson(it.recordJson) })
+        eq(relayControlSyncAnswers(relayControlSync(request, origin, feed, 0uL), built), RelaySyncVerdict.ANSWERS)
+        eq(relayControlSyncAnswers(relayControlSync(request, origin, feed, 1uL), built), RelaySyncVerdict.AFTER)
         val refusedPage = page.mapIndexed { i, r -> if (i == 1) RelayFeedRecord(r.feedSeq, ctlRecord("P4_unknown_field")) else r }
-        throwsCode("unknown_field") { relayControlSyncResult(origin, feed, 3uL, 0uL, refusedPage) }
-        throwsCode("malformed") { relayControlSyncResult(origin, feed, 2uL, 0uL, page) }
-        throwsCode("malformed") { relayControlSyncResult(origin, feed, 3uL, 0uL, listOf(page[1], page[0])) }
+        throwsCode("unknown_field") { result(0uL, 3uL, refusedPage) }
+        throwsCode("malformed") { result(0uL, 2uL, page) }
+        throwsCode("malformed") { result(0uL, 3uL, listOf(page[1], page[0])) }
+        // Strictly after the echoed after; a head below after holds no record.
+        throwsCode("malformed") { result(1uL, 3uL, page) }
+        eq((relayDecodeToHost(result(9uL, 3uL, emptyList())) as RelayToHost.ControlSyncResult).records.size, 0)
+        throwsCode("malformed") { result(9uL, 3uL, listOf(page[2])) }
         val heads = listOf(RelayFeedHead(origin, feed, 3uL, 1793620940000uL))
         val hm = relayHeads(heads, mlogHead)
         eq(relayDecodeToHost(hm), RelayToHost.Heads(heads, mlogHead))
@@ -1043,7 +1056,7 @@ fun main(args: Array<String>) {
         val fetched = relayDecodeToHost(relayMembershipFetchResult(mlogHead, entries)) as RelayToHost.MembershipFetchResult
         eq(fetched.head, mlogHead)
         eq(fetched.entries.map(::canonicalJson), entries.map(::canonicalJson))
-        throwsCode("wrong_message") { relayDecodeToHost(relayControlSync(origin, null, 0uL)) }
+        throwsCode("wrong_message") { relayDecodeToHost(relayControlSync(request, origin, null, 0uL)) }
         throwsCode("wrong_message") { relayDecodeToStation("{\"type\":\"relay\",\"op\":\"push_hint\",\"hints\":[]}") }
         throwsCode("not_strict") { relayDecodeToStation("{") }
     }
@@ -1118,9 +1131,9 @@ fun main(args: Array<String>) {
                 "control_sync" -> {
                     val feed = f.obj()["feed_id"] as String?
                     val after = f["after"].l().toULong()
-                    eq(relayControlSync(f["origin"].s(), feed, after), wire, name)
+                    eq(relayControlSync(f["request_id"].s(), f["origin"].s(), feed, after), wire, name)
                     throwsCode("wrong_message") { relayDecodeToHost(wire) }
-                    eq(relayDecodeToStation(wire), RelayToStation.ControlSync(f["origin"].s(), feed, after), name)
+                    eq(relayDecodeToStation(wire), RelayToStation.ControlSync(f["request_id"].s(), f["origin"].s(), feed, after), name)
                 }
                 "control_sync_result" -> {
                     val items = f["records"].arr()
@@ -1128,12 +1141,16 @@ fun main(args: Array<String>) {
                     val judged = c["judged"].arr()
                     val refused = judged.firstOrNull { it["parses"] == false }
                     eq(refused != null, c.obj()["hand_assembled"] == true, "$name hand_assembled")
-                    val build = { relayControlSyncResult(f["origin"].s(), f["feed_id"].s(), f["head"].l().toULong(), f["station_time"].l().toULong(), records) }
+                    val build = {
+                        relayControlSyncResult(f["request_id"].s(), f["origin"].s(), f["feed_id"].s(), f["after"].l().toULong(),
+                            f["head"].l().toULong(), f["station_time"].l().toULong(), records)
+                    }
                     if (refused == null) eq(build(), wire, name) else throwsCode(refused["error"].s()) { build() }
                     throwsCode("wrong_message") { relayDecodeToStation(wire) }
                     val read = relayDecodeToHost(wire) as RelayToHost.ControlSyncResult
-                    eq(listOf(read.origin, read.feedId, read.head, read.stationTime),
-                        listOf(f["origin"].s(), f["feed_id"].s(), f["head"].l().toULong(), f["station_time"].l().toULong()), name)
+                    eq(listOf(read.requestId, read.origin, read.feedId, read.after, read.head, read.stationTime),
+                        listOf(f["request_id"].s(), f["origin"].s(), f["feed_id"].s(), f["after"].l().toULong(),
+                            f["head"].l().toULong(), f["station_time"].l().toULong()), name)
                     eq(read.records.size, items.size, "$name records")
                     read.records.forEachIndexed { i, r ->
                         eq(r.feedSeq, items[i]["feed_seq"].l().toULong(), "$name feed_seq")
@@ -1230,6 +1247,33 @@ fun main(args: Array<String>) {
             if (bad["reader"].s() == "to_host") throwsCode(bad["code"].s()) { relayDecodeToHost(wire) }
             else throwsCode(bad["code"].s()) { relayDecodeToStation(wire) }
         }
+    }
+    check("Station calls: correlation, each matching case's verdict through relayControlSyncAnswers") {
+        fun verdict(v: RelaySyncVerdict) = when (v) {
+            RelaySyncVerdict.ANSWERS -> "answers"
+            RelaySyncVerdict.REQUEST_ID -> "request_id"
+            RelaySyncVerdict.ORIGIN -> "origin"
+            RelaySyncVerdict.FEED_ID -> "feed_id"
+            RelaySyncVerdict.AFTER -> "after"
+        }
+        val cases = stationCalls["matching"].arr()
+        eq(cases.size >= 9, true, "matching cases")
+        val seen = mutableSetOf<String>()
+        for (c in cases) {
+            val calls = c["calls"].arr()
+            val verdicts = c["verdicts"].arr()
+            eq(calls.size, verdicts.size, "${c["name"]} verdicts")
+            calls.forEachIndexed { i, call ->
+                val got = verdict(relayControlSyncAnswers(call.s(), c["result"].s()))
+                eq(got, verdicts[i].s(), "${c["name"]} call $i")
+                seen.add(got)
+            }
+        }
+        eq(seen.sorted(), listOf("after", "answers", "feed_id", "origin", "request_id"), "every verdict")
+        val first = cases[0]
+        throwsCode("wrong_message") { relayControlSyncAnswers(first["result"].s(), first["result"].s()) }
+        throwsCode("wrong_message") { relayControlSyncAnswers(first["calls"][0].s(), first["calls"][0].s()) }
+        throwsCode("wrong_message") { relayControlSyncAnswers(first["calls"][0].s(), relayControlSyncRefused(RelayRefusalCode.FORBIDDEN)) }
     }
     check("Station: the Portal's statuses in their classes") {
         for ((status, want) in listOf(200 to "confirm", 401 to "retry", 408 to "retry", 429 to "retry", 500 to "retry", 503 to "retry",
