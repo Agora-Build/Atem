@@ -780,3 +780,73 @@ fn a_heads_before_host_works_pass_finds_the_delegated_clock() {
         assert_eq!(closed(&rig), None);
     });
 }
+
+/// PR 11 (PR 7's alerts beside PR 10's control alerts): the two kinds stay
+/// apart. A control record that fails verification is kept as evidence
+/// and raises a control alert (Decision 12: `runtime.log`, at most hourly;
+/// counted on the `Control feeds:` line); a delegated task of unknown
+/// outcome raises an owner's alert (I.4.6, §11.3: `alert_list`, the
+/// `Delegated:` count, its push hint). Neither shows where the other does.
+#[test]
+fn control_alerts_and_unknown_outcome_alerts_stay_apart() {
+    use crate::runtime::protocol::DelegatedStatus;
+    use crate::session_protocol::membership::r9log::{auth, secret};
+    use atem_client::control::ControlAction;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut s = fed_host(&mut rig, root, &os);
+        alerts_on(&mut rig);
+        // An unknown outcome of the phone's (its task never started: the
+        // gate is closed until the Station's heads).
+        let template = phone_task(
+            &mut rig,
+            &s.phone,
+            "AN_UNKNOWN_OUTCOME",
+            host_now().wall_ms + HOUR,
+        );
+        let template = stored_record(&rig, &template);
+        let unknown = unknown_outcomes(&rig, &template, PHONE, 1);
+        // The Station's feed: a cover, then a record that fails
+        // verification.
+        let head = s.log.log.head();
+        bridge_heads(&mut rig, 1, head);
+        let cover = own_record(&s.log, "svc-bot", ControlAction::Cover, 1);
+        bridge_page(&mut rig, 1, &[(1, &cover)]);
+        s.log
+            .keys
+            .insert_ed25519(auth("svc-forger"), &secret("forger"));
+        let forged = crate::runtime::delegated::feeds::signed_record(
+            &s.log,
+            "svc-bot",
+            "svc-forger",
+            ControlAction::Hold,
+            uuid::Uuid::new_v4().to_string(),
+            (ORIGIN, OWN_FEED),
+            host_now().wall_ms + 2,
+        );
+        rig.bridge.feed_advance(clocks_after(2_000));
+        bridge_heads(&mut rig, 2, head);
+        bridge_page(&mut rig, 2, &[(2, &forged)]);
+        // The control alert: one, on the `Control feeds:` line only.
+        let line = rig.bridge.feeds_status().unwrap();
+        assert!(
+            line.contains(&format!(
+                "; 1 alert(s) since the start, the latest: a control record from the feed of {ORIGIN} kept as evidence"
+            )),
+            "{line}"
+        );
+        // The owner's alerts: the unknown outcome only.
+        let (alerts, more) = page_for(&mut rig, &s.phone, None);
+        assert!(!more);
+        assert_eq!(
+            alerts.iter().map(|a| a.task_id.clone()).collect::<Vec<_>>(),
+            unknown
+        );
+        assert_eq!(alert_rows(&rig).len(), 1, "no row for the control alert");
+        assert_eq!(
+            rig.bridge.delegated_status(),
+            Some(DelegatedStatus { unresolved: 1 })
+        );
+    });
+}

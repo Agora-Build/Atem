@@ -1073,6 +1073,41 @@ pub(crate) mod tests {
         assert_eq!(report(dir.path()).feeds, None);
     }
 
+    /// PR 11 (PR 7's `Delegated:` line and PR 10's `Control feeds:` line
+    /// together): each appears only when the runtime sends it, and with
+    /// both the order is Clock, Control feeds, Delegated: the host's own
+    /// state (its clock, its Station's gate and control alerts), then its
+    /// tasks' (the unresolved outcomes, PR 7's alerts).
+    #[test]
+    fn the_control_feeds_and_delegated_lines_come_in_order() {
+        use crate::runtime::protocol::DelegatedStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        let with = |feeds: Option<&str>, delegated: Option<u32>| {
+            render(&gather_full(
+                &src,
+                None,
+                &running(RuntimeStatus {
+                    clock: Some("c".into()),
+                    feeds: feeds.map(Into::into),
+                    delegated: delegated.map(|unresolved| DelegatedStatus { unresolved }),
+                    ..Default::default()
+                }),
+            ))
+        };
+        let clock = "\nClock:          c\n";
+        let feeds = "Control feeds:  revocations checked\n";
+        let delegated = "Delegated:      1 unresolved outcome (atem task list --unknown)\n";
+        let both = with(Some("revocations checked"), Some(1));
+        assert!(
+            both.ends_with(&format!("{clock}{feeds}{delegated}")),
+            "{both}"
+        );
+        assert!(with(Some("revocations checked"), None).ends_with(&format!("{clock}{feeds}")));
+        assert!(with(None, Some(1)).ends_with(&format!("{clock}{delegated}")));
+        assert!(with(None, None).ends_with(clock));
+    }
+
     /// Host-work-v1 §11.6 "On the host" ("`atem status` shows the number of
     /// unresolved outcomes"), design I.4.6: the runtime's `Delegated:` line,
     /// after the others, only while something is delegated (the runtime
