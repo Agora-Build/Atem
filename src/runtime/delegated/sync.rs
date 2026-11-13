@@ -73,11 +73,16 @@
 //!   genesis, are those captured with the call; a discovery call's (no
 //!   `feed_id`; this host never makes one) only on the own feed this
 //!   generation's `heads` announced ([`Ask::judge`]). A call is retired by
-//!   its id when it is answered, when it goes unanswered for 30 seconds
-//!   (the Station's deadline: an hourly Station-fault alert, `atem status`
-//!   says so, and a new call with a fresh id may go at once, under the
-//!   pacing), and when the link generation changes (the Station cancels
-//!   the old generation's jobs; bytes written before may still come). A
+//!   its id when it is answered, when it goes unanswered for 35 seconds
+//!   ([`SYNC_TIMEOUT_MS`]: the Station's agreed 30 and a 5-second grace;
+//!   an hourly Station-fault alert, and a new call with a fresh id goes at
+//!   once under the pacing, or after a refusal at the next `heads` past
+//!   its backoff; `atem status` says it was asked again only while that
+//!   retry is live), and when the link generation changes (the Station
+//!   cancels the old generation's jobs; bytes written before may still
+//!   come). A call retired before it went (in the pass that asked it) is
+//!   never sent ([`FeedSync::outgoing`]), and one the link didn't take is
+//!   dropped by its id ([`FeedSync::unsent`]). A
 //!   page with a retired id is drained: counted, nothing advanced, no gate
 //!   opened, no fault. A page with an id the host never sent (or no longer
 //!   keeps: the last [`RETIRED_KEPT`]) is unsolicited: a Station fault. A
@@ -108,7 +113,7 @@
 //!   new link generation starts afresh), on a reset, after 60 seconds
 //!   without `heads`, on a Station clock beyond the cap, on any refusal or
 //!   Station fault (until a page asked after it reads), and while the feed
-//!   isn't read to the announced head (a call unanswered: asked again).
+//!   isn't read to the announced head.
 //! - **The start view** ([`super::gate::Gates`]) gets the feed part as it
 //!   changes ([`FeedSync::take_gates`]), so the start check reads it at
 //!   once (Decision 16).
@@ -142,9 +147,12 @@ pub struct Clocks {
     pub mono_ms: u64,
     pub boot_ms: Option<u64>,
 }
-/// A `control_sync` unanswered this long is retired (Astation's deadline,
-/// ruling C1b-a): a new call, with a fresh id, may go.
-pub const SYNC_TIMEOUT_MS: u64 = 30_000;
+/// A `control_sync` unanswered this long is retired (ruling C1b-a): a new
+/// call, with a fresh id, may go. The Station's agreed deadline is 30 s
+/// (Astation on #164: a bounded result within 30 seconds, or the link
+/// fenced); the host waits 5 s more, so a result written just inside it
+/// isn't drained in transit (ruling C1b-b, Atem-internal: §11.4).
+pub const SYNC_TIMEOUT_MS: u64 = 35_000;
 /// The retired `request_id`s kept: a page with one of them is drained;
 /// one older than these reads as unsolicited (a fault: fail closed).
 pub const RETIRED_KEPT: usize = 256;
@@ -165,8 +173,8 @@ pub enum Closed {
     HeadsLate,
     /// A refusal on the link (Decision 20).
     Refused,
-    /// The last `control_sync` went unanswered for 30 s and nothing has
-    /// answered since: it was retired and asked again (ruling C1b-a).
+    /// A `control_sync` went unanswered for 35 s, was retired and asked
+    /// again, and that retry is live (rulings C1b-a, C1b-b).
     Unanswered,
     /// A Station fault (its code): a page the reader refused as a whole,
     /// one that doesn't answer the live call, an unsolicited one.
@@ -218,10 +226,10 @@ impl Closed {
 
 /// Decision 20's `atem status` text.
 pub const REFUSED_STATUS: &str = "Station refused feed access (forbidden); retrying";
-/// The status after a `control_sync` went unanswered for 30 s (ruling
-/// C1b-a): retired, asked again with a new id.
+/// The status while the retry of a `control_sync` that went unanswered for
+/// 35 s is live (rulings C1b-a, C1b-b).
 pub const UNANSWERED: &str =
-    "a control_sync went unanswered for 30 s; asked again with a new request id";
+    "a control_sync went unanswered for 35 s; asked again with a new request id";
 
 /// Decision 12's alert for a page that isn't strict JSON.
 pub const NOT_STRICT: &str = "Station sent a page that isn't strict JSON";
@@ -440,7 +448,9 @@ pub struct FeedSync {
     /// The ids of the calls retired, the latest [`RETIRED_KEPT`]: their
     /// pages are drained.
     retired: std::collections::VecDeque<String>,
-    /// The last call went unanswered for 30 s and no page answered since.
+    /// The live call is the retry of one that went unanswered (asked in
+    /// the tick that retired it), not answered yet: what `atem status`
+    /// says only while that retry is live (ruling C1b-b, m1).
     unanswered: bool,
     refused_at: Option<u64>,
     /// The last ask a `heads` or the pass started, and the last page that
@@ -588,25 +598,30 @@ impl FeedSync {
     }
 
     /// The pass's monotonic time and the feed store (`None`: not loaded):
-    /// a live call unanswered for 30 s retired (ruling C1b-a: an hourly
-    /// Station-fault alert), then a `control_sync` due now (one the feed
-    /// needs while a recent `heads` announced it, a new one with a fresh
-    /// id after a timeout, under the pacing), and the hourly alert counts
-    /// due. The bridge runs it after the pass's messages, so a page that
-    /// came in time answers its call first (Task 33 re-review 3, m1).
+    /// a live call unanswered for 35 s retired ([`SYNC_TIMEOUT_MS`], ruling
+    /// C1b-a: an hourly Station-fault alert), then a `control_sync` due now
+    /// (one the feed needs while a recent `heads` announced it, a new one
+    /// with a fresh id after a timeout, under the pacing; after a refusal,
+    /// none before a `heads` past its backoff), and the hourly alert counts
+    /// due. A retry asked here is what `atem status` reports as asked again
+    /// (ruling C1b-b, m1: never when nothing was asked). The bridge runs it
+    /// after the pass's messages, so a page that came in time answers its
+    /// call first (Task 33 re-review 3, m1).
     pub fn tick(&mut self, now: Clocks, feeds: Option<&FeedStore>) -> Vec<ControlSync> {
         self.advance(now, feeds);
+        let mut timed_out = false;
         if let Some(ask) = &self.in_flight
             && self.now >= ask.sent_at.saturating_add(SYNC_TIMEOUT_MS)
         {
             let origin = ask.call.origin.clone();
             self.retire_live();
-            self.unanswered = true;
+            self.unanswered = false;
+            timed_out = true;
             self.timeouts += 1;
             self.alert(
                 Alert::Page,
                 format!(
-                    "a control_sync to {origin} went unanswered for 30 s; it is retired and asked again with a new request id, its gate closed until a page is read"
+                    "a control_sync to {origin} went unanswered for 35 s and was retired; a new call, with a new request id, goes when the feed needs a page"
                 ),
             );
         }
@@ -615,7 +630,12 @@ impl FeedSync {
         if !self.heads_fresh() || self.resync == Some(Resync::Refused) {
             return Vec::new();
         }
-        self.ask(true).into_iter().collect()
+        let call = self.ask(true);
+        // Only a retry actually asked is reported as one.
+        if timed_out && call.is_some() {
+            self.unanswered = true;
+        }
+        call.into_iter().collect()
     }
 
     /// The monotonic time and the feed store (`None`: not loaded) as they
@@ -932,11 +952,34 @@ impl FeedSync {
         Ok(self.ask(false))
     }
 
-    /// The call just asked for couldn't be handed to the link: none in
-    /// flight (asked again at the next `heads` or pass), its id never sent
-    /// (not retired: a page naming it is unsolicited).
-    pub fn unsent(&mut self) {
-        self.in_flight = None;
+    /// The call `request_id` wasn't handed to the link (ruling C1b-b, m2):
+    /// never sent. If it is the live call, none is live (asked again at
+    /// the next `heads` or pass); a newer live call stays. Its id leaves
+    /// the retired ones: a page naming it is unsolicited.
+    pub fn unsent(&mut self, request_id: &str) {
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|ask| ask.call.request_id == request_id)
+        {
+            self.in_flight = None;
+        }
+        self.retired.retain(|id| id != request_id);
+    }
+
+    /// The pass's `control_sync`s as they may go: only the live call. One
+    /// retired in the same pass (a page, a refusal or a new generation
+    /// came after it was asked) is never sent ([`FeedSync::unsent`]).
+    pub fn outgoing(&mut self, calls: Vec<ControlSync>) -> Vec<ControlSync> {
+        let (live, retired): (Vec<_>, Vec<_>) = calls.into_iter().partition(|call| {
+            self.in_flight
+                .as_ref()
+                .is_some_and(|ask| ask.call.request_id == call.request_id)
+        });
+        for call in retired {
+            self.unsent(&call.request_id);
+        }
+        live
     }
 
     /// The start view's copy of the feed part, when it changed since the
@@ -983,7 +1026,7 @@ impl FeedSync {
         let Some(announced) = &self.announced else {
             return Some(Closed::NoFeed(self.own_feeds));
         };
-        if self.unanswered {
+        if self.unanswered && self.in_flight.is_some() {
             return Some(Closed::Unanswered);
         }
         if self.reset.is_some() {
@@ -1210,6 +1253,8 @@ impl FeedSync {
             feed_id: Some(announced.feed_id),
             after,
         };
+        // A new call: no retry's, unless the tick that retired one says so.
+        self.unanswered = false;
         self.in_flight = Some(Ask {
             call: call.clone(),
             link_gen,

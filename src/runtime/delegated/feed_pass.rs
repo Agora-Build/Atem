@@ -132,7 +132,7 @@ impl HostBridge {
 
     /// The sync's calls due at the pass, after its messages (a feed that
     /// needs a page while a recent `heads` announced it, a reset's read from
-    /// 0 its mark lets go, a new call after one went unanswered for 30 s:
+    /// 0 its mark lets go, a new call after one went unanswered for 35 s:
     /// retired, ruling C1b-a).
     pub(crate) fn feed_tick(&mut self, now: Clocks) -> Vec<Call> {
         let list = self.sync_list();

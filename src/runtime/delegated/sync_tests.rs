@@ -2057,3 +2057,174 @@ fn a_rescan_keeps_the_committed_stops_a_regrown_feed_omits() {
     assert!(standing.held, "the hold kept");
     assert!(standing.revoked.is_some(), "the revoke kept");
 }
+
+// ------------------------------------------------- C1b fix round 1 (C1b-b)
+
+/// Ruling C1b-b, m1 (the review's probe): `atem status` says a call went
+/// unanswered and was asked again only while that retry is live. A `heads`
+/// lowers the announced head to the cursor under the same `feed_id` (no
+/// reset: not below the cursor) while a call is live; the call times out,
+/// is retired, and nothing is left to ask: no "asked again", and the gate
+/// isn't held closed for the rest of the generation.
+#[test]
+fn a_timeout_with_nothing_left_to_ask_neither_says_asked_again_nor_holds_the_gate() {
+    let mut rig = rig();
+    rig.opened();
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)], "A");
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 2), Vec::new(), "A live; no reset");
+    // A unanswered: retired, nothing asked.
+    assert_eq!(rig.pass(SYNC_TIMEOUT_MS - SEC), Vec::new());
+    assert_eq!(rig.sync.live_call(), None, "retired");
+    assert_eq!(rig.sync.dump()["timeouts"], 1);
+    assert_eq!(rig.sync.dump()["unanswered"], false, "no retry asked");
+    assert_ne!(rig.sync.closed(), Some(Closed::Unanswered));
+    assert_eq!(rig.sync.closed(), None, "read to the announced head");
+    assert!(rig.open(&native()));
+    let lines = rig.sync.take_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(!lines[0].contains("asked again"), "{}", lines[0]);
+    // Later `heads`: still open.
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 2), Vec::new());
+    assert!(rig.open(&native()));
+}
+
+/// Ruling C1b-b, m1: after a refusal the retry of a call that timed out
+/// waits for a `heads` past the backoff; meanwhile nothing says it was
+/// asked again, and once it is, `atem status` says so until its page.
+#[test]
+fn unanswered_is_said_only_while_the_retry_is_live() {
+    let mut rig = rig();
+    rig.opened();
+    let release = rig.record(FEED, ControlAction::Release);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    rig.sync.on_refused(RefusedCall::MembershipFetch);
+    // A times out in the refusal's backoff: retired, not asked again.
+    assert_eq!(rig.pass(SYNC_TIMEOUT_MS), Vec::new());
+    assert_eq!(rig.sync.live_call(), None);
+    assert_eq!(rig.sync.closed(), Some(Closed::Refused));
+    // Past the backoff, at a heads: asked (no "asked again" for a call the
+    // refusal's resynchronization asks).
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    assert_eq!(rig.sync.dump()["unanswered"], false);
+    let b = rig.last();
+    rig.answer(&b, 3, &[(3, &release)]);
+    assert!(rig.open(&native()));
+    // A timeout whose retry goes at once: said while it is live.
+    let hold = rig.record(FEED, ControlAction::Hold);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 3)]);
+    assert_eq!(rig.pass(SYNC_TIMEOUT_MS), [sync_call(FEED, 3)]);
+    assert_eq!(rig.sync.closed(), Some(Closed::Unanswered));
+    let c = rig.last();
+    rig.answer(&c, 4, &[(4, &hold)]);
+    assert_eq!(rig.sync.closed(), None);
+    // A retry the link didn't take: no longer said once it isn't live.
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 5), [sync_call(FEED, 4)]);
+    assert_eq!(rig.pass(SYNC_TIMEOUT_MS), [sync_call(FEED, 4)]);
+    assert_eq!(rig.sync.closed(), Some(Closed::Unanswered));
+    let d = rig.last();
+    rig.sync.unsent(&d.request_id);
+    assert_eq!(
+        rig.sync.closed(),
+        Some(Closed::Behind {
+            cursor: Some(4),
+            head: 5
+        })
+    );
+}
+
+/// Ruling C1b-b, m2: a call that couldn't be handed to the link is dropped
+/// by its id: a newer live call stays live. A call retired in the pass
+/// that asked it (here by a page the reader refused, the reset found next
+/// letting the read from 0 go) is never sent: the pass's calls go only
+/// while they are the live call, and the retired one leaves the retired
+/// ids (never sent: a page naming it is unsolicited).
+#[test]
+fn an_unsent_call_is_dropped_by_its_id_and_a_retired_one_never_goes() {
+    let mut rig = rig();
+    rig.opened();
+    rig.pass(SEC);
+    // One pass: A asked; a page the reader refuses retires A; a rollback
+    // found lets B (the read from 0) go.
+    let mut calls = rig.heads(FEED, 3);
+    let a = rig.last();
+    rig.on_page(Err(RelayError::NotStrict));
+    calls.extend(rig.heads(FEED, 1));
+    let b = rig.last();
+    assert_eq!(calls, [sync_call(FEED, 2), sync_call(FEED, 0)]);
+    assert_ne!(a.request_id, b.request_id);
+    // Only B goes.
+    let sending = rig.sync.outgoing(vec![a.clone(), b.clone()]);
+    assert_eq!(sending, [b.clone()]);
+    // A failed send of A (had it gone) leaves B live.
+    rig.sync.unsent(&a.request_id);
+    assert_eq!(rig.sync.live_call(), Some(b.clone()));
+    // A's id never went: a page naming it is unsolicited.
+    let faults = rig.sync.dump()["faults"].as_u64().unwrap();
+    rig.answer(&a, 3, &[]);
+    assert_eq!(rig.sync.dump()["unsolicited"], 1);
+    assert_eq!(rig.drained(), 0);
+    assert_eq!(rig.sync.dump()["faults"], faults + 1);
+    // B's own failed send: none live.
+    rig.sync.unsent(&b.request_id);
+    assert_eq!(rig.sync.live_call(), None);
+}
+
+/// Ruling C1b-b, m3: the host keeps the latest 256 retired ids. A page
+/// naming the oldest one kept is drained; one naming an id older than
+/// those reads as unsolicited, a Station fault (fail closed).
+#[test]
+fn the_latest_256_retired_ids_are_kept_and_an_older_one_is_unsolicited() {
+    let mut rig = rig();
+    rig.opened();
+    // 257 calls, each retired by the next link generation.
+    let mut ids = Vec::new();
+    for link_gen in 2..=258 {
+        rig.pass(SEC);
+        assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)], "{link_gen}");
+        ids.push(rig.last());
+        rig.sync.on_link(Some(&link(link_gen, ORIGIN)));
+    }
+    // With `opened`'s call, 258 retired: the latest 256 kept.
+    assert_eq!(rig.sync.dump()["retired"], 256);
+    rig.answer(&ids[1], 3, &[]);
+    assert_eq!(rig.drained(), 1, "the oldest kept");
+    assert_eq!(rig.sync.dump()["faults"], 0);
+    rig.answer(&ids[0], 3, &[]);
+    assert_eq!(rig.sync.dump()["unsolicited"], 1, "evicted");
+    assert_eq!(rig.sync.closed(), Some(Closed::Fault(UNSOLICITED)));
+}
+
+/// Ruling C1b-b, m6: the host's deadline is 35 s, a 5 s grace over the
+/// Station's agreed 30 s (Atem-internal, §11.4): a page that comes at 34 s
+/// answers its call; at 35 s the call is retired.
+#[test]
+fn the_hosts_deadline_is_the_stations_30_s_and_a_5_s_grace() {
+    assert_eq!(SYNC_TIMEOUT_MS, 35_000);
+    let mut rig = rig();
+    rig.opened();
+    let release = rig.record(FEED, ControlAction::Release);
+    let hold = rig.record(FEED, ControlAction::Hold);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    let a = rig.last();
+    assert_eq!(rig.pass(34 * SEC), Vec::new(), "not retired at 34 s");
+    assert_eq!(rig.sync.live_call(), Some(a.clone()));
+    rig.answer(&a, 3, &[(3, &release)]);
+    assert!(!rig.feeds.standing(BOT).held);
+    assert_eq!(rig.drained(), 0);
+    // The next call: retired at 35 s.
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 3)]);
+    assert_eq!(rig.pass(35 * SEC - 1), Vec::new());
+    assert_eq!(rig.pass(1), [sync_call(FEED, 3)], "retired, asked again");
+    let b = rig.last();
+    rig.answer(&b, 4, &[(4, &hold)]);
+    assert!(rig.open(&native()));
+}

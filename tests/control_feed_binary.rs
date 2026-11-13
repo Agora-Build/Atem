@@ -64,7 +64,7 @@ const REVOKED: &str = "sender revoked";
 const REFUSED: &str = "Station refused feed access (forbidden); retrying";
 const RESET: &str = "the control feed was reset; reading it again from position 0";
 const UNANSWERED: &str =
-    "a control_sync went unanswered for 30 s; asked again with a new request id";
+    "a control_sync went unanswered for 35 s; asked again with a new request id";
 const CLOCK_AHEAD: &str = "Station clock ahead of this host";
 const NO_HEADS_60S: &str = "no heads from the Station for 60 s";
 /// The Station faults' reasons (`sync::fault_text`).
@@ -76,6 +76,24 @@ const OTHER_ORIGIN: &str = "Station sent a page that doesn't answer its call (an
 const UNSOLICITED: &str = "Station sent a page for a call this host never made";
 /// The stored control state that doesn't read (`HostBridge::feeds_status`).
 const DAMAGED: &str = "the stored control state doesn't read; no delegated task starts. Restore ";
+/// The host's deadline for a `control_sync` (`sync::SYNC_TIMEOUT_MS`: the
+/// Station's 30 s and a 5 s grace).
+const SYNC_DEADLINE: u64 = 35_000;
+/// The runtime.log lines only the Station link and the control feeds
+/// write, by their exact patterns: the sync's alerts (`sync.rs`) and the
+/// feed store's evidence lines (`feeds.rs`, "… an hour per source") end
+/// alike; the link's refusals and unread messages (`station.rs`); the
+/// bridge's mark and page failures (`feed_pass.rs`) and fetch results not
+/// carried (`host_bridge.rs`); the delegated clock's cap.
+const STATION_LINES: [&str; 7] = [
+    "; at most one such line an hour",
+    "atem runtime: the Station refused this host's ",
+    " Station message(s) the reader refused were dropped",
+    "atem runtime: a control feed's reset couldn't be marked",
+    "atem runtime: a control feed page couldn't be applied",
+    " device-list fetch result(s) not carried",
+    "Station clock ahead of this host",
+];
 /// The host the clients name.
 const IDS: HostIds = HostIds {
     account: ACCOUNT,
@@ -1045,12 +1063,7 @@ fn no_station_call_without_host_delegated() {
             .unwrap();
         assert_eq!(rows, 0, "{via:?}: no clock row");
         let log = rig.runtime_log();
-        for line in [
-            "Station",
-            "control feed",
-            "control_sync",
-            "membership_fetch",
-        ] {
+        for line in STATION_LINES {
             assert!(!log.contains(line), "{via:?}: {line:?} in {log}");
         }
     }
@@ -1945,7 +1958,7 @@ fn same_cursor_retries_apply_only_the_live_ids_page() {
     };
     assert_eq!(sync_of(&a), rig.sync(1));
     // Unanswered for 30 s: retired; asked again at once, a fresh id.
-    rig.clock.add_mono(31_000);
+    rig.clock.add_mono(SYNC_DEADLINE + 1_000);
     let b = rig.station().hold_call(link);
     assert_eq!(sync_of(&b), rig.sync(1));
     assert_ne!(request_id(&a), request_id(&b));
@@ -1954,13 +1967,13 @@ fn same_cursor_retries_apply_only_the_live_ids_page() {
     rig.status_feeds(&format!("{GATE_CLOSED} ({UNANSWERED})"));
     within("the alert", || {
         rig.runtime_log().contains(&format!(
-            "a control_sync to {NO_RELAY} went unanswered for 30 s"
+            "a control_sync to {NO_RELAY} went unanswered for 35 s"
         ))
     });
     // B unanswered too (the Station's heads keep coming): C.
     rig.clock.add_mono(1_000);
     rig.station().heads_now();
-    rig.clock.add_mono(30_000);
+    rig.clock.add_mono(SYNC_DEADLINE);
     let c = rig.station().hold_call(link);
     assert_eq!(sync_of(&c), rig.sync(1));
     assert_ne!(request_id(&c), request_id(&b));
@@ -2449,7 +2462,7 @@ fn a_late_refusal_retires_the_live_call_and_costs_liveness_only() {
         station.hold_call(link)
     };
     // A unanswered for 30 s: B asked.
-    rig.clock.add_mono(31_000);
+    rig.clock.add_mono(SYNC_DEADLINE + 1_000);
     let b = rig.station().hold_call(link);
     assert_eq!(sync_of(&b), rig.sync(1));
     assert_ne!(request_id(&a), request_id(&b));

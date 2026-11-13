@@ -48,7 +48,9 @@
 //!   again after the wait (R9.5). One that ends during a refusal's backoff
 //!   is fetched when the backoff ends, still with no `heads` (Astation,
 //!   #164: the fetch resumes when its deferred entry clears, the existing
-//!   backoffs applying); one that ends with a fetch in flight needs none.
+//!   backoffs applying); one that ends with a fetch in flight needs none
+//!   while that fetch may carry the entry, and is fetched after the
+//!   backoff if it is refused instead (ruling C1b-b, m4).
 //!
 //! **The gate's device-list part** ([`ListPart`], design I.5.8): fetched up
 //! to the head the Station announced last on this link generation (the last
@@ -147,8 +149,11 @@ pub struct DeviceListFetch {
     announced: Option<Head>,
     /// Where a fetch stopped at a deferred entry, kept while it may hold.
     stopped: Option<Stopped>,
-    /// Its deferral ended with no fetch in flight: fetch again as soon as
-    /// nothing holds it (a refusal's backoff), with no `heads`.
+    /// Its deferral ended and no fetch has carried since: fetch again as
+    /// soon as nothing holds it (a fetch in flight, a refusal's backoff),
+    /// with no `heads`. A fetch in flight at the clearing carries the
+    /// entry if it is answered (its result ends this), not if it is
+    /// refused (ruling C1b-b, m4).
     resume: bool,
     in_flight: Option<InFlight>,
     /// The last refusal (monotonic ms).
@@ -207,6 +212,8 @@ impl DeviceListFetch {
         if self.in_flight.take().is_none() {
             return FetchApply::Unasked;
         }
+        // Its carriage carries a cleared deferral's entry too.
+        self.resume = false;
         self.results += 1;
         self.named = Some(r.head);
         FetchApply::Carry(r.entries)
@@ -333,11 +340,12 @@ impl DeviceListFetch {
 
     /// The stop at a deferred entry is dropped once the list no longer
     /// defers that entry (`deferred`: the list's deferral now); the fetch
-    /// resumes then, unless one is in flight (it carries the entry).
+    /// resumes then, once nothing holds it (a fetch in flight carries the
+    /// entry if answered: its result ends the resumption).
     fn settle_stop(&mut self, deferred: Option<u64>) {
         if self.stopped.is_some_and(|stop| deferred != Some(stop.seq)) {
             self.stopped = None;
-            self.resume = self.in_flight.is_none();
+            self.resume = true;
         }
     }
 
@@ -607,6 +615,47 @@ mod tests {
         assert_eq!(f.tick(end, Some(&head(5)), None), fetch(5));
         assert_eq!(f.tick(end + 1, Some(&head(5)), None), None, "once");
         assert_eq!(f.dump()["in_flight"], 5);
+    }
+
+    /// Ruling C1b-b, m4: a deferral that clears while a fetch is in flight
+    /// needs no fetch of its own while that fetch may carry the entry; if
+    /// that fetch is refused instead, the fetch resumes once the backoff
+    /// ends, with no `heads`, once. Answered, nothing more goes.
+    #[test]
+    fn a_deferral_that_clears_with_a_fetch_in_flight_then_refused_resumes_after_it() {
+        let stopped = || {
+            let mut f = DeviceListFetch::default();
+            f.tick(1_000, Some(&head(3)), None);
+            assert_eq!(f.on_heads(&head(9), &head(3), None), fetch(3));
+            assert!(matches!(f.on_result(result(9)), FetchApply::Carry(_)));
+            assert_eq!(f.carried(&head(3), &head(5), Some(6)), None);
+            // A head announced anew while it defers: fetched, in flight.
+            f.tick(2_000, Some(&head(5)), Some(6));
+            assert_eq!(f.on_heads(&head(10), &head(5), Some(6)), fetch(5));
+            // The deferral clears with it in flight: nothing more.
+            assert_eq!(f.tick(3_000, Some(&head(5)), None), None);
+            f
+        };
+        // Refused: resumed when the backoff ends.
+        let mut f = stopped();
+        f.on_refused();
+        let end = 3_000 + REFUSAL_BACKOFF_MS;
+        assert_eq!(f.tick(end - 1, Some(&head(5)), None), None, "backing off");
+        assert_eq!(f.tick(end, Some(&head(5)), None), fetch(5), "no heads");
+        assert_eq!(f.tick(end + 1, Some(&head(5)), None), None, "once");
+        // Answered (it carried the entry): nothing more.
+        let mut f = stopped();
+        assert!(matches!(f.on_result(result(10)), FetchApply::Carry(_)));
+        assert_eq!(f.carried(&head(5), &head(10), None), None);
+        assert_eq!(f.tick(end, Some(&head(10)), None), None);
+        assert_eq!(f.dump()["in_flight"], Value::Null);
+        // Answered with a carriage that moved nothing: the stall's pause
+        // holds, as for any carriage (no fetch for the cleared deferral).
+        let mut f = stopped();
+        assert!(matches!(f.on_result(result(10)), FetchApply::Carry(_)));
+        assert_eq!(f.carried(&head(5), &head(5), None), None);
+        assert_eq!(f.tick(3_001, Some(&head(5)), None), None);
+        assert_eq!(f.dump()["in_flight"], Value::Null);
     }
 
     /// A stop whose deferral ended while a fetch was refused waits out the

@@ -1628,7 +1628,7 @@ impl HostBridge {
             }
         }
         // The feed sync's tick after the pass's messages: a page that came
-        // before its call's 30 s deadline answers it first, never drained
+        // before its call's 35 s deadline answers it first, never drained
         // as a retired call's (Task 33 re-review 3, m1; ruling C1b-a).
         calls.extend(self.feed_tick(now));
         // The device list may have moved (a carriage): pending control
@@ -1637,6 +1637,26 @@ impl HostBridge {
         let Some(station) = self.station.as_mut() else {
             return;
         };
+        // A `control_sync` goes only while it is the live call: one retired
+        // in this same pass is never sent (ruling C1b-b, m2).
+        let mut syncs = Vec::new();
+        let mut calls: Vec<StationCall> = calls
+            .into_iter()
+            .filter_map(|call| match call {
+                StationCall::Sync(sync) => {
+                    syncs.push(sync);
+                    None
+                }
+                fetch => Some(fetch),
+            })
+            .collect();
+        calls.extend(
+            station
+                .feed
+                .outgoing(syncs)
+                .into_iter()
+                .map(StationCall::Sync),
+        );
         for call in calls {
             let sent = self.r9_link.is_some()
                 && call
@@ -1645,7 +1665,7 @@ impl HostBridge {
             if !sent {
                 match call {
                     StationCall::Fetch(_) => station.fetch.unsent(),
-                    StationCall::Sync(_) => station.feed.unsent(),
+                    StationCall::Sync(sync) => station.feed.unsent(&sync.request_id),
                 }
             }
         }
