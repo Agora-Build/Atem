@@ -4240,7 +4240,9 @@ Station's acknowledgments (delegated host work, host-work-v1 §11.4;
 `side: "relay"`, run against atem-client's reference ledger):
 `r9-control-ack-resign`, `r9-control-ack-per-effect`,
 `r9-control-ack-deadline`, `r9-control-ack-durable`,
-`r9-control-ack-portal-refusals`.
+`r9-control-ack-portal-refusals`, and (**for Astation's sign-off**,
+amended for step 4: typed reasons, host-work-v1 §11.4 wire rule 10)
+`r9-control-ack-reasons`.
 
 ### R9.13 Open questions for Astation
 
