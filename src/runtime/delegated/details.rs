@@ -72,6 +72,11 @@ pub const UNKNOWN_ALERT: &str = "unknown alert";
 /// 32 outcomes unresolved on this host`). Not a row of §11.6's table: it
 /// is part of an alert's reason, no task's detail.
 pub const OUTCOMES_UNRESOLVED_ON_THIS_HOST: &str = "outcomes unresolved on this host";
+/// The detail `atem task resolve <task_id> failed` gives a task when the
+/// owner gives none (step 4's open question 2, owner-approved). Not a row
+/// of §11.6's table: a `failed` resolution's detail is the resolver's own
+/// (§11.2), and this is the one the host's own command gives for the owner.
+pub const RESOLVED_AS_FAILED_ON_THE_HOST: &str = "resolved as failed on the host";
 /// A receipt (session-v1 R9.14 item 6): an `accepted` attempt found at
 /// recovery; the session host's own text.
 pub use crate::session_protocol::host::DETAIL_WITHDRAWN_AT_RECOVERY as WITHDRAWN_AT_RECOVERY;

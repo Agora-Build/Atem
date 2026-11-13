@@ -321,7 +321,7 @@ impl Store {
     }
 
     /// The unresolved alerts, in the host's order.
-    fn unresolved_alerts(&self) -> Result<Vec<Alert>> {
+    pub(crate) fn unresolved_alerts(&self) -> Result<Vec<Alert>> {
         let host_id = self.bound()?.map(|h| h.atem_device_id).unwrap_or_default();
         let mut q = self.db.prepare(UNRESOLVED_ALERTS)?;
         let alerts = q

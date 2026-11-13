@@ -4,8 +4,8 @@ use crate::runtime::delegated::authority::Caller;
 use crate::runtime::delegated::{Admission, NoFeeds, SenderClass, classify, details};
 use crate::runtime::host_clock::HostClock;
 use crate::runtime::host_work::{
-    AUTHORIZATION_EXPIRED, Accepted, Config, LaunchRecord, MessageFrame, Profile, Store,
-    WorkRecord,
+    AUTHORIZATION_EXPIRED, Accepted, Config, KEPT_REPLY_BUDGET, LaunchRecord, MessageFrame,
+    Profile, Store, WorkRecord,
 };
 use crate::session_protocol::r9::{HostWorkError, ProjectScope};
 use atem_client::principal::{Authority, Need, Op};
@@ -55,6 +55,8 @@ mod collab_launch_bridge;
 mod delegated_dispatch;
 #[path = "delegated/hints.rs"]
 mod delegated_hints;
+#[path = "delegated/owner.rs"]
+mod delegated_owner;
 #[path = "delegated/recovery.rs"]
 mod delegated_recovery;
 #[path = "delegated/requests.rs"]
@@ -1657,6 +1659,9 @@ impl HostBridge {
     /// About once a minute, after a scheduling pass: the payloads of
     /// host-work records settled a day past their deadline go, remote and
     /// local alike (`Store::drop_payloads`; every record stays, one
+    /// runtime.log line says how many), a delegated task's reply, kept 30
+    /// days after its task settled, then goes (`Store::drop_kept_replies`;
+    /// over the kept replies' budget the oldest go early, and one
     /// runtime.log line says how many), and collaboration counters whose
     /// windows passed.
     fn work_cleanup(&mut self) -> anyhow::Result<()> {
@@ -1676,6 +1681,10 @@ impl HostBridge {
                 count(dropped.messages, "message"),
                 count(dropped.uploads, "upload")
             );
+        }
+        let kept = store.drop_kept_replies(now, KEPT_REPLY_BUDGET)?;
+        if kept.early > 0 {
+            eprintln!("atem runtime: host work: {}", kept_early_line(kept.early));
         }
         crate::runtime::collab::prune_counters(&store.db, now)
     }
@@ -2194,6 +2203,17 @@ impl HostBridge {
     }
 }
 
+/// What runtime.log says when kept replies go before their 30 days, the
+/// kept replies' budget full (design I.4.7, step 4's open question 3).
+fn kept_early_line(n: usize) -> String {
+    format!(
+        "the replies kept for delegated tasks are over their {} MiB budget: dropped the text and context of {n} {} before {} 30 days, oldest first (records kept)",
+        KEPT_REPLY_BUDGET >> 20,
+        if n == 1 { "reply" } else { "replies" },
+        if n == 1 { "its" } else { "their" }
+    )
+}
+
 /// A prompt receipt completed with the outcome `interrupted` (journaled as
 /// its detail).
 fn turn_interrupted(receipt: &wire::Receipt) -> bool {
@@ -2224,6 +2244,7 @@ mod local_tests {
         include!("delegated/recovery_tests.rs");
         include!("delegated/alerts_tests.rs");
         include!("delegated/resolve_tests.rs");
+        include!("delegated/owner_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};

@@ -73,6 +73,11 @@ struct Rig {
     membership: bool,
     /// The broker's state after each pass (`ATEM_TEST_STATE_DUMP`).
     dump: bool,
+    /// The debug hook turns `host.delegated` on (`ATEM_TEST_HOST_FEATURES`);
+    /// off: a restart without it.
+    hook: bool,
+    /// Context snapshots from `<sandbox>/context` (`ATEM_TEST_CONTEXT_DIR`).
+    context: bool,
 }
 
 impl Rig {
@@ -148,6 +153,8 @@ principals = {principals}
             faults: false,
             membership: false,
             dump: false,
+            hook: true,
+            context: false,
         }
     }
 
@@ -187,7 +194,14 @@ principals = {principals}
             .unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_atem"));
         command.env_clear();
-        command.env("ATEM_TEST_HOST_FEATURES", "host.delegated");
+        if self.hook {
+            command.env("ATEM_TEST_HOST_FEATURES", "host.delegated");
+        }
+        if self.context {
+            let context = self.sandbox.dir.path().join("context");
+            std::fs::create_dir_all(&context).unwrap();
+            command.env("ATEM_TEST_CONTEXT_DIR", context);
+        }
         if let Some(controls) = &self.controls {
             command.env("ATEM_TEST_HOST_CONTROLS", controls);
         }
@@ -1251,4 +1265,193 @@ fn sigkill_after_attempt_commit_and_after_accepted_runs_once() {
     assert_eq!(all.len(), 2, "{all:?}");
     assert_eq!(all[0], (accepted, Some("withdrawn".into())));
     assert_eq!(all[1].1.as_deref(), Some("started"));
+}
+
+/// What the owner's terminal (outside any session) prints for `atem
+/// <args>`: its stdout; the command must succeed.
+fn owner(rig: &Rig, args: &[&str]) -> String {
+    let (out, err, ok) = rig.sandbox.atem(args);
+    assert!(ok, "atem {args:?} failed: {out}{err}");
+    out
+}
+
+/// Host-work-v1 §11.6 "On the host", step 4's open question 2: `atem task
+/// list --unknown` and `atem task resolve` are the owner's, run from a
+/// terminal outside any agent session. Run by an agent of the runtime (its
+/// own child) both are refused with the reason, and nothing changes; from
+/// the owner's terminal the same runtime answers.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_HOST_CONTROLS hooks"
+)]
+fn task_resolve_refused_inside_an_agent_session() {
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_controls(gate_open());
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let t = task(&launch, "IN_ITS_TURN", HOUR);
+    enqueue(&mut phone, &mut r, &t);
+    in_turn(&rig, &t["task_id"], "IN_ITS_TURN");
+    let tid = t["task_id"].as_str().unwrap();
+    let inside = "atem task runs from the owner's terminal, not inside an Atem session";
+    for (n, args) in [
+        (1, vec!["task", "resolve", tid, "failed"]),
+        (
+            2,
+            vec![
+                "task",
+                "resolve",
+                tid,
+                "failed",
+                "--detail",
+                "from the agent",
+            ],
+        ),
+        (3, vec!["task", "list", "--unknown"]),
+    ] {
+        let run = agent_run(&rig.fake, n, &args);
+        assert_ne!(run["code"], 0, "{run}");
+        assert!(
+            run["stderr"].as_str().unwrap().contains(inside),
+            "{args:?}: {run}"
+        );
+    }
+    let status = stored(&rig, &t["task_id"]);
+    assert_eq!(
+        (status["state"].as_str(), status.get("resolved")),
+        (Some("submitted"), None),
+        "{status}"
+    );
+    // The owner's terminal: answered (nothing is unknown yet).
+    assert_eq!(owner(&rig, &["task", "list", "--unknown"]), "");
+    let (out, err, ok) = rig.sandbox.atem(&["task", "resolve", tid, "failed"]);
+    assert!(!ok, "{out}");
+    assert!(
+        err.contains(&format!(
+            "task {tid} is submitted; only a task of unknown outcome is resolved"
+        )),
+        "{err}"
+    );
+}
+
+/// Host-work-v1 §11.6 "On the host" ("`atem task list --unknown` lists the
+/// unresolved outcomes: the task, session, sender, reason and when"; "`atem
+/// task resolve <task_id> failed|done` resolves one as the owner, on the
+/// host. Its `resolved.by` is `local`"), step 4's open question 2 and
+/// ruling T23a, through the CLI and the real runtime: two of the phone's
+/// tasks run on two sessions and their agents exit, so both outcomes are
+/// unknown. The owner lists them and resolves one `failed` (the default
+/// detail). The runtime restarts without the hook: the other is still
+/// listed and the owner resolves it `done` with a vault entry, taken as a
+/// reply's context is (encryption on, read back). Each is stored resolved
+/// by `local`; nothing is left unresolved.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_CONTEXT_DIR hooks"
+)]
+fn the_owner_lists_and_resolves_unknown_outcomes_from_the_terminal() {
+    use sha2::{Digest, Sha256};
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    support::astation::write_encryption_mode(&rig.sandbox.config(), "on");
+    rig.with_controls(gate_open());
+    rig.context = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let (first, second) = (svc.session(&mut r), svc.session(&mut r));
+    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let one = task(&first, "OWNER_ONE", HOUR);
+    let two = task(&second, "OWNER_TWO", HOUR);
+    for t in [&one, &two] {
+        enqueue(&mut phone, &mut r, t);
+    }
+    in_turn(&rig, &one["task_id"], "OWNER_ONE");
+    in_turn(&rig, &two["task_id"], "OWNER_TWO");
+    // Both agents exit in their turns.
+    private(&rig.fake.join("exit"), "");
+    for t in [&one, &two] {
+        wait_stored(&rig, &t["task_id"], "outcome_unknown", "agent exited");
+    }
+    let (one_id, two_id) = (
+        one["task_id"].as_str().unwrap(),
+        two["task_id"].as_str().unwrap(),
+    );
+    let listed = owner(&rig, &["task", "list", "--unknown"]);
+    let lines: Vec<&str> = listed.lines().collect();
+    assert_eq!(lines.len(), 2, "{listed}");
+    for (line, (tid, launch)) in lines.iter().zip([(one_id, &first), (two_id, &second)]) {
+        let head = format!(
+            "{tid}  {}  member:{PHONE}  agent exited  ",
+            launch["session_id"].as_str().unwrap()
+        );
+        assert!(line.starts_with(&head), "{line}");
+        // When: the local `YYYY-MM-DD HH:MM`.
+        assert_eq!(line.len(), head.len() + 16, "{line}");
+    }
+    assert_eq!(
+        owner(&rig, &["task", "resolve", one_id, "failed"]),
+        format!("{one_id}: resolved as failed\n")
+    );
+    let failed = stored(&rig, &one["task_id"]);
+    assert_eq!(
+        (
+            failed["state"].as_str(),
+            failed["detail"].as_str(),
+            failed["resolved"]["by"].as_str()
+        ),
+        (
+            Some("failed"),
+            Some("resolved as failed on the host"),
+            Some("local")
+        ),
+        "{failed}"
+    );
+    // A restart without the hook: the other is still the owner's to settle.
+    drop((r, svc, phone));
+    rig.kill();
+    rig.hook = false;
+    rig.start();
+    let listed = owner(&rig, &["task", "list", "--unknown"]);
+    assert_eq!(listed.lines().count(), 1, "{listed}");
+    assert!(listed.starts_with(&format!("{two_id}  ")), "{listed}");
+    let text = "The change landed; the owner checked it.";
+    let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let name = format!("{:x}", Sha256::digest(b"v-result:1@1"));
+    private(
+        &rig.sandbox
+            .dir
+            .path()
+            .join("context")
+            .join(format!("{name}.json")),
+        &json!({"kind":"vault","id":"v-result:1","version":1,"digest":digest,"text":text})
+            .to_string(),
+    );
+    assert_eq!(
+        owner(
+            &rig,
+            &["task", "resolve", two_id, "done", "--vault", "v-result:1@1"]
+        ),
+        format!("{two_id}: resolved as done\n")
+    );
+    let done = stored(&rig, &two["task_id"]);
+    assert_eq!(
+        (
+            done["state"].as_str(),
+            done["result"]["text"].as_str(),
+            done["resolved"]["by"].as_str()
+        ),
+        (Some("completed"), Some(text), Some("local")),
+        "{done}"
+    );
+    assert_eq!(owner(&rig, &["task", "list", "--unknown"]), "");
+    // The same resolution again: the recorded status.
+    assert_eq!(
+        owner(&rig, &["task", "resolve", one_id, "failed"]),
+        format!("{one_id}: resolved as failed\n")
+    );
 }
