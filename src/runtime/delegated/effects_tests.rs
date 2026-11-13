@@ -912,3 +912,39 @@ fn the_hook_off_refuses_and_carries_out_nothing() {
         assert!(rig.bridge.r9.revoked_services().is_empty());
     });
 }
+
+/// PR 11 setup review note 4 (design I.3.3's "awaiting_result,
+/// outcome_unknown" column): a revoke with `interrupt_running` leaves the
+/// bot's task awaiting its result and its task of unknown outcome as they
+/// are, writing no intent for either (their turn ended, or none can be tied
+/// to them), so no acknowledgment can count one; the owner still reads
+/// both, the bot neither.
+#[test]
+fn a_revoke_leaves_awaiting_and_unknown_outcomes_alone() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = covered_bot(&mut rig, root, &os, start);
+        let awaiting = bot_running(&mut rig, &s, "REVOKE_LEAVES_AWAITING", start).await;
+        complete(&mut rig, &awaiting).await;
+        let template = stored_record(&rig, &awaiting);
+        let [unknown] = unknown_outcomes(&rig, &template, BOT, 1)
+            .try_into()
+            .unwrap();
+        feed(&mut rig, &s.log, &[&bot_record(&s.log, revoke(true), 2)]);
+        passes(&mut rig, 3);
+        assert!(intents(&rig, &awaiting).is_empty());
+        assert!(intents(&rig, &unknown).is_empty());
+        assert_eq!(settled(&rig, &awaiting).0, WorkState::AwaitingResult);
+        assert_eq!(
+            settled(&rig, &unknown),
+            (WorkState::OutcomeUnknown, details::AGENT_EXITED.into())
+        );
+        let (mac, bot) = (s.mac.clone(), s.bot.clone());
+        for task in [&awaiting, &unknown] {
+            assert!(ask(&mut rig, &mac, Q::Query(task)).is_ok(), "the owner");
+            assert_eq!(ask(&mut rig, &bot, Q::Query(task)), forbidden());
+        }
+    });
+}
