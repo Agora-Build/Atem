@@ -1932,10 +1932,10 @@ fn a_reset_read_in_a_pause_after_the_link_dropped_lowers_the_cursor_first() {
 }
 
 /// Ruling C1b-a (wire rule 11; Astation's "same-cursor retries" and
-/// "reordered old replies"): a `control_sync` unanswered for 30 seconds is
+/// "reordered old replies"): a `control_sync` unanswered for 35 seconds is
 /// retired, the Station-fault alert goes, `atem status` says so, and the
 /// host asks again at once at the same cursor with a fresh `request_id`;
-/// so again 30 seconds later. The Station's late answers to the retired
+/// so again 35 seconds later. The Station's late answers to the retired
 /// calls, the newer first, are drained: nothing of them applies and the
 /// gate stays closed. The live call's page applies and the gate opens.
 #[test]
@@ -1957,7 +1957,7 @@ fn same_cursor_retries_apply_only_the_live_ids_page() {
         station.hold_call(link)
     };
     assert_eq!(sync_of(&a), rig.sync(1));
-    // Unanswered for 30 s: retired; asked again at once, a fresh id.
+    // Unanswered for 35 s: retired; asked again at once, a fresh id.
     rig.clock.add_mono(SYNC_DEADLINE + 1_000);
     let b = rig.station().hold_call(link);
     assert_eq!(sync_of(&b), rig.sync(1));
@@ -2461,7 +2461,7 @@ fn a_late_refusal_retires_the_live_call_and_costs_liveness_only() {
         station.heads_now();
         station.hold_call(link)
     };
-    // A unanswered for 30 s: B asked.
+    // A unanswered for 35 s: B asked.
     rig.clock.add_mono(SYNC_DEADLINE + 1_000);
     let b = rig.station().hold_call(link);
     assert_eq!(sync_of(&b), rig.sync(1));
