@@ -5964,10 +5964,12 @@ fn write_control_vectors() {
 //
 // `r9-vectors-delegated-wire` (session-v1 R9.14, planned): the shapes of
 // `host_enc_key_get` and its `host_enc_key` answer, and of receipts with and
-// without provenance (`task_id`, `sender`), valid and refused. Every value
-// comes from the crate's own builders; the valid answer's `enc_key` and
-// `enc_sig` are `r9-vectors-membership-log`'s first `host_enc_key` pair, so
-// its binding verifies against log L.
+// without provenance (`task_id`, `sender`), valid and refused; and the r9
+// welcome's optional `verifier` (R9.2, R9.8; Atem's proposal, for
+// Astation's agreement) with this build's own inventory. Every value comes
+// from the crate's own builders; the valid answer's `enc_key` and `enc_sig`
+// are `r9-vectors-membership-log`'s first `host_enc_key` pair, so its
+// binding verifies against log L.
 
 const WIRE_ID: &str = "c1c2c3c4-0000-4000-8000-000000000001";
 const WIRE_RE: &str = "c1c2c3c4-0000-4000-8000-000000000002";
@@ -6217,11 +6219,18 @@ fn delegated_wire_vectors(book: &Book) -> Value {
         receipts.push(case(name, false, m));
     }
 
+    // The r9 welcome's optional `verifier` (R9.2 "How a verifier reports
+    // itself", R9.8; Atem's proposal, for Astation's agreement): a welcome
+    // without one (as v0.8.0 to v0.8.5 hosts send it), with this build's,
+    // with a newer host's (names this build doesn't know are read, never
+    // judged), the bounds, and one refused case per rule.
+    let welcomes = welcome_cases(&log);
+
     json!({
         "name": "r9-vectors-delegated-wire",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4 and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without. Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
+        "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4 and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without; and the r9 welcome's optional verifier (R9.2 \"How a verifier reports itself\", R9.8; Atem's proposal, for Astation's agreement): absent, or exactly version (an integer from 1 to 2^32 - 1) and actions (1-64 names, sorted by bytes, each once, each 1-32 bytes of [a-z0-9_] starting with a letter; a name the reader doesn't know is read, never refused); `verifier` is this release's own (version 2: R9.2's sixteen actions). Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
         "host_enc_key_binding": {
             "account_id": log.account_id(),
             "genesis_hash": genesis.to_hex(),
@@ -6232,7 +6241,201 @@ fn delegated_wire_vectors(book: &Book) -> Value {
         "host_enc_key_get": gets,
         "host_enc_key": keys,
         "receipt": receipts,
+        "verifier": atem_client::membership::VerifierInventory::ours().to_json(),
+        "welcome": welcomes,
     })
+}
+
+/// The `welcome` section of `r9-vectors-delegated-wire`: one welcome to log
+/// L's head, then its `verifier` varied.
+fn welcome_cases(log: &Membership) -> Vec<Value> {
+    use atem_client::membership::{VerifierInventory, known_actions};
+    use atem_client::principal::{ClientKind, Permission};
+    use atem_client::session::r9::{PendingRecovery, R9_FEATURES, REVISION, Welcome};
+    use atem_client::session::revision::KNOWN_FEATURES;
+    use serde_json::json;
+    let base = Welcome {
+        id: WIRE_ID.into(),
+        re: Some(WIRE_RE.into()),
+        account_id: log.account_id().into(),
+        atem_device_id: "host-a".into(),
+        host_trust_gen: 1,
+        runtime_gen: "c1c2c3c4-0000-4000-8000-0000000000a1".into(),
+        controller_session: "c1c2c3c4-0000-4000-8000-0000000000a2".into(),
+        attachment_gen: "c1c2c3c4-0000-4000-8000-0000000000a3".into(),
+        client_kind: ClientKind::Native,
+        permissions: vec![Permission::Control, Permission::View],
+        authorization_ms_left: 86_400_000,
+        server_time: 1_793_620_800_000,
+        revision: REVISION,
+        features: KNOWN_FEATURES
+            .iter()
+            .chain(R9_FEATURES)
+            .map(|f| f.to_string())
+            .collect(),
+        principal: "member:dev-phone".into(),
+        scope: None,
+        head: log.head(),
+        pending_recovery: Vec::<PendingRecovery>::new(),
+        channel_id: s(&load("r9-vectors-channel-handshake"), "channel_id").into(),
+        verifier: None,
+    };
+    let with = |verifier: Option<VerifierInventory>| {
+        let mut w = base.clone();
+        w.verifier = verifier;
+        w.to_json()
+    };
+    let ours = VerifierInventory::ours();
+    let inventory = |version: u32, actions: Vec<String>| {
+        Some(VerifierInventory::new(version, actions).expect("a valid inventory"))
+    };
+    let mut newer: Vec<String> = ours.actions().to_vec();
+    newer.push("later_action".into());
+    newer.sort();
+    // The sixteen actions and `n` made-up ones, sorted: a newer verifier
+    // lists every action of the versions before it (R9.2, versions only
+    // widen).
+    let names = |n: usize| {
+        let mut all = ours.actions().to_vec();
+        all.extend((0..n).map(|i| format!("action_{i:02}")));
+        all.sort();
+        all
+    };
+    let case = |name: &str, valid: bool, message: Value| json!({"name": name, "valid": valid, "message": message});
+    let mut cases = vec![
+        case("welcome_without_verifier", true, with(None)),
+        case("welcome_with_verifier", true, with(Some(ours.clone()))),
+        case(
+            "welcome_verifier_of_a_newer_host",
+            true,
+            with(inventory(3, newer)),
+        ),
+        case(
+            "welcome_verifier_64_actions",
+            true,
+            with(inventory(3, names(48))),
+        ),
+        case(
+            "welcome_verifier_32_byte_action",
+            true,
+            with(inventory(3, {
+                let mut all = ours.actions().to_vec();
+                all.push(format!("a{}", "_".repeat(31)));
+                all.sort();
+                all
+            })),
+        ),
+        case(
+            "welcome_verifier_largest_version",
+            true,
+            with(inventory(u32::MAX, ours.actions().to_vec())),
+        ),
+    ];
+    let edit = |f: &dyn Fn(&mut Value)| {
+        let mut m = with(Some(ours.clone()));
+        f(&mut m["data"]["verifier"]);
+        m
+    };
+    let known: Vec<&str> = known_actions().to_vec();
+    for (name, m) in [
+        ("welcome_verifier_not_null", edit(&|v| *v = Value::Null)),
+        (
+            "welcome_verifier_is_an_object",
+            edit(&|v| *v = json!([2, known])),
+        ),
+        (
+            "welcome_verifier_unknown_field",
+            edit(&|v| v["extra"] = json!(1)),
+        ),
+        (
+            "welcome_verifier_needs_version",
+            edit(&|v| {
+                v.as_object_mut().unwrap().remove("version");
+            }),
+        ),
+        (
+            "welcome_verifier_needs_actions",
+            edit(&|v| {
+                v.as_object_mut().unwrap().remove("actions");
+            }),
+        ),
+        (
+            "welcome_verifier_version_from_one",
+            edit(&|v| v["version"] = json!(0)),
+        ),
+        (
+            "welcome_verifier_version_below_2_32",
+            edit(&|v| v["version"] = json!(1u64 << 32)),
+        ),
+        (
+            "welcome_verifier_version_is_a_number",
+            edit(&|v| v["version"] = json!("2")),
+        ),
+        (
+            "welcome_verifier_actions_is_an_array",
+            edit(&|v| v["actions"] = json!("add")),
+        ),
+        (
+            "welcome_verifier_actions_not_empty",
+            edit(&|v| v["actions"] = json!([])),
+        ),
+        (
+            "welcome_verifier_at_most_64_actions",
+            edit(&|v| v["actions"] = json!(names(49))),
+        ),
+        (
+            "welcome_verifier_actions_sorted",
+            edit(&|v| v["actions"] = json!(["remove", "add"])),
+        ),
+        (
+            "welcome_verifier_actions_once",
+            edit(&|v| v["actions"] = json!(["add", "add", "remove"])),
+        ),
+        (
+            "welcome_verifier_action_is_a_string",
+            edit(&|v| v["actions"] = json!(["add", 7])),
+        ),
+        (
+            "welcome_verifier_action_not_empty",
+            edit(&|v| v["actions"] = json!([""])),
+        ),
+        (
+            "welcome_verifier_action_lower_case",
+            edit(&|v| v["actions"] = json!(["Add"])),
+        ),
+        (
+            "welcome_verifier_action_no_hyphen",
+            edit(&|v| v["actions"] = json!(["add-host"])),
+        ),
+        (
+            "welcome_verifier_action_starts_with_a_letter",
+            edit(&|v| v["actions"] = json!(["_add"])),
+        ),
+        (
+            "welcome_verifier_action_at_most_32_bytes",
+            edit(&|v| v["actions"] = json!([format!("a{}", "_".repeat(32))])),
+        ),
+    ] {
+        cases.push(case(name, false, m));
+    }
+    // Text the vectors' integer-only JSON can't hold, or a parser would
+    // fold: a fraction, a duplicate key.
+    let text = with(inventory(2, vec!["add".into()])).to_string();
+    let at = r#""verifier":{"actions":["add"],"version":2}"#;
+    assert!(text.contains(at), "{text}");
+    for (name, raw) in [
+        (
+            "welcome_verifier_version_is_an_integer",
+            r#""verifier":{"actions":["add"],"version":2.5}"#,
+        ),
+        (
+            "welcome_verifier_duplicate_key",
+            r#""verifier":{"actions":["add"],"version":2,"version":3}"#,
+        ),
+    ] {
+        cases.push(json!({"name": name, "valid": false, "raw": text.replace(at, raw)}));
+    }
+    cases
 }
 
 #[test]
@@ -6331,6 +6534,36 @@ fn delegated_wire() {
             assert_eq!(
                 swire::to_value(&Envelope::Session(message)),
                 case["message"],
+                "{name}"
+            );
+        }
+        run.pass(format!(
+            "{name}: {}",
+            if case["valid"] == true {
+                "read and written back"
+            } else {
+                "refused"
+            }
+        ));
+    }
+    // This build's verifier, pinned (version 2: R9.2's sixteen actions).
+    let ours = atem_client::membership::VerifierInventory::ours();
+    assert_eq!(run.get("verifier"), ours.to_json());
+    assert_eq!(ours.version(), atem_client::membership::VERIFIER_VERSION);
+    run.pass("verifier: this build's version and actions");
+    for case in run.get("welcome").as_array().unwrap() {
+        let name = s(case, "name");
+        let read = match Incoming::parse(&bytes(case)) {
+            Ok(Incoming::Welcome(welcome)) => Some(welcome),
+            Ok(other) => panic!("{name}: not a welcome: {other:?}"),
+            Err(_) => None,
+        };
+        assert_eq!(read.is_some(), case["valid"] == true, "{name}");
+        if let Some(welcome) = read {
+            assert_eq!(welcome.to_json(), case["message"], "{name}");
+            assert_eq!(
+                welcome.verifier().map(|v| v.to_json()),
+                case["message"]["data"].get("verifier").cloned(),
                 "{name}"
             );
         }

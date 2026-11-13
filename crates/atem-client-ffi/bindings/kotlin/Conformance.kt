@@ -564,6 +564,28 @@ fun main(args: Array<String>) {
                 v.obj()["reason"] != "bad_enc_sig", v["label"].s())
         }
     }
+    // The verifier's own inventory: r9-vectors-delegated-wire's `verifier`,
+    // what this binding's verifier reports about itself (session-v1 R9.2 "How
+    // a verifier reports itself"; Atem's proposal, for Astation's
+    // agreement): version 2, the sixteen actions, sorted by bytes (ASCII,
+    // so String order), each once; every action the membership-log vectors
+    // sign is one of them.
+    val wireShapes = load("r9-vectors-delegated-wire")
+    check("verifier inventory: version and known actions (R9.2)") {
+        val ours = verifierInventory()
+        eq(ours.version.toLong(), wireShapes["verifier"]["version"].l(), "version")
+        eq(ours.actions, wireShapes["verifier"]["actions"].arr().map { it.s() }, "actions")
+        eq(ours.version, 2u)
+        eq(ours.actions.size, 16)
+        for ((a, b) in ours.actions.zipWithNext()) if (a >= b) throw AssertionError("not sorted at $b")
+        for (v in vectors) {
+            val action = v["entry"]["body"]["action"].s()
+            if (action !in ours.actions) throw AssertionError("${v["label"].s()}: $action isn't listed")
+        }
+        for (a in listOf("project_set", "project_remove", "host_sender_revoke", "host_sender_readmit", "host_enc_key")) {
+            if (a !in ours.actions) throw AssertionError("$a isn't listed")
+        }
+    }
     check("device-list actions: a manager signs each under a purpose that names it (R9.6 rule 4)") {
         val mac = JdkKeys()
         mac.addP256("dev-mac/auth", unhex(keys["dev-mac"]["auth"]["secret_hex"].s()), unhex(keys["dev-mac"]["auth"]["pub_hex"].s()))

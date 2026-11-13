@@ -253,6 +253,12 @@ fn kotlin_phone_and_wasm_browser_use_the_host_over_tcp() {
     let browser_js = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bindings/js/browser.mjs");
 
     let host = Host::new();
+    // The host reports its verifier (R9.2 "How a verifier reports itself",
+    // Atem's proposal): the phone and the browser read it from their
+    // welcome. The bot's host (below) sends none.
+    host.core.lock().unwrap().welcome_override = Some(|w| {
+        w.verifier = Some(atem_client::membership::VerifierInventory::ours());
+    });
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let host_port = listener.local_addr().unwrap().port();
     host.serve(listener);

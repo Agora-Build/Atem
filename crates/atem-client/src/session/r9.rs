@@ -407,7 +407,9 @@ fn pending_list(value: &Value) -> Option<Vec<PendingRecovery>> {
 
 /// The r9 `welcome` (§R9.8): r8's fields with `revision: 9`, plus the
 /// principal, its kind, permissions and scope, the head after the carriage,
-/// `pending_recovery` (always present), `channel_id`.
+/// `pending_recovery` (always present), `channel_id`, and the host
+/// verifier's report `verifier` (optional; Atem's proposal, for Astation's
+/// agreement).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Welcome {
     pub id: String,
@@ -429,9 +431,19 @@ pub struct Welcome {
     pub head: Head,
     pub pending_recovery: Vec<PendingRecovery>,
     pub channel_id: String,
+    /// The host verifier's report (R9.2 "How a verifier reports itself"):
+    /// absent from hosts that send none, never `null`.
+    pub verifier: Option<crate::membership::VerifierInventory>,
 }
 
 impl Welcome {
+    /// What the host's verifier reports about itself, if it did (R9.2 "How
+    /// a verifier reports itself"; Atem's proposal, for Astation's
+    /// agreement).
+    pub fn verifier(&self) -> Option<&crate::membership::VerifierInventory> {
+        self.verifier.as_ref()
+    }
+
     pub fn to_json(&self) -> Value {
         let mut data = json!({
             "v": 1, "op": "welcome", "id": self.id,
@@ -452,6 +464,9 @@ impl Welcome {
         if let Some(scope) = &self.scope {
             data["scope"] = scope.to_json();
         }
+        if let Some(verifier) = &self.verifier {
+            data["verifier"] = verifier.to_json();
+        }
         json!({"type": "session", "data": data})
     }
 
@@ -460,9 +475,11 @@ impl Welcome {
     }
 
     /// Reads a `welcome`'s `data` (unknown fields ignored, §1; every field
-    /// above required, `scope` optional). The client's checks against its
-    /// own state are [`crate::connect`]'s.
+    /// above required, `scope` and `verifier` optional, `verifier` read
+    /// strictly inside: [`crate::membership::VerifierInventory::from_json`]).
+    /// The client's checks against its own state are [`crate::connect`]'s.
     pub fn from_data(data: &Value) -> Result<Welcome, &'static str> {
+        use crate::membership::VerifierInventory;
         use crate::principal::{ClientKind, Permission, ScopeView};
         let o = data.as_object().ok_or("welcome")?;
         if o.get("op").and_then(Value::as_str) != Some("welcome") {
@@ -521,6 +538,10 @@ impl Welcome {
                 .and_then(pending_list)
                 .ok_or("pending_recovery")?,
             channel_id: s("channel_id")?,
+            verifier: match o.get("verifier") {
+                None => None,
+                Some(v) => Some(VerifierInventory::from_json(v)?),
+            },
         })
     }
 }
@@ -1624,6 +1645,181 @@ mod tests {
             refused(&|d| d["enc_sig"] = json!(b64u(&[7u8; 63])));
             refused(&|d| d["enc_sig"] = json!(b64u(&[7u8; 65])));
             refused(&|d| d["enc_sig"] = json!("not base64url!"));
+        }
+    }
+
+    /// The welcome's optional `verifier` (R9.2 "How a verifier reports
+    /// itself", R9.8; Atem's proposal, for Astation's agreement): read
+    /// strictly when present, absent as before.
+    mod verifier {
+        use super::*;
+        use crate::membership::{VerifierInventory, known_actions};
+        use crate::principal::{ClientKind, Permission};
+
+        fn welcome() -> Welcome {
+            Welcome {
+                id: "aaaaaaaa-0000-4000-8000-0000000000d1".into(),
+                re: Some("aaaaaaaa-0000-4000-8000-0000000000d2".into()),
+                account_id: "acct-test-1".into(),
+                atem_device_id: "host-a".into(),
+                host_trust_gen: 1,
+                runtime_gen: "rg".into(),
+                controller_session: "cs".into(),
+                attachment_gen: "ag".into(),
+                client_kind: ClientKind::Native,
+                permissions: vec![Permission::View, Permission::Control],
+                authorization_ms_left: 1000,
+                server_time: 1_793_620_800_000,
+                revision: REVISION,
+                features: vec!["membership.carry".into()],
+                principal: "member:dev-phone".into(),
+                scope: None,
+                head: Head {
+                    seq: 4,
+                    hash: crate::Hash32([4; 32]),
+                },
+                pending_recovery: vec![],
+                channel_id: "ch-1".into(),
+                verifier: None,
+            }
+        }
+
+        /// The `data` of a welcome carrying `verifier` as given.
+        fn data_with(verifier: Value) -> Value {
+            let mut data = welcome().to_json()["data"].clone();
+            data["verifier"] = verifier;
+            data
+        }
+
+        fn read(data: &Value) -> Result<Welcome, &'static str> {
+            let bytes = json!({"type": "session", "data": data}).to_string();
+            match Incoming::parse(bytes.as_bytes())? {
+                Incoming::Welcome(w) => Ok(*w),
+                other => panic!("not a welcome: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn welcome_reads_an_optional_verifier() {
+            let ours = VerifierInventory::ours();
+            assert_eq!(ours.actions(), known_actions());
+            let data = data_with(json!({"version": 2, "actions": known_actions()}));
+            let w = read(&data).unwrap();
+            assert_eq!(w.verifier(), Some(&ours));
+            assert_eq!(w.to_json()["data"], data, "written back as read");
+
+            // A newer host may know actions this build doesn't: its names
+            // are read, never judged.
+            let newer = data_with(json!({"version": 3, "actions": ["add", "zz_later_action"]}));
+            let w = read(&newer).unwrap();
+            let v = w.verifier().unwrap();
+            assert_eq!(
+                (v.version(), v.actions()),
+                (3, &["add".to_owned(), "zz_later_action".to_owned()][..])
+            );
+
+            // The bounds: 64 names, a 32-byte name, the largest version.
+            let many: Vec<String> = (0..64).map(|i| format!("a{i:02}")).collect();
+            assert_eq!(
+                read(&data_with(json!({"version": 3, "actions": many})))
+                    .unwrap()
+                    .verifier()
+                    .unwrap()
+                    .actions()
+                    .len(),
+                64
+            );
+            let long = format!("a{}", "_".repeat(31));
+            assert!(read(&data_with(json!({"version": 3, "actions": [long]}))).is_ok());
+            assert!(read(&data_with(json!({"version": u32::MAX, "actions": ["add"]}))).is_ok());
+        }
+
+        #[test]
+        fn welcome_refuses_a_malformed_verifier() {
+            let many: Vec<String> = (0..65).map(|i| format!("a{i:02}")).collect();
+            let long = format!("a{}", "_".repeat(32));
+            for (why, verifier) in [
+                ("null", json!(null)),
+                ("not an object", json!([2, ["add"]])),
+                (
+                    "unknown field",
+                    json!({"version": 2, "actions": ["add"], "extra": 1}),
+                ),
+                ("no version", json!({"actions": ["add"]})),
+                ("no actions", json!({"version": 2})),
+                ("version 0", json!({"version": 0, "actions": ["add"]})),
+                (
+                    "version negative",
+                    json!({"version": -1, "actions": ["add"]}),
+                ),
+                (
+                    "version a fraction",
+                    json!({"version": 1.5, "actions": ["add"]}),
+                ),
+                (
+                    "version a string",
+                    json!({"version": "2", "actions": ["add"]}),
+                ),
+                (
+                    "version above u32",
+                    json!({"version": u64::from(u32::MAX) + 1, "actions": ["add"]}),
+                ),
+                (
+                    "actions not an array",
+                    json!({"version": 2, "actions": "add"}),
+                ),
+                ("no action", json!({"version": 2, "actions": []})),
+                ("65 actions", json!({"version": 2, "actions": many})),
+                (
+                    "not sorted",
+                    json!({"version": 2, "actions": ["remove", "add"]}),
+                ),
+                (
+                    "a duplicate",
+                    json!({"version": 2, "actions": ["add", "add"]}),
+                ),
+                ("not a string", json!({"version": 2, "actions": ["add", 7]})),
+                ("empty name", json!({"version": 2, "actions": [""]})),
+                ("upper case", json!({"version": 2, "actions": ["Add"]})),
+                ("a hyphen", json!({"version": 2, "actions": ["add-host"]})),
+                (
+                    "a leading digit",
+                    json!({"version": 2, "actions": ["1add"]}),
+                ),
+                (
+                    "a leading underscore",
+                    json!({"version": 2, "actions": ["_add"]}),
+                ),
+                ("33 bytes", json!({"version": 2, "actions": [long]})),
+            ] {
+                assert_eq!(
+                    read(&data_with(verifier)).map(|_| ()),
+                    Err("verifier"),
+                    "{why}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_welcome_without_verifier_still_reads() {
+            let data = welcome().to_json()["data"].clone();
+            assert!(
+                data.get("verifier").is_none(),
+                "nothing written without one"
+            );
+            let w = read(&data).unwrap();
+            assert_eq!(w.verifier(), None);
+            assert_eq!(w, welcome());
+            // Other unknown fields are still ignored (§1), beside it or not.
+            let mut more = data.clone();
+            more["later_field"] = json!({"x": 1});
+            assert_eq!(read(&more).unwrap(), welcome());
+            let mut both = data_with(json!({"version": 2, "actions": known_actions()}));
+            both["later_field"] = json!(1);
+            assert_eq!(
+                read(&both).unwrap().verifier(),
+                Some(&VerifierInventory::ours())
+            );
         }
     }
 
