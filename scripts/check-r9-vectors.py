@@ -32,6 +32,7 @@ import hmac
 import json
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
@@ -1353,6 +1354,25 @@ def delegated_task(facts):
     )
 
 
+# Unicode's White_Space property (PropList.txt), written out: an alert's
+# reason must carry something else (host-work-v1 §11.3).
+WHITE_SPACE = set(
+    "\t\n\x0b\x0c\r \x85\xa0\u1680" + "".join(chr(c) for c in range(0x2000, 0x200B))
+    + "\u2028\u2029\u202f\u205f\u3000"
+)
+
+
+def reason_ok(reason):
+    """An outcome_unknown alert's reason (host-work-v1 §11.3): 1-256 bytes,
+    not blank (something besides White_Space), no control (Cc) or format
+    (Cf) character."""
+    return (
+        1 <= len(reason.encode()) <= 256
+        and any(c not in WHITE_SPACE for c in reason)
+        and not any(unicodedata.category(c) in ("Cc", "Cf") for c in reason)
+    )
+
+
 def check_push_hint(file, data, report, context):
     """Push hints (R9.9; delegated host-work I.4.6): every hint's body jcs and
     signing input, the host's signature (by the key the chain names for it),
@@ -1450,7 +1470,7 @@ def check_push_hint(file, data, report, context):
             case.equal(jcs(details["facts"]), details["plain_jcs"], "plain_jcs = jcs of the four facts")
             case.equal(sorted(details["facts"]), ["reason", "sender", "session_id", "task_id"], "exactly the four facts")
             facts = details["facts"]
-            case.check(1 <= len(facts["reason"].encode()) <= 256, "reason within 1-256 bytes")
+            case.check(reason_ok(facts["reason"]), "reason within 1-256 bytes, not blank, no control or format character")
             case.check(delegated_task(facts), "a delegated sender's (member:, service: or host:) UUID v4 task")
             case.check(re.fullmatch(r"ses-[a-z2-7]{12}", facts["session_id"]) is not None, "session_id")
             case.check(re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", body["alert_id"]) is not None, "alert_id is a UUID v4")
@@ -1488,7 +1508,15 @@ def check_push_hint(file, data, report, context):
             plain = hpke_open(unhex(secrets[device]), b64u_decode(wire["enc"]), b64u_decode(wire["ct"]), info)
             case.equal(plain.decode(), jcs(case_["facts"]), "opens to exactly the stated facts")
             case.equal(sorted(case_["facts"]), ["reason", "sender", "session_id", "task_id"], "the four facts")
-            case.check(not delegated_task(case_["facts"]), "not a delegated sender's UUID v4 task")
+            delegated, ok = delegated_task(case_["facts"]), reason_ok(case_["facts"]["reason"])
+            case.check(not delegated or not ok, "not a delegated sender's UUID v4 task, or a reason that isn't one")
+            if delegated:
+                reason = case_["facts"]["reason"]
+                case.check(reason != "" and all(c in WHITE_SPACE for c in reason), "a delegated task's blank reason (White_Space only)")
+    with report.case(file, "outcome_unknown_invalid_facts: coverage") as case:
+        kinds = [delegated_task(c["facts"]) for c in data["outcome_unknown_invalid_facts"]]
+        case.check(False in kinds, "a task that isn't a delegated sender's")
+        case.check(kinds.count(True) == 1, "the deferred blank-reason case: a delegated task's blank reason (Astation's review of PR 2)")
 
 
 def check_delegated_wire(file, data, report, context):

@@ -1597,7 +1597,10 @@ Vectors:
   among them.
 - `fixtures/r9-vectors-push-hint.json`: the hints, and
   `outcome_unknown_invalid_facts` (a `local` and a browser grant's task,
-  refused at open).
+  and, **for Astation** (amended for step 4: the deferred blank-reason
+  vector Astation's review of PR 2 asked for before phone hint support is
+  accepted, #120 comment 6848326392), a delegated task whose `reason` is
+  blank, a space, a tab and an ideographic space: each refused at open).
 
 ### 11.4 Station calls and acknowledgments
 

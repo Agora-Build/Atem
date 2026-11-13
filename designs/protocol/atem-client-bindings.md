@@ -483,7 +483,9 @@ A phone receiving a hint (APNs/FCM payload):
    `outcome_unknown_invalid_facts`). A `reason` that is blank (nothing but
    White_Space) or carries a control or Cf character is refused `malformed`
    at open too, and one over 256 bytes is refused (**for Astation**,
-   amended for step 4: a blank one is new; no vector carries one yet). A
+   amended for step 4: a blank one is new; `outcome_unknown_invalid_facts`
+   carries one, a delegated task's reason of a space, a tab and an
+   ideographic space, the deferred vector Astation asked for). A
    locked device shows a generic hint instead.
 
 `verify_push_hint` takes both kinds of hint (the body's `kind`, which only

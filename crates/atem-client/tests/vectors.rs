@@ -2575,6 +2575,28 @@ fn check_outcome_unknown(run: &mut Run, book: &Book) {
             s(case, "reason")
         ));
     }
+    // The deferred blank-reason case (Astation's review of PR 2, #120
+    // comment 6848326392: before phone hint support is accepted): a
+    // delegated sender's UUID v4 task whose reason is blank, nothing but
+    // White_Space, is refused at open like the others.
+    use atem_client::session::alerts::{valid_reason, valid_sender, valid_task_id};
+    let blank = run
+        .get("outcome_unknown_invalid_facts")
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| {
+            let facts = &case["facts"];
+            let reason = s(facts, "reason");
+            valid_task_id(s(facts, "task_id"))
+                && valid_sender(s(facts, "sender"))
+                && !reason.is_empty()
+                && reason.trim().is_empty()
+                && !valid_reason(reason)
+        })
+        .count();
+    assert_eq!(blank, 1, "a delegated task's blank reason");
+    run.pass("outcome_unknown_invalid_facts: a delegated task's blank reason among them");
     // The key type is the one the builder makes.
     let _: &AlertKey = first[0].key();
 }
@@ -2811,6 +2833,16 @@ fn outcome_unknown_vectors(book: &Book) -> BTreeMap<&'static str, Value> {
             }),
             "a browser grant's task: browser grants keep v1 and raise no alert",
         ),
+        (
+            "ae6fb035-7182-4dac-b50d-4b2ca31e6f78",
+            json!({
+                "task_id": "c4d9e8f7-1a2b-4c3d-8e5f-6a7b8c9d0e1f",
+                "session_id": "ses-aaaaaaaaaaaa",
+                "sender": "service:svc-discord",
+                "reason": " \t\u{3000}",
+            }),
+            "a delegated sender's task whose reason is blank (nothing but White_Space: a space, a tab and an ideographic space): refused at open (Astation's review of PR 2, #120 comment 6848326392: the deferred blank-reason vector, before phone hint support is accepted)",
+        ),
     ] {
         let device = "dev-phone";
         let template = Alert {
@@ -2868,7 +2900,7 @@ fn outcome_unknown_vectors(book: &Book) -> BTreeMap<&'static str, Value> {
         (
             "outcome_unknown_note",
             json!(
-                "Hints of kind outcome_unknown (delegated host-work I.4.6): the body's type is atem-push-hint and its label atem-push-hint-v1 like an approval hint's, told apart by `kind` (no `state`, no session_id, process_gen or approval_id; `alert_id` instead). The task, session, sender and reason are only in the sealed part, jcs of {reason, sender, session_id, task_id}. info = enc([\"atem-push-seal-v1\", account_id, genesis_hash, host_id, u64(host_trust_gen), \"outcome_unknown\", alert_id, u64(created_at), u64(expires_at), device_id, enc_kid]) (11 fields; an approval's has 12). ikmE_hex = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Entries 0 and 1 are one alert for two recipients; entry 2 is another alert at the bounds. Only a delegated sender's (member:, service: or host:) UUID v4 task raises an alert. outcome_unknown_acks are the push_ack entries, one per hint. Each outcome_unknown_invalid carries the first hint's sealed envelope (except bad_sealed's, which is the point) so only its code refuses it; the runner checks the code with both verifiers. Each outcome_unknown_invalid_facts is well signed and well sealed (both verifiers take it, and its sealed_hash names its sealed part), but its sealed facts aren't a delegated task's: the recipient refuses it at open (malformed)."
+                "Hints of kind outcome_unknown (delegated host-work I.4.6): the body's type is atem-push-hint and its label atem-push-hint-v1 like an approval hint's, told apart by `kind` (no `state`, no session_id, process_gen or approval_id; `alert_id` instead). The task, session, sender and reason are only in the sealed part, jcs of {reason, sender, session_id, task_id}. info = enc([\"atem-push-seal-v1\", account_id, genesis_hash, host_id, u64(host_trust_gen), \"outcome_unknown\", alert_id, u64(created_at), u64(expires_at), device_id, enc_kid]) (11 fields; an approval's has 12). ikmE_hex = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Entries 0 and 1 are one alert for two recipients; entry 2 is another alert at the bounds. Only a delegated sender's (member:, service: or host:) UUID v4 task raises an alert. outcome_unknown_acks are the push_ack entries, one per hint. Each outcome_unknown_invalid carries the first hint's sealed envelope (except bad_sealed's, which is the point) so only its code refuses it; the runner checks the code with both verifiers. Each outcome_unknown_invalid_facts is well signed and well sealed (both verifiers take it, and its sealed_hash names its sealed part), but its sealed facts aren't a delegated task's, or its reason is blank (nothing but White_Space; for Astation, amended for step 4: the deferred blank-reason case, Astation's review of PR 2): the recipient refuses it at open (malformed)."
             ),
         ),
     ])

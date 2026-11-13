@@ -1881,7 +1881,8 @@ final class ConformanceTests: XCTestCase {
             try throwsCode("bad_sealed") { _ = try PushHintBook().offer(hint: swapped) }
             try throwsCode("open_failed") { _ = try swapped.open(provider: providerFor("dev-phone"), encKeyId: "enc", deviceId: "dev-phone") }
             // Well signed and well sealed, but the sealed facts aren't a
-            // delegated sender's UUID v4 task: verified and kept, refused at open.
+            // delegated sender's UUID v4 task, or the reason is blank:
+            // verified and kept, refused at open.
             for c in a(push["outcome_unknown_invalid_facts"]).map(o) {
                 for verifier in [PushVerifier.client, PushVerifier.relay] {
                     _ = try verifyPushHint(hintJson: js(c["hint"]!), log: logL(), nowMs: nowP, verifier: verifier)
