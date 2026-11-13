@@ -225,9 +225,11 @@ pub enum AstationMessage {
     /// as its raw JSON text, for the runtime's r9 push.
     #[serde(skip)]
     Relay(String),
-    /// A relay message over 256 KiB (§R9.9, host-work-v1 §11.4): told by
-    /// its `type` alone and dropped by the reader, only its size passed on
-    /// (counted), never its text.
+    /// A relay message over 256 KiB (§R9.9, host-work-v1 §11.4), dropped by
+    /// the reader before anything else reads it: after the two scans every
+    /// message gets (a channel envelope? a session family?), its length,
+    /// then a scan of its `type` that builds no tree. Only its size is
+    /// passed on (counted), never its text.
     #[serde(skip)]
     RelayTooLarge(usize),
 
@@ -1284,6 +1286,13 @@ impl AstationClient {
                                 Some(AstationMessage::SessionOversize { id: session_message_id(&text), family: family.to_string() })
                             }
                             Some(_) => Some(AstationMessage::SessionWire(text)),
+                            // §R9.9, host-work-v1 §11.4: a relay message over
+                            // 256 KiB is dropped before anything else reads it:
+                            // the length first, then a scan of its `type` that
+                            // builds no tree; only its size is passed on.
+                            None if text.len() > crate::app::hosted::RELAY_MESSAGE_BYTES && is_relay_message(&text) => {
+                                Some(AstationMessage::RelayTooLarge(text.len()))
+                            }
                             None if removed_op_detail(&text).is_some() => {
                                 removed_op_detail(&text).map(|detail| AstationMessage::RemovedOp { detail: detail.into() })
                             }
@@ -1305,11 +1314,6 @@ impl AstationClient {
                             }
                             // §R9.7b: the relay's reply to this link's proof,
                             // checked here (never passed on raw).
-                            // §R9.9, host-work-v1 §11.4: over 256 KiB, the
-                            // `type` peek is all that read it.
-                            None if is_relay_message(&text) && text.len() > crate::app::hosted::RELAY_MESSAGE_BYTES => {
-                                Some(AstationMessage::RelayTooLarge(text.len()))
-                            }
                             None if is_relay_message(&text) => match route.as_mut().map(|route| (route.on_reply(&text), atem_client::host_route::RelayReply::parse(text.as_bytes()).is_some())) {
                                 Some((Some(crate::session_protocol::r9::route::RouteResult::Routed { .. }), _)) => Some(AstationMessage::HostRouted),
                                 Some((Some(crate::session_protocol::r9::route::RouteResult::Refused(code)), _)) => Some(AstationMessage::HostRouteRefused(code)),
@@ -3062,10 +3066,12 @@ mod tests {
         server.abort();
     }
 
-    /// §R9.9, host-work-v1 §11.4: a relay message over 256 KiB is told by
-    /// its `type` alone and dropped there, its size passed on for the
-    /// count, never its text (no route reply check, no Station reader); one
-    /// at the bound is passed on whole.
+    /// §R9.9, host-work-v1 §11.4: a relay message over 256 KiB is dropped
+    /// by the reader before any other check reads it (its length, then its
+    /// `type`), its size passed on for the count, never its text (no route
+    /// reply check, no Station reader, not even `host_challenge`'s full
+    /// parse: an oversize relay `host_challenge` is dropped the same way);
+    /// one at the bound is passed on whole.
     #[tokio::test]
     async fn a_relay_message_over_256_kib_is_dropped_after_its_type_peek() {
         use crate::app::hosted::RELAY_MESSAGE_BYTES;
@@ -3082,6 +3088,10 @@ mod tests {
             let mut socket = tokio_tungstenite::accept_async_with_config(socket, Some(super::link_ws_config())).await.unwrap();
             socket.send(Message::Text(relay(RELAY_MESSAGE_BYTES + 1))).await.unwrap();
             socket.send(Message::Text(relay(RELAY_MESSAGE_BYTES))).await.unwrap();
+            // A relay `host_challenge` over the bound: dropped as one, never
+            // parsed as a challenge.
+            let challenge = format!(r#"{{"nonce":"{}","op":"host_challenge","room":"r","type":"relay"}}"#, "A".repeat(RELAY_MESSAGE_BYTES));
+            socket.send(Message::Text(challenge)).await.unwrap();
             socket.send(Message::Text(r#"{"type":"channel","event":"open","channel":"h2","transport":"relay"}"#.into())).await.unwrap();
             let _ = socket.next().await;
         });
@@ -3089,16 +3099,17 @@ mod tests {
         client.connect_raw(&format!("ws://{address}")).await.unwrap();
         let mut got = Vec::new();
         tokio::time::timeout(WAIT, async {
-            while got.len() < 3 {
+            while got.len() < 4 {
                 match client.recv_message() {
                     Some(message) => got.push(message),
                     None => tokio::time::sleep(Duration::from_millis(10)).await,
                 }
             }
-        }).await.expect("three messages");
+        }).await.expect("four messages");
         assert!(matches!(&got[0], AstationMessage::RelayTooLarge(n) if *n == RELAY_MESSAGE_BYTES + 1), "{got:?}");
         assert!(matches!(&got[1], AstationMessage::Relay(t) if t.len() == RELAY_MESSAGE_BYTES), "{:?}", got[1..].iter().map(|m| format!("{m:?}").len()).collect::<Vec<_>>());
-        assert!(matches!(&got[2], AstationMessage::Channel(t) if t.contains("\"h2\"")), "{got:?}");
+        assert!(matches!(&got[2], AstationMessage::RelayTooLarge(n) if *n > RELAY_MESSAGE_BYTES), "{:?}", got[2..].iter().map(|m| format!("{m:?}").len()).collect::<Vec<_>>());
+        assert!(matches!(&got[3], AstationMessage::Channel(t) if t.contains("\"h2\"")), "{got:?}");
         server.abort();
     }
 

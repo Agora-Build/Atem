@@ -9,7 +9,8 @@
 //! it), Astation's local `:8080` (which proxies the calls to the Station),
 //! or a routed relay link with no Astation (§R9.7b). Its Station is the
 //! selected Station ([`StationLink::origin`]). A new link generation starts
-//! afresh: nothing in flight carries over, and a refusal's backoff ends.
+//! afresh: nothing in flight carries over, and a refusal's backoff ends; the
+//! fetch's pacing carries over ([`DeviceListFetch::next_generation`]).
 //!
 //! Here so far: the device list's fetch ([`super::fetch`]) and the
 //! refusals' runtime.log lines (Decision 20: at most one an hour per kind).
@@ -109,9 +110,10 @@ impl Station {
     }
 
     /// The link as the App has it now (`link_gen`: the r9 link generation, none
-    /// while it is down): a new generation starts afresh, its kind and
-    /// origin taken then; the kind is followed within a generation (a
-    /// routed link Astation authenticates becomes a relay link).
+    /// while it is down): a new generation starts afresh (the fetch's pacing
+    /// kept), its kind and origin taken then; the kind is followed within a
+    /// generation (a routed link Astation authenticates becomes a relay
+    /// link).
     pub fn sync_link(
         &mut self,
         link_gen: Option<u64>,
@@ -120,7 +122,7 @@ impl Station {
     ) {
         let Some(link_gen) = link_gen else {
             if self.link.take().is_some() {
-                self.fetch = DeviceListFetch::default();
+                self.fetch = self.fetch.next_generation();
             }
             return;
         };
@@ -132,8 +134,7 @@ impl Station {
                     kind: kind(),
                     origin: origin(),
                 });
-                self.fetch = DeviceListFetch::default();
-                self.fetch.tick(self.now, None);
+                self.fetch = self.fetch.next_generation();
             }
         }
     }
@@ -235,6 +236,7 @@ impl Station {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::delegated::fetch::{HEADS_PACE_MS, STALL_PAUSE_MS};
     use atem_client::control::{CallRefused, Heads, MembershipFetchResult, RefusalCode};
     use atem_client::encoding::Hash32;
 
@@ -348,6 +350,40 @@ mod tests {
         s.receive(&refused(RefusedCall::ControlAck), None);
         assert_eq!(s.logged[2], Some(1_000 + REFUSAL_LOG_EVERY_MS));
         assert_eq!(s.logged[0], Some(1_000));
+    }
+
+    /// Task 30 re-review N1: a new link generation (or the link dropping
+    /// and coming back) keeps the fetch's pacing: after a carriage that
+    /// moved nothing, no fetch at a `heads` for 30 s whatever the
+    /// generation; and at most one a second a `heads` starts.
+    #[test]
+    fn a_new_link_generation_keeps_the_fetch_pacing() {
+        let mut s = Station::new();
+        up(&mut s, 1);
+        s.tick(10_000, Some(head(3)));
+        let fetch = |after| Inbound::Send(MembershipFetch { after });
+        assert_eq!(s.receive(&heads(5), Some(head(3))), fetch(3));
+        let junk = MembershipFetchResult {
+            head: head(5),
+            entries: Vec::new(),
+        }
+        .to_json()
+        .unwrap()
+        .to_string();
+        assert_eq!(s.receive(&junk, Some(head(3))), Inbound::Carry(Vec::new()));
+        assert_eq!(s.fetch.carried(&head(3), &head(3)), None, "a stall");
+        up(&mut s, 2);
+        s.tick(10_000 + STALL_PAUSE_MS - 1, Some(head(3)));
+        assert_eq!(s.receive(&heads(5), Some(head(3))), Inbound::Nothing);
+        s.tick(10_000 + STALL_PAUSE_MS, Some(head(3)));
+        assert_eq!(s.receive(&heads(5), Some(head(3))), fetch(3));
+        // Down and up again at once: nothing in flight, the pace kept.
+        s.sync_link(None, || LinkKind::Relay, || None);
+        up(&mut s, 3);
+        assert_eq!(s.dump()["fetch"]["in_flight"], Value::Null);
+        assert_eq!(s.receive(&heads(5), Some(head(3))), Inbound::Nothing);
+        s.tick(10_000 + STALL_PAUSE_MS + HEADS_PACE_MS, Some(head(3)));
+        assert_eq!(s.receive(&heads(5), Some(head(3))), fetch(3));
     }
 
     /// I1: a Station that sends `heads` and junk results, many in one pass

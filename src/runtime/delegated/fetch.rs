@@ -26,7 +26,11 @@
 //!   any more, so a result arriving after it is one nobody asked for), and
 //!   the host fetches again only at a `heads` at least
 //!   [`REFUSAL_BACKOFF_MS`] later on its monotonic clock, or on the next
-//!   link generation (a new [`DeviceListFetch`]).
+//!   link generation ([`DeviceListFetch::next_generation`]).
+//! - **A new link generation** starts with nothing in flight, no named
+//!   head and no refusal's backoff, but keeps the pacing: a Station that
+//!   forces new generations (a dropped socket, a re-authentication) gets
+//!   no more fetches than at a `heads`.
 //! - **A fetch with no answer** for [`FETCH_TIMEOUT_MS`] (lost, or its
 //!   result over 256 KiB, dropped unread: Decision 21) is sent again, from
 //!   the list's head then; not once another carrier (a phone's channel)
@@ -168,6 +172,21 @@ impl DeviceListFetch {
     /// flight (the next `heads` asks again).
     pub fn unsent(&mut self) {
         self.in_flight = None;
+    }
+
+    /// The fetch on the link's next generation (a new link, or none): nothing
+    /// in flight, no head named and no refusal's backoff (Decision 20), but
+    /// the pacing of the fetches a `heads` starts carries over, so a new
+    /// generation buys a Station no carriage (Task 30 re-review N1). The
+    /// clock and the count of results go on too.
+    pub fn next_generation(&self) -> DeviceListFetch {
+        DeviceListFetch {
+            now: self.now,
+            heads_fetch_at: self.heads_fetch_at,
+            stalled_at: self.stalled_at,
+            results: self.results,
+            ..DeviceListFetch::default()
+        }
     }
 
     /// For the state dump.
@@ -316,9 +335,13 @@ mod tests {
         assert_eq!(f.on_heads(&head(5), &head(3)), fetch(3));
         assert_eq!(f.dump()["backoff"], false);
 
+        // Refused again: the next link generation has no backoff, but keeps
+        // the pacing (a second after the last fetch a heads started).
         f.on_refused();
-        let mut next_link = DeviceListFetch::default();
-        next_link.tick(10_000 + REFUSAL_BACKOFF_MS, Some(&head(3)));
+        let mut next_link = f.next_generation();
+        assert_eq!(next_link.dump()["backoff"], false);
+        assert_eq!(next_link.on_heads(&head(5), &head(3)), None, "paced");
+        next_link.tick(10_000 + REFUSAL_BACKOFF_MS + HEADS_PACE_MS, Some(&head(3)));
         assert_eq!(next_link.on_heads(&head(5), &head(3)), fetch(3));
     }
 

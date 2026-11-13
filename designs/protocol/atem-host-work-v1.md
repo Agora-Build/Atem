@@ -1483,11 +1483,13 @@ a count over its bound refused before any item is read; the grammars of the
 signed objects (an `origin` exact as `station_route::normalize_relay`
 writes it, `feed_id` and `record_id` UUID v4, ids of 1 to 128 characters of
 `[A-Za-z0-9._:-]`, lowercase hex hashes). A builder checks what the reader
-checks. On the host, the link's reader tells a relay message by its
-top-level `type` (a scan that keeps nothing else, as for every message on
-the link) and checks the bound right after it: a relay message over
-262,144 bytes reaches no route check, no reader and no Station link; it is
-counted and dropped. The wire rules below are **Atem's proposal, agreed
+checks. On the host, the link's reader drops a relay message over 262,144
+bytes before anything else reads it: past the two scans every message on
+the link gets (is it a channel envelope, a session family), the length comes
+first, then a scan of the top-level `type` that builds no tree. Such a
+message reaches no other check (not even `host_challenge`'s), no route
+check, no reader and no Station link; it is dropped, and counted while the
+link carries r9. The wire rules below are **Atem's proposal, agreed
 with Astation (2026-11-11, #120 comment 6810116314)** (the design names the
 messages, not these rules):
 

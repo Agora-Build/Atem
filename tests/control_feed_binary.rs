@@ -380,6 +380,9 @@ fn fetch_refused_advances_nothing_and_retries() {
     rig.until_station("the next link generation", |s| {
         s["link"]["gen"].as_u64() > Some(generation)
     });
+    // The new generation keeps the fetch's pacing (a second after the last
+    // fetch a heads started).
+    rig.clock.add_mono(1_000);
     rig.announce();
     rig.serve_until_head(5);
     assert_eq!(rig.calls().last(), Some(&fetch(4)));
