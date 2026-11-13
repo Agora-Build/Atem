@@ -1230,6 +1230,19 @@ floor (after a host switches to it, or after another Station's record
 issued ahead of its clock was evicted) has its covers and releases
 refused as possible replays until its `issued_at` passes the floor; it
 fails safe (holds stay, nothing new starts).
+
+**A release lifts only holds issued before it** (O1, requested by
+Astation, 2026-11-13; **for Astation**, amended for step 4; host-work-v1
+§11.1 rule 6). Each service part keeps `hold_issued_at`, the newest
+`issued_at` of every hold the state verified for it (one that found it
+held, read out of order, from another feed or none, or under a counted id
+included), and a release taken in feed order while held lifts the hold
+only when issued strictly after it; one issued no later, the same
+millisecond included, is `refused` with `why` `not_after_hold`, no
+evidence, and takes no position in the feed's order. No eviction, reset,
+coverage change or restart erases it. A stored `v` 2 part without
+`hold_issued_at` loads only while it holds nothing; a held one without it
+is `stored_invalid`.
 Only principals of the device list count records, so a state stays far
 under the 64 MiB that `from_json` and `control_state_from_parts` read (a larger one is
 `too_large`). The acknowledgment ledger doesn't prune in this version.

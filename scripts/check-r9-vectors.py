@@ -840,6 +840,14 @@ def check_host_work_control(file, data, report, context):
                 case.check(pin is None or pin in ids, f"{what} {principal}: its revocation's and cover's records kept")
             if "evicted_floor" in part:
                 case.equal(len(records), MAX_RECORD_IDS, f"{what} {principal}: an evicted floor, its records full")
+            if principal.startswith("host:"):
+                case.check("hold_issued_at" not in part, f"{what} {principal}: a host principal's part keeps no hold's time")
+            else:
+                at = part.get("hold_issued_at")
+                case.check(
+                    (at is None or (isinstance(at, int) and 0 <= at <= SAFE_MAX)) and (at is not None or not part["held"]),
+                    f"{what} {principal}: hold_issued_at a safe integer, present whenever held",
+                )
             case.check(all(len(feeds) == 1 for feeds in part.get("order", {}).values()), f"{what} {principal}: one feed per origin in order")
             copies, wrong = 0, []
             for record_id, digest, issued_at in records:
@@ -905,6 +913,7 @@ def check_host_work_control(file, data, report, context):
             case.equal(last["standing"], standing_of(sequence["state"], principal), "the last step's standing is the state's")
             check_why(case, sequence)
             derive_bound(case, sequence)
+            derive_hold_time(case, sequence)
 
 
 # Applied::why's codes (host-work-v1 §11.1), by what they explain.
@@ -913,7 +922,7 @@ WHY_VERIFIER_REFUSED = {
     "wrong_account", "bad_signature", "key_mismatch", "signer_not_allowed",
     "removed_manager", "host_key_signed", "not_a_service", "not_a_revoke",
 }
-WHY_STATE_REFUSED = {"order", "after_revoke", "not_newer"}
+WHY_STATE_REFUSED = {"order", "after_revoke", "not_newer", "not_after_hold"}
 WHY_EVIDENCE = WHY_VERIFIER_REFUSED | {"collision", "possible_replay"}
 WHY_CODES = WHY_PENDING | WHY_VERIFIER_REFUSED | WHY_STATE_REFUSED | {"collision", "possible_replay"}
 
@@ -1039,6 +1048,80 @@ def derive_bound(case, sequence):
         # An id evicted and counted again is in the final records.
         gone = set(evicted[principal]) - set(got)
         case.equal(sorted(set(begin + added) - set(got)), sorted(gone), f"{principal}: the ids gone are (initial + counted) - final")
+
+
+def derive_hold_time(case, sequence):
+    """O1, derived from the file alone (no state machine): per principal,
+    the hold's time starts as `initial`'s `hold_issued_at` and becomes the
+    newest `issued_at` of every hold step that holds or finds the principal
+    held (`applied` or `duplicate`, evidence or not: a hold under a counted
+    id still applies) while it isn't revoked. Each release that reaches the
+    rule (its principal held and not revoked, and not refused for anything
+    else: pending, a verifier's reason, a possible replay, a collision or
+    feed order) must lift the hold (`applied`) exactly when its `issued_at`
+    is strictly greater than that time, and otherwise be `refused` with
+    `why` `not_after_hold`, no evidence; no other step has that `why`. The
+    final state's `hold_issued_at` must be the time derived.
+
+    Its limits, as derive_bound's: each step's verification and feed order
+    are taken as written (the Rust runner and the suites check those)."""
+    initial = sequence.get("initial", {}).get("principals", {})
+    final = sequence["state"]["principals"]
+    time, held, revoked = {}, {}, {}
+
+    def start(principal):
+        part = initial.get(principal, {})
+        time[principal] = part.get("hold_issued_at")
+        held[principal] = part.get("held", False)
+        revoked[principal] = "revoked_by" in part
+
+    for principal in set(initial) | set(final):
+        start(principal)
+    other_refusals = WHY_PENDING | WHY_VERIFIER_REFUSED | {"possible_replay", "collision", "order"}
+    wrong, reached = [], 0
+    for i, step in enumerate(sequence["steps"], 1):
+        body = by_label_of(step["record"])["record"]["body"]
+        principal, expect = body["principal"], step["expect"]
+        if principal not in time:
+            start(principal)
+        why = expect.get("why")
+        in_force = expect["result"] in ("applied", "duplicate")
+        action = body["action"]
+        if action == "hold" and in_force and not revoked[principal]:
+            at = time[principal]
+            time[principal] = body["issued_at"] if at is None else max(at, body["issued_at"])
+            held[principal] = True
+            if why == "not_after_hold":
+                wrong.append(i)
+        elif action == "release" and held[principal] and not revoked[principal] and why not in other_refusals:
+            reached += 1
+            at = time[principal]
+            lifts = at is None or body["issued_at"] > at
+            if lifts and expect["result"] != "applied":
+                wrong.append(i)
+            if not lifts and (expect["result"], expect["evidence"], why) != ("refused", False, "not_after_hold"):
+                wrong.append(i)
+            if expect["result"] == "applied":
+                held[principal] = False
+        elif why == "not_after_hold":
+            wrong.append(i)
+        if action == "revoke" and any(
+            e["effect"] == "revocation" and e["result"] in ("applied", "duplicate") for e in expect["effects"]
+        ):
+            revoked[principal] = True
+    case.check(
+        not wrong,
+        f"{reached} releases reach the signed-time rule: each lifts the hold exactly when issued after every hold verified before it, "
+        "else is refused with why not_after_hold (no other step has it)" + (f" (not: steps {wrong})" if wrong else ""),
+    )
+    for principal in sorted(time):
+        if principal.startswith("host:"):
+            continue
+        case.equal(
+            final.get(principal, {}).get("hold_issued_at"),
+            time[principal],
+            f"{principal}: hold_issued_at, the newest issued_at of every hold verified while not revoked",
+        )
 
 
 # ------------------------------------------------ r9-control-ack-* fixtures

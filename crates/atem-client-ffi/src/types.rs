@@ -1003,7 +1003,8 @@ record! {
         /// `removed_manager`, `host_key_signed`, `not_a_service`,
         /// `not_a_revoke`), or the state's: `list_frozen`, `not_revoked`,
         /// `revoke_not_applied`, `order`, `after_revoke`, `collision`,
-        /// `not_newer`, `possible_replay` (host-work-v1 §11.1).
+        /// `not_newer`, `possible_replay`, `not_after_hold` (host-work-v1
+        /// §11.1).
         pub why: Option<String>,
     }
 }

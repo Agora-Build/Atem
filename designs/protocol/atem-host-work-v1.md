@@ -1132,6 +1132,30 @@ The rules:
    feed's included. A release while no hold is in force is a `duplicate`;
    else one in order is `applied` and any other `refused`. A hold replayed
    is a `duplicate` by its `record_id` and holds nothing again.
+
+   **A release lifts only holds issued before it** (**O1, requested by
+   Astation (2026-11-13, #120 comment 6848326392)**; amended for step 4,
+   the built form for Astation's sign-off). Feed order alone can't protect
+   a newer hold: `feed_seq` isn't signed, and the evicted floor (rule 1)
+   guards only evicted records, so a carrier could serve a release it
+   withheld, or one refused before, after a newer hold. So:
+   - The host keeps, per principal, the newest `issued_at` of every hold
+     it verified while the principal wasn't revoked: one that held, one
+     that found the principal held (a `duplicate`), one read out of
+     order, from another feed or at no position, and one under a counted
+     `record_id` (evidence, applied as a stop).
+   - A release taken in feed order while held lifts the hold only when its
+     `issued_at` is **strictly after** that time. One issued no later (the
+     same millisecond included) is `refused`, `not_after_hold`, no
+     evidence (a genuine record, only stale), and takes no position in the
+     feed's order.
+   - Nothing lowers or clears the time: no release, cover, eviction, feed
+     reset, coverage change or restart. A cover never releases; after a
+     revoke nothing is released (rule 7).
+   - The feed-order rule above stays; this rule is added to it. A Station
+     meets it for its own records by its duty below: each release it signs
+     for a principal is issued after every record it signed for it before,
+     its holds included.
 7. **After a revoke**, `cover`, `hold` and `release` change nothing: a
    `duplicate` when they ask for what is recorded, else `refused`.
 
@@ -1167,7 +1191,15 @@ of some 125 bytes (about 32 KB), one order entry per origin the
 principal's holds and releases were read from (one, for a host syncing its
 own Station), and a few hundred bytes more. The whole state (`to_json`,
 `"v": 2`) is the parts by principal under the device list's account and
-genesis. `standing(principal)` is what is in force: its
+genesis. **A service's part keeps the hold's time** (`hold_issued_at`,
+O1; **for Astation**, amended for step 4): the newest `issued_at` of every
+hold verified for it (rule 6), present from its first hold on and whenever
+`held`. The format stays `"v": 2`. A stored part without it (written
+before O1) is read as "no hold's time known" only while `held` is false:
+every hold a later release could lift is then verified after the load, so
+its time is recorded before any release is weighed. A held part without it
+is damage and fails the load (`stored_invalid` in the bindings), since the
+hold in force has no known time. `standing(principal)` is what is in force: its
 revocation (the revoking record's `record_id`; a host principal's
 revocation is a device-list entry, never here), the revocations whose
 interrupt a record put in force (a service's revoking `record_id`, a host
@@ -1176,9 +1208,10 @@ principal's `revoke_seq` in decimal), the hold, and the covering feed
 (the verifier's reason, or `list_frozen`, `not_revoked`: a service's
 interrupt before its revocation, `revoke_not_applied`: a host principal's
 before host-work applied its revoke) or `refused` (the verifier's reason,
-or `order`, `after_revoke`, `not_newer`, `possible_replay`), or kept as
-evidence (`collision`, `possible_replay`): `Applied.why`, the host's for its
-pending store, evidence and alerts.
+or `order`, `after_revoke`, `not_newer`, `possible_replay`,
+`not_after_hold`: a release issued no later than the hold, rule 6, O1,
+amended for step 4), or kept as evidence (`collision`, `possible_replay`):
+`Applied.why`, the host's for its pending store, evidence and alerts.
 
 **Resets** (**Atem's proposal, agreed with Astation (2026-11-11, #120
 comment 6810116314) and Auth/Portal (2026-11-12, #147 comment 6813332550)**: design I.5.2's snapshot re-issues "the latest revoke, hold or
@@ -1270,7 +1303,15 @@ record is pending or refused or kept as evidence (the bindings'
 sequence's `state` is v2, each step carries its `standing` and `why`, two
 sequences and three records are new in the file, and the checker's checks
 of parts, `why` and the bound below are new; its steps' other fields are as
-they were.)
+they were.) (**For Astation**, amended for step 4, O1: the records
+`W1_release_withheld`…`W8_b_release_newer`, the sequences `Q21`…`Q27` (a
+withheld and a previously refused release after a newer hold, equal
+timestamps, a newer hold while held, holds from another feed, at no
+position and under a counted id, restart and eviction from an `initial`
+state, a reset and a coverage change, a legitimate newer release, and no
+release after a revoke), each part's `hold_issued_at`, and `Q10` and `Q11`
+whose covering feed's release issued before the hold is now refused and a
+newer one lifts it.)
 They run in `crates/atem-client/tests/vectors.rs`, in the bindings'
 `tests/control.rs` and in the Swift, Kotlin and WASM conformance suites;
 `scripts/check-r9-vectors.py` recomputes their cryptographic values
@@ -1288,7 +1329,14 @@ alone: the ids each step counts and the oldest unpinned ones evicted past
 256, the final records in order, `evicted_floor` as the newest `issued_at`
 evicted, and every possible replay (an unrevoked principal's cover or
 release, its id not counted, issued no later than the floor then) refused
-as evidence with `why` `possible_replay`. It derives no other verdict.
+as evidence with `why` `possible_replay`. It also derives O1 from the steps
+alone (**for Astation**, amended for step 4): the hold's time as the newest
+`issued_at` of every hold step that holds or finds the principal held while
+it isn't revoked, from `initial`'s; every release that reaches the rule
+(held, not revoked, not refused for another reason) `applied` exactly when
+issued strictly after it, else refused `not_after_hold` with no evidence,
+and no other step with that `why`; and each final part's `hold_issued_at`.
+It derives no other verdict.
 Every SDK package's checksum manifest lists the file.
 
 ### 11.2 `work_interrupt` and `work_resolve`

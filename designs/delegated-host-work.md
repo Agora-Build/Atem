@@ -67,8 +67,12 @@ passage (in II.4.1 and II.4.2) is marked "Amended for step 4, for Astation's rev
 256 counted record ids per principal, oldest first, and the evicted floor) refines I.5.4's collision row and I.5.5 step
 1 for evicted ids: an evicted id is no longer known, so another body under it is no collision, and an evicted record
 that comes back is verified and applied as a new one (an evicted hold replayed holds again; an evicted cover or release
-issued no later than the floor is refused as a possible replay). The design text below is unchanged; the contract
-states the refinement.
+issued no later than the floor is refused as a possible replay). And rule 6's signed-time rule (O1, requested by
+Astation on 2026-11-13, #120 comment 6848326392; the built form for its sign-off) adds to I.5.5 step 4 for releases: a
+release lifts a hold only when issued strictly after every hold the host verified for the principal (a hold that found
+it held, read out of order, from another feed or none, or under a counted id included), so a release a carrier withheld
+can't lift a newer hold; the host keeps that hold's time in the principal's part, and no eviction, reset, coverage
+change or restart erases it. The design text below is unchanged; the contract states the refinement.
 
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256
