@@ -396,8 +396,8 @@ fn gate_device_list_part_needs_the_announced_head_or_a_deferred_stop() {
     let phone = task(&log, PHONE, LATER);
     let head = log.log.head();
     let mut v = view(&log);
-    // The feed part alone (the stand-in's, PR 10's feeds): closed.
-    v.gates = Gates::closed_until_feeds();
+    // The feed part alone (the sync's), no device-list part: closed.
+    v.gates = Gates::default();
     v.gates.open_feed(ORIGIN);
     assert_eq!(may_start(&v, &bot, Some(0)), Err(Event::GateClosed));
     assert_eq!(may_start(&v, &phone, Some(0)), Err(Event::GateClosed));
@@ -637,7 +637,7 @@ fn conditions_2_to_5_withdraw_at_executing() {
             "the gate closed (5)",
             // The phone's channel closed, no Station gate open (this
             // version's gates).
-            Box::new(|v| v.gates = Gates::closed_until_feeds()),
+            Box::new(|v| v.gates = Gates::default()),
             Event::GateClosed,
         ),
     ];

@@ -1454,6 +1454,7 @@ impl Server {
                 .as_ref()
                 .and_then(HostBridge::device_list_status),
             clock: self.bridge.as_ref().and_then(HostBridge::clock_status),
+            feeds: self.bridge.as_ref().and_then(HostBridge::feeds_status),
         }
     }
 

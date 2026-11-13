@@ -1,0 +1,918 @@
+//! The host's sync of its own Station's control feed and the feed part of
+//! the revocation gate (the delegated host-work design I.5.2, I.5.8, I.6.5;
+//! host-work-v1 §11.4 "Heads, resets and the gate"; step 4's Decisions 12,
+//! 14, 16 and 20). Only with `host.delegated` on (Decision 11), on the
+//! host's Station link ([`super::station`]); records apply through the feed
+//! store ([`FeedStore`], I.5.5).
+//!
+//! - **One origin.** The host syncs only the feed of its own Station (the
+//!   link's origin, Decision 14). A `heads` feed of another origin is
+//!   ignored, counted and alerted (hourly); its gate is never opened. The
+//!   own origin's `heads` must name exactly one feed ("One feed per
+//!   account", §11.4): none, or more than one, keeps the gate closed.
+//! - **Heads** (I.5.8). Each `heads` refreshes the 60-second window and
+//!   announces the feed's head. Its `station_time` goes through the
+//!   delegated clock's cap ([`HostClock::station_time`], I.6.5): one beyond
+//!   `H` + 10 minutes (or one the clock couldn't record) moves no floor and
+//!   closes the origin's gate until a `heads` within the cap; a page's
+//!   `station_time` is taken the same way (I.6.5: both carry it), and one
+//!   beyond the cap closes the gate too.
+//! - **Resets** (I.5.2, §11.4). The announced feed isn't the one the host
+//!   read (an unknown `feed_id` for a known origin), or its head is below
+//!   the host's cursor (the feed rolled back under the same id), or a page
+//!   names a head below the cursor: a reset. The gate stays closed until
+//!   the feed is read again from position 0, and that read's first page
+//!   replaces the origin's old cursor in its own transaction
+//!   ([`FeedStore::restart`]), only then. A feed the host never read is read
+//!   from 0 too (no reset counted).
+//! - **Only the announced feed is synced.** `control_sync` names the feed
+//!   the last `heads` announced, and a page is taken only for the call in
+//!   flight, whose `(origin, feed_id)` it must carry: positions come only
+//!   from that page's own feed. A page of another feed (a Station serving
+//!   its current feed for an old `feed_id`, §11.4's open question) applies
+//!   nothing and reads as a reset; one nobody asked for applies nothing.
+//! - **Pages** (§11.4). A page the reader refused as a whole (not strict
+//!   JSON, or out of its grammar) is a Station fault: nothing applies, the
+//!   cursor stays, the gate stays closed until a page that reads, and an
+//!   owner alert goes to `runtime.log` (one an hour per kind, Decision 12).
+//!   A record that doesn't parse is evidence ([`FeedStore::unparsed`]) and
+//!   the page stands: delivery progress, never application evidence. Each
+//!   page is one `BEGIN IMMEDIATE` transaction ([`FeedStore::begin`]): its
+//!   records in order, the pending records re-verified after a record whose
+//!   revocation applied, then the commit, which adopts the state and
+//!   publishes the standings (Decision 16). A page stops at a record the
+//!   device list can't serve, or a position that isn't the host's own
+//!   Station's: what applied before commits, the cursor stays there. A page
+//!   with no record reads the feed up to its head (§11.4 rule 7: gaps are
+//!   allowed, and an empty page after the cursor says none remains).
+//! - **Pacing** (as the device-list fetch's, Task 30 I1). One `control_sync`
+//!   in flight at a time. Those a `heads` or the pass start are at most one
+//!   a second, and none for 30 seconds after a page that moved nothing or
+//!   was refused. After a page that moved the cursor while the feed is
+//!   still ahead, the next is asked at once (real records bound it). One
+//!   unanswered for 30 seconds is dropped, and asked again.
+//! - **Refusals** (Decision 20). Any refusal on the link
+//!   (`control_sync_refused`, `membership_fetch_refused`,
+//!   `control_ack_refused`) closes every gate the link serves: nothing
+//!   advances (no cursor, announced head, clock floor or acknowledgment),
+//!   and the host's own wait on the link ends (the sync in flight is
+//!   dropped, so a page arriving after it is one nobody asked for). The
+//!   gate stays closed until a page asked for after a 30-second backoff
+//!   reads ("repairs the association and resynchronizes"), at a `heads` or
+//!   the pass, or on the next link generation. A refusal completes and
+//!   correlates nothing.
+//! - **The gate** (I.5.8). An origin's feed part is open while the link is
+//!   up, a `heads` came within 60 seconds, its `station_time` is within the
+//!   cap, no refusal, fault or reset waits, and the feed the last `heads`
+//!   announced is read up to its head. The device-list part is the host's
+//!   own fetch's ([`super::fetch::ListPart`]): [`GateView`] ANDs them. The
+//!   native gate is the host's own Station's. Closed on any disconnect (a
+//!   new link generation starts afresh), on a reset, after 60 seconds
+//!   without `heads`, on a Station clock beyond the cap, and on any
+//!   refusal.
+//! - **The start view** ([`super::gate::Gates`]) gets the feed part as it
+//!   changes ([`FeedSync::take_gates`]), so the start check reads it at
+//!   once (Decision 16).
+use super::DelegatedSender;
+use super::feeds::{FeedStore, ListNotServing, NotOwnStation, Reapplied};
+use super::fetch::{HEADS_PACE_MS, REFUSAL_BACKOFF_MS, STALL_PAUSE_MS};
+use super::gate::GateView;
+use super::station::StationLink;
+use crate::runtime::host_clock::{HostClock, StationTime};
+use crate::runtime::host_work::Store;
+use crate::session_protocol::membership::ListState;
+use atem_client::control::{
+    Applied, ControlSync, ControlSyncResult, FeedPos, Heads, HostAction, RefusedCall, RelayError,
+};
+use serde_json::{Value, json};
+use std::collections::BTreeSet;
+
+/// The gate closes when no `heads` came for this long (I.5.8).
+pub const NO_HEADS_MS: u64 = 60_000;
+/// A `control_sync` unanswered this long is asked again.
+pub const SYNC_TIMEOUT_MS: u64 = 30_000;
+/// One alert line an hour per kind (Decision 12, as I.5.4's alerts).
+pub const ALERT_EVERY_MS: u64 = 3_600_000;
+
+/// Why the host's own Station's feed part of the gate is closed, as
+/// `atem status` says it ([`Closed::text`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Closed {
+    /// No Station link, or its Station's origin can't be read.
+    NoLink,
+    /// The control state isn't loaded.
+    Unloaded,
+    /// No `heads` yet on this link.
+    NoHeads,
+    /// No `heads` for 60 seconds.
+    HeadsLate,
+    /// A refusal on the link (Decision 20).
+    Refused,
+    /// A page the reader refused as a whole (its code).
+    Fault(&'static str),
+    /// A `station_time` beyond the cap.
+    ClockAhead,
+    /// A `station_time` the delegated clock couldn't record.
+    ClockUnrecorded,
+    /// The last `heads` announced no feed of the host's own Station, or
+    /// more than one (how many).
+    NoFeed(usize),
+    /// A reset: the feed is read again from position 0.
+    Reset,
+    /// The start's recovery (design I.6.2 step 7): the feed is read again.
+    Restarted,
+    /// The feed isn't read up to the announced head yet.
+    Behind { cursor: Option<u64>, head: u64 },
+}
+
+impl Closed {
+    /// The reason `atem status` gives.
+    pub fn text(&self) -> String {
+        match self {
+            Closed::NoLink => "no Station link".into(),
+            Closed::Unloaded => "the control state isn't loaded".into(),
+            Closed::NoHeads => "waiting for the Station's heads".into(),
+            Closed::HeadsLate => "no heads from the Station for 60 s".into(),
+            Closed::Refused => REFUSED_STATUS.into(),
+            Closed::Fault("not_strict") => NOT_STRICT.into(),
+            Closed::Fault(code) => format!("Station sent a page the reader refused ({code})"),
+            Closed::ClockAhead => "Station clock ahead of this host".into(),
+            Closed::ClockUnrecorded => "the host clock didn't record the Station's time".into(),
+            Closed::NoFeed(0) => "the Station announced no control feed for this host".into(),
+            Closed::NoFeed(n) => {
+                format!("the Station announced {n} control feeds for this host's account")
+            }
+            Closed::Reset => "the control feed was reset; reading it again from position 0".into(),
+            Closed::Restarted => "reading the control feed again since the start".into(),
+            Closed::Behind {
+                cursor: Some(cursor),
+                head,
+            } => format!("reading the control feed ({cursor} of {head})"),
+            Closed::Behind { cursor: None, head } => {
+                format!("reading the control feed (0 of {head})")
+            }
+        }
+    }
+}
+
+/// Decision 20's `atem status` text.
+pub const REFUSED_STATUS: &str = "Station refused feed access (forbidden); retrying";
+/// Decision 12's alert for a page that isn't strict JSON.
+pub const NOT_STRICT: &str = "Station sent a page that isn't strict JSON";
+
+/// Why a fresh page is needed before the gate opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resync {
+    Refused,
+    Fault(&'static str),
+    Restarted,
+}
+
+/// The feed of the host's own Station the last `heads` announced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Announced {
+    feed_id: String,
+    head: u64,
+}
+
+/// The `control_sync` in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ask {
+    feed_id: String,
+    after: u64,
+    sent_at: u64,
+    /// Read from the feed's start (a reset, or a feed never read): its page
+    /// replaces the origin's cursor first.
+    restart: bool,
+}
+
+/// What a page brought, committed. Its records' effects on tasks are PR
+/// 11's (Task 35: `applied` and `reapplied` carry their actions); the
+/// bridge reads only `next` until then.
+#[derive(Debug, Default)]
+#[allow(dead_code)]
+pub struct Synced {
+    /// The records applied, each with its position, in feed order.
+    pub applied: Vec<(FeedPos, Applied)>,
+    /// Pending records applied again in the page's transaction (after a
+    /// record whose revocation applied).
+    pub reapplied: Vec<Reapplied>,
+    /// The next page, asked at once: the feed is still ahead.
+    pub next: Option<ControlSync>,
+}
+
+/// What a page is applied against.
+pub struct PageCx<'a> {
+    pub store: &'a Store,
+    pub feeds: &'a mut FeedStore,
+    /// The device list as it is now.
+    pub list: &'a ListState,
+    /// Host-work's applied device-list `seq` (a host principal's interrupt
+    /// waits for it).
+    pub applied_seq: u64,
+}
+
+/// One kind of alert's hourly limit (Decision 12).
+#[derive(Debug, Default, Clone)]
+struct Hourly {
+    last: Option<u64>,
+    counted: u64,
+    text: Option<String>,
+}
+
+/// The kinds of the sync's own alerts.
+#[derive(Debug, Clone, Copy)]
+enum Alert {
+    Page = 0,
+    Reset = 1,
+    OtherOrigin = 2,
+    Feeds = 3,
+}
+
+/// The host's sync of its own Station's control feed (the module docs).
+#[derive(Debug)]
+pub struct FeedSync {
+    /// The link generation and its Station's origin (none: no link).
+    link_gen: Option<u64>,
+    own: Option<String>,
+    /// The host's monotonic clock at the last tick (ms).
+    now: u64,
+    /// The last `heads` on this link generation (monotonic ms).
+    heads_at: Option<u64>,
+    announced: Option<Announced>,
+    /// How many feeds of the host's own Station the last `heads` named.
+    own_feeds: usize,
+    /// The last `station_time` that didn't count, until a `heads` within
+    /// the cap.
+    clock: Option<StationTime>,
+    resync: Option<Resync>,
+    /// A reset waits for the feed to be read from position 0.
+    reset: bool,
+    /// The last announcement is stale (the Station served another feed
+    /// than it named): nothing is asked before the next `heads`.
+    wait_heads: bool,
+    /// The feed store's committed feed of the own origin, as last seen:
+    /// `(feed_id, cursor)`.
+    synced: Option<(String, u64)>,
+    loaded: bool,
+    in_flight: Option<Ask>,
+    refused_at: Option<u64>,
+    /// The last ask a `heads` or the pass started, and the last page that
+    /// moved nothing (monotonic ms): the pacing, kept across generations.
+    paced_at: Option<u64>,
+    stalled_at: Option<u64>,
+    alerts: [Hourly; 4],
+    lines: Vec<String>,
+    /// The sync's alerts in this run, and the latest's text (`atem
+    /// status`).
+    alerts_in_run: u64,
+    last_alert: Option<String>,
+    /// What the start view was last given: the own origin and whether its
+    /// feed part is open.
+    published: (Option<String>, bool),
+    // Counts, for the state dump.
+    heads: u64,
+    pages: u64,
+    unasked: u64,
+    refusals: u64,
+    faults: u64,
+    resets: u64,
+    other_origin: u64,
+    failures: u64,
+}
+
+impl Default for FeedSync {
+    fn default() -> Self {
+        FeedSync::new()
+    }
+}
+
+impl FeedSync {
+    pub fn new() -> FeedSync {
+        FeedSync {
+            link_gen: None,
+            own: None,
+            now: 0,
+            heads_at: None,
+            announced: None,
+            own_feeds: 0,
+            clock: None,
+            resync: None,
+            reset: false,
+            wait_heads: false,
+            synced: None,
+            loaded: false,
+            in_flight: None,
+            refused_at: None,
+            paced_at: None,
+            stalled_at: None,
+            alerts: Default::default(),
+            lines: Vec::new(),
+            alerts_in_run: 0,
+            last_alert: None,
+            published: (None, false),
+            heads: 0,
+            pages: 0,
+            unasked: 0,
+            refusals: 0,
+            faults: 0,
+            resets: 0,
+            other_origin: 0,
+            failures: 0,
+        }
+    }
+
+    /// The link as the Station has it (`None`: down). A new generation
+    /// starts afresh: no `heads`, nothing announced or in flight, no
+    /// refusal's backoff and nothing waiting to be read again but a reset
+    /// (the gate is closed until its `heads`); the pacing carries over.
+    pub fn on_link(&mut self, link: Option<&StationLink>) {
+        let Some(link) = link else {
+            self.on_link_down();
+            return;
+        };
+        if self.link_gen == Some(link.link_gen) {
+            return;
+        }
+        self.fresh_generation();
+        self.link_gen = Some(link.link_gen);
+        self.own = link.origin.clone();
+    }
+
+    /// The link went down: every gate it served closes.
+    pub fn on_link_down(&mut self) {
+        self.fresh_generation();
+        self.link_gen = None;
+        self.own = None;
+    }
+
+    fn fresh_generation(&mut self) {
+        self.heads_at = None;
+        self.wait_heads = false;
+        self.announced = None;
+        self.own_feeds = 0;
+        self.clock = None;
+        self.resync = None;
+        self.in_flight = None;
+        self.refused_at = None;
+    }
+
+    /// The start's recovery (design I.6.2 step 7): the gate closes until a
+    /// page asked from now reads.
+    pub fn restart(&mut self) {
+        self.resync = Some(Resync::Restarted);
+        self.in_flight = None;
+    }
+
+    /// The pass's monotonic time and the feed store (`None`: not loaded):
+    /// a `control_sync` due now (one unanswered too long, or one the feed
+    /// needs while a recent `heads` announced it), and the hourly alert
+    /// counts due.
+    pub fn tick(&mut self, now_mono: u64, feeds: Option<&FeedStore>) -> Vec<ControlSync> {
+        self.advance(now_mono, feeds);
+        if let Some(ask) = &self.in_flight
+            && now_mono >= ask.sent_at.saturating_add(SYNC_TIMEOUT_MS)
+        {
+            self.in_flight = None;
+            return self.ask(false).into_iter().collect();
+        }
+        // After a refusal, only a `heads` past the backoff asks again
+        // (Decision 20); after a page of another feed, only a `heads`
+        // (its announcement is stale).
+        if !self.heads_fresh() || self.resync == Some(Resync::Refused) || self.wait_heads {
+            return Vec::new();
+        }
+        self.ask(true).into_iter().collect()
+    }
+
+    /// The monotonic time and the feed store (`None`: not loaded) as they
+    /// are now, with no call: what the gate reads (60 s without `heads`),
+    /// and the hourly alert counts due.
+    pub fn advance(&mut self, now_mono: u64, feeds: Option<&FeedStore>) {
+        self.now = now_mono;
+        self.observe(feeds);
+        self.alerts_due();
+    }
+
+    /// A page couldn't be applied (its transaction failed and rolled back:
+    /// nothing of it applied): asked again after the pause. Whether to log
+    /// it (the first, then at powers of two).
+    pub fn failed(&mut self) -> bool {
+        self.stalled_at = Some(self.now);
+        self.failures += 1;
+        self.failures.is_power_of_two()
+    }
+
+    /// The Station's `heads` on the link: the clock (and its store) takes
+    /// the own feed's `station_time`; `feeds` is the feed store (`None`: not
+    /// loaded). The `control_sync` to send, if any.
+    pub fn on_heads(
+        &mut self,
+        h: &Heads,
+        clock: Option<(&mut HostClock, &Store)>,
+        feeds: Option<&FeedStore>,
+    ) -> Vec<ControlSync> {
+        if self.link_gen.is_none() {
+            return Vec::new();
+        }
+        self.heads += 1;
+        self.heads_at = Some(self.now);
+        self.wait_heads = false;
+        let Some(own) = self.own.clone() else {
+            return Vec::new();
+        };
+        let (mine, others): (Vec<_>, Vec<_>) = h.feeds.iter().partition(|f| f.origin == own);
+        if !others.is_empty() {
+            self.other_origin += others.len() as u64;
+            self.alert(
+                Alert::OtherOrigin,
+                format!(
+                    "the Station's heads named {} control feed(s) of another origin than this host's own Station ({own}); ignored",
+                    others.len()
+                ),
+            );
+        }
+        self.own_feeds = mine.len();
+        self.announced = match mine.as_slice() {
+            [one] => Some(Announced {
+                feed_id: one.feed_id.clone(),
+                head: one.head,
+            }),
+            [] => None,
+            many => {
+                self.alert(
+                    Alert::Feeds,
+                    format!(
+                        "the Station's heads named {} control feeds of {own} for this host; none is read",
+                        many.len()
+                    ),
+                );
+                None
+            }
+        };
+        if let [one] = mine.as_slice() {
+            let verdict = match clock {
+                Some((clock, store)) => clock.station_time(&own, one.station_time, store),
+                None => StationTime::Unrecorded,
+            };
+            self.clock = (verdict != StationTime::Within).then_some(verdict);
+        }
+        self.observe(feeds);
+        self.note_reset_at_heads();
+        self.ask(true).into_iter().collect()
+    }
+
+    /// A `control_sync_result` on the link, or a message that was one and
+    /// the reader refused (`Err`). Applied in one transaction when it
+    /// answers the call in flight (`cx`: the feed store and the list; none
+    /// while the feeds aren't loaded, and then nothing applies). An error:
+    /// the transaction failed and rolled back (nothing applied, the cursor
+    /// stays); the page is asked again.
+    pub fn on_page(
+        &mut self,
+        page: Result<ControlSyncResult, RelayError>,
+        clock: Option<(&mut HostClock, &Store)>,
+        cx: Option<PageCx<'_>>,
+    ) -> anyhow::Result<Synced> {
+        let Some(ask) = self.in_flight.take() else {
+            self.unasked += 1;
+            if let Err(e) = page {
+                self.fault(e.code());
+            }
+            return Ok(Synced::default());
+        };
+        let page = match page {
+            Ok(page) => page,
+            Err(e) => {
+                self.fault(e.code());
+                return Ok(Synced::default());
+            }
+        };
+        let Some(own) = self.own.clone() else {
+            return Ok(Synced::default());
+        };
+        if page.origin != own {
+            self.fault("another_origin");
+            return Ok(Synced::default());
+        }
+        if page.feed_id != ask.feed_id {
+            // The Station served another feed than the one asked: a reset
+            // (its current feed for an old id). Nothing of it applies.
+            self.note_reset("the Station served another feed than the one asked");
+            self.stalled_at = Some(self.now);
+            // The announcement is stale: nothing more is asked of it.
+            self.wait_heads = true;
+            return Ok(Synced::default());
+        }
+        if let Some((clock, store)) = clock {
+            let verdict = clock.station_time(&own, page.station_time, store);
+            if verdict != StationTime::Within {
+                self.clock = Some(verdict);
+            }
+        }
+        let Some(cx) = cx else {
+            // The feeds aren't loaded: nothing applies; asked again later.
+            self.stalled_at = Some(self.now);
+            return Ok(Synced::default());
+        };
+        self.observe(Some(cx.feeds));
+        let below = self
+            .synced
+            .as_ref()
+            .is_some_and(|(feed_id, cursor)| *feed_id == page.feed_id && page.head < *cursor);
+        if !ask.restart && below {
+            self.note_reset("its head below this host's cursor");
+            let next = self.ask(false);
+            return Ok(Synced {
+                next,
+                ..Synced::default()
+            });
+        }
+        if !FeedStore::serves(cx.list) {
+            // Nothing applies while the list doesn't serve: the record
+            // isn't consumed, the feed is read on from here once it does
+            // (asked again after the pause).
+            self.stalled_at = Some(self.now);
+            return Ok(Synced::default());
+        }
+        let before = self.synced.clone();
+        let mut synced = apply_page(&page, &ask, cx.store, cx.feeds, cx.list, cx.applied_seq)?;
+        self.pages += 1;
+        self.observe(Some(cx.feeds));
+        if ask.restart {
+            self.reset = false;
+        }
+        self.resync = None;
+        let moved = self.synced != before;
+        synced.next = if moved {
+            self.ask(false)
+        } else {
+            self.stalled_at = Some(self.now);
+            None
+        };
+        Ok(synced)
+    }
+
+    /// A refusal of `call` on the link (Decision 20): nothing advances,
+    /// every gate the link serves closes, the host's own wait ends, and a
+    /// page is asked again only after the backoff.
+    pub fn on_refused(&mut self, _call: RefusedCall) {
+        if self.link_gen.is_none() {
+            return;
+        }
+        self.refusals += 1;
+        self.resync = Some(Resync::Refused);
+        self.refused_at = Some(self.now);
+        self.in_flight = None;
+    }
+
+    /// The call just asked for couldn't be handed to the link: none in
+    /// flight (asked again at the next `heads` or pass).
+    pub fn unsent(&mut self) {
+        self.in_flight = None;
+    }
+
+    /// The start view's copy of the feed part, when it changed since the
+    /// last: the host's own Station's origin, and the origins whose feed
+    /// part is open (that one, or none).
+    pub fn take_gates(&mut self) -> Option<(Option<String>, BTreeSet<String>)> {
+        let now = (self.own.clone(), self.closed().is_none());
+        if now == self.published {
+            return None;
+        }
+        self.published = now.clone();
+        let open = match (&now.0, now.1) {
+            (Some(own), true) => BTreeSet::from([own.clone()]),
+            _ => BTreeSet::new(),
+        };
+        Some((now.0, open))
+    }
+
+    /// Why the host's own Station's feed part is closed (`None`: open), in
+    /// the order `atem status` reports it.
+    pub fn closed(&self) -> Option<Closed> {
+        if self.link_gen.is_none() || self.own.is_none() {
+            return Some(Closed::NoLink);
+        }
+        match self.resync {
+            Some(Resync::Refused) => return Some(Closed::Refused),
+            Some(Resync::Fault(code)) => return Some(Closed::Fault(code)),
+            _ => {}
+        }
+        if !self.loaded {
+            return Some(Closed::Unloaded);
+        }
+        let Some(at) = self.heads_at else {
+            return Some(Closed::NoHeads);
+        };
+        if self.now >= at.saturating_add(NO_HEADS_MS) {
+            return Some(Closed::HeadsLate);
+        }
+        match self.clock {
+            Some(StationTime::Ahead) => return Some(Closed::ClockAhead),
+            Some(_) => return Some(Closed::ClockUnrecorded),
+            None => {}
+        }
+        let Some(announced) = &self.announced else {
+            return Some(Closed::NoFeed(self.own_feeds));
+        };
+        if self.reset {
+            return Some(Closed::Reset);
+        }
+        if self.resync == Some(Resync::Restarted) {
+            return Some(Closed::Restarted);
+        }
+        match &self.synced {
+            Some((feed_id, cursor)) if *feed_id == announced.feed_id => (*cursor < announced.head)
+                .then_some(Closed::Behind {
+                    cursor: Some(*cursor),
+                    head: announced.head,
+                }),
+            _ => Some(Closed::Behind {
+                cursor: None,
+                head: announced.head,
+            }),
+        }
+    }
+
+    /// The host's own Station's origin, on the link now.
+    pub fn own(&self) -> Option<&str> {
+        self.own.as_deref()
+    }
+
+    /// The sync's alerts in this run (the runtime.log lines are at most
+    /// one an hour per kind) and the latest one's text.
+    pub fn alerts(&self) -> (u64, Option<&str>) {
+        (self.alerts_in_run, self.last_alert.as_deref())
+    }
+
+    /// The `runtime.log` lines not taken yet (alerts).
+    pub fn take_lines(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.lines)
+    }
+
+    /// For the state dump (debug builds).
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    pub fn dump(&self) -> Value {
+        json!({
+            "own": self.own,
+            "open": self.closed().is_none(),
+            "closed": self.closed().map(|c| c.text()),
+            "announced": self.announced.as_ref().map(|a| json!({"feed_id": a.feed_id, "head": a.head})),
+            "synced": self.synced.as_ref().map(|(feed_id, cursor)| json!({"feed_id": feed_id, "cursor": cursor})),
+            "in_flight": self.in_flight.as_ref().map(|a| json!({"feed_id": a.feed_id, "after": a.after})),
+            "heads": self.heads,
+            "pages": self.pages,
+            "unasked": self.unasked,
+            "refusals": self.refusals,
+            "faults": self.faults,
+            "resets": self.resets,
+            "other_origin": self.other_origin,
+        })
+    }
+
+    // ------------------------------------------------------------ inside
+
+    /// The feed store's committed feed of the own origin, as it is now.
+    fn observe(&mut self, feeds: Option<&FeedStore>) {
+        self.loaded = feeds.is_some();
+        self.synced = match (feeds, &self.own) {
+            (Some(feeds), Some(own)) => feeds.current_feed(own),
+            _ => None,
+        };
+    }
+
+    fn heads_fresh(&self) -> bool {
+        self.heads_at
+            .is_some_and(|at| self.now < at.saturating_add(NO_HEADS_MS))
+    }
+
+    /// At a `heads`: the announced feed against the one read (a reset).
+    fn note_reset_at_heads(&mut self) {
+        let (Some(announced), Some((feed_id, cursor))) = (&self.announced, &self.synced) else {
+            return;
+        };
+        if *feed_id != announced.feed_id {
+            self.note_reset("a new feed id");
+        } else if announced.head < *cursor {
+            self.note_reset("its head below this host's cursor");
+        }
+    }
+
+    /// A reset: the feed is read from position 0 (counted once until that
+    /// read commits).
+    fn note_reset(&mut self, why: &str) {
+        if self.reset {
+            return;
+        }
+        self.reset = true;
+        self.resets += 1;
+        let origin = self.own.clone().unwrap_or_default();
+        self.alert(
+            Alert::Reset,
+            format!(
+                "the control feed of {origin} was reset ({why}); reading it again from position 0"
+            ),
+        );
+    }
+
+    /// A page the reader refused, or one that names another origin: a
+    /// Station fault.
+    fn fault(&mut self, code: &'static str) {
+        self.faults += 1;
+        self.resync = Some(Resync::Fault(code));
+        self.stalled_at = Some(self.now);
+        let origin = self.own.clone().unwrap_or_default();
+        let what = match code {
+            "not_strict" => NOT_STRICT.to_string(),
+            "another_origin" => "Station sent a page of another origin".to_string(),
+            code => format!("Station sent a page the reader refused ({code})"),
+        };
+        self.alert(
+            Alert::Page,
+            format!("{what} ({origin}); its gate stays closed and the page is asked again"),
+        );
+    }
+
+    /// The `control_sync` the announced feed needs now, if any: one at a
+    /// time, none in a refusal's backoff; `paced`: one a `heads` or the pass
+    /// starts (at most one a second, none for 30 seconds after a page that
+    /// moved nothing).
+    fn ask(&mut self, paced: bool) -> Option<ControlSync> {
+        let own = self.own.clone()?;
+        let announced = self.announced.clone()?;
+        if !self.loaded || self.in_flight.is_some() {
+            return None;
+        }
+        if let Some(at) = self.refused_at {
+            if self.now < at.saturating_add(REFUSAL_BACKOFF_MS) {
+                return None;
+            }
+            self.refused_at = None;
+        }
+        let read = self
+            .synced
+            .as_ref()
+            .filter(|(feed_id, _)| *feed_id == announced.feed_id)
+            .map(|(_, cursor)| *cursor);
+        let behind = read.is_none_or(|cursor| cursor < announced.head);
+        if !(behind || self.reset || self.resync.is_some()) {
+            return None;
+        }
+        if paced {
+            let within =
+                |at: Option<u64>, ms: u64| at.is_some_and(|at| self.now < at.saturating_add(ms));
+            if within(self.paced_at, HEADS_PACE_MS) || within(self.stalled_at, STALL_PAUSE_MS) {
+                return None;
+            }
+            self.paced_at = Some(self.now);
+        }
+        let restart = self.reset || read.is_none();
+        let after = if restart { 0 } else { read.unwrap_or(0) };
+        self.in_flight = Some(Ask {
+            feed_id: announced.feed_id.clone(),
+            after,
+            sent_at: self.now,
+            restart,
+        });
+        Some(ControlSync {
+            origin: own,
+            feed_id: Some(announced.feed_id),
+            after,
+        })
+    }
+
+    /// One line now for `kind` when its hour passed, else counted (the
+    /// latest kept for the line at the hour's end).
+    fn alert(&mut self, kind: Alert, text: String) {
+        self.alerts_in_run += 1;
+        self.last_alert = Some(text.clone());
+        let h = &mut self.alerts[kind as usize];
+        let due = h
+            .last
+            .is_none_or(|last| self.now < last || self.now >= last.saturating_add(ALERT_EVERY_MS));
+        if due {
+            let more = std::mem::take(&mut h.counted);
+            h.text = None;
+            h.last = Some(self.now);
+            self.line(text, more);
+        } else {
+            h.counted += 1;
+            h.text = Some(text);
+        }
+    }
+
+    /// The counted alerts whose hour passed: the latest, with how many came
+    /// since the last line.
+    fn alerts_due(&mut self) {
+        for kind in [Alert::Page, Alert::Reset, Alert::OtherOrigin, Alert::Feeds] {
+            let h = &mut self.alerts[kind as usize];
+            let due = h.last.is_some_and(|last| {
+                self.now < last || self.now >= last.saturating_add(ALERT_EVERY_MS)
+            });
+            if due && let Some(text) = h.text.take() {
+                let more = std::mem::take(&mut h.counted);
+                h.last = Some(self.now);
+                self.line(text, more);
+            }
+        }
+    }
+
+    fn line(&mut self, text: String, more: u64) {
+        let more = if more > 0 {
+            format!(" ({more} more since the last such line)")
+        } else {
+            String::new()
+        };
+        self.lines.push(format!(
+            "atem runtime: {text}{more}; at most one such line an hour"
+        ));
+    }
+}
+
+impl GateView for FeedSync {
+    /// The feed part (this sync's) AND the device-list part (`fetched`,
+    /// the host's own fetch's): only the host's own Station's gate can
+    /// open; a native's is that one.
+    fn open_for(&self, sender: &DelegatedSender, fetched: Option<&str>) -> bool {
+        let origin = match sender {
+            DelegatedSender::Native { .. } => self.own.as_deref(),
+            DelegatedSender::Service { feed, .. } => Some(feed.origin.as_str()),
+        };
+        origin.is_some_and(|origin| {
+            self.own.as_deref() == Some(origin)
+                && self.closed().is_none()
+                && fetched == Some(origin)
+        })
+    }
+}
+
+/// A page's records in one transaction, its commit included: applied in
+/// order (a record that doesn't parse kept as evidence), the pending
+/// records re-verified after a record whose revocation applied; stopped at
+/// a record the list can't serve or a position that isn't the host's own
+/// Station's (what applied before commits). A page with no record reads
+/// the feed up to its head. A reset's read (`ask.restart`) replaces the
+/// origin's cursor first.
+fn apply_page(
+    page: &ControlSyncResult,
+    ask: &Ask,
+    store: &Store,
+    feeds: &mut FeedStore,
+    list: &ListState,
+    applied_seq: u64,
+) -> anyhow::Result<Synced> {
+    let pos = |feeds: &FeedStore, seq: u64| feeds.position(&page.feed_id, seq);
+    let tx = feeds.begin(store)?;
+    if ask.restart {
+        let Some(start) = pos(feeds, 0) else {
+            return Ok(Synced::default());
+        };
+        feeds.restart(&tx, start)?;
+    }
+    let mut applied = Vec::new();
+    let mut reapplied = Vec::new();
+    let mut stopped = false;
+    for entry in page.records.iter().filter(|e| e.feed_seq > ask.after) {
+        let Some(at) = pos(feeds, entry.feed_seq) else {
+            stopped = true;
+            break;
+        };
+        match entry.parse_record() {
+            Err(e) => feeds.unparsed(&tx, &entry.raw().to_string(), e.code(), at)?,
+            Ok(record) => match feeds.apply(&tx, &record, list, at.clone(), applied_seq) {
+                Ok(a) => {
+                    let revoked = a
+                        .actions
+                        .iter()
+                        .any(|action| matches!(action, HostAction::Revoke(_)));
+                    applied.push((at, a));
+                    if revoked {
+                        reapplied.extend(feeds.reverify_pending(&tx, list, applied_seq)?);
+                    }
+                }
+                Err(e) if e.is::<ListNotServing>() || e.is::<NotOwnStation>() => {
+                    stopped = true;
+                    break;
+                }
+                Err(e) => return Err(e),
+            },
+        }
+    }
+    if !stopped
+        && page.records.iter().all(|e| e.feed_seq <= ask.after)
+        && let Some(head) = pos(feeds, page.head.max(ask.after))
+    {
+        feeds.advance(&tx, head)?;
+    }
+    feeds.commit(tx)?;
+    Ok(Synced {
+        applied,
+        reapplied,
+        next: None,
+    })
+}
+
+#[cfg(test)]
+#[path = "sync_tests.rs"]
+mod tests;

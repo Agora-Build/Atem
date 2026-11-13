@@ -103,6 +103,19 @@ fn system_reading() -> Option<OsReading> {
     }
 }
 
+/// What became of a Station's `station_time` ([`HostClock::station_time`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StationTime {
+    /// Within the cap and recorded: it counts.
+    Within,
+    /// Beyond `H` + 10 minutes: the floor didn't move, the origin's gate
+    /// closes (§11.6, "The cap").
+    Ahead,
+    /// Not recorded: no reading, a damaged record not kept aside, or a
+    /// write that failed. It doesn't count.
+    Unrecorded,
+}
+
 pub struct HostClock {
     state: ClockState,
     /// The latest reading observed.
@@ -328,11 +341,23 @@ impl HostClock {
     /// write failed. While the record is damaged, one within the cap of the
     /// reading starts the clock afresh from it (`ClockState::station_afresh`)
     /// and counts once written; one beyond keeps it waiting (false).
-    // Called on a Station's heads (step 4, Task 33).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn station(&mut self, origin: &str, station_time_ms: u64, store: &Store) -> bool {
+        self.station_time(origin, station_time_ms, store) == StationTime::Within
+    }
+
+    /// [`HostClock::station`], saying why one doesn't count: beyond the cap
+    /// (the origin's gate closes, with the hourly alert), or not recorded (no
+    /// reading, a damaged record not kept aside, or a write that failed).
+    /// Called on a Station's `heads` and pages (step 4, Task 33).
+    pub fn station_time(
+        &mut self,
+        origin: &str,
+        station_time_ms: u64,
+        store: &Store,
+    ) -> StationTime {
         let Some(r) = (self.read)() else {
-            return false;
+            return StationTime::Unrecorded;
         };
         let aside = self.damaged.as_ref().map(|d| d.aside);
         if aside == Some(false) {
@@ -343,7 +368,7 @@ impl HostClock {
             self.state = next;
             log_events(&events);
             self.last = Some(r);
-            return false;
+            return StationTime::Unrecorded;
         }
         let StationStep {
             next,
@@ -356,8 +381,13 @@ impl HostClock {
         self.state = next;
         log_events(&events);
         self.last = Some(r.clone());
+        let verdict = |written: bool| match (written, within_cap) {
+            (true, true) => StationTime::Within,
+            (_, false) => StationTime::Ahead,
+            (false, true) => StationTime::Unrecorded,
+        };
         match aside {
-            None => self.persist(store, &r) && within_cap,
+            None => verdict(self.persist(store, &r)),
             Some(true) if within_cap => {
                 self.damaged = None;
                 log(format!(
@@ -365,9 +395,9 @@ impl HostClock {
                     utc(station_time_ms),
                     utc(r.wall_ms)
                 ));
-                self.persist(store, &r)
+                verdict(self.persist(store, &r))
             }
-            Some(_) => false,
+            Some(_) => StationTime::Ahead,
         }
     }
 

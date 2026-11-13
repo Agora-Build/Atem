@@ -2381,18 +2381,23 @@ impl R9Host {
     /// (host-work-v1 §11.4) goes to the Station link, as received
     /// ([`R9Host::take_station_messages`]).
     pub fn relay_message(&mut self, text: &str) {
-        let Ok(value) = serde_json::from_str::<Value>(text) else {
-            return;
-        };
-        if value
-            .get("op")
-            .and_then(Value::as_str)
-            .is_some_and(is_station_message)
-        {
+        // The `op` alone, peeked with no whole-value parse: a Station page
+        // that isn't strict JSON elsewhere (a lone surrogate) still reaches
+        // the Station link, whose strict reader refuses it as a Station
+        // fault (host-work-v1 §11.4; Task 30 review 5).
+        #[derive(serde::Deserialize)]
+        struct Peek {
+            op: Option<String>,
+        }
+        let op = serde_json::from_str::<Peek>(text).ok().and_then(|p| p.op);
+        if op.as_deref().is_some_and(is_station_message) {
             // At most the App's relay messages of a pass (`RELAY_LIMIT`).
             self.station_inbox.push(text.to_owned());
             return;
         }
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
         let matched = self.push.ack(&value);
         if matched == 0 && value.get("op").and_then(Value::as_str) == Some("push_ack") {
             self.input_log.log(self.last_mono, || {

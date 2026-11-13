@@ -29,12 +29,14 @@
 //!   transaction that reads it. Records carried over a channel
 //!   ([`FeedStore::apply_carried`]) have no position.
 //! - **Loading** ([`FeedStore::load`]) reads the parts of the host's pinned
-//!   device list ([`ControlState::from_parts`]): the parts of an earlier
-//!   list are logged and their rows deleted; a part of the current list
-//!   that doesn't read fails the load, and the caller keeps delegated work
+//!   device list ([`ControlState::from_parts`]): a part of another list (an
+//!   unexpected mismatch under this pairing), or a part of the current list
+//!   that doesn't read, fails the load, and the caller keeps delegated work
 //!   stopped (never an empty state in its place: [`Feeds::Damaged`]). A
 //!   store starts empty only when it is new, which a new host identity (a
-//!   new pairing or verification) makes it: the old one is moved aside.
+//!   new pairing or verification, the only pairing change that permits a
+//!   fresh state: Astation on #120, 2026-11-13) makes it: the old one is
+//!   moved aside.
 //!   The `control_*` tables are made by the first load: a store whose
 //!   feeds never load (the hook off, no delegated task) has none, as on
 //!   main.
@@ -358,22 +360,17 @@ impl FeedStore {
         }
         let loaded = ControlState::from_parts(list, parts)
             .map_err(|e| anyhow!("the stored control state doesn't read: {e}"))?;
-        let mut lines = Vec::new();
+        // Only a pairing change this host made itself starts a fresh state,
+        // and that moves the store aside (a new host identity): parts of
+        // another list in this pairing's store are damage, never cleaned up
+        // (Astation on #120, 2026-11-13; ruling A6).
         if !loaded.foreign.is_empty() {
-            let tx = store.immediate()?;
-            for principal in &loaded.foreign {
-                tx.execute(
-                    "DELETE FROM control_principals WHERE principal=?1",
-                    [principal],
-                )?;
-            }
-            tx.commit()?;
-            for principal in &loaded.foreign {
-                lines.push(format!(
-                    "atem runtime: the control state of {principal} belonged to an earlier device list; removed"
-                ));
-            }
+            bail!(
+                "the stored control state of {} belongs to another device list than this pairing's",
+                loaded.foreign.join(", ")
+            );
         }
+        let lines = Vec::new();
         let mut cursors = BTreeMap::new();
         {
             let mut st = db.prepare("SELECT origin, feed_id, cursor FROM control_feeds")?;
@@ -531,6 +528,20 @@ impl FeedStore {
         self.stage(mem, out)
     }
 
+    /// The host's own Station's feed `pos.feed_id` is read again from its
+    /// start (a reset, §11.4: a new `feed_id`, or a head below the cursor),
+    /// in `tx`: the origin's cursors go (one feed per origin) and this
+    /// feed's is `pos.feed_seq` exactly, lower than it was if need be. In
+    /// the transaction of the reset's first page, before its records: the
+    /// old cursor goes then, and only then.
+    pub fn restart(&mut self, tx: &FeedTx, pos: FeedPos) -> Result<()> {
+        self.ours(tx)?;
+        self.own_position(&pos)?;
+        let mut mem = self.staged.take().unwrap_or_else(|| self.mem.clone());
+        let out = mem.restart(tx, &pos);
+        self.stage(mem, out)
+    }
+
     /// A record of the feed at `pos` that doesn't parse (`code`, the
     /// parse's): kept as evidence, the cursor past it, in `tx`.
     pub fn unparsed(&mut self, tx: &FeedTx, text: &str, code: &str, pos: FeedPos) -> Result<()> {
@@ -639,8 +650,7 @@ impl FeedStore {
         Ok(())
     }
 
-    /// The `runtime.log` lines not taken yet (alerts, earlier lists' parts
-    /// removed).
+    /// The `runtime.log` lines not taken yet (alerts).
     pub fn take_lines(&mut self) -> Vec<String> {
         std::mem::take(&mut self.lines)
     }
@@ -659,6 +669,27 @@ impl FeedStore {
             feed_id: feed_id.to_string(),
             feed_seq,
         })
+    }
+
+    /// The feed of `origin` the host reads, as committed: its `feed_id`
+    /// and cursor (one feed per origin, Task 32 review m4). None when it has
+    /// read none, or holds more than one (a store from before m4): unknown,
+    /// so the feed is read from its start.
+    pub fn current_feed(&self, origin: &str) -> Option<(String, u64)> {
+        let mut of = self
+            .mem
+            .cursors
+            .iter()
+            .filter(|((o, _), _)| o == origin)
+            .map(|((_, feed_id), cursor)| (feed_id.clone(), *cursor));
+        let one = of.next()?;
+        of.next().is_none().then_some(one)
+    }
+
+    /// Whether a record may apply against `list` now: it serves (not
+    /// frozen, held, faulted or gone).
+    pub fn serves(list: &ListState) -> bool {
+        serving(list).is_ok()
     }
 
     /// The committed cursor of a feed.
@@ -854,6 +885,22 @@ impl Mem {
             params![pos.origin, pos.feed_id, i64::try_from(cursor)?],
         )?;
         self.cursors.insert(key, cursor);
+        Ok(())
+    }
+
+    /// The origin's cursors replaced by `pos`'s, exactly ([`FeedStore::restart`]).
+    fn restart(&mut self, tx: &Connection, pos: &FeedPos) -> Result<()> {
+        tx.execute(
+            "DELETE FROM control_feeds WHERE origin=?1",
+            params![pos.origin],
+        )?;
+        self.cursors.retain(|(origin, _), _| *origin != pos.origin);
+        tx.execute(
+            "INSERT INTO control_feeds(origin,feed_id,cursor) VALUES(?1,?2,?3)",
+            params![pos.origin, pos.feed_id, i64::try_from(pos.feed_seq)?],
+        )?;
+        self.cursors
+            .insert((pos.origin.clone(), pos.feed_id.clone()), pos.feed_seq);
         Ok(())
     }
 

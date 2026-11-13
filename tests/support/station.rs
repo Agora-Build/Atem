@@ -331,6 +331,15 @@ impl FakeStation {
         served
     }
 
+    /// [`FakeStation::serve`] on the newest link of the fake Astation (a
+    /// runtime started again connects anew), if it has one.
+    pub fn serve_latest(&mut self) -> Vec<Result<ToStation, RelayError>> {
+        match self.out.latest() {
+            Some(link) => self.serve(link),
+            None => Vec::new(),
+        }
+    }
+
     /// Serves `link` until the host's next call arrived (at most a minute)
     /// and answers it.
     pub fn next_call(&mut self, link: u64) -> Result<ToStation, RelayError> {

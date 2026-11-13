@@ -173,8 +173,7 @@ pub struct StartView {
     /// The session journal halted.
     pub halted: bool,
     /// The senders' standings by principal, as the control feeds
-    /// committed them (`FeedStore`'s publisher, Decision 16; the
-    /// debug-only stand-in `ATEM_TEST_HOST_CONTROLS` replaces them).
+    /// committed them (`FeedStore`'s publisher, Decision 16).
     pub standings: BTreeMap<String, SenderStanding>,
     /// The stored control state couldn't be read (`Feeds::Damaged`): no
     /// sender's revocations can be checked, so no delegated task starts,
@@ -209,7 +208,7 @@ impl StartView {
             standings: BTreeMap::new(),
             controls_damaged: false,
             config: Config::default(),
-            gates: Gates::closed_until_feeds(),
+            gates: Gates::default(),
             fetch: None,
             scopes: ScopeHashes::default(),
             host_id: host_id.to_string(),

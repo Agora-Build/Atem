@@ -23,6 +23,7 @@ pub mod fetch;
 pub mod gate;
 pub mod start;
 pub mod station;
+pub mod sync;
 
 use crate::runtime::test_hooks::HostFeatures;
 use crate::session_protocol::r9::HostWorkError;
@@ -449,7 +450,7 @@ mod tests {
     }
 
     /// Design I.1.3: a service is delegated only while a feed this host
-    /// syncs covers it (none until the feeds exist: [`NoFeeds`]); browser
+    /// syncs covers it (none while the feeds aren't loaded: [`NoFeeds`]); browser
     /// grants, `local`, host senders (`host.senders` is never on in step 4)
     /// and anything else keep v1, covered or not.
     #[test]

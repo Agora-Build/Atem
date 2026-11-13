@@ -480,7 +480,7 @@ fn expiry_neither_fails_nor_stops_accepted_tasks() {
             .unwrap()
             .save_work(&record)
             .unwrap();
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let second = bot_task(&mut rig, &s, "EXPIRY_SECOND", start + 3 * HOUR);
         blocked(&mut rig, &second, details::REVOCATIONS_NOT_YET_CHECKED).await;
         // The grant expires: `D` passes it.
@@ -594,7 +594,7 @@ fn control_gen_change_doesnt_forbid_reads() {
         let first = phone_task(&mut rig, &phone, "GEN_FIRST", start + HOUR);
         run(&mut rig, &first, "GEN_FIRST").await;
         reply(&mut rig, &first, "GEN_REPLY", &[]).unwrap();
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let second = phone_task(&mut rig, &phone, "GEN_SECOND", start + HOUR);
         blocked(&mut rig, &second, details::REVOCATIONS_NOT_YET_CHECKED).await;
         rig.bridge.features = HostFeatures::default();
@@ -648,7 +648,7 @@ fn narrowing_fails_only_uncovered_unstarted_tasks() {
         let mut s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
         let first = bot_task(&mut rig, &s, "NARROW_FIRST", start + HOUR);
         run(&mut rig, &first, "NARROW_FIRST").await;
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let second = bot_task(&mut rig, &s, "NARROW_SECOND", start + HOUR);
         let bot = s.bot.clone();
         let (message, message_task) = message_from(&rig, BOT, "rs", "NARROW_MESSAGE", None);
@@ -744,7 +744,7 @@ fn widening_and_renewal_change_nothing() {
         let mut s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
         let first = bot_task(&mut rig, &s, "WIDEN_FIRST", start + HOUR);
         run(&mut rig, &first, "WIDEN_FIRST").await;
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let second = bot_task(&mut rig, &s, "WIDEN_SECOND", start + HOUR);
         blocked(&mut rig, &second, details::REVOCATIONS_NOT_YET_CHECKED).await;
         let bot = s.bot.clone();
@@ -797,7 +797,7 @@ fn route_change_fails_unstarted_keeps_awaiting_and_unknown() {
         let first = phone_task(&mut rig, &phone, "ROUTE_FIRST", start + HOUR);
         run(&mut rig, &first, "ROUTE_FIRST").await;
         reply(&mut rig, &first, "ROUTE_REPLY", &[]).unwrap();
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         // Of unknown outcome (its agent exited mid-turn, say).
         let unknown = phone_task(&mut rig, &phone, "ROUTE_UNKNOWN", start + HOUR);
         let mut record = stored_record(&rig, &unknown);
@@ -1085,7 +1085,7 @@ fn revoked_senders_reply_readable_by_the_owner_not_the_sender() {
         let first = bot_task(&mut rig, &s, "REVOKED_FIRST", start + HOUR);
         run(&mut rig, &first, "REVOKED_FIRST").await;
         reply(&mut rig, &first, "REVOKED_REPLY", &[]).unwrap();
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let second = bot_task(&mut rig, &s, "REVOKED_SECOND", start + HOUR);
         blocked(&mut rig, &second, details::REVOCATIONS_NOT_YET_CHECKED).await;
         rig.bridge
@@ -1481,7 +1481,7 @@ fn a_projects_scoped_grant_expiring_with_a_task_queued_still_runs() {
         let os = ManualOs::at(start);
         let agent = TableAgent::new(true);
         let s = with_project_bot(&mut rig, root, &os, start + HOUR, &[PROJECT], &agent).await;
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let task = bot_task(&mut rig, &s, "PROJECTS_EXPIRY", start + 3 * HOUR);
         assert_eq!(
             stored_record(&rig, &task)
@@ -1598,7 +1598,7 @@ fn a_narrowing_that_drops_the_project_is_forbidden() {
         .await;
         let first = bot_task(&mut rig, &s, "PROJECTS_FIRST", start + HOUR);
         run(&mut rig, &first, "PROJECTS_FIRST").await;
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let second = bot_task(&mut rig, &s, "PROJECTS_SECOND", start + HOUR);
         blocked(&mut rig, &second, details::REVOCATIONS_NOT_YET_CHECKED).await;
         let out = s.log.narrow_service(

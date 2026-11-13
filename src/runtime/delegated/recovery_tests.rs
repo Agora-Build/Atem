@@ -750,7 +750,7 @@ fn the_stored_control_state_is_read_before_the_recovery() {
         let start = host_now().wall_ms;
         let os = ManualOs::at(start);
         let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let task = bot_task(&mut rig, &s, "REVOKED_BEFORE_THE_CRASH", start + 2 * HOUR);
         blocked(&mut rig, &task, details::REVOCATIONS_NOT_YET_CHECKED).await;
         commit_bot_records(
@@ -846,7 +846,7 @@ fn a_damaged_control_state_never_makes_a_service_v1() {
         let task = bot_task(&mut rig, &s, "BOT_BEFORE_THE_DAMAGE", start + HOUR);
         run(&mut rig, &task, "BOT_BEFORE_THE_DAMAGE").await;
         // A message of the bot's, its task waiting at the closed gate.
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let (earlier, _) = message_from(&rig, BOT, "rs", "BOT_EARLIER_MESSAGE", None);
         ask_req(&mut rig, &s.bot, &earlier).unwrap();
         commit_bot_records(

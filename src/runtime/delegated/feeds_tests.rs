@@ -679,12 +679,13 @@ fn a_position_is_always_the_hosts_own_stations() {
     );
 }
 
-/// Bindings §9 step 3 (ruling T4e): the parts of another device list (an
-/// earlier pairing's leftovers) never load: each is logged and its row
-/// deleted, while the current list's parts beside them load with their
-/// stops.
+/// Astation's answer on #120 (2026-11-13; ruling A6): only a pairing
+/// change this host made itself starts a fresh state, and that moves the
+/// store aside (a new host identity, a new store). Parts of another device
+/// list in the store of this pairing are an unexpected mismatch: damage.
+/// The load fails (delegated work stops) and nothing is deleted.
 #[test]
-fn an_earlier_lists_parts_are_logged_and_deleted_at_load() {
+fn another_lists_parts_under_this_pairing_are_damage() {
     let mut rig = rig();
     let hold = rig.bot(ControlAction::Hold);
     rig.apply_at(&hold, 1);
@@ -714,15 +715,14 @@ fn an_earlier_lists_parts_are_logged_and_deleted_at_load() {
         .unwrap();
     assert_eq!(rig.stored().parts.len(), 2);
 
-    let mut again = load(&rig.store, &rig.log, &rig.clock);
-    assert!(again.standing(BOT).held, "the current list's stop loads");
-    assert!(!again.standing("service:svc-old").held, "never loaded");
-    let parts = rig.stored().parts;
-    assert_eq!(parts.len(), 1);
-    assert_eq!(parts[0].0, BOT);
-    let lines = again.take_lines();
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    assert!(lines[0].contains("service:svc-old"), "{}", lines[0]);
+    let error = FeedStore::load(&rig.store, &rig.log.log)
+        .err()
+        .expect("damage, never a cleanup");
+    assert!(
+        format!("{error:#}").contains("service:svc-old"),
+        "{error:#}"
+    );
+    assert_eq!(rig.stored().parts.len(), 2, "nothing deleted");
 }
 
 /// Bindings §9 step 3 (ruling PR2b): a part of the current list that

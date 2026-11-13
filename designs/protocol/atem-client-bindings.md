@@ -1189,7 +1189,9 @@ synchronized clock: it orders covers (below).
    that can't be read is `malformed`: it names no list, so nothing may
    start empty. Parts name their device list, so a store of parts
    loads the current list's parts and skips the others, reporting them
-   in `foreign` (delete those rows): an old list's leftovers never load,
+   in `foreign` (delete those rows only when your own pairing changed;
+   under the same pairing they are damage: stop the work, as Astation
+   answered on #120, 2026-11-13): an old list's leftovers never load,
    so a service id that recurs in the new list inherits no revoke, hold or
    coverage, and the current list's stops beside them stay in force. At a
    live re-pair, delete the old list's rows in the transaction that adopts

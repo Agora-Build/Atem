@@ -67,6 +67,11 @@ impl LinkSender {
             let _ = tx.send(Cmd::Send(text));
         }
     }
+
+    /// The newest link the fake took (connection numbers only grow).
+    pub fn latest(&self) -> Option<u64> {
+        self.0.lock().unwrap().keys().max().copied()
+    }
 }
 
 impl FakeAstation {

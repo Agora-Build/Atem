@@ -55,6 +55,8 @@ mod collab_bridge;
 mod collab_launch_bridge;
 #[path = "delegated/dispatch.rs"]
 mod delegated_dispatch;
+#[path = "delegated/feed_pass.rs"]
+mod delegated_feed_pass;
 #[path = "delegated/recovery.rs"]
 mod delegated_recovery;
 #[path = "delegated/requests.rs"]
@@ -195,6 +197,10 @@ pub(super) struct State {
     /// the pinned device list before the start's recovery and any
     /// dispatch.
     pub(super) feeds: crate::runtime::delegated::feeds::Feeds,
+    /// The device list's head (`seq`, hash) the pending control records
+    /// were last applied again at (`feeds_reverify`): none since the feeds
+    /// loaded, so once at start.
+    reverified: Option<(u64, atem_client::encoding::Hash32)>,
     /// Tests: the control view senders are classified on in place of the
     /// feeds (a feed covering a service, standings the test sets).
     #[cfg(test)]
@@ -239,6 +245,7 @@ impl State {
             clock_checked: false,
             read_due: Instant::now(),
             feeds: crate::runtime::delegated::feeds::Feeds::Unloaded,
+            reverified: None,
             #[cfg(test)]
             controls: None,
             #[cfg(test)]
@@ -478,11 +485,6 @@ impl HostBridge {
         if let Some(controls) = &self.work.controls {
             return classify(principal, list, controls.as_ref(), self.features);
         }
-        // Debug builds: the stand-in for the feeds (`ATEM_TEST_HOST_CONTROLS`).
-        #[cfg(debug_assertions)]
-        if let Some(controls) = crate::runtime::test_hooks::host_controls() {
-            return classify(principal, list, &controls, self.features);
-        }
         if let Feeds::Loaded(feeds) = &self.work.feeds {
             return classify(principal, list, feeds.as_ref(), self.features);
         }
@@ -496,23 +498,20 @@ impl HostBridge {
     }
 
     /// The host's control state can't be checked: the feeds aren't loaded
-    /// or don't read, and no stand-in replaces them. A service's revocation,
-    /// hold and coverage are unknown then (ruling T32b).
+    /// or don't read (tests: and no control view stands in for them). A
+    /// service's revocation, hold and coverage are unknown then (ruling
+    /// T32b).
     pub(super) fn controls_unchecked(&self) -> bool {
         !matches!(self.work.feeds, Feeds::Loaded(_)) && !self.controls_stood_in()
     }
 
-    /// Whether a stand-in drives the start view's standings in place of the
-    /// control feeds: the tests' control view, or the debug-only
-    /// `ATEM_TEST_HOST_CONTROLS`. The feeds still load then, but don't
-    /// publish their load or tell the view they don't read.
+    /// Tests: a control view drives the start view's standings in place of
+    /// the control feeds (`State::controls`). The feeds still load then,
+    /// but don't publish their load or tell the view they don't read.
+    /// Never in a build: the debug stand-in for the feeds is gone (Task 33).
     fn controls_stood_in(&self) -> bool {
         #[cfg(test)]
         if self.work.controls.is_some() {
-            return true;
-        }
-        #[cfg(debug_assertions)]
-        if crate::runtime::test_hooks::host_controls().is_some() {
             return true;
         }
         false
@@ -561,6 +560,9 @@ impl HostBridge {
                     self.start_view().controls_damaged = false;
                 }
                 self.work.feeds = Feeds::Loaded(Box::new(feeds));
+                // Its pending records applied again once, at the next
+                // re-verification (`feeds_reverify`).
+                self.work.reverified = None;
             }
             Err(error) => {
                 eprintln!(
@@ -843,17 +845,6 @@ impl HostBridge {
         // As `work_config` gave it when it loaded (a pass runs only with a
         // file that loaded and hosting on).
         view.config = config;
-        // Debug builds: the stand-in for the feeds (`ATEM_TEST_HOST_CONTROLS`)
-        // gives the standings and the Station gates, as a sync would.
-        #[cfg(debug_assertions)]
-        if let Some(controls) = crate::runtime::test_hooks::host_controls() {
-            view.standings = controls.standings;
-            view.gates.set_stations(
-                controls.own,
-                controls.open,
-                !controls.device_list_from_fetch,
-            );
-        }
     }
 
     /// At an orderly stop: the delegated clock's last reading, written.
@@ -897,8 +888,11 @@ impl HostBridge {
             return;
         }
         // The control feeds into the start view before the recovery reads
-        // it and before any dispatch (Task 21 review m8).
+        // it and before any dispatch (Task 21 review m8), their pending
+        // records applied again once loaded and whenever the device list
+        // moved (Task 32 review).
         self.ensure_feeds();
+        self.feeds_reverify();
         if !self.work.recovered {
             // Delegated tasks are recovered after the session journal (design
             // I.6.2 step 2: `SessionHost::recover`, run in this pass before
@@ -2392,6 +2386,7 @@ mod local_tests {
         include!("delegated/dispatch_tests.rs");
         include!("delegated/lifecycle_tests.rs");
         include!("delegated/recovery_tests.rs");
+        include!("delegated/feed_pass_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};

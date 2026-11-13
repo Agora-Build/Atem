@@ -1,20 +1,24 @@
 //! Delegated host work in the real runtime (the delegated host-work design,
 //! Part I; VII.A; host-work-v1 §11.6): the debug hook turns `host.delegated`
 //! on (`ATEM_TEST_HOST_FEATURES`), and where a test needs a Station's
-//! revocation gate open or a service a feed covers, the stand-in for the
-//! control feeds says so (`ATEM_TEST_HOST_CONTROLS`; PR 10 builds the
-//! feeds). Encrypted r9 clients, fake agents, temp profiles; clocks move on
-//! the debug host clock (`ATEM_TEST_HOST_CLOCK`), never by waiting.
+//! revocation gate open or a service a feed covers, the fake Station
+//! (tests/support/station.rs) serves the host's own Station's control feed,
+//! its `cover` records included, and its heads: the host syncs it as it
+//! would its Station's (Task 33). Encrypted r9 clients, fake agents, temp
+//! profiles; clocks move on the debug host clock (`ATEM_TEST_HOST_CLOCK`),
+//! never by waiting.
 #![cfg(target_os = "linux")]
 mod support;
 
 use atem_client::connect::{Attached, Event, Identity};
-use atem_client::control::{MembershipFetch, RelayError, ToStation};
+use atem_client::control::{ControlAction, MembershipFetch, RelayError, ToStation};
 use atem_client::membership::ServiceScope;
 use serde_json::{Value, json};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use support::astation::{FakeAstation, write_verified_pairing};
 use support::host_clock::HostClock;
@@ -30,13 +34,11 @@ const ACCOUNT: &str = "acct-delegated";
 /// A native member holding `control`: a delegated sender.
 const PHONE: &str = "dev-phone";
 /// The service the tests launch sessions with (`svc-work`); delegated only
-/// while the stand-in's feed covers it.
+/// while the fake Station's feed covers it.
 const SVC: &str = "svc-work";
-/// The Station of the stand-in for the feeds: the host's own.
-const ORIGIN: &str = "https://station.test";
 /// The relay setting the rig gives the runtime (its link is the fake
 /// Astation's local one): the selected Station's origin, normalized, so the
-/// fake Station's ([`Rig::with_station`]).
+/// fake Station's ([`Rig::with_station`]): the host's own Station.
 const STATION: &str = "http://127.0.0.1:1";
 /// After a fetch whose carriage moved nothing, the host fetches nothing at
 /// a `heads` for this long (its monotonic clock).
@@ -72,8 +74,6 @@ struct Rig {
     log: TestLog,
     runtime: Option<Child>,
     fake: PathBuf,
-    /// The stand-in for the feeds (`ATEM_TEST_HOST_CONTROLS`), when on.
-    controls: Option<PathBuf>,
     /// The debug host clock (`ATEM_TEST_HOST_CLOCK`), when on.
     clock: Option<HostClock>,
     /// The broker faults (`ATEM_TEST_PTY_FAULTS`).
@@ -83,7 +83,9 @@ struct Rig {
     /// The broker's state after each pass (`ATEM_TEST_STATE_DUMP`).
     dump: bool,
     /// The fake Station on the link ([`Rig::with_station`]).
-    station: Option<FakeStation>,
+    station: Option<Arc<Mutex<FakeStation>>>,
+    /// The thread serving it while it is online ([`Rig::station_online`]).
+    pump: Mutex<Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>>,
 }
 
 impl Rig {
@@ -154,33 +156,76 @@ principals = {principals}
             log,
             runtime: None,
             fake,
-            controls: None,
             clock: None,
             faults: false,
             membership: false,
             dump: false,
             station: None,
+            pump: Mutex::new(None),
         }
     }
 
-    /// The fake Station of [`STATION`] on the link, holding the rig's list,
-    /// announcing only when a test says (made before the runtime: it takes
-    /// the host's calls from the start).
+    /// The fake Station of [`STATION`] on the link, holding the rig's list
+    /// and an empty control feed, announcing only when a test says (made
+    /// before the runtime: it takes the host's calls from the start), and
+    /// the state dump on (where the gate shows).
     fn with_station(&mut self) {
         let mut station = FakeStation::new(&self.astation, STATION, &self.log, HOST, 1);
         station.silence_heads(true);
-        self.station = Some(station);
+        self.station = Some(Arc::new(Mutex::new(station)));
+        self.dump = true;
     }
 
-    fn station(&mut self) -> &mut FakeStation {
-        self.station.as_mut().expect("the fake Station")
+    fn station(&self) -> MutexGuard<'_, FakeStation> {
+        self.station
+            .as_ref()
+            .expect("the fake Station")
+            .lock()
+            .unwrap()
     }
 
-    /// The stand-in for the feeds on, its file saying `value`.
-    fn with_controls(&mut self, value: Value) {
-        let path = self.sandbox.dir.path().join("controls.json");
-        replace(&path, &value.to_string());
-        self.controls = Some(path);
+    /// The fake Station online from now on, as a Station is: a thread
+    /// answers every call of the host's newest link and announces `heads`
+    /// (on a new link at once, then every second), with `cover`, its feed
+    /// covering [`SVC`] first. Then waits until the host's own Station's
+    /// gate is open (its feed read to the announced head, the device list
+    /// holding the announced head).
+    fn station_online(&self, cover: bool) {
+        {
+            let mut station = self.station();
+            if cover {
+                let record = station.record_for(SVC, ControlAction::Cover);
+                station.append(record);
+            }
+            station.silence_heads(false);
+        }
+        let station = self.station.clone().expect("the fake Station");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let pump = std::thread::spawn(move || {
+            let mut last = Instant::now();
+            while !stopped.load(Ordering::SeqCst) {
+                {
+                    let mut station = station.lock().unwrap();
+                    station.serve_latest();
+                    if last.elapsed() >= Duration::from_secs(1) {
+                        station.heads_now();
+                        last = Instant::now();
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        *self.pump.lock().unwrap() = Some((stop, pump));
+        self.gate_open();
+    }
+
+    /// Waits until the host's own Station's gate is open (state dump).
+    fn gate_open(&self) {
+        within("the host's own Station's gate", || {
+            let station = dumped(self)["station"].clone();
+            station["feed"]["open"] == true && station["list_part"] == true
+        });
     }
 
     /// The debug host clock on, at the real clocks.
@@ -213,9 +258,6 @@ principals = {principals}
         let mut command = Command::new(env!("CARGO_BIN_EXE_atem"));
         command.env_clear();
         command.env("ATEM_TEST_HOST_FEATURES", "host.delegated");
-        if let Some(controls) = &self.controls {
-            command.env("ATEM_TEST_HOST_CONTROLS", controls);
-        }
         if let Some(clock) = &self.clock {
             command.env("ATEM_TEST_HOST_CLOCK", &clock.path);
         }
@@ -281,6 +323,10 @@ principals = {principals}
 
 impl Drop for Rig {
     fn drop(&mut self) {
+        if let Some((stop, pump)) = self.pump.get_mut().unwrap().take() {
+            stop.store(true, Ordering::SeqCst);
+            let _ = pump.join();
+        }
         self.sandbox.track();
         if let Some(mut child) = self.runtime.take() {
             let _ = child.kill();
@@ -605,24 +651,6 @@ fn reply(rig: &Rig, n: u32, text: &str) {
     assert_eq!(run["code"], 0, "{run}");
 }
 
-/// The stand-in's feed: the host's own Station's gate open.
-fn gate_open() -> Value {
-    json!({"own": ORIGIN, "open": [ORIGIN]})
-}
-
-/// The stand-in's feed of the fake Station ([`STATION`], the host's own)
-/// open, the gate's device-list part left to the host's own fetch (design
-/// I.5.8).
-fn station_feed_open() -> Value {
-    json!({"own": STATION, "open": [STATION], "device_list_from_fetch": true})
-}
-
-/// [`gate_open`], and the feed of that Station covering [`SVC`].
-fn covers_svc() -> Value {
-    json!({"own": ORIGIN, "open": [ORIGIN],
-        "standings": {format!("service:{SVC}"): {"coverage": {"origin": ORIGIN, "feed_id": "feed-1"}}}})
-}
-
 /// VII.A test 1 (design I.4.3: "The sender's channel and online status are
 /// not conditions"): the phone enqueues two tasks and goes while the first
 /// runs; the first ends and the second starts and ends with the phone
@@ -631,13 +659,14 @@ fn covers_svc() -> Value {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_HOST_CONTROLS hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn sender_disconnects_and_later_reads_both_replies() {
     let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(gate_open());
+    rig.with_station();
     rig.start();
     let mut r = Router::new(&rig.astation);
+    rig.station_online(false);
     let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
@@ -675,7 +704,7 @@ fn sender_disconnects_and_later_reads_both_replies() {
 }
 
 /// VII.A test 2 (design I.2, I.3.3 "Grant or integration expires"): a
-/// service a feed covers (the stand-in's) enqueues two tasks; its grant
+/// service the fake Station's feed covers enqueues two tasks; its grant
 /// expires (the host clock 25 minutes on) while the first runs and the
 /// second waits. The second still runs, before its deadline. The expired
 /// service can't even connect to ask; after the Mac renews it, it reads
@@ -683,14 +712,15 @@ fn sender_disconnects_and_later_reads_both_replies() {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_HOST_CLOCK hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn an_expired_grants_task_still_runs_and_nothing_runs_twice() {
     let mut rig = Rig::prepared(20 * MIN, false);
-    rig.with_controls(covers_svc());
+    rig.with_station();
     rig.with_clock();
     rig.start();
     let mut r = Router::new(&rig.astation);
+    rig.station_online(true);
     let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     let first = task(&launch, "EXPIRY_FIRST", 2 * HOUR);
@@ -703,7 +733,7 @@ fn an_expired_grants_task_still_runs_and_nothing_runs_twice() {
             format!("service:{SVC}"),
             "{admission}"
         );
-        assert_eq!(admission["feed"]["origin"], ORIGIN, "{admission}");
+        assert_eq!(admission["feed"]["origin"], STATION, "{admission}");
     }
     in_turn(&rig, &first["task_id"], "EXPIRY_FIRST");
     wait_stored(&rig, &second["task_id"], "blocked", BEHIND);
@@ -976,16 +1006,16 @@ fn receipt(rig: &Rig, rid: &str) -> Value {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS, ATEM_TEST_PTY_FAULTS, ATEM_TEST_MEMBERSHIP_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS, ATEM_TEST_MEMBERSHIP_FAULTS and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn a_freeze_at_the_start_fails_the_attempt() {
     let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(gate_open());
+    rig.with_station();
     rig.faults = true;
     rig.membership = true;
-    rig.dump = true;
     rig.start();
     let mut r = Router::new(&rig.astation);
+    rig.station_online(false);
     let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     let sid = launch["session_id"].as_str().unwrap().to_string();
@@ -1158,15 +1188,16 @@ fn native_on_a_lan_runs_after_its_carriage() {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_HOST_CLOCK hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn clock_set_back_never_runs_an_expired_task() {
     const EXPIRED: &str = "expired before submission";
     let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(gate_open());
+    rig.with_station();
     rig.with_clock();
     rig.start();
     let mut r = Router::new(&rig.astation);
+    rig.station_online(false);
     let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
@@ -1215,14 +1246,15 @@ fn clock_set_back_never_runs_an_expired_task() {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_PTY_FAULTS hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn sigkill_after_attempt_commit_and_after_accepted_runs_once() {
     let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(gate_open());
+    rig.with_station();
     rig.faults = true;
     rig.start();
     let mut r = Router::new(&rig.astation);
+    rig.station_online(false);
     let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
@@ -1309,6 +1341,31 @@ fn fetch(after: u64) -> Result<ToStation, RelayError> {
     Ok(ToStation::MembershipFetch(MembershipFetch { after }))
 }
 
+/// The host's next device-list fetch on `link`, answered; its feed syncs
+/// (`control_sync`) on the way answered too.
+fn next_fetch(station: &mut FakeStation, link: u64) -> Result<ToStation, RelayError> {
+    loop {
+        let call = station.next_call(link);
+        if !matches!(call, Ok(ToStation::ControlSync(_))) {
+            return call;
+        }
+    }
+}
+
+/// The device-list fetches the host sent so far (its feed syncs aside).
+fn fetches(station: &FakeStation) -> usize {
+    station
+        .sent()
+        .iter()
+        .filter(|bytes| {
+            matches!(
+                ToStation::decode(bytes.as_bytes()),
+                Ok(ToStation::MembershipFetch(_))
+            )
+        })
+        .count()
+}
+
 /// The phone's removal, signed by `dev-new` (the subject of `log`'s
 /// pending recovery) on `log`'s head: deferred on a host until the wait
 /// ends (R9.5). Not appended: `log` itself can't verify it before then.
@@ -1338,13 +1395,11 @@ fn removal_by_the_pending(log: &TestLog) -> Value {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn a_fetch_stopping_at_a_deferred_entry_marks_device_list_update_pending() {
     let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(station_feed_open());
     rig.with_clock();
-    rig.dump = true;
     rig.with_station();
     rig.start();
     let mut r = Router::new(&rig.astation);
@@ -1358,11 +1413,12 @@ fn a_fetch_stopping_at_a_deferred_entry_marks_device_list_update_pending() {
     rig.log.recovery_add("dev-new");
     let deferred = removal_by_the_pending(&rig.log);
     let log = &rig.log;
-    let station = rig.station.as_mut().unwrap();
+    let mut station = rig.station();
     station.set_log_beyond(log, &[deferred]);
     station.serve(link);
     station.heads_now();
-    assert_eq!(station.next_call(link), fetch(pinned));
+    assert_eq!(next_fetch(&mut station, link), fetch(pinned));
+    drop(station);
     let s = until_station(&rig, "the stop at the deferred entry", |s| {
         s["fetch"]["stopped"] == pinned + 2
     });
@@ -1389,7 +1445,7 @@ fn a_fetch_stopping_at_a_deferred_entry_marks_device_list_update_pending() {
     assert_eq!(s["fetch"]["stopped"], pinned + 2, "{s}");
     two_passes(&rig);
     rig.station().serve(link);
-    assert_eq!(rig.station().sent().len(), 1, "{:?}", rig.station().sent());
+    assert_eq!(fetches(&rig.station()), 1, "{:?}", rig.station().sent());
     wait_stored(&rig, &t["task_id"], "blocked", "device list update pending");
     assert!(attempts(&rig, &t["task_id"]).is_empty());
     assert!(!input(&rig).contains("DEFERRED_BY_THE_FETCH"));
@@ -1404,17 +1460,17 @@ fn a_fetch_stopping_at_a_deferred_entry_marks_device_list_update_pending() {
 /// passed meanwhile expires, and the others wait `revocations not yet
 /// checked` (the gate's device-list part no longer holds: the list is
 /// behind the announced head) until the fetch applies the entry. Then the
-/// removed phone's task is cancelled, `sender revoked`, and the Mac's runs.
+/// removed phone's task is cancelled, `sender revoked`, and the Mac's runs
+/// once the Station's next heads opens the feed part again (none came for
+/// the 24 hours the host's clock moved).
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn the_deferral_ends_with_the_recovery_wait_and_tasks_are_checked_again() {
     let mut rig = Rig::prepared(48 * HOUR, false);
-    rig.with_controls(station_feed_open());
     rig.with_clock();
-    rig.dump = true;
     rig.with_station();
     rig.start();
     let mut r = Router::new(&rig.astation);
@@ -1426,11 +1482,12 @@ fn the_deferral_ends_with_the_recovery_wait_and_tasks_are_checked_again() {
     // the host's clock.
     rig.log.recovery_add("dev-new");
     let log = &rig.log;
-    let station = rig.station.as_mut().unwrap();
+    let mut station = rig.station();
     station.set_log(log);
     station.serve(link);
     station.heads_now();
-    assert_eq!(station.next_call(link), fetch(pinned));
+    assert_eq!(next_fetch(&mut station, link), fetch(pinned));
+    drop(station);
     within("the recovery", || list_head(&rig) == pinned + 1);
 
     // Five minutes before the wait ends, the entry its subject signed.
@@ -1438,10 +1495,11 @@ fn the_deferral_ends_with_the_recovery_wait_and_tasks_are_checked_again() {
         .set((24 * HOUR - 5 * MIN) as i64, 24 * HOUR - 5 * MIN);
     let deferred = removal_by_the_pending(&rig.log);
     let log = &rig.log;
-    let station = rig.station.as_mut().unwrap();
+    let mut station = rig.station();
     station.set_log_beyond(log, &[deferred]);
     station.heads_now();
-    assert_eq!(station.next_call(link), fetch(pinned + 1));
+    assert_eq!(next_fetch(&mut station, link), fetch(pinned + 1));
+    drop(station);
     until_station(&rig, "the stop at the deferred entry", |s| {
         s["fetch"]["stopped"] == pinned + 2
     });
@@ -1482,14 +1540,21 @@ fn the_deferral_ends_with_the_recovery_wait_and_tasks_are_checked_again() {
     assert_eq!(s["list_part"], false, "{s}");
     // The host fetched the entry again at once, with no heads.
     let heads = s["heads"].clone();
-    assert_eq!(rig.station().next_call(link), fetch(pinned + 1));
+    assert_eq!(next_fetch(&mut rig.station(), link), fetch(pinned + 1));
     within("the removal", || list_head(&rig) == pinned + 2);
     wait_stored(&rig, &removed["task_id"], "cancelled", "sender revoked");
-    in_turn(&rig, &runs["task_id"], "BY_THE_MAC");
-    complete_turn(&rig, &runs["task_id"]);
     let s = dumped(&rig)["station"].clone();
     assert_eq!(s["heads"], heads, "no heads since: {s}");
     assert_eq!(s["list_part"], true, "{s}");
+    // No heads came for 24 h on the host's clock: the feed part opens at
+    // the Station's next heads, and the Mac's task runs.
+    rig.station().heads_now();
+    within("the gate open again", || {
+        rig.station().serve(link);
+        dumped(&rig)["station"]["feed"]["open"] == true
+    });
+    in_turn(&rig, &runs["task_id"], "BY_THE_MAC");
+    complete_turn(&rig, &runs["task_id"]);
     for t in [&removed, &due] {
         assert!(attempts(&rig, &t["task_id"]).is_empty());
     }

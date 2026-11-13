@@ -1149,7 +1149,12 @@ reporting its principal for the host to delete** (ruling T4e): an earlier
 pairing's leftovers never load, so a service id that recurs in the new list
 inherits no revoke, hold or coverage, while the current list's parts beside
 them (a live re-pair whose old rows weren't deleted yet) load with their
-stops. A part of the current list that fails strict reading, or one whose
+stops. (**Atem's host, step 4, per Astation's answer on #120,
+2026-11-13:** only a pairing change the host made itself permits a fresh
+state or deleting another list's rows, and Atem's host moves its whole
+store aside then: a new host identity, a new store. So a part of another
+list in the store of the current pairing is an unexpected mismatch: the
+load fails as damage, nothing is deleted, and delegated work stops.) A part of the current list that fails strict reading, or one whose
 device list can't be read, still fails the load; nothing is skipped
 unless it names another list. At a live re-pair the host deletes the old
 list's rows in the transaction that adopts the new list's empty state.
@@ -1831,6 +1836,57 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
   can't reveal a fork at or below that `seq`, and a window fetch would be a
   later wire item. "Up to a deferred entry" is the host's fetch, under that
   same announced head, stopping at an entry its list still defers.)
+
+**On the host (Atem's readings, step 4, Task 33, for Astation's
+information; nothing on the wire changes).** The host syncs only its own
+Station's feed (step 4's Decision 14):
+
+- **What a `heads` announces.** Its feed of the host's own Station's origin
+  must be named exactly once ("One feed per account"): none, or more than
+  one, keeps that origin's gate closed (with an hourly `runtime.log` line
+  for more than one). A feed of another origin is ignored, counted and
+  logged at most hourly; its gate never opens. Each `heads` restarts the
+  60-second window.
+- **Station time.** A `heads`' `station_time` (of the own feed) and a
+  page's both go through the cap (design I.6.5: both carry it): one
+  beyond `H` + 10 minutes, or one the host clock couldn't record, moves no
+  floor and closes the origin's gate; only a later `heads` within the cap
+  opens it again. A page beyond the cap still applies its records (a stop
+  is never held back).
+- **Only the announced feed.** `control_sync` names the feed the last
+  `heads` announced, one call in flight. A page is taken only as the
+  answer to that call and must carry its `(origin, feed_id)`; one nobody
+  asked for applies nothing. A page of another `feed_id` than the one
+  asked (a Station that serves its current feed for an old id: the open
+  question above) applies nothing either, reads as a reset, and the host
+  asks nothing more until the next `heads`: so either answer to that
+  question works.
+- **Resets.** The announced `feed_id` isn't the one the host read, or the
+  announced head (or a page's `head`) is below the cursor: the feed is
+  read again from position 0 (`after: 0`, the same `feed_id` too after a
+  rollback), and that read's first page replaces the origin's old cursor
+  in its own transaction, only then (it may lower it). A feed the host
+  never read is read from 0 the same way.
+- **Pages.** A page with no record after the cursor reads the feed up to
+  its `head` (positions left out are gaps, rule 7); otherwise the cursor
+  goes to the page's last record and the rest is asked at once. A page
+  stops at a record while the device list doesn't serve, and the cursor
+  stays there. A page that doesn't read as a whole (any reader refusal,
+  not only non-strict JSON) is the fault above; the message is recognized
+  as a page by its `op` alone, so a page with a lone surrogate elsewhere is
+  still one. A message that isn't JSON at all is dropped before any
+  reader, as on every family of the link; the call it answered is asked
+  again after 30 seconds unanswered.
+- **Pacing** (as the device-list fetch's). The calls a `heads` or the
+  host's pass start are at most one a second, none for 30 seconds after a
+  page that moved nothing or was refused; one unanswered for 30 seconds is
+  asked again.
+- **Refusals.** Any of the three closes the gate and ends the sync in
+  flight; the next `control_sync` goes at the first `heads` 30 seconds or
+  more after it, or on the link's next generation, and the gate opens only
+  with a page asked for then (the resynchronization), even when the
+  cursor already held the head. `atem status` says `Station refused feed
+  access (forbidden); retrying`.
 
 #### Acknowledgments
 

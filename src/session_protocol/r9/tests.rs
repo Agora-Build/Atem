@@ -3702,3 +3702,23 @@ fn a_stations_messages_go_to_the_station_link() {
     assert_eq!(rig.engine.take_station_messages(), station);
     assert!(rig.engine.take_station_messages().is_empty());
 }
+
+/// Task 30 review 5: the `op` is peeked without a whole-value parse, so a
+/// Station page that isn't strict JSON elsewhere (a lone surrogate, a
+/// fraction, a duplicate key) still reaches the Station link, whose strict
+/// reader refuses it as a Station fault (host-work-v1 §11.4) rather than
+/// dropped unseen here.
+#[test]
+fn a_station_page_that_isnt_strict_still_reaches_the_station_link() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    let pages = [
+        r#"{"type":"relay","op":"control_sync_result","feed_id":"\ud800","records":[]}"#,
+        r#"{"type":"relay","op":"control_sync_result","head":0.5}"#,
+        r#"{"type":"relay","op":"control_sync_result","head":1,"head":2}"#,
+    ];
+    for text in pages {
+        rig.engine.relay_message(text);
+    }
+    assert_eq!(rig.engine.take_station_messages(), pages);
+}

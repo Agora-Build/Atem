@@ -54,9 +54,9 @@ fn manual_clock(rig: &mut LocalRig, os: &ManualOs) {
 
 /// The rig as a delegated host: `host.delegated` on, the phone pinned with
 /// route `rm`, the delegated clock on `os`, and with `gate` the host's own
-/// Station's gate open (what the feeds will make it, PR 10: this version's
-/// are closed, so otherwise only the phone's own caught-up channel opens
-/// it). The phone's authority, and the list.
+/// Station's gate open (as its feed sync and fetch make it, stood in for
+/// here; otherwise only the phone's own caught-up channel opens it). The
+/// phone's authority, and the list.
 fn delegated(rig: &mut LocalRig, root: &Path, os: &ManualOs, gate: bool) -> (Authority, TestLog) {
     // On before the list opens: its deferral is kept on disk then.
     rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();

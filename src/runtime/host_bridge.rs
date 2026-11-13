@@ -65,7 +65,9 @@
 //! none until then), and a rebind or trust change drops them all.
 use super::broker::{BrokerSession, SessionState as BrokerState, WriteOutcome, WriteTag};
 use super::delegated::start::{DelegatedStart, StartView};
-use super::delegated::station::{Inbound as StationInbound, LinkKind, Station};
+use super::delegated::station::{
+    Call as StationCall, Inbound as StationInbound, LinkKind, Station,
+};
 use super::project_scope::{AgentHasher, ProjectHasher, ProjectScopes};
 use super::refusal_log::{self, RefusalLog, Request};
 use super::worker_approvals::Event as ApprovalEvent;
@@ -1502,6 +1504,9 @@ impl HostBridge {
             || station_link_kind(app),
             || app.astation_client.selected_station_origin(),
         );
+        // The gate follows the link and the time (60 s without `heads`)
+        // at every pass, whatever the Station sends.
+        self.feed_advance(host_now().mono_ms);
         self.refresh_fetch_view();
     }
 
@@ -1536,13 +1541,16 @@ impl HostBridge {
     fn station_pass(&mut self, messages: Vec<String>, cx: &mut Cx) {
         let applied = self.membership.as_ref().map(MembershipHost::head);
         let deferred = self.list_deferral();
+        let now = host_now().mono_ms;
         let Some(station) = self.station.as_mut() else {
             return;
         };
-        let mut calls: Vec<atem_client::control::MembershipFetch> = station
-            .tick(host_now().mono_ms, applied, deferred)
+        let mut calls: Vec<StationCall> = station
+            .tick(now, applied, deferred)
             .into_iter()
+            .map(StationCall::Fetch)
             .collect();
+        calls.extend(self.feed_tick(now));
         for text in messages {
             let applied = self.membership.as_ref().map(MembershipHost::head);
             let deferred = self.list_deferral();
@@ -1551,11 +1559,24 @@ impl HostBridge {
             };
             let inbound = station.receive(&text, applied, deferred);
             // A `heads` may name a head beyond the list: the gate's
-            // device-list part follows before anything else runs.
+            // device-list part follows before anything else runs; so does
+            // its feed part after a refusal (Decision 16).
             self.refresh_fetch_view();
+            self.publish_feed_gates();
             match inbound {
                 StationInbound::Nothing => {}
-                StationInbound::Send(call) => calls.push(call),
+                // The fetch took the announced list head; the feed sync
+                // takes its feeds (§11.4).
+                StationInbound::Heads(heads, fetch) => {
+                    calls.extend(fetch.map(StationCall::Fetch));
+                    calls.extend(self.feed_heads(&heads));
+                    self.publish_feed_gates();
+                }
+                StationInbound::Page(page) => {
+                    calls.extend(self.feed_page(page));
+                    // The page's gate, as it committed (Decision 16).
+                    self.publish_feed_gates();
+                }
                 StationInbound::Carry(entries) => {
                     // Every entry or none: a carriage is never shortened.
                     let carried: Result<Vec<StrictValue>, _> = entries
@@ -1589,11 +1610,14 @@ impl HostBridge {
                         (applied, after, self.station.as_mut())
                         && let Some(call) = station.fetch.carried(&before, &after, stopped_at)
                     {
-                        calls.push(call);
+                        calls.push(StationCall::Fetch(call));
                     }
                 }
             }
         }
+        // The device list may have moved (a carriage): pending control
+        // records are applied again.
+        self.feeds_reverify();
         let Some(station) = self.station.as_mut() else {
             return;
         };
@@ -1601,11 +1625,15 @@ impl HostBridge {
             let sent = self.r9_link.is_some()
                 && call
                     .to_json()
-                    .is_ok_and(|text| cx.client.try_send_wire(text.to_string(), false).is_ok());
+                    .is_some_and(|text| cx.client.try_send_wire(text.to_string(), false).is_ok());
             if !sent {
-                station.fetch.unsent();
+                match call {
+                    StationCall::Fetch(_) => station.fetch.unsent(),
+                    StationCall::Sync(_) => station.feed.unsent(),
+                }
             }
         }
+        self.publish_feed_gates();
         self.refresh_fetch_view();
     }
 
