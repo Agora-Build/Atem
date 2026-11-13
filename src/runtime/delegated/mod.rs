@@ -12,15 +12,18 @@
 //! complete it ([`authority`], I.4.5, Decision 15), what the bridge answers
 //! the delegated ops it doesn't serve yet ([`request`]), the owner's alerts
 //! and the capacity limits on unknown outcomes ([`alerts`], I.4.6), the
-//! resolution of an unknown outcome ([`resolve`], I.4.6), and §11.6's
-//! detail texts ([`details`]).
+//! resolution of an unknown outcome ([`resolve`], I.4.6), §11.6's detail
+//! texts ([`details`]), and the host's Station link with its own device-list
+//! fetch ([`station`], [`fetch`], I.5.8).
 pub mod alerts;
 pub mod attempts;
 pub mod authority;
 pub mod details;
+pub mod fetch;
 pub mod gate;
 pub mod resolve;
 pub mod start;
+pub mod station;
 
 use crate::runtime::test_hooks::HostFeatures;
 use crate::session_protocol::r9::HostWorkError;

@@ -65,6 +65,7 @@
 //! none until then), and a rebind or trust change drops them all.
 use super::broker::{BrokerSession, SessionState as BrokerState, WriteOutcome, WriteTag};
 use super::delegated::start::{DelegatedStart, StartView};
+use super::delegated::station::{Inbound as StationInbound, LinkKind, Station};
 use super::project_scope::{AgentHasher, ProjectHasher, ProjectScopes};
 use super::refusal_log::{self, RefusalLog, Request};
 use super::worker_approvals::Event as ApprovalEvent;
@@ -706,6 +707,12 @@ pub struct HostBridge {
     /// The link generation the r9 host runs on, and the socket it runs on.
     r9_link: Option<u64>,
     r9_socket: u64,
+    /// The host's Station link (its calls and the Station's messages,
+    /// host-work-v1 §11.4): only with `host.delegated` (Decision 11).
+    station: Option<Station>,
+    /// Fetch results not carried because an entry didn't read back (never
+    /// expected: they came from the strict reader).
+    unconverted_fetches: u64,
     /// The profile's pairing files (the device list is reopened from them).
     pairing: Option<crate::paths::PairingPaths>,
     /// The pinned host's `host_channel_key`; r9 can't serve without it.
@@ -929,6 +936,8 @@ impl HostBridge {
             },
             r9_link: None,
             r9_socket: 0,
+            station: None,
+            unconverted_fetches: 0,
             pairing,
             host_key,
             host_pub,
@@ -1479,6 +1488,128 @@ impl HostBridge {
         self.r9_exec(effects, cx);
     }
 
+    /// The host's Station link follows the r9 link (host-work-v1 §11.4):
+    /// only with `host.delegated` (Decision 11; off, the bridge has none and
+    /// the Station's messages are dropped, as before); a new generation
+    /// starts afresh, its kind and the selected Station's origin taken then.
+    fn sync_station_link(&mut self, app: &App) {
+        if !self.features.delegated {
+            self.station = None;
+            return;
+        }
+        let link_gen = self.r9_link;
+        self.station.get_or_insert_with(Station::new).sync_link(
+            link_gen,
+            || station_link_kind(app),
+            || app.astation_client.selected_station_origin(),
+        );
+        self.refresh_fetch_view();
+    }
+
+    /// The start view's copy of the host's own fetch on its Station link
+    /// (the gates' device-list part, design I.5.8), after the link or its
+    /// fetch changed. The list it is judged against is the view's own, as
+    /// it commits.
+    fn refresh_fetch_view(&self) {
+        if !self.features.delegated {
+            return;
+        }
+        let fetch = self.station.as_ref().and_then(Station::list_fetch);
+        self.start_view().fetch = fetch;
+    }
+
+    /// The device list's deferral, as the fetch reads it: the deferred
+    /// entry's `seq` (design I.4.3).
+    fn list_deferral(&self) -> Option<u64> {
+        self.membership
+            .as_ref()
+            .and_then(MembershipHost::deferred_stop)
+            .map(|d| d.seq)
+    }
+
+    /// The Station's messages of this pass, as received (none while
+    /// `host.delegated` is off: dropped), and the host's calls: the device
+    /// list's fetch (design I.5.8, session-v1 R9.3). A fetch result is
+    /// applied as any carriage, with no more trust than any carrier: the
+    /// list's own verification (`carry`), then the r9 engine's effects
+    /// (`R9Host::carried`: fences, push recipients, `membership_head`).
+    /// Calls go on the link's control queue, as the relay's push messages.
+    fn station_pass(&mut self, messages: Vec<String>, cx: &mut Cx) {
+        let applied = self.membership.as_ref().map(MembershipHost::head);
+        let deferred = self.list_deferral();
+        let Some(station) = self.station.as_mut() else {
+            return;
+        };
+        let mut calls: Vec<atem_client::control::MembershipFetch> = station
+            .tick(host_now().mono_ms, applied, deferred)
+            .into_iter()
+            .collect();
+        for text in messages {
+            let applied = self.membership.as_ref().map(MembershipHost::head);
+            let deferred = self.list_deferral();
+            let Some(station) = self.station.as_mut() else {
+                return;
+            };
+            let inbound = station.receive(&text, applied, deferred);
+            // A `heads` may name a head beyond the list: the gate's
+            // device-list part follows before anything else runs.
+            self.refresh_fetch_view();
+            match inbound {
+                StationInbound::Nothing => {}
+                StationInbound::Send(call) => calls.push(call),
+                StationInbound::Carry(entries) => {
+                    // Every entry or none: a carriage is never shortened.
+                    let carried: Result<Vec<StrictValue>, _> = entries
+                        .iter()
+                        .map(|e| StrictValue::parse(e.to_json().to_string().as_bytes(), usize::MAX))
+                        .collect();
+                    // Where the carriage stopped at a deferred entry, if it
+                    // did: nothing past it applies before its wait ends.
+                    let mut stopped_at = None;
+                    match carried {
+                        Ok(carried) => {
+                            if let Some(result) = self.carry(&carried, cx) {
+                                stopped_at = result.deferred_at();
+                                let effects =
+                                    self.r9_call(|r9, parts| r9.carried(&result, None, parts));
+                                self.r9_exec(effects, cx);
+                            }
+                        }
+                        Err(_) => {
+                            self.unconverted_fetches += 1;
+                            if self.unconverted_fetches.is_power_of_two() {
+                                eprintln!(
+                                    "atem runtime: {} device-list fetch result(s) not carried (an entry didn't read back)",
+                                    self.unconverted_fetches
+                                );
+                            }
+                        }
+                    }
+                    let after = self.membership.as_ref().map(MembershipHost::head);
+                    if let (Some(before), Some(after), Some(station)) =
+                        (applied, after, self.station.as_mut())
+                        && let Some(call) = station.fetch.carried(&before, &after, stopped_at)
+                    {
+                        calls.push(call);
+                    }
+                }
+            }
+        }
+        let Some(station) = self.station.as_mut() else {
+            return;
+        };
+        for call in calls {
+            let sent = self.r9_link.is_some()
+                && call
+                    .to_json()
+                    .is_ok_and(|text| cx.client.try_send_wire(text.to_string(), false).is_ok());
+            if !sent {
+                station.fetch.unsent();
+            }
+        }
+        self.refresh_fetch_view();
+    }
+
     /// The device list changed on disk while the runtime runs (a pairing
     /// pinned one, `atem unpair` removed it, a re-pin replaced it): it is
     /// opened again, the session host takes the pin's identity, r8 is
@@ -1777,6 +1908,7 @@ impl HostBridge {
             self.drive_pass(&mut cx);
         }
         self.sync_r9_link(r9_app_link(app), &mut cx);
+        self.sync_station_link(app);
         if !adopting
             && app
                 .hosted
@@ -1809,11 +1941,14 @@ impl HostBridge {
                 }
             }
             for (link_gen, text) in std::mem::take(&mut hosted.relay) {
-                // §R9.9: the relay's `push_ack` on the link it was sent on.
+                // §R9.9: the relay's `push_ack` on the link it was sent on;
+                // §11.4: the Station's messages to this host (below).
                 if Some(link_gen) == self.r9_link {
                     self.r9.relay_message(&text);
                 }
             }
+            let station = self.r9.take_station_messages();
+            self.station_pass(station, &mut cx);
             for (link_gen, handle, why) in overflow {
                 if Some(link_gen) == self.r9_link {
                     let effects = self.r9_call(|r9, parts| r9.refuse_unread(&handle, why, parts));
@@ -1954,6 +2089,14 @@ impl HostBridge {
             "receipts": receipts,
             "receipts_visible": visible,
             "membership_error": self.membership_error,
+            "station": self.station.as_ref().map(|station| {
+                let mut dump = station.dump();
+                // The gates' device-list part now (design I.5.8).
+                dump["list_part"] = json!(self.membership.as_ref().is_some_and(|m| {
+                    station.fetch.part().holds(m.membership(), self.list_deferral())
+                }));
+                dump
+            }),
         });
         if let Some(m) = self.membership.as_ref() {
             let control_gen: serde_json::Map<String, serde_json::Value> = principals
@@ -5019,6 +5162,19 @@ fn r9_app_link(app: &App) -> Option<u64> {
         && !app.station_direct_blocked()
         && (app.astation_reauth.is_none() || app.astation_routed))
         .then_some(app.astation_link_gen)
+}
+
+/// How the App's link reaches the Station: routed on the host's route
+/// proof with no Astation (§R9.7b), else Astation's local link or the
+/// relay.
+fn station_link_kind(app: &App) -> LinkKind {
+    if app.astation_routed && !app.astation_connected {
+        return LinkKind::Routed;
+    }
+    match app.astation_client.via() {
+        Some(crate::websocket_client::LinkVia::Local) => LinkKind::Local,
+        _ => LinkKind::Relay,
+    }
 }
 
 fn app_link(app: &App) -> Option<u64> {

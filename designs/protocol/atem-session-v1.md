@@ -2449,7 +2449,14 @@ fenced). Atem sends every attachment `membership_head{head,
 pending_recovery}` (no `re`) when its head moves or a pending entry
 starts, takes effect or is cancelled, so clients fetch. Atem may also fetch the suffix
 from the relay over its own link; it gets no more trust than any
-carrier.
+carrier. **Amended in step 4, 2026-11-13 (Atem's proposal, for
+Astation's agreement):** Atem does so behind `host.delegated` until its
+activation (a host without it fetches nothing), with `membership_fetch{after}`
+(host-work-v1 §11.4) whenever its Station's `heads` name a device-list head
+beyond its own, the result applied as a carriage; a fetch that stops at a
+deferred entry (R9.5) asks nothing more while the host still defers that
+entry and the Station announces the same head, and it counts as fetched up
+to that entry for the revocation gate (delegated host-work I.4.3, I.5.8).
 
 **Control records on an open channel** (planned: feature `host.senders`,
 which no host advertises yet; the records are host-work-v1 §11.1). A native
@@ -2702,7 +2709,14 @@ estimate on the host's clock, recomputed on every report. The 100 ms
 `advance` pass checks the wait; while an entry is pending the host also
 asks the relay over its link for the suffix after its head every 15
 minutes and 5 minutes before `effective_at` (a fetch never delays
-activation: a relay that fails it gains nothing).
+activation: a relay that fails it gains nothing). **Amended in step 4,
+2026-11-13 (changed agreed meaning, needs Astation's agreement):** that
+fetch is R9.3's, run at its Station's `heads` (every (re)connection, every
+30 s, and at once when it stores a control record; host-work-v1 §11.4) in
+place of this schedule, and at once when a deferral it stopped at ends on
+this host (after a refusal's backoff, at the next `heads`); until
+`host.delegated` is activated a host doesn't fetch, and pending entries and
+their decisions reach it with carriers only.
 
 **During the wait the subject has no access** (not even `view`): a
 `hello` by it, or by a device added only by an entry deferred behind it,

@@ -9,6 +9,7 @@
 mod support;
 
 use atem_client::connect::{Attached, Event, Identity};
+use atem_client::control::{MembershipFetch, RelayError, ToStation};
 use atem_client::membership::ServiceScope;
 use serde_json::{Value, json};
 use std::os::unix::fs::PermissionsExt;
@@ -19,6 +20,7 @@ use support::astation::{FakeAstation, write_verified_pairing};
 use support::host_clock::HostClock;
 use support::r9::{Out, Router, client_ms, write_pin};
 use support::r9log::{self, MAC, TestLog, auth, secret};
+use support::station::FakeStation;
 use support::{Sandbox, within};
 
 /// The longest a "wait until" helper waits; it only bounds a failure.
@@ -32,6 +34,13 @@ const PHONE: &str = "dev-phone";
 const SVC: &str = "svc-work";
 /// The Station of the stand-in for the feeds: the host's own.
 const ORIGIN: &str = "https://station.test";
+/// The relay setting the rig gives the runtime (its link is the fake
+/// Astation's local one): the selected Station's origin, normalized, so the
+/// fake Station's ([`Rig::with_station`]).
+const STATION: &str = "http://127.0.0.1:1";
+/// After a fetch whose carriage moved nothing, the host fetches nothing at
+/// a `heads` for this long (its monotonic clock).
+const STALL_PAUSE: u64 = 30_000;
 /// The browser grant the route lists (v1's lifecycle).
 const GRANT: &str = "5f0c8a52-2c1e-4b7a-9d3e-1a2b3c4d5e6f";
 const MIN: u64 = 60_000;
@@ -78,6 +87,8 @@ struct Rig {
     hook: bool,
     /// Context snapshots from `<sandbox>/context` (`ATEM_TEST_CONTEXT_DIR`).
     context: bool,
+    /// The fake Station on the link ([`Rig::with_station`]).
+    station: Option<FakeStation>,
 }
 
 impl Rig {
@@ -155,7 +166,21 @@ principals = {principals}
             dump: false,
             hook: true,
             context: false,
+            station: None,
         }
+    }
+
+    /// The fake Station of [`STATION`] on the link, holding the rig's list,
+    /// announcing only when a test says (made before the runtime: it takes
+    /// the host's calls from the start).
+    fn with_station(&mut self) {
+        let mut station = FakeStation::new(&self.astation, STATION, &self.log, HOST, 1);
+        station.silence_heads(true);
+        self.station = Some(station);
+    }
+
+    fn station(&mut self) -> &mut FakeStation {
+        self.station.as_mut().expect("the fake Station")
     }
 
     /// The stand-in for the feeds on, its file saying `value`.
@@ -228,7 +253,7 @@ principals = {principals}
                 .env("XDG_RUNTIME_DIR", &self.sandbox.run)
                 .env("PATH", "/usr/bin:/bin")
                 .env("ASTATION_WS", &self.astation.url)
-                .env("ASTATION_RELAY_URL", "http://127.0.0.1:1")
+                .env("ASTATION_RELAY_URL", STATION)
                 .env("ATEM_RUNTIME_IDLE_SECS", "1")
                 .env("ATEM_TEST_NO_INIT_LIMIT", "1")
                 .stdin(Stdio::null())
@@ -597,6 +622,13 @@ fn reply(rig: &Rig, n: u32, text: &str) {
 /// The stand-in's feed: the host's own Station's gate open.
 fn gate_open() -> Value {
     json!({"own": ORIGIN, "open": [ORIGIN]})
+}
+
+/// The stand-in's feed of the fake Station ([`STATION`], the host's own)
+/// open, the gate's device-list part left to the host's own fetch (design
+/// I.5.8).
+fn station_feed_open() -> Value {
+    json!({"own": STATION, "open": [STATION], "device_list_from_fetch": true})
 }
 
 /// [`gate_open`], and the feed of that Station covering [`SVC`].
@@ -1545,4 +1577,216 @@ fn a_done_whose_client_goes_away_resolves_nothing_and_says_so() {
         format!("{tid}: resolved as done\n")
     );
     assert_eq!(stored(&rig, &t["task_id"])["resolved"]["by"], "local");
+}
+
+// ── The host's own device-list fetch and deferred entries (design I.4.3,
+// I.5.8; session-v1 R9.3, R9.5) ──
+
+/// The host's Station link in its state dump.
+fn until_station(rig: &Rig, what: &str, done: impl Fn(&Value) -> bool) -> Value {
+    let mut last = Value::Null;
+    within(what, || {
+        last = dumped(rig)["station"].clone();
+        done(&last)
+    });
+    last
+}
+
+/// The head `seq` of the host's device list, as written.
+fn list_head(rig: &Rig) -> u64 {
+    let path = rig.sandbox.config().join("pairing/membership.json");
+    let state: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    state["head"]["seq"].as_u64().unwrap()
+}
+
+fn fetch(after: u64) -> Result<ToStation, RelayError> {
+    Ok(ToStation::MembershipFetch(MembershipFetch { after }))
+}
+
+/// The phone's removal, signed by `dev-new` (the subject of `log`'s
+/// pending recovery) on `log`'s head: deferred on a host until the wait
+/// ends (R9.5). Not appended: `log` itself can't verify it before then.
+fn removal_by_the_pending(log: &TestLog) -> Value {
+    use atem_client::membership::entry::Action;
+    let body = log.log.draft(
+        "dev-new",
+        r9log::host_now().wall_ms,
+        &Action::Remove {
+            device_id: PHONE.into(),
+        },
+    );
+    atem_client::membership::sign_entry(&log.keys, &auth("dev-new"), body)
+        .unwrap()
+        .object()
+        .to_json()
+}
+
+/// Design I.4.3 ("Deferred entries"), I.5.8: the host's own fetch brings a
+/// pending `recovery_add` and an entry its subject signed, which the host
+/// defers. The fetch stops there (no fetch again from the new head), and
+/// every unstarted delegated remote task waits, `device list update
+/// pending`: the phone's too, though its own channel is caught up. The stop
+/// is the gate's device-list part ("fetched up to a deferred entry"), and
+/// while it holds the list isn't behind: the Station's next `heads`, naming
+/// the same head past the pacing, brings no fetch.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_fetch_stopping_at_a_deferred_entry_marks_device_list_update_pending() {
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_controls(station_feed_open());
+    rig.with_clock();
+    rig.dump = true;
+    rig.with_station();
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let link = r.link;
+    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let pinned = list_head(&rig);
+    // The Station's list: a pending recovery, then an entry its subject
+    // signed.
+    rig.log.recovery_add("dev-new");
+    let deferred = removal_by_the_pending(&rig.log);
+    let log = &rig.log;
+    let station = rig.station.as_mut().unwrap();
+    station.set_log_beyond(log, &[deferred]);
+    station.serve(link);
+    station.heads_now();
+    assert_eq!(station.next_call(link), fetch(pinned));
+    let s = until_station(&rig, "the stop at the deferred entry", |s| {
+        s["fetch"]["stopped"] == pinned + 2
+    });
+    assert_eq!(list_head(&rig), pinned + 1, "the recovery applied");
+    assert!(s["fetch"]["in_flight"].is_null(), "no fetch again: {s}");
+    assert_eq!(s["list_part"], true, "fetched up to a deferred entry: {s}");
+    assert!(
+        rig.sandbox
+            .config()
+            .join("runtime/journal/membership_deferred")
+            .is_file()
+    );
+
+    let t = task_until(&launch, "DEFERRED_BY_THE_FETCH", rig.clock().wall() + HOUR);
+    enqueue(&mut phone, &mut r, &t);
+    wait_stored(&rig, &t["task_id"], "blocked", "device list update pending");
+
+    // The same head announced again, past every pacing: not behind.
+    let heads = s["heads"].as_u64().unwrap();
+    rig.clock().add_mono(STALL_PAUSE + 1_000);
+    rig.station().heads_now();
+    let s = until_station(&rig, "the next heads", |s| s["heads"] == heads + 1);
+    assert!(s["fetch"]["in_flight"].is_null(), "{s}");
+    assert_eq!(s["fetch"]["stopped"], pinned + 2, "{s}");
+    two_passes(&rig);
+    rig.station().serve(link);
+    assert_eq!(rig.station().sent().len(), 1, "{:?}", rig.station().sent());
+    wait_stored(&rig, &t["task_id"], "blocked", "device list update pending");
+    assert!(attempts(&rig, &t["task_id"]).is_empty());
+    assert!(!input(&rig).contains("DEFERRED_BY_THE_FETCH"));
+}
+
+/// VII.A test 15 (design I.4.3, "Deferred entries"; session-v1 R9.5): the
+/// host's fetch stops at an entry the subject of a pending recovery signed
+/// (the phone's removal), and every unstarted delegated remote task waits,
+/// `device list update pending`. The wait ends on the host's clock: the
+/// deferral ends, the host fetches the entry again at once (no `heads`),
+/// and nothing dispatches before it is checked again: a task whose deadline
+/// passed meanwhile expires, and the others wait `revocations not yet
+/// checked` (the gate's device-list part no longer holds: the list is
+/// behind the announced head) until the fetch applies the entry. Then the
+/// removed phone's task is cancelled, `sender revoked`, and the Mac's runs.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn the_deferral_ends_with_the_recovery_wait_and_tasks_are_checked_again() {
+    let mut rig = Rig::prepared(48 * HOUR, false);
+    rig.with_controls(station_feed_open());
+    rig.with_clock();
+    rig.dump = true;
+    rig.with_station();
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let link = r.link;
+    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let pinned = list_head(&rig);
+    // The recovery reaches the host by its fetch: its wait starts now on
+    // the host's clock.
+    rig.log.recovery_add("dev-new");
+    let log = &rig.log;
+    let station = rig.station.as_mut().unwrap();
+    station.set_log(log);
+    station.serve(link);
+    station.heads_now();
+    assert_eq!(station.next_call(link), fetch(pinned));
+    within("the recovery", || list_head(&rig) == pinned + 1);
+
+    // Five minutes before the wait ends, the entry its subject signed.
+    rig.clock()
+        .set((24 * HOUR - 5 * MIN) as i64, 24 * HOUR - 5 * MIN);
+    let deferred = removal_by_the_pending(&rig.log);
+    let log = &rig.log;
+    let station = rig.station.as_mut().unwrap();
+    station.set_log_beyond(log, &[deferred]);
+    station.heads_now();
+    assert_eq!(station.next_call(link), fetch(pinned + 1));
+    until_station(&rig, "the stop at the deferred entry", |s| {
+        s["fetch"]["stopped"] == pinned + 2
+    });
+
+    // The phone's task and two of the Mac's, one due in two minutes.
+    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let mut mac = Dev::new(&mut r, &rig.log, MAC, false);
+    let wall = rig.clock().wall();
+    let removed = task_until(&launch, "BY_THE_REMOVED_PHONE", wall + HOUR);
+    let runs = task_until(&launch, "BY_THE_MAC", wall + HOUR);
+    let due = task_until(&launch, "DUE_DURING_THE_WAIT", wall + 2 * MIN);
+    enqueue(&mut phone, &mut r, &removed);
+    enqueue(&mut mac, &mut r, &runs);
+    enqueue(&mut mac, &mut r, &due);
+    for t in [&removed, &runs, &due] {
+        wait_stored(&rig, &t["task_id"], "blocked", "device list update pending");
+    }
+    // The senders go: their gate is the host's own Station's now, with no
+    // caught-up channel of their own.
+    phone.close(&mut r);
+    mac.close(&mut r);
+
+    // The wait ends on the host's clock (24 h and a minute since the host
+    // first saw the recovery). Checked again before anything dispatches.
+    rig.clock().set((24 * HOUR + MIN) as i64, 24 * HOUR + MIN);
+    wait_stored(
+        &rig,
+        &due["task_id"],
+        "expired",
+        "expired before submission",
+    );
+    for t in [&removed, &runs] {
+        wait_stored(&rig, &t["task_id"], "blocked", GATE_CLOSED);
+    }
+    let s = until_station(&rig, "the deferral's end", |s| {
+        s["fetch"]["stopped"].is_null()
+    });
+    assert_eq!(s["list_part"], false, "{s}");
+    // The host fetched the entry again at once, with no heads.
+    let heads = s["heads"].clone();
+    assert_eq!(rig.station().next_call(link), fetch(pinned + 1));
+    within("the removal", || list_head(&rig) == pinned + 2);
+    wait_stored(&rig, &removed["task_id"], "cancelled", "sender revoked");
+    in_turn(&rig, &runs["task_id"], "BY_THE_MAC");
+    complete_turn(&rig, &runs["task_id"]);
+    let s = dumped(&rig)["station"].clone();
+    assert_eq!(s["heads"], heads, "no heads since: {s}");
+    assert_eq!(s["list_part"], true, "{s}");
+    for t in [&removed, &due] {
+        assert!(attempts(&rig, &t["task_id"]).is_empty());
+    }
+    assert!(!input(&rig).contains("BY_THE_REMOVED_PHONE"));
+    assert!(!input(&rig).contains("DUE_DURING_THE_WAIT"));
 }
