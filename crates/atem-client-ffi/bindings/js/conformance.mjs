@@ -690,7 +690,7 @@ const ACKS = readdirSync(fixturesDir)
   .sort();
 for (const name of ACKS) {
   check(`Station acks: ${name} through AckLedgerHandle`, () => {
-    eq(ACKS.length, 5, "the acknowledgment fixtures");
+    eq(ACKS.length, 6, "the acknowledgment fixtures");
     const f = load(name);
     const setup = f.setup;
     const st = setup.station;
@@ -910,6 +910,17 @@ check("Station calls: the byte goldens build exactly, read back to their fields 
   };
   eq(calls.max_message_bytes, 262144);
   eq(calls.calls.length >= 20, true, "goldens");
+  // The shared vocabulary of reasons (O5), exported: a reason outside it is
+  // a later version's, unrecognized.
+  const vocabulary = m.controlWhyCodes();
+  same(vocabulary, calls.why_codes, "the vocabulary of reasons");
+  const reasonsOf = (name) =>
+    calls.calls
+      .find((c) => c.name === name)
+      .fields.results.flatMap((r) => r.effects)
+      .flatMap((e) => (e.why === undefined ? [] : [e.why]));
+  eq(reasonsOf("control_ack_with_reasons").every((w) => vocabulary.includes(w)), true, "known reasons");
+  eq(reasonsOf("control_ack_with_unrecognized_reasons").filter((w) => !vocabulary.includes(w)).length, 2, "unrecognized reasons");
   for (const c of calls.calls) {
     const f = c.fields;
     const wire = c.wire;

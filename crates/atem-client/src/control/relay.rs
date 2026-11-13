@@ -736,6 +736,9 @@ pub enum AckResult {
     /// the interrupt when the entry asked for one. A result of `applied` or
     /// `duplicate` means the effect is durable, so `applied_seq` has
     /// reached `entry.seq`; behind it only `pending` or `refused` is said.
+    /// Its reason, written by host-work (host-work-v1 §11.4 wire rule 10):
+    /// `revoke_not_applied` beside an effect `pending` while `applied_seq`
+    /// is behind the entry, and none otherwise in this version.
     Entry {
         entry: EntryRef,
         applied_seq: u64,

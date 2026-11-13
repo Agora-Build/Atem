@@ -871,7 +871,7 @@ fun main(args: Array<String>) {
     val ackNames = dir.list()!!.filter { it.startsWith("r9-control-ack-") && it.endsWith(".json") }
         .map { it.removeSuffix(".json") }.sorted()
     for (name in ackNames) check("Station acks: $name through AckLedgerHandle") {
-        eq(ackNames.size, 5, "the acknowledgment fixtures")
+        eq(ackNames.size, 6, "the acknowledgment fixtures")
         val f = load(name)
         val setup = f["setup"]
         val st = setup["station"]
@@ -1101,6 +1101,15 @@ fun main(args: Array<String>) {
         }
         eq(stationCalls["max_message_bytes"].l(), 262144L)
         eq(stationCalls["calls"].arr().size >= 20, true, "goldens")
+        // The shared vocabulary of reasons (O5), exported: a reason outside
+        // it is a later version's, unrecognized.
+        val vocabulary = controlWhyCodes()
+        eq(vocabulary, stationCalls["why_codes"].arr().map { it.s() }, "the vocabulary of reasons")
+        fun reasonsOf(name: String): List<String> =
+            stationCalls["calls"].arr().first { it["name"].s() == name }["fields"]["results"].arr()
+                .flatMap { it["effects"].arr() }.mapNotNull { it.obj()["why"] as String? }
+        eq(reasonsOf("control_ack_with_reasons").all { it in vocabulary }, true, "known reasons")
+        eq(reasonsOf("control_ack_with_unrecognized_reasons").count { it !in vocabulary }, 2, "unrecognized reasons")
         for (c in stationCalls["calls"].arr()) {
             val f = c["fields"]
             val wire = c["wire"].s()

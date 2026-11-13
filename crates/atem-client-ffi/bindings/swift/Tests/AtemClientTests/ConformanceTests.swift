@@ -1092,7 +1092,7 @@ final class ConformanceTests: XCTestCase {
             .sorted()
         for name in ackNames {
             check("Station acks: \(name) through AckLedgerHandle") {
-                try eq(ackNames.count, 5, "the acknowledgment fixtures")
+                try eq(ackNames.count, 6, "the acknowledgment fixtures")
                 let f = try load(name)
                 let setup = o(f["setup"])
                 let st = o(setup["station"])
@@ -1349,6 +1349,17 @@ final class ConformanceTests: XCTestCase {
             }
             try eq(u(stationCalls["max_message_bytes"]), 262144)
             try eq(a(stationCalls["calls"]).count >= 20, true, "goldens")
+            // The shared vocabulary of reasons (O5), exported: a reason
+            // outside it is a later version's, unrecognized.
+            let vocabulary = controlWhyCodes()
+            try eq(vocabulary, a(stationCalls["why_codes"]).map(s), "the vocabulary of reasons")
+            func reasonsOf(_ name: String) -> [String] {
+                let golden = a(stationCalls["calls"]).map(o).first { s($0["name"]) == name }!
+                let results = a(o(golden["fields"])["results"]).map(o)
+                return results.flatMap { a($0["effects"]).map(o) }.compactMap { $0["why"] as? String }
+            }
+            try eq(reasonsOf("control_ack_with_reasons").allSatisfy { vocabulary.contains($0) }, true, "known reasons")
+            try eq(reasonsOf("control_ack_with_unrecognized_reasons").filter { !vocabulary.contains($0) }.count, 2, "unrecognized reasons")
             for c in a(stationCalls["calls"]).map(o) {
                 let f = o(c["fields"])
                 let wire = s(c["wire"])
@@ -2122,6 +2133,6 @@ final class ConformanceTests: XCTestCase {
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 72)
+        XCTAssertEqual(passed, 73)
     }
 }

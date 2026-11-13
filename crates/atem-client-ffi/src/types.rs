@@ -954,8 +954,8 @@ record! {
         /// `result` and counts nothing. A code of the shared vocabulary
         /// (`ControlApplied.why`'s), or, read from a `control_ack`, a
         /// well-formed one this build doesn't know (1 to 64 bytes of
-        /// `[a-z0-9_]`), given as it came: treat a code you don't know as
-        /// unrecognized. A builder refuses one beside `applied` or
+        /// `[a-z0-9_]`), given as it came: a code outside
+        /// `control_why_codes()` is unrecognized. A builder refuses one beside `applied` or
         /// `duplicate`, or one that isn't well formed (`malformed`).
         pub why: Option<String>,
     }

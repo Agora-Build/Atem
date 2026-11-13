@@ -299,7 +299,7 @@ fn ack_fixtures() -> Vec<Value> {
         .map(|n| n.trim_end_matches(".json").to_owned())
         .collect();
     names.sort();
-    assert_eq!(names.len(), 5);
+    assert_eq!(names.len(), 6);
     names.iter().map(|n| load(n)).collect()
 }
 
@@ -989,6 +989,22 @@ fn reasons_through_the_bindings() {
         (first.result, first.why.as_deref()),
         (ControlResultKind::Refused, Some("a_later_reason"))
     );
+    // The vocabulary, exported: a Station tells an unrecognized code by it,
+    // without a list of its own.
+    let codes = atem_client_ffi::control::control_why_codes();
+    let want: Vec<String> = file["why_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(s)
+        .collect();
+    assert_eq!(codes, want);
+    assert!(!codes.contains(&"a_later_reason".to_owned()));
+    for r in &golden("control_ack_with_reasons").results {
+        for e in effects(r) {
+            assert!(e.why.is_none_or(|why| codes.contains(&why)));
+        }
+    }
     let reasoned = golden("control_ack_with_reasons");
     let mut ack = reasoned.clone();
     let bad = |ack: &ControlAckInfo| code(relay_control_ack(ack.clone()).unwrap_err());

@@ -891,6 +891,14 @@ fn control_body(v: JsValue) -> JsResult<ControlRecordBody> {
     })
 }
 
+/// The shared vocabulary of reasons, every code once in a fixed order
+/// (`control_why_codes`): a well-formed reason outside it, read from a
+/// `control_ack`, is a later version's, unrecognized.
+#[wasm_bindgen(js_name = controlWhyCodes)]
+pub fn control_why_codes() -> Vec<String> {
+    crate::control::control_why_codes()
+}
+
 /// A record's body, field by field (`parse_control_record`).
 #[wasm_bindgen(js_name = parseControlRecord)]
 pub fn parse_control_record(record_json: String) -> JsResult<JsValue> {

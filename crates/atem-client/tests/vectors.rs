@@ -2580,6 +2580,7 @@ fn check_outcome_unknown(run: &mut Run, book: &Book) {
     // delegated sender's UUID v4 task whose reason is blank, nothing but
     // White_Space, is refused at open like the others.
     use atem_client::session::alerts::{valid_reason, valid_sender, valid_task_id};
+    use atem_client::session::framing::is_format;
     let blank = run
         .get("outcome_unknown_invalid_facts")
         .as_array()
@@ -2588,17 +2589,66 @@ fn check_outcome_unknown(run: &mut Run, book: &Book) {
         .filter(|case| {
             let facts = &case["facts"];
             let reason = s(facts, "reason");
+            // Refused by the blank rule alone: no control or format
+            // character a reader might refuse it for instead.
             valid_task_id(s(facts, "task_id"))
                 && valid_sender(s(facts, "sender"))
                 && !reason.is_empty()
                 && reason.trim().is_empty()
+                && !reason.chars().any(|c| c.is_control() || is_format(c))
                 && !valid_reason(reason)
         })
         .count();
-    assert_eq!(blank, 1, "a delegated task's blank reason");
+    assert_eq!(
+        blank, 1,
+        "a delegated task's blank reason, with no control or format character"
+    );
     run.pass("outcome_unknown_invalid_facts: a delegated task's blank reason among them");
     // The key type is the one the builder makes.
     let _: &AlertKey = first[0].key();
+}
+
+/// The independent checker writes out General_Category Cf (`CF_RANGES` in
+/// `scripts/check-r9-vectors.py`) so its reason rule doesn't follow
+/// Python's own Unicode version: it must be exactly the set the core's
+/// `framing::is_format` gives (Unicode 18.0.0), and its Cc rule
+/// `char::is_control`.
+#[test]
+fn checker_format_ranges_are_the_framing_modules() {
+    use atem_client::session::framing::is_format;
+    let script = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/check-r9-vectors.py"),
+    )
+    .unwrap();
+    let start = script
+        .find("CF_RANGES = [")
+        .expect("CF_RANGES in the checker");
+    let end = start + script[start..].find("\n]").unwrap();
+    let hex = |t: &str| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).unwrap();
+    let theirs: Vec<(u32, u32)> = script[start..end]
+        .split('(')
+        .skip(1)
+        .map(|pair| {
+            let pair = pair.split(')').next().unwrap();
+            let (a, b) = pair.split_once(',').unwrap();
+            (hex(a), hex(b))
+        })
+        .collect();
+    let mut ours: Vec<(u32, u32)> = Vec::new();
+    for cp in 0..=0x10FFFFu32 {
+        let Some(c) = char::from_u32(cp) else {
+            continue;
+        };
+        if is_format(c) {
+            match ours.last_mut() {
+                Some(r) if r.1 + 1 == cp => r.1 = cp,
+                _ => ours.push((cp, cp)),
+            }
+        }
+        let checker_cc = cp <= 0x1F || (0x7F..=0x9F).contains(&cp);
+        assert_eq!(c.is_control(), checker_cc, "{cp:#x}");
+    }
+    assert_eq!(theirs, ours, "the checker's CF_RANGES");
 }
 
 /// The `outcome_unknown` entries of `r9-vectors-push-hint` (kept apart from
@@ -2839,9 +2889,9 @@ fn outcome_unknown_vectors(book: &Book) -> BTreeMap<&'static str, Value> {
                 "task_id": "c4d9e8f7-1a2b-4c3d-8e5f-6a7b8c9d0e1f",
                 "session_id": "ses-aaaaaaaaaaaa",
                 "sender": "service:svc-discord",
-                "reason": " \t\u{3000}",
+                "reason": " \u{a0}\u{3000}",
             }),
-            "a delegated sender's task whose reason is blank (nothing but White_Space: a space, a tab and an ideographic space): refused at open (Astation's review of PR 2, #120 comment 6848326392: the deferred blank-reason vector, before phone hint support is accepted)",
+            "a delegated sender's task whose reason is blank (nothing but White_Space: a space, a no-break space and an ideographic space, none a control or format character, so only the blank rule refuses it): refused at open (Astation's review of PR 2, #120 comment 6848326392: the deferred blank-reason vector, before phone hint support is accepted)",
         ),
     ] {
         let device = "dev-phone";
@@ -6042,7 +6092,7 @@ fn control_vectors(book: &Book) -> Value {
         ),
         g.sequence_on(
             "Q19_evicted_records_replayed_are_refused",
-            "a principal keeps at most 256 counted record ids, oldest first, never evicting the coverage's cover, and its evicted floor is the newest issued_at evicted (decision 19, rulings T4a and T4d, for Astation's agreement): from svc-discord covered, held, released and full (S1_cover, S2_hold, S3_release, then 253 copies of S3_release), F1_hold holds and evicts S2_hold, F2_hold evicts S3_release; S3_release re-served at a fresh position of the covering feed is a possible replay, refused and kept as evidence, so the hold stays (feed_seq isn't signed: a carrier that controls positions could otherwise lift it); F3_release, issued after the floor, lifts it; S2_hold replayed holds again, since the floor guards only covers and releases (a stop always wins, and a hold grants nothing); B1_cover_stale, issued before the floor, is refused as a possible replay",
+            "a principal keeps at most 256 counted record ids, oldest first, never evicting the coverage's cover, and its evicted floor is the newest issued_at evicted (decision 19, rulings T4a and T4d, agreed with Astation on 2026-11-13, #120 comment 6848326392): from svc-discord covered, held, released and full (S1_cover, S2_hold, S3_release, then 253 copies of S3_release), F1_hold holds and evicts S2_hold, F2_hold evicts S3_release; S3_release re-served at a fresh position of the covering feed is a possible replay, refused and kept as evidence, so the hold stays (feed_seq isn't signed: a carrier that controls positions could otherwise lift it); F3_release, issued after the floor, lifts it; S2_hold replayed holds again, since the floor guards only covers and releases (a stop always wins, and a hold grants nothing); B1_cover_stale, issued before the floor, is refused as a possible replay",
             Some((
                 &g.filled(
                     &[("S1_cover", a(1)), ("S2_hold", a(2)), ("S3_release", a(3))],
@@ -6183,7 +6233,7 @@ fn control_vectors(book: &Book) -> Value {
         "name": "r9-vectors-host-work-control",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part names its device list, account_id and genesis_hash, and its `records` are the [record_id, digest, issued_at] triples that counted, oldest first; `order` holds one feed per Station origin). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). Its `expect.why` is Applied::why's code (host-work-v1 §11.1: the verifier's pending or refusal reason, or list_frozen, not_revoked, revoke_not_applied, order, after_revoke, collision, not_newer, possible_replay, not_after_hold), present exactly when the record is pending or refused or kept as evidence. A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover, and raises the part's `evicted_floor` to the newest issued_at evicted; a cover or release of a principal not revoked, under an id not counted and issued no later than the floor, is refused as a possible replay and kept as evidence; a hold, revoke or interrupt never is (decision 19, rulings T4a and T4d, for Astation's agreement). A service's part keeps `hold_issued_at`, the newest issued_at of every hold verified while it wasn't revoked (one that held or found it held, read out of order, from another feed, at no position or under a counted id), never lowered or cleared; a release taken in feed order while held lifts the hold only when issued strictly after it, else it is refused with why not_after_hold (no evidence) and takes no position in the feed's order (O1, Astation's review of PR 2, #120 comment 6848326392, for Astation's agreement).",
+        "note": "Control records (delegated host-work I.5.3 to I.5.5, II.3.1; host-work-v1 §11.1; planned: host.senders, not advertised). Wire {\"body\":{…},\"sig\"}; signing input enc([\"atem-host-work-control-v1\", jcs(body)]) (R9.1). The device list is r9-vectors-membership-log's log L followed by `chain` (labels of its others); signers' keys are r9-vectors-keys' (`signed_with`). A service record's principal_key is the r9_svc of the principal's auth_key (SHA-256 of its raw bytes, decision 8), written beside it. `checks`: verify_control's verdict on each chain (valid with the verified signer and, for the principal's own key, the seq that enrolled it; pending or refused with its reason); `parse_error`: the record's parse refuses it (in a feed, refused per record and kept as evidence; over a channel the whole control_records message is invalid_request). `sequences`: ControlState::apply on one host, step by step (the record, the list of the transaction, its feed position or none over a channel, host-work's applied device-list seq) with the record's result, each effect's result, the host's actions and whether the record is kept as evidence; each step applies to the state the step before it left; `state` is ControlState::to_json after the last step (v2: one part per principal, `principals`; each part names its device list, account_id and genesis_hash, and its `records` are the [record_id, digest, issued_at] triples that counted, oldest first; `order` holds one feed per Station origin). A step's position is {origin, feed_id, feed_seq}: a record counts as read at its own feed's position only when origin and feed_id are its body's. Record ids are UUID v4 numbered by record (the X* records and V6_conflicting_id reuse another record's id on purpose). Atem's proposals, for Astation's and Auth/Portal's agreement: covers are ordered by (issued_at, record_id); a hold applies from any feed, a release only from the covering feed after its cover and after that feed's last hold or release; record ids are per principal, and another body under an id the same principal's record counted with is evidence (a stop still applies, a cover or release is refused). Each step's `standing` is ControlState::standing of its record's principal after it (held, interrupted, and revoked and coverage {origin, feed_id} when there are). Its `expect.why` is Applied::why's code (host-work-v1 §11.1: the verifier's pending or refusal reason, or list_frozen, not_revoked, revoke_not_applied, order, after_revoke, collision, not_newer, possible_replay, not_after_hold), present exactly when the record is pending or refused or kept as evidence. A sequence with `initial` starts from that state (ControlState::to_json) instead of a new one: its records of svc-discord that aren't the file's are the record `fill`'s body under those record ids (each signed by svc-discord's key and counted, at no position), so svc-discord's records start full. A principal keeps at most 256 counted record ids (MAX_RECORD_IDS): the next evicts the oldest, never the revocation's record nor the coverage's cover, and raises the part's `evicted_floor` to the newest issued_at evicted; a cover or release of a principal not revoked, under an id not counted and issued no later than the floor, is refused as a possible replay and kept as evidence; a hold, revoke or interrupt never is (decision 19, rulings T4a and T4d, agreed with Astation on 2026-11-13, #120 comment 6848326392). A service's part keeps `hold_issued_at`, the newest issued_at of every hold verified while it wasn't revoked (one that held or found it held, read out of order, from another feed, at no position or under a counted id), never lowered or cleared; a release taken in feed order while held lifts the hold only when issued strictly after it, else it is refused with why not_after_hold (no evidence) and takes no position in the feed's order (O1, requested in Astation's review of PR 2, #120 comment 6848326392; for Astation's sign-off). Each effect pending or refused in `expect` carries the step's why (O5, for Astation's sign-off).",
         "account_id": "acct-test-1",
         "genesis_hash": genesis_hash().to_hex(),
         "stations": {
@@ -6915,7 +6965,7 @@ use atem_client::control::{
     AckResult, ApplicationResult, CallRefused, ControlAck, ControlSync, ControlSyncResult,
     EffectKind, EffectResult, EffectWhy, EntryRef, FeedEntry, FeedHead, Heads, MAX_WHY_BYTES,
     MembershipFetch, MembershipFetchResult, RefusalCode, RefusedCall, RelayError, ToHost,
-    ToStation,
+    ToStation, Why,
 };
 
 const STATION_CALLS: &str = "r9-vectors-station-calls";
@@ -7241,6 +7291,7 @@ const STATION_CALL_OPS: [&str; 9] = [
 fn station_calls_build_byte_for_byte() {
     let mut run = station_calls_file();
     assert_eq!(run.get("max_message_bytes"), RELAY_MAX_BYTES);
+    run.get("why_codes");
     run.get("invalid");
     for case in run.get("at_the_bound").as_array().unwrap() {
         let name = s(case, "name");
@@ -7283,6 +7334,7 @@ fn station_calls_build_byte_for_byte() {
 fn station_calls_decode_to_their_fields() {
     let mut run = station_calls_file();
     run.get("max_message_bytes");
+    run.get("why_codes");
     run.get("invalid");
     // A text of exactly the bound is read (the same bound for every call
     // that can carry a large page), and gives back what `accepts` says.
@@ -7397,6 +7449,22 @@ fn station_call_reasons_are_known_or_unrecognized() {
                 .is_none_or(|w| matches!(w, EffectWhy::Known(_)))
         );
     }
+    // The vocabulary, as the file lists it: exactly the core's, in its
+    // order, and each code a reason's form.
+    let codes: Vec<String> = file["why_codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        codes,
+        Why::vocabulary()
+            .iter()
+            .map(|w| w.code().to_owned())
+            .collect::<Vec<_>>()
+    );
+    assert!(codes.iter().all(|c| EffectWhy::well_formed(c)));
     let later = whys(&case("control_ack_with_unrecognized_reasons"));
     assert_eq!(
         later
@@ -7418,6 +7486,7 @@ fn station_call_reasons_are_known_or_unrecognized() {
 fn station_calls_refuse_the_invalid_variants() {
     let mut run = station_calls_file();
     run.get("max_message_bytes");
+    run.get("why_codes");
     run.get("calls");
     run.get("at_the_bound");
     let invalid = run.get("invalid");
@@ -8724,8 +8793,17 @@ fn station_call_vectors() -> Value {
         "name": STATION_CALLS,
         "kind": "vectors",
         "requires": "r9",
-        "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", for Astation's agreement). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
+        "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", agreed with Astation on 2026-11-13, #120 comment 6848326392: a strict-JSON page may hold individually invalid records, whose evidence is kept, which aren't applied, and whose delivery is no application evidence). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. `why_codes` is the shared vocabulary of typed reasons (O5, host-work-v1 §11.4 wire rule 10, for Astation's sign-off), in the core's order: a well-formed reason outside it is a later version's, read as unrecognized. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
         "max_message_bytes": RELAY_MAX_BYTES,
+        // The shared vocabulary of reasons (O5), written out by hand in the
+        // core's order; the runner holds it equal to `Why::vocabulary`.
+        "why_codes": [
+            "principal_unknown", "signer_unknown", "revoke_not_in_list", "list_frozen",
+            "not_revoked", "revoke_not_applied", "wrong_account", "bad_signature",
+            "key_mismatch", "signer_not_allowed", "removed_manager", "host_key_signed",
+            "not_a_service", "not_a_revoke", "order", "after_revoke", "collision", "not_newer",
+            "possible_replay", "not_after_hold",
+        ],
         "calls": g.calls,
         "at_the_bound": at_bound,
         "invalid": g.invalid,

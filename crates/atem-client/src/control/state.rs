@@ -74,7 +74,8 @@
 //!    only ever adds), while a `cover` or `release` is `refused`. A record
 //!    kept pending or refused takes no `record_id`, so a forgery never
 //!    blocks the genuine record. **Bounded** (decision 19, rulings T4a and
-//!    T4d, for Astation's agreement): a principal keeps at most
+//!    T4d, agreed with Astation: stops are never blocked by it, and the
+//!    floor complements O1, rule 6): a principal keeps at most
 //!    [`MAX_RECORD_IDS`] counted ids, and the next evicts its oldest,
 //!    never the record that revoked it nor the coverage's cover; the
 //!    principal's evicted floor is the newest `issued_at` evicted. An
@@ -88,8 +89,9 @@
 //!    `refused` and kept as evidence ([`Why::PossibleReplay`]). A cover
 //!    or release applies when it was issued after every evicted record of
 //!    that principal, which a Station meets for every record it signed
-//!    itself when each cover or release it signs for a principal is issued
-//!    after every record it signed for it before. A
+//!    itself when each record it signs for a principal, holds included,
+//!    is issued after every record it signed for it before (its signing
+//!    duty, agreed with Astation, host-work-v1 §11.1). A
 //!    stop never meets the floor: a `hold` applies as any hold (an
 //!    evicted one replayed holds again, which grants nothing), and a
 //!    `revoke` or `interrupt_running` replayed is a `duplicate` (a
@@ -476,8 +478,11 @@ impl Why {
         }
     }
 
-    /// From the name, exactly.
-    pub fn from_code(code: &str) -> Option<Self> {
+    /// The shared vocabulary, every reason once, in a fixed order: the
+    /// verifier's pending reasons, its refusal reasons, then the state's.
+    /// A well-formed code outside it is a later version's (O5:
+    /// [`EffectWhy::Unrecognized`]).
+    pub fn vocabulary() -> Vec<Why> {
         PendingReason::ALL
             .into_iter()
             .map(Why::Pending)
@@ -490,7 +495,12 @@ impl Why {
                 Why::PossibleReplay,
                 Why::NotAfterHold,
             ])
-            .find(|why| why.code() == code)
+            .collect()
+    }
+
+    /// From the name, exactly.
+    pub fn from_code(code: &str) -> Option<Self> {
+        Why::vocabulary().into_iter().find(|why| why.code() == code)
     }
 }
 

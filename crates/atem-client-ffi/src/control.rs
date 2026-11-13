@@ -193,6 +193,20 @@ pub fn control_record_with_signature(
     Ok(object_json(&object))
 }
 
+/// The shared vocabulary of reasons (O5; **for Astation**, amended for step
+/// 4): every code `ControlApplied.why` and `ControlEffectResult.why` can
+/// take in this version, once each, in a fixed order. A Station that reads
+/// a well-formed reason outside it in a `control_ack` treats it as
+/// unrecognized (a later version's): information only, the result
+/// unchanged. Use it rather than a list of your own.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn control_why_codes() -> Vec<String> {
+    atem_client::control::Why::vocabulary()
+        .iter()
+        .map(|why| why.code().to_owned())
+        .collect()
+}
+
 /// A record's body, field by field, read as a host reads it (strict JSON,
 /// at most 16 KiB, exactly the body's fields). The signature is not
 /// checked: that needs the device list (`verify_control_record`).
