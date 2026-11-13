@@ -758,7 +758,13 @@ impl RecordResult {
             if effects.iter().any(|seen| seen.effect == effect) {
                 return Err("effects");
             }
-            effects.push(EffectResult { effect, result });
+            // A `control_records_result` carries no reason (step 3's
+            // wire, unchanged; O5 is the acknowledgment's).
+            effects.push(EffectResult {
+                effect,
+                result,
+                why: None,
+            });
         }
         // The record's result follows from its effects' (§11.1).
         if result != ApplicationResult::of_effects(&effects) {
@@ -1155,7 +1161,11 @@ mod tests {
         }
 
         fn effect(effect: EffectKind, result: ApplicationResult) -> EffectResult {
-            EffectResult { effect, result }
+            EffectResult {
+                effect,
+                result,
+                why: None,
+            }
         }
 
         fn results_for(records: &[ControlRecord]) -> Vec<RecordResult> {

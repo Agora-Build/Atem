@@ -174,7 +174,13 @@ fn applied_json(a: &ControlApplied) -> Value {
     let effects: Vec<Value> = a
         .effects
         .iter()
-        .map(|e| json!({"effect": effect_code(e.effect), "result": result_code(e.result)}))
+        .map(|e| {
+            let mut v = json!({"effect": effect_code(e.effect), "result": result_code(e.result)});
+            if let Some(why) = &e.why {
+                v["why"] = why.as_str().into();
+            }
+            v
+        })
         .collect();
     let mut v = json!({
         "result": result_code(a.result),

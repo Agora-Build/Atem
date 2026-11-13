@@ -269,6 +269,7 @@ fn applied_info(applied: Applied) -> ControlApplied {
             .map(|e| ControlEffectResult {
                 effect: effect_kind(e.effect),
                 result: result_kind(e.result),
+                why: e.why.as_ref().map(|why| why.code().to_owned()),
             })
             .collect(),
         actions: applied

@@ -332,10 +332,60 @@ impl EffectKind {
 }
 
 /// One effect's result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectResult {
     pub effect: EffectKind,
     pub result: ApplicationResult,
+    /// Why the effect isn't in force (O5): set exactly when `result` is
+    /// `pending` or `refused`, never beside `applied` or `duplicate`.
+    /// Information only: it never changes `result`.
+    pub why: Option<EffectWhy>,
+}
+
+/// The most bytes of a reason an effect result carries (O5): 1 to this
+/// many of `[a-z0-9_]`.
+pub const MAX_WHY_BYTES: usize = 64;
+
+/// Why an effect isn't in force, as an effect result carries it (O5): a
+/// code of the shared vocabulary ([`Why`]), or one this build doesn't
+/// know (a later version's), read from an acknowledgment. The state gives
+/// [`EffectWhy::Known`] only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectWhy {
+    Known(Why),
+    /// Well formed, outside this build's vocabulary: information only.
+    Unrecognized(String),
+}
+
+impl EffectWhy {
+    /// The code as written.
+    pub fn code(&self) -> &str {
+        match self {
+            EffectWhy::Known(why) => why.code(),
+            EffectWhy::Unrecognized(code) => code,
+        }
+    }
+
+    /// Whether `code` is a reason's form: 1 to [`MAX_WHY_BYTES`] bytes of
+    /// `[a-z0-9_]`.
+    pub fn well_formed(code: &str) -> bool {
+        (1..=MAX_WHY_BYTES).contains(&code.len())
+            && code
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    }
+
+    /// A reason as read: a known code, or a well-formed one this build
+    /// doesn't know; `None` for anything else.
+    pub fn read(code: &str) -> Option<Self> {
+        if !Self::well_formed(code) {
+            return None;
+        }
+        Some(Why::from_code(code).map_or_else(
+            || EffectWhy::Unrecognized(code.to_owned()),
+            EffectWhy::Known,
+        ))
+    }
 }
 
 /// What the host does in the transaction that applies the record (I.5.5).
@@ -371,7 +421,8 @@ pub enum HostAction {
 
 /// Why a record is pending or refused, or kept as evidence
 /// ([`Applied::why`]): what a host keeps beside a pending record or a
-/// record kept as evidence, and alerts with.
+/// record kept as evidence, and alerts with. The shared vocabulary of
+/// reasons: an effect result carries one too ([`EffectWhy`], O5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Why {
     /// It waits: [`verify_control`]'s reason, a frozen list, a service's
@@ -464,17 +515,26 @@ pub struct Applied {
 
 impl Applied {
     /// Every effect of a record with `action` gets `result`; nothing done.
+    /// Each effect not in force says `why` too (O5).
     fn all(
         action: ControlAction,
         result: ApplicationResult,
         evidence: bool,
         why: Option<Why>,
     ) -> Self {
+        let not_in_force = matches!(
+            result,
+            ApplicationResult::Pending | ApplicationResult::Refused
+        );
         Applied {
             record_result: result,
             effects: EffectKind::of(action)
                 .into_iter()
-                .map(|effect| EffectResult { effect, result })
+                .map(|effect| EffectResult {
+                    effect,
+                    result,
+                    why: why.filter(|_| not_in_force).map(EffectWhy::Known),
+                })
                 .collect(),
             actions: Vec::new(),
             evidence,
@@ -644,12 +704,21 @@ struct Outcome {
 
 impl Outcome {
     fn effect(&mut self, effect: EffectKind, result: ApplicationResult) {
-        self.effects.push(EffectResult { effect, result });
+        self.effects.push(EffectResult {
+            effect,
+            result,
+            why: None,
+        });
     }
 
-    /// An effect that isn't in force (`pending` or `refused`), and why.
+    /// An effect that isn't in force (`pending` or `refused`), and why: the
+    /// effect says it too (O5).
     fn not_in_force(&mut self, effect: EffectKind, result: ApplicationResult, why: Why) {
-        self.effect(effect, result);
+        self.effects.push(EffectResult {
+            effect,
+            result,
+            why: Some(EffectWhy::Known(why)),
+        });
         self.why.get_or_insert(why);
     }
 
@@ -1834,6 +1903,17 @@ mod control_state_tests {
                 applied.record_result,
                 rec.record_id()
             );
+            // Each effect not in force says why (the record's why); one in
+            // force says nothing (O5).
+            for e in &mut applied.effects {
+                let not_in_force = matches!(
+                    e.result,
+                    ApplicationResult::Pending | ApplicationResult::Refused
+                );
+                let want = applied.why.filter(|_| not_in_force).map(EffectWhy::Known);
+                assert_eq!(e.why, want, "{:?} of {}", e.effect, rec.record_id());
+                e.why = None;
+            }
             applied.why = None;
             *self = next;
             applied
@@ -2072,7 +2152,11 @@ mod control_state_tests {
             record_result,
             effects: effects
                 .iter()
-                .map(|&(effect, result)| EffectResult { effect, result })
+                .map(|&(effect, result)| EffectResult {
+                    effect,
+                    result,
+                    why: None,
+                })
                 .collect(),
             actions,
             evidence: false,
@@ -5747,6 +5831,59 @@ mod control_state_tests {
         let mut part = host.part("host:host-a").unwrap();
         part["hold_issued_at"] = json!(issued(5));
         assert!(ControlState::from_parts(&fx.list, vec![("host:host-a".into(), part)]).is_err());
+    }
+
+    /// O5: each effect result says why it isn't in force (the record's
+    /// `why`), and nothing when it is, a colliding stop's included (its
+    /// record is evidence; its effects apply).
+    #[test]
+    fn an_effect_not_in_force_says_why() {
+        use super::super::verify::{PendingReason as P, RefusalReason as F};
+        let fx = Fx::new();
+        let mut state = fx.state();
+        let s = |n: u32, action: ControlAction| fx.svc(n, "svc-1", "svc-1", action, A);
+        let effect = |rec: &ControlRecord, pos, state: &ControlState| {
+            state.apply(rec, &fx.list, pos, 0).applied.effects
+        };
+        let why = |kind, result, why| EffectResult {
+            effect: kind,
+            result,
+            why: Some(EffectWhy::Known(why)),
+        };
+        assert_eq!(
+            effect(&s(1, INTERRUPT), at(A, 1), &state),
+            vec![why(E::Interrupt, R::Pending, Why::Pending(P::NotRevoked))]
+        );
+        let forged = fx.sign(
+            &fx.service_body(2, "svc-1", "svc-1", revoke(true), A),
+            "svc-2",
+        );
+        assert_eq!(
+            effect(&forged, at(A, 1), &state),
+            vec![
+                why(E::Revocation, R::Refused, Why::Refused(F::BadSignature)),
+                why(E::Interrupt, R::Refused, Why::Refused(F::BadSignature)),
+            ]
+        );
+        state.adopt(&s(3, C::Cover), &fx.list, at(A, 1), 0);
+        state.adopt(&s(5, C::Hold), &fx.list, at(A, 2), 0);
+        assert_eq!(
+            effect(&s(4, C::Release), at(A, 3), &state),
+            vec![why(E::Release, R::Refused, Why::NotAfterHold)]
+        );
+        // A hold under the cover's id: evidence, a duplicate, no reason.
+        let mut colliding = fx.service_body(6, "svc-1", "svc-1", C::Hold, A);
+        colliding.record_id = rid(3);
+        let t = state.apply(&fx.sign(&colliding, "svc-1"), &fx.list, at(A, 3), 0);
+        assert_eq!(t.applied.why, Some(Why::Collision));
+        assert_eq!(
+            t.applied.effects,
+            vec![EffectResult {
+                effect: E::Hold,
+                result: R::Duplicate,
+                why: None,
+            }]
+        );
     }
 
     #[test]

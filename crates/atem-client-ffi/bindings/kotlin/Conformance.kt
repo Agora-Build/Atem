@@ -716,10 +716,16 @@ fun main(args: Array<String>) {
         is ControlHostAction.Interrupt -> mapOf("type" to "interrupt", "principal" to a.principal, "revocation" to a.revocation)
         is ControlHostAction.Cover -> mapOf("type" to "cover", "principal" to a.principal, "origin" to a.origin, "feed_id" to a.feedId)
     }
+    // An effect as the vectors write it: `why` (O5) only when there is one.
+    fun controlEffectOf(e: ControlEffectResult): Map<String, Any?> {
+        val m = linkedMapOf<String, Any?>("effect" to e.effect.name.lowercase(), "result" to e.result.name.lowercase())
+        e.why?.let { m["why"] = it }
+        return m
+    }
     fun controlAppliedOf(a: ControlApplied): Map<String, Any?> {
         val m = linkedMapOf<String, Any?>(
             "result" to a.result.name.lowercase(),
-            "effects" to a.effects.map { mapOf("effect" to it.effect.name.lowercase(), "result" to it.result.name.lowercase()) },
+            "effects" to a.effects.map(::controlEffectOf),
             "actions" to a.actions.map(::controlActionOf),
             "evidence" to a.evidence)
         // Why it is pending, refused or evidence: present exactly then.
@@ -1138,8 +1144,7 @@ fun main(args: Array<String>) {
                     eq(relayControlAck(read.ack), wire, "$name written again")
                     // What it decoded to, field by field, against the golden's fields
                     // (a mapping wrong both ways round wouldn't show in the re-encoding).
-                    fun effectsOf(e: List<ControlEffectResult>) =
-                        e.map { mapOf("effect" to it.effect.name.lowercase(), "result" to it.result.name.lowercase()) }
+                    fun effectsOf(e: List<ControlEffectResult>) = e.map(::controlEffectOf)
                     val ack = read.ack
                     val decoded = mapOf(
                         "account_id" to ack.accountId, "cursor" to ack.cursor.toLong(), "feed_id" to ack.feedId,

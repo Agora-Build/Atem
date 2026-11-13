@@ -744,6 +744,7 @@ fn golden_effects(v: &Value) -> Vec<ControlEffectResult> {
                 "refused" => ControlResultKind::Refused,
                 other => panic!("result {other}"),
             },
+            why: e.get("why").map(s),
         })
         .collect()
 }
@@ -766,7 +767,10 @@ fn golden_effects_json(effects: &[ControlEffectResult]) -> Value {
                     ControlResultKind::Pending => "pending",
                     ControlResultKind::Refused => "refused",
                 };
-                json!({"effect": effect, "result": result})
+                match &e.why {
+                    Some(why) => json!({"effect": effect, "result": result, "why": why}),
+                    None => json!({"effect": effect, "result": result}),
+                }
             })
             .collect(),
     )
@@ -952,6 +956,57 @@ fn golden_wire(case: &Value) -> String {
             )
         }
     }
+}
+
+/// Typed reasons (O5) through the production exports: a golden's reasons
+/// decode as they came (a code this build doesn't know included, its
+/// result unchanged), and the builder refuses a reason beside an effect in
+/// force or one that isn't well formed, `malformed`.
+#[test]
+fn reasons_through_the_bindings() {
+    let file = load("r9-vectors-station-calls");
+    let golden = |name: &str| {
+        let case = file["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap();
+        let Ok(RelayToStation::ControlAck { ack }) = relay_decode_to_station(s(&case["wire"]))
+        else {
+            panic!("{name}: an ack")
+        };
+        ack
+    };
+    let effects = |r: &RelayAckResult| match r {
+        RelayAckResult::Record { effects, .. } | RelayAckResult::Entry { effects, .. } => {
+            effects.clone()
+        }
+    };
+    let later = golden("control_ack_with_unrecognized_reasons");
+    let first = effects(&later.results[0]).remove(0);
+    assert_eq!(
+        (first.result, first.why.as_deref()),
+        (ControlResultKind::Refused, Some("a_later_reason"))
+    );
+    let reasoned = golden("control_ack_with_reasons");
+    let mut ack = reasoned.clone();
+    let bad = |ack: &ControlAckInfo| code(relay_control_ack(ack.clone()).unwrap_err());
+    // Beside an effect in force (S1_cover's applied).
+    let RelayAckResult::Record { effects, .. } = &mut ack.results[2] else {
+        panic!("a record's result")
+    };
+    effects[0].why = Some("order".into());
+    assert_eq!(bad(&ack), "malformed");
+    for text in ["", "Order", "not after hold", &"z".repeat(65)] {
+        let mut ack = reasoned.clone();
+        let RelayAckResult::Record { effects, .. } = &mut ack.results[0] else {
+            panic!("a record's result")
+        };
+        effects[0].why = Some(text.into());
+        assert_eq!(bad(&ack), "malformed", "{text:?}");
+    }
+    assert!(relay_control_ack(reasoned).is_ok());
 }
 
 /// `r9-vectors-station-calls` through the production exports: every golden

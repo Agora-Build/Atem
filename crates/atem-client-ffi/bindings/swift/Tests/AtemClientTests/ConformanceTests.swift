@@ -921,7 +921,12 @@ final class ConformanceTests: XCTestCase {
             }
         }
         func controlAppliedOf(_ applied: ControlApplied) -> [String: Any] {
-            let effects: [[String: Any]] = applied.effects.map { ["effect": effectCode($0.effect), "result": resultCode($0.result)] }
+            // Each effect: `why` (O5) only when there is one.
+            let effects: [[String: Any]] = applied.effects.map { e in
+                var out: [String: Any] = ["effect": effectCode(e.effect), "result": resultCode(e.result)]
+                if let why = e.why { out["why"] = why }
+                return out
+            }
             var out: [String: Any] = ["result": resultCode(applied.result), "effects": effects, "actions": applied.actions.map(controlActionOf), "evidence": applied.evidence]
             // Why it is pending, refused or evidence: present exactly then.
             if let why = applied.why { out["why"] = why }
@@ -1400,7 +1405,11 @@ final class ConformanceTests: XCTestCase {
                     // What it decoded to, field by field, against the golden's fields
                     // (a mapping wrong both ways round wouldn't show in the re-encoding).
                     func effectsOf(_ e: [ControlEffectResult]) -> [[String: Any]] {
-                        e.map { ["effect": effectCode($0.effect), "result": resultCode($0.result)] }
+                        e.map { e in
+                            var out: [String: Any] = ["effect": effectCode(e.effect), "result": resultCode(e.result)]
+                            if let why = e.why { out["why"] = why }
+                            return out
+                        }
                     }
                     let results: [[String: Any]] = ack.results.map { r in
                         switch r {

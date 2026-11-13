@@ -1145,24 +1145,32 @@ fn items<T: serde::de::DeserializeOwned>(
         .collect()
 }
 
-/// `[{effect, result}]`, by their wire names.
+/// `[{effect, result, why?}]`, by their wire names: `why` (O5) absent,
+/// `null` or a reason's code.
 fn effect_results(v: &JsValue) -> JsResult<Vec<crate::types::ControlEffectResult>> {
     #[derive(Deserialize)]
     struct E {
         effect: String,
         result: String,
+        #[serde(default)]
+        why: Option<String>,
     }
-    items::<E>(v, &["effect", "result"], "effects [{effect, result}]")?
-        .into_iter()
-        .map(|e| {
-            Ok(crate::types::ControlEffectResult {
-                effect: crate::station::effect_kind_of(&e.effect)
-                    .ok_or_else(|| bad("effect: revocation, interrupt, hold, release or cover"))?,
-                result: crate::station::result_kind_of(&e.result)
-                    .ok_or_else(|| bad("result: applied, duplicate, pending or refused"))?,
-            })
+    items::<E>(
+        v,
+        &["effect", "result", "why"],
+        "effects [{effect, result, why?}]",
+    )?
+    .into_iter()
+    .map(|e| {
+        Ok(crate::types::ControlEffectResult {
+            effect: crate::station::effect_kind_of(&e.effect)
+                .ok_or_else(|| bad("effect: revocation, interrupt, hold, release or cover"))?,
+            result: crate::station::result_kind_of(&e.result)
+                .ok_or_else(|| bad("result: applied, duplicate, pending or refused"))?,
+            why: e.why,
         })
-        .collect()
+    })
+    .collect()
 }
 
 fn strict_head(v: JsValue) -> JsResult<crate::types::LogHead> {

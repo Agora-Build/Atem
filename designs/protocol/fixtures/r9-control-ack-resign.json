@@ -4,7 +4,7 @@
   "kind": "scenario",
   "side": "relay",
   "log": "r9-vectors-membership-log",
-  "note": "Test 48, a native stop no Portal report covers (I.5.4, I.5.8). dev-ipad, a native manager, signed M3_revoke_by_removed_manager (a revoke of svc-discord with interrupt_running: true) and was removed before host-b received it; host-c had applied it. dev-mac's M2_interrupt follows it. host-b's scan cursor moves past both, but its per-effect results are refused (M3, the strict rule) and pending (M2: the service isn't revoked there), so the re-sign alerts stay: the cursor never counts. A current manager re-signs M3 as M4_revoke_resigned (the same stop, a new record_id); host-b reports M4 applied and M2 duplicate, and every alert ends: alerts are per effect, so a record stays alerted only until every effect it carries is in force on every host it covers, through any record, and host-c, which applied the original, is done for the re-signed copy already. Its later duplicate for M4 (and that ack resent) counts nothing more. No Station revoke is recorded, so nothing goes to the Portal. Record times are the vectors'; the order is the feed's.",
+  "note": "Test 48, a native stop no Portal report covers (I.5.4, I.5.8). dev-ipad, a native manager, signed M3_revoke_by_removed_manager (a revoke of svc-discord with interrupt_running: true) and was removed before host-b received it; host-c had applied it. dev-mac's M2_interrupt follows it. host-b's scan cursor moves past both, but its per-effect results are refused (M3, the strict rule) and pending (M2: the service isn't revoked there), each with its typed reason (removed_manager, not_revoked; O5, amended for step 4), so the re-sign alerts stay: the cursor never counts, a reason is information only, and nothing is re-signed for it. A current manager re-signs M3 as M4_revoke_resigned (the same stop, a new record_id); host-b reports M4 applied and M2 duplicate, and every alert ends: alerts are per effect, so a record stays alerted only until every effect it carries is in force on every host it covers, through any record, and host-c, which applied the original, is done for the re-signed copy already. Its later duplicate for M4 (and that ack resent) counts nothing more. No Station revoke is recorded, so nothing goes to the Portal. Record times are the vectors'; the order is the feed's.",
   "setup": {
     "station": {
       "origin": "https://station-dev.agora.build",
@@ -139,11 +139,13 @@
             "effects": [
               {
                 "effect": "revocation",
-                "result": "refused"
+                "result": "refused",
+                "why": "removed_manager"
               },
               {
                 "effect": "interrupt",
-                "result": "refused"
+                "result": "refused",
+                "why": "removed_manager"
               }
             ]
           },
@@ -152,7 +154,8 @@
             "effects": [
               {
                 "effect": "interrupt",
-                "result": "pending"
+                "result": "pending",
+                "why": "not_revoked"
               }
             ]
           }

@@ -948,6 +948,16 @@ record! {
     pub struct ControlEffectResult {
         pub effect: ControlEffectKind,
         pub result: ControlResultKind,
+        /// Why the effect isn't in force (O5; **for Astation**, amended for
+        /// step 4): set exactly when `result` is `pending` or `refused`,
+        /// else `None` (JS `null`). Information only: it never changes
+        /// `result` and counts nothing. A code of the shared vocabulary
+        /// (`ControlApplied.why`'s), or, read from a `control_ack`, a
+        /// well-formed one this build doesn't know (1 to 64 bytes of
+        /// `[a-z0-9_]`), given as it came: treat a code you don't know as
+        /// unrecognized. A builder refuses one beside `applied` or
+        /// `duplicate`, or one that isn't well formed (`malformed`).
+        pub why: Option<String>,
     }
 }
 

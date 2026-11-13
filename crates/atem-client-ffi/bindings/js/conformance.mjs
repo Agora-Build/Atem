@@ -567,9 +567,12 @@ check("control records: the builders reproduce every record; a body the parse re
   throwsCode(() => m.controlRecordSigningInput({ ...controlBodyOf(ctl.records[0].record.body), feed_id: "x" }), "malformed");
 });
 const controlActionOut = ({ feedId, ...rest }) => (feedId === undefined ? rest : { ...rest, feed_id: feedId });
+// An effect as the vectors write it: `why` (O5) only when there is one.
+const effectOut = ({ why, ...rest }) => (why === null || why === undefined ? rest : { ...rest, why });
 // An applied object as the vectors write it: `why` only when there is one.
-const controlAppliedOut = ({ why, actions, ...rest }) => ({
+const controlAppliedOut = ({ why, actions, effects, ...rest }) => ({
   ...rest,
+  effects: effects.map(effectOut),
   actions: actions.map(controlActionOut),
   ...(why === null || why === undefined ? {} : { why }),
 });
@@ -959,8 +962,8 @@ check("Station calls: the byte goldens build exactly, read back to their fields 
             origin: read.ack.origin,
             results: read.ack.results.map((r) =>
               r.type === "entry"
-                ? { applied_seq: r.appliedSeq, effects: r.effects, entry: { entry_hash: r.entryHash, seq: r.seq } }
-                : { effects: r.effects, record_id: r.recordId },
+                ? { applied_seq: r.appliedSeq, effects: r.effects.map(effectOut), entry: { entry_hash: r.entryHash, seq: r.seq } }
+                : { effects: r.effects.map(effectOut), record_id: r.recordId },
             ),
           },
           f,

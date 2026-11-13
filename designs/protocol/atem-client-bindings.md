@@ -1337,7 +1337,7 @@ or close an invalid or superseded link.
 
 | call | what it does |
 |---|---|
-| `relay_decode_to_station(message)` | reads a host's call strictly (at most 256 KiB as received, one strict I-JSON parse, exact fields, never `null`): `ControlSync{origin, feed_id?, after}`, `ControlAck{ack}` or `MembershipFetch{after}`. Another relay message on the link (`push_hint`, `push_seen`, …) is `Invalid{wrong_message}`: dispatch it elsewhere. The calling host is never a field: take it from the link's verified association (below) |
+| `relay_decode_to_station(message)` | reads a host's call strictly (at most 256 KiB as received, one strict I-JSON parse, exact fields, never `null`): `ControlSync{origin, feed_id?, after}`, `ControlAck{ack}` or `MembershipFetch{after}`. Another relay message on the link (`push_hint`, `push_seen`, …) is `Invalid{wrong_message}`: dispatch it elsewhere. The calling host is never a field: take it from the link's verified association (below). An ack's `ControlEffectResult.why` (O5, **for Astation**, amended for step 4; host-work-v1 §11.4 wire rule 10) is why an effect `pending` or `refused` isn't in force, as the host wrote it, or `None` (JS `null`): read it as information only, never as a count or a request to re-sign, and treat a code you don't know as unrecognized (a later version's; the result stands). A reason that is `null`, not a text, empty, over 64 bytes, outside `[a-z0-9_]` or beside `applied` or `duplicate` refuses the whole ack, `Invalid{malformed}` |
 | `relay_control_sync_result(origin, feed_id, head, station_time, records)` | the page after the host's `after`: at most 64 `RelayFeedRecord{feed_seq, record_json}`, ascending, each `feed_seq` in `1..=head`, 256 KiB in all. Each record goes through the control parser first: one it refuses is `Invalid{code}` with its parse code, and the page isn't written. Serve only records you validated at intake and stored |
 | `relay_heads(feeds, membership)` | each covering feed's `RelayFeedHead{origin, feed_id, head, station_time}` (at most 64, a feed once) and the device list's `LogHead`. Send it on every (re)connection, every 30 seconds and at once when a record is stored |
 | `relay_membership_fetch_result(head, entries)` | the device list's head and the entries after the host's `after` (signed objects' JSON), at most 64: an R9.3 carriage |
@@ -1349,7 +1349,10 @@ message of the six calls and the three refusals as the exact text these
 builders write (compact, keys in RFC 8785 order), with its decoded fields,
 the control parser's verdict on each page record, and the invalid texts each
 reader refuses with its code (an unknown field, a `null`, a duplicate key,
-an unknown refusal code, a count of 65) and the byte bound for each call
+an unknown refusal code, a count of 65, and each refused form of a
+typed reason: `null`, not a text, empty, over 64 bytes, outside
+`[a-z0-9_]`, beside `applied` or `duplicate`, a duplicate `why` key)
+and the byte bound for each call
 that can carry a large page (a text of exactly 262,144 bytes read, one of
 262,145 and one of 300,000 refused, for `control_sync_result` and
 `membership_fetch_result` alike): a Station that writes or reads the same

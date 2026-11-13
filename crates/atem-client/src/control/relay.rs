@@ -46,6 +46,19 @@
 //! for a host sender's revoke, the device-list entry (`seq`, `entry_hash`)
 //! and host-work's applied device-list `seq`.
 //!
+//! **Typed reasons** (O5, Astation's review of PR 2, #120 comment
+//! 6848326392). An effect `pending` or `refused` may say why: `why`, a
+//! code of the shared vocabulary ([`super::state::Why`]), 1 to
+//! [`super::state::MAX_WHY_BYTES`] bytes of `[a-z0-9_]`. The host writes
+//! one exactly where its effect result has one (never beside `applied` or
+//! `duplicate`). It is information for the Station only: it never changes
+//! a result, never counts as evidence, and asks for no re-signing. A
+//! reader refuses the whole ack for a `why` that is `null`, not a text,
+//! empty, over the bound, outside the character set or beside an effect
+//! in force; it reads a well-formed code it doesn't know as unrecognized
+//! ([`EffectWhy::Unrecognized`]), the result unchanged, so a new reason
+//! never breaks an older Station. Absent: no reason.
+//!
 //! **A feed's records are judged one at a time** (I.5.4). A
 //! `control_sync_result` keeps each record's value as the Station sent it,
 //! of any JSON type, and checks nothing of it: one record the control
@@ -96,7 +109,7 @@ use crate::session::wire::is_uuid_v4;
 use crate::station_route::normalize_relay;
 
 use super::record::{ControlError, ControlRecord};
-use super::state::{ApplicationResult, EffectKind, EffectResult};
+use super::state::{ApplicationResult, EffectKind, EffectResult, EffectWhy};
 
 /// The most bytes one relay message is, as sent (R9.9): checked before a
 /// reader parses anything, and by every builder.
@@ -647,9 +660,33 @@ fn effects_json(effects: &[EffectResult]) -> Value {
     Value::Array(
         effects
             .iter()
-            .map(|e| json!({"effect": e.effect.code(), "result": e.result.code()}))
+            .map(|e| {
+                let mut o = json!({"effect": e.effect.code(), "result": e.result.code()});
+                if let Some(why) = &e.why {
+                    o["why"] = json!(why.code());
+                }
+                o
+            })
             .collect(),
     )
+}
+
+/// An effect's reason, as an ack writes and reads it (O5): only beside
+/// `pending` or `refused`, and only a well-formed code (a known one, or
+/// one this build doesn't know, read as unrecognized).
+fn check_why(e: &EffectResult) -> Result<()> {
+    let Some(why) = &e.why else {
+        return Ok(());
+    };
+    let not_in_force = matches!(
+        e.result,
+        ApplicationResult::Pending | ApplicationResult::Refused
+    );
+    if not_in_force && EffectWhy::well_formed(why.code()) {
+        Ok(())
+    } else {
+        Err(RelayError::Malformed("why"))
+    }
 }
 
 fn read_effects(f: &Fields) -> Result<Vec<EffectResult>> {
@@ -661,12 +698,22 @@ fn read_effects(f: &Fields) -> Result<Vec<EffectResult>> {
     items
         .iter()
         .map(|item| {
-            let e = Fields::of(item, &["effect", "result"], "effects")?;
+            let e = Fields::of(item, &["effect", "result", "why"], "effects")?;
+            // Absent: no reason; present, a well-formed text (never null).
+            let why = match e.0.get("why") {
+                None => None,
+                Some(why) => Some(
+                    why.as_str()
+                        .and_then(EffectWhy::read)
+                        .ok_or(RelayError::Malformed("why"))?,
+                ),
+            };
             Ok(EffectResult {
                 effect: EffectKind::from_code(e.text("effect")?)
                     .ok_or(RelayError::Malformed("effects"))?,
                 result: ApplicationResult::from_code(e.text("result")?)
                     .ok_or(RelayError::Malformed("effects"))?,
+                why,
             })
         })
         .collect()
@@ -674,7 +721,8 @@ fn read_effects(f: &Fields) -> Result<Vec<EffectResult>> {
 
 /// One result in a `control_ack`: exactly one of two forms, by what it
 /// names (I.5.8, "Delivery progress is not application"). Each carries a
-/// result per effect, never the cursor's progress.
+/// result per effect, never the cursor's progress, and each effect not in
+/// force may say why (O5, the module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AckResult {
     /// A control record, by its `record_id`: the effects it carries, once
@@ -697,6 +745,10 @@ pub enum AckResult {
 
 impl AckResult {
     fn check(&self) -> Result<()> {
+        let effects = match self {
+            AckResult::Record { effects, .. } | AckResult::Entry { effects, .. } => effects,
+        };
+        effects.iter().try_for_each(check_why)?;
         match self {
             AckResult::Record { record_id, effects } => {
                 if !is_uuid_v4(record_id) {
@@ -1165,6 +1217,8 @@ impl ToHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::state::{EffectWhy, MAX_WHY_BYTES, Why};
+    use crate::control::verify::{PendingReason, RefusalReason};
     use crate::encoding::b64u;
     use serde_json::json;
 
@@ -1215,7 +1269,20 @@ mod tests {
     }
 
     fn effect(effect: EffectKind, result: ApplicationResult) -> EffectResult {
-        EffectResult { effect, result }
+        EffectResult {
+            effect,
+            result,
+            why: None,
+        }
+    }
+
+    /// An effect not in force, with its reason.
+    fn effect_why(effect: EffectKind, result: ApplicationResult, why: Why) -> EffectResult {
+        EffectResult {
+            effect,
+            result,
+            why: Some(EffectWhy::Known(why)),
+        }
     }
 
     fn bytes(message: &Value) -> Vec<u8> {
@@ -2502,5 +2569,231 @@ mod tests {
             ToHost::decode(big.as_bytes()).unwrap_err(),
             RelayError::TooLarge
         );
+    }
+
+    // ------------------------------------------------ typed reasons (O5)
+
+    /// An ack whose effects not in force say why, beside effects in force
+    /// that say nothing: a record's and an entry's.
+    fn reasoned_ack() -> ControlAck {
+        use ApplicationResult::{Applied, Duplicate, Pending, Refused};
+        ack(vec![
+            AckResult::Record {
+                record_id: record_id(1),
+                effects: vec![effect_why(EffectKind::Release, Refused, Why::NotAfterHold)],
+            },
+            AckResult::Record {
+                record_id: record_id(2),
+                effects: vec![effect_why(
+                    EffectKind::Interrupt,
+                    Pending,
+                    Why::Pending(PendingReason::NotRevoked),
+                )],
+            },
+            AckResult::Record {
+                record_id: record_id(3),
+                effects: vec![
+                    effect(EffectKind::Revocation, Duplicate),
+                    effect(EffectKind::Interrupt, Applied),
+                ],
+            },
+            AckResult::Record {
+                record_id: record_id(4),
+                effects: vec![
+                    effect_why(
+                        EffectKind::Revocation,
+                        Refused,
+                        Why::Refused(RefusalReason::RemovedManager),
+                    ),
+                    effect_why(
+                        EffectKind::Interrupt,
+                        Refused,
+                        Why::Refused(RefusalReason::RemovedManager),
+                    ),
+                ],
+            },
+            AckResult::Entry {
+                entry: EntryRef {
+                    seq: 20,
+                    entry_hash: hash(0x44),
+                },
+                applied_seq: 19,
+                effects: vec![effect_why(
+                    EffectKind::Revocation,
+                    Pending,
+                    Why::Pending(PendingReason::RevokeNotApplied),
+                )],
+            },
+        ])
+    }
+
+    /// O5 (Astation's review of PR 2, #120 comment 6848326392): each
+    /// effect result may carry `why`, a reason of the shared vocabulary,
+    /// written exactly where the effect isn't in force. A reason this
+    /// reader doesn't know is read as unrecognized, the result unchanged;
+    /// absent is no reason.
+    #[test]
+    fn reasons_ride_beside_the_effects_not_in_force() {
+        let sent = reasoned_ack();
+        let wire = sent.to_json().unwrap();
+        let results = &wire["results"];
+        assert_eq!(results[0]["effects"][0]["why"], "not_after_hold");
+        assert_eq!(results[1]["effects"][0]["why"], "not_revoked");
+        assert_eq!(results[3]["effects"][1]["why"], "removed_manager");
+        assert_eq!(results[4]["effects"][0]["why"], "revoke_not_applied");
+        for e in results[2]["effects"].as_array().unwrap() {
+            assert!(e.get("why").is_none(), "in force: no reason");
+        }
+        assert_eq!(ControlAck::decode(&bytes(&wire)).unwrap(), sent);
+
+        // A well-formed reason this reader doesn't know: unrecognized, the
+        // result and everything else unchanged, written back as it came.
+        let later = "a_later_reason";
+        let unknown = with(&wire, "/results/0/effects/0/why", json!(later));
+        let read = ControlAck::decode(&unknown).unwrap();
+        let AckResult::Record { effects, .. } = &read.results[0] else {
+            panic!("a record's result")
+        };
+        assert_eq!(
+            effects[0],
+            EffectResult {
+                effect: EffectKind::Release,
+                result: ApplicationResult::Refused,
+                why: Some(EffectWhy::Unrecognized(later.into())),
+            }
+        );
+        assert_eq!(read.results[1..], sent.results[1..]);
+        assert_eq!(bytes(&read.to_json().unwrap()), unknown);
+        // At the bound, and every code of the vocabulary, is well formed.
+        let longest = "z".repeat(MAX_WHY_BYTES);
+        let at_bound = with(&wire, "/results/0/effects/0/why", json!(longest));
+        assert!(ControlAck::decode(&at_bound).is_ok());
+        for code in ["order", "not_after_hold", "possible_replay", "list_frozen"] {
+            assert_eq!(
+                EffectWhy::read(code),
+                Some(EffectWhy::Known(Why::from_code(code).unwrap()))
+            );
+        }
+        // Absent: no reason, as every step-3 ack.
+        let bare = without(&wire, "/results/0/effects/0", "why");
+        let AckResult::Record { effects, .. } = &ControlAck::decode(&bare).unwrap().results[0]
+        else {
+            panic!("a record's result")
+        };
+        assert_eq!(effects[0].why, None);
+    }
+
+    /// A reason is read strictly: `null`, a non-string, an empty string,
+    /// over 64 bytes or outside `[a-z0-9_]` refuses the whole ack, and so
+    /// does a reason beside `applied` or `duplicate` (a reason says why an
+    /// effect isn't in force). A duplicate key is a strict parse's fault,
+    /// as everywhere; an effect field other than `why` is unknown.
+    #[test]
+    fn a_malformed_reason_refuses_the_whole_ack() {
+        let wire = reasoned_ack().to_json().unwrap();
+        let at = "/results/0/effects/0/why";
+        for bad in [
+            json!(null),
+            json!(7),
+            json!(true),
+            json!(["order"]),
+            json!(""),
+            json!("z".repeat(MAX_WHY_BYTES + 1)),
+            json!("Not_after_hold"),
+            json!("not after hold"),
+            json!("not-after-hold"),
+            json!("ordér"),
+        ] {
+            let r = ControlAck::decode(&with(&wire, at, bad.clone()));
+            assert_eq!(r, Err(RelayError::Malformed("why")), "{bad}");
+        }
+        // Beside an effect in force.
+        for (pointer, why) in [
+            ("/results/2/effects/0", "order"),
+            ("/results/2/effects/1", "a_later_reason"),
+        ] {
+            let mut changed = wire.clone();
+            changed.pointer_mut(pointer).unwrap()["why"] = json!(why);
+            assert_eq!(
+                ControlAck::decode(&bytes(&changed)),
+                Err(RelayError::Malformed("why")),
+                "{pointer}"
+            );
+        }
+        // A duplicate key anywhere: not strict JSON.
+        let text = String::from_utf8(bytes(&wire)).unwrap();
+        let doubled = text.replacen(
+            "\"why\":\"not_after_hold\"",
+            "\"why\":\"order\",\"why\":\"not_after_hold\"",
+            1,
+        );
+        assert_ne!(doubled, text);
+        assert_eq!(
+            ControlAck::decode(doubled.as_bytes()),
+            Err(RelayError::NotStrict)
+        );
+        // Another field beside an effect.
+        let reason = add(&wire, "/results/0/effects/0", "reason");
+        assert_eq!(ControlAck::decode(&reason), Err(RelayError::UnknownField));
+    }
+
+    /// The builder checks what the reader checks: a reason only beside an
+    /// effect not in force, and only a well-formed one.
+    #[test]
+    fn the_builder_writes_a_reason_only_where_the_reader_takes_one() {
+        let set = |why: EffectWhy, result: ApplicationResult| {
+            ack(vec![AckResult::Record {
+                record_id: record_id(1),
+                effects: vec![EffectResult {
+                    effect: EffectKind::Release,
+                    result,
+                    why: Some(why),
+                }],
+            }])
+            .to_json()
+        };
+        let known = || EffectWhy::Known(Why::Order);
+        for result in [ApplicationResult::Applied, ApplicationResult::Duplicate] {
+            assert_eq!(set(known(), result), Err(RelayError::Malformed("why")));
+        }
+        for result in [ApplicationResult::Pending, ApplicationResult::Refused] {
+            assert!(set(known(), result).is_ok());
+        }
+        let refused = ApplicationResult::Refused;
+        for bad in ["", "Order", "a b", &"z".repeat(MAX_WHY_BYTES + 1)] {
+            let why = EffectWhy::Unrecognized(bad.into());
+            assert_eq!(
+                set(why, refused),
+                Err(RelayError::Malformed("why")),
+                "{bad}"
+            );
+        }
+        assert!(set(EffectWhy::Unrecognized("a_later_reason".into()), refused).is_ok());
+    }
+
+    /// The step-3 refusals stay exactly as agreed: an ack carrying reasons
+    /// changes nothing about them.
+    #[test]
+    fn refusals_are_unchanged_by_reasons() {
+        for (call, wire) in [
+            (
+                RefusedCall::ControlSync,
+                r#"{"code":"forbidden","op":"control_sync_refused","type":"relay"}"#,
+            ),
+            (
+                RefusedCall::MembershipFetch,
+                r#"{"code":"forbidden","op":"membership_fetch_refused","type":"relay"}"#,
+            ),
+            (
+                RefusedCall::ControlAck,
+                r#"{"code":"forbidden","op":"control_ack_refused","type":"relay"}"#,
+            ),
+        ] {
+            let refused = CallRefused {
+                call,
+                code: RefusalCode::Forbidden,
+            };
+            assert_eq!(refused.to_json().unwrap().to_string(), wire);
+        }
     }
 }

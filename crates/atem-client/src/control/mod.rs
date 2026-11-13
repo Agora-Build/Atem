@@ -42,8 +42,8 @@ pub use relay::{
     ToHost, ToStation,
 };
 pub use state::{
-    ApplicationResult, Applied, ControlState, Coverage, EffectKind, EffectResult, FeedPos,
-    HostAction, LoadedParts, MAX_RECORD_IDS, Standing, Transition, Why,
+    ApplicationResult, Applied, ControlState, Coverage, EffectKind, EffectResult, EffectWhy,
+    FeedPos, HostAction, LoadedParts, MAX_RECORD_IDS, MAX_WHY_BYTES, Standing, Transition, Why,
 };
 pub use verify::{
     ControlCheck, PendingReason, RefusalReason, VerifiedControl, VerifiedSigner, verify_control,

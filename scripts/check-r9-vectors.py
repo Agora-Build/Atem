@@ -938,6 +938,12 @@ def check_why(case, sequence):
     for i, step in enumerate(sequence["steps"], 1):
         expect = step["expect"]
         result, evidence, why = expect["result"], expect["evidence"], expect.get("why")
+        # Each effect not in force says the record's why; one in force says
+        # nothing (O5).
+        for e in expect["effects"]:
+            not_in_force = e["result"] in ("pending", "refused")
+            if e.get("why") != (why if not_in_force else None) or (not_in_force and why is None):
+                bad.append(i)
         explains = result in ("pending", "refused") or evidence
         if (why is not None) != explains or (why is not None and why not in WHY_CODES):
             bad.append(i)
@@ -951,8 +957,9 @@ def check_why(case, sequence):
             bad.append(i)
     case.check(
         not bad,
-        "every step's why: a code of its kind, present exactly when pending, refused or evidence"
-        + (f" (not: steps {bad})" if bad else ""),
+        "every step's why: a code of its kind, present exactly when pending, refused or evidence, "
+        "and on each effect exactly when it isn't in force"
+        + (f" (not: steps {sorted(set(bad))})" if bad else ""),
     )
 
 
@@ -2313,16 +2320,27 @@ def _read_heads(v):
         raise Refused("malformed")  # wire rule 6: an (origin, feed_id) once
 
 
+# An effect's reason (O5): 1 to 64 bytes of [a-z0-9_], only beside an
+# effect not in force; a code outside the vocabulary is read, unrecognized.
+RELAY_WHY = r"[a-z0-9_]{1,64}"
+
+
 def _relay_effects(result):
     items = result.get("effects")
     if not isinstance(items, list) or not 1 <= len(items) <= 2:
         raise Refused("malformed")
     out = []
     for item in items:
-        _relay_exact(item, ["effect", "result"])
+        _relay_exact(item, ["effect", "result", "why"])
         effect, outcome = _relay_text(item, "effect"), _relay_text(item, "result")
         if effect not in RELAY_EFFECTS or outcome not in RELAY_RESULTS:
             raise Refused("malformed")
+        if "why" in item:
+            why = item["why"]
+            if not isinstance(why, str) or re.fullmatch(RELAY_WHY, why) is None:
+                raise Refused("malformed")  # null, not a text, empty, over 64 bytes, another character
+            if outcome not in ("pending", "refused"):
+                raise Refused("malformed")  # a reason says why an effect isn't in force
         out.append((effect, outcome))
     return out
 
@@ -2553,6 +2571,13 @@ def check_station_calls(file, data, report, context):
                 for v in control["records"]:
                     if "parse_error" not in v:
                         by_id.setdefault(v["record"]["body"]["record_id"], []).append(v["record"]["body"])
+                # Typed reasons (O5): the vocabulary's codes, but in the
+                # golden of a later version's, which carries codes outside it.
+                whys = [e["why"] for r in f["results"] for e in r["effects"] if "why" in e]
+                if "unrecognized" in name:
+                    case.check(any(w not in WHY_CODES for w in whys), "reasons outside the vocabulary: read, unrecognized")
+                else:
+                    case.check(all(w in WHY_CODES for w in whys), "each reason a code of the vocabulary", f"got {whys}")
                 for result in f["results"]:
                     effects = [e["effect"] for e in result["effects"]]
                     if "record_id" in result:
@@ -2643,6 +2668,16 @@ def check_station_calls(file, data, report, context):
             "the byte bound refused one byte over and at 300,000, for a page and a fetch result",
         )
         case.equal(sum("wire_fill" in b for b in data["invalid"]), 4, "four texts over the byte bound")
+        reasons = {
+            "control_ack_why_null", "control_ack_why_not_a_string", "control_ack_why_empty",
+            "control_ack_why_over_64_bytes", "control_ack_why_upper_case", "control_ack_why_outside_the_characters",
+            "control_ack_why_beside_applied", "control_ack_why_beside_duplicate", "control_ack_why_duplicate_key",
+        }
+        case.check(reasons <= seen, "every refused form of a reason (O5)", f"missing {sorted(reasons - seen)}")
+        case.check(
+            {"control_ack_with_reasons", "control_ack_with_unrecognized_reasons"} <= names,
+            "goldens with reasons and with a later version's reasons",
+        )
         counts = {b["name"] for b in data["invalid"] if b["code"] == "too_large"}
         case.check({"control_sync_result_65_records", "heads_65_feeds", "control_ack_65_results", "membership_fetch_result_65_entries"} <= counts, "65 records, feeds, results and entries")
 

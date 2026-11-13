@@ -2699,7 +2699,8 @@
             "effects": [
               {
                 "effect": "hold",
-                "result": "refused"
+                "result": "refused",
+                "why": "after_revoke"
               }
             ],
             "evidence": false,
@@ -2759,11 +2760,13 @@
             "effects": [
               {
                 "effect": "revocation",
-                "result": "refused"
+                "result": "refused",
+                "why": "removed_manager"
               },
               {
                 "effect": "interrupt",
-                "result": "refused"
+                "result": "refused",
+                "why": "removed_manager"
               }
             ],
             "evidence": true,
@@ -2831,11 +2834,13 @@
             "effects": [
               {
                 "effect": "revocation",
-                "result": "refused"
+                "result": "refused",
+                "why": "removed_manager"
               },
               {
                 "effect": "interrupt",
-                "result": "refused"
+                "result": "refused",
+                "why": "removed_manager"
               }
             ],
             "evidence": true,
@@ -2891,7 +2896,8 @@
             "effects": [
               {
                 "effect": "revocation",
-                "result": "pending"
+                "result": "pending",
+                "why": "signer_unknown"
               }
             ],
             "evidence": false,
@@ -2919,7 +2925,8 @@
             "effects": [
               {
                 "effect": "revocation",
-                "result": "pending"
+                "result": "pending",
+                "why": "signer_unknown"
               }
             ],
             "evidence": false,
@@ -3113,7 +3120,8 @@
             "effects": [
               {
                 "effect": "cover",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_newer"
               }
             ],
             "evidence": false,
@@ -3143,7 +3151,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "order"
               }
             ],
             "evidence": false,
@@ -3238,7 +3247,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "order"
               }
             ],
             "evidence": false,
@@ -3498,7 +3508,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "order"
               }
             ],
             "evidence": false,
@@ -3712,7 +3723,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "order"
               }
             ],
             "evidence": false,
@@ -3779,7 +3791,8 @@
             "effects": [
               {
                 "effect": "interrupt",
-                "result": "pending"
+                "result": "pending",
+                "why": "revoke_not_in_list"
               }
             ],
             "evidence": false,
@@ -3802,7 +3815,8 @@
             "effects": [
               {
                 "effect": "interrupt",
-                "result": "pending"
+                "result": "pending",
+                "why": "revoke_not_applied"
               }
             ],
             "evidence": false,
@@ -3908,7 +3922,8 @@
             "effects": [
               {
                 "effect": "interrupt",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_a_revoke"
               }
             ],
             "evidence": true,
@@ -3933,7 +3948,8 @@
             "effects": [
               {
                 "effect": "interrupt",
-                "result": "refused"
+                "result": "refused",
+                "why": "host_key_signed"
               }
             ],
             "evidence": true,
@@ -4056,7 +4072,8 @@
             "effects": [
               {
                 "effect": "cover",
-                "result": "refused"
+                "result": "refused",
+                "why": "collision"
               }
             ],
             "evidence": true,
@@ -4086,7 +4103,8 @@
             "effects": [
               {
                 "effect": "cover",
-                "result": "refused"
+                "result": "refused",
+                "why": "bad_signature"
               }
             ],
             "evidence": true,
@@ -4116,7 +4134,8 @@
             "effects": [
               {
                 "effect": "cover",
-                "result": "refused"
+                "result": "refused",
+                "why": "wrong_account"
               }
             ],
             "evidence": true,
@@ -4146,7 +4165,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "key_mismatch"
               }
             ],
             "evidence": true,
@@ -4176,7 +4196,8 @@
             "effects": [
               {
                 "effect": "hold",
-                "result": "refused"
+                "result": "refused",
+                "why": "signer_not_allowed"
               }
             ],
             "evidence": true,
@@ -4206,7 +4227,8 @@
             "effects": [
               {
                 "effect": "revocation",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_a_service"
               }
             ],
             "evidence": true,
@@ -4232,7 +4254,8 @@
             "effects": [
               {
                 "effect": "revocation",
-                "result": "pending"
+                "result": "pending",
+                "why": "principal_unknown"
               }
             ],
             "evidence": false,
@@ -4406,7 +4429,8 @@
             "effects": [
               {
                 "effect": "cover",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_newer"
               }
             ],
             "evidence": false,
@@ -4470,7 +4494,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "order"
               }
             ],
             "evidence": false,
@@ -4500,7 +4525,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_after_hold"
               }
             ],
             "evidence": false,
@@ -4748,7 +4774,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "order"
               }
             ],
             "evidence": false,
@@ -4778,7 +4805,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_after_hold"
               }
             ],
             "evidence": false,
@@ -4874,7 +4902,8 @@
             "effects": [
               {
                 "effect": "interrupt",
-                "result": "pending"
+                "result": "pending",
+                "why": "not_revoked"
               }
             ],
             "evidence": false,
@@ -5192,7 +5221,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "order"
               }
             ],
             "evidence": false,
@@ -5337,7 +5367,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "order"
               }
             ],
             "evidence": false,
@@ -5627,7 +5658,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "order"
               }
             ],
             "evidence": false,
@@ -5767,7 +5799,8 @@
             "effects": [
               {
                 "effect": "cover",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_newer"
               }
             ],
             "evidence": false,
@@ -6196,7 +6229,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "collision"
               }
             ],
             "evidence": true,
@@ -6226,7 +6260,8 @@
             "effects": [
               {
                 "effect": "cover",
-                "result": "refused"
+                "result": "refused",
+                "why": "collision"
               }
             ],
             "evidence": true,
@@ -9063,7 +9098,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "possible_replay"
               }
             ],
             "evidence": true,
@@ -9161,7 +9197,8 @@
             "effects": [
               {
                 "effect": "cover",
-                "result": "refused"
+                "result": "refused",
+                "why": "possible_replay"
               }
             ],
             "evidence": true,
@@ -11913,7 +11950,8 @@
             "effects": [
               {
                 "effect": "hold",
-                "result": "refused"
+                "result": "refused",
+                "why": "after_revoke"
               }
             ],
             "evidence": false,
@@ -12073,7 +12111,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "order"
               }
             ],
             "evidence": false,
@@ -12171,7 +12210,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_after_hold"
               }
             ],
             "evidence": false,
@@ -12201,7 +12241,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_after_hold"
               }
             ],
             "evidence": false,
@@ -12386,7 +12427,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_after_hold"
               }
             ],
             "evidence": false,
@@ -12605,7 +12647,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_after_hold"
               }
             ],
             "evidence": false,
@@ -12876,7 +12919,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_after_hold"
               }
             ],
             "evidence": false,
@@ -12930,7 +12974,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_after_hold"
               }
             ],
             "evidence": false,
@@ -12990,7 +13035,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_after_hold"
               }
             ],
             "evidence": false,
@@ -15682,7 +15728,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_after_hold"
               }
             ],
             "evidence": false,
@@ -15741,7 +15788,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_after_hold"
               }
             ],
             "evidence": false,
@@ -15975,7 +16023,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_after_hold"
               }
             ],
             "evidence": false,
@@ -16041,7 +16090,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "not_after_hold"
               }
             ],
             "evidence": false,
@@ -16262,7 +16312,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "after_revoke"
               }
             ],
             "evidence": false,
@@ -16293,7 +16344,8 @@
             "effects": [
               {
                 "effect": "release",
-                "result": "refused"
+                "result": "refused",
+                "why": "after_revoke"
               }
             ],
             "evidence": false,

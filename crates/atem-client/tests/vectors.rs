@@ -4927,6 +4927,12 @@ impl<'a> ControlGen<'a> {
             assert_eq!(why.is_some(), explains, "{label} step {}: why", i + 1);
             if let Some(why) = why {
                 step["expect"]["why"] = why.into();
+                // Each effect not in force says why too (O5).
+                for e in step["expect"]["effects"].as_array_mut().unwrap() {
+                    if matches!(e["result"].as_str(), Some("pending" | "refused")) {
+                        e["why"] = why.into();
+                    }
+                }
             }
         }
         let mut v = serde_json::json!({"label": label, "note": note, "steps": steps, "state": state.to_json()});
@@ -6194,6 +6200,11 @@ fn applied_of(a: &ControlApplied) -> Value {
     if let Some(why) = a.why {
         v["why"] = why.code().into();
     }
+    for (i, e) in a.effects.iter().enumerate() {
+        if let Some(why) = &e.why {
+            v["effects"][i]["why"] = why.code().into();
+        }
+    }
     v
 }
 
@@ -6870,8 +6881,9 @@ fn delegated_wire() {
 
 use atem_client::control::{
     AckResult, ApplicationResult, CallRefused, ControlAck, ControlSync, ControlSyncResult,
-    EffectKind, EffectResult, EntryRef, FeedEntry, FeedHead, Heads, MembershipFetch,
-    MembershipFetchResult, RefusalCode, RefusedCall, RelayError, ToHost, ToStation,
+    EffectKind, EffectResult, EffectWhy, EntryRef, FeedEntry, FeedHead, Heads, MAX_WHY_BYTES,
+    MembershipFetch, MembershipFetchResult, RefusalCode, RefusedCall, RelayError, ToHost,
+    ToStation,
 };
 
 const STATION_CALLS: &str = "r9-vectors-station-calls";
@@ -6915,6 +6927,9 @@ fn call_effects(value: &Value) -> Vec<EffectResult> {
         .map(|e| EffectResult {
             effect: EffectKind::from_code(s(e, "effect")).unwrap(),
             result: ApplicationResult::from_code(s(e, "result")).unwrap(),
+            why: e
+                .get("why")
+                .map(|why| EffectWhy::read(why.as_str().unwrap()).unwrap()),
         })
         .collect()
 }
@@ -7056,7 +7071,14 @@ fn describe_effects(effects: &[EffectResult]) -> Value {
     Value::Array(
         effects
             .iter()
-            .map(|e| serde_json::json!({"effect": e.effect.code(), "result": e.result.code()}))
+            .map(|e| {
+                let mut v =
+                    serde_json::json!({"effect": e.effect.code(), "result": e.result.code()});
+                if let Some(why) = &e.why {
+                    v["why"] = why.code().into();
+                }
+                v
+            })
             .collect(),
     )
 }
@@ -7302,6 +7324,60 @@ fn station_calls_decode_to_their_fields() {
         run.pass(format!("{name}: decoded"));
     }
     run.finish();
+}
+
+/// Typed reasons (O5): the goldens' reasons decode as the vocabulary's
+/// codes, and those of a later version as unrecognized, their results
+/// unchanged; every reason sits beside an effect not in force.
+#[test]
+fn station_call_reasons_are_known_or_unrecognized() {
+    let file = load(STATION_CALLS);
+    let case = |name: &str| {
+        let c = file["calls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no golden {name}"));
+        ControlAck::decode(s(c, "wire").as_bytes()).unwrap()
+    };
+    let whys = |ack: &ControlAck| -> Vec<(ApplicationResult, Option<EffectWhy>)> {
+        ack.results
+            .iter()
+            .flat_map(|r| match r {
+                AckResult::Record { effects, .. } | AckResult::Entry { effects, .. } => {
+                    effects.clone()
+                }
+            })
+            .map(|e| (e.result, e.why))
+            .collect()
+    };
+    let known = whys(&case("control_ack_with_reasons"));
+    assert!(known.iter().any(|(r, _)| *r == ApplicationResult::Applied));
+    for (result, why) in &known {
+        let not_in_force = matches!(
+            result,
+            ApplicationResult::Pending | ApplicationResult::Refused
+        );
+        assert_eq!(why.is_some(), not_in_force, "{result:?}");
+        assert!(
+            why.as_ref()
+                .is_none_or(|w| matches!(w, EffectWhy::Known(_)))
+        );
+    }
+    let later = whys(&case("control_ack_with_unrecognized_reasons"));
+    assert_eq!(
+        later
+            .iter()
+            .map(|(r, w)| (*r, matches!(w, Some(EffectWhy::Unrecognized(_)))))
+            .collect::<Vec<_>>(),
+        [
+            (ApplicationResult::Refused, true),
+            (ApplicationResult::Refused, true),
+            (ApplicationResult::Pending, false),
+        ]
+    );
+    assert_eq!(later[1].1.as_ref().unwrap().code().len(), MAX_WHY_BYTES);
 }
 
 /// Every invalid variant is refused, with its code, by its side's reader and
@@ -7650,12 +7726,36 @@ fn station_call_vectors() -> Value {
     );
 
     // -------------------------------------------------------- control_ack
+    // Each effect `(effect, result, why)`: a reason (O5) only where the
+    // effect isn't in force.
+    let effects_why = |codes: &[(&str, &str, Option<&str>)]| -> Vec<EffectResult> {
+        codes
+            .iter()
+            .map(|(e, r, why)| EffectResult {
+                effect: EffectKind::from_code(e).unwrap(),
+                result: ApplicationResult::from_code(r).unwrap(),
+                why: why.map(|why| EffectWhy::read(why).unwrap()),
+            })
+            .collect()
+    };
+    let effects_why_json = |codes: &[(&str, &str, Option<&str>)]| -> Value {
+        Value::Array(
+            codes
+                .iter()
+                .map(|(e, r, why)| match why {
+                    Some(why) => json!({"effect": e, "result": r, "why": why}),
+                    None => json!({"effect": e, "result": r}),
+                })
+                .collect(),
+        )
+    };
     let effects = |codes: &[(&str, &str)]| -> Vec<EffectResult> {
         codes
             .iter()
             .map(|(e, r)| EffectResult {
                 effect: EffectKind::from_code(e).unwrap(),
                 result: ApplicationResult::from_code(r).unwrap(),
+                why: None,
             })
             .collect()
     };
@@ -7674,6 +7774,32 @@ fn station_call_vectors() -> Value {
                 effects: effects(codes),
             },
             json!({"record_id": id, "effects": effects_json(codes)}),
+        )
+    };
+    let record_why = |id: &str, codes: &[(&str, &str, Option<&str>)]| {
+        (
+            AckResult::Record {
+                record_id: id.to_owned(),
+                effects: effects_why(codes),
+            },
+            json!({"record_id": id, "effects": effects_why_json(codes)}),
+        )
+    };
+    let entry_why = |label: &str, applied_seq: u64, codes: &[(&str, &str, Option<&str>)]| {
+        let e = entry(label);
+        let seq = e["entry"]["body"]["seq"].as_u64().unwrap();
+        let hash = s(&e, "entry_hash").to_owned();
+        (
+            AckResult::Entry {
+                entry: EntryRef {
+                    seq,
+                    entry_hash: Hash32::from_hex(&hash).unwrap(),
+                },
+                applied_seq,
+                effects: effects_why(codes),
+            },
+            json!({"entry": {"seq": seq, "entry_hash": hash}, "applied_seq": applied_seq,
+                "effects": effects_why_json(codes)}),
         )
     };
     let entry_result = |label: &str, applied_seq: u64, codes: &[(&str, &str)]| {
@@ -7806,6 +7932,76 @@ fn station_call_vectors() -> Value {
                 )
             })
             .collect(),
+        &mut g,
+    );
+    // Typed reasons (O5, Astation's review of PR 2, #120 comment
+    // 6848326392): each effect not in force says why; information only.
+    ack(
+        "control_ack_with_reasons",
+        "partial effects with typed reasons (O5): each effect pending or refused says why, a code of the shared why vocabulary (a release issued before the hold in force, an interrupt waiting for its revocation, a stop signed by a removed manager on both its effects, a release that may be an evicted one replayed, a principal the list doesn't hold yet, an entry host-work hasn't applied); the effects in force beside them say nothing. A reason never changes a result and counts nothing",
+        &feed,
+        9,
+        vec![
+            record_why(
+                &record_id("W1_release_withheld"),
+                &[("release", "refused", Some("not_after_hold"))],
+            ),
+            record_why(
+                &record_id("S6_interrupt"),
+                &[("interrupt", "pending", Some("not_revoked"))],
+            ),
+            record_why(&record_id("S1_cover"), &[("cover", "applied", None)]),
+            record_why(
+                &record_id("S5_revoke_interrupt"),
+                &[
+                    ("revocation", "duplicate", None),
+                    ("interrupt", "applied", None),
+                ],
+            ),
+            record_why(
+                &record_id("M3_revoke_by_removed_manager"),
+                &[
+                    ("revocation", "refused", Some("removed_manager")),
+                    ("interrupt", "refused", Some("removed_manager")),
+                ],
+            ),
+            record_why(
+                &record_id("S3_release"),
+                &[("release", "refused", Some("possible_replay"))],
+            ),
+            record_why(
+                &record_id("V5_principal_unknown"),
+                &[("revocation", "pending", Some("principal_unknown"))],
+            ),
+            entry_why(
+                "HS7_revoke",
+                6,
+                &[("revocation", "pending", Some("revoke_not_applied"))],
+            ),
+        ],
+        &mut g,
+    );
+    let longest = format!("a_later_reason_{}", "z".repeat(MAX_WHY_BYTES - 15));
+    assert_eq!(longest.len(), MAX_WHY_BYTES);
+    ack(
+        "control_ack_with_unrecognized_reasons",
+        "reasons this reader doesn't know (a later version's), one at the 64-byte bound: well formed (1 to 64 bytes of [a-z0-9_]), so read as unrecognized, information only; each result is unchanged and the reason is written back as it came",
+        &feed,
+        9,
+        vec![
+            record_why(
+                &record_id("W1_release_withheld"),
+                &[("release", "refused", Some("a_later_reason"))],
+            ),
+            record_why(
+                &record_id("W2_release_refused_before"),
+                &[("release", "refused", Some(&longest))],
+            ),
+            record_why(
+                &record_id("S6_interrupt"),
+                &[("interrupt", "pending", Some("not_revoked"))],
+            ),
+        ],
         &mut g,
     );
 
@@ -8348,6 +8544,53 @@ fn station_call_vectors() -> Value {
     g.bad_edit("control_ack_feed_id_missing", a, "malformed", |v| {
         v.as_object_mut().unwrap().remove("feed_id");
     });
+    // Typed reasons (O5): `why` refuses the whole ack when it isn't a
+    // well-formed reason beside an effect not in force.
+    let r = "control_ack_with_reasons";
+    for (name, why) in [
+        ("control_ack_why_null", Value::Null),
+        ("control_ack_why_not_a_string", json!(7)),
+        ("control_ack_why_empty", json!("")),
+        (
+            "control_ack_why_over_64_bytes",
+            json!("z".repeat(MAX_WHY_BYTES + 1)),
+        ),
+        ("control_ack_why_upper_case", json!("Not_after_hold")),
+        (
+            "control_ack_why_outside_the_characters",
+            json!("not-after-hold"),
+        ),
+    ] {
+        g.bad_edit(name, r, "malformed", |v| {
+            v["results"][0]["effects"][0]["why"] = why
+        });
+    }
+    g.bad_edit("control_ack_why_beside_applied", r, "malformed", |v| {
+        v["results"][2]["effects"][0]["why"] = json!("order")
+    });
+    g.bad_edit("control_ack_why_beside_duplicate", r, "malformed", |v| {
+        v["results"][3]["effects"][0]["why"] = json!("order")
+    });
+    g.bad_edit(
+        "control_ack_effect_unknown_field",
+        r,
+        "unknown_field",
+        |v| v["results"][0]["effects"][0]["reason"] = json!("not_after_hold"),
+    );
+    let wire = g.wires[r].clone();
+    let doubled = wire.replacen(
+        r#""why":"not_after_hold""#,
+        r#""why":"order","why":"not_after_hold""#,
+        1,
+    );
+    assert_ne!(doubled, wire);
+    g.bad(
+        "control_ack_why_duplicate_key",
+        "control_ack",
+        "to_station",
+        "not_strict",
+        doubled,
+    );
 
     // membership_fetch
     let f = "membership_fetch";

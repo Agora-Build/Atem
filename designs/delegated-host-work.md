@@ -72,7 +72,10 @@ Astation on 2026-11-13, #120 comment 6848326392; the built form for its sign-off
 release lifts a hold only when issued strictly after every hold the host verified for the principal (a hold that found
 it held, read out of order, from another feed or none, or under a counted id included), so a release a carrier withheld
 can't lift a newer hold; the host keeps that hold's time in the principal's part, and no eviction, reset, coverage
-change or restart erases it. The design text below is unchanged; the contract states the refinement.
+change or restart erases it. I.5.8's acknowledgment gains typed reasons (O5, requested by Astation on the same day): each
+effect `pending` or `refused` in a `control_ack` may say why, a bounded code of the shared vocabulary, information only
+(it never changes a result, counts nothing and asks for no re-signing; host-work-v1 §11.4 wire rule 10). The design
+text below is unchanged; the contract states the refinement.
 
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256

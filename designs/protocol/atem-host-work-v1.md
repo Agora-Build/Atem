@@ -1311,7 +1311,8 @@ position and under a counted id, restart and eviction from an `initial`
 state, a reset and a coverage change, a legitimate newer release, and no
 release after a revoke), each part's `hold_issued_at`, and `Q10` and `Q11`
 whose covering feed's release issued before the hold is now refused and a
-newer one lifts it.)
+newer one lifts it. O5: each effect `pending` or `refused` in `expect`
+carries the step's `why`, and one in force none.)
 They run in `crates/atem-client/tests/vectors.rs`, in the bindings'
 `tests/control.rs` and in the Swift, Kotlin and WASM conformance suites;
 `scripts/check-r9-vectors.py` recomputes their cryptographic values
@@ -1685,6 +1686,35 @@ not these rules):
    are all entry results or results for records bound to no feed (a host
    principal's `interrupt_running`): it names the host's own Station feed
    (the feed of the Station its link reaches) and its cursor there.
+10. **Typed reasons** (**O5, requested by Astation (2026-11-13, #120
+    comment 6848326392)**; amended for step 4, the exact shape for
+    Astation's review). Each effect of a result may carry `why`, a code of
+    the shared vocabulary (§11.1, "The state, per principal": `Applied.why`'s
+    codes), `{"effect":"release","result":"refused","why":"not_after_hold"}`.
+    - **Writer.** An authenticated host writes a reason exactly where its
+      effect result has one: beside `pending` or `refused`, never beside
+      `applied` or `duplicate`. A host never re-signs anything for it.
+    - **Reader.** Absent: no reason. `null`, a value that isn't a text, an
+      empty text, more than 64 bytes or a character outside `[a-z0-9_]`,
+      and a reason beside `applied` or `duplicate`: the whole ack is
+      `malformed`. A well-formed reason the reader doesn't know (a later
+      version's) is read as unrecognized, its result unchanged: a reason is
+      information only, so a new one never breaks an older Station. A
+      duplicate key anywhere refuses the whole ack, as in every message of
+      these readers (`not_strict`: the strict parse's code; Atem's reading
+      of "malformed" in Astation's ruling, which names the refusal, not the
+      code); a field beside an effect other than `why` is `unknown_field`.
+    - **Information only.** A reason never changes an application result,
+      never counts and never advances evidence by itself: the results
+      still describe only effects durably committed on the host. The
+      Station must not take a reason for a request to re-sign: a fresh
+      signature is a new authorization decision, made only after the
+      Station confirmed the current authoritative state still asks for it.
+      `possible_replay`, ordering (`order`, `not_after_hold`), revocation
+      (`after_revoke`) and the verifier's refusals are not interchangeable.
+    - **Unchanged:** the step-3 refusals (`control_sync_refused`,
+      `membership_fetch_refused`, `control_ack_refused`) stay exactly as
+      agreed, byte for byte; a `control_records_result` carries no reason.
 
 **Real budgets.** The 256 KiB bound counts the whole message, so a Station
 fills a page below it: 64 records of the largest size (a 4,096-byte body
@@ -1830,7 +1860,8 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
   is the record's durable per-effect application result (§11.1:
   `applied`, `duplicate`, `pending`, `refused`). Only `applied` and
   `duplicate` say an effect is in force on that host; the Station counts
-  nothing from the cursor, `pending` or `refused`.
+  nothing from the cursor, `pending` or `refused`, nor from a reason
+  (wire rule 10, O5, amended for step 4).
 - **When a host acknowledges** (**Atem's proposal, agreed with Astation
   (2026-11-11, #120 comment 6810116314)**; the design leaves it open). After each page's transaction
   committed, the results of that page's records, with the new cursor. Since
@@ -2070,7 +2101,9 @@ R9.9). Their wire is written with stage 3.
 `fixtures/schema.md`, "Station acknowledgment steps"; design test 48):
 `r9-control-ack-resign` (a native stop refused under the strict rule while
 the cursor moves past it, its re-sign alert kept, the re-signed copy
-applied, and a host that applied the original done for the copy),
+applied, and a host that applied the original done for the copy; the
+refused and pending results carry their typed reasons, which count
+nothing and re-sign nothing: O5, **for Astation**, amended for step 4),
 `r9-control-ack-per-effect` (a revoke that adds an interrupt, one
 `revocation_applied` per host and integration, a native revoke applied
 first and named, a host that applied the revocation through another
@@ -2109,7 +2142,15 @@ builder refuses them; a `null` or a string record kept as evidence is
 `control_ack` with both result forms, `membership_fetch` and its result, and
 the three refusals; and the invalid variants a reader refuses, each with its
 code (an unknown field, a `null`, a duplicate key, an unknown refusal code
-and a count over 64 among them). The 256 KiB bound is pinned for each call
+and a count over 64 among them). (**For Astation**, amended for step 4,
+O5: `control_ack_with_reasons`, partial effects whose effects not in force
+say why beside effects in force that say nothing, and
+`control_ack_with_unrecognized_reasons`, codes of a later version, one at
+64 bytes, read as unrecognized with their results unchanged; and each
+refused form of a reason, `control_ack_why_*`: `null`, not a text, empty,
+over 64 bytes, upper case, outside `[a-z0-9_]`, beside `applied`, beside
+`duplicate`, a duplicate `why` key (`not_strict`), and another field beside
+an effect (`unknown_field`). The checker's reader takes the same rules.) The 256 KiB bound is pinned for each call
 that can carry a large page, `control_sync_result` and
 `membership_fetch_result`: a text of exactly 262,144 bytes is read, and one
 of 262,145 and one of 300,000 bytes are `too_large` (no 512 KiB exemption
