@@ -573,9 +573,15 @@ impl ControlSyncResult {
 
     /// Whether this page answers `call`: the same `request_id`, the same
     /// `origin`, the same `feed_id` when the call named one (a call that
-    /// named none, from 0, is answered on whichever feed the page names:
-    /// the account's current one) and the same `after`. `Ok(())` when it
-    /// does; else the first field that differs, in that order.
+    /// named none, from 0, is answered on whichever feed the page names;
+    /// this helper can't tell that it is the account's current feed: the
+    /// caller checks it against the own feed this generation's `heads`
+    /// announced) and the same `after`. `Ok(())` when it does; else the
+    /// first field that differs, in that order.
+    ///
+    /// An answering page whose `head` is below its `after` (it has no
+    /// records) says the feed went back: the caller marks a rescan from 0
+    /// durably and never moves its cursor on it.
     ///
     /// The one decision the host and Astation's `:8080` proxy share. It
     /// compares the two messages only: the caller compares the rest of what

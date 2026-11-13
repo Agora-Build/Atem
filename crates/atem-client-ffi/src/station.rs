@@ -430,6 +430,12 @@ pub fn relay_control_sync_result(
 /// advances nothing and opens no gate. A `request_id` is a correlation
 /// value, never authorization. A refusal (`control_sync_refused`) names a
 /// call kind and carries no id: it is never a result here.
+///
+/// A call from 0 that named no feed is answered on whichever feed the
+/// result names; check it against the own feed this generation's `heads`
+/// announced. An answering result whose `head` is below its `after` (no
+/// records) says the feed went back: mark a rescan from 0 durably and
+/// never move the cursor on it.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
 pub fn relay_control_sync_answers(call: String, result: String) -> Result<RelaySyncVerdict> {
     let call = ControlSync::decode(call.as_bytes())?;

@@ -1295,7 +1295,8 @@ unit_enum! {
     /// differs, in this order.
     pub enum RelaySyncVerdict {
         /// The same `request_id`, origin, feed (when the call named one) and
-        /// `after`.
+        /// `after`. With `head` below `after` (no records), the feed went
+        /// back: rescan from 0, never move the cursor.
         Answers,
         /// Another call's id: a retired, timed-out or old generation's call,
         /// or none.
