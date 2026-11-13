@@ -710,7 +710,10 @@ impl ControlRecordsRequest {
 pub struct RecordResult {
     pub record_id: String,
     pub result: ApplicationResult,
-    /// Every effect the record carries, once each.
+    /// Every effect the record carries, once each. Their reasons (`why`)
+    /// aren't carried: a `control_records_result` has none (step 3's wire,
+    /// unchanged; typed reasons, O5, are the Station acknowledgment's), so
+    /// they are written without one and read as `None`.
     pub effects: Vec<EffectResult>,
 }
 

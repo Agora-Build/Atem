@@ -740,9 +740,11 @@ def check_host_work_control(file, data, report, context):
     it), each service record's principal_key against the r9_svc of the
     principal's auth_key, each step's position against the stations, and
     the record digests a sequence's state keeps (by principal, then
-    record_id: the SHA-256 of a body of that principal with that id).
-    Verdicts and per-effect results are the Rust runner's and the binding
-    suites' (R9.12)."""
+    record_id: the SHA-256 of a body of that principal with that id), each
+    `why` (of its kind, and on each effect exactly when it isn't in force),
+    and, from the steps alone, the bound (derive_bound) and O1's signed-time
+    rule (derive_hold_time). Verdicts and other per-effect results are the
+    Rust runner's and the binding suites' (R9.12)."""
     keys = context["keys"]
     mlog = context["membership_log"]
     entries = {v["label"]: v["entry"]["body"] for v in mlog["log"] + mlog["others"]}
@@ -2514,9 +2516,11 @@ def check_station_calls(file, data, report, context):
     allowed more for either (the 512 KiB of stage 3's mailbox calls is no
     exemption for `membership_fetch_result`) fails. A record that is not a
     JSON object is `malformed` to the signed-object parse (R9.1: a signed
-    object is an object), derived here. The builders' exact bytes are the
-    Rust runner's (`station_calls_build_byte_for_byte`) and the binding
-    suites'."""
+    object is an object), derived here. An effect's typed reason (O5) is
+    read by the same rules as the Rust reader: absent, or 1 to 64 bytes of
+    [a-z0-9_] beside `pending` or `refused`, a code outside the vocabulary
+    read as unrecognized. The builders' exact bytes are the Rust runner's
+    (`station_calls_build_byte_for_byte`) and the binding suites'."""
     mlog = context["membership_log"]
     control = context["host_work_control"]
     with report.case(file, "bound") as case:
