@@ -814,7 +814,13 @@ impl HostBridge {
                     }
                     self.collab_reply_pass()
                 })
-                .and_then(|_| self.schedule_work(cx))
+                .and_then(|_| {
+                    // Debug builds: held by the test (`hold_host_work`).
+                    if crate::runtime::test_hooks::host_work_held() {
+                        return Ok(());
+                    }
+                    self.schedule_work(cx)
+                })
                 .and_then(|_| self.work_cleanup());
             if passed.is_err() {
                 self.work_fail();
@@ -2034,12 +2040,17 @@ impl HostBridge {
             return Ok(());
         }
         // A delegated task of unknown outcome says why, as its receipt does
-        // (`agent exited`, `outcome could not be established`, session-v1
-        // R9.14 item 6): the reason the owner's alert names (`host.alerts`).
-        if let (true, ReceiptState::OutcomeUnknown, Some(detail)) =
-            (r.delegated.is_some(), receipt.state, &receipt.detail)
-        {
-            r.status.detail = detail.clone();
+        // (§11.6's `agent exited`, `outcome could not be established`,
+        // `write interrupted`; session-v1 R9.14 item 6): the reason the
+        // owner's alert names (`host.alerts`).
+        if let (true, ReceiptState::OutcomeUnknown, Some(reason)) = (
+            r.delegated.is_some(),
+            receipt.state,
+            details::UNKNOWN_OUTCOME_REASONS
+                .into_iter()
+                .find(|reason| receipt.detail.as_deref() == Some(*reason)),
+        ) {
+            r.status.detail = reason.into();
             if let Some(reply) = self.collab_reply_of(&r.task.task_id) {
                 collab_bridge::apply_reply(r, &reply);
             }

@@ -71,6 +71,8 @@ struct Rig {
     faults: bool,
     /// The device-list hooks (`ATEM_TEST_MEMBERSHIP_FAULTS`).
     membership: bool,
+    /// The broker's state after each pass (`ATEM_TEST_STATE_DUMP`).
+    dump: bool,
 }
 
 impl Rig {
@@ -145,6 +147,7 @@ principals = {principals}
             clock: None,
             faults: false,
             membership: false,
+            dump: false,
         }
     }
 
@@ -172,6 +175,10 @@ principals = {principals}
         self.sandbox.dir.path().join("membership")
     }
 
+    fn dump_file(&self) -> PathBuf {
+        self.sandbox.dir.path().join("state.json")
+    }
+
     fn start(&mut self) {
         let output = std::fs::OpenOptions::new()
             .create(true)
@@ -194,6 +201,9 @@ principals = {principals}
         if self.membership {
             std::fs::create_dir_all(self.membership_dir()).unwrap();
             command.env("ATEM_TEST_MEMBERSHIP_FAULTS", self.membership_dir());
+        }
+        if self.dump {
+            command.env("ATEM_TEST_STATE_DUMP", self.dump_file());
         }
         // A stale socket file of a killed runtime isn't the new one's.
         let _ = std::fs::remove_file(self.sandbox.config().join("runtime.socket"));
@@ -334,6 +344,29 @@ impl Dev {
                     }
                 }
             }
+        }
+    }
+
+    /// The read binding of `sid` (after `list`).
+    fn read(&self, sid: &str) -> Value {
+        json!({"target": self.a.target(sid).expect("listed"),
+               "attachment_gen": self.a.welcome().attachment_gen})
+    }
+
+    /// Lists the sessions until `sid` is among them.
+    fn list(&mut self, r: &mut Router, sid: &str) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            self.send(r, json!({"op":"list"}));
+            let sessions = self.wait(r, |v| v["op"] == "sessions");
+            if sessions["sessions"]
+                .as_array()
+                .is_some_and(|all| all.iter().any(|d| d["session_id"] == sid))
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{sid} never listed: {sessions}");
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
 
@@ -864,40 +897,112 @@ fn local_tasks_never_wait_for_a_gate() {
     assert!(attempts(&rig, &gated["task_id"]).is_empty());
 }
 
-/// VII.A test 17 (design I.4.3 condition 2a, Decision 16): the phone's
-/// attempt waits `accepted` (the broker's `hold_dispatch`) when a
-/// conflicting entry (the runtime's own fetch carries it) freezes the
-/// device list. The attempt never starts: it is withdrawn, and the task
-/// fails `sender's authority changed`, its prompt never written.
+/// The broker's state after a pass (`ATEM_TEST_STATE_DUMP`), as a JSON
+/// value (`Null` before the first).
+fn dumped(rig: &Rig) -> Value {
+    std::fs::read_to_string(rig.dump_file())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or(Value::Null)
+}
+
+/// Waits for two passes of the broker begun after now: whatever a marker
+/// file said before was read again since.
+fn two_passes(rig: &Rig) {
+    let pass = |rig: &Rig| dumped(rig)["pass"].as_u64().unwrap_or(0);
+    let now = pass(rig);
+    within("two passes", || pass(rig) >= now + 2);
+}
+
+/// The session host's receipt of `rid`, as the state dump shows it.
+fn receipt(rig: &Rig, rid: &str) -> Value {
+    dumped(rig)["receipts"][rid].clone()
+}
+
+/// VII.A test 17 (design I.4.3 condition 2a, Decision 16; session-v1 R9.14
+/// item 3): the start check refuses an attempt a freeze stops, before
+/// host-work has processed the freeze. The session's queue holds the Mac's
+/// own prompt, then the phone's attempt (host-work's submit, made once the
+/// broker's `hold_dispatch` is gone, starts the Mac's turn ahead of it), so
+/// the attempt waits `accepted` behind a running turn. Host-work's
+/// scheduling is then held (`hold_host_work`) and a conflicting entry (the
+/// runtime's own fetch carries it) freezes the device list. The Mac's turn
+/// ends; the session host asks the start check, which withdraws the attempt
+/// (`withdrawn by the host`) while host-work's store still shows the task
+/// `submitted` with its attempt live. Released, host-work settles it from
+/// the withdrawal: `failed`, `sender's authority changed`, one attempt
+/// `withdrawn`, its prompt never written.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_MEMBERSHIP_FAULTS hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS, ATEM_TEST_PTY_FAULTS, ATEM_TEST_MEMBERSHIP_FAULTS and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn a_freeze_at_the_start_fails_the_attempt() {
     let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_controls(gate_open());
     rig.faults = true;
     rig.membership = true;
+    rig.dump = true;
     rig.start();
     let mut r = Router::new(&rig.astation);
     let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
+    let sid = launch["session_id"].as_str().unwrap().to_string();
+    let mut mac = Dev::new(&mut r, &rig.log, MAC, false);
+    mac.list(&mut r, &sid);
     let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    private(&rig.faults().join("hold_dispatch"), "");
+    let hold_host_work = rig.faults().join("hold_host_work");
+    let hold_dispatch = rig.faults().join("hold_dispatch");
+    private(&hold_host_work, "");
+    private(&hold_dispatch, "");
+    two_passes(&rig);
     let held = task(&launch, "FROZEN_AT_START", HOUR);
-    enqueue(&mut phone, &mut r, &held);
+    assert_eq!(enqueue(&mut phone, &mut r, &held)["state"], "queued");
+    // The Mac's prompt is accepted first; the Mac gives the lease back.
+    let accepted = mac.request(
+        &mut r,
+        json!({"op":"submit","binding":mac.read(&sid),"kind":"prompt","request_id":uuid(),
+            "acquire":true,"payload":{"text":"MAC_TURN"}}),
+    );
+    assert_eq!(
+        (&accepted["op"], &accepted["state"]),
+        (&json!("receipt"), &json!("accepted")),
+        "{accepted}"
+    );
+    let lease = mac.request(
+        &mut r,
+        json!({"op":"acquire","binding":mac.read(&sid),"takeover":false}),
+    );
+    assert_eq!(lease["op"], "lease", "{lease}");
+    let released = mac.request(&mut r, json!({"op":"release","binding":lease["binding"]}));
+    assert_eq!(released["op"], "lease_released", "{released}");
+    // The dispatch goes on (seen by the broker before host-work's next
+    // pass); then host-work's submit queues the attempt behind the Mac's
+    // prompt, whose turn begins.
+    std::fs::remove_file(&hold_dispatch).unwrap();
+    two_passes(&rig);
+    std::fs::remove_file(&hold_host_work).unwrap();
+    within("the Mac's turn", || input(&rig).contains("MAC_TURN"));
     let deadline = Instant::now() + WAIT;
-    while !(stored(&rig, &held["task_id"])["state"] == "submitted"
-        && ends(&rig, &held["task_id"]) == [None])
-    {
+    let attempt = loop {
+        let all = attempts(&rig, &held["task_id"]);
+        if let [(id, None)] = all.as_slice()
+            && receipt(&rig, id)["state"] == "accepted"
+            && stored(&rig, &held["task_id"])["state"] == "submitted"
+        {
+            break id.clone();
+        }
         assert!(
             Instant::now() < deadline,
-            "no attempt waits accepted: {}",
+            "no attempt waits accepted: {all:?} {}",
             stored(&rig, &held["task_id"])
         );
         std::thread::sleep(Duration::from_millis(40));
-    }
-    // A conflict: an entry at the head's own `seq` with another body.
+    };
+    // Host-work's scheduling held; the freeze: an entry at the head's own
+    // `seq` with another body.
+    private(&hold_host_work, "");
+    two_passes(&rig);
     let conflict = rig.log.conflicting_add("dev-other");
     replace(
         &rig.membership_dir().join("carry.json"),
@@ -906,7 +1011,19 @@ fn a_freeze_at_the_start_fails_the_attempt() {
     within("the carriage applied", || {
         rig.membership_dir().join("carried").exists()
     });
-    std::fs::remove_file(rig.faults().join("hold_dispatch")).unwrap();
+    let carried = std::fs::read_to_string(rig.membership_dir().join("carried")).unwrap();
+    assert!(carried.starts_with("Frozen"), "{carried}");
+    // The Mac's turn ends: the session host asks the start check.
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    within("the start check's withdrawal", || {
+        let rc = receipt(&rig, &attempt);
+        rc["state"] == "rejected" && rc["detail"] == "withdrawn by the host"
+    });
+    // Before host-work processed the freeze.
+    assert_eq!(stored(&rig, &held["task_id"])["state"], "submitted");
+    assert_eq!(ends(&rig, &held["task_id"]), [None]);
+    assert!(!input(&rig).contains("FROZEN_AT_START"));
+    std::fs::remove_file(&hold_host_work).unwrap();
     wait_stored(
         &rig,
         &held["task_id"],
@@ -914,12 +1031,10 @@ fn a_freeze_at_the_start_fails_the_attempt() {
         "sender's authority changed",
     );
     assert_eq!(
-        ends(&rig, &held["task_id"]),
-        [Some("withdrawn".to_string())]
+        attempts(&rig, &held["task_id"]),
+        [(attempt, Some("withdrawn".to_string()))]
     );
     assert!(!input(&rig).contains("FROZEN_AT_START"));
-    let carried = std::fs::read_to_string(rig.membership_dir().join("carried")).unwrap();
-    assert!(carried.starts_with("Frozen"), "{carried}");
 }
 
 /// VII.A test 20 (design I.5.8, "Native senders"; Task 19 review M2): no

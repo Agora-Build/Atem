@@ -44,6 +44,18 @@ pub const INTERRUPTED_AT_DEADLINE: &str = "interrupted at deadline";
 // Used by Task 23: unresolved outcomes.
 #[allow(dead_code)]
 pub const DEADLINE_PASSED_OUTCOME_UNKNOWN: &str = "deadline passed; outcome unknown";
+/// `outcome_unknown`, as its attempt's receipt says (session-v1 R9.14
+/// item 6, design I.6.3; Atem's addition): its agent exited; no turn state
+/// proves the turn ran or is current; or a write failed after it may have
+/// reached the agent. The session host's own texts.
+pub use crate::session_protocol::host::{
+    DETAIL_AGENT_EXITED as AGENT_EXITED, DETAIL_UNRECONCILED as OUTCOME_NOT_ESTABLISHED,
+    DETAIL_WRITE_INTERRUPTED as WRITE_INTERRUPTED,
+};
+/// The reasons a delegated task of unknown outcome takes from its
+/// attempt's receipt.
+pub const UNKNOWN_OUTCOME_REASONS: [&str; 3] =
+    [AGENT_EXITED, OUTCOME_NOT_ESTABLISHED, WRITE_INTERRUPTED];
 /// A `work_interrupt` result: the task's turn isn't the session's current
 /// turn (§11.2); that result only, never stored.
 // Used by Task 27: `work_interrupt`.
@@ -62,7 +74,7 @@ pub use crate::session_protocol::host::DETAIL_WITHDRAWN_BY_HOST as WITHDRAWN_BY_
 
 /// Every text, in the table's order.
 #[cfg(test)]
-pub const ALL: [&str; 18] = [
+pub const ALL: [&str; 21] = [
     PAUSED,
     REVOCATIONS_NOT_YET_CHECKED,
     DEVICE_LIST_UPDATE_PENDING,
@@ -77,6 +89,9 @@ pub const ALL: [&str; 18] = [
     EXPIRED_BEFORE_THE_SPAWN,
     INTERRUPTED_AT_DEADLINE,
     DEADLINE_PASSED_OUTCOME_UNKNOWN,
+    AGENT_EXITED,
+    OUTCOME_NOT_ESTABLISHED,
+    WRITE_INTERRUPTED,
     NOT_RUNNING,
     TOO_MANY_UNRESOLVED_OUTCOMES,
     WITHDRAWN_BY_THE_HOST,
@@ -138,6 +153,10 @@ mod tests {
             (failed, vec![EXPIRED_BEFORE_THE_SPAWN]),
             ("`awaiting_result`", vec![INTERRUPTED_AT_DEADLINE]),
             ("`outcome_unknown`", vec![DEADLINE_PASSED_OUTCOME_UNKNOWN]),
+            (
+                "`outcome_unknown`",
+                vec![AGENT_EXITED, OUTCOME_NOT_ESTABLISHED, WRITE_INTERRUPTED],
+            ),
             ("(a `work_interrupt` result)", vec![NOT_RUNNING]),
             ("(an error)", vec![TOO_MANY_UNRESOLVED_OUTCOMES]),
             (

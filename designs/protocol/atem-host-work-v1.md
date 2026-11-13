@@ -2398,6 +2398,7 @@ exact.
 | `failed` | `expired before the spawn` | a launch still waiting at the spawn boundary at its expiry |
 | `awaiting_result` | `interrupted at deadline` | a running turn interrupted at the task's deadline (then `expired` as today) |
 | `outcome_unknown` | `deadline passed; outcome unknown` | its deadline passed unresolved |
+| `outcome_unknown` | `agent exited`, `outcome could not be established`, `write interrupted` | (**Atem's addition, for Astation**) why, as its attempt's receipt says (session-v1 R9.14 item 6; design I.6.3: "the task follows"): its agent exited; no turn state proves its turn ran or is current (a restart's reconciliation); a write failed after it may have reached the agent. The reason the owner's alert names (§11.3) |
 | (a `work_interrupt` result) | `not running` | the task's turn isn't the session's current turn (§11.2) |
 | (an error) | `too many unresolved outcomes` | `busy`, the 64 or 256 limit |
 | (a receipt) | `withdrawn by the host`, `withdrawn at recovery` | session-v1 R9.14 items 3, 4 and 6; the task's state follows the event |

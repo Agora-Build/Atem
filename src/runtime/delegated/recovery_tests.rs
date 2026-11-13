@@ -339,14 +339,42 @@ fn recovery_runs_in_the_designs_order() {
 /// crash between the commit and the submit) ends `not_admitted`, and one
 /// the session host had `accepted` is withdrawn at recovery (R9.14 item 6)
 /// and ends `withdrawn`: both tasks go back to `queued`, neither attempt is
-/// live or sent again, and each task then runs once, on a new attempt.
+/// live or sent again, and each task then runs once, on a new attempt. A
+/// third attempt `accepted` at the crash is a tablet's, whose removal was
+/// carried before it (I.6.3: "becomes `cancelled` (`sender revoked`) if its
+/// sender has been revoked in the meantime"): its attempt ends `withdrawn`
+/// and the task takes the event's state, never a second attempt.
 #[test]
 fn absent_or_accepted_attempt_returns_to_queued() {
+    use atem_client::channel::Principal;
     local_test(async |root| {
         let mut rig = LocalRig::new(root).await;
         let start = host_now().wall_ms;
         let os = ManualOs::at(start);
-        let (phone, _) = delegated(&mut rig, root, &os, true);
+        let (phone, mut log) = delegated(&mut rig, root, &os, true);
+        // A tablet (a native member holding `control`) and its route `rt`.
+        let added = log.add_native("dev-tablet", &["control", "view"]);
+        carry(&mut rig, &log, added);
+        rig.bridge
+            .work
+            .config
+            .routes
+            .push(crate::runtime::host_work::Route {
+                id: "rt".into(),
+                revision: 1,
+                profile_id: "p".into(),
+                principals: vec!["member:dev-tablet".into()],
+                labels: vec![],
+                launch: Default::default(),
+                results: false,
+                auto_report: Default::default(),
+            });
+        let tablet = resolve(
+            &log,
+            Principal::Native {
+                device_id: "dev-tablet".into(),
+            },
+        );
         let running = phone_task(&mut rig, &phone, "QUEUED_RUNNING", start + 3 * HOUR);
         turn_journaled(&mut rig, &running, "QUEUED_RUNNING").await;
         let absent = phone_task(&mut rig, &phone, "QUEUED_ABSENT", start + 3 * HOUR);
@@ -359,7 +387,15 @@ fn absent_or_accepted_attempt_returns_to_queued() {
             )
             .await;
         }
+        let removed = phone_task_on(&mut rig, &tablet, "rt", "QUEUED_REMOVED", start + 3 * HOUR);
+        blocked(
+            &mut rig,
+            &removed,
+            "waiting for an earlier task on this session",
+        )
+        .await;
         let accepted_attempt = attempt_behind_the_turn(&mut rig, &accepted, "QUEUED_ACCEPTED");
+        let removed_attempt = attempt_behind_the_turn(&mut rig, &removed, "QUEUED_REMOVED");
         let absent_attempt = committed_attempt(&mut rig, &absent);
         assert!(
             rig.bridge
@@ -367,10 +403,19 @@ fn absent_or_accepted_attempt_returns_to_queued() {
                 .attempt_receipt(&absent_attempt, &absent)
                 .is_none()
         );
+        // The tablet's removal commits; host-work's pass never sees it.
+        let removal = log.remove("dev-tablet");
+        carry(&mut rig, &log, removal);
         let steps = restart(&mut rig, root, &os, false, false);
         let queued = Some((WorkState::Queued, "waiting for a ready agent".to_string()));
         assert_eq!(reconciled(&steps, &absent), queued);
         assert_eq!(reconciled(&steps, &accepted), queued);
+        let cancelled = Some((WorkState::Cancelled, details::SENDER_REVOKED.to_string()));
+        assert_eq!(reconciled(&steps, &removed), cancelled);
+        assert_eq!(
+            attempts(&rig, &removed),
+            [(removed_attempt.clone(), Some("withdrawn".into()), true)]
+        );
         let receipt = rig
             .bridge
             .host
@@ -391,7 +436,7 @@ fn absent_or_accepted_attempt_returns_to_queued() {
             attempts(&rig, &accepted),
             [(accepted_attempt.clone(), Some("withdrawn".into()), true)]
         );
-        for attempt in [&absent_attempt, &accepted_attempt] {
+        for attempt in [&absent_attempt, &accepted_attempt, &removed_attempt] {
             assert!(!rig.bridge.start_view().is_live(attempt));
         }
         rig.bridge.start_view().gates.open_own_station(ORIGIN);
@@ -411,6 +456,13 @@ fn absent_or_accepted_attempt_returns_to_queued() {
             assert_eq!(&all[0].0, first);
             assert_eq!(all[1].1.as_deref(), Some("started"));
         }
+        // The removed tablet's task: no second attempt, never written.
+        assert!(!text.contains("QUEUED_REMOVED"));
+        assert_eq!(
+            settled(&rig, &removed),
+            (WorkState::Cancelled, details::SENDER_REVOKED.into())
+        );
+        assert_eq!(attempts(&rig, &removed).len(), 1);
     });
 }
 

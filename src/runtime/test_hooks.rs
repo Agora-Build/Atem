@@ -132,11 +132,18 @@
 //!   standings (a service its `coverage` names is a delegated sender). The
 //!   start's recovery closes every gate (design I.6.2 step 7); the next
 //!   pass reads the file again, as a feed's sync would open it. A missing
-//!   file is no feed; one that doesn't parse too, with a runtime.log line.
+//!   file is no feed (no standing, every Station gate closed, also in the
+//!   start view); one that doesn't parse too, with a runtime.log line.
 //!   Write it to a temporary name and rename it into place.
 //! - `<ATEM_TEST_PTY_FAULTS dir>/crash_after_attempt_commit`: the runtime
 //!   kills itself (`SIGKILL`) right after the next delegated attempt's row
 //!   committed, before its submit (VII.A test 7).
+//! - `<ATEM_TEST_PTY_FAULTS dir>/hold_host_work`: while it exists,
+//!   host-work's scheduling pass (`schedule_work`) doesn't run: requests
+//!   are still answered and the start's recovery still runs, but no task is
+//!   dispatched, settled or withdrawn by host-work, so what the session
+//!   host does meanwhile (the start check at `executing`, VII.A test 17) is
+//!   seen before host-work processes it.
 //!
 //! Like the other hooks, these are read from the process environment once:
 //! a unit-test process started with one set sees it in every `HostBridge`
@@ -415,6 +422,16 @@ mod imp {
 
     pub fn launches_held() -> bool {
         faults_dir().is_some_and(|dir| dir.join("hold_launches").exists())
+    }
+
+    pub fn host_work_held() -> bool {
+        faults_dir().is_some_and(|dir| dir.join("hold_host_work").exists())
+    }
+
+    /// The stand-in for the feeds is named (whatever its file holds).
+    pub fn host_controls_named() -> bool {
+        static CELL: OnceLock<Option<PathBuf>> = OnceLock::new();
+        env_path("ATEM_TEST_HOST_CONTROLS", &CELL).is_some()
     }
 
     pub fn no_init_limit() -> bool {
@@ -724,11 +741,15 @@ impl crate::runtime::delegated::ControlView for HostControls {
 }
 
 /// The stand-in for the control feeds (`ATEM_TEST_HOST_CONTROLS`), as its
-/// file says now: none without the hook, or while the file is missing or
-/// doesn't parse (no feeds, as in a release build).
+/// file says now: none without the hook; with it, the empty stand-in (no
+/// feed: no standing, every Station gate closed) while the file is missing
+/// or doesn't parse.
 #[cfg(debug_assertions)]
 pub fn host_controls() -> Option<HostControls> {
-    imp::host_controls()
+    if !imp::host_controls_named() {
+        return None;
+    }
+    Some(imp::host_controls().unwrap_or_default())
 }
 
 /// The next device-list write fault (`<file>:<step>`), once.
@@ -907,6 +928,16 @@ pub fn hold_dispatch() -> Option<bool> {
 #[cfg(debug_assertions)]
 pub fn launches_held() -> bool {
     imp::launches_held()
+}
+
+/// Host-work's scheduling pass waits (`<pty faults>/hold_host_work`):
+/// requests are still answered and the start's recovery still runs, but no
+/// task is dispatched, settled or withdrawn by it. Release builds: never.
+pub fn host_work_held() -> bool {
+    #[cfg(debug_assertions)]
+    return imp::host_work_held();
+    #[cfg(not(debug_assertions))]
+    false
 }
 
 /// `init`s aren't rate-limited per link (`ATEM_TEST_NO_INIT_LIMIT`).
