@@ -59,7 +59,8 @@ these marks.
 `cc180912cd8d3afc11c20f77a3ebc4e8a81989ede1327afc90df52d09c39eb83`), changed only by this status block, Appendix B, the link to
 the diagram, the two Astation file references in XI (written so they are not read as paths in this repository), and
 one update marked "updated after agreement" in III.4 (the phone's login is live on dev, Auth #19), and the framing,
-host-mail and clock amendments above, and the marks of step 3's agreements. The diagram is
+host-mail and clock amendments above, the marks of step 3's agreements, and IX.1 Q7's answer (marked "answered in
+step 4"). The diagram is
 `delegated-host-work-flows.html` (frozen `flows.html`, SHA-256
 `587a4c74ca9c2645dd3a2c79908813da573451479c0a0a846896fd3ff909cf6a`), changed only in the phone's login in figures 1
 and 2, marked the same way, and, after step 3's agreements, in figure 1 (both hosts use the same Station) and
@@ -380,7 +381,7 @@ they can only be interrupted.
 | Narrowing (less scope, fewer ops, other roles) | Per the new grant | Those no longer covered fail `sender's authorization narrowed` | Continue | Kept; completable within the new grant | Readable within the new grant |
 | Pause, admin pause, owner disabled (`hold` record) | Refused (Auth issues no tokens; the Station refuses) | Held: `blocked`, detail `paused`, until `release` or the deadline | Continue | Kept | Kept |
 | Resume, owner enabled (`release` record) | Allowed again | Run again, if before their deadline | n/a | Kept | Readable |
-| Revocation (`revoke` record), or R9 removal of the sender | Refused for good | Cancelled: `cancelled`, detail `sender revoked` | Continue, or are interrupted if the record asks | Kept; only the owner can complete or resolve them | Kept; readable by the owner, not the sender |
+| Revocation (`revoke` record), or R9 removal of the sender | Refused for good | Cancelled: `cancelled`, detail `sender revoked` | Continue, or are interrupted if the record asks | Kept; the owner can query them, interrupt their turn and resolve an `outcome_unknown` one (I.4.5); nobody completes them, so one `awaiting_result` expires at its deadline (**amended 2026-11-13, #120 comment 6848463998**: it said "only the owner can complete or resolve them", but I.4.5 gives the owner no `work_complete`) | Kept; readable by the owner, not the sender |
 | Route revision, principals or profile changed | Per the new route | Fail `route changed` | Continue | Kept | Readable |
 | Device list frozen or faulted | Refused | Fail `sender's authority changed` (as today) | Continue | Kept | Kept |
 | Host leaves the device list, or host trust changes | Refused | Fail (as today; a new host identity starts an empty store) | Per session-v1 | Moved aside with the old store | Moved aside with the old store |
@@ -544,6 +545,11 @@ R4 bounds accepted tasks by their original deadline (at most 24 h after admissio
   task, an unexpired grant that isn't revoked or removed, and `notify` and `prompt` in the current grant.
 - A changed `control_gen` no longer forbids these calls, so a renewed grant reads its own tasks again.
 - A route change doesn't hide a task or its reply from its sender.
+- **A cancel is confirmed only by its commit.** `work_cancel` answers `cancelled` once the task's cancellation and its
+  attempt's end commit together. A crash after the withdrawal but before that commit leaves the caller uncertain:
+  recovery may queue a fresh, authorized attempt. The client queries the task and may cancel again; it never shows a
+  cancellation as confirmed from the withdrawal alone. This version keeps no cancel intent (**added 2026-11-13, #120
+  comment 6848463998**).
 
 **The owner.** A native member holding `control` at the host's current device-list head is the owner's voice. It may
 `work_query`, `reply_query` and `work_resolve` any task, including those of a revoked sender.
@@ -3169,6 +3175,20 @@ forced binding; the rooms the migration can't resolve are refused until claimed 
    beside it), with its relay fixture in Atem's protocol fixtures (III.1, test 48); Atem owns it (VIII.3), and IV row
    5 lists it as a contract change.
 7. Settle account-trust §3.4 and session-v1 R9.5 on the host's own relay fetch of the device list (V.3).
+   **Answered in step 4 (2026-11-13).** The host fetches the device list itself over its one link
+   (`membership_fetch`, host-work-v1 §11.4), behind `host.delegated` until activation; account-trust §3.4 says so in
+   place of "not implemented". It fetches when its Station's `heads` (every (re)connection, every 30 s, and at once
+   when the Station stores a control record) name a head beyond its own, which takes the place of R9.5's 15-minute
+   schedule (a Station that withholds `heads` could withhold the entries as well), and again at once when a deferral
+   it stopped at ends on this host (after a refusal's backoff, at the next `heads`). A fetch that stops at a deferred
+   entry asks nothing more while the deferral holds and the announced head is the same, and counts as fetched up to
+   that entry for the gate (I.5.8). "The announced head" is the last `heads`' device-list head, which the host's list
+   must hold as that very entry, `seq` and hash; a list that differs from the Station's keeps the gate closed
+   (host-work-v1 §11.4, "The gate", Atem's reading for Astation): the host's own fetch, `after` its head `seq`,
+   can't reveal a fork at or below that `seq`, a device's diverged window does (R9.3, R9.4), and a window fetch would
+   be a later wire item. The residual is I.5.8's accepted one: after a deferral's wait ends, a stale announced head
+   can let a task start before the deferred entry is carried again. R9.3 and R9.5 each gain one sentence, marked for
+   Astation's agreement (R9.5's as a changed agreed meaning).
 
 ### IX.2 Astation
 

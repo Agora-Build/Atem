@@ -78,6 +78,10 @@ pub struct StatusReport {
     pub local_agents: Line,
     /// The runtime's r9 device list, when it has one (`Device list:`).
     pub device_list: Option<Line>,
+    /// The runtime's delegated clock (`Clock:`, host-work-v1 §11.6): while
+    /// it holds deadlines back, while its record is damaged, and for a day
+    /// after a repair or a lowering.
+    pub clock: Option<Line>,
     /// Printed after the block (e.g. the reset steps for broken key files).
     pub notes: Vec<String>,
 }
@@ -333,6 +337,13 @@ pub fn gather_full(
         // No runtime: what the files say (read only).
         _ => passive_device_list_line(&src.paths.pairing, local_datetime),
     };
+    let clock = match runtime {
+        Look::Running {
+            status: Some(status),
+            ..
+        } => status.clock.clone().map(Line::new),
+        _ => None,
+    };
     let connected =
         matches!(runtime, Look::Running { status: Some(status), .. } if status.astation);
     if paired.as_ref().is_some_and(|p| p.relay_only) && !connected {
@@ -347,6 +358,7 @@ pub fn gather_full(
         relay,
         local_agents,
         device_list,
+        clock,
         notes,
     }
 }
@@ -600,6 +612,9 @@ pub fn render(report: &StatusReport) -> String {
     if let Some(line) = &report.device_list {
         out.push_str(&format!("{:<16}{}\n", "Device list:", line.value));
     }
+    if let Some(line) = &report.clock {
+        out.push_str(&format!("{:<16}{}\n", "Clock:", line.value));
+    }
     for note in &report.notes {
         out.push_str(note);
         out.push('\n');
@@ -801,6 +816,7 @@ pub(crate) mod tests {
             relay: Line::new("r"),
             local_agents: Line::new("l"),
             device_list: Some(line),
+            clock: None,
             notes: Vec::new(),
         };
         assert!(render(&report).contains("\nDevice list:    held ("));
@@ -889,6 +905,7 @@ pub(crate) mod tests {
             relay: Line::new("connected locally"),
             local_agents: Line::new("2 running (claude ready, codex ready)"),
             device_list: None,
+            clock: None,
             notes: Vec::new(),
         };
         assert_eq!(
@@ -953,6 +970,34 @@ pub(crate) mod tests {
         let report = super::tests::report(dir.path());
         assert!(!report.notes.iter().any(|note| note == RELAY_ONLY_NOTE));
         assert_eq!(report.pairing.value, "paired (astation-1, trust gen 1)");
+    }
+
+    /// The host clock's line, when the runtime reports one (it holds
+    /// delegated deadlines back, host-work-v1 §11.6), after the others.
+    #[test]
+    fn the_clock_line_shows_what_the_runtime_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        let quiet = gather_full(&src, None, &running(RuntimeStatus::default()));
+        assert_eq!(quiet.clock, None);
+        assert!(!render(&quiet).contains("Clock:"));
+        let text = crate::runtime::host_clock::AHEAD_ENABLE_SYNC;
+        let held = gather_full(
+            &src,
+            None,
+            &running(RuntimeStatus {
+                clock: Some(text.into()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(held.clock, Some(Line::new(text)));
+        assert!(
+            render(&held).contains(&format!("\nClock:          {text}\n")),
+            "{}",
+            render(&held)
+        );
+        // No runtime, no line.
+        assert_eq!(report(dir.path()).clock, None);
     }
 
     #[test]

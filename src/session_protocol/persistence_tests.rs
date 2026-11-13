@@ -301,6 +301,8 @@ fn the_refusal_list_survives_a_crash_around_its_rename() {
         kind: ReceiptKind::Prompt,
         payload_digest: "0".repeat(64),
         updated_at: 1,
+        detail: None,
+        provenance: None,
     };
     j.record_refusal(refusal(1)).unwrap();
     std::fs::write(state.join("refused.tmp"), b"half a file").unwrap();
@@ -596,6 +598,7 @@ fn recovered_work_is_resolved_before_a_connect_changes_control() {
         updated_at: 1,
         principal: "c1".into(),
         control_gen: 1,
+        provenance: None,
     })
     .unwrap();
     let mut host =

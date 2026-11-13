@@ -67,7 +67,8 @@
 //! that fails the link is closed without a reply. An orderly stop with a
 //! healthy journal writes the clean-close record (`close_cleanly`). At start
 //! (`recover`) recovered queued work is resolved in the appendix's order:
-//! refused (`acceptance not confirmed`), no clean close or lost control
+//! refused (the detail its refusal-list entry records: `acceptance not
+//! confirmed`, or `withdrawn by the host`), no clean close or lost control
 //! history (`authorization history unknown`: a queued request whose
 //! principal `principals` doesn't name at its `control_gen`), trust changed, an older `control_gen` (`control
 //! revoked`), else it waits for its principal to be welcomed with `control`
@@ -86,8 +87,38 @@
 //! lease, which it never needs, checks, takes or moves; an active rule of
 //! that exact process only, else `stale_target`), dispatched to the runtime
 //! like other work.
+//!
+//! Delegated host work (session-v1 R9.14, planned; only behind the
+//! runtime's debug-only hook): the host-local `host-work` principal has one
+//! internal attachment, connected and welcomed by the runtime (`welcome_r9`;
+//! an r8 `hello` never welcomes it) with `view` and `control`. It is no
+//! remote principal and is never fenced: its `control_gen` stays 1 through
+//! device-list fences, freezes and faults. It submits only through
+//! `submit_host_work`, whose provenance (`task_id`, `sender`) is recorded
+//! with `accepted` and carried by the request's receipts; no other receipt
+//! has one. It renews and releases its own leases (`renew`, `release`).
+//! Its requests become `executing` only after host-work's start check
+//! (`StartCheck`, `set_start_check`; none installed: never), asked in that
+//! same step; refused, they are `rejected` (`withdrawn by the host`) before
+//! any effect. Host-work may withdraw its own request (`withdraw`): an
+//! `accepted` one is rejected so, one not in the journal goes on the
+//! refusal list with that detail (a late submit gets that receipt, the
+//! restart records it; with the list full, a submit of it is `busy` in this
+//! run), an `executing` one is reported started, and an id recorded under
+//! another submitter is left alone. A
+//! `request_id` recorded under another submitter, where either is the
+//! `host-work` principal, is `request_id_reused` even with every immutable
+//! value equal (R9.14 items 3, 4, 7). Host-work interrupts its executing
+//! attempt's turn with the host's own authority (`host_interrupt`, item 5):
+//! the turn check first, then the input epoch and the revocation of
+//! another controller's lease (`revoked`), then the write; receipt-less,
+//! like local input. While the intent stays pending only the revocation
+//! repeats (`host_interrupt_revoke_lease`). The chat's half of the turn
+//! check is the runtime's, passed in as the request whose turn the chat
+//! shows running.
 
 use super::canonical::{self, MAX_SAFE_INTEGER};
+pub use super::journal::Provenance;
 use super::journal::{self, ControlState, Journal, JournalError, Record, Refusal, Stored, TurnIds};
 use super::revision::{FEATURES, RECEIPT_RESULT, REVISION};
 use super::wire::{
@@ -162,6 +193,20 @@ pub const DETAIL_TURN_DONE: &str = "done";
 /// An r8 `hello` on a host with a device list (r9 "No compatibility").
 pub const R8_REFUSED: &str = "this host has a device list: connect with atem-session revision 9";
 pub const DETAIL_TURN_INTERRUPTED: &str = "interrupted";
+/// A `host-work` request its start check refused, or host-work withdrew
+/// (session-v1 R9.14 items 3, 4): `rejected` before any effect.
+pub const DETAIL_WITHDRAWN_BY_HOST: &str = "withdrawn by the host";
+/// A recovered `accepted` request of the `host-work` principal (R9.14
+/// item 6): never confirmed, `rejected` at the start before anything is
+/// dispatched, whether or not the previous run ended cleanly.
+pub const DETAIL_WITHDRAWN_AT_RECOVERY: &str = "withdrawn at recovery";
+/// `busy` for a submit of a request host-work withdrew while the refusal
+/// list was full (R9.14 item 4): never admitted.
+pub const DETAIL_REFUSAL_LIST_FULL: &str = journal::REFUSAL_LIST_FULL;
+/// Requests held closed in memory once the refusal list is full
+/// (`Withdrawal::ListFull`), at most; one more halts the journal instead
+/// (`Withdrawal::Halted`), so memory stays bounded too.
+pub const MAX_UNLISTED: usize = 4096;
 
 // ── Inputs and outputs ────────────────────────────────────────────────────
 
@@ -305,6 +350,10 @@ pub enum Effect {
         request_id: String,
         target: Target,
         kind: ReceiptKind,
+        /// The turn a `host-work` prompt started, as journaled at the
+        /// chat's acceptance (R9.14 items 5, 6): reconciled with the
+        /// adopted worker's chat. `None` for every other request.
+        turn: Option<TurnIds>,
     },
     /// Hand the lease holder's answer to the agent's waiting permission
     /// prompt (`executing` is already durable). Report back with
@@ -334,6 +383,14 @@ pub enum Effect {
     PushResolved {
         approval_id: String,
         reason: ApprovalCloseReason,
+    },
+    /// Write the interrupt key to the session on the host's own authority
+    /// (session-v1 R9.14 item 5; `host_interrupt`): the input epoch already
+    /// moved. It is no submission and has no receipt; the runtime reports
+    /// what became of the write to host-work.
+    HostInterrupt {
+        session_id: String,
+        request_id: String,
     },
     /// A chat-v1 reply to the conversation that submitted (or was refused).
     /// The runtime's chat stream renders it with its own `generation` and
@@ -403,6 +460,93 @@ pub enum DispatchReport {
     FailedAfterPossibleEffect,
     /// Reconciliation could not establish the outcome.
     Unknown,
+    /// Reconciliation found the agent process the request ran in gone:
+    /// `outcome_unknown`, `agent exited` (R9.14 item 6).
+    AgentExited,
+}
+
+/// What the chat of the session a host-work prompt ran in shows at a start
+/// (session-v1 R9.14 items 5, 6): the adopted worker's chat as the
+/// runtime's bridge has it, or the fixtures' fake runtime's
+/// (`adopted_chat`). Read by `reconcile_turn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdoptedChat<'a> {
+    /// A live agent process of the prompt's `process_gen`: its worker was
+    /// adopted, and its agent hasn't exited.
+    pub live: bool,
+    /// The adopted worker's chat arrived (a worker with a chat adapter
+    /// sends it on connecting; one without sends none, and nothing is
+    /// waited for).
+    pub arrived: bool,
+    /// It has turn state (chat-v1; false: no chat, or it was withdrawn).
+    pub chat: bool,
+    pub current_turn: Option<&'a str>,
+    pub last_completed: Option<&'a str>,
+    /// How `last_completed` ended, when known.
+    pub last_outcome: Option<crate::chat::adapter::Outcome>,
+}
+
+/// How a host-work prompt `executing` at a start is reconciled
+/// (`reconcile_turn`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reconciled {
+    /// The adopted worker's chat hasn't arrived: decided later, at the
+    /// latest `RECONCILE_MS` after the start's recovery.
+    Wait,
+    /// The turn it started still runs: it stays `executing`, and the
+    /// runtime rebinds the chat's current turn to it.
+    Running,
+    /// Settled with this report.
+    Report(DispatchReport),
+}
+
+/// A host-work prompt's reconciliation waits this long at most for its
+/// adopted worker's chat after the start's recovery (as §H's confirmation
+/// window, `CONFIRM_MS`); then it is `outcome_unknown`, `outcome could not
+/// be established` (Task 16a's review, M1). The chat comes right after the
+/// worker's `hello`, so only a worker that breaks that rule ever reaches it.
+pub const RECONCILE_MS: u64 = CONFIRM_MS;
+
+/// The one decision table of the reconciliation of host-work's prompt
+/// `executing` at a start, which started `turn` (R9.14 items 5, 6),
+/// from `chat` (the runtime's bridge and the fixtures' fake runtime both
+/// read it). `expired`: `RECONCILE_MS` passed since the start's recovery.
+/// - its process gone → `outcome_unknown`, `agent exited`;
+/// - its chat not arrived → wait (past the bound: `outcome_unknown`);
+/// - no turn state → `outcome_unknown`: nothing can be established;
+/// - its turn ended → `completed` with that outcome and the turn's ids, or
+///   `outcome_unknown` when the outcome isn't known;
+/// - its turn still current → it runs (stays `executing`, rebound);
+/// - another turn current, or none → `outcome_unknown`: it ended, how is
+///   unknown.
+pub fn reconcile_turn(turn: &TurnIds, chat: &AdoptedChat<'_>, expired: bool) -> Reconciled {
+    let unknown = Reconciled::Report(DispatchReport::Unknown);
+    if !chat.live {
+        return Reconciled::Report(DispatchReport::AgentExited);
+    }
+    if !chat.arrived {
+        return if expired { unknown } else { Reconciled::Wait };
+    }
+    if !chat.chat {
+        return unknown;
+    }
+    let id = turn.turn_id.as_str();
+    if chat.last_completed == Some(id) {
+        let detail = match chat.last_outcome {
+            Some(crate::chat::adapter::Outcome::Done) => DETAIL_TURN_DONE,
+            Some(crate::chat::adapter::Outcome::Interrupted) => DETAIL_TURN_INTERRUPTED,
+            None => return unknown,
+        };
+        return Reconciled::Report(DispatchReport::Completed {
+            detail: Some(detail.to_string()),
+            turn_id: Some(id.to_string()),
+            user_message_id: Some(turn.user_message_id.clone()),
+        });
+    }
+    if chat.current_turn == Some(id) {
+        return Reconciled::Running;
+    }
+    unknown
 }
 
 /// What the runtime knows of an agent permission prompt (r7). The runtime
@@ -415,6 +559,148 @@ pub struct ApprovalInfo {
     pub tool: String,
     pub summary: String,
     pub always_rules: Vec<AlwaysRule>,
+}
+
+/// Host-work's start check (session-v1 R9.14 item 3; design I.4.3,
+/// conditions 2, 2a, 3, 4 and 5): asked once for each request of the
+/// `host-work` principal, in the step that would make it `executing`,
+/// after §H's dispatch check and before the `executing` record and any
+/// effect. It reads the runtime's committed state as it is at that moment
+/// (Decision 16: the views update when what they show commits), so
+/// anything committed before the step, in the same call chain too, is seen.
+/// `Send`, as the session host is.
+pub trait StartCheck: Send {
+    fn check(&self, req: &StartRequest<'_>) -> StartVerdict;
+}
+
+/// The request a start check is asked about.
+#[derive(Debug, Clone, Copy)]
+pub struct StartRequest<'a> {
+    /// The attempt's id (host-work-v1 §11.6).
+    pub request_id: &'a str,
+    pub session_id: &'a str,
+    pub process_gen: &'a str,
+    /// The delegated task and sender it attempts (R9.14 item 2).
+    pub provenance: &'a Provenance,
+}
+
+/// A start check's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartVerdict {
+    /// The step goes on as §6 says: `executing`, then the dispatch.
+    Go,
+    /// `rejected` (`withdrawn by the host`), before any effect.
+    Withdraw,
+}
+
+/// Tests: a check that always gives this verdict.
+#[cfg(test)]
+impl StartCheck for StartVerdict {
+    fn check(&self, _req: &StartRequest<'_>) -> StartVerdict {
+        *self
+    }
+}
+
+/// The immutable values (§6) of a `host-work` request host-work withdraws
+/// (R9.14 item 4), beside its `request_id`: what goes on the refusal list
+/// when the request isn't in the journal yet. The kind is `prompt`, the
+/// only one the principal submits. `provenance` is the attempt's
+/// (admission metadata, R9.14 item 2, kept with the entry so the receipt
+/// a late submit or the restart gives carries it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Immutable {
+    pub target: Target,
+    pub payload_digest: String,
+    pub provenance: Provenance,
+}
+
+/// What a withdrawal found (R9.14 item 4; design I.5.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Withdrawal {
+    /// It was `accepted` and is now `rejected` (`withdrawn by the host`),
+    /// durably; or it was `rejected` already. No side effect.
+    Rejected,
+    /// It wasn't in the journal: it is on the refusal list, so it never
+    /// runs (a late submit gets the `rejected` receipt, a restart records
+    /// it). No side effect.
+    Listed,
+    /// The id is recorded under another submitter (R9.14 item 7): that
+    /// request isn't host-work's, and nothing is written or changed. The
+    /// attempt's own submit is `request_id_reused`, so it never runs: never
+    /// admitted, and not counted as an attempt (host-work-v1 §11.6).
+    Reused,
+    /// It wasn't in the journal, and the refusal list is full: nothing
+    /// written, and the journal doesn't halt. A submit of it in this run is
+    /// refused `busy` (`refusal list full`), so it never runs here; after a
+    /// restart it is simply absent (never admitted, design I.6.4). No side
+    /// effect. (Past `MAX_UNLISTED` such requests in a run: `Halted`.)
+    ListFull,
+    /// It is `executing` or past it: the task is running (or ran).
+    Started,
+    /// A write the withdrawal needed failed: the journal halted, and
+    /// nothing becomes `executing` until the restart, which settles it.
+    Halted,
+}
+
+/// What an interrupt with host authority did (session-v1 R9.14 item 5;
+/// design I.5.7): `host_interrupt`, and `host_interrupt_revoke_lease` on
+/// the later passes of a pending intent. Only `Written` and `Revoked`
+/// changed anything.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostInterrupt {
+    /// The turn check passed: the input epoch moved, a lease another
+    /// controller held was revoked (`lease_changed{reason: "revoked"}`),
+    /// and the write (`Effect::HostInterrupt`) is the last effect.
+    Written(Vec<Effect>),
+    /// `host_interrupt_revoke_lease`'s: the turn check passed and a lease
+    /// another controller held was revoked (its end moved the input
+    /// epoch); nothing written. Empty when nobody else held it.
+    Revoked(Vec<Effect>),
+    /// The session's current turn isn't the attempt's: the chat shows no
+    /// turn running (no turn state, its prompt not taken yet, the turn
+    /// ended) or another one; or a request of another submitter, another
+    /// session's, or one whose session no longer runs its process. Nothing
+    /// done.
+    NotCurrentTurn,
+    /// The attempt isn't executing: queued (`accepted`), settled, or not in
+    /// the journal (never admitted, or settled and evicted). Nothing done:
+    /// one not yet started is host-work's to withdraw (I.5.7). After a
+    /// broker restart it doesn't mean the turn ended: an attempt the start's
+    /// reconciliation settled `outcome_unknown` may still be running (no
+    /// turn state proved it current; `recover`).
+    NotExecuting,
+    /// The journal halted (r8 §I): nothing done; the restart settles the
+    /// attempt.
+    Halted,
+}
+
+impl Withdrawal {
+    /// Its name in the drive hook's results and the fixtures
+    /// (`host_work_withdraw`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Withdrawal::Rejected => "rejected",
+            Withdrawal::Listed => "listed",
+            Withdrawal::Reused => "reused",
+            Withdrawal::ListFull => "list_full",
+            Withdrawal::Started => "started",
+            Withdrawal::Halted => "halted",
+        }
+    }
+}
+
+impl HostInterrupt {
+    /// Its name in the drive hook's results and the fixtures
+    /// (`host_work_interrupt`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HostInterrupt::Written(_) => "written",
+            HostInterrupt::Revoked(_) => "revoked",
+            HostInterrupt::NotCurrentTurn => "not_current_turn",
+            HostInterrupt::NotExecuting => "not_executing",
+            HostInterrupt::Halted => "halted",
+        }
+    }
 }
 
 // ── State ─────────────────────────────────────────────────────────────────
@@ -609,6 +895,22 @@ pub struct SessionHost<J: Journal> {
     /// `hello` is refused (`unsupported_version`, `revision: 9`) and no
     /// attachment is welcomed outside the channel.
     refuse_r8: bool,
+    /// The provenance of the `host-work` submit being admitted
+    /// (`submit_host_work`, session-v1 R9.14 item 2), recorded with its
+    /// `accepted`; `None` for every other request.
+    admitting: Option<Provenance>,
+    /// Host-work's start check (R9.14 item 3); none: every `host-work`
+    /// request is withdrawn at its start (fail closed).
+    start_check: Option<Box<dyn StartCheck>>,
+    /// The refusal list as this run wrote it for withdrawals of requests
+    /// not in the journal (R9.14 item 4), by request id: a submit consults
+    /// it before the dedup. (A failed admission write's entry needs no
+    /// consulting: the journal halted, so every later submit is `busy`.)
+    listed: HashMap<String, Refusal>,
+    /// Requests host-work withdrew before they were journaled while the
+    /// refusal list was full (`Withdrawal::ListFull`): a submit of one in
+    /// this run is `busy`, never admitted.
+    unlisted: HashSet<String>,
     /// Fixtures (`hold_dispatch`; debug builds only, the real runtime's
     /// fixture hook): accepted work stays queued.
     #[cfg(any(test, debug_assertions))]
@@ -673,6 +975,10 @@ impl<J: Journal> SessionHost<J> {
             refused: Refused::default(),
             out: Vec::new(),
             refuse_r8: false,
+            admitting: None,
+            start_check: None,
+            listed: HashMap::new(),
+            unlisted: HashSet::new(),
             #[cfg(any(test, debug_assertions))]
             dispatch_held: false,
         };
@@ -957,6 +1263,10 @@ impl<J: Journal> SessionHost<J> {
             return Err("principal must be an opaque id".into());
         }
         let has_control = a.permissions.contains(&Permission::Control);
+        if is_host_work(&a.principal) && !has_control {
+            // R9.14 item 1: it never loses `control`.
+            return Err("the host-work principal holds control".into());
+        }
         self.resolve_once();
         self.principal_control(&a.principal, has_control);
         let old: Vec<String> = self
@@ -1034,7 +1344,14 @@ impl<J: Journal> SessionHost<J> {
     /// `control`), every lease held by one of its attachments (live or
     /// gone) is revoked, and each of its accepted requests not yet executing
     /// is rejected (`control revoked`), in memory when a write fails.
+    ///
+    /// The `host-work` principal is never fenced (session-v1 R9.14 item 1):
+    /// its `control_gen` stays 1, and a frozen, faulted or held device list
+    /// or a halted journal stops delegated tasks through the start check.
     fn fence(&mut self, principal: &str, raise: bool, fence_seq: u64, all_attachments: bool) {
+        if is_host_work(principal) {
+            return;
+        }
         let st = self.principal(principal);
         let mut durable = true;
         if raise {
@@ -1148,7 +1465,13 @@ impl<J: Journal> SessionHost<J> {
     /// (no clean close → `authorization history unknown`, an older
     /// `control_gen` → `control revoked`). A failed write follows §H "A
     /// failed revocation write" (in memory, the journal halts).
+    ///
+    /// The `host-work` principal is no remote principal and is never fenced
+    /// (session-v1 R9.14 item 1): nothing happens.
     pub fn fence_principal(&mut self, principal: &str, seq: u64) -> Vec<Effect> {
+        if is_host_work(principal) {
+            return self.take();
+        }
         let raise = seq == 0 || self.principal(principal).fence_seq < seq;
         if !self.resolved {
             if raise {
@@ -1179,7 +1502,8 @@ impl<J: Journal> SessionHost<J> {
 
     /// Every principal the host knows to be remote: attachments, lease
     /// holders, accepted work and principals holding `control` (§R9.3
-    /// "every remote principal").
+    /// "every remote principal"). Never the host-local `host-work`
+    /// principal (session-v1 R9.14 item 1).
     pub fn remote_principals(&self) -> Vec<String> {
         let mut all: BTreeSet<String> = self
             .attachments
@@ -1201,6 +1525,7 @@ impl<J: Journal> SessionHost<J> {
                 all.insert(p.clone());
             }
         }
+        all.remove(wire::HOST_WORK_PRINCIPAL);
         all.into_iter().collect()
     }
 
@@ -1211,7 +1536,9 @@ impl<J: Journal> SessionHost<J> {
     /// epoch rises, so queued raw bytes are dropped at the write boundary)
     /// and its accepted work not yet executing rejected (`control
     /// revoked`); then the journal halts (§I) until the restart, which
-    /// replays the carriage record and the fences.
+    /// replays the carriage record and the fences. The `host-work`
+    /// principal, named or not, is never fenced (R9.14 item 1): the halt
+    /// stops its tasks through the start check.
     pub fn membership_fault(&mut self, principals: Option<&[String]>) -> Vec<Effect> {
         self.resolve_once();
         self.halt_journal();
@@ -1413,6 +1740,111 @@ impl<J: Journal> SessionHost<J> {
         self.take()
     }
 
+    /// Interrupts the turn of host-work's attempt `request_id` on
+    /// `session_id` with the host's own authority (session-v1 R9.14 item 5,
+    /// design I.5.7), as local input does (§5) and in this order: the whole
+    /// turn check (`host_interrupt_blocked`; refused, nothing is done),
+    /// then the input epoch and the revocation of a lease another
+    /// controller holds (`revoked`, never `local_input`: attachments see a
+    /// revocation; the host-work principal's own lease stays), then the
+    /// write (`Effect::HostInterrupt`, last). No submission: no receipt,
+    /// nothing journaled, nothing on the refusal list; the attempt's own
+    /// prompt receipt completes with its turn (`interrupted`, §6).
+    ///
+    /// `running` is the chat's half of the check, which only the runtime
+    /// knows: the request whose turn the session's chat shows running under
+    /// today's Esc rule (chat, `working` or `waiting`), `None` without one.
+    /// It takes no `now`: a lease past its deadline that no `advance` ended
+    /// yet is ended `revoked`, not `expired` (for at most one pass), so
+    /// callers run it after the pass's `advance`.
+    pub fn host_interrupt(
+        &mut self,
+        session_id: &str,
+        request_id: &str,
+        running: Option<&str>,
+    ) -> HostInterrupt {
+        if let Some(blocked) = self.host_interrupt_blocked(session_id, request_id, running) {
+            return blocked;
+        }
+        if let Some(s) = self.sessions.get_mut(session_id) {
+            s.input_epoch += 1;
+        }
+        self.revoke_other_lease(session_id);
+        self.out.push(Effect::HostInterrupt {
+            session_id: session_id.to_string(),
+            request_id: request_id.to_string(),
+        });
+        HostInterrupt::Written(self.take())
+    }
+
+    /// Item 5's later passes while an intent is pending, once its interrupt
+    /// was delivered: the same turn check (`running` as `host_interrupt`
+    /// takes it), then only the revocation of a lease another controller
+    /// holds (so a takeover during the turn can't defeat the owner's
+    /// choice); nothing written. `Revoked`, empty when nobody else holds
+    /// the lease.
+    pub fn host_interrupt_revoke_lease(
+        &mut self,
+        session_id: &str,
+        request_id: &str,
+        running: Option<&str>,
+    ) -> HostInterrupt {
+        if let Some(blocked) = self.host_interrupt_blocked(session_id, request_id, running) {
+            return blocked;
+        }
+        self.revoke_other_lease(session_id);
+        HostInterrupt::Revoked(self.take())
+    }
+
+    /// Item 5's turn check: why `host_interrupt` (or
+    /// `host_interrupt_revoke_lease`) would do nothing now, if it would. A
+    /// halted journal first; then the attempt must be the `host-work`
+    /// principal's prompt on that session, `executing` in its running
+    /// process (the receipt is `executing` from the paste on, so this alone
+    /// doesn't make its turn the current one); then the chat must show its
+    /// turn running (`running`).
+    fn host_interrupt_blocked(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        running: Option<&str>,
+    ) -> Option<HostInterrupt> {
+        if self.journal_halted {
+            return Some(HostInterrupt::Halted);
+        }
+        let Some(e) = self.receipts.get(request_id) else {
+            return Some(HostInterrupt::NotExecuting);
+        };
+        let s = &e.stored;
+        if !is_host_work(&s.principal)
+            || s.kind != ReceiptKind::Prompt
+            || s.target.session_id != session_id
+        {
+            return Some(HostInterrupt::NotCurrentTurn);
+        }
+        if s.state != ReceiptState::Executing {
+            return Some(HostInterrupt::NotExecuting);
+        }
+        let runs = self.sessions.get(session_id).is_some_and(|x| {
+            x.state == SessionState::Running && x.spec.process_gen == s.target.process_gen
+        });
+        (!runs || running != Some(request_id)).then_some(HostInterrupt::NotCurrentTurn)
+    }
+
+    /// Ends a lease of `session_id` held by anyone but the `host-work`
+    /// principal, reason `revoked` (its end moves the input epoch first, so
+    /// the holder's queued bytes are dropped at the write boundary).
+    fn revoke_other_lease(&mut self, session_id: &str) {
+        let other = self
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.lease.as_ref())
+            .is_some_and(|l| !is_host_work(&l.principal));
+        if other {
+            self.end_lease(session_id, LeaseChangeReason::Revoked, None);
+        }
+    }
+
     /// Called by the PTY writer right before writing a queued remote chunk,
     /// with the monotonic time of the write: the chunk's input epoch must
     /// still be current and its lease unexpired (`now >= deadline` is
@@ -1498,6 +1930,10 @@ impl<J: Journal> SessionHost<J> {
             DispatchReport::Unknown => (
                 ReceiptState::OutcomeUnknown,
                 Some(DETAIL_UNRECONCILED.to_string()),
+            ),
+            DispatchReport::AgentExited => (
+                ReceiptState::OutcomeUnknown,
+                Some(DETAIL_AGENT_EXITED.to_string()),
             ),
         };
         let no_effect = state == ReceiptState::Rejected;
@@ -1877,6 +2313,9 @@ impl<J: Journal> SessionHost<J> {
     }
 
     fn install(&mut self, replayed: journal::Replayed) {
+        // A new run: the start's resolution records the list's entries.
+        self.listed.clear();
+        self.unlisted.clear();
         self.receipts = replayed
             .receipts
             .into_iter()
@@ -1952,16 +2391,46 @@ impl<J: Journal> SessionHost<J> {
 
     /// The start's rules (r8 §H Recovery, §I.3), once per start, before
     /// anything is dispatched: requests on the refusal list are `rejected`
-    /// ("acceptance not confirmed"), then the list is cleared; after a run
-    /// without a clean close every other recovered `accepted` request is
-    /// `rejected` ("authorization history unknown"); after a clean close a
-    /// changed trust generation rejects it ("host trust changed"), a
-    /// `control_gen` below its principal's durable one too ("control
-    /// revoked"), and the rest waits for its principal to be welcomed with
-    /// `control` (`CONFIRM_MS`). `executing` work is never dispatched again,
-    /// only reconciled. If a resolution can't be persisted, remote sessions
-    /// stay disabled (`start_error`, the journal halted) and nothing is
-    /// dispatched or reconciled.
+    /// with the detail each entry records ("acceptance not confirmed" for a
+    /// failed admission write, "withdrawn by the host" for host-work's
+    /// withdrawal, R9.14 item 4), then the list is cleared; every other
+    /// recovered `accepted` request of the `host-work` principal is
+    /// `rejected` ("withdrawn at recovery", R9.14 item 6: it is never
+    /// confirmed, whatever the clean close says); after a run without a
+    /// clean close every other one is `rejected` ("authorization history
+    /// unknown"); after a clean close a changed trust generation rejects it
+    /// ("host trust changed"), a `control_gen` below its principal's durable
+    /// one too ("control revoked"), and the rest waits for its principal to
+    /// be welcomed with `control` (`CONFIRM_MS`). `executing` work is never
+    /// dispatched again, only reconciled (`Effect::Reconcile`). If a
+    /// resolution can't be persisted, remote sessions stay disabled
+    /// (`start_error`, the journal halted) and nothing is dispatched or
+    /// reconciled.
+    ///
+    /// Host-work's order at a start (design I.6.2: its interrupt intents at
+    /// step 3, the reconciliation of its tasks with their attempts'
+    /// receipts at step 4). A host-work prompt's `Reconcile` carries the
+    /// turn it started (`turn_started`), and the runtime decides it from the
+    /// adopted worker's chat with `reconcile_turn`: a turn still running
+    /// stays `executing`, its request rebound to the chat's current turn, so
+    /// the intents carried out after this find it executing and current
+    /// (R9.14 item 5: "delivering once more if that turn is still the
+    /// session's current turn"). Every other case is settled here:
+    /// - a turn that ended (`completed` with its outcome, or
+    ///   `outcome_unknown` when the outcome isn't known) or a worker that is
+    ///   gone (`agent exited`): nothing is left to deliver ("a turn that has
+    ///   already ended makes it do nothing");
+    /// - a turn never journaled, a chat without turn state (withdrawn), a
+    ///   chat showing another turn, or one that never arrived within
+    ///   `RECONCILE_MS` (`outcome could not be established`): the turn may
+    ///   still run, but no turn state proves it current, and the interrupt
+    ///   writes no blind Esc, so an intent can't be delivered; the owner
+    ///   learns of it through the `outcome_unknown` alert (host.alerts).
+    ///
+    /// Until the adopted chat arrives the receipt stays `executing` and the
+    /// interrupt's turn check refuses (`NotCurrentTurn`, no turn state):
+    /// `HostBridge::host_work_reconciling` tells host-work's recovery (Task
+    /// 26) to keep such an intent pending until the decision.
     pub fn recover(&mut self) -> Vec<Effect> {
         self.resolve_once();
         if self.start_error.is_some() {
@@ -1979,6 +2448,7 @@ impl<J: Journal> SessionHost<J> {
                 request_id: e.stored.request_id.clone(),
                 target: e.stored.target.clone(),
                 kind: e.stored.kind,
+                turn: e.stored.turn.clone(),
             })
             .collect();
         self.out.extend(reconcile);
@@ -2019,7 +2489,8 @@ impl<J: Journal> SessionHost<J> {
             on_list.insert(r.request_id.clone());
             match self.receipts.get(&r.request_id).map(|e| e.stored.state) {
                 Some(ReceiptState::Accepted) => {
-                    let detail = Some(DETAIL_ACCEPTANCE_NOT_CONFIRMED);
+                    // The detail its entry records (R9.14 item 4).
+                    let detail = Some(refusal_detail(&r));
                     if !self.transition(&r.request_id, ReceiptState::Rejected, detail) {
                         return Err(UNPERSISTED.into());
                     }
@@ -2044,20 +2515,37 @@ impl<J: Journal> SessionHost<J> {
         // was accepted (`principals`), at a generation no lower than the
         // request's: one the file doesn't name, or names lower, means the
         // control history was lost (a missing or older `principals`), and a
-        // fence it held can't be told from none.
+        // fence it held can't be told from none. The `host-work`
+        // principal's requests are left out: they are withdrawn whatever
+        // that history says (R9.14 item 6), and its control state is never
+        // fenced (item 1).
         let history_lost = queued.iter().any(|(_, rid)| {
             let s = &self.receipts[rid].stored;
-            self.principals
-                .get(&s.principal)
-                .is_none_or(|p| p.control_gen < s.control_gen)
+            !by_host_work(s)
+                && self
+                    .principals
+                    .get(&s.principal)
+                    .is_none_or(|p| p.control_gen < s.control_gen)
         });
         for (_, rid) in queued {
             debug_assert!(!on_list.contains(&rid));
-            let (principal, control_gen, trust) = {
+            let (principal, control_gen, trust, host_work) = {
                 let s = &self.receipts[&rid].stored;
-                (s.principal.clone(), s.control_gen, s.target.host_trust_gen)
+                let host_work = by_host_work(s);
+                (
+                    s.principal.clone(),
+                    s.control_gen,
+                    s.target.host_trust_gen,
+                    host_work,
+                )
             };
-            let detail = if !self.previous_clean || history_lost {
+            let detail = if host_work {
+                // R9.14 item 6: never confirmed, so never scheduled (nor
+                // when `welcome_r9` confirms the principal): no side effect,
+                // and host-work queues the task again for a new attempt.
+                // §H's rules 2 and 3 don't apply to it.
+                Some(DETAIL_WITHDRAWN_AT_RECOVERY)
+            } else if !self.previous_clean || history_lost {
                 Some(DETAIL_HISTORY_UNKNOWN)
             } else if trust != self.ctx.host_trust_gen {
                 Some(DETAIL_TRUST_CHANGED)
@@ -2081,7 +2569,8 @@ impl<J: Journal> SessionHost<J> {
     }
 
     /// A refused request whose `accepted` record never reached the disk:
-    /// recorded directly as `rejected` with its immutable values (§I.3).
+    /// recorded directly as `rejected` with its immutable values (§I.3), the
+    /// detail its entry records and its provenance (R9.14 item 4).
     fn record_refused(&mut self, r: Refusal) -> Result<(), ()> {
         let updated_at = self.wall();
         let record = Record::Rejected {
@@ -2089,8 +2578,9 @@ impl<J: Journal> SessionHost<J> {
             target: r.target.clone(),
             kind: r.kind,
             payload_digest: r.payload_digest.clone(),
-            detail: DETAIL_ACCEPTANCE_NOT_CONFIRMED.into(),
+            detail: refusal_detail(&r).into(),
             updated_at,
+            provenance: r.provenance.clone(),
         };
         if !self.append(record) {
             return Err(());
@@ -2098,18 +2588,8 @@ impl<J: Journal> SessionHost<J> {
         let order = self.next_order;
         self.next_order += 1;
         let stored = Stored {
-            request_id: r.request_id.clone(),
-            target: r.target.clone(),
-            kind: r.kind,
-            payload_digest: r.payload_digest,
-            payload: None,
-            state: ReceiptState::Rejected,
-            detail: Some(DETAIL_ACCEPTANCE_NOT_CONFIRMED.into()),
             updated_at,
-            result: None,
-            order,
-            principal: String::new(),
-            control_gen: 0,
+            ..refused_stored(&r, order)
         };
         self.index(&r.target.session_id, &r.request_id);
         self.receipts.insert(
@@ -2175,6 +2655,23 @@ impl<J: Journal> SessionHost<J> {
             .map(|l| l.deadline)
     }
 
+    /// Whether a request of `principal` on `session_id` is still open
+    /// (`accepted` or `executing`): the `host-work` principal's turn runs
+    /// (session-v1 R9.14 item 1).
+    pub fn has_open_request(&self, principal: &str, session_id: &str) -> bool {
+        self.receipts_of(session_id)
+            .any(|e| e.stored.principal == principal && !journal::is_final(e.stored.state))
+    }
+
+    /// The sessions whose lease `attachment` holds.
+    pub fn leases_of(&self, attachment: &str) -> Vec<String> {
+        self.sessions
+            .iter()
+            .filter(|(_, s)| s.lease.as_ref().is_some_and(|l| l.attachment == attachment))
+            .map(|(sid, _)| sid.clone())
+            .collect()
+    }
+
     /// Live attachments that were welcomed (r8 fixtures' `attachments`).
     pub fn welcomed_attachments(&self) -> usize {
         self.attachments.values().filter(|a| a.welcomed()).count()
@@ -2202,18 +2699,82 @@ impl<J: Journal> SessionHost<J> {
     }
 
     pub fn receipt(&self, request_id: &str) -> Option<Receipt> {
-        self.receipts
-            .get(request_id)
-            .map(|e| self.render(&e.stored))
+        self.stored_or_listed(request_id).map(|s| self.render(&s))
     }
 
-    /// Every receipt's request id, every registered session's id and
-    /// every principal with a control state (debug builds: the real
-    /// runtime's fixture state dump).
+    /// The recorded request `request_id`; or, for one host-work withdrew
+    /// before it was journaled (R9.14 item 4), the `rejected` request its
+    /// refusal-list entry stands for in this run, as the restart records it
+    /// (`refused_stored`). So a listed request reads the same before the
+    /// restart as after (PR 5 review M2).
+    fn stored_or_listed(&self, request_id: &str) -> Option<std::borrow::Cow<'_, Stored>> {
+        if let Some(e) = self.receipts.get(request_id) {
+            return Some(std::borrow::Cow::Borrowed(&e.stored));
+        }
+        let r = self.listed.get(request_id)?;
+        Some(std::borrow::Cow::Owned(refused_stored(r, 0)))
+    }
+
+    /// The receipt of host-work's attempt `request_id` for the task
+    /// `task_id`, which host-work settles the attempt by (design I.6.3,
+    /// I.6.4). Only a request of the `host-work` principal whose provenance
+    /// names that task is the attempt's: a receipt recorded under another
+    /// submitter under that id (R9.14 item 7), or host-work's for another
+    /// task, is not, and reads as `None`, as an absent one does (the
+    /// attempt was never admitted; Task 14's review).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn attempt_receipt(&self, request_id: &str, task_id: &str) -> Option<Receipt> {
+        let s = self.stored_or_listed(request_id)?;
+        let its = by_host_work(&s) && s.provenance.as_ref().is_some_and(|p| p.task_id == task_id);
+        its.then(|| self.render(&s))
+    }
+
+    /// The chat accepted host-work's prompt `request_id`, which started
+    /// `turn` (R9.14 items 5, 6): journaled durably, once, so a restart
+    /// reconciles the receipt with the adopted worker's chat
+    /// (`Effect::Reconcile`'s `turn`). Only for an `executing` prompt of the
+    /// `host-work` principal with no turn yet, and opaque ids
+    /// (`journal::turn_coherent`): for anything else nothing is written, so
+    /// a v1 prompt's journal is unchanged. Nothing is sent. True when it is
+    /// durable; a failed write halts the journal (§I), and the restart then
+    /// fails the receipt closed (`outcome_unknown`).
+    pub fn turn_started(&mut self, request_id: &str, turn: TurnIds) -> bool {
+        let Some(e) = self.receipts.get(request_id) else {
+            return false;
+        };
+        let s = &e.stored;
+        let host_work = is_host_work(&s.principal);
+        if !journal::turn_coherent(s.state, s.kind, host_work, s.turn.is_some(), &turn) {
+            return false;
+        }
+        let record = Record::TurnStarted {
+            request_id: request_id.to_string(),
+            turn: turn.clone(),
+        };
+        if !self.append(record) {
+            return false;
+        }
+        self.receipts.get_mut(request_id).unwrap().stored.turn = Some(turn);
+        true
+    }
+
+    /// The turn host-work's prompt `request_id` started, as journaled.
+    #[cfg(test)]
+    pub fn recorded_turn(&self, request_id: &str) -> Option<&TurnIds> {
+        self.receipts.get(request_id)?.stored.turn.as_ref()
+    }
+
+    /// Every receipt's request id (a listed request's too, as `receipt`
+    /// reads it), every registered session's id and every principal with a
+    /// control state (debug builds: the real runtime's fixture state dump).
     #[cfg(any(test, debug_assertions))]
     pub fn debug_ids(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
         (
-            self.receipts.keys().cloned().collect(),
+            self.receipts
+                .keys()
+                .chain(self.listed.keys())
+                .cloned()
+                .collect(),
             self.sessions.keys().cloned().collect(),
             self.principals.keys().cloned().collect(),
         )
@@ -2279,6 +2840,230 @@ impl<J: Journal> SessionHost<J> {
             Ok(Envelope::Family(f)) => self.on_family(attachment, f),
         }
         self.take()
+    }
+
+    /// Delegated host work (session-v1 R9.14 item 2): the `host-work`
+    /// principal's internal `attachment` submits `data` (a session-v1
+    /// `submit`'s `data`: a `prompt`, which must acquire, `acquire: true`)
+    /// with its `provenance`, recorded with `accepted` and carried by each
+    /// of the request's receipts as `task_id` and `sender`. The rest is §6
+    /// and §F, answered on the attachment, where nothing leaves the host:
+    /// the runtime reads the outcome with `receipt`. Refused
+    /// `invalid_request`, nothing recorded: another principal's attachment,
+    /// a provenance the receipt reader would refuse, anything but a
+    /// `prompt` submit, one that doesn't acquire (R9.14 item 1: each prompt
+    /// acquires with the prompt), a `takeover` (it acquires only while
+    /// nobody holds the lease). The `host-work` principal submits no other
+    /// way. Admitted, the
+    /// request starts only after the start check says so (R9.14 item 3); a
+    /// `request_id` recorded under another submitter is `request_id_reused`
+    /// (item 7), and one host-work withdrew before it was journaled gets
+    /// its `rejected` receipt (item 4).
+    pub fn submit_host_work(
+        &mut self,
+        attachment: &str,
+        data: Value,
+        provenance: Provenance,
+    ) -> Vec<Effect> {
+        let bytes = serde_json::to_vec(&json!({"type": "session", "data": data}))
+            .expect("JSON values serialize");
+        let decoded = wire::decode(&bytes);
+        let now = self.now;
+        if let (Some(a), Ok(Envelope::Session(m))) = (self.attachments.get(attachment), &decoded) {
+            // A prompt that never takes over (only an interrupt the owner
+            // chose may, R9.14 item 5).
+            let prompt = matches!(
+                m.op,
+                Op::Submit {
+                    kind: ReceiptKind::Prompt,
+                    acquire: Some(true),
+                    takeover: None,
+                    ..
+                }
+            );
+            if !is_host_work(&a.principal) || !prompt || !provenance.valid() {
+                let re = Some(m.id.clone());
+                self.error(attachment, re, ErrorCode::InvalidRequest, None);
+                return self.take();
+            }
+        }
+        self.admitting = Some(provenance);
+        let effects = self.receive_decoded(attachment, decoded, now);
+        self.admitting = None;
+        effects
+    }
+
+    /// Installs host-work's start check (R9.14 item 3), in place of any
+    /// earlier one.
+    pub fn set_start_check(&mut self, check: Box<dyn StartCheck>) {
+        self.start_check = Some(check);
+    }
+
+    /// Host-work withdraws its own request `request_id` (session-v1 R9.14
+    /// item 4, design I.5.6), serialized with the start check's step (each
+    /// is one call on the session host, so neither sees the other half
+    /// done):
+    /// - **recorded and still `accepted`:** it is `rejected` (`withdrawn by
+    ///   the host`), durable before this returns `Rejected`; one `rejected`
+    ///   already, for any reason, is `Rejected` too, nothing written;
+    /// - **not in the journal:** its immutable values go on the refusal list
+    ///   with that detail and the attempt's provenance (`Listed`): a late
+    ///   submit of it gets that `rejected` receipt instead of running, and
+    ///   the restart records it so. An id this run listed already is
+    ///   `Listed`, nothing written. With the list full nothing is written
+    ///   and the journal doesn't halt (`ListFull`): a submit of it in this
+    ///   run is `busy` (`refusal list full`); past `MAX_UNLISTED` of those,
+    ///   the journal halts (`Halted`);
+    /// - **recorded under another submitter:** `Reused`, nothing written or
+    ///   changed (that request isn't host-work's to withdraw; the attempt's
+    ///   own submit is `request_id_reused`, item 7);
+    /// - **`executing` or past it:** `Started`, nothing changes.
+    ///
+    /// A write it needs that fails halts the journal (§I), and nothing
+    /// becomes `executing` until the restart, which settles the request
+    /// (`Halted`). An `accepted` request whose rejection couldn't be
+    /// written goes on the refusal list too, if that write works, so the
+    /// restart rejects it with this detail (as the start check's refusal
+    /// does). A recorded request of host-work's is found by its id,
+    /// whatever `immutable` says. Never offered to a client. Its effects
+    /// (the submitter's `rejected` receipt) wait for `take_effects`.
+    pub fn withdraw(&mut self, request_id: &str, immutable: &Immutable) -> Withdrawal {
+        let state = self.receipts.get(request_id).map(|e| {
+            let s = &e.stored;
+            (by_host_work(s), s.state)
+        });
+        match state {
+            Some((false, _)) => Withdrawal::Reused,
+            Some((true, ReceiptState::Accepted)) => {
+                if self.transition(
+                    request_id,
+                    ReceiptState::Rejected,
+                    Some(DETAIL_WITHDRAWN_BY_HOST),
+                ) {
+                    self.waiting.remove(request_id);
+                    return Withdrawal::Rejected;
+                }
+                self.list_unwritten_withdrawal(request_id);
+                Withdrawal::Halted
+            }
+            Some((true, ReceiptState::Rejected)) => Withdrawal::Rejected,
+            Some((true, _)) => Withdrawal::Started,
+            None if self.listed.contains_key(request_id) => Withdrawal::Listed,
+            None if self.unlisted.contains(request_id) => Withdrawal::ListFull,
+            None => {
+                debug_assert!(immutable.provenance.valid(), "{immutable:?}");
+                let refusal = self.withdrawn_refusal(
+                    request_id,
+                    &immutable.target,
+                    &immutable.payload_digest,
+                    Some(immutable.provenance.clone()),
+                );
+                match self.journal.record_refusal(refusal.clone()) {
+                    Ok(()) => {
+                        self.listed.insert(request_id.to_string(), refusal);
+                        Withdrawal::Listed
+                    }
+                    // A certain refusal, nothing written: fail closed for
+                    // this request only (the log is healthy), while memory
+                    // allows; past that, as a failed write.
+                    Err(e) if e.refusal_list_full() && self.unlisted.len() < MAX_UNLISTED => {
+                        self.unlisted.insert(request_id.to_string());
+                        Withdrawal::ListFull
+                    }
+                    Err(_) => {
+                        self.halt_journal();
+                        Withdrawal::Halted
+                    }
+                }
+            }
+        }
+    }
+
+    /// The refusal-list entry of host-work's withdrawn request (R9.14 item
+    /// 4): its immutable values (a `prompt`), `withdrawn by the host` and
+    /// the attempt's provenance (left out if it isn't valid: no receipt may
+    /// carry such a provenance, and a submit with it is refused anyway).
+    fn withdrawn_refusal(
+        &self,
+        request_id: &str,
+        target: &Target,
+        payload_digest: &str,
+        provenance: Option<Provenance>,
+    ) -> Refusal {
+        Refusal {
+            request_id: request_id.to_string(),
+            target: target.clone(),
+            kind: ReceiptKind::Prompt,
+            payload_digest: payload_digest.to_string(),
+            updated_at: self.wall(),
+            detail: Some(DETAIL_WITHDRAWN_BY_HOST.to_string()),
+            provenance: provenance.filter(Provenance::valid),
+        }
+    }
+
+    /// A withdrawal of the `accepted` host-work request `rid` (the start
+    /// check's refusal, or `withdraw`) couldn't be written, so the journal
+    /// halted (§I) and it stays `accepted` until the restart. It goes on the
+    /// refusal list too, best effort, so the restart rejects it `withdrawn
+    /// by the host` before anything is dispatched (R9.14 items 4, 6.1);
+    /// should that write fail as well, the restart's recovery settles it
+    /// (`withdrawn at recovery`, item 6.2).
+    fn list_unwritten_withdrawal(&mut self, rid: &str) {
+        self.halt_journal();
+        let s = &self.receipts[rid].stored;
+        let refusal =
+            self.withdrawn_refusal(rid, &s.target, &s.payload_digest, s.provenance.clone());
+        let _ = self.journal.record_refusal(refusal);
+    }
+
+    /// The `host-work` principal's internal `attachment` renews the lease
+    /// it holds on `session_id` at monotonic `now` (session-v1 R9.14 item
+    /// 1: the runtime does on its own pass, every 5 s while the turn runs).
+    /// As a client's `renew` (§5): it never acquires, and a lease it
+    /// doesn't hold live is `stale_lease`. Its effects wait for
+    /// `take_effects` (its own `lease` reply goes nowhere).
+    pub fn renew(&mut self, attachment: &str, session_id: &str, now: u64) -> Checked {
+        let b = self.internal_binding(attachment, session_id, now)?;
+        self.on_renew(attachment, None, &b)
+    }
+
+    /// The `host-work` principal's internal `attachment` releases the lease
+    /// it holds on `session_id` at monotonic `now` (its turn ended, R9.14
+    /// item 1), as a client's `release` (§5): viewers get `lease_changed`
+    /// (`released`). Its effects wait for `take_effects`.
+    pub fn release(&mut self, attachment: &str, session_id: &str, now: u64) -> Checked {
+        let b = self.internal_binding(attachment, session_id, now)?;
+        self.on_release(attachment, None, &b)
+    }
+
+    /// The binding a `host-work` attachment's own lease request carries:
+    /// the session's current process and lease epoch. Timers due by `now`
+    /// fire first; refused as any request after a journal halt (`busy`).
+    fn internal_binding(&mut self, att: &str, session_id: &str, now: u64) -> Checked<Binding> {
+        self.tick(now);
+        if !self
+            .attachments
+            .get(att)
+            .is_some_and(|a| is_host_work(&a.principal))
+        {
+            return Err(ErrorCode::Unauthorized);
+        }
+        self.admit_request(att)?;
+        let s = self
+            .sessions
+            .get(session_id)
+            .ok_or(ErrorCode::UnknownSession)?;
+        Ok(Binding {
+            target: Target {
+                account_id: self.ctx.account_id.clone(),
+                atem_device_id: self.ctx.atem_device_id.clone(),
+                host_trust_gen: self.ctx.host_trust_gen,
+                session_id: session_id.to_string(),
+                process_gen: s.spec.process_gen.clone(),
+            },
+            attachment_gen: att.to_string(),
+            lease_epoch: Some(s.lease_epoch),
+        })
     }
 
     fn send(&mut self, attachment: &str, re: Option<String>, op: Op) {
@@ -2435,6 +3220,11 @@ impl<J: Journal> SessionHost<J> {
     fn on_session(&mut self, att: &str, m: SessionMessage) {
         let re = Some(m.id.clone());
         let result = match m.op {
+            // R9.14 item 1: never welcomed over a link, only through the
+            // runtime's internal path (`welcome_r9`).
+            Op::Hello { .. } if is_host_work(&self.attachments[att].principal) => {
+                Err(ErrorCode::Unauthorized)
+            }
             Op::Hello { .. } if self.refuse_r8 => {
                 self.refuse_r8_hello(att, re);
                 return;
@@ -2450,8 +3240,8 @@ impl<J: Journal> SessionHost<J> {
                 Op::Acquire { binding, takeover } => {
                     self.acquire(att, re.clone(), &binding, takeover)
                 }
-                Op::Renew { binding } => self.renew(att, re.clone(), &binding),
-                Op::Release { binding } => self.release(att, re.clone(), &binding),
+                Op::Renew { binding } => self.on_renew(att, re.clone(), &binding),
+                Op::Release { binding } => self.on_release(att, re.clone(), &binding),
                 Op::Submit {
                     binding,
                     request_id,
@@ -2899,7 +3689,7 @@ impl<J: Journal> SessionHost<J> {
     }
 
     /// Renews only the live lease at its epoch; never re-acquires.
-    fn renew(&mut self, att: &str, re: Option<String>, b: &Binding) -> Checked {
+    fn on_renew(&mut self, att: &str, re: Option<String>, b: &Binding) -> Checked {
         self.holds(att, b)?;
         if !self.attachments[att].can(Permission::Control) {
             return Err(ErrorCode::Forbidden);
@@ -2914,7 +3704,7 @@ impl<J: Journal> SessionHost<J> {
         Ok(())
     }
 
-    fn release(&mut self, att: &str, re: Option<String>, b: &Binding) -> Checked {
+    fn on_release(&mut self, att: &str, re: Option<String>, b: &Binding) -> Checked {
         self.holds(att, b)?;
         self.end_lease(&b.target.session_id, LeaseChangeReason::Released, Some(att));
         self.send(att, re, Op::LeaseReleased {});
@@ -3012,13 +3802,44 @@ impl<J: Journal> SessionHost<J> {
         payload: Value,
         send: SendParams,
     ) -> Checked {
+        // R9.14 item 2: the `host-work` principal submits only with its
+        // provenance (`submit_host_work`), and only it carries one.
+        if is_host_work(&self.attachments[att].principal) != self.admitting.is_some() {
+            return Err(ErrorCode::InvalidRequest);
+        }
         self.check_binding(att, b)?;
         let acquire = self.send_rules(kind, b, &send)?;
         let digest =
             canonical::payload_digest(&payload).map_err(|_| ErrorCode::UnsupportedVersion)?;
+        let host_work = is_host_work(&self.attachments[att].principal);
+        // A request host-work withdrew while the refusal list was full: in
+        // this run it is never admitted, whoever submits it.
+        if self.unlisted.contains(request_id) {
+            self.refused.detail = Some(DETAIL_REFUSAL_LIST_FULL);
+            return Err(ErrorCode::Busy);
+        }
+        // R9.14 item 4: a request host-work withdrew before it was
+        // journaled gets the `rejected` receipt its refusal-list entry
+        // records instead of running (no lease, nothing recorded); the
+        // entry is host-work's (item 7 below).
+        if let Some(r) = self.listed.get(request_id) {
+            if !host_work || r.target != b.target || r.kind != kind || r.payload_digest != digest {
+                return Err(ErrorCode::RequestIdReused);
+            }
+            let stored = refused_stored(r, 0);
+            self.report_stored(att, reply, stored);
+            return Ok(());
+        }
         if let Some(e) = self.receipts.get(request_id) {
             let st = &e.stored;
-            if st.target != b.target || st.kind != kind || st.payload_digest != digest {
+            // R9.14 item 7: recorded under another submitter, where either
+            // is the `host-work` principal, it is reused even with every
+            // immutable value equal (between any others, §6 as before).
+            if by_host_work(st) != host_work
+                || st.target != b.target
+                || st.kind != kind
+                || st.payload_digest != digest
+            {
                 return Err(ErrorCode::RequestIdReused);
             }
             // Same request, whatever flags it carries: the recorded state,
@@ -3117,6 +3938,7 @@ impl<J: Journal> SessionHost<J> {
             updated_at,
             principal: principal.clone(),
             control_gen,
+            provenance: self.admitting.clone(),
         };
         // §I.1: accepted only once durable; only then does anything act.
         if !self.append(record) {
@@ -3137,6 +3959,8 @@ impl<J: Journal> SessionHost<J> {
             order,
             principal,
             control_gen,
+            provenance: self.admitting.clone(),
+            turn: None,
         };
         let chat = match &reply {
             Reply::Chat { conversation_id } => Some(conversation_id.clone()),
@@ -3211,12 +4035,42 @@ impl<J: Journal> SessionHost<J> {
             kind,
             payload_digest: digest.to_string(),
             updated_at,
+            detail: None,
+            // A `host-work` prompt's, so the restart's receipt carries it.
+            provenance: self.admitting.clone(),
         };
         match self.journal.record_refusal(refusal) {
             Ok(()) => self.refused.detail = Some(DETAIL_ACCEPTANCE_NOT_RECORDED),
             Err(_) => self.refused.close = true,
         }
         Err(ErrorCode::Busy)
+    }
+
+    /// Tells `att` the receipt of a request that isn't in `receipts` (one
+    /// on this run's refusal list) on its channel.
+    fn report_stored(&mut self, att: &str, reply: Reply, stored: Stored) {
+        match reply {
+            Reply::Session(re) => {
+                let receipt = self.render(&stored);
+                self.send(att, re, Op::Receipt(receipt));
+            }
+            Reply::Chat { conversation_id } => {
+                let session_id = stored.target.session_id.clone();
+                let reply = chat_reply(&Entry {
+                    stored,
+                    submitted_by: None,
+                    observe_deadline: None,
+                    chat: None,
+                    turn_id: None,
+                });
+                self.out.push(Effect::Chat {
+                    attachment: att.to_string(),
+                    conversation_id,
+                    session_id,
+                    reply,
+                });
+            }
+        }
     }
 
     /// Tells `att` the request's current state on its channel.
@@ -3301,6 +4155,23 @@ impl<J: Journal> SessionHost<J> {
         }
     }
 
+    /// Host-work's start check says the `host-work` request `rid` may
+    /// start (R9.14 item 3). Fails closed: no check installed, or a request
+    /// without its provenance, never starts.
+    fn may_start(&self, rid: &str) -> bool {
+        let s = &self.receipts[rid].stored;
+        let (Some(check), Some(provenance)) = (&self.start_check, &s.provenance) else {
+            return false;
+        };
+        let req = StartRequest {
+            request_id: &s.request_id,
+            session_id: &s.target.session_id,
+            process_gen: &s.target.process_gen,
+            provenance,
+        };
+        check.check(&req) == StartVerdict::Go
+    }
+
     /// Why an accepted request may not be dispatched now, if it may not.
     fn dispatch_blocker(&self, t: &Target) -> Option<&'static str> {
         if t.host_trust_gen != self.ctx.host_trust_gen {
@@ -3347,6 +4218,16 @@ impl<J: Journal> SessionHost<J> {
                 self.finish(rid, ReceiptState::Rejected, Some(DETAIL_CONTROL_REVOKED));
                 return;
             }
+        }
+        // R9.14 item 3: a `host-work` request starts only after host-work's
+        // start check, in this same step, before its `executing` record and
+        // any effect; refused, it is `rejected` (`withdrawn by the host`).
+        if is_host_work(&self.receipts[rid].stored.principal) && !self.may_start(rid) {
+            if !self.transition(rid, ReceiptState::Rejected, Some(DETAIL_WITHDRAWN_BY_HOST)) {
+                // The journal halted, as `withdraw`'s failed write does.
+                self.list_unwritten_withdrawal(rid);
+            }
+            return;
         }
         // The payload is dropped once the request leaves `accepted`.
         let payload = self.receipts[rid]
@@ -3806,9 +4687,9 @@ impl<J: Journal> SessionHost<J> {
                 seen.push(*rid);
                 first
             })
-            .filter_map(|rid| self.receipts.get(rid))
-            .filter(|e| e.stored.target == b.target)
-            .map(|e| self.render(&e.stored))
+            .filter_map(|rid| self.stored_or_listed(rid))
+            .filter(|s| s.target == b.target)
+            .map(|s| self.render(&s))
             .collect();
         self.send(att, re, Op::Receipts { receipts });
         Ok(())
@@ -4280,10 +5161,52 @@ fn to_receipt(s: &Stored, with_result: bool) -> Receipt {
         updated_at: s.updated_at,
         lease: None,
         result,
-        // Delegated host work (session-v1 R9.14): only the `host-work`
-        // principal's receipts carry them, and it doesn't exist yet.
-        task_id: None,
-        sender: None,
+        // Delegated host work (session-v1 R9.14 item 2): only the
+        // `host-work` principal's prompts carry them, as admitted.
+        task_id: s.provenance.as_ref().map(|p| p.task_id.clone()),
+        sender: s.provenance.as_ref().map(|p| p.sender.clone()),
+    }
+}
+
+/// The host-local principal of delegated host work (session-v1 R9.14).
+fn is_host_work(principal: &str) -> bool {
+    principal == wire::HOST_WORK_PRINCIPAL
+}
+
+/// Whether a recorded request is the `host-work` principal's: its
+/// principal, or, for one recorded straight as `rejected` from the refusal
+/// list (no principal recorded), its provenance (R9.14 item 2).
+fn by_host_work(s: &Stored) -> bool {
+    is_host_work(&s.principal) || s.provenance.is_some()
+}
+
+/// The detail of the `rejected` receipt a refusal-list entry stands for:
+/// the one it records (`withdrawn by the host`, R9.14 item 4), else a
+/// failed admission write's (§I.3).
+fn refusal_detail(r: &Refusal) -> &str {
+    r.detail
+        .as_deref()
+        .unwrap_or(DETAIL_ACCEPTANCE_NOT_CONFIRMED)
+}
+
+/// The `rejected` receipt a refusal-list entry stands for, at `order`:
+/// its immutable values, detail and provenance; nothing was accepted.
+fn refused_stored(r: &Refusal, order: u64) -> Stored {
+    Stored {
+        request_id: r.request_id.clone(),
+        target: r.target.clone(),
+        kind: r.kind,
+        payload_digest: r.payload_digest.clone(),
+        payload: None,
+        state: ReceiptState::Rejected,
+        detail: Some(refusal_detail(r).to_string()),
+        updated_at: r.updated_at,
+        result: None,
+        order,
+        principal: journal::refused_principal(r.provenance.as_ref()),
+        control_gen: 0,
+        provenance: r.provenance.clone(),
+        turn: None,
     }
 }
 

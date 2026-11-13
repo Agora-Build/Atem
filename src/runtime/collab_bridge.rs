@@ -35,9 +35,10 @@ const SILENT: &str = "turn ended without a reply";
 /// The silent-turn report of a turn that ended interrupted: both facts.
 const SILENT_INTERRUPTED: &str = "turn interrupted without a reply";
 
-/// A task whose target route or profile approval changed since it was
-/// accepted: it can never be dispatched, or its result delivered, under it.
-pub(super) const ROUTE_CHANGED: &str = "route changed";
+// A task whose target route or profile approval changed since it was
+// accepted: it can never be dispatched, or its result delivered, under it
+// (host-work-v1's text; §11.6 names it too, so it has one definition).
+pub(super) use crate::runtime::delegated::details::ROUTE_CHANGED;
 
 /// A reply's text fits the task that carries it to its sender.
 const MAX_REPLY_TEXT: usize = atem_client::session::host_work::MAX_REPLY_TEXT_BYTES;
@@ -177,8 +178,7 @@ impl HostBridge {
         }
         let receipt = task.status.receipt_id.as_str();
         if let Some(turn) = self
-            .host
-            .receipt(receipt)
+            .task_receipt(task)
             .and_then(|r| r.result)
             .map(|r| r.turn_id)
         {
@@ -566,6 +566,7 @@ impl HostBridge {
                 return Ok(false);
             }
             store.enqueue(&WorkRecord {
+                delegated: None,
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
                 control_gen: grant.origin.control_gen,
@@ -1350,8 +1351,7 @@ impl HostBridge {
                 || turn.is_some_and(|turn| {
                     task.turn_id.as_deref() == Some(turn)
                         || self
-                            .host
-                            .receipt(&task.status.receipt_id)
+                            .task_receipt(&task)
                             .and_then(|r| r.result)
                             .is_some_and(|r| r.turn_id == turn)
                 });
@@ -1361,10 +1361,7 @@ impl HostBridge {
             let starting = matches!(
                 task.status.state,
                 WorkState::Submitting | WorkState::Submitted
-            ) && self
-                .host
-                .receipt(&task.status.receipt_id)
-                .is_some_and(|r| r.result.is_none());
+            ) && self.task_receipt(&task).is_some_and(|r| r.result.is_none());
             if bound || starting {
                 return Ok(task.task.workflow_id);
             }
@@ -1522,6 +1519,7 @@ impl HostBridge {
             };
             let task = local_task(message, &r.task_id, target);
             let record = WorkRecord {
+                delegated: None,
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
                 control_gen: self.host.control_gen("local"),
