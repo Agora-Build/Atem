@@ -52,9 +52,14 @@ const GRANTS_PER_PASS: i64 = 256;
 /// says how the reply stands. A reply never completes its task, and a
 /// settled task (a delegated one resolved `failed` among them, design
 /// I.4.6) stays as it is. A delegated task of unknown outcome past its
-/// deadline keeps saying so until a submitted reply moves it.
+/// deadline is moved by no reply and keeps saying so: it stays
+/// `outcome_unknown` until it is resolved (design I.4.6, host-work-v1
+/// §11.3; an `awaiting_result` past its deadline would only expire).
 pub(super) fn apply_reply(task: &mut WorkRecord, reply: &ResultRow) {
-    if reply.state == ReplyState::Submitted && task.status.state == WorkState::OutcomeUnknown {
+    if reply.state == ReplyState::Submitted
+        && task.status.state == WorkState::OutcomeUnknown
+        && !task.deadline_passed
+    {
         task.status.state = WorkState::AwaitingResult;
     }
     let past_deadline = task.status.state == WorkState::OutcomeUnknown && task.deadline_passed;
@@ -322,7 +327,7 @@ impl HostBridge {
             );
         }
         let now = host_now().wall_ms;
-        if now >= task.task.expires_at {
+        if self.reply_past_deadline(&task, now, &mut None) {
             bail!("task {id} expired");
         }
         let Some(turn) = self.collab_task_turn(&task, sessions) else {
@@ -450,13 +455,16 @@ impl HostBridge {
         let now = host_now().wall_ms;
         let due =
             results::publishing_due(&self.work.store.as_ref().unwrap().db, now, !local_waits)?;
+        // The delegated clock's `D`, read once a pass if a delegated task's
+        // reply needs it.
+        let mut d = None;
         for (row, attempts) in due {
             let store = self.work.store.as_ref().unwrap();
             let task_id = row.task_id().to_string();
             let Some(task) = store.work(&task_id)? else {
                 continue;
             };
-            if now >= task.task.expires_at {
+            if self.reply_past_deadline(&task, now, &mut d) {
                 self.work.context_jobs.remove(&row.result_id);
                 self.collab_reply_refused(&task_id, results::EXPIRED)?;
                 continue;
@@ -521,6 +529,31 @@ impl HostBridge {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Whether `task`'s deadline passed for a reply to it, at wall time
+    /// `wall`: a v1 task's on the wall clock, as always; a delegated
+    /// sender's on the delegated clock `D` (step 4's clock rule; `d` keeps
+    /// the reading taken for it, one a pass; without one, the wall clock,
+    /// which `D` never trails), or once it was marked past it
+    /// (`deadline_passed`). A reply then is refused, `expired`, whatever the
+    /// task's state, so a task of unknown outcome past its deadline stays
+    /// so until it is resolved (design I.4.4, I.4.6).
+    fn reply_past_deadline(&self, task: &WorkRecord, wall: u64, d: &mut Option<u64>) -> bool {
+        if task.delegated.is_none() {
+            return wall >= task.task.expires_at;
+        }
+        let now = *d.get_or_insert_with(|| {
+            let d = self
+                .work
+                .clock
+                .as_ref()
+                .filter(|c| !c.damaged())
+                .and_then(|c| c.reading())
+                .map_or(0, |n| n.d_ms);
+            wall.max(d)
+        });
+        task.deadline_passed || now >= task.task.expires_at
     }
 
     /// Publishes `specs` in the background (at most two at a time); the

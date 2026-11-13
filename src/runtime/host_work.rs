@@ -585,10 +585,13 @@ pub struct WorkRecord {
     pub delegated: Option<crate::runtime::delegated::Admission>,
     /// A delegated task of unknown outcome whose deadline passed
     /// unresolved (design I.4.6, host-work-v1 §11.6 "Unknown outcomes"):
-    /// it stays `outcome_unknown`, with its alert, until it is resolved or
-    /// a reply moves it, and no longer holds its session (`work_waits` has
-    /// no row for it, so no pass reads it again). Set once, by
-    /// `Store::settle_due`; never on a v1 task, whose record is as before.
+    /// it stays `outcome_unknown`, with its alert, until it is resolved (no
+    /// reply moves it any more: `apply_reply`, and a reply then is refused
+    /// `expired`), and no longer holds its session (`work_waits` has no row
+    /// for it, so no pass reads it again). Set once, by `Store::settle_due`,
+    /// and kept as a fact of its history once the task is resolved (the
+    /// triggers read it only with `outcome_unknown`); never on a v1 task,
+    /// whose record is as before.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deadline_passed: bool,
 }

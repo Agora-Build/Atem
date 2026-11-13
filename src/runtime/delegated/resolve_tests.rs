@@ -745,12 +745,14 @@ fn resolving_ends_the_alert() {
     });
 }
 
-/// Design I.4.6: a delegated task of unknown outcome past its deadline
-/// keeps saying so while its agent's reply publishes its context, or after
-/// it was refused: only a submitted reply moves it, to `awaiting_result`,
-/// whose detail then says how the reply stands.
+/// Design I.4.6 (it "stays `outcome_unknown` until it is resolved"),
+/// host-work-v1 §11.3 ("no other ending exists"): a delegated task of unknown
+/// outcome past its deadline is moved by no reply, whatever its state:
+/// publishing, refused or submitted, it stays `outcome_unknown` with the
+/// deadline's detail (a submitted one would make it `awaiting_result`, which
+/// the next pass expires, ending its alert with nobody resolving it).
 #[test]
-fn a_reply_not_yet_submitted_leaves_the_deadlines_detail() {
+fn no_reply_moves_a_task_past_its_deadline() {
     use crate::runtime::collab::results::{Binding, Reply, ReplyState, ResultRow};
     local_test(async |root| {
         let mut rig = LocalRig::new(root).await;
@@ -777,7 +779,11 @@ fn a_reply_not_yet_submitted_leaves_the_deadlines_detail() {
             },
             start,
         );
-        for state in [ReplyState::Publishing, ReplyState::Refused] {
+        for state in [
+            ReplyState::Publishing,
+            ReplyState::Refused,
+            ReplyState::Submitted,
+        ] {
             row.state = state;
             collab_bridge::apply_reply(&mut record, &row);
             assert_eq!(
@@ -789,11 +795,236 @@ fn a_reply_not_yet_submitted_leaves_the_deadlines_detail() {
                 "{state:?}"
             );
         }
-        row.state = ReplyState::Submitted;
-        collab_bridge::apply_reply(&mut record, &row);
-        assert_eq!(
-            (record.status.state, record.status.detail.as_str()),
-            (WorkState::AwaitingResult, "reply submitted")
+    });
+}
+
+/// The phone's task, run, its outcome then unknown (`write interrupted`)
+/// with its turn still running, and host-work's passes held: its id.
+async fn unknown_in_its_turn(
+    rig: &mut LocalRig,
+    phone: &Authority,
+    prompt: &str,
+    expires_at: u64,
+) -> String {
+    let task = phone_task(rig, phone, prompt, expires_at);
+    turn_journaled(rig, &task, prompt).await;
+    hold_host_work(rig);
+    make_unknown(rig, &task, details::WRITE_INTERRUPTED);
+    task
+}
+
+/// Design I.4.4 ("the deadline bounds the whole task"), I.4.6, step 4's
+/// clock rule (every delegated deadline is compared on `D`): the delegated
+/// clock passes the deadline of the phone's task of unknown outcome while
+/// the wall clock hasn't. Its agent's reply then is refused, `expired`, as
+/// any reply after its task's deadline, and stores nothing: the task stays
+/// `outcome_unknown`, unresolved, with the deadline's detail and its alert,
+/// later passes leave it as it is, and it can still be resolved.
+#[test]
+fn a_reply_after_the_deadline_on_d_is_refused_and_the_task_stays_unresolved() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, true);
+        alerts_on(&mut rig);
+        let task = unknown_in_its_turn(&mut rig, &phone, "LATE_REPLY", start + HOUR).await;
+        let unresolved = (
+            WorkState::OutcomeUnknown,
+            details::DEADLINE_PASSED_OUTCOME_UNKNOWN.to_string(),
         );
+        // `D` reaches the deadline; the wall clock is an hour short of it.
+        os.pass(HOUR);
+        passes(&mut rig, 3);
+        assert!(host_now().wall_ms < start + HOUR);
+        assert_eq!(settled(&rig, &task), unresolved);
+        let refused = reply(&mut rig, &task, "LATE_REPLY_TEXT", &[]).unwrap_err();
+        assert_eq!(refused, format!("task {task} expired"));
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        assert!(
+            crate::runtime::collab::results::load(&store.db, &task)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(settled(&rig, &task), unresolved);
+        assert_eq!(stored_record(&rig, &task).status.resolved, None);
+        let before = serde_json::to_value(stored_record(&rig, &task)).unwrap();
+        passes(&mut rig, 3);
+        assert_eq!(
+            serde_json::to_value(stored_record(&rig, &task)).unwrap(),
+            before
+        );
+        let (alerts, _) = page_for(&mut rig, &phone, None);
+        assert_eq!(
+            alerts
+                .iter()
+                .map(|a| (a.task_id.as_str(), a.reason.as_str()))
+                .collect::<Vec<_>>(),
+            [(task.as_str(), details::WRITE_INTERRUPTED)]
+        );
+        let (req, answer) = resolve_by(&mut rig, &phone, &task, &failure("too late"));
+        assert_eq!(resolved_status(&req, answer).state, WorkState::Failed);
+    });
+}
+
+/// The same with a reply stored before the deadline that was still
+/// publishing its context: its publication completes once the delegated
+/// clock passed the deadline (the wall clock hasn't). The pass refuses the
+/// reply, `expired before context publication`, as a reply whose task's
+/// deadline passed before it was published; the reply stays stored, and the
+/// task stays `outcome_unknown`, unresolved, with its alert.
+#[test]
+fn a_reply_publishing_past_the_deadline_on_d_is_refused_and_the_task_stays_unresolved() {
+    use crate::runtime::collab::results::{self, Binding, Reply, ReplyState, ResultRow};
+    use crate::runtime::collab_context::{ContextSpec, VaultRef};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, true);
+        alerts_on(&mut rig);
+        let task = unknown_in_its_turn(&mut rig, &phone, "PUBLISHING_REPLY", start + HOUR).await;
+        // Stored before the deadline, publishing (as `atem message reply
+        // --vault` stores one).
+        let mut record = stored_record(&rig, &task);
+        let row = ResultRow::new(
+            Reply {
+                binding: Binding {
+                    task_id: task.clone(),
+                    session_id: rig.sid.to_string(),
+                    process_gen: record.task.target.process_gen.clone(),
+                    turn_id: rig
+                        .bridge
+                        .collab_task_turn(&record, &rig.sessions)
+                        .expect("its turn"),
+                },
+                text: "the reply".into(),
+                references: vec![ContextSpec::Vault {
+                    reference: VaultRef::parse("v-context:1@1").unwrap(),
+                }],
+                context: vec![],
+                dropped: false,
+            },
+            start,
+        );
+        assert_eq!(row.state, ReplyState::Publishing);
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let tx = store.db.unchecked_transaction().unwrap();
+        results::submit(&tx, &row).unwrap();
+        collab_bridge::apply_reply(&mut record, &row);
+        store.save_work(&record).unwrap();
+        tx.commit().unwrap();
+        // Its publication is done, handed over at the next pass.
+        let (done, rx) = tokio::sync::oneshot::channel();
+        done.send(Ok(vec![snapshot("the published context")]))
+            .unwrap();
+        rig.bridge
+            .work
+            .context_jobs
+            .insert(row.result_id.clone(), rx);
+        // `D` reaches the deadline; the wall clock is an hour short of it.
+        os.pass(HOUR);
+        passes(&mut rig, 3);
+        assert!(host_now().wall_ms < start + HOUR);
+        assert_eq!(
+            settled(&rig, &task),
+            (
+                WorkState::OutcomeUnknown,
+                details::DEADLINE_PASSED_OUTCOME_UNKNOWN.into()
+            )
+        );
+        assert_eq!(stored_record(&rig, &task).status.resolved, None);
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        let stored = results::load(&store.db, &task).unwrap().expect("stored");
+        assert_eq!(
+            (stored.state, stored.detail.as_str()),
+            (ReplyState::Refused, results::EXPIRED)
+        );
+        // (Not read with `reply_query` here: its reconciliation would follow
+        // the turn this rig still runs, a receipt no real unknown outcome
+        // has; `reply_query` returns this row.)
+        assert_eq!(stored.reply.text, "the reply");
+        let (alerts, _) = page_for(&mut rig, &phone, None);
+        assert_eq!(
+            alerts
+                .iter()
+                .map(|a| a.task_id.as_str())
+                .collect::<Vec<_>>(),
+            [task.as_str()]
+        );
+        passes(&mut rig, 3);
+        assert_eq!(settled(&rig, &task).0, WorkState::OutcomeUnknown);
+    });
+}
+
+/// Host-work-v1 §11.2 ("checks, each time, that the caller is the task's
+/// sender with current authority, or the owner"), design I.4.5 ("the
+/// owner may `work_resolve` any task, including those of a revoked
+/// sender"): the bot resolves one of its tasks. Once a `revoke` record
+/// applies to it, the same resolution again is `forbidden` (the caller is
+/// checked before the recorded status is returned), and so is resolving
+/// another of its tasks, which the Mac, the owner, then resolves. With the
+/// revocation gone but its grant lapsed (on the delegated clock), the bot is
+/// `forbidden` again, and the phone, an owner too, resolves its last task.
+#[test]
+fn work_resolve_needs_current_authority_and_the_owner_resolves_a_revoked_senders_task() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        alerts_on(&mut rig);
+        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        let template = bot_task(&mut rig, &s, "BOT_TEMPLATE", start + HOUR);
+        let template = stored_record(&rig, &template);
+        let tasks = unknown_outcomes(&rig, &template, BOT, 3);
+        let stopped = failure("stopped");
+        let (req, answer) = resolve_by(&mut rig, &s.bot, &tasks[0], &stopped);
+        let first = resolved_status(&req, answer);
+        assert_eq!(first.resolved.as_ref().unwrap().by, BOT);
+        // A `revoke` record applies to the bot.
+        rig.bridge
+            .start_view()
+            .standings
+            .get_mut(BOT)
+            .unwrap()
+            .revoked = Some("rec-1".into());
+        assert_eq!(
+            resolve_by(&mut rig, &s.bot, &tasks[0], &stopped).1,
+            forbidden()
+        );
+        assert_eq!(
+            resolve_by(&mut rig, &s.bot, &tasks[1], &stopped).1,
+            forbidden()
+        );
+        assert_eq!(settled(&rig, &tasks[1]).0, WorkState::OutcomeUnknown);
+        let resolution = done_with("the owner's result", 1);
+        let (req, answer) = resolve_by(&mut rig, &s.mac, &tasks[1], &resolution);
+        let by_owner = resolved_status(&req, answer);
+        assert_eq!(
+            (
+                by_owner.state,
+                by_owner.resolved.as_ref().unwrap().by.as_str()
+            ),
+            (WorkState::Completed, "member:dev-mac")
+        );
+        // The revocation gone, its grant lapsed on the delegated clock.
+        rig.bridge
+            .start_view()
+            .standings
+            .get_mut(BOT)
+            .unwrap()
+            .revoked = None;
+        os.pass(3 * HOUR + 1_000);
+        passes(&mut rig, 2);
+        assert_eq!(
+            resolve_by(&mut rig, &s.bot, &tasks[2], &stopped).1,
+            forbidden()
+        );
+        assert_eq!(settled(&rig, &tasks[2]).0, WorkState::OutcomeUnknown);
+        let (req, answer) = resolve_by(&mut rig, &s.phone, &tasks[2], &stopped);
+        let by_phone = resolved_status(&req, answer);
+        assert_eq!(by_phone.resolved.as_ref().unwrap().by, PHONE);
+        assert_eq!(stored_record(&rig, &tasks[0]).status, first);
     });
 }
