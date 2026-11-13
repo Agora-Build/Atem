@@ -875,3 +875,40 @@ fn a_new_identity_drops_what_the_old_stores_records_asked() {
         assert!(rig.bridge.r9.revoked_services().is_empty());
     });
 }
+
+/// Hook off = main (step 4's Decision 10): with `host.delegated` off, no
+/// service request is refused for its control standing (one the start
+/// view says is revoked included: nothing reads it), and a pass carries
+/// out nothing of the records' (no feeds, no followups, no revoked
+/// services in the r9 engine).
+#[test]
+fn the_hook_off_refuses_and_carries_out_nothing() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        rig.bridge.features = HostFeatures::default();
+        rig.bridge.start_view().standings.insert(
+            BOT.into(),
+            SenderStanding {
+                revoked: Some("rec-1".into()),
+                ..SenderStanding::default()
+            },
+        );
+        let bot = s.bot.clone();
+        let profiles = hw::Request::Profiles {
+            v: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            host: rig.bridge.work_host(),
+        };
+        let reply = ask_req(&mut rig, &bot, &profiles);
+        assert!(
+            matches!(reply, Ok(ResultBody::Profiles { .. })),
+            "{reply:?}"
+        );
+        passes(&mut rig, 2);
+        assert!(rig.bridge.work.followups.is_empty());
+        assert!(rig.bridge.r9.revoked_services().is_empty());
+    });
+}
