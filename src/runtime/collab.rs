@@ -1024,6 +1024,7 @@ mod tests {
 
     fn record(task: WorkTask, principal: &str, message: Option<MessageFrame>) -> WorkRecord {
         WorkRecord {
+            delegated: None,
             principal: principal.into(),
             attachment_owner: String::new(),
             control_gen: 1,

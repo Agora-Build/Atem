@@ -412,6 +412,25 @@ impl Config {
     pub fn route(&self, id: &str) -> Option<&Route> {
         self.routes.iter().find(|r| r.id == id)
     }
+
+    /// The route or profile approval a task was accepted under (`a`) is no
+    /// longer this one: the route is gone or has another revision or
+    /// profile, no longer names the task's principal, or its profile has
+    /// another revision or project (host-work v1, and the delegated start
+    /// check's condition 4).
+    pub fn route_changed(&self, a: &Accepted) -> bool {
+        let Some(route) = self.route(&a.route_id) else {
+            return true;
+        };
+        let Some(profile) = self.profile(&route.profile_id) else {
+            return true;
+        };
+        route.revision != a.route_revision
+            || !route.principals.contains(&a.principal)
+            || profile.id != a.profile_id
+            || profile.revision != a.profile_revision
+            || profile.project != a.project
+    }
 }
 
 impl Profile {
@@ -554,6 +573,12 @@ pub struct WorkRecord {
     /// lines come from the outbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<MessageFrame>,
+    /// A delegated sender's task (design I.1.3, I.4.1): what it was
+    /// admitted under, frozen before the enqueue was answered. None for a
+    /// v1 task (`local`, a browser grant, a service no feed covers, every
+    /// sender while `host.delegated` is off), whose record is as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated: Option<crate::runtime::delegated::Admission>,
 }
 
 /// What a message's task renders around its text: the message's id and
@@ -796,6 +821,9 @@ pub struct Store {
     pub(super) state: PathBuf,
 }
 
+/// How many damaged clock records `clock_aside` keeps (the latest).
+const CLOCK_ASIDE_KEPT: u32 = 8;
+
 pub(super) fn valid_owner(owner: &str) -> bool {
     atem_client::session::wire::is_digest(owner)
 }
@@ -846,12 +874,18 @@ fn track_open_records(db: &Connection) -> Result<()> {
 }
 
 /// The columns of a `work_waits` row, from `{r}` (a task record's JSON; a
-/// record that isn't JSON gives NULLs, due at once) for task `{t}`.
+/// record that isn't JSON gives NULLs, due at once) for task `{t}`. A
+/// delegated task (one with an admission record) is due at its deadline
+/// only: no authorization expiry ends it (design I.2), and its deadline is
+/// compared with the delegated clock (`settle_due`).
 fn wait_columns(t: &str, r: &str) -> String {
     let field = |path: &str| format!("json_extract({r},'$.{path}')");
     format!(
-        "{t}.id,{t}.state,min(coalesce({expires},0),coalesce({auth},{expires},0)),\
-        {expires},{auth},{session},{principal},{gen},{route},{route_rev},{profile},{profile_rev},{project}",
+        "{t}.id,{t}.state,CASE WHEN {delegated} THEN coalesce({expires},0) \
+        ELSE min(coalesce({expires},0),coalesce({auth},{expires},0)) END,\
+        {expires},{auth},{session},{principal},{gen},{route},{route_rev},{profile},{profile_rev},{project},\
+        {delegated}",
+        delegated = format!("({} IS NOT NULL)", field("delegated")),
         expires = field("task.expires_at"),
         auth = field("authorization_expires_at"),
         session = field("task.target.session_id"),
@@ -919,15 +953,19 @@ fn waiting(values: Vec<rusqlite::types::Value>) -> Option<(u64, Accepted)> {
 /// passes read these columns through their indexes and never a task's
 /// record (`Store::settle_due`, `settle_lost`, `holds_unknown_outcome`). A
 /// database without the table gets it, filled once.
+///
+/// Its `delegated` column (a task with an admission record, step 4) has
+/// its own index with the due time, so `settle_due` reads v1 rows by the
+/// wall clock and delegated ones by the delegated clock. It is additive: a
+/// table without it gets it (`ALTER TABLE … ADD COLUMN`, guarded by
+/// `pragma table_info`), the two triggers that fill rows are made again
+/// with it, and the rows are filled again from the records once.
 fn track_waits(db: &Connection) -> Result<()> {
     let tracked: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_waits')",
         [],
         |r| r.get(0),
     )?;
-    if tracked {
-        return Ok(());
-    }
     let waiting = "('awaiting_result','outcome_unknown')";
     let checked = "(SELECT CASE WHEN json_valid(NEW.record) THEN NEW.record ELSE '{}' END AS r)";
     let new = wait_columns("NEW", "r");
@@ -935,15 +973,8 @@ fn track_waits(db: &Connection) -> Result<()> {
         "w",
         "(CASE WHEN json_valid(w.record) THEN w.record ELSE '{}' END)",
     );
-    let tx = db.unchecked_transaction()?;
-    tx.execute_batch(&format!(
-        "CREATE TABLE work_waits (id TEXT PRIMARY KEY, state TEXT NOT NULL, due_ms INTEGER,
-            expires_at INTEGER, authorization_expires_at INTEGER, session_id TEXT,
-            principal TEXT, control_gen INTEGER, route_id TEXT, route_revision INTEGER,
-            profile_id TEXT, profile_revision INTEGER, project TEXT) WITHOUT ROWID;
-        CREATE INDEX work_waits_due ON work_waits(due_ms);
-        CREATE INDEX work_waits_session ON work_waits(session_id, state);
-        CREATE TRIGGER work_waits_opened AFTER INSERT ON work
+    let fills = format!(
+        "CREATE TRIGGER work_waits_opened AFTER INSERT ON work
             WHEN NEW.state IN {waiting} BEGIN
             INSERT OR REPLACE INTO work_waits SELECT {new} FROM {checked};
         END;
@@ -951,10 +982,42 @@ fn track_waits(db: &Connection) -> Result<()> {
             DELETE FROM work_waits WHERE id=OLD.id;
             INSERT INTO work_waits SELECT {new} FROM {checked} WHERE NEW.state IN {waiting};
         END;
+        CREATE INDEX work_waits_delegated ON work_waits(delegated, due_ms);
+        INSERT INTO work_waits SELECT {existing} FROM work w WHERE w.state IN {waiting};"
+    );
+    if tracked {
+        let delegated: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_waits') WHERE name='delegated')",
+            [],
+            |r| r.get(0),
+        )?;
+        if delegated {
+            return Ok(());
+        }
+        let tx = db.unchecked_transaction()?;
+        tx.execute_batch(&format!(
+            "ALTER TABLE work_waits ADD COLUMN delegated INTEGER NOT NULL DEFAULT 0;
+            DROP TRIGGER IF EXISTS work_waits_opened;
+            DROP TRIGGER IF EXISTS work_waits_changed;
+            DELETE FROM work_waits;
+            {fills}"
+        ))?;
+        tx.commit()?;
+        return Ok(());
+    }
+    let tx = db.unchecked_transaction()?;
+    tx.execute_batch(&format!(
+        "CREATE TABLE work_waits (id TEXT PRIMARY KEY, state TEXT NOT NULL, due_ms INTEGER,
+            expires_at INTEGER, authorization_expires_at INTEGER, session_id TEXT,
+            principal TEXT, control_gen INTEGER, route_id TEXT, route_revision INTEGER,
+            profile_id TEXT, profile_revision INTEGER, project TEXT,
+            delegated INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
+        CREATE INDEX work_waits_due ON work_waits(due_ms);
+        CREATE INDEX work_waits_session ON work_waits(session_id, state);
         CREATE TRIGGER work_waits_deleted AFTER DELETE ON work BEGIN
             DELETE FROM work_waits WHERE id=OLD.id;
         END;
-        INSERT INTO work_waits SELECT {existing} FROM work w WHERE w.state IN {waiting};"
+        {fills}"
     ))?;
     tx.commit()?;
     Ok(())
@@ -1018,7 +1081,14 @@ impl Store {
                 size INTEGER NOT NULL, bytes BLOB NOT NULL, PRIMARY KEY(owner,id));
             CREATE TABLE IF NOT EXISTS closed_records (
                 kind TEXT NOT NULL, id TEXT NOT NULL, at_ms INTEGER NOT NULL,
-                PRIMARY KEY(kind,id)) WITHOUT ROWID;")?;
+                PRIMARY KEY(kind,id)) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS clock (id INTEGER PRIMARY KEY CHECK (id = 1), state TEXT);
+            CREATE TABLE IF NOT EXISTS attempts (
+                task_id TEXT NOT NULL, attempt_id TEXT PRIMARY KEY, n INTEGER NOT NULL,
+                \"end\" TEXT, counted INTEGER NOT NULL, created_ms INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS attempts_task ON attempts(task_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS attempts_live ON attempts(task_id)
+                WHERE \"end\" IS NULL;")?;
         track_open_records(&db)?;
         track_waits(&db)?;
         std::fs::File::open(state)?.sync_all()?;
@@ -1038,6 +1108,100 @@ impl Store {
             bail!("host work database belongs to another account or trust generation");
         }
         Ok(())
+    }
+
+    /// The delegated clock's record as stored (`host_clock::HostClock`
+    /// reads it): none before its first write, else the value as it is,
+    /// whatever its type, so a damaged one is never taken for none.
+    pub fn load_clock(&self) -> Result<Option<rusqlite::types::Value>> {
+        Ok(self
+            .db
+            .query_row("SELECT state FROM clock WHERE id=1", [], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Writes the delegated clock's record.
+    pub fn save_clock(&self, state: &crate::runtime::host_clock::state::ClockState) -> Result<()> {
+        self.put_clock(&rusqlite::types::Value::Text(state.to_json()))
+    }
+
+    /// Writes `value` as the clock's record as it is (a damaged one carried
+    /// into a new store stays damaged).
+    pub fn put_clock(&self, value: &rusqlite::types::Value) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO clock(id,state) VALUES(1,?1)
+            ON CONFLICT(id) DO UPDATE SET state=excluded.state",
+            [value],
+        )?;
+        Ok(())
+    }
+
+    /// Keeps the clock's stored record aside (`clock_aside`, found at
+    /// `at_ms`), as it is, never read again: once, while it is the latest
+    /// copy, and only the latest `CLOCK_ASIDE_KEPT` copies. The table is made
+    /// with the first copy, so a store whose clock never kept one has only
+    /// `clock`.
+    pub fn keep_clock_aside(&self, at_ms: u64) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS clock_aside (at_ms INTEGER NOT NULL, state)")?;
+        tx.execute(
+            "INSERT INTO clock_aside(at_ms,state) SELECT ?1,c.state FROM clock c
+            WHERE c.id=1 AND NOT EXISTS(SELECT 1 FROM clock_aside a
+                WHERE a.rowid=(SELECT max(rowid) FROM clock_aside) AND a.state IS c.state)",
+            [at_ms],
+        )?;
+        tx.execute(
+            "DELETE FROM clock_aside WHERE rowid NOT IN
+            (SELECT rowid FROM clock_aside ORDER BY rowid DESC LIMIT ?1)",
+            [CLOCK_ASIDE_KEPT],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The clock's record of the newest retired store that has one
+    /// (`retire`), and that store's path, read only: the record is the
+    /// host's, not the identity's, so a new store that has none yet (a crash
+    /// between the retire and the clock's first write there) takes it.
+    pub fn retired_clock(&self) -> Result<Option<(rusqlite::types::Value, PathBuf)>> {
+        let mut retired: Vec<(u64, PathBuf)> = std::fs::read_dir(&self.state)?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name().into_string().ok()?;
+                let at_ms = name
+                    .strip_prefix("host-work.sqlite.retired-")?
+                    .parse()
+                    .ok()?;
+                Some((at_ms, entry.path()))
+            })
+            .collect();
+        retired.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, path) in retired {
+            // An error names the retired file (PR 4 re-review N1).
+            let read = || -> Result<Option<rusqlite::types::Value>> {
+                let db = Connection::open_with_flags(
+                    &path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?;
+                let has_table: bool = db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='clock')",
+                    [],
+                    |r| r.get(0),
+                )?;
+                if !has_table {
+                    return Ok(None);
+                }
+                Ok(db
+                    .query_row("SELECT state FROM clock WHERE id=1", [], |r| r.get(0))
+                    .optional()?)
+            };
+            let value = read().with_context(|| path.display().to_string())?;
+            if let Some(value) = value {
+                return Ok(Some((value, path)));
+            }
+        }
+        Ok(None)
     }
 
     /// The host these records belong to; none before the first `bind`.
@@ -1376,19 +1540,36 @@ impl Store {
     /// time, so a pass reads only what is due. A record that can't be read
     /// (`work_waits` has no deadline for it, so it is due at once) is
     /// settled as such (`fail_unreadable`). Returns how many settled.
-    pub fn settle_due(&self, now: u64) -> Result<usize> {
+    ///
+    /// A delegated task (one with an admission record) compares its deadline
+    /// with the delegated clock instead (`now_d`, §11.6 "Deadline
+    /// comparisons"; without a reading, the wall clock, which `D` never
+    /// trails), and no authorization expiry fails it (design I.2: expiry
+    /// stops new requests only). v1 rows are read by the wall clock and
+    /// delegated ones by `D`, each through an index on its due time
+    /// (`work_waits.delegated`), so a pass with `D` ahead reads no v1 row
+    /// before its time.
+    pub fn settle_due(&self, now: u64, now_d: Option<u64>) -> Result<usize> {
+        let d = now_d.unwrap_or(now);
         let mut due = Vec::new();
-        {
-            let mut q = self.db.prepare(
-                "SELECT id,expires_at,authorization_expires_at FROM work_waits WHERE due_ms<=?1",
-            )?;
-            let rows = q.query_map([now], |r| {
-                Ok((r.get::<_, String>(0)?, vec![r.get(1)?, r.get(2)?]))
+        let mut take = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> Result<()> {
+            let mut q = self.db.prepare(sql)?;
+            let rows = q.query_map(params, |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    vec![r.get(1)?, r.get(2)?],
+                    r.get::<_, bool>(3)?,
+                ))
             })?;
             for row in rows {
-                let (id, values) = row?;
+                let (id, values, delegated) = row?;
                 match waiting(values) {
                     None => due.push((id, Some(RECORD_UNREADABLE))),
+                    Some((deadline, _)) if delegated => {
+                        if d >= deadline {
+                            due.push((id, None));
+                        }
+                    }
                     Some((deadline, _)) if now >= deadline => due.push((id, None)),
                     Some((_, accepted))
                         if accepted
@@ -1400,8 +1581,65 @@ impl Store {
                     Some(_) => {}
                 }
             }
+            Ok(())
+        };
+        // Due by the wall clock: v1's rows, and delegated ones `D` (never
+        // behind the wall clock) settles too.
+        take(
+            "SELECT id,expires_at,authorization_expires_at,delegated FROM work_waits WHERE due_ms<=?1",
+            &[&now],
+        )?;
+        // Delegated rows due by `D` only, through their own index: no v1 row
+        // due between the wall clock and `D` is read.
+        if d > now {
+            take(
+                "SELECT id,expires_at,authorization_expires_at,delegated FROM work_waits WHERE delegated=1 AND due_ms>?1 AND due_ms<=?2",
+                &[&now, &d],
+            )?;
         }
         self.settle(due)
+    }
+
+    /// Delegated tasks awaiting their result whose deadline `D` reached
+    /// (design I.6.2 step 6, at a start's recovery): expired, as
+    /// `settle_due` expires them, through the delegated rows' due index.
+    /// The tasks it expired.
+    pub fn settle_awaiting_delegated(&self, d: u64) -> Result<Vec<String>> {
+        let mut q = self.db.prepare(
+            "SELECT id,expires_at,authorization_expires_at FROM work_waits
+            WHERE delegated=1 AND due_ms<=?1 AND state='awaiting_result'",
+        )?;
+        let rows = q.query_map([d], |r| {
+            Ok((r.get::<_, String>(0)?, vec![r.get(1)?, r.get(2)?]))
+        })?;
+        let mut due = Vec::new();
+        for row in rows {
+            let (id, values) = row?;
+            match waiting(values) {
+                None => due.push((id, Some(RECORD_UNREADABLE))),
+                Some((deadline, _)) if d >= deadline => due.push((id, None)),
+                Some(_) => {}
+            }
+        }
+        let expired = due
+            .iter()
+            .filter(|(_, why)| why.is_none())
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.settle(due)?;
+        Ok(expired)
+    }
+
+    /// Whether an open task is a delegated sender's: the store then needs
+    /// the delegated clock, whatever the hook says now (step 4, Decision
+    /// 10). Read through `open_records`, so closed records cost nothing.
+    pub fn has_delegated(&self) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM open_records o CROSS JOIN work w ON w.id=o.id
+            WHERE o.kind='work' AND json_extract(w.record,'$.delegated') IS NOT NULL)",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     /// Before its deadline, a task awaiting its result or of unknown
@@ -1418,9 +1656,13 @@ impl Store {
     ) -> Result<usize> {
         let mut due = Vec::new();
         {
+            // A delegated task has its own rules (design I.3.3: awaiting and
+            // unknown ones are kept) and its deadline is `settle_due`'s, on
+            // the delegated clock: never v1's.
             let mut q = self.db.prepare(
                 "SELECT id,expires_at,principal,control_gen,authorization_expires_at,
-                route_id,route_revision,profile_id,profile_revision,project FROM work_waits",
+                route_id,route_revision,profile_id,profile_revision,project FROM work_waits
+                WHERE delegated=0",
             )?;
             let rows = q.query_map([], |r| {
                 let values = [1, 4, 2, 3, 5, 6, 7, 8, 9]
@@ -1452,7 +1694,7 @@ impl Store {
         now: u64,
         lost: impl FnMut(&Accepted) -> Option<&'static str>,
     ) -> Result<usize> {
-        Ok(self.settle_due(now)? + self.settle_lost(now, lost)?)
+        Ok(self.settle_due(now, None)? + self.settle_lost(now, lost)?)
     }
 
     /// Expires each of `due` (no reason) or fails it with its reason; an
@@ -1696,7 +1938,10 @@ impl Store {
     /// live) or of unknown outcome, and a task found submitting is of unknown
     /// outcome; neither is ever retried. Identities stay for the life of
     /// the database (`drop_payloads` drops payloads only), so a retry is
-    /// always answered from its record, never turned into new work.
+    /// always answered from its record, never turned into new work. A
+    /// delegated task (one with an admission record) is left to its own
+    /// recovery, by its attempt's receipt (design I.6.3, the bridge's
+    /// `recover_delegated`): its attempt may be proven never run.
     pub fn recover(
         &self,
         sessions: &BTreeMap<crate::session::SessionId, super::broker::BrokerSession>,
@@ -1718,6 +1963,9 @@ impl Store {
             self.save_launch(&record)?;
         }
         for mut record in self.tasks_in(WorkState::Submitting)? {
+            if record.delegated.is_some() {
+                continue;
+            }
             record.status.state = WorkState::OutcomeUnknown;
             record.status.detail =
                 "submission interrupted; recover its receipt before any further action".into();
@@ -1900,6 +2148,7 @@ mod tests {
     fn task() -> WorkRecord {
         let task_id = uuid::Uuid::new_v4().to_string();
         WorkRecord {
+            delegated: None,
             principal: "member:phone".into(),
             attachment_owner: String::new(),
             control_gen: 1,
@@ -2173,6 +2422,132 @@ mod tests {
         assert_eq!(store.settle_overdue(2_000, |_| None).unwrap(), 1);
     }
 
+    /// A task awaiting its result, delegated or not, due at `expires_at`
+    /// (its authorization expiring at `auth`), written directly.
+    fn waiting_task(store: &Store, delegated: bool, expires_at: u64, auth: Option<u64>) -> String {
+        use crate::runtime::delegated::{Admission, DelegatedSender};
+        let mut r = task();
+        r.task.expires_at = expires_at;
+        r.authorization_expires_at = auth;
+        r.status.state = WorkState::AwaitingResult;
+        r.delegated = delegated.then(|| Admission {
+            principal: "member:phone".into(),
+            principal_key: "ab".repeat(32),
+            sender: DelegatedSender::Native {
+                device_id: "phone".into(),
+            },
+            feed: None,
+            route_id: "backend".into(),
+            route_revision: 1,
+            ops_at_admission: vec!["notify".into(), "prompt".into()],
+            scope_at_admission: serde_json::Value::Null,
+            grant_expires_at: None,
+            device_list_seq: 3,
+            projects_matched: vec![],
+        });
+        store
+            .db
+            .execute(
+                "INSERT INTO work(id,record,state) VALUES(?1,?2,'awaiting_result')",
+                params![r.task.task_id, serde_json::to_string(&r).unwrap()],
+            )
+            .unwrap();
+        r.task.task_id
+    }
+
+    /// Task 19 review M7: `work_waits` keeps whether a task is delegated,
+    /// so `settle_due` takes v1 rows by the wall clock and delegated rows by
+    /// the delegated clock's `D`, each through an index on its due time: with
+    /// `D` ahead, a v1 row due between the wall clock and `D` is never read,
+    /// and a delegated row is due at its deadline only (its authorization
+    /// expiry ends nothing, design I.2).
+    #[test]
+    fn settle_due_takes_v1_rows_by_the_wall_clock_and_delegated_rows_by_d() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let v1 = [
+            waiting_task(&store, false, 1_500, None),
+            waiting_task(&store, false, 1_500, None),
+        ];
+        let delegated = waiting_task(&store, true, 1_500, Some(900));
+        let state = |id: &str| store.work(id).unwrap().unwrap().status.state;
+        let due: Vec<(String, i64, i64)> = {
+            let mut q = store
+                .db
+                .prepare("SELECT id,due_ms,delegated FROM work_waits ORDER BY id")
+                .unwrap();
+            q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        for (id, due_ms, flag) in due {
+            assert_eq!(due_ms, 1_500, "{id}: its deadline");
+            assert_eq!(flag == 1, id == delegated, "{id}");
+        }
+        // Both statements read through an index, never the whole table.
+        for sql in [
+            "SELECT id,expires_at,authorization_expires_at,delegated FROM work_waits WHERE due_ms<=?1",
+            "SELECT id,expires_at,authorization_expires_at,delegated FROM work_waits WHERE delegated=1 AND due_ms>?1 AND due_ms<=?2",
+        ] {
+            let plan: Vec<String> = store
+                .db
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(
+                    rusqlite::params_from_iter(std::iter::repeat_n(0, sql.matches('?').count())),
+                    |r| r.get(3),
+                )
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            assert!(
+                plan.iter().all(|step| step.starts_with("SEARCH")),
+                "{sql}: {plan:?}"
+            );
+        }
+        assert_eq!(store.settle_due(1_000, Some(1_400)).unwrap(), 0);
+        assert_eq!(store.settle_due(1_000, Some(2_000)).unwrap(), 1);
+        assert_eq!(state(&delegated), WorkState::Expired);
+        assert!(v1.iter().all(|id| state(id) == WorkState::AwaitingResult));
+        assert_eq!(store.settle_due(1_500, None).unwrap(), 2);
+    }
+
+    /// The `delegated` column is additive: a store whose `work_waits` has
+    /// none (this branch before Task 19's review) gets it when it opens,
+    /// filled from the records, and its triggers keep it from then on.
+    #[test]
+    fn work_waits_gains_its_delegated_column_when_a_store_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let delegated = waiting_task(&store, true, 1_500, Some(900));
+        store
+            .db
+            .execute_batch(
+                "DROP INDEX work_waits_delegated;
+                DROP TRIGGER work_waits_opened;
+                DROP TRIGGER work_waits_changed;
+                ALTER TABLE work_waits DROP COLUMN delegated;
+                UPDATE work_waits SET due_ms=900;",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        let row = |id: &str| -> (i64, i64) {
+            store
+                .db
+                .query_row(
+                    "SELECT due_ms,delegated FROM work_waits WHERE id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(row(&delegated), (1_500, 1));
+        let v1 = waiting_task(&store, false, 1_500, Some(900));
+        assert_eq!(row(&v1), (900, 0));
+    }
+
     /// A task whose outcome is unknown (a restart in its turn, a launch of
     /// unknown outcome) expires at its deadline too: it holds its session's
     /// queue until then, never for good, and nothing is resubmitted. Its
@@ -2202,8 +2577,8 @@ mod tests {
             store.active_tasks().unwrap().is_empty(),
             "none read per pass"
         );
-        assert_eq!(store.settle_due(999).unwrap(), 0);
-        assert_eq!(store.settle_due(1_000).unwrap(), 1);
+        assert_eq!(store.settle_due(999, None).unwrap(), 0);
+        assert_eq!(store.settle_due(1_000, None).unwrap(), 1);
         let expired = store.work(&r.task.task_id).unwrap().unwrap();
         assert_eq!(
             (expired.status.state, expired.status.detail.as_str()),
@@ -2332,7 +2707,7 @@ mod tests {
         assert!(!open(&ids[3]));
         // Awaiting its result: at its deadline.
         assert_eq!(state(&ids[2]), "awaiting_result");
-        assert_eq!(store.settle_due(1_000).unwrap(), 1);
+        assert_eq!(store.settle_due(1_000, None).unwrap(), 1);
         assert_eq!(detail(&ids[2]), unreadable);
         assert_eq!(grant(&ids[2]), "ended");
         // Settled before: closed as it is when its payloads are due (or

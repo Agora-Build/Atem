@@ -41,6 +41,31 @@ jobs:
         if: runner.os != 'Linux'
         run: cargo test --release --target ${{ matrix.target }} --no-fail-fast
 
+      # macOS: the delegated clock's readings, printed (the run above captures
+      # test output, so only pass or fail reaches the log). Read only:
+      # `continuous_time_counts_from_boot` prints the gap between
+      # mach_continuous_time and now − kern.boottime,
+      # `ntp_gettime_reports_a_state` the state ntp_gettime reports, and the
+      # ignored `real_os_report_macos` one JSON line of what `os::read()` sees
+      # (src/runtime/host_clock/os.rs). The same build: nothing is rebuilt.
+      # It runs even when the test step failed, so the readings still reach
+      # the log (PR 4 re-review N4).
+      - name: Print the macOS clock readings
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --release --target ${{ matrix.target }} --bin atem -- \
+            --exact --nocapture --include-ignored \
+            runtime::host_clock::os::tests::continuous_time_counts_from_boot \
+            runtime::host_clock::os::tests::ntp_gettime_reports_a_state \
+            runtime::host_clock::os::tests::real_os_report_macos \
+            2>&1 | tee clock-readings.log
+          if ! grep -qE '^test result: ok\. 3 passed; 0 failed;' clock-readings.log; then
+            echo "::error::the macOS clock readings did not all run"
+            exit 1
+          fi
+
       # Linux: the cred agent locks its memory only when RLIMIT_MEMLOCK is
       # unlimited or at least 512 MiB (runners default to 8 MiB), so raise it
       # for this shell and everything it starts, then run the tests with the
@@ -69,6 +94,53 @@ jobs:
           fi
           exit $status
 
+      # The atem binary's release-only unit tests (`#[cfg(not(debug_assertions))]`:
+      # they prove the debug-only hooks are compiled out, e.g. that a release
+      # build can't turn on `host.delegated`), each by its exact name, in the
+      # release build the step above made (nothing is rebuilt): the step
+      # fails unless every one of them ran and passed, on every target.
+      - name: Run the release-only unit tests (release build)
+        shell: bash
+        run: |
+          set -o pipefail
+          units=(runtime::test_hooks::tests::host_work_drive_is_off_in_release
+                 runtime::test_hooks::tests::host_features_are_off_in_release
+                 runtime::delegated::tests::release_builds_never_turn_on_host_features)
+          # Every such test in src is in the list: a test fn whose attributes
+          # (the lines above it, doc comments included) say
+          # `cfg(not(debug_assertions))`. The scan is the same on every
+          # target, so it runs on Linux (GNU awk) only.
+          if [ "$RUNNER_OS" = Linux ]; then
+            found=$(find src -name '*.rs' -print0 | xargs -0 awk '
+              /^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/ {
+                if (attrs ~ /cfg\([[:space:]]*not\([[:space:]]*debug_assertions[[:space:]]*\)[[:space:]]*\)/ &&
+                    attrs ~ /#\[(tokio::)?test[]( ]/) {
+                  sub(/^.*fn[[:space:]]+/, ""); sub(/[^A-Za-z0-9_].*$/, ""); print
+                }
+                attrs = ""; next
+              }
+              /^[[:space:]]*$/ || /[;{}][[:space:]]*$/ { attrs = ""; next }
+              { attrs = attrs " " $0 }')
+            for n in $found; do
+              if [[ " ${units[*]} " != *"::$n "* ]]; then
+                echo "::error::$n is a release-only unit test; add it to this step's units"
+                exit 1
+              fi
+            done
+          fi
+          cargo test --release --target ${{ matrix.target }} --bin atem -- --exact --format pretty "${units[@]}" 2>&1 \
+            | tee release-unit-tests.log
+          for u in "${units[@]}"; do
+            if ! grep -qxF "test $u ... ok" release-unit-tests.log; then
+              echo "::error::$u did not run in the release build"
+              exit 1
+            fi
+          done
+          if ! grep -qE "^test result: ok\. ${#units[@]} passed;" release-unit-tests.log; then
+            echo "::error::the release-only unit tests did not all run"
+            exit 1
+          fi
+
       # Every test binary with debug-only `#[ignore]` tests (they need the
       # test hooks in src/runtime/test_hooks.rs and the r9 host clock, which
       # release builds leave out, so the release run above ignores them):
@@ -83,7 +155,10 @@ jobs:
           bins=(runtime_fixtures_binary runtime_build_binary membership_binary
                 r9_two_hosts_binary r9_revoked_binary r9_multi_device_binary
                 r9_push_binary r9_services_binary worker_binary host_work_binary
-                collab_binary)
+                collab_binary delegated_binary control_feed_binary)
+          # Ignored in every build until its input is in the tree, by name:
+          # PR 2's station-call vectors (step 4's Task 34 removes it).
+          still_ignored=(the_hosts_fetch_bytes_match_the_goldens)
           # Every binary with a debug-only ignore is in the list.
           for f in $(grep -rlzP 'cfg_attr\(\s*not\(debug_assertions\),\s*ignore' tests); do
             t=$(basename "$f" .rs)
@@ -96,7 +171,82 @@ jobs:
           for t in "${bins[@]}"; do args+=(--test "$t"); done
           cargo test --no-fail-fast "${args[@]}" -- --format pretty 2>&1 \
             | tee debug-hook-tests.log
-          if grep -E '^test .* \.\.\. ignored' debug-hook-tests.log; then
+          ignored=$(grep -E '^test .* \.\.\. ignored' debug-hook-tests.log || true)
+          for t in "${still_ignored[@]}"; do
+            ignored=$(printf '%s\n' "$ignored" | grep -v "^test $t \.\.\. ignored" || true)
+          done
+          if [ -n "$ignored" ]; then
+            printf '%s\n' "$ignored"
             echo "::error::tests were ignored in the debug build"
+            exit 1
+          fi
+          # The atem binary's debug-only unit tests (`#[cfg(debug_assertions)]`,
+          # so the release run above doesn't even build them, or ignored in
+          # release with `cfg_attr(not(debug_assertions), ignore)`), each by
+          # its exact name: the step fails unless every one of them ran and
+          # passed.
+          units=(runtime::host_bridge::tests::the_drive_hook_plays_host_works_side_through_the_bridge)
+          # Every such test in src is in the list: a test fn whose attributes
+          # (the lines above it, doc comments included) say either form.
+          # Gate tests one by one: a test in a debug-only module isn't seen.
+          found=$(find src -name '*.rs' -print0 | xargs -0 awk '
+            /^[[:space:]]*(pub(\([^)]*\))?[[:space:]]+)?(async[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/ {
+              if ((attrs ~ /cfg\([[:space:]]*debug_assertions[[:space:]]*\)/ ||
+                   attrs ~ /cfg_attr\([[:space:]]*not\([[:space:]]*debug_assertions[[:space:]]*\)[[:space:]]*,[[:space:]]*ignore/) &&
+                  attrs ~ /#\[(tokio::)?test[]( ]/) {
+                sub(/^.*fn[[:space:]]+/, ""); sub(/[^A-Za-z0-9_].*$/, ""); print
+              }
+              attrs = ""; next
+            }
+            /^[[:space:]]*$/ || /[;{}][[:space:]]*$/ { attrs = ""; next }
+            { attrs = attrs " " $0 }')
+          for n in $found; do
+            if [[ " ${units[*]} " != *"::$n "* ]]; then
+              echo "::error::$n is a debug-only unit test; add it to this step's units"
+              exit 1
+            fi
+          done
+          cargo test --bin atem -- --exact --format pretty "${units[@]}" 2>&1 \
+            | tee debug-unit-tests.log
+          for u in "${units[@]}"; do
+            if ! grep -qxF "test $u ... ok" debug-unit-tests.log; then
+              echo "::error::$u did not run in the debug build"
+              exit 1
+            fi
+          done
+          if ! grep -qE "^test result: ok\. ${#units[@]} passed;" debug-unit-tests.log; then
+            echo "::error::the debug-only unit tests did not all run"
+            exit 1
+          fi
+
+      # The delegated clock's time-namespace guard against a real namespace
+      # (host-work-v1 §11.6 "one boot", Decision 17): the ignored test
+      # `timens_offset_is_seen_in_a_time_namespace` checks that the reading
+      # reports the boot-time offset `unshare --time --boottime=86400` gives
+      # its children and that the clock state's guard sees it. A new time
+      # namespace needs privilege, so the bin's unit-test binary runs under
+      # sudo, forked into it. It is the release test binary the earlier step
+      # built (the same cargo flags, so `--no-run` only reports it); cargo's
+      # JSON output names it. Fails when no binary is found, the test fails or
+      # no test ran: zero tests passed is no pass.
+      - name: Run the time-namespace clock test (unshare --time)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --target ${{ matrix.target }} --bin atem --no-run --message-format=json \
+            > "$RUNNER_TEMP/atem-test-build.json"
+          BIN=$(jq -rs '[.[] | select(.reason == "compiler-artifact" and .target.name == "atem"
+                                      and (.target.kind | index("bin")) and .profile.test and .executable)
+                         | .executable] | unique
+                        | if length == 1 then .[0] else error("expected one atem test binary, found \(length)") end' \
+            "$RUNNER_TEMP/atem-test-build.json")
+          test -x "$BIN"
+          echo "test binary: $BIN"
+          TEST=runtime::host_clock::os::tests::timens_offset_is_seen_in_a_time_namespace
+          sudo unshare --time --boottime=86400 --fork "$BIN" --exact "$TEST" --ignored --nocapture \
+            2>&1 | tee "$RUNNER_TEMP/timens-test.log"
+          if ! grep -qE '^test result: ok\. 1 passed; 0 failed;' "$RUNNER_TEMP/timens-test.log"; then
+            echo "::error::the time-namespace test did not run and pass"
             exit 1
           fi

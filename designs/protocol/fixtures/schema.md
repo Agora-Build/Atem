@@ -365,6 +365,45 @@ definition (host-work-v1 §11.4, "Reports") and its report's integration
 and host. They run in `crates/atem-client/tests/r9_fixtures.rs` and in the
 Swift, Kotlin and WASM conformance suites (through `AckLedgerHandle`).
 
+Delegated host work (`r9-delegated-*`, `side: "host"`; session-v1 R9.14,
+behind `host.delegated`, which no host advertises). Two host runners run
+them: the in-process one (`membership::fixtures_tests`), through the fake
+runtime, and the real runtime's (`tests/r9_runner`), through the runtime's
+debug-only drive hook (`ATEM_TEST_HOST_WORK_DRIVE`, with
+`ATEM_TEST_HOST_FEATURES=host.delegated`; `src/runtime/test_hooks.rs`). No
+client-side runner (atem-client, the bindings, Astation's) runs them: the
+`host_work_*` and `adopted_chat` steps play host-internal parts, and what a
+client observes is in the fixtures' `expect` steps.
+
+The harness's rules. Host-work's internal attachment is made at each
+runtime start, after the start's recovery, with a start check that says
+`go`. Every prompt pasted on a session is its agent's turn `turn-<n>` (`n`
+counts the prompts that process took), taken at once, so the chat's
+acceptance journals a host-work prompt's turn; the turn ends at
+`turn_complete`. Host-work's lease is released at the pass after its turn
+ended, as the runtime's renewal pass does; its renewals aren't played, so a
+host-work turn stays under the 15 s lease (no `advance_ms` while one runs).
+A step's `result` is a subset match: each key it names must equal what
+host-work heard, and other keys aren't checked.
+
+| step | meaning |
+|---|---|
+| `{"host_work_submit": session_id, "request_id": r, "task_id": t, "sender": s, "text": x, "result": {…}}` | host-work submits attempt `r` of task `t` (sent by `s`): a session-v1 `submit` of the prompt `x` on its internal attachment, acquiring the lease (`acquire: true`), with the attempt's provenance. What host-work heard: the refusal, `{"code", "detail"?}` (for example `lease_held`, `request_id_reused`), or the receipt after the step, `{"state", "detail"?}` |
+| `{"host_work_verdict": "go"\|"withdraw"}` | host-work's start check (R9.14 item 3) answers that from now on (a runtime start resets it to `go`) |
+| `{"host_work_withdraw": session_id, "request_id": r, "task_id": t, "sender": s, "text": x, "result": w}` | host-work withdraws attempt `r` (R9.14 item 4; its immutable values from those fields). `w`: `rejected` (it was `accepted`, now `rejected` `withdrawn by the host`, or was `rejected` already); `listed` (not in the journal: on the refusal list); `reused` (the id is recorded under another submitter: nothing changed); `list_full` (not in the journal, and the refusal list is full: nothing written); `started` (it is `executing` or past it); `halted` (a write it needed failed: the journal halted, §I) |
+| `{"host_work_interrupt": session_id, "request_id": r, "revoke_only"?: true, "result": i}` | the interrupt with host authority of `r`'s turn (R9.14 item 5; the turn check's chat half read from the session's chat), or its revoke-only call. `i`: `written` (the turn check passed, another controller's lease, if any, was revoked, and the key was written and delivered, as item 5 defines it); `revoked` (the revoke-only call: the turn check passed and another controller's lease, if any, was revoked; nothing written); `not_current_turn` (the session's chat shows no turn of `r` running: its prompt not taken yet, the turn ended, no turn state, or another turn); `not_executing` (`r` isn't `executing`: queued, settled, or never admitted); `halted` (the journal halted, §I) |
+| `{"adopted_chat": session_id, "current_turn": t\|null, "last_completed": t\|null, "outcome"?: "done"\|"interrupted", "chat"?: false}` | after a restart, the adopted worker's chat arrives showing those turns (`outcome`: how `last_completed` ended, absent when not known; `chat: false`: no turn state). A host-work prompt `executing` at the restart stays `executing` until then (at most 60 s) and is then decided as R9.14 item 6's table says. The two runners differ here: the in-process runner feeds the chat state; the real-runtime runner waits until the real agent's chat shows it and every reconciliation is decided, and reports `chat: false`, which the real agent can't produce on demand, NOT RUN with its reason |
+| `{"turn_complete": session_id, "turn_id": t, "outcome"?: "done"\|"interrupted"}` | r8's step; in r9 scenarios `outcome: "interrupted"` ends the turn interrupted (the agent's `[Request interrupted by user]` entry). r8 fixtures have no `outcome` |
+
+| fixture | checks |
+|---|---|
+| `r9-delegated-provenance` | items 1, 2: host-work's attempt is `lease_held` while a native holds the lease, and nothing runs; once free, host-work acquires it as any controller (`lease_changed{granted}`, a native's Send `lease_held`); its receipt carries `task_id` and `sender` for a native's `receipt_query`, through the turn's end; the lease is released at the turn's end |
+| `r9-delegated-start-check-withdraws` | item 3: withdraw → `rejected` `withdrawn by the host` before any effect; go → it runs; a queued attempt is checked when it would start, not at admission |
+| `r9-delegated-withdrawal-refusal-list` | item 4: an attempt not in the journal is `listed`, reads `rejected` `withdrawn by the host`, its late submit gets that receipt and never runs, and the restart records it so; a queued one `rejected`, an executing one `started` |
+| `r9-delegated-host-interrupt` | item 5 (and 6): the turn check (that it comes first is pinned by the host's unit tests), a native's taken-over lease revoked with the Esc, again by the revoke-only call (which writes nothing); a restart while the turn runs keeps it `executing` (adopted chat), the interrupt delivered once more, the turn's real end `completed` `interrupted` |
+| `r9-delegated-recovery-withdrawn` | item 6: after an orderly restart and after a crash, recovered `accepted` host-work requests `withdrawn at recovery`, a refusal-list entry with its own detail, nothing of host-work run at its re-welcome, a native's queued prompt keeping §H |
+| `r9-delegated-request-id-across-submitters` | item 7: `request_id_reused` both ways between host-work and a native, even with every immutable value equal |
+
 In r9 scenarios `advance_ms` moves the host's (or relay's) monotonic
 and wall clocks together, and `set_wall_clock` the wall clock only.
 `expect_push` takes `due_at` (the stage's due time on the relay's clock,
