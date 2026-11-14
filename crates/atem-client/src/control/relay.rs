@@ -9,8 +9,8 @@
 //!
 //! | `op` | direction | fields |
 //! |---|---|---|
-//! | `control_sync` | host → Station | `origin`, `feed_id?`, `after` |
-//! | `control_sync_result` | Station → host | `origin`, `feed_id`, `head`, `station_time`, `records:[{feed_seq, record}]` |
+//! | `control_sync` | host → Station | `request_id`, `origin`, `feed_id?`, `after` |
+//! | `control_sync_result` | Station → host | `request_id`, `origin`, `feed_id`, `after`, `head`, `station_time`, `records:[{feed_seq, record}]` |
 //! | `heads` | Station → host | `feeds:[{origin, feed_id, head, station_time}]`, `membership:{seq, hash}` |
 //! | `control_ack` | host → Station | `account_id`, `genesis_hash`, `host_id`, `host_trust_gen`, `origin`, `feed_id`, `cursor`, `results` |
 //! | `membership_fetch` | host → Station | `after` |
@@ -30,6 +30,20 @@
 //! origins) is the one the signed objects use. Each builder checks what its
 //! reader checks, so what it writes is what the reader accepts.
 //!
+//! **Correlation** (amended in place on Astation's request, #164 comment
+//! 6858189009; unshipped, so no new version and no fallback). A
+//! `control_sync` names itself with `request_id`, a lowercase UUID v4 the
+//! host makes fresh for every call (a timeout's retry and a new link
+//! generation's call included), and its `control_sync_result` carries the
+//! same id and echoes the call's `after`; a call that names a feed is
+//! answered on that feed. Cursor echoes alone can't tell two calls at the
+//! same cursor apart. [`ControlSyncResult::answers`] is the one matching
+//! decision the host and Astation's `:8080` proxy share; the link
+//! generation, account and genesis captured with the call are the caller's
+//! to compare. A page holds only records strictly after its `after`, so a
+//! record at or below it is `malformed`, and a page whose `head` is below
+//! its `after` (the feed went back: the host rescans) holds none.
+//!
 //! **Which host is calling** (I.5.8). No call has a field that names the
 //! caller. The Station takes the calling host from the link's verified
 //! association (its account, root, host, trust generation and connection;
@@ -45,6 +59,19 @@
 //! effect is in force. A result names the exact record (`record_id`), or,
 //! for a host sender's revoke, the device-list entry (`seq`, `entry_hash`)
 //! and host-work's applied device-list `seq`.
+//!
+//! **Typed reasons** (O5, Astation's review of PR 2, #120 comment
+//! 6848326392). An effect `pending` or `refused` may say why: `why`, a
+//! code of the shared vocabulary ([`super::state::Why`]), 1 to
+//! [`super::state::MAX_WHY_BYTES`] bytes of `[a-z0-9_]`. The host writes
+//! one exactly where its effect result has one (never beside `applied` or
+//! `duplicate`). It is information for the Station only: it never changes
+//! a result, never counts as evidence, and asks for no re-signing. A
+//! reader refuses the whole ack for a `why` that is `null`, not a text,
+//! empty, over the bound, outside the character set or beside an effect
+//! in force; it reads a well-formed code it doesn't know as unrecognized
+//! ([`EffectWhy::Unrecognized`]), the result unchanged, so a new reason
+//! never breaks an older Station. Absent: no reason.
 //!
 //! **A feed's records are judged one at a time** (I.5.4). A
 //! `control_sync_result` keeps each record's value as the Station sent it,
@@ -74,8 +101,9 @@
 //! link's ([`super::ledger::AckRefusal::reply`]). A refusal is an
 //! authorization failure on that link, never an empty successful page or an
 //! application acknowledgment: it advances no cursor, membership head, clock
-//! floor or ledger evidence and opens no gate. It carries no request id and
-//! never completes or correlates a request. The host keeps that link's
+//! floor or ledger evidence and opens no gate. It carries no request id or
+//! cursor (a `control_sync`'s `request_id` included: a refusal names a call
+//! kind, never a request) and never completes or correlates a request. The host keeps that link's
 //! synchronization gates closed while it repairs the association and
 //! resynchronizes; the transport may still fence or close the link.
 //!
@@ -96,7 +124,7 @@ use crate::session::wire::is_uuid_v4;
 use crate::station_route::normalize_relay;
 
 use super::record::{ControlError, ControlRecord};
-use super::state::{ApplicationResult, EffectKind, EffectResult};
+use super::state::{ApplicationResult, EffectKind, EffectResult, EffectWhy};
 
 /// The most bytes one relay message is, as sent (R9.9): checked before a
 /// reader parses anything, and by every builder.
@@ -310,13 +338,29 @@ fn check_head(head: &Head, what: &'static str) -> Result<()> {
 
 // ---------------------------------------------------------- control_sync
 
-/// `control_sync{origin, feed_id?, after}` (host → Station): read the feed
-/// `feed_id` of the Station at `origin` after position `after`, the last
-/// position this host has read of it (0: none). A host that doesn't know
-/// the feed yet omits `feed_id` and starts at 0: a cursor belongs to a
-/// feed, so there is none to continue from without one.
+fn check_request_id(request_id: &str) -> Result<()> {
+    if is_uuid_v4(request_id) {
+        Ok(())
+    } else {
+        Err(RelayError::Malformed("request_id"))
+    }
+}
+
+/// `control_sync{request_id, origin, feed_id?, after}` (host → Station):
+/// read the feed `feed_id` of the Station at `origin` after position
+/// `after`, the last position this host has read of it (0: none). A host
+/// that doesn't know the feed yet omits `feed_id` and starts at 0: a cursor
+/// belongs to a feed, so there is none to continue from without one.
+///
+/// `request_id` names this call, so its result can be told apart from any
+/// other's (correlation, amended in place on Astation's request, #164
+/// comment 6858189009): a lowercase UUID v4, which the builder takes from
+/// the caller. The host makes a fresh one for every call: a retry after a
+/// timeout and a call on a new link generation get new ids, even at the
+/// same cursor. An id is a correlation value, never authorization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlSync {
+    pub request_id: String,
     pub origin: String,
     pub feed_id: Option<String>,
     pub after: u64,
@@ -324,6 +368,7 @@ pub struct ControlSync {
 
 impl ControlSync {
     fn check(&self) -> Result<()> {
+        check_request_id(&self.request_id)?;
         check_origin(&self.origin)?;
         if let Some(feed_id) = &self.feed_id {
             check_feed_id(feed_id)?;
@@ -339,6 +384,7 @@ impl ControlSync {
     pub fn to_json(&self) -> Result<Value> {
         self.check()?;
         let mut m = message(op::CONTROL_SYNC);
+        m.insert("request_id".into(), json!(self.request_id));
         m.insert("origin".into(), json!(self.origin));
         if let Some(feed_id) = &self.feed_id {
             m.insert("feed_id".into(), json!(feed_id));
@@ -356,9 +402,10 @@ impl ControlSync {
         let f = Fields::message(
             root,
             op::CONTROL_SYNC,
-            &["type", "op", "origin", "feed_id", "after"],
+            &["type", "op", "request_id", "origin", "feed_id", "after"],
         )?;
         let sync = ControlSync {
+            request_id: f.text("request_id")?.to_owned(),
             origin: f.text("origin")?.to_owned(),
             feed_id: f.optional_text("feed_id")?.map(str::to_owned),
             after: f.uint("after")?,
@@ -407,28 +454,40 @@ impl FeedEntry {
     }
 }
 
-/// `control_sync_result{origin, feed_id, head, station_time, records}`
-/// (Station → host): the records of the feed after the position asked
-/// (ascending `feed_seq`, none above `head`), the feed's `head` and the
-/// Station's clock. Identity of the feed: `(origin, feed_id)` (I.5.2).
+/// `control_sync_result{request_id, origin, feed_id, after, head,
+/// station_time, records}` (Station → host): the answer to the call
+/// `request_id` names, echoing its `after`: the records of the feed after
+/// that position (ascending `feed_seq`, none above `head`; gaps are
+/// legal), the feed's `head` and the Station's clock. Identity of the
+/// feed: `(origin, feed_id)` (I.5.2). A call that named a feed is answered
+/// on that feed; one that named none (from 0) learns the account's current
+/// feed here. A `head` below `after` (the feed went back on the same id)
+/// comes with no records: the host rescans from 0. Whether it answers a
+/// given call is [`ControlSyncResult::answers`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlSyncResult {
+    /// The call's id, as it sent it.
+    pub request_id: String,
     pub origin: String,
     pub feed_id: String,
+    /// The call's `after`, echoed.
+    pub after: u64,
     /// The feed's last position (0: an empty feed).
     pub head: u64,
     /// The Station's clock, ms since the epoch (unsigned: I.6.5).
     pub station_time: u64,
-    /// At most [`MAX_FEED_RECORDS`], ascending, each in `1..=head`.
+    /// At most [`MAX_FEED_RECORDS`], ascending, each in `after + 1..=head`.
     pub records: Vec<FeedEntry>,
 }
 
 impl ControlSyncResult {
-    const FIELDS: [&'static str; 7] = [
+    const FIELDS: [&'static str; 9] = [
         "type",
         "op",
+        "request_id",
         "origin",
         "feed_id",
+        "after",
         "head",
         "station_time",
         "records",
@@ -438,11 +497,15 @@ impl ControlSyncResult {
         if self.records.len() > MAX_FEED_RECORDS {
             return Err(RelayError::TooLarge);
         }
+        check_request_id(&self.request_id)?;
         check_origin(&self.origin)?;
         check_feed_id(&self.feed_id)?;
+        check_safe(self.after, "after")?;
         check_safe(self.head, "head")?;
         check_safe(self.station_time, "station_time")?;
-        let mut previous = 0;
+        // Strictly after the echoed `after`, ascending, none above `head`:
+        // with `head` below `after`, no record at all.
+        let mut previous = self.after;
         for entry in &self.records {
             if entry.feed_seq <= previous || entry.feed_seq > self.head {
                 return Err(RelayError::Malformed("feed_seq"));
@@ -457,8 +520,10 @@ impl ControlSyncResult {
     pub fn to_json(&self) -> Result<Value> {
         self.check()?;
         let mut m = message(op::CONTROL_SYNC_RESULT);
+        m.insert("request_id".into(), json!(self.request_id));
         m.insert("origin".into(), json!(self.origin));
         m.insert("feed_id".into(), json!(self.feed_id));
+        m.insert("after".into(), json!(self.after));
         m.insert("head".into(), json!(self.head));
         m.insert("station_time".into(), json!(self.station_time));
         m.insert(
@@ -494,14 +559,91 @@ impl ControlSyncResult {
             })
             .collect::<Result<Vec<_>>>()?;
         let result = ControlSyncResult {
+            request_id: f.text("request_id")?.to_owned(),
             origin: f.text("origin")?.to_owned(),
             feed_id: f.text("feed_id")?.to_owned(),
+            after: f.uint("after")?,
             head: f.uint("head")?,
             station_time: f.uint("station_time")?,
             records,
         };
         result.check()?;
         Ok(result)
+    }
+
+    /// Whether this page answers `call`: the same `request_id`, the same
+    /// `origin`, the same `feed_id` when the call named one (a call that
+    /// named none, from 0, is answered on whichever feed the page names;
+    /// this helper can't tell that it is the account's current feed: the
+    /// caller checks it against the own feed this generation's `heads`
+    /// announced) and the same `after`. `Ok(())` when it does; else the
+    /// first field that differs, in that order.
+    ///
+    /// An answering page whose `head` is below its `after` (it has no
+    /// records) says the feed went back: the caller marks a rescan from 0
+    /// durably and never moves its cursor on it.
+    ///
+    /// The one decision the host and Astation's `:8080` proxy share. It
+    /// compares the two messages only: the caller compares the rest of what
+    /// it captured with the call, the authenticated link generation (a page
+    /// read on another generation answers nothing), the account and the
+    /// genesis; and it keeps at most one live call per link generation, so a
+    /// page that answers a retired, timed-out or old-generation call (or no
+    /// call) advances nothing and opens no gate. A `request_id` is a
+    /// correlation value, never authorization. Refusals name a call kind,
+    /// never a request: none answers or correlates a call.
+    pub fn answers(&self, call: &ControlSync) -> std::result::Result<(), SyncMismatch> {
+        if self.request_id != call.request_id {
+            return Err(SyncMismatch::RequestId);
+        }
+        if self.origin != call.origin {
+            return Err(SyncMismatch::Origin);
+        }
+        if call.feed_id.as_ref().is_some_and(|f| *f != self.feed_id) {
+            return Err(SyncMismatch::FeedId);
+        }
+        if self.after != call.after {
+            return Err(SyncMismatch::After);
+        }
+        Ok(())
+    }
+}
+
+/// Why a `control_sync_result` doesn't answer a `control_sync`
+/// ([`ControlSyncResult::answers`]): the first of its fields that differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMismatch {
+    /// Another call's id (a retired call's, a timed-out one's, an old
+    /// generation's, or no call's).
+    RequestId,
+    /// Another Station's.
+    Origin,
+    /// Another feed than the one the call named.
+    FeedId,
+    /// Another `after` than the call's.
+    After,
+}
+
+impl SyncMismatch {
+    /// The field's name, as the goldens write it.
+    pub fn code(self) -> &'static str {
+        match self {
+            SyncMismatch::RequestId => "request_id",
+            SyncMismatch::Origin => "origin",
+            SyncMismatch::FeedId => "feed_id",
+            SyncMismatch::After => "after",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        [
+            SyncMismatch::RequestId,
+            SyncMismatch::Origin,
+            SyncMismatch::FeedId,
+            SyncMismatch::After,
+        ]
+        .into_iter()
+        .find(|m| m.code() == code)
     }
 }
 
@@ -647,9 +789,33 @@ fn effects_json(effects: &[EffectResult]) -> Value {
     Value::Array(
         effects
             .iter()
-            .map(|e| json!({"effect": e.effect.code(), "result": e.result.code()}))
+            .map(|e| {
+                let mut o = json!({"effect": e.effect.code(), "result": e.result.code()});
+                if let Some(why) = &e.why {
+                    o["why"] = json!(why.code());
+                }
+                o
+            })
             .collect(),
     )
+}
+
+/// An effect's reason, as an ack writes and reads it (O5): only beside
+/// `pending` or `refused`, and only a well-formed code (a known one, or
+/// one this build doesn't know, read as unrecognized).
+fn check_why(e: &EffectResult) -> Result<()> {
+    let Some(why) = &e.why else {
+        return Ok(());
+    };
+    let not_in_force = matches!(
+        e.result,
+        ApplicationResult::Pending | ApplicationResult::Refused
+    );
+    if not_in_force && EffectWhy::well_formed(why.code()) {
+        Ok(())
+    } else {
+        Err(RelayError::Malformed("why"))
+    }
 }
 
 fn read_effects(f: &Fields) -> Result<Vec<EffectResult>> {
@@ -661,12 +827,22 @@ fn read_effects(f: &Fields) -> Result<Vec<EffectResult>> {
     items
         .iter()
         .map(|item| {
-            let e = Fields::of(item, &["effect", "result"], "effects")?;
+            let e = Fields::of(item, &["effect", "result", "why"], "effects")?;
+            // Absent: no reason; present, a well-formed text (never null).
+            let why = match e.0.get("why") {
+                None => None,
+                Some(why) => Some(
+                    why.as_str()
+                        .and_then(EffectWhy::read)
+                        .ok_or(RelayError::Malformed("why"))?,
+                ),
+            };
             Ok(EffectResult {
                 effect: EffectKind::from_code(e.text("effect")?)
                     .ok_or(RelayError::Malformed("effects"))?,
                 result: ApplicationResult::from_code(e.text("result")?)
                     .ok_or(RelayError::Malformed("effects"))?,
+                why,
             })
         })
         .collect()
@@ -674,7 +850,8 @@ fn read_effects(f: &Fields) -> Result<Vec<EffectResult>> {
 
 /// One result in a `control_ack`: exactly one of two forms, by what it
 /// names (I.5.8, "Delivery progress is not application"). Each carries a
-/// result per effect, never the cursor's progress.
+/// result per effect, never the cursor's progress, and each effect not in
+/// force may say why (O5, the module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AckResult {
     /// A control record, by its `record_id`: the effects it carries, once
@@ -688,6 +865,9 @@ pub enum AckResult {
     /// the interrupt when the entry asked for one. A result of `applied` or
     /// `duplicate` means the effect is durable, so `applied_seq` has
     /// reached `entry.seq`; behind it only `pending` or `refused` is said.
+    /// Its reason, written by host-work (host-work-v1 §11.4 wire rule 10):
+    /// `revoke_not_applied` beside an effect `pending` while `applied_seq`
+    /// is behind the entry, and none otherwise in this version.
     Entry {
         entry: EntryRef,
         applied_seq: u64,
@@ -697,6 +877,10 @@ pub enum AckResult {
 
 impl AckResult {
     fn check(&self) -> Result<()> {
+        let effects = match self {
+            AckResult::Record { effects, .. } | AckResult::Entry { effects, .. } => effects,
+        };
+        effects.iter().try_for_each(check_why)?;
         match self {
             AckResult::Record { record_id, effects } => {
                 if !is_uuid_v4(record_id) {
@@ -1165,6 +1349,8 @@ impl ToHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::state::{EffectWhy, MAX_WHY_BYTES, Why};
+    use crate::control::verify::{PendingReason, RefusalReason};
     use crate::encoding::b64u;
     use serde_json::json;
 
@@ -1215,25 +1401,47 @@ mod tests {
     }
 
     fn effect(effect: EffectKind, result: ApplicationResult) -> EffectResult {
-        EffectResult { effect, result }
+        EffectResult {
+            effect,
+            result,
+            why: None,
+        }
+    }
+
+    /// An effect not in force, with its reason.
+    fn effect_why(effect: EffectKind, result: ApplicationResult, why: Why) -> EffectResult {
+        EffectResult {
+            effect,
+            result,
+            why: Some(EffectWhy::Known(why)),
+        }
     }
 
     fn bytes(message: &Value) -> Vec<u8> {
         message.to_string().into_bytes()
     }
 
+    /// A call's `request_id`: a lowercase UUID v4.
+    const REQUEST: &str = "5d0e9a3c-2b1f-4c8d-9e7a-6b5c4d3e2f10";
+    /// Another call's (a retry at the same cursor, say).
+    const REQUEST_2: &str = "8a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+
     fn sync() -> ControlSync {
         ControlSync {
+            request_id: REQUEST.into(),
             origin: ORIGIN.into(),
             feed_id: Some(FEED.into()),
             after: 41,
         }
     }
 
+    /// The answer to `sync()`: `records` records from position 42.
     fn sync_result(records: u64) -> ControlSyncResult {
         ControlSyncResult {
+            request_id: REQUEST.into(),
             origin: ORIGIN.into(),
             feed_id: FEED.into(),
+            after: 41,
             head: 1000,
             station_time: STATION_TIME,
             records: (1..=records)
@@ -1391,6 +1599,7 @@ mod tests {
         assert_eq!(ControlSync::decode(&bytes(&wire)).unwrap(), sent);
         // A host that doesn't know the feed yet omits `feed_id`.
         let first = ControlSync {
+            request_id: REQUEST.into(),
             origin: ORIGIN.into(),
             feed_id: None,
             after: 0,
@@ -1536,6 +1745,7 @@ mod tests {
             &message, "", "feed_id"
         )))); // after 41 needs a feed
         let first = ControlSync {
+            request_id: REQUEST.into(),
             origin: ORIGIN.into(),
             feed_id: None,
             after: 0,
@@ -1720,8 +1930,8 @@ mod tests {
     /// A `control_sync_result` of exactly `len` bytes whose one record is
     /// raw (kept, not judged) and padded.
     fn padded_result(len: usize) -> Vec<u8> {
-        let base = json!({"type": "relay", "op": "control_sync_result", "origin": ORIGIN,
-            "feed_id": FEED, "head": 1, "station_time": STATION_TIME,
+        let base = json!({"type": "relay", "op": "control_sync_result", "request_id": REQUEST,
+            "origin": ORIGIN, "feed_id": FEED, "after": 0, "head": 1, "station_time": STATION_TIME,
             "records": [{"feed_seq": 1, "record": {"pad": ""}}]})
         .to_string();
         let padding = "x".repeat(len - base.len());
@@ -1918,8 +2128,8 @@ mod tests {
         // A record the parser refuses is kept as evidence and refused alone
         // (I.5.4): the feed's other records, and its position, still arrive.
         let good = service_record(1).object().to_json();
-        let message = json!({"type": "relay", "op": "control_sync_result", "origin": ORIGIN,
-        "feed_id": FEED, "head": 6, "station_time": STATION_TIME,
+        let message = json!({"type": "relay", "op": "control_sync_result", "request_id": REQUEST,
+        "origin": ORIGIN, "feed_id": FEED, "after": 0, "head": 6, "station_time": STATION_TIME,
         "records": [
             {"feed_seq": 1, "record": good},
             {"feed_seq": 2, "record": {}},
@@ -1982,8 +2192,8 @@ mod tests {
         // after parsing it strictly. The host refuses the page, keeps its
         // cursor, leaves the gate closed and alerts (rate limited); this
         // layer says which refusal it is.
-        let message = json!({"type": "relay", "op": "control_sync_result", "origin": ORIGIN,
-        "feed_id": FEED, "head": 3, "station_time": STATION_TIME,
+        let message = json!({"type": "relay", "op": "control_sync_result", "request_id": REQUEST,
+        "origin": ORIGIN, "feed_id": FEED, "after": 0, "head": 3, "station_time": STATION_TIME,
         "records": [
             {"feed_seq": 1, "record": service_record(1).object().to_json()},
             {"feed_seq": 2, "record": {"pad": "PAD"}},
@@ -2028,7 +2238,7 @@ mod tests {
         };
         assert!(ControlSyncResult::decode(&seqs(42, 43, 44)).is_ok());
         assert!(
-            ControlSyncResult::decode(&seqs(10, 50, 1000)).is_ok(),
+            ControlSyncResult::decode(&seqs(42, 50, 1000)).is_ok(),
             "gaps are the host's to judge"
         );
         for bad in [(43, 42, 44), (42, 42, 44), (0, 1, 2), (998, 999, 1001)] {
@@ -2051,16 +2261,229 @@ mod tests {
         // A cursor belongs to a feed: with no `feed_id` there is no position
         // to continue from.
         let first = ControlSync {
+            request_id: REQUEST.into(),
             origin: ORIGIN.into(),
             feed_id: None,
             after: 5,
         };
         assert_eq!(first.to_json(), Err(RelayError::Malformed("after")));
-        let wire = json!({"type": "relay", "op": "control_sync", "origin": ORIGIN, "after": 5});
+        let wire = json!({"type": "relay", "op": "control_sync", "request_id": REQUEST,
+            "origin": ORIGIN, "after": 5});
         assert_eq!(
             ControlSync::decode(&bytes(&wire)),
             Err(RelayError::Malformed("after"))
         );
+    }
+
+    // ------------------------------------------------------- correlation
+
+    /// Correlation (amended in place on Astation's request, #164 comment
+    /// 6858189009): a `control_sync` names itself with `request_id`, a
+    /// lowercase UUID v4 the host makes fresh for every call, and its
+    /// result carries the same id and echoes the call's `after`. Both are
+    /// required; a bad id is refused like any bad field.
+    #[test]
+    fn a_sync_and_its_result_carry_the_calls_id() {
+        let call = sync().to_json().unwrap();
+        assert_eq!(call["request_id"], REQUEST);
+        let page = sync_result(1).to_json().unwrap();
+        assert_eq!(page["request_id"], REQUEST);
+        assert_eq!(page["after"], 41);
+        for (op, message) in [("control_sync", &call), ("control_sync_result", &page)] {
+            assert_eq!(
+                read(op, &without(message, "", "request_id")),
+                Err(RelayError::Malformed("request_id")),
+                "{op} without request_id"
+            );
+            for bad in [
+                json!(null),
+                json!(7),
+                json!(""),
+                json!("not-a-uuid"),
+                json!(REQUEST.to_uppercase()),
+                // Version 5, the version nibble.
+                json!("5d0e9a3c-2b1f-5c8d-9e7a-6b5c4d3e2f10"),
+                // Not RFC 4122's variant.
+                json!("5d0e9a3c-2b1f-4c8d-1e7a-6b5c4d3e2f10"),
+                json!(format!("{{{REQUEST}}}")),
+                json!(format!(" {REQUEST}")),
+            ] {
+                assert_eq!(
+                    read(op, &with(message, "/request_id", bad.clone())),
+                    Err(RelayError::Malformed("request_id")),
+                    "{op} {bad}"
+                );
+            }
+        }
+        // The result's echoed `after` is required, a safe whole number.
+        assert_eq!(
+            read("control_sync_result", &without(&page, "", "after")),
+            Err(RelayError::Malformed("after"))
+        );
+        for bad in [json!(null), json!("41"), json!(-1)] {
+            assert_eq!(
+                read("control_sync_result", &with(&page, "/after", bad.clone())),
+                Err(RelayError::Malformed("after")),
+                "{bad}"
+            );
+        }
+        // The builders check what the readers check.
+        let mut upper = sync();
+        upper.request_id = REQUEST.to_uppercase();
+        assert_eq!(upper.to_json(), Err(RelayError::Malformed("request_id")));
+        let mut v5 = sync_result(0);
+        v5.request_id = "5d0e9a3c-2b1f-5c8d-9e7a-6b5c4d3e2f10".into();
+        assert_eq!(v5.to_json(), Err(RelayError::Malformed("request_id")));
+        let mut unsafe_after = sync_result(0);
+        unsafe_after.after = crate::canonical::MAX_SAFE_INTEGER + 1;
+        unsafe_after.head = unsafe_after.after;
+        assert_eq!(unsafe_after.to_json(), Err(RelayError::Malformed("after")));
+    }
+
+    /// A page holds the records strictly after its echoed `after`,
+    /// ascending and none above `head`; gaps stay legal. A page whose
+    /// `head` is below its `after` (the feed went back on the same id: the
+    /// host rescans) holds no record: any record would be above its head.
+    #[test]
+    fn a_page_holds_only_records_after_its_after() {
+        let page = |after: u64, head: u64, seqs: &[u64]| {
+            let mut m = sync_result(0).to_json().unwrap();
+            m["after"] = json!(after);
+            m["head"] = json!(head);
+            m["records"] = Value::Array(
+                seqs.iter()
+                    .map(|s| json!({"feed_seq": s, "record": 0}))
+                    .collect(),
+            );
+            bytes(&m)
+        };
+        let decode = |b: Vec<u8>| ControlSyncResult::decode(&b).map(drop);
+        assert_eq!(decode(page(41, 50, &[42, 45, 50])), Ok(()), "gaps legal");
+        assert_eq!(decode(page(0, 3, &[1, 2, 3])), Ok(()), "from the start");
+        assert_eq!(decode(page(41, 41, &[])), Ok(()), "nothing new");
+        // A record at or below `after`: this page answers another call, or
+        // none.
+        for seqs in [&[41][..], &[40], &[40, 42], &[1, 42], &[42, 41]] {
+            assert_eq!(
+                decode(page(41, 50, seqs)),
+                Err(RelayError::Malformed("feed_seq")),
+                "{seqs:?}"
+            );
+        }
+        // `head` below `after`: legal only with no records.
+        assert_eq!(decode(page(41, 7, &[])), Ok(()));
+        assert_eq!(decode(page(41, 0, &[])), Ok(()));
+        for seqs in [&[8][..], &[7], &[42]] {
+            assert_eq!(
+                decode(page(41, 7, seqs)),
+                Err(RelayError::Malformed("feed_seq")),
+                "{seqs:?}"
+            );
+        }
+        // The builder refuses what the reader refuses.
+        let mut at_after = sync_result(2); // records 42, 43
+        at_after.after = 42;
+        assert_eq!(at_after.to_json(), Err(RelayError::Malformed("feed_seq")));
+        let mut back = sync_result(0);
+        back.head = 7;
+        assert!(back.to_json().is_ok());
+        let mut back_with_records = sync_result(1);
+        back_with_records.head = 7;
+        assert_eq!(
+            back_with_records.to_json(),
+            Err(RelayError::Malformed("feed_seq"))
+        );
+    }
+
+    /// The one helper the host and Astation's `:8080` proxy share to tell
+    /// whether a page answers a call: the same `request_id`, origin, feed
+    /// (when the call names one) and `after`. The link generation, account
+    /// and genesis captured with the call are the caller's to compare.
+    #[test]
+    fn a_page_answers_only_its_own_call() {
+        let call = sync();
+        let page = sync_result(2);
+        assert_eq!(page.answers(&call), Ok(()));
+        let other = |edit: &dyn Fn(&mut ControlSyncResult)| {
+            let mut p = sync_result(0);
+            edit(&mut p);
+            p.answers(&call)
+        };
+        assert_eq!(
+            other(&|p| p.request_id = REQUEST_2.into()),
+            Err(SyncMismatch::RequestId)
+        );
+        assert_eq!(
+            other(&|p| p.origin = "https://station.agora.build".into()),
+            Err(SyncMismatch::Origin)
+        );
+        assert_eq!(
+            other(&|p| p.feed_id = FEED_2.into()),
+            Err(SyncMismatch::FeedId)
+        );
+        assert_eq!(other(&|p| p.after = 40), Err(SyncMismatch::After));
+        assert_eq!(other(&|p| p.after = 0), Err(SyncMismatch::After));
+        // The id is compared first: a page that differs in more names it.
+        assert_eq!(
+            other(&|p| {
+                p.request_id = REQUEST_2.into();
+                p.after = 0;
+            }),
+            Err(SyncMismatch::RequestId)
+        );
+        // Neither the head, the clock nor the records decide.
+        assert_eq!(
+            other(&|p| {
+                p.head = 3;
+                p.station_time = 0;
+            }),
+            Ok(())
+        );
+
+        // Discovery: a call that names no feed (from 0) is answered on the
+        // feed the page names, the account's current one.
+        let discovery = ControlSync {
+            request_id: REQUEST.into(),
+            origin: ORIGIN.into(),
+            feed_id: None,
+            after: 0,
+        };
+        let mut found = sync_result(0);
+        found.after = 0;
+        found.feed_id = FEED_2.into();
+        assert_eq!(found.answers(&discovery), Ok(()));
+        assert_eq!(page.answers(&discovery), Err(SyncMismatch::After));
+
+        // Two calls at the same cursor (a timeout's retry, a new link
+        // generation's call) differ only by their ids: a page answers the
+        // one it names, so a late reply to a retired call is no answer to
+        // the live one.
+        let retired = sync();
+        let live = ControlSync {
+            request_id: REQUEST_2.into(),
+            ..sync()
+        };
+        let late = sync_result(1);
+        assert_eq!(late.answers(&retired), Ok(()));
+        assert_eq!(late.answers(&live), Err(SyncMismatch::RequestId));
+        let fresh = ControlSyncResult {
+            request_id: REQUEST_2.into(),
+            ..sync_result(1)
+        };
+        assert_eq!(fresh.answers(&live), Ok(()));
+        assert_eq!(fresh.answers(&retired), Err(SyncMismatch::RequestId));
+
+        // Each mismatch's name, as the goldens write it.
+        for (m, code) in [
+            (SyncMismatch::RequestId, "request_id"),
+            (SyncMismatch::Origin, "origin"),
+            (SyncMismatch::FeedId, "feed_id"),
+            (SyncMismatch::After, "after"),
+        ] {
+            assert_eq!(m.code(), code);
+            assert_eq!(SyncMismatch::from_code(code), Some(m));
+        }
+        assert_eq!(SyncMismatch::from_code("answers"), None);
     }
 
     #[test]
@@ -2472,6 +2895,16 @@ mod tests {
                     r#""code":"forbidden","detail":null"#.to_owned(),
                     RelayError::UnknownField,
                 ),
+                // No request id and no cursor: a refusal names a call kind,
+                // never a request (correlation leaves it unchanged).
+                (
+                    format!(r#""code":"forbidden","request_id":"{REQUEST}""#),
+                    RelayError::UnknownField,
+                ),
+                (
+                    r#""code":"forbidden","after":41"#.to_owned(),
+                    RelayError::UnknownField,
+                ),
                 // A duplicate key: the parse refuses the message whole.
                 (
                     r#""code":"forbidden","code":"forbidden""#.to_owned(),
@@ -2502,5 +2935,231 @@ mod tests {
             ToHost::decode(big.as_bytes()).unwrap_err(),
             RelayError::TooLarge
         );
+    }
+
+    // ------------------------------------------------ typed reasons (O5)
+
+    /// An ack whose effects not in force say why, beside effects in force
+    /// that say nothing: a record's and an entry's.
+    fn reasoned_ack() -> ControlAck {
+        use ApplicationResult::{Applied, Duplicate, Pending, Refused};
+        ack(vec![
+            AckResult::Record {
+                record_id: record_id(1),
+                effects: vec![effect_why(EffectKind::Release, Refused, Why::NotAfterHold)],
+            },
+            AckResult::Record {
+                record_id: record_id(2),
+                effects: vec![effect_why(
+                    EffectKind::Interrupt,
+                    Pending,
+                    Why::Pending(PendingReason::NotRevoked),
+                )],
+            },
+            AckResult::Record {
+                record_id: record_id(3),
+                effects: vec![
+                    effect(EffectKind::Revocation, Duplicate),
+                    effect(EffectKind::Interrupt, Applied),
+                ],
+            },
+            AckResult::Record {
+                record_id: record_id(4),
+                effects: vec![
+                    effect_why(
+                        EffectKind::Revocation,
+                        Refused,
+                        Why::Refused(RefusalReason::RemovedManager),
+                    ),
+                    effect_why(
+                        EffectKind::Interrupt,
+                        Refused,
+                        Why::Refused(RefusalReason::RemovedManager),
+                    ),
+                ],
+            },
+            AckResult::Entry {
+                entry: EntryRef {
+                    seq: 20,
+                    entry_hash: hash(0x44),
+                },
+                applied_seq: 19,
+                effects: vec![effect_why(
+                    EffectKind::Revocation,
+                    Pending,
+                    Why::Pending(PendingReason::RevokeNotApplied),
+                )],
+            },
+        ])
+    }
+
+    /// O5 (Astation's review of PR 2, #120 comment 6848326392): each
+    /// effect result may carry `why`, a reason of the shared vocabulary,
+    /// written exactly where the effect isn't in force. A reason this
+    /// reader doesn't know is read as unrecognized, the result unchanged;
+    /// absent is no reason.
+    #[test]
+    fn reasons_ride_beside_the_effects_not_in_force() {
+        let sent = reasoned_ack();
+        let wire = sent.to_json().unwrap();
+        let results = &wire["results"];
+        assert_eq!(results[0]["effects"][0]["why"], "not_after_hold");
+        assert_eq!(results[1]["effects"][0]["why"], "not_revoked");
+        assert_eq!(results[3]["effects"][1]["why"], "removed_manager");
+        assert_eq!(results[4]["effects"][0]["why"], "revoke_not_applied");
+        for e in results[2]["effects"].as_array().unwrap() {
+            assert!(e.get("why").is_none(), "in force: no reason");
+        }
+        assert_eq!(ControlAck::decode(&bytes(&wire)).unwrap(), sent);
+
+        // A well-formed reason this reader doesn't know: unrecognized, the
+        // result and everything else unchanged, written back as it came.
+        let later = "a_later_reason";
+        let unknown = with(&wire, "/results/0/effects/0/why", json!(later));
+        let read = ControlAck::decode(&unknown).unwrap();
+        let AckResult::Record { effects, .. } = &read.results[0] else {
+            panic!("a record's result")
+        };
+        assert_eq!(
+            effects[0],
+            EffectResult {
+                effect: EffectKind::Release,
+                result: ApplicationResult::Refused,
+                why: Some(EffectWhy::Unrecognized(later.into())),
+            }
+        );
+        assert_eq!(read.results[1..], sent.results[1..]);
+        assert_eq!(bytes(&read.to_json().unwrap()), unknown);
+        // At the bound, and every code of the vocabulary, is well formed.
+        let longest = "z".repeat(MAX_WHY_BYTES);
+        let at_bound = with(&wire, "/results/0/effects/0/why", json!(longest));
+        assert!(ControlAck::decode(&at_bound).is_ok());
+        for code in ["order", "not_after_hold", "possible_replay", "list_frozen"] {
+            assert_eq!(
+                EffectWhy::read(code),
+                Some(EffectWhy::Known(Why::from_code(code).unwrap()))
+            );
+        }
+        // Absent: no reason, as every step-3 ack.
+        let bare = without(&wire, "/results/0/effects/0", "why");
+        let AckResult::Record { effects, .. } = &ControlAck::decode(&bare).unwrap().results[0]
+        else {
+            panic!("a record's result")
+        };
+        assert_eq!(effects[0].why, None);
+    }
+
+    /// A reason is read strictly: `null`, a non-string, an empty string,
+    /// over 64 bytes or outside `[a-z0-9_]` refuses the whole ack, and so
+    /// does a reason beside `applied` or `duplicate` (a reason says why an
+    /// effect isn't in force). A duplicate key is a strict parse's fault,
+    /// as everywhere; an effect field other than `why` is unknown.
+    #[test]
+    fn a_malformed_reason_refuses_the_whole_ack() {
+        let wire = reasoned_ack().to_json().unwrap();
+        let at = "/results/0/effects/0/why";
+        for bad in [
+            json!(null),
+            json!(7),
+            json!(true),
+            json!(["order"]),
+            json!(""),
+            json!("z".repeat(MAX_WHY_BYTES + 1)),
+            json!("Not_after_hold"),
+            json!("not after hold"),
+            json!("not-after-hold"),
+            json!("ordér"),
+        ] {
+            let r = ControlAck::decode(&with(&wire, at, bad.clone()));
+            assert_eq!(r, Err(RelayError::Malformed("why")), "{bad}");
+        }
+        // Beside an effect in force.
+        for (pointer, why) in [
+            ("/results/2/effects/0", "order"),
+            ("/results/2/effects/1", "a_later_reason"),
+        ] {
+            let mut changed = wire.clone();
+            changed.pointer_mut(pointer).unwrap()["why"] = json!(why);
+            assert_eq!(
+                ControlAck::decode(&bytes(&changed)),
+                Err(RelayError::Malformed("why")),
+                "{pointer}"
+            );
+        }
+        // A duplicate key anywhere: not strict JSON.
+        let text = String::from_utf8(bytes(&wire)).unwrap();
+        let doubled = text.replacen(
+            "\"why\":\"not_after_hold\"",
+            "\"why\":\"order\",\"why\":\"not_after_hold\"",
+            1,
+        );
+        assert_ne!(doubled, text);
+        assert_eq!(
+            ControlAck::decode(doubled.as_bytes()),
+            Err(RelayError::NotStrict)
+        );
+        // Another field beside an effect.
+        let reason = add(&wire, "/results/0/effects/0", "reason");
+        assert_eq!(ControlAck::decode(&reason), Err(RelayError::UnknownField));
+    }
+
+    /// The builder checks what the reader checks: a reason only beside an
+    /// effect not in force, and only a well-formed one.
+    #[test]
+    fn the_builder_writes_a_reason_only_where_the_reader_takes_one() {
+        let set = |why: EffectWhy, result: ApplicationResult| {
+            ack(vec![AckResult::Record {
+                record_id: record_id(1),
+                effects: vec![EffectResult {
+                    effect: EffectKind::Release,
+                    result,
+                    why: Some(why),
+                }],
+            }])
+            .to_json()
+        };
+        let known = || EffectWhy::Known(Why::Order);
+        for result in [ApplicationResult::Applied, ApplicationResult::Duplicate] {
+            assert_eq!(set(known(), result), Err(RelayError::Malformed("why")));
+        }
+        for result in [ApplicationResult::Pending, ApplicationResult::Refused] {
+            assert!(set(known(), result).is_ok());
+        }
+        let refused = ApplicationResult::Refused;
+        for bad in ["", "Order", "a b", &"z".repeat(MAX_WHY_BYTES + 1)] {
+            let why = EffectWhy::Unrecognized(bad.into());
+            assert_eq!(
+                set(why, refused),
+                Err(RelayError::Malformed("why")),
+                "{bad}"
+            );
+        }
+        assert!(set(EffectWhy::Unrecognized("a_later_reason".into()), refused).is_ok());
+    }
+
+    /// The step-3 refusals stay exactly as agreed: an ack carrying reasons
+    /// changes nothing about them.
+    #[test]
+    fn refusals_are_unchanged_by_reasons() {
+        for (call, wire) in [
+            (
+                RefusedCall::ControlSync,
+                r#"{"code":"forbidden","op":"control_sync_refused","type":"relay"}"#,
+            ),
+            (
+                RefusedCall::MembershipFetch,
+                r#"{"code":"forbidden","op":"membership_fetch_refused","type":"relay"}"#,
+            ),
+            (
+                RefusedCall::ControlAck,
+                r#"{"code":"forbidden","op":"control_ack_refused","type":"relay"}"#,
+            ),
+        ] {
+            let refused = CallRefused {
+                call,
+                code: RefusalCode::Forbidden,
+            };
+            assert_eq!(refused.to_json().unwrap().to_string(), wire);
+        }
     }
 }

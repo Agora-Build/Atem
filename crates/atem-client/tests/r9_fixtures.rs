@@ -1251,7 +1251,7 @@ fn r9_control_ack_scenarios() {
         .map(|n| n.trim_end_matches(".json").to_owned())
         .collect();
     names.sort();
-    assert_eq!(names.len(), 5, "{names:?}");
+    assert_eq!(names.len(), 6, "{names:?}");
     let mut passed = 0;
     for name in &names {
         let file = load(name);

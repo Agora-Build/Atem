@@ -31,10 +31,13 @@
 //!   body, or a body over 4,096 bytes; or anything else the signed-object
 //!   parse refuses. The host refuses those bytes
 //!   too, under the SHA-256 of the bytes as fetched (host-work-v1 §11.5).
-//!   The receiver passes its own trust generation (from its pairing) and the
+//!   The receiver passes its own trust generation (from its pairing), the
 //!   keys it accepts now (`MailRecipientData.keys`: its current key, and the
 //!   previous one only inside its 24 h window unless `retire_previous`
-//!   retired it).
+//!   retired it) and every key id it made in that generation
+//!   (`MailRecipientData.generated`, from its own record, each id written
+//!   durably before the key was handed out): mail sealed to a key id in
+//!   neither list is refused for good, even when signed beyond its head.
 #[cfg(feature = "uniffi")]
 use std::sync::Arc;
 
@@ -94,8 +97,8 @@ record! {
 }
 
 record! {
-    /// This host as the receiver: its `host_id`, its current trust generation
-    /// and the keys that may open mail now.
+    /// This host as the receiver: its `host_id`, its current trust
+    /// generation, the keys that may open mail now and every key it made.
     pub struct MailRecipientData {
         pub host_id: String,
         /// The host's own trust generation, from its pairing, never one read
@@ -103,6 +106,15 @@ record! {
         /// `add_host`).
         pub host_trust_gen: u64,
         pub keys: Vec<MailKeyData>,
+        /// Every `enc_kid` (16 hex) this host made at that generation, from
+        /// its own record (each id written durably before the key was handed
+        /// out; a lost record rebuilt from the private keys it still holds),
+        /// never from its device list; a key in `keys` counts as made,
+        /// listed here or not. A key id
+        /// in neither `keys` nor `generated` is refused `enc_key_not_accepted`
+        /// for good, even when the object is signed beyond this host's head;
+        /// one here but not in `keys` waits there.
+        pub generated: Vec<String>,
     }
 }
 
@@ -139,8 +151,17 @@ data_enum! {
         Refused { reason: String, evidence: String },
         /// Refused after the signature verified and the sealed part matched:
         /// the host reports it to the sender (a status naming `object_id`,
-        /// `refused: invalid_request`), and it claims the id.
-        RefusedAuthenticated { object_id: String, reason: String },
+        /// `refused: invalid_request`), and it claims `(sender_host.host_id,
+        /// object_id)`; `sender_host.host_trust_gen` says which `add_host`
+        /// key verified the copy.
+        RefusedAuthenticated {
+            object_id: String,
+            reason: String,
+            /// The authenticated sender host (named `sender_host`, not
+            /// `sender`: `Open`'s and `Accepted`'s `sender` is a principal
+            /// string, and one field name has one type).
+            sender_host: MailHostData,
+        },
         /// A local failure (the key provider): nothing is decided; retry.
         Unavailable { code: String, detail: String },
     }
@@ -166,7 +187,14 @@ data_enum! {
         Refused { reason: String, evidence: String },
         /// As `EnvelopeVerdictInfo::RefusedAuthenticated` (nothing is
         /// reported back for a result).
-        RefusedAuthenticated { object_id: String, reason: String },
+        RefusedAuthenticated {
+            object_id: String,
+            reason: String,
+            /// The authenticated sender host (named `sender_host`, not
+            /// `sender`: `Open`'s and `Accepted`'s `sender` is a principal
+            /// string, and one field name has one type).
+            sender_host: MailHostData,
+        },
         /// As `EnvelopeVerdictInfo::Unavailable`.
         Unavailable { code: String, detail: String },
     }
@@ -179,6 +207,20 @@ impl MailHostData {
             host_trust_gen: safe_int(self.host_trust_gen, "host_trust_gen")?,
         })
     }
+}
+
+impl From<HostRef> for MailHostData {
+    fn from(host: HostRef) -> Self {
+        MailHostData {
+            host_id: host.host_id,
+            host_trust_gen: host.host_trust_gen,
+        }
+    }
+}
+
+/// A key id as the caller passes it: 16 lowercase hex.
+fn kid(enc_kid: &str) -> Result<[u8; 8]> {
+    hex_decode_array::<8>(enc_kid).map_err(|_| AtemError::malformed("enc_kid is 16 lowercase hex"))
 }
 
 impl MailFieldsData {
@@ -207,16 +249,18 @@ impl MailRecipientData {
         let keys = self
             .keys
             .iter()
-            .map(|k| {
-                let kid = hex_decode_array::<8>(&k.enc_kid)
-                    .map_err(|_| AtemError::malformed("enc_kid is 16 lowercase hex"))?;
-                Ok((KeyId::new(k.key_id.clone()), kid))
-            })
+            .map(|k| Ok((KeyId::new(k.key_id.clone()), kid(&k.enc_kid)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let generated = self
+            .generated
+            .iter()
+            .map(|k| kid(k))
             .collect::<Result<Vec<_>>>()?;
         Ok(Recipient {
             host_id: self.host_id.clone(),
             host_trust_gen: safe_int(self.host_trust_gen, "host_trust_gen")?,
             keys,
+            generated,
         })
     }
 }
@@ -282,12 +326,15 @@ impl From<EnvelopeVerdict> for EnvelopeVerdictInfo {
                 reason: reason.into(),
                 evidence: evidence.to_hex(),
             },
-            EnvelopeVerdict::RefusedAuthenticated { object_id, reason } => {
-                EnvelopeVerdictInfo::RefusedAuthenticated {
-                    object_id,
-                    reason: reason.into(),
-                }
-            }
+            EnvelopeVerdict::RefusedAuthenticated {
+                object_id,
+                reason,
+                sender,
+            } => EnvelopeVerdictInfo::RefusedAuthenticated {
+                object_id,
+                reason: reason.into(),
+                sender_host: sender.into(),
+            },
             EnvelopeVerdict::Unavailable { error } => EnvelopeVerdictInfo::Unavailable {
                 code: error.code().into(),
                 detail: error.to_string(),
@@ -327,12 +374,15 @@ impl From<ResultVerdict> for ResultVerdictInfo {
                 reason: reason.into(),
                 evidence: evidence.to_hex(),
             },
-            ResultVerdict::RefusedAuthenticated { object_id, reason } => {
-                ResultVerdictInfo::RefusedAuthenticated {
-                    object_id,
-                    reason: reason.into(),
-                }
-            }
+            ResultVerdict::RefusedAuthenticated {
+                object_id,
+                reason,
+                sender,
+            } => ResultVerdictInfo::RefusedAuthenticated {
+                object_id,
+                reason: reason.into(),
+                sender_host: sender.into(),
+            },
             ResultVerdict::Unavailable { error } => ResultVerdictInfo::Unavailable {
                 code: error.code().into(),
                 detail: error.to_string(),
@@ -598,10 +648,79 @@ mod tests {
             host_id: "host-b".into(),
             host_trust_gen,
             keys: vec![],
+            generated: vec![],
         };
         assert!(me(1).to_recipient().is_ok());
         let err = me(1 << 53).to_recipient().unwrap_err();
         assert_eq!(err.code(), "not_canonical");
+    }
+
+    /// Every key id the receiver made reaches the core as it was given; one
+    /// that isn't 16 lowercase hex is refused, as a key's `enc_kid` is.
+    #[test]
+    fn the_generated_key_ids_are_read_strictly() {
+        let me = |generated: &[&str]| MailRecipientData {
+            host_id: "host-b".into(),
+            host_trust_gen: 1,
+            keys: vec![],
+            generated: generated.iter().map(|k| k.to_string()).collect(),
+        };
+        let got = me(&["0123456789abcdef", "fedcba9876543210"])
+            .to_recipient()
+            .unwrap();
+        assert_eq!(
+            got.generated,
+            vec![
+                [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
+                [0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10],
+            ]
+        );
+        for bad in [
+            "0123456789ABCDEF",
+            "0123456789abcde",
+            "0123456789abcdef0",
+            "",
+        ] {
+            let err = me(&[bad]).to_recipient().unwrap_err();
+            assert_eq!(err.code(), "malformed", "{bad:?}");
+        }
+    }
+
+    /// An authenticated refusal carries the sender the core names.
+    #[test]
+    fn a_refused_authenticated_verdict_names_its_sender() {
+        let sender = || HostRef {
+            host_id: "host-a".into(),
+            host_trust_gen: 2,
+        };
+        let want = MailHostData {
+            host_id: "host-a".into(),
+            host_trust_gen: 2,
+        };
+        assert_eq!(
+            EnvelopeVerdictInfo::from(EnvelopeVerdict::RefusedAuthenticated {
+                object_id: "id".into(),
+                reason: "expired",
+                sender: sender(),
+            }),
+            EnvelopeVerdictInfo::RefusedAuthenticated {
+                object_id: "id".into(),
+                reason: "expired".into(),
+                sender_host: want.clone(),
+            }
+        );
+        assert_eq!(
+            ResultVerdictInfo::from(ResultVerdict::RefusedAuthenticated {
+                object_id: "id".into(),
+                reason: "expired",
+                sender: sender(),
+            }),
+            ResultVerdictInfo::RefusedAuthenticated {
+                object_id: "id".into(),
+                reason: "expired".into(),
+                sender_host: want,
+            }
+        );
     }
 
     /// A verdict whose plaintext can't be written back is no Open or

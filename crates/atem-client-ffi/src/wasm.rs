@@ -901,6 +901,14 @@ fn control_body(v: JsValue) -> JsResult<ControlRecordBody> {
     })
 }
 
+/// The shared vocabulary of reasons, every code once in a fixed order
+/// (`control_why_codes`): a well-formed reason outside it, read from a
+/// `control_ack`, is a later version's, unrecognized.
+#[wasm_bindgen(js_name = controlWhyCodes)]
+pub fn control_why_codes() -> Vec<String> {
+    crate::control::control_why_codes()
+}
+
 /// A record's body, field by field (`parse_control_record`).
 #[wasm_bindgen(js_name = parseControlRecord)]
 pub fn parse_control_record(record_json: String) -> JsResult<JsValue> {
@@ -984,12 +992,30 @@ impl ControlStateHandle {
     pub fn to_json(&self) -> String {
         self.0.to_json()
     }
+    /// Every principal the state has a part for, sorted.
+    pub fn principals(&self) -> Vec<String> {
+        self.0.principals()
+    }
+    /// `principal`'s part (canonical JSON), or `undefined`: what a store
+    /// keeping one row per principal writes for each principal a
+    /// transition `touched`.
+    pub fn part(&self, principal: String) -> Option<String> {
+        self.0.part(principal)
+    }
+    /// What is in force for `principal`: `{revoked, interrupted, held,
+    /// coverage}` (`revoked` and `coverage`, `{origin, feedId}`, `null`
+    /// when there are none).
+    pub fn standing(&self, principal: String) -> JsResult<JsValue> {
+        to_js(&self.0.standing(principal))
+    }
     /// Applies a record to this state (`pos`: `{origin, feedId, feedSeq}`,
     /// or `null`/`undefined` over a channel) and returns a
     /// `ControlTransition`: `applied` (`{result, effects: [{effect,
-    /// result}], actions: [{type, principal, …}], evidence}`) and `next`,
-    /// the state after it. This handle doesn't change: use `next` once
-    /// your transaction storing `next.toJson()` committed.
+    /// result}], actions: [{type, principal, …}], evidence, why}`) and `next`,
+    /// the state after it, and `touched`, the principals whose part it
+    /// changed. This handle doesn't change: use `next` once your
+    /// transaction storing `next.toJson()` (or the touched parts)
+    /// committed.
     pub fn apply(
         &self,
         record_json: String,
@@ -1022,7 +1048,66 @@ impl ControlStateHandle {
         Ok(ControlTransition {
             applied: to_js(&transition.applied)?,
             next: transition.next,
+            touched: transition.touched,
         })
+    }
+}
+
+/// The state of `log`'s device list made of the stored parts that name it
+/// (`control_state_from_parts`): `parts` is an array of `{principal,
+/// partJson}`, in any order. Returns a `ControlLoadedParts`: `state` (a
+/// `ControlStateHandle`) and `foreign`, the principals whose parts name
+/// another account or genesis, skipped: delete their rows.
+#[wasm_bindgen(js_name = controlStateFromParts)]
+pub fn control_state_from_parts(
+    log: &MembershipLog,
+    parts: JsValue,
+) -> JsResult<ControlLoadedParts> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct P {
+        principal: String,
+        part_json: String,
+    }
+    let parts = items::<P>(
+        &parts,
+        &["principal", "partJson"],
+        "parts [{principal, partJson}]",
+    )?
+    .into_iter()
+    .map(|p| crate::types::ControlStatePart {
+        principal: p.principal,
+        part_json: p.part_json,
+    })
+    .collect();
+    let loaded = err(crate::control::control_state_from_parts(
+        log.0.clone(),
+        parts,
+    ))?;
+    Ok(ControlLoadedParts {
+        state: loaded.state,
+        foreign: loaded.foreign,
+    })
+}
+
+/// What `controlStateFromParts` gives (`crate::control::ControlLoadedParts`).
+#[wasm_bindgen]
+pub struct ControlLoadedParts {
+    state: Arc<crate::control::ControlStateHandle>,
+    foreign: Vec<String>,
+}
+
+#[wasm_bindgen]
+impl ControlLoadedParts {
+    /// The state of the device list, made of its own parts.
+    #[wasm_bindgen(getter)]
+    pub fn state(&self) -> ControlStateHandle {
+        ControlStateHandle(self.state.clone())
+    }
+    /// The principals whose parts name another list (sorted): delete them.
+    #[wasm_bindgen(getter)]
+    pub fn foreign(&self) -> Vec<String> {
+        self.foreign.clone()
     }
 }
 
@@ -1031,11 +1116,13 @@ impl ControlStateHandle {
 pub struct ControlTransition {
     applied: JsValue,
     next: Arc<crate::control::ControlStateHandle>,
+    touched: Vec<String>,
 }
 
 #[wasm_bindgen]
 impl ControlTransition {
-    /// What the record did: `{result, effects, actions, evidence}`.
+    /// What the record did: `{result, effects, actions, evidence, why}`
+    /// (`why` `null` when the record counted without question).
     #[wasm_bindgen(getter)]
     pub fn applied(&self) -> JsValue {
         self.applied.clone()
@@ -1046,6 +1133,11 @@ impl ControlTransition {
     #[wasm_bindgen(getter)]
     pub fn next(&self) -> ControlStateHandle {
         ControlStateHandle(self.next.clone())
+    }
+    /// The principals whose part `next` changed: the record's, or none.
+    #[wasm_bindgen(getter)]
+    pub fn touched(&self) -> Vec<String> {
+        self.touched.clone()
     }
 }
 
@@ -1071,24 +1163,32 @@ fn items<T: serde::de::DeserializeOwned>(
         .collect()
 }
 
-/// `[{effect, result}]`, by their wire names.
+/// `[{effect, result, why?}]`, by their wire names: `why` (O5) absent,
+/// `null` or a reason's code.
 fn effect_results(v: &JsValue) -> JsResult<Vec<crate::types::ControlEffectResult>> {
     #[derive(Deserialize)]
     struct E {
         effect: String,
         result: String,
+        #[serde(default)]
+        why: Option<String>,
     }
-    items::<E>(v, &["effect", "result"], "effects [{effect, result}]")?
-        .into_iter()
-        .map(|e| {
-            Ok(crate::types::ControlEffectResult {
-                effect: crate::station::effect_kind_of(&e.effect)
-                    .ok_or_else(|| bad("effect: revocation, interrupt, hold, release or cover"))?,
-                result: crate::station::result_kind_of(&e.result)
-                    .ok_or_else(|| bad("result: applied, duplicate, pending or refused"))?,
-            })
+    items::<E>(
+        v,
+        &["effect", "result", "why"],
+        "effects [{effect, result, why?}]",
+    )?
+    .into_iter()
+    .map(|e| {
+        Ok(crate::types::ControlEffectResult {
+            effect: crate::station::effect_kind_of(&e.effect)
+                .ok_or_else(|| bad("effect: revocation, interrupt, hold, release or cover"))?,
+            result: crate::station::result_kind_of(&e.result)
+                .ok_or_else(|| bad("result: applied, duplicate, pending or refused"))?,
+            why: e.why,
         })
-        .collect()
+    })
+    .collect()
 }
 
 fn strict_head(v: JsValue) -> JsResult<crate::types::LogHead> {
@@ -1097,35 +1197,50 @@ fn strict_head(v: JsValue) -> JsResult<crate::types::LogHead> {
 }
 
 /// A host's call to its Station, read strictly (`relay_decode_to_station`):
-/// `{type: "control_sync", origin, feedId?, after}`, `{type:
+/// `{type: "control_sync", requestId, origin, feedId?, after}`, `{type:
 /// "control_ack", ack: {…}}` or `{type: "membership_fetch", after}`.
 #[wasm_bindgen(js_name = relayDecodeToStation)]
 pub fn relay_decode_to_station(message: String) -> JsResult<JsValue> {
     ok(crate::station::relay_decode_to_station(message))
 }
 
-/// A Station's message to a host, read strictly (`relay_decode_to_host`).
+/// A Station's message to a host, read strictly (`relay_decode_to_host`):
+/// a page is `{type: "control_sync_result", requestId, origin, feedId,
+/// after, head, stationTime, records}`.
 #[wasm_bindgen(js_name = relayDecodeToHost)]
 pub fn relay_decode_to_host(message: String) -> JsResult<JsValue> {
     ok(crate::station::relay_decode_to_host(message))
 }
 
-/// `control_sync{origin, feed_id?, after}` (`relay_control_sync`).
+/// `control_sync{request_id, origin, feed_id?, after}`
+/// (`relay_control_sync`): `requestId` is the caller's, a fresh lowercase
+/// UUID v4 for every call (a timeout's retry and a new link generation's
+/// call included).
 #[wasm_bindgen(js_name = relayControlSync)]
-pub fn relay_control_sync(origin: String, feed_id: Option<String>, after: f64) -> JsResult<String> {
+pub fn relay_control_sync(
+    request_id: String,
+    origin: String,
+    feed_id: Option<String>,
+    after: f64,
+) -> JsResult<String> {
     err(crate::station::relay_control_sync(
+        request_id,
         origin,
         feed_id,
         ms(after)?,
     ))
 }
 
-/// `control_sync_result` (`relay_control_sync_result`): `records` is
-/// `[{feedSeq, recordJson}]`, each record one the control parser accepts.
+/// `control_sync_result` (`relay_control_sync_result`): the call's
+/// `requestId` and `after`; `records` is `[{feedSeq, recordJson}]`, each
+/// record one the control parser accepts, strictly after `after`.
 #[wasm_bindgen(js_name = relayControlSyncResult)]
+#[allow(clippy::too_many_arguments)]
 pub fn relay_control_sync_result(
+    request_id: String,
     origin: String,
     feed_id: String,
+    after: f64,
     head: f64,
     station_time: f64,
     records: JsValue,
@@ -1146,12 +1261,24 @@ pub fn relay_control_sync_result(
         })
         .collect::<JsResult<Vec<_>>>()?;
     err(crate::station::relay_control_sync_result(
+        request_id,
         origin,
         feed_id,
+        ms(after)?,
         ms(head)?,
         ms(station_time)?,
         records,
     ))
+}
+
+/// Whether the result text answers the call text
+/// (`relay_control_sync_answers`): `"answers"`, or the first field that
+/// differs, `"request_id"`, `"origin"`, `"feed_id"` or `"after"`. The
+/// caller compares the link generation, account and genesis it captured
+/// with the call, and keeps one live call per generation.
+#[wasm_bindgen(js_name = relayControlSyncAnswers)]
+pub fn relay_control_sync_answers(call: String, result: String) -> JsResult<JsValue> {
+    ok(crate::station::relay_control_sync_answers(call, result))
 }
 
 /// `heads{feeds, membership}` (`relay_heads`): `feeds` is `[{origin,
@@ -2553,7 +2680,7 @@ fn mail_fields(v: JsValue) -> JsResult<crate::host_mail::MailFieldsData> {
     })
 }
 
-/// `{hostId, hostTrustGen, keys: [{keyId, encKid}]}`.
+/// `{hostId, hostTrustGen, keys: [{keyId, encKid}], generated: [encKid]}`.
 #[cfg(all(feature = "software-keys", feature = "host"))]
 fn mail_recipient(v: JsValue) -> JsResult<crate::host_mail::MailRecipientData> {
     #[derive(Deserialize)]
@@ -2568,10 +2695,16 @@ fn mail_recipient(v: JsValue) -> JsResult<crate::host_mail::MailRecipientData> {
         host_id: String,
         host_trust_gen: f64,
         keys: Vec<K>,
+        generated: Vec<String>,
     }
-    mail_keys_only(&v, &["hostId", "hostTrustGen", "keys"], "recipient")?;
-    let r: R = serde_wasm_bindgen::from_value(v)
-        .map_err(|_| bad("recipient {hostId, hostTrustGen, keys: [{keyId, encKid}]}"))?;
+    mail_keys_only(
+        &v,
+        &["hostId", "hostTrustGen", "keys", "generated"],
+        "recipient",
+    )?;
+    let r: R = serde_wasm_bindgen::from_value(v).map_err(|_| {
+        bad("recipient {hostId, hostTrustGen, keys: [{keyId, encKid}], generated: [encKid]}")
+    })?;
     Ok(crate::host_mail::MailRecipientData {
         host_id: r.host_id,
         host_trust_gen: ms(r.host_trust_gen)?,
@@ -2583,6 +2716,7 @@ fn mail_recipient(v: JsValue) -> JsResult<crate::host_mail::MailRecipientData> {
                 enc_kid: k.enc_kid,
             })
             .collect(),
+        generated: r.generated,
     })
 }
 
@@ -2698,7 +2832,8 @@ pub fn seal_result_with_ikm(
 /// Host role: the receiver's checks 1 to 6 (`open_envelope`): `{type:
 /// "open", plainJson, sender}`, `{type: "pending", hostId, hostTrustGen}`,
 /// `{type: "refused", reason, evidence}`, `{type: "refused_authenticated",
-/// objectId, reason}` or `{type: "unavailable", code, detail}`.
+/// objectId, reason, senderHost: {hostId, hostTrustGen}}` or `{type:
+/// "unavailable", code, detail}`.
 #[cfg(all(feature = "software-keys", feature = "host"))]
 #[wasm_bindgen(js_name = openEnvelope)]
 pub fn open_envelope(

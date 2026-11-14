@@ -37,9 +37,9 @@ use std::sync::Arc;
 use atem_client::canonical::{Numbers, parse_strict};
 use atem_client::control::{
     AckLedger, AckResult, ApplicationResult, CallRefused, ControlAck, ControlRecord, ControlSync,
-    ControlSyncResult, EffectKind, EffectResult, EntryRef, FeedEntry, FeedHead, Heads, LedgerAlert,
-    LedgerTransition, LinkAssociation, MembershipFetch, MembershipFetchResult, RefusalCode,
-    RefusedCall, Report, ReportAnswer, ReportIntent, ToHost, ToStation,
+    ControlSyncResult, EffectKind, EffectResult, EffectWhy, EntryRef, FeedEntry, FeedHead, Heads,
+    LedgerAlert, LedgerTransition, LinkAssociation, MembershipFetch, MembershipFetchResult,
+    RefusalCode, RefusedCall, Report, ReportAnswer, ReportIntent, SyncMismatch, ToHost, ToStation,
 };
 use serde_json::Value;
 
@@ -50,7 +50,8 @@ use crate::log::{object_json, objects_of};
 use crate::types::{
     ControlAckInfo, ControlEffectKind, ControlEffectResult, ControlResultKind, LedgerAlertInfo,
     LinkAssociationInfo, LogHead, RelayAckResult, RelayFeedHead, RelayFeedRecord, RelayRefusalCode,
-    RelayToHost, RelayToStation, ReportAnswerKind, ReportIntentInfo, StationReport,
+    RelaySyncVerdict, RelayToHost, RelayToStation, ReportAnswerKind, ReportIntentInfo,
+    StationReport,
 };
 
 fn refusal_code(code: RefusalCode) -> RelayRefusalCode {
@@ -108,12 +109,17 @@ pub(crate) fn result_kind_of(code: &str) -> Option<ControlResultKind> {
     ApplicationResult::from_code(code).map(result_kind)
 }
 
+/// The effects as the core takes them. A reason that isn't well formed is
+/// passed on as written, for the ack's own check to refuse (`malformed`).
 fn effects_of(effects: &[ControlEffectResult]) -> Vec<EffectResult> {
     effects
         .iter()
         .map(|e| EffectResult {
             effect: effect_of(e.effect),
             result: result_of(e.result),
+            why: e.why.as_ref().map(|why| {
+                EffectWhy::read(why).unwrap_or_else(|| EffectWhy::Unrecognized(why.clone()))
+            }),
         })
         .collect()
 }
@@ -124,6 +130,7 @@ fn effects_info(effects: &[EffectResult]) -> Vec<ControlEffectResult> {
         .map(|e| ControlEffectResult {
             effect: effect_kind(e.effect),
             result: result_kind(e.result),
+            why: e.why.as_ref().map(|why| why.code().to_owned()),
         })
         .collect()
 }
@@ -286,6 +293,7 @@ fn wire(value: Value) -> String {
 pub fn relay_decode_to_station(message: String) -> Result<RelayToStation> {
     Ok(match ToStation::decode(message.as_bytes())? {
         ToStation::ControlSync(sync) => RelayToStation::ControlSync {
+            request_id: sync.request_id,
             origin: sync.origin,
             feed_id: sync.feed_id,
             after: sync.after,
@@ -304,8 +312,10 @@ pub fn relay_decode_to_station(message: String) -> Result<RelayToStation> {
 pub fn relay_decode_to_host(message: String) -> Result<RelayToHost> {
     Ok(match ToHost::decode(message.as_bytes())? {
         ToHost::ControlSyncResult(page) => RelayToHost::ControlSyncResult {
+            request_id: page.request_id,
             origin: page.origin,
             feed_id: page.feed_id,
+            after: page.after,
             head: page.head,
             station_time: page.station_time,
             records: page
@@ -346,11 +356,20 @@ pub fn relay_decode_to_host(message: String) -> Result<RelayToHost> {
     })
 }
 
-/// `control_sync{origin, feed_id?, after}` (host → Station). Without
-/// `feed_id`, `after` is 0.
+/// `control_sync{request_id, origin, feed_id?, after}` (host → Station).
+/// Without `feed_id` (initial discovery), `after` is 0. `request_id` is the
+/// caller's, a lowercase UUID v4: a host makes a fresh one for every call,
+/// a retry after a timeout and a call on a new link generation included,
+/// even at the same cursor.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
-pub fn relay_control_sync(origin: String, feed_id: Option<String>, after: u64) -> Result<String> {
+pub fn relay_control_sync(
+    request_id: String,
+    origin: String,
+    feed_id: Option<String>,
+    after: u64,
+) -> Result<String> {
     let sync = ControlSync {
+        request_id,
         origin,
         feed_id,
         after,
@@ -358,15 +377,21 @@ pub fn relay_control_sync(origin: String, feed_id: Option<String>, after: u64) -
     Ok(wire(sync.to_json()?))
 }
 
-/// `control_sync_result{origin, feed_id, head, station_time, records}`
-/// (Station → host): at most 64 records, ascending `feed_seq` in
-/// `1..=head`, 256 KiB in all. Each record must be one the control parser
-/// accepts (`Invalid{code}` with its parse code otherwise): a Station
-/// validates records at intake and serves only what it stored.
+/// `control_sync_result{request_id, origin, feed_id, after, head,
+/// station_time, records}` (Station → host): the answer to the call
+/// `request_id` names, echoing its `after`, on the feed it named (a call
+/// that named none: the account's current feed). At most 64 records,
+/// ascending `feed_seq` strictly after `after` and at most `head` (a `head`
+/// below `after`: no records), 256 KiB in all. Each record must be one the
+/// control parser accepts (`Invalid{code}` with its parse code otherwise):
+/// a Station validates records at intake and serves only what it stored.
 #[cfg_attr(feature = "uniffi", uniffi::export)]
+#[allow(clippy::too_many_arguments)]
 pub fn relay_control_sync_result(
+    request_id: String,
     origin: String,
     feed_id: String,
+    after: u64,
     head: u64,
     station_time: u64,
     records: Vec<RelayFeedRecord>,
@@ -379,13 +404,49 @@ pub fn relay_control_sync_result(
         })
         .collect::<Result<Vec<_>>>()?;
     let page = ControlSyncResult {
+        request_id,
         origin,
         feed_id,
+        after,
         head,
         station_time,
         records,
     };
     Ok(wire(page.to_json()?))
+}
+
+/// Whether the `control_sync_result` text `result` answers the
+/// `control_sync` text `call`, each read strictly by its own reader
+/// (`Invalid{code}` if either isn't one): `Answers` when both carry the
+/// same `request_id`, origin, feed (when the call named one) and `after`,
+/// else the first field that differs. The one matching decision the host
+/// and Astation's `:8080` proxy share.
+///
+/// It compares the two messages only. The caller compares the rest of
+/// what it captured with the call: the authenticated link generation (a
+/// result read on another generation answers nothing), the account and
+/// the genesis; and it keeps at most one live call per link generation, so
+/// a result that answers a retired, timed-out or old-generation call
+/// advances nothing and opens no gate. A `request_id` is a correlation
+/// value, never authorization. A refusal (`control_sync_refused`) names a
+/// call kind and carries no id: it is never a result here.
+///
+/// A call from 0 that named no feed is answered on whichever feed the
+/// result names; check it against the own feed this generation's `heads`
+/// announced. An answering result whose `head` is below its `after` (no
+/// records) says the feed went back: mark a rescan from 0 durably and
+/// never move the cursor on it.
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+pub fn relay_control_sync_answers(call: String, result: String) -> Result<RelaySyncVerdict> {
+    let call = ControlSync::decode(call.as_bytes())?;
+    let result = ControlSyncResult::decode(result.as_bytes())?;
+    Ok(match result.answers(&call) {
+        Ok(()) => RelaySyncVerdict::Answers,
+        Err(SyncMismatch::RequestId) => RelaySyncVerdict::RequestId,
+        Err(SyncMismatch::Origin) => RelaySyncVerdict::Origin,
+        Err(SyncMismatch::FeedId) => RelaySyncVerdict::FeedId,
+        Err(SyncMismatch::After) => RelaySyncVerdict::After,
+    })
 }
 
 /// `heads{feeds, membership}` (Station → host): each covering feed's head

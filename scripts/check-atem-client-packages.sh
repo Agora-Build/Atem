@@ -39,6 +39,7 @@ SHIPPED_VECTORS=(
   r9-vectors-push-hint.json:r9-vectors-push-hint.json
   r9-vectors-delegated-wire.json:r9-vectors-delegated-wire.json
   r9-vectors-host-envelope.json:r9-vectors-host-envelope.json
+  r9-vectors-station-calls.json:r9-vectors-station-calls.json
 )
 for fixture in "$ROOT"/designs/protocol/fixtures/r9-control-ack-*.json; do
   SHIPPED_VECTORS+=("$(basename "$fixture"):$(basename "$fixture")")

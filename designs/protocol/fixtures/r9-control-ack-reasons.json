@@ -1,0 +1,260 @@
+{
+  "name": "r9-control-ack-reasons",
+  "requires": "r9",
+  "kind": "scenario",
+  "side": "relay",
+  "log": "r9-vectors-membership-log",
+  "note": "Test 48 with typed reasons (O5, host-work-v1 §11.4 wire rule 10; for Astation's sign-off, new in step 4): each effect pending or refused in an ack may say why, and the reason is information only. The Station records dev-ipad's M3_revoke_by_removed_manager and dev-mac's M2_interrupt (native, so alerted for re-signing) and its own S4_revoke, each covering host-b and host-c. host-b acknowledges M3 refused (removed_manager on both effects), M2 pending (not_revoked) and S4 pending (list_frozen): nothing counts, nothing is reported, the re-sign alerts stay and nothing is re-signed. The same ack without reasons gives the same: no report, the same alerts. host-c applied S4 and reports it beside M3 refused with its reasons and M2 pending with a reason of a later version (a_later_reason, read as unrecognized): its revocation_applied for S4 is made as without reasons, and the re-sign alerts stay. Record times are the vectors'; the order is the feed's.",
+  "setup": {
+    "station": {
+      "origin": "https://station-dev.agora.build",
+      "account_id": "acct-test-1",
+      "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89"
+    },
+    "records": "r9-vectors-host-work-control",
+    "integrations": {
+      "i-01jc5zq9x8w7v6t5s4r3q2p1n0": "service:svc-discord"
+    },
+    "links": {
+      "host-b": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "connection_id": "relay-1:host-b"
+      },
+      "host-c": {
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-c",
+        "host_trust_gen": 1,
+        "connection_id": "relay-1:host-c"
+      }
+    },
+    "station_now_ms": 1793620940000
+  },
+  "steps": [
+    {
+      "control_record": "M3_revoke_by_removed_manager",
+      "covered_hosts": [
+        "host-b",
+        "host-c"
+      ],
+      "made": []
+    },
+    {
+      "control_record": "M2_interrupt",
+      "covered_hosts": [
+        "host-b",
+        "host-c"
+      ],
+      "made": []
+    },
+    {
+      "control_record": "S4_revoke",
+      "revoked_at_ms": 1793620903000,
+      "covered_hosts": [
+        "host-b",
+        "host-c"
+      ],
+      "made": []
+    },
+    {
+      "expect_resign_alerts": [
+        "M2_interrupt",
+        "M3_revoke_by_removed_manager"
+      ]
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 3,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000016",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "refused",
+                "why": "removed_manager"
+              },
+              {
+                "effect": "interrupt",
+                "result": "refused",
+                "why": "removed_manager"
+              }
+            ]
+          },
+          {
+            "record_id": "00000000-0000-4000-8000-000000000015",
+            "effects": [
+              {
+                "effect": "interrupt",
+                "result": "pending",
+                "why": "not_revoked"
+              }
+            ]
+          },
+          {
+            "record_id": "00000000-0000-4000-8000-000000000004",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "pending",
+                "why": "list_frozen"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-b",
+      "made": []
+    },
+    {
+      "expect_resign_alerts": [
+        "M2_interrupt",
+        "M3_revoke_by_removed_manager"
+      ]
+    },
+    {
+      "expect_report": []
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-b",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 3,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000016",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "refused"
+              },
+              {
+                "effect": "interrupt",
+                "result": "refused"
+              }
+            ]
+          },
+          {
+            "record_id": "00000000-0000-4000-8000-000000000015",
+            "effects": [
+              {
+                "effect": "interrupt",
+                "result": "pending"
+              }
+            ]
+          },
+          {
+            "record_id": "00000000-0000-4000-8000-000000000004",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "pending"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-b",
+      "made": []
+    },
+    {
+      "expect_resign_alerts": [
+        "M2_interrupt",
+        "M3_revoke_by_removed_manager"
+      ]
+    },
+    {
+      "expect_report": []
+    },
+    {
+      "control_ack": {
+        "type": "relay",
+        "op": "control_ack",
+        "account_id": "acct-test-1",
+        "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+        "host_id": "host-c",
+        "host_trust_gen": 1,
+        "origin": "https://station-dev.agora.build",
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "cursor": 3,
+        "results": [
+          {
+            "record_id": "00000000-0000-4000-8000-000000000004",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "applied"
+              }
+            ]
+          },
+          {
+            "record_id": "00000000-0000-4000-8000-000000000016",
+            "effects": [
+              {
+                "effect": "revocation",
+                "result": "refused",
+                "why": "removed_manager"
+              },
+              {
+                "effect": "interrupt",
+                "result": "refused",
+                "why": "removed_manager"
+              }
+            ]
+          },
+          {
+            "record_id": "00000000-0000-4000-8000-000000000015",
+            "effects": [
+              {
+                "effect": "interrupt",
+                "result": "pending",
+                "why": "a_later_reason"
+              }
+            ]
+          }
+        ]
+      },
+      "link": "host-c",
+      "made": [
+        "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+      ]
+    },
+    {
+      "expect_report": [
+        {
+          "not_before": [],
+          "report": {
+            "host": "host-c",
+            "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0",
+            "kind": "revocation_applied",
+            "record_id": "00000000-0000-4000-8000-000000000004"
+          },
+          "report_id": "revocation_applied:e5eb0bb947aecfcded0c036d782b2c65695ddcda321382a1cddb482b8b0b169d"
+        }
+      ]
+    },
+    {
+      "expect_resign_alerts": [
+        "M2_interrupt",
+        "M3_revoke_by_removed_manager"
+      ]
+    }
+  ]
+}

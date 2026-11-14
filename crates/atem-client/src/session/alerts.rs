@@ -72,11 +72,14 @@ pub fn valid_sender(sender: &str) -> bool {
     is_delegated_sender(sender)
 }
 
-/// A reason: 1-[`MAX_REASON_BYTES`] bytes, no control or Cf character (the
-/// framing module's rule: no bidi control or zero-width character in text
-/// shown to the owner).
+/// A reason: 1-[`MAX_REASON_BYTES`] bytes, not blank (empty after trimming
+/// white space, as a `failed` resolution's detail is judged), no control or
+/// Cf character (the framing module's rule: no bidi control or zero-width
+/// character in text shown to the owner). The reason is kept as given:
+/// padding is no fault, only a reason of nothing else.
 pub fn valid_reason(reason: &str) -> bool {
     (1..=MAX_REASON_BYTES).contains(&reason.len())
+        && !reason.trim().is_empty()
         && !reason
             .chars()
             .any(|c| c.is_control() || super::framing::is_format(c))
@@ -104,19 +107,37 @@ pub fn in_order(alerts: &[Alert]) -> bool {
 
 /// The host's side of `alert_list` (the host keeps its alerts; step 4): the
 /// page after `after`, at most `limit` alerts in the host's order, and
-/// whether more follow. `None` for an `after` the host has no alert for (the
-/// alert ended, or never was): `stale_target`, detail `unknown alert`.
-pub fn page(alerts: &[Alert], after: Option<&str>, limit: usize) -> Option<(Vec<Alert>, bool)> {
+/// whether more follow.
+/// - `Ok(None)` for an `after` the host has no alert for (the alert ended,
+///   or never was): `stale_target`, detail `unknown alert`.
+/// - `Err("invalid_request")` for a `limit` outside `1..=`[`MAX_PAGE`],
+///   checked first: 0 is a page of no alert that says more follow, a result
+///   no reader takes (`more` needs a last alert to continue from) and a
+///   caller could not follow; above [`MAX_PAGE`] is a page the reader
+///   refuses for its size. The limit is the host's own (the request has no
+///   such field; the host passes [`MAX_PAGE`]), so this is a host's fault,
+///   never a wire input.
+pub fn page(
+    alerts: &[Alert],
+    after: Option<&str>,
+    limit: usize,
+) -> Result<Option<(Vec<Alert>, bool)>, &'static str> {
+    if !(1..=MAX_PAGE).contains(&limit) {
+        return Err("invalid_request");
+    }
     let mut ordered: Vec<&Alert> = alerts.iter().collect();
     ordered.sort_by_key(|a| a.seq);
     let start = match after {
         None => 0,
-        Some(after) => ordered.iter().position(|a| a.alert_id == after)? + 1,
+        Some(after) => match ordered.iter().position(|a| a.alert_id == after) {
+            Some(at) => at + 1,
+            None => return Ok(None),
+        },
     };
     let rest = &ordered[start..];
     let taken: Vec<Alert> = rest.iter().take(limit).map(|a| (*a).clone()).collect();
     let more = rest.len() > taken.len();
-    Some((taken, more))
+    Ok(Some((taken, more)))
 }
 
 #[cfg(test)]
@@ -259,21 +280,23 @@ mod tests {
     fn a_later_alert_with_an_earlier_created_at_is_listed_after_the_cursor() {
         // Alert 2 was created after alert 1, with the wall clock set back.
         let held = vec![alert(2, 1_000), alert(1, 5_000), alert(3, 6_000)];
-        let (first, more) = page(&held, None, 1).unwrap();
+        let (first, more) = page(&held, None, 1).unwrap().unwrap();
         assert_eq!((first.len(), more), (1, true));
         assert_eq!(first[0].seq, 1);
-        let (next, more) = page(&held, Some(&first[0].alert_id), 1).unwrap();
+        let (next, more) = page(&held, Some(&first[0].alert_id), 1).unwrap().unwrap();
         assert_eq!((next[0].seq, next[0].created_at, more), (2, 1_000, true));
-        let (last, more) = page(&held, Some(&next[0].alert_id), 10).unwrap();
+        let (last, more) = page(&held, Some(&next[0].alert_id), 10).unwrap().unwrap();
         assert_eq!((last.len(), last[0].seq, more), (1, 3, false));
         // Every page is in order, and a client reading it agrees.
         for (p, _) in [
-            page(&held, None, MAX_PAGE).unwrap(),
-            page(&held, Some(&first[0].alert_id), MAX_PAGE).unwrap(),
+            page(&held, None, MAX_PAGE).unwrap().unwrap(),
+            page(&held, Some(&first[0].alert_id), MAX_PAGE)
+                .unwrap()
+                .unwrap(),
         ] {
             assert!(in_order(&p));
         }
-        let (all, more) = page(&held, None, MAX_PAGE).unwrap();
+        let (all, more) = page(&held, None, MAX_PAGE).unwrap().unwrap();
         assert_eq!(
             (all.iter().map(|a| a.seq).collect::<Vec<_>>(), more),
             (vec![1, 2, 3], false)
@@ -281,11 +304,101 @@ mod tests {
         // A cursor the host has no alert for is `stale_target`'s case.
         assert_eq!(
             page(&held, Some("aaaaaaaa-0000-4000-8000-0000000000ff"), 10),
-            None
+            Ok(None)
         );
         // Past the last alert: an empty page, and no more.
-        let (none, more) = page(&held, Some(&last[0].alert_id), 10).unwrap();
+        let (none, more) = page(&held, Some(&last[0].alert_id), 10).unwrap().unwrap();
         assert_eq!((none.len(), more), (0, false));
+    }
+
+    /// A reason says something: one that is blank after trimming white space
+    /// (as a `failed` resolution's detail is judged) is refused, in the
+    /// alert and in a result carrying it. White space is `White_Space`, the
+    /// Unicode ones (no-break, ideographic) included; control white space
+    /// (a tab, a newline) was already refused as a control character.
+    #[test]
+    fn an_all_blank_alert_reason_is_refused() {
+        for blank in [
+            " ",
+            "   ",
+            "\u{00A0}",
+            "\u{2003}\u{00A0}",
+            "\u{3000}",
+            " \u{00A0}\u{3000} ",
+            "\u{0085}",
+            "\t",
+            "\n",
+        ] {
+            assert!(!valid_reason(blank), "{blank:?}");
+            let mut a = alert(1, 100);
+            a.reason = blank.into();
+            assert!(!a.valid(), "{blank:?}");
+        }
+        // What says something stays valid, padding and inner spaces as given.
+        for good in [
+            "agent exited",
+            " agent exited ",
+            "write  interrupted",
+            "\u{00A0}x",
+            "é 中文",
+        ] {
+            assert!(valid_reason(good), "{good:?}");
+            let mut a = alert(1, 100);
+            a.reason = good.into();
+            assert!(a.valid(), "{good:?}");
+        }
+        // A result with a blank reason is no result.
+        let request = list(None);
+        let good = answer(&request, vec![alert(1, 100)], false);
+        assert!(Response::from_data(&good).is_ok());
+        for blank in [" ", "   ", "\u{00A0}\u{3000}"] {
+            let mut data = good.clone();
+            data["result"]["alerts"][0]["reason"] = json!(blank);
+            assert!(Response::from_data(&data).is_err(), "{blank:?}");
+        }
+    }
+
+    /// A page asks for between 1 and `MAX_PAGE` alerts: with a limit of 0 the
+    /// host would answer an empty page with `more` true, which no reader takes
+    /// (`more` needs a last alert to continue from) and a caller could never
+    /// follow, and above `MAX_PAGE` a page the reader refuses for its size.
+    /// It is refused as a request is, `invalid_request`, and the check comes
+    /// before the cursor's, so it is no `stale_target` either.
+    #[test]
+    fn page_with_limit_zero_is_refused() {
+        let held = vec![alert(1, 100), alert(2, 200), alert(3, 300)];
+        assert_eq!(page(&held, None, 0), Err("invalid_request"));
+        assert_eq!(
+            page(&held, Some(&held[0].alert_id), 0),
+            Err("invalid_request")
+        );
+        // Whatever the list holds, even nothing, and whatever the cursor
+        // names, even an alert the host has none for.
+        assert_eq!(page(&[], None, 0), Err("invalid_request"));
+        assert_eq!(
+            page(&held, Some("aaaaaaaa-0000-4000-8000-0000000000ff"), 0),
+            Err("invalid_request")
+        );
+        // Above the most a result carries it is refused too, whatever the
+        // list holds; `MAX_PAGE` itself is the most there is.
+        assert_eq!(page(&held, None, MAX_PAGE + 1), Err("invalid_request"));
+        assert_eq!(page(&[], None, usize::MAX), Err("invalid_request"));
+        assert_eq!(
+            page(
+                &held,
+                Some("aaaaaaaa-0000-4000-8000-0000000000ff"),
+                MAX_PAGE + 1
+            ),
+            Err("invalid_request")
+        );
+        assert!(page(&held, None, MAX_PAGE).is_ok());
+        // One alert is the least a page carries, and it goes on.
+        let (one, more) = page(&held, None, 1).unwrap().unwrap();
+        assert_eq!((one.len(), more), (1, true));
+        // An answer built from a page is a result a reader takes.
+        let request = list(None);
+        let (taken, more) = page(&held, None, MAX_PAGE).unwrap().unwrap();
+        assert!(Response::from_data(&answer(&request, taken, more)).is_ok());
     }
 
     #[test]
