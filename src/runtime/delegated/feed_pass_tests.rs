@@ -896,15 +896,20 @@ fn an_ack_goes_only_after_its_commit() {
         bridge_heads(&mut rig, 3, head);
         bridge_page(&mut rig, 3, &[(3, &hold)]);
         assert!(acks_in(&sent.texts()).is_empty());
-        assert_eq!(stored(&rig), 2, "the revoke's, kept, and the hold's");
+        assert_eq!(
+            stored(&rig),
+            3,
+            "the cover's (sent once, kept while its connection lasts), the revoke's and the hold's"
+        );
         assert_eq!(
             rig.bridge.station.as_ref().unwrap().feed.dump()["synced"]["cursor"],
             3
         );
         // A restart: the feeds loaded again; the link up, the next pass
-        // sends what the table holds: the revoke's (in force, its resends
-        // owed at every connection) and the hold's, never sent (the
-        // cover's, sent once, left the book).
+        // sends what the table holds: the cover's once more (a restart
+        // can't know whether its connection was refused, review m1), the
+        // revoke's (in force, owed at every connection) and the hold's,
+        // never sent.
         rig.bridge.work.feeds = crate::runtime::delegated::feeds::Feeds::Unloaded;
         rig.bridge.ensure_feeds();
         station_pass(&mut rig, 33_100, vec![]);
@@ -917,7 +922,11 @@ fn an_ack_goes_only_after_its_commit() {
                 AckResult::Entry { .. } => unreachable!(),
             })
             .collect();
-        assert_eq!(ids, [revoke.record_id(), hold.record_id()], "{acks:?}");
+        assert_eq!(
+            ids,
+            [cover.record_id(), revoke.record_id(), hold.record_id()],
+            "{acks:?}"
+        );
         assert_eq!(acks[0].cursor, 3);
     });
 }
@@ -995,6 +1004,80 @@ fn with_the_hook_off_no_acknowledgment_is_kept_or_sent() {
         assert!(acks_in(&sent.texts()).is_empty());
         assert!(rig.bridge.station.is_none());
         assert_eq!(db(&rig), 0);
+    });
+}
+
+/// Review m5 (ruling T36a): when the acks' sent mark can't be written, the
+/// sends are kept in memory all the same: nothing goes again on that
+/// connection pass after pass (the Station gets no stream of duplicates);
+/// a kept result goes at the next connection as usual.
+#[test]
+fn a_failed_sent_mark_sends_nothing_again_on_that_connection() {
+    use atem_client::control::{AckResult, ControlAction};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        let head = s.log.log.head();
+        let mut sent = rig.app.astation_client.capture_sent_for_test();
+        rig.bridge.r9_link = Some(1);
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute_batch(
+                "CREATE TRIGGER no_mark BEFORE UPDATE ON control_acks
+                 BEGIN SELECT RAISE(ABORT, 'no mark'); END;",
+            )
+            .unwrap();
+        let revoke = own_record(
+            &s.log,
+            "svc-bot",
+            ControlAction::Revoke {
+                interrupt_running: false,
+            },
+            1,
+        );
+        station_pass(
+            &mut rig,
+            0,
+            vec![heads_text(&[(ORIGIN, OWN_FEED, 1)], head)],
+        );
+        let page = page_text(&rig, 1, &[(1, &revoke)]);
+        station_pass(&mut rig, 100, vec![page]);
+        let first = acks_in(&sent.texts());
+        assert_eq!(first.len(), 1, "{first:?}");
+        for n in 0..5 {
+            station_pass(&mut rig, 200 + n * 100, vec![]);
+        }
+        assert!(acks_in(&sent.texts()).is_empty(), "nothing again");
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute_batch("DROP TRIGGER no_mark;")
+            .unwrap();
+        // The next connection: the revoke's result, kept, goes again.
+        rig.bridge.station.as_mut().unwrap().sync_link(
+            Some(2),
+            2,
+            || crate::runtime::delegated::station::LinkKind::Routed,
+            || Some(ORIGIN.to_string()),
+        );
+        rig.bridge.r9_link = Some(2);
+        station_pass(&mut rig, 1_000, vec![]);
+        let again = acks_in(&sent.texts());
+        assert!(
+            again.iter().any(|ack| ack.results.iter().any(|r| matches!(
+                r,
+                AckResult::Record { record_id, .. } if record_id == revoke.record_id()
+            ))),
+            "{again:?}"
+        );
     });
 }
 

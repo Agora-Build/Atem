@@ -26,6 +26,18 @@ fn record(
     action: ControlAction,
     issued_at: u64,
 ) -> ControlRecord {
+    let record_id = uuid::Uuid::new_v4().to_string();
+    record_with_id(service, signer, action, issued_at, &record_id)
+}
+
+/// [`record`] under `record_id`.
+fn record_with_id(
+    service: &str,
+    signer: ControlSigner,
+    action: ControlAction,
+    issued_at: u64,
+    record_id: &str,
+) -> ControlRecord {
     let mut keys = SoftwareKeys::new();
     keys.insert_ed25519(auth("k"), &secret("acks k"));
     let public = keys.public_key(&auth("k")).unwrap();
@@ -40,7 +52,7 @@ fn record(
         principal_key: Some(principal_key_of(&public).unwrap()),
         signer,
         action,
-        record_id: uuid::Uuid::new_v4().to_string(),
+        record_id: record_id.into(),
         issued_at,
         about: ControlAbout {
             integration_id: Some(format!("i-{service}")),
@@ -139,9 +151,20 @@ fn send(
     cursor: u64,
     now: u64,
 ) -> Vec<Vec<AckResult>> {
-    let due = book.due(link, Some((FEED, cursor)), &claim(), Some(now));
+    send_at(db, book, link, cursor, Some(now))
+}
+
+/// [`send`] at `D` = `now`, which may have no reading.
+fn send_at(
+    db: &Connection,
+    book: &mut AckBook,
+    link: &StationLink,
+    cursor: u64,
+    now: Option<u64>,
+) -> Vec<Vec<AckResult>> {
+    let due = book.due(link, Some((FEED, cursor)), &claim(), now);
     let tx = db.unchecked_transaction().unwrap();
-    book.sent(&tx, link, Some(now), &due).unwrap();
+    book.sent(&tx, link, now, &due).unwrap();
     tx.commit().unwrap();
     due.into_iter().map(|d| d.ack.results).collect()
 }
@@ -410,12 +433,17 @@ fn other_in_force_results_once_per_connection() {
         native.record_id().to_owned(),
         interrupt.record_id().to_owned(),
     ];
-    let stored: Vec<String> = table(&db).into_iter().map(|(key, _, _)| key).collect();
-    assert_eq!(stored, kept, "those sent once left");
+    let stored =
+        |db: &Connection| -> Vec<String> { table(db).into_iter().map(|(key, _, _)| key).collect() };
+    // Those sent once are kept until their connection ends with no
+    // refusal (review m1).
+    assert_eq!(stored(&db), all);
     // The same connection, an hour on: nothing.
     assert!(send(&db, &mut book, &link(1), 5, ISSUED + HOUR).is_empty());
-    // The next connection: once each, and again not on it.
+    // The next connection: once each, and again not on it; those sent
+    // once on the last one, which ended with no refusal, left.
     assert_eq!(ids(&send(&db, &mut book, &link(2), 5, ISSUED + HOUR)), kept);
+    assert_eq!(stored(&db), kept);
     assert!(send(&db, &mut book, &link(2), 5, ISSUED + 2 * HOUR).is_empty());
     // A restart's first connection, a day on: once each.
     let mut again = AckBook::load(&db).unwrap();
@@ -554,4 +582,408 @@ fn the_cursor_goes_on_and_feedless_results_name_the_own_feed() {
     send(&db, &mut book, &link(1), 4, ISSUED);
     let stored: Vec<String> = table(&db).into_iter().map(|(key, _, _)| key).collect();
     assert_eq!(stored, [carried.record_id()], "the other Station's left");
+}
+
+/// Review I1 (ruling T36a): the per-principal bound takes only results that
+/// are entirely `duplicate` and go once per connection. A result that puts
+/// an effect in force (`applied`) and a service's own revoke are always
+/// kept: here, after a native revoke and four re-signed copies, the
+/// Station's own revoke adding `interrupt_running` (`revocation`
+/// duplicate, `interrupt` applied) still goes on every connection and every
+/// 10 minutes; a fifth copy, beyond the bound, goes once.
+#[test]
+fn the_bound_never_takes_an_applied_effect_or_an_own_revoke() {
+    let (db, mut book) = fresh();
+    let natives: Vec<ControlRecord> = (0..6)
+        .map(|n| {
+            record(
+                BOT,
+                ControlSigner::Member(format!("dev-{n}")),
+                ControlAction::Revoke {
+                    interrupt_running: false,
+                },
+                ISSUED + n,
+            )
+        })
+        .collect();
+    let duplicate = applied(&[(EffectKind::Revocation, ApplicationResult::Duplicate, None)]);
+    commit(
+        &db,
+        &mut book,
+        &[Acked::of(
+            &natives[0],
+            &in_force(EffectKind::Revocation),
+            Some(&at(1)),
+        )],
+    );
+    for (n, native) in natives[1..5].iter().enumerate() {
+        commit(
+            &db,
+            &mut book,
+            &[Acked::of(native, &duplicate, Some(&at(n as u64 + 2)))],
+        );
+    }
+    let own = own_revoke(true, ISSUED + 10);
+    let interrupt = applied(&[
+        (EffectKind::Revocation, ApplicationResult::Duplicate, None),
+        (EffectKind::Interrupt, ApplicationResult::Applied, None),
+    ]);
+    commit(&db, &mut book, &[Acked::of(&own, &interrupt, Some(&at(6)))]);
+    commit(
+        &db,
+        &mut book,
+        &[Acked::of(&natives[5], &duplicate, Some(&at(7)))],
+    );
+    assert_eq!(
+        ids(&send(&db, &mut book, &link(1), 7, ISSUED + 20)).len(),
+        7
+    );
+    let mut kept: Vec<String> = natives[..5]
+        .iter()
+        .map(|r| r.record_id().to_owned())
+        .collect();
+    kept.push(own.record_id().to_owned());
+    assert_eq!(ids(&send(&db, &mut book, &link(2), 7, ISSUED + 21)), kept);
+    // Ten minutes on: the own revoke again.
+    assert_eq!(
+        ids(&send(&db, &mut book, &link(2), 7, ISSUED + 21 + 10 * MIN)),
+        [own.record_id()]
+    );
+}
+
+/// Review m1 (ruling T36a): a result that goes once is kept until its
+/// connection ends with no `control_ack_refused`. On a connection that is
+/// refused it goes again on the next one; one that ends with no refusal
+/// lets it leave the book, and so do 10 minutes on `D` on a live connection
+/// with no refusal. A restart (which can't know whether its last connection
+/// was refused) sends it once more.
+#[test]
+fn a_refused_connections_once_results_go_again_on_the_next() {
+    let (db, mut book) = fresh();
+    let cover = record(BOT, ControlSigner::Principal, ControlAction::Cover, ISSUED);
+    let waiting = record(
+        "svc-two",
+        ControlSigner::Member("dev-mac".into()),
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+        ISSUED,
+    );
+    let pending = applied(&[(
+        EffectKind::Revocation,
+        ApplicationResult::Pending,
+        Some(Why::Pending(PendingReason::SignerUnknown)),
+    )]);
+    commit(
+        &db,
+        &mut book,
+        &[
+            Acked::of(&cover, &in_force(EffectKind::Cover), Some(&at(1))),
+            Acked::of(&waiting, &pending, Some(&at(2))),
+        ],
+    );
+    let both = [cover.record_id(), waiting.record_id()];
+    assert_eq!(ids(&send(&db, &mut book, &link(1), 2, ISSUED)), both);
+    book.on_refused();
+    // The next connection: both again; it ends with no refusal.
+    assert_eq!(ids(&send(&db, &mut book, &link(2), 2, ISSUED + MIN)), both);
+    assert_eq!(table(&db).len(), 2, "kept while their connection lasts");
+    assert!(send(&db, &mut book, &link(3), 2, ISSUED + 2 * MIN).is_empty());
+    assert!(table(&db).is_empty(), "{:?}", table(&db));
+    // Ten minutes with no refusal on a live connection: gone too.
+    let hold = record(BOT, ControlSigner::Principal, ControlAction::Hold, ISSUED);
+    commit(
+        &db,
+        &mut book,
+        &[Acked::of(&hold, &in_force(EffectKind::Hold), Some(&at(3)))],
+    );
+    assert_eq!(
+        ids(&send(&db, &mut book, &link(3), 3, ISSUED + 3 * MIN)),
+        [hold.record_id()]
+    );
+    assert_eq!(table(&db).len(), 1);
+    assert!(send(&db, &mut book, &link(3), 3, ISSUED + 13 * MIN).is_empty());
+    assert!(table(&db).is_empty());
+    // Sent, then a restart: once more at the first connection.
+    let release = record(
+        BOT,
+        ControlSigner::Principal,
+        ControlAction::Release,
+        ISSUED,
+    );
+    commit(
+        &db,
+        &mut book,
+        &[Acked::of(
+            &release,
+            &in_force(EffectKind::Release),
+            Some(&at(4)),
+        )],
+    );
+    send(&db, &mut book, &link(3), 4, ISSUED + 14 * MIN);
+    let mut again = AckBook::load(&db).unwrap();
+    assert_eq!(
+        ids(&send(&db, &mut again, &link(1), 4, ISSUED + 15 * MIN)),
+        [release.record_id()]
+    );
+}
+
+/// Review m2 (ruling T36a): a second body under a `record_id` this
+/// principal's result is held for (a collision: a Station fault or a
+/// double-signing signer) never replaces the first body's result, which
+/// goes on as before; it is logged once (with no content) and sent
+/// nowhere, so it never blocks the other results. The same body applied
+/// again (a `pending` record that now applies) is held with its new
+/// result.
+#[test]
+fn a_second_body_never_replaces_the_first_bodys_result() {
+    let (db, mut book) = fresh();
+    let id = uuid::Uuid::new_v4().to_string();
+    let first = record_with_id(
+        BOT,
+        ControlSigner::Principal,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+        ISSUED,
+        &id,
+    );
+    let second = record_with_id(
+        BOT,
+        ControlSigner::Principal,
+        ControlAction::Revoke {
+            interrupt_running: true,
+        },
+        ISSUED + 1,
+        &id,
+    );
+    let other = record(
+        "svc-two",
+        ControlSigner::Member("dev-mac".into()),
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+        ISSUED,
+    );
+    commit(
+        &db,
+        &mut book,
+        &[
+            Acked::of(&first, &in_force(EffectKind::Revocation), Some(&at(1))),
+            Acked::of(&other, &in_force(EffectKind::Revocation), Some(&at(2))),
+        ],
+    );
+    send(&db, &mut book, &link(1), 2, ISSUED);
+    let collision = applied(&[
+        (EffectKind::Revocation, ApplicationResult::Duplicate, None),
+        (EffectKind::Interrupt, ApplicationResult::Applied, None),
+    ]);
+    for n in 0..2 {
+        commit(
+            &db,
+            &mut book,
+            &[Acked::of(&second, &collision, Some(&at(3 + n)))],
+        );
+    }
+    let lines = book.take_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains(&id) && lines[0].contains("service:svc-bot"),
+        "{lines:?}"
+    );
+    // No result due for it on this connection (the cursor alone goes);
+    // the next has the first body's result, with the other's.
+    assert!(ids(&send(&db, &mut book, &link(1), 4, ISSUED + MIN)).is_empty());
+    let due = book.due(&link(2), Some((FEED, 4)), &claim(), Some(ISSUED + MIN));
+    let results: Vec<AckResult> = due.into_iter().flat_map(|d| d.ack.results).collect();
+    assert_eq!(
+        results,
+        [
+            AckResult::Record {
+                record_id: id.clone(),
+                effects: in_force(EffectKind::Revocation).effects,
+            },
+            AckResult::Record {
+                record_id: other.record_id().into(),
+                effects: in_force(EffectKind::Revocation).effects,
+            },
+        ]
+    );
+    // The same body, pending first, then applied: held with its new result.
+    let late = record(
+        "svc-three",
+        ControlSigner::Member("dev-mac".into()),
+        ControlAction::Hold,
+        ISSUED,
+    );
+    let waits = applied(&[(
+        EffectKind::Hold,
+        ApplicationResult::Pending,
+        Some(Why::Pending(PendingReason::SignerUnknown)),
+    )]);
+    commit(&db, &mut book, &[Acked::of(&late, &waits, Some(&at(5)))]);
+    commit(
+        &db,
+        &mut book,
+        &[Acked::of(&late, &in_force(EffectKind::Hold), None)],
+    );
+    let due = book.due(&link(1), Some((FEED, 5)), &claim(), Some(ISSUED + MIN));
+    assert_eq!(
+        due.into_iter()
+            .flat_map(|d| d.ack.results)
+            .collect::<Vec<_>>(),
+        [AckResult::Record {
+            record_id: late.record_id().into(),
+            effects: in_force(EffectKind::Hold).effects,
+        }]
+    );
+    assert!(book.take_lines().is_empty());
+}
+
+/// Review m4: at most `MAX_ACK_RESULTS` results an ack (65 make two acks
+/// naming the same feed and cursor), and a `record_id` once an ack (wire
+/// rule 6: two principals' results under one `record_id` go in two acks).
+#[test]
+fn a_batch_splits_at_64_results_and_at_a_shared_record_id() {
+    let (db, mut book) = fresh();
+    let covers: Vec<Acked> = (0..65)
+        .map(|n| {
+            let cover = record(
+                &format!("svc-{n}"),
+                ControlSigner::Principal,
+                ControlAction::Cover,
+                ISSUED,
+            );
+            Acked::of(&cover, &in_force(EffectKind::Cover), Some(&at(n + 1)))
+        })
+        .collect();
+    commit(&db, &mut book, &covers);
+    let due = book.due(&link(1), Some((FEED, 65)), &claim(), Some(ISSUED));
+    let sizes: Vec<usize> = due.iter().map(|d| d.ack.results.len()).collect();
+    assert_eq!(sizes, [MAX_ACK_RESULTS, 1]);
+    assert!(
+        due.iter()
+            .all(|d| d.ack.cursor == 65 && d.ack.feed_id == FEED)
+    );
+    assert!(due.iter().all(|d| d.ack.to_json().is_ok()));
+    send(&db, &mut book, &link(1), 65, ISSUED);
+    let id = uuid::Uuid::new_v4().to_string();
+    let shared: Vec<Acked> = ["svc-a", "svc-b"]
+        .iter()
+        .map(|service| {
+            let hold = record_with_id(
+                service,
+                ControlSigner::Principal,
+                ControlAction::Hold,
+                ISSUED,
+                &id,
+            );
+            Acked::of(&hold, &in_force(EffectKind::Hold), Some(&at(66)))
+        })
+        .collect();
+    commit(&db, &mut book, &shared);
+    let due = book.due(&link(1), Some((FEED, 66)), &claim(), Some(ISSUED));
+    let sizes: Vec<usize> = due.iter().map(|d| d.ack.results.len()).collect();
+    assert_eq!(sizes, [1, 1], "a record_id once an ack");
+    assert!(due.iter().all(|d| d.ack.to_json().is_ok()));
+}
+
+/// Review m4: with no reading of `D`, a service's own revoke goes on every
+/// connection only (no 10-minute resend) and is never taken as past its
+/// deadline; sent with no reading, it goes again at once when a reading
+/// comes.
+#[test]
+fn with_no_reading_of_d_an_own_revoke_goes_per_connection_only() {
+    let (db, mut book) = fresh();
+    let revoke = own_revoke(false, ISSUED);
+    commit(
+        &db,
+        &mut book,
+        &[Acked::of(
+            &revoke,
+            &in_force(EffectKind::Revocation),
+            Some(&at(1)),
+        )],
+    );
+    let id = [revoke.record_id()];
+    assert_eq!(ids(&send_at(&db, &mut book, &link(1), 1, None)), id);
+    assert!(send_at(&db, &mut book, &link(1), 1, None).is_empty());
+    assert_eq!(ids(&send_at(&db, &mut book, &link(2), 1, None)), id);
+    assert!(send_at(&db, &mut book, &link(2), 1, None).is_empty());
+    // A reading now: the 10 minutes start, at once.
+    assert_eq!(ids(&send(&db, &mut book, &link(2), 1, ISSUED + MIN)), id);
+    assert!(send(&db, &mut book, &link(2), 1, ISSUED + 2 * MIN).is_empty());
+    // Never spent without a reading, however long.
+    assert_eq!(ids(&send_at(&db, &mut book, &link(3), 1, None)), id);
+    assert_eq!(table(&db).len(), 1);
+}
+
+/// Review m6 (ruling T36a): rows of the table that don't read, or read but
+/// aren't results the shared writer takes (a reason beside `applied`, the
+/// wrong effects for a record), are skipped, kept as they are, and logged
+/// once with no content; the other rows go as usual.
+#[test]
+fn rows_that_dont_read_are_logged_once_and_skipped() {
+    let (db, mut book) = fresh();
+    let good = record(BOT, ControlSigner::Principal, ControlAction::Hold, ISSUED);
+    commit(
+        &db,
+        &mut book,
+        &[Acked::of(&good, &in_force(EffectKind::Hold), Some(&at(1)))],
+    );
+    // Each wrong in one way: a key that isn't a record id, effects that
+    // don't read, a reason beside `applied`, effects no record carries, a
+    // digest that doesn't read.
+    let digest = Hash32([7; 32]).to_hex();
+    for (key, effects, digest) in [
+        (
+            "not-a-uuid",
+            r#"[{"effect":"hold","result":"applied"}]"#,
+            digest.as_str(),
+        ),
+        (
+            "22222222-2222-4222-8222-222222222222",
+            "not json",
+            digest.as_str(),
+        ),
+        (
+            "33333333-3333-4333-8333-333333333333",
+            r#"[{"effect":"hold","result":"applied","why":"order"}]"#,
+            digest.as_str(),
+        ),
+        (
+            "44444444-4444-4444-8444-444444444444",
+            r#"[{"effect":"hold","result":"applied"},{"effect":"cover","result":"applied"}]"#,
+            digest.as_str(),
+        ),
+        (
+            "55555555-5555-4555-8555-555555555555",
+            r#"[{"effect":"hold","result":"applied"}]"#,
+            "00",
+        ),
+    ] {
+        db.execute(
+            "INSERT INTO control_acks(origin,feed_id,key,principal,digest,effects,resend_until_ms)
+            VALUES(?1,?2,?3,'service:svc-x',?4,?5,0)",
+            rusqlite::params![ORIGIN, FEED, key, digest, effects],
+        )
+        .unwrap();
+    }
+    let mut book = AckBook::load(&db).unwrap();
+    let lines = book.take_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("5 control acknowledgment row(s)"),
+        "{lines:?}"
+    );
+    assert!(
+        !lines[0].contains("order") && !lines[0].contains("2222"),
+        "{lines:?}"
+    );
+    assert_eq!(
+        ids(&send(&db, &mut book, &link(1), 1, ISSUED)),
+        [good.record_id()]
+    );
+    assert_eq!(table(&db).len(), 6, "kept as they are");
+    assert!(AckBook::load(&db).unwrap().dump()["unreadable"] == 5);
 }

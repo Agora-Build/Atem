@@ -364,6 +364,26 @@ impl HostBridge {
     /// stays owed, unsent, and is logged (the first, then at powers of
     /// two).
     pub(crate) fn ack_text(&mut self, due: &DueAck) -> Option<String> {
+        #[cfg(test)]
+        {
+            use atem_client::control::AckResult;
+            let ids = due
+                .ack
+                .results
+                .iter()
+                .filter_map(|r| match r {
+                    AckResult::Record { record_id, .. } => Some(record_id.clone()),
+                    AckResult::Entry { .. } => None,
+                })
+                .collect();
+            let attached = self
+                .r9
+                .attachments()
+                .into_iter()
+                .map(|(_, principal)| principal)
+                .collect();
+            self.work.acks_handed.push((ids, attached));
+        }
         match due.ack.to_json() {
             Ok(text) => Some(text.to_string()),
             Err(error) => {
@@ -406,7 +426,11 @@ impl HostBridge {
         else {
             return;
         };
-        if let Err(error) = feeds.acks_sent(store, &link, now_d, sent) {
+        let sent = feeds.acks_sent(store, &link, now_d, sent);
+        for line in feeds.take_ack_lines() {
+            eprintln!("{line}");
+        }
+        if let Err(error) = sent {
             self.work.ack_failures += 1;
             if self.work.ack_failures.is_power_of_two() {
                 eprintln!(

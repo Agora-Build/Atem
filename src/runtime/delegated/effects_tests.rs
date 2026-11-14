@@ -1993,6 +1993,51 @@ fn another_identitys_store_takes_no_page_and_sends_no_ack() {
     });
 }
 
+/// Review m3 (ruling T36a; carry: "send a record's result only after the
+/// revoke's session-v1 fence has run"): in the Station step that commits a
+/// revoke of the bot, whose channel is live, the bot's attachments are
+/// fenced before the revoke's ack is handed to the link.
+#[test]
+fn a_revokes_ack_goes_after_its_fence() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = fed_bot(&mut rig, root, &os, start);
+        r9_link_up(&mut rig);
+        service_hello(&mut rig, &s.log, "bot-1", "svc-bot").unwrap();
+        assert!(attached(&rig, BOT));
+        let mut sent = station_up(&mut rig, 7);
+        let revoked = bot_record(&s.log, revoke(false), 2);
+        let heads = heads_text(&[(ORIGIN, OWN_FEED, 2)], s.log.log.head());
+        station_pass(&mut rig, 0, vec![heads]);
+        let page = page_text(&rig, 2, &[(2, &revoked)]);
+        station_pass(&mut rig, 100, vec![page]);
+        let id = revoked.record_id().to_string();
+        let (_, attached_then) = rig
+            .bridge
+            .work
+            .acks_handed
+            .iter()
+            .find(|(ids, _)| ids.contains(&id))
+            .expect("the revoke's ack handed to the link")
+            .clone();
+        assert!(
+            !attached_then.iter().any(|p| p == BOT),
+            "fenced before its ack: {attached_then:?}"
+        );
+        assert!(!attached(&rig, BOT));
+        assert!(
+            acks_in(&sent.texts())
+                .iter()
+                .any(|ack| ack.results.iter().any(|r| matches!(
+                    r,
+                    atem_client::control::AckResult::Record { record_id, .. } if *record_id == id
+                )))
+        );
+    });
+}
+
 /// Ruling T35d, B (hook off = main): with `host.delegated` off a store
 /// gets no control table and no unread mark, a pass and a new identity's
 /// store included.

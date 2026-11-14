@@ -256,6 +256,10 @@ pub(super) struct State {
     /// spawn (production only logs it).
     #[cfg(test)]
     failed_before_spawn: HashMap<String, &'static str>,
+    /// Tests: each ack as it was handed to the link (its results' record
+    /// ids) with the principals the r9 engine held attachments of then.
+    #[cfg(test)]
+    acks_handed: Vec<(Vec<String>, Vec<String>)>,
 }
 
 /// Whether the host keeps a control state, and whose (ruling T35d, A): the
@@ -321,6 +325,8 @@ impl State {
             recovery: Vec::new(),
             #[cfg(test)]
             failed_before_spawn: HashMap::new(),
+            #[cfg(test)]
+            acks_handed: Vec::new(),
         }
     }
 }

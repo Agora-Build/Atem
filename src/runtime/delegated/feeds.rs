@@ -88,6 +88,9 @@ pub const KEPT: usize = 32;
 pub const PERSIST_EVERY_MS: u64 = 60_000;
 /// One alert line an hour per source (I.5.4, Decision 12).
 pub const ALERT_EVERY_MS: u64 = 3_600_000;
+/// After an acknowledgments' write that failed, a write that only removes
+/// what is spent waits this long (review m5).
+pub const ACK_RETRY_MS: u64 = 10_000;
 /// A part read at load: far above a part's bound (§11.1: about 32 KB).
 const MAX_PART_BYTES: usize = 1 << 20;
 /// A record kept as evidence keeps at most this much of its text.
@@ -382,6 +385,9 @@ pub struct FeedStore {
     own: Option<String>,
     /// The device list it was loaded for: its account and genesis.
     list: (String, atem_client::encoding::Hash32),
+    /// After an acknowledgments' write that failed, the next one that only
+    /// removes what is spent waits until then (monotonic ms; review m5).
+    ack_retry_at: Option<u64>,
     /// The host identity the store is bound to (`None`: not bound yet):
     /// the bridge applies records into it, and acknowledges them, only while
     /// it is the host's current one (Task 35 re-review 2, notes for Task
@@ -508,6 +514,7 @@ impl FeedStore {
             open: Arc::new(AtomicU64::new(0)),
             own: None,
             list: (list.account_id().to_string(), list.genesis_hash()),
+            ack_retry_at: None,
             identity,
             alerts: Alerts::default(),
             tally: AlertTally::default(),
@@ -632,16 +639,48 @@ impl FeedStore {
         let Some(book) = self.mem.acks.as_ref() else {
             return Ok(());
         };
-        if sent.is_empty() && !book.tidy_due(link, now_d) {
+        let now = (self.clock)().mono_ms;
+        // After a write that failed, removing what is spent waits a while
+        // (review m5): it isn't tried at every pass.
+        let tidy = book.tidy_due(link, now_d) && self.ack_retry_at.is_none_or(|at| now >= at);
+        if sent.is_empty() && !tidy {
             return Ok(());
         }
-        let mut book = book.clone();
-        let tx = store.immediate()?;
-        if book.sent(&tx, link, now_d, sent)? {
-            tx.commit()?;
+        let mut next = book.clone();
+        let written = (|| -> Result<()> {
+            let tx = store.immediate()?;
+            if next.sent(&tx, link, now_d, sent)? {
+                tx.commit()?;
+            }
+            Ok(())
+        })();
+        match written {
+            Ok(()) => {
+                self.mem.acks = Some(next);
+                self.ack_retry_at = None;
+                Ok(())
+            }
+            Err(error) => {
+                // The sends happened: marked in memory all the same, so
+                // none goes again on this connection (review m5); a restart
+                // sends them again at most once more, which counts nothing
+                // twice.
+                if let Some(book) = self.mem.acks.as_mut() {
+                    book.mark_sent(link, now_d, sent);
+                }
+                self.ack_retry_at = Some(now.saturating_add(ACK_RETRY_MS));
+                Err(error)
+            }
         }
-        self.mem.acks = Some(book);
-        Ok(())
+    }
+
+    /// The `runtime.log` lines of the acknowledgments not taken yet.
+    pub fn take_ack_lines(&mut self) -> Vec<String> {
+        self.mem
+            .acks
+            .as_mut()
+            .map(AckBook::take_lines)
+            .unwrap_or_default()
     }
 
     /// `control_ack_refused` came (Decision 20, [`AckBook::on_refused`]).
