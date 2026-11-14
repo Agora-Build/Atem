@@ -380,15 +380,6 @@ impl AckBook {
     /// The book in `db`, its table made if missing.
     pub fn load(db: &Connection) -> Result<AckBook> {
         db.execute_batch(TABLE)?;
-        // A table of an earlier build of this branch, made before `alone`.
-        let has_alone = db
-            .prepare("SELECT 1 FROM pragma_table_info('control_acks') WHERE name='alone'")?
-            .exists([])?;
-        if !has_alone {
-            db.execute_batch(
-                "ALTER TABLE control_acks ADD COLUMN alone INTEGER NOT NULL DEFAULT 0",
-            )?;
-        }
         let mut book = AckBook::default();
         let mut q = db.prepare(
             "SELECT origin, feed_id, key, principal, digest, effects, resend_until_ms, sent_gen,
