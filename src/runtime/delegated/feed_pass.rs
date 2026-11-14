@@ -30,7 +30,19 @@
 //!   yet takes nothing).
 //! - **Never with the start view locked.** A commit publishes the
 //!   standings, which locks the view: the list is copied out first.
+//! - **Only this identity's store** (Task 35 re-review 2, notes for Task
+//!   36): the store takes pages and re-verifications, and acknowledges
+//!   them, only while it is bound to the host's current identity
+//!   ([`loaded`]); another identity's (kept while hosting is paused across
+//!   a re-verify) or one not bound yet takes nothing and sends nothing.
+//! - **Acknowledgments** (Task 36, [`super::acks`]): each record's result
+//!   is written in its transaction (`apply_page`, `feeds_reverify`); the
+//!   bridge hands the acks due to the link at the end of its Station step,
+//!   after the records' followups ([`HostBridge::acks_due`],
+//!   [`HostBridge::acks_sent`]); a `control_ack_refused` holds them for the
+//!   connection ([`HostBridge::ack_refused`]).
 use super::*;
+use crate::runtime::delegated::acks::{Acked, DueAck};
 use crate::runtime::delegated::effects::{Followup, act};
 use crate::runtime::delegated::feeds::Reapplied;
 use crate::runtime::delegated::station::Call;
@@ -44,13 +56,23 @@ const APPLIED_SEQ: u64 = 0;
 /// The re-verified records kept for Task 35 at most (`keep_reapplied`).
 pub(crate) const KEPT_REAPPLIED: usize = 64;
 
-/// The feed store when its records may be read and applied: loaded for
-/// the device list that committed (`list`: the start view's; feeds of
-/// another list, a re-pin the pass hasn't moved the store aside for yet,
-/// take nothing), the receipt database healthy.
-fn loaded<'a>(work: &'a State, list: Option<&ListState>) -> Option<&'a FeedStore> {
+/// The feed store when its records may be read and applied, and
+/// acknowledged: loaded for the device list that committed (`list`: the
+/// start view's; feeds of another list, a re-pin the pass hasn't moved the
+/// store aside for yet, take nothing), its store bound to the host's
+/// current identity (`identity`; Task 35 re-review 2, notes for Task 36:
+/// another identity's store, kept while hosting is paused across a
+/// re-verify, or a store not bound yet, takes no page, no re-verification
+/// and sends no ack), the receipt database healthy.
+fn loaded<'a>(
+    work: &'a State,
+    list: Option<&ListState>,
+    identity: &HostTarget,
+) -> Option<&'a FeedStore> {
     match (&work.feeds, &work.store, work.error, list) {
-        (Feeds::Loaded(feeds), Some(_), false, Some(list)) if feeds.for_list(&list.membership) => {
+        (Feeds::Loaded(feeds), Some(_), false, Some(list))
+            if feeds.for_list(&list.membership) && feeds.identity() == Some(identity) =>
+        {
             Some(feeds)
         }
         _ => None,
@@ -91,7 +113,7 @@ impl HostBridge {
     /// logged (the first, then at powers of two) and tried again at the next
     /// step: nothing is asked meanwhile, the gate stays closed.
     fn persist_reset_mark(&mut self, list: Option<&ListState>) -> Option<Call> {
-        let fits = loaded(&self.work, list).is_some();
+        let fits = loaded(&self.work, list, &self.work_host()).is_some();
         let State {
             feeds: Feeds::Loaded(feeds),
             store: Some(store),
@@ -121,7 +143,7 @@ impl HostBridge {
     /// with no call; the start view gets the change.
     pub(crate) fn feed_advance(&mut self, now: Clocks) {
         let list = self.sync_list();
-        let feeds = loaded(&self.work, list.as_ref());
+        let feeds = loaded(&self.work, list.as_ref(), &self.work_host());
         if let Some(station) = self.station.as_mut() {
             station.feed.advance(now, feeds);
         }
@@ -137,7 +159,7 @@ impl HostBridge {
     /// retired, ruling C1b-a).
     pub(crate) fn feed_tick(&mut self, now: Clocks) -> Vec<Call> {
         let list = self.sync_list();
-        let feeds = loaded(&self.work, list.as_ref());
+        let feeds = loaded(&self.work, list.as_ref(), &self.work_host());
         let Some(station) = self.station.as_mut() else {
             return Vec::new();
         };
@@ -162,7 +184,7 @@ impl HostBridge {
         // Station's next `heads` (Task 34).
         self.ensure_clock();
         let list = self.sync_list();
-        let fits = loaded(&self.work, list.as_ref()).is_some();
+        let fits = loaded(&self.work, list.as_ref(), &self.work_host()).is_some();
         let State {
             feeds,
             store,
@@ -201,7 +223,7 @@ impl HostBridge {
         self.ensure_clock();
         // Copied out: a commit publishes the standings into the view.
         let list = self.sync_list();
-        let fits = loaded(&self.work, list.as_ref()).is_some();
+        let fits = loaded(&self.work, list.as_ref(), &self.work_host()).is_some();
         let State {
             feeds,
             store,
@@ -266,7 +288,7 @@ impl HostBridge {
         if self.work.reverified == Some(key) {
             return;
         }
-        if loaded(&self.work, Some(&list)).is_none() {
+        if loaded(&self.work, Some(&list), &self.work_host()).is_none() {
             return;
         }
         let State {
@@ -285,9 +307,14 @@ impl HostBridge {
                 let tx = feeds.begin(store)?;
                 let again = feeds.reverify_pending(&tx, &list, APPLIED_SEQ)?;
                 let mut followups = Vec::new();
+                let mut acked = Vec::new();
                 for r in &again {
                     followups.extend(act(store, &tx, &r.applied.actions)?);
+                    acked.push(Acked::of(&r.record, &r.applied, r.pos.as_ref()));
                 }
+                // Their results, owed the Station (Task 36), in the same
+                // transaction.
+                feeds.acknowledge(&tx, &acked)?;
                 feeds.commit(tx)?;
                 Ok((again, followups))
             })();
@@ -301,15 +328,101 @@ impl HostBridge {
     }
 
     /// Records a re-verification applied (Task 33 review m4), their
-    /// effects written in their transaction (Task 35): kept for Task 36's
-    /// acknowledgments, at most [`KEPT_REAPPLIED`], the oldest dropped
-    /// first; dropped with the store when a new identity moves it aside.
+    /// effects (Task 35) and their results owed the Station (Task 36)
+    /// written in their transaction: the latest kept in memory for the
+    /// tests, at most [`KEPT_REAPPLIED`], the oldest dropped first; dropped
+    /// with the store when a new identity moves it aside.
     fn keep_reapplied(&mut self, again: Vec<Reapplied>) {
         let kept = &mut self.work.reapplied;
         kept.extend(again);
         if kept.len() > KEPT_REAPPLIED {
             let excess = kept.len() - KEPT_REAPPLIED;
             kept.drain(..excess);
+        }
+    }
+
+    /// The acknowledgments due to the host's own Station now (Task 36,
+    /// host-work-v1 §11.4 "Acknowledgments"; [`super::acks`]): only from a
+    /// feed store that may be acknowledged ([`loaded`]: this identity's,
+    /// for the committed list, healthy), on the Station link, at `D`. The
+    /// bridge hands them to the link at the end of its Station step, after
+    /// the records' followups (a revoke's session-v1 fence), so a result
+    /// goes once its effects are durable and its fence ran.
+    pub(crate) fn acks_due(&self) -> Vec<DueAck> {
+        let list = self.start_view().list.clone();
+        let Some(feeds) = loaded(&self.work, list.as_ref(), &self.work_host()) else {
+            return Vec::new();
+        };
+        let Some(link) = self.station.as_ref().and_then(|station| station.link()) else {
+            return Vec::new();
+        };
+        let now_d = self.start_view().now_d_ms;
+        feeds.acks_due(link, now_d)
+    }
+
+    /// An ack's wire text, by the shared core's builder; one it refuses
+    /// stays owed, unsent, and is logged (the first, then at powers of
+    /// two).
+    pub(crate) fn ack_text(&mut self, due: &DueAck) -> Option<String> {
+        match due.ack.to_json() {
+            Ok(text) => Some(text.to_string()),
+            Err(error) => {
+                self.work.ack_unbuilt += 1;
+                if self.work.ack_unbuilt.is_power_of_two() {
+                    eprintln!(
+                        "atem runtime: {} control acknowledgment(s) the shared builder refused ({}); kept, not sent",
+                        self.work.ack_unbuilt,
+                        error.code()
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// `sent`, acks [`HostBridge::acks_due`] gave, were handed to the link:
+    /// marked sent (what is spent leaves the book), in their own
+    /// transaction. A write that fails is logged (the first, then at powers
+    /// of two): they stay due, and go again.
+    pub(crate) fn acks_sent(&mut self, sent: &[DueAck]) {
+        let list = self.start_view().list.clone();
+        if loaded(&self.work, list.as_ref(), &self.work_host()).is_none() {
+            return;
+        }
+        let Some(link) = self
+            .station
+            .as_ref()
+            .and_then(|station| station.link())
+            .cloned()
+        else {
+            return;
+        };
+        let now_d = self.start_view().now_d_ms;
+        let State {
+            feeds: Feeds::Loaded(feeds),
+            store: Some(store),
+            ..
+        } = &mut self.work
+        else {
+            return;
+        };
+        if let Err(error) = feeds.acks_sent(store, &link, now_d, sent) {
+            self.work.ack_failures += 1;
+            if self.work.ack_failures.is_power_of_two() {
+                eprintln!(
+                    "atem runtime: {} control acknowledgment(s) couldn't be marked sent ({error:#}); they go again",
+                    self.work.ack_failures
+                );
+            }
+        }
+    }
+
+    /// `control_ack_refused` on the Station link (Decision 20): the feed
+    /// sync closed the gates already; the book takes nothing as delivered
+    /// and sends nothing more on that connection ([`super::acks`]).
+    pub(crate) fn ack_refused(&mut self) {
+        if let Feeds::Loaded(feeds) = &mut self.work.feeds {
+            feeds.acks_refused();
         }
     }
 
@@ -609,7 +722,7 @@ impl HostBridge {
                 station.feed.own().unwrap_or_default()
             )
         };
-        let counts = loaded(&self.work, list).map(|feeds| {
+        let counts = loaded(&self.work, list, &self.work_host()).map(|feeds| {
             format!(
                 "; {} kept as evidence, {} pending",
                 feeds.evidence_count(),

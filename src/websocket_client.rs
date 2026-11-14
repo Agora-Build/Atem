@@ -1103,6 +1103,16 @@ impl AstationClient {
         PausedWriter { rx, writer }
     }
 
+    /// Tests: every message handed to the link from now on, kept for the
+    /// test to read ([`SentForTest::texts`]) instead of written: as if
+    /// connected, whether or not the client is.
+    #[cfg(test)]
+    pub(crate) fn capture_sent_for_test(&mut self) -> SentForTest {
+        let (tx, rx) = mpsc::unbounded_channel::<OutboundMessage>();
+        self.sender = Some(tx);
+        SentForTest { rx }
+    }
+
     /// Pretend the link reached Astation `via`.
     #[cfg(test)]
     pub(crate) fn set_via_for_test(&mut self, via: LinkVia) {
@@ -2638,6 +2648,27 @@ impl AstationClient {
             .and_then(|c| c.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("Relay response missing 'code' field"))
+    }
+}
+
+/// What `capture_sent_for_test` kept of the messages handed to the link.
+#[cfg(test)]
+pub(crate) struct SentForTest {
+    rx: mpsc::UnboundedReceiver<OutboundMessage>,
+}
+
+#[cfg(test)]
+impl SentForTest {
+    /// The raw session-family texts (`try_send_wire`'s) handed to the link
+    /// since the last call, in order; other messages are skipped.
+    pub(crate) fn texts(&mut self) -> Vec<String> {
+        let mut texts = Vec::new();
+        while let Ok(outbound) = self.rx.try_recv() {
+            if let AstationMessage::SessionWire(text) = outbound.message {
+                texts.push(text);
+            }
+        }
+        texts
     }
 }
 

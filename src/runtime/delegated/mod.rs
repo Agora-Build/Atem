@@ -20,8 +20,11 @@
 //! detail texts ([`details`]), the host's Station link with its own
 //! device-list fetch ([`station`], [`fetch`], I.5.8), and the control feed
 //! store ([`feeds`], I.5.4, I.5.5: records applied with the cursor in one
-//! transaction, the senders' standings), and what the records do to the
-//! tasks, in that transaction ([`effects`], I.5.5 to I.5.7).
+//! transaction, the senders' standings), what the records do to the
+//! tasks, in that transaction ([`effects`], I.5.5 to I.5.7), and the
+//! acknowledgments of their results to the host's Station, written there
+//! too ([`acks`], I.5.8, §11.4).
+pub mod acks;
 pub mod alerts;
 pub mod attempts;
 pub mod authority;

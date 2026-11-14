@@ -226,6 +226,11 @@ pub(super) struct State {
     /// What control records' effects asked of the bridge once their
     /// transaction committed, not carried out yet (`effects_pass`).
     followups: Vec<crate::runtime::delegated::effects::Followup>,
+    /// Acknowledgments whose `sent` mark failed to write, and those the
+    /// shared builder refused, in this run (their log lines: the first,
+    /// then at powers of two).
+    ack_failures: u64,
+    ack_unbuilt: u64,
     /// Whether this host keeps a control state (ruling T35d, A), read once
     /// when the store opens (`read_kept`; none: not read yet).
     kept: Option<KeptControls>,
@@ -303,6 +308,8 @@ impl State {
             reverified: None,
             reapplied: Vec::new(),
             followups: Vec::new(),
+            ack_failures: 0,
+            ack_unbuilt: 0,
             kept: None,
             alert_tally: Default::default(),
             intents: Default::default(),
@@ -708,7 +715,16 @@ impl HostBridge {
         let (Some(store), Some(m)) = (self.work.store.as_ref(), self.membership.as_ref()) else {
             return;
         };
-        let loaded = FeedStore::load(store, m.membership());
+        // With `host.delegated` on, the results owed the Station too (Task
+        // 36): its table only then (hook off = main).
+        let acks = self.features.delegated;
+        let loaded = FeedStore::load(store, m.membership()).and_then(|feeds| {
+            if acks {
+                feeds.with_acks(store)
+            } else {
+                Ok(feeds)
+            }
+        });
         let stood_in = self.controls_stood_in();
         match loaded {
             Ok(mut feeds) => {
@@ -1254,6 +1270,11 @@ impl HostBridge {
                 // read (ruling T35f, m3).
                 if matches!(self.work.kept, Some(KeptControls::Of(_))) {
                     self.work.kept = Some(KeptControls::Of(identity.clone()));
+                }
+                // Feeds it loaded unbound apply and acknowledge for this
+                // identity now (Task 36: only a bound store's do).
+                if let Feeds::Loaded(feeds) = &mut self.work.feeds {
+                    feeds.bind(identity.clone());
                 }
                 return true;
             }

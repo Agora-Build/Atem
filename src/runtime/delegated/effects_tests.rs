@@ -1899,6 +1899,100 @@ fn an_owner_command_while_paused_makes_this_identitys_store() {
     });
 }
 
+/// The host's Station link up (generation `n`, the rig's r9 link with it)
+/// and the link's sends kept: what the bridge's Station step hands it.
+fn station_up(rig: &mut LocalRig, n: u64) -> crate::websocket_client::SentForTest {
+    use crate::runtime::delegated::station::{LinkKind, Station};
+    let mut station = Station::new();
+    station.sync_link(Some(n), n, || LinkKind::Routed, || Some(ORIGIN.to_string()));
+    rig.bridge.station = Some(station);
+    rig.bridge.r9_link = Some(n);
+    rig.app.astation_client.capture_sent_for_test()
+}
+
+/// Task 35 re-review 2, notes for Task 36 (1 to 3): while hosting is paused
+/// across a re-verify, the store is the previous identity's: it takes no
+/// page (nothing is asked for it, nothing applies into it) and sends no
+/// ack, its unsent results included (never under the new identity's
+/// claim). Hosting resumes: the new identity's store reads the feed from
+/// 0 and acknowledges what it applied itself, under its own claim: the
+/// cover applied before is `applied` again (Atem's reading: results per
+/// identity; the Station counts per host, so nothing counts twice).
+#[test]
+fn another_identitys_store_takes_no_page_and_sends_no_ack() {
+    use atem_client::control::{AckResult, ApplicationResult};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        rig.bridge.work.controls = None;
+        rig.bridge.start_view().standings.clear();
+        let cover = bot_record(&s.log, ControlAction::Cover, 1);
+        // Read with no send loop: its result is owed, unsent.
+        feed(&mut rig, &s.log, &[&cover]);
+        let unsent = |rig: &LocalRig| -> i64 {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .query_row(
+                    "SELECT count(*) FROM control_acks WHERE sent_gen IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(unsent(&rig), 1);
+        rig.bridge.work.config.enabled = false;
+        passes(&mut rig, 1);
+        reverify(&mut rig, root, &mut s);
+        passes(&mut rig, 1);
+        assert!(rig.bridge.kept_elsewhere());
+        let mut sent = station_up(&mut rig, 1);
+        let heads = heads_text(&[(ORIGIN, OWN_FEED, 2)], s.log.log.head());
+        station_pass(&mut rig, 0, vec![heads.clone()]);
+        let page = page_text(&rig, 2, &[(2, &bot_record(&s.log, revoke(false), 2))]);
+        station_pass(&mut rig, 100, vec![page]);
+        assert!(
+            sent.texts().is_empty(),
+            "nothing asked, nothing acknowledged"
+        );
+        assert_eq!(unsent(&rig), 1, "still owed, never sent under gen 2");
+        let cursor = match &rig.bridge.work.feeds {
+            Feeds::Loaded(feeds) => feeds.cursor(ORIGIN, OWN_FEED),
+            _ => None,
+        };
+        assert_eq!(cursor, Some(1), "nothing applied into it");
+        // Hosting resumes: this identity's store, read from 0.
+        rig.bridge.work.config.enabled = true;
+        passes(&mut rig, 1);
+        assert_eq!(
+            unsent(&rig),
+            0,
+            "the old store's results went aside with it"
+        );
+        let mut sent = station_up(&mut rig, 2);
+        station_pass(
+            &mut rig,
+            1_000,
+            vec![heads_text(&[(ORIGIN, OWN_FEED, 1)], s.log.log.head())],
+        );
+        let page = page_text(&rig, 1, &[(1, &cover)]);
+        station_pass(&mut rig, 1_100, vec![page]);
+        let acks = acks_in(&sent.texts());
+        assert_eq!(acks.len(), 1, "{acks:?}");
+        assert_eq!(acks[0].host_trust_gen, 2);
+        let AckResult::Record { record_id, effects } = &acks[0].results[0] else {
+            panic!("a record's result");
+        };
+        assert_eq!(record_id, cover.record_id());
+        assert_eq!(effects[0].result, ApplicationResult::Applied);
+    });
+}
+
 /// Ruling T35d, B (hook off = main): with `host.delegated` off a store
 /// gets no control table and no unread mark, a pass and a new identity's
 /// store included.

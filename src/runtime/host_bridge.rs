@@ -1606,6 +1606,9 @@ impl HostBridge {
             self.publish_feed_gates();
             match inbound {
                 StationInbound::Nothing => {}
+                // The gates closed already (Decision 20); the
+                // acknowledgments' book holds what it owes (Task 36).
+                StationInbound::AckRefused => self.ack_refused(),
                 // The fetch took the announced list head; the feed sync
                 // takes its feeds (§11.4).
                 StationInbound::Heads(heads, fetch) => {
@@ -1666,6 +1669,10 @@ impl HostBridge {
         // What the records' effects asked once they committed (design
         // I.5.5): withdrawals, fences, intents.
         self.effects_pass(cx);
+        // The acknowledgments due (Task 36, §11.4): after the records'
+        // commits and their followups (a revoke's session-v1 fence), so a
+        // result goes once its effects are durable and its fence ran.
+        let acks = self.acks_due();
         let Some(station) = self.station.as_mut() else {
             return;
         };
@@ -1701,6 +1708,19 @@ impl HostBridge {
                 }
             }
         }
+        // The acks the link took are marked sent; one it didn't take, or
+        // the shared builder refuses (logged: the first, then at powers of
+        // two), stays due.
+        let mut acked = Vec::new();
+        for due in acks {
+            let Some(text) = self.ack_text(&due) else {
+                continue;
+            };
+            if self.r9_link.is_some() && cx.client.try_send_wire(text, false).is_ok() {
+                acked.push(due);
+            }
+        }
+        self.acks_sent(&acked);
         self.publish_feed_gates();
         self.refresh_fetch_view();
     }
@@ -2193,6 +2213,10 @@ impl HostBridge {
                 dump["list_part"] = json!(self.membership.as_ref().is_some_and(|m| {
                     station.fetch.part().holds(m.membership(), self.list_deferral())
                 }));
+                // The acknowledgments' book (Task 36), as committed.
+                if let super::delegated::feeds::Feeds::Loaded(feeds) = &self.work.feeds {
+                    dump["acks"] = json!(feeds.acks_dump());
+                }
                 dump
             }),
         });

@@ -64,6 +64,8 @@
 // The feeds' sync (Task 33) applies records, re-verifies pending ones and
 // keeps unparsed ones; until it exists only the tests do.
 #![cfg_attr(not(test), allow(dead_code))]
+use super::acks::{AckBook, Acked, Claim, DueAck};
+use super::station::StationLink;
 use super::{ControlView, FeedRef, SenderStanding};
 use crate::runtime::host_work::Store;
 use crate::session_protocol::membership::ListState;
@@ -71,6 +73,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use atem_client::canonical::{Numbers, parse_strict};
 use atem_client::control::{ApplicationResult, Applied, ControlRecord, ControlState, FeedPos, Why};
 use atem_client::membership::{HostNow, Membership};
+use atem_client::session::host_work::HostTarget;
 use rusqlite::{Connection, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -273,6 +276,10 @@ struct Mem {
     /// made with the tables, gone with the commit that first reads the own
     /// Station's feed up to its announced head.
     unread: bool,
+    /// The results owed the host's own Station (Task 36, [`AckBook`]),
+    /// written with their records' transaction: with `host.delegated` on
+    /// only ([`FeedStore::with_acks`]).
+    acks: Option<AckBook>,
 }
 
 /// Per source: when its last line went and what came since.
@@ -375,6 +382,11 @@ pub struct FeedStore {
     own: Option<String>,
     /// The device list it was loaded for: its account and genesis.
     list: (String, atem_client::encoding::Hash32),
+    /// The host identity the store is bound to (`None`: not bound yet):
+    /// the bridge applies records into it, and acknowledges them, only while
+    /// it is the host's current one (Task 35 re-review 2, notes for Task
+    /// 36).
+    identity: Option<HostTarget>,
     alerts: Alerts,
     /// The alerts raised in this run (their lines are hourly), and the
     /// latest's text with when it came (`atem status`, Task 33 review m7):
@@ -473,7 +485,9 @@ impl FeedStore {
         let unread = db.query_row("SELECT EXISTS(SELECT 1 FROM control_unread)", [], |r| {
             r.get(0)
         })?;
+        let identity = store.bound()?;
         let mem = Mem {
+            acks: None,
             resets,
             unread,
             state: loaded.state,
@@ -494,6 +508,7 @@ impl FeedStore {
             open: Arc::new(AtomicU64::new(0)),
             own: None,
             list: (list.account_id().to_string(), list.genesis_hash()),
+            identity,
             alerts: Alerts::default(),
             tally: AlertTally::default(),
             lines,
@@ -530,6 +545,115 @@ impl FeedStore {
             [],
             |r| r.get(0),
         )?)
+    }
+
+    /// The store's acknowledgments (Task 36), with `host.delegated` on: its
+    /// table made if missing, the results it holds read.
+    pub fn with_acks(mut self, store: &Store) -> Result<FeedStore> {
+        self.mem.acks = Some(AckBook::load(&store.db)?);
+        Ok(self)
+    }
+
+    /// The host identity the store is bound to, as it was when it loaded
+    /// or its first use bound it ([`FeedStore::bind`]).
+    pub fn identity(&self) -> Option<&HostTarget> {
+        self.identity.as_ref()
+    }
+
+    /// The store, loaded before it was bound, is bound to `identity` now
+    /// (its first use, ruling T35f, m3).
+    pub fn bind(&mut self, identity: HostTarget) {
+        self.identity = Some(identity);
+    }
+
+    /// `results`, of the records applied in `tx`, owed the host's own
+    /// Station (Task 36): written in `tx`, the records' own transaction, and
+    /// held once it committed ([`FeedStore::commit`]); nothing without the
+    /// acknowledgments ([`FeedStore::with_acks`]).
+    pub fn acknowledge(&mut self, tx: &FeedTx, results: &[Acked]) -> Result<()> {
+        self.ours(tx)?;
+        if self.mem.acks.is_none() || results.is_empty() {
+            return Ok(());
+        }
+        let mut mem = self.staged.take().unwrap_or_else(|| self.mem.clone());
+        let out = match mem.acks.as_mut() {
+            Some(book) => book.on_committed(tx, results),
+            None => Ok(()),
+        };
+        self.stage(mem, out)
+    }
+
+    /// The acks due on `link` at `D` = `now_d` ([`AckBook::due`]), as
+    /// committed: under the claim of the identity the store is bound to and
+    /// its device list's root, naming the link's Station's feed as this
+    /// store reads it and its cursor. None without acknowledgments, an
+    /// identity or a feed read.
+    pub fn acks_due(&self, link: &StationLink, now_d: Option<u64>) -> Vec<DueAck> {
+        let (Some(book), Some(identity), Some(origin)) = (
+            self.mem.acks.as_ref(),
+            self.identity.as_ref(),
+            link.origin.as_deref(),
+        ) else {
+            return Vec::new();
+        };
+        if identity.account_id != self.list.0 {
+            return Vec::new();
+        }
+        let claim = Claim {
+            account_id: identity.account_id.clone(),
+            genesis_hash: self.list.1,
+            host_id: identity.atem_device_id.clone(),
+            host_trust_gen: identity.host_trust_gen,
+        };
+        let feed = self.current_feed(origin);
+        book.due(
+            link,
+            feed.as_ref()
+                .map(|(feed_id, cursor)| (feed_id.as_str(), *cursor)),
+            &claim,
+            now_d,
+        )
+    }
+
+    /// `sent`, acks [`FeedStore::acks_due`] gave, were handed to `link` at
+    /// `now_d` ([`AckBook::sent`]), in a transaction of their own (as
+    /// [`FeedStore::tick`] writes evidence): written only when something
+    /// changed, held only once it committed (else they stay due).
+    pub fn acks_sent(
+        &mut self,
+        store: &Store,
+        link: &StationLink,
+        now_d: Option<u64>,
+        sent: &[DueAck],
+    ) -> Result<()> {
+        if self.open.load(Ordering::SeqCst) != self.generation {
+            self.discard();
+        }
+        let Some(book) = self.mem.acks.as_ref() else {
+            return Ok(());
+        };
+        if sent.is_empty() && !book.tidy_due(link, now_d) {
+            return Ok(());
+        }
+        let mut book = book.clone();
+        let tx = store.immediate()?;
+        if book.sent(&tx, link, now_d, sent)? {
+            tx.commit()?;
+        }
+        self.mem.acks = Some(book);
+        Ok(())
+    }
+
+    /// `control_ack_refused` came (Decision 20, [`AckBook::on_refused`]).
+    pub fn acks_refused(&mut self) {
+        if let Some(book) = self.mem.acks.as_mut() {
+            book.on_refused();
+        }
+    }
+
+    /// The acknowledgments' state, for the state dump.
+    pub fn acks_dump(&self) -> Option<Value> {
+        self.mem.acks.as_ref().map(AckBook::dump)
     }
 
     /// The store's control state was never read in full (ruling T35d, B),

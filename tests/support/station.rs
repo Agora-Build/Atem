@@ -44,7 +44,9 @@
 //!   `control_ack_refused` when it refuses the ack for its association on
 //!   this link ([`AckRefusal::reply`]); nothing for any other refusal. The
 //!   link's verified association is the host the fake was made for, its
-//!   connection `link-<n>`.
+//!   connection `link-<n>`. An ack is counted as it comes, even while the
+//!   test waits for another call to hold ([`FakeStation::hold_call`];
+//!   [`FakeStation::hold_ack`] holds one).
 //! - [`FakeStation::refuse`]: that call answered with its typed refusal,
 //!   nothing served or counted.
 //! - [`FakeStation::serve_other_account`]: a Station that serves another
@@ -367,26 +369,65 @@ impl FakeStation {
         }
     }
 
-    /// Serves `link` until the host's next call arrived (at most a minute)
-    /// and answers it.
+    /// Serves `link` until the host's next call of any kind (a
+    /// `control_ack` included) arrived (at most a minute) and answers it.
     pub fn next_call(&mut self, link: u64) -> Result<ToStation, RelayError> {
-        let held = self.hold_call(link);
+        let held = self.hold_next(link, |_| true);
         self.answer_held(held)
     }
 
-    /// Serves `link` until the host's next call arrived (at most a minute)
-    /// and keeps it unanswered (in [`FakeStation::sent`] from now): a
-    /// Station slow to answer, or one whose answer the test writes itself.
-    /// [`FakeStation::answer_held`] answers it later; a call never answered
-    /// is one the Station never answers.
+    /// Serves `link` until the host's next call that isn't a `control_ack`
+    /// arrived (at most a minute) and keeps it unanswered (in
+    /// [`FakeStation::sent`] from now): a Station slow to answer, or one
+    /// whose answer the test writes itself. [`FakeStation::answer_held`]
+    /// answers it later; a call never answered is one the Station never
+    /// answers. The host's acks that come first are counted as they come,
+    /// as a Station does (an ack has no answer): [`FakeStation::hold_ack`]
+    /// holds one.
     pub fn hold_call(&mut self, link: u64) -> Held {
+        self.hold_next(link, |call| !matches!(call, Ok(ToStation::ControlAck(_))))
+    }
+
+    /// Serves `link` until the host's next `control_ack` arrived (at most
+    /// a minute) and keeps it uncounted, as [`FakeStation::hold_call`]
+    /// keeps a call; the calls that come first are answered as they come.
+    pub fn hold_ack(&mut self, link: u64) -> Held {
+        self.hold_next(link, |call| matches!(call, Ok(ToStation::ControlAck(_))))
+    }
+
+    /// The host's next call on `link` that `held` takes, kept unanswered;
+    /// the ones before it answered as they come.
+    fn hold_next(
+        &mut self,
+        link: u64,
+        held: impl Fn(&Result<ToStation, RelayError>) -> bool,
+    ) -> Held {
         self.attach(link);
-        let (link, bytes) = self
-            .calls
-            .recv_timeout(WAIT)
-            .expect("the host sent no Station call");
-        self.sent.push(bytes.clone());
-        Held { link, bytes }
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let (from, bytes) = self
+                .calls
+                .recv_timeout(left)
+                .expect("the host sent no such Station call");
+            if held(&ToStation::decode(bytes.as_bytes())) {
+                self.sent.push(bytes.clone());
+                return Held { link: from, bytes };
+            }
+            let _ = self.answer(from, bytes);
+        }
+    }
+
+    /// The host's `control_ack`s the fake read so far, as the shared reader
+    /// reads them.
+    pub fn acks_sent(&self) -> Vec<ControlAck> {
+        self.sent
+            .iter()
+            .filter_map(|bytes| match ToStation::decode(bytes.as_bytes()) {
+                Ok(ToStation::ControlAck(ack)) => Some(ack),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Answers `held` now, as [`FakeStation::serve`] would answer it then,

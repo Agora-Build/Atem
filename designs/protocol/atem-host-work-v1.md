@@ -1864,8 +1864,9 @@ acknowledgments and reports revocations to the Portal (design I.5.8,
 "Delivery progress is not application"; I.6.5). **Planned:** release
 builds make none of these calls in this version (**updated in step 4,
 2026-11-13:** behind the debug-only `host.delegated` hook the host makes
-`membership_fetch`). They are relay messages, not
-session ops, so no welcome feature gates them; they arrive with
+`membership_fetch` and `control_sync`, and, from Task 36,
+`control_ack`). They are relay messages, not session ops, so no welcome
+feature gates them; they arrive with
 `host.senders` and delegated work. Types: `atem_client::control::relay`
 (every message, its reader and builder) and `atem_client::control::ledger`
 (the Station's reference acknowledgment ledger, `AckLedger`); for Station
@@ -2344,7 +2345,8 @@ only its own Station's feed (step 4's Decision 14):
   call, whichever call it was meant for, so a late refusal costs liveness
   only (the live call's page is then drained); the other two leave the
   sync call live, its page applying but ending nothing (it was asked
-  before the refusal). The next `control_sync` goes at the first `heads` 30
+  before the refusal), and a `control_ack_refused` also stops the host's
+  acks on that connection ("Acknowledgments" below). The next `control_sync` goes at the first `heads` 30
   seconds or more after the refusal, or on the link's next generation. On
   the same link generation the gate opens only with a page asked for then
   (the resynchronization), even when the cursor already held the head. A
@@ -2398,6 +2400,63 @@ only its own Station's feed (step 4's Decision 14):
   `record_id` its result names. Astation's re-sign alert (I.5.4) stays on a
   native-signed record until every effect it carries is in force on every
   host it covers.
+
+**On the host (step 4, Task 36; behind the debug-only `host.delegated`
+hook, so no release build sends one).** The host's book of what it owes
+its own Station (`src/runtime/delegated/acks.rs`, the `control_acks`
+table of `host-work.sqlite`, made only with the hook on):
+
+- **Durable before acknowledged, as built.** Each record's result is
+  written in the transaction that applies the record (a page's, or a
+  re-verification's), with its effects, its intents and the cursor; a
+  transaction that fails writes none. It goes on the link only after that
+  commit, at the end of the host's Station step, after what the records'
+  effects ask once committed (a revoke's session-v1 fence among them): a
+  result says `applied` once the revoked service is cut off. A crash
+  between the commit and the send loses nothing (the row goes at the next
+  connection); an ack the link doesn't take stays owed.
+- **What a result says.** Exactly the state's per-effect results of that
+  application (§11.1), reasons included (wire rule 10, the shared core's
+  writer); a record applied again is owed with its new result (a
+  `duplicate`), never the earlier one.
+- **What an ack names** (**Atem's reading, for Astation**). The claim of
+  the identity the host's store is bound to (its account, root, host id and
+  trust generation), and the host's own Station's feed and its committed
+  cursor, whatever feed a result's record was read from: a feedless
+  result (rule 9), and a pending record re-verified after a reset replaced
+  the feed it was read from (a result names its record; the ack's feed and
+  cursor say how far the host reads the feed it reads now). A result of a
+  record read from another Station's feed (one the host has left) is
+  dropped unsent: the host has no link to that Station.
+- **Only this identity's store** (**Atem's reading, for Astation and
+  Auth/Portal**). A store bound to another identity (hosting paused across
+  a re-verify, §11.1) takes no page, applies no re-verification and sends
+  no ack, its unsent results included: never under the new identity's
+  claim. The new identity's store reads the feed from 0 and acknowledges
+  what it applied itself: a stop applied under the previous identity is
+  `applied` again under the new one, never `duplicate` from another store.
+  The Station counts per host id and effect, so nothing counts twice.
+- **Resends, bounded** (**Atem's reading, for Astation**). A service's own
+  revoke's in-force result: on every connection (a link generation on its
+  socket: a restart, a reconnection or a re-authentication starts one) and
+  every 10 minutes on `D` (§11.6) while connected, until its `issued_at`
+  plus 25 hours on `D`, then dropped; one first owed after that goes once.
+  Any other in-force result of a `revoke` or `interrupt_running` once per
+  connection. Every other result (not in force, or a `cover`, `hold` or
+  `release`) goes once, and leaves the book once handed to the link: an
+  ack has no answer, and such a result is information only. At most 4
+  in-force results of a principal are kept for resending, its first ones;
+  a later one goes once (each effect counts once per host whichever record
+  says so, and a principal's revocation and its interrupt are each put in
+  force once).
+- **The cursor.** An ack also goes when the committed cursor moved since
+  the last ack of the run, with whatever results are due (none for a page
+  of no record).
+- **A refusal** (**Atem's reading, for Astation**). A `control_ack_refused`
+  advances nothing in the book (no result taken as delivered or dropped,
+  no resend's schedule moved) and closes the gates (Decision 20); the host
+  sends no more acks on that connection, since an ack's claim is its
+  link's association or it isn't, and resumes at the next connection.
 
 #### Reports (agreed with Auth/Portal, 2026-11-11)
 

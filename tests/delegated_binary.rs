@@ -1056,11 +1056,15 @@ fn fetch(after: u64) -> Result<ToStation, RelayError> {
 }
 
 /// The host's next device-list fetch on `link`, answered; its feed syncs
-/// (`control_sync`) on the way answered too.
+/// (`control_sync`) and acknowledgments (`control_ack`, Task 36) on the way
+/// answered too.
 fn next_fetch(station: &mut FakeStation, link: u64) -> Result<ToStation, RelayError> {
     loop {
         let call = station.next_call(link);
-        if !matches!(call, Ok(ToStation::ControlSync(_))) {
+        if !matches!(
+            call,
+            Ok(ToStation::ControlSync(_) | ToStation::ControlAck(_))
+        ) {
             return call;
         }
     }

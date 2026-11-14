@@ -93,6 +93,9 @@ pub enum Inbound {
     /// A `control_sync_result`, or a message that was one and the reader
     /// refused: for [`FeedSync::on_page`].
     Page(Result<ControlSyncResult, RelayError>),
+    /// `control_ack_refused`: the gates closed ([`FeedSync::on_refused`]);
+    /// for the acknowledgments' book too (`AckBook::on_refused`).
+    AckRefused,
 }
 
 /// A call the host sends its Station on the link.
@@ -249,7 +252,7 @@ impl Station {
             }
             Ok(ToHost::ControlAckRefused(_)) => {
                 self.refused(RefusedCall::ControlAck);
-                Inbound::Nothing
+                Inbound::AckRefused
             }
             Ok(ToHost::ControlSyncResult(page)) => Inbound::Page(Ok(page)),
             // A page the reader refused as a whole: a Station fault, for
@@ -431,10 +434,12 @@ mod tests {
             RefusedCall::MembershipFetch,
             RefusedCall::MembershipFetch,
         ] {
-            assert_eq!(
-                s.receive(&refused(call), Some(head(3)), None),
-                Inbound::Nothing
-            );
+            // An ack's refusal is for the acknowledgments' book too.
+            let expected = match call {
+                RefusedCall::ControlAck => Inbound::AckRefused,
+                _ => Inbound::Nothing,
+            };
+            assert_eq!(s.receive(&refused(call), Some(head(3)), None), expected);
         }
         let dump = s.dump();
         assert_eq!(dump["refusals"]["control_sync"], 1);

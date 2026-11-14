@@ -118,6 +118,7 @@
 //!   changes ([`FeedSync::take_gates`]), so the start check reads it at
 //!   once (Decision 16).
 use super::DelegatedSender;
+use super::acks::Acked;
 use super::effects::{Followup, act};
 use super::feeds::{FeedStore, ListNotServing, NotOwnStation, Reapplied};
 use super::fetch::{HEADS_PACE_MS, REFUSAL_BACKOFF_MS, STALL_PAUSE_MS};
@@ -366,8 +367,9 @@ struct Ask {
 /// ask of the bridge after the commit is `followups`.
 #[derive(Debug, Default)]
 pub struct Synced {
-    /// The records applied, each with its position, in feed order (Task
-    /// 36's acknowledgments read their effects).
+    /// The records applied, each with its position, in feed order (their
+    /// results owed the Station were written in the page's transaction,
+    /// Task 36: tests read them here).
     #[allow(dead_code)]
     pub applied: Vec<(FeedPos, Applied)>,
     /// Pending records applied again in the page's transaction (after a
@@ -1373,8 +1375,10 @@ impl GateView for FeedSync {
 /// Station's (what applied before commits). Every record is after the
 /// call's `after` ([`FeedSync::on_page`] faults a page that isn't). A page
 /// with no record reads the feed up to its head. A reset's read
-/// (`ask.restart`) replaces the origin's cursor first. What the effects ask
-/// of the bridge is returned only once the page committed.
+/// (`ask.restart`) replaces the origin's cursor first. Each record's result
+/// is written for the Station's acknowledgment in the same transaction
+/// ([`super::acks`], Task 36). What the effects ask of the bridge is
+/// returned only once the page committed.
 fn apply_page(
     page: &ControlSyncResult,
     ask: &Ask,
@@ -1403,6 +1407,9 @@ fn apply_page(
     let mut applied = Vec::new();
     let mut reapplied = Vec::new();
     let mut followups = Vec::new();
+    // What the Station is owed of them (Task 36): each record's result, in
+    // feed order, written in this transaction.
+    let mut acked = Vec::new();
     let mut stopped = false;
     for entry in &page.records {
         let Some(at) = pos(feeds, entry.feed_seq) else {
@@ -1419,10 +1426,16 @@ fn apply_page(
                         .iter()
                         .any(|action| matches!(action, HostAction::Revoke(_)));
                     followups.extend(act(store, &tx, &a.actions)?);
+                    acked.push(Acked::of(&record, &a, Some(&at)));
                     applied.push((at, a));
                     if revoked {
                         for again in feeds.reverify_pending(&tx, list, applied_seq)? {
                             followups.extend(act(store, &tx, &again.applied.actions)?);
+                            acked.push(Acked::of(
+                                &again.record,
+                                &again.applied,
+                                again.pos.as_ref(),
+                            ));
                             reapplied.push(again);
                         }
                     }
@@ -1458,6 +1471,7 @@ fn apply_page(
     if !stopped && first_read_at.is_some_and(|head| reached >= head) {
         feeds.clear_unread(&tx)?;
     }
+    feeds.acknowledge(&tx, &acked)?;
     feeds.commit(tx)?;
     Ok(Synced {
         applied,

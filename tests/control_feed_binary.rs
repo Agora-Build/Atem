@@ -85,8 +85,9 @@ const SYNC_DEADLINE: u64 = 35_000;
 /// feed store's evidence lines (`feeds.rs`, "… an hour per source") end
 /// alike; the link's refusals and unread messages (`station.rs`); the
 /// bridge's mark and page failures (`feed_pass.rs`) and fetch results not
-/// carried (`host_bridge.rs`); the delegated clock's cap.
-const STATION_LINES: [&str; 7] = [
+/// carried (`host_bridge.rs`); the delegated clock's cap; the
+/// acknowledgments' failures (`feed_pass.rs`, Task 36).
+const STATION_LINES: [&str; 9] = [
     "; at most one such line an hour",
     "atem runtime: the Station refused this host's ",
     " Station message(s) the reader refused were dropped",
@@ -94,6 +95,8 @@ const STATION_LINES: [&str; 7] = [
     "atem runtime: a control feed page couldn't be applied",
     " device-list fetch result(s) not carried",
     "Station clock ahead of this host",
+    " control acknowledgment(s) couldn't be marked sent",
+    " control acknowledgment(s) the shared builder refused",
 ];
 /// The host the clients name.
 const IDS: HostIds = HostIds {
@@ -638,9 +641,10 @@ impl Rig {
     }
 
     /// What no refusal may move (§11.4 "Refusals"): the feed's cursor, the
-    /// device list, the control state, its evidence and reset marks, and the
+    /// device list, the control state, its evidence and reset marks, the
     /// records' effects (the tasks' states, the interrupt intents; the
-    /// clock floor: [`Rig::floor_offset`]).
+    /// clock floor: [`Rig::floor_offset`]), the host's acknowledgments'
+    /// book and the Station's ledger of them.
     fn unmoved(&self) -> Unmoved {
         let pinned: Value = serde_json::from_slice(
             &std::fs::read(self.sandbox.config().join("pairing/membership.json")).unwrap(),
@@ -671,7 +675,25 @@ impl Rig {
             resets: self.reset_marks(),
             tasks,
             intents: all_intents(self),
+            acks: self.ack_rows(),
+            ledger: self.station().acks().to_json(),
         }
+    }
+
+    /// The host's acknowledgments' book as stored (`control_acks`, Task
+    /// 36): each result's record id, effects and last send (link
+    /// generation, `D`), in the order written; none without the table.
+    fn ack_rows(&self) -> Vec<(String, String, Option<i64>, Option<i64>)> {
+        let db = self.db();
+        let Ok(mut q) =
+            db.prepare("SELECT key, effects, sent_gen, sent_ms FROM control_acks ORDER BY rowid")
+        else {
+            return Vec::new();
+        };
+        q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
     }
 }
 
@@ -717,6 +739,10 @@ struct Unmoved {
     /// interrupt intents.
     tasks: Vec<(String, String)>,
     intents: Vec<(String, String)>,
+    /// The host's acknowledgments' book (Task 36: what it owes, and when
+    /// each result last went) and the Station's reference ledger of them.
+    acks: Vec<(String, String, Option<i64>, Option<i64>)>,
+    ledger: Value,
 }
 
 impl HostRig for Rig {
@@ -752,7 +778,7 @@ fn fetch(after: u64) -> ToStation {
 }
 
 /// The host's next device-list fetch on `link`, answered; its feed syncs
-/// on the way answered too.
+/// and acknowledgments on the way answered too.
 fn next_fetch(station: &mut FakeStation, link: u64) -> ToStation {
     loop {
         let call = station.next_call(link).unwrap();
@@ -1163,8 +1189,19 @@ fn the_hosts_station_calls_match_the_goldens() {
         rig.cursor() == Some(1) && rig.reset_marks().is_empty() && rig.gate_open()
     });
     // Each call's own id: a lowercase UUID v4 ([`blank`] checks it), none
-    // twice ([`Rig::syncs`]).
-    let sent = rig.station().sent();
+    // twice ([`Rig::syncs`]). Its acks of what it read (Task 36) aside:
+    // their wire is the shared builder's (`ControlAck::to_json`).
+    let sent: Vec<String> = rig
+        .station()
+        .sent()
+        .into_iter()
+        .filter(|bytes| {
+            !matches!(
+                ToStation::decode(bytes.as_bytes()),
+                Ok(ToStation::ControlAck(_))
+            )
+        })
+        .collect();
     let ids: Vec<String> = sent
         .iter()
         .filter_map(|bytes| match ToStation::decode(bytes.as_bytes()) {
@@ -1376,11 +1413,14 @@ fn another_accounts_records_apply_nothing() {
     assert_eq!(rig.unmoved().list, pinned);
 }
 
-/// Decision 20, §11.4 "Refusals" (all three): a `control_sync_refused`, a
-/// `membership_fetch_refused` and a `control_ack_refused` each close the
-/// host's own Station's gate and advance nothing: no feed cursor, no
-/// device-list head, no clock floor, no control state, evidence or reset
-/// mark (the acknowledgment book is Task 36's). The next `heads` within the
+/// Decision 20, §11.4 "Refusals" (all three, each answering the host's
+/// own call: the `control_ack_refused` a real ack's, Task 34 review item 2):
+/// a `control_sync_refused`, a `membership_fetch_refused` and a
+/// `control_ack_refused` each close the host's own Station's gate and
+/// advance nothing: no feed cursor, no device-list head, no clock floor, no
+/// control state, evidence or reset mark, and neither the host's
+/// acknowledgments' book nor the Station's ledger (Task 36: the refused ack
+/// counted nothing). The next `heads` within the
 /// 30-second backoff asks nothing and opens nothing; the gate stays closed,
 /// and `atem status` says the Station refused. Past the backoff the next
 /// `heads` asks again, and the gate opens only with a page asked then
@@ -1414,45 +1454,44 @@ fn each_refusal_keeps_the_gate_closed_and_advances_nothing() {
                 rig.log.add_native("dev-tablet", &["view"]);
                 rig.station().set_log(&rig.log);
             }
-            RefusedCall::ControlAck => {}
+            // Something to acknowledge, in force (its result kept to be
+            // sent again): read, its ack the one refused.
+            RefusedCall::ControlAck => {
+                rig.append(
+                    SVC,
+                    ControlAction::Revoke {
+                        interrupt_running: false,
+                    },
+                );
+            }
         }
         rig.station().refuse(call, true);
-        let held = match call {
-            RefusedCall::ControlAck => None,
-            _ => {
-                let mut station = rig.station();
-                station.on_link(link);
-                station.heads_now();
-                Some(station.hold_call(link))
+        let held = {
+            let mut station = rig.station();
+            station.on_link(link);
+            station.heads_now();
+            match call {
+                // The page answered, its ack held.
+                RefusedCall::ControlAck => {
+                    let sync = station.hold_call(link);
+                    station.answer_held(sync).unwrap();
+                    station.hold_ack(link)
+                }
+                _ => station.hold_call(link),
             }
         };
         rig.two_passes();
         let before = rig.unmoved();
         let floor = rig.floor_offset();
-        let sent = rig.station().sent().len();
-        match held {
-            Some(held) => {
-                rig.station().answer_held(held).unwrap();
-            }
-            // The host makes no ack in this version: the refusal comes on
-            // its own (it answers no request anyway).
-            None => rig.astation.send(
-                link,
-                CallRefused {
-                    call,
-                    code: RefusalCode::Forbidden,
-                }
-                .to_json()
-                .unwrap()
-                .to_string(),
-            ),
-        }
+        let acks = rig.station().acks_sent().len();
+        rig.station().answer_held(held).unwrap();
         let station = rig.until_station("the refusal", |s| s["refusals"][name] == 1);
         assert_eq!(station["feed"]["closed"], REFUSED, "{name}: {station}");
         assert!(!rig.gate_open(), "{name}");
         assert_eq!(rig.unmoved(), before, "{name}");
         assert!(rig.floor_offset() <= floor, "{name}: the floor advanced");
         rig.status_feeds(&format!("{GATE_CLOSED} ({REFUSED})"));
+        let sent = rig.station().sent().len();
 
         // The next heads within the backoff: nothing asked, still closed.
         let heads = station["heads"].as_u64().unwrap();
@@ -1465,21 +1504,213 @@ fn each_refusal_keeps_the_gate_closed_and_advances_nothing() {
         assert_eq!(rig.feed()["closed"], REFUSED, "{name}");
         assert_eq!(rig.unmoved().synced, before.synced, "{name}");
 
-        // Past the backoff: asked again, and open with that page.
+        // Past the backoff: asked again, and open with that page (after an
+        // ack's refusal, a record more, whose result isn't sent on that
+        // connection).
+        if call == RefusedCall::ControlAck {
+            rig.append("svc-late", ControlAction::Cover);
+        }
         rig.station().refuse(call, false);
         rig.clock.add_mono(30_000);
         rig.announce();
         rig.serve_until(&format!("{name}: open again"), |rig| rig.gate_open());
         let syncs = rig.syncs();
         let last = syncs.last().unwrap();
-        assert_eq!(last, &rig.sync(1), "{name}: {syncs:?}");
+        // The revoke was read before its ack's refusal.
+        let read = if call == RefusedCall::ControlAck {
+            2
+        } else {
+            1
+        };
+        assert_eq!(last, &rig.sync(read), "{name}: {syncs:?}");
         assert!(rig.station().sent().len() > sent, "{name}");
         match call {
             RefusedCall::ControlSync => assert_eq!(rig.cursor(), Some(2)),
             RefusedCall::MembershipFetch => assert_eq!(rig.head(), 5),
-            RefusedCall::ControlAck => assert_eq!(rig.cursor(), Some(1)),
+            RefusedCall::ControlAck => {
+                rig.serve_until("the late record read", |rig| rig.cursor() == Some(3));
+                rig.two_passes();
+                rig.station().serve(link);
+                // Nothing more acknowledged on that connection (the held
+                // ack was the last).
+                assert_eq!(rig.station().acks_sent().len(), acks, "{name}");
+                assert!(rig.dump()["station"]["acks"]["held"] == true);
+            }
         }
     }
+}
+
+/// Decision 20, §11.4 "Refusals" (the half Task 34's review found
+/// untested at binary level): a `membership_fetch_refused` or a
+/// `control_ack_refused` closes the gate but leaves the `control_sync` in
+/// flight live; its page applies (its records, the cursor) and ends
+/// nothing: it was asked before the refusal, so the gate stays closed. After
+/// a `control_ack_refused` the page's result isn't sent on that connection
+/// (Task 36); after a `membership_fetch_refused` it is.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_refusal_of_another_call_leaves_the_sync_live_and_its_page_ends_nothing() {
+    for call in [RefusedCall::MembershipFetch, RefusedCall::ControlAck] {
+        let rig = Rig::full(Via::Local);
+        rig.cover_and_open();
+        let link = rig.link();
+        let name = match call {
+            RefusedCall::MembershipFetch => "membership_fetch",
+            _ => "control_ack",
+        };
+        let at = rig.append(SVC, ControlAction::Hold);
+        rig.clock.add_mono(1_000);
+        let held = {
+            let mut station = rig.station();
+            station.heads_now();
+            station.hold_call(link)
+        };
+        assert_eq!(sync_of(&held), rig.sync(1), "{name}");
+        let acks = rig.station().acks_sent().len();
+        rig.astation.send(
+            link,
+            CallRefused {
+                call,
+                code: RefusalCode::Forbidden,
+            }
+            .to_json()
+            .unwrap()
+            .to_string(),
+        );
+        let station = rig.until_station("the refusal", |s| s["refusals"][name] == 1);
+        assert_eq!(station["feed"]["closed"], REFUSED, "{name}");
+        assert_eq!(
+            station["feed"]["in_flight"]["request_id"],
+            request_id(&held),
+            "{name}: the sync call still live"
+        );
+        // Its page applies, and ends nothing.
+        rig.station().answer_held(held).unwrap();
+        rig.until_feed("the page applied", |f| f["synced"]["cursor"] == at);
+        rig.two_passes();
+        rig.station().serve(link);
+        assert_eq!(rig.feed()["closed"], REFUSED, "{name}");
+        assert!(!rig.gate_open(), "{name}");
+        let sent = rig.station().acks_sent().len();
+        match call {
+            RefusedCall::ControlAck => assert_eq!(sent, acks, "{name}: held"),
+            _ => assert_eq!(sent, acks + 1, "{name}: the hold's result"),
+        }
+    }
+}
+
+/// Task 36 (§11.4 "Acknowledgments", "What the Station counts"; the
+/// reference ledger, `AckLedger`, the fake Station's): the host reads a
+/// service's own `revoke` with `interrupt_running` and acknowledges it,
+/// and the ledger counts each effect once for the host (its revocation,
+/// the interrupt) and makes its reports (`revocation_applied`, `revoked`).
+/// The result sent again (on a new connection; 10 minutes on `D`) and a
+/// re-signed copy's (`duplicate`) count nothing twice and make no report
+/// more; the ledger refuses none of the host's acks.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn the_reference_ledger_counts_each_effect_once() {
+    let rig = Rig::full(Via::Local);
+    rig.cover_and_open();
+    let link = rig.link();
+    let revoke = ControlAction::Revoke {
+        interrupt_running: true,
+    };
+    let at = rig.append(SVC, revoke);
+    rig.clock.add_mono(1_000);
+    rig.announce();
+    let done = |rig: &Rig| rig.station().acks().to_json()["done"].clone();
+    let pending = |rig: &Rig| rig.station().acks().to_json()["pending"].clone();
+    rig.serve_until("the revoke counted", |rig| {
+        rig.cursor() == Some(at) && done(rig).as_array().is_some_and(|d| d.len() == 2)
+    });
+    let counted = done(&rig);
+    let effects: Vec<&str> = counted
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            assert_eq!(d["host"], HOST);
+            assert_eq!(d["principal"], format!("service:{SVC}"));
+            d["effect"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(effects, ["revocation", "interrupt"], "{counted}");
+    let reports = pending(&rig);
+    let kinds: Vec<&str> = reports
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["report_id"].as_str().unwrap().split(':').next().unwrap())
+        .collect();
+    assert_eq!(kinds, ["revocation_applied", "revoked"], "{reports}");
+    let first = rig.station().acks_sent();
+    let revoke_id = match &first.last().unwrap().results[..] {
+        [atem_client::control::AckResult::Record { record_id, .. }] => record_id.clone(),
+        other => panic!("the revoke's result: {other:?}"),
+    };
+    let sent_again = |rig: &Rig, before: usize| {
+        rig.serve_until("the revoke's result sent again", |rig| {
+            rig.station().acks_sent()[before..].iter().any(|ack| {
+                ack.results.iter().any(|r| {
+                    matches!(r, atem_client::control::AckResult::Record { record_id, .. } if *record_id == revoke_id)
+                })
+            })
+        });
+    };
+    // A new connection: sent again; nothing counted twice.
+    let before = rig.station().acks_sent().len();
+    reauthenticate(&rig, 0xa);
+    sent_again(&rig, before);
+    assert_eq!(
+        (done(&rig), pending(&rig)),
+        (counted.clone(), reports.clone())
+    );
+    // Ten minutes on `D`, the same connection: sent again.
+    let before = rig.station().acks_sent().len();
+    rig.clock.add_mono(10 * MIN);
+    sent_again(&rig, before);
+    assert_eq!(
+        (done(&rig), pending(&rig)),
+        (counted.clone(), reports.clone())
+    );
+    // A re-signed copy: `duplicate` for both effects; nothing counted.
+    let copy = rig.append(SVC, revoke);
+    rig.clock.add_mono(1_000);
+    rig.announce();
+    rig.serve_until("the copy read", |rig| rig.cursor() == Some(copy));
+    rig.serve_until("its ack read", |rig| {
+        rig.station()
+            .acks_sent()
+            .iter()
+            .any(|ack| ack.cursor == copy && !ack.results.is_empty())
+    });
+    let copied = rig
+        .station()
+        .acks_sent()
+        .into_iter()
+        .find(|ack| ack.cursor == copy && !ack.results.is_empty())
+        .unwrap();
+    let results: Vec<&str> = copied
+        .results
+        .iter()
+        .flat_map(|r| match r {
+            atem_client::control::AckResult::Record { effects, .. } => {
+                effects.iter().map(|e| e.result.code()).collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        })
+        .collect();
+    assert!(results.contains(&"duplicate"), "{copied:?}");
+    assert_eq!((done(&rig), pending(&rig)), (counted, reports));
+    assert!(rig.station().ack_refusals().is_empty());
+    let _ = link;
 }
 
 /// VII.A test 16 (design I.5.8, session-v1 R9.7b): a routed host, no
