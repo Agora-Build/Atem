@@ -1416,11 +1416,16 @@ fn the_owner_lists_and_resolves_unknown_outcomes_from_the_terminal() {
     let listed = owner(&rig, &["task", "list", "--unknown"]);
     let lines: Vec<&str> = listed.lines().collect();
     assert_eq!(lines.len(), 2, "{listed}");
-    for (line, (tid, launch)) in lines.iter().zip([(one_id, &first), (two_id, &second)]) {
+    // Both agents exit at once: their alerts are raised in either order.
+    for (tid, launch) in [(one_id, &first), (two_id, &second)] {
         let head = format!(
             "{tid}  {}  member:{PHONE}  agent exited  ",
             launch["session_id"].as_str().unwrap()
         );
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with(tid))
+            .unwrap_or_else(|| panic!("{tid} not listed: {listed}"));
         assert!(line.starts_with(&head), "{line}");
         // When: the local `YYYY-MM-DD HH:MM`.
         assert_eq!(line.len(), head.len() + 16, "{line}");
@@ -1577,6 +1582,460 @@ fn a_done_whose_client_goes_away_resolves_nothing_and_says_so() {
         format!("{tid}: resolved as done\n")
     );
     assert_eq!(stored(&rig, &t["task_id"])["resolved"]["by"], "local");
+}
+
+/// The bare Esc bytes the rig's agent was given (a bracketed paste's
+/// `ESC [` doesn't count).
+fn escs(rig: &Rig) -> usize {
+    let text = input(rig);
+    text.matches('\x1b').count() - text.matches("\x1b[").count()
+}
+
+/// One interrupt intent as `runtime/host-work.sqlite` stores it.
+#[derive(Debug)]
+struct Intent {
+    attempt_id: String,
+    reason: String,
+    done: bool,
+    delivered_turn: Option<String>,
+}
+
+/// Task `tid`'s interrupt intents, oldest first.
+fn intents(rig: &Rig, tid: &Value) -> Vec<Intent> {
+    let db =
+        rusqlite::Connection::open(rig.sandbox.config().join("runtime/host-work.sqlite")).unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    let mut q = db
+        .prepare(
+            "SELECT attempt_id,reason,done_ms IS NOT NULL,delivered_turn FROM intents
+            WHERE task_id=?1 ORDER BY rowid",
+        )
+        .unwrap();
+    q.query_map([tid.as_str().unwrap()], |r| {
+        Ok(Intent {
+            attempt_id: r.get(0)?,
+            reason: r.get(1)?,
+            done: r.get(2)?,
+            delivered_turn: r.get(3)?,
+        })
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// The host interrupt writes the runtime handed to a worker so far (the
+/// state dump's count).
+fn interrupt_writes(rig: &Rig) -> u64 {
+    dumped(rig)["host_work"]["interrupt_writes"]
+        .as_u64()
+        .unwrap_or(0)
+}
+
+/// Waits for `n` host-work scheduling passes begun after now (every 100
+/// ms; a broker tick isn't one): the count moves past `now + n`, so the
+/// pass under way at `now` doesn't count.
+fn work_passes(rig: &Rig, n: u64) {
+    let passes = |rig: &Rig| dumped(rig)["host_work"]["passes"].as_u64().unwrap_or(0);
+    let now = passes(rig);
+    within("host-work's scheduling passes", || passes(rig) > now + n);
+}
+
+/// VII.A test 12 (design I.4.4, I.5.7; session-v1 R9.14 item 5): a
+/// delegated turn still running when the delegated clock reaches its task's
+/// deadline is interrupted on the host's authority: an intent with reason
+/// `deadline` is stored for its attempt, the Esc is written once (no blind
+/// second one while the turn goes on), and the turn it reached recorded.
+/// The turn ends interrupted (its receipt `completed`, `interrupted`), and
+/// the task, after `awaiting_result` (`interrupted at deadline`), expires
+/// as today (`expired awaiting a result`); the intent is done. The clock
+/// moves only on the debug host clock (its boot-time counter), never by
+/// waiting.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_turn_running_at_its_deadline_is_interrupted_and_expires() {
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_controls(gate_open());
+    rig.with_clock();
+    rig.dump = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let t = task_until(&launch, "DEADLINE_TURN", rig.clock().wall() + 10 * MIN);
+    let tid = &t["task_id"];
+    enqueue(&mut phone, &mut r, &t);
+    in_turn(&rig, tid, "DEADLINE_TURN");
+    let attempt = stored(&rig, tid)["receipt_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(intents(&rig, tid).is_empty(), "nothing before the deadline");
+    assert_eq!(escs(&rig), 0);
+    // The boot-time counter passes the deadline (the wall clock where it
+    // is): `D` reaches it.
+    rig.clock().set(0, 10 * MIN);
+    within("the deadline's interrupt", || {
+        intents(&rig, tid)
+            .first()
+            .is_some_and(|i| i.delivered_turn.is_some())
+    });
+    let stored_intents = intents(&rig, tid);
+    let [intent] = stored_intents.as_slice() else {
+        panic!("one intent: {stored_intents:?}");
+    };
+    assert_eq!(
+        (
+            intent.attempt_id.as_str(),
+            intent.reason.as_str(),
+            intent.done
+        ),
+        (attempt.as_str(), "deadline", false)
+    );
+    // The fake agent appends what it read on its own poll.
+    within("the Esc", || escs(&rig) == 1);
+    assert_eq!(escs(&rig), 1);
+    assert_eq!(interrupt_writes(&rig), 1);
+    // The turn goes on (the fake agent ignores the Esc): only the lease
+    // revocation repeats, nothing is written again in three more
+    // scheduling passes (the writes counted as the runtime makes them).
+    work_passes(&rig, 3);
+    assert_eq!(interrupt_writes(&rig), 1, "once per turn");
+    assert_eq!(escs(&rig), 1, "once per turn");
+    assert_eq!(stored(&rig, tid)["state"], "submitted");
+    // The agent's turn ends interrupted, as after an Esc.
+    std::fs::write(rig.fake.join("interrupt"), "").unwrap();
+    wait_stored(&rig, tid, "expired", "expired awaiting a result");
+    let rc = receipt(&rig, &attempt);
+    assert_eq!(
+        (&rc["state"], &rc["detail"]),
+        (&json!("completed"), &json!("interrupted")),
+        "{rc}"
+    );
+    let stored_intents = intents(&rig, tid);
+    let [intent] = stored_intents.as_slice() else {
+        panic!("one intent: {stored_intents:?}");
+    };
+    assert!(intent.done, "{intent:?}");
+    assert_eq!(escs(&rig), 1);
+    assert_eq!(input(&rig).matches("DEADLINE_TURN").count(), 1);
+    assert_eq!(ends(&rig, tid), [Some("started".to_string())]);
+    let status = work(&mut phone, &mut r, tid);
+    assert_eq!(status["result"]["work"]["state"], "expired", "{status}");
+}
+
+/// VII.A test 12 while hosting is paused (ruling T26a; design I.4.4): the
+/// turn runs when `runtime.toml` stops loading (agent hosting off until it
+/// is fixed), and the delegated clock then reaches its task's deadline.
+/// The deadline's interrupt is still delivered, once, while paused; the
+/// turn ends interrupted, and the task's record waits untouched until the
+/// file loads again: then it expires (`expired awaiting a result`).
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_paused_host_still_interrupts_a_turn_at_its_deadline() {
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_controls(gate_open());
+    rig.with_clock();
+    rig.dump = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let t = task_until(&launch, "PAUSED_TURN", rig.clock().wall() + 10 * MIN);
+    let tid = &t["task_id"];
+    enqueue(&mut phone, &mut r, &t);
+    in_turn(&rig, tid, "PAUSED_TURN");
+    let attempt = stored(&rig, tid)["receipt_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // `runtime.toml` stops loading: hosting is paused.
+    let file = rig.sandbox.config().join("runtime.toml");
+    let valid = std::fs::read_to_string(&file).unwrap();
+    replace(&file, "this is not a runtime.toml");
+    let log = rig.sandbox.dir.path().join("runtime.log");
+    within("hosting paused", || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("agent hosting is off until it is fixed")
+    });
+    rig.clock().set(0, 10 * MIN);
+    within("the deadline's interrupt while paused", || {
+        intents(&rig, tid)
+            .first()
+            .is_some_and(|i| i.delivered_turn.is_some())
+    });
+    work_passes(&rig, 3);
+    assert_eq!(interrupt_writes(&rig), 1, "once per turn");
+    within("the Esc while paused", || escs(&rig) == 1);
+    assert_eq!(escs(&rig), 1);
+    assert_eq!(intents(&rig, tid)[0].attempt_id, attempt);
+    // The turn ends interrupted, still paused.
+    std::fs::write(rig.fake.join("interrupt"), "").unwrap();
+    within("the turn's interrupted end", || {
+        receipt(&rig, &attempt)["state"] == "completed"
+    });
+    assert_eq!(receipt(&rig, &attempt)["detail"], "interrupted");
+    within("the intent done while paused", || {
+        intents(&rig, tid)[0].done
+    });
+    assert_eq!(
+        stored(&rig, tid)["state"],
+        "submitted",
+        "untouched while paused"
+    );
+    // The file loads again.
+    replace(&file, &valid);
+    wait_stored(&rig, tid, "expired", "expired awaiting a result");
+    assert_eq!(interrupt_writes(&rig), 1);
+    assert_eq!(escs(&rig), 1);
+    assert_eq!(input(&rig).matches("PAUSED_TURN").count(), 1);
+}
+
+/// `dev` asks `work_interrupt` of task `tid` (feature `host.delegated`).
+fn interrupt(dev: &mut Dev, r: &mut Router, tid: &Value) -> Value {
+    dev.request(
+        r,
+        json!({"op":"work_interrupt","host":host(),"task_id":tid}),
+    )
+}
+
+/// Design I.4.5, host-work-v1 §11.2, over a real channel: the phone (its
+/// task's sender, a native member holding `control`) sends `work_interrupt`
+/// while the task's turn runs. The client core takes the `work` result,
+/// the task's status before the interrupt (`submitted`, in the agent's
+/// turn); one Esc reaches the agent and no intent is stored (a one-shot
+/// request). The service, neither the sender nor the owner, is `forbidden`
+/// (its channel let the request through: it holds `notify`). The turn
+/// ends interrupted, the task awaits its result (`turn interrupted`), and
+/// the same request then answers that status with `not running`, which
+/// isn't stored.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_HOST_CONTROLS hooks"
+)]
+fn work_interrupt_over_the_senders_channel() {
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_controls(gate_open());
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let t = task(&launch, "CHANNEL_INTERRUPT", HOUR);
+    let tid = &t["task_id"];
+    enqueue(&mut phone, &mut r, &t);
+    in_turn(&rig, tid, "CHANNEL_INTERRUPT");
+    let refused = interrupt(&mut svc, &mut r, tid);
+    assert_eq!(refused["code"], "forbidden", "{refused}");
+    let reply = interrupt(&mut phone, &mut r, tid);
+    let work = &reply["result"]["work"];
+    assert_eq!(
+        (&work["state"], &work["detail"], &work["receipt_id"]),
+        (
+            &json!("submitted"),
+            &json!("in the agent's turn"),
+            &stored(&rig, tid)["receipt_id"]
+        ),
+        "{reply}"
+    );
+    within("the Esc", || escs(&rig) == 1);
+    assert!(intents(&rig, tid).is_empty(), "no intent");
+    std::fs::write(rig.fake.join("interrupt"), "").unwrap();
+    wait_stored(&rig, tid, "awaiting_result", "turn interrupted");
+    let again = interrupt(&mut phone, &mut r, tid);
+    let work = &again["result"]["work"];
+    assert_eq!(
+        (&work["state"], &work["detail"]),
+        (&json!("awaiting_result"), &json!("not running")),
+        "{again}"
+    );
+    assert_eq!(stored(&rig, tid)["detail"], "turn interrupted");
+    assert_eq!(escs(&rig), 1);
+    assert_eq!(input(&rig).matches("CHANNEL_INTERRUPT").count(), 1);
+}
+
+/// Ruling T27a (2): `work_interrupt` is a stop, so it is served while
+/// hosting is paused (`runtime.toml` stops loading), as the deadline's
+/// interrupt is (T26a). The phone's channel, admitted before the pause,
+/// sends it: the result is the task's status, and one Esc reaches the
+/// agent. Its other host-work requests stay `busy` meanwhile, and a second
+/// `work_interrupt` of the same turn writes nothing (one Esc per attempt
+/// and turn). The turn ends interrupted; the task's record waits for the
+/// file to load again, then reads `turn interrupted`.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn work_interrupt_is_served_while_hosting_is_paused() {
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_controls(gate_open());
+    rig.dump = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let t = task(&launch, "PAUSED_INTERRUPT", HOUR);
+    let tid = &t["task_id"];
+    enqueue(&mut phone, &mut r, &t);
+    in_turn(&rig, tid, "PAUSED_INTERRUPT");
+    let attempt = stored(&rig, tid)["receipt_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // `runtime.toml` stops loading: hosting is paused.
+    let file = rig.sandbox.config().join("runtime.toml");
+    let valid = std::fs::read_to_string(&file).unwrap();
+    replace(&file, "this is not a runtime.toml");
+    let log = rig.sandbox.dir.path().join("runtime.log");
+    within("hosting paused", || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("agent hosting is off until it is fixed")
+    });
+    let query = work(&mut phone, &mut r, tid);
+    assert_eq!(query["code"], "busy", "{query}");
+    let reply = interrupt(&mut phone, &mut r, tid);
+    let work_status = &reply["result"]["work"];
+    assert_eq!(
+        (&work_status["state"], &work_status["detail"]),
+        (&json!("submitted"), &json!("in the agent's turn")),
+        "{reply}"
+    );
+    within("the Esc while paused", || escs(&rig) == 1);
+    assert_eq!(interrupt_writes(&rig), 1);
+    // Reported and taken in, then asked again: nothing written.
+    work_passes(&rig, 2);
+    let again = interrupt(&mut phone, &mut r, tid);
+    assert_eq!(again["result"]["work"]["state"], "submitted", "{again}");
+    work_passes(&rig, 3);
+    assert_eq!(interrupt_writes(&rig), 1, "one Esc per turn");
+    assert_eq!(escs(&rig), 1);
+    assert!(intents(&rig, tid).is_empty(), "no intent");
+    // The turn ends interrupted, still paused; the record waits.
+    std::fs::write(rig.fake.join("interrupt"), "").unwrap();
+    within("the turn's interrupted end", || {
+        receipt(&rig, &attempt)["state"] == "completed"
+    });
+    assert_eq!(receipt(&rig, &attempt)["detail"], "interrupted");
+    assert_eq!(
+        stored(&rig, tid)["state"],
+        "submitted",
+        "untouched while paused"
+    );
+    replace(&file, &valid);
+    wait_stored(&rig, tid, "awaiting_result", "turn interrupted");
+    assert_eq!(escs(&rig), 1);
+}
+
+/// The stand-in's feed covering [`SVC`] (its gate open), the service held
+/// or revoked as `standing` adds.
+fn svc_standing(standing: Value) -> Value {
+    let mut svc = json!({"coverage": {"origin": ORIGIN, "feed_id": "feed-1"}});
+    for (key, value) in standing.as_object().unwrap() {
+        svc[key] = value.clone();
+    }
+    json!({"own": ORIGIN, "open": [ORIGIN], "standings": {format!("service:{SVC}"): svc}})
+}
+
+/// `dev`'s `host_launch` of profile `backend`, expiring in ten minutes
+/// (room for a slow runner): its request id and session id (the reply
+/// says `starting`).
+fn launch_backend(dev: &mut Dev, r: &mut Router) -> (String, String) {
+    let rid = uuid();
+    let reply = dev.request(
+        r,
+        json!({"op":"host_launch","host":host(),"request_id":rid,
+            "profile_id":"backend","profile_revision":1,
+            "expires_at":r9log::host_now().wall_ms + 10 * MIN}),
+    );
+    let launch = &reply["result"]["launch"];
+    assert_eq!(launch["state"], "starting", "{reply}");
+    (rid, launch["session_id"].as_str().unwrap().to_string())
+}
+
+/// Launch `rid`'s state, as its sender's `host_launch_query` reads it.
+fn launch_state(dev: &mut Dev, r: &mut Router, rid: &str) -> Value {
+    let reply = dev.request(
+        r,
+        json!({"op":"host_launch_query","host":host(),"request_id":rid}),
+    );
+    reply["result"]["launch"]["state"].clone()
+}
+
+/// No worker was ever spawned for session `sid` (no spec, no record).
+fn never_spawned(rig: &Rig, sid: &str) -> bool {
+    let workers = rig.sandbox.config().join("runtime/workers");
+    !workers.join(format!("{sid}.spec.json")).exists()
+        && !workers.join(format!("{sid}.json")).exists()
+}
+
+/// VII.A test 19, its launch half (design I.4.3, "Launches"; host-work-v1
+/// §11.6): in the real runtime, a covered service's `host_launch` while the
+/// stand-in holds it waits at the spawn boundary through host-work's
+/// passes: `starting`, no worker spawned, its reason in `runtime.log`. The
+/// release lets it start. A launch while the service is revoked ends
+/// `failed` at once, nothing spawned, never `outcome_unknown`, the detail
+/// in `runtime.log`.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_held_senders_launch_waits_and_a_revoked_ones_fails() {
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_controls(svc_standing(json!({"held": true})));
+    rig.dump = true;
+    rig.start();
+    let log = rig.sandbox.dir.path().join("runtime.log");
+    // The stand-in's file, rewritten while the runtime runs.
+    let controls = rig.controls.clone().unwrap();
+    let standing = |value: Value| replace(&controls, &svc_standing(value).to_string());
+    let logged = |text: &str| {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains(text)
+    };
+    let mut r = Router::new(&rig.astation);
+    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let (held, sid) = launch_backend(&mut svc, &mut r);
+    within("the wait logged", || {
+        logged(&format!(
+            "launch {held} waits at the spawn boundary: paused"
+        ))
+    });
+    work_passes(&rig, 5);
+    assert_eq!(launch_state(&mut svc, &mut r, &held), "starting");
+    assert!(never_spawned(&rig, &sid), "nothing spawned while held");
+    // Released: it starts.
+    standing(json!({}));
+    within("the released launch started", || {
+        launch_state(&mut svc, &mut r, &held) == "started"
+    });
+    // Revoked: the next launch fails at once.
+    standing(json!({"revoked": "rec-revoke"}));
+    work_passes(&rig, 2);
+    let (revoked, sid) = launch_backend(&mut svc, &mut r);
+    within("the revoked launch failed", || {
+        let state = launch_state(&mut svc, &mut r, &revoked);
+        assert_ne!(state, "outcome_unknown");
+        state == "failed"
+    });
+    assert!(never_spawned(&rig, &sid), "nothing spawned when revoked");
+    assert!(logged(&format!(
+        "launch {revoked} failed before its spawn: sender revoked"
+    )));
 }
 
 // ── The host's own device-list fetch and deferred entries (design I.4.3,

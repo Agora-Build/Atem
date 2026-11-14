@@ -74,6 +74,12 @@ impl HostBridge {
         cx: &mut Cx,
     ) -> anyhow::Result<()> {
         let sid = r.task.target.session_id.clone();
+        // Design I.4.4: an attempt still waiting to start, or a turn still
+        // running, at the deadline: an interrupt intent, durable before the
+        // pass carries it out (after this loop).
+        if super::delegated_interrupts::past_deadline(r, now_d) {
+            self.deadline_intent(r)?;
+        }
         let live = self
             .work
             .store
