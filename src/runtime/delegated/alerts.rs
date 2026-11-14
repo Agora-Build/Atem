@@ -37,9 +37,7 @@ use crate::runtime::host_work::{Store, WorkRecord};
 use crate::session_protocol::membership::host_now;
 use crate::session_protocol::r9::HostWorkError;
 use anyhow::{Result, bail};
-use atem_client::session::alerts::{
-    Alert, AlertKind, MAX_PAGE, MAX_REASON_BYTES, page, valid_reason,
-};
+use atem_client::session::alerts::{Alert, AlertKind, MAX_REASON_BYTES, page, valid_reason};
 use atem_client::session::host_work::WorkState;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::cell::Cell;
@@ -316,15 +314,10 @@ impl Store {
         after: Option<&str>,
         limit: usize,
     ) -> Result<(Vec<Alert>, bool), PageRefused> {
-        // Until PR 2 (feat/delegated-core-host-api, 750d2a3 and eb20698) is
-        // in this stack: `page()` there returns `Result` and refuses a limit
-        // outside 1..=64. Then: `page(..).map_err(|_| InvalidLimit)?
-        // .ok_or(StaleCursor)`, and drop this local check.
-        if !(1..=MAX_PAGE).contains(&limit) {
-            return Err(PageRefused::InvalidLimit);
-        }
         let alerts = self.unresolved_alerts().map_err(|_| PageRefused::Store)?;
-        page(&alerts, after, limit).ok_or(PageRefused::StaleCursor)
+        page(&alerts, after, limit)
+            .map_err(|_| PageRefused::InvalidLimit)?
+            .ok_or(PageRefused::StaleCursor)
     }
 
     /// The unresolved alerts, in the host's order.
@@ -416,6 +409,7 @@ pub fn reason_with_note(reason: &str, unresolved: u32) -> String {
 mod tests {
     use super::*;
     use crate::runtime::delegated::{Admission, DelegatedSender};
+    use atem_client::session::alerts::MAX_PAGE;
     use atem_client::session::host_work::{WorkStatus, WorkTask, digest};
     use atem_client::session::wire::Target;
 
