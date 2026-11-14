@@ -3430,7 +3430,11 @@ sender. Between 2 and 4 MiB Atem applies the bound itself (the row above).
 Atem's `close` reasons: `closed` (Atem ended it: after a refusal or a
 fence), `unknown_channel`, `busy`, `too_large`, `malformed`,
 `handshake_failed` (a clear handshake error frame was sent first),
-`expired` (the channel's lifetime ended, R9.7 "Limits").
+`expired` (the channel's lifetime ended, R9.7 "Limits"). A service's or
+browser grant's expiry (which also fences the principal) and the records
+and bytes limits are lifetime ends: `expired`; a removal, a demotion, a
+revoked grant, a frozen list and a failed record are `closed`. (Atem's
+reading, for Astation.)
 
 **Clients and bindings.** A client implementation holds one
 `ClientConnection` (the shared core's per-channel state) per virtual

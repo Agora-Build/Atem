@@ -55,7 +55,7 @@ use crate::paths::PairingPaths;
 use atem_client::canonical::StrictValue;
 use atem_client::channel::responder::{AwaitFinish, HostContext, InitLimiter, Responder};
 use atem_client::channel::wire::{self as chwire, Frame};
-use atem_client::channel::{Channel, ClearCode, Principal};
+use atem_client::channel::{Channel, ChannelError, ClearCode, Principal};
 use atem_client::membership::{Admission, HostNow, MemberStatus};
 use atem_client::principal::{
     Authority, BrowserGrant, ClientKind, Denied, GRANT_ISSUED_AHEAD_MS, GRANT_MAX_LIFETIME_MS,
@@ -403,6 +403,11 @@ pub struct R9Host {
     /// ruling T35c; only behind `host.delegated`): every service's `hello`
     /// is refused `busy`, as host work answers its requests.
     services_unchecked: bool,
+    /// The `close` reason of an attachment the session host is about to
+    /// close for a fence that ends its channel's lifetime (a service's or
+    /// a browser grant's expiry): `expired`, not `closed`. Noted before the
+    /// fence, gone at the end of the pass like `fence_errors`.
+    closing: HashMap<String, &'static str>,
     /// Attachments whose channel Atem closed (overflow), for the session
     /// host to forget.
     dead: Vec<String>,
@@ -520,6 +525,17 @@ fn error(code: &str, re: Option<&str>, detail: Option<&str>) -> SessionError {
         re: re.map(str::to_owned),
         detail: detail.map(str::to_owned),
         ..SessionError::new(code)
+    }
+}
+
+/// The `close` reason for a channel step that failed (§R9.7a): a limit
+/// reached (the lifetime, or 2^32 records or 2^36 bytes in a direction,
+/// §R9.7 "Limits") ended the channel's life, `expired`; every other
+/// failure (a gap, a replay, a failed tag) is `closed`.
+fn close_reason(e: &ChannelError) -> &'static str {
+    match e {
+        ChannelError::Limit(_) => reason::EXPIRED,
+        _ => reason::CLOSED,
     }
 }
 
@@ -776,6 +792,7 @@ impl R9Host {
             revoked_services: HashSet::new(),
             revoked_fenced: HashSet::new(),
             services_unchecked: false,
+            closing: HashMap::new(),
             dead: Vec::new(),
             flush_cursor: None,
             push: push::HostPush::default(),
@@ -1278,7 +1295,7 @@ impl R9Host {
                             .log(mono, || format!("a channel closed: {}", e.code()));
                         let chan = self.chans.get_mut(handle).expect("checked");
                         chan.phase = Phase::Open(a);
-                        return self.fail(handle, reason::CLOSED, parts);
+                        return self.fail(handle, close_reason(&e), parts);
                     }
                 };
                 let attachment = a.attachment.clone();
@@ -1694,9 +1711,9 @@ impl R9Host {
         };
         let frame = match channel.seal(&welcome.to_bytes(), mono) {
             Ok(frame) => frame,
-            Err(_) => {
+            Err(e) => {
                 effects.extend(parts.host.disconnect(&attachment));
-                self.reply_and_close(handle, None, reason::CLOSED);
+                self.reply_and_close(handle, None, close_reason(&e));
                 return effects;
             }
         };
@@ -1802,6 +1819,7 @@ impl R9Host {
     /// noted for.
     pub fn end_pass(&mut self) {
         self.fence_errors.clear();
+        self.closing.clear();
     }
 
     /// The services a control record revoked on this host, as the
@@ -2824,7 +2842,8 @@ impl R9Host {
             chan.queue.push_back(text);
         }
         a.channel.close();
-        chan.close.get_or_insert(reason::CLOSED);
+        let why = self.closing.remove(att).unwrap_or(reason::CLOSED);
+        chan.close.get_or_insert(why);
     }
 
     fn seal_to(&mut self, att: &str, plain: &[u8], now_mono: u64) {
@@ -2846,26 +2865,34 @@ impl R9Host {
                 if chan.queued > limit {
                     // Fallen behind: closed explicitly, never a silent drop.
                     log("a channel's output passed its bound; closed (busy)");
-                    self.overflow(&handle);
+                    self.overflow(&handle, reason::BUSY);
                 }
             }
             Err(e) => {
+                // A limit reached (its lifetime, or its records or bytes,
+                // §R9.7 "Limits") ends the channel `expired`; anything else
+                // Atem can't seal is `busy`.
+                let why = if close_reason(&e) == reason::EXPIRED {
+                    reason::EXPIRED
+                } else {
+                    reason::BUSY
+                };
                 log(&format!(
-                    "a channel can't take a record ({}); closed",
+                    "a channel can't take a record ({}); closing it with {why}",
                     e.code()
                 ));
-                self.overflow(&handle);
+                self.overflow(&handle, why);
             }
         }
     }
 
-    /// Closes `handle` at once with `busy` (its queue goes); the attachment
+    /// Closes `handle` at once with `why` (its queue goes); the attachment
     /// is gone from the session host by the next pass ([`R9Host::reap`]).
-    fn overflow(&mut self, handle: &str) {
+    fn overflow(&mut self, handle: &str, why: &'static str) {
         if let Some(chan) = self.chans.get_mut(handle) {
             chan.queue.clear();
             chan.queued = 0;
-            chan.close = Some(reason::BUSY);
+            chan.close = Some(why);
             if let Phase::Open(a) = std::mem::replace(&mut chan.phase, Phase::Closing) {
                 self.dead.push(a.attachment.clone());
                 self.by_attachment.remove(&a.attachment);
@@ -2974,6 +3001,16 @@ impl R9Host {
                 principal.clone(),
                 error(code::UNAUTHORIZED, None, Some("expired")),
             );
+            // The principal's expiry is its channels' lifetime ending
+            // (§R9.7 "Limits"): their close says so, chosen before the
+            // fence closes them.
+            for chan in self.chans.values() {
+                if let Phase::Open(a) = &chan.phase
+                    && a.authority.name() == principal
+                {
+                    self.closing.insert(a.attachment.clone(), reason::EXPIRED);
+                }
+            }
             effects.extend(parts.host.fence_principal(&principal, 0));
         }
         let before = self.revoked.len();
