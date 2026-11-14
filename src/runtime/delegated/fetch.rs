@@ -18,8 +18,11 @@
 //!   gets no more of them than any carrier: the fetches a `heads` starts
 //!   are at most one every [`HEADS_PACE_MS`] (a channel's init's pace), and
 //!   none for [`STALL_PAUSE_MS`] after a result whose carriage moved
-//!   nothing (a deferred, conflicting or junk carriage). So `heads` and
-//!   results in a burst carry at most once.
+//!   nothing while the list is still behind the head the Station named (a
+//!   deferred, conflicting or junk carriage). So `heads` and results in a
+//!   burst carry at most once. A carriage that moved nothing because
+//!   another carrier had brought the list to that head already pauses
+//!   nothing (Task 37 review M3).
 //! - **A refusal** (`membership_fetch_refused`, step 4's Decision 20)
 //!   advances nothing (no head, nothing applied) and is never taken as an
 //!   answer: it ends the host's own wait on the link (no fetch is in flight
@@ -76,8 +79,8 @@ pub const REFUSAL_BACKOFF_MS: u64 = 30_000;
 pub const FETCH_TIMEOUT_MS: u64 = 30_000;
 /// The fetches a `heads` starts: at most one this often (I1).
 pub const HEADS_PACE_MS: u64 = 1_000;
-/// After a result whose carriage moved nothing, no fetch at a `heads` for
-/// this long (I1).
+/// After a result whose carriage moved nothing while the list stayed
+/// behind the named head, no fetch at a `heads` for this long (I1).
 pub const STALL_PAUSE_MS: u64 = 30_000;
 
 /// What to do with a `membership_fetch_result`.
@@ -160,7 +163,8 @@ pub struct DeviceListFetch {
     refused_at: Option<u64>,
     /// The last fetch a `heads` started (monotonic ms).
     heads_fetch_at: Option<u64>,
-    /// The last result whose carriage moved nothing (monotonic ms).
+    /// The last result whose carriage moved nothing while the list stayed
+    /// behind the named head (monotonic ms).
     stalled_at: Option<u64>,
     /// Results taken.
     results: u64,
@@ -223,15 +227,23 @@ impl DeviceListFetch {
     /// to `after`, the carriage stopping at the deferred entry `stopped_at`
     /// (its `seq`) if it did: the next fetch while still behind, if it moved
     /// and stopped at no deferred entry (nothing past one applies before
-    /// its wait ends: the stop is kept instead); if it moved nothing, a
-    /// pause for the fetches a `heads` starts.
+    /// its wait ends: the stop is kept instead); if it moved nothing while
+    /// the list is still behind the head the Station named (a deferred,
+    /// conflicting or junk carriage), a pause for the fetches a `heads`
+    /// starts. One that moved nothing because another carrier had already
+    /// brought the list to that head pauses nothing (Task 37 review M3, as
+    /// the feed sync's F1).
     pub fn carried(
         &mut self,
         before: &Head,
         after: &Head,
         stopped_at: Option<u64>,
     ) -> Option<MembershipFetch> {
-        if after.seq <= before.seq {
+        let behind = [self.announced, self.named]
+            .iter()
+            .flatten()
+            .any(|named| named.seq > after.seq);
+        if after.seq <= before.seq && behind {
             self.stalled_at = Some(self.now);
         }
         if let Some(seq) = stopped_at {
@@ -453,6 +465,26 @@ mod tests {
         assert_eq!(f.on_heads(&head(12), &head(9), None), None);
         f.tick(11_000 + STALL_PAUSE_MS, Some(&head(9)), None);
         assert_eq!(f.on_heads(&head(12), &head(9), None), fetch(9));
+    }
+
+    /// Task 37 review M3 (ruling T37a; F1's sibling): a carriage that moved
+    /// nothing because another carrier (a native's channel) had already
+    /// brought the list to the announced head is what the fetch was for: it
+    /// pauses nothing, so a head the Station announces a second later is
+    /// fetched at once. One that leaves the list behind the announced head
+    /// still pauses (`fetches_a_heads_starts_are_paced`).
+    #[test]
+    fn a_carriage_that_finds_the_list_at_the_head_pauses_nothing() {
+        let mut f = DeviceListFetch::default();
+        f.tick(10_000, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(5), &head(3), None), fetch(3));
+        // Meanwhile a native's carriage brought the list to 5: the result
+        // carries nothing new.
+        assert!(matches!(f.on_result(result(5)), FetchApply::Carry(_)));
+        assert_eq!(f.carried(&head(5), &head(5), None), None);
+        // A head announced a second later: fetched at once.
+        f.tick(11_000, Some(&head(5)), None);
+        assert_eq!(f.on_heads(&head(6), &head(5), None), fetch(5));
     }
 
     /// I1: many `heads` and junk results in one pass (the host's clock
