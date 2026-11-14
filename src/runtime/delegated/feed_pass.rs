@@ -574,8 +574,15 @@ impl HostBridge {
             .unwrap_or(&self.dir)
             .join("host-work.sqlite");
         if matches!(self.work.feeds, Feeds::Damaged) {
+            // Services are refused for it only with the hook on (ruling
+            // T35f, m2: with it off nothing is, as on main).
+            let services = if self.features.delegated {
+                "; services are refused (busy) until it reads"
+            } else {
+                ""
+            };
             return Some(format!(
-                "the stored control state doesn't read; no delegated task starts. Restore {} from a backup, or pair this host again (a new identity starts a fresh store), then run `atem runtime restart`; services are refused (busy) until it reads",
+                "the stored control state doesn't read; no delegated task starts. Restore {} from a backup, or pair this host again (a new identity starts a fresh store), then run `atem runtime restart`{services}",
                 store.display()
             ));
         }
@@ -635,7 +642,9 @@ impl HostBridge {
                 store.display()
             )
         } else if self.kept_elsewhere() {
-            "; services are refused (busy) until this host identity's own store is made (hosting on: `enabled = true` in runtime.toml) and has read its Station's control feed in full".to_string()
+            // Hosting makes it, and so does an owner's command that opens
+            // the store while hosting is paused (ruling T35f, m4).
+            "; services are refused (busy) until this host identity's own store is made (by hosting, `enabled = true` in runtime.toml, or by an owner command that opens the store, such as `atem task list --unknown` or `atem message status`) and has read its Station's control feed in full".to_string()
         } else if matches!(self.work.feeds, Feeds::Loaded(_)) {
             "; services are refused (busy) until this host's first complete read of its Station's control feed (it needs the Station's heads)".to_string()
         } else {

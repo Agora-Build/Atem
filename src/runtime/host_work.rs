@@ -1159,10 +1159,47 @@ fn holds_a_wait(state: &str, r: &str) -> String {
     format!("NOT ({state}='outcome_unknown' AND json_extract({r},'{WAITS_RULE}') IS 1)")
 }
 
+// Tests: the step of a store's replacement (`Store::replace`, and what its
+// caller makes the new store with) that fails, as a crash or an I/O error
+// there would.
+#[cfg(test)]
+thread_local! {
+    static REPLACE_FAULT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests: `step` of a store's replacement fails from now on (`None`: none).
+#[cfg(test)]
+pub(crate) fn fail_replace_at(step: Option<&'static str>) {
+    REPLACE_FAULT.with(|fault| fault.set(step));
+}
+
+/// A step of a store's replacement (`Store::replace`): an error when a test
+/// makes it fail ([`fail_replace_at`]); nothing in a build.
+pub(crate) fn replace_step(step: &'static str) -> Result<()> {
+    #[cfg(test)]
+    if REPLACE_FAULT.with(std::cell::Cell::get) == Some(step) {
+        bail!("a test's fault at the replacement's {step} step");
+    }
+    let _ = step;
+    Ok(())
+}
+
+/// The store's file in the runtime's state directory.
+const STORE_FILE: &str = "host-work.sqlite";
+
+/// The name a new identity's store is built under before it replaces the
+/// current one ([`Store::replace`]).
+const NEXT_STORE_FILE: &str = "host-work.sqlite.next";
+
 impl Store {
     pub fn open(state: &Path) -> Result<Self> {
+        Self::open_file(state, STORE_FILE)
+    }
+
+    /// The store in the file `name` of `state` (made if missing).
+    fn open_file(state: &Path, name: &str) -> Result<Self> {
         super::worker::private_dir(state)?;
-        let path = state.join("host-work.sqlite");
+        let path = state.join(name);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1384,6 +1421,60 @@ impl Store {
         }
         std::fs::File::open(&state)?.sync_all()?;
         Ok(aside)
+    }
+
+    /// [`Store::retire`] and the next store in one step, for a host whose
+    /// identity changed while it keeps a control state (ruling T35f, m1):
+    /// the new store is built whole at a temporary path (`make` binds it and
+    /// makes its tables), closed, and only then renamed over
+    /// `host-work.sqlite`, the directory synced; the old one is kept aside
+    /// (a hard link, as `retire`'s), its hot journal with it. A failure at
+    /// any step, or a crash there, leaves `host-work.sqlite` the old store
+    /// or the whole new one, never none and never one `make` didn't finish;
+    /// what an earlier attempt left at the temporary path is removed first.
+    /// The new store, opened again at its path, and where the old one went.
+    pub fn replace(
+        self,
+        at_ms: u64,
+        make: impl FnOnce(&Store) -> Result<()>,
+    ) -> Result<(Store, PathBuf)> {
+        let state = self.state.clone();
+        let path = state.join(STORE_FILE);
+        let next = state.join(NEXT_STORE_FILE);
+        for leftover in [
+            next.clone(),
+            state.join(format!("{NEXT_STORE_FILE}-journal")),
+        ] {
+            match std::fs::remove_file(&leftover) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
+        replace_step("build")?;
+        let built = Self::open_file(&state, NEXT_STORE_FILE)?;
+        make(&built)?;
+        replace_step("close")?;
+        built.db.close().map_err(|(_, e)| e)?;
+        let Self { db, .. } = self;
+        db.close().map_err(|(_, e)| e)?;
+        let aside = state.join(format!("{STORE_FILE}.retired-{at_ms}"));
+        replace_step("link")?;
+        std::fs::hard_link(&path, &aside)?;
+        // A hot journal belongs to the retired file, never to the next one.
+        replace_step("journal")?;
+        let journal = state.join(format!("{STORE_FILE}-journal"));
+        if journal.exists() {
+            std::fs::rename(
+                &journal,
+                state.join(format!("{STORE_FILE}.retired-{at_ms}-journal")),
+            )?;
+        }
+        replace_step("rename")?;
+        std::fs::rename(&next, &path)?;
+        replace_step("sync")?;
+        std::fs::File::open(&state)?.sync_all()?;
+        replace_step("reopen")?;
+        Ok((Self::open(&state)?, aside))
     }
 
     pub fn launch(&self, id: &str) -> Result<Option<LaunchRecord>> {
@@ -2560,6 +2651,45 @@ mod tests {
             serde_json::from_str::<HostTarget>(&identity).unwrap(),
             host()
         );
+        let tasks: i64 = kept
+            .query_row("SELECT count(*) FROM work", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tasks, 1);
+    }
+
+    /// Ruling T35f, m1: `replace` keeps the old store aside, as `retire`
+    /// does, and puts the new one, as `make` made it, at the store's path;
+    /// what an earlier attempt left at the temporary path goes first.
+    #[test]
+    fn a_replaced_store_is_kept_aside_and_the_new_one_is_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.bind(&host()).unwrap();
+        assert!(store.enqueue(&task()).unwrap());
+        std::fs::write(dir.path().join(NEXT_STORE_FILE), b"an earlier attempt's").unwrap();
+        let mut other = host();
+        other.host_trust_gen += 1;
+        let (store, aside) = store
+            .replace(7, |next| {
+                next.bind(&other)?;
+                next.db.execute_batch("CREATE TABLE made (one INTEGER)")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(aside, dir.path().join("host-work.sqlite.retired-7"));
+        assert_eq!(store.bound().unwrap(), Some(other));
+        assert!(store.open_tasks().unwrap().is_empty());
+        let made: bool = store
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='made')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(made);
+        assert!(!dir.path().join(NEXT_STORE_FILE).exists());
+        let kept = Connection::open(&aside).unwrap();
         let tasks: i64 = kept
             .query_row("SELECT count(*) FROM work", [], |r| r.get(0))
             .unwrap();

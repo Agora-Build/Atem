@@ -1665,6 +1665,240 @@ fn a_reverify_while_hosting_is_paused_keeps_every_service_busy() {
     });
 }
 
+/// Ruling T35f, m1: a new identity's store replaces the old one in one
+/// step. A failure at any step of the swap (or a crash there: nothing is
+/// undone, so the disk is as a crash just before that step leaves it)
+/// leaves `host-work.sqlite` either the old identity's store, its control
+/// state whole, or the new identity's, bound, with its control tables and
+/// its unread mark; never no store, never one without control tables. A
+/// start with hosting off then finds a control state kept: the revoked bot
+/// stays refused (revoked, or every service `busy`).
+#[test]
+fn a_failed_store_swap_never_leaves_the_host_without_its_control_state() {
+    for step in [
+        "build", "bind", "prepare", "close", "link", "journal", "rename", "sync", "reopen",
+    ] {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let start = host_now().wall_ms;
+            let os = ManualOs::at(start);
+            let s = fed_bot(&mut rig, root, &os, start);
+            feed(&mut rig, &s.log, &[&bot_record(&s.log, revoke(false), 2)]);
+            let old = rig.bridge.work_host();
+            let new = HostTarget {
+                host_trust_gen: old.host_trust_gen + 1,
+                ..old.clone()
+            };
+            crate::runtime::host_work::fail_replace_at(Some(step));
+            let swapped = rig.bridge.work_store_ready(&new);
+            crate::runtime::host_work::fail_replace_at(None);
+            assert!(!swapped, "{step}: the swap failed");
+            // On disk, as a start finds it.
+            let state = root.join("runtime");
+            assert!(state.join("host-work.sqlite").exists(), "{step}: a store");
+            let store = Store::open(&state).unwrap();
+            assert!(
+                FeedStore::kept_in(&store).unwrap(),
+                "{step}: control tables"
+            );
+            let bound = store.bound().unwrap();
+            let unread: bool = store
+                .db
+                .query_row("SELECT EXISTS(SELECT 1 FROM control_unread)", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            if bound.as_ref() == Some(&old) {
+                let part: Option<String> = store
+                    .db
+                    .query_row(
+                        "SELECT part FROM control_principals WHERE principal=?1",
+                        [BOT],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                assert!(part.is_some(), "{step}: the old state whole");
+                assert!(!unread, "{step}");
+            } else {
+                assert_eq!(bound.as_ref(), Some(&new), "{step}: bound");
+                assert!(unread, "{step}: the new store unread");
+            }
+            // A start with hosting off: the store opened, its control state
+            // kept, and the revoked bot refused either way.
+            rig.bridge.work.store = Some(store);
+            rig.bridge.work.kept = None;
+            rig.bridge.work.feeds = Feeds::Unloaded;
+            rig.bridge.start_view().standings.clear();
+            rig.bridge.read_kept();
+            assert!(rig.bridge.keeps_controls(), "{step}");
+            if rig.bridge.kept_here() {
+                rig.bridge.ensure_feeds();
+                assert!(!rig.bridge.controls_unchecked(), "{step}");
+                assert!(
+                    rig.bridge.start_view().standings[BOT].revoked.is_some(),
+                    "{step}"
+                );
+            } else {
+                assert!(rig.bridge.controls_unchecked(), "{step}: busy");
+            }
+        });
+    }
+}
+
+/// The host's next trust generation on the same device list, pinned, and
+/// the session host rebound to it (`atem pair verify`, as a runtime sees
+/// it).
+fn reverify(rig: &mut LocalRig, root: &Path, s: &mut Senders) {
+    use crate::session_protocol::membership::r9log::secret;
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    s.log.add_host("host", 2, &secret("delegated host"));
+    let pairing = crate::profile::Sources::in_dir(&root.join("profile"))
+        .paths
+        .pairing;
+    MembershipHost::pin(
+        &pairing,
+        &rig.bridge.dir,
+        &HostPin {
+            host_id: "host".into(),
+            host_trust_gen: 2,
+        },
+        &s.log.log,
+        &secret("delegated host"),
+    )
+    .unwrap();
+    let identity = crate::runtime::host_bridge::Identity {
+        account_id: "acct".into(),
+        atem_device_id: "host".into(),
+        host_trust_gen: 2,
+    };
+    let mut cx = Cx {
+        client: &rig.app.astation_client,
+        sessions: &mut rig.sessions,
+    };
+    rig.bridge.pairing = Some(pairing);
+    rig.bridge.reopen_list_if_changed(&mut cx);
+    rig.bridge.pairing = None;
+    assert!(rig.bridge.adopt_identity(&identity, &mut cx));
+}
+
+/// Ruling T35f, m3: a fresh store (made with its control tables, never
+/// bound) loads while hosting is paused, the host is verified again, and
+/// hosting resumes: the store's first use binds it to the new identity,
+/// whose control state it then keeps, so services are `busy` only until
+/// its first complete read, then served (not `busy` until a restart).
+#[test]
+fn a_fresh_store_loaded_while_paused_then_reverified_serves_services_after_its_read() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        rig.bridge.work.controls = None;
+        rig.bridge.start_view().standings.clear();
+        // A first pairing's store, made with its tables, never bound.
+        let state = root.join("runtime");
+        rig.bridge.work.store = None;
+        let _ = std::fs::remove_file(state.join("host-work.sqlite"));
+        let store = Store::open(&state).unwrap();
+        FeedStore::prepare(&store).unwrap();
+        assert_eq!(store.bound().unwrap(), None);
+        rig.bridge.work.store = Some(store);
+        rig.bridge.work.kept = None;
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        // Hosting paused before its first pass: the store loads.
+        rig.bridge.work.config.enabled = false;
+        passes(&mut rig, 1);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
+        reverify(&mut rig, root, &mut s);
+        r9_link_up(&mut rig);
+        let hello = |rig: &mut LocalRig, handle: &str| {
+            hello_at(
+                rig,
+                &s.log,
+                handle,
+                Identity::service("svc-bot", auth("svc-bot")),
+                2,
+            )
+        };
+        assert_eq!(refusal(hello(&mut rig, "bot-a")), unchecked());
+        // Hosting resumes: the store's first use binds it to this identity.
+        rig.bridge.work.config.enabled = true;
+        passes(&mut rig, 1);
+        let bound = rig.bridge.work.store.as_ref().unwrap().bound().unwrap();
+        assert_eq!(bound, Some(rig.bridge.work_host()));
+        assert_eq!(
+            refusal(hello(&mut rig, "bot-b")),
+            unchecked(),
+            "unread until its first complete read"
+        );
+        feed(
+            &mut rig,
+            &s.log,
+            &[&bot_record(&s.log, ControlAction::Cover, 1)],
+        );
+        passes(&mut rig, 1);
+        hello(&mut rig, "bot-c").unwrap();
+    });
+}
+
+/// Ruling T35f, m4 (§11.1 corrected): while hosting is paused across a
+/// re-verify, an owner's command that opens the store (`atem task list
+/// --unknown` here) moves the old identity's store aside and makes this
+/// identity's, as hosting does; `atem status` names that way out. The new
+/// store is this identity's, so it loads while paused, its first complete
+/// read is made then, and services are served, hosting still paused.
+#[test]
+fn an_owner_command_while_paused_makes_this_identitys_store() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = fed_bot(&mut rig, root, &os, start);
+        rig.bridge.work.config.enabled = false;
+        passes(&mut rig, 1);
+        reverify(&mut rig, root, &mut s);
+        passes(&mut rig, 1);
+        assert!(rig.bridge.kept_elsewhere());
+        let link = rig
+            .bridge
+            .station
+            .replace(crate::runtime::delegated::station::Station::new());
+        let line = rig.bridge.feeds_status().unwrap_or_default();
+        assert!(
+            line.contains(
+                "an owner command that opens the store, such as `atem task list --unknown`"
+            ),
+            "{line}"
+        );
+        rig.bridge.station = link;
+        assert!(rig.bridge.owner_unknown_tasks().unwrap().is_empty());
+        let bound = rig.bridge.work.store.as_ref().unwrap().bound().unwrap();
+        assert_eq!(bound, Some(rig.bridge.work_host()));
+        assert!(rig.bridge.kept_here());
+        passes(&mut rig, 1);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
+        r9_link_up(&mut rig);
+        let hello = |rig: &mut LocalRig, handle: &str| {
+            hello_at(
+                rig,
+                &s.log,
+                handle,
+                Identity::service("svc-bot", auth("svc-bot")),
+                2,
+            )
+        };
+        assert_eq!(refusal(hello(&mut rig, "bot-a")), unchecked());
+        feed(
+            &mut rig,
+            &s.log,
+            &[&bot_record(&s.log, ControlAction::Cover, 1)],
+        );
+        passes(&mut rig, 1);
+        assert!(!rig.bridge.hosting_enabled(), "still paused");
+        hello(&mut rig, "bot-b").unwrap();
+    });
+}
+
 /// Ruling T35d, B (hook off = main): with `host.delegated` off a store
 /// gets no control table and no unread mark, a pass and a new identity's
 /// store included.
@@ -1733,6 +1967,30 @@ fn atem_status_says_why_services_are_refused() {
             "{}",
             line(&rig)
         );
+    });
+}
+
+/// Ruling T35f, m2 (hook off = main): with `host.delegated` off (the hook
+/// removed with delegated tasks left, so the feeds still load) a damaged
+/// control state's status line says nothing of services, which are refused
+/// nothing for it then; with it on, the line says they are.
+#[test]
+fn with_the_hook_off_the_damaged_line_says_nothing_of_services() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let _s = fed_bot(&mut rig, root, &os, start);
+        damage(&mut rig);
+        let line = rig.bridge.feeds_status().unwrap_or_default();
+        assert!(line.contains("services are refused"), "{line}");
+        rig.bridge.features = HostFeatures::default();
+        let line = rig.bridge.feeds_status().unwrap_or_default();
+        assert!(
+            line.starts_with("the stored control state doesn't read"),
+            "{line}"
+        );
+        assert!(!line.contains("services"), "{line}");
     });
 }
 

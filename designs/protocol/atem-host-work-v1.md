@@ -1302,9 +1302,17 @@ applies again; what needs the session host comes after that commit.
   - is another identity's: the store is still bound to the identity before
     a re-verify or a re-pair (revoke is final, ruling T35e). This identity
     never read its feed: hosting replaces the store with this identity's,
-    unread (above), at its next pass while on, or when it resumes.
-    Meanwhile the old identity's standings refuse nothing for it: a service
-    it revoked is `busy` like every other.
+    unread (above), at its next pass while on, or when it resumes; so does
+    an owner's command that opens the store while hosting is paused
+    (`atem task list --unknown`, `atem task resolve`, `atem message
+    status`; ruling T35f, m4). The new store is built whole beside the old
+    one and renamed over it, the old one kept aside (ruling T35f, m1): a
+    failure or a crash at any step leaves the old store or the whole new
+    one, never no control state. Meanwhile the old identity's standings
+    refuse nothing for it: a service it revoked is `busy` like every
+    other. A store never bound yet (a fresh one, loaded while hosting was
+    paused before its first use) is this identity's at its first use,
+    which binds it (ruling T35f, m3).
 
   Meanwhile every service's `hello` that the device list would admit is
   refused `busy`, `revocations not yet checked` (the device-list decision
@@ -1342,9 +1350,12 @@ applies again; what needs the session host comes after that commit.
   they ask for are carried out (a stop always wins); before the start's
   recovery they wait for it. A revoked service stays refused and the
   others are admitted. A store bound to another identity (hosting paused
-  across a re-verify) is neither moved aside nor loaded while paused: that
-  is hosting's business when it resumes. Until then, and until the new
-  store's first complete read, every service is `busy` (above).
+  across a re-verify) is never loaded while paused, and the pass never
+  moves it aside then; hosting replaces it when it resumes, and an
+  owner's command that opens the store does so meanwhile (above; ruling
+  T35f, m4), after which this identity's store loads and reads its feed
+  while paused. Until then, and until the new store's first complete
+  read, every service is `busy` (above).
 - **With `host.delegated` off** (the hook removed with delegated tasks
   left), a record still reaches the tasks the store holds, but nothing of
   session-v1: no fence, and no `hello` refused for the control state.

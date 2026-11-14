@@ -1059,7 +1059,9 @@ impl HostBridge {
             // A control state this host keeps for its identity loads
             // whatever hosting's state (ruling T35d, A): a revoked service
             // stays refused while hosting is off. Never a store moved aside
-            // here: another identity's store is hosting's business.
+            // by this pass: another identity's store is replaced by hosting,
+            // or by an owner's command that opens the store (ruling T35f,
+            // m4), after which this identity's own loads here.
             if self.features.delegated {
                 self.read_kept();
                 if self.kept_here() {
@@ -1242,7 +1244,19 @@ impl HostBridge {
         };
         match store.bound() {
             Ok(Some(bound)) if bound != *identity => {}
-            Ok(_) => return store.bind(identity).is_ok(),
+            Ok(Some(_)) => return store.bind(identity).is_ok(),
+            Ok(None) => {
+                if store.bind(identity).is_err() {
+                    return false;
+                }
+                // Its first use binds it: the control state it keeps is this
+                // identity's from now on, whoever was the host when it was
+                // read (ruling T35f, m3).
+                if matches!(self.work.kept, Some(KeptControls::Of(_))) {
+                    self.work.kept = Some(KeptControls::Of(identity.clone()));
+                }
+                return true;
+            }
             Err(_) => return false,
         }
         for p in self.work.pending.drain().map(|(_, p)| p) {
@@ -1265,16 +1279,26 @@ impl HostBridge {
         let state = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
         let store = self.work.store.take().expect("checked above");
         let delegated = self.features.delegated;
-        let next = store.retire(host_now().wall_ms).and_then(|aside| {
-            let store = Store::open(&state)?;
-            store.bind(identity)?;
+        let next = if delegated {
             // A new identity's store keeps a control state from its start,
-            // unread until its first complete read (ruling T35d, B).
-            if delegated {
-                FeedStore::prepare(&store)?;
-            }
-            Ok((store, aside))
-        });
+            // unread until its first complete read (ruling T35d, B), and
+            // replaces the old one in one step (ruling T35f, m1): a failure
+            // or a crash never leaves the host with no control state while
+            // the old identity's revokes matter.
+            store.replace(host_now().wall_ms, |next| {
+                crate::runtime::host_work::replace_step("bind")?;
+                next.bind(identity)?;
+                crate::runtime::host_work::replace_step("prepare")?;
+                FeedStore::prepare(next)
+            })
+        } else {
+            // With the hook off, as main.
+            store.retire(host_now().wall_ms).and_then(|aside| {
+                let store = Store::open(&state)?;
+                store.bind(identity)?;
+                Ok((store, aside))
+            })
+        };
         self.work.kept = Some(if delegated {
             KeptControls::Of(identity.clone())
         } else {
