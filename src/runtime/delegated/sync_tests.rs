@@ -1095,6 +1095,45 @@ fn a_resync_page_at_the_head_pauses_nothing() {
     assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 3)]);
 }
 
+/// Task 37 re-review N1 (ruling T37b), the sync's side: a page that moved
+/// nothing pauses the calls while the host is behind the highest head the
+/// Station named since the call was sent, not only the latest `heads`'. A
+/// Station that announces a head beyond the host's, then names the host's
+/// own cursor while that call is in flight, and answers with a page that
+/// moves nothing, gets the 30-second pause all the same. (The page's own
+/// head counts as named too.)
+#[test]
+fn a_station_that_names_a_lower_head_mid_call_still_pauses_the_sync() {
+    let mut rig = rig();
+    rig.opened();
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 2)]);
+    // In flight, the Station names the host's own cursor.
+    assert_eq!(rig.heads(FEED, 2), Vec::new(), "one in flight");
+    // Its page: the cursor's own head, no record. Nothing moved, and the
+    // host stayed behind the 4 the call was asked for.
+    let page = rig.page_of(FEED, 2, vec![]);
+    assert!(rig.on_page(page).next.is_none());
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 4), Vec::new(), "paused");
+    assert_eq!(rig.pass(STALL_PAUSE_MS - SEC - 1), Vec::new());
+    assert_eq!(rig.heads(FEED, 4), Vec::new(), "paused");
+    assert_eq!(rig.pass(1), [sync_call(FEED, 2)], "asked once it passed");
+
+    // A page at the head the call was asked for pauses nothing, as
+    // `a_resync_page_at_the_head_pauses_nothing`: the same shape with the
+    // Station's word never beyond the cursor.
+    let mut rig = self::rig();
+    rig.opened();
+    rig.sync.restart();
+    assert_eq!(rig.pass(SEC), [sync_call(FEED, 2)]);
+    assert_eq!(rig.heads(FEED, 2), Vec::new(), "one in flight");
+    let page = rig.page_of(FEED, 2, vec![]);
+    assert!(rig.on_page(page).next.is_none());
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)], "not paused");
+}
+
 /// Task 33 review m5: a `station_time` the delegated clock can't record
 /// (here no clock at all) counts as no `station_time`: the gate closes until
 /// a `heads` whose time is recorded within the cap.
@@ -1874,6 +1913,7 @@ fn a_page_answers_the_live_call_only_as_it_was_captured() {
         sent_at: 0,
         restart: true,
         epoch: 0,
+        named: 0,
     };
     let here = Some((1, SOCKET));
     let page = rig.page_for(&discovery, FEED, 0, vec![]).unwrap();

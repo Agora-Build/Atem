@@ -18,11 +18,14 @@
 //!   gets no more of them than any carrier: the fetches a `heads` starts
 //!   are at most one every [`HEADS_PACE_MS`] (a channel's init's pace), and
 //!   none for [`STALL_PAUSE_MS`] after a result whose carriage moved
-//!   nothing while the list is still behind the head the Station named (a
-//!   deferred, conflicting or junk carriage). So `heads` and results in a
-//!   burst carry at most once. A carriage that moved nothing because
-//!   another carrier had brought the list to that head already pauses
-//!   nothing (Task 37 review M3).
+//!   nothing while the list is still behind the head the Station named for
+//!   that fetch (a deferred, conflicting or junk carriage). So `heads` and
+//!   results in a burst carry at most once. A carriage that moved nothing
+//!   because another carrier had brought the list to that head already
+//!   pauses nothing (Task 37 review M3). The head named for a fetch is the
+//!   highest the Station named since it was sent: the head it was sent
+//!   for, each `heads`' since (one that names a lower head, the host's own
+//!   included, lowers nothing) and the result's own (Task 37 re-review N1).
 //! - **A refusal** (`membership_fetch_refused`, step 4's Decision 20)
 //!   advances nothing (no head, nothing applied) and is never taken as an
 //!   answer: it ends the host's own wait on the link (no fetch is in flight
@@ -98,6 +101,12 @@ pub enum FetchApply {
 struct InFlight {
     after: u64,
     sent_at: u64,
+    /// The highest head the Station has named since this fetch was sent:
+    /// the head it was sent for, raised by every later `heads` (never
+    /// lowered), and by a result's own head ([`DeviceListFetch::on_result`]).
+    /// What the pause after a carriage that moved nothing is judged against
+    /// (Task 37 re-review N1).
+    named: u64,
 }
 
 /// Where the host's fetch stopped at a deferred entry (design I.4.3).
@@ -159,6 +168,12 @@ pub struct DeviceListFetch {
     /// refused (ruling C1b-b, m4).
     resume: bool,
     in_flight: Option<InFlight>,
+    /// The highest head named since the fetch whose result is being
+    /// carried was sent, that result's own head included: set by
+    /// [`DeviceListFetch::on_result`], read once by
+    /// [`DeviceListFetch::carried`] (the bridge applies the one and then
+    /// calls the other with nothing between).
+    carrying: u64,
     /// The last refusal (monotonic ms).
     refused_at: Option<u64>,
     /// The last fetch a `heads` started (monotonic ms).
@@ -183,7 +198,10 @@ impl DeviceListFetch {
         self.named = Some(*membership);
         self.announced = Some(*membership);
         self.settle_stop(deferred);
-        if self.in_flight.is_some() {
+        if let Some(sent) = &mut self.in_flight {
+            // Named since the fetch was sent, whatever it is (a head the
+            // Station lowers again changes nothing here).
+            sent.named = sent.named.max(membership.seq);
             return None;
         }
         if let Some(at) = self.refused_at {
@@ -213,12 +231,13 @@ impl DeviceListFetch {
     /// A `membership_fetch_result` (read by the shared reader, within 256
     /// KiB): its entries to carry, if a fetch waits for one.
     pub fn on_result(&mut self, r: MembershipFetchResult) -> FetchApply {
-        if self.in_flight.take().is_none() {
+        let Some(sent) = self.in_flight.take() else {
             return FetchApply::Unasked;
-        }
+        };
         // Its carriage carries a cleared deferral's entry too.
         self.resume = false;
         self.results += 1;
+        self.carrying = sent.named.max(r.head.seq);
         self.named = Some(r.head);
         FetchApply::Carry(r.entries)
     }
@@ -232,17 +251,16 @@ impl DeviceListFetch {
     /// conflicting or junk carriage), a pause for the fetches a `heads`
     /// starts. One that moved nothing because another carrier had already
     /// brought the list to that head pauses nothing (Task 37 review M3, as
-    /// the feed sync's F1).
+    /// the feed sync's F1). "That head" is the highest the Station named
+    /// since the fetch was sent (a later, lower `heads` doesn't lower it),
+    /// the result's own head included (Task 37 re-review N1).
     pub fn carried(
         &mut self,
         before: &Head,
         after: &Head,
         stopped_at: Option<u64>,
     ) -> Option<MembershipFetch> {
-        let behind = [self.announced, self.named]
-            .iter()
-            .flatten()
-            .any(|named| named.seq > after.seq);
+        let behind = std::mem::take(&mut self.carrying) > after.seq;
         if after.seq <= before.seq && behind {
             self.stalled_at = Some(self.now);
         }
@@ -304,6 +322,7 @@ impl DeviceListFetch {
         self.in_flight = Some(InFlight {
             after,
             sent_at: now_mono,
+            named: in_flight.named,
         });
         Some(MembershipFetch { after })
     }
@@ -370,6 +389,7 @@ impl DeviceListFetch {
         self.in_flight = Some(InFlight {
             after: applied.seq,
             sent_at: self.now,
+            named: named.seq,
         });
         Some(MembershipFetch { after: applied.seq })
     }
@@ -485,6 +505,73 @@ mod tests {
         // A head announced a second later: fetched at once.
         f.tick(11_000, Some(&head(5)), None);
         assert_eq!(f.on_heads(&head(6), &head(5), None), fetch(5));
+    }
+
+    /// Task 37 re-review N1 (ruling T37b): "behind" is judged against the
+    /// highest head the Station named since the fetch was sent, not the
+    /// latest one. A Station that announces a head beyond the host's, then
+    /// names the host's own head while that fetch is in flight, and answers
+    /// with a carriage that moves nothing, still pauses the fetches a
+    /// `heads` starts for 30 s: the list stayed behind a head the Station
+    /// named for this fetch. The result's own head counts as named too.
+    #[test]
+    fn a_station_that_names_a_lower_head_mid_fetch_still_pauses() {
+        let mut f = DeviceListFetch::default();
+        f.tick(10_000, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(4), &head(3), None), fetch(3));
+        // In flight, the Station names the host's own head.
+        assert_eq!(f.on_heads(&head(3), &head(3), None), None);
+        // Its answer names that head and carries nothing that moves it.
+        assert!(matches!(f.on_result(result(3)), FetchApply::Carry(_)));
+        assert_eq!(f.carried(&head(3), &head(3), None), None);
+        // The next `heads` naming the head the fetch was sent for: paused.
+        f.tick(11_000, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(4), &head(3), None), None, "paused");
+        f.tick(10_000 + STALL_PAUSE_MS - 1, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(4), &head(3), None), None, "paused");
+        f.tick(10_000 + STALL_PAUSE_MS, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(4), &head(3), None), fetch(3));
+
+        // A head named higher in flight counts too (the highest, not the
+        // first or the last), and so does the result's own.
+        let mut f = DeviceListFetch::default();
+        f.tick(10_000, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(4), &head(3), None), fetch(3));
+        f.on_heads(&head(6), &head(3), None);
+        f.on_heads(&head(3), &head(3), None);
+        assert!(matches!(f.on_result(result(3)), FetchApply::Carry(_)));
+        assert_eq!(f.carried(&head(3), &head(3), None), None);
+        f.tick(11_000, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(6), &head(3), None), None, "paused");
+        let mut f = DeviceListFetch::default();
+        f.tick(10_000, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(4), &head(3), None), fetch(3));
+        f.on_heads(&head(3), &head(3), None);
+        assert!(matches!(f.on_result(result(7)), FetchApply::Carry(_)));
+        assert_eq!(f.carried(&head(3), &head(3), None), None);
+        f.tick(11_000, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(3), &head(3), None), None, "paused");
+        assert_eq!(f.on_heads(&head(4), &head(3), None), None, "paused");
+    }
+
+    /// The pause's rule when a later fetch is asked from a carriage that
+    /// moved the head: the head named for it is the newest at that ask, and
+    /// what is named since counts from there.
+    #[test]
+    fn the_pause_judges_each_fetch_by_the_heads_named_since_it_was_sent() {
+        let mut f = DeviceListFetch::default();
+        f.tick(10_000, Some(&head(3)), None);
+        assert_eq!(f.on_heads(&head(9), &head(3), None), fetch(3));
+        assert!(matches!(f.on_result(result(9)), FetchApply::Carry(_)));
+        // 3 to 5 of 9: a second fetch, sent with 9 named.
+        assert_eq!(f.carried(&head(3), &head(5), None), fetch(5));
+        // In flight the Station lowers its word to the host's own head.
+        assert_eq!(f.on_heads(&head(5), &head(5), None), None);
+        assert!(matches!(f.on_result(result(5)), FetchApply::Carry(_)));
+        // Nothing moved, the list at 5 of the 9 named for this fetch: paused.
+        assert_eq!(f.carried(&head(5), &head(5), None), None);
+        f.tick(11_000, Some(&head(5)), None);
+        assert_eq!(f.on_heads(&head(9), &head(5), None), None, "paused");
     }
 
     /// I1: many `heads` and junk results in one pass (the host's clock

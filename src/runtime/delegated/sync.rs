@@ -59,13 +59,16 @@
 //! - **Pacing** (as the device-list fetch's, Task 30 I1). One `control_sync`
 //!   in flight at a time. Those a `heads` or the pass start are at most one
 //!   a second, and none for 30 seconds after a page that moved nothing and
-//!   left the host behind the head the Station announced, or was refused
-//!   (a resynchronization's page that finds the host at the head pauses
-//!   nothing: Task 37). After a page that moved the cursor while the feed is
-//!   still ahead, the next is asked at once (real records bound it), and
-//!   so is a reset's read from 0 once its mark is written (one call in
-//!   flight, and a reset counts once until its read begins, so it stays
-//!   bounded by the pages).
+//!   left the host behind the head the Station named for that call, or was
+//!   refused (a resynchronization's page that finds the host at the head
+//!   pauses nothing: Task 37). The head named for a call is the highest the
+//!   Station named since it was asked: the head it was asked at, each
+//!   `heads`' for its feed since (one that names a lower head lowers
+//!   nothing) and the page's own (Task 37 re-review N1). After a page that
+//!   moved the cursor while the feed is still ahead, the next is asked at
+//!   once (real records bound it), and so is a reset's read from 0 once its
+//!   mark is written (one call in flight, and a reset counts once until
+//!   its read begins, so it stays bounded by the pages).
 //! - **Matching** (wire rule 11, ruling C1b-a). Every call gets a fresh
 //!   `request_id` (a lowercase UUID v4 from the OS CSPRNG): a retry and a
 //!   new link generation's call too, whatever the cursor. At most one call
@@ -362,6 +365,11 @@ struct Ask {
     /// The sync's epoch when it was asked: a page asked before the latest
     /// refusal, fault or restart ends no resynchronization.
     epoch: u64,
+    /// The highest head of the call's feed the Station has named since it
+    /// was asked: the announced head it was asked at, raised by each later
+    /// `heads` for that feed (never lowered by one). What the pause after a
+    /// page that moved nothing is judged against (Task 37 re-review N1).
+    named: u64,
 }
 
 /// What a page brought, committed. Its records' effects on tasks were
@@ -726,6 +734,13 @@ impl FeedSync {
                 None
             }
         };
+        // Named since the live call was asked, whatever a later `heads`
+        // says of the head again (N1).
+        if let (Some(ask), [one]) = (self.in_flight.as_mut(), mine.as_slice())
+            && ask.call.feed_id.as_deref() == Some(one.feed_id.as_str())
+        {
+            ask.named = ask.named.max(one.head);
+        }
         if let [one] = mine.as_slice() {
             let verdict = match clock {
                 Some((clock, store)) => clock.station_time(&own, one.station_time, store),
@@ -917,13 +932,15 @@ impl FeedSync {
             self.ask(false)
         } else {
             // A page that moved nothing pauses the calls only while the
-            // host is still behind the head the Station announced (pages
-            // that don't reach it). One that found the host at the head (a
-            // resynchronization's: the start's recovery, a refusal's, a
-            // fault's) is what was expected, and pauses nothing (Task 37
-            // finding: it kept the next record unread for 30 s, its gate
-            // closed meanwhile).
-            if self.behind() {
+            // host is still behind the head the Station named for this
+            // call: the highest since it was asked (a later `heads` that
+            // names a lower head doesn't lower it), the page's own
+            // included (pages that don't reach it). One that found the host
+            // at the head (a resynchronization's: the start's recovery, a
+            // refusal's, a fault's) is what was expected, and pauses
+            // nothing (Task 37 finding: it kept the next record unread for
+            // 30 s, its gate closed meanwhile; re-review N1).
+            if self.behind_of(&page.feed_id, ask.named.max(page.head)) {
                 self.stalled_at = Some(self.now);
             }
             None
@@ -1230,15 +1247,13 @@ impl FeedSync {
         );
     }
 
-    /// The host's read of the announced feed is behind its head (or of
-    /// another feed, or none).
-    fn behind(&self) -> bool {
-        self.announced.as_ref().is_some_and(|announced| {
-            self.synced
-                .as_ref()
-                .filter(|(feed_id, _)| *feed_id == announced.feed_id)
-                .is_none_or(|(_, cursor)| *cursor < announced.head)
-        })
+    /// The host's read of `feed_id` is behind `head` (or of another feed,
+    /// or none).
+    fn behind_of(&self, feed_id: &str, head: u64) -> bool {
+        self.synced
+            .as_ref()
+            .filter(|(read, _)| read == feed_id)
+            .is_none_or(|(_, cursor)| *cursor < head)
     }
 
     /// The `control_sync` the announced feed needs now, if any: one at a
@@ -1303,6 +1318,7 @@ impl FeedSync {
             sent_at: self.now,
             restart,
             epoch: self.epoch,
+            named: announced.head,
         });
         Some(call)
     }
