@@ -1168,6 +1168,58 @@ fn a_receipt_database_fault_leaves_every_service_unchecked() {
     });
 }
 
+/// Re-review of the M3 fix: with hosting on, a `host-work.sqlite` that can't
+/// be opened marks the control state unreadable and also faults the receipt
+/// database (`Store::open` fails, `work_fail`). `atem status` then names the
+/// store and the way out (move it aside or restore it), not the receipt
+/// database's restart alone, which fails the same way.
+#[test]
+fn a_store_that_cant_be_opened_says_so_in_the_status_not_the_receipt_fault() {
+    use std::os::unix::fs::PermissionsExt;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let _s = fed_bot(&mut rig, root, &os, start);
+        r9_link_up(&mut rig);
+        // The store closed and replaced by a file that isn't a database,
+        // hosting enabled on disk.
+        rig.bridge.work.store = None;
+        let store = root.join("runtime").join("host-work.sqlite");
+        for name in [
+            "host-work.sqlite",
+            "host-work.sqlite-wal",
+            "host-work.sqlite-shm",
+        ] {
+            let _ = std::fs::remove_file(root.join("runtime").join(name));
+        }
+        std::fs::write(&store, vec![0xA5u8; 8192]).unwrap();
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        rig.bridge.work.kept = None;
+        rig.bridge.work.error = false;
+        let path = root.join("runtime.toml");
+        std::fs::write(&path, "version = 1\nenabled = true\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        rig.bridge.work.available = true;
+        rig.bridge.work.refresh = Instant::now();
+        rig.bridge.work_config();
+        assert!(rig.bridge.work.error, "the receipt database faulted");
+        assert!(
+            matches!(rig.bridge.work.kept, Some(super::KeptControls::Unreadable)),
+            "the control state is unreadable"
+        );
+        assert!(rig.bridge.controls_unchecked());
+        let line = rig.bridge.feeds_status().unwrap_or_default();
+        assert!(
+            line.ends_with(&format!(
+                "; services are refused (busy) until the control state loads: {} can't be opened (move it aside or restore it, then run `atem runtime restart`)",
+                store.display()
+            )),
+            "{line}"
+        );
+    });
+}
+
 /// Review I2 (D9, ruling T35c): the r9 engine's revoked services come back
 /// from the stored control state, never from memory. After a restart with
 /// hosting paused (probe B), the stored state loads anyway (ruling T35d,

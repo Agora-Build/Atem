@@ -789,14 +789,16 @@ impl HostBridge {
         // out.
         let services = if !(self.features.delegated && self.controls_unchecked()) {
             String::new()
-        } else if self.work.error {
-            "; services are refused (busy) until `atem runtime restart` (the receipt database failed)"
-                .to_string()
         } else if matches!(self.work.kept, Some(super::KeptControls::Unreadable)) {
+            // First: a store that can't be opened faults the receipt
+            // database too, and a restart alone fails the same way.
             format!(
                 "; services are refused (busy) until the control state loads: {} can't be opened (move it aside or restore it, then run `atem runtime restart`)",
                 store.display()
             )
+        } else if self.work.error {
+            "; services are refused (busy) until `atem runtime restart` (the receipt database failed)"
+                .to_string()
         } else if self.kept_elsewhere() {
             // Hosting makes it, and so does an owner's command that opens
             // the store while hosting is paused (ruling T35f, m4).
