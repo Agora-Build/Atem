@@ -416,8 +416,12 @@ Host-work v1, unchanged except for the selector destination:
   readiness, drafts, approvals, leases and expiry apply as today;
 - a task is submitted as a session-v1 prompt with `acquire` on its sender's
   attachment, and the prompt's receipt drives the task's states. A remote
-  sender's attachment is its live channel (delegated senders: see
-  [delegated-host-work.md](delegated-host-work.md), I.4.2). A local task's
+  sender's attachment is its live channel. A delegated sender's task (a
+  native member's, or a covered service's; built behind a debug-only hook
+  and advertised by no release build) is submitted instead by the host-local
+  `host-work` principal, attempt by attempt, with no channel of its sender
+  ([delegated-host-work.md](delegated-host-work.md), I.4.2;
+  [agent-hosting.md](agent-hosting.md) sections 4 and 7). A local task's
   sender is `local`, whoever prompted the agent that
   sent it (section 6). Local senders share one internal attachment, created
   through the session host's existing `connect` and welcome path (again after a
@@ -431,7 +435,12 @@ Host-work v1, unchanged except for the selector destination:
 - the prompt carries the task, workflow and reply ids and each snapshot, so the
   agent knows what it answers and to whom, in the framing of section 10;
 - routes with `launch = "on_message"` start a session when none matches
-  (section 5).
+  (section 5);
+- with delegated work on (the debug-only hook), local tasks keep this
+  lifecycle: they are never delegated, never wait for a revocation gate and
+  never count toward the unresolved-outcome limits. A delegated task waiting
+  for the gate, a hold or a deferred device-list entry doesn't hold its
+  session, so a local task queued after it passes it.
 
 **Pauses, not fences.** Three things pause hosting: a `runtime.toml` that
 doesn't load, hosting disabled, and a receipt-database fault. While one lasts,
@@ -859,6 +868,16 @@ grants across broker restarts. It needs no network transport for text-only work;
 Memory/Vault publication waits for a reachable relay. A lost or uncertain
 launch is not respawned automatically. **Stages 2 and 3 (planned):** see
 [delegated-host-work.md](delegated-host-work.md), Part II.
+
+**Delegated senders** (built behind a debug-only hook; advertised by no
+release build). A delegated task left `submitting` at a restart doesn't
+become `outcome_unknown` as a v1 task does: it is reconciled, as one left
+`submitted` is, by its attempt's receipt ([delegated-host-work.md](delegated-host-work.md),
+I.6.3). An attempt never admitted, or withdrawn at recovery from `accepted`,
+leaves the task `queued` for a new attempt, so it runs once; one that reached
+`executing` follows its adopted turn, or `outcome_unknown` (with an owner
+alert) when its outcome can't be established; it never runs twice. Local
+tasks keep section 10's lifecycle.
 
 ## 12. Transports
 

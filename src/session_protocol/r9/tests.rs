@@ -1121,6 +1121,110 @@ fn attachments_are_fenced_alone_and_a_principal_together() {
     assert_eq!(rig.list("phone").len(), 2);
 }
 
+/// A service a control record revoked (delegated host-work design I.5.5
+/// step 2, the runtime's `effects`): its attachments are fenced through §H
+/// (`control_gen` raised, each closed after `unauthorized`, `revoked`), its
+/// later `hello`s refused the same way, while another principal stays; with
+/// nothing revoked (`set_revoked_services` empty, a new identity), it is
+/// admitted again.
+#[test]
+fn a_service_a_control_record_revoked_is_fenced_and_refused() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("bot-1", bot());
+    rig.advance(1000);
+    rig.connect("phone", phone());
+    rig.attached("bot-1");
+    rig.attached("phone");
+    let before = rig.rt.host.control_gen("service:svc-bot");
+    rig.run(|e, p| ((), e.fence_revoked("service:svc-bot", p)));
+    rig.pump();
+    assert_eq!(rig.refused("bot-1").0, "closed");
+    assert!(rig.rt.host.control_gen("service:svc-bot") > before);
+    assert_eq!(rig.engine.status().attachments, 1, "the phone stays");
+    rig.advance(1000);
+    rig.connect("bot-2", bot());
+    assert_eq!(
+        rig.refused("bot-2"),
+        ("unauthorized".into(), Some(DETAIL_REVOKED.into()))
+    );
+    rig.engine.set_revoked_services(HashSet::new());
+    rig.advance(1000);
+    rig.connect("bot-3", bot());
+    rig.attached("bot-3");
+}
+
+/// Ruling T35c: while the runtime's control state can't be checked, every
+/// service's `hello` is refused `busy` (`revocations not yet checked`) and
+/// entering that state fences every live service attachment through §H;
+/// a native member is untouched. Leaving it admits services again.
+#[test]
+fn services_are_busy_while_the_control_state_is_unchecked() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("bot-1", bot());
+    rig.advance(1000);
+    rig.connect("phone", phone());
+    rig.attached("bot-1");
+    rig.attached("phone");
+    let before = rig.rt.host.control_gen("service:svc-bot");
+    rig.run(|e, p| ((), e.set_services_unchecked(true, p)));
+    rig.pump();
+    assert_eq!(rig.refused("bot-1").0, "closed");
+    assert!(rig.rt.host.control_gen("service:svc-bot") > before);
+    assert_eq!(rig.engine.status().attachments, 1, "the phone stays");
+    // Staying unchecked fences nothing more.
+    let fenced = rig.rt.host.control_gen("service:svc-bot");
+    rig.run(|e, p| ((), e.set_services_unchecked(true, p)));
+    assert_eq!(rig.rt.host.control_gen("service:svc-bot"), fenced);
+    rig.advance(1000);
+    rig.connect("bot-2", bot());
+    assert_eq!(
+        rig.refused("bot-2"),
+        ("busy".into(), Some(DETAIL_UNCHECKED.into()))
+    );
+    rig.advance(1000);
+    rig.connect("phone-2", phone());
+    rig.attached("phone-2");
+    rig.run(|e, p| ((), e.set_services_unchecked(false, p)));
+    rig.advance(1000);
+    rig.connect("bot-3", bot());
+    rig.attached("bot-3");
+}
+
+/// Review N1 (ruling T35d): while the control state is unchecked, the
+/// device list still decides first: an expired service gets its final
+/// `unauthorized`, never the retryable `busy`; a service the list admits
+/// gets `busy`. A revoked one gets its final `revoked` before the `busy`
+/// too.
+#[test]
+fn the_device_lists_refusal_comes_before_the_unchecked_busy() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.engine.start_services_unchecked(true);
+    rig.connect("bot-1", bot());
+    assert_eq!(
+        rig.refused("bot-1"),
+        ("busy".into(), Some(DETAIL_UNCHECKED.into()))
+    );
+    rig.engine
+        .set_revoked_services(HashSet::from(["service:svc-bot".to_string()]));
+    rig.advance(1000);
+    rig.connect("bot-2", bot());
+    assert_eq!(
+        rig.refused("bot-2"),
+        ("unauthorized".into(), Some(DETAIL_REVOKED.into()))
+    );
+    rig.engine.set_revoked_services(HashSet::new());
+    // The bot's grant expires: its own final refusal.
+    rig.advance(3_600_000);
+    rig.connect("bot-3", bot());
+    assert_eq!(
+        rig.refused("bot-3"),
+        ("unauthorized".into(), Some("expired".into()))
+    );
+}
+
 /// `revoke_grant` from the issuer: the browser is fenced ("grant revoked")
 /// and can't come back with that grant.
 #[test]
@@ -4126,4 +4230,66 @@ fn a_stations_messages_go_to_the_station_link() {
     }
     assert_eq!(rig.engine.take_station_messages(), station);
     assert!(rig.engine.take_station_messages().is_empty());
+}
+
+/// Task 30 review 5: the `op` is peeked without a whole-value parse, so a
+/// Station page that isn't strict JSON elsewhere (a lone surrogate, a
+/// fraction, a duplicate key) still reaches the Station link, whose strict
+/// reader refuses it as a Station fault (host-work-v1 §11.4) rather than
+/// dropped unseen here.
+#[test]
+fn a_station_page_that_isnt_strict_still_reaches_the_station_link() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.engine.set_delegated_features(true, false);
+    let pages = [
+        r#"{"type":"relay","op":"control_sync_result","feed_id":"\ud800","records":[]}"#,
+        r#"{"type":"relay","op":"control_sync_result","head":0.5}"#,
+        r#"{"type":"relay","op":"control_sync_result","head":1,"head":2}"#,
+    ];
+    for text in pages {
+        rig.engine.relay_message(text);
+    }
+    assert_eq!(rig.engine.take_station_messages(), pages);
+    // Task 33 review m2: nesting past serde's depth, and a duplicate `op`
+    // key, reach it too.
+    let deep = format!(
+        r#"{{"type":"relay","op":"control_sync_result","records":[{{"record":{}1{}}}]}}"#,
+        "[".repeat(300),
+        "]".repeat(300)
+    );
+    let twice = r#"{"type":"relay","op":"push_ack","op":"control_sync_result"}"#;
+    rig.engine.relay_message(&deep);
+    rig.engine.relay_message(twice);
+    assert_eq!(rig.engine.take_station_messages(), [deep.as_str(), twice]);
+}
+
+/// Ruling T33c, N1: with `host.delegated` off (as on main, and in every
+/// release build) relay messages are read exactly as main reads them: a
+/// whole-value parse, the last `op` winning. A `push_ack` with a duplicate
+/// `op` still reaches the push engine (here it acknowledges nothing, which
+/// main logs), and a Station page no parse takes (a lone surrogate) is
+/// dropped, not routed. With it on, both go to the Station link.
+#[test]
+fn with_the_hook_off_relay_messages_are_read_as_main_reads_them() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    let twice = r#"{"type":"relay","op":"heads","op":"push_ack","acks":[]}"#;
+    let surrogate = r#"{"type":"relay","op":"control_sync_result","feed_id":"\ud800"}"#;
+    let before = rig.engine.input_lines_written();
+    rig.engine.relay_message(twice);
+    rig.engine.relay_message(surrogate);
+    assert_eq!(
+        rig.engine.input_lines_written(),
+        before + 1,
+        "the push engine's line"
+    );
+    assert!(rig.engine.take_station_messages().is_empty());
+    rig.engine.set_delegated_features(true, false);
+    rig.advance(10_000);
+    let before = rig.engine.input_lines_written();
+    rig.engine.relay_message(twice);
+    rig.engine.relay_message(surrogate);
+    assert_eq!(rig.engine.input_lines_written(), before);
+    assert_eq!(rig.engine.take_station_messages(), [twice, surrogate]);
 }

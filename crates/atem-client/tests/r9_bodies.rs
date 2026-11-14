@@ -764,6 +764,11 @@ fn outcome_unknown_hint_seal_open() {
     assert!(edit(&|p| p.reason.clear()).is_err());
     assert!(edit(&|p| p.reason = "a\nb".into()).is_err());
     assert!(edit(&|p| p.reason = "a\u{202E}b".into()).is_err(), "no Cf");
+    assert!(edit(&|p| p.reason = "   ".into()).is_err(), "not blank");
+    assert!(
+        edit(&|p| p.reason = "\u{00A0}\u{3000}".into()).is_err(),
+        "not blank in Unicode white space either"
+    );
     assert!(edit(&|p| p.sender = "phone".into()).is_err());
     // Only a delegated sender's UUID v4 task raises an alert:
     // `local` and browser grants keep v1, and a local selector's UUID v5

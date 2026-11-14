@@ -124,22 +124,25 @@
 //!   in the order written, and `verdict.json` reuses its name.
 //!   `RuntimeClient` never passes it on (as every `ATEM_TEST_*`); release
 //!   builds compile it out.
-//! - `ATEM_TEST_HOST_CONTROLS=<file>` (the delegated binary tests, with
-//!   `host.delegated` on): a stand-in for the control feeds a delegated
-//!   host syncs (PR 10 builds them), read at every pass and every
-//!   classification, `{"own"?: origin, "open"?: [origin…], "standings"?:
-//!   {principal: {"coverage"?: {"origin", "feed_id"}, "revoked"?: id,
-//!   "held"?: bool}}}`: the host's own Station's origin (a native member's
-//!   gate), the origins whose revocation gate is open, and the senders'
-//!   standings (a service its `coverage` names is a delegated sender). The
-//!   start's recovery closes every gate (design I.6.2 step 7); the next
-//!   pass reads the file again, as a feed's sync would open it. A missing
-//!   file is no feed (no standing, every Station gate closed, also in the
-//!   start view); one that doesn't parse too, with a runtime.log line.
-//!   Write it to a temporary name and rename it into place.
 //! - `<ATEM_TEST_PTY_FAULTS dir>/crash_after_attempt_commit`: the runtime
 //!   kills itself (`SIGKILL`) right after the next delegated attempt's row
 //!   committed, before its submit (VII.A test 7).
+//! - VII.A test 7's other crash points (Task 37), each a marker in the same
+//!   directory, used once: the runtime kills itself (`SIGKILL`) at the
+//!   point, after a `runtime.log` line naming it (`crash_point`):
+//!   - `crash_after_executing`: right after a `host-work` attempt's
+//!     `executing` record is durable, before its prompt is dispatched;
+//!   - `crash_during_record_application`: in a control page's transaction,
+//!     right after its first record applied with its effects, before the
+//!     commit;
+//!   - `crash_after_page_commit`: right after a control page that applied a
+//!     record committed, before its followups (withdrawals, fences,
+//!     intents) and its acknowledgments;
+//!   - `crash_after_ack_handoff`: right after acknowledgments carrying a
+//!     result were handed to the link, before their sent marks are written.
+//!
+//!   While `<dir>/hold_crash` exists a crash point that fired waits before
+//!   the kill (the link's writer goes on), so a test can see what went out.
 //! - `<ATEM_TEST_PTY_FAULTS dir>/hold_host_work`: while it exists,
 //!   host-work's scheduling pass (`schedule_work`) doesn't run: requests
 //!   are still answered and the start's recovery still runs, but no task is
@@ -153,8 +156,7 @@
 //! Like the other hooks, these are read from the process environment once:
 //! a unit-test process started with one set sees it in every `HostBridge`
 //! it opens (`ATEM_TEST_HOST_FEATURES` turns host-work on in them; the
-//! drive hook would take and answer files in that directory;
-//! `ATEM_TEST_HOST_CONTROLS` would cover and gate senders), so run the
+//! drive hook would take and answer files in that directory), so run the
 //! bin's tests without them (PR 5 review M11).
 
 /// The delegated host-work features this runtime runs (session-v1 R9.14,
@@ -433,10 +435,8 @@ mod imp {
         faults_dir().is_some_and(|dir| dir.join("hold_host_work").exists())
     }
 
-    /// The stand-in for the feeds is named (whatever its file holds).
-    pub fn host_controls_named() -> bool {
-        static CELL: OnceLock<Option<PathBuf>> = OnceLock::new();
-        env_path("ATEM_TEST_HOST_CONTROLS", &CELL).is_some()
+    pub fn crash_held() -> bool {
+        faults_dir().is_some_and(|dir| dir.join("hold_crash").exists())
     }
 
     pub fn no_init_limit() -> bool {
@@ -487,29 +487,6 @@ mod imp {
                 }
             }
         })
-    }
-
-    /// The stand-in for the control feeds (`ATEM_TEST_HOST_CONTROLS`), read
-    /// at each call; none while the file is missing or unreadable (one line
-    /// per new reason it doesn't parse).
-    pub fn host_controls() -> Option<super::HostControls> {
-        static CELL: OnceLock<Option<PathBuf>> = OnceLock::new();
-        static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-        let path = env_path("ATEM_TEST_HOST_CONTROLS", &CELL)?;
-        let text = std::fs::read_to_string(path).ok()?;
-        match super::HostControls::parse(&text) {
-            Ok(controls) => Some(controls),
-            Err(error) => {
-                let mut last = LAST
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if last.as_deref() != Some(error.as_str()) {
-                    eprintln!("atem runtime: ATEM_TEST_HOST_CONTROLS ignored ({error})");
-                    *last = Some(error);
-                }
-                None
-            }
-        }
     }
 
     fn drive_dir() -> Option<&'static PathBuf> {
@@ -678,93 +655,21 @@ pub fn crash_after_attempt_commit() -> bool {
     false
 }
 
-/// The debug-only stand-in for the control feeds a delegated host syncs
-/// (`ATEM_TEST_HOST_CONTROLS`; PR 10 builds the feeds): the host's own
-/// Station's origin, the origins whose revocation gate is open, and the
-/// senders' standings (the feed covering a service, a revocation, a hold).
-#[cfg(debug_assertions)]
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct HostControls {
-    pub own: Option<String>,
-    pub open: std::collections::BTreeSet<String>,
-    pub standings: std::collections::BTreeMap<String, crate::runtime::delegated::SenderStanding>,
-    /// The device-list part of the `open` origins' gates is the host's own
-    /// fetch's (design I.5.8); otherwise the stand-in opens their whole
-    /// gate.
-    pub device_list_from_fetch: bool,
-}
-
-#[cfg(debug_assertions)]
-impl HostControls {
-    /// The hook's file: `{"own"?: origin, "open"?: [origin…], "standings"?:
-    /// {principal: {"coverage"?: {"origin", "feed_id"}, "revoked"?: id,
-    /// "held"?: bool}}, "device_list_from_fetch"?: bool}`, no other field.
-    /// `open` opens those origins' whole gate, or with
-    /// `device_list_from_fetch` their feed part only, the device-list part
-    /// then the host's own fetch's.
-    pub fn parse(text: &str) -> Result<HostControls, String> {
-        use crate::runtime::delegated::{FeedRef, SenderStanding};
-        use std::collections::{BTreeMap, BTreeSet};
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct File {
-            #[serde(default)]
-            own: Option<String>,
-            #[serde(default)]
-            open: BTreeSet<String>,
-            #[serde(default)]
-            standings: BTreeMap<String, Standing>,
-            #[serde(default)]
-            device_list_from_fetch: bool,
+/// A crash point of VII.A test 7 (`<ATEM_TEST_PTY_FAULTS dir>/<name>`,
+/// once; the module docs): the runtime kills itself (`SIGKILL`) here, after
+/// a `runtime.log` line saying `what`, waiting first while
+/// `<dir>/hold_crash` exists. Release builds: never.
+#[cfg_attr(test, allow(dead_code))]
+pub fn crash_point(_name: &str, _what: &str) {
+    #[cfg(debug_assertions)]
+    if imp::take_fault(_name) {
+        eprintln!("atem runtime: test hook: killed {_what}");
+        while imp::crash_held() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Standing {
-            #[serde(default)]
-            coverage: Option<FeedRef>,
-            #[serde(default)]
-            revoked: Option<String>,
-            #[serde(default)]
-            held: bool,
-        }
-        let file: File = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        Ok(HostControls {
-            own: file.own,
-            open: file.open,
-            device_list_from_fetch: file.device_list_from_fetch,
-            standings: file
-                .standings
-                .into_iter()
-                .map(|(principal, s)| {
-                    let standing = SenderStanding {
-                        revoked: s.revoked,
-                        held: s.held,
-                        coverage: s.coverage,
-                    };
-                    (principal, standing)
-                })
-                .collect(),
-        })
+        // SAFETY: signals this process; nothing after it runs.
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
     }
-}
-
-#[cfg(debug_assertions)]
-impl crate::runtime::delegated::ControlView for HostControls {
-    fn standing(&self, principal: &str) -> crate::runtime::delegated::SenderStanding {
-        self.standings.get(principal).cloned().unwrap_or_default()
-    }
-}
-
-/// The stand-in for the control feeds (`ATEM_TEST_HOST_CONTROLS`), as its
-/// file says now: none without the hook; with it, the empty stand-in (no
-/// feed: no standing, every Station gate closed) while the file is missing
-/// or doesn't parse.
-#[cfg(debug_assertions)]
-pub fn host_controls() -> Option<HostControls> {
-    if !imp::host_controls_named() {
-        return None;
-    }
-    Some(imp::host_controls().unwrap_or_default())
 }
 
 /// The next device-list write fault (`<file>:<step>`), once.

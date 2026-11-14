@@ -97,15 +97,36 @@ pub(crate) fn session_family(text: &str) -> Option<&'static str> {
 /// A relay message for Atem (`{"type":"relay",…}`, atem-session-v1.md
 /// §R9.9: the relay's `push_ack`), from its `type`.
 pub(crate) fn is_relay_message(text: &str) -> bool {
+    is_relay_message_with(
+        text,
+        crate::runtime::test_hooks::host_features().delegated,
+    )
+}
+
+/// [`is_relay_message`] with `host.delegated` on or off (the debug-only
+/// hook; off in every release build).
+fn is_relay_message_with(text: &str, delegated: bool) -> bool {
     #[derive(Deserialize)]
     struct Peek {
         #[serde(rename = "type")]
         kind: Option<String>,
     }
-    serde_json::from_str::<Peek>(text)
-        .ok()
-        .and_then(|p| p.kind)
-        .is_some_and(|kind| kind == "relay")
+    match serde_json::from_str::<Peek>(text) {
+        Ok(peek) => peek.kind.is_some_and(|kind| kind == "relay"),
+        // One the peek can't read (a duplicate key, a message cut short) is
+        // a relay message only with `host.delegated` on, and only when its
+        // top-level names say it is a Station's to this host: it goes to
+        // the Station link, whose strict reader answers it as a Station
+        // fault (host-work-v1 §11.4; Task 33 review m2). Otherwise, and with
+        // the hook off (as on main: ruling T33c, N1), it is dropped unread.
+        Err(_) => {
+            delegated
+                && crate::session_protocol::r9::peek::relay_op(
+                    text,
+                    crate::session_protocol::r9::is_station_message,
+                )
+        }
+    }
 }
 
 /// Message types removed in atem-session r6 (§0): no compatibility, but
@@ -540,6 +561,9 @@ pub struct SystemStatus {
 /// queues hold the rest (§R9.7a "Bounds").
 const CHANNEL_INFLIGHT_BYTES: usize = 8 << 20;
 
+/// The next socket's process-wide id ([`AstationClient::socket_id`]).
+static NEXT_SOCKET_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct AstationClient {
     sender: Option<mpsc::UnboundedSender<OutboundMessage>>,
     /// Bytes of channel envelopes queued on `sender` and not yet written.
@@ -556,6 +580,9 @@ pub struct AstationClient {
     /// Counts the sockets this client opened (`connect_raw`): a link
     /// generation's channels live on one socket only (§R9.7a).
     socket_gen: u64,
+    /// The socket this client opened last, named across the process
+    /// ([`NEXT_SOCKET_ID`]; 0: none yet).
+    socket_id: u64,
     connected_astation_id: Option<String>,
     /// The newest challenge answered on this socket, as (astation_id,
     /// challenge): a repeat of it is spent and is not answered again.
@@ -737,6 +764,7 @@ impl AstationClient {
             local_token_path_override: None,
             ws_closed: false,
             socket_gen: 0,
+            socket_id: 0,
             connected_astation_id: None,
             answered_challenge: None,
             held_encryption: Vec::new(),
@@ -1085,6 +1113,16 @@ impl AstationClient {
         PausedWriter { rx, writer }
     }
 
+    /// Tests: every message handed to the link from now on, kept for the
+    /// test to read ([`SentForTest::texts`]) instead of written: as if
+    /// connected, whether or not the client is.
+    #[cfg(test)]
+    pub(crate) fn capture_sent_for_test(&mut self) -> SentForTest {
+        let (tx, rx) = mpsc::unbounded_channel::<OutboundMessage>();
+        self.sender = Some(tx);
+        SentForTest { rx }
+    }
+
     /// Pretend the link reached Astation `via`.
     #[cfg(test)]
     pub(crate) fn set_via_for_test(&mut self, via: LinkVia) {
@@ -1368,6 +1406,7 @@ impl AstationClient {
         self.transport_tasks = vec![writer_task, reader_task];
         self.ws_closed = false;
         self.socket_gen += 1;
+        self.socket_id = NEXT_SOCKET_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         Ok(())
     }
@@ -1375,6 +1414,16 @@ impl AstationClient {
     /// The socket the client uses now (a new one after every reconnect).
     pub fn socket_gen(&self) -> u64 {
         self.socket_gen
+    }
+
+    /// The socket the client uses now, named across the process: no other
+    /// socket any client of this process opened has it (0: none opened).
+    /// Unlike [`AstationClient::socket_gen`], which counts one client's
+    /// sockets and starts again in each new client (every reconnect makes
+    /// one), it tells two links' sockets apart (host-work-v1 §11.4: a
+    /// `control_sync` is captured with its socket and answered only there).
+    pub fn socket_id(&self) -> u64 {
+        self.socket_id
     }
 
     /// Authenticate with Astation after WebSocket connection.
@@ -2613,6 +2662,27 @@ impl AstationClient {
     }
 }
 
+/// What `capture_sent_for_test` kept of the messages handed to the link.
+#[cfg(test)]
+pub(crate) struct SentForTest {
+    rx: mpsc::UnboundedReceiver<OutboundMessage>,
+}
+
+#[cfg(test)]
+impl SentForTest {
+    /// The raw session-family texts (`try_send_wire`'s) handed to the link
+    /// since the last call, in order; other messages are skipped.
+    pub(crate) fn texts(&mut self) -> Vec<String> {
+        let mut texts = Vec::new();
+        while let Ok(outbound) = self.rx.try_recv() {
+            if let AstationMessage::SessionWire(text) = outbound.message {
+                texts.push(text);
+            }
+        }
+        texts
+    }
+}
+
 /// A writer `pause_writer_for_test` held back.
 #[cfg(test)]
 pub(crate) struct PausedWriter {
@@ -2807,6 +2877,32 @@ mod tests {
         assert!(!is_relay_message(r#"{"type":"session","data":{"op":"relay"}}"#));
         assert!(!is_relay_message(r#"{"op":"push_ack"}"#));
         assert!(!is_relay_message("not json"));
+        // Task 33 review m2: nesting past serde's depth is still a relay
+        // message (its top-level `type` read with no recursion), so a
+        // Station page nested that deep reaches the Station link's reader.
+        let deep = format!(
+            r#"{{"type":"relay","op":"control_sync_result","records":{}1{}}}"#,
+            "[".repeat(300),
+            "]".repeat(300)
+        );
+        assert!(is_relay_message(&deep));
+        // With `host.delegated` on, a Station page cut short (or with a
+        // duplicate key) still goes to the Station link; another relay
+        // message that doesn't read doesn't. With it off (as on main, and in
+        // every release build: ruling T33c, N1) neither does: dropped
+        // unread, as main drops them, taking no relay slot.
+        let cut = r#"{"type":"relay","op":"control_sync_result","records":[{"#;
+        let twice = r#"{"type":"relay","type":"relay","op":"heads","feeds":[]}"#;
+        let ack = r#"{"type":"relay","type":"relay","op":"push_ack","acks":[]}"#;
+        assert!(is_relay_message_with(cut, true));
+        assert!(is_relay_message_with(twice, true));
+        assert!(!is_relay_message_with(ack, true));
+        for text in [cut, twice, ack] {
+            assert!(!is_relay_message_with(text, false), "{text}");
+        }
+        assert!(!crate::runtime::test_hooks::host_features().delegated);
+        assert!(!is_relay_message(cut), "the hook off in tests");
+        assert!(!is_relay_message(&format!(r#"{{"type":"session","x":{}1{}}}"#, "[".repeat(300), "]".repeat(300))));
         assert_eq!(session_family(r#"{"type":"relay","op":"push_ack"}"#), None);
     }
 
@@ -3076,6 +3172,43 @@ mod tests {
         assert!(matches!(&got[1], AstationMessage::SessionOversize { id: None, family } if family == "session"), "{got:?}");
         assert!(matches!(&got[2], AstationMessage::Channel(t) if t.contains("\"h2\"")), "{got:?}");
         assert_eq!(got.len(), 3, "nothing else was delivered: {got:?}");
+        server.abort();
+    }
+
+    /// host-work-v1 §11.4 ("Matching a page to its call"): every socket any
+    /// client of the process opens has its own id, while `socket_gen`
+    /// counts one client's sockets and starts again in each new client (a
+    /// reconnect makes a new client).
+    #[tokio::test]
+    async fn every_socket_has_its_own_id() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut open = Vec::new();
+            for _ in 0..3 {
+                let (socket, _) = listener.accept().await.unwrap();
+                open.push(
+                    tokio_tungstenite::accept_async_with_config(
+                        socket,
+                        Some(super::link_ws_config()),
+                    )
+                    .await
+                    .unwrap(),
+                );
+            }
+            std::future::pending::<()>().await;
+        });
+        let url = format!("ws://{address}");
+        let mut a = AstationClient::new();
+        assert_eq!(a.socket_id(), 0, "none opened");
+        a.connect_raw(&url).await.unwrap();
+        let mut b = AstationClient::new();
+        b.connect_raw(&url).await.unwrap();
+        assert_eq!(a.socket_gen(), b.socket_gen(), "each client counts its own");
+        assert_ne!(a.socket_id(), b.socket_id());
+        let first = a.socket_id();
+        a.connect_raw(&url).await.unwrap();
+        assert!(a.socket_id() != first && a.socket_id() != b.socket_id());
         server.abort();
     }
 

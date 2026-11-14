@@ -99,7 +99,9 @@ pub enum VerifiedSigner {
     Manager { device_id: String },
 }
 
-/// Why a record waits.
+/// Why a record waits. [`verify_control`] gives the first three;
+/// [`ControlState::apply`](super::state::ControlState::apply) the others,
+/// for a record that verified (or one it never verifies, on a frozen list).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingReason {
     /// The list has no member `service:<id>` names, or no `add_host` of the
@@ -110,6 +112,15 @@ pub enum PendingReason {
     SignerUnknown,
     /// A host principal's `revoke_seq` is beyond the list's head.
     RevokeNotInList,
+    /// The device list is frozen (R9.4): nothing new applies until it is
+    /// reconciled.
+    ListFrozen,
+    /// A service's `interrupt_running`: the service isn't revoked on this
+    /// host yet (I.5.5 step 3).
+    NotRevoked,
+    /// A host principal's `interrupt_running`: host-work's applied
+    /// device-list `seq` hasn't reached its `revoke_seq` (II.3.1).
+    RevokeNotApplied,
 }
 
 impl PendingReason {
@@ -119,8 +130,21 @@ impl PendingReason {
             PendingReason::PrincipalUnknown => "principal_unknown",
             PendingReason::SignerUnknown => "signer_unknown",
             PendingReason::RevokeNotInList => "revoke_not_in_list",
+            PendingReason::ListFrozen => "list_frozen",
+            PendingReason::NotRevoked => "not_revoked",
+            PendingReason::RevokeNotApplied => "revoke_not_applied",
         }
     }
+
+    /// Every reason, in declaration order.
+    pub const ALL: [PendingReason; 6] = [
+        PendingReason::PrincipalUnknown,
+        PendingReason::SignerUnknown,
+        PendingReason::RevokeNotInList,
+        PendingReason::ListFrozen,
+        PendingReason::NotRevoked,
+        PendingReason::RevokeNotApplied,
+    ];
 }
 
 /// Why a record is refused. A host principal's record other than
@@ -167,6 +191,18 @@ impl RefusalReason {
             RefusalReason::NotARevoke => "not_a_revoke",
         }
     }
+
+    /// Every reason, in declaration order.
+    pub const ALL: [RefusalReason; 8] = [
+        RefusalReason::WrongAccount,
+        RefusalReason::BadSignature,
+        RefusalReason::KeyMismatch,
+        RefusalReason::SignerNotAllowed,
+        RefusalReason::RemovedManager,
+        RefusalReason::HostKeySigned,
+        RefusalReason::NotAService,
+        RefusalReason::NotARevoke,
+    ];
 }
 
 /// Verifies `rec` against `list`, the device list at the head the host

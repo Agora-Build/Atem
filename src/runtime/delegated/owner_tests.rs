@@ -316,7 +316,7 @@ fn task_resolve_refuses_a_v1_task() {
         let os = ManualOs::at(start);
         let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
         alerts_on(&mut rig);
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         rig.bridge.features = HostFeatures::default();
         let v1 = phone_task(&mut rig, &s.phone, "V1_UNKNOWN", start + HOUR);
         alerts_on(&mut rig);

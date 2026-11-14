@@ -234,6 +234,19 @@ pub struct ProjectScopes {
     checked: HashMap<String, Instant>,
 }
 
+/// The key a delegated task's launch project is hashed under in
+/// [`ProjectScopes`] (Task 20 re-review M1, ruling T20c): the project key
+/// itself stays host-private, kept with the task's record (`project`), and
+/// its hashes outlive the task's session, so a grant re-issued under a kid
+/// the task's admission didn't see (a `K` rotation) is still compared.
+/// Never a session id (`ses-…`) or a profile's scope key (`profile:…`).
+pub fn task_project_key(project: &str) -> String {
+    format!(
+        "delegated:{}",
+        atem_client::session::host_work::digest(project.as_bytes())
+    )
+}
+
 /// The kid of a `projects` entry (`h1.<kid>.<hash>`).
 pub fn kid_of(entry: &str) -> Option<&str> {
     entry

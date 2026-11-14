@@ -810,6 +810,7 @@ impl HostConn {
                                 effects: vec![EffectResult {
                                     effect: EffectKind::Interrupt,
                                     result: ApplicationResult::Pending,
+                                    why: None,
                                 }],
                             })
                             .collect(),

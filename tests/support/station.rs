@@ -6,7 +6,9 @@
 //! the host sends is read by its strict reader, from the bytes the host
 //! sent; the fake writes no wire JSON of its own.
 //!
-//! The test drives it, nothing runs in the background. Make it before the
+//! The test drives it: the `FakeStation` itself runs nothing in the
+//! background ([`Pump`] puts it online on a thread of its own, when a test
+//! asks). Make it before the
 //! runtime starts (it takes the host's calls from then on:
 //! [`FakeAstation::station_calls`]), then [`FakeStation::serve`] the
 //! host's link: on a link it hasn't served it announces `heads` (as on
@@ -25,25 +27,26 @@
 //! - `control_sync`: the records after `after` of the account's one feed at
 //!   this Station, ascending, as many as fit in one message (at most 64,
 //!   and the whole message within 256 KiB: the builder's own bounds), with
-//!   the feed's head and the Station's time. A call for a feed that isn't
-//!   the account's at this Station (another origin, a `feed_id` the
-//!   account never had here) is refused, `control_sync_refused` ("One feed
-//!   per account").
-//! - A `control_sync` naming the account's feed from before a reset: §11.4
-//!   doesn't say. Two readings, chosen with [`FakeStation::stale_feed`]:
-//!   [`StaleFeed::Refuse`] (the default), `control_sync_refused`, the
-//!   literal reading of "not its account's feed at this Station": **Atem's
-//!   reading, not confirmed with Astation**; or [`StaleFeed::ServeCurrent`],
-//!   the account's current feed from position 0, as for a call without a
-//!   `feed_id` (the result's `feed_id` is then the only in-band reset
-//!   signal the wire has). A host must handle both until Astation answers.
+//!   the feed's head and the Station's time, the call's `request_id` and
+//!   `after` echoed (wire rule 11). A call for a feed that isn't the
+//!   account's at this Station (another origin, a `feed_id` the account
+//!   never had here) is refused, `control_sync_refused` ("One feed per
+//!   account").
+//! - A `control_sync` naming the account's feed from before a reset is
+//!   refused, `control_sync_refused` (wire rule 11, as Astation decided on
+//!   #164): [`StaleFeed::Refuse`], the default. [`StaleFeed::ServeCurrent`]
+//!   is a Station that breaks the rule, for the host's defences: the
+//!   account's current feed from position 0 (`after: 0` echoed), its
+//!   `feed_id` not the call's, a page the host takes for no answer.
 //! - `membership_fetch`: the device list's entries after `after`, as many
 //!   as fit (at most 64, within 256 KiB), and its head.
 //! - `control_ack`: no answer when the reference [`AckLedger`] counts it;
 //!   `control_ack_refused` when it refuses the ack for its association on
 //!   this link ([`AckRefusal::reply`]); nothing for any other refusal. The
 //!   link's verified association is the host the fake was made for, its
-//!   connection `link-<n>`.
+//!   connection `link-<n>`. An ack is counted as it comes, even while the
+//!   test waits for another call to hold ([`FakeStation::hold_call`];
+//!   [`FakeStation::hold_ack`] holds one).
 //! - [`FakeStation::refuse`]: that call answered with its typed refusal,
 //!   nothing served or counted.
 //! - [`FakeStation::serve_other_account`]: a Station that serves another
@@ -89,17 +92,36 @@ const HEARTBEAT: Duration = Duration::from_secs(30);
 const WAIT: Duration = Duration::from_secs(60);
 
 /// What a `control_sync` naming the account's feed from before a reset
-/// gets: §11.4 doesn't say (the module docs).
+/// gets (the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleFeed {
-    /// `control_sync_refused`: the literal "not its account's feed at this
-    /// Station" (Atem's reading, not confirmed with Astation).
+    /// `control_sync_refused`: wire rule 11, as Astation decided on #164.
     Refuse,
-    /// The account's current feed from position 0 (`after` ignored: a
-    /// cursor belongs to a feed), as for a call with no `feed_id`. The
-    /// result's `feed_id` is then the only in-band reset signal the wire
-    /// has.
+    /// A Station that breaks the rule: the account's current feed from
+    /// position 0 (`after: 0`: a cursor belongs to a feed), as for a call
+    /// with no `feed_id`. The page names another feed than the call, so it
+    /// doesn't answer it (`ControlSyncResult::answers`).
     ServeCurrent,
+}
+
+/// A call of the host's the fake took and hasn't answered
+/// ([`FakeStation::hold_call`]).
+#[derive(Debug)]
+pub struct Held {
+    link: u64,
+    bytes: String,
+}
+
+impl Held {
+    /// The call, as the shared reader reads it.
+    pub fn call(&self) -> Result<ToStation, RelayError> {
+        ToStation::decode(self.bytes.as_bytes())
+    }
+
+    /// The link it came on.
+    pub fn link(&self) -> u64 {
+        self.link
+    }
 }
 
 /// One account at this Station: its device list and its one control feed
@@ -331,15 +353,87 @@ impl FakeStation {
         served
     }
 
-    /// Serves `link` until the host's next call arrived (at most a minute)
-    /// and answers it.
-    pub fn next_call(&mut self, link: u64) -> Result<ToStation, RelayError> {
+    /// Takes `link` as the host's link, answering nothing: `heads` there
+    /// when it is a link not served yet (unless silenced), as
+    /// [`FakeStation::serve`] would.
+    pub fn on_link(&mut self, link: u64) {
         self.attach(link);
-        let (from, bytes) = self
-            .calls
-            .recv_timeout(WAIT)
-            .expect("the host sent no Station call");
-        self.answer(from, bytes)
+    }
+
+    /// [`FakeStation::serve`] on the newest link of the fake Astation (a
+    /// runtime started again connects anew), if it has one.
+    pub fn serve_latest(&mut self) -> Vec<Result<ToStation, RelayError>> {
+        match self.out.latest() {
+            Some(link) => self.serve(link),
+            None => Vec::new(),
+        }
+    }
+
+    /// Serves `link` until the host's next call of any kind (a
+    /// `control_ack` included) arrived (at most a minute) and answers it.
+    pub fn next_call(&mut self, link: u64) -> Result<ToStation, RelayError> {
+        let held = self.hold_next(link, |_| true);
+        self.answer_held(held)
+    }
+
+    /// Serves `link` until the host's next call that isn't a `control_ack`
+    /// arrived (at most a minute) and keeps it unanswered (in
+    /// [`FakeStation::sent`] from now): a Station slow to answer, or one
+    /// whose answer the test writes itself. [`FakeStation::answer_held`]
+    /// answers it later; a call never answered is one the Station never
+    /// answers. The host's acks that come first are counted as they come,
+    /// as a Station does (an ack has no answer): [`FakeStation::hold_ack`]
+    /// holds one.
+    pub fn hold_call(&mut self, link: u64) -> Held {
+        self.hold_next(link, |call| !matches!(call, Ok(ToStation::ControlAck(_))))
+    }
+
+    /// Serves `link` until the host's next `control_ack` arrived (at most
+    /// a minute) and keeps it uncounted, as [`FakeStation::hold_call`]
+    /// keeps a call; the calls that come first are answered as they come.
+    pub fn hold_ack(&mut self, link: u64) -> Held {
+        self.hold_next(link, |call| matches!(call, Ok(ToStation::ControlAck(_))))
+    }
+
+    /// The host's next call on `link` that `held` takes, kept unanswered;
+    /// the ones before it answered as they come.
+    fn hold_next(
+        &mut self,
+        link: u64,
+        held: impl Fn(&Result<ToStation, RelayError>) -> bool,
+    ) -> Held {
+        self.attach(link);
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let (from, bytes) = self
+                .calls
+                .recv_timeout(left)
+                .expect("the host sent no such Station call");
+            if held(&ToStation::decode(bytes.as_bytes())) {
+                self.sent.push(bytes.clone());
+                return Held { link: from, bytes };
+            }
+            let _ = self.answer(from, bytes);
+        }
+    }
+
+    /// The host's `control_ack`s the fake read so far, as the shared reader
+    /// reads them.
+    pub fn acks_sent(&self) -> Vec<ControlAck> {
+        self.sent
+            .iter()
+            .filter_map(|bytes| match ToStation::decode(bytes.as_bytes()) {
+                Ok(ToStation::ControlAck(ack)) => Some(ack),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Answers `held` now, as [`FakeStation::serve`] would answer it then,
+    /// on the link it came on (a link gone since gets nothing).
+    pub fn answer_held(&mut self, held: Held) -> Result<ToStation, RelayError> {
+        self.reply(held.link, &held.bytes)
     }
 
     /// The served account's device list from now on: `log`. A log of the
@@ -524,6 +618,20 @@ impl FakeStation {
         self.stale = mode;
     }
 
+    /// The served account's feed, still empty, is named `feed_id` (a UUID
+    /// v4) instead of the fake's own: a test comparing the host's calls
+    /// with vectors that name a feed. A later [`FakeStation::reset`] mints
+    /// the fake's own ids again (and a call naming this one then is refused
+    /// as an unknown feed's, whatever [`FakeStation::stale_feed`] says).
+    pub fn name_feed(&mut self, feed_id: &str) {
+        let served = self.served_mut();
+        assert!(
+            served.records.is_empty(),
+            "name the feed before it holds a record"
+        );
+        served.feed_id = feed_id.to_owned();
+    }
+
     /// The Station's clock from now on, `ms` (`station_time` in heads and
     /// pages, the ledger's time, records' `issued_at`).
     pub fn station_time(&mut self, ms: u64) {
@@ -680,8 +788,13 @@ impl FakeStation {
 
     /// Reads the host's call and answers it on its link.
     fn answer(&mut self, link: u64, bytes: String) -> Result<ToStation, RelayError> {
+        self.sent.push(bytes.clone());
+        self.reply(link, &bytes)
+    }
+
+    /// Answers the host's call `bytes` (already in `sent`) on `link`.
+    fn reply(&mut self, link: u64, bytes: &str) -> Result<ToStation, RelayError> {
         let call = ToStation::decode(bytes.as_bytes());
-        self.sent.push(bytes);
         let reply = match &call {
             Ok(ToStation::ControlSync(sync)) => Some(self.page(sync)),
             Ok(ToStation::MembershipFetch(fetch)) => Some(self.fetched(*fetch)),
@@ -720,8 +833,12 @@ impl FakeStation {
         let now = self.now();
         fit(entries.len().min(MAX_FEED_RECORDS), |n| {
             ControlSyncResult {
+                // The call's id, and the `after` served from (the call's
+                // own, but for another feed's: wire rule 11).
+                request_id: sync.request_id.clone(),
                 origin: self.origin.clone(),
                 feed_id: served.feed_id.clone(),
+                after,
                 head: served.feed_head(),
                 station_time: now,
                 records: entries[..n].to_vec(),
@@ -770,6 +887,54 @@ impl FakeStation {
                 self.ack_refusals.push(refused);
                 reply
             }
+        }
+    }
+}
+
+/// A fake Station online, as a Station is ([`Pump::start`]): a thread
+/// answers every call of the host's newest link at once and announces
+/// `heads` (on a new link at once unless silenced, then every second of
+/// real time, so the host's 60 seconds without `heads` never lapse on a
+/// slow runner). It stops when dropped.
+pub struct Pump {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Pump {
+    /// `station` online from now on (the test shares it with the thread).
+    pub fn start(station: std::sync::Arc<std::sync::Mutex<FakeStation>>) -> Pump {
+        use std::sync::atomic::Ordering;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut last = Instant::now();
+            while !stopped.load(Ordering::SeqCst) {
+                {
+                    let mut station = station.lock().unwrap_or_else(|e| e.into_inner());
+                    station.serve_latest();
+                    if last.elapsed() >= Duration::from_secs(1) {
+                        if station.link.is_some() {
+                            station.heads_now();
+                        }
+                        last = Instant::now();
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        Pump {
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Pump {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }

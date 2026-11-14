@@ -59,9 +59,30 @@ pub enum Refused {
     /// The sender, its current grant without `notify` and `prompt`, or no
     /// longer covering the task's target (host, session, project).
     NotCovered,
+    /// The sender, a service, while the host's control state can't be read
+    /// (damaged or not loaded): its revocation and hold can't be checked,
+    /// so it is answered `busy`, never let through (ruling T32b). The owner
+    /// still reads.
+    Unchecked,
+    /// The sender, whose current grant covers the task's target only if a
+    /// `projects` comparison that can't be made yet matches (a locked cred
+    /// agent, a hash just asked for: Task 32 review m1): `busy`, never a
+    /// `forbidden` that might not stand.
+    ProjectPending,
     /// The sender, asking `work_interrupt` with no `interrupt` in its
     /// current grant (host-work-v1 §11.2).
     NoInterrupt,
+}
+
+impl Refused {
+    /// The error code it is answered with (host-work-v1 §7): `busy` while
+    /// what decides can't be read yet, else `forbidden`.
+    pub fn code(self) -> &'static str {
+        match self {
+            Refused::Unchecked | Refused::ProjectPending => "busy",
+            _ => "forbidden",
+        }
+    }
 }
 
 /// What [`interaction`] reads besides the caller and the task.
@@ -70,6 +91,10 @@ pub struct Grounds<'a> {
     pub list: &'a Membership,
     /// The sender's control standing (revoked, held, coverage).
     pub standing: &'a SenderStanding,
+    /// The control state couldn't be read (`Feeds` damaged or not loaded):
+    /// `standing` says nothing, so a service sender is [`Refused::Unchecked`]
+    /// (a native's authority comes from the device list alone).
+    pub unchecked: bool,
     /// This host's id (a service grant's `hosts`).
     pub host_id: &'a str,
     /// The time a grant's expiry is compared with: the host's wall clock,
@@ -78,8 +103,9 @@ pub struct Grounds<'a> {
     /// Whether the task's session is in a `projects` scope entry, for a
     /// kid the admission didn't see (an entry it matched at admission
     /// decides without it, `Admission::project_matches`): none while that
-    /// can't be compared (a locked cred agent), which leaves it out of
-    /// scope.
+    /// can't be compared (a locked cred agent, a hash not made yet), which
+    /// leaves it out of scope, as [`Refused::ProjectPending`] when that
+    /// comparison alone decides.
     pub projects: &'a dyn Fn(&str) -> Option<bool>,
 }
 
@@ -127,9 +153,14 @@ fn caller(
 ) -> Result<Caller, Refused> {
     let refused = if caller_principal == task.principal && digest(caller_key) == task.principal_key
     {
-        match sender_authority(caller_key, task, session_id, at, interrupt) {
-            Ok(()) => return Ok(Caller::Sender),
-            Err(why) => why,
+        let service = matches!(task.sender, DelegatedSender::Service { .. });
+        if service && at.unchecked {
+            Refused::Unchecked
+        } else {
+            match sender_authority(caller_key, task, session_id, at, interrupt) {
+                Ok(()) => return Ok(Caller::Sender),
+                Err(why) => why,
+            }
         }
     } else {
         Refused::NotTheSender
@@ -184,16 +215,56 @@ fn sender_authority(
     // A `projects` entry the task's project matched at admission covers it
     // without a hash (I1): the live comparison only for a kid it didn't see.
     let projects = |entry: &str| task.project_matches(entry, at.projects);
-    if !grant.allows(Need::Op(Op::Notify))
-        || !grant.allows(Need::Op(Op::Prompt))
-        || !grant.session_in_scope(at.host_id, session_id, &projects)
-    {
+    if !grant.allows(Need::Op(Op::Notify)) || !grant.allows(Need::Op(Op::Prompt)) {
         return Err(Refused::NotCovered);
     }
+    // Decided on the device list alone, like the ops above: before a
+    // comparison that may still be pending (PR 11), so it is never a `busy`
+    // that turns into `forbidden`.
     if interrupt && !grant.allows(Need::Op(Op::Interrupt)) {
         return Err(Refused::NoInterrupt);
     }
+    if !grant.session_in_scope(at.host_id, session_id, &projects) {
+        // In scope if every comparison still pending matched: not yet
+        // decided, never narrowed (as the start check's `waiting for
+        // unlock`); out of it whatever they say: not covered.
+        let pending_in =
+            grant.session_in_scope(at.host_id, session_id, &|e| projects(e).or(Some(true)));
+        return Err(if pending_in {
+            Refused::ProjectPending
+        } else {
+            Refused::NotCovered
+        });
+    }
     Ok(())
+}
+
+/// Who a caller is to a message's delegated tasks together (`message_query`
+/// and a `message_publish` retry), from what [`interaction`] said of each:
+/// every task must let it through; a refusal that stands (`forbidden`) is
+/// answered whatever the recipients' order, before one that can't be
+/// decided yet (`busy`), so a caller that would be refused anyway isn't
+/// told to retry (Task 32 re-review N3). With none refused: the owner when
+/// any task saw the owner in it.
+pub fn every_caller(
+    each: impl IntoIterator<Item = Result<Caller, Refused>>,
+) -> Result<Caller, Refused> {
+    let mut caller = Caller::Sender;
+    let mut undecided = None;
+    for one in each {
+        match one {
+            Ok(Caller::Owner) => caller = Caller::Owner,
+            Ok(Caller::Sender) => {}
+            Err(refused) if refused.code() == "busy" => {
+                undecided.get_or_insert(refused);
+            }
+            Err(refused) => return Err(refused),
+        }
+    }
+    match undecided {
+        Some(refused) => Err(refused),
+        None => Ok(caller),
+    }
 }
 
 /// A native member holding `control` at the head, under its own key.
@@ -233,6 +304,38 @@ mod tests {
                 ..SenderStanding::default()
             }
         }
+    }
+
+    /// Task 32 re-review N3: a message's tasks answer as one: a definitive
+    /// refusal (`forbidden`) wins over one that can't be decided yet
+    /// (`busy`) whatever the order of the recipients; otherwise the first
+    /// `busy`; with none, the owner when any task saw one.
+    #[test]
+    fn a_definitive_refusal_wins_over_busy_in_either_order() {
+        use Refused::*;
+        let both = |a: Result<Caller, Refused>, b| {
+            (
+                every_caller([a, b]).map_err(Refused::code),
+                every_caller([b, a]).map_err(Refused::code),
+            )
+        };
+        assert_eq!(
+            both(Err(ProjectPending), Err(NotCovered)),
+            (Err("forbidden"), Err("forbidden"))
+        );
+        assert_eq!(
+            both(Err(Unchecked), Err(Revoked)),
+            (Err("forbidden"), Err("forbidden"))
+        );
+        assert_eq!(
+            both(Ok(Caller::Sender), Err(ProjectPending)),
+            (Err("busy"), Err("busy"))
+        );
+        assert_eq!(
+            both(Ok(Caller::Sender), Ok(Caller::Owner)),
+            (Ok(Caller::Owner), Ok(Caller::Owner))
+        );
+        assert_eq!(every_caller([]), Ok(Caller::Sender));
     }
 
     /// A bot expiry a day ahead (the verifier's limit is 90 days).
@@ -312,6 +415,7 @@ mod tests {
             &Grounds {
                 list: &log.log,
                 standing,
+                unchecked: false,
                 host_id: HOST,
                 now_ms,
                 projects: &|_| Some(false),
@@ -355,6 +459,51 @@ mod tests {
         // The owner's id under another key: not the owner.
         assert_eq!(
             ask(&log, "member:dev-phone", "dev-viewer", &bot, &none, 0),
+            Err(Refused::NotTheSender)
+        );
+    }
+
+    /// Ruling T32b (Task 32 review I1): while the control state can't be
+    /// read, a service sender is refused `Unchecked` (`busy`), its standing
+    /// unknown, never let through on an empty one; the owner still reads,
+    /// and a native sender (its authority is the device list's) is
+    /// unchanged.
+    #[test]
+    fn an_unchecked_control_state_refuses_a_service_sender_only() {
+        let log = log(later());
+        let none = SenderStanding::default();
+        let bot = admitted(&log, "service:svc-bot");
+        let phone = admitted(&log, "member:dev-phone");
+        let unchecked = |who: &str, device: &str, task: &Admission| {
+            interaction(
+                who,
+                &key(&log, device),
+                task,
+                S1,
+                &Grounds {
+                    list: &log.log,
+                    standing: &none,
+                    unchecked: true,
+                    host_id: HOST,
+                    now_ms: 0,
+                    projects: &|_| Some(false),
+                },
+            )
+        };
+        assert_eq!(
+            unchecked("service:svc-bot", "svc-bot", &bot),
+            Err(Refused::Unchecked)
+        );
+        assert_eq!(
+            unchecked("member:dev-phone", "dev-phone", &bot),
+            Ok(Caller::Owner)
+        );
+        assert_eq!(
+            unchecked("member:dev-phone", "dev-phone", &phone),
+            Ok(Caller::Sender)
+        );
+        assert_eq!(
+            unchecked("member:dev-viewer", "dev-viewer", &bot),
             Err(Refused::NotTheSender)
         );
     }
@@ -477,6 +626,7 @@ mod tests {
             &Grounds {
                 list: &log.log,
                 standing: &none,
+                unchecked: false,
                 host_id: HOST,
                 now_ms: 0,
                 projects: &|_| None,
@@ -493,6 +643,7 @@ mod tests {
             &Grounds {
                 list: &log.log,
                 standing: &none,
+                unchecked: false,
                 host_id: HOST,
                 now_ms: 0,
                 projects: &|_| None,
@@ -522,6 +673,7 @@ mod tests {
                 &Grounds {
                     list: &log.log,
                     standing: &none,
+                    unchecked: false,
                     host_id: HOST,
                     now_ms: 0,
                     projects: &|_| Some(false),
@@ -576,6 +728,7 @@ mod tests {
         let at = Grounds {
             list: &log.log,
             standing: &revoked,
+            unchecked: false,
             host_id: HOST,
             now_ms: 0,
             projects: &|_| Some(false),
@@ -584,6 +737,50 @@ mod tests {
             interrupter("service:svc-bot", &key(&log, "svc-bot"), &bot, S1, &at),
             Err(Refused::Revoked)
         );
+    }
+
+    /// PR 11 (PR 8's `interrupter` with PR 10's `ProjectPending`): a sender
+    /// asking `work_interrupt` without `interrupt` in its grant is refused
+    /// for good (`forbidden`) even while a `projects` comparison of its task
+    /// is still pending: the missing op is decided on the device list alone,
+    /// so it is checked before the comparison, as `notify` and `prompt` are,
+    /// never a `busy` that turns into `forbidden` once the hash is made. Its
+    /// other requests still wait for the comparison (`busy`).
+    #[test]
+    fn a_missing_interrupt_is_forbidden_before_a_pending_project() {
+        const ENTRY: &str =
+            "h1.0a0b0c0d.8888888888888888888888888888888888888888888888888888888888888888";
+        let mut log = log(later());
+        log.add_service_projects(
+            "svc-proj",
+            &[HOST],
+            Some(&[ENTRY]),
+            None,
+            &["message", "notify", "prompt", "view"],
+            later(),
+        );
+        let task = admitted(&log, "service:svc-proj");
+        let none = SenderStanding::default();
+        let at = Grounds {
+            list: &log.log,
+            standing: &none,
+            unchecked: false,
+            host_id: HOST,
+            now_ms: 0,
+            // The comparison can't be made yet (a hash not made).
+            projects: &|_| None,
+        };
+        let key = key(&log, "svc-proj");
+        assert_eq!(
+            interaction("service:svc-proj", &key, &task, S1, &at).map_err(Refused::code),
+            Err("busy"),
+            "its other requests wait"
+        );
+        assert_eq!(
+            interrupter("service:svc-proj", &key, &task, S1, &at),
+            Err(Refused::NoInterrupt)
+        );
+        assert_eq!(Refused::NoInterrupt.code(), "forbidden");
     }
 
     /// Task 20 review I1: the `projects` entries the task's project matched
@@ -623,6 +820,7 @@ mod tests {
                 &Grounds {
                     list: &log.log,
                     standing: &none,
+                    unchecked: false,
                     host_id: HOST,
                     now_ms: 0,
                     projects,
@@ -631,7 +829,11 @@ mod tests {
         };
         assert_eq!(at(&log, &frozen, &|_| None), Ok(Caller::Sender));
         assert_eq!(at(&log, &frozen, &|_| Some(false)), Ok(Caller::Sender));
-        assert_eq!(at(&log, &live, &|_| None), Err(Refused::NotCovered));
+        // Without frozen entries, a comparison not made yet decides nothing
+        // (`busy`, never a `forbidden` that might not stand: Task 32 review
+        // m1); one made decides.
+        assert_eq!(at(&log, &live, &|_| None), Err(Refused::ProjectPending));
+        assert_eq!(at(&log, &live, &|_| Some(false)), Err(Refused::NotCovered));
         assert_eq!(at(&log, &live, &|e| Some(e == PA)), Ok(Caller::Sender));
         // Narrowed to the other project under that kid.
         log.narrow_service(
@@ -651,6 +853,12 @@ mod tests {
             later(),
         );
         assert_eq!(at(&log, &frozen, &|e| Some(e == PC)), Ok(Caller::Sender));
-        assert_eq!(at(&log, &frozen, &|_| None), Err(Refused::NotCovered));
+        assert_eq!(
+            at(&log, &frozen, &|_| Some(false)),
+            Err(Refused::NotCovered)
+        );
+        // Its hash not made yet (a locked agent, a project just asked for):
+        // `busy` (m1).
+        assert_eq!(at(&log, &frozen, &|_| None), Err(Refused::ProjectPending));
     }
 }

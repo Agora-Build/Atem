@@ -333,7 +333,7 @@ fn alert_list_answers_native_control_only() {
         let os = ManualOs::at(start);
         let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
         alerts_on(&mut rig);
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let template = phone_task(&mut rig, &s.phone, "ALERT_TEMPLATE", start + HOUR);
         let template = stored_record(&rig, &template);
         let task = unknown_outcomes(&rig, &template, PHONE, 1).remove(0);
@@ -460,7 +460,7 @@ fn sixty_four_from_one_sender_refuse_its_new_tasks() {
         let os = ManualOs::at(start);
         let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
         alerts_on(&mut rig);
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let template = phone_task(&mut rig, &s.phone, "CAP_TEMPLATE", start + HOUR);
         let template = stored_record(&rig, &template);
         let mut seeded = unknown_outcomes(&rig, &template, PHONE, 63);
@@ -542,7 +542,7 @@ fn two_fifty_six_refuse_every_remote_sender_not_local() {
         let os = ManualOs::at(start);
         let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
         alerts_on(&mut rig);
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let template = phone_task(&mut rig, &s.phone, "CAP_TEMPLATE", start + HOUR);
         let template = stored_record(&rig, &template);
         let mut seeded = Vec::new();
@@ -959,7 +959,7 @@ fn a_delegated_task_whose_receipt_is_gone_alerts_outcome_could_not_be_establishe
         let os = ManualOs::at(start);
         let (phone, _) = delegated(&mut rig, root, &os, true);
         alerts_on(&mut rig);
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let task = phone_task(&mut rig, &phone, "RECEIPT_GONE", start + HOUR);
         // Submitted on an attempt the session host no longer has.
         let mut record = stored_record(&rig, &task);

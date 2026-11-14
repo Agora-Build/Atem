@@ -12,8 +12,10 @@
 //! [`record`] parses and builds the object: what holds for the record
 //! alone. [`verify`] checks who may sign which action, against which key of
 //! the device list (I.5.4). [`state`] applies it to a host's control state
-//! and gives its per-effect application results (I.5.5, I.5.8); carrying
-//! out the actions is the host's. [`relay`] is the wire of a host's calls to
+//! and gives its per-effect application results and why one isn't in force
+//! (I.5.5, I.5.8), what is in force per principal, and the state's parts per
+//! principal, as a host stores them; carrying out the actions is the
+//! host's. [`relay`] is the wire of a host's calls to
 //! its Station (I.5.8): the feed, its heads, the host's acknowledgments of
 //! per-effect results, and its own device-list fetch. [`ledger`] is the
 //! Station's reference side of those acknowledgments: what each covered host
@@ -37,11 +39,11 @@ pub use record::{
 pub use relay::{
     AckResult, CallRefused, ControlAck, ControlSync, ControlSyncResult, EntryRef, FeedEntry,
     FeedHead, Heads, MembershipFetch, MembershipFetchResult, RefusalCode, RefusedCall, RelayError,
-    ToHost, ToStation,
+    SyncMismatch, ToHost, ToStation,
 };
 pub use state::{
-    ApplicationResult, Applied, ControlState, EffectKind, EffectResult, FeedPos, HostAction,
-    Transition,
+    ApplicationResult, Applied, ControlState, Coverage, EffectKind, EffectResult, EffectWhy,
+    FeedPos, HostAction, LoadedParts, MAX_RECORD_IDS, MAX_WHY_BYTES, Standing, Transition, Why,
 };
 pub use verify::{
     ControlCheck, PendingReason, RefusalReason, VerifiedControl, VerifiedSigner, verify_control,

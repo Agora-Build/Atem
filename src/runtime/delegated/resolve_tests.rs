@@ -74,7 +74,7 @@ fn resolved_status(req: &hw::Request, reply: Result<ResultBody, HostWorkError>) 
 /// `outcome_unknown` (`agent exited`) before any ran: the host's own
 /// Station's gate closed first, so none is dispatched. Their ids.
 fn phone_unknowns(rig: &mut LocalRig, s: &Senders, n: usize, expires_at: u64) -> Vec<String> {
-    rig.bridge.start_view().gates = Gates::closed_until_feeds();
+    rig.bridge.start_view().gates = Gates::default();
     let template = phone_task(rig, &s.phone, "RESOLVE_TEMPLATE", expires_at);
     let template = stored_record(rig, &template);
     unknown_outcomes(rig, &template, PHONE, n)
@@ -484,7 +484,7 @@ fn resolve_of_a_v1_task_is_forbidden() {
         let os = ManualOs::at(start);
         let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
         alerts_on(&mut rig);
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         // The phone's v1 task: accepted with the hook off.
         rig.bridge.features = HostFeatures::default();
         let v1 = phone_task(&mut rig, &s.phone, "V1_UNKNOWN", start + HOUR);
@@ -1006,7 +1006,7 @@ fn work_resolve_needs_current_authority_and_the_owner_resolves_a_revoked_senders
         let os = ManualOs::at(start);
         let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
         alerts_on(&mut rig);
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let template = bot_task(&mut rig, &s, "BOT_TEMPLATE", start + HOUR);
         let template = stored_record(&rig, &template);
         let tasks = unknown_outcomes(&rig, &template, BOT, 3);
@@ -1058,5 +1058,97 @@ fn work_resolve_needs_current_authority_and_the_owner_resolves_a_revoked_senders
         let by_phone = resolved_status(&req, answer);
         assert_eq!(by_phone.resolved.as_ref().unwrap().by, PHONE);
         assert_eq!(stored_record(&rig, &tasks[0]).status, first);
+    });
+}
+
+/// PR 11 (PR 7's and PR 8's requests under PR 10's ruling T20c, Task 32
+/// review m1): an unresolved unknown outcome's record closes a day after
+/// its deadline, alert kept, so a start doesn't register its launch
+/// project. Like `work_query`, the bot's `work_interrupt` and `work_resolve`
+/// of it register that project when they ask: while its hash under the
+/// grant's new kid isn't made the bot is `busy`, never a `forbidden` that
+/// would stand, and then answered (`not running`; resolved `failed`).
+#[test]
+fn a_resolve_or_interrupt_whose_tasks_project_isnt_hashed_yet_is_busy_until_it_is() {
+    const KID_A: &str = "0e0f0a1a";
+    const PROJECT_A: &str =
+        "h1.0e0f0a1a.6666666666666666666666666666666666666666666666666666666666666666";
+    const KID_B: &str = "0e0f0a1b";
+    const PROJECT_B: &str =
+        "h1.0e0f0a1b.7777777777777777777777777777777777777777777777777777777777777777";
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let agent = TableAgent::new(true);
+        let mut s =
+            with_project_bot(&mut rig, root, &os, start + 3 * HOUR, &[PROJECT], &agent).await;
+        rig.bridge.start_view().gates = Gates::default();
+        let template = bot_task(&mut rig, &s, "PROJECTS_UNKNOWN", start + HOUR);
+        let template = stored_record(&rig, &template);
+        let [unknown] = unknown_outcomes(&rig, &template, BOT, 1)
+            .try_into()
+            .unwrap();
+        let session = rig.sessions.remove(&rig.sid).unwrap();
+        let _ = session.stop();
+        let bot = s.bot.clone();
+        // As a start finds it once its record closed: its project not
+        // registered, its session gone; the grant re-issued under a kid its
+        // admission didn't see.
+        let regrant = |rig: &mut LocalRig, s: &mut Senders, kid: &str, project: &str| {
+            rig.bridge
+                .projects
+                .forget(&crate::runtime::project_scope::task_project_key(
+                    RIG_PROJECT,
+                ));
+            agent
+                .table
+                .lock()
+                .unwrap()
+                .insert((RIG_PROJECT.into(), kid.into()), project.into());
+            let change = s.log.set_service(
+                "svc-bot",
+                &ServiceScope::new(["host"]).projects(Some([project])).ops([
+                    "interrupt",
+                    "message",
+                    "notify",
+                    "prompt",
+                    "stop",
+                ]),
+                start + 3 * HOUR,
+            );
+            carry(rig, &s.log, change);
+        };
+        let until_answered =
+            async |rig: &mut LocalRig,
+                   ask: &dyn Fn(&mut LocalRig) -> Result<ResultBody, HostWorkError>| {
+                let deadline = Instant::now() + Duration::from_secs(60);
+                let mut asked = ask(rig);
+                assert_eq!(asked, busy(), "not yet hashed");
+                while asked.is_err() && Instant::now() < deadline {
+                    assert_eq!(asked, busy(), "busy until hashed, never forbidden");
+                    passes(rig, 1);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    asked = ask(rig);
+                }
+                asked
+            };
+        passes(&mut rig, 3);
+        regrant(&mut rig, &mut s, KID_A, PROJECT_A);
+        let interrupted = until_answered(&mut rig, &|rig: &mut LocalRig| {
+            ask(rig, &bot, Q::Interrupt(&unknown))
+        })
+        .await;
+        let interrupted = status(interrupted);
+        assert_eq!(
+            (interrupted.state, interrupted.detail.as_str()),
+            (WorkState::OutcomeUnknown, "not running")
+        );
+        regrant(&mut rig, &mut s, KID_B, PROJECT_B);
+        let resolved = until_answered(&mut rig, &|rig: &mut LocalRig| {
+            resolve_by(rig, &bot, &unknown, &failure("given up")).1
+        })
+        .await;
+        assert_eq!(status(resolved).state, WorkState::Failed);
     });
 }

@@ -9,18 +9,30 @@
 //! it), Astation's local `:8080` (which proxies the calls to the Station),
 //! or a routed relay link with no Astation (§R9.7b). Its Station is the
 //! selected Station ([`StationLink::origin`]). A new link generation starts
-//! afresh: nothing in flight carries over, and a refusal's backoff ends; the
-//! fetch's pacing carries over ([`DeviceListFetch::next_generation`]).
+//! afresh: the fetch in flight doesn't carry over, a refusal's backoff
+//! ends, and the live `control_sync` is retired by its id (a page that
+//! still carries it is drained: [`FeedSync::on_link`], ruling C1b-a); the
+//! fetch's pacing carries over ([`DeviceListFetch::next_generation`]), and
+//! so does the sync's.
 //!
-//! Here so far: the device list's fetch ([`super::fetch`]), its part of the
-//! revocation gate ([`Station::list_fetch`]) and the refusals' runtime.log
-//! lines (Decision 20: at most one an hour per kind).
-//! The feeds (`control_sync`, its pages, the gates, `atem status`) are PR
-//! 10's: their messages are read and dropped.
+//! Here: the device list's fetch ([`super::fetch`]) and its part of the
+//! revocation gate ([`Station::list_fetch`]), the sync of the host's own
+//! Station's control feed and the gate's feed part ([`super::sync`]: the
+//! bridge hands it `heads` and pages, [`Inbound::Heads`] and
+//! [`Inbound::Page`], with the feed store and the clock), and the
+//! refusals: every gate the link serves closes ([`FeedSync::on_refused`])
+//! and a runtime.log line goes at most once an hour per kind (Decision 20).
+//! A message the reader refuses is counted and dropped, unless it is a
+//! `control_sync_result` (peeked leniently, so a page that isn't strict
+//! JSON is still known as one): that page is a Station fault the sync
+//! answers ([`Inbound::Page`] with the reader's error).
 use super::fetch::{DeviceListFetch, FetchApply};
 use super::start::StationFetch;
+use super::sync::FeedSync;
 use atem_client::SignedObject;
-use atem_client::control::{MembershipFetch, RefusedCall, ToHost};
+use atem_client::control::{
+    ControlSync, ControlSyncResult, Heads, MembershipFetch, RefusedCall, RelayError, ToHost,
+};
 use atem_client::membership::Head;
 use serde_json::{Value, json};
 
@@ -53,6 +65,11 @@ impl LinkKind {
 pub struct StationLink {
     /// The link generation (the App's `astation_link_gen`).
     pub link_gen: u64,
+    /// The socket it runs on (`AstationClient::socket_id`): captured with
+    /// each `control_sync`, which a page answers only on the generation and
+    /// socket it went on (host-work-v1 §11.4, "Matching a page to its
+    /// call"; ruling C1b-a).
+    pub socket: u64,
     pub kind: LinkKind,
     /// The selected Station's origin (`station_route::destination`,
     /// normalized by `normalize_relay`), whatever the link: Astation's
@@ -65,12 +82,37 @@ pub struct StationLink {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inbound {
     Nothing,
-    /// Send this call on the link.
-    Send(MembershipFetch),
     /// Apply these entries as any carriage (`HostBridge::carry`, then
     /// `R9Host::carried`), then [`DeviceListFetch::carried`] with where the
     /// carriage stopped at a deferred entry.
     Carry(Vec<SignedObject>),
+    /// `heads`: the fetch's call, if one is due ([`DeviceListFetch`] took
+    /// the announced list head already); the heads for the feed sync
+    /// ([`FeedSync::on_heads`], with the clock and the feed store).
+    Heads(Heads, Option<MembershipFetch>),
+    /// A `control_sync_result`, or a message that was one and the reader
+    /// refused: for [`FeedSync::on_page`].
+    Page(Result<ControlSyncResult, RelayError>),
+    /// `control_ack_refused`: the gates closed ([`FeedSync::on_refused`]);
+    /// for the acknowledgments' book too (`AckBook::on_refused`).
+    AckRefused,
+}
+
+/// A call the host sends its Station on the link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Call {
+    Fetch(MembershipFetch),
+    Sync(ControlSync),
+}
+
+impl Call {
+    /// The wire message (the shared builder's).
+    pub fn to_json(&self) -> Option<Value> {
+        match self {
+            Call::Fetch(fetch) => fetch.to_json().ok(),
+            Call::Sync(sync) => sync.to_json().ok(),
+        }
+    }
 }
 
 /// The host's side of its Station (the module docs give the rules).
@@ -78,6 +120,8 @@ pub enum Inbound {
 pub struct Station {
     link: Option<StationLink>,
     pub fetch: DeviceListFetch,
+    /// The sync of the host's own Station's control feed.
+    pub feed: FeedSync,
     /// The host's monotonic clock at the last tick (ms).
     now: u64,
     /// `heads` read.
@@ -113,37 +157,40 @@ impl Station {
     }
 
     /// The link as the App has it now (`link_gen`: the r9 link generation, none
-    /// while it is down): a new generation starts afresh (the fetch's pacing
-    /// kept), its kind and origin taken then; the kind is followed within a
-    /// generation (a routed link Astation authenticates becomes a relay
-    /// link).
+    /// while it is down; `socket`: the socket it runs on): a new generation
+    /// starts afresh (the fetch's pacing kept), its kind and origin taken
+    /// then; the kind is followed within a generation (a routed link
+    /// Astation authenticates becomes a relay link).
     pub fn sync_link(
         &mut self,
         link_gen: Option<u64>,
+        socket: u64,
         kind: impl FnOnce() -> LinkKind,
         origin: impl FnOnce() -> Option<String>,
     ) {
         let Some(link_gen) = link_gen else {
             if self.link.take().is_some() {
                 self.fetch = self.fetch.next_generation();
+                self.feed.on_link_down();
             }
             return;
         };
         match self.link.as_mut() {
-            Some(link) if link.link_gen == link_gen => link.kind = kind(),
+            Some(link) if link.link_gen == link_gen && link.socket == socket => link.kind = kind(),
             _ => {
                 self.link = Some(StationLink {
                     link_gen,
+                    socket,
                     kind: kind(),
                     origin: origin(),
                 });
                 self.fetch = self.fetch.next_generation();
+                self.feed.on_link(self.link.as_ref());
             }
         }
     }
 
-    /// The link now (the feeds read its origin, PR 10).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The link now (the feeds read its origin).
     pub fn link(&self) -> Option<&StationLink> {
         self.link.as_ref()
     }
@@ -186,9 +233,9 @@ impl Station {
         match ToHost::decode(bytes.as_bytes()) {
             Ok(ToHost::Heads(heads)) => {
                 self.heads += 1;
-                applied
-                    .and_then(|applied| self.fetch.on_heads(&heads.membership, &applied, deferred))
-                    .map_or(Inbound::Nothing, Inbound::Send)
+                let fetch = applied
+                    .and_then(|applied| self.fetch.on_heads(&heads.membership, &applied, deferred));
+                Inbound::Heads(heads, fetch)
             }
             Ok(ToHost::MembershipFetchResult(result)) => match self.fetch.on_result(result) {
                 FetchApply::Carry(entries) => Inbound::Carry(entries),
@@ -199,16 +246,18 @@ impl Station {
                 self.fetch.on_refused();
                 Inbound::Nothing
             }
-            // Calls this host makes with the feeds (PR 10).
             Ok(ToHost::ControlSyncRefused(_)) => {
                 self.refused(RefusedCall::ControlSync);
                 Inbound::Nothing
             }
             Ok(ToHost::ControlAckRefused(_)) => {
                 self.refused(RefusedCall::ControlAck);
-                Inbound::Nothing
+                Inbound::AckRefused
             }
-            Ok(ToHost::ControlSyncResult(_)) => Inbound::Nothing,
+            Ok(ToHost::ControlSyncResult(page)) => Inbound::Page(Ok(page)),
+            // A page the reader refused as a whole: a Station fault, for
+            // the sync to answer (§11.4).
+            Err(e) if is_page(bytes) => Inbound::Page(Err(e)),
             Err(e) => {
                 // Counted, never its content.
                 self.unread += 1;
@@ -237,13 +286,16 @@ impl Station {
                 "control_ack": self.refusals[2],
             },
             "unread": self.unread,
+            "feed": self.feed.dump(),
         })
     }
 
-    /// A refusal of `call` on this link (Decision 20): counted, and a
-    /// runtime.log line at most once an hour per kind. It names no request
-    /// and completes none.
+    /// A refusal of `call` on this link (Decision 20): counted, every gate
+    /// the link serves closes (the feed sync's part, whatever the call),
+    /// and a runtime.log line at most once an hour per kind. It names no
+    /// request and completes none.
     fn refused(&mut self, call: RefusedCall) {
+        self.feed.on_refused(call);
         let i = slot(call);
         self.refusals[i] += 1;
         let due = self.logged[i]
@@ -256,6 +308,17 @@ impl Station {
             );
         }
     }
+}
+
+/// Whether `bytes` is a `control_sync_result`, its top-level names read
+/// with no tree (`peek`: any `op` occurrence, whatever else it holds: a
+/// lone surrogate, a fraction, a duplicate key, nesting past a parser's
+/// depth, a page cut short), so a page the strict reader refuses is still
+/// known as a page (Task 30 review 5, Task 33 review m2).
+fn is_page(bytes: &str) -> bool {
+    crate::session_protocol::r9::peek::top_level_strings(bytes, "op")
+        .iter()
+        .any(|op| op == atem_client::control::relay::op::CONTROL_SYNC_RESULT)
 }
 
 #[cfg(test)]
@@ -292,9 +355,19 @@ mod tests {
         .to_string()
     }
 
+    /// What a `heads` gave the fetch: its call, if one went.
+    fn fetched(inbound: Inbound) -> Option<MembershipFetch> {
+        match inbound {
+            Inbound::Heads(_, call) => call,
+            Inbound::Nothing => None,
+            other => panic!("not a heads: {other:?}"),
+        }
+    }
+
     fn up(station: &mut Station, link_gen: u64) {
         station.sync_link(
             Some(link_gen),
+            1,
             || LinkKind::Routed,
             || Some("https://s.test".into()),
         );
@@ -305,19 +378,19 @@ mod tests {
     #[test]
     fn a_new_link_generation_starts_afresh() {
         let mut s = Station::new();
-        assert_eq!(s.receive(&heads(5), Some(head(3)), None), Inbound::Nothing);
+        assert_eq!(fetched(s.receive(&heads(5), Some(head(3)), None)), None);
         up(&mut s, 1);
         assert_eq!(
-            s.receive(&heads(5), Some(head(3)), None),
-            Inbound::Send(MembershipFetch { after: 3 })
+            fetched(s.receive(&heads(5), Some(head(3)), None)),
+            Some(MembershipFetch { after: 3 })
         );
-        s.sync_link(Some(1), || LinkKind::Relay, || panic!("not asked again"));
+        s.sync_link(Some(1), 1, || LinkKind::Relay, || panic!("not asked again"));
         assert_eq!(s.link().unwrap().kind, LinkKind::Relay);
         assert_eq!(s.dump()["fetch"]["in_flight"], 3, "the same generation");
         up(&mut s, 2);
         assert_eq!(s.dump()["fetch"]["in_flight"], Value::Null);
         assert_eq!(s.link().unwrap().origin.as_deref(), Some("https://s.test"));
-        s.sync_link(None, || LinkKind::Relay, || None);
+        s.sync_link(None, 0, || LinkKind::Relay, || None);
         assert!(s.link().is_none());
     }
 
@@ -327,7 +400,7 @@ mod tests {
     fn messages_are_read_strictly() {
         let mut s = Station::new();
         up(&mut s, 1);
-        assert_eq!(s.receive(&heads(5), None, None), Inbound::Nothing);
+        assert_eq!(fetched(s.receive(&heads(5), None, None)), None);
         assert_eq!(s.dump()["heads"], 1);
         let result = MembershipFetchResult {
             head: head(5),
@@ -337,7 +410,7 @@ mod tests {
         .unwrap()
         .to_string();
         assert_eq!(s.receive(&result, Some(head(3)), None), Inbound::Nothing);
-        s.receive(&heads(5), Some(head(3)), None);
+        fetched(s.receive(&heads(5), Some(head(3)), None));
         assert_eq!(
             s.receive(&result, Some(head(3)), None),
             Inbound::Carry(Vec::new())
@@ -354,17 +427,19 @@ mod tests {
         let mut s = Station::new();
         up(&mut s, 1);
         s.tick(1_000, Some(head(3)), None);
-        s.receive(&heads(5), Some(head(3)), None);
+        fetched(s.receive(&heads(5), Some(head(3)), None));
         for call in [
             RefusedCall::ControlSync,
             RefusedCall::ControlAck,
             RefusedCall::MembershipFetch,
             RefusedCall::MembershipFetch,
         ] {
-            assert_eq!(
-                s.receive(&refused(call), Some(head(3)), None),
-                Inbound::Nothing
-            );
+            // An ack's refusal is for the acknowledgments' book too.
+            let expected = match call {
+                RefusedCall::ControlAck => Inbound::AckRefused,
+                _ => Inbound::Nothing,
+            };
+            assert_eq!(s.receive(&refused(call), Some(head(3)), None), expected);
         }
         let dump = s.dump();
         assert_eq!(dump["refusals"]["control_sync"], 1);
@@ -389,8 +464,8 @@ mod tests {
         let mut s = Station::new();
         up(&mut s, 1);
         s.tick(10_000, Some(head(3)), None);
-        let fetch = |after| Inbound::Send(MembershipFetch { after });
-        assert_eq!(s.receive(&heads(5), Some(head(3)), None), fetch(3));
+        let fetch = |after| Some(MembershipFetch { after });
+        assert_eq!(fetched(s.receive(&heads(5), Some(head(3)), None)), fetch(3));
         let junk = MembershipFetchResult {
             head: head(5),
             entries: Vec::new(),
@@ -405,16 +480,16 @@ mod tests {
         assert_eq!(s.fetch.carried(&head(3), &head(3), None), None, "a stall");
         up(&mut s, 2);
         s.tick(10_000 + STALL_PAUSE_MS - 1, Some(head(3)), None);
-        assert_eq!(s.receive(&heads(5), Some(head(3)), None), Inbound::Nothing);
+        assert_eq!(fetched(s.receive(&heads(5), Some(head(3)), None)), None);
         s.tick(10_000 + STALL_PAUSE_MS, Some(head(3)), None);
-        assert_eq!(s.receive(&heads(5), Some(head(3)), None), fetch(3));
+        assert_eq!(fetched(s.receive(&heads(5), Some(head(3)), None)), fetch(3));
         // Down and up again at once: nothing in flight, the pace kept.
-        s.sync_link(None, || LinkKind::Relay, || None);
+        s.sync_link(None, 0, || LinkKind::Relay, || None);
         up(&mut s, 3);
         assert_eq!(s.dump()["fetch"]["in_flight"], Value::Null);
-        assert_eq!(s.receive(&heads(5), Some(head(3)), None), Inbound::Nothing);
+        assert_eq!(fetched(s.receive(&heads(5), Some(head(3)), None)), None);
         s.tick(10_000 + STALL_PAUSE_MS + HEADS_PACE_MS, Some(head(3)), None);
-        assert_eq!(s.receive(&heads(5), Some(head(3)), None), fetch(3));
+        assert_eq!(fetched(s.receive(&heads(5), Some(head(3)), None)), fetch(3));
     }
 
     /// I1: a Station that sends `heads` and junk results, many in one pass
@@ -433,12 +508,79 @@ mod tests {
         .to_string();
         let mut carriages = 0;
         for _ in 0..32 {
-            s.receive(&heads(9), Some(head(3)), None);
+            fetched(s.receive(&heads(9), Some(head(3)), None));
             if let Inbound::Carry(_) = s.receive(&junk, Some(head(3)), None) {
                 carriages += 1;
                 s.fetch.carried(&head(3), &head(3), None);
             }
         }
         assert_eq!(carriages, 1);
+    }
+
+    /// Decision 20: a refusal of any kind closes the gates the link serves
+    /// (the feed sync's part), and a `membership_fetch_refused` leaves the
+    /// fetch's announced head and stop as they were (Task 31 review).
+    #[test]
+    fn every_refusal_closes_the_links_feed_gate() {
+        for call in [
+            RefusedCall::ControlSync,
+            RefusedCall::MembershipFetch,
+            RefusedCall::ControlAck,
+        ] {
+            let mut s = Station::new();
+            up(&mut s, 1);
+            s.tick(1_000, Some(head(3)), None);
+            fetched(s.receive(&heads(5), Some(head(3)), None));
+            let part = s.fetch.part();
+            s.receive(&refused(call), Some(head(3)), None);
+            assert_eq!(
+                s.feed.closed(),
+                Some(crate::runtime::delegated::sync::Closed::Refused),
+                "{call:?}"
+            );
+            assert_eq!(s.fetch.part(), part, "{call:?}");
+        }
+    }
+
+    /// §11.4: a `control_sync_result` the reader refuses as a whole (here a
+    /// lone surrogate, a duplicate key) is still known as a page, for the
+    /// sync to answer as a Station fault; any other message it refuses is
+    /// counted and dropped.
+    #[test]
+    fn a_page_the_reader_refuses_is_still_a_page() {
+        let mut s = Station::new();
+        up(&mut s, 1);
+        for bytes in [
+            r#"{"type":"relay","op":"control_sync_result","origin":"https://s.test","feed_id":"\ud800","head":0,"station_time":1,"records":[]}"#,
+            r#"{"type":"relay","op":"control_sync_result","origin":"https://s.test","origin":"https://s.test","feed_id":"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b","head":0,"station_time":1,"records":[]}"#,
+            r#"{"type":"relay","op":"control_sync_result","origin":"https://s.test","feed_id":"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b","head":0.5,"station_time":1,"records":[]}"#,
+        ] {
+            assert_eq!(
+                s.receive(bytes, Some(head(3)), None),
+                Inbound::Page(Err(RelayError::NotStrict)),
+                "{bytes}"
+            );
+        }
+        // Task 33 review m2: nesting past the parsers' depth, and a
+        // duplicate `op` key, are pages too.
+        let deep = format!(
+            r#"{{"type":"relay","op":"control_sync_result","records":[{{"feed_seq":1,"record":{}1{}}}]}}"#,
+            "[".repeat(300),
+            "]".repeat(300)
+        );
+        let twice = r#"{"type":"relay","op":"heads","op":"control_sync_result","records":[]}"#;
+        for bytes in [deep.as_str(), twice] {
+            assert_eq!(
+                s.receive(bytes, Some(head(3)), None),
+                Inbound::Page(Err(RelayError::NotStrict)),
+                "{bytes}"
+            );
+        }
+        assert_eq!(s.dump()["unread"], 0);
+        let page = r#"{"type":"relay","op":"control_sync_result","origin":"https://s.test","feed_id":"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b","head":0,"station_time":1,"records":[],"extra":1}"#;
+        assert_eq!(
+            s.receive(page, Some(head(3)), None),
+            Inbound::Page(Err(RelayError::UnknownField))
+        );
     }
 }

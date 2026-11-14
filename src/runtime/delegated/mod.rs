@@ -17,18 +17,27 @@
 //! answers the delegated ops it doesn't serve ([`request`]), the owner's
 //! alerts and the capacity limits on unknown outcomes ([`alerts`], I.4.6),
 //! the resolution of an unknown outcome ([`resolve`], I.4.6), §11.6's
-//! detail texts ([`details`]), and the host's Station link with its own
-//! device-list fetch ([`station`], [`fetch`], I.5.8).
+//! detail texts ([`details`]), the host's Station link with its own
+//! device-list fetch ([`station`], [`fetch`], I.5.8), and the control feed
+//! store ([`feeds`], I.5.4, I.5.5: records applied with the cursor in one
+//! transaction, the senders' standings), what the records do to the
+//! tasks, in that transaction ([`effects`], I.5.5 to I.5.7), and the
+//! acknowledgments of their results to the host's Station, written there
+//! too ([`acks`], I.5.8, §11.4).
+pub mod acks;
 pub mod alerts;
 pub mod attempts;
 pub mod authority;
 pub mod details;
+pub mod effects;
+pub mod feeds;
 pub mod fetch;
 pub mod gate;
 pub mod intents;
 pub mod resolve;
 pub mod start;
 pub mod station;
+pub mod sync;
 
 use crate::runtime::test_hooks::HostFeatures;
 use crate::session_protocol::r9::HostWorkError;
@@ -72,6 +81,13 @@ pub enum SenderClass {
     /// Host-work v1's (§4): browser grants, services no feed covers,
     /// `local`, and everyone while `host.delegated` is off.
     V1,
+    /// A service in effect on the list while the host's control state
+    /// can't be read (`feeds::Feeds` damaged or not loaded): whether a feed
+    /// covers it, revoked it or holds it isn't known, so its requests are
+    /// `busy` and nothing is stored; never v1, which a revoke or hold
+    /// wouldn't stop (ruling T32b: damage loosens nothing). `classify`
+    /// never gives it: the bridge does (`HostBridge::sender_class`).
+    Unchecked,
 }
 
 /// What the host's control state says of a principal: revoked (by which
@@ -89,8 +105,10 @@ pub trait ControlView {
     fn standing(&self, principal: &str) -> SenderStanding;
 }
 
-/// The view while the host syncs no feed (until the feeds exist): nobody is
-/// revoked, held or covered.
+/// The view while the host's control feeds aren't loaded, or don't read
+/// ([`feeds::Feeds`]): nobody is revoked, held or covered. The bridge never
+/// lets that loosen anything: a service is `SenderClass::Unchecked` then
+/// (`busy`), and no delegated task starts (`StartView::controls_damaged`).
 pub struct NoFeeds;
 
 impl ControlView for NoFeeds {
@@ -255,8 +273,7 @@ pub fn classify(
             device_id: device_id.to_owned(),
         });
     }
-    if let Some(device_id) = principal.strip_prefix("service:")
-        && matches!(kind(device_id), Some(MemberKind::Service { .. }))
+    if let Some(device_id) = active_service(principal, list)
         && let Some(feed) = controls.standing(principal).coverage
     {
         return SenderClass::Delegated(DelegatedSender::Service {
@@ -265,6 +282,16 @@ pub fn classify(
         });
     }
     SenderClass::V1
+}
+
+/// The device id of `principal` when it is `service:<id>` and a service in
+/// effect on `list`: whom a feed may cover (`classify`'s service test).
+pub fn active_service<'p>(principal: &'p str, list: &Membership) -> Option<&'p str> {
+    let device_id = principal.strip_prefix("service:")?;
+    list.member(device_id)
+        .filter(|m| m.status == MemberStatus::Active)
+        .filter(|m| matches!(m.member.kind, MemberKind::Service { .. }))
+        .map(|_| device_id)
 }
 
 /// What the bridge answers a `host.delegated` or `host.alerts` op that
@@ -432,7 +459,7 @@ mod tests {
     }
 
     /// Design I.1.3: a service is delegated only while a feed this host
-    /// syncs covers it (none until the feeds exist: [`NoFeeds`]); browser
+    /// syncs covers it (none while the feeds aren't loaded: [`NoFeeds`]); browser
     /// grants, `local`, host senders (`host.senders` is never on in step 4)
     /// and anything else keep v1, covered or not.
     #[test]

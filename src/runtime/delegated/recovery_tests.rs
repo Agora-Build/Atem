@@ -736,3 +736,282 @@ fn with_the_hook_off_a_withdrawn_attempts_task_is_blocked_never_run() {
         assert_eq!(attempts(&rig, &waiting).len(), 1);
     });
 }
+
+/// PR 10 (Task 21 review m8; design I.6.2 step 4): the control state the
+/// feeds committed before a crash is read into the start view before the
+/// start's recovery: the bot, revoked by a record applied while its task
+/// waited for its gate, has that task cancelled `sender revoked` at the
+/// recovery, never back to `queued`, and it never runs.
+#[test]
+fn the_stored_control_state_is_read_before_the_recovery() {
+    use atem_client::control::ControlAction;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        rig.bridge.start_view().gates = Gates::default();
+        let task = bot_task(&mut rig, &s, "REVOKED_BEFORE_THE_CRASH", start + 2 * HOUR);
+        blocked(&mut rig, &task, details::REVOCATIONS_NOT_YET_CHECKED).await;
+        commit_bot_records(
+            &rig,
+            &s.log,
+            &[
+                ControlAction::Cover,
+                ControlAction::Revoke {
+                    interrupt_running: false,
+                },
+            ],
+        );
+        let steps = restart(&mut rig, root, &os, false, true);
+        let cancelled = Some((WorkState::Cancelled, details::SENDER_REVOKED.to_string()));
+        assert_eq!(reconciled(&steps, &task), cancelled);
+        assert!(rig.bridge.start_view().standings[BOT].revoked.is_some());
+        rig.bridge.start_view().gates.open_own_station(ORIGIN);
+        passes(&mut rig, 3);
+        assert_eq!(settled(&rig, &task), outcome(Event::Revoked));
+        assert!(!input(&rig).contains("REVOKED_BEFORE_THE_CRASH"));
+    });
+}
+
+/// Bindings §9 step 3 (ruling PR2b), PR 10's ruling: a part of the current
+/// list's control state that doesn't read stops every delegated task,
+/// fail closed (`revocations not yet checked`, the gate open or not), never
+/// an empty state in its place; once the store is repaired, the next start
+/// runs it.
+#[test]
+fn a_control_state_that_doesnt_read_starts_no_delegated_task() {
+    use crate::runtime::delegated::feeds::Feeds;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (phone, _) = delegated(&mut rig, root, &os, false);
+        let task = phone_task(&mut rig, &phone, "DAMAGED_CONTROLS", start + 3 * HOUR);
+        blocked(&mut rig, &task, details::REVOCATIONS_NOT_YET_CHECKED).await;
+        let db = |rig: &LocalRig, sql: &str| {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .execute(sql, [])
+                .unwrap();
+        };
+        db(
+            &rig,
+            "INSERT INTO control_principals(principal,part) VALUES('service:svc-x','{damaged')",
+        );
+        restart(&mut rig, root, &os, false, true);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Damaged));
+        assert!(rig.bridge.start_view().controls_damaged);
+        rig.bridge.start_view().gates.open_own_station(ORIGIN);
+        passes(&mut rig, 5);
+        assert_eq!(settled(&rig, &task), outcome(Event::GateClosed));
+        assert!(attempts(&rig, &task).is_empty());
+        assert!(!input(&rig).contains("DAMAGED_CONTROLS"));
+
+        // Repaired (the row removed), the next start runs it.
+        db(
+            &rig,
+            "DELETE FROM control_principals WHERE principal='service:svc-x'",
+        );
+        restart(&mut rig, root, &os, false, true);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
+        assert!(!rig.bridge.start_view().controls_damaged);
+        rig.bridge.start_view().gates.open_own_station(ORIGIN);
+        rig.until(|r| input(r).contains("DAMAGED_CONTROLS")).await;
+    });
+}
+
+/// Ruling T32b (Task 32 review I1): a damaged control state never makes a
+/// service a v1 sender. The bot, covered and since revoked by records the
+/// feeds committed, is refused `busy` while a part of the state doesn't
+/// read: its `work_enqueue` and its `message_publish` with an agent
+/// recipient store nothing, and its query, `message_query` and completion
+/// of its own work are refused while the owner still reads; a native's
+/// task is still admitted, and waits `revocations not yet checked`. Once
+/// the store is repaired, after a restart, the bot is delegated and
+/// revoked.
+#[test]
+fn a_damaged_control_state_never_makes_a_service_v1() {
+    use crate::runtime::delegated::feeds::Feeds;
+    use atem_client::control::ControlAction;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        let task = bot_task(&mut rig, &s, "BOT_BEFORE_THE_DAMAGE", start + HOUR);
+        run(&mut rig, &task, "BOT_BEFORE_THE_DAMAGE").await;
+        // A message of the bot's, its task waiting at the closed gate.
+        rig.bridge.start_view().gates = Gates::default();
+        let (earlier, _) = message_from(&rig, BOT, "rs", "BOT_EARLIER_MESSAGE", None);
+        ask_req(&mut rig, &s.bot, &earlier).unwrap();
+        commit_bot_records(
+            &rig,
+            &s.log,
+            &[
+                ControlAction::Cover,
+                ControlAction::Revoke {
+                    interrupt_running: false,
+                },
+            ],
+        );
+        let db = |rig: &LocalRig, sql: &str| {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .execute(sql, [])
+                .unwrap();
+        };
+        db(
+            &rig,
+            "INSERT INTO control_principals(principal,part) VALUES('service:svc-x','{damaged')",
+        );
+        restart(&mut rig, root, &os, false, true);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Damaged));
+        assert_eq!(rig.bridge.sender_class(BOT), SenderClass::Unchecked);
+        let stored = |rig: &LocalRig, id: &str| {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .work(id)
+                .unwrap()
+                .is_some()
+        };
+
+        // Its enqueue: `busy`, nothing stored.
+        let mut req = phone_enqueue(&rig, "BOT_WHILE_DAMAGED");
+        if let hw::Request::Enqueue { route_id, .. } = &mut req {
+            *route_id = "rs".into();
+        }
+        assert_eq!(ask_req(&mut rig, &s.bot, &req), busy());
+        assert!(!stored(&rig, &enqueued(&req)));
+        // Its publish with an agent recipient: `busy`, nothing stored.
+        let (publish, recipient) = message_from(&rig, BOT, "rs", "BOT_MESSAGE_WHILE_DAMAGED", None);
+        assert_eq!(ask_req(&mut rig, &s.bot, &publish), busy());
+        assert!(!stored(&rig, &recipient));
+        let hw::Request::Publish { message, .. } = &publish else {
+            unreachable!()
+        };
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        assert!(store.message(&message.message_id).unwrap().is_none());
+        // Its own work: `busy`; the owner reads it.
+        assert_eq!(ask(&mut rig, &s.bot, Q::Query(&task)), busy());
+        assert_eq!(ask(&mut rig, &s.bot, Q::Reply(&task)), busy());
+        assert_eq!(ask(&mut rig, &s.bot, Q::Complete(&task, "done")), busy());
+        assert_eq!(ask(&mut rig, &s.bot, Q::Message(&earlier)), busy());
+        assert_eq!(settled(&rig, &task).0, WorkState::AwaitingResult);
+        assert_eq!(
+            status(ask(&mut rig, &s.mac, Q::Query(&task))).state,
+            WorkState::AwaitingResult
+        );
+        assert!(ask(&mut rig, &s.mac, Q::Message(&earlier)).is_ok());
+        // A native's task is admitted, and waits.
+        let phone = phone_task(&mut rig, &s.phone, "PHONE_WHILE_DAMAGED", start + 2 * HOUR);
+        assert!(stored_record(&rig, &phone).delegated.is_some());
+        rig.bridge.start_view().gates.open_own_station(ORIGIN);
+        blocked(&mut rig, &phone, details::REVOCATIONS_NOT_YET_CHECKED).await;
+
+        // Repaired, the next start: delegated, and revoked.
+        db(
+            &rig,
+            "DELETE FROM control_principals WHERE principal='service:svc-x'",
+        );
+        restart(&mut rig, root, &os, false, true);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
+        assert!(matches!(
+            rig.bridge.sender_class(BOT),
+            SenderClass::Delegated(crate::runtime::delegated::DelegatedSender::Service { .. })
+        ));
+        assert!(rig.bridge.start_view().standings[BOT].revoked.is_some());
+        assert_eq!(ask(&mut rig, &s.bot, Q::Query(&task)), forbidden());
+    });
+}
+
+/// PR 11 (PRs 7 and 8 merged into PR 10; the Task 32 review's notes for
+/// Task 35): `work_resolve` (PR 7) and `work_interrupt` (PR 8) take their
+/// caller rule on the grounds every delegated request has, so ruling
+/// T32b's guard holds for them too. While the control state doesn't read,
+/// the bot (a covered service whose grant holds `interrupt`) is answered
+/// `busy` for both, as for its other requests: never a `forbidden` that
+/// might not stand. Nothing changes: its unknown outcome stays unresolved,
+/// and no Esc reaches its running turn. The owner still resolves.
+#[test]
+fn a_damaged_control_state_answers_a_services_resolve_and_interrupt_busy() {
+    use crate::runtime::delegated::feeds::Feeds;
+    use atem_client::session::host_work::Resolution;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot_ops(
+            &mut rig,
+            root,
+            &os,
+            start + 3 * HOUR,
+            &["interrupt", "message", "notify", "prompt", "stop", "view"],
+        );
+        let running = bot_task(&mut rig, &s, "BOT_IN_ITS_TURN", start + HOUR);
+        rig.until(|r| input(r).contains("BOT_IN_ITS_TURN")).await;
+        // A task of the bot's whose outcome is unknown, never started.
+        rig.bridge.start_view().gates = Gates::default();
+        let template = bot_task(&mut rig, &s, "BOT_TEMPLATE", start + HOUR);
+        let template = stored_record(&rig, &template);
+        let [unknown] = unknown_outcomes(&rig, &template, BOT, 1)
+            .try_into()
+            .unwrap();
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute(
+                "INSERT INTO control_principals(principal,part) VALUES('service:svc-x','{damaged')",
+                [],
+            )
+            .unwrap();
+        restart(&mut rig, root, &os, false, true);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Damaged));
+        let escs = |rig: &LocalRig| input(rig).matches('\x1b').count();
+        let before = escs(&rig);
+        let given_up = Resolution::Failed {
+            detail: "given up".into(),
+        };
+        let resolve = |rig: &LocalRig| hw::Request::WorkResolve {
+            v: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            host: rig.bridge.work_host(),
+            task_id: unknown.clone(),
+            resolution: given_up.clone(),
+        };
+        let req = resolve(&rig);
+        assert_eq!(ask_req(&mut rig, &s.bot, &req), busy(), "work_resolve");
+        assert_eq!(
+            ask(&mut rig, &s.bot, Q::Interrupt(&running)),
+            busy(),
+            "work_interrupt"
+        );
+        passes(&mut rig, 3);
+        assert_eq!(escs(&rig), before, "no Esc");
+        let r = stored_record(&rig, &unknown);
+        assert_eq!(
+            (r.status.state, r.status.resolved),
+            (WorkState::OutcomeUnknown, None)
+        );
+        // The owner still resolves it.
+        let req = resolve(&rig);
+        assert_eq!(
+            status(ask_req(&mut rig, &s.mac, &req)).state,
+            WorkState::Failed
+        );
+    });
+}

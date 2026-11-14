@@ -1,42 +1,45 @@
 //! Delegated host work in the real runtime (the delegated host-work design,
 //! Part I; VII.A; host-work-v1 §11.6): the debug hook turns `host.delegated`
 //! on (`ATEM_TEST_HOST_FEATURES`), and where a test needs a Station's
-//! revocation gate open or a service a feed covers, the stand-in for the
-//! control feeds says so (`ATEM_TEST_HOST_CONTROLS`; PR 10 builds the
-//! feeds). Encrypted r9 clients, fake agents, temp profiles; clocks move on
-//! the debug host clock (`ATEM_TEST_HOST_CLOCK`), never by waiting.
+//! revocation gate open or a service a feed covers, the fake Station
+//! (tests/support/station.rs) serves the host's own Station's control feed,
+//! its `cover` records included, and its heads: the host syncs it as it
+//! would its Station's (Task 33). Encrypted r9 clients, fake agents, temp
+//! profiles; clocks move on the debug host clock (`ATEM_TEST_HOST_CLOCK`),
+//! never by waiting.
 #![cfg(target_os = "linux")]
 mod support;
 
-use atem_client::connect::{Attached, Event, Identity};
-use atem_client::control::{MembershipFetch, RelayError, ToStation};
+use atem_client::connect::Identity;
+use atem_client::control::{ControlAction, MembershipFetch, RelayError, ToStation};
 use atem_client::membership::ServiceScope;
 use serde_json::{Value, json};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use support::astation::{FakeAstation, write_verified_pairing};
+use support::delegated::{
+    Dev, HostIds, HostRig, WAIT, attempts, complete_turn, enqueue, enqueue_data, escs, host_db,
+    hosting_toml, in_turn, input, intents, never_ran, private, record, refused_hello, replace,
+    stored, task, task_until, uuid, wait_stored,
+};
 use support::host_clock::HostClock;
-use support::r9::{Out, Router, client_ms, write_pin};
+use support::r9::{Router, write_pin};
 use support::r9log::{self, MAC, TestLog, auth, secret};
-use support::station::FakeStation;
+use support::station::{FakeStation, Pump};
 use support::{Sandbox, within};
 
-/// The longest a "wait until" helper waits; it only bounds a failure.
-const WAIT: Duration = Duration::from_secs(60);
 const HOST: &str = "host-delegated";
 const ACCOUNT: &str = "acct-delegated";
 /// A native member holding `control`: a delegated sender.
 const PHONE: &str = "dev-phone";
 /// The service the tests launch sessions with (`svc-work`); delegated only
-/// while the stand-in's feed covers it.
+/// while the fake Station's feed covers it.
 const SVC: &str = "svc-work";
-/// The Station of the stand-in for the feeds: the host's own.
-const ORIGIN: &str = "https://station.test";
 /// The relay setting the rig gives the runtime (its link is the fake
 /// Astation's local one): the selected Station's origin, normalized, so the
-/// fake Station's ([`Rig::with_station`]).
+/// fake Station's ([`Rig::with_station`]): the host's own Station.
 const STATION: &str = "http://127.0.0.1:1";
 /// After a fetch whose carriage moved nothing, the host fetches nothing at
 /// a `heads` for this long (its monotonic clock).
@@ -48,23 +51,14 @@ const HOUR: u64 = 60 * MIN;
 /// What a delegated task waits with while its sender's gate is closed.
 const GATE_CLOSED: &str = "revocations not yet checked";
 const BEHIND: &str = "waiting for an earlier task on this session";
-
-fn uuid() -> String {
-    uuid::Uuid::new_v4().to_string()
-}
-
-fn private(path: &Path, text: &str) {
-    std::fs::write(path, text).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
-}
-
-/// `text` into `path`, renamed into place (a runtime reading it never
-/// sees half of it).
-fn replace(path: &Path, text: &str) {
-    let tmp = path.with_extension("tmp");
-    private(&tmp, text);
-    std::fs::rename(&tmp, path).unwrap();
-}
+/// What a held sender's task waits with (§11.6 "Details").
+const PAUSED: &str = "paused";
+const REVOKED: &str = "sender revoked";
+/// The host the clients name.
+const IDS: HostIds = HostIds {
+    account: ACCOUNT,
+    host: HOST,
+};
 
 struct Rig {
     sandbox: Sandbox,
@@ -72,8 +66,6 @@ struct Rig {
     log: TestLog,
     runtime: Option<Child>,
     fake: PathBuf,
-    /// The stand-in for the feeds (`ATEM_TEST_HOST_CONTROLS`), when on.
-    controls: Option<PathBuf>,
     /// The debug host clock (`ATEM_TEST_HOST_CLOCK`), when on.
     clock: Option<HostClock>,
     /// The broker faults (`ATEM_TEST_PTY_FAULTS`).
@@ -82,13 +74,17 @@ struct Rig {
     membership: bool,
     /// The broker's state after each pass (`ATEM_TEST_STATE_DUMP`).
     dump: bool,
+    /// The fake Station on the link ([`Rig::with_station`]).
+    station: Option<Arc<Mutex<FakeStation>>>,
+    /// The thread serving it while it is online ([`Rig::station_online`]).
+    pump: Mutex<Option<Pump>>,
     /// The debug hook turns `host.delegated` on (`ATEM_TEST_HOST_FEATURES`);
     /// off: a restart without it.
     hook: bool,
+    /// With the hook, `host.alerts` too.
+    alerts: bool,
     /// Context snapshots from `<sandbox>/context` (`ATEM_TEST_CONTEXT_DIR`).
     context: bool,
-    /// The fake Station on the link ([`Rig::with_station`]).
-    station: Option<FakeStation>,
 }
 
 impl Rig {
@@ -121,31 +117,13 @@ impl Rig {
             &env_file,
             &json!({"CLAUDE_CLI_BIN": bin, "FAKE_DIR": fake}).to_string(),
         );
-        let principals =
-            format!(r#"["member:{MAC}", "member:{PHONE}", "service:{SVC}", "browser:{GRANT}"]"#);
-        let mut toml = format!(
-            r#"
-version = 1
-enabled = true
-[[profiles]]
-id = "backend"
-revision = 1
-label = "Backend"
-provider = "claude"
-cwd = {cwd:?}
-project = "local:home"
-principals = {principals}
-env_names = ["CLAUDE_CLI_BIN", "FAKE_DIR"]
-env_file = {env_file:?}
-[[routes]]
-id = "backend"
-revision = 1
-profile_id = "backend"
-principals = {principals}
-"#,
-            cwd = sandbox.home.to_str().unwrap(),
-            env_file = env_file.to_str().unwrap()
-        );
+        let principals = [
+            format!("member:{MAC}"),
+            format!("member:{PHONE}"),
+            format!("service:{SVC}"),
+            format!("browser:{GRANT}"),
+        ];
+        let mut toml = hosting_toml(&sandbox.home, &env_file, &principals);
         if collab {
             toml.push_str(
                 "[[routes]]\nid = \"peer\"\nrevision = 1\nprofile_id = \"backend\"\n\
@@ -159,35 +137,63 @@ principals = {principals}
             log,
             runtime: None,
             fake,
-            controls: None,
             clock: None,
             faults: false,
             membership: false,
             dump: false,
-            hook: true,
-            context: false,
             station: None,
+            pump: Mutex::new(None),
+            hook: true,
+            alerts: false,
+            context: false,
         }
     }
 
-    /// The fake Station of [`STATION`] on the link, holding the rig's list,
-    /// announcing only when a test says (made before the runtime: it takes
-    /// the host's calls from the start).
+    /// The fake Station of [`STATION`] on the link, holding the rig's list
+    /// and an empty control feed, announcing only when a test says (made
+    /// before the runtime: it takes the host's calls from the start), and
+    /// the state dump on (where the gate shows).
     fn with_station(&mut self) {
         let mut station = FakeStation::new(&self.astation, STATION, &self.log, HOST, 1);
         station.silence_heads(true);
-        self.station = Some(station);
+        self.station = Some(Arc::new(Mutex::new(station)));
+        self.dump = true;
     }
 
-    fn station(&mut self) -> &mut FakeStation {
-        self.station.as_mut().expect("the fake Station")
+    fn station(&self) -> MutexGuard<'_, FakeStation> {
+        self.station
+            .as_ref()
+            .expect("the fake Station")
+            .lock()
+            .unwrap()
     }
 
-    /// The stand-in for the feeds on, its file saying `value`.
-    fn with_controls(&mut self, value: Value) {
-        let path = self.sandbox.dir.path().join("controls.json");
-        replace(&path, &value.to_string());
-        self.controls = Some(path);
+    /// The fake Station online from now on, as a Station is: a thread
+    /// answers every call of the host's newest link and announces `heads`
+    /// (on a new link at once, then every second), with `cover`, its feed
+    /// covering [`SVC`] first. Then waits until the host's own Station's
+    /// gate is open (its feed read to the announced head, the device list
+    /// holding the announced head).
+    fn station_online(&self, cover: bool) {
+        {
+            let mut station = self.station();
+            if cover {
+                let record = station.record_for(SVC, ControlAction::Cover);
+                station.append(record);
+            }
+            station.silence_heads(false);
+        }
+        let station = self.station.clone().expect("the fake Station");
+        *self.pump.lock().unwrap() = Some(Pump::start(station));
+        self.gate_open();
+    }
+
+    /// Waits until the host's own Station's gate is open (state dump).
+    fn gate_open(&self) {
+        within("the host's own Station's gate", || {
+            let station = dumped(self)["station"].clone();
+            station["feed"]["open"] == true && station["list_part"] == true
+        });
     }
 
     /// The debug host clock on, at the real clocks.
@@ -220,15 +226,17 @@ principals = {principals}
         let mut command = Command::new(env!("CARGO_BIN_EXE_atem"));
         command.env_clear();
         if self.hook {
-            command.env("ATEM_TEST_HOST_FEATURES", "host.delegated");
+            let features = if self.alerts {
+                "host.delegated,host.alerts"
+            } else {
+                "host.delegated"
+            };
+            command.env("ATEM_TEST_HOST_FEATURES", features);
         }
         if self.context {
             let context = self.sandbox.dir.path().join("context");
             std::fs::create_dir_all(&context).unwrap();
             command.env("ATEM_TEST_CONTEXT_DIR", context);
-        }
-        if let Some(controls) = &self.controls {
-            command.env("ATEM_TEST_HOST_CONTROLS", controls);
         }
         if let Some(clock) = &self.clock {
             command.env("ATEM_TEST_HOST_CLOCK", &clock.path);
@@ -246,6 +254,11 @@ principals = {principals}
         }
         // A stale socket file of a killed runtime isn't the new one's.
         let _ = std::fs::remove_file(self.sandbox.config().join("runtime.socket"));
+        // Nor is its state dump: a read right after the restart would see
+        // its state and its higher pass count (`two_passes`, `work_passes`).
+        if self.dump {
+            let _ = std::fs::remove_file(self.dump_file());
+        }
         self.runtime = Some(
             command
                 .arg("runtime")
@@ -293,8 +306,19 @@ principals = {principals}
     }
 }
 
+impl HostRig for Rig {
+    fn config_dir(&self) -> PathBuf {
+        self.sandbox.config()
+    }
+
+    fn fake_dir(&self) -> PathBuf {
+        self.fake.clone()
+    }
+}
+
 impl Drop for Rig {
     fn drop(&mut self) {
+        drop(self.pump.get_mut().unwrap().take());
         self.sandbox.track();
         if let Some(mut child) = self.runtime.take() {
             let _ = child.kill();
@@ -303,203 +327,8 @@ impl Drop for Rig {
     }
 }
 
-/// An r9 client of the host.
-struct Dev {
-    handle: String,
-    a: Attached,
-    backlog: Vec<Value>,
-}
-
-impl Dev {
-    fn new(r: &mut Router, log: &TestLog, id: &str, service: bool) -> Dev {
-        Dev::new_via(r, "relay", log, id, service)
-    }
-
-    /// Admitted on a channel the router labels `transport` (`relay`, or
-    /// `direct`: Astation's :8080 on the local network).
-    fn new_via(r: &mut Router, transport: &str, log: &TestLog, id: &str, service: bool) -> Dev {
-        let identity = if service {
-            Identity::service(id, auth(id))
-        } else {
-            Identity::native(id, auth(id))
-        };
-        Dev::admitted(r, transport, log, &identity)
-    }
-
-    fn admitted(r: &mut Router, transport: &str, log: &TestLog, identity: &Identity) -> Dev {
-        let handle = uuid();
-        let a = r
-            .connect_via(&handle, transport, log, HOST, identity)
-            .unwrap_or_else(|e| panic!("admission failed: {e:?}"));
-        Dev {
-            handle,
-            a,
-            backlog: Vec::new(),
-        }
-    }
-
-    fn request(&mut self, r: &mut Router, data: Value) -> Value {
-        let id = self.send(r, data);
-        self.wait(r, |v| v["re"] == id.as_str())
-    }
-
-    /// Sends a session request; its id.
-    fn send(&mut self, r: &mut Router, mut data: Value) -> String {
-        let id = uuid();
-        data["v"] = json!(1);
-        data["id"] = json!(id);
-        let frame = self
-            .a
-            .send(&json!({"type":"session","data":data}), client_ms())
-            .unwrap();
-        r.frame(&self.handle, &frame);
-        id
-    }
-
-    /// The first message (in the backlog, or arriving) `matches` takes.
-    fn wait(&mut self, r: &mut Router, matches: impl Fn(&Value) -> bool) -> Value {
-        let deadline = Instant::now() + WAIT;
-        loop {
-            if let Some(at) = self.backlog.iter().position(&matches) {
-                return self.backlog.remove(at);
-            }
-            assert!(
-                Instant::now() < deadline,
-                "nothing matched in time: {:?}",
-                self.backlog
-            );
-            match r.next(&self.handle) {
-                Out::Close(reason) => panic!("channel closed: {reason:?}"),
-                Out::Frame(frame) => {
-                    for e in self.a.on_frame(&frame, client_ms()).unwrap() {
-                        let value = match e {
-                            Event::Family(f) => f.data,
-                            Event::Session(m) => Some(
-                                atem_client::session::wire::to_value(
-                                    &atem_client::session::wire::Envelope::Session(m),
-                                )["data"]
-                                    .clone(),
-                            ),
-                            Event::Error(e) => Some(
-                                serde_json::from_slice::<Value>(&e.to_bytes()).unwrap()["data"]
-                                    .clone(),
-                            ),
-                            _ => None,
-                        };
-                        if let Some(v) = value {
-                            self.backlog.push(v);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// The read binding of `sid` (after `list`).
-    fn read(&self, sid: &str) -> Value {
-        json!({"target": self.a.target(sid).expect("listed"),
-               "attachment_gen": self.a.welcome().attachment_gen})
-    }
-
-    /// Lists the sessions until `sid` is among them.
-    fn list(&mut self, r: &mut Router, sid: &str) {
-        let deadline = Instant::now() + WAIT;
-        loop {
-            self.send(r, json!({"op":"list"}));
-            let sessions = self.wait(r, |v| v["op"] == "sessions");
-            if sessions["sessions"]
-                .as_array()
-                .is_some_and(|all| all.iter().any(|d| d["session_id"] == sid))
-            {
-                return;
-            }
-            assert!(Instant::now() < deadline, "{sid} never listed: {sessions}");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    /// The client goes: its channel closed.
-    fn close(self, r: &mut Router) {
-        r.close(&self.handle);
-    }
-
-    /// A session it launches on profile `backend`: its `launch` (session
-    /// id and process generation).
-    fn session(&mut self, r: &mut Router) -> Value {
-        let rid = uuid();
-        let launch = self.request(
-            r,
-            json!({"op":"host_launch","host":host(),"request_id":rid,
-                "profile_id":"backend","profile_revision":1,
-                "expires_at":r9log::host_now().wall_ms + 60_000}),
-        );
-        assert!(launch["result"].is_object(), "{launch}");
-        let deadline = Instant::now() + WAIT;
-        loop {
-            let value = self.request(
-                r,
-                json!({"op":"host_launch_query","host":host(),"request_id":rid}),
-            );
-            if value["result"]["launch"]["state"] == "started" {
-                return value["result"]["launch"].clone();
-            }
-            assert!(Instant::now() < deadline, "launch failed: {value}");
-            std::thread::sleep(Duration::from_millis(40));
-        }
-    }
-
-    /// Carries `entries` on its channel (the `membership` op) and waits for
-    /// the host's head in answer.
-    fn carry(&mut self, r: &mut Router, entries: &[Value]) {
-        let signed: Vec<_> = entries
-            .iter()
-            .map(|e| atem_client::SignedObject::parse(e.to_string().as_bytes()).unwrap())
-            .collect();
-        let (id, frame) = self.a.send_membership(&signed, client_ms()).unwrap();
-        r.frame(&self.handle, &frame);
-        loop {
-            let Out::Frame(frame) = r.next(&self.handle) else {
-                panic!("membership channel closed");
-            };
-            let events = self.a.on_frame(&frame, client_ms()).unwrap();
-            if events
-                .iter()
-                .any(|e| matches!(e, Event::MembershipHead { re: Some(re), .. } if re == &id))
-            {
-                return;
-            }
-        }
-    }
-}
-
 fn host() -> Value {
-    json!({"account_id":ACCOUNT,"atem_device_id":HOST,"host_trust_gen":1})
-}
-
-/// A task of `text` for `launch`'s session, its deadline at host time
-/// `expires_at`.
-fn task_until(launch: &Value, text: &str, expires_at: u64) -> Value {
-    let mut target = host();
-    target["session_id"] = launch["session_id"].clone();
-    target["process_gen"] = launch["process_gen"].clone();
-    json!({"task_id":uuid(),"workflow_id":uuid(),"target":target,"expires_at":expires_at,
-        "prompt":text,"context":[]})
-}
-
-/// [`task_until`], its deadline `ms` from now.
-fn task(launch: &Value, text: &str, ms: u64) -> Value {
-    task_until(launch, text, r9log::host_now().wall_ms + ms)
-}
-
-fn enqueue_data(task: &Value) -> Value {
-    json!({"op":"work_enqueue","host":host(),"route_id":"backend","route_revision":1,"task":task})
-}
-
-/// `dev` enqueues `task`: the reply's `work`.
-fn enqueue(dev: &mut Dev, r: &mut Router, task: &Value) -> Value {
-    let reply = dev.request(r, enqueue_data(task));
-    assert!(reply["result"]["work"].is_object(), "{reply}");
-    reply["result"]["work"].clone()
+    IDS.json()
 }
 
 fn work(dev: &mut Dev, r: &mut Router, tid: &Value) -> Value {
@@ -510,55 +339,6 @@ fn reply_query(dev: &mut Dev, r: &mut Router, tid: &Value) -> Value {
     dev.request(r, json!({"op":"reply_query","host":host(),"task_id":tid}))
 }
 
-/// Task `tid`'s record as `runtime/host-work.sqlite` stores it.
-fn record(rig: &Rig, tid: &Value) -> Value {
-    let db =
-        rusqlite::Connection::open(rig.sandbox.config().join("runtime/host-work.sqlite")).unwrap();
-    db.busy_timeout(Duration::from_secs(5)).unwrap();
-    let record: String = db
-        .query_row(
-            "SELECT record FROM work WHERE id=?1",
-            [tid.as_str().unwrap()],
-            |r| r.get(0),
-        )
-        .unwrap();
-    serde_json::from_str(&record).unwrap()
-}
-
-/// Task `tid`'s status as stored (whatever its sender may read).
-fn stored(rig: &Rig, tid: &Value) -> Value {
-    record(rig, tid)["status"].clone()
-}
-
-fn wait_stored(rig: &Rig, tid: &Value, state: &str, detail: &str) {
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let status = stored(rig, tid);
-        if status["state"] == state && status["detail"] == detail {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "expected {state} ({detail}): {status}"
-        );
-        std::thread::sleep(Duration::from_millis(40));
-    }
-}
-
-/// Task `tid`'s attempts: (id, end), in order.
-fn attempts(rig: &Rig, tid: &Value) -> Vec<(String, Option<String>)> {
-    let db =
-        rusqlite::Connection::open(rig.sandbox.config().join("runtime/host-work.sqlite")).unwrap();
-    db.busy_timeout(Duration::from_secs(5)).unwrap();
-    let mut q = db
-        .prepare(r#"SELECT attempt_id,"end" FROM attempts WHERE task_id=?1 ORDER BY n"#)
-        .unwrap();
-    q.query_map([tid.as_str().unwrap()], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect()
-}
-
 /// The ends of task `tid`'s attempts, in order.
 fn ends(rig: &Rig, tid: &Value) -> Vec<Option<String>> {
     attempts(rig, tid).into_iter().map(|(_, end)| end).collect()
@@ -566,32 +346,6 @@ fn ends(rig: &Rig, tid: &Value) -> Vec<Option<String>> {
 
 fn delegated(rig: &Rig, tid: &Value) -> bool {
     record(rig, tid)["delegated"].is_object()
-}
-
-/// What the agent of the rig's sessions was given, in order.
-fn input(rig: &Rig) -> String {
-    std::fs::read_to_string(rig.fake.join("input")).unwrap_or_default()
-}
-
-/// Task `tid` (of prompt `text`) is in its agent's turn: pasted once, the
-/// turn its prompt became stored.
-fn in_turn(rig: &Rig, tid: &Value, text: &str) {
-    within("the task's prompt", || input(rig).contains(text));
-    wait_stored(rig, tid, "submitted", "in the agent's turn");
-}
-
-/// The rig's agent ends its turn: task `tid` awaits its result.
-fn complete_turn(rig: &Rig, tid: &Value) {
-    std::fs::write(rig.fake.join("complete"), "").unwrap();
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let status = stored(rig, tid);
-        if status["state"] == "awaiting_result" {
-            return;
-        }
-        assert!(Instant::now() < deadline, "the turn never ended: {status}");
-        std::thread::sleep(Duration::from_millis(40));
-    }
 }
 
 /// `argv` run by the fake agent of `fake` as its own child (`run-<n>.json`).
@@ -619,24 +373,6 @@ fn reply(rig: &Rig, n: u32, text: &str) {
     assert_eq!(run["code"], 0, "{run}");
 }
 
-/// The stand-in's feed: the host's own Station's gate open.
-fn gate_open() -> Value {
-    json!({"own": ORIGIN, "open": [ORIGIN]})
-}
-
-/// The stand-in's feed of the fake Station ([`STATION`], the host's own)
-/// open, the gate's device-list part left to the host's own fetch (design
-/// I.5.8).
-fn station_feed_open() -> Value {
-    json!({"own": STATION, "open": [STATION], "device_list_from_fetch": true})
-}
-
-/// [`gate_open`], and the feed of that Station covering [`SVC`].
-fn covers_svc() -> Value {
-    json!({"own": ORIGIN, "open": [ORIGIN],
-        "standings": {format!("service:{SVC}"): {"coverage": {"origin": ORIGIN, "feed_id": "feed-1"}}}})
-}
-
 /// VII.A test 1 (design I.4.3: "The sender's channel and online status are
 /// not conditions"): the phone enqueues two tasks and goes while the first
 /// runs; the first ends and the second starts and ends with the phone
@@ -645,18 +381,19 @@ fn covers_svc() -> Value {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_HOST_CONTROLS hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn sender_disconnects_and_later_reads_both_replies() {
     let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(gate_open());
+    rig.with_station();
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    rig.station_online(false);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let first = task(&launch, "OFFLINE_FIRST", HOUR);
-    let second = task(&launch, "OFFLINE_SECOND", HOUR);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let first = task(IDS, &launch, "OFFLINE_FIRST", HOUR);
+    let second = task(IDS, &launch, "OFFLINE_SECOND", HOUR);
     for t in [&first, &second] {
         assert_eq!(enqueue(&mut phone, &mut r, t)["state"], "queued");
         assert!(delegated(&rig, &t["task_id"]), "a delegated task");
@@ -670,7 +407,7 @@ fn sender_disconnects_and_later_reads_both_replies() {
     reply(&rig, 2, "ANSWER_SECOND");
     complete_turn(&rig, &second["task_id"]);
     // Later, the phone reads both.
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
     for (t, answer) in [(&first, "ANSWER_FIRST"), (&second, "ANSWER_SECOND")] {
         let status = work(&mut phone, &mut r, &t["task_id"]);
         assert_eq!(
@@ -689,7 +426,7 @@ fn sender_disconnects_and_later_reads_both_replies() {
 }
 
 /// VII.A test 2 (design I.2, I.3.3 "Grant or integration expires"): a
-/// service a feed covers (the stand-in's) enqueues two tasks; its grant
+/// service the fake Station's feed covers enqueues two tasks; its grant
 /// expires (the host clock 25 minutes on) while the first runs and the
 /// second waits. The second still runs, before its deadline. The expired
 /// service can't even connect to ask; after the Mac renews it, it reads
@@ -697,18 +434,19 @@ fn sender_disconnects_and_later_reads_both_replies() {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_HOST_CLOCK hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn an_expired_grants_task_still_runs_and_nothing_runs_twice() {
     let mut rig = Rig::prepared(20 * MIN, false);
-    rig.with_controls(covers_svc());
+    rig.with_station();
     rig.with_clock();
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    rig.station_online(true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let first = task(&launch, "EXPIRY_FIRST", 2 * HOUR);
-    let second = task(&launch, "EXPIRY_SECOND", 2 * HOUR);
+    let first = task(IDS, &launch, "EXPIRY_FIRST", 2 * HOUR);
+    let second = task(IDS, &launch, "EXPIRY_SECOND", 2 * HOUR);
     for t in [&first, &second] {
         enqueue(&mut svc, &mut r, t);
         let admission = record(&rig, &t["task_id"])["delegated"].clone();
@@ -717,7 +455,7 @@ fn an_expired_grants_task_still_runs_and_nothing_runs_twice() {
             format!("service:{SVC}"),
             "{admission}"
         );
-        assert_eq!(admission["feed"]["origin"], ORIGIN, "{admission}");
+        assert_eq!(admission["feed"]["origin"], STATION, "{admission}");
     }
     in_turn(&rig, &first["task_id"], "EXPIRY_FIRST");
     wait_stored(&rig, &second["task_id"], "blocked", BEHIND);
@@ -739,11 +477,11 @@ fn an_expired_grants_task_still_runs_and_nothing_runs_twice() {
         ("unauthorized".to_string(), Some("expired".to_string()))
     );
     // The Mac renews it.
-    let mut mac = Dev::new(&mut r, &rig.log, MAC, false);
+    let mut mac = Dev::new(&mut r, IDS, &rig.log, MAC, false);
     let until = rig.clock().wall() + 3 * HOUR;
     let renewal = rig.log.renew_service(SVC, until);
     mac.carry(&mut r, &[renewal]);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     for (t, answer) in [(&first, "ANSWER_FIRST"), (&second, "ANSWER_SECOND")] {
         let status = work(&mut svc, &mut r, &t["task_id"]);
         assert_eq!(
@@ -774,12 +512,16 @@ fn browser_and_uncovered_service_keep_v1() {
     const EXPIRED: &str = "sender's authorization expired";
     let mut rig = Rig::prepared(20 * MIN, false);
     rig.with_clock();
+    rig.with_station();
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    // Services wait for the host's first complete read of its Station's
+    // feed (ruling T35d, B): an empty one, read.
+    rig.station_online(false);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     // The session is busy with a task of the service's.
-    let busy = task(&launch, "V1_BUSY", 2 * HOUR);
+    let busy = task(IDS, &launch, "V1_BUSY", 2 * HOUR);
     enqueue(&mut svc, &mut r, &busy);
     in_turn(&rig, &busy["task_id"], "V1_BUSY");
     let wall = rig.clock().wall();
@@ -796,11 +538,12 @@ fn browser_and_uncovered_service_keep_v1() {
     let mut browser = Dev::admitted(
         &mut r,
         "relay",
+        IDS,
         &rig.log,
         &Identity::browser(grant, key).unwrap(),
     );
-    let from_svc = task(&launch, "V1_SERVICE", 2 * HOUR);
-    let from_browser = task(&launch, "V1_BROWSER", 2 * HOUR);
+    let from_svc = task(IDS, &launch, "V1_SERVICE", 2 * HOUR);
+    let from_browser = task(IDS, &launch, "V1_BROWSER", 2 * HOUR);
     enqueue(&mut svc, &mut r, &from_svc);
     enqueue(&mut browser, &mut r, &from_browser);
     for t in [&busy, &from_svc, &from_browser] {
@@ -905,18 +648,30 @@ fn local_tasks(rig: &Rig) -> Vec<Value> {
 )]
 fn local_tasks_never_wait_for_a_gate() {
     let mut rig = Rig::prepared(4 * HOUR, true);
+    // The state dump: where the host's channels show.
+    rig.dump = true;
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
-    let launch = svc.session(&mut r);
-    let busy = task(&launch, "GATE_BUSY", HOUR);
-    enqueue(&mut svc, &mut r, &busy);
+    // No Station: services wait for the host's first read of its feed
+    // (ruling T35d, B). The phone, its channel caught up (I.5.8), launches
+    // the session and keeps it busy.
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let launch = phone.session(&mut r);
+    let busy = task(IDS, &launch, "GATE_BUSY", HOUR);
+    enqueue(&mut phone, &mut r, &busy);
     in_turn(&rig, &busy["task_id"], "GATE_BUSY");
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let gated = task(&launch, "GATE_PHONE", HOUR);
+    let gated = task(IDS, &launch, "GATE_PHONE", HOUR);
     enqueue(&mut phone, &mut r, &gated);
     assert!(delegated(&rig, &gated["task_id"]));
+    // The phone goes: its gate is the host's own Station's (none) once the
+    // host has dropped its channel. A close reaches the host at one of its
+    // passes: until then the phone's caught-up channel would pass its gate
+    // (I.5.8, "Native senders"; C1b flake, its siblings).
+    let open = dumped(&rig)["channels"].as_u64().unwrap();
     phone.close(&mut r);
+    within("the phone's channel closed", || {
+        dumped(&rig)["channels"].as_u64() == Some(open - 1)
+    });
     complete_turn(&rig, &busy["task_id"]);
     wait_stored(&rig, &gated["task_id"], "blocked", GATE_CLOSED);
     // A local agent sends to the session (`tag:peer`).
@@ -974,6 +729,25 @@ fn receipt(rig: &Rig, rid: &str) -> Value {
     dumped(rig)["receipts"][rid].clone()
 }
 
+/// Waits until the state dump shows `field` of `rid`'s receipt as `value`.
+/// The dump is written at the end of a pass, after the store commits and
+/// the agent's input is written, so a read right after a wait on either
+/// can see the pass before (a slow runner): it is polled, never read once.
+fn receipt_becomes(rig: &Rig, rid: &str, field: &str, value: &str) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let seen = receipt(rig, rid);
+        if seen[field] == value {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{rid}'s receipt {field} never became {value}: {seen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// VII.A test 17 (design I.4.3 condition 2a, Decision 16; session-v1 R9.14
 /// item 3): the start check refuses an attempt a freeze stops, before
 /// host-work has processed the freeze. The session's queue holds the Mac's
@@ -990,28 +764,28 @@ fn receipt(rig: &Rig, rid: &str) -> Value {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS, ATEM_TEST_PTY_FAULTS, ATEM_TEST_MEMBERSHIP_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS, ATEM_TEST_MEMBERSHIP_FAULTS and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn a_freeze_at_the_start_fails_the_attempt() {
     let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(gate_open());
+    rig.with_station();
     rig.faults = true;
     rig.membership = true;
-    rig.dump = true;
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    rig.station_online(false);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     let sid = launch["session_id"].as_str().unwrap().to_string();
-    let mut mac = Dev::new(&mut r, &rig.log, MAC, false);
+    let mut mac = Dev::new(&mut r, IDS, &rig.log, MAC, false);
     mac.list(&mut r, &sid);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
     let hold_host_work = rig.faults().join("hold_host_work");
     let hold_dispatch = rig.faults().join("hold_dispatch");
     private(&hold_host_work, "");
     private(&hold_dispatch, "");
     two_passes(&rig);
-    let held = task(&launch, "FROZEN_AT_START", HOUR);
+    let held = task(IDS, &launch, "FROZEN_AT_START", HOUR);
     assert_eq!(enqueue(&mut phone, &mut r, &held)["state"], "queued");
     // The Mac's prompt is accepted first; the Mac gives the lease back.
     let accepted = mac.request(
@@ -1110,12 +884,13 @@ fn native_on_a_lan_runs_after_its_carriage() {
     let mut rig = Rig::prepared(4 * HOUR, false);
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new_via(&mut r, "direct", &rig.log, SVC, true);
-    let launch = svc.session(&mut r);
-    // The phone's list is a head ahead of the host's.
+    // The phone's list is a head ahead of the host's. (It launches the
+    // session: with no Station, services wait for the host's first read of
+    // its feed, ruling T35d, B.)
     rig.log.add_native("dev-tablet", &["view"]);
-    let mut phone = Dev::new_via(&mut r, "direct", &rig.log, PHONE, false);
-    let first = task(&launch, "LAN_FIRST", HOUR);
+    let mut phone = Dev::new_via(&mut r, "direct", IDS, &rig.log, PHONE, false);
+    let launch = phone.session(&mut r);
+    let first = task(IDS, &launch, "LAN_FIRST", HOUR);
     enqueue(&mut phone, &mut r, &first);
     in_turn(&rig, &first["task_id"], "LAN_FIRST");
     complete_turn(&rig, &first["task_id"]);
@@ -1135,7 +910,7 @@ fn native_on_a_lan_runs_after_its_carriage() {
         .object()
         .to_json();
     phone.carry(&mut r, &[recovery, deferred]);
-    let second = task(&launch, "LAN_SECOND", HOUR);
+    let second = task(IDS, &launch, "LAN_SECOND", HOUR);
     enqueue(&mut phone, &mut r, &second);
     wait_stored(
         &rig,
@@ -1151,7 +926,7 @@ fn native_on_a_lan_runs_after_its_carriage() {
             target: recovery_hash,
         },
     );
-    let mut mac = Dev::new_via(&mut r, "direct", &rig.log, MAC, false);
+    let mut mac = Dev::new_via(&mut r, "direct", IDS, &rig.log, MAC, false);
     mac.carry(&mut r, std::slice::from_ref(&approve));
     wait_stored(&rig, &second["task_id"], "blocked", GATE_CLOSED);
     assert!(!input(&rig).contains("LAN_SECOND"));
@@ -1172,22 +947,23 @@ fn native_on_a_lan_runs_after_its_carriage() {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_HOST_CLOCK hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn clock_set_back_never_runs_an_expired_task() {
     const EXPIRED: &str = "expired before submission";
     let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(gate_open());
+    rig.with_station();
     rig.with_clock();
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    rig.station_online(false);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
     let wall = rig.clock().wall();
-    let running = task_until(&launch, "BACK_RUNNING", wall + 3 * HOUR);
-    let soon = task_until(&launch, "BACK_SOON", wall + 10 * MIN);
-    let later = task_until(&launch, "BACK_LATER", wall + 20 * MIN);
+    let running = task_until(IDS, &launch, "BACK_RUNNING", wall + 3 * HOUR);
+    let soon = task_until(IDS, &launch, "BACK_SOON", wall + 10 * MIN);
+    let later = task_until(IDS, &launch, "BACK_LATER", wall + 20 * MIN);
     for t in [&running, &soon, &later] {
         enqueue(&mut phone, &mut r, t);
     }
@@ -1208,8 +984,8 @@ fn clock_set_back_never_runs_an_expired_task() {
     let mut r = Router::new(&rig.astation);
     wait_stored(&rig, &later["task_id"], "expired", EXPIRED);
     complete_turn(&rig, &running["task_id"]);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let next = task_until(&launch, "BACK_NEXT", rig.clock().wall() + 3 * HOUR);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let next = task_until(IDS, &launch, "BACK_NEXT", rig.clock().wall() + 3 * HOUR);
     enqueue(&mut phone, &mut r, &next);
     in_turn(&rig, &next["task_id"], "BACK_NEXT");
     let text = input(&rig);
@@ -1219,33 +995,138 @@ fn clock_set_back_never_runs_an_expired_task() {
     }
 }
 
-/// VII.A test 7, its first two crash points (design I.6.2, I.6.3, I.6.4;
-/// session-v1 R9.14 item 6): the runtime is killed (`SIGKILL`) right after
-/// an attempt's row committed, before its submit, and, for another task,
-/// after the session host `accepted` its attempt (the broker's
-/// `hold_dispatch` keeps it from starting). At each restart the attempt is
-/// reconciled (never admitted; withdrawn at recovery), never sent again,
-/// and the task runs once, on a new attempt.
+/// Task `tid`'s attempts as stored: (id, end, counted), in order.
+fn attempt_rows(rig: &Rig, tid: &Value) -> Vec<(String, Option<String>, bool)> {
+    let db = host_db(rig);
+    let mut q = db
+        .prepare(r#"SELECT attempt_id,"end",counted FROM attempts WHERE task_id=?1 ORDER BY n"#)
+        .unwrap();
+    q.query_map([tid.as_str().unwrap()], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
+/// `principal`'s stored control part (`control_principals`).
+fn part(rig: &Rig, principal: &str) -> Option<String> {
+    host_db(rig)
+        .query_row(
+            "SELECT part FROM control_principals WHERE principal=?1",
+            [principal],
+            |r| r.get(0),
+        )
+        .ok()
+}
+
+/// The host's own Station's feed cursor as stored (`control_feeds`).
+fn stored_cursor(rig: &Rig) -> Option<u64> {
+    host_db(rig)
+        .query_row(
+            "SELECT cursor FROM control_feeds WHERE origin=?1",
+            [STATION],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+        .map(|c| c as u64)
+}
+
+/// Whether the host's book holds a result for `record_id` (`control_acks`).
+fn ack_owed(rig: &Rig, record_id: &str) -> bool {
+    host_db(rig)
+        .query_row(
+            "SELECT count(*) FROM control_acks WHERE key=?1",
+            [record_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .is_ok_and(|n| n > 0)
+}
+
+/// Task `tid` has an unresolved alert (`alerts`, its owner's).
+fn alerted(rig: &Rig, tid: &Value) -> bool {
+    host_db(rig)
+        .query_row(
+            "SELECT count(*) FROM alerts WHERE task_id=?1 AND ended_ms IS NULL",
+            [tid.as_str().unwrap()],
+            |r| r.get::<_, i64>(0),
+        )
+        .is_ok_and(|n| n == 1)
+}
+
+/// VII.A test 7 (design I.6.2 to I.6.4, I.5.5; session-v1 R9.14 item 6;
+/// Task 35 and 36 reviews, notes for Task 37): the runtime is killed
+/// (`SIGKILL`) at each crash point, and after each restart nothing runs
+/// twice, nothing revoked runs, and every `outcome_unknown` stays
+/// unresolved:
+/// 1. after an attempt's commit, before its submit
+///    (`crash_after_attempt_commit`): the attempt is never admitted, and
+///    the task runs once, on a new attempt;
+/// 2. after the session `accepted` the attempt (the broker's
+///    `hold_dispatch` keeps it from starting): withdrawn at recovery, then
+///    the task runs once, on a new attempt;
+/// 3. after `executing`: right after its record is durable, before the
+///    prompt is dispatched (`crash_after_executing`): the turn was never
+///    written, and the task can't be shown to have run or not: it is
+///    `outcome_unknown` (`outcome could not be established`), alerted,
+///    never written, never dispatched again; and with the turn running
+///    (killed from outside): the turn goes on, adopted, and ends once;
+/// 4. between storing a record and acknowledging it
+///    (`crash_after_page_commit`): a hold committed while the service's
+///    attempt waits `accepted`, its withdrawal not yet made: the restart
+///    withdraws it at recovery, uncounted (the hold's mark), the task
+///    waits `paused`, and the hold's result goes;
+/// 5. between handing a result to the link and writing its sent mark
+///    (`crash_after_ack_handoff`, held until the Station read it): the
+///    release's result goes again after the restart, and the ledger counts
+///    nothing twice; a result that goes once goes once more after a later
+///    restart (its connection's end unknown);
+/// 6. during a record's application (`crash_during_record_application`): a
+///    revoke with `interrupt_running` while the service's turn runs and
+///    another of its tasks waits: nothing of it stored (cursor, part,
+///    tasks, intents, results); after the restart it applies once: the
+///    waiting task cancelled, never run, the turn interrupted once;
+/// 7. between a revoke's commit and its followups (`crash_after_page_commit`,
+///    Task 37 review I2), on a host of its own: a revoke with
+///    `interrupt_running` while the service's turn runs and its attempt on
+///    another session waits `accepted`: at the death its intent is stored
+///    and undelivered, no Esc, the attempt live, the result owed unsent;
+///    after the restart the attempt is withdrawn at recovery and its task
+///    `cancelled`, never written, the intent carried out exactly once (one
+///    Esc, `turn interrupted`), each effect counted once, the service's
+///    `hello` refused as revoked.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_PTY_FAULTS hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
 )]
-fn sigkill_after_attempt_commit_and_after_accepted_runs_once() {
+fn sigkill_at_each_crash_point() {
     let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(gate_open());
+    rig.with_station();
     rig.faults = true;
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    rig.station_online(true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
+    let other = svc.session(&mut r);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let crash = |rig: &Rig, name: &str| private(&rig.faults().join(name), "");
+    // What every restart keeps: each prompt written at most once, the
+    // revoked service's waiting task never, the unknown outcome unresolved.
+    let once = |rig: &Rig, prompts: &[&str]| {
+        let text = input(rig);
+        for prompt in prompts {
+            assert!(text.matches(prompt).count() <= 1, "{prompt} ran twice");
+        }
+    };
+    let principal = format!("service:{SVC}");
 
-    // Killed after the attempt's commit, before its submit.
-    private(&rig.faults().join("crash_after_attempt_commit"), "");
-    let first = task(&launch, "KILLED_AT_COMMIT", HOUR);
+    // 1. After an attempt's commit, before its submit.
+    crash(&rig, "crash_after_attempt_commit");
+    let first = task(IDS, &launch, "KILLED_AT_COMMIT", HOUR);
     // Its reply may never be sent: the runtime dies in the same pass.
-    phone.send(&mut r, enqueue_data(&first));
+    phone.send(&mut r, enqueue_data(IDS, &first));
     drop((r, svc, phone));
     rig.died();
     let committed = attempts(&rig, &first["task_id"]);
@@ -1268,10 +1149,10 @@ fn sigkill_after_attempt_commit_and_after_accepted_runs_once() {
         [Some("started".to_string())]
     );
 
-    // Killed after the session `accepted` the attempt.
+    // 2. After the session `accepted` the attempt.
     private(&rig.faults().join("hold_dispatch"), "");
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let second = task(&launch, "KILLED_AFTER_ACCEPTED", HOUR);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let second = task(IDS, &launch, "KILLED_AFTER_ACCEPTED", HOUR);
     enqueue(&mut phone, &mut r, &second);
     let deadline = Instant::now() + WAIT;
     while !(stored(&rig, &second["task_id"])["state"] == "submitted"
@@ -1290,13 +1171,624 @@ fn sigkill_after_attempt_commit_and_after_accepted_runs_once() {
     std::fs::remove_file(rig.faults().join("hold_dispatch")).unwrap();
     assert!(!input(&rig).contains("KILLED_AFTER_ACCEPTED"));
     rig.start();
+    let mut r = Router::new(&rig.astation);
     in_turn(&rig, &second["task_id"], "KILLED_AFTER_ACCEPTED");
     complete_turn(&rig, &second["task_id"]);
+    once(&rig, &["KILLED_AT_COMMIT", "KILLED_AFTER_ACCEPTED"]);
     assert_eq!(input(&rig).matches("KILLED_AFTER_ACCEPTED").count(), 1);
     let all = attempts(&rig, &second["task_id"]);
     assert_eq!(all.len(), 2, "{all:?}");
     assert_eq!(all[0], (accepted, Some("withdrawn".into())));
     assert_eq!(all[1].1.as_deref(), Some("started"));
+
+    // 3. After `executing`, before the dispatch (on the other session: an
+    // unknown outcome holds its session until its deadline).
+    crash(&rig, "crash_after_executing");
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let unknown = task(IDS, &other, "KILLED_AFTER_EXECUTING", HOUR);
+    phone.send(&mut r, enqueue_data(IDS, &unknown));
+    drop((r, phone));
+    rig.died();
+    let executing = attempts(&rig, &unknown["task_id"]);
+    assert_eq!(executing.len(), 1, "{executing:?}");
+    assert!(!input(&rig).contains("KILLED_AFTER_EXECUTING"));
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    wait_stored(
+        &rig,
+        &unknown["task_id"],
+        "outcome_unknown",
+        "outcome could not be established",
+    );
+    assert!(alerted(&rig, &unknown["task_id"]));
+    work_passes(&rig, 3);
+    assert_eq!(attempts(&rig, &unknown["task_id"]).len(), 1);
+    assert!(!input(&rig).contains("KILLED_AFTER_EXECUTING"));
+    // Its turn running, killed from outside: adopted, it ends once.
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let running = task(IDS, &launch, "KILLED_IN_ITS_TURN", HOUR);
+    enqueue(&mut phone, &mut r, &running);
+    in_turn(&rig, &running["task_id"], "KILLED_IN_ITS_TURN");
+    drop((r, phone));
+    rig.kill();
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    complete_turn(&rig, &running["task_id"]);
+    assert_eq!(input(&rig).matches("KILLED_IN_ITS_TURN").count(), 1);
+    assert_eq!(
+        ends(&rig, &running["task_id"]),
+        [Some("started".to_string())]
+    );
+
+    // 4. Between storing a record and acknowledging it: a hold, its
+    // withdrawal of the service's accepted attempt not yet made.
+    private(&rig.faults().join("hold_dispatch"), "");
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    let held = task(IDS, &launch, "KILLED_BEFORE_THE_WITHDRAWAL", HOUR);
+    enqueue(&mut svc, &mut r, &held);
+    within("the service's attempt accepted", || {
+        stored(&rig, &held["task_id"])["state"] == "submitted"
+            && ends(&rig, &held["task_id"]) == [None]
+    });
+    let withdrawn = attempts(&rig, &held["task_id"])[0].0.clone();
+    crash(&rig, "crash_after_page_commit");
+    let hold = {
+        let mut station = rig.station();
+        let record = station.record_for(SVC, ControlAction::Hold);
+        let at = station.append(record);
+        drop(station);
+        record_id_at(&rig, at)
+    };
+    drop((r, svc));
+    rig.died();
+    assert!(ack_owed(&rig, &hold), "the hold's result stored");
+    assert!(results_of(&rig, &hold).is_empty(), "and never sent");
+    assert_eq!(
+        attempt_rows(&rig, &held["task_id"]),
+        [(withdrawn.clone(), None, false)],
+        "live, its withdrawal marked uncounted"
+    );
+    std::fs::remove_file(rig.faults().join("hold_dispatch")).unwrap();
+    rig.start();
+    let r = Router::new(&rig.astation);
+    wait_stored(&rig, &held["task_id"], "blocked", PAUSED);
+    assert_eq!(
+        attempt_rows(&rig, &held["task_id"]),
+        [(withdrawn.clone(), Some("withdrawn".into()), false)]
+    );
+    receipt_becomes(&rig, &withdrawn, "detail", "withdrawn at recovery");
+    within("the hold's result sent", || {
+        results_of(&rig, &hold) == [[("hold".to_string(), "applied".to_string())]]
+    });
+    assert!(!input(&rig).contains("KILLED_BEFORE_THE_WITHDRAWAL"));
+
+    // 5. Between handing a result to the link and its sent mark: the
+    // release's, the Station reading it before the kill.
+    // The hold first: an ack handed off before it would fire the crash
+    // point unheld (review M1).
+    private(&rig.faults().join("hold_crash"), "");
+    crash(&rig, "crash_after_ack_handoff");
+    let release = {
+        let mut station = rig.station();
+        let record = station.record_for(SVC, ControlAction::Release);
+        let at = station.append(record);
+        drop(station);
+        record_id_at(&rig, at)
+    };
+    within("the release's result read", || {
+        !results_of(&rig, &release).is_empty()
+    });
+    std::fs::remove_file(rig.faults().join("hold_crash")).unwrap();
+    drop(r);
+    rig.died();
+    let done = counted(&rig);
+    rig.start();
+    let r = Router::new(&rig.astation);
+    within("the release's result again", || {
+        results_of(&rig, &release).len() == 2
+    });
+    assert_eq!(counted(&rig), done, "nothing counted twice");
+    // It released the task: it runs, once, on a second attempt.
+    in_turn(&rig, &held["task_id"], "KILLED_BEFORE_THE_WITHDRAWAL");
+    complete_turn(&rig, &held["task_id"]);
+    let rows = attempt_rows(&rig, &held["task_id"]);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1].1.as_deref(), Some("started"));
+    // Sent, marked, then a restart: the release's (sent once) goes once
+    // more, since the restart can't know its connection wasn't refused.
+    within("the release's result marked sent", || {
+        host_db(&rig)
+            .query_row(
+                "SELECT sent_gen IS NOT NULL FROM control_acks WHERE key=?1",
+                [release.as_str()],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+    });
+    drop(r);
+    rig.kill();
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    within("the release's result once more", || {
+        results_of(&rig, &release).len() == 3
+    });
+    assert_eq!(counted(&rig), done);
+
+    // 6. During a record's application: a revoke with its interrupt.
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    let turn = task(IDS, &launch, "REVOKED_MID_APPLICATION_TURN", HOUR);
+    let waits = task(IDS, &launch, "REVOKED_MID_APPLICATION_WAITS", HOUR);
+    for t in [&turn, &waits] {
+        enqueue(&mut svc, &mut r, t);
+    }
+    in_turn(&rig, &turn["task_id"], "REVOKED_MID_APPLICATION_TURN");
+    wait_stored(&rig, &waits["task_id"], "blocked", BEHIND);
+    let covered = part(&rig, &principal).unwrap();
+    let cursor = stored_cursor(&rig);
+    crash(&rig, "crash_during_record_application");
+    let revoke = {
+        let mut station = rig.station();
+        let record = station.record_for(
+            SVC,
+            ControlAction::Revoke {
+                interrupt_running: true,
+            },
+        );
+        let at = station.append(record);
+        drop(station);
+        record_id_at(&rig, at)
+    };
+    drop((r, svc));
+    rig.died();
+    assert_eq!(stored_cursor(&rig), cursor, "no partial cursor");
+    assert_eq!(part(&rig, &principal), Some(covered.clone()));
+    assert_eq!(stored(&rig, &waits["task_id"])["state"], "blocked");
+    assert!(intents(&rig, &turn["task_id"]).is_empty());
+    assert!(!ack_owed(&rig, &revoke));
+    assert_eq!(escs(&rig), 0);
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    wait_stored(&rig, &waits["task_id"], "cancelled", REVOKED);
+    within("the revoke's interrupt", || {
+        intents(&rig, &turn["task_id"])
+            .first()
+            .is_some_and(|i| i.delivered_turn.is_some())
+    });
+    within("the Esc", || escs(&rig) == 1);
+    std::fs::write(rig.fake.join("interrupt"), "").unwrap();
+    wait_stored(
+        &rig,
+        &turn["task_id"],
+        "awaiting_result",
+        "turn interrupted",
+    );
+    assert_ne!(part(&rig, &principal), Some(covered));
+    assert_eq!(
+        refused_hello(&mut r, IDS, &rig.log, SVC, true),
+        ("unauthorized".to_string(), Some("revoked".to_string()))
+    );
+    within("the revoke counted", || {
+        counted(&rig)
+            .iter()
+            .filter(|(p, _, id)| *p == principal && *id == revoke)
+            .count()
+            == 2
+    });
+
+    // Every restart: nothing ran twice, nothing revoked ran, the unknown
+    // outcome unresolved.
+    once(
+        &rig,
+        &[
+            "KILLED_AT_COMMIT",
+            "KILLED_AFTER_ACCEPTED",
+            "KILLED_IN_ITS_TURN",
+            "KILLED_BEFORE_THE_WITHDRAWAL",
+            "REVOKED_MID_APPLICATION_TURN",
+        ],
+    );
+    never_ran(&rig, &waits["task_id"], "REVOKED_MID_APPLICATION_WAITS");
+    assert!(!input(&rig).contains("KILLED_AFTER_EXECUTING"));
+    let status = stored(&rig, &unknown["task_id"]);
+    assert_eq!(status["state"], "outcome_unknown", "{status}");
+    assert!(status.get("resolved").is_none(), "{status}");
+    assert!(alerted(&rig, &unknown["task_id"]));
+    assert_eq!(escs(&rig), 1);
+    assert!(rig.station().ack_refusals().is_empty());
+    drop(r);
+    drop(rig);
+
+    // 7. Between a revoke's commit and its followups, with its interrupt
+    // (Task 35 review's notes for Task 37; Task 37 review I2), on a host of
+    // its own: the service's turn runs on one session while its attempt on
+    // another waits `accepted` (`hold_dispatch`).
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_station();
+    rig.faults = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    rig.station_online(true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    let (first, second) = (svc.session(&mut r), svc.session(&mut r));
+    let turn = task(IDS, &first, "REVOKED_AFTER_COMMIT_TURN", HOUR);
+    enqueue(&mut svc, &mut r, &turn);
+    in_turn(&rig, &turn["task_id"], "REVOKED_AFTER_COMMIT_TURN");
+    private(&rig.faults().join("hold_dispatch"), "");
+    two_passes(&rig);
+    let held = task(IDS, &second, "REVOKED_AFTER_COMMIT_ACCEPTED", HOUR);
+    enqueue(&mut svc, &mut r, &held);
+    within("its attempt accepted", || {
+        stored(&rig, &held["task_id"])["state"] == "submitted"
+            && ends(&rig, &held["task_id"]) == [None]
+    });
+    let accepted = attempts(&rig, &held["task_id"])[0].0.clone();
+    receipt_becomes(&rig, &accepted, "state", "accepted");
+    crash(&rig, "crash_after_page_commit");
+    let revoke = {
+        let mut station = rig.station();
+        let record = station.record_for(
+            SVC,
+            ControlAction::Revoke {
+                interrupt_running: true,
+            },
+        );
+        let at = station.append(record);
+        drop(station);
+        record_id_at(&rig, at)
+    };
+    drop((r, svc));
+    rig.died();
+    // At the death: the record's effects stored, its followups not run.
+    let stored_intents = intents(&rig, &turn["task_id"]);
+    let [intent] = stored_intents.as_slice() else {
+        panic!("one intent for the turn: {stored_intents:?}");
+    };
+    assert_eq!(
+        (
+            intent.reason.as_str(),
+            intent.revocation.as_deref(),
+            intent.done
+        ),
+        ("revoke", Some(revoke.as_str()), false)
+    );
+    assert!(intent.delivered_turn.is_none(), "never delivered");
+    assert_eq!(escs(&rig), 0);
+    assert_eq!(
+        attempt_rows(&rig, &held["task_id"]),
+        [(accepted.clone(), None, true)],
+        "the accepted attempt live"
+    );
+    assert!(ack_owed(&rig, &revoke), "the result stored");
+    assert!(results_of(&rig, &revoke).is_empty(), "and never sent");
+    assert!(!input(&rig).contains("REVOKED_AFTER_COMMIT_ACCEPTED"));
+    // The restart: the attempt withdrawn at recovery and its task cancelled;
+    // the intent carried out once.
+    std::fs::remove_file(rig.faults().join("hold_dispatch")).unwrap();
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    wait_stored(&rig, &held["task_id"], "cancelled", REVOKED);
+    receipt_becomes(&rig, &accepted, "detail", "withdrawn at recovery");
+    assert_eq!(
+        attempts(&rig, &held["task_id"]),
+        [(accepted, Some("withdrawn".into()))]
+    );
+    within("the intent delivered", || {
+        intents(&rig, &turn["task_id"])
+            .first()
+            .is_some_and(|i| i.delivered_turn.is_some())
+    });
+    within("the Esc", || escs(&rig) == 1);
+    std::fs::write(rig.fake.join("interrupt"), "").unwrap();
+    wait_stored(
+        &rig,
+        &turn["task_id"],
+        "awaiting_result",
+        "turn interrupted",
+    );
+    work_passes(&rig, 3);
+    assert_eq!(escs(&rig), 1, "carried out once");
+    assert_eq!(intents(&rig, &turn["task_id"]).len(), 1);
+    assert!(intents(&rig, &turn["task_id"])[0].done);
+    assert_eq!(
+        refused_hello(&mut r, IDS, &rig.log, SVC, true),
+        ("unauthorized".to_string(), Some("revoked".to_string()))
+    );
+    let principal = format!("service:{SVC}");
+    within("both effects counted", || counted(&rig).len() == 2);
+    assert_eq!(
+        counted(&rig),
+        [
+            (principal.clone(), "revocation".to_string(), revoke.clone()),
+            (principal, "interrupt".to_string(), revoke),
+        ]
+    );
+    assert_eq!(input(&rig).matches("REVOKED_AFTER_COMMIT_TURN").count(), 1);
+    assert!(!input(&rig).contains("REVOKED_AFTER_COMMIT_ACCEPTED"));
+    assert!(rig.station().ack_refusals().is_empty());
+}
+
+// ── The host's own device-list fetch and deferred entries (design I.4.3,
+// I.5.8; session-v1 R9.3, R9.5) ──
+
+/// The host's Station link in its state dump.
+fn until_station(rig: &Rig, what: &str, done: impl Fn(&Value) -> bool) -> Value {
+    let mut last = Value::Null;
+    within(what, || {
+        last = dumped(rig)["station"].clone();
+        done(&last)
+    });
+    last
+}
+
+/// The head `seq` of the host's device list, as written.
+fn list_head(rig: &Rig) -> u64 {
+    let path = rig.sandbox.config().join("pairing/membership.json");
+    let state: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    state["head"]["seq"].as_u64().unwrap()
+}
+
+fn fetch(after: u64) -> Result<ToStation, RelayError> {
+    Ok(ToStation::MembershipFetch(MembershipFetch { after }))
+}
+
+/// The host's next device-list fetch on `link`, answered; its feed syncs
+/// (`control_sync`) and acknowledgments (`control_ack`, Task 36) on the way
+/// answered too.
+fn next_fetch(station: &mut FakeStation, link: u64) -> Result<ToStation, RelayError> {
+    loop {
+        let call = station.next_call(link);
+        if !matches!(
+            call,
+            Ok(ToStation::ControlSync(_) | ToStation::ControlAck(_))
+        ) {
+            return call;
+        }
+    }
+}
+
+/// The host's next feed sync on `link`, answered (its fetches on the way
+/// answered too): a Station answers each call at once, and an unanswered
+/// sync ends the sync on its link generation (ruling T33d), so a test
+/// answers it before it moves the host's clock past 30 s.
+fn next_sync(station: &mut FakeStation, link: u64) {
+    loop {
+        if matches!(station.next_call(link), Ok(ToStation::ControlSync(_))) {
+            return;
+        }
+    }
+}
+
+/// The device-list fetches the host sent so far (its feed syncs aside).
+fn fetches(station: &FakeStation) -> usize {
+    station
+        .sent()
+        .iter()
+        .filter(|bytes| {
+            matches!(
+                ToStation::decode(bytes.as_bytes()),
+                Ok(ToStation::MembershipFetch(_))
+            )
+        })
+        .count()
+}
+
+/// The phone's removal, signed by `dev-new` (the subject of `log`'s
+/// pending recovery) on `log`'s head: deferred on a host until the wait
+/// ends (R9.5). Not appended: `log` itself can't verify it before then.
+fn removal_by_the_pending(log: &TestLog) -> Value {
+    use atem_client::membership::entry::Action;
+    let body = log.log.draft(
+        "dev-new",
+        r9log::host_now().wall_ms,
+        &Action::Remove {
+            device_id: PHONE.into(),
+        },
+    );
+    atem_client::membership::sign_entry(&log.keys, &auth("dev-new"), body)
+        .unwrap()
+        .object()
+        .to_json()
+}
+
+/// Design I.4.3 ("Deferred entries"), I.5.8: the host's own fetch brings a
+/// pending `recovery_add` and an entry its subject signed, which the host
+/// defers. The fetch stops there (no fetch again from the new head), and
+/// every unstarted delegated remote task waits, `device list update
+/// pending`: the phone's too, though its own channel is caught up. The stop
+/// is the gate's device-list part ("fetched up to a deferred entry"), and
+/// while it holds the list isn't behind: the Station's next `heads`, naming
+/// the same head past the pacing, brings no fetch.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_fetch_stopping_at_a_deferred_entry_marks_device_list_update_pending() {
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_clock();
+    rig.with_station();
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let link = r.link;
+    // The phone launches the session: services wait for the host's first
+    // complete read of its feed (ruling T35d, B).
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let launch = phone.session(&mut r);
+    let pinned = list_head(&rig);
+    // The Station's list: a pending recovery, then an entry its subject
+    // signed.
+    rig.log.recovery_add("dev-new");
+    let deferred = removal_by_the_pending(&rig.log);
+    let log = &rig.log;
+    let mut station = rig.station();
+    station.set_log_beyond(log, &[deferred]);
+    station.serve(link);
+    station.heads_now();
+    assert_eq!(next_fetch(&mut station, link), fetch(pinned));
+    drop(station);
+    let s = until_station(&rig, "the stop at the deferred entry", |s| {
+        s["fetch"]["stopped"] == pinned + 2
+    });
+    assert_eq!(list_head(&rig), pinned + 1, "the recovery applied");
+    assert!(s["fetch"]["in_flight"].is_null(), "no fetch again: {s}");
+    assert_eq!(s["list_part"], true, "fetched up to a deferred entry: {s}");
+    assert!(
+        rig.sandbox
+            .config()
+            .join("runtime/journal/membership_deferred")
+            .is_file()
+    );
+
+    let t = task_until(
+        IDS,
+        &launch,
+        "DEFERRED_BY_THE_FETCH",
+        rig.clock().wall() + HOUR,
+    );
+    enqueue(&mut phone, &mut r, &t);
+    wait_stored(&rig, &t["task_id"], "blocked", "device list update pending");
+
+    // The same head announced again, past every pacing: not behind.
+    let heads = s["heads"].as_u64().unwrap();
+    rig.clock().add_mono(STALL_PAUSE + 1_000);
+    rig.station().heads_now();
+    let s = until_station(&rig, "the next heads", |s| s["heads"] == heads + 1);
+    assert!(s["fetch"]["in_flight"].is_null(), "{s}");
+    assert_eq!(s["fetch"]["stopped"], pinned + 2, "{s}");
+    two_passes(&rig);
+    rig.station().serve(link);
+    assert_eq!(fetches(&rig.station()), 1, "{:?}", rig.station().sent());
+    wait_stored(&rig, &t["task_id"], "blocked", "device list update pending");
+    assert!(attempts(&rig, &t["task_id"]).is_empty());
+    assert!(!input(&rig).contains("DEFERRED_BY_THE_FETCH"));
+}
+
+/// VII.A test 15 (design I.4.3, "Deferred entries"; session-v1 R9.5): the
+/// host's fetch stops at an entry the subject of a pending recovery signed
+/// (the phone's removal), and every unstarted delegated remote task waits,
+/// `device list update pending`. The wait ends on the host's clock: the
+/// deferral ends, the host fetches the entry again at once (no `heads`),
+/// and nothing dispatches before it is checked again: a task whose deadline
+/// passed meanwhile expires, and the others wait `revocations not yet
+/// checked` (the gate's device-list part no longer holds: the list is
+/// behind the announced head) until the fetch applies the entry. Then the
+/// removed phone's task is cancelled, `sender revoked`, and the Mac's runs
+/// once the Station's next heads opens the feed part again (none came for
+/// the 24 hours the host's clock moved).
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn the_deferral_ends_with_the_recovery_wait_and_tasks_are_checked_again() {
+    let mut rig = Rig::prepared(48 * HOUR, false);
+    rig.with_clock();
+    rig.with_station();
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let link = r.link;
+    // The Mac launches the session (services wait for the host's first
+    // complete read of its feed, ruling T35d, B), and its channel goes: a
+    // native channel left open would pass its gate (I.5.8).
+    let mut launcher = Dev::new(&mut r, IDS, &rig.log, MAC, false);
+    let launch = launcher.session(&mut r);
+    launcher.close(&mut r);
+    let pinned = list_head(&rig);
+    // The recovery reaches the host by its fetch: its wait starts now on
+    // the host's clock.
+    rig.log.recovery_add("dev-new");
+    let log = &rig.log;
+    let mut station = rig.station();
+    station.set_log(log);
+    station.serve(link);
+    station.heads_now();
+    assert_eq!(next_fetch(&mut station, link), fetch(pinned));
+    // The feed's sync answered before the host's clock moves on.
+    next_sync(&mut station, link);
+    drop(station);
+    within("the recovery", || list_head(&rig) == pinned + 1);
+
+    // Five minutes before the wait ends, the entry its subject signed.
+    rig.clock()
+        .set((24 * HOUR - 5 * MIN) as i64, 24 * HOUR - 5 * MIN);
+    let deferred = removal_by_the_pending(&rig.log);
+    let log = &rig.log;
+    let mut station = rig.station();
+    station.set_log_beyond(log, &[deferred]);
+    station.heads_now();
+    assert_eq!(next_fetch(&mut station, link), fetch(pinned + 1));
+    drop(station);
+    until_station(&rig, "the stop at the deferred entry", |s| {
+        s["fetch"]["stopped"] == pinned + 2
+    });
+
+    // The phone's task and two of the Mac's, one due in two minutes.
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let mut mac = Dev::new(&mut r, IDS, &rig.log, MAC, false);
+    let wall = rig.clock().wall();
+    let removed = task_until(IDS, &launch, "BY_THE_REMOVED_PHONE", wall + HOUR);
+    let runs = task_until(IDS, &launch, "BY_THE_MAC", wall + HOUR);
+    let due = task_until(IDS, &launch, "DUE_DURING_THE_WAIT", wall + 2 * MIN);
+    enqueue(&mut phone, &mut r, &removed);
+    enqueue(&mut mac, &mut r, &runs);
+    enqueue(&mut mac, &mut r, &due);
+    for t in [&removed, &runs, &due] {
+        wait_stored(&rig, &t["task_id"], "blocked", "device list update pending");
+    }
+    // The senders go: their gate is the host's own Station's now, with no
+    // caught-up channel of their own. A close reaches the host at one of its
+    // passes, maybe after the one that sees the clock below: wait until it
+    // has dropped both channels, or a native whose close is still on its
+    // way passes its gate by that channel (I.5.8, "Native senders") the
+    // moment the deferral ends.
+    let open = dumped(&rig)["channels"].as_u64().unwrap();
+    phone.close(&mut r);
+    mac.close(&mut r);
+    within("the senders' channels closed", || {
+        dumped(&rig)["channels"].as_u64() == Some(open - 2)
+    });
+
+    // The wait ends on the host's clock (24 h and a minute since the host
+    // first saw the recovery). Checked again before anything dispatches.
+    rig.clock().set((24 * HOUR + MIN) as i64, 24 * HOUR + MIN);
+    wait_stored(
+        &rig,
+        &due["task_id"],
+        "expired",
+        "expired before submission",
+    );
+    for t in [&removed, &runs] {
+        wait_stored(&rig, &t["task_id"], "blocked", GATE_CLOSED);
+    }
+    let s = until_station(&rig, "the deferral's end", |s| {
+        s["fetch"]["stopped"].is_null()
+    });
+    assert_eq!(s["list_part"], false, "{s}");
+    // The host fetched the entry again at once, with no heads.
+    let heads = s["heads"].clone();
+    assert_eq!(next_fetch(&mut rig.station(), link), fetch(pinned + 1));
+    within("the removal", || list_head(&rig) == pinned + 2);
+    wait_stored(&rig, &removed["task_id"], "cancelled", "sender revoked");
+    // The dump is written at the end of a pass; the cancellation is in the
+    // store mid-pass.
+    two_passes(&rig);
+    let s = dumped(&rig)["station"].clone();
+    assert_eq!(s["heads"], heads, "no heads since: {s}");
+    assert_eq!(s["list_part"], true, "{s}");
+    // No heads came for 24 h on the host's clock: the feed part opens at
+    // the Station's next heads, and the Mac's task runs.
+    rig.station().heads_now();
+    within("the gate open again", || {
+        rig.station().serve(link);
+        dumped(&rig)["station"]["feed"]["open"] == true
+    });
+    in_turn(&rig, &runs["task_id"], "BY_THE_MAC");
+    complete_turn(&rig, &runs["task_id"]);
+    for t in [&removed, &due] {
+        assert!(attempts(&rig, &t["task_id"]).is_empty());
+    }
+    assert!(!input(&rig).contains("BY_THE_REMOVED_PHONE"));
+    assert!(!input(&rig).contains("DUE_DURING_THE_WAIT"));
 }
 
 /// What the owner's terminal (outside any session) prints for `atem
@@ -1315,17 +1807,18 @@ fn owner(rig: &Rig, args: &[&str]) -> String {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_HOST_CONTROLS hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn task_resolve_refused_inside_an_agent_session() {
     let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(gate_open());
+    rig.with_station();
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    rig.station_online(false);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let t = task(&launch, "IN_ITS_TURN", HOUR);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let t = task(IDS, &launch, "IN_ITS_TURN", HOUR);
     enqueue(&mut phone, &mut r, &t);
     in_turn(&rig, &t["task_id"], "IN_ITS_TURN");
     let tid = t["task_id"].as_str().unwrap();
@@ -1384,21 +1877,22 @@ fn task_resolve_refused_inside_an_agent_session() {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_CONTEXT_DIR hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_STATE_DUMP and ATEM_TEST_CONTEXT_DIR hooks"
 )]
 fn the_owner_lists_and_resolves_unknown_outcomes_from_the_terminal() {
     use sha2::{Digest, Sha256};
     let mut rig = Rig::prepared(4 * HOUR, false);
     support::astation::write_encryption_mode(&rig.sandbox.config(), "on");
-    rig.with_controls(gate_open());
+    rig.with_station();
     rig.context = true;
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    rig.station_online(false);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let (first, second) = (svc.session(&mut r), svc.session(&mut r));
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let one = task(&first, "OWNER_ONE", HOUR);
-    let two = task(&second, "OWNER_TWO", HOUR);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let one = task(IDS, &first, "OWNER_ONE", HOUR);
+    let two = task(IDS, &second, "OWNER_TWO", HOUR);
     for t in [&one, &two] {
         enqueue(&mut phone, &mut r, t);
     }
@@ -1501,7 +1995,7 @@ fn the_owner_lists_and_resolves_unknown_outcomes_from_the_terminal() {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_CONTEXT_DIR hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_STATE_DUMP and ATEM_TEST_CONTEXT_DIR hooks"
 )]
 fn a_done_whose_client_goes_away_resolves_nothing_and_says_so() {
     use sha2::{Digest, Sha256};
@@ -1515,14 +2009,15 @@ fn a_done_whose_client_goes_away_resolves_nothing_and_says_so() {
         ),
         "{err}"
     );
-    rig.with_controls(gate_open());
+    rig.with_station();
     rig.context = true;
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    rig.station_online(false);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let t = task(&launch, "GOES_AWAY", HOUR);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let t = task(IDS, &launch, "GOES_AWAY", HOUR);
     enqueue(&mut phone, &mut r, &t);
     in_turn(&rig, &t["task_id"], "GOES_AWAY");
     private(&rig.fake.join("exit"), "");
@@ -1584,46 +2079,6 @@ fn a_done_whose_client_goes_away_resolves_nothing_and_says_so() {
     assert_eq!(stored(&rig, &t["task_id"])["resolved"]["by"], "local");
 }
 
-/// The bare Esc bytes the rig's agent was given (a bracketed paste's
-/// `ESC [` doesn't count).
-fn escs(rig: &Rig) -> usize {
-    let text = input(rig);
-    text.matches('\x1b').count() - text.matches("\x1b[").count()
-}
-
-/// One interrupt intent as `runtime/host-work.sqlite` stores it.
-#[derive(Debug)]
-struct Intent {
-    attempt_id: String,
-    reason: String,
-    done: bool,
-    delivered_turn: Option<String>,
-}
-
-/// Task `tid`'s interrupt intents, oldest first.
-fn intents(rig: &Rig, tid: &Value) -> Vec<Intent> {
-    let db =
-        rusqlite::Connection::open(rig.sandbox.config().join("runtime/host-work.sqlite")).unwrap();
-    db.busy_timeout(Duration::from_secs(5)).unwrap();
-    let mut q = db
-        .prepare(
-            "SELECT attempt_id,reason,done_ms IS NOT NULL,delivered_turn FROM intents
-            WHERE task_id=?1 ORDER BY rowid",
-        )
-        .unwrap();
-    q.query_map([tid.as_str().unwrap()], |r| {
-        Ok(Intent {
-            attempt_id: r.get(0)?,
-            reason: r.get(1)?,
-            done: r.get(2)?,
-            delivered_turn: r.get(3)?,
-        })
-    })
-    .unwrap()
-    .map(Result::unwrap)
-    .collect()
-}
-
 /// The host interrupt writes the runtime handed to a worker so far (the
 /// state dump's count).
 fn interrupt_writes(rig: &Rig) -> u64 {
@@ -1654,19 +2109,19 @@ fn work_passes(rig: &Rig, n: u64) {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn a_turn_running_at_its_deadline_is_interrupted_and_expires() {
     let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(gate_open());
+    rig.with_station();
     rig.with_clock();
-    rig.dump = true;
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    rig.station_online(false);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let t = task_until(&launch, "DEADLINE_TURN", rig.clock().wall() + 10 * MIN);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let t = task_until(IDS, &launch, "DEADLINE_TURN", rig.clock().wall() + 10 * MIN);
     let tid = &t["task_id"];
     enqueue(&mut phone, &mut r, &t);
     in_turn(&rig, tid, "DEADLINE_TURN");
@@ -1737,19 +2192,19 @@ fn a_turn_running_at_its_deadline_is_interrupted_and_expires() {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn a_paused_host_still_interrupts_a_turn_at_its_deadline() {
     let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(gate_open());
+    rig.with_station();
     rig.with_clock();
-    rig.dump = true;
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    rig.station_online(false);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let t = task_until(&launch, "PAUSED_TURN", rig.clock().wall() + 10 * MIN);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let t = task_until(IDS, &launch, "PAUSED_TURN", rig.clock().wall() + 10 * MIN);
     let tid = &t["task_id"];
     enqueue(&mut phone, &mut r, &t);
     in_turn(&rig, tid, "PAUSED_TURN");
@@ -1821,17 +2276,18 @@ fn interrupt(dev: &mut Dev, r: &mut Router, tid: &Value) -> Value {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_HOST_CONTROLS hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn work_interrupt_over_the_senders_channel() {
     let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(gate_open());
+    rig.with_station();
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    rig.station_online(false);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let t = task(&launch, "CHANNEL_INTERRUPT", HOUR);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let t = task(IDS, &launch, "CHANNEL_INTERRUPT", HOUR);
     let tid = &t["task_id"];
     enqueue(&mut phone, &mut r, &t);
     in_turn(&rig, tid, "CHANNEL_INTERRUPT");
@@ -1875,18 +2331,18 @@ fn work_interrupt_over_the_senders_channel() {
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_STATE_DUMP hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn work_interrupt_is_served_while_hosting_is_paused() {
     let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(gate_open());
-    rig.dump = true;
+    rig.with_station();
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    rig.station_online(false);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let t = task(&launch, "PAUSED_INTERRUPT", HOUR);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let t = task(IDS, &launch, "PAUSED_INTERRUPT", HOUR);
     let tid = &t["task_id"];
     enqueue(&mut phone, &mut r, &t);
     in_turn(&rig, tid, "PAUSED_INTERRUPT");
@@ -1939,14 +2395,18 @@ fn work_interrupt_is_served_while_hosting_is_paused() {
     assert_eq!(escs(&rig), 1);
 }
 
-/// The stand-in's feed covering [`SVC`] (its gate open), the service held
-/// or revoked as `standing` adds.
-fn svc_standing(standing: Value) -> Value {
-    let mut svc = json!({"coverage": {"origin": ORIGIN, "feed_id": "feed-1"}});
-    for (key, value) in standing.as_object().unwrap() {
-        svc[key] = value.clone();
-    }
-    json!({"own": ORIGIN, "open": [ORIGIN], "standings": {format!("service:{SVC}"): svc}})
+/// A record of the fake Station's about [`SVC`] at its feed's next
+/// position, with the Station online ([`Rig::station_online`]): announced
+/// at once, and read by the host before this returns (its cursor there).
+fn control(rig: &Rig, action: ControlAction) {
+    let at = {
+        let mut station = rig.station();
+        let record = station.record_for(SVC, action);
+        station.append(record)
+    };
+    within("the record read", || {
+        dumped(rig)["station"]["feed"]["synced"]["cursor"].as_u64() >= Some(at)
+    });
 }
 
 /// `dev`'s `host_launch` of profile `backend`, expiring in ten minutes
@@ -1983,32 +2443,34 @@ fn never_spawned(rig: &Rig, sid: &str) -> bool {
 
 /// VII.A test 19, its launch half (design I.4.3, "Launches"; host-work-v1
 /// §11.6): in the real runtime, a covered service's `host_launch` while the
-/// stand-in holds it waits at the spawn boundary through host-work's
-/// passes: `starting`, no worker spawned, its reason in `runtime.log`. The
-/// release lets it start. A launch while the service is revoked ends
-/// `failed` at once, nothing spawned, never `outcome_unknown`, the detail
-/// in `runtime.log`.
+/// fake Station's feed holds it waits at the spawn boundary through
+/// host-work's passes: `starting`, no worker spawned, its reason in
+/// `runtime.log`. The feed's release lets it start. Held again, a launch
+/// waits; the feed's revoke then ends it `failed` (`sender revoked`),
+/// nothing spawned, never `outcome_unknown`, read from the store and
+/// `runtime.log`: the revoke fenced the service's channel (design I.5.5
+/// step 2), and a new `hello` of it is refused (`unauthorized`, `revoked`),
+/// so no later request of it reaches the host (one that did would be
+/// `forbidden`: the bridge's tests).
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS and ATEM_TEST_STATE_DUMP hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_STATE_DUMP hooks"
 )]
 fn a_held_senders_launch_waits_and_a_revoked_ones_fails() {
     let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(svc_standing(json!({"held": true})));
-    rig.dump = true;
+    rig.with_station();
     rig.start();
     let log = rig.sandbox.dir.path().join("runtime.log");
-    // The stand-in's file, rewritten while the runtime runs.
-    let controls = rig.controls.clone().unwrap();
-    let standing = |value: Value| replace(&controls, &svc_standing(value).to_string());
     let logged = |text: &str| {
         std::fs::read_to_string(&log)
             .unwrap_or_default()
             .contains(text)
     };
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
+    rig.station_online(true);
+    control(&rig, ControlAction::Hold);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let (held, sid) = launch_backend(&mut svc, &mut r);
     within("the wait logged", || {
         logged(&format!(
@@ -2019,233 +2481,972 @@ fn a_held_senders_launch_waits_and_a_revoked_ones_fails() {
     assert_eq!(launch_state(&mut svc, &mut r, &held), "starting");
     assert!(never_spawned(&rig, &sid), "nothing spawned while held");
     // Released: it starts.
-    standing(json!({}));
+    control(&rig, ControlAction::Release);
     within("the released launch started", || {
         launch_state(&mut svc, &mut r, &held) == "started"
     });
-    // Revoked: the next launch fails at once.
-    standing(json!({"revoked": "rec-revoke"}));
-    work_passes(&rig, 2);
-    let (revoked, sid) = launch_backend(&mut svc, &mut r);
-    within("the revoked launch failed", || {
-        let state = launch_state(&mut svc, &mut r, &revoked);
+    // Held again, a launch waits at the spawn boundary; revoked: it fails
+    // there, nothing spawned (its sender's channel is fenced by then: its
+    // state is the store's and runtime.log's).
+    control(&rig, ControlAction::Hold);
+    let (waiting, sid) = launch_backend(&mut svc, &mut r);
+    within("the second wait logged", || {
+        logged(&format!(
+            "launch {waiting} waits at the spawn boundary: paused"
+        ))
+    });
+    control(
+        &rig,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    let state = |rig: &Rig| {
+        host_db(rig)
+            .query_row(
+                "SELECT record FROM launches WHERE id=?1",
+                [waiting.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|text| serde_json::from_str::<Value>(&text).unwrap()["status"]["state"].clone())
+            .unwrap()
+    };
+    within("the waiting launch failed", || {
+        let state = state(&rig);
         assert_ne!(state, "outcome_unknown");
         state == "failed"
     });
     assert!(never_spawned(&rig, &sid), "nothing spawned when revoked");
     assert!(logged(&format!(
-        "launch {revoked} failed before its spawn: sender revoked"
+        "launch {waiting} failed before its spawn: sender revoked"
     )));
+    // At the request: the revoked service can't come back.
+    assert_eq!(
+        refused_hello(&mut r, IDS, &rig.log, SVC, true),
+        ("unauthorized".to_string(), Some("revoked".to_string()))
+    );
 }
 
-// ── The host's own device-list fetch and deferred entries (design I.4.3,
-// I.5.8; session-v1 R9.3, R9.5) ──
+// ── VII.A against the fake Station (Task 37) ──
 
-/// The host's Station link in its state dump.
-fn until_station(rig: &Rig, what: &str, done: impl Fn(&Value) -> bool) -> Value {
-    let mut last = Value::Null;
-    within(what, || {
-        last = dumped(rig)["station"].clone();
-        done(&last)
+/// `record` stored at the fake Station's feed's next position, the
+/// Station online ([`Rig::station_online`]): announced at once, and read by
+/// the host before this returns (its cursor there). Its position.
+fn control_record(rig: &Rig, record: atem_client::SignedObject) -> u64 {
+    let at = rig.station().append(record);
+    within("the record read", || {
+        dumped(rig)["station"]["feed"]["synced"]["cursor"].as_u64() >= Some(at)
     });
-    last
+    at
 }
 
-/// The head `seq` of the host's device list, as written.
-fn list_head(rig: &Rig) -> u64 {
-    let path = rig.sandbox.config().join("pairing/membership.json");
-    let state: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    state["head"]["seq"].as_u64().unwrap()
+/// [`control`], the record kept (to serve it again).
+fn control_kept(rig: &Rig, action: ControlAction) -> atem_client::SignedObject {
+    let record = rig.station().record_for(SVC, action);
+    control_record(rig, record.clone());
+    record
 }
 
-fn fetch(after: u64) -> Result<ToStation, RelayError> {
-    Ok(ToStation::MembershipFetch(MembershipFetch { after }))
+/// The id of the record at `seq` of the fake Station's feed.
+fn record_id_at(rig: &Rig, seq: u64) -> String {
+    let station = rig.station();
+    let records = station.records();
+    let (_, record) = records
+        .iter()
+        .find(|(at, _)| *at == seq)
+        .unwrap_or_else(|| panic!("no record at {seq}"));
+    record.record_id().to_owned()
 }
 
-/// The phone's removal, signed by `dev-new` (the subject of `log`'s
-/// pending recovery) on `log`'s head: deferred on a host until the wait
-/// ends (R9.5). Not appended: `log` itself can't verify it before then.
-fn removal_by_the_pending(log: &TestLog) -> Value {
-    use atem_client::membership::entry::Action;
-    let body = log.log.draft(
-        "dev-new",
-        r9log::host_now().wall_ms,
-        &Action::Remove {
-            device_id: PHONE.into(),
+/// The results of `record_id` in the acks the fake Station read so far,
+/// each as its (effect, result) codes.
+fn results_of(rig: &Rig, record_id: &str) -> Vec<Vec<(String, String)>> {
+    rig.station()
+        .acks_sent()
+        .iter()
+        .flat_map(|ack| ack.results.iter())
+        .filter_map(|r| match r {
+            atem_client::control::AckResult::Record {
+                record_id: id,
+                effects,
+            } if id == record_id => Some(
+                effects
+                    .iter()
+                    .map(|e| (e.effect.code().to_string(), e.result.code().to_string()))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What the Station's reference ledger counted for the host: (principal,
+/// effect, record id), in order.
+fn counted(rig: &Rig) -> Vec<(String, String, String)> {
+    rig.station().acks().to_json()["done"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            assert_eq!(d["host"], HOST, "{d}");
+            let text = |k: &str| d[k].as_str().unwrap().to_string();
+            (text("principal"), text("effect"), text("record_id"))
+        })
+        .collect()
+}
+
+/// VII.A test 5 (design I.3.3 "Pause" and "Resume", I.4.3 "Holding tasks
+/// don't hold the session", I.5.5 step 4; host-work-v1 §11.1 rule 1): the
+/// Station holds the covered service while its task waits behind the
+/// phone's turn: the task waits `paused`, and doesn't hold its session: the
+/// phone's next task and a local agent's task, queued after it, run past
+/// it. The release lets it run. The Station holds the service again (its
+/// next task waits `paused`), then serves the earlier release again at a
+/// later position: the same record, a `duplicate` the host ignores, so the
+/// task stays paused until a new release. Each ran once.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn pause_holds_and_resume_releases() {
+    let mut rig = Rig::prepared(4 * HOUR, true);
+    rig.with_station();
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    rig.station_online(true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let busy = task(IDS, &launch, "PAUSE_PHONE_BUSY", HOUR);
+    enqueue(&mut phone, &mut r, &busy);
+    in_turn(&rig, &busy["task_id"], "PAUSE_PHONE_BUSY");
+    let held = task(IDS, &launch, "PAUSE_HELD", HOUR);
+    enqueue(&mut svc, &mut r, &held);
+    wait_stored(&rig, &held["task_id"], "blocked", BEHIND);
+    // The hold: the service's task waits paused.
+    control(&rig, ControlAction::Hold);
+    wait_stored(&rig, &held["task_id"], "blocked", PAUSED);
+    // The phone's next task and a local agent's pass it.
+    let after = task(IDS, &launch, "PAUSE_PHONE_AFTER", HOUR);
+    enqueue(&mut phone, &mut r, &after);
+    complete_turn(&rig, &busy["task_id"]);
+    in_turn(&rig, &after["task_id"], "PAUSE_PHONE_AFTER");
+    let other = local_session(&rig, "other");
+    let sent = agent_run(
+        &other,
+        1,
+        &["message", "send", "--to", "tag:peer", "PAUSE_LOCAL"],
+    );
+    assert_eq!(sent["code"], 0, "{sent}");
+    complete_turn(&rig, &after["task_id"]);
+    within("the local task's prompt", || {
+        input(&rig).contains("PAUSE_LOCAL")
+    });
+    let local = local_tasks(&rig);
+    assert_eq!(local.len(), 1, "{local:?}");
+    let tid = local[0]["task"]["task_id"].clone();
+    complete_turn(&rig, &tid);
+    let done = agent_run(&other, 2, &["message", "complete", tid.as_str().unwrap()]);
+    assert_eq!(done["code"], 0, "{done}");
+    assert_eq!(stored(&rig, &held["task_id"])["detail"], PAUSED);
+    never_ran(&rig, &held["task_id"], "PAUSE_HELD");
+    // The release: it runs.
+    let release = control_kept(&rig, ControlAction::Release);
+    in_turn(&rig, &held["task_id"], "PAUSE_HELD");
+    complete_turn(&rig, &held["task_id"]);
+    // Held again; the earlier release served again is ignored.
+    control(&rig, ControlAction::Hold);
+    let again = task(IDS, &launch, "PAUSE_HELD_AGAIN", HOUR);
+    enqueue(&mut svc, &mut r, &again);
+    wait_stored(&rig, &again["task_id"], "blocked", PAUSED);
+    let release_id = {
+        let record = atem_client::control::ControlRecord::from_signed(release.clone()).unwrap();
+        record.record_id().to_owned()
+    };
+    let replayed = control_record(&rig, release);
+    assert_eq!(record_id_at(&rig, replayed), release_id, "the same record");
+    work_passes(&rig, 3);
+    assert_eq!(stored(&rig, &again["task_id"])["detail"], PAUSED);
+    never_ran(&rig, &again["task_id"], "PAUSE_HELD_AGAIN");
+    within("the replay's result", || {
+        results_of(&rig, &release_id)
+            .iter()
+            .any(|r| r == &[("release".to_string(), "duplicate".to_string())])
+    });
+    // A new release: it runs.
+    control(&rig, ControlAction::Release);
+    in_turn(&rig, &again["task_id"], "PAUSE_HELD_AGAIN");
+    complete_turn(&rig, &again["task_id"]);
+    let text = input(&rig);
+    for prompt in [
+        "PAUSE_PHONE_BUSY",
+        "PAUSE_PHONE_AFTER",
+        "PAUSE_LOCAL",
+        "PAUSE_HELD",
+        "PAUSE_HELD_AGAIN",
+    ] {
+        let n = text.matches(prompt).count();
+        // `PAUSE_HELD` is a prefix of `PAUSE_HELD_AGAIN`.
+        let expected = if prompt == "PAUSE_HELD" { 2 } else { 1 };
+        assert_eq!(n, expected, "{prompt}");
+    }
+    assert!(rig.station().ack_refusals().is_empty());
+}
+
+/// The Mac's prompt, accepted first on `launch`'s session, then `dev`'s
+/// task `t`, whose attempt host-work's dispatch (made once the broker's
+/// `hold_dispatch` is gone) queues behind it: the attempt waits `accepted`
+/// behind the Mac's running turn (as in
+/// `a_freeze_at_the_start_fails_the_attempt`). The attempt's id.
+fn accepted_behind_the_macs_turn(
+    rig: &Rig,
+    r: &mut Router,
+    mac: &mut Dev,
+    dev: &mut Dev,
+    launch: &Value,
+    t: &Value,
+) -> String {
+    let sid = launch["session_id"].as_str().unwrap().to_string();
+    mac.list(r, &sid);
+    let hold_host_work = rig.faults().join("hold_host_work");
+    let hold_dispatch = rig.faults().join("hold_dispatch");
+    private(&hold_host_work, "");
+    private(&hold_dispatch, "");
+    two_passes(rig);
+    assert_eq!(enqueue(dev, r, t)["state"], "queued");
+    let accepted = mac.request(
+        r,
+        json!({"op":"submit","binding":mac.read(&sid),"kind":"prompt","request_id":uuid(),
+            "acquire":true,"payload":{"text":"MAC_TURN"}}),
+    );
+    assert_eq!(accepted["state"], "accepted", "{accepted}");
+    let lease = mac.request(
+        r,
+        json!({"op":"acquire","binding":mac.read(&sid),"takeover":false}),
+    );
+    assert_eq!(lease["op"], "lease", "{lease}");
+    let released = mac.request(r, json!({"op":"release","binding":lease["binding"]}));
+    assert_eq!(released["op"], "lease_released", "{released}");
+    std::fs::remove_file(&hold_dispatch).unwrap();
+    two_passes(rig);
+    std::fs::remove_file(&hold_host_work).unwrap();
+    within("the Mac's turn", || input(rig).contains("MAC_TURN"));
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let all = attempts(rig, &t["task_id"]);
+        if let [(id, None)] = all.as_slice()
+            && receipt(rig, id)["state"] == "accepted"
+            && stored(rig, &t["task_id"])["state"] == "submitted"
+        {
+            return id.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no attempt waits accepted: {all:?} {}",
+            stored(rig, &t["task_id"])
+        );
+        std::thread::sleep(Duration::from_millis(40));
+    }
+}
+
+/// After an event against task `t`'s attempt `attempt`, waiting `accepted`
+/// behind the Mac's turn, and the end of that turn (when the start check
+/// runs at the latest): the attempt was withdrawn and the task settled
+/// `state`/`detail` from it; its prompt is never written and no other
+/// attempt is made, whatever more passes run (design I.5.9: never both; a
+/// withdrawn attempt isn't retried).
+#[track_caller]
+fn withdrawn_never_run(rig: &Rig, t: &Value, attempt: &str, state: &str, detail: &str) {
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    within("the Mac's turn ended", || {
+        !rig.fake.join("complete").exists()
+    });
+    wait_stored(rig, &t["task_id"], state, detail);
+    within("the withdrawal recorded", || {
+        let rc = receipt(rig, attempt);
+        rc["state"] == "rejected" && rc["detail"] == "withdrawn by the host"
+    });
+    work_passes(rig, 3);
+    let status = stored(rig, &t["task_id"]);
+    assert_eq!(
+        (&status["state"], &status["detail"]),
+        (&json!(state), &json!(detail))
+    );
+    assert_eq!(
+        attempts(rig, &t["task_id"]),
+        [(attempt.to_string(), Some("withdrawn".to_string()))]
+    );
+    let prompt = t["prompt"].as_str().unwrap();
+    assert!(!input(rig).contains(prompt), "{prompt} written");
+}
+
+/// VII.A test 6 (design I.4.3 "The same check runs at the start", I.5.6,
+/// I.5.9; session-v1 R9.14 item 3): an event against an attempt waiting
+/// `accepted` behind another turn ends it one way only: withdrawn
+/// (`withdrawn by the host`) and the task settled from the event, never
+/// written, never retried. The Station's revoke (`cancelled`, `sender
+/// revoked`), an R9 removal of the sender (the phone: `cancelled`, `sender
+/// revoked`), a narrowing that drops `prompt` (`failed`, `sender's
+/// authorization narrowed`) and a route change (`failed`, `route
+/// changed`), each on a host of its own. A revoke at the moment of dispatch
+/// (the queued task's dispatch held while the record commits) cancels the
+/// task before any attempt: none is ever made. (A revoke landing after the
+/// attempt reached `executing`, where the task runs, is
+/// `a_record_against_a_live_attempt`.)
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn revoke_at_dispatch_and_while_accepted_never_both() {
+    #[derive(Clone, Copy, Debug)]
+    enum Event {
+        Revoke,
+        Removal,
+        Narrowing,
+        RouteChange,
+    }
+    for event in [
+        Event::Revoke,
+        Event::Removal,
+        Event::Narrowing,
+        Event::RouteChange,
+    ] {
+        let mut rig = Rig::prepared(4 * HOUR, false);
+        rig.with_station();
+        rig.faults = true;
+        rig.start();
+        let mut r = Router::new(&rig.astation);
+        rig.station_online(true);
+        let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+        let launch = svc.session(&mut r);
+        let mut mac = Dev::new(&mut r, IDS, &rig.log, MAC, false);
+        let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+        let t = task(IDS, &launch, &format!("ACCEPTED_{event:?}"), HOUR);
+        let sender = match event {
+            Event::Removal => &mut phone,
+            _ => &mut svc,
+        };
+        let attempt = accepted_behind_the_macs_turn(&rig, &mut r, &mut mac, sender, &launch, &t);
+        let (state, detail) = match event {
+            Event::Revoke => {
+                control(
+                    &rig,
+                    ControlAction::Revoke {
+                        interrupt_running: false,
+                    },
+                );
+                ("cancelled", REVOKED)
+            }
+            Event::Removal => {
+                let removal = rig.log.remove(PHONE);
+                mac.carry(&mut r, &[removal]);
+                ("cancelled", REVOKED)
+            }
+            Event::Narrowing => {
+                let narrower =
+                    ServiceScope::new([HOST]).ops(["launch", "message", "notify", "view"]);
+                let narrowing = rig.log.narrow_service(SVC, &narrower, None);
+                mac.carry(&mut r, &[narrowing]);
+                ("failed", "sender's authorization narrowed")
+            }
+            Event::RouteChange => {
+                let file = rig.sandbox.config().join("runtime.toml");
+                let toml = std::fs::read_to_string(&file).unwrap();
+                let route = "revision = 1\nprofile_id = \"backend\"";
+                assert_eq!(toml.matches(route).count(), 1, "{toml}");
+                replace(
+                    &file,
+                    &toml.replace(route, "revision = 2\nprofile_id = \"backend\""),
+                );
+                // A change is the runtime's once it loaded the file (at most
+                // a second on): a task naming the new revision is accepted
+                // then. (Its turn would otherwise end first, a start the
+                // change didn't precede: never both still, but not this
+                // case.)
+                let deadline = Instant::now() + WAIT;
+                loop {
+                    let probe = task(IDS, &launch, "ROUTE_PROBE", HOUR);
+                    let mut data = enqueue_data(IDS, &probe);
+                    data["route_revision"] = json!(2);
+                    let reply = phone.request(&mut r, data);
+                    if reply["result"]["work"].is_object() {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the new route never loaded: {reply}"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                ("failed", "route changed")
+            }
+        };
+        withdrawn_never_run(&rig, &t, &attempt, state, detail);
+        drop((r, svc, mac, phone));
+    }
+
+    // A revoke at the moment of dispatch: the record commits while the
+    // task's dispatch is held; no attempt is ever made.
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_station();
+    rig.faults = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    rig.station_online(true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let hold_host_work = rig.faults().join("hold_host_work");
+    private(&hold_host_work, "");
+    two_passes(&rig);
+    let t = task(IDS, &launch, "REVOKED_AT_DISPATCH", HOUR);
+    assert_eq!(enqueue(&mut svc, &mut r, &t)["state"], "queued");
+    control(
+        &rig,
+        ControlAction::Revoke {
+            interrupt_running: false,
         },
     );
-    atem_client::membership::sign_entry(&log.keys, &auth("dev-new"), body)
-        .unwrap()
-        .object()
-        .to_json()
+    wait_stored(&rig, &t["task_id"], "cancelled", REVOKED);
+    std::fs::remove_file(&hold_host_work).unwrap();
+    work_passes(&rig, 3);
+    assert_eq!(stored(&rig, &t["task_id"])["state"], "cancelled");
+    never_ran(&rig, &t["task_id"], "REVOKED_AT_DISPATCH");
 }
 
-/// Design I.4.3 ("Deferred entries"), I.5.8: the host's own fetch brings a
-/// pending `recovery_add` and an entry its subject signed, which the host
-/// defers. The fetch stops there (no fetch again from the new head), and
-/// every unstarted delegated remote task waits, `device list update
-/// pending`: the phone's too, though its own channel is caught up. The stop
-/// is the gate's device-list part ("fetched up to a deferred entry"), and
-/// while it holds the list isn't behind: the Station's next `heads`, naming
-/// the same head past the pacing, brings no fetch.
+/// `dev`'s `work_resolve` of task `tid`: the reply.
+fn resolve(dev: &mut Dev, r: &mut Router, tid: &Value, resolution: Value) -> Value {
+    dev.request(
+        r,
+        json!({"op":"work_resolve","host":host(),"task_id":tid,"resolution":resolution}),
+    )
+}
+
+/// `dev`'s `alert_list` (`host.alerts`), first page: the alerts.
+fn alert_list(dev: &mut Dev, r: &mut Router) -> Vec<Value> {
+    let reply = dev.request(r, json!({"op":"alert_list","host":host()}));
+    reply["result"]["alerts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no alerts: {reply}"))
+        .clone()
+}
+
+/// `n` unresolved outcomes of `sender` recorded in the host's store (their
+/// alerts: what the capacity limits count), on session `sid`.
+fn unresolved_outcomes(rig: &Rig, sender: &str, sid: &str, n: u32) {
+    let db = host_db(rig);
+    let base: i64 = db
+        .query_row("SELECT coalesce(max(seq),0) FROM alerts", [], |r| r.get(0))
+        .unwrap();
+    for k in 0..n {
+        db.execute(
+            "INSERT INTO alerts(alert_id,seq,task_id,session_id,sender,reason,created_ms)
+            VALUES(?1,?2,?3,?4,?5,'agent exited',?6)",
+            rusqlite::params![
+                uuid(),
+                base + 1_000_000 + i64::from(k),
+                uuid(),
+                sid,
+                sender,
+                r9log::host_now().wall_ms as i64
+            ],
+        )
+        .unwrap();
+    }
+}
+
+/// A task of the phone's on a session of its own whose agent exits in its
+/// turn: `outcome_unknown`, `agent exited`. The session's launch.
+fn an_unknown_outcome(
+    rig: &Rig,
+    r: &mut Router,
+    svc: &mut Dev,
+    phone: &mut Dev,
+    prompt: &str,
+) -> (Value, Value) {
+    let launch = svc.session(r);
+    let t = task(IDS, &launch, prompt, HOUR);
+    enqueue(phone, r, &t);
+    in_turn(rig, &t["task_id"], prompt);
+    private(&rig.fake.join("exit"), "");
+    wait_stored(rig, &t["task_id"], "outcome_unknown", "agent exited");
+    std::fs::remove_file(rig.fake.join("exit")).unwrap();
+    (t, launch)
+}
+
+/// VII.A test 13, Atem's side (design I.4.6; host-work-v1 §11.2, §11.3,
+/// §11.6 "Unknown outcomes" and "Capacity"): an unknown outcome raises an
+/// alert the owner lists (`alert_list`: the task, its sender and reason);
+/// "Mark failed" (the owner's `work_resolve`, `failed`) and "Mark done"
+/// (the sender's, `done` with a snapshot) resolve one each, ending its
+/// alert. With 64 unresolved from the phone (one real, the rest recorded in
+/// the store), the phone's requests that would make a task are refused
+/// `busy`, `too many unresolved outcomes`, storing nothing (`work_enqueue`,
+/// and `message_publish` to an agent), while the service's go on; with 256
+/// on the host every remote sender's are, and a local agent's message is
+/// still accepted. The owner resolving the real one lets both senders in.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_STATE_DUMP hooks"
 )]
-fn a_fetch_stopping_at_a_deferred_entry_marks_device_list_update_pending() {
-    let mut rig = Rig::prepared(4 * HOUR, false);
-    rig.with_controls(station_feed_open());
-    rig.with_clock();
-    rig.dump = true;
+fn unresolved_limits_refuse_new_tasks() {
+    const TOO_MANY: &str = "too many unresolved outcomes";
+    let mut rig = Rig::prepared(4 * HOUR, true);
     rig.with_station();
+    rig.alerts = true;
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let link = r.link;
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
-    let launch = svc.session(&mut r);
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let pinned = list_head(&rig);
-    // The Station's list: a pending recovery, then an entry its subject
-    // signed.
-    rig.log.recovery_add("dev-new");
-    let deferred = removal_by_the_pending(&rig.log);
-    let log = &rig.log;
-    let station = rig.station.as_mut().unwrap();
-    station.set_log_beyond(log, &[deferred]);
-    station.serve(link);
-    station.heads_now();
-    assert_eq!(station.next_call(link), fetch(pinned));
-    let s = until_station(&rig, "the stop at the deferred entry", |s| {
-        s["fetch"]["stopped"] == pinned + 2
-    });
-    assert_eq!(list_head(&rig), pinned + 1, "the recovery applied");
-    assert!(s["fetch"]["in_flight"].is_null(), "no fetch again: {s}");
-    assert_eq!(s["list_part"], true, "fetched up to a deferred entry: {s}");
-    assert!(
-        rig.sandbox
-            .config()
-            .join("runtime/journal/membership_deferred")
-            .is_file()
+    rig.station_online(false);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let mut mac = Dev::new(&mut r, IDS, &rig.log, MAC, false);
+    let phone_name = format!("member:{PHONE}");
+
+    // An unknown outcome: alerted; the owner marks it failed.
+    let (first, _) = an_unknown_outcome(&rig, &mut r, &mut svc, &mut phone, "UNKNOWN_FIRST");
+    let alerts = alert_list(&mut mac, &mut r);
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(
+        (
+            &alerts[0]["task_id"],
+            &alerts[0]["sender"],
+            &alerts[0]["reason"]
+        ),
+        (
+            &first["task_id"],
+            &json!(phone_name),
+            &json!("agent exited")
+        ),
+        "{alerts:?}"
     );
+    let failed = resolve(
+        &mut mac,
+        &mut r,
+        &first["task_id"],
+        json!({"kind":"failed","detail":"agent exited"}),
+    );
+    let work = &failed["result"]["work"];
+    assert_eq!(
+        (&work["state"], &work["resolved"]["by"]),
+        (&json!("failed"), &json!(format!("member:{MAC}"))),
+        "{failed}"
+    );
+    assert!(alert_list(&mut mac, &mut r).is_empty());
+    // Another: its sender marks it done.
+    let (second, _) = an_unknown_outcome(&rig, &mut r, &mut svc, &mut phone, "UNKNOWN_SECOND");
+    assert_eq!(alert_list(&mut mac, &mut r).len(), 1);
+    let text = "Checked by hand: it landed.";
+    let snapshot = json!({"kind":"vault","id":"v-done:1","version":1,"text":text,
+        "digest":atem_client::session::host_work::digest(text.as_bytes())});
+    let done = resolve(
+        &mut phone,
+        &mut r,
+        &second["task_id"],
+        json!({"kind":"done","result":snapshot}),
+    );
+    let work = &done["result"]["work"];
+    assert_eq!(
+        (&work["state"], &work["resolved"]["by"]),
+        (&json!("completed"), &json!(phone_name)),
+        "{done}"
+    );
+    assert!(alert_list(&mut mac, &mut r).is_empty());
 
-    let t = task_until(&launch, "DEFERRED_BY_THE_FETCH", rig.clock().wall() + HOUR);
-    enqueue(&mut phone, &mut r, &t);
-    wait_stored(&rig, &t["task_id"], "blocked", "device list update pending");
+    // A third, left unresolved, and 63 more of the phone's: 64.
+    let (third, _) = an_unknown_outcome(&rig, &mut r, &mut svc, &mut phone, "UNKNOWN_THIRD");
+    let open = svc.session(&mut r);
+    let sid = open["session_id"].as_str().unwrap().to_string();
+    unresolved_outcomes(&rig, &phone_name, &sid, 63);
+    let stored_before = stored_tasks(&rig);
+    let refused = phone.request(
+        &mut r,
+        enqueue_data(IDS, &task(IDS, &open, "PHONE_OVER_ITS_LIMIT", HOUR)),
+    );
+    assert_eq!(
+        (&refused["code"], &refused["detail"]),
+        (&json!("busy"), &json!(TOO_MANY)),
+        "{refused}"
+    );
+    let mut target = IDS.json();
+    target["session_id"] = open["session_id"].clone();
+    target["process_gen"] = open["process_gen"].clone();
+    let now = r9log::host_now().wall_ms;
+    let message = json!({"message_id":uuid(),"workflow_id":uuid(),"sender":phone_name,
+        "created_at":now,"expires_at":now + HOUR,"text":"PHONE_MESSAGE_OVER_ITS_LIMIT",
+        "context":[],"recipients":[{"recipient_id":uuid(),"host":host(),
+            "destination":{"kind":"agent","route_id":"backend","route_revision":1,
+                "target":target}}]});
+    let refused = phone.request(
+        &mut r,
+        json!({"op":"message_publish","host":host(),"message":message}),
+    );
+    assert_eq!(
+        (&refused["code"], &refused["detail"]),
+        (&json!("busy"), &json!(TOO_MANY)),
+        "{refused}"
+    );
+    assert_eq!(stored_tasks(&rig), stored_before, "nothing stored");
+    // Another sender's go on.
+    let by_svc = task(IDS, &open, "SERVICE_UNDER_THE_LIMIT", HOUR);
+    enqueue(&mut svc, &mut r, &by_svc);
+    in_turn(&rig, &by_svc["task_id"], "SERVICE_UNDER_THE_LIMIT");
+    complete_turn(&rig, &by_svc["task_id"]);
 
-    // The same head announced again, past every pacing: not behind.
-    let heads = s["heads"].as_u64().unwrap();
-    rig.clock().add_mono(STALL_PAUSE + 1_000);
-    rig.station().heads_now();
-    let s = until_station(&rig, "the next heads", |s| s["heads"] == heads + 1);
-    assert!(s["fetch"]["in_flight"].is_null(), "{s}");
-    assert_eq!(s["fetch"]["stopped"], pinned + 2, "{s}");
-    two_passes(&rig);
-    rig.station().serve(link);
-    assert_eq!(rig.station().sent().len(), 1, "{:?}", rig.station().sent());
-    wait_stored(&rig, &t["task_id"], "blocked", "device list update pending");
-    assert!(attempts(&rig, &t["task_id"]).is_empty());
-    assert!(!input(&rig).contains("DEFERRED_BY_THE_FETCH"));
+    // 256 on the host: every remote sender's refused; a local one isn't.
+    unresolved_outcomes(&rig, "service:svc-other", &sid, 256 - 64);
+    for (dev, prompt) in [
+        (&mut svc, "SERVICE_OVER_THE_HOSTS_LIMIT"),
+        (&mut phone, "PHONE_OVER_THE_HOSTS_LIMIT"),
+    ] {
+        let refused = dev.request(&mut r, enqueue_data(IDS, &task(IDS, &open, prompt, HOUR)));
+        assert_eq!(
+            (&refused["code"], &refused["detail"]),
+            (&json!("busy"), &json!(TOO_MANY)),
+            "{prompt}: {refused}"
+        );
+    }
+    let other = local_session(&rig, "other");
+    let sent = agent_run(
+        &other,
+        1,
+        &[
+            "message",
+            "send",
+            "--to",
+            "tag:peer",
+            "LOCAL_OVER_THE_HOSTS_LIMIT",
+        ],
+    );
+    assert_eq!(sent["code"], 0, "{sent}");
+    within("the local task's prompt", || {
+        input(&rig).contains("LOCAL_OVER_THE_HOSTS_LIMIT")
+    });
+
+    // The owner resolves the real one: 63 of the phone's, 255 on the host.
+    let failed = resolve(
+        &mut mac,
+        &mut r,
+        &third["task_id"],
+        json!({"kind":"failed","detail":"checked by the owner"}),
+    );
+    assert_eq!(failed["result"]["work"]["state"], "failed", "{failed}");
+    let local = local_tasks(&rig);
+    complete_turn(&rig, &local[0]["task"]["task_id"]);
+    for (dev, prompt) in [
+        (&mut phone, "PHONE_UNDER_ITS_LIMIT_AGAIN"),
+        (&mut svc, "SERVICE_UNDER_THE_HOSTS_LIMIT_AGAIN"),
+    ] {
+        let t = task(IDS, &open, prompt, HOUR);
+        assert_eq!(enqueue(dev, &mut r, &t)["state"], "queued");
+        in_turn(&rig, &t["task_id"], prompt);
+        complete_turn(&rig, &t["task_id"]);
+    }
+    let text = input(&rig);
+    for prompt in [
+        "PHONE_OVER_ITS_LIMIT",
+        "PHONE_MESSAGE_OVER_ITS_LIMIT",
+        "SERVICE_OVER_THE_HOSTS_LIMIT",
+        "PHONE_OVER_THE_HOSTS_LIMIT",
+    ] {
+        assert!(!text.contains(prompt), "{prompt} ran");
+    }
 }
 
-/// VII.A test 15 (design I.4.3, "Deferred entries"; session-v1 R9.5): the
-/// host's fetch stops at an entry the subject of a pending recovery signed
-/// (the phone's removal), and every unstarted delegated remote task waits,
-/// `device list update pending`. The wait ends on the host's clock: the
-/// deferral ends, the host fetches the entry again at once (no `heads`),
-/// and nothing dispatches before it is checked again: a task whose deadline
-/// passed meanwhile expires, and the others wait `revocations not yet
-/// checked` (the gate's device-list part no longer holds: the list is
-/// behind the announced head) until the fetch applies the entry. Then the
-/// removed phone's task is cancelled, `sender revoked`, and the Mac's runs.
+/// The tasks the host's store holds.
+fn stored_tasks(rig: &Rig) -> i64 {
+    host_db(rig)
+        .query_row("SELECT count(*) FROM work", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// Launch `rid` waits at the spawn boundary for `reason` (its runtime.log
+/// line), never spawned, `starting` to its sender, through host-work's
+/// passes.
+#[track_caller]
+fn launch_waits(rig: &Rig, svc: &mut Dev, r: &mut Router, rid: &str, sid: &str, reason: &str) {
+    let log = rig.sandbox.dir.path().join("runtime.log");
+    let line = format!("launch {rid} waits at the spawn boundary: {reason}");
+    within(&line, || {
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains(&line)
+    });
+    work_passes(rig, 3);
+    assert_eq!(launch_state(svc, r, rid), "starting");
+    assert!(never_spawned(rig, sid), "nothing spawned while it waits");
+}
+
+/// The launch `rid` ended `failed` with `detail` (runtime.log), never
+/// `outcome_unknown`, nothing spawned, no alert raised (read from the
+/// store: its sender's channel may be fenced by then).
+#[track_caller]
+fn launch_failed(rig: &Rig, rid: &str, sid: &str, detail: &str) {
+    let state = |rig: &Rig| {
+        host_db(rig)
+            .query_row("SELECT record FROM launches WHERE id=?1", [rid], |row| {
+                row.get::<_, String>(0)
+            })
+            .map(|text| serde_json::from_str::<Value>(&text).unwrap()["status"]["state"].clone())
+            .unwrap()
+    };
+    within("the launch failed", || {
+        let state = state(rig);
+        assert_ne!(state, "outcome_unknown");
+        state == "failed"
+    });
+    assert!(never_spawned(rig, sid), "nothing spawned");
+    let log = std::fs::read_to_string(rig.sandbox.dir.path().join("runtime.log")).unwrap();
+    assert!(
+        log.contains(&format!("launch {rid} failed before its spawn: {detail}")),
+        "{log}"
+    );
+    // No alert (design I.4.3, "Launches"; review M5): the host's alerts
+    // hold none.
+    let alerts: i64 = host_db(rig)
+        .query_row("SELECT count(*) FROM alerts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(alerts, 0, "an alert for a failed launch");
+}
+
+/// VII.A test 19 (design I.4.3, "Launches"; host-work-v1 §11.6,
+/// "Launches"): a covered service's `host_launch` checked at the spawn
+/// boundary. Each reason that can clear makes it wait there, `starting`,
+/// nothing spawned, its reason in runtime.log, and it starts once the
+/// reason clears: a hold (then a release); 60 seconds with no `heads` on
+/// the host's clock, the gate closed (then the Station's `heads`); the
+/// host's own fetch stopped at a deferred device-list entry (then the
+/// Mac's approval of the pending recovery ends the wait). A reason that
+/// can't clear ends it `failed` at once, never `outcome_unknown`, nothing
+/// spawned: the Station's revoke of a waiting launch (`sender revoked`),
+/// and, on another host, a frozen device list (`sender's authority
+/// changed`). (A launch on message has no delegated sender in step 4, and
+/// a receipt-database fault keeps v1's fence: see the report.)
 #[test]
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CONTROLS, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK, ATEM_TEST_MEMBERSHIP_FAULTS and ATEM_TEST_STATE_DUMP hooks"
 )]
-fn the_deferral_ends_with_the_recovery_wait_and_tasks_are_checked_again() {
-    let mut rig = Rig::prepared(48 * HOUR, false);
-    rig.with_controls(station_feed_open());
-    rig.with_clock();
-    rig.dump = true;
+fn launch_at_the_spawn_boundary_waits_for_hold_gap_and_deferral_and_fails_on_revoke() {
+    use atem_client::membership::entry::Action;
+    let mut rig = Rig::prepared(4 * HOUR, false);
     rig.with_station();
+    rig.with_clock();
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let link = r.link;
-    let mut svc = Dev::new(&mut r, &rig.log, SVC, true);
-    let launch = svc.session(&mut r);
-    let pinned = list_head(&rig);
-    // The recovery reaches the host by its fetch: its wait starts now on
-    // the host's clock.
-    rig.log.recovery_add("dev-new");
-    let log = &rig.log;
-    let station = rig.station.as_mut().unwrap();
-    station.set_log(log);
-    station.serve(link);
-    station.heads_now();
-    assert_eq!(station.next_call(link), fetch(pinned));
-    within("the recovery", || list_head(&rig) == pinned + 1);
+    rig.station_online(true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    let started = |svc: &mut Dev, r: &mut Router, rid: &str| {
+        within("the launch started", || {
+            launch_state(svc, r, rid) == "started"
+        });
+    };
 
-    // Five minutes before the wait ends, the entry its subject signed.
-    rig.clock()
-        .set((24 * HOUR - 5 * MIN) as i64, 24 * HOUR - 5 * MIN);
+    // A hold, then the release.
+    control(&rig, ControlAction::Hold);
+    let (rid, sid) = launch_backend(&mut svc, &mut r);
+    launch_waits(&rig, &mut svc, &mut r, &rid, &sid, "paused");
+    control(&rig, ControlAction::Release);
+    started(&mut svc, &mut r, &rid);
+
+    // No heads for 60 s on the host's clock, then the Station's heads. A
+    // heads of the pump's may still be on its way, and one the host reads
+    // after the clock moves would start the 60 s again (review M2): a last
+    // heads, naming another origin's feed too, goes behind it on the link
+    // (which keeps their order); once the host counted that one, none of
+    // the pump's is left.
+    drop(rig.pump.lock().unwrap().take());
+    let other = dumped(&rig)["station"]["feed"]["other_origin"]
+        .as_u64()
+        .unwrap();
+    {
+        let mut station = rig.station();
+        let own = atem_client::control::FeedHead {
+            origin: station.origin().to_string(),
+            feed_id: station.feed_id().to_string(),
+            head: station.records().last().map_or(0, |(seq, _)| *seq),
+            station_time: r9log::host_now().wall_ms,
+        };
+        let foreign = atem_client::control::FeedHead {
+            origin: "https://station-other.test".into(),
+            feed_id: uuid(),
+            head: 1,
+            station_time: r9log::host_now().wall_ms,
+        };
+        station.heads_with(vec![own, foreign]);
+    }
+    within("the last heads read", || {
+        dumped(&rig)["station"]["feed"]["other_origin"].as_u64() > Some(other)
+    });
+    rig.clock().add_mono(61_000);
+    within("the gate closed", || {
+        dumped(&rig)["station"]["feed"]["open"] == false
+    });
+    let (rid, sid) = launch_backend(&mut svc, &mut r);
+    launch_waits(
+        &rig,
+        &mut svc,
+        &mut r,
+        &rid,
+        &sid,
+        "revocations not yet checked",
+    );
+    let station = rig.station.clone().expect("the fake Station");
+    *rig.pump.lock().unwrap() = Some(Pump::start(station));
+    started(&mut svc, &mut r, &rid);
+
+    // The host's own fetch stops at a deferred entry; the Mac approves the
+    // pending recovery.
+    let pinned = list_head(&rig);
+    rig.log.recovery_add("dev-new");
+    let recovery = rig.log.entries.last().unwrap().hash();
     let deferred = removal_by_the_pending(&rig.log);
     let log = &rig.log;
-    let station = rig.station.as_mut().unwrap();
-    station.set_log_beyond(log, &[deferred]);
-    station.heads_now();
-    assert_eq!(station.next_call(link), fetch(pinned + 1));
+    rig.station().set_log_beyond(log, &[deferred]);
     until_station(&rig, "the stop at the deferred entry", |s| {
         s["fetch"]["stopped"] == pinned + 2
     });
-
-    // The phone's task and two of the Mac's, one due in two minutes.
-    let mut phone = Dev::new(&mut r, &rig.log, PHONE, false);
-    let mut mac = Dev::new(&mut r, &rig.log, MAC, false);
-    let wall = rig.clock().wall();
-    let removed = task_until(&launch, "BY_THE_REMOVED_PHONE", wall + HOUR);
-    let runs = task_until(&launch, "BY_THE_MAC", wall + HOUR);
-    let due = task_until(&launch, "DUE_DURING_THE_WAIT", wall + 2 * MIN);
-    enqueue(&mut phone, &mut r, &removed);
-    enqueue(&mut mac, &mut r, &runs);
-    enqueue(&mut mac, &mut r, &due);
-    for t in [&removed, &runs, &due] {
-        wait_stored(&rig, &t["task_id"], "blocked", "device list update pending");
-    }
-    // The senders go: their gate is the host's own Station's now, with no
-    // caught-up channel of their own.
-    phone.close(&mut r);
-    mac.close(&mut r);
-
-    // The wait ends on the host's clock (24 h and a minute since the host
-    // first saw the recovery). Checked again before anything dispatches.
-    rig.clock().set((24 * HOUR + MIN) as i64, 24 * HOUR + MIN);
-    wait_stored(
+    let (rid, sid) = launch_backend(&mut svc, &mut r);
+    launch_waits(
         &rig,
-        &due["task_id"],
-        "expired",
-        "expired before submission",
+        &mut svc,
+        &mut r,
+        &rid,
+        &sid,
+        "device list update pending",
     );
-    for t in [&removed, &runs] {
-        wait_stored(&rig, &t["task_id"], "blocked", GATE_CLOSED);
-    }
-    let s = until_station(&rig, "the deferral's end", |s| {
-        s["fetch"]["stopped"].is_null()
+    let approve = rig
+        .log
+        .append(MAC, Action::RecoveryApprove { target: recovery });
+    let log = &rig.log;
+    rig.station().set_log(log);
+    let mut mac = Dev::new(&mut r, IDS, &rig.log, MAC, false);
+    mac.carry(&mut r, &[approve]);
+    started(&mut svc, &mut r, &rid);
+
+    // Held again, waiting; the revoke fails it.
+    control(&rig, ControlAction::Hold);
+    let (rid, sid) = launch_backend(&mut svc, &mut r);
+    launch_waits(&rig, &mut svc, &mut r, &rid, &sid, "paused");
+    control(
+        &rig,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    launch_failed(&rig, &rid, &sid, REVOKED);
+    drop((r, svc, mac));
+
+    // Another host: the device list frozen under a waiting launch.
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_station();
+    rig.membership = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    rig.station_online(true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    control(&rig, ControlAction::Hold);
+    let (rid, sid) = launch_backend(&mut svc, &mut r);
+    launch_waits(&rig, &mut svc, &mut r, &rid, &sid, "paused");
+    let conflict = rig.log.conflicting_add("dev-other");
+    replace(
+        &rig.membership_dir().join("carry.json"),
+        &json!({"entries": [conflict]}).to_string(),
+    );
+    within("the carriage applied", || {
+        rig.membership_dir().join("carried").exists()
     });
-    assert_eq!(s["list_part"], false, "{s}");
-    // The host fetched the entry again at once, with no heads.
-    let heads = s["heads"].clone();
-    assert_eq!(rig.station().next_call(link), fetch(pinned + 1));
-    within("the removal", || list_head(&rig) == pinned + 2);
-    wait_stored(&rig, &removed["task_id"], "cancelled", "sender revoked");
-    in_turn(&rig, &runs["task_id"], "BY_THE_MAC");
-    complete_turn(&rig, &runs["task_id"]);
-    let s = dumped(&rig)["station"].clone();
-    assert_eq!(s["heads"], heads, "no heads since: {s}");
-    assert_eq!(s["list_part"], true, "{s}");
-    for t in [&removed, &due] {
-        assert!(attempts(&rig, &t["task_id"]).is_empty());
-    }
-    assert!(!input(&rig).contains("BY_THE_REMOVED_PHONE"));
-    assert!(!input(&rig).contains("DUE_DURING_THE_WAIT"));
+    let carried = std::fs::read_to_string(rig.membership_dir().join("carried")).unwrap();
+    assert!(carried.starts_with("Frozen"), "{carried}");
+    launch_failed(&rig, &rid, &sid, "sender's authority changed");
+}
+
+/// VII.A test 21 (design I.5.5 "A task with a live attempt", I.5.6;
+/// host-work-v1 §11.1, "The effects on tasks, as built in step 4"): the
+/// service's attempt waits `accepted` behind the Mac's turn; host-work's
+/// scheduling is held, and the Mac's turn ends, so the session host starts
+/// the attempt (its start check passes): `executing`, its turn running,
+/// before host-work saw it start. Then the Station's revoke lands: the
+/// record's transaction finds the attempt live and settles nothing; its
+/// withdrawal, asked after the commit, finds it started, so the task runs.
+/// Polled throughout, the task never shows `cancelled` while its turn
+/// runs: it ends `awaiting_result` from its turn's end, on the one attempt,
+/// which started; its prompt written once, no interrupt.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_record_against_a_live_attempt() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_station();
+    rig.faults = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    rig.station_online(true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let mut mac = Dev::new(&mut r, IDS, &rig.log, MAC, false);
+    let t = task(IDS, &launch, "REVOKED_AS_IT_STARTS", HOUR);
+    let tid = t["task_id"].clone();
+    let attempt = accepted_behind_the_macs_turn(&rig, &mut r, &mut mac, &mut svc, &launch, &t);
+    // Every state the store shows from now on.
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let poll = {
+        let (seen, stop) = (seen.clone(), stop.clone());
+        let db = rig.sandbox.config().join("runtime/host-work.sqlite");
+        let id = tid.as_str().unwrap().to_string();
+        std::thread::spawn(move || {
+            let db = rusqlite::Connection::open(db).unwrap();
+            db.busy_timeout(Duration::from_secs(5)).unwrap();
+            while !stop.load(Ordering::SeqCst) {
+                let state: String = db
+                    .query_row("SELECT state FROM work WHERE id=?1", [&id], |r| r.get(0))
+                    .unwrap();
+                let mut seen = seen.lock().unwrap();
+                if seen.last() != Some(&state) {
+                    seen.push(state);
+                }
+                drop(seen);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    // Host-work held; the Mac's turn ends: the attempt starts.
+    let hold_host_work = rig.faults().join("hold_host_work");
+    private(&hold_host_work, "");
+    two_passes(&rig);
+    std::fs::write(rig.fake.join("complete"), "").unwrap();
+    within("its turn", || input(&rig).contains("REVOKED_AS_IT_STARTS"));
+    receipt_becomes(&rig, &attempt, "state", "executing");
+    assert_eq!(ends(&rig, &tid), [None], "host-work hasn't seen it start");
+    // The revoke lands.
+    control(
+        &rig,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    two_passes(&rig);
+    assert_eq!(stored(&rig, &tid)["state"], "submitted");
+    assert_eq!(ends(&rig, &tid), [None]);
+    std::fs::remove_file(&hold_host_work).unwrap();
+    wait_stored(&rig, &tid, "submitted", "in the agent's turn");
+    complete_turn(&rig, &tid);
+    stop.store(true, Ordering::SeqCst);
+    poll.join().unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert!(!seen.iter().any(|s| s == "cancelled"), "{seen:?}");
+    assert_eq!(
+        seen.last().map(String::as_str),
+        Some("awaiting_result"),
+        "{seen:?}"
+    );
+    assert_eq!(attempts(&rig, &tid), [(attempt, Some("started".into()))]);
+    assert_eq!(input(&rig).matches("REVOKED_AS_IT_STARTS").count(), 1);
+    assert!(intents(&rig, &tid).is_empty());
+    assert_eq!(escs(&rig), 0);
 }

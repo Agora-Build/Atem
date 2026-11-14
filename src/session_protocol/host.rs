@@ -1426,6 +1426,12 @@ impl<J: Journal> SessionHost<J> {
         self.principal(principal).control_gen
     }
 
+    /// Whether `principal`'s durable control state still grants `control`
+    /// (welcomed with it, and no fence since).
+    pub fn grants_control(&self, principal: &str) -> bool {
+        self.principal(principal).control
+    }
+
     /// A digest of every principal's `control_gen` (a principal the host
     /// doesn't keep has generation 1): it changes whenever one is raised (a
     /// fence) or forgotten, so the runtime re-checks what was accepted
@@ -1454,7 +1460,8 @@ impl<J: Journal> SessionHost<J> {
 
     /// r9 §R9.3 step 4: membership entry `seq` (a removal, `set_roles`,
     /// `remove_host` of this host, an expiry shortening; 0 for a freeze,
-    /// which names no entry) fences `principal` through §H: the
+    /// which names no entry, and for a service a control record revoked,
+    /// delegated host-work design I.5.5 step 2) fences `principal` through §H: the
     /// `control_revoked` fence (its raised `control_gen`, naming `seq`) is
     /// written, every attachment of the principal is fenced (view ones too),
     /// its leases revoked and its accepted work not yet executing rejected
@@ -4253,6 +4260,15 @@ impl<J: Journal> SessionHost<J> {
             // §I.6: no effect; the journal halted, so the rejection can't be
             // recorded either: the restart resolves it (it stays accepted).
             return;
+        }
+        // Debug builds: the runtime is killed here, a host-work attempt's
+        // `executing` durable and its prompt not dispatched (VII.A test 7).
+        #[cfg(not(test))]
+        if is_host_work(&self.receipts[rid].stored.principal) {
+            crate::runtime::test_hooks::crash_point(
+                "crash_after_executing",
+                "after a host-work attempt's executing record, before its dispatch",
+            );
         }
         let now = self.now;
         let e = self.receipts.get_mut(rid).unwrap();

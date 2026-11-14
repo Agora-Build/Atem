@@ -1,6 +1,7 @@
 # Delegated host work and host-to-host senders: one design
 
-Status: **planned, not implemented** (nothing is built). Agreed by Atem, Astation and Auth/Portal on 2026-11-08
+Status: **agreed; step 4 (Part I's host side) built behind a debug-only hook and advertised by no release build;
+the rest planned** (2026-11-14; "Step 4 built" below). Agreed by Atem, Astation and Auth/Portal on 2026-11-08
 (revision 6b); the owner decided every choice (Appendix A, and owner choice 20 on 2026-11-08). Astation's
 confirmation is [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6715069931); Portal PR #31
 records the agreement as D29. Nothing activates (features unadvertised, the signing gate closed) until the
@@ -50,17 +51,71 @@ comment 6810116314), and confirmed #148's refusal wire (2026-11-12, #148 comment
 report items (2026-11-11, #148 comment 6803727308) and #147's items 1 to 3 (2026-11-12, #147 comment
 6813332550). The agreed items are marked in host-work-v1 §11, session-v1 R9.2, R9.3, R9.7b, R9.8, R9.9 and
 R9.14 and in the bindings contract. Still open, or step 4 acceptance: the runtime's enforcement of the feed store
-and the host's gates and cursors, byte-level goldens for the relay messages, the clock provider's tests,
+and the host's gates and cursors, byte-level goldens for the relay messages (`r9-vectors-station-calls.json`, new in step 4,
+agreed with Astation on 2026-11-13, #120 comment 6848326392), the clock provider's tests,
 `no_match`'s wire form and the status of a selector-resolved (UUID v5) task. The design text below changes only in
-these marks.
+these marks and the amendments that follow.
+
+**Amended for step 4, agreed with Astation (2026-11-13, #120 comment 6848326392) (host mail).** Two changes to II.4.2's receiver, built in the shared core
+(host-work-v1 §11.5). Only a key the host made waits: mail sealed to a key id the host never made in its current trust
+generation is refused at once, even when signed beyond its head, since every `host_enc_key` entry for the host carries
+the host's own `enc_sig`; so the host records every key id it makes durably, before it hands the key out (II.4.1). And
+a refusal of a verified copy (steps 5 and 6) names its sender, `(host_id, host_trust_gen)`: the claim on its `id` is
+`(sender.host_id, id)`, as before, and `host_trust_gen` says which `add_host` key verified the copy. Each changed
+passage (in II.4.1 and II.4.2) is marked "Amended for step 4, agreed with Astation".
+
+**Refined in the contract for step 4.** host-work-v1 §11.1 rule 1's bound (at most 256 counted record ids per
+principal, oldest first, and the evicted floor; **agreed with Astation, 2026-11-13, #120 comment 6848326392**: stops are
+never blocked by it, and the floor complements O1 below, it doesn't replace it) refines I.5.4's collision row and I.5.5
+step 1 for evicted ids: an evicted id is no longer known, so another body under it is no collision, and an evicted
+record that comes back is verified and applied as a new one (an evicted hold replayed holds again; an evicted cover or
+release issued no later than the floor is refused as a possible replay). Rule 6's signed-time rule (O1, requested by
+Astation in the same comment; the built form **for its sign-off**) adds to I.5.5 step 4 for releases: a release lifts
+a hold only when issued strictly after every hold the host verified for the principal (a hold that found it held, read
+out of order, from another feed or none, or under a counted id included), so a release a carrier withheld can't lift a
+newer hold; the host keeps that hold's time in the principal's part, and no eviction, reset, coverage change or restart
+erases it. The Station's signing duty (agreed in the same comment) makes every record a Station signs for a principal,
+holds included, strictly newer than every record it signed for it before, its high-water mark kept durably before
+publishing, carried at handover and across restart and snapshot generation, waiting rather than bypassing it; what O1
+leaves (a hold another signer issued with a clock behind, and a release refused until the Station's clock passes
+another signer's hold) is stated as its residuals. I.5.8's acknowledgment gains typed reasons (O5, requested by
+Astation on the same day; **for its sign-off**): each effect `pending` or `refused` in a `control_ack` may say why, a
+bounded code of the shared vocabulary, information only (it never changes a result, counts nothing and asks for no
+re-signing; host-work-v1 §11.4 wire rule 10). The design text below is unchanged; the contract states the refinement.
+
+**Step 4 built, behind a debug-only hook (2026-11-14).** Atem built V.2's step 4, Part I's host side:
+- the session host's `host-work` principal (session-v1 R9.14 items 1 to 7; item 8 is still refused);
+- the lifecycle of host-work-v1 §11.6: who is delegated, the admission record, attempts and `receipt_id`, the start
+  check, recovery, the deadline interrupt and interrupt intents, `work_interrupt`, `work_resolve`, unknown outcomes
+  with their alerts, `alert_list` and push hints, the capacity limits, delegated launches at the spawn boundary, the
+  owner's `atem task list --unknown` and `atem task resolve`, and reply retention;
+- the delegated clock (I.6.5; host-work-v1 §11.6, "Clocks"), with real-OS checks;
+- the Station link and its calls (host-work-v1 §11.4): the host's own device-list fetch (IX.1 Q7), the sync of its own
+  Station's control feed with resets, correlation and the revocation gate, and the typed refusals;
+- the records' effects on tasks (host-work-v1 §11.1) and the acknowledgments with their resends (§11.4);
+- with them, R9.7a's `expired` at a channel's lifetime end and the device-list verifier's inventory in `welcome`. The
+  framing shipped before (PR #124, bindings #145).
+
+Only a debug build's `atem runtime` started with `ATEM_TEST_HOST_FEATURES=host.delegated[,host.alerts]` in its own
+environment runs any of it, and only such a runtime lists `host.delegated` and `host.alerts` in its `welcome`. Release
+builds compile the hook out: no feature, no Station call, hosting as before. `host.senders` stays off (the hook refuses
+it), and the signing gate stays closed. Activation is a later owner decision, after the joint check (V.2 step 7,
+VII.A); a dev host turns the features on as [agent-hosting.md](agent-hosting.md) section 14 says ("Delegated work
+on a dev host"). The contracts say what is built: host-work-v1 §11 (its "as built in step 4" passages) and session-v1
+R9.14. Astation answered step 4's contract questions on 2026-11-13 (#120 comments 6848326392 and 6848463998, #164
+comment 6858189009) and signed off O1 and O5 (#156 comment 6858184397); marks written before those answers still read
+"for Astation" until a docs change marks them agreed. The readings written since (host-work-v1 §11.1's effects on
+tasks and service refusals, §11.4's acknowledgments) wait for its answer. The design text below changes only in I.5.5
+step 2's fence sentence (marked "changed to match Atem's spec") and in IX.1 Q7's answer.
 
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256
 `cc180912cd8d3afc11c20f77a3ebc4e8a81989ede1327afc90df52d09c39eb83`), changed only by this status block, Appendix B, the link to
 the diagram, the two Astation file references in XI (written so they are not read as paths in this repository), and
 one update marked "updated after agreement" in III.4 (the phone's login is live on dev, Auth #19), and the framing,
-host-mail and clock amendments above, the marks of step 3's agreements, and IX.1 Q7's answer (marked "answered in
-step 4"). The diagram is
+host-mail and clock amendments above, the marks of step 3's agreements, IX.1 Q7's answer (marked "answered in
+step 4"), I.5.5 step 2's fence sentence (marked "changed to match Atem's spec") and the note on step 4's status in the
+paragraph that says nothing here is built. The diagram is
 `delegated-host-work-flows.html` (frozen `flows.html`, SHA-256
 `587a4c74ca9c2645dd3a2c79908813da573451479c0a0a846896fd3ff909cf6a`), changed only in the phone's login in figures 1
 and 2, marked the same way, and, after step 3's agreements, in figure 1 (both hosts use the same Station) and
@@ -81,7 +136,9 @@ design; next to it stays only the diagram of the flows. It merges two designs:
 - Atem's host-to-host senders: stages 2 and 3 of agent collaboration ([agent-collaboration.md](agent-collaboration.md) on Atem's
   branch `feat/agent-collaboration`, `3e60fcc`).
 
-Nothing here is built. The owner has decided every choice: those of Appendix A on 2026-11-07, and owner choice 20,
+Nothing here is built. (**Status since agreement:** the prompt framing is built, and so is step 4, Part I's host side,
+behind a debug-only hook and advertised by no release build; see the status block.) The owner has decided every
+choice: those of Appendix A on 2026-11-07, and owner choice 20,
 which Astation's review raised, on 2026-11-08 (VIII.2). Nothing is built from this design until Atem, Astation and
 Auth/Portal have reviewed it independently and agreed the cross-team contract, and nothing is merged or deployed
 before that contract is agreed and validated. As the source's §10 says (V.3), it gets a new Atem branch and pull
@@ -577,7 +634,7 @@ R4 bounds accepted tasks by their original deadline (at most 24 h after admissio
   - A receipt-database fault holds the intents, which live in that database, until the restart it asks for. Recovery
     step 3 (I.6.2) and the first pass carry them out then.
   - A runtime started while paused opens and recovers its store only once hosting is on.
-- **With `host.delegated` turned off after tasks were accepted** (step 4's Decision 10, a debug-only hook), a started
+- **With `host.delegated` turned off after tasks were accepted** (a debug-only hook in step 4), a started
   task's turn is still interrupted at its deadline. Atem-internal.
 
 ### I.4.5 Queries, cancel, complete, replies, and new operations
@@ -820,7 +877,10 @@ identity, `account_id` and `genesis_hash` (R9.2), carried as push hints carry th
 a count, plus the 32 most recent of each, persisted at most once a minute. Alerts for failed or conflicting records are
 rate-limited to one an hour per source, with the count: per origin for a feed, and per carrying principal for records
 that arrive over a channel (II.3.1), which have no origin. A Station or a carrier can't fill a host's storage or
-flood the owner with alerts this way.
+flood the owner with alerts this way. **Atem's reading (step 4):** "at most once a minute" is for
+evidence, which has no effect. A pending record is written in the transaction that applies it, with the cursor
+(I.5.5): it is a deferred effect past the cursor, and a crash before a later write would lose a stop the feed never
+serves again. Its 32-row bound still caps storage, and the cursor's write already costs the transaction.
 
 ### I.5.5 Applying a record on the host
 
@@ -828,9 +888,10 @@ Each record is applied in one `host-work.sqlite` transaction, together with the 
 
 1. **Idempotent.** `record_id` is unique. A record already stored is acknowledged and changes nothing.
 2. **Revoke is final.** The first `revoke` marks the principal revoked. The host refuses all its future requests,
-   and runs session-v1's §H fence for it where it has attachments: `control_gen` is raised and its attachments are
-   fenced. **Changed for host senders:** a host principal has no attachments, so there is nothing to fence. Every
-   unstarted task is cancelled (`cancelled`, detail `sender revoked`, held ones included), with any attempt not yet
+   and runs session-v1's §H fence for it once, whether or not it has attachments: its `control_gen` is raised, and
+   each attachment it has is fenced (**changed to match Atem's spec**, host-work-v1 §11.1, step 4: the raised
+   `control_gen` also ends a v1 task the service had before a feed covered it). **Changed for host senders:** a
+   host principal has no attachments, so there is nothing to fence. Every unstarted task is cancelled (`cancelled`, detail `sender revoked`, held ones included), with any attempt not yet
    `executing` withdrawn (I.5.6). A later `hold` or `release` for it is ignored.
 3. **Interrupt is monotonic.** An `interrupt_running: true` on a `revoke`, or a later `interrupt_running` record for a
    revoked principal, writes a durable **interrupt intent** for each of its started tasks. Nothing ever withdraws an
@@ -880,8 +941,12 @@ restart; interrupting a turn that has already ended does nothing.
 - **Retention.** It keeps records for at least 30 days, and each principal's latest state for as long as the
   principal exists (I.5.2).
 - **Transport.** Atem has one outbound link: the relay, or Astation's local `:8080`.
-  - **On the relay**, the host calls `control_sync{origin, feed_id?, after}` over its own authenticated relay
-    connection, and gets `{origin, feed_id, head, station_time, records}`.
+  - **On the relay**, the host calls `control_sync{request_id, origin, feed_id?, after}` over its own authenticated
+    relay connection, and gets `{request_id, origin, feed_id, after, head, station_time, records}`. **Amended in
+    place on Astation's request (#164 comment 6858189009):** `request_id` (a fresh UUID v4 for every call) and the
+    echoed `after` let the host match each result to its live call (host-work-v1 §11.4, wire rule 11). A result of a
+    retired call (one unanswered for 35 seconds, refused, or of an earlier link generation) advances nothing and opens
+    no gate (§11.4, "Matching a page to its call").
   - **On `:8080`**, Astation proxies the same calls and announcements to the Station unchanged. Records are signed,
     and Astation is a native manager. **New rule:** the host's own device-list fetch (below) and the mailbox calls
     (II.4.3) are proxied the same way.
@@ -1817,10 +1882,16 @@ devices' keys):
 every one, the private key is `pairing/host_enc_key`, 0600, plain like `host_channel_key`, so a host whose cred agent
 is locked can still open its mail. The host makes it at pairing and at `atem pair verify`, with a new
 `host_channel_key`, and, on a host paired earlier, at the first start of a build that knows it when the file is
-missing. `atem unpair` deletes it, as it deletes `host_channel_key` (R9.3). In (a) and (b) the host vouches for its
-key with `enc_sig`: Ed25519 by `host_key` over `enc(["atem-host-enc-key-v1", account_id, genesis_hash, host_id,
-u64(host_trust_gen), enc_pub])`. The ceremony already authenticates `host_key` (it is inside the commitment and the
-safety code, R9.2 "Pairing"), so the commitment and the safety code don't change.
+missing. `atem unpair` deletes it, as it deletes `host_channel_key` (R9.3). **Amended for step 4, agreed with
+Astation (2026-11-13, #120 comment 6848326392).** The host records the `enc_kid` of every key it makes durably, before `host_enc_key_get` returns the key, and
+keeps the record for that trust generation. It passes the record to II.4.2's receiver (`generated`, host-work-v1
+§11.5); a key it accepts counts as made, listed there or not. A lost record is rebuilt from the private keys the host
+still holds for that generation; mail sealed to
+a key whose private part is gone couldn't be opened anyway. Mail sealed to a key whose id the record lacks, and signed
+beyond the host's head, is refused for good. In (a) and (b) the host vouches for its key with `enc_sig`: Ed25519 by
+`host_key` over `enc(["atem-host-enc-key-v1", account_id, genesis_hash, host_id, u64(host_trust_gen), enc_pub])`. The
+ceremony already authenticates `host_key` (it is inside the commitment and the safety code, R9.2 "Pairing"), so the
+commitment and the safety code don't change.
 
 | Option | What it is | Cost |
 |---|---|---|
@@ -1889,7 +1960,13 @@ with the sealed part beside it.
    is beyond this host's head, a key it doesn't accept waits (below): its own new `host_enc_key` may be among the
    entries it lacks. A key the host generated and handed out but whose `host_enc_key` its own list hasn't applied yet
    should be accepted too: a sender whose list already has the entry seals to it, and the mail then opens at once
-   instead of waiting.
+   instead of waiting. **Amended for step 4, agreed with Astation.** Only a key the host made waits. The host keeps
+   the id of every key it made in its current trust generation, recorded durably before it hands the key out (II.4.1),
+   and passes them with the ids of the keys it accepts: a key whose id is missing has its mail refused for good. Every
+   `host_enc_key` entry for the host carries the host's own `enc_sig`, so no entry it lacks can make any other key one
+   it accepts. Mail sealed to a key id the host never made is refused even when `signed_at_head.seq` is beyond its head,
+   and never waits. There the refusal comes after the checks that settle at any head (step 3's, below), step 5's times
+   and, when this host's list holds the claimed `(host_id, host_trust_gen)`, step 4's check of the copy.
 3. The sender is a current host at its applied head whose newest `add_host` has exactly `sender.host_trust_gen`.
    **Owner decision 2026-11-07:** its `host_id` is `authorized(g)` at this host's head (II.3.1), `signed_at_head.seq`
    is at least g, and this host's entry at `signed_at_head.seq` has `signed_at_head.hash`. **Amended after
@@ -1913,7 +1990,8 @@ with the sealed part beside it.
   it waits, below), and there step 3 also refuses a claimed generation the list doesn't hold, or whose `add_host` comes
   after `signed_at_head.seq`: the list the sender signed at is the one this host holds. Two are refused at any head,
   since `add_host` generations strictly rise: a generation below the sender's newest, and an envelope from a removed
-  host at the generation it last held (after step 5's times when the head is beyond this host's). These refusals claim
+  host at the generation it last held (after step 5's times when the head is beyond this host's). **Amended for step 4,
+  agreed with Astation.** A third is refused at any head: a key id this host never made (step 2). These refusals claim
   no `id` (Duplicates, below): the sender's own copy, sent again, is still judged.
 - **Amended after agreement, 2026-11-10 (agreed with Astation, 2026-11-11, #120 comment 6810116314).** **Step 3 for a `signed_at_head.seq` beyond this host's head**
   (it read: "for a `sender.host_trust_gen`, or a `signed_at_head.seq`, beyond this host's head"): the host may not have
@@ -1923,7 +2001,8 @@ with the sealed part beside it.
   result), it then verifies the copy as step 4 does, its signature with that `add_host`'s `host_key` and its sealed part
   against the signed `sealed_hash`, and refuses an object that fails, since that pair has one key forever (so neither
   junk nor a variant of the sender's own object takes its slots); otherwise (a sender it doesn't know, or a generation
-  above its newest) the signature can't be checked yet. One that passes stays pending, isn't marked done, and is judged
+  above its newest) the signature can't be checked yet. **Amended for step 4, agreed with Astation.** Then one sealed
+  to a key id this host never made is refused (step 2). One that passes stays pending, isn't marked done, and is judged
   again after each device-list advance and each change of the keys it accepts, until it expires. At most 64 objects stay
   pending per claimed `(host_id, host_trust_gen)` and 256 in all; more are dropped undecided (it read: "more are refused
   and kept as evidence"): an overflow is no verdict, records nothing, claims no `id` and isn't marked done, so the
@@ -1931,7 +2010,9 @@ with the sealed part beside it.
   can't stop its other work. **New rule.**
 - **Steps 5 and 6, once step 4 passed:** the sender is authenticated, so the refusal is reported back to it as a
   status naming the object's `id`, `refused` with `invalid_request` (II.4.4); its outbox doesn't stay `sent` until
-  expiry.
+  expiry. **Amended for step 4, agreed with Astation.** The refusal names that sender, `(host_id, host_trust_gen)`.
+  The claim on the `id` is `(sender.host_id, id)` (Duplicates, below), never the host's whose object another host
+  re-signed; `host_trust_gen` only says which `add_host` key verified the copy.
 - **Step 7:** a recorded decision (`refused`), reported back (II.4.4).
 - **Duplicates.** **Amended after agreement, 2026-11-10 (agreed with Astation, 2026-11-11, #120 comment 6810116314)** (it read: "The same `id` with the same
   `sealed_hash` is a duplicate: acknowledged, nothing changes. The same `id` with other bytes is refused and kept as
@@ -3241,7 +3322,8 @@ forced binding; the rooms the migration can't resolve are refused until claimed 
    place of "not implemented". It fetches when its Station's `heads` (every (re)connection, every 30 s, and at once
    when the Station stores a control record) name a head beyond its own, which takes the place of R9.5's 15-minute
    schedule (a Station that withholds `heads` could withhold the entries as well), and again at once when a deferral
-   it stopped at ends on this host (after a refusal's backoff, at the next `heads`). A fetch that stops at a deferred
+   it stopped at ends on this host, with no `heads` (one that ends during a refusal's backoff, when the backoff ends:
+   Astation, #164 comment 6858189009). A fetch that stops at a deferred
    entry asks nothing more while the deferral holds and the announced head is the same, and counts as fetched up to
    that entry for the gate (I.5.8). "The announced head" is the last `heads`' device-list head, which the host's list
    must hold as that very entry, `seq` and hash; a list that differs from the Station's keeps the gate closed
