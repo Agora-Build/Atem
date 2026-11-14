@@ -2157,3 +2157,131 @@ fn a_bridge_opened_with_the_hook_starts_refusing_services() {
         assert!(!off.r9.services_unchecked());
     });
 }
+
+/// The bot enqueues `prompt` through route `rs` while no feed covers it:
+/// a v1 task (no admission record), its deadline `expires_at`.
+fn bot_v1_task(rig: &mut LocalRig, s: &Senders, prompt: &str, expires_at: u64) -> String {
+    let mut req = phone_enqueue(rig, prompt);
+    if let hw::Request::Enqueue { route_id, task, .. } = &mut req {
+        *route_id = "rs".into();
+        task.expires_at = expires_at;
+    }
+    ask_req(rig, &s.bot, &req).unwrap();
+    let id = enqueued(&req);
+    assert!(stored_record(rig, &id).delegated.is_none(), "a v1 task");
+    id
+}
+
+/// The bot, no feed covering it yet (the feeds alone decide, read once),
+/// welcomed on channel `bot-1` (its control state granted), its v1 task of
+/// `V1_BEHIND` queued behind the phone's turn, then its channel gone: the
+/// phone's running task and the v1 task.
+async fn a_v1_task_behind_the_phones_turn(
+    rig: &mut LocalRig,
+    s: &Senders,
+    start: u64,
+) -> (String, String) {
+    rig.bridge.work.controls = None;
+    rig.bridge.start_view().standings.clear();
+    feed(rig, &s.log, &[]);
+    assert!(matches!(rig.bridge.sender_class(BOT), SenderClass::V1));
+    r9_link_up(rig);
+    service_hello(rig, &s.log, "bot-1", "svc-bot").unwrap();
+    let busy = phone_running(rig, s, "PHONE_BUSY", start).await;
+    let v1 = bot_v1_task(rig, s, "V1_BEHIND", start + HOUR);
+    blocked(rig, &v1, BEHIND).await;
+    envelope_in(rig, &envelope::close("bot-1", Some("client_gone")));
+    passes(rig, 1);
+    assert!(!attached(rig, BOT));
+    (busy, v1)
+}
+
+/// The v1 task ended `failed`, `sender's authority changed` (host-work-v1
+/// §11.1: a v1 task the service had follows v1's rules, which the revoke's
+/// fence ends), never run, and the session isn't held: the phone's turn
+/// ends and a later task of the phone's runs on it.
+async fn ended_by_the_fence(rig: &mut LocalRig, s: &Senders, busy: &str, v1: &str, start: u64) {
+    rig.until(|r| settled(r, v1) == (WorkState::Failed, details::AUTHORITY_CHANGED.to_string()))
+        .await;
+    complete(rig, busy).await;
+    let later = phone_task(rig, &s.phone, "PHONE_LATER", start + HOUR);
+    run(rig, &later, "PHONE_LATER").await;
+    assert!(!input(rig).contains("V1_BEHIND"));
+}
+
+/// Host-work-v1 §11.1 ("The effects on tasks, as built in step 4"; Task 37
+/// review I1): a revoke of a service with no live channel still runs its
+/// §H fence (`control_gen` raised), which ends the v1 task it had from
+/// before its cover: `failed`, `sender's authority changed`; a later task
+/// on that session then runs.
+#[test]
+fn a_revoke_ends_a_channelless_services_pre_cover_v1_task() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        let (busy, v1) = a_v1_task_behind_the_phones_turn(&mut rig, &s, start).await;
+        let before = rig.bridge.host.control_gen(BOT);
+        feed(
+            &mut rig,
+            &s.log,
+            &[
+                &bot_record(&s.log, ControlAction::Cover, 1),
+                &bot_record(&s.log, revoke(false), 2),
+            ],
+        );
+        passes(&mut rig, 2);
+        assert_eq!(rig.bridge.host.control_gen(BOT), before + 1);
+        ended_by_the_fence(&mut rig, &s, &busy, &v1, start).await;
+    });
+}
+
+/// Task 37 review I1 (ruling T37a), the crash between a revoke's commit and
+/// its followups: the fence, a followup in memory, is lost with the run.
+/// At the next start the loaded control state shows the service revoked
+/// while the session host still grants it `control`: the fence is written
+/// then, once, and the service's pre-cover v1 task ends as without the
+/// crash (`failed`, `sender's authority changed`), not held until its
+/// deadline; a later task on that session runs.
+#[test]
+fn a_revokes_fence_lost_to_a_crash_is_written_at_the_next_load() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        let (busy, v1) = a_v1_task_behind_the_phones_turn(&mut rig, &s, start).await;
+        let before = rig.bridge.host.control_gen(BOT);
+        feed(
+            &mut rig,
+            &s.log,
+            &[
+                &bot_record(&s.log, ControlAction::Cover, 1),
+                &bot_record(&s.log, revoke(false), 2),
+            ],
+        );
+        // The run ends before the followups (the fence among them).
+        assert!(
+            rig.bridge.work.followups.iter().any(|f| matches!(
+                f,
+                crate::runtime::delegated::effects::Followup::Fence { .. }
+            )),
+            "{:?}",
+            rig.bridge.work.followups
+        );
+        rig.bridge.work.followups.clear();
+        assert_eq!(rig.bridge.host.control_gen(BOT), before);
+        restart(&mut rig, root, &os, false, true);
+        passes(&mut rig, 2);
+        assert_eq!(rig.bridge.host.control_gen(BOT), before + 1);
+        // The Station's feed read again: the gate open (for the phone's
+        // later task).
+        rig.bridge.start_view().gates.open_own_station(ORIGIN);
+        ended_by_the_fence(&mut rig, &s, &busy, &v1, start).await;
+        // Once: another start writes no fence more.
+        restart(&mut rig, root, &os, false, true);
+        passes(&mut rig, 2);
+        assert_eq!(rig.bridge.host.control_gen(BOT), before + 1);
+    });
+}

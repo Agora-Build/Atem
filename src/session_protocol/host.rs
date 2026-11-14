@@ -1426,6 +1426,12 @@ impl<J: Journal> SessionHost<J> {
         self.principal(principal).control_gen
     }
 
+    /// Whether `principal`'s durable control state still grants `control`
+    /// (welcomed with it, and no fence since).
+    pub fn grants_control(&self, principal: &str) -> bool {
+        self.principal(principal).control
+    }
+
     /// A digest of every principal's `control_gen` (a principal the host
     /// doesn't keep has generation 1): it changes whenever one is raised (a
     /// fence) or forgotten, so the runtime re-checks what was accepted

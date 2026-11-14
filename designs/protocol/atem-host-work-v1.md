@@ -1277,7 +1277,12 @@ applies again; what needs the session host comes after that commit.
   `unauthorized`, `revoked`; its later `hello`s are refused the same way
   (session-v1 R9.11), from the stored control state after a restart too. A
   v1 task the service had (admitted before its cover) follows v1's rules,
-  which the fence ends (`sender's authority changed`).
+  which the fence ends (`sender's authority changed`). The fence runs after
+  the record's commit; a run that ends between the two loses it, so a
+  loaded control state that shows a service revoked while the session
+  host still grants it `control` writes its fence then, once (Task 37
+  review I1): its v1 tasks end the same way, never holding their sessions
+  until their deadlines.
 - **No service holds session-v1 while the control state is unchecked**
   (rulings T35c, T35d and T35e, **Atem's reading, for Astation**), on a
   host that keeps a control state: a host-work store whose control tables

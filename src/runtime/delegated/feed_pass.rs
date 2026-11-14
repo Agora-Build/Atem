@@ -562,7 +562,14 @@ impl HostBridge {
     /// I.5.5 step 2) as the committed standings have them, the control
     /// feeds loaded (a new host identity clears them with its store). A
     /// service revoked whose channel is live when the loaded state is read
-    /// (one admitted before) is fenced then, once.
+    /// (one admitted before) is fenced then, once; so is one the session
+    /// host still grants `control` (Task 37 review I1, ruling T37a): its
+    /// revoke's fence, a followup in memory, was lost with a run that ended
+    /// between the record's commit and its followups. Written now, durably,
+    /// it ends the service's v1 tasks as the fence would have (§11.1:
+    /// `sender's authority changed`), rather than leave them holding their
+    /// sessions until their deadlines; a service fenced already holds no
+    /// `control`, so nothing is written twice.
     fn sync_revoked(&mut self, cx: &mut Cx) {
         if !matches!(self.work.feeds, Feeds::Loaded(_)) || self.controls_stood_in() {
             return;
@@ -577,15 +584,21 @@ impl HostBridge {
         if &revoked == self.r9.revoked_services() {
             return;
         }
-        let live: std::collections::BTreeSet<String> = self
+        let mut fence: std::collections::BTreeSet<String> = self
             .r9
             .attachments()
             .into_iter()
             .map(|(_, principal)| principal)
             .filter(|principal| revoked.contains(principal))
             .collect();
+        fence.extend(
+            revoked
+                .iter()
+                .filter(|principal| self.host.grants_control(principal))
+                .cloned(),
+        );
         self.r9.set_revoked_services(revoked);
-        for principal in live {
+        for principal in fence {
             let effects = self.r9_call(|r9, parts| r9.fence_revoked(&principal, parts));
             self.r9_exec(effects, cx);
         }

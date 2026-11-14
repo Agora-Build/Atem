@@ -3488,8 +3488,12 @@ fn revoke_while_offline_then_reconnect_never_starts() {
 /// control state damaged: the service's `hello` is `busy`, and when the
 /// phone's turn ends the service's v1 task isn't dispatched (it waits for a
 /// channel the service can't get). Repaired: the revoke's result goes once
-/// (counted once, its row marked sent), the service's `hello` is refused
-/// as revoked, and neither queued task ever ran; the turn ran once.
+/// (counted once, its row marked sent) and the service's `hello` is refused
+/// as revoked. The revoke's fence, lost with the third run, is written at
+/// the load (Task 37 review I1): the v1 task ends as without the crash
+/// (`failed`, `sender's authority changed`, §11.1) and holds its session no
+/// more, so a later task of the phone's runs there. Neither queued task
+/// ever ran; the turn ran once.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -3498,7 +3502,7 @@ fn revoke_while_offline_then_reconnect_never_starts() {
 fn kill_during_the_sync_and_repeat() {
     let mut rig = Rig::full(Via::Local);
     let principal = format!("service:{SVC}");
-    let (running, v1, queued, covered, at, revoke) = {
+    let (launch, running, v1, queued, covered, at, revoke) = {
         let mut r = Router::on(&rig.astation, rig.link());
         // The feed read once (empty): services are admitted.
         rig.open_gate();
@@ -3527,7 +3531,7 @@ fn kill_during_the_sync_and_repeat() {
                 interrupt_running: false,
             },
         );
-        (running, v1, queued, covered, at, revoke)
+        (launch, running, v1, queued, covered, at, revoke)
     };
     let waits = |rig: &Rig, t: &Value, prompt: &str, when: &str| {
         assert_eq!(stored(rig, &t["task_id"])["state"], "blocked", "{when}");
@@ -3634,10 +3638,19 @@ fn kill_during_the_sync_and_repeat() {
         refused_hello(&mut r, IDS, &rig.log, SVC, true),
         ("unauthorized".to_string(), Some("revoked".to_string()))
     );
-    rig.two_passes();
+    // The v1 task ends as without the crash (§11.1: the revoke's fence ends
+    // it), the fence written at the load (its followup was lost with the
+    // run), and holds its session no more: a later task runs.
+    wait_stored(&rig, &v1["task_id"], "failed", "sender's authority changed");
+    never_ran(&rig, &v1["task_id"], "SYNC_KILLED_V1");
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let later = task(IDS, &launch, "AFTER_THE_FENCE", HOUR);
+    enqueue(&mut phone, &mut r, &later);
+    in_turn(&rig, &later["task_id"], "AFTER_THE_FENCE");
+    complete_turn(&rig, &later["task_id"]);
     assert_eq!(input(&rig).matches("SYNC_KILLED_RUNNING").count(), 1);
     never_ran(&rig, &queued["task_id"], "SYNC_KILLED_QUEUED");
-    waits(&rig, &v1, "SYNC_KILLED_V1", "repaired");
+    never_ran(&rig, &v1["task_id"], "SYNC_KILLED_V1");
     assert_eq!(acks_naming(&rig, &revoke), 1);
     assert!(rig.station().ack_refusals().is_empty());
 }
