@@ -1272,9 +1272,10 @@ applies again; what needs the session host comes after that commit.
   nobody completes them, so one awaiting its result expires at its
   deadline). From the commit on, the host refuses every request of the
   service, `forbidden` whatever it asks (`busy` instead while the control
-  state doesn't read), and session-v1's §H fence runs once where it has
-  attachments: its `control_gen` is raised and each attachment closed after
-  `unauthorized`, `revoked`; its later `hello`s are refused the same way
+  state doesn't read), and session-v1's §H fence runs once, whether or not
+  the service has attachments: its `control_gen` is raised, and each
+  attachment it has is closed after `unauthorized`, `revoked`; its later
+  `hello`s are refused the same way
   (session-v1 R9.11), from the stored control state after a restart too. A
   v1 task the service had (admitted before its cover) follows v1's rules,
   which the fence ends (`sender's authority changed`). The fence runs after
