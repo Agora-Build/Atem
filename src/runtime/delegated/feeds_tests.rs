@@ -981,6 +981,16 @@ fn the_control_tables_come_with_the_feeds() {
             .unwrap()
     };
     assert_eq!(tables(&store), 0);
-    FeedStore::load(&store, &list().log).unwrap();
-    assert_eq!(tables(&store), 6, "control_resets with them");
+    let feeds = FeedStore::load(&store, &list().log).unwrap();
+    assert_eq!(
+        tables(&store),
+        7,
+        "control_resets and control_unread with them"
+    );
+    // Ruling T35d, B: made with the "never read" mark, which a load keeps.
+    assert!(feeds.never_read());
+    assert!(FeedStore::load(&store, &list().log).unwrap().never_read());
+    // A store whose tables came before the mark existed reads as read.
+    store.db.execute_batch("DROP TABLE control_unread").unwrap();
+    assert!(!FeedStore::load(&store, &list().log).unwrap().never_read());
 }

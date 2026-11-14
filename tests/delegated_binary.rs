@@ -496,8 +496,12 @@ fn browser_and_uncovered_service_keep_v1() {
     const EXPIRED: &str = "sender's authorization expired";
     let mut rig = Rig::prepared(20 * MIN, false);
     rig.with_clock();
+    rig.with_station();
     rig.start();
     let mut r = Router::new(&rig.astation);
+    // Services wait for the host's first complete read of its Station's
+    // feed (ruling T35d, B): an empty one, read.
+    rig.station_online(false);
     let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
     // The session is busy with a task of the service's.
@@ -630,12 +634,14 @@ fn local_tasks_never_wait_for_a_gate() {
     let mut rig = Rig::prepared(4 * HOUR, true);
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
-    let launch = svc.session(&mut r);
-    let busy = task(IDS, &launch, "GATE_BUSY", HOUR);
-    enqueue(&mut svc, &mut r, &busy);
-    in_turn(&rig, &busy["task_id"], "GATE_BUSY");
+    // No Station: services wait for the host's first read of its feed
+    // (ruling T35d, B). The phone, its channel caught up (I.5.8), launches
+    // the session and keeps it busy.
     let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let launch = phone.session(&mut r);
+    let busy = task(IDS, &launch, "GATE_BUSY", HOUR);
+    enqueue(&mut phone, &mut r, &busy);
+    in_turn(&rig, &busy["task_id"], "GATE_BUSY");
     let gated = task(IDS, &launch, "GATE_PHONE", HOUR);
     enqueue(&mut phone, &mut r, &gated);
     assert!(delegated(&rig, &gated["task_id"]));
@@ -833,11 +839,12 @@ fn native_on_a_lan_runs_after_its_carriage() {
     let mut rig = Rig::prepared(4 * HOUR, false);
     rig.start();
     let mut r = Router::new(&rig.astation);
-    let mut svc = Dev::new_via(&mut r, "direct", IDS, &rig.log, SVC, true);
-    let launch = svc.session(&mut r);
-    // The phone's list is a head ahead of the host's.
+    // The phone's list is a head ahead of the host's. (It launches the
+    // session: with no Station, services wait for the host's first read of
+    // its feed, ruling T35d, B.)
     rig.log.add_native("dev-tablet", &["view"]);
     let mut phone = Dev::new_via(&mut r, "direct", IDS, &rig.log, PHONE, false);
+    let launch = phone.session(&mut r);
     let first = task(IDS, &launch, "LAN_FIRST", HOUR);
     enqueue(&mut phone, &mut r, &first);
     in_turn(&rig, &first["task_id"], "LAN_FIRST");
@@ -1123,9 +1130,10 @@ fn a_fetch_stopping_at_a_deferred_entry_marks_device_list_update_pending() {
     rig.start();
     let mut r = Router::new(&rig.astation);
     let link = r.link;
-    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
-    let launch = svc.session(&mut r);
+    // The phone launches the session: services wait for the host's first
+    // complete read of its feed (ruling T35d, B).
     let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let launch = phone.session(&mut r);
     let pinned = list_head(&rig);
     // The Station's list: a pending recovery, then an entry its subject
     // signed.
@@ -1199,8 +1207,12 @@ fn the_deferral_ends_with_the_recovery_wait_and_tasks_are_checked_again() {
     rig.start();
     let mut r = Router::new(&rig.astation);
     let link = r.link;
-    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
-    let launch = svc.session(&mut r);
+    // The Mac launches the session (services wait for the host's first
+    // complete read of its feed, ruling T35d, B), and its channel goes: a
+    // native channel left open would pass its gate (I.5.8).
+    let mut launcher = Dev::new(&mut r, IDS, &rig.log, MAC, false);
+    let launch = launcher.session(&mut r);
+    launcher.close(&mut r);
     let pinned = list_head(&rig);
     // The recovery reaches the host by its fetch: its wait starts now on
     // the host's clock.

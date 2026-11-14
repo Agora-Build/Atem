@@ -1279,13 +1279,37 @@ applies again; what needs the session host comes after that commit.
   v1 task the service had (admitted before its cover) follows v1's rules,
   which the fence ends (`sender's authority changed`).
 - **No service holds session-v1 while the control state is unchecked**
-  (ruling T35c): while it is damaged or not loaded (a runtime starts so, and
-  stays so while it starts with hosting paused or can't bind its store),
-  every service's `hello` is refused `busy`, `revocations not yet checked`,
-  as host work answers its requests, and entering that state closes every
-  live service attachment through the same §H fence, after the same error.
-  Natives, browser grants and `local` are unaffected. Once the state loads,
-  services are admitted again, those it revokes refused as above.
+  (rulings T35c and T35d, **Atem's reading, for Astation**), on a host that
+  keeps a control state: a host-work store bound to the host's current
+  identity whose control tables exist (read once when the store opens), or
+  a store that exists and can't be opened or read. With hosting on, the
+  store makes its control tables as it opens, so a fresh one is unread
+  from then, and another identity's store counts too: hosting replaces it
+  with this identity's at its next pass. A host that never had a
+  control state (hosting never configured, or never enabled, and no store)
+  refuses no service: services keep session-v1 as without delegated tasks.
+  This never depends on the advertised `host.delegated`. On such a host the
+  state is unchecked while it:
+  - is damaged (a control part that doesn't read);
+  - doesn't load (the store can't be opened or bound; a runtime starts
+    unloaded, and loads it at its first pass whatever hosting's state);
+  - was never read: the transaction that makes a store's control tables
+    writes a durable "never read" mark, as does a new host identity's store
+    (a first pairing's, a re-pair's, a re-verify's), and the commit that
+    reads the host's own Station's feed up to the head the Station announced
+    (its `heads`, or the page's own if higher) clears it. A first read cut
+    short keeps the mark across a crash. Without a Station link, the state
+    stays unread.
+
+  Meanwhile every service's `hello` that the device list would admit is
+  refused `busy`, `revocations not yet checked` (the device-list decision
+  comes first: a removed or expired service gets its final `unauthorized`,
+  and a revoked one `unauthorized`, `revoked`), as host work answers its
+  requests, and entering that state closes every live service attachment
+  through the same §H fence, after the same error. Natives, browser grants
+  and `local` are unaffected. Once the state reads, services are admitted
+  again, those it revokes refused as above. `atem status`'s `Control
+  feeds:` line says which of the three holds, with its way out.
 - **The interrupt** (`interrupt_running: true` on the revoke, or a later
   `interrupt_running` record) writes an intent (reason `revoke`) for each
   task whose turn may run: one in its turn, or whose attempt is live (one
@@ -1301,14 +1325,21 @@ applies again; what needs the session host comes after that commit.
   counted whoever makes it: the start check, or the recovery after a crash
   (`withdrawn at recovery`).
 - **`release`** puts the paused tasks back in `queued`; they get an attempt
-  through the start check before their deadline.
+  through the start check before their deadline. It also ends the hold's
+  mark on its principal's live attempts (a hold lifted before its
+  withdrawal), in its transaction: a later withdrawal of one of them for
+  another cause (the recovery after a crash, a halted write) is counted.
 - **`cover`** changes no task: the service's later tasks are delegated.
-- **While hosting is paused**, once the control feeds have loaded in this
-  run, the records still apply with their effects, and the withdrawals and
-  intents they ask for are carried out (a stop always wins); before the
-  start's recovery they wait for it. A runtime started with hosting paused
-  binds no store and loads no feed: nothing applies until hosting resumes,
-  and the state stays unchecked meanwhile (above).
+- **While hosting is paused** (stopped, or a `runtime.toml` that doesn't
+  load), the control state still loads when the store is bound to the
+  host's current identity (ruling T35d, A): the store is opened for it, the
+  records still apply with their effects, and the withdrawals and intents
+  they ask for are carried out (a stop always wins); before the start's
+  recovery they wait for it. A revoked service stays refused and the
+  others are admitted. A store bound to another identity (hosting paused
+  across a re-verify) isn't moved aside while paused: that is hosting's
+  business when it resumes, and until then this host keeps no control
+  state of its current identity (above).
 - **With `host.delegated` off** (the hook removed with delegated tasks
   left), a record still reaches the tasks the store holds, but nothing of
   session-v1: no fence, and no `hello` refused for the control state.
@@ -3081,7 +3112,8 @@ The sender's channel and online status are not conditions.
 - **The limit.** At most **8** attempts per task, then `failed`, `too
   many attempts`. Attempts a hold withdrew don't count (as built in step 4,
   a crash before the withdrawal included: the hold's cause is written with
-  the attempt, §11.1). Nor does an
+  the attempt, §11.1; a release ends it, so a later withdrawal for another
+  cause counts). Nor does an
   attempt the session host answered `request_id_reused` (an id recorded
   under another submitter, session-v1 R9.14 item 7): it was never
   admitted, and the host takes a fresh id. The deadline bounds them

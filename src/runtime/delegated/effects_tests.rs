@@ -454,9 +454,11 @@ fn cover_makes_a_service_delegated_for_future_tasks_only() {
         let start = host_now().wall_ms;
         let os = ManualOs::at(start);
         let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
-        // The feeds alone decide (no control view standing in).
+        // The feeds alone decide (no control view standing in), read in
+        // full once (an empty feed: ruling T35d, B), the bot uncovered.
         rig.bridge.work.controls = None;
         rig.bridge.start_view().standings.clear();
+        feed(&mut rig, &s.log, &[]);
         assert_eq!(rig.bridge.sender_class(BOT), SenderClass::V1);
         let mut before = phone_enqueue(&rig, "COVER_BEFORE");
         if let hw::Request::Enqueue { route_id, .. } = &mut before {
@@ -506,9 +508,20 @@ fn hello_as(
     handle: &str,
     identity: Identity,
 ) -> Result<atem_client::connect::Attached, atem_client::connect::ConnectError> {
+    hello_at(rig, log, handle, identity, 1)
+}
+
+/// [`hello_as`] to the host at trust generation `trust_gen`.
+fn hello_at(
+    rig: &mut LocalRig,
+    log: &TestLog,
+    handle: &str,
+    identity: Identity,
+    trust_gen: u64,
+) -> Result<atem_client::connect::Attached, atem_client::connect::ConnectError> {
     rig.bridge.r9.reset_init_limiter();
     envelope_in(rig, &envelope::open(handle, Transport::Relay));
-    let (connecting, init) = Connector::new("host").start(&log.log, 1).unwrap();
+    let (connecting, init) = Connector::new("host").start(&log.log, trust_gen).unwrap();
     envelope_in(rig, &envelope::frame(handle, &init));
     let accept = frames_for(rig, handle).remove(0);
     let (welcoming, finish) = connecting
@@ -1035,9 +1048,9 @@ fn attached(rig: &LocalRig, principal: &str) -> bool {
 /// service holds session-v1, as host-work answers it `busy`. A state found
 /// damaged closes every live service attachment (§H, after `busy`,
 /// `revocations not yet checked`) and refuses every service's `hello` the
-/// same way; so does one not loaded (a runtime started with hosting
-/// paused never loads it). Natives are admitted throughout. Once the
-/// feeds load, a service not revoked is admitted again.
+/// same way. Natives are admitted throughout. Repaired, with hosting
+/// paused, the state loads anyway (ruling T35d, A), and the bot, not
+/// revoked, is admitted again.
 #[test]
 fn every_services_hello_is_busy_while_the_control_state_is_unchecked() {
     local_test(async |root| {
@@ -1072,8 +1085,9 @@ fn every_services_hello_is_busy_while_the_control_state_is_unchecked() {
             unchecked()
         );
         hello_as(&mut rig, &s.log, "phone-2", phone_identity()).unwrap();
-        // Repaired, but hosting paused when the feeds would load again:
-        // they don't, and the state stays unchecked.
+        // Repaired with hosting paused: the store, bound to this host's
+        // identity, keeps a control state, which loads whatever hosting
+        // does (ruling T35d, A): the bot, not revoked, is admitted.
         rig.bridge
             .work
             .store
@@ -1085,33 +1099,23 @@ fn every_services_hello_is_busy_while_the_control_state_is_unchecked() {
                 [],
             )
             .unwrap();
-        let config = rig.bridge.work.config.clone();
         rig.bridge.work.feeds = Feeds::Unloaded;
         rig.bridge.work.config = Config::default();
         rig.bridge.work.config_problem = Some("expected a table".into());
         passes(&mut rig, 2);
-        assert!(matches!(rig.bridge.work.feeds, Feeds::Unloaded));
-        assert_eq!(
-            refusal(service_hello(&mut rig, &s.log, "bot-3", "svc-bot")),
-            unchecked()
-        );
-        hello_as(&mut rig, &s.log, "phone-3", phone_identity()).unwrap();
-        // Hosting back: the feeds load, and the bot (not revoked) is in.
-        rig.bridge.work.config = config;
-        rig.bridge.work.config_problem = None;
-        passes(&mut rig, 2);
         assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
-        service_hello(&mut rig, &s.log, "bot-4", "svc-bot").unwrap();
+        service_hello(&mut rig, &s.log, "bot-3", "svc-bot").unwrap();
+        hello_as(&mut rig, &s.log, "phone-3", phone_identity()).unwrap();
     });
 }
 
 /// Review I2 (D9, ruling T35c): the r9 engine's revoked services come back
-/// from the stored control state, never from memory. After a restart the
-/// revoked bot's `hello` is `busy` while the feeds aren't loaded (hosting
-/// paused at the start: probe B), and refused `unauthorized`, `revoked`
-/// once they load. A channel of it live when the loaded state is first
-/// read (as one admitted before it) is fenced then, its `control_gen`
-/// raised once.
+/// from the stored control state, never from memory. After a restart with
+/// hosting paused (probe B), the stored state loads anyway (ruling T35d,
+/// A), and the revoked bot's `hello` is refused `unauthorized`, `revoked`;
+/// so it is with hosting back. A channel of it live when the loaded state
+/// is first read (as one admitted before it) is fenced then, its
+/// `control_gen` raised once.
 #[test]
 fn a_revoked_services_hello_stays_refused_across_a_restart() {
     local_test(async |root| {
@@ -1128,7 +1132,8 @@ fn a_revoked_services_hello_stays_refused_across_a_restart() {
         restart(&mut rig, root, &os, false, true);
         r9_link_up(&mut rig);
         // As the restart finds them while hosting is paused: the feeds not
-        // loaded, nothing of the last run's in memory.
+        // loaded, nothing of the last run's in memory. The store keeps a
+        // control state of this identity: it loads anyway (ruling T35d, A).
         let config = rig.bridge.work.config.clone();
         rig.bridge.work.feeds = Feeds::Unloaded;
         rig.bridge
@@ -1137,9 +1142,10 @@ fn a_revoked_services_hello_stays_refused_across_a_restart() {
         rig.bridge.work.config = Config::default();
         rig.bridge.work.config_problem = Some("expected a table".into());
         passes(&mut rig, 2);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
         assert_eq!(
             refusal(service_hello(&mut rig, &s.log, "bot-2", "svc-bot")),
-            unchecked()
+            revoked_refusal()
         );
         hello_as(&mut rig, &s.log, "phone-1", phone_identity()).unwrap();
         rig.bridge.work.config = config;
@@ -1319,5 +1325,313 @@ fn a_release_makes_a_withdrawal_at_recovery_count() {
             attempts(&rig, &task),
             [(attempt, Some("withdrawn".into()), true)]
         );
+    });
+}
+
+/// Ruling T35d, A: hosting enabled, then switched off on purpose (and the
+/// runtime started again so): the store, bound to this host's identity,
+/// keeps a control state, which loads whatever hosting does. The revoked
+/// bot stays refused (`unauthorized`, `revoked`); another service, not
+/// revoked, is admitted.
+#[test]
+fn a_host_with_hosting_off_still_refuses_a_revoked_service_and_admits_another() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = fed_bot(&mut rig, root, &os, start);
+        let entry = s.log.add_service(
+            "svc-two",
+            &["host"],
+            None,
+            &["notify", "prompt", "view"],
+            start + 3 * HOUR,
+        );
+        carry(&mut rig, &s.log, entry);
+        feed(&mut rig, &s.log, &[&bot_record(&s.log, revoke(false), 2)]);
+        rig.bridge.work.config.enabled = false;
+        assert!(!rig.bridge.hosting_enabled());
+        r9_link_up(&mut rig);
+        passes(&mut rig, 2);
+        assert_eq!(
+            refusal(service_hello(&mut rig, &s.log, "bot-1", "svc-bot")),
+            revoked_refusal()
+        );
+        service_hello(&mut rig, &s.log, "two-1", "svc-two").unwrap();
+        // A start with hosting off: nothing of the last run in memory.
+        restart(&mut rig, root, &os, false, true);
+        rig.bridge.work.config.enabled = false;
+        r9_link_up(&mut rig);
+        passes(&mut rig, 2);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
+        assert_eq!(
+            refusal(service_hello(&mut rig, &s.log, "bot-2", "svc-bot")),
+            revoked_refusal()
+        );
+        service_hello(&mut rig, &s.log, "two-2", "svc-two").unwrap();
+    });
+}
+
+/// Ruling T35d, B: a fresh store (a first pairing) keeps its control state
+/// unread until its first complete read of the host's own Station's feed:
+/// services are `busy` until then (their `hello`s and their host-work
+/// requests), and served once that read reached the announced head.
+#[test]
+fn services_are_busy_until_a_fresh_stores_first_complete_read() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        rig.bridge.work.controls = None;
+        rig.bridge.start_view().standings.clear();
+        r9_link_up(&mut rig);
+        passes(&mut rig, 1);
+        assert_eq!(
+            refusal(service_hello(&mut rig, &s.log, "bot-1", "svc-bot")),
+            unchecked()
+        );
+        let bot = s.bot.clone();
+        let profiles = hw::Request::Profiles {
+            v: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            host: rig.bridge.work_host(),
+        };
+        assert_eq!(ask_req(&mut rig, &bot, &profiles), busy());
+        hello_as(&mut rig, &s.log, "phone-1", phone_identity()).unwrap();
+        // The first complete read (the cover, up to the announced head).
+        feed(
+            &mut rig,
+            &s.log,
+            &[&bot_record(&s.log, ControlAction::Cover, 1)],
+        );
+        passes(&mut rig, 1);
+        service_hello(&mut rig, &s.log, "bot-2", "svc-bot").unwrap();
+        assert!(matches!(
+            ask_req(&mut rig, &bot, &profiles),
+            Ok(ResultBody::Profiles { .. })
+        ));
+    });
+}
+
+/// Ruling T35d, A and B: on a hosting host (the hook on, hosting enabled) a
+/// fresh store keeps a control state, never read, from the moment a pass's
+/// `work_config` opens it, so no service's `hello` of that pass is admitted
+/// before the pass's first load makes the control tables.
+#[test]
+fn a_hosting_hosts_fresh_store_keeps_a_control_state_from_its_open() {
+    use std::os::unix::fs::PermissionsExt;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let _s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        rig.bridge.work.controls = None;
+        rig.bridge.start_view().standings.clear();
+        // A first pairing's store: none yet, hosting enabled on disk.
+        rig.bridge.work.store = None;
+        for name in [
+            "host-work.sqlite",
+            "host-work.sqlite-wal",
+            "host-work.sqlite-shm",
+        ] {
+            let _ = std::fs::remove_file(root.join("runtime").join(name));
+        }
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        rig.bridge.work.kept = None;
+        let path = root.join("runtime.toml");
+        std::fs::write(&path, "version = 1\nenabled = true\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        rig.bridge.work.available = true;
+        rig.bridge.work.refresh = Instant::now();
+        rig.bridge.work_config();
+        assert!(rig.bridge.hosting_enabled());
+        // As the pass's `hello`s see it, before its `work_pass` loads.
+        rig.bridge.sync_services(&mut Cx {
+            client: &rig.app.astation_client,
+            sessions: &mut rig.sessions,
+        });
+        assert!(rig.bridge.controls_unchecked());
+        assert!(rig.bridge.r9.services_unchecked());
+    });
+}
+
+/// Ruling T35d, B: a re-verification (the next trust generation, the same
+/// device list) starts a new store, unread: the revoked bot is never
+/// admitted in between. Refused as revoked under the old store until it
+/// is moved aside, `busy` while the new one is unread, and refused as
+/// revoked again once the new store read its Station's feed from 0.
+#[test]
+fn a_reverify_never_admits_a_revoked_service_in_between() {
+    use crate::session_protocol::membership::r9log::secret;
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = fed_bot(&mut rig, root, &os, start);
+        let cover = bot_record(&s.log, ControlAction::Cover, 1);
+        let revoked = bot_record(&s.log, revoke(false), 2);
+        feed(&mut rig, &s.log, &[&revoked]);
+        r9_link_up(&mut rig);
+        assert_eq!(
+            refusal(service_hello(&mut rig, &s.log, "bot-1", "svc-bot")),
+            revoked_refusal()
+        );
+        // `atem pair verify`: the host's next trust generation on the same
+        // list, pinned, and the session host rebound to it.
+        s.log.add_host("host", 2, &secret("delegated host"));
+        let pairing = crate::profile::Sources::in_dir(&root.join("profile"))
+            .paths
+            .pairing;
+        MembershipHost::pin(
+            &pairing,
+            &rig.bridge.dir,
+            &HostPin {
+                host_id: "host".into(),
+                host_trust_gen: 2,
+            },
+            &s.log.log,
+            &secret("delegated host"),
+        )
+        .unwrap();
+        let identity = crate::runtime::host_bridge::Identity {
+            account_id: "acct".into(),
+            atem_device_id: "host".into(),
+            host_trust_gen: 2,
+        };
+        {
+            let mut cx = Cx {
+                client: &rig.app.astation_client,
+                sessions: &mut rig.sessions,
+            };
+            rig.bridge.pairing = Some(pairing);
+            rig.bridge.reopen_list_if_changed(&mut cx);
+            rig.bridge.pairing = None;
+            assert!(rig.bridge.adopt_identity(&identity, &mut cx));
+        }
+        let bot_hello = |rig: &mut LocalRig, handle: &str| {
+            refusal(hello_at(
+                rig,
+                &s.log,
+                handle,
+                Identity::service("svc-bot", auth("svc-bot")),
+                2,
+            ))
+        };
+        for n in 0..3 {
+            let refused = bot_hello(&mut rig, &format!("bot-a{n}"));
+            assert!(
+                refused == revoked_refusal() || refused == unchecked(),
+                "{refused:?}"
+            );
+            passes(&mut rig, 1);
+        }
+        assert_eq!(
+            bot_hello(&mut rig, "bot-b"),
+            unchecked(),
+            "the new store, unread"
+        );
+        hello_at(&mut rig, &s.log, "phone-1", phone_identity(), 2).unwrap();
+        // The Station's feed read from 0 into the new store.
+        feed(&mut rig, &s.log, &[&cover, &revoked]);
+        passes(&mut rig, 1);
+        assert_eq!(bot_hello(&mut rig, "bot-c"), revoked_refusal());
+    });
+}
+
+/// Ruling T35d, B (hook off = main): with `host.delegated` off a store
+/// gets no control table and no unread mark, a pass and a new identity's
+/// store included.
+#[test]
+fn with_the_hook_off_a_store_gets_no_control_table() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let (_phone, _log) = pin_phone_log(&mut rig, root);
+        passes(&mut rig, 2);
+        let tables = |rig: &LocalRig| -> Vec<String> {
+            let db = &rig.bridge.work.store.as_ref().unwrap().db;
+            let mut q = db
+                .prepare("SELECT name FROM sqlite_master WHERE name LIKE 'control%'")
+                .unwrap();
+            q.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert!(tables(&rig).is_empty(), "{:?}", tables(&rig));
+        let other = HostTarget {
+            account_id: "acct".into(),
+            atem_device_id: "host".into(),
+            host_trust_gen: 9,
+        };
+        assert!(rig.bridge.work_store_ready(&other));
+        assert!(tables(&rig).is_empty(), "{:?}", tables(&rig));
+    });
+}
+
+/// Ruling T35d (re-review out-of-scope note 1): `atem status`'s `Control
+/// feeds:` line says why services are refused, with the way out: a store
+/// never read, a control state that doesn't read.
+#[test]
+fn atem_status_says_why_services_are_refused() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        rig.bridge.work.controls = None;
+        let line = |rig: &LocalRig| rig.bridge.feeds_status().unwrap_or_default();
+        rig.bridge.station = Some(crate::runtime::delegated::station::Station::new());
+        passes(&mut rig, 1);
+        assert!(
+            line(&rig).contains(
+                "services are refused (busy) until this host's first complete read of its Station's control feed"
+            ),
+            "{}",
+            line(&rig)
+        );
+        feed(
+            &mut rig,
+            &s.log,
+            &[&bot_record(&s.log, ControlAction::Cover, 1)],
+        );
+        rig.bridge.station = Some(crate::runtime::delegated::station::Station::new());
+        assert!(
+            !line(&rig).contains("services are refused"),
+            "{}",
+            line(&rig)
+        );
+        damage(&mut rig);
+        assert!(
+            line(&rig).contains("services are refused (busy) until it reads"),
+            "{}",
+            line(&rig)
+        );
+    });
+}
+
+/// Re-review out-of-scope note 2: a bridge opened with `host.delegated` on
+/// starts refusing every service's `hello`, before any pass (fail closed
+/// from the start); with it off it doesn't.
+#[test]
+fn a_bridge_opened_with_the_hook_starts_refusing_services() {
+    local_test(async |root| {
+        let on = HostBridge::open_with_features(
+            &root.join("on/runtime/journal"),
+            None,
+            Clock::default(),
+            HostFeatures::parse("host.delegated").unwrap(),
+        )
+        .unwrap();
+        assert!(on.r9.services_unchecked());
+        let off = HostBridge::open_with_features(
+            &root.join("off/runtime/journal"),
+            None,
+            Clock::default(),
+            HostFeatures::default(),
+        )
+        .unwrap();
+        assert!(!off.r9.services_unchecked());
     });
 }

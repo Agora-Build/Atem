@@ -1688,6 +1688,8 @@ fn commit_bot_records(
         let pos = feeds.position(FEED_ID, i as u64 + 1).unwrap();
         feeds.apply(&tx, &rec, &list, pos, 0).unwrap();
     }
+    // As a sync's read of the feed up to its head (ruling T35d, B).
+    feeds.clear_unread(&tx).unwrap();
     feeds.commit(tx).unwrap();
 }
 
@@ -1710,7 +1712,8 @@ fn the_feeds_cover_a_service_and_reach_the_start_view_at_commit() {
         rig.bridge.start_view().standings.clear();
         passes(&mut rig, 1);
         assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
-        assert_eq!(rig.bridge.sender_class(BOT), SenderClass::V1, "not covered");
+        // Never read in full yet (ruling T35d, B): unchecked, never v1.
+        assert_eq!(rig.bridge.sender_class(BOT), SenderClass::Unchecked);
         let list = rig.bridge.membership.as_ref().unwrap().list_state();
         let apply = |rig: &mut LocalRig, action: ControlAction, seq: u64| {
             let rec = signed_record(
@@ -1730,6 +1733,8 @@ fn the_feeds_cover_a_service_and_reach_the_start_view_at_commit() {
             let tx = feeds.begin(store).unwrap();
             let pos = feeds.position(FEED_ID, seq).unwrap();
             feeds.apply(&tx, &rec, &list, pos, 0).unwrap();
+            // As a sync's read of the feed up to its head.
+            feeds.clear_unread(&tx).unwrap();
             feeds.commit(tx).unwrap();
         };
         apply(&mut rig, ControlAction::Cover, 1);

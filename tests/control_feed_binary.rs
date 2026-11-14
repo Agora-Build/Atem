@@ -1217,16 +1217,16 @@ fn the_hosts_station_calls_match_the_goldens() {
 fn a_remote_task_waits_revocations_not_yet_checked_until_the_gate_opens() {
     let rig = Rig::full(Via::Local);
     let mut r = Router::on(&rig.astation, rig.link());
-    // No feed covers the service yet: v1, it launches the session and keeps
-    // it busy.
-    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
-    let launch = svc.session(&mut r);
-    let busy = task(IDS, &launch, "GATE_BUSY", HOUR);
-    enqueue(&mut svc, &mut r, &busy);
-    assert!(admission(&rig, &busy["task_id"]).is_null(), "v1");
-    in_turn(&rig, &busy["task_id"], "GATE_BUSY");
-    // The phone's task (a native member: delegated); the phone goes.
+    // Services wait for the host's first complete read of its Station's
+    // feed (ruling T35d, B). The phone, a native member whose channel
+    // caught the host up (I.5.8: no gate for it then), launches the session
+    // and keeps it busy.
     let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let launch = phone.session(&mut r);
+    let busy = task(IDS, &launch, "GATE_BUSY", HOUR);
+    enqueue(&mut phone, &mut r, &busy);
+    in_turn(&rig, &busy["task_id"], "GATE_BUSY");
+    // The phone's next task (a native member: delegated); the phone goes.
     let native = task(IDS, &launch, "GATE_NATIVE", HOUR);
     enqueue(&mut phone, &mut r, &native);
     assert_eq!(
@@ -1262,6 +1262,7 @@ fn a_remote_task_waits_revocations_not_yet_checked_until_the_gate_opens() {
 
     // A feed covering the service from now on: its tasks are delegated,
     // waiting for its coverage's origin's gate.
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     rig.cover_and_open();
     // No heads for 60 s on the host's clock: the gate closes.
     rig.clock.add_mono(61_000);
@@ -1671,14 +1672,15 @@ fn a_later_interrupt_running_record_interrupts_a_routed_hosts_turn_after_a_takeo
     assert_eq!(intents(&rig, tid).len(), 1);
 }
 
-/// Ruling T35c (review I1, I2): what a revoked service and a native get
-/// from the host's r9 engine across restarts, in three states of the
-/// control state. Loaded: the revoked service's `hello` is refused
+/// Rulings T35c (review I1, I2) and T35d (A): what a revoked service and a
+/// native get from the host's r9 engine across restarts, in three states
+/// of the control state. Loaded: the revoked service's `hello` is refused
 /// (`unauthorized`, `revoked`), from the stored state alone (the last run's
 /// memory is gone). Damaged: every service's is `busy` (`revocations not
-/// yet checked`), as host work answers it. Not loaded, the runtime started
-/// with hosting paused: `busy` too. The phone, a native member, is admitted
-/// in all three.
+/// yet checked`), as host work answers it. Started with hosting paused: the
+/// store keeps a control state of this identity, which loads anyway, so the
+/// revoked service is refused as revoked. The phone, a native member, is
+/// admitted in all three.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -1724,7 +1726,8 @@ fn a_revoked_service_is_refused_across_restarts_and_every_service_is_busy_while_
         assert_eq!(refused_hello(&mut r, IDS, &rig.log, SVC, true), busy);
         Dev::new(&mut r, IDS, &rig.log, PHONE, false);
     }
-    // Repaired, but started with hosting paused: never loaded.
+    // Repaired, and started with hosting paused: the store keeps a control
+    // state of this identity, which loads anyway (ruling T35d, A).
     rig.kill();
     rig.set_part(&principal, &revoked);
     let toml = rig.sandbox.config().join("runtime.toml");
@@ -1735,10 +1738,13 @@ fn a_revoked_service_is_refused_across_restarts_and_every_service_is_busy_while_
         rig.runtime_log()
             .contains("agent hosting is off until it is fixed")
     });
-    rig.two_passes();
+    within("the feeds loaded while paused", || rig.cursor() == Some(at));
     {
         let mut r = Router::on(&rig.astation, rig.link());
-        assert_eq!(refused_hello(&mut r, IDS, &rig.log, SVC, true), busy);
+        assert_eq!(
+            refused_hello(&mut r, IDS, &rig.log, SVC, true),
+            ("unauthorized".to_string(), Some("revoked".to_string()))
+        );
         Dev::new(&mut r, IDS, &rig.log, PHONE, false);
     }
     // Hosting back: loaded, refused as revoked again.
@@ -1748,6 +1754,40 @@ fn a_revoked_service_is_refused_across_restarts_and_every_service_is_busy_while_
     assert_eq!(
         refused_hello(&mut r, IDS, &rig.log, SVC, true),
         ("unauthorized".to_string(), Some("revoked".to_string()))
+    );
+}
+
+/// Ruling T35d, A: with `host.delegated` on, a host that keeps no control
+/// state (hosting never configured: no `runtime.toml`, no store) refuses
+/// no service: its `hello` is admitted as on main, the phone's too.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_host_that_keeps_no_control_state_refuses_no_service() {
+    let mut rig = Rig::full(Via::Local);
+    rig.kill();
+    std::fs::remove_file(rig.sandbox.config().join("runtime.toml")).unwrap();
+    // The store, if the first run made one before the kill.
+    for name in [
+        "host-work.sqlite",
+        "host-work.sqlite-wal",
+        "host-work.sqlite-shm",
+    ] {
+        let _ = std::fs::remove_file(rig.sandbox.config().join("runtime").join(name));
+    }
+    rig.start_again();
+    rig.two_passes();
+    let mut r = Router::on(&rig.astation, rig.link());
+    Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    assert!(
+        !rig.sandbox
+            .config()
+            .join("runtime/host-work.sqlite")
+            .exists(),
+        "no store made"
     );
 }
 

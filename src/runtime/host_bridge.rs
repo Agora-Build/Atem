@@ -772,6 +772,18 @@ impl HostBridge {
         profile: Option<&crate::profile::Sources>,
         clock: Clock,
     ) -> anyhow::Result<Self> {
+        Self::open_with_features(dir, profile, clock, super::test_hooks::host_features())
+    }
+
+    /// [`HostBridge::open`] with the delegated host-work features `features`
+    /// (the debug-only hook's, read once when the runtime starts; tests give
+    /// their own).
+    pub(super) fn open_with_features(
+        dir: &Path,
+        profile: Option<&crate::profile::Sources>,
+        clock: Clock,
+        features: super::test_hooks::HostFeatures,
+    ) -> anyhow::Result<Self> {
         let journal = FileJournal::open(dir).map_err(|e| anyhow::anyhow!(e.0))?;
         // r8 §H: the previous run ended cleanly only if the journal's
         // clean-close record names its epoch, read before this run takes
@@ -816,7 +828,6 @@ impl HostBridge {
         // installed would withdraw them all). The drive hook (debug builds)
         // replaces it with its own verdicts once host-work's attachment
         // exists.
-        let features = super::test_hooks::host_features();
         let start_view = Arc::new(std::sync::Mutex::new(StartView::new(
             &identity.atem_device_id,
         )));

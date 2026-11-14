@@ -867,6 +867,14 @@ impl FeedSync {
                 .filter(|a| a.feed_id == page.feed_id)
                 .map_or(page.head, |a| a.head.max(page.head))
         });
+        // A store never read in full (ruling T35d, B) is read so with the
+        // commit that reaches the announced head (the page's own, if higher).
+        let first_read_at = cx.feeds.never_read().then(|| {
+            self.announced
+                .as_ref()
+                .filter(|a| a.feed_id == page.feed_id)
+                .map_or(page.head, |a| a.head.max(page.head))
+        });
         let mut synced = apply_page(
             &page,
             &ask,
@@ -874,7 +882,7 @@ impl FeedSync {
             cx.feeds,
             cx.list,
             cx.applied_seq,
-            complete_at,
+            (complete_at, first_read_at),
         )?;
         self.pages += 1;
         // The page's head is the Station's word as fresh as a `heads`': the
@@ -1374,7 +1382,7 @@ fn apply_page(
     feeds: &mut FeedStore,
     list: &ListState,
     applied_seq: u64,
-    complete_at: Option<u64>,
+    (complete_at, first_read_at): (Option<u64>, Option<u64>),
 ) -> anyhow::Result<Synced> {
     let pos = |feeds: &FeedStore, seq: u64| feeds.position(&page.feed_id, seq);
     // No position can be formed (the store has no own Station's origin):
@@ -1444,6 +1452,11 @@ fn apply_page(
         && let Some(origin) = feeds.position(&page.feed_id, 0).map(|p| p.origin)
     {
         feeds.clear_reset(&tx, &origin)?;
+    }
+    // A store never read in full is with this commit when it reaches the
+    // announced head (ruling T35d, B).
+    if !stopped && first_read_at.is_some_and(|head| reached >= head) {
+        feeds.clear_unread(&tx)?;
     }
     feeds.commit(tx)?;
     Ok(Synced {

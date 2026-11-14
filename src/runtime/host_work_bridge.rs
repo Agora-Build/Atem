@@ -226,6 +226,9 @@ pub(super) struct State {
     /// What control records' effects asked of the bridge once their
     /// transaction committed, not carried out yet (`effects_pass`).
     followups: Vec<crate::runtime::delegated::effects::Followup>,
+    /// Whether this host keeps a control state (ruling T35d, A), read once
+    /// when the store opens (`read_kept`; none: not read yet).
+    kept: Option<KeptControls>,
     /// The run's control-alert tally the feed stores count into (it
     /// outlives a store loaded again: ruling T33c, N3).
     alert_tally: crate::runtime::delegated::feeds::AlertTally,
@@ -248,6 +251,19 @@ pub(super) struct State {
     /// spawn (production only logs it).
     #[cfg(test)]
     failed_before_spawn: HashMap<String, &'static str>,
+}
+
+/// Whether the host keeps a control state, and whose (ruling T35d, A): the
+/// service refusals for the control state (a `hello`'s `busy`, host work's)
+/// apply only where it does, for this host's identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum KeptControls {
+    /// No store, or one without control tables: services as on main.
+    None,
+    /// A store with control tables, bound to this identity.
+    Of(HostTarget),
+    /// A store that exists and can't be opened or read: fail closed.
+    Unreadable,
 }
 
 impl State {
@@ -287,6 +303,7 @@ impl State {
             reverified: None,
             reapplied: Vec::new(),
             followups: Vec::new(),
+            kept: None,
             alert_tally: Default::default(),
             intents: Default::default(),
             #[cfg(debug_assertions)]
@@ -493,10 +510,37 @@ impl HostBridge {
             }
         };
         self.work.config = config;
-        if self.work.config.enabled && self.work.store.is_none() && !self.work.error {
-            match Store::open(self.dir.parent().unwrap_or(&self.dir)) {
-                Ok(store) => self.work.store = Some(store),
-                Err(_) => self.work_fail(),
+        // With `host.delegated` on, a store that exists opens whatever
+        // hosting's state, so a control state it keeps loads with hosting
+        // off too (ruling T35d, A); otherwise only with hosting on, as on
+        // main.
+        let state = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
+        let exists = state.join("host-work.sqlite").exists();
+        let wanted = self.work.config.enabled || (self.features.delegated && exists);
+        if wanted && self.work.store.is_none() && !self.work.error {
+            match Store::open(&state) {
+                Ok(store) => {
+                    // Hosting's store keeps a control state from its open,
+                    // never read if fresh (ruling T35d, B): this pass's
+                    // `hello`s come before its first load.
+                    let prepared = !(self.features.delegated && self.work.config.enabled)
+                        || FeedStore::prepare(&store).is_ok();
+                    self.work.store = Some(store);
+                    // Read once it opened (with the hook only: off, nothing
+                    // reads it, as on main).
+                    self.work.kept = (!prepared).then_some(KeptControls::Unreadable);
+                    if self.features.delegated {
+                        self.read_kept();
+                    }
+                }
+                Err(_) => {
+                    if self.features.delegated && exists {
+                        self.work.kept = Some(KeptControls::Unreadable);
+                    }
+                    if self.work.config.enabled {
+                        self.work_fail();
+                    }
+                }
             }
         }
         for p in &self.work.config.profiles {
@@ -545,24 +589,68 @@ impl HostBridge {
         if let Some(controls) = &self.work.controls {
             return classify(principal, list, controls.as_ref(), self.features);
         }
-        if let Feeds::Loaded(feeds) = &self.work.feeds {
-            return classify(principal, list, feeds.as_ref(), self.features);
-        }
         if self.features.delegated
             && self.controls_unchecked()
             && crate::runtime::delegated::active_service(principal, list).is_some()
         {
             return SenderClass::Unchecked;
         }
+        if let Feeds::Loaded(feeds) = &self.work.feeds {
+            return classify(principal, list, feeds.as_ref(), self.features);
+        }
         classify(principal, list, &NoFeeds, self.features)
     }
 
-    /// The host's control state can't be checked: the feeds aren't loaded
-    /// or don't read (tests: and no control view stands in for them). A
-    /// service's revocation, hold and coverage are unknown then (ruling
-    /// T32b).
+    /// The host's control state can't be checked for services (ruling
+    /// T32b; T35d): where this host keeps one (`keeps_controls`, A), the
+    /// feeds aren't loaded, don't read, or were never read in full (B)
+    /// (tests: and no control view stands in for them). A service's
+    /// revocation, hold and coverage are unknown then. A host that keeps
+    /// none refuses nothing for it: services as on main.
     pub(super) fn controls_unchecked(&self) -> bool {
-        !matches!(self.work.feeds, Feeds::Loaded(_)) && !self.controls_stood_in()
+        if self.controls_stood_in() || !self.keeps_controls() {
+            return false;
+        }
+        match &self.work.feeds {
+            Feeds::Loaded(feeds) => feeds.never_read(),
+            _ => true,
+        }
+    }
+
+    /// Whether this host keeps a control state of its current identity
+    /// (ruling T35d, A): a store bound to it with control tables, or a store
+    /// that can't be read (fail closed). As read when the store opened
+    /// (`read_kept`), a load and a new identity's store. Another identity's
+    /// store counts while hosting is on: this pass's `work_pass` replaces it
+    /// with this identity's, unread (B).
+    pub(super) fn keeps_controls(&self) -> bool {
+        match &self.work.kept {
+            Some(KeptControls::Of(identity)) => {
+                *identity == self.work_host() || self.hosting_enabled()
+            }
+            Some(KeptControls::Unreadable) => true,
+            Some(KeptControls::None) | None => false,
+        }
+    }
+
+    /// Whether the open store keeps a control state, and whose, read once
+    /// (ruling T35d, A): nothing while it's read already or there is no
+    /// store.
+    pub(super) fn read_kept(&mut self) {
+        if self.work.kept.is_some() {
+            return;
+        }
+        let Some(store) = self.work.store.as_ref() else {
+            return;
+        };
+        let kept = match (FeedStore::kept_in(store), store.bound()) {
+            (Ok(true), Ok(Some(identity))) => KeptControls::Of(identity),
+            // Not bound yet: bound to this identity at its first use.
+            (Ok(true), Ok(None)) => KeptControls::Of(self.work_host()),
+            (Ok(false), Ok(_)) => KeptControls::None,
+            _ => KeptControls::Unreadable,
+        };
+        self.work.kept = Some(kept);
     }
 
     /// Tests: a control view drives the start view's standings in place of
@@ -624,6 +712,8 @@ impl HostBridge {
                 // Its pending records applied again once, at the next
                 // re-verification (`feeds_reverify`).
                 self.work.reverified = None;
+                // The store keeps a control state of this identity now.
+                self.work.kept = Some(KeptControls::Of(self.work_host()));
             }
             Err(error) => {
                 eprintln!(
@@ -637,6 +727,7 @@ impl HostBridge {
                     view.controls_damaged = true;
                 }
                 self.work.feeds = Feeds::Damaged;
+                self.work.kept = Some(KeptControls::Of(self.work_host()));
             }
         }
     }
@@ -951,6 +1042,17 @@ impl HostBridge {
                 );
             }
             self.work_fence_launches();
+            // A control state this host keeps for its identity loads
+            // whatever hosting's state (ruling T35d, A): a revoked service
+            // stays refused while hosting is off. Never a store moved aside
+            // here: another identity's store is hosting's business.
+            if self.features.delegated {
+                self.read_kept();
+                if self.keeps_controls() {
+                    self.ensure_feeds();
+                    self.feeds_reverify();
+                }
+            }
             // A stop always wins: what control records' effects asked once
             // they committed is carried out while paused too.
             self.effects_pass(cx);
@@ -1148,10 +1250,21 @@ impl HostBridge {
         }
         let state = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
         let store = self.work.store.take().expect("checked above");
+        let delegated = self.features.delegated;
         let next = store.retire(host_now().wall_ms).and_then(|aside| {
             let store = Store::open(&state)?;
             store.bind(identity)?;
+            // A new identity's store keeps a control state from its start,
+            // unread until its first complete read (ruling T35d, B).
+            if delegated {
+                FeedStore::prepare(&store)?;
+            }
             Ok((store, aside))
+        });
+        self.work.kept = Some(if delegated {
+            KeptControls::Of(identity.clone())
+        } else {
+            KeptControls::None
         });
         match next {
             Ok((store, aside)) => {

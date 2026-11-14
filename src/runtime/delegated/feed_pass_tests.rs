@@ -207,7 +207,8 @@ fn a_page_through_the_bridge_reaches_the_start_view_at_its_commit() {
         let mut rig = LocalRig::new(root).await;
         let os = ManualOs::at(host_now().wall_ms);
         let s = fed_host(&mut rig, root, &os);
-        assert_eq!(rig.bridge.sender_class(BOT), SenderClass::V1);
+        // Never read in full yet (ruling T35d, B): unchecked, never v1.
+        assert_eq!(rig.bridge.sender_class(BOT), SenderClass::Unchecked);
         let head = s.log.log.head();
         let calls = bridge_heads(&mut rig, 1, head);
         assert_eq!(
@@ -378,7 +379,7 @@ fn the_control_feeds_status_line() {
         let mut s = fed_host(&mut rig, root, &os);
         assert_eq!(
             rig.bridge.feeds_status().unwrap(),
-            "revocations not yet checked (waiting for the Station's heads); 0 kept as evidence, 0 pending"
+            "revocations not yet checked (waiting for the Station's heads); 0 kept as evidence, 0 pending; services are refused (busy) until this host's first complete read of its Station's control feed (it needs the Station's heads)"
         );
         let head = s.log.log.head();
         bridge_heads(&mut rig, 1, head);

@@ -108,7 +108,9 @@ const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS control_counts (
         kind TEXT PRIMARY KEY, count INTEGER NOT NULL) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS control_resets (
-        origin TEXT PRIMARY KEY, restarted TEXT NOT NULL) WITHOUT ROWID;";
+        origin TEXT PRIMARY KEY, restarted TEXT NOT NULL) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS control_unread (
+        one INTEGER PRIMARY KEY CHECK (one = 1)) WITHOUT ROWID;";
 
 /// A run's count of control alerts and the latest one's text with when it
 /// came, shared by whatever counts into it (`atem status`).
@@ -267,6 +269,10 @@ struct Mem {
     /// The resets pending, per origin: the feed whose read from 0 began
     /// (its cursor replaced), or `""` before it did (ruling T33c).
     resets: BTreeMap<String, String>,
+    /// The store's control state was never read in full (ruling T35d, B):
+    /// made with the tables, gone with the commit that first reads the own
+    /// Station's feed up to its announced head.
+    unread: bool,
 }
 
 /// Per source: when its last line went and what came since.
@@ -388,7 +394,7 @@ impl FeedStore {
     /// error: the caller keeps delegated work stopped.
     pub fn load(store: &Store, list: &Membership) -> Result<FeedStore> {
         let db = &store.db;
-        db.execute_batch(TABLES)?;
+        Self::prepare(store)?;
         let rows: Vec<(String, String)> = {
             let mut st = db.prepare("SELECT principal, part FROM control_principals")?;
             st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -464,8 +470,12 @@ impl FeedStore {
             st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<rusqlite::Result<BTreeMap<_, _>>>()?
         };
+        let unread = db.query_row("SELECT EXISTS(SELECT 1 FROM control_unread)", [], |r| {
+            r.get(0)
+        })?;
         let mem = Mem {
             resets,
+            unread,
             state: loaded.state,
             cursors,
             pending,
@@ -490,6 +500,55 @@ impl FeedStore {
             publisher: None,
             clock: Box::new(crate::session_protocol::membership::host_now),
         })
+    }
+
+    /// The control tables of `store`, made if it has none yet, in one
+    /// transaction with the durable "never read" mark (ruling T35d, B): a
+    /// fresh store's control state is unchecked until its first complete
+    /// read. A store that has them keeps its mark as it is (one from before
+    /// the mark existed reads as read).
+    pub fn prepare(store: &Store) -> Result<()> {
+        let tx = store.immediate()?;
+        let fresh = !Self::kept_in_db(&tx)?;
+        tx.execute_batch(TABLES)?;
+        if fresh {
+            tx.execute("INSERT INTO control_unread(one) VALUES(1)", [])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Whether `store` keeps a control state: its control tables exist
+    /// (ruling T35d, A). Read only.
+    pub fn kept_in(store: &Store) -> Result<bool> {
+        Self::kept_in_db(&store.db)
+    }
+
+    fn kept_in_db(db: &Connection) -> Result<bool> {
+        Ok(db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='control_principals')",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The store's control state was never read in full (ruling T35d, B),
+    /// as committed: services are unchecked until it is.
+    pub fn never_read(&self) -> bool {
+        self.mem.unread
+    }
+
+    /// The own Station's feed is read in full for the first time, in `tx`
+    /// (the commit that reaches its announced head).
+    pub fn clear_unread(&mut self, tx: &FeedTx) -> Result<()> {
+        self.ours(tx)?;
+        let mut mem = self.staged.take().unwrap_or_else(|| self.mem.clone());
+        let out = (|| {
+            tx.execute("DELETE FROM control_unread", [])?;
+            mem.unread = false;
+            Ok(())
+        })();
+        self.stage(mem, out)
     }
 
     /// A `BEGIN IMMEDIATE` transaction on `store` for records to apply in

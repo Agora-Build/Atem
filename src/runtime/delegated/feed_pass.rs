@@ -395,6 +395,9 @@ impl HostBridge {
     /// - **Checked** (loaded): the revoked services follow the committed
     ///   standings ([`HostBridge::sync_revoked`]).
     pub(in crate::runtime::host_bridge) fn sync_services(&mut self, cx: &mut Cx) {
+        if self.features.delegated {
+            self.read_kept();
+        }
         let unchecked = self.features.delegated && self.controls_unchecked();
         if unchecked != self.r9.services_unchecked() {
             let effects = self.r9_call(|r9, parts| r9.set_services_unchecked(unchecked, parts));
@@ -560,14 +563,15 @@ impl HostBridge {
     /// runtime.log lines are hourly). None otherwise (the hook off: as
     /// main).
     pub fn feeds_status(&self) -> Option<String> {
+        let store = self
+            .dir
+            .parent()
+            .unwrap_or(&self.dir)
+            .join("host-work.sqlite");
         if matches!(self.work.feeds, Feeds::Damaged) {
             return Some(format!(
-                "the stored control state doesn't read; no delegated task starts. Restore {} from a backup, or pair this host again (a new identity starts a fresh store), then run `atem runtime restart`",
-                self.dir
-                    .parent()
-                    .unwrap_or(&self.dir)
-                    .join("host-work.sqlite")
-                    .display()
+                "the stored control state doesn't read; no delegated task starts. Restore {} from a backup, or pair this host again (a new identity starts a fresh store), then run `atem runtime restart`; services are refused (busy) until it reads",
+                store.display()
             ));
         }
         let station = self.station.as_ref()?;
@@ -616,7 +620,24 @@ impl HostBridge {
                 format!("; {n} alert(s) since the start, the latest: {latest}")
             }
         };
-        Some(format!("{gate}{}{alerts}", counts.unwrap_or_default()))
+        // Why services are refused, if they are (ruling T35d), with the way
+        // out.
+        let services = if !(self.features.delegated && self.controls_unchecked()) {
+            String::new()
+        } else if matches!(self.work.kept, Some(super::KeptControls::Unreadable)) {
+            format!(
+                "; services are refused (busy) until the control state loads: {} can't be opened (move it aside or restore it, then run `atem runtime restart`)",
+                store.display()
+            )
+        } else if matches!(self.work.feeds, Feeds::Loaded(_)) {
+            "; services are refused (busy) until this host's first complete read of its Station's control feed (it needs the Station's heads)".to_string()
+        } else {
+            "; services are refused (busy) until the control state loads".to_string()
+        };
+        Some(format!(
+            "{gate}{}{alerts}{services}",
+            counts.unwrap_or_default()
+        ))
     }
 }
 
