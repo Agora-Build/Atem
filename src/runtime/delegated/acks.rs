@@ -22,11 +22,16 @@
 //!   state's reason (O5), written by the shared core's builder
 //!   (`ControlAck::to_json`), never `write_intent`'s boolean. The same
 //!   record applied again (a `pending` one that applies, a `duplicate`) is
-//!   acknowledged again with that result. Another body under a `record_id`
-//!   held (a collision) never replaces the first body's result: logged
-//!   once, acknowledged nowhere, so it can't make the Station refuse an ack
-//!   carrying others. A row that doesn't read, or that the writer wouldn't
-//!   take, is skipped, kept as it is, and logged once with no content.
+//!   acknowledged again with that result. A collision (the state's verdict,
+//!   `Why::Collision`: another body under a `record_id` its principal's
+//!   record counted with) is never kept, whether or not the first body's
+//!   result still is: logged once, acknowledged nowhere, so it can't make
+//!   the Station refuse an ack carrying others. Another body the state
+//!   took as no collision (the body held never counted: `pending` or
+//!   `refused`) replaces the result held, and goes in an ack of its own
+//!   (the Station may track the first body under that id). A row that
+//!   doesn't read, or that the writer wouldn't take, is skipped, kept as it
+//!   is, and logged once with no content.
 //! - **What an ack names.** The host's own claim (the account, the root,
 //!   the host id and trust generation of the identity its store is bound
 //!   to), and the host's own Station's feed and its cursor as committed now,
@@ -58,13 +63,14 @@
 //!   ([`StationLink`]): a restart, a reconnection and a re-authentication
 //!   each start a new one.
 //! - **A refusal** (`control_ack_refused`, Decision 20) advances nothing
-//!   here: no result is taken as delivered, dropped or moved on, and no
-//!   resend's schedule changes; the sync closes the gates. **Atem's
-//!   reading:** nothing more is sent on the connection the refused ack went
-//!   on (an ack's claim is its link's association or it isn't, so the next
-//!   one there would be refused too, and closing the gates again with
-//!   each); the book goes on at the next connection, where everything sent
-//!   on the refused one goes again.
+//!   here: no result is taken as delivered, dropped or moved on; the sync
+//!   closes the gates. **Atem's reading:** nothing more is sent on the
+//!   connection the refused ack went on (an ack's claim is its link's
+//!   association or it isn't, so the next one there would be refused too,
+//!   and closing the gates again with each); the book goes on at the next
+//!   connection, where everything sent on the refused one goes again: its
+//!   results read as never sent (in memory; ruling T36b, N4), so a second
+//!   refused connection in a row that never took one loses none.
 //! - **The cursor** ("the ack of the cursor itself goes on"). An ack also
 //!   goes when the committed cursor moved since the last ack of this run,
 //!   with whatever results are due (none, for a page with no record).
@@ -80,7 +86,7 @@ use anyhow::{Context, Result, anyhow};
 use atem_client::control::relay::MAX_ACK_RESULTS;
 use atem_client::control::{
     AckResult, ApplicationResult, Applied, ControlAck, ControlAction, ControlPrincipal,
-    ControlRecord, ControlSigner, EffectKind, EffectResult, EffectWhy, FeedPos,
+    ControlRecord, ControlSigner, EffectKind, EffectResult, EffectWhy, FeedPos, Why,
 };
 use atem_client::encoding::Hash32;
 use rusqlite::{Connection, params};
@@ -109,11 +115,13 @@ pub const ONCE_KEPT_MS: u64 = 600_000;
 /// and `sent_ms`: the link generation and `D` of its last send (`NULL`:
 /// never sent).
 /// `digest`: the hex SHA-256 of the record's body's `jcs`, the body whose
-/// result the row holds (review m2).
+/// result the row holds (review m2). `alone`: 1 when it replaced another
+/// body's result under its `record_id` (ruling T36b, N2): it goes in an ack
+/// of its own.
 const TABLE: &str = "CREATE TABLE IF NOT EXISTS control_acks (
     origin TEXT NOT NULL, feed_id TEXT NOT NULL, key TEXT NOT NULL, principal TEXT NOT NULL,
     digest TEXT NOT NULL, effects TEXT NOT NULL, resend_until_ms INTEGER, sent_gen INTEGER,
-    sent_ms INTEGER, PRIMARY KEY(principal, key))";
+    sent_ms INTEGER, alone INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(principal, key))";
 
 /// How often a result is sent again (the module docs). Ordered: what a
 /// result is kept for is the most of what its applications ask.
@@ -190,6 +198,9 @@ pub struct Acked {
     /// order, each not in force with its reason (O5): the state's own.
     pub effects: Vec<EffectResult>,
     pub resend: Resend,
+    /// The state took it as a collision (`Why::Collision`, ruling T36b,
+    /// N2): never kept.
+    pub collision: bool,
 }
 
 impl Acked {
@@ -203,6 +214,7 @@ impl Acked {
             digest: Hash32::of(record.object().jcs().as_bytes()),
             effects: applied.effects.clone(),
             resend: Resend::of(record, applied),
+            collision: applied.why == Some(Why::Collision),
         }
     }
 }
@@ -254,8 +266,9 @@ struct Row {
     effects: Vec<EffectResult>,
     resend: Resend,
     sent: Sent,
-    /// Another body came under its `record_id` (review m2): logged, once.
-    collided: bool,
+    /// It replaced another body's result under its `record_id` (ruling
+    /// T36b, N2): it goes in an ack of its own.
+    alone: bool,
 }
 
 impl Row {
@@ -349,6 +362,9 @@ pub struct AckBook {
     link: Option<Link>,
     /// A refusal came on this connection: nothing more goes on it.
     held: Option<Link>,
+    /// The collisions logged, `(principal, record_id)` (ruling T36b, N2:
+    /// once each; bounded by the record ids the state counts).
+    collisions: BTreeSet<(String, String)>,
     refusals: u64,
     /// Rows that don't read, or that the shared writer wouldn't take: kept
     /// on disk as they are, never sent (review m6).
@@ -364,9 +380,19 @@ impl AckBook {
     /// The book in `db`, its table made if missing.
     pub fn load(db: &Connection) -> Result<AckBook> {
         db.execute_batch(TABLE)?;
+        // A table of an earlier build of this branch, made before `alone`.
+        let has_alone = db
+            .prepare("SELECT 1 FROM pragma_table_info('control_acks') WHERE name='alone'")?
+            .exists([])?;
+        if !has_alone {
+            db.execute_batch(
+                "ALTER TABLE control_acks ADD COLUMN alone INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
         let mut book = AckBook::default();
         let mut q = db.prepare(
-            "SELECT origin, feed_id, key, principal, digest, effects, resend_until_ms, sent_gen
+            "SELECT origin, feed_id, key, principal, digest, effects, resend_until_ms, sent_gen,
+                alone
             FROM control_acks ORDER BY rowid",
         )?;
         // Each column read as whatever it holds: a row that doesn't read is
@@ -377,10 +403,11 @@ impl AckBook {
                 (text(0), text(1), text(2), text(3), text(4), text(5)),
                 r.get::<_, Option<i64>>(6).ok(),
                 r.get::<_, Option<i64>>(7).ok(),
+                r.get::<_, i64>(8).ok(),
             ))
         })?;
         for row in rows {
-            let read = row.ok().and_then(|(texts, resend, sent)| {
+            let read = row.ok().and_then(|(texts, resend, sent, alone)| {
                 let (Some(origin), Some(feed_id), Some(record_id), Some(principal)) =
                     (texts.0, texts.1, texts.2, texts.3)
                 else {
@@ -399,7 +426,7 @@ impl AckBook {
                     } else {
                         Sent::Never
                     },
-                    collided: false,
+                    alone: alone? != 0,
                 };
                 writable(&row.result()).then_some(row)
             });
@@ -422,32 +449,35 @@ impl AckBook {
     /// (each written there; adopt the book only once `tx` committed). A
     /// record already held, the same body applied again (a `pending` one
     /// that now applies, one served again), is held with its new result,
-    /// due again, sent again as the most of what its results ask. Another
-    /// body under a `record_id` held (a collision) never replaces the
-    /// first body's result: it is logged once, with no content, and kept
-    /// nowhere (review m2). A principal's first [`RESENT_PER_PRINCIPAL`]
-    /// results that are entirely `duplicate` once per connection are kept
-    /// for resending, a later one goes once; one that puts an effect in
-    /// force, and a service's own revoke, are always kept (review I1).
+    /// due again, sent again as the most of what its results ask. A
+    /// collision (the state's verdict, ruling T36b, N2) is never kept,
+    /// whether or not a result is held under its `record_id`: logged once,
+    /// with no content (review m2). Another body the state took as no
+    /// collision (the body held never counted) replaces the result held,
+    /// in an ack of its own from then on. A principal's first
+    /// [`RESENT_PER_PRINCIPAL`] results that are entirely `duplicate` once
+    /// per connection are kept for resending, a later one goes once; one
+    /// that puts an effect in force, and a service's own revoke, are always
+    /// kept (review I1), and a result once kept stays kept when its record
+    /// is applied again (ruling T36b, N1): only a new result, or one held
+    /// to go once, is capped.
     pub fn on_committed(&mut self, tx: &Connection, results: &[Acked]) -> Result<()> {
         for acked in results {
+            if acked.collision {
+                let key = (acked.principal.clone(), acked.record_id.clone());
+                if !self.collisions.contains(&key) {
+                    self.lines.push(format!(
+                        "atem runtime: another body under {} record {} isn't acknowledged; the first body's result stands",
+                        acked.principal, acked.record_id
+                    ));
+                    self.collisions.insert(key);
+                }
+                continue;
+            }
             let held = self
                 .rows
                 .iter()
                 .position(|r| r.principal == acked.principal && r.record_id == acked.record_id);
-            if let Some(i) = held
-                && self.rows[i].digest != acked.digest
-            {
-                let row = &mut self.rows[i];
-                if !row.collided {
-                    row.collided = true;
-                    self.lines.push(format!(
-                        "atem runtime: another body under {} record {} isn't acknowledged; the first body's result stands",
-                        row.principal, row.record_id
-                    ));
-                }
-                continue;
-            }
             let result = AckResult::Record {
                 record_id: acked.record_id.clone(),
                 effects: acked.effects.clone(),
@@ -462,23 +492,30 @@ impl AckBook {
                 }
                 continue;
             }
-            let mut resend = held.map_or(acked.resend, |i| acked.resend.max(self.rows[i].resend));
-            let newly_bounded = held.is_none_or(|i| {
-                let row = &self.rows[i];
-                !Row::bounded(row.resend, &row.effects)
-            });
-            if Row::bounded(resend, &acked.effects) && newly_bounded {
+            // Another body than the one held, which the state took as no
+            // collision: the body held never counted.
+            let replaced = held.is_some_and(|i| self.rows[i].digest != acked.digest);
+            let mut resend = match held {
+                Some(i) if !replaced => acked.resend.max(self.rows[i].resend),
+                _ => acked.resend,
+            };
+            let cappable = held.is_none_or(|i| replaced || self.rows[i].resend == Resend::Once);
+            if Row::bounded(resend, &acked.effects) && cappable {
                 let bounded = self
                     .rows
                     .iter()
-                    .filter(|r| {
-                        r.principal == acked.principal && Row::bounded(r.resend, &r.effects)
+                    .enumerate()
+                    .filter(|(i, r)| {
+                        Some(*i) != held
+                            && r.principal == acked.principal
+                            && Row::bounded(r.resend, &r.effects)
                     })
                     .count();
                 if bounded >= RESENT_PER_PRINCIPAL {
                     resend = Resend::Once;
                 }
             }
+            let alone = replaced || held.is_some_and(|i| self.rows[i].alone);
             let row = Row {
                 origin: acked.origin.clone(),
                 feed_id: acked.feed_id.clone(),
@@ -488,14 +525,15 @@ impl AckBook {
                 effects: acked.effects.clone(),
                 resend,
                 sent: Sent::Never,
-                collided: false,
+                alone,
             };
             tx.execute(
-                "INSERT INTO control_acks(origin,feed_id,key,principal,digest,effects,resend_until_ms,sent_gen,sent_ms)
-                VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL)
+                "INSERT INTO control_acks(origin,feed_id,key,principal,digest,effects,resend_until_ms,sent_gen,sent_ms,alone)
+                VALUES(?1,?2,?3,?4,?5,?6,?7,NULL,NULL,?8)
                 ON CONFLICT(principal,key) DO UPDATE SET origin=excluded.origin,
-                    feed_id=excluded.feed_id, effects=excluded.effects,
-                    resend_until_ms=excluded.resend_until_ms, sent_gen=NULL, sent_ms=NULL",
+                    feed_id=excluded.feed_id, digest=excluded.digest, effects=excluded.effects,
+                    resend_until_ms=excluded.resend_until_ms, sent_gen=NULL, sent_ms=NULL,
+                    alone=excluded.alone",
                 params![
                     row.origin,
                     row.feed_id,
@@ -504,6 +542,7 @@ impl AckBook {
                     row.digest.to_hex(),
                     effects_text(&row.effects),
                     resend.stored(),
+                    i64::from(alone),
                 ],
             )?;
             match held {
@@ -566,6 +605,13 @@ impl AckBook {
         let mut batch: Vec<&Row> = Vec::new();
         let mut ids = BTreeSet::new();
         for row in due {
+            // A result that replaced another body's goes alone (ruling
+            // T36b, N2): the Station may track the first body's effects
+            // under its id and refuse the whole ack carrying it.
+            if row.alone {
+                acks.push(ack(vec![row]));
+                continue;
+            }
             if batch.len() == MAX_ACK_RESULTS || ids.contains(row.record_id.as_str()) {
                 acks.push(ack(std::mem::take(&mut batch)));
                 ids.clear();
@@ -580,11 +626,12 @@ impl AckBook {
     }
 
     /// `sent`, acks [`AckBook::due`] gave, were handed to `link` at `now_d`:
-    /// their results are marked sent there (one sent once leaves the book),
-    /// the cursor they named is the one acknowledged, and what is spent (a
-    /// result past its resends, one read from another Station's feed than
-    /// `link`'s) leaves the book, in `tx`. Whether anything changed (else
-    /// nothing was written).
+    /// their results are marked sent there, the cursor they named is the one
+    /// acknowledged, and what is spent (one sent once, on a connection that
+    /// ended or lasted [`ONCE_KEPT_MS`] with no refusal; a result past its
+    /// resends; one read from another Station's feed than `link`'s) leaves
+    /// the book, in `tx`. Whether anything changed (else nothing was
+    /// written).
     pub fn sent(
         &mut self,
         tx: &Connection,
@@ -666,10 +713,20 @@ impl AckBook {
     }
 
     /// `control_ack_refused` (Decision 20): nothing advances (the module
-    /// docs); nothing more goes on the connection the last ack went on.
+    /// docs); nothing more goes on the connection the last ack went on, and
+    /// what went on it reads as never sent (in memory), so it goes on the
+    /// next connection that takes it, however many refused connections
+    /// come first (ruling T36b, N4).
     pub fn on_refused(&mut self) {
         self.refusals += 1;
         self.held = self.link;
+        if let Some(held) = self.held {
+            for row in &mut self.rows {
+                if matches!(row.sent, Sent::On { link, .. } if link == held) {
+                    row.sent = Sent::Never;
+                }
+            }
+        }
     }
 
     /// The `runtime.log` lines not taken yet (rows that don't read, a

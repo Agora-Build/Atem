@@ -403,7 +403,9 @@ impl HostBridge {
     /// `sent`, acks [`HostBridge::acks_due`] gave, were handed to the link:
     /// marked sent (what is spent leaves the book), in their own
     /// transaction. A write that fails is logged (the first, then at powers
-    /// of two): they stay due, and go again.
+    /// of two): the sends are marked in memory all the same, so none goes
+    /// again on this connection (review m5); what is spent leaves the book
+    /// once a write succeeds, and a restart may send them once more.
     pub(crate) fn acks_sent(&mut self, sent: &[DueAck]) {
         let list = self.start_view().list.clone();
         if loaded(&self.work, list.as_ref(), &self.work_host()).is_none() {
@@ -434,7 +436,7 @@ impl HostBridge {
             self.work.ack_failures += 1;
             if self.work.ack_failures.is_power_of_two() {
                 eprintln!(
-                    "atem runtime: {} control acknowledgment(s) couldn't be marked sent ({error:#}); they go again",
+                    "atem runtime: {} control acknowledgment(s) couldn't be marked sent ({error:#}); none goes again on this connection",
                     self.work.ack_failures
                 );
             }

@@ -2424,13 +2424,18 @@ table of `host-work.sqlite`, made only with the hook on):
   application (§11.1), reasons included (wire rule 10, the shared core's
   writer); the same record applied again (a `pending` one that now
   applies, one served again) is owed with its new result, never the
-  earlier one. Another body under a `record_id` the book holds a result
-  for (a collision: a Station fault or a double-signing signer, kept as
-  evidence by §11.1 rule 1) never replaces the first body's result: it is
-  logged once, with no content, and acknowledged nowhere, so it can never
-  make the Station refuse an ack that carries other results. A row of the
-  table that doesn't read, or that the writer wouldn't take, is kept as
-  it is, logged once with no content, and never sent.
+  earlier one. A collision (§11.1 rule 1: another body under a
+  `record_id` its principal's record counted with, the state's own
+  verdict, kept as evidence; a Station fault or a double-signing signer)
+  is never acknowledged, whether or not the first body's result is still
+  in the book: it is logged once, with no content, so it can never make
+  the Station refuse an ack that carries other results. Another body the
+  state took as no collision (the body the book holds a result for never
+  counted: it was `pending` or `refused`) replaces that result, and goes
+  in an ack of its own from then on, since the Station may track the first
+  body under that `record_id`. A row of the table that doesn't read, or
+  that the writer wouldn't take, is kept as it is, logged once with no
+  content, and never sent.
 - **What an ack names** (**Atem's reading, for Astation**). The claim of
   the identity the host's store is bound to (its account, root, host id and
   trust generation), and the host's own Station's feed and its committed
@@ -2468,7 +2473,10 @@ table of `host-work.sqlite`, made only with the hook on):
   connection are kept for resending, its first ones; a later one goes once
   (each effect counts once per host whichever record says so). A result
   that puts an effect in force (`applied`, at most one per effect: §11.1)
-  and a service's own revoke's (bounded by its 25 hours) are always kept.
+  and a service's own revoke's (bounded by its 25 hours) are always kept,
+  and a result once kept stays kept when its record is applied again (a
+  reset's read from 0 serving it again as `duplicate`): only a new result,
+  or one that goes once, is weighed against the bound.
 - **The cursor.** An ack also goes when the committed cursor moved since
   the last ack of the run, with whatever results are due (none for a page
   of no record).
@@ -2478,7 +2486,8 @@ table of `host-work.sqlite`, made only with the hook on):
   sends no more acks on that connection, since an ack's claim is its
   link's association or it isn't, and resumes at the next connection,
   where every result sent on the refused one goes again, those that go
-  once included.
+  once included: they read as never sent (in memory), so a second refused
+  connection in a row that never took one loses none.
 
 #### Reports (agreed with Auth/Portal, 2026-11-11)
 

@@ -484,8 +484,9 @@ fn other_in_force_results_once_per_connection() {
 }
 
 /// Decision 20, §11.4 "Refusals": `control_ack_refused` advances nothing in
-/// the book: no result is taken as delivered or dropped, its table is
-/// unchanged, and no resend's schedule moves. Nothing more goes on the
+/// the book: no result is taken as delivered or dropped, and its table is
+/// unchanged; what went on the refused connection reads as never sent
+/// there (ruling T36b, N4: in memory only). Nothing more goes on the
 /// connection it came on (the next ack there would be refused too), not
 /// even a new commit's result or an own revoke's 10 minutes; at the next
 /// connection everything owed goes, as without the refusal.
@@ -514,9 +515,18 @@ fn an_ack_refusal_advances_nothing() {
     let before = book.clone();
     book.on_refused();
     assert_eq!(table(&db), stored);
+    let unsent = |rows: &[Row]| -> Vec<Row> {
+        rows.iter()
+            .map(|r| Row {
+                sent: Sent::Never,
+                ..r.clone()
+            })
+            .collect()
+    };
     assert_eq!(
-        book.rows, before.rows,
-        "nothing taken as delivered or moved"
+        book.rows,
+        unsent(&before.rows),
+        "nothing taken as delivered or moved; what went reads as never sent"
     );
     assert_eq!(book.acked, before.acked);
     // Nothing more on that connection: the 10 minutes passed, a new
@@ -774,10 +784,11 @@ fn a_second_body_never_replaces_the_first_bodys_result() {
         ],
     );
     send(&db, &mut book, &link(1), 2, ISSUED);
-    let collision = applied(&[
+    // The state's verdict: a collision (ruling T36b, N2).
+    let collision = collided(applied(&[
         (EffectKind::Revocation, ApplicationResult::Duplicate, None),
         (EffectKind::Interrupt, ApplicationResult::Applied, None),
-    ]);
+    ]));
     for n in 0..2 {
         commit(
             &db,
@@ -986,4 +997,286 @@ fn rows_that_dont_read_are_logged_once_and_skipped() {
     );
     assert_eq!(table(&db).len(), 6, "kept as they are");
     assert!(AckBook::load(&db).unwrap().dump()["unreadable"] == 5);
+}
+
+/// What applying `record` gave when the state took it as a collision
+/// (another body under a `record_id` its principal's record counted with:
+/// `Why::Collision`, kept as evidence), its effects `applied`'s.
+fn collided(applied: Applied) -> Applied {
+    Applied {
+        why: Some(Why::Collision),
+        evidence: true,
+        ..applied
+    }
+}
+
+/// Ruling T36b, N1 (Task 36 re-review 1): a kept result with an `applied`
+/// effect, applied again with the same body (a reset's read from 0 serves
+/// it again: every effect `duplicate`), stays kept once per connection,
+/// though four results of its principal that are entirely `duplicate` are
+/// kept already. Only a new row, or one that goes once, is capped.
+#[test]
+fn an_applied_row_served_again_stays_kept() {
+    let (db, mut book) = fresh();
+    let natives: Vec<ControlRecord> = (0..5)
+        .map(|n| {
+            record(
+                BOT,
+                ControlSigner::Member(format!("dev-{n}")),
+                ControlAction::Revoke {
+                    interrupt_running: n == 0,
+                },
+                ISSUED + n,
+            )
+        })
+        .collect();
+    let both = applied(&[
+        (EffectKind::Revocation, ApplicationResult::Applied, None),
+        (EffectKind::Interrupt, ApplicationResult::Applied, None),
+    ]);
+    commit(
+        &db,
+        &mut book,
+        &[Acked::of(&natives[0], &both, Some(&at(1)))],
+    );
+    let duplicate = applied(&[(EffectKind::Revocation, ApplicationResult::Duplicate, None)]);
+    for (n, native) in natives[1..].iter().enumerate() {
+        commit(
+            &db,
+            &mut book,
+            &[Acked::of(native, &duplicate, Some(&at(n as u64 + 2)))],
+        );
+    }
+    assert_eq!(ids(&send(&db, &mut book, &link(1), 5, ISSUED)).len(), 5);
+    // A reset's read from 0 serves the first again: both effects duplicate.
+    let again = applied(&[
+        (EffectKind::Revocation, ApplicationResult::Duplicate, None),
+        (EffectKind::Interrupt, ApplicationResult::Duplicate, None),
+    ]);
+    commit(
+        &db,
+        &mut book,
+        &[Acked::of(&natives[0], &again, Some(&at(1)))],
+    );
+    assert_eq!(
+        book.rows[0].resend,
+        Resend::PerConnection,
+        "kept, never demoted"
+    );
+    let all: Vec<String> = natives.iter().map(|r| r.record_id().to_owned()).collect();
+    assert_eq!(
+        ids(&send(&db, &mut book, &link(1), 5, ISSUED)),
+        [all[0].clone()]
+    );
+    for n in 2..4 {
+        assert_eq!(ids(&send(&db, &mut book, &link(n), 5, ISSUED)), all);
+    }
+    // After a restart too.
+    let mut loaded = AckBook::load(&db).unwrap();
+    assert_eq!(ids(&send(&db, &mut loaded, &link(1), 5, ISSUED)), all);
+    assert_eq!(ids(&send(&db, &mut loaded, &link(2), 5, ISSUED)), all);
+}
+
+/// Ruling T36b, N2: whether a second body under a held `record_id` is a
+/// collision is the state's verdict (`Why::Collision`), never the book's
+/// first sighting. A first body the state never counted (`pending`) holds
+/// the key in the book, but a second body the state then applies (no
+/// collision for the state) replaces its result: owed, in an ack of its
+/// own (the Station may track the first body's effects under that id), and
+/// written with its own digest (N5). A real collision is never kept,
+/// whether or not the first body's row is still in the book (one that left
+/// it after its connection), and is logged once.
+#[test]
+fn the_states_collision_verdict_decides_the_first_body() {
+    let (db, mut book) = fresh();
+    let id = uuid::Uuid::new_v4().to_string();
+    let first = record_with_id(
+        BOT,
+        ControlSigner::Member("dev-mac".into()),
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+        ISSUED,
+        &id,
+    );
+    let second = record_with_id(
+        BOT,
+        ControlSigner::Member("dev-mac".into()),
+        ControlAction::Revoke {
+            interrupt_running: true,
+        },
+        ISSUED + 1,
+        &id,
+    );
+    let other = record(
+        "svc-two",
+        ControlSigner::Member("dev-mac".into()),
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+        ISSUED,
+    );
+    let pending = applied(&[(
+        EffectKind::Revocation,
+        ApplicationResult::Pending,
+        Some(Why::Pending(PendingReason::SignerUnknown)),
+    )]);
+    commit(&db, &mut book, &[Acked::of(&first, &pending, Some(&at(1)))]);
+    send(&db, &mut book, &link(1), 1, ISSUED);
+    // The second body applies (the first never counted): it replaces the
+    // first's result, beside another principal's result.
+    let both = applied(&[
+        (EffectKind::Revocation, ApplicationResult::Applied, None),
+        (EffectKind::Interrupt, ApplicationResult::Applied, None),
+    ]);
+    commit(
+        &db,
+        &mut book,
+        &[
+            Acked::of(&second, &both, Some(&at(2))),
+            Acked::of(&other, &in_force(EffectKind::Revocation), Some(&at(3))),
+        ],
+    );
+    assert!(book.take_lines().is_empty(), "no collision");
+    let due = book.due(&link(2), Some((FEED, 3)), &claim(), Some(ISSUED));
+    let acks: Vec<Vec<AckResult>> = due.into_iter().map(|d| d.ack.results).collect();
+    assert_eq!(
+        acks,
+        [
+            vec![AckResult::Record {
+                record_id: id.clone(),
+                effects: both.effects.clone(),
+            }],
+            vec![AckResult::Record {
+                record_id: other.record_id().into(),
+                effects: in_force(EffectKind::Revocation).effects,
+            }],
+        ],
+        "the replaced result alone"
+    );
+    // Written with the second body's digest (N5), and alone after a
+    // restart too.
+    let digest: String = db
+        .query_row(
+            "SELECT digest FROM control_acks WHERE key=?1",
+            [id.as_str()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        digest,
+        Hash32::of(second.object().jcs().as_bytes()).to_hex()
+    );
+    let mut loaded = AckBook::load(&db).unwrap();
+    let due = loaded.due(&link(1), Some((FEED, 3)), &claim(), Some(ISSUED));
+    assert_eq!(
+        due.iter().map(|d| d.ack.results.len()).collect::<Vec<_>>(),
+        [1, 1]
+    );
+    send(&db, &mut loaded, &link(1), 3, ISSUED);
+
+    // A real collision whose first body's row has left the book (a hold,
+    // sent once on a connection that ended with no refusal): never kept,
+    // logged once.
+    let hold_id = uuid::Uuid::new_v4().to_string();
+    let hold = record_with_id(
+        BOT,
+        ControlSigner::Principal,
+        ControlAction::Hold,
+        ISSUED,
+        &hold_id,
+    );
+    let replayed = record_with_id(
+        BOT,
+        ControlSigner::Principal,
+        ControlAction::Hold,
+        ISSUED + 5,
+        &hold_id,
+    );
+    commit(
+        &db,
+        &mut loaded,
+        &[Acked::of(&hold, &in_force(EffectKind::Hold), Some(&at(4)))],
+    );
+    send(&db, &mut loaded, &link(1), 4, ISSUED);
+    send(&db, &mut loaded, &link(2), 4, ISSUED);
+    assert!(
+        !table(&db).iter().any(|(key, _, _)| *key == hold_id),
+        "the first hold's row left"
+    );
+    for n in 0..2 {
+        commit(
+            &db,
+            &mut loaded,
+            &[Acked::of(
+                &replayed,
+                &collided(in_force(EffectKind::Hold)),
+                Some(&at(5 + n)),
+            )],
+        );
+    }
+    assert!(
+        !table(&db).iter().any(|(key, _, _)| *key == hold_id),
+        "a collision is never kept"
+    );
+    let lines = loaded.take_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains(&hold_id), "{lines:?}");
+    assert!(
+        ids(&send(&db, &mut loaded, &link(3), 6, ISSUED))
+            .iter()
+            .all(|r| *r != hold_id)
+    );
+}
+
+/// Ruling T36b, N4: a result that goes once survives two refused
+/// connections in a row though the second never took it (a full queue):
+/// sent on refused connection A, not taken on B (its other ack was), B
+/// refused too: it goes on C.
+#[test]
+fn two_refused_connections_in_a_row_lose_no_send_once_result() {
+    let (db, mut book) = fresh();
+    let cover = record(BOT, ControlSigner::Principal, ControlAction::Cover, ISSUED);
+    commit(
+        &db,
+        &mut book,
+        &[Acked::of(
+            &cover,
+            &in_force(EffectKind::Cover),
+            Some(&at(1)),
+        )],
+    );
+    assert_eq!(
+        ids(&send(&db, &mut book, &link(1), 1, ISSUED)),
+        [cover.record_id()]
+    );
+    book.on_refused();
+    // Two principals' holds under one `record_id`: two acks on B, the
+    // cover's with the first.
+    let id = uuid::Uuid::new_v4().to_string();
+    let holds: Vec<Acked> = ["svc-a", "svc-b"]
+        .iter()
+        .enumerate()
+        .map(|(n, service)| {
+            let hold = record_with_id(
+                service,
+                ControlSigner::Principal,
+                ControlAction::Hold,
+                ISSUED,
+                &id,
+            );
+            Acked::of(&hold, &in_force(EffectKind::Hold), Some(&at(2 + n as u64)))
+        })
+        .collect();
+    commit(&db, &mut book, &holds);
+    let due = book.due(&link(2), Some((FEED, 3)), &claim(), Some(ISSUED));
+    assert_eq!(due.len(), 2, "{due:?}");
+    assert!(ids(&[due[0].ack.results.clone()]).contains(&cover.record_id().to_owned()));
+    // The first isn't taken (the queue is full); the second is.
+    let tx = db.unchecked_transaction().unwrap();
+    book.sent(&tx, &link(2), Some(ISSUED), &due[1..]).unwrap();
+    tx.commit().unwrap();
+    book.on_refused();
+    let resent = ids(&send(&db, &mut book, &link(3), 3, ISSUED + MIN));
+    assert!(resent.contains(&cover.record_id().to_owned()), "{resent:?}");
 }
