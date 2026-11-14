@@ -140,8 +140,9 @@ wins, unless it contradicts the contract text: then stop and report.
 | Core runner (`src/session_protocol/fixtures.rs`) | every base and `r8-*` scenario: host ones against `SessionHost` in a fake runtime (with the memory journal and with the `FileJournal`), client ones against the client machines; reports `r9-*` as not run | `cargo test --bin atem session_protocol::fixtures` |
 | atem-client (`crates/atem-client/tests/`) | the r9 vectors, client and relay scenarios (against a reference relay; the Station's acknowledgment scenarios `r9-control-ack-*` against the reference ledger), and host scenarios against a test host | `cargo test -p atem-client -p atem-client-ffi` |
 | r9 engine (`src/session_protocol/r9/fixtures_tests.rs`) | the `r9-envelope-*` fixtures in process | `cargo test --bin atem session_protocol::r9::fixtures_tests` |
+| r9 host, in process (`src/session_protocol/membership/fixtures_tests.rs`) | every r9 host scenario but the envelope's, against the real r9 admission engine, device-list store and session host over a `FileJournal` (the fake runtime's PTY and dispatcher); in the `r9-delegated-*` ones the harness plays host-work (session-v1 R9.14) | `cargo test --bin atem session_protocol::membership::fixtures_tests -- --nocapture` (`ATEM_R9_FIXTURE=<name>`) |
 | Real runtime, r8 (`tests/runtime_fixtures_binary.rs`) | host scenarios against the `atem runtime` binary, real `atem worker`s running a fake Claude Code, and a fake Astation playing the client | `cargo test --test runtime_fixtures_binary` (`ATEM_FIXTURE=<name>` runs one) |
-| Real runtime, r9 (`tests/r9_runner/`) | every r9 host scenario: a device list pinned as `atem pair` writes it, clients that speak `atem-ch1` in the envelope, a fake Astation that also plays the relay | `cargo test --test runtime_fixtures_binary r9_fixtures -- --nocapture` (`ATEM_FIXTURE=<name>[,…]`; `ATEM_R9_PARALLEL` runtimes at once, default 6) |
+| Real runtime, r9 (`tests/r9_runner/`) | every r9 host scenario: a device list pinned as `atem pair` writes it, clients that speak `atem-ch1` in the envelope, a fake Astation that also plays the relay; the `r9-delegated-*` ones with `host.delegated` on and host-work's side played through the debug-only drive hook (`ATEM_TEST_HOST_WORK_DRIVE`) | `cargo test --test runtime_fixtures_binary r9_fixtures -- --nocapture` (`ATEM_FIXTURE=<name>[,…]`; `ATEM_R9_PARALLEL` runtimes at once, default 6) |
 | Bindings | Swift, Kotlin and WASM conformance over the r9 vectors, the host-work prompt-framing vectors (`prompt-framing-v1.json`, `framing-size-v1.json`) and the acknowledgment fixtures | `./scripts/check-atem-client-bindings.sh [kotlin] [wasm] [swift] [e2e]` |
 
 Notes:
@@ -162,6 +163,11 @@ Notes:
   removed, the real-runtime r8 runner (a fake Astation sending a clear `hello`
   on the link of a host with no device list) has no host to talk to; its
   scenarios run inside r9 channels, as the r9 runner's do.
+- The `r9-delegated-*` host scenarios (session-v1 R9.14) run in the two
+  host runners above only. No client-side runner (atem-client, the
+  bindings, Astation's) runs them: their `host_work_*` and `adopted_chat`
+  steps are host-internal, and what a client observes is in their
+  `expect` steps.
 - More r9 behavior in the real runtime, beyond the fixtures:
   `tests/r9_*_binary.rs` (admission, several devices, push, services,
   two enrolled hosts, revoked grants, host route proof) and

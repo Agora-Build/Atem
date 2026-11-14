@@ -1,0 +1,200 @@
+//! The revocation gate (design I.5.8; host-work-v1 §11.6, start check
+//! condition 5): an unstarted delegated task starts only while its sender's
+//! gate is open.
+//!
+//! - **A Station's gate** has two parts (I.5.8): its feed, applied up to
+//!   the announced head (PR 10's feeds; until then only a stand-in opens
+//!   it), and the device list, fetched up to the head that Station announced
+//!   or up to a deferred entry (`StartView::fetched`, from the host's own
+//!   fetch on its link, so only the host's own Station's gate can have it).
+//!   It opens only with both.
+//! - **A covered service** waits for the gate of the origin of its
+//!   principal's **current** coverage (step 4's Decision 14).
+//! - **A native member** waits for the gate of the host's own Station (the
+//!   selected route's relay origin), or passes while it holds an authorized
+//!   channel whose `hello` carriage brought the host up to the native's own
+//!   head (I.5.8, "Native senders"; `R9Host::native_caught_up`). That is
+//!   v1's rule (a native's task dispatches while its channel is open), so a
+//!   host reached only on a local network, with no Station, still runs a
+//!   connected native's work (VII.A test 20).
+//!
+//! This version syncs no feed: every Station's gate is closed
+//! ([`Gates::closed_until_feeds`]) until the feeds exist (PR 10), so only a
+//! native with a caught-up channel passes.
+use super::DelegatedSender;
+use std::collections::BTreeSet;
+
+/// Whether a delegated sender's gate is open now; `fetched`: the Station
+/// whose gate has its device-list part (`StartView::fetched`).
+pub trait GateView {
+    fn open_for(&self, sender: &DelegatedSender, fetched: Option<&str>) -> bool;
+}
+
+/// The gates as the host knows them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Gates {
+    /// The Station origins whose feed part is open (design I.5.8): none
+    /// until the host syncs feeds.
+    open: BTreeSet<String>,
+    /// The Station origins whose whole gate a stand-in for the feeds opened
+    /// (tests, and the debug-only `ATEM_TEST_HOST_CONTROLS` unless it leaves
+    /// the device-list part to the fetch): their device-list part too.
+    stood_in: BTreeSet<String>,
+    /// The host's own Station's origin: a native member's gate.
+    own: Option<String>,
+    /// The native members (`member:<id>`) holding a caught-up channel
+    /// (`R9Host::native_caught_up`).
+    caught_up: BTreeSet<String>,
+}
+
+impl Gates {
+    /// Every Station's gate closed: the host syncs no feed yet (PR 10), so
+    /// a native member passes only with its own caught-up channel and a
+    /// service never does.
+    pub fn closed_until_feeds() -> Gates {
+        Gates::default()
+    }
+
+    /// The native members holding a caught-up channel, as the r9 engine
+    /// has them now.
+    pub fn set_caught_up(&mut self, natives: BTreeSet<String>) {
+        self.caught_up = natives;
+    }
+
+    /// Every Station's gate closed (design I.6.2 step 7, at a start's
+    /// recovery): a delegated sender's remote tasks wait until its feed is
+    /// synced again. The natives' caught-up channels stay: each one's
+    /// carriage was applied in this run.
+    pub fn close_stations(&mut self) {
+        self.open.clear();
+        self.stood_in.clear();
+    }
+
+    /// Whether any Station's gate is open.
+    #[cfg(test)]
+    pub fn any_station_open(&self) -> bool {
+        !self.open.is_empty()
+    }
+
+    /// The Station gates as the debug-only stand-in for the feeds says
+    /// (`ATEM_TEST_HOST_CONTROLS`): the host's own Station's origin and the
+    /// origins whose feed part is open; with `whole`, their device-list
+    /// part too (else it is the host's own fetch's).
+    #[cfg(debug_assertions)]
+    pub fn set_stations(&mut self, own: Option<String>, open: BTreeSet<String>, whole: bool) {
+        self.own = own;
+        self.stood_in = if whole { open.clone() } else { BTreeSet::new() };
+        self.open = open;
+    }
+
+    /// Tests: `origin`'s whole gate is open, and it is the host's own
+    /// Station's (what the feeds and the fetch will make it, PR 10).
+    #[cfg(test)]
+    pub fn open_own_station(&mut self, origin: &str) {
+        self.open_feed(origin);
+        self.stood_in.insert(origin.to_string());
+    }
+
+    /// Tests: `origin`'s feed part is open, and it is the host's own
+    /// Station's; its device-list part is the fetch's.
+    #[cfg(test)]
+    pub fn open_feed(&mut self, origin: &str) {
+        self.own = Some(origin.to_string());
+        self.open.insert(origin.to_string());
+    }
+
+    /// `origin`'s gate: its feed part, and its device-list part (`fetched`
+    /// names it, or a stand-in opened the whole gate).
+    fn station_open(&self, origin: &str, fetched: Option<&str>) -> bool {
+        self.open.contains(origin) && (fetched == Some(origin) || self.stood_in.contains(origin))
+    }
+}
+
+impl GateView for Gates {
+    fn open_for(&self, sender: &DelegatedSender, fetched: Option<&str>) -> bool {
+        match sender {
+            DelegatedSender::Native { device_id } => {
+                self.own
+                    .as_deref()
+                    .is_some_and(|own| self.station_open(own, fetched))
+                    || self.caught_up.contains(&format!("member:{device_id}"))
+            }
+            DelegatedSender::Service { feed, .. } => self.station_open(&feed.origin, fetched),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::delegated::FeedRef;
+
+    const ORIGIN: &str = "https://station-dev.agora.build";
+
+    fn native(id: &str) -> DelegatedSender {
+        DelegatedSender::Native {
+            device_id: id.into(),
+        }
+    }
+
+    fn service(origin: &str) -> DelegatedSender {
+        DelegatedSender::Service {
+            device_id: "svc-bot".into(),
+            feed: FeedRef {
+                origin: origin.into(),
+                feed_id: "feed-1".into(),
+            },
+        }
+    }
+
+    /// This version's gates (VII.A test 20, design I.5.8): every Station's
+    /// closed, so a service never passes and a native passes only while it
+    /// holds a caught-up channel, its own; once the feeds open the host's
+    /// own Station's gate, every native passes and a service whose current
+    /// coverage names that origin does.
+    #[test]
+    fn closed_until_feeds_passes_only_a_caught_up_native() {
+        let mut gates = Gates::closed_until_feeds();
+        assert!(!gates.open_for(&native("dev-phone"), None));
+        assert!(!gates.open_for(&service(ORIGIN), None));
+        gates.set_caught_up(BTreeSet::from(["member:dev-phone".to_string()]));
+        assert!(gates.open_for(&native("dev-phone"), None));
+        assert!(
+            !gates.open_for(&native("dev-tablet"), None),
+            "its own channel only"
+        );
+        assert!(!gates.open_for(&service(ORIGIN), None));
+        gates.set_caught_up(BTreeSet::new());
+        assert!(
+            !gates.open_for(&native("dev-phone"), None),
+            "the channel closed"
+        );
+
+        gates.open_own_station(ORIGIN);
+        assert!(gates.open_for(&native("dev-tablet"), None));
+        assert!(gates.open_for(&service(ORIGIN), None));
+        assert!(!gates.open_for(&service("https://other.example"), None));
+
+        // A start's recovery closes every Station's gate; a native's own
+        // caught-up channel still opens its own.
+        gates.set_caught_up(BTreeSet::from(["member:dev-phone".to_string()]));
+        gates.close_stations();
+        assert!(!gates.any_station_open());
+        assert!(!gates.open_for(&native("dev-tablet"), None));
+        assert!(!gates.open_for(&service(ORIGIN), None));
+        assert!(gates.open_for(&native("dev-phone"), None));
+
+        // The feed part alone: the device-list part is the fetch's, and
+        // only for the Station it names.
+        let mut gates = Gates::closed_until_feeds();
+        gates.open_feed(ORIGIN);
+        assert!(!gates.open_for(&service(ORIGIN), None));
+        assert!(!gates.open_for(&native("dev-tablet"), None));
+        assert!(!gates.open_for(&service(ORIGIN), Some("https://other.example")));
+        assert!(gates.open_for(&service(ORIGIN), Some(ORIGIN)));
+        assert!(gates.open_for(&native("dev-tablet"), Some(ORIGIN)));
+        // The fetch's part with no feed part: closed.
+        let gates = Gates::closed_until_feeds();
+        assert!(!gates.open_for(&service(ORIGIN), Some(ORIGIN)));
+    }
+}

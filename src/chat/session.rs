@@ -446,6 +446,43 @@ impl ChatSession {
         self.last_completed.as_deref()
     }
 
+    /// How `last_completed_turn` ended, when known.
+    pub fn last_outcome(&self) -> Option<Outcome> {
+        self.last_outcome
+    }
+
+    /// The turn the remote prompt `request_id` began and its user message
+    /// (ids), as the retained history shows them.
+    pub fn prompt_turn(&self, request_id: &str) -> Option<(&str, &str)> {
+        self.history
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User && m.request_id.as_deref() == Some(request_id))
+            .map(|m| (m.turn_id.as_str(), m.message_id.as_str()))
+    }
+
+    /// After a broker restart: the current turn `turn_id`, still running,
+    /// is the one the remote prompt `request_id` began, with the user
+    /// message `user_message_id` (host-work's attempt, its turn journaled
+    /// at the acceptance, session-v1 R9.14 items 5, 6). A worker's chat
+    /// never names the requests a broker submitted, so the restored session
+    /// doesn't know it: from now on `current_request_id` names it, and the
+    /// turn's end completes it with that user message. False, nothing
+    /// changed, unless `turn_id` is the current turn and hasn't ended.
+    pub fn rebind_turn(&mut self, turn_id: &str, request_id: &str, user_message_id: &str) -> bool {
+        let ended = self.last_completed.as_deref() == Some(turn_id);
+        match &mut self.current_turn {
+            Some((turn, request)) if turn == turn_id && !ended => {
+                *request = Some(request_id.to_string());
+            }
+            _ => return false,
+        }
+        self.record(request_id, RequestState::Accepted);
+        self.user_messages
+            .insert(request_id.to_string(), user_message_id.to_string());
+        true
+    }
+
     /// The request id of the remote prompt that began the current turn
     /// (none for one typed in the terminal).
     pub fn current_request_id(&self) -> Option<&str> {

@@ -83,6 +83,9 @@ async function main() {
   const welcome = conn.onWelcome(await wire.recv(), log, mono());
   console.log(`WELCOME ${welcome.principal} ${welcome.clientKind} ${[...welcome.permissions].sort().join(",")} ${welcome.revision} ${welcome.head.seq}`);
   expect(welcome.authorizationMsLeft <= 3_000_000, "authorization bounded by the grant");
+  // The host's verifier inventory (R9.2, Atem's proposal): this test's host
+  // reports the shared core's, the same as this binding's own.
+  expect(JSON.stringify(welcome.verifier) === JSON.stringify(m.verifierInventory()) && welcome.verifier.version === 2, "welcome verifier");
 
   async function exchange(out, done) {
     wire.send(out.frame);

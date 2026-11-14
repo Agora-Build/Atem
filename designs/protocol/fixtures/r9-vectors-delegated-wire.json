@@ -322,7 +322,7 @@
   ],
   "kind": "vectors",
   "name": "r9-vectors-delegated-wire",
-  "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4 and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without. Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
+  "note": "Delegated host work's session-v1 shapes (R9.14, planned; not advertised): host_enc_key_get (exactly v, op and a UUID v4 id), its answer host_enc_key (exactly v, op, id, re, host_id, host_trust_gen, enc_key {alg: x25519, pub: 32 bytes}, enc_sig: 64 bytes), and receipts with provenance (task_id a UUID v4 and sender member:/service:/host: with a 1-128 byte id, both or neither, on a prompt receipt only; absent, never null) and without; and the r9 welcome's optional verifier (R9.2 \"How a verifier reports itself\", R9.8; Atem's proposal, for Astation's agreement): absent, or exactly version (an integer from 1 to 2^32 - 1) and actions (1-64 names, sorted by bytes, each once, each 1-32 bytes of [a-z0-9_] starting with a letter; a name the reader doesn't know is read, never refused); `verifier` is this release's own (version 2: R9.2's sixteen actions). Each case is valid or refused as a whole; a `raw` case is read as its exact text. The valid answer's enc_key and enc_sig are r9-vectors-membership-log's first host_enc_key pair: enc_sig verifies with host-a's host_key of log L over enc_sig_input_hex.",
   "receipt": [
     {
       "message": {
@@ -744,5 +744,1728 @@
       "valid": false
     }
   ],
-  "requires": "r9"
+  "requires": "r9",
+  "verifier": {
+    "actions": [
+      "add",
+      "add_host",
+      "genesis",
+      "host_enc_key",
+      "host_sender_readmit",
+      "host_sender_revoke",
+      "k_backup",
+      "project_remove",
+      "project_set",
+      "recovery_add",
+      "recovery_approve",
+      "recovery_veto",
+      "remove",
+      "remove_host",
+      "set_recovery_key",
+      "set_roles"
+    ],
+    "version": 2
+  },
+  "welcome": [
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1
+        },
+        "type": "session"
+      },
+      "name": "welcome_without_verifier",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "add",
+              "add_host",
+              "genesis",
+              "host_enc_key",
+              "host_sender_readmit",
+              "host_sender_revoke",
+              "k_backup",
+              "project_remove",
+              "project_set",
+              "recovery_add",
+              "recovery_approve",
+              "recovery_veto",
+              "remove",
+              "remove_host",
+              "set_recovery_key",
+              "set_roles"
+            ],
+            "version": 2
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_with_verifier",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "add",
+              "add_host",
+              "genesis",
+              "host_enc_key",
+              "host_sender_readmit",
+              "host_sender_revoke",
+              "k_backup",
+              "later_action",
+              "project_remove",
+              "project_set",
+              "recovery_add",
+              "recovery_approve",
+              "recovery_veto",
+              "remove",
+              "remove_host",
+              "set_recovery_key",
+              "set_roles"
+            ],
+            "version": 3
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_of_a_newer_host",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "action_00",
+              "action_01",
+              "action_02",
+              "action_03",
+              "action_04",
+              "action_05",
+              "action_06",
+              "action_07",
+              "action_08",
+              "action_09",
+              "action_10",
+              "action_11",
+              "action_12",
+              "action_13",
+              "action_14",
+              "action_15",
+              "action_16",
+              "action_17",
+              "action_18",
+              "action_19",
+              "action_20",
+              "action_21",
+              "action_22",
+              "action_23",
+              "action_24",
+              "action_25",
+              "action_26",
+              "action_27",
+              "action_28",
+              "action_29",
+              "action_30",
+              "action_31",
+              "action_32",
+              "action_33",
+              "action_34",
+              "action_35",
+              "action_36",
+              "action_37",
+              "action_38",
+              "action_39",
+              "action_40",
+              "action_41",
+              "action_42",
+              "action_43",
+              "action_44",
+              "action_45",
+              "action_46",
+              "action_47",
+              "add",
+              "add_host",
+              "genesis",
+              "host_enc_key",
+              "host_sender_readmit",
+              "host_sender_revoke",
+              "k_backup",
+              "project_remove",
+              "project_set",
+              "recovery_add",
+              "recovery_approve",
+              "recovery_veto",
+              "remove",
+              "remove_host",
+              "set_recovery_key",
+              "set_roles"
+            ],
+            "version": 3
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_64_actions",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "a_______________________________",
+              "add",
+              "add_host",
+              "genesis",
+              "host_enc_key",
+              "host_sender_readmit",
+              "host_sender_revoke",
+              "k_backup",
+              "project_remove",
+              "project_set",
+              "recovery_add",
+              "recovery_approve",
+              "recovery_veto",
+              "remove",
+              "remove_host",
+              "set_recovery_key",
+              "set_roles"
+            ],
+            "version": 3
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_32_byte_action",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "add",
+              "add_host",
+              "genesis",
+              "host_enc_key",
+              "host_sender_readmit",
+              "host_sender_revoke",
+              "k_backup",
+              "project_remove",
+              "project_set",
+              "recovery_add",
+              "recovery_approve",
+              "recovery_veto",
+              "remove",
+              "remove_host",
+              "set_recovery_key",
+              "set_roles"
+            ],
+            "version": 4294967295
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_largest_version",
+      "valid": true
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": null
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_not_null",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": [
+            2,
+            [
+              "add",
+              "add_host",
+              "genesis",
+              "host_enc_key",
+              "host_sender_readmit",
+              "host_sender_revoke",
+              "k_backup",
+              "project_remove",
+              "project_set",
+              "recovery_add",
+              "recovery_approve",
+              "recovery_veto",
+              "remove",
+              "remove_host",
+              "set_recovery_key",
+              "set_roles"
+            ]
+          ]
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_is_an_object",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "add",
+              "add_host",
+              "genesis",
+              "host_enc_key",
+              "host_sender_readmit",
+              "host_sender_revoke",
+              "k_backup",
+              "project_remove",
+              "project_set",
+              "recovery_add",
+              "recovery_approve",
+              "recovery_veto",
+              "remove",
+              "remove_host",
+              "set_recovery_key",
+              "set_roles"
+            ],
+            "extra": 1,
+            "version": 2
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_unknown_field",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "add",
+              "add_host",
+              "genesis",
+              "host_enc_key",
+              "host_sender_readmit",
+              "host_sender_revoke",
+              "k_backup",
+              "project_remove",
+              "project_set",
+              "recovery_add",
+              "recovery_approve",
+              "recovery_veto",
+              "remove",
+              "remove_host",
+              "set_recovery_key",
+              "set_roles"
+            ]
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_needs_version",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "version": 2
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_needs_actions",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "add",
+              "add_host",
+              "genesis",
+              "host_enc_key",
+              "host_sender_readmit",
+              "host_sender_revoke",
+              "k_backup",
+              "project_remove",
+              "project_set",
+              "recovery_add",
+              "recovery_approve",
+              "recovery_veto",
+              "remove",
+              "remove_host",
+              "set_recovery_key",
+              "set_roles"
+            ],
+            "version": 0
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_version_from_one",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "add",
+              "add_host",
+              "genesis",
+              "host_enc_key",
+              "host_sender_readmit",
+              "host_sender_revoke",
+              "k_backup",
+              "project_remove",
+              "project_set",
+              "recovery_add",
+              "recovery_approve",
+              "recovery_veto",
+              "remove",
+              "remove_host",
+              "set_recovery_key",
+              "set_roles"
+            ],
+            "version": 4294967296
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_version_below_2_32",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "add",
+              "add_host",
+              "genesis",
+              "host_enc_key",
+              "host_sender_readmit",
+              "host_sender_revoke",
+              "k_backup",
+              "project_remove",
+              "project_set",
+              "recovery_add",
+              "recovery_approve",
+              "recovery_veto",
+              "remove",
+              "remove_host",
+              "set_recovery_key",
+              "set_roles"
+            ],
+            "version": "2"
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_version_is_a_number",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": "add",
+            "version": 2
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_actions_is_an_array",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [],
+            "version": 2
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_actions_not_empty",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "action_00",
+              "action_01",
+              "action_02",
+              "action_03",
+              "action_04",
+              "action_05",
+              "action_06",
+              "action_07",
+              "action_08",
+              "action_09",
+              "action_10",
+              "action_11",
+              "action_12",
+              "action_13",
+              "action_14",
+              "action_15",
+              "action_16",
+              "action_17",
+              "action_18",
+              "action_19",
+              "action_20",
+              "action_21",
+              "action_22",
+              "action_23",
+              "action_24",
+              "action_25",
+              "action_26",
+              "action_27",
+              "action_28",
+              "action_29",
+              "action_30",
+              "action_31",
+              "action_32",
+              "action_33",
+              "action_34",
+              "action_35",
+              "action_36",
+              "action_37",
+              "action_38",
+              "action_39",
+              "action_40",
+              "action_41",
+              "action_42",
+              "action_43",
+              "action_44",
+              "action_45",
+              "action_46",
+              "action_47",
+              "action_48",
+              "add",
+              "add_host",
+              "genesis",
+              "host_enc_key",
+              "host_sender_readmit",
+              "host_sender_revoke",
+              "k_backup",
+              "project_remove",
+              "project_set",
+              "recovery_add",
+              "recovery_approve",
+              "recovery_veto",
+              "remove",
+              "remove_host",
+              "set_recovery_key",
+              "set_roles"
+            ],
+            "version": 2
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_at_most_64_actions",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "remove",
+              "add"
+            ],
+            "version": 2
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_actions_sorted",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "add",
+              "add",
+              "remove"
+            ],
+            "version": 2
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_actions_once",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "add",
+              7
+            ],
+            "version": 2
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_action_is_a_string",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              ""
+            ],
+            "version": 2
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_action_not_empty",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "Add"
+            ],
+            "version": 2
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_action_lower_case",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "add-host"
+            ],
+            "version": 2
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_action_no_hyphen",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "_add"
+            ],
+            "version": 2
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_action_starts_with_a_letter",
+      "valid": false
+    },
+    {
+      "message": {
+        "data": {
+          "account_id": "acct-test-1",
+          "atem_device_id": "host-a",
+          "attachment_gen": "c1c2c3c4-0000-4000-8000-0000000000a3",
+          "authorization_ms_left": 86400000,
+          "channel_id": "5666bb33cbfd2a1f6d5bafcdf76f40a9",
+          "client_kind": "native",
+          "controller_session": "c1c2c3c4-0000-4000-8000-0000000000a2",
+          "features": [
+            "chat.history_end",
+            "chat.history",
+            "chat.lookup",
+            "chat.coverage",
+            "receipt.result",
+            "approval.session_rules",
+            "approval.card_reason",
+            "chat.send_acquire",
+            "approval.lease_free",
+            "membership.carry",
+            "push.sealed",
+            "approval.seen",
+            "grant.revoke",
+            "recovery.wait",
+            "host.policy"
+          ],
+          "head": {
+            "hash": "beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79",
+            "seq": 6
+          },
+          "host_trust_gen": 1,
+          "id": "c1c2c3c4-0000-4000-8000-000000000001",
+          "op": "welcome",
+          "pending_recovery": [],
+          "permissions": [
+            "control",
+            "view"
+          ],
+          "principal": "member:dev-phone",
+          "re": "c1c2c3c4-0000-4000-8000-000000000002",
+          "revision": 9,
+          "runtime_gen": "c1c2c3c4-0000-4000-8000-0000000000a1",
+          "server_time": 1793620800000,
+          "v": 1,
+          "verifier": {
+            "actions": [
+              "a________________________________"
+            ],
+            "version": 2
+          }
+        },
+        "type": "session"
+      },
+      "name": "welcome_verifier_action_at_most_32_bytes",
+      "valid": false
+    },
+    {
+      "name": "welcome_verifier_version_is_an_integer",
+      "raw": "{\"data\":{\"account_id\":\"acct-test-1\",\"atem_device_id\":\"host-a\",\"attachment_gen\":\"c1c2c3c4-0000-4000-8000-0000000000a3\",\"authorization_ms_left\":86400000,\"channel_id\":\"5666bb33cbfd2a1f6d5bafcdf76f40a9\",\"client_kind\":\"native\",\"controller_session\":\"c1c2c3c4-0000-4000-8000-0000000000a2\",\"features\":[\"chat.history_end\",\"chat.history\",\"chat.lookup\",\"chat.coverage\",\"receipt.result\",\"approval.session_rules\",\"approval.card_reason\",\"chat.send_acquire\",\"approval.lease_free\",\"membership.carry\",\"push.sealed\",\"approval.seen\",\"grant.revoke\",\"recovery.wait\",\"host.policy\"],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"host_trust_gen\":1,\"id\":\"c1c2c3c4-0000-4000-8000-000000000001\",\"op\":\"welcome\",\"pending_recovery\":[],\"permissions\":[\"control\",\"view\"],\"principal\":\"member:dev-phone\",\"re\":\"c1c2c3c4-0000-4000-8000-000000000002\",\"revision\":9,\"runtime_gen\":\"c1c2c3c4-0000-4000-8000-0000000000a1\",\"server_time\":1793620800000,\"v\":1,\"verifier\":{\"actions\":[\"add\"],\"version\":2.5}},\"type\":\"session\"}",
+      "valid": false
+    },
+    {
+      "name": "welcome_verifier_duplicate_key",
+      "raw": "{\"data\":{\"account_id\":\"acct-test-1\",\"atem_device_id\":\"host-a\",\"attachment_gen\":\"c1c2c3c4-0000-4000-8000-0000000000a3\",\"authorization_ms_left\":86400000,\"channel_id\":\"5666bb33cbfd2a1f6d5bafcdf76f40a9\",\"client_kind\":\"native\",\"controller_session\":\"c1c2c3c4-0000-4000-8000-0000000000a2\",\"features\":[\"chat.history_end\",\"chat.history\",\"chat.lookup\",\"chat.coverage\",\"receipt.result\",\"approval.session_rules\",\"approval.card_reason\",\"chat.send_acquire\",\"approval.lease_free\",\"membership.carry\",\"push.sealed\",\"approval.seen\",\"grant.revoke\",\"recovery.wait\",\"host.policy\"],\"head\":{\"hash\":\"beb18469b583c1aa981b09da8ed461538ea6171693d345f63105c5ab5d0aea79\",\"seq\":6},\"host_trust_gen\":1,\"id\":\"c1c2c3c4-0000-4000-8000-000000000001\",\"op\":\"welcome\",\"pending_recovery\":[],\"permissions\":[\"control\",\"view\"],\"principal\":\"member:dev-phone\",\"re\":\"c1c2c3c4-0000-4000-8000-000000000002\",\"revision\":9,\"runtime_gen\":\"c1c2c3c4-0000-4000-8000-0000000000a1\",\"server_time\":1793620800000,\"v\":1,\"verifier\":{\"actions\":[\"add\"],\"version\":2,\"version\":3}},\"type\":\"session\"}",
+      "valid": false
+    }
+  ]
 }

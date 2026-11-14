@@ -54,7 +54,7 @@ use crate::paths::PairingPaths;
 use atem_client::canonical::StrictValue;
 use atem_client::channel::responder::{AwaitFinish, HostContext, InitLimiter, Responder};
 use atem_client::channel::wire::{self as chwire, Frame};
-use atem_client::channel::{Channel, ClearCode, Principal};
+use atem_client::channel::{Channel, ChannelError, ClearCode, Principal};
 use atem_client::membership::{Admission, HostNow, MemberStatus};
 use atem_client::principal::{
     Authority, BrowserGrant, ClientKind, Denied, GRANT_ISSUED_AHEAD_MS, GRANT_MAX_LIFETIME_MS,
@@ -250,6 +250,16 @@ struct Attached {
     attachment: String,
     authority: Authority,
     grant: Option<atem_client::SignedObject>,
+    /// A native member's latest carriage (its `hello`'s, then each
+    /// `membership` op's) left the host holding what it carried last (design
+    /// I.5.8, "Native senders"): its delegated tasks pass the revocation
+    /// gate while this channel is open.
+    caught_up: bool,
+    /// Its welcome listed `host.delegated`: while hosting is paused, the
+    /// host takes `work_interrupt` only from such a channel (ruling T27a,
+    /// Task 27 review I1). With hosting on, host-work ops are judged by the
+    /// host's current features, not the channel's welcome.
+    offered_delegated: bool,
 }
 
 enum Phase {
@@ -295,8 +305,30 @@ pub struct HostWorkRequest {
     pub request: atem_client::session::host_work::Request,
 }
 
+/// A host-work request refused (host-work-v1 §7): its code, and the
+/// `detail` its session `error` carries (none unless a refusal names one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostWorkError {
+    pub code: &'static str,
+    pub detail: Option<&'static str>,
+}
+
+impl From<&'static str> for HostWorkError {
+    fn from(code: &'static str) -> Self {
+        Self { code, detail: None }
+    }
+}
+
 pub struct R9Host {
     host_work_enabled: bool,
+    /// While host work is off (hosting paused), `work_interrupt` is still
+    /// taken: a stop (ruling T27a), when the runtime can serve it.
+    host_work_stops: bool,
+    /// `host.delegated` and `host.alerts` (`alerts` only with `delegated`),
+    /// as the runtime's debug-only hook turned them on (step 4, Decision
+    /// 10); listed only with hosting on.
+    delegated: bool,
+    alerts: bool,
     host_work_requests: VecDeque<HostWorkRequest>,
     limits: Limits,
     /// The live link generation.
@@ -349,6 +381,11 @@ pub struct R9Host {
     seen: HashSet<(String, String)>,
     /// The error a fenced principal's attachments get before their close.
     fence_errors: HashMap<String, SessionError>,
+    /// The `close` reason of an attachment the session host is about to
+    /// close for a fence that ends its channel's lifetime (a service's or
+    /// a browser grant's expiry): `expired`, not `closed`. Noted before the
+    /// fence, gone at the end of the pass like `fence_errors`.
+    closing: HashMap<String, &'static str>,
     /// Attachments whose channel Atem closed (overflow), for the session
     /// host to forget.
     dead: Vec<String>,
@@ -356,6 +393,9 @@ pub struct R9Host {
     flush_cursor: Option<String>,
     /// Sealed push hints and seen for the relay (§R9.9).
     push: push::HostPush,
+    /// The Station's messages to this host (host-work-v1 §11.4), as
+    /// received, for the bridge's Station link (taken every pass).
+    station_inbox: Vec<String>,
     /// Lines driven by the router's or the relay's input, rate-limited.
     input_log: LineLimit,
     /// The latest monotonic time seen (for lines without a clock at hand).
@@ -440,6 +480,20 @@ impl LineLimit {
     }
 }
 
+/// A Station's message to a host (host-work-v1 §11.4), by its `op`.
+fn is_station_message(op: &str) -> bool {
+    use atem_client::control::relay::op;
+    [
+        op::CONTROL_SYNC_RESULT,
+        op::HEADS,
+        op::MEMBERSHIP_FETCH_RESULT,
+        op::CONTROL_SYNC_REFUSED,
+        op::MEMBERSHIP_FETCH_REFUSED,
+        op::CONTROL_ACK_REFUSED,
+    ]
+    .contains(&op)
+}
+
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -449,6 +503,17 @@ fn error(code: &str, re: Option<&str>, detail: Option<&str>) -> SessionError {
         re: re.map(str::to_owned),
         detail: detail.map(str::to_owned),
         ..SessionError::new(code)
+    }
+}
+
+/// The `close` reason for a channel step that failed (§R9.7a): a limit
+/// reached (the lifetime, or 2^32 records or 2^36 bytes in a direction,
+/// §R9.7 "Limits") ended the channel's life, `expired`; every other
+/// failure (a gap, a replay, a failed tag) is `closed`.
+fn close_reason(e: &ChannelError) -> &'static str {
+    match e {
+        ChannelError::Limit(_) => reason::EXPIRED,
+        _ => reason::CLOSED,
     }
 }
 
@@ -506,11 +571,53 @@ impl R9Host {
         self.host_work_enabled = enabled;
     }
 
+    /// While host work is off (hosting paused), whether `work_interrupt` of
+    /// `host.delegated` (when the runtime's hook turned it on) is still
+    /// taken and queued for the runtime: a stop always wins (ruling T27a,
+    /// like the deadline's interrupt, T26a). The runtime says so only while
+    /// it can serve it (its store recovered, no receipt-database fault).
+    /// Only from a channel whose welcome listed `host.delegated` (one
+    /// welcomed before the pause; Task 27 review I1). Nothing else is
+    /// taken, and no welcome lists more for it.
+    pub fn enable_host_work_stops(&mut self, enabled: bool) {
+        self.host_work_stops = enabled;
+    }
+
+    /// The open channel of `attachment` was offered `host.delegated` in its
+    /// welcome.
+    fn offered_delegated(&self, attachment: &str) -> bool {
+        self.by_attachment
+            .get(attachment)
+            .and_then(|handle| self.chans.get(handle))
+            .is_some_and(|c| matches!(&c.phase, Phase::Open(a) if a.offered_delegated))
+    }
+
+    /// The delegated features the runtime runs (`host.delegated`,
+    /// `host.alerts`): off unless its debug-only hook turned them on (step 4
+    /// of delegated host work, Decision 10; never in a release build).
+    /// `alerts` counts only with `delegated`.
+    pub fn set_delegated_features(&mut self, delegated: bool, alerts: bool) {
+        self.delegated = delegated;
+        self.alerts = alerts && delegated;
+    }
+
+    /// Whether this host's welcome lists `host.alerts`: hosting on, and the
+    /// hook's `host.delegated` and `host.alerts`. The one rule for both the
+    /// welcome and the making (signing and first send) of `outcome_unknown`
+    /// hints (host-work-v1 §11.3: "only behind `host.alerts`"), so the two
+    /// can't disagree; hints already made are resent whatever it says then
+    /// (session-v1 R9.9).
+    fn alerts_advertised(&self) -> bool {
+        self.host_work_enabled && self.delegated && self.alerts
+    }
+
     /// The features a welcome lists: the one source of what this host takes
     /// (an op of a feature not listed here is `unsupported_version`,
-    /// session-v1 §A). Step 3 of delegated host work advertises none of
-    /// `host.delegated`, `host.alerts` and `host.senders`.
-    fn advertised_features(&self) -> Vec<String> {
+    /// session-v1 §A). `host.delegated` and `host.alerts` only as the
+    /// runtime's debug-only hook turned them on, and like the other
+    /// host-work features only with hosting on; `host.senders` never in
+    /// step 4 of delegated host work.
+    pub(crate) fn advertised_features(&self) -> Vec<String> {
         let mut features: Vec<String> = crate::session_protocol::revision::FEATURES
             .iter()
             .map(|f| f.to_string())
@@ -524,6 +631,12 @@ impl R9Host {
                 atem_client::session::messages::FEATURE.to_owned(),
                 atem_client::session::attachments::FEATURE.to_owned(),
             ]);
+            if self.delegated {
+                features.push(atem_client::session::host_work::DELEGATED_FEATURE.to_owned());
+            }
+            if self.alerts_advertised() {
+                features.push(atem_client::session::host_work::ALERTS_FEATURE.to_owned());
+            }
         }
         features
     }
@@ -579,7 +692,7 @@ impl R9Host {
         &mut self,
         attachment: &str,
         request: &atem_client::session::host_work::Request,
-        result: Result<atem_client::session::host_work::ResultBody, &'static str>,
+        result: Result<atem_client::session::host_work::ResultBody, HostWorkError>,
         now: u64,
     ) {
         let Some(handle) = self.by_attachment.get(attachment) else {
@@ -599,7 +712,7 @@ impl R9Host {
             )
             .to_string()
             .into_bytes(),
-            Err(code) => error(code, Some(request.id()), None).to_bytes(),
+            Err(e) => error(e.code, Some(request.id()), e.detail).to_bytes(),
         };
         self.seal_to(attachment, &bytes, now);
     }
@@ -623,6 +736,9 @@ impl R9Host {
         let revoked_path = journal_dir.map(|d| d.join(REVOKED_GRANTS_FILE));
         let mut host = R9Host {
             host_work_enabled: false,
+            host_work_stops: false,
+            delegated: false,
+            alerts: false,
             host_work_requests: VecDeque::new(),
             limits,
             link: None,
@@ -651,9 +767,11 @@ impl R9Host {
             quarantine_retry_at: 0,
             seen: HashSet::new(),
             fence_errors: HashMap::new(),
+            closing: HashMap::new(),
             dead: Vec::new(),
             flush_cursor: None,
             push: push::HostPush::default(),
+            station_inbox: Vec::new(),
             input_log: LineLimit::default(),
             last_mono: 0,
             policy_paths: None,
@@ -728,6 +846,38 @@ impl R9Host {
     /// Whether `att` is an r9 attachment (its messages go back here).
     pub fn owns(&self, att: &str) -> bool {
         self.by_attachment.contains_key(att)
+    }
+
+    /// Design I.5.8 ("Native senders"): `principal` (a native member, with
+    /// the auth key `key`, its raw bytes) holds an open channel whose
+    /// `hello` carriage brought this host up to the native's own head: its
+    /// delegated tasks pass the revocation gate while it lasts. (The
+    /// runtime reads them all at once, `caught_up_natives`.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn native_caught_up(&self, principal: &str, key: &[u8]) -> bool {
+        self.chans.values().any(|c| match &c.phase {
+            Phase::Open(a) => {
+                a.caught_up
+                    && a.authority.client_kind == ClientKind::Native
+                    && a.authority.name() == principal
+                    && a.authority.key.as_bytes() == key
+            }
+            _ => false,
+        })
+    }
+
+    /// Every native member [`R9Host::native_caught_up`] holds for, with
+    /// the key of its channel.
+    pub fn caught_up_natives(&self) -> Vec<(String, Vec<u8>)> {
+        self.chans
+            .values()
+            .filter_map(|c| match &c.phase {
+                Phase::Open(a) if a.caught_up && a.authority.client_kind == ClientKind::Native => {
+                    Some((a.authority.name(), a.authority.key.as_bytes().to_vec()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// The r9 attachments, with their principals.
@@ -1120,7 +1270,7 @@ impl R9Host {
                             .log(mono, || format!("a channel closed: {}", e.code()));
                         let chan = self.chans.get_mut(handle).expect("checked");
                         chan.phase = Phase::Open(a);
-                        return self.fail(handle, reason::CLOSED, parts);
+                        return self.fail(handle, close_reason(&e), parts);
                     }
                 };
                 let attachment = a.attachment.clone();
@@ -1422,6 +1572,13 @@ impl R9Host {
             self.reply_and_close(handle, frame, reason::CLOSED);
             return effects;
         }
+        // Design I.5.8 ("Native senders"): a native member whose `hello`
+        // carriage left this host holding its own head (the host was there
+        // already, or the carriage brought it there).
+        let caught_up = authority.client_kind == ClientKind::Native
+            && m.membership()
+                .entry(membership.head.seq)
+                .is_some_and(|e| e.hash() == membership.head.hash);
         // The session host's attachment: one per channel (its own client),
         // speaking for the principal (r8 §H).
         let attachment = new_id();
@@ -1471,6 +1628,9 @@ impl R9Host {
         effects.extend(parts.host.take_effects());
         let ctx = parts.host.context().clone();
         let features = self.advertised_features();
+        let offered_delegated = features
+            .iter()
+            .any(|f| f == atem_client::session::host_work::DELEGATED_FEATURE);
         let welcome = Welcome {
             id: new_id(),
             re: re.clone(),
@@ -1496,12 +1656,16 @@ impl R9Host {
                 .map(PendingRecovery::of)
                 .collect(),
             channel_id: channel.channel_id().to_owned(),
+            // The host's device-list verifier, in every welcome (R9.2 "How
+            // a verifier reports itself"; Atem's proposal, for Astation's
+            // agreement).
+            verifier: Some(atem_client::membership::VerifierInventory::ours()),
         };
         let frame = match channel.seal(&welcome.to_bytes(), mono) {
             Ok(frame) => frame,
-            Err(_) => {
+            Err(e) => {
                 effects.extend(parts.host.disconnect(&attachment));
-                self.reply_and_close(handle, None, reason::CLOSED);
+                self.reply_and_close(handle, None, close_reason(&e));
                 return effects;
             }
         };
@@ -1521,6 +1685,8 @@ impl R9Host {
             attachment: attachment.clone(),
             authority,
             grant: hello.grant.clone(),
+            caught_up,
+            offered_delegated,
         }));
         self.by_attachment.insert(attachment, handle.to_string());
         effects
@@ -1605,6 +1771,7 @@ impl R9Host {
     /// noted for.
     pub fn end_pass(&mut self) {
         self.fence_errors.clear();
+        self.closing.clear();
     }
 
     /// Every r9 attachment gets `membership_head` (the head moved, or a
@@ -1679,11 +1846,17 @@ impl R9Host {
             // advertise, if the op is one: after the authority check (a
             // principal outside the op's right still learns `forbidden`),
             // before anything is read.
+            let stop_while_paused = !self.host_work_enabled
+                && self.host_work_stops
+                && self.delegated
+                && data.get("op").and_then(Value::as_str) == Some("work_interrupt")
+                && self.offered_delegated(att);
             let unadvertised = data
                 .get("op")
                 .and_then(Value::as_str)
                 .and_then(delegated_feature_of)
-                .filter(|feature| !self.advertised_features().iter().any(|f| f == feature));
+                .filter(|feature| !self.advertised_features().iter().any(|f| f == feature))
+                .filter(|_| !stop_while_paused);
             if matches!(
                 data.get("op").and_then(Value::as_str),
                 Some(
@@ -1704,17 +1877,20 @@ impl R9Host {
                 )
             ) {
                 // A host-work op of a feature this host doesn't advertise
-                // (`host.delegated`'s and `host.alerts`', none in step 3) is
-                // refused as every host-work request the host can't take is
-                // (`busy`, host-work v1 §7), naming the feature; it is never
-                // decoded or queued.
+                // (`host.delegated`'s and `host.alerts`', listed only as the
+                // runtime's debug-only hook turns them on) is refused as every
+                // host-work request the host can't take is (`busy`, host-work
+                // v1 §7), naming the feature; it is never decoded or queued.
+                // Advertised, it is queued for the runtime like the others.
                 if let Some(feature) = unadvertised {
                     refuse(
                         self,
                         code::BUSY,
                         Some(&format!("{feature} is not advertised")),
                     );
-                } else if !self.host_work_enabled || self.host_work_requests.len() >= 64 {
+                } else if !(self.host_work_enabled || stop_while_paused)
+                    || self.host_work_requests.len() >= 64
+                {
                     refuse(self, code::BUSY, Some("agent hosting is disabled or busy"));
                 } else {
                     match atem_client::session::host_work::Request::decode(plain) {
@@ -1979,6 +2155,28 @@ impl R9Host {
         let mut fences = HostFences::new(parts.host);
         let result = m.apply_carriage(&entries, &parts.now.host, &mut fences);
         let mut effects = fences.effects;
+        // Design I.5.8 ("whose carriage"): a native's standing follows its
+        // latest carriage, as its `hello`'s did. Caught up when the host now
+        // holds the last entry it carried; an empty carriage changes nothing.
+        if let Some(last) = entries
+            .last()
+            .map(|e| atem_client::membership::Entry::from_strict(e).ok())
+        {
+            let holds = last.is_some_and(|e| {
+                m.membership()
+                    .entry(e.seq)
+                    .is_some_and(|ours| ours.hash() == e.hash())
+            });
+            if let Some(Phase::Open(a)) = self
+                .by_attachment
+                .get(att)
+                .and_then(|handle| self.chans.get_mut(handle))
+                .map(|c| &mut c.phase)
+                && a.authority.client_kind == ClientKind::Native
+            {
+                a.caught_up = holds;
+            }
+        }
         let reply = match result.carried {
             Carried::NotRecorded | Carried::Refused | Carried::Crashed => {
                 error(code::BUSY, re, Some(DETAIL_NOT_RECORDED)).to_bytes()
@@ -2252,18 +2450,80 @@ impl R9Host {
             .resolved(approval_id, &reason, signer_of(&parts.list), wall);
     }
 
+    /// An alert was raised (host-work-v1 §11.3; the bridge hands it over
+    /// once its row is committed, so it is durable before any hint shows
+    /// it): its `outcome_unknown` hints, one per native member holding
+    /// `control` at the head, the task, session, sender and the alert's own
+    /// reason sealed to each (R9.9). Only while the welcome lists
+    /// `host.alerts` ([`R9Host::alerts_advertised`]: hosting on, the
+    /// hook's features on; host-work-v1 §11.3 "Compatibility"), and never
+    /// while push is suppressed (`push_suppressed`). An alert raised while
+    /// either holds is never hinted later.
+    pub fn alert_opened<J: Journal>(
+        &mut self,
+        alert: &atem_client::session::alerts::Alert,
+        parts: &mut Parts<'_, J>,
+    ) {
+        if !self.alerts_advertised() {
+            return;
+        }
+        self.push.suppress(push_suppressed(parts));
+        let wall = parts.now.host.wall_ms;
+        let Some(key) = alert_push_key(&parts.list, &alert.alert_id) else {
+            return;
+        };
+        let plain = atem_client::push::AlertPlain {
+            task_id: alert.task_id.clone(),
+            session_id: alert.session_id.clone(),
+            sender: alert.sender.clone(),
+            reason: alert.reason.clone(),
+        };
+        self.push
+            .alert_opened(key, alert.created_at, &plain, signer_of(&parts.list), wall);
+    }
+
+    /// An alert ended (its task resolved, or a reply moved it): its hints
+    /// are not sent again (an alert has no resolved hint, R9.9).
+    pub fn alert_ended(&mut self, alert_id: &str) {
+        self.push.alert_ended(alert_id);
+    }
+
+    /// The alerts whose hints still wait for the relay (what the bridge
+    /// asks the store about: one that ended stops its hints).
+    pub fn hinted_alerts(&self) -> Vec<String> {
+        self.push.alert_ids()
+    }
+
     /// A relay message on Atem's link (`{"type":"relay",…}`): a `push_ack`
-    /// ends the resends of what it names.
+    /// ends the resends of what it names; a Station's message to this host
+    /// (host-work-v1 §11.4) goes to the Station link, as received
+    /// ([`R9Host::take_station_messages`]).
     pub fn relay_message(&mut self, text: &str) {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             return;
         };
+        if value
+            .get("op")
+            .and_then(Value::as_str)
+            .is_some_and(is_station_message)
+        {
+            // At most the App's relay messages of a pass (`RELAY_LIMIT`).
+            self.station_inbox.push(text.to_owned());
+            return;
+        }
         let matched = self.push.ack(&value);
         if matched == 0 && value.get("op").and_then(Value::as_str) == Some("push_ack") {
             self.input_log.log(self.last_mono, || {
                 "a push_ack acknowledged nothing pending".into()
             });
         }
+    }
+
+    /// The Station's messages received since the last call, in order (the
+    /// bridge reads them with the shared reader, or drops them while
+    /// `host.delegated` is off).
+    pub fn take_station_messages(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.station_inbox)
     }
 
     /// The head may have moved: open hints of devices no longer recipients
@@ -2415,7 +2675,8 @@ impl R9Host {
             chan.queue.push_back(text);
         }
         a.channel.close();
-        chan.close.get_or_insert(reason::CLOSED);
+        let why = self.closing.remove(att).unwrap_or(reason::CLOSED);
+        chan.close.get_or_insert(why);
     }
 
     fn seal_to(&mut self, att: &str, plain: &[u8], now_mono: u64) {
@@ -2437,26 +2698,34 @@ impl R9Host {
                 if chan.queued > limit {
                     // Fallen behind: closed explicitly, never a silent drop.
                     log("a channel's output passed its bound; closed (busy)");
-                    self.overflow(&handle);
+                    self.overflow(&handle, reason::BUSY);
                 }
             }
             Err(e) => {
+                // A limit reached (its lifetime, or its records or bytes,
+                // §R9.7 "Limits") ends the channel `expired`; anything else
+                // Atem can't seal is `busy`.
+                let why = if close_reason(&e) == reason::EXPIRED {
+                    reason::EXPIRED
+                } else {
+                    reason::BUSY
+                };
                 log(&format!(
-                    "a channel can't take a record ({}); closed",
+                    "a channel can't take a record ({}); closing it with {why}",
                     e.code()
                 ));
-                self.overflow(&handle);
+                self.overflow(&handle, why);
             }
         }
     }
 
-    /// Closes `handle` at once with `busy` (its queue goes); the attachment
+    /// Closes `handle` at once with `why` (its queue goes); the attachment
     /// is gone from the session host by the next pass ([`R9Host::reap`]).
-    fn overflow(&mut self, handle: &str) {
+    fn overflow(&mut self, handle: &str, why: &'static str) {
         if let Some(chan) = self.chans.get_mut(handle) {
             chan.queue.clear();
             chan.queued = 0;
-            chan.close = Some(reason::BUSY);
+            chan.close = Some(why);
             if let Phase::Open(a) = std::mem::replace(&mut chan.phase, Phase::Closing) {
                 self.dead.push(a.attachment.clone());
                 self.by_attachment.remove(&a.attachment);
@@ -2565,6 +2834,16 @@ impl R9Host {
                 principal.clone(),
                 error(code::UNAUTHORIZED, None, Some("expired")),
             );
+            // The principal's expiry is its channels' lifetime ending
+            // (§R9.7 "Limits"): their close says so, chosen before the
+            // fence closes them.
+            for chan in self.chans.values() {
+                if let Phase::Open(a) = &chan.phase
+                    && a.authority.name() == principal
+                {
+                    self.closing.insert(a.attachment.clone(), reason::EXPIRED);
+                }
+            }
             effects.extend(parts.host.fence_principal(&principal, 0));
         }
         let before = self.revoked.len();
@@ -2914,6 +3193,22 @@ fn approval_key(
         &request.session_id,
         &request.process_gen,
         &request.approval_id,
+    ))
+}
+
+/// An alert's push identity on this host (R9.9, "`outcome_unknown` hint"):
+/// the pinned list's account and genesis, this host and its trust
+/// generation, the alert's id.
+fn alert_push_key(list: &DeviceList<'_>, alert_id: &str) -> Option<atem_client::push::AlertKey> {
+    let DeviceList::Open { m, .. } = list else {
+        return None;
+    };
+    let pin = m.pin_of();
+    Some(atem_client::push::AlertKey::new(
+        m.membership(),
+        &pin.host_id,
+        pin.host_trust_gen,
+        alert_id,
     ))
 }
 

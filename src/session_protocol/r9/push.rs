@@ -41,11 +41,32 @@
 //!   (hints due together are split, never one frame the link or relay
 //!   refuses forever); at most [`MAX_RELAY_OUT_BYTES`] waiting for the
 //!   link (the rest go at the next resend).
+//!
+//! **`outcome_unknown` hints** (§R9.9, feature `host.alerts`; delegated
+//! host-work I.4.6, host-work-v1 §11.3): for each alert the bridge hands
+//! over once its row is committed ([`HostPush::alert_opened`]), one hint per
+//! recipient (the same recipients), the task, session, sender and reason
+//! sealed to each one's `enc_key`, its `created_at` the alert's and its
+//! window [`ALERT_HINT_LIFETIME_MS`]. Kept apart from the approvals (by
+//! alert id: their own acks, recipients, expiry and room) and delivered as
+//! an open hint is: the same bytes every 10 s and at each reconnect until
+//! the relay acknowledges each, the alert ends ([`HostPush::alert_ended`]:
+//! an alert has no resolved hint and no seen), or `expires_at + 300 s`
+//! passes (a resend already queued for the link is taken back when the alert
+//! ends); no guard on Atem's side (nothing cancels an alert's hint, and its
+//! ack is still wanted). Signed and first sent only while the welcome lists
+//! `host.alerts` (`R9Host` checks it); hints already made are resent as
+//! above whatever the welcome lists then. The same suppression and the same
+//! message bounds;
+//! at most [`MAX_ALERTS`] alerts tracked, a published alert never forgotten
+//! for room (a new alert finding none gets no hint, a counted runtime.log
+//! line; `alert_list` still lists it). A broker restart ends them, as it
+//! ends the approvals': alerts raised before it get no hint again.
 use super::HostKey;
 use atem_client::membership::Membership;
 use atem_client::push::{
-    self, ApprovalKey, GUARD_MARGIN_MS, Hint, HintPlain, HostApproval, Identity, Outbox,
-    SeenOutcome, Verifier,
+    self, AlertHint, AlertKey, AlertPlain, ApprovalKey, GUARD_MARGIN_MS, Hint, HintPlain,
+    HostApproval, Identity, Outbox, SeenOutcome, Verifier,
 };
 use std::collections::{BTreeMap, VecDeque};
 
@@ -60,6 +81,14 @@ pub const MAX_RELAY_OUT_BYTES: usize = 16 << 20;
 pub const MAX_MESSAGE_BYTES: usize = 256 << 10;
 /// The suppression reason of a host without a device list.
 pub const NO_LIST: &str = "no device list";
+/// Alerts whose `outcome_unknown` hints are tracked at most, apart from
+/// the approvals (see the module docs for what makes room).
+pub const MAX_ALERTS: usize = 64;
+/// An alert hint's window (`expires_at − created_at`): the longest a hint
+/// may have (§R9.9: "a notification is pushed at most for a quarter of an
+/// hour"). An alert has no expiry of its own: it lasts until its task is
+/// resolved, and `alert_list` and Astation's daily reminder outlast it.
+pub const ALERT_HINT_LIFETIME_MS: u64 = push::MAX_HINT_LIFETIME_MS;
 /// How long after `expires_at` the outbox still resends (§R9.9).
 const RESEND_AFTER_EXPIRY_MS: u64 = push::CLIENT_SKEW_MS;
 
@@ -94,6 +123,16 @@ impl Tracked {
     }
 }
 
+/// One alert's `outcome_unknown` hints on the host.
+struct TrackedAlert {
+    expires_at: u64,
+    /// Each unacknowledged hint and when it was first queued.
+    unacked: BTreeMap<Identity, u64>,
+    /// Its hints were handed to the link (or acknowledged): the relay may
+    /// hold them, so the alert is never forgotten to make room.
+    published: bool,
+}
+
 /// What `atem status` shows of the relay delivery.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PushStatus {
@@ -118,6 +157,12 @@ pub struct HostPush {
     /// New approvals that got no hint because every tracked one holds a
     /// published lifecycle.
     unhinted: u64,
+    /// The alerts' `outcome_unknown` hints, by alert id (keyed apart from
+    /// the approvals).
+    alerts: BTreeMap<String, TrackedAlert>,
+    alert_order: VecDeque<String>,
+    /// New alerts that got no hint because every tracked one is published.
+    unhinted_alerts: u64,
 }
 
 /// What signing needs: the verified log, the host's key.
@@ -343,9 +388,126 @@ impl HostPush {
         self.queue(message);
     }
 
+    /// An alert was raised (its row committed; host-work-v1 §11.3): its
+    /// `outcome_unknown` hints, one per recipient of the head (every native
+    /// member with `control`), the task, session, sender and reason
+    /// (`plain`) sealed to each one's `enc_key`, queued and sent while the
+    /// link is up. `created_at` is the alert's (one clock for `alert_list`
+    /// and the hint), `expires_at` = `created_at` +
+    /// [`ALERT_HINT_LIFETIME_MS`], `now` the host clock. An alert already
+    /// tracked signs nothing new: its hints go on with their first bytes.
+    pub fn alert_opened(
+        &mut self,
+        key: AlertKey,
+        created_at: u64,
+        plain: &AlertPlain,
+        signer: Option<Signer<'_>>,
+        now: u64,
+    ) {
+        let alert_id = key.alert_id.clone();
+        if self.alerts.contains_key(&alert_id) {
+            return;
+        }
+        let Some(signer) = self.usable(signer) else {
+            log(&format!(
+                "alert {alert_id}: no hint ({})",
+                self.suppressed.unwrap_or(NO_LIST)
+            ));
+            return;
+        };
+        let expires_at = created_at.saturating_add(ALERT_HINT_LIFETIME_MS);
+        if now.max(created_at) >= push::guard(expires_at) {
+            log(&format!(
+                "alert {alert_id}: no hint (its window ends within {} s)",
+                GUARD_MARGIN_MS / 1000
+            ));
+            return;
+        }
+        if push::recipients(signer.log).is_empty() {
+            // No native member with control: nobody to tell.
+            log(&format!("alert {alert_id}: no recipient"));
+            return;
+        }
+        if self.alerts.len() >= MAX_ALERTS && !self.make_alert_room() {
+            // Every tracked alert's hints are published and unacknowledged:
+            // the new one goes unhinted (`alert_list` lists it as always).
+            self.unhinted_alerts += 1;
+            if self.unhinted_alerts.is_power_of_two() {
+                log(&format!(
+                    "alert {alert_id}: no hint ({MAX_ALERTS} published alerts unacknowledged; {} unhinted so far)",
+                    self.unhinted_alerts
+                ));
+            }
+            return;
+        }
+        let objects = match push::alert_hints(
+            &signer.key.keys,
+            &signer.key.id,
+            signer.log,
+            &key,
+            created_at,
+            expires_at,
+            plain,
+        ) {
+            Ok(objects) => objects,
+            Err(e) => {
+                log(&format!("alert {alert_id}: no hint ({e})"));
+                return;
+            }
+        };
+        let hints: Vec<AlertHint> = objects
+            .iter()
+            .filter_map(|o| {
+                match AlertHint::verify(o, signer.log, now.max(created_at), Verifier::Client) {
+                    Ok(h) => Some(h),
+                    Err(r) => {
+                        log(&format!(
+                            "alert {alert_id}: a hint failed its own check ({})",
+                            r.code()
+                        ));
+                        None
+                    }
+                }
+            })
+            .collect();
+        if hints.is_empty() {
+            return;
+        }
+        let tracked = TrackedAlert {
+            expires_at,
+            unacked: hints.iter().map(|h| (h.identity(), now)).collect(),
+            published: self.link,
+        };
+        let message = self.outbox.send_alert_hints(&hints, now);
+        self.queue(message);
+        log(&format!("alert {alert_id}: {} sealed hint(s)", hints.len()));
+        self.alert_order.push_back(alert_id.clone());
+        self.alerts.insert(alert_id, tracked);
+    }
+
+    /// The alert ended (its task resolved, or a reply moved it to
+    /// `awaiting_result`): its hints not yet acknowledged are not sent
+    /// again. An alert has no resolved hint (§R9.9): `alert_list` no longer
+    /// lists it, and that is what a device reads.
+    pub fn alert_ended(&mut self, alert_id: &str) {
+        if self.alerts.contains_key(alert_id) {
+            log(&format!(
+                "alert {alert_id}: ended; its hints are not sent again"
+            ));
+            self.forget_alert(alert_id);
+            self.unqueue_alert(alert_id);
+        }
+    }
+
+    /// The alerts whose hints wait for the relay, oldest first.
+    pub fn alert_ids(&self) -> Vec<String> {
+        self.alert_order.iter().cloned().collect()
+    }
+
     /// The relay's `push_ack` (any other relay message is ignored): each
     /// identity it names is done; an acknowledged resolved hint ends its
-    /// approval. Returns how many tracked identities it acknowledged.
+    /// approval, an alert whose every hint is acknowledged ends its
+    /// tracking. Returns how many tracked identities it acknowledged.
     pub fn ack(&mut self, message: &serde_json::Value) -> usize {
         let acks = push::parse_push_ack(message);
         if acks.is_empty() {
@@ -368,13 +530,30 @@ impl HostPush {
         for id in ended {
             self.forget(&id);
         }
+        let mut acknowledged = Vec::new();
+        for ack in &acks {
+            if let Identity::Alert { key, .. } = ack
+                && let Some(t) = self.alerts.get_mut(&key.alert_id)
+                && t.unacked.remove(ack).is_some()
+            {
+                matched += 1;
+                t.published = true;
+                if t.unacked.is_empty() {
+                    acknowledged.push(key.alert_id.clone());
+                }
+            }
+        }
+        for id in acknowledged {
+            self.forget_alert(&id);
+        }
         matched
     }
 
-    /// The head moved (or the pass): open hints not yet acknowledged whose
-    /// device is no longer a recipient at the head (removed, or lost
-    /// `control`) are never sent again; what waits for the link is
-    /// rebuilt without them. Returns how many were dropped.
+    /// The head moved (or the pass): open hints and alert hints not yet
+    /// acknowledged whose device is no longer a recipient at the head
+    /// (removed, or lost `control`; a device id is never reused, so its
+    /// `enc_key` never changes) are never sent again; what waits for the
+    /// link is rebuilt without them. Returns how many were dropped.
     pub fn sync_recipients(&mut self, membership: &Membership, now: u64) -> usize {
         let current: std::collections::BTreeSet<String> = push::recipients(membership)
             .into_iter()
@@ -401,10 +580,37 @@ impl HostPush {
                 gone.push(i);
             }
         }
+        let mut emptied = Vec::new();
+        for (id, t) in self.alerts.iter_mut() {
+            let stale: Vec<Identity> = t
+                .unacked
+                .keys()
+                .filter(|i| matches!(i, Identity::Alert { device_id, .. } if !current.contains(device_id)))
+                .cloned()
+                .collect();
+            if stale.is_empty() {
+                continue;
+            }
+            for i in stale {
+                if let Identity::Alert { device_id, .. } = &i {
+                    log(&format!(
+                        "alert {id}: {device_id} is no longer a recipient; its hint is not sent again"
+                    ));
+                }
+                t.unacked.remove(&i);
+                gone.push(i);
+            }
+            if t.unacked.is_empty() {
+                emptied.push(id.clone());
+            }
+        }
         if gone.is_empty() {
             return 0;
         }
         self.outbox.on_ack(&gone);
+        for id in emptied {
+            self.forget_alert(&id);
+        }
         if self.link && !self.out.is_empty() {
             // Messages already waiting may hold them: rebuilt from what is
             // still pending (a resend now is idempotent at the relay).
@@ -447,6 +653,9 @@ impl HostPush {
                 t.published = true;
             }
         }
+        for t in self.alerts.values_mut() {
+            t.published = true;
+        }
         for m in self.outbox.reconnect(now) {
             self.queue(m);
         }
@@ -459,12 +668,19 @@ impl HostPush {
         self.out_bytes = 0;
     }
 
-    /// The device list was pinned again or removed: every approval's
-    /// hints belong to the old identity and are dropped.
+    /// The device list was pinned again or removed: every approval's and
+    /// alert's hints belong to the old identity and are dropped.
     pub fn reset(&mut self) {
-        if !self.approvals.is_empty() {
+        if !self.approvals.is_empty() || !self.alerts.is_empty() {
+            // Main's line while no alert is tracked (always, with the hook
+            // off).
+            let alerts = if self.alerts.is_empty() {
+                String::new()
+            } else {
+                format!(" and {} alert(s)", self.alerts.len())
+            };
             log(&format!(
-                "{} approval(s) dropped (the device list changed)",
+                "{} approval(s){alerts} dropped (the device list changed)",
                 self.approvals.len()
             ));
         }
@@ -491,6 +707,7 @@ impl HostPush {
             .approvals
             .values()
             .flat_map(|t| t.unacked.values())
+            .chain(self.alerts.values().flat_map(|t| t.unacked.values()))
             .min()
             .copied();
         PushStatus {
@@ -510,6 +727,18 @@ impl HostPush {
     #[cfg(test)]
     pub fn tracks(&self, approval_id: &str) -> bool {
         self.approvals.contains_key(approval_id)
+    }
+
+    /// Whether `alert_id` has hints tracked (tests).
+    #[cfg(test)]
+    pub fn tracks_alert(&self, alert_id: &str) -> bool {
+        self.alerts.contains_key(alert_id)
+    }
+
+    /// New alerts that got no hint for want of room (tests).
+    #[cfg(test)]
+    pub fn unhinted_alerts(&self) -> u64 {
+        self.unhinted_alerts
     }
 
     // ── Internal ──
@@ -551,7 +780,8 @@ impl HostPush {
     }
 
     /// The guard (opens and seens end at `expires_at − 15 s`) and expiry
-    /// (an approval is forgotten at `expires_at + 300 s`).
+    /// (an approval, or an alert's hints, forgotten at `expires_at + 300
+    /// s`; an alert's hints have no guard on Atem's side).
     fn prune(&mut self, now: u64) {
         let mut gone = Vec::new();
         for (id, t) in self.approvals.iter_mut() {
@@ -577,6 +807,80 @@ impl HostPush {
         for id in gone {
             self.forget(&id);
         }
+        let expired: Vec<String> = self
+            .alerts
+            .iter()
+            .filter(|(_, t)| now >= t.expires_at.saturating_add(RESEND_AFTER_EXPIRY_MS))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            self.forget_alert(&id);
+        }
+    }
+
+    /// Forgets one tracked alert to make room, never a published one (the
+    /// relay may hold its hints): the oldest whose hints never went out.
+    /// An alert whose hints are all acknowledged is forgotten at once, so
+    /// none of those is left. False when there is none.
+    fn make_alert_room(&mut self) -> bool {
+        let Some(victim) = self
+            .alert_order
+            .iter()
+            .find(|id| self.alerts.get(*id).is_some_and(|t| !t.published))
+            .cloned()
+        else {
+            return false;
+        };
+        log(&format!(
+            "alert {victim}: forgotten to make room (its hints never went out)"
+        ));
+        self.forget_alert(&victim);
+        true
+    }
+
+    /// Takes `alert_id`'s hints out of what waits for the link (a resend
+    /// queued earlier in this pass), leaving every other message as it was
+    /// queued; a message left with no hint goes.
+    fn unqueue_alert(&mut self, alert_id: &str) {
+        if self.out.is_empty() {
+            return;
+        }
+        let of_alert = |h: &serde_json::Value| {
+            h["body"]["kind"] == push::ALERT_KIND && h["body"]["alert_id"] == alert_id
+        };
+        let mut kept = VecDeque::new();
+        let mut bytes = 0;
+        for text in std::mem::take(&mut self.out) {
+            let text = match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(mut m)
+                    if m["op"] == "push_hint"
+                        && m["hints"]
+                            .as_array()
+                            .is_some_and(|hs| hs.iter().any(&of_alert)) =>
+                {
+                    let hints = m["hints"].as_array_mut().expect("an array");
+                    hints.retain(|h| !of_alert(h));
+                    if hints.is_empty() {
+                        continue;
+                    }
+                    m.to_string()
+                }
+                _ => text,
+            };
+            bytes += text.len();
+            kept.push_back(text);
+        }
+        self.out = kept;
+        self.out_bytes = bytes;
+    }
+
+    /// Drops an alert's hints and everything of them still waiting.
+    fn forget_alert(&mut self, alert_id: &str) {
+        if let Some(t) = self.alerts.remove(alert_id) {
+            let pending: Vec<Identity> = t.unacked.into_keys().collect();
+            self.outbox.on_ack(&pending);
+        }
+        self.alert_order.retain(|a| a != alert_id);
     }
 
     /// Forgets one tracked approval to make room, never a published

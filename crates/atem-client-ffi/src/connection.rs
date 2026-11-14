@@ -96,6 +96,7 @@ fn welcome_info(w: &Welcome) -> WelcomeInfo {
         pending_recovery: w.pending_recovery.iter().map(pending_info).collect(),
         channel_id: w.channel_id.clone(),
         scope_json: w.scope.as_ref().map(|s| canonical_lossy(&s.to_json())),
+        verifier: w.verifier().map(Into::into),
         json: canonical_lossy(&w.to_json()),
     }
 }

@@ -8,13 +8,18 @@ use crate::memory::cred_agent::AgentLook;
 use crate::runtime::client::{Look, version_of};
 use std::collections::BTreeMap;
 
-/// The first line: `atem 0.8.0 (build …) · protocol r9`, the atem-session
-/// revision this build speaks (designs/protocol/README.md).
+/// The first line: `atem 0.8.0 (build …) · protocol r9 · device-list
+/// verifier v2 (16 actions)`: the atem-session revision this build speaks
+/// (designs/protocol/README.md) and its device-list verifier, the version
+/// and action count its r9 welcome reports (session-v1 R9.2 "How a verifier
+/// reports itself").
 pub fn first_line(own: &str) -> String {
     format!(
-        "atem {} (build {own}) \u{b7} protocol r{}",
+        "atem {} (build {own}) \u{b7} protocol r{} \u{b7} device-list verifier v{} ({} actions)",
         version_of(own),
-        atem_client::session::r9::REVISION
+        atem_client::session::r9::REVISION,
+        atem_client::membership::VERIFIER_VERSION,
+        atem_client::membership::known_actions().len()
     )
 }
 
@@ -170,7 +175,36 @@ mod tests {
     fn nothing_running_is_one_line_with_the_protocol() {
         assert_eq!(
             render(OWN, &Look::NotRunning, &None),
-            "atem 0.7.2 (build 0.7.2+100.000000000-5) \u{b7} protocol r9\n"
+            "atem 0.7.2 (build 0.7.2+100.000000000-5) \u{b7} protocol r9 \u{b7} device-list verifier v2 (16 actions)\n"
+        );
+    }
+
+    /// The first line names this build's device-list verifier (R9.2 "How a
+    /// verifier reports itself"): its version and how many actions it knows.
+    #[test]
+    fn version_prints_the_device_list_verifier() {
+        let text = render(OWN, &Look::NotRunning, &None);
+        assert!(
+            text.ends_with(" \u{b7} device-list verifier v2 (16 actions)\n"),
+            "{text}"
+        );
+        let first = first_line(OWN);
+        assert!(
+            first.contains(&format!(
+                "device-list verifier v{} ({} actions)",
+                atem_client::membership::VERIFIER_VERSION,
+                atem_client::membership::known_actions().len()
+            )),
+            "{first}"
+        );
+        // With a runtime running, still the first line.
+        let text = render(OWN, &running(OWN, Vec::new()), &None);
+        assert!(
+            text.lines()
+                .next()
+                .unwrap()
+                .ends_with("device-list verifier v2 (16 actions)"),
+            "{text}"
         );
     }
 

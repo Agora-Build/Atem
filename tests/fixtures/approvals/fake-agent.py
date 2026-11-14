@@ -17,6 +17,8 @@
 #   kill-<n>            the hook is killed (the prompt was interrupted)
 #   stop-<n>            the hook is stopped (SIGSTOP): it never takes a decision
 #   exit                the agent exits
+#   interrupt           the current turn ends interrupted, as after an Esc
+#                       (its "[Request interrupted by user]" entry)
 #   transcript-<n>.jsonl  transcript entries (one JSON object per line), appended
 #                       to the transcript as they are, in order of n from 1, with
 #                       no hook: what a conversation already held, or content
@@ -25,7 +27,7 @@
 #   run-<n>.json        {argv}: run as its own child, to its end (run-<n>.out)
 # What it saw, in $FAKE_DIR: input (every byte its terminal delivered),
 # events (one line per thing it did: "started", "input <bytes>", "asked <n>", "answer <n>
-# <allow|deny|none> <message>", "ran <n>", "refused <n>", "completed <turn>",
+# <allow|deny|none> <message>", "ran <n>", "refused <n>", "completed <turn>", "interrupted <turn>",
 # "winch", "signal <n> worker_alive=<bool>"), answer-<n>.json (the hook's raw
 # output).
 # With --settings each bracketed paste is a prompt (chat hooks and a
@@ -193,6 +195,13 @@ while True:
             if line.strip():
                 log(json.loads(line))
         events.write("transcribed %d\n" % transcribed)
+    interrupt = os.path.join(ctl, "interrupt")
+    if turns and os.path.exists(interrupt):
+        os.remove(interrupt)
+        turn = turns.pop(0)
+        log({"type": "user", "uuid": "i-" + turn, "promptId": turn, "message": {
+            "role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}})
+        events.write("interrupted %s\n" % turn)
     complete = os.path.join(ctl, "complete")
     if turns and os.path.exists(complete):
         os.remove(complete)

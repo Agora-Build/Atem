@@ -554,16 +554,71 @@ pub async fn spawn(
     request: &SpawnRequest,
     env: Option<LaunchEnv>,
 ) -> Result<WorkerHandle> {
-    spawn_guarded(paths, request, env, None).await
+    spawn_guarded(paths, request, env, None, None).await
 }
 
 pub type SpawnGuard = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// What a delegated sender's launch's check says at the spawn boundary,
+/// before the worker is spawned (design I.4.3, "Launches").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreSpawn {
+    Go,
+    /// Hosting §5's fences (a receipt-database fault, a halted session
+    /// journal alone, hosting switched off): as a [`SpawnGuard`] refusing,
+    /// the launch's outcome unknown.
+    Fence,
+    /// A reason that can clear: handed back to wait, nothing spawned.
+    Wait,
+    /// A reason that can't clear, with its detail: nothing spawned.
+    Fail(&'static str),
+}
+
+/// A delegated sender's launch's check at the spawn boundary
+/// ([`PreSpawn`]); in place of its [`SpawnGuard`] there (the guard still
+/// fences after the spawn, up to the worker's `start`).
+pub type PreSpawnCheck = std::sync::Arc<dyn Fn() -> PreSpawn + Send + Sync>;
+
+/// A launch its [`PreSpawnCheck`] refused before the worker was spawned:
+/// nothing ran, so its outcome is known (never `outcome_unknown`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotSpawned {
+    /// It waits at the spawn boundary (handed back).
+    Wait,
+    /// It failed, with the check's detail.
+    Fail(&'static str),
+}
+
+impl std::fmt::Display for NotSpawned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotSpawned::Wait => f.write_str("the launch waits at the spawn boundary"),
+            NotSpawned::Fail(detail) => write!(f, "the launch failed before its spawn: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for NotSpawned {}
+
+/// The spawn boundary, before anything is spawned: `check` when there is
+/// one (a delegated sender's launch), else `guard` (`false` fences).
+pub fn before_spawn(guard: Option<&SpawnGuard>, check: Option<&PreSpawnCheck>) -> Result<()> {
+    match check.map(|check| check()) {
+        Some(PreSpawn::Go) => Ok(()),
+        Some(PreSpawn::Wait) => Err(NotSpawned::Wait.into()),
+        Some(PreSpawn::Fail(detail)) => Err(NotSpawned::Fail(detail).into()),
+        Some(PreSpawn::Fence) => bail!("remote launch authorization changed"),
+        None if guard.is_some_and(|g| !g()) => bail!("remote launch authorization changed"),
+        None => Ok(()),
+    }
+}
 
 pub async fn spawn_guarded(
     paths: &WorkerPaths,
     request: &SpawnRequest,
     env: Option<LaunchEnv>,
     guard: Option<SpawnGuard>,
+    check: Option<PreSpawnCheck>,
 ) -> Result<WorkerHandle> {
     if let Some(env) = &env {
         crate::session::check_env(&env.to_os()).map_err(|e| anyhow!(e))?;
@@ -575,9 +630,8 @@ pub async fn spawn_guarded(
         tokio::task::spawn_blocking(move || crate::memory::project::project_key_for(&cwd))
             .await
             .ok();
-    if guard.as_ref().is_some_and(|g| !g()) {
-        bail!("remote launch authorization changed");
-    }
+    // The spawn boundary: nothing is written or spawned before it.
+    before_spawn(guard.as_ref(), check.as_ref())?;
     let spec = WorkerSpec {
         session_id: sid.to_string(),
         process_gen: request.process_gen.clone(),

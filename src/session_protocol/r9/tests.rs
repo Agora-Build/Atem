@@ -583,6 +583,50 @@ fn a_phone_a_bot_and_a_browser_are_admitted_on_one_link() {
     assert_eq!(rig.list("ch-browser"), vec![SID.to_string()]);
 }
 
+/// Every welcome names the host's device-list verifier (R9.2 "How a
+/// verifier reports itself", R9.8; Atem's proposal, for Astation's
+/// agreement): its
+/// version and the actions it knows, the shared core's own, for a native
+/// member, a service and a browser alike. It is no feature: the features
+/// are what they were.
+#[test]
+fn welcome_names_the_verifier_inventory() {
+    use atem_client::membership::{VERIFIER_VERSION, VerifierInventory, known_actions};
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("ch-phone", phone());
+    rig.advance(1000);
+    rig.connect("ch-bot", bot());
+    rig.advance(1000);
+    let wall = rig.now.host.wall_ms;
+    let (grant, key) = rig.log.grant(
+        "dev-phone",
+        "aaaaaaaa-1111-4111-8111-000000000002",
+        HOST,
+        1,
+        Some(SID),
+        &["view"],
+        wall,
+        wall + 600_000,
+    );
+    rig.connect("ch-browser", Identity::browser(grant, key).unwrap());
+    for handle in ["ch-phone", "ch-bot", "ch-browser"] {
+        let w = welcome(&mut rig, handle);
+        let verifier = w
+            .verifier()
+            .unwrap_or_else(|| panic!("{handle}: no verifier"));
+        assert_eq!(verifier, &VerifierInventory::ours(), "{handle}");
+        assert_eq!(verifier.version(), VERIFIER_VERSION);
+        assert_eq!(verifier.version(), 2);
+        assert_eq!(verifier.actions(), known_actions());
+        assert!(
+            !w.features.iter().any(|f| f.contains("verifier")),
+            "{handle}"
+        );
+        assert_eq!(w.to_json()["data"]["verifier"], verifier.to_json());
+    }
+}
+
 /// Step 3 teaches the host the new device-list entries (project grants,
 /// host-sender revocation, host encryption keys) and advertises nothing: a
 /// welcome after the host carried them lists the features it listed before,
@@ -1068,7 +1112,10 @@ fn attachments_are_fenced_alone_and_a_principal_together() {
     // The bot's expiry passes: both of its attachments (one left) go, the
     // phone stays.
     rig.advance(3_600_000);
-    assert_eq!(rig.refused("bot-2").0, "closed");
+    assert_eq!(
+        rig.refused("bot-2"),
+        ("closed".into(), Some("expired".into()))
+    );
     assert_eq!(rig.engine.status().attachments, 1);
     assert!(rig.rt.host.control_gen("service:svc-bot") >= 2);
     assert_eq!(rig.list("phone").len(), 2);
@@ -2587,6 +2634,143 @@ fn a_browser_whose_issuer_is_in_a_later_window_is_membership_incomplete() {
     assert_eq!(rig.m.as_ref().unwrap().head(), client_log.head());
 }
 
+/// Design I.5.8 ("Native senders"), VII.A test 20: a native member holds
+/// a caught-up channel while its `hello` carriage left this host holding
+/// the native's own head (the host there already, or brought there), and
+/// only on that open channel, with its own key: a service never counts, a
+/// carriage the window cut short (`more`) doesn't, and a closed channel
+/// stops counting.
+#[test]
+fn a_native_is_caught_up_while_its_channel_carried_the_host_to_its_head() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    let key = |rig: &Rig, id: &str| {
+        rig.log
+            .log
+            .member(id)
+            .unwrap()
+            .member
+            .auth_key
+            .as_bytes()
+            .to_vec()
+    };
+    let phone_key = key(&rig, "dev-phone");
+    assert!(!rig.engine.native_caught_up("member:dev-phone", &phone_key));
+    // Its head is the host's.
+    rig.connect("ph", phone());
+    rig.attached("ph");
+    assert!(rig.engine.native_caught_up("member:dev-phone", &phone_key));
+    assert!(
+        !rig.engine
+            .native_caught_up("member:dev-phone", b"another key")
+    );
+    assert_eq!(
+        rig.engine.caught_up_natives(),
+        vec![("member:dev-phone".to_string(), phone_key.clone())]
+    );
+    // A service is no native, whatever its carriage (one `init` a second).
+    rig.advance(1000);
+    rig.connect("bot", bot());
+    rig.attached("bot");
+    assert!(
+        !rig.engine
+            .native_caught_up("service:svc-bot", &key(&rig, "svc-bot"))
+    );
+    // The channel closes: no longer.
+    rig.envelope_in(&envelope::close("ph", None));
+    assert!(!rig.engine.native_caught_up("member:dev-phone", &phone_key));
+    // A phone 65 entries ahead: its first carriage brings the host 64 of
+    // them (`more`), not to its head; the next one does.
+    for n in 0..65 {
+        rig.log
+            .add_native(&format!("dev-n{n:02}"), &["control", "view"]);
+    }
+    let client_log = rig.log.log.clone();
+    rig.advance(1000);
+    rig.connect_with("ph2", phone(), Some(&client_log));
+    rig.attached("ph2");
+    assert_ne!(rig.m.as_ref().unwrap().head(), client_log.head());
+    assert!(!rig.engine.native_caught_up("member:dev-phone", &phone_key));
+    rig.advance(1000);
+    rig.connect_with("ph3", phone(), Some(&client_log));
+    rig.attached("ph3");
+    assert_eq!(rig.m.as_ref().unwrap().head(), client_log.head());
+    assert!(rig.engine.native_caught_up("member:dev-phone", &phone_key));
+}
+
+/// Design I.5.8 ("whose carriage"), Task 19 review M2: a native's
+/// `membership` op updates its channel's caught-up standing as its `hello`
+/// did. Its carriage stops at a deferred entry: not caught up (the host
+/// doesn't hold what it carried last), and still not after the wait ends
+/// by another carrier's approval; once it carries the head the host holds,
+/// caught up again. An empty carriage changes nothing.
+#[test]
+fn a_membership_op_updates_the_natives_caught_up_standing() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    let phone_key = rig
+        .log
+        .log
+        .member("dev-phone")
+        .unwrap()
+        .member
+        .auth_key
+        .as_bytes()
+        .to_vec();
+    let caught_up = |rig: &Rig| rig.engine.native_caught_up("member:dev-phone", &phone_key);
+    rig.connect("ph", phone());
+    rig.attached("ph");
+    assert!(caught_up(&rig));
+    let op = |entries: Vec<Value>| {
+        json!({"type": "session", "data": {"v": 1, "op": "membership",
+            "id": new_id(), "entries": entries}})
+    };
+    // A pending `recovery_add`, and an entry its subject signed: deferred.
+    let recovery = rig.log.recovery_add("dev-new");
+    let recovery_hash = rig.log.entries.last().unwrap().hash();
+    let body = rig.log.log.draft(
+        "dev-new",
+        rig.now.host.wall_ms,
+        &atem_client::membership::entry::Action::Remove {
+            device_id: "dev-phone".into(),
+        },
+    );
+    let deferred =
+        atem_client::membership::sign_entry(&rig.log.keys, &r9log::auth("dev-new"), body)
+            .unwrap()
+            .object()
+            .to_json();
+    rig.send("ph", &op(vec![recovery, deferred]));
+    assert!(rig.m.as_ref().unwrap().deferred_stop().is_some());
+    assert!(
+        !caught_up(&rig),
+        "the host doesn't hold what it carried last"
+    );
+    // An empty carriage changes nothing.
+    rig.send("ph", &op(vec![]));
+    assert!(!caught_up(&rig));
+    // The wait ends by the Mac's approval, carried by another device: the
+    // phone carried nothing since, so it stays not caught up.
+    let approve = rig.log.append(
+        r9log::MAC,
+        atem_client::membership::entry::Action::RecoveryApprove {
+            target: recovery_hash,
+        },
+    );
+    let entry = StrictValue::parse(approve.to_string().as_bytes(), usize::MAX).unwrap();
+    {
+        let now = rig.now.host.clone();
+        let m = rig.m.as_mut().unwrap();
+        let mut fences = HostFences::new(&mut rig.rt.host);
+        m.apply_carriage(&[entry], &now, &mut fences);
+    }
+    assert_eq!(rig.m.as_ref().unwrap().deferred_stop(), None);
+    assert!(!caught_up(&rig), "no re-carry, no standing");
+    // It carries the head the host holds now: caught up again.
+    rig.send("ph", &op(vec![approve]));
+    assert!(caught_up(&rig));
+}
+
 /// Re-review N1a: a grant revoked while it isn't live and the wall clock
 /// is behind the high-water mark is kept for the window after the host's
 /// trusted time (`max(wall, high_water)`), not after the rolled-back wall
@@ -3326,6 +3510,218 @@ mod delegated_work_ops {
         rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
         assert_eq!(rig.engine.take_host_work().len(), 1);
     }
+
+    /// Ruling T27a: `work_interrupt` is a stop, so while hosting is paused
+    /// (host work off) the engine still takes it and queues it for the
+    /// runtime, but only while the runtime says it can serve it
+    /// (`enable_host_work_stops`: the hook on, its store recovered, no
+    /// receipt-database fault). Nothing else is taken (`work_resolve`,
+    /// `alert_list`, `work_query` stay `busy`), and no welcome lists more.
+    /// With the hook off, the stops change nothing.
+    #[test]
+    fn work_interrupt_is_taken_while_hosting_is_paused() {
+        let take = |rig: &mut Rig, handle: &str, op: &str| {
+            let plain = message(rig, handle, op);
+            let (att, authority) = match &rig.engine.chans[handle].phase {
+                Phase::Open(a) => (a.attachment.clone(), a.authority.clone()),
+                _ => panic!("open"),
+            };
+            rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
+            rig.pump();
+        };
+        let mut rig = Rig::new();
+        rig.engine.set_delegated_features(true, true);
+        rig.engine.enable_host_work(true);
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        // Paused, the runtime unable to serve a stop: refused as before.
+        rig.engine.enable_host_work(false);
+        assert_eq!(
+            refusal(&mut rig, "ch-phone", "work_interrupt"),
+            not_advertised("work_interrupt")
+        );
+        // It can serve it: queued, unanswered until it answers.
+        rig.engine.enable_host_work_stops(true);
+        take(&mut rig, "ch-phone", "work_interrupt");
+        assert!(rig.events("ch-phone").is_empty(), "queued, not answered");
+        let queued: Vec<_> = rig
+            .engine
+            .take_host_work()
+            .into_iter()
+            .map(|q| {
+                matches!(
+                    q.request,
+                    atem_client::session::host_work::Request::WorkInterrupt { .. }
+                )
+            })
+            .collect();
+        assert_eq!(queued, [true], "work_interrupt, once");
+        for op in ["work_resolve", "alert_list"] {
+            assert_eq!(
+                refusal(&mut rig, "ch-phone", op),
+                not_advertised(op),
+                "{op}"
+            );
+        }
+        assert!(rig.engine.take_host_work().is_empty());
+        // A new channel's welcome lists no host-work feature meanwhile.
+        rig.advance(1000);
+        rig.connect("ch-new", phone());
+        let features = welcome(&mut rig, "ch-new").features;
+        for feature in ["host.work", DELEGATED_FEATURE, ALERTS_FEATURE] {
+            assert!(!features.iter().any(|f| f == feature), "{feature}");
+        }
+        // Task 27 review I1: that channel wasn't offered `host.delegated`,
+        // so its `work_interrupt` (sent raw, as a client ignoring its
+        // welcome would) is refused, the stops on or not; the channel
+        // welcomed before the pause still gets its own taken.
+        assert_eq!(
+            refusal(&mut rig, "ch-new", "work_interrupt"),
+            not_advertised("work_interrupt")
+        );
+        assert!(rig.engine.take_host_work().is_empty());
+        take(&mut rig, "ch-phone", "work_interrupt");
+        assert_eq!(rig.engine.take_host_work().len(), 1);
+        // The hook off: nothing is taken, whatever the runtime says.
+        rig.engine.set_delegated_features(false, false);
+        assert_eq!(
+            refusal(&mut rig, "ch-phone", "work_interrupt"),
+            not_advertised("work_interrupt")
+        );
+        assert!(rig.engine.take_host_work().is_empty());
+        assert!(rig.relay.is_empty());
+    }
+
+    /// Step 4, Decision 10: the runtime hands the engine the hook's
+    /// features (`HostFeatures`, read once when it starts). `host.delegated`
+    /// and `host.alerts` are listed only when the hook turns them on, and
+    /// only while hosting is on (they are host-work features: a host lists
+    /// those only then, §1); `host.senders` never. Listed, their ops are
+    /// taken: decoded, queued for the runtime, and answered with what it
+    /// says (`host.delegated`'s `busy` until their handlers exist, with its
+    /// detail; `alert_list` here with `delegated::request`'s plain `busy`:
+    /// the bridge serves it, and its tests are the bridge's).
+    #[test]
+    fn welcome_lists_delegated_and_alerts_only_with_the_hook() {
+        use crate::runtime::test_hooks::HostFeatures;
+        fn lists(rig: &mut Rig, handle: &str) -> [bool; 3] {
+            let features = welcome(rig, handle).features;
+            [DELEGATED_FEATURE, ALERTS_FEATURE, SENDERS_FEATURE]
+                .map(|feature| features.iter().any(|f| f == feature))
+        }
+        let both = HostFeatures::parse("host.delegated,host.alerts").unwrap();
+        let mut rig = Rig::new();
+        rig.link_up();
+        let cases = [
+            (None, true, [false, false, false]),
+            (Some("host.delegated"), true, [true, false, false]),
+            (
+                Some("host.delegated,host.alerts"),
+                true,
+                [true, true, false],
+            ),
+            (
+                Some("host.delegated,host.alerts"),
+                false,
+                [false, false, false],
+            ),
+        ];
+        for (n, (hook, hosting, listed)) in cases.into_iter().enumerate() {
+            let features =
+                hook.map_or_else(HostFeatures::default, |v| HostFeatures::parse(v).unwrap());
+            rig.engine
+                .set_delegated_features(features.delegated, features.alerts);
+            rig.engine.enable_host_work(hosting);
+            let handle = format!("ch-{n}");
+            rig.advance(1000);
+            rig.connect(&handle, phone());
+            assert_eq!(
+                lists(&mut rig, &handle),
+                listed,
+                "hook {hook:?}, hosting {hosting}"
+            );
+            assert_eq!(
+                welcome(&mut rig, &handle)
+                    .features
+                    .iter()
+                    .any(|f| f == "host.work"),
+                hosting
+            );
+        }
+        // The hook on, hosting on: each op is queued for the runtime, and
+        // nothing is answered before it answers.
+        rig.engine
+            .set_delegated_features(both.delegated, both.alerts);
+        rig.engine.enable_host_work(true);
+        for op in OPS {
+            let plain = message(&mut rig, "ch-2", op);
+            let (att, authority) = match &rig.engine.chans["ch-2"].phase {
+                Phase::Open(a) => (a.attachment.clone(), a.authority.clone()),
+                _ => panic!("open"),
+            };
+            rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
+        }
+        rig.pump();
+        assert!(rig.events("ch-2").is_empty(), "queued, not answered");
+        let queued = rig.engine.take_host_work();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|q| q.request.feature())
+                .collect::<Vec<_>>(),
+            [DELEGATED_FEATURE, DELEGATED_FEATURE, ALERTS_FEATURE]
+        );
+        for q in queued {
+            let reply = crate::runtime::delegated::request(both, &q.request);
+            let mono = rig.now.mono;
+            rig.engine
+                .host_work_reply(&q.attachment, &q.request, reply, mono);
+            rig.pump();
+            let events = rig.events("ch-2");
+            let detail = (q.request.feature() == DELEGATED_FEATURE)
+                .then(|| format!("{} is not served yet", q.request.feature()));
+            assert_eq!(
+                Rig::last_error(&events),
+                Some(("busy".into(), detail)),
+                "{events:?}"
+            );
+        }
+        assert!(rig.relay.is_empty());
+    }
+
+    /// `host.alerts` without `host.delegated` is ignored (Decision 10): the
+    /// hook's value turns nothing on, and an engine handed it anyway lists
+    /// neither feature and takes none of the ops.
+    #[test]
+    fn host_alerts_without_host_delegated_is_ignored() {
+        use crate::runtime::test_hooks::HostFeatures;
+        assert_eq!(
+            HostFeatures::parse("host.alerts"),
+            Ok(HostFeatures::default())
+        );
+        let mut rig = Rig::new();
+        rig.engine.enable_host_work(true);
+        rig.engine.set_delegated_features(false, true);
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        let features = welcome(&mut rig, "ch-phone").features;
+        assert!(
+            features.iter().any(|f| f == "host.work"),
+            "hosting is on: {features:?}"
+        );
+        for feature in [DELEGATED_FEATURE, ALERTS_FEATURE, SENDERS_FEATURE] {
+            assert!(!features.iter().any(|f| f == feature), "{feature}");
+        }
+        for op in OPS {
+            assert_eq!(
+                refusal(&mut rig, "ch-phone", op),
+                not_advertised(op),
+                "{op}"
+            );
+        }
+        assert!(rig.engine.take_host_work().is_empty());
+        assert!(rig.relay.is_empty());
+    }
 }
 
 /// `host_enc_key_get` (delegated host-work design II.4.1, feature
@@ -3403,4 +3799,331 @@ mod host_enc_key_get {
         assert!(rig.engine.take_host_work().is_empty());
         assert!(rig.relay.is_empty());
     }
+}
+
+/// How a channel ends (§R9.7a Atem's `close` reasons): `expired` when its
+/// lifetime ended (the 24 h or the principal's expiry, or a record or byte
+/// limit, §R9.7 "Limits"), `closed` for a fence that isn't an expiry or a
+/// failed record, `busy` for a queue past its bound.
+mod channel_end {
+    use super::*;
+    use atem_client::channel::{MAX_DIRECTION_BYTES, MAX_RECORDS};
+
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+
+    fn attachment_of(rig: &Rig, handle: &str) -> String {
+        match &rig.engine.chans[handle].phase {
+            Phase::Open(a) => a.attachment.clone(),
+            _ => panic!("{handle} is open"),
+        }
+    }
+
+    /// The reason of Atem's one `close` of `handle`.
+    fn closed_with(rig: &Rig, handle: &str) -> Option<String> {
+        let all: Vec<_> = rig.closes.iter().filter(|(h, _)| h == handle).collect();
+        assert_eq!(all.len(), 1, "{handle}: {:?}", rig.closes);
+        all[0].1.clone()
+    }
+
+    /// The clocks move on with no pass in between (a record or a message
+    /// arrives as a lifetime ends, before the next 100 ms pass).
+    fn skip(rig: &mut Rig, ms: u64) {
+        rig.now.mono += ms;
+        rig.now.host.mono_ms += ms;
+        rig.now.host.wall_ms += ms;
+        rig.rt.set_now(rig.now.mono);
+    }
+
+    /// Atem has a message for `handle`'s client (a session-family record).
+    fn message_for(rig: &mut Rig, handle: &str, text: &str) {
+        let att = attachment_of(rig, handle);
+        let mono = rig.now.host.mono_ms;
+        rig.engine
+            .deliver_family(&att, SID, text, &NoProjects, HOST, mono);
+        rig.pump();
+    }
+
+    /// A phone's channel with a request sealed in time, not yet sent.
+    fn phone_with_a_request(rig: &mut Rig) -> Vec<u8> {
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        let mono = rig.now.host.mono_ms;
+        let (_, frame) = rig.attached("ch-phone").list(mono).unwrap();
+        frame
+    }
+
+    #[test]
+    fn an_inbound_record_at_the_channel_deadline_closes_expired() {
+        let mut rig = Rig::new();
+        let frame = phone_with_a_request(&mut rig);
+        // The record was sealed in time and reaches Atem as the lifetime
+        // ends: the channel's own check refuses it.
+        skip(&mut rig, DAY);
+        rig.send_frame("ch-phone", &frame);
+        assert_eq!(closed_with(&rig, "ch-phone").as_deref(), Some("expired"));
+        assert_eq!(rig.engine.status().attachments, 0);
+    }
+
+    #[test]
+    fn an_outbound_record_at_the_channel_deadline_closes_expired() {
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        // A second channel: it keeps going, the first one's lifetime ends
+        // while Atem has something to send on it.
+        rig.connect("ch-other", phone());
+        skip(&mut rig, DAY - 1000);
+        message_for(&mut rig, "ch-phone", "{}");
+        assert_eq!(closed_with(&rig, "ch-phone").as_deref(), Some("expired"));
+        assert_eq!(rig.engine.status().attachments, 1);
+        assert!(!rig.closes.iter().any(|(h, _)| h == "ch-other"));
+    }
+
+    /// A service's channel ends at its expiry (the principal's, wall and
+    /// monotonic): the close is `expired` for every attachment of the
+    /// principal; a browser grant the same; the phone stays. The rig's
+    /// clocks move in lockstep, so the channel's own deadline
+    /// (`mono + (expires_at - wall)`) is reached with the wall expiry and
+    /// its `unauthorized`/`expired` fence record can't be sealed: only
+    /// `close{expired}` goes out. The record is sent only when the wall
+    /// clock passes the expiry before the monotonic deadline (as the shared
+    /// fixture `r9-service-scope-and-expiry` steps it).
+    #[test]
+    fn a_service_channel_at_its_expiry_closes_expired() {
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("bot-1", bot());
+        rig.advance(1000);
+        rig.connect("bot-2", bot());
+        rig.advance(1000);
+        let browser = browser_of(&mut rig, 7);
+        rig.connect("ch-browser", browser);
+        rig.advance(1000);
+        // The grant's 50 minutes pass.
+        rig.advance(50 * 60_000);
+        assert_eq!(closed_with(&rig, "ch-browser").as_deref(), Some("expired"));
+        assert!(!rig.closes.iter().any(|(h, _)| h.starts_with("bot")));
+        // The service's hour passes (it was issued an hour from the rig's
+        // start).
+        rig.advance(3_600_000);
+        for bot in ["bot-1", "bot-2"] {
+            assert_eq!(closed_with(&rig, bot).as_deref(), Some("expired"), "{bot}");
+        }
+        assert_eq!(rig.engine.status().attachments, 1);
+        assert!(!rig.closes.iter().any(|(h, _)| h == "ch-phone"));
+        assert_eq!(rig.list("ch-phone").len(), 2);
+    }
+
+    /// A channel's record and byte limits (§R9.7 "Limits"), either way:
+    /// the side that reaches one sends nothing more and closes `expired`.
+    #[test]
+    fn the_record_and_byte_limits_close_expired() {
+        type Position = ((u64, u64), (u64, u64));
+        // (what the host channel has sent, what it has received).
+        let cases: [(&str, Position, bool); 4] = [
+            ("sent records", ((MAX_RECORDS, 0), (0, 0)), false),
+            ("sent bytes", ((0, MAX_DIRECTION_BYTES - 1), (0, 0)), false),
+            ("received records", ((0, 0), (MAX_RECORDS, 0)), true),
+            (
+                "received bytes",
+                ((0, 0), (0, MAX_DIRECTION_BYTES - 1)),
+                true,
+            ),
+        ];
+        for (name, (sent, received), inbound) in cases {
+            let mut rig = Rig::new();
+            let frame = phone_with_a_request(&mut rig);
+            let Phase::Open(a) = &mut rig.engine.chans.get_mut("ch-phone").unwrap().phase else {
+                panic!("open");
+            };
+            a.channel.set_position_for_test(sent, received);
+            if inbound {
+                rig.send_frame("ch-phone", &frame);
+            } else {
+                message_for(&mut rig, "ch-phone", "{}");
+            }
+            assert_eq!(
+                closed_with(&rig, "ch-phone").as_deref(),
+                Some("expired"),
+                "{name}"
+            );
+            assert_eq!(rig.engine.status().attachments, 0, "{name}");
+        }
+    }
+
+    /// A removal, a revoked grant and a failed record are not a lifetime
+    /// ending: they still close `closed`.
+    #[test]
+    fn a_fence_that_is_not_an_expiry_still_closes_closed() {
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-bot", bot());
+        rig.advance(1000);
+        let browser = browser_of(&mut rig, 8);
+        rig.connect("ch-browser", browser);
+        rig.advance(1000);
+        // The bot is removed by a carried entry.
+        let removal = rig.log.remove("svc-bot");
+        let mono = rig.now.host.mono_ms;
+        let entry = atem_client::SignedObject::parse(removal.to_string().as_bytes()).unwrap();
+        let (_, frame) = rig
+            .attached("ch-phone")
+            .send_membership(&[entry], mono)
+            .unwrap();
+        rig.send_frame("ch-phone", &frame);
+        assert_eq!(closed_with(&rig, "ch-bot").as_deref(), Some("closed"));
+        // The browser's grant is revoked.
+        revoke_from(&mut rig, "ch-phone", &revoked_grant_id(8));
+        assert_eq!(closed_with(&rig, "ch-browser").as_deref(), Some("closed"));
+        assert_eq!(rig.engine.status().attachments, 1);
+        // The phone's own channel went on, and a record that fails (a
+        // replay) closes it `closed` too, never `expired`.
+        let mono = rig.now.host.mono_ms;
+        let (_, frame) = rig.attached("ch-phone").list(mono).unwrap();
+        rig.send_frame("ch-phone", &frame);
+        rig.events("ch-phone");
+        rig.send_frame("ch-phone", &frame);
+        assert_eq!(closed_with(&rig, "ch-phone").as_deref(), Some("closed"));
+    }
+
+    /// A queue past its bound, and a record Atem can't seal for another
+    /// reason than a limit, still close `busy`.
+    #[test]
+    fn a_channel_queue_past_its_bound_still_closes_busy() {
+        let mut rig = Rig::new();
+        rig.engine = R9Host::new(
+            Limits {
+                queued_bytes: 8 * 1024,
+                ..Limits::default()
+            },
+            None,
+        );
+        rig.link_up();
+        rig.connect("slow", phone());
+        rig.advance(1000);
+        rig.stalled = true;
+        for _ in 0..40 {
+            let mono = rig.now.host.mono_ms;
+            let (_, frame) = rig.attached("slow").list(mono).unwrap();
+            let text = envelope::frame("slow", &frame);
+            rig.run(|e, p| ((), e.on_envelope(&text, p)));
+        }
+        rig.stalled = false;
+        rig.pump();
+        assert_eq!(closed_with(&rig, "slow").as_deref(), Some("busy"));
+        // A message over the record bound can't be sealed (not a limit).
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        let big = "x".repeat(atem_client::channel::MAX_PLAINTEXT + 1);
+        message_for(&mut rig, "ch-phone", &big);
+        assert_eq!(closed_with(&rig, "ch-phone").as_deref(), Some("busy"));
+    }
+
+    /// An idle native channel reaches its 24 h (monotonic only) at a pass:
+    /// the pass closes it `expired`, with no record first, and nothing else
+    /// goes.
+    #[test]
+    fn an_idle_native_channel_at_24_hours_closes_expired_at_the_pass() {
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-other", phone());
+        // The first channel's day ends (the second's, a second later, not).
+        rig.advance(DAY - 1000);
+        assert_eq!(closed_with(&rig, "ch-phone").as_deref(), Some("expired"));
+        assert!(!rig.closes.iter().any(|(h, _)| h == "ch-other"));
+        assert_eq!(rig.engine.status().attachments, 1);
+        assert_eq!(rig.list("ch-other").len(), 2);
+    }
+
+    /// When a principal's expiry and a fence that isn't an expiry meet in
+    /// one runtime pass, the first fence to close the attachment decides
+    /// the reason. The pass commits the device list (`membership_pass`)
+    /// before `r9.tick`, so a removal carried in the same pass as the
+    /// expiry closes `closed`; `expired` is noted only by `tick`, right
+    /// before its own fence, so a removal never inherits it.
+    #[test]
+    fn a_removal_in_the_pass_of_an_expiry_closes_closed() {
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-bot", bot());
+        rig.advance(1000);
+        // The bot's hour is over, but no pass ran yet.
+        skip(&mut rig, 3_600_000);
+        let removal = rig.log.remove("svc-bot");
+        let entry = atem_client::SignedObject::parse(removal.to_string().as_bytes()).unwrap();
+        // The phone sealed the carriage in time (its day goes on).
+        let mono = rig.now.host.mono_ms;
+        let (_, frame) = rig
+            .attached("ch-phone")
+            .send_membership(&[entry], mono)
+            .unwrap();
+        rig.send_frame("ch-phone", &frame);
+        assert_eq!(closed_with(&rig, "ch-bot").as_deref(), Some("closed"));
+        // The pass that follows finds the bot gone: no second close.
+        rig.advance(1);
+        assert_eq!(closed_with(&rig, "ch-bot").as_deref(), Some("closed"));
+        assert_eq!(rig.engine.status().attachments, 1);
+    }
+
+    /// `close_reason` is what the inbound record and the welcome seal call:
+    /// every limit is a lifetime end; no other failure is.
+    #[test]
+    fn close_reason_maps_only_the_limits_to_expired() {
+        use atem_client::channel::Limit;
+        for limit in [Limit::Records, Limit::Bytes, Limit::Lifetime] {
+            assert_eq!(close_reason(&ChannelError::Limit(limit)), "expired");
+        }
+        for other in [
+            ChannelError::RecordRejected,
+            ChannelError::Closed,
+            ChannelError::TooLarge,
+            ChannelError::Busy,
+            ChannelError::StaleTarget,
+        ] {
+            assert_eq!(close_reason(&other), "closed", "{other:?}");
+        }
+    }
+}
+
+/// host-work-v1 §11.4: a Station's messages to this host go to the Station
+/// link as received, in order, and never to the push engine; a `push_ack`
+/// still goes to the push engine; anything else is neither.
+#[test]
+fn a_stations_messages_go_to_the_station_link() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    let station = [
+        r#"{"type":"relay","op":"heads","feeds":[],"membership":{"seq":3,"hash":"ab"}}"#,
+        r#"{ "type": "relay", "op": "membership_fetch_result", "head": {}, "entries": [] }"#,
+        r#"{"type":"relay","op":"control_sync_result"}"#,
+        r#"{"type":"relay","op":"control_sync_refused","code":"forbidden"}"#,
+        r#"{"type":"relay","op":"membership_fetch_refused","code":"forbidden"}"#,
+        r#"{"type":"relay","op":"control_ack_refused","code":"forbidden"}"#,
+    ];
+    for text in station {
+        rig.engine.relay_message(text);
+    }
+    // The host's own calls, a push_ack and other relay messages: not the
+    // Station's to this host.
+    for text in [
+        r#"{"type":"relay","op":"membership_fetch","after":3}"#,
+        r#"{"type":"relay","op":"push_ack","acks":[]}"#,
+        r#"{"type":"relay","op":"host_route_ok"}"#,
+    ] {
+        rig.engine.relay_message(text);
+    }
+    assert_eq!(rig.engine.take_station_messages(), station);
+    assert!(rig.engine.take_station_messages().is_empty());
 }

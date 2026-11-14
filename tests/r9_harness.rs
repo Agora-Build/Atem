@@ -371,12 +371,22 @@ fn run(
             .connect_via(name, transport, log, HOST, who)
             .unwrap_or_else(|e| panic!("{name} refused: {e:?}"));
         let w = a.welcome();
+        // The host's device-list verifier (R9.2 "How a verifier reports
+        // itself"; Atem's proposal): the shared core's, in every welcome.
+        let verifier = w
+            .verifier()
+            .unwrap_or_else(|| panic!("{name}: the welcome names no verifier"));
+        assert_eq!(
+            verifier,
+            &atem_client::membership::VerifierInventory::ours(),
+            "{name}"
+        );
         t.note(
             "admission",
             name,
             json!({"principal": w.principal, "client_kind": w.client_kind.as_str(),
                    "permissions": w.permissions.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
-                   "head_seq": w.head.seq}),
+                   "head_seq": w.head.seq, "verifier": verifier.to_json()}),
         );
         devs.push(Dev {
             name: name.clone(),

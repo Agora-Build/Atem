@@ -9,7 +9,7 @@ use atem_client::encoding::{Hash32, b64u};
 use atem_client::membership::entry::{
     Action, HostRecord, Member, MemberKind, Role, RolesChange, Scope,
 };
-use atem_client::membership::{Entry, HostNow, Membership, sign_entry};
+use atem_client::membership::{Entry, Head, HostNow, Membership, sign_entry};
 use atem_client::principal::{BrowserGrant, Op};
 use atem_client::{Alg, KeyId, PublicKey, SignedObject, SoftwareKeys};
 use serde_json::Value;
@@ -418,6 +418,103 @@ impl TestLog {
             .unwrap()
             .object;
         (grant, key)
+    }
+}
+
+impl TestLog {
+    /// The list grown by the Mac's entries `body` drafts, each on the head
+    /// before it, until it gives `None`: chained by hand and the whole chain
+    /// verified once at the end ([`TestLog::append`] verifies all of it at
+    /// every entry: slow in debug for a long list).
+    pub fn grow(&mut self, mut body: impl FnMut(&TestLog, Head) -> Option<Value>) {
+        let mut head = self.log.head();
+        while let Some(draft) = body(self, head) {
+            let entry = sign_entry(&self.keys, &auth(MAC), draft).unwrap();
+            head = Head {
+                seq: entry.seq,
+                hash: entry.hash(),
+            };
+            self.entries.push(entry);
+        }
+        self.log = Membership::verify_chain(
+            &self.account,
+            &self.genesis_hash(),
+            &self.entries,
+            &self.now,
+        )
+        .unwrap()
+        .membership;
+    }
+
+    /// The Mac's `add` of service `id` (its Ed25519 key from `secret(id)`)
+    /// with `scope`, drafted on `head`; `None` when the builder refuses it
+    /// or its body is over the 4,096-byte bound.
+    pub fn service_body(
+        &self,
+        head: Head,
+        id: &str,
+        scope: &atem_client::membership::ServiceScope,
+    ) -> Option<Value> {
+        let now = now_wall();
+        let key = PublicKey::new(Alg::Ed25519, &ed_pub(&secret(id))).unwrap();
+        let action =
+            atem_client::membership::service_add(id, key, scope, now + 3_600_000, now).ok()?;
+        let body = atem_client::membership::draft_on(
+            &self.account,
+            &self.genesis_hash(),
+            head.seq + 1,
+            &head.hash,
+            MAC,
+            now,
+            &action,
+        );
+        let size = atem_client::canonical::jcs(&body).unwrap().len();
+        (size <= atem_client::signed::MAX_BODY_BYTES).then_some(body)
+    }
+
+    /// A service `svc-big-<n>` whose entry's body is as near the 4,096-byte
+    /// bound as its scope gets: sixteen 128-character hosts, then project
+    /// hashes, then session ids, each added while the body stays within it
+    /// (more than 4,000 bytes).
+    pub fn near_max_service(&self, head: Head, n: usize) -> Value {
+        use atem_client::membership::ServiceScope;
+        let id = format!("svc-big-{n}");
+        let hosts: Vec<String> = (0..16)
+            .map(|j| format!("{:x<128}", format!("h{n}-{j}-")))
+            .collect();
+        let fits = |scope: &ServiceScope| self.service_body(head, &id, scope);
+        let project = |k: usize| format!("h1.0a0b0c0d.{:064x}", n * 100 + k);
+        let session = |k: usize| {
+            let digits = format!("{:012}", n * 100 + k);
+            let base32: String = digits
+                .bytes()
+                .map(|d| (b'a' + (d - b'0')) as char)
+                .collect();
+            format!("ses-{base32}")
+        };
+        let scope_of = |projects: usize, sessions: usize| {
+            let scope = ServiceScope::new(hosts.clone()).ops(["view"]);
+            let scope = scope.projects(Some((0..projects).map(project)));
+            if sessions == 0 {
+                scope
+            } else {
+                scope.sessions(Some((0..sessions).map(session)))
+            }
+        };
+        let mut projects = 0;
+        while projects < 64 && fits(&scope_of(projects + 1, 0)).is_some() {
+            projects += 1;
+        }
+        let mut sessions = 0;
+        while sessions < 64 && fits(&scope_of(projects, sessions + 1)).is_some() {
+            sessions += 1;
+        }
+        let body = fits(&scope_of(projects, sessions)).unwrap();
+        assert!(
+            atem_client::canonical::jcs(&body).unwrap().len() > 4000,
+            "a near-max entry"
+        );
+        body
     }
 }
 

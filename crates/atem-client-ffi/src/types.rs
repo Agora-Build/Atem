@@ -272,6 +272,30 @@ record! {
     }
 }
 
+record! {
+    /// What a device-list verifier reports about itself (session-v1 R9.2
+    /// "How a verifier reports itself"; Atem's proposal, for Astation's
+    /// agreement): `version` (from 1) names its action set,
+    /// `actions` are the actions it knows, sorted by bytes, each once.
+    /// `verifier_inventory()` is this binding's own verifier;
+    /// `WelcomeInfo.verifier` is the host's, when its welcome carried one.
+    /// It is a claim, not a proof: an unknown, offline or unconfirmed
+    /// verifier still keeps the signing gate closed.
+    pub struct VerifierInventory {
+        pub version: u32,
+        pub actions: Vec<String>,
+    }
+}
+
+impl From<&atem_client::membership::VerifierInventory> for VerifierInventory {
+    fn from(v: &atem_client::membership::VerifierInventory) -> Self {
+        VerifierInventory {
+            version: v.version(),
+            actions: v.actions().to_vec(),
+        }
+    }
+}
+
 data_enum! {
     /// Why a signer shouldn't draft a change now
     /// (`MembershipLog::check_change`; advisory, the verifier still accepts
@@ -738,6 +762,9 @@ record! {
         pub pending_recovery: Vec<PendingRecoveryInfo>,
         pub channel_id: String,
         pub scope_json: Option<String>,
+        /// The host verifier's report, absent when the host sent none
+        /// (Atem's proposal, for Astation's agreement).
+        pub verifier: Option<VerifierInventory>,
         /// The whole welcome (canonical JSON).
         pub json: String,
     }

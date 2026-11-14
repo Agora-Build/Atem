@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use support::astation::{ASTATION, FakeAstation, write_encryption_mode, write_verified_pairing};
-use support::host_clock::HostClock;
+use support::host_clock::{Delegated, HostClock};
 use support::r9::{Out, Router, client_ms, write_pin};
 use support::r9log::{self, MAC, TestLog, auth, secret};
 use support::{Sandbox, within};
@@ -47,6 +47,9 @@ struct Rig {
     /// Debug-build host clock (`ATEM_TEST_HOST_CLOCK`, `host_clock_at`);
     /// set before `start`.
     clock: Option<PathBuf>,
+    /// Debug-build delegated host-work features
+    /// (`ATEM_TEST_HOST_FEATURES`); set before `start`.
+    features: Option<&'static str>,
 }
 
 impl Rig {
@@ -149,6 +152,7 @@ principals = ["member:{MAC}", "service:svc-work", "service:svc-restricted"]
             faults_hook: false,
             projects: None,
             clock: None,
+            features: None,
         }
     }
 
@@ -175,6 +179,9 @@ principals = ["member:{MAC}", "service:svc-work", "service:svc-restricted"]
         }
         if let Some(clock) = &self.clock {
             command.env("ATEM_TEST_HOST_CLOCK", clock);
+        }
+        if let Some(features) = self.features {
+            command.env("ATEM_TEST_HOST_FEATURES", features);
         }
         self.runtime = Some(
             command
@@ -3568,5 +3575,69 @@ fn a_reply_is_redacted_before_it_is_stored_and_read() {
     assert!(
         !db.windows(TOKEN.len()).any(|w| w == TOKEN.as_bytes()),
         "the credential value was stored"
+    );
+}
+
+/// The delegated clock in the real runtime (host-work-v1 §11.6), built
+/// because the debug hook turns `host.delegated` on, on the debug hook's
+/// readings (`ATEM_TEST_HOST_CLOCK` with its optional fields): a first
+/// reading the OS doesn't report synchronized carries the mark, a wall
+/// clock then set half an hour back holds deadlines back and `atem status`
+/// names the fix; the first synchronized reading lowers the record (one
+/// runtime.log line), and `atem status` then shows the lowering with its
+/// values instead of the fix.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_CLOCK and ATEM_TEST_HOST_FEATURES hooks"
+)]
+fn atem_status_names_the_clock_fix_on_the_hooks_readings() {
+    const FIX: &str = "Clock:          host clock ahead of its record; enable time synchronization (chrony with rtcsync, or systemd-timesyncd)";
+    const LOWERED: &str = "Clock:          host clock lowered to the wall clock at a boot's first synchronized reading at ";
+    let mut rig = Rig::prepared("claude", |_| {});
+    let clock = HostClock::start(rig.sandbox.dir.path(), "host-clock");
+    clock.set_delegated(Some(Delegated {
+        synced: Some(false),
+        ..Delegated::defaults(0)
+    }));
+    rig.clock = Some(clock.path.clone());
+    rig.features = Some("host.delegated");
+    rig.start();
+    let db = rig.sandbox.config().join("runtime/host-work.sqlite");
+    within("the clock's first reading, with the mark", || {
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()
+            .and_then(|c| {
+                c.query_row("SELECT state FROM clock WHERE id=1", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .ok()
+            })
+            .is_some_and(|state| state.contains(r#""mark":true"#))
+    });
+    let status = || {
+        let (out, err, ok) = rig.sandbox.atem(&["status"]);
+        assert!(ok, "{out}{err}");
+        out
+    };
+    assert!(!status().contains("Clock:"));
+    clock.set_wall(-30 * 60_000);
+    within("atem status names the fix", || status().contains(FIX));
+    clock.set_delegated(None);
+    within("atem status shows the lowering, not the fix", || {
+        let out = status();
+        out.contains(LOWERED) && !out.contains(FIX)
+    });
+    let line = status()
+        .lines()
+        .find(|l| l.starts_with("Clock:"))
+        .unwrap()
+        .to_string();
+    assert!(line.contains("wall_hw "), "{line}");
+    let log = runtime_log(&rig);
+    assert_eq!(
+        log.matches("atem runtime: host clock: lowered").count(),
+        1,
+        "{log}"
     );
 }

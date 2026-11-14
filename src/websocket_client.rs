@@ -225,6 +225,15 @@ pub enum AstationMessage {
     /// as its raw JSON text, for the runtime's r9 push.
     #[serde(skip)]
     Relay(String),
+    /// A relay message over 256 KiB (§R9.9, host-work-v1 §11.4), dropped by
+    /// the reader before anything else reads it: after the two scans every
+    /// message gets (a channel envelope? a session family?), its length,
+    /// then a scan of its `type` that builds no tree. Only its size is
+    /// passed on (counted while the link carries r9), never its text. One
+    /// over the link's 2 MiB bound never gets here: it is dropped from its
+    /// first bytes, and logged.
+    #[serde(skip)]
+    RelayTooLarge(usize),
 
     /// The relay verified this link's host route proof (§R9.7b,
     /// `host_route_ok`, checked by the link's reader: this host, a head it
@@ -656,9 +665,19 @@ pub(crate) fn relay_label(relay_url: &str, atem_id: &str) -> String {
     }
 }
 
-/// One encryption migration at a time per process: the runtime's link and
-/// an operation on it may both be asked to finish one.
-pub(crate) static MIGRATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// One encryption migration at a time per profile: the runtime's link and
+/// an operation on it may both be asked to finish one. Keyed by the
+/// profile's cred directory (`CredPaths::dir`), so profiles that share a
+/// process (one temp profile per test) never wait on or skip for each other.
+/// A runtime serves one profile, so the map holds one entry there and is
+/// never pruned.
+pub(crate) fn migration_lock(cred: &crate::paths::CredPaths) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS.get_or_init(Default::default).lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(cred.dir.clone()).or_default().clone()
+}
 
 /// Why a connection couldn't authenticate with the saved session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -989,6 +1008,16 @@ impl AstationClient {
         self.relay_origin.as_deref()
     }
 
+    /// The selected Station's origin (`station_route::destination`,
+    /// normalized by `normalize_relay`), whatever the link: the host's own
+    /// Station (the delegated host-work design I.5.8). `None` when the
+    /// selection can't be read.
+    pub(crate) fn selected_station_origin(&self) -> Option<String> {
+        let src = self.profile_sources().ok()?;
+        let (origin, _) = crate::station_route::destination(&src, &self.device_atem_id()).ok()?;
+        atem_client::station_route::normalize_relay(&origin).ok()
+    }
+
     pub(crate) fn selected_destination_current(&self) -> bool {
         self.profile_sources().and_then(|src| {
             let (origin, blocked) = crate::station_route::destination(&src, &self.device_atem_id())?;
@@ -1269,6 +1298,13 @@ impl AstationClient {
                                 Some(AstationMessage::SessionOversize { id: session_message_id(&text), family: family.to_string() })
                             }
                             Some(_) => Some(AstationMessage::SessionWire(text)),
+                            // §R9.9, host-work-v1 §11.4: a relay message over
+                            // 256 KiB is dropped before anything else reads it:
+                            // the length first, then a scan of its `type` that
+                            // builds no tree; only its size is passed on.
+                            None if text.len() > crate::app::hosted::RELAY_MESSAGE_BYTES && is_relay_message(&text) => {
+                                Some(AstationMessage::RelayTooLarge(text.len()))
+                            }
                             None if removed_op_detail(&text).is_some() => {
                                 removed_op_detail(&text).map(|detail| AstationMessage::RemovedOp { detail: detail.into() })
                             }
@@ -2329,15 +2365,16 @@ impl AstationClient {
     /// migration was pending, so there was nothing to run or report.
     async fn finish_encryption_migration(&self, astation_id: &str, kid: Option<String>) -> Result<Option<String>> {
         self.check_capture()?;
+        let src = self.profile_sources()?;
+        let lock = migration_lock(&src.paths.cred);
         let _one = if self.is_op_view {
-            MIGRATION.lock().await
+            lock.lock_owned().await
         } else {
-            match MIGRATION.try_lock() {
+            match lock.try_lock_owned() {
                 Ok(guard) => guard,
                 Err(_) => return Ok(Some("An encryption migration is already running".into())),
             }
         };
-        let src = self.profile_sources()?;
         let agent = self.cred_agent();
         let trust = crate::memory::trust::TrustStore::load_from(&src.paths.cred.trust)?;
         let epoch = crate::memory::verification::effective_state(&trust, astation_id)?
@@ -3042,6 +3079,53 @@ mod tests {
         server.abort();
     }
 
+    /// §R9.9, host-work-v1 §11.4: a relay message over 256 KiB is dropped
+    /// by the reader before any other check reads it (its length, then its
+    /// `type`), its size passed on for the count, never its text (no route
+    /// reply check, no Station reader, not even `host_challenge`'s full
+    /// parse: an oversize relay `host_challenge` is dropped the same way);
+    /// one at the bound is passed on whole.
+    #[tokio::test]
+    async fn a_relay_message_over_256_kib_is_dropped_after_its_type_peek() {
+        use crate::app::hosted::RELAY_MESSAGE_BYTES;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // The builders' key order: `type` last, after the entries.
+        let relay = |total: usize| {
+            let head = r#"{"entries":[""#;
+            let tail = r#""],"op":"membership_fetch_result","type":"relay"}"#;
+            format!("{head}{}{tail}", "A".repeat(total - head.len() - tail.len()))
+        };
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async_with_config(socket, Some(super::link_ws_config())).await.unwrap();
+            socket.send(Message::Text(relay(RELAY_MESSAGE_BYTES + 1))).await.unwrap();
+            socket.send(Message::Text(relay(RELAY_MESSAGE_BYTES))).await.unwrap();
+            // A relay `host_challenge` over the bound: dropped as one, never
+            // parsed as a challenge.
+            let challenge = format!(r#"{{"nonce":"{}","op":"host_challenge","room":"r","type":"relay"}}"#, "A".repeat(RELAY_MESSAGE_BYTES));
+            socket.send(Message::Text(challenge)).await.unwrap();
+            socket.send(Message::Text(r#"{"type":"channel","event":"open","channel":"h2","transport":"relay"}"#.into())).await.unwrap();
+            let _ = socket.next().await;
+        });
+        let mut client = AstationClient::new();
+        client.connect_raw(&format!("ws://{address}")).await.unwrap();
+        let mut got = Vec::new();
+        tokio::time::timeout(WAIT, async {
+            while got.len() < 4 {
+                match client.recv_message() {
+                    Some(message) => got.push(message),
+                    None => tokio::time::sleep(Duration::from_millis(10)).await,
+                }
+            }
+        }).await.expect("four messages");
+        assert!(matches!(&got[0], AstationMessage::RelayTooLarge(n) if *n == RELAY_MESSAGE_BYTES + 1), "{got:?}");
+        assert!(matches!(&got[1], AstationMessage::Relay(t) if t.len() == RELAY_MESSAGE_BYTES), "{:?}", got[1..].iter().map(|m| format!("{m:?}").len()).collect::<Vec<_>>());
+        assert!(matches!(&got[2], AstationMessage::RelayTooLarge(n) if *n > RELAY_MESSAGE_BYTES), "{:?}", got[2..].iter().map(|m| format!("{m:?}").len()).collect::<Vec<_>>());
+        assert!(matches!(&got[3], AstationMessage::Channel(t) if t.contains("\"h2\"")), "{got:?}");
+        server.abort();
+    }
+
     #[tokio::test]
     async fn closed_transport_is_detected_before_buffered_input_is_drained() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3226,6 +3310,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let device = crate::memory::fake_astation::UnlockedDevice::new(dir.path());
         let mut client = client_of(&device, dir.path());
+        let off = signed_mode(&device, crate::memory::crypto::EncryptionMode::Off, None, 5);
+        assert_eq!(client.handle_encryption_message(&off).await.unwrap(), Some(String::new()));
+    }
+
+    /// Another profile's migration holding the lock must not make this
+    /// profile's link skip (the process-wide lock did: parallel tests failed
+    /// on each other).
+    #[tokio::test]
+    async fn another_profiles_migration_does_not_hold_this_profiles_link() {
+        let _profile = crate::test_profile::temp();
+        let dir = tempfile::tempdir().unwrap();
+        let device = crate::memory::fake_astation::UnlockedDevice::new(dir.path());
+        let mut client = client_of(&device, dir.path());
+        let other = tempfile::tempdir().unwrap();
+        let _elsewhere = migration_lock(&crate::paths::ProfilePaths::in_dir(other.path()).cred).lock_owned().await;
         let off = signed_mode(&device, crate::memory::crypto::EncryptionMode::Off, None, 5);
         assert_eq!(client.handle_encryption_message(&off).await.unwrap(), Some(String::new()));
     }

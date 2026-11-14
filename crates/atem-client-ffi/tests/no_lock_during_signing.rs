@@ -3,7 +3,8 @@
 //! has read the same objects must complete. Covers the channel signature
 //! (`ClientConnection::on_accept`), a browser grant, an entry and a K-backup
 //! entry. Before the fix, the grant and the handshake held the log's lock
-//! through the prompt and a UI thread reading the log blocked.
+//! through the prompt and a UI thread reading the log blocked. The same
+//! native handshake also checks `WelcomeInfo.verifier`.
 // The provider-taking calls are the UniFFI layer's (default feature).
 #![cfg(feature = "uniffi")]
 
@@ -139,10 +140,10 @@ fn log_l() -> Arc<MembershipLog> {
     .unwrap()
 }
 
-#[test]
-fn the_channel_signature_holds_no_lock() {
+/// The test host (`atem-client/tests/support/host.rs`) at log L, serving
+/// one session.
+fn host_core() -> HostCore {
     let book = Book::load();
-    let log = log_l();
     let core_log = atem_client::membership::Membership::verify_chain(
         ACCOUNT,
         &genesis_hash(),
@@ -156,7 +157,7 @@ fn the_channel_signature_holds_no_lock() {
             .as_str()
             .unwrap(),
     );
-    let mut core = HostCore::new(
+    HostCore::new(
         core_log,
         support::Clock::at(WALL).now,
         &seed,
@@ -166,9 +167,11 @@ fn the_channel_signature_holds_no_lock() {
             project: "h1.b982533d.abababababababababababababababababababababababababababababababab"
                 .into(),
         }],
-    );
-    let mut host = HostConn::new(&mut core);
-    let conn = ClientConnection::new(
+    )
+}
+
+fn phone() -> Arc<ClientConnection> {
+    ClientConnection::new(
         "host-a".into(),
         ClientIdentity {
             kind: PrincipalKind::Native,
@@ -178,7 +181,15 @@ fn the_channel_signature_holds_no_lock() {
         },
         None,
     )
-    .unwrap();
+    .unwrap()
+}
+
+#[test]
+fn the_channel_signature_holds_no_lock() {
+    let log = log_l();
+    let mut core = host_core();
+    let mut host = HostConn::new(&mut core);
+    let conn = phone();
     let provider = Prompting::new();
     let (l, c) = (log.clone(), conn.clone());
     provider.set_probe(Box::new(move || {
@@ -195,6 +206,71 @@ fn the_channel_signature_holds_no_lock() {
     let welcome = conn.on_welcome(first, log, 1_000).unwrap();
     assert_eq!(welcome.principal, "member:dev-phone");
     assert_eq!(provider.prompts.lock().unwrap().len(), 1);
+}
+
+/// `WelcomeInfo.verifier` (session-v1 R9.2 "How a verifier reports
+/// itself"; Atem's proposal, for Astation's agreement): the host's
+/// inventory when its welcome carried one, `None` when it didn't, and a
+/// malformed one refuses the welcome (`malformed`, detail `verifier`). It
+/// shares this file's native handshake.
+#[test]
+fn the_welcome_info_carries_the_hosts_verifier() {
+    use atem_client::membership::VerifierInventory;
+    use atem_client_ffi::error::AtemError;
+    use atem_client_ffi::types::WelcomeInfo;
+    type Rewrite = fn(&mut HostCore);
+    let welcome = |setup: Rewrite| -> Result<WelcomeInfo, AtemError> {
+        let log = log_l();
+        let mut core = host_core();
+        setup(&mut core);
+        let mut host = HostConn::new(&mut core);
+        let conn = phone();
+        let init = conn.start(log.clone(), 1_000).unwrap();
+        let accept = host.on_frame(&mut core, &init).frames.remove(0);
+        let finish = conn
+            .on_accept(accept, log.clone(), Prompting::new(), 1_000)
+            .unwrap();
+        let first = host.on_frame(&mut core, &finish).frames.remove(0);
+        let info = conn.on_welcome(first, log, 1_000);
+        if let Ok(info) = &info {
+            assert_eq!(
+                conn.welcome().as_ref(),
+                Some(info),
+                "welcome() as on_welcome"
+            );
+        }
+        info
+    };
+    let ours = atem_client_ffi::log::verifier_inventory();
+    assert_eq!(ours.version, 2);
+
+    let info = welcome(|core| {
+        core.welcome_override = Some(|w| w.verifier = Some(VerifierInventory::ours()));
+    })
+    .unwrap();
+    assert_eq!(info.verifier, Some(ours.clone()));
+    let json: serde_json::Value = serde_json::from_str(&info.json).unwrap();
+    assert_eq!(
+        json["data"]["verifier"]["actions"],
+        serde_json::json!(ours.actions)
+    );
+
+    let info = welcome(|_| {}).unwrap();
+    assert_eq!(info.verifier, None);
+
+    let refused = welcome(|core| {
+        core.welcome_json_override = Some(|w| {
+            w["data"]["verifier"] = serde_json::json!({"version": 0, "actions": ["add"]});
+        });
+    })
+    .unwrap_err();
+    assert_eq!(
+        refused,
+        AtemError::Invalid {
+            code: "malformed".into(),
+            detail: "verifier".into()
+        }
+    );
 }
 
 #[test]

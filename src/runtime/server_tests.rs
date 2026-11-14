@@ -751,6 +751,9 @@ fn the_runtime_environment_is_sanitized() {
         // passed on to a runtime a client starts.
         ("ATEM_TEST_CLOCK_FILE", "/tmp/clock"),
         ("ATEM_TEST_PTY_FAULTS", "/tmp/faults"),
+        // The delegated host-work hooks too (step 4, Decision 10).
+        ("ATEM_TEST_HOST_FEATURES", "host.delegated"),
+        ("ATEM_TEST_HOST_WORK_DRIVE", "/tmp/drive"),
     ]
     .map(|(k, v)| (OsString::from(k), OsString::from(v)));
     let kept: Vec<String> = super::client::runtime_env_from(vars.clone().into_iter(), &[])
@@ -770,7 +773,11 @@ fn the_runtime_environment_is_sanitized() {
     );
     let kept: Vec<String> = super::client::runtime_env_from(
         vars.into_iter(),
-        &["ANTHROPIC_API_KEY", "ATEM_TEST_CLOCK_FILE"],
+        &[
+            "ANTHROPIC_API_KEY",
+            "ATEM_TEST_CLOCK_FILE",
+            "ATEM_TEST_HOST_WORK_DRIVE",
+        ],
     )
     .into_iter()
     .map(|(key, _)| key.into_string().unwrap())

@@ -1724,3 +1724,239 @@ fn capacity_counts_new_entries() {
         "pinned at seq 13 (1 remote client); 13/1024 entries, 3/256 members, 2/64 hosts"
     );
 }
+
+// ── Deferrals and host-work's start view (step 4, Task 19) ──
+
+mod deferrals {
+    use super::*;
+    use crate::session_protocol::membership::r9log::{MAC, TestLog, auth, host_now, secret};
+    use atem_client::membership::sign_entry;
+    use std::sync::{Arc, Mutex};
+
+    /// A list pinned for host-a: the Mac, host-a and a phone; then a
+    /// pending `recovery_add` of `dev-new` (in `log`, not carried yet).
+    fn list() -> (Rig, TestLog) {
+        let rig = Rig::new();
+        let mut log = TestLog::genesis("acct-deferred", &secret("deferred astation"));
+        log.add_host("host-a", 1, &secret("deferred host"));
+        log.add_native("dev-phone", &["control", "view"]);
+        MembershipHost::pin(
+            &rig.pairing,
+            &rig.journal,
+            &pin_a(),
+            &log.log,
+            &secret("deferred host"),
+        )
+        .unwrap();
+        (rig, log)
+    }
+
+    fn strict(v: &Value) -> StrictValue {
+        StrictValue::parse(v.to_string().as_bytes(), usize::MAX).unwrap()
+    }
+
+    /// An entry by `dev-new` (still pending) on `log`'s head: deferred on a
+    /// host that holds the recovery pending (§R9.5 "During the wait").
+    fn by_the_pending(log: &TestLog) -> Value {
+        let body = log.log.draft(
+            "dev-new",
+            host_now().wall_ms,
+            &atem_client::membership::entry::Action::Remove {
+                device_id: "dev-phone".into(),
+            },
+        );
+        sign_entry(&log.keys, &auth("dev-new"), body)
+            .unwrap()
+            .object()
+            .to_json()
+    }
+
+    fn open(rig: &Rig) -> MembershipHost {
+        let mut f = RecFences::default();
+        rig.open(2, &host_now(), &mut f).unwrap().0
+    }
+
+    /// Design I.4.3 ("Deferred entries"), host-work-v1 §11.6: a carriage
+    /// that stops at a deferred entry is recorded (its `seq`, and when the
+    /// wait it depends on ends), kept beside `membership_applied` only with
+    /// `host.delegated` on (`set_persist_deferred`), read back at a start,
+    /// and ended by a carriage that commits past it or by the end of the
+    /// wait (here another manager's approval).
+    #[test]
+    fn a_deferred_carriage_is_recorded_kept_and_cleared() {
+        let (rig, mut log) = list();
+        let recovery = log.recovery_add("dev-new");
+        let recovery_hash = log.entries.last().unwrap().hash();
+        let deferred = by_the_pending(&log);
+        let mut host = open(&rig);
+        assert_eq!(host.deferred_stop(), None);
+        let mut f = RecFences::default();
+        let now = host_now();
+        let result = host.apply_carriage(&[strict(&recovery), strict(&deferred)], &now, &mut f);
+        assert_eq!(result.carried, Carried::Committed);
+        let stop = host.deferred_stop().expect("stopped at the deferred entry");
+        assert_eq!(stop.seq, host.head().seq + 1);
+        assert_eq!(stop.on, Some(recovery_hash));
+        assert_eq!(stop.until_ms, now.wall_ms + RECOVERY_WAIT_MS);
+        // Without the hook nothing is written; with it, kept at once.
+        assert!(!rig.exists(DlFile::Deferred));
+        host.set_persist_deferred(true);
+        assert!(rig.exists(DlFile::Deferred));
+        // Carried again (nothing new appended): still the same deferral.
+        let again = host.apply_carriage(&[strict(&deferred)], &now, &mut f);
+        assert_eq!(again.carried, Carried::Unchanged);
+        assert_eq!(host.deferred_stop(), Some(stop));
+        // A restart reads it back.
+        drop(host);
+        let mut host = open(&rig);
+        assert_eq!(host.deferred_stop(), Some(stop));
+        host.set_persist_deferred(true);
+        // The Mac approves the recovery: the wait ended, the deferral too,
+        // and its file goes.
+        let approve = log.append(
+            MAC,
+            atem_client::membership::entry::Action::RecoveryApprove {
+                target: recovery_hash,
+            },
+        );
+        host.apply_carriage(&[strict(&approve)], &host_now(), &mut f);
+        assert_eq!(host.deferred_stop(), None);
+        assert!(!rig.exists(DlFile::Deferred));
+    }
+
+    /// A carriage that commits past the deferred entry's `seq` ends the
+    /// deferral, the recovery still pending; and a record that can't be
+    /// read holds delegated work (fail closed) until that happens.
+    #[test]
+    fn a_carriage_past_the_deferral_ends_it_and_an_unreadable_record_holds() {
+        let (rig, mut log) = list();
+        let recovery = log.recovery_add("dev-new");
+        let deferred = by_the_pending(&log);
+        let mut host = open(&rig);
+        host.set_persist_deferred(true);
+        let mut f = RecFences::default();
+        host.apply_carriage(&[strict(&recovery), strict(&deferred)], &host_now(), &mut f);
+        let stop = host.deferred_stop().unwrap();
+        // Unreadable at the next start: a deferral at the next seq.
+        std::fs::write(rig.journal.join("membership_deferred"), b"{").unwrap();
+        drop(host);
+        let mut host = open(&rig);
+        assert_eq!(
+            host.deferred_stop(),
+            Some(DeferredStop {
+                seq: stop.seq,
+                until_ms: 0,
+                on: None
+            })
+        );
+        // The Mac's own entry at that seq commits: past it.
+        let past = log.add_native("dev-tablet", &["view"]);
+        let result = host.apply_carriage(&[strict(&past)], &host_now(), &mut f);
+        assert_eq!(result.carried, Carried::Committed);
+        assert!(host.head().seq >= stop.seq);
+        assert_eq!(host.deferred_stop(), None);
+    }
+
+    /// The lines this thread logged about deferrals since the last call.
+    fn deferral_lines() -> Vec<String> {
+        super::super::LOGGED
+            .with(|l| std::mem::take(&mut *l.borrow_mut()))
+            .into_iter()
+            .filter(|l| l.contains("deferr"))
+            .collect()
+    }
+
+    /// Hook off = main (Task 19 review I1): a carriage that stops at a
+    /// deferred entry writes no new runtime.log line and no file without
+    /// `host.delegated`. With it, one line per change of where it stopped
+    /// (`seq`, `on`): carried again at a moment whose wall and monotonic
+    /// clocks moved 1 ms apart (its estimated end moves with them), nothing
+    /// more is logged or written.
+    #[test]
+    fn a_deferral_logs_once_per_entry_and_only_with_the_hook() {
+        for hook in [false, true] {
+            let (rig, mut log) = list();
+            let recovery = log.recovery_add("dev-new");
+            let deferred = by_the_pending(&log);
+            let mut host = open(&rig);
+            host.set_persist_deferred(hook);
+            deferral_lines();
+            let mut f = RecFences::default();
+            let first = host_now();
+            host.apply_carriage(&[strict(&recovery), strict(&deferred)], &first, &mut f);
+            let stop = host.deferred_stop().expect("stopped at the deferred entry");
+            let written = rig.read(DlFile::Deferred);
+            // Later, its wall clock 1 ms further than its monotonic clock.
+            let later = HostNow {
+                wall_ms: first.wall_ms + 1_001,
+                mono_ms: first.mono_ms + 1_000,
+                boot_id: first.boot_id.clone(),
+            };
+            host.apply_carriage(&[strict(&deferred)], &later, &mut f);
+            assert_eq!(host.deferred_stop(), Some(stop), "the same entry");
+            assert_eq!(rig.read(DlFile::Deferred), written, "not written again");
+            let lines = deferral_lines();
+            if hook {
+                assert_eq!(lines.len(), 1, "{lines:?}");
+                assert!(written.is_some());
+            } else {
+                assert!(lines.is_empty(), "{lines:?}");
+                assert!(written.is_none());
+            }
+        }
+    }
+
+    /// The fences a commit brings in the order the session host sees them.
+    struct Ordered(Arc<Mutex<Vec<String>>>);
+
+    impl Fences for Ordered {
+        fn fence(&mut self, principal: &str, _seq: u64) {
+            self.0.lock().unwrap().push(format!("fence {principal}"));
+        }
+        fn fault(&mut self, _principals: Option<&[String]>) {
+            self.0.lock().unwrap().push("fault".into());
+        }
+        fn remote_principals(&self) -> Vec<String> {
+            vec!["member:dev-phone".into()]
+        }
+    }
+
+    /// Step 4's Decision 16: host-work's start view is told the committed
+    /// list before any fence the commit brings reaches the session host, so
+    /// a start the fence lets run sees it: a removal, then a freeze.
+    #[test]
+    fn the_start_view_is_told_before_the_fences() {
+        let (rig, mut log) = list();
+        let mut host = open(&rig);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let told = seen.clone();
+        host.set_publisher(Box::new(move |state: ListState| {
+            let phone = state
+                .membership
+                .member("dev-phone")
+                .is_some_and(|m| m.status == atem_client::membership::MemberStatus::Active);
+            told.lock()
+                .unwrap()
+                .push(format!("list phone={phone} frozen={}", state.frozen));
+        }));
+        assert_eq!(*seen.lock().unwrap(), ["list phone=true frozen=false"]);
+        seen.lock().unwrap().clear();
+        let removal = log.remove("dev-phone");
+        let mut f = Ordered(seen.clone());
+        host.apply_carriage(&[strict(&removal)], &host_now(), &mut f);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["list phone=false frozen=false", "fence member:dev-phone"]
+        );
+        seen.lock().unwrap().clear();
+        let conflict = log.conflicting_add("dev-other");
+        host.apply_carriage(&[strict(&conflict)], &host_now(), &mut f);
+        let order = seen.lock().unwrap().clone();
+        assert_eq!(order[0], "list phone=false frozen=true", "{order:?}");
+        assert!(
+            order[1..].iter().all(|e| e.starts_with("fence")),
+            "{order:?}"
+        );
+        assert!(order.len() > 1, "{order:?}");
+    }
+}

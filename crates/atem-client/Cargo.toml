@@ -35,9 +35,12 @@ unicode-security = "=0.1.3"
 # (`service` principals hold a software key, R9.6 rule 5). Native members
 # use a platform provider (Secure Enclave, Android Keystore, WebCrypto).
 software-keys = []
-# Deterministic HPKE ephemerals (`seal_with_ikm`) for known-answer vectors.
-# Never enabled by the bindings or by atem's build (atem's tests only:
-# its host fixture runner seals the hellos a fixture overrides).
+# Test-only helpers: deterministic HPKE ephemerals (`seal_with_ikm`) and
+# fixed handshake secrets (`start_with`, `on_init_with`) for known-answer
+# vectors, and `Channel::set_position_for_test`, which moves a channel's
+# counters so a record or byte limit is reachable without sending 2^32
+# records. Never enabled by the bindings or by atem's build (atem's tests
+# only: its host fixture runner seals the hellos a fixture overrides).
 test-vectors = []
 
 [dev-dependencies]

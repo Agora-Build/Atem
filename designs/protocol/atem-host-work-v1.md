@@ -1455,6 +1455,71 @@ not name is `forbidden`, as for `work_query`.
   `resolved`. A resolved task shows there only as its state and `detail`;
   `work_query` gives the resolver.
 
+**`work_interrupt`, as built in step 4** (behind the debug-only hook):
+- **Only a delegated task.** A task of a sender that isn't delegated
+  (`local`, a browser grant, a service no feed covers) is `forbidden`, to
+  its sender and to the owner, as for `work_resolve`: only a delegated
+  task's turn runs under the host's own principal, which is what the host
+  interrupts (session-v1 R9.14 item 5). **Atem's reading, for Astation to
+  confirm.**
+- **The session's current turn** is the task's current attempt
+  `executing`, its turn shown running by the session's chat (R9.14 item
+  5's turn check). Anything else answers `not running`: a queued task, an
+  attempt still waiting `accepted` (nothing is withdrawn: it stays
+  queued), a turn the start's reconciliation hasn't rebound yet after a
+  restart (that says nothing of the turn), or a turn that ended.
+- **A halted session journal** is `busy`, not `not running`: the turn may
+  still be current, and nothing is written until the restart.
+- **One Esc per attempt and turn, from host-work's own sources**
+  (`work_interrupt` and the intents, §11.6's deadline interrupt
+  included). The request is one-shot: no intent, nothing
+  repeated on later passes. Every interrupt written to an attempt's turn,
+  by a request or by an intent, is recorded. While that write waits for
+  the worker's answer, or once the turn got its interrupt, a later request
+  or intent in that turn writes nothing (it only revokes another
+  controller's lease). Such a request's result is the task's status as it
+  is: its own `detail`, not `not running`, since the turn is current.
+  - **Where it is kept.** In memory for the turn, with or without an
+    intent. Where the attempt has a pending intent, it is also stored with
+    that intent, marked as the request's.
+  - **The detail.** A turn the request's interrupt ended reads `turn
+    interrupted`, never `interrupted at deadline`.
+  - **An error after queueing** (R9.14 item 5) counts as the turn's
+    interrupt, but it may not have reached the terminal: a request or
+    intent 10 s later, the turn still current, writes it again. That is
+    item 5's own exception, now shared by requests.
+  - **A write that wrote nothing** (`consumed`: on Codex the Esc only
+    handed a waiting approval to its own dialog; `dropped`; `no_effect`)
+    leaves the turn without its interrupt. A request isn't repeated (an
+    intent is, on its next pass), and its result, given before the write's
+    outcome, doesn't say so. The caller sees the turn go on in later
+    queries and may ask again; a request takes the outcomes reported so far
+    into account first, so asking again right away is written.
+  - **Residual.** The record lives for one run. After a restart, a turn
+    still current (rebound) can get one more Esc, from a request as from a
+    pending intent (R9.14 item 5's restart rule).
+  - **Not counted.** An Esc host-work didn't write: a principal holding
+    `control` can still send its own (a takeover, then its session-v1
+    `interrupt`), and so can the person at the terminal, as the session
+    host allows today. With one of those in the same turn, the turn can
+    get two.
+  - **Atem's choice.**
+- **While hosting is paused** (`runtime.toml` doesn't load, or `enabled =
+  false`), `work_interrupt` is still served: a stop always wins, as for
+  the deadline's interrupt (§11.6). **Atem's reading, for Astation to
+  confirm.**
+  - **Which channels.** While hosting is paused, the host takes
+    `work_interrupt` only from a channel whose welcome listed
+    `host.delegated`, that is one welcomed before the pause. A welcome
+    during the pause lists no host-work feature, so the client core sends
+    nothing, and the host refuses it from such a channel (`busy`,
+    `host.delegated is not advertised`). With hosting on, the host judges
+    every host-work op by its current features, as before.
+  - **What else.** Every other host-work request stays `busy`.
+  - **Still `busy`:** after a receipt-database fault, before the store is
+    recovered (a runtime started while paused), and with a halted session
+    journal.
+
 **Client core.** `Attached::send` refuses both unless `welcome.features`
 lists `host.delegated` (`host feature not available`). A result answers
 `work_interrupt` when it is that task's status; it answers `work_resolve`
@@ -1543,7 +1608,7 @@ alerts.)
 | `session_id` | the task's target session (`ses-` and 12 characters) |
 | `task_id` | the task: a UUID v4 (a delegated task's id) |
 | `sender` | the delegated sender that enqueued the task: `member:<id>`, `service:<id>` or `host:<id>` (an id of 1-128 bytes of `[A-Za-z0-9._:-]`), as a receipt's provenance names it (session-v1 R9.14). Never `local` or `browser:` |
-| `reason` | why the outcome is unknown, for people: 1-256 bytes, not blank (something besides White_Space; amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**), no control or Cf character (`agent exited`, `write interrupted`, `deadline passed; outcome unknown`) |
+| `reason` | why the outcome is unknown, for people: 1-256 bytes, not blank (something besides White_Space; amended for step 4, **agreed with Astation (2026-11-13, #120 comment 6848326392)**), no control or Cf character. Atem gives one of §11.6's `outcome_unknown` reasons as the task's receipt says (`agent exited`, `outcome could not be established`, `write interrupted`), with the note below at 32. Kept as raised: the task's `detail` changes at its deadline, the alert's `reason` doesn't |
 | `created_at` | Unix ms on the host's wall clock: when the task became `outcome_unknown`. For people only: it orders nothing |
 | `more` | `true` when alerts follow this page; then the page isn't empty |
 
@@ -1562,10 +1627,11 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
     miss it (**Atem's choice, agreed with Astation (2026-11-11, #120
     comment 6810116314)**).
   - At most **64** alerts per result (**Atem's choice, agreed with
-    Astation (2026-11-11, #120 comment 6810116314)**). A host holds at
-    most 256 unresolved outcomes (design I.4.6), so a full list is four
-    pages. An alert is typically about 450 bytes, at most about 750, and
-    about 1 KB with escaping.
+    Astation (2026-11-11, #120 comment 6810116314)**). New remote tasks
+    stop at 256 unresolved outcomes (design I.4.6, §11.6 "Capacity"), but
+    tasks already accepted can still add to them, so a client pages until
+    `more` is `false`, never assuming four pages. An alert is typically
+    about 450 bytes, at most about 750, and about 1 KB with escaping.
   - A caller asks for the next page with `after` equal to the last
     `alert_id` it read, until `more` is `false`. The cursor stays the
     `alert_id`; the host finds it and lists what follows it in `seq`. A page
@@ -1584,10 +1650,11 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
   `outcome_unknown` and unresolved, one alert each. An alert ends when its
   task is resolved (`work_resolve`, or the host's command) or a reply
   moves it to `awaiting_result` (design I.4.6, "Ending"); an ended alert is
-  no longer listed. No other ending exists in this store: a delegated
-  task's `outcome_unknown` never expires (§11.6, "Unknown outcomes"), and a
-  new host identity moves the whole store aside, alerts included (design
-  I.3.3). A task reaches `outcome_unknown` once, so an alert is never raised
+  no longer listed. A delegated task's `outcome_unknown` never expires
+  (§11.6, "Unknown outcomes"). Two other endings exist: a task whose record
+  the host can't read any more is settled `failed` (`record unreadable`),
+  and its alert ends with it; and a new host identity moves the whole store
+  aside, alerts included (design I.3.3). A task reaches `outcome_unknown` once, so an alert is never raised
   twice for one. The host keeps an alert for every unresolved outcome; at 32
   unresolved on a host the `reason` of a new alert says so (for example
   `agent exited; 32 outcomes unresolved on this host`) within the 256 bytes
@@ -1602,9 +1669,16 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
 
 **The push hint.** The host signs an `outcome_unknown` hint per recipient
 when an alert is raised: a body of `atem-push-hint` with a `kind`, the task,
-session, sender and reason sealed to the recipient's `enc_key`. Session-v1
-R9.9 specifies it; the shared vectors are `r9-vectors-push-hint`
-(`outcome_unknown*`).
+session, sender and reason sealed to the recipient's `enc_key`. The host
+makes it once, when the alert is committed, and only while its welcome lists
+`host.alerts`, the condition under which it answers `alert_list`: the feature
+gates a hint's creation and first send. A hint already made goes on with its
+bounded resends (R9.9) after the feature is no longer advertised, as after
+hosting pauses (**amended 2026-11-13, #120 comment 6848463998**: it said the
+host "sends it only while" the welcome lists the feature). An alert that got
+no hint is still listed. Session-v1 R9.9 specifies the hint,
+its delivery and what loses it (**Atem's choices, for Astation to confirm**).
+The shared vectors are `r9-vectors-push-hint` (`outcome_unknown*`).
 
 **Client core.** `Attached::send` refuses `alert_list` unless
 `welcome.features` lists `host.alerts` (`host feature not available`),
@@ -1651,8 +1725,10 @@ A host reads each Station's control feed, acknowledges what it applied and
 fetches its own device list over its one link; the Station counts the
 acknowledgments and reports revocations to the Portal (design I.5.8,
 "Transport", "Which host is calling", "Heads", "Acknowledgment" and
-"Delivery progress is not application"; I.6.5). **Planned:** the host
-makes none of these calls in this version. They are relay messages, not
+"Delivery progress is not application"; I.6.5). **Planned:** release
+builds make none of these calls in this version (**updated in step 4,
+2026-11-13:** behind the debug-only `host.delegated` hook the host makes
+`membership_fetch`). They are relay messages, not
 session ops, so no welcome feature gates them; they arrive with
 `host.senders` and delegated work. Types: `atem_client::control::relay`
 (every message, its reader and builder) and `atem_client::control::ledger`
@@ -1699,9 +1775,9 @@ a count over its bound refused before any item is read; the grammars of the
 signed objects (an `origin` exact as `station_route::normalize_relay`
 writes it, `feed_id` and `record_id` UUID v4, ids of 1 to 128 characters of
 `[A-Za-z0-9._:-]`, lowercase hex hashes). A builder checks what the reader
-checks. The wire rules below are **Atem's proposal, agreed with Astation
-(2026-11-11, #120 comment 6810116314)** (the design names the messages,
-not these rules):
+checks. The wire rules below are **Atem's proposal, agreed
+with Astation (2026-11-11, #120 comment 6810116314)** (the design names the
+messages, not these rules):
 
 1. At most 64 records in a `control_sync_result`, 64 results in a
    `control_ack`, 64 feeds in a `heads` and 64 entries in a
@@ -1824,6 +1900,17 @@ not these rules):
       no cursor. A refusal names a call kind, never a request: it answers
       and correlates no call.
 
+**On the host** (**Atem's reading of "checked before any parse", for
+Astation's information**, step 4, 2026-11-13: no tree is built before the
+bound), the link's reader drops a relay message over 262,144 bytes before
+anything else reads it: past the two scans every message on the link gets
+(is it a channel envelope, a session family), the length comes first, then
+a scan of the top-level `type` that builds no tree. Such a message reaches
+no other check (not even `host_challenge`'s), no route check, no reader and
+no Station link; it is dropped, and counted while the link carries r9 (one
+over the link's 2 MiB bound is dropped earlier, from its first bytes, and
+logged).
+
 **Real budgets.** The 256 KiB bound counts the whole message, so a Station
 fills a page below it: 64 records of the largest size (a 4,096-byte body
 `jcs` plus its signature and the item's own bytes) don't fit in one
@@ -1878,6 +1965,12 @@ feed at this Station) is refused, `forbidden`, and nothing of another
 account is served: no principal, `integration_id`, `about.by`, record id or
 revocation time of another account reaches the link. The refusal is
 `control_sync_refused` or `membership_fetch_refused` ("Refusals" below).
+**Open (needs Astation's answer; step 4, 2026-11-13):** what a
+`control_sync` naming the account's own feed from before a reset (a
+`feed_id` the account had at this Station) gets: `control_sync_refused`, the
+literal "not its account's feed at this Station" (Atem's default reading),
+or the account's current feed from position 0, the result's `feed_id` then
+the only in-band reset signal. Atem's host handles both.
 
 **Refusals** (**agreed with Astation on 2026-11-11**, #120 comment
 6810116314, and confirmed against the implementation on 2026-11-12, #148
@@ -1907,6 +2000,12 @@ host's call on the link with exactly one of:
   membership head, clock floor or ledger evidence and opens no gate. It
   carries no request id (a `control_sync`'s `request_id` is never echoed in
   one: wire rule 11) and must not complete or correlate a request.
+  carries no request id and must not complete or correlate a request.
+  (**Atem's reading, for Astation's agreement**, step 4, 2026-11-13: a
+  refusal names a call kind, not a request: it completes and matches none;
+  on that kind the host backs off (its device-list fetch 30 s, ended by the
+  link's next generation) and drops what it had in flight on the link, so a
+  later result is unasked.)
 - The host keeps that link's synchronization gates closed while it repairs
   the association and resynchronizes. The transport may still fence or
   close an invalid or superseded link; a refusal creates no authority for
@@ -1957,7 +2056,17 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
   mailbox up to its head. It closes on any disconnect, on a reset, and when
   no head arrived for 60 seconds. While it is closed no unstarted remote
   task of a principal that feed covers starts (`blocked`, `revocations not
-  yet checked`).
+  yet checked`). (**Atem's reading, for Astation**, step 4, 2026-11-13:
+  "up to its head" is the host's list holding the device-list head the
+  last `heads` announced as that very entry, `seq` and hash, never a
+  `membership_fetch_result`'s `head`; so `heads.membership` must be exactly
+  the Station's stored log head, the bindings' `LogHead` (R9.3), or that
+  Station's gate stays closed. A host list that differs from the Station's
+  keeps the gate closed until a carrier brings the difference (R9.3's
+  diverged window, R9.4): the host's own fetch, `after` its head `seq`,
+  can't reveal a fork at or below that `seq`, and a window fetch would be a
+  later wire item. "Up to a deferred entry" is the host's fetch, under that
+  same announced head, stopping at an entry its list still defers.)
 
 #### Acknowledgments
 
@@ -2706,6 +2815,16 @@ The sender's channel and online status are not conditions.
   that can't clear ends it `failed` at once with the event's detail, and
   never `outcome_unknown`. A receipt-database fault, a halted journal and
   hosting switched off still fence it as §4 says.
+  - **As built in step 4.** Only `host_launch` reaches it (a launch on
+    message's sender is `local`). Its profile stands for the route of
+    condition 4. A waiting launch reads `starting`, a refused one `failed`;
+    the reason goes to `runtime.log` (§3 has no `detail`). A
+    `runtime.toml` that doesn't load is waited out at the spawn boundary
+    too. **Atem's reading, for Astation to confirm:** the check just
+    before the worker is spawned is the launch's linearization point; after
+    the spawn its guard only fences, as every launch's. A restart turns a
+    launch still waiting into `outcome_unknown`, as §3 says of every
+    `starting` launch.
 
 #### Attempts and `receipt_id`
 
@@ -2736,6 +2855,47 @@ The sender's channel and online status are not conditions.
   task is reconciled with its latest attempt's receipt and route changes
   are applied (design I.6.2, I.6.3).
 
+#### The deadline interrupt
+
+A delegated task whose turn still runs at its deadline (on the clock below)
+is interrupted (design I.4.4, I.5.7):
+- **The intent.** The host writes an interrupt intent with reason
+  `deadline` for its attempt. It is durable before anything acts on it.
+- **The interrupt.** The host interrupts the turn with host authority
+  (session-v1 R9.14 item 5): once per turn in a run, and only the lease
+  revocation repeats while the intent is pending.
+- **What the task does.** The turn ends interrupted, the task goes to
+  `awaiting_result`, `interrupted at deadline`, and then `expired` as
+  today.
+- **An attempt still waiting `accepted`** is withdrawn instead, and the
+  task is `expired`, `expired before submission`.
+
+As built in step 4:
+- **The detail.** `interrupted at deadline` names only a turn the
+  deadline's interrupt reached. A turn that ended interrupted otherwise
+  keeps `turn interrupted`.
+- **While hosting is paused. Atem's reading, for Astation to confirm.**
+  The interrupt, and every pending intent, is carried out while hosting
+  is paused (`runtime.toml` doesn't load, or `enabled = false`). A stop
+  grants nothing, and the turn's own lease goes on renewing during a
+  pause. Host-work dispatches nothing, and the task's record waits for
+  the pause to end, but for one stop: an attempt still waiting `accepted`
+  at its deadline is withdrawn, and its task expires (`expired before
+  submission`) at once, even while paused. An attempt already `accepted`
+  behind another turn follows the session host's queue and its start
+  check, which doesn't read the pause.
+  - **Residuals.** A receipt-database fault holds the intents until the
+    restart it asks for (recovery step 3 carries them out then). A runtime
+    started while paused carries them out once hosting is on.
+- **At a restart. Atem's reading, for Astation to confirm.** A pending
+  intent whose attempt is `rejected` at recovery step 3 gives the task the
+  intent's state. That covers `withdrawn at recovery`, and also a
+  `session closed` not yet processed: the task becomes `expired`, not
+  `failed`. Design I.6.3, "As built in step 4", has the details.
+- **With `host.delegated` turned off after tasks were accepted** (the
+  debug-only hook removed), a started task's turn is still interrupted at
+  its deadline.
+
 #### Unknown outcomes
 
 - `outcome_unknown` is final for execution: such a task is never
@@ -2746,9 +2906,19 @@ The sender's channel and online status are not conditions.
   unknown`. It stays `outcome_unknown` until `work_resolve` (§11.2) or the
   host's own command (below) resolves it, which records the resolver and
   the time (`resolved`).
-- A reply its agent submits proves the turn ran: the task moves to
-  `awaiting_result` and still needs `work_complete`. A reply that arrives
-  after a `failed` resolution is stored, and the task stays `failed`.
+- A reply its agent submits before the task's deadline proves the turn
+  ran: the task moves to `awaiting_result` and still needs
+  `work_complete`. A reply that arrives after a `failed` resolution, before
+  the deadline, is stored, and the task stays `failed`. **Atem's reading,
+  for Astation:** after the task's deadline (on the delegated clock below),
+  as for every task, a reply is refused (`expired`) and nothing is stored.
+- **Atem's choice, for Astation:** while the task stays `outcome_unknown`
+  (its reply still publishing, or refused), its `detail` stays its reason
+  (the Details table's `outcome_unknown` rows: `agent exited`, `outcome
+  could not be established`, `write interrupted`, or the deadline's text);
+  `reply_query` shows the reply. A delegated task in its turn whose
+  attempt's receipt is gone (evicted or lost) says `outcome could not be
+  established`.
 - Each one raises an alert (§11.3); the alert ends when the task is
   resolved, or a reply moves it to `awaiting_result`.
 
@@ -2783,6 +2953,8 @@ exact.
 | `blocked` | `revocations not yet checked` | the revocation gate (or, for a host sender, the mailbox gate) is closed |
 | `blocked` | `device list update pending` | the last carriage or fetch stopped at a deferred entry |
 | `blocked` | `waiting for unlock` | a locked cred agent leaves the project scope pending |
+| `blocked` | `journal halted; restart Atem` | (**Atem's addition, for Astation**) the session journal halted with the device list usable (no fault): the task waits until the restart; session-v1 §I's own text |
+| `blocked` | `host.delegated is off` | (**Atem's addition, for Astation**) a task accepted while `host.delegated` was on, not started, after a restart without it: it is never dispatched, and expires at its deadline (on the clock below) |
 | `cancelled` | `sender revoked` | a `revoke` record, an R9 removal, or a host sender's `host_sender_revoke`, `remove_host` or new membership epoch |
 | `failed` | `sender's authorization narrowed` | the current grant (or a host sender's projects) no longer covers the task |
 | `failed` | `route changed` | the route's revision, principals or profile changed |
@@ -2791,6 +2963,7 @@ exact.
 | `failed` | `expired before the spawn` | a launch still waiting at the spawn boundary at its expiry |
 | `awaiting_result` | `interrupted at deadline` | a running turn interrupted at the task's deadline (then `expired` as today) |
 | `outcome_unknown` | `deadline passed; outcome unknown` | its deadline passed unresolved |
+| `outcome_unknown` | `agent exited`, `outcome could not be established`, `write interrupted` | (**Atem's addition, for Astation**) why, as its attempt's receipt says (session-v1 R9.14 item 6; design I.6.3: "the task follows"): its agent exited; no turn state proves its turn ran or is current (a restart's reconciliation); a write failed after it may have reached the agent. The reason the owner's alert names (§11.3) |
 | (a `work_interrupt` result) | `not running` | the task's turn isn't the session's current turn (§11.2) |
 | (an error) | `too many unresolved outcomes` | `busy`, the 64 or 256 limit |
 | (a receipt) | `withdrawn by the host`, `withdrawn at recovery` | session-v1 R9.14 items 3, 4 and 6; the task's state follows the event |
@@ -3257,6 +3430,53 @@ actual sync flags, suspend, reboot and repairs still need step 4 tests.
   task: a task of `local`, a browser grant or a service no feed covers
   keeps v1, and its unknown outcome expires.
 
-Both commands are built in step 4, with the lifecycle. Their output, and
-how `done` takes its result snapshot and `failed` its detail, are
-step 4's.
+Both commands are built in step 4, with the lifecycle. The rest of this
+section is **Atem's choice** (step 4's open questions 2 and 3, approved by
+the owner), filling what the design leaves open. It is Atem-internal: no
+field or message changes, and the one text a client can see is `failed`'s
+default detail.
+
+- **`failed`'s detail (Atem's choice).** `atem task resolve <task_id>
+  failed [--detail TEXT]`: a detail given is kept byte for byte under
+  §11.2's rule (1–1024 bytes, not blank, no control or Cf character);
+  without one the task's `detail` is `resolved as failed on the host`,
+  which its sender reads with `work_query` like any other.
+- **`done`'s result (Atem's choice).** `atem task resolve <task_id> done`
+  takes exactly one `--memory ID` or `--vault ID:ENTRY@VERSION`, and no
+  free text. The snapshot is captured, published and read back as `atem
+  message reply` takes its context: vault context only while the account's
+  signed encryption mode is `on`, a vault reference names its entry, and an
+  entry the credential redactor would change is refused. Nothing is kept
+  until the task is resolved with it: a command abandoned while its
+  snapshot is being published resolves nothing (a memory may already be on
+  the relay, and `runtime.log` says so). A task already resolved publishes
+  nothing: the same snapshot again (the same memory with its text
+  unchanged, or the same vault entry and version) returns its recorded
+  status, and anything else is another resolution, refused.
+- **Who runs them (Atem's choice).** Both commands are the owner's, `list`
+  too since it shows every sender's tasks: they are refused inside an agent
+  session and for a process that can't be verified, by the verified
+  process-ancestry check `atem message status` uses. On the runtime's
+  same-user socket this is a correctness guard, not a security boundary.
+- **With `host.delegated` off (Atem's choice).** Both commands work
+  whether or not `host.delegated` is on: with it off nothing remote can
+  settle a delegated task of unknown outcome, so the owner's command is
+  the only way. `resolved` still reaches the wire only behind
+  `host.delegated` (§11.2, "Compatibility"). The commands need the
+  host-work records, which open once hosting is enabled in the runtime's
+  life; otherwise they say the records are unavailable.
+- **`atem status` (Atem's choice).** Its `Delegated:` line (`N unresolved
+  outcomes (atem task list --unknown)`, or `no unresolved outcomes`)
+  appears only while something is delegated: `host.delegated` on, a
+  delegated task open, or an outcome unresolved. Otherwise the status is
+  what it was before the line existed.
+- **Replies (design I.4.7; the budget is Atem's choice).** A delegated
+  task's reply text and context are kept 30 days after the task settles
+  (`completed`, `failed`, `cancelled` or `expired`; a reply stored after
+  its task settled counts from its storing), past the day after the
+  deadline when the task's own payloads go, without keeping the task an
+  open record. They have their own budget of 64 MiB per host: over it the
+  oldest go first, before their 30 days, and one `runtime.log` line says
+  how many went early. Then they drop as a v1 reply does: metadata, digest
+  and state stay. A task not settled (an unresolved unknown outcome) drops
+  its reply with its own payloads, as v1 does.

@@ -3,7 +3,9 @@
 //! on this boot. The file holds the offsets (`offsets <wall_ms> <mono_ms>
 //! <boot_id>`) and the runtime adds them to its own clocks at every read,
 //! so a move is in force once its write returns and the clocks go on
-//! without one.
+//! without one. The delegated clock (host-work-v1 §11.6) reads the same
+//! file; `set_delegated` adds its optional fields (boot-time counter, sync
+//! report, machine, namespace offset), else it takes their defaults.
 //!
 //! (The tests wrote the clocks themselves, every 20 ms from a thread, and a
 //! move only stored the new offsets: a write landing late under load let
@@ -21,9 +23,43 @@ pub struct HostClock {
     /// The file to pass as `ATEM_TEST_HOST_CLOCK`.
     pub path: PathBuf,
     boot: String,
-    /// The wall offset (negative: behind) and the monotonic one; held while
-    /// the file is written.
-    offsets: Mutex<(i64, u64)>,
+    /// What the file says; held while it is written.
+    offsets: Mutex<Offsets>,
+}
+
+struct Offsets {
+    /// The wall offset (negative: behind).
+    wall: i64,
+    mono: u64,
+    delegated: Option<Delegated>,
+}
+
+/// The delegated clock's optional fields of `ATEM_TEST_HOST_CLOCK`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delegated {
+    /// Its boot-time counter: the real monotonic clock plus this (it may be
+    /// negative).
+    pub boot_ms: i64,
+    /// The OS's sync report (`None`: no report).
+    pub synced: Option<bool>,
+    /// The machine identity, 32 lowercase hex digits.
+    pub machine_hex: String,
+    /// The boot-time namespace offset.
+    pub timens_boot_ms: i64,
+}
+
+impl Delegated {
+    /// What the runtime takes when the fields are left out, at monotonic
+    /// offset `mono_ms`: the counter is the monotonic clock, synchronized,
+    /// the test machine (`test_hooks::TEST_MACHINE`), no namespace offset.
+    pub fn defaults(mono_ms: u64) -> Delegated {
+        Delegated {
+            boot_ms: mono_ms as i64,
+            synced: Some(true),
+            machine_hex: "6174656d2d746573742d686f73742d31".into(),
+            timens_boot_ms: 0,
+        }
+    }
 }
 
 fn real_wall_ms() -> u64 {
@@ -42,18 +78,33 @@ impl HostClock {
         let clock = HostClock {
             path: dir.join(name),
             boot,
-            offsets: Mutex::new((0, 0)),
+            offsets: Mutex::new(Offsets {
+                wall: 0,
+                mono: 0,
+                delegated: None,
+            }),
         };
         clock.apply(|_| {});
         clock
     }
 
     /// Changes the offsets and writes them (atomically) before returning.
-    fn apply(&self, change: impl FnOnce(&mut (i64, u64))) {
+    fn apply(&self, change: impl FnOnce(&mut Offsets)) {
         let mut offsets = self.offsets.lock().unwrap();
         change(&mut offsets);
         let tmp = self.path.with_extension("tmp");
-        let text = format!("offsets {} {} {}", offsets.0, offsets.1, self.boot);
+        let mut text = format!("offsets {} {} {}", offsets.wall, offsets.mono, self.boot);
+        if let Some(d) = &offsets.delegated {
+            let synced = match d.synced {
+                Some(true) => "1",
+                Some(false) => "0",
+                None => "-",
+            };
+            text.push_str(&format!(
+                " {} {synced} {} {}",
+                d.boot_ms, d.machine_hex, d.timens_boot_ms
+            ));
+        }
         std::fs::write(&tmp, text).unwrap();
         std::fs::rename(&tmp, &self.path).unwrap();
     }
@@ -62,26 +113,33 @@ impl HostClock {
     /// and the monotonic clock `mono_ms` ahead of the real one, then waits
     /// one host pass.
     pub fn set(&self, wall_ms: i64, mono_ms: u64) {
-        self.apply(|o| *o = (wall_ms, mono_ms));
+        self.apply(|o| (o.wall, o.mono) = (wall_ms, mono_ms));
         std::thread::sleep(PASS);
     }
 
     /// Sets the wall clock `ms` from the real one (negative: behind), then
     /// waits one host pass.
     pub fn set_wall(&self, ms: i64) {
-        self.apply(|o| o.0 = ms);
+        self.apply(|o| o.wall = ms);
         std::thread::sleep(PASS);
     }
 
     /// Moves the monotonic clock `ms` on (it never goes back), then waits
     /// for a host pass (with slack, as before).
     pub fn add_mono(&self, ms: u64) {
-        self.apply(|o| o.1 += ms);
+        self.apply(|o| o.mono += ms);
         std::thread::sleep(4 * PASS);
+    }
+
+    /// Sets the delegated clock's fields (`None`: their defaults), then
+    /// waits one host pass.
+    pub fn set_delegated(&self, delegated: Option<Delegated>) {
+        self.apply(|o| o.delegated = delegated);
+        std::thread::sleep(PASS);
     }
 
     /// The host's wall clock now.
     pub fn wall(&self) -> u64 {
-        (real_wall_ms() as i64 + self.offsets.lock().unwrap().0) as u64
+        (real_wall_ms() as i64 + self.offsets.lock().unwrap().wall) as u64
     }
 }

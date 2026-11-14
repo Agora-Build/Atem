@@ -84,8 +84,9 @@ cases from `fixtures/host-work/framing-size-v1.json` (each with its complete
 inputs and the expected checked length), the control records' vectors from
 `fixtures/r9-vectors-host-work-control.json` (§9), the push hints' vectors
 from `fixtures/r9-vectors-push-hint.json` (approvals and `outcome_unknown`
-alerts, R9.9), the delegated wire shapes from
-`fixtures/r9-vectors-delegated-wire.json` (session-v1 R9.14), the
+alerts, R9.9), the delegated wire shapes and the r9 welcome's `verifier`
+from `fixtures/r9-vectors-delegated-wire.json` (session-v1 R9.14; R9.2 and
+R9.8), the
 envelopes' and results' vectors from `fixtures/r9-vectors-host-envelope.json`
 (host-work-v1 §11.5; planned, host role), the Station calls' byte goldens
 from `fixtures/r9-vectors-station-calls.json` (host-work-v1 §11.4, §9) and
@@ -335,6 +336,8 @@ Effects and timers:
 - **`WelcomeInfo`**: `authorization_ms_left` bounds the channel (the
   binding enforces it); show `pending_recovery`; `fetch_to(log)` → fetch
   up to that head and `extend` the log (never adopt it unverified).
+  `verifier` is the host verifier's inventory, absent when the host sent
+  none (Atem's proposal; see "The verifier's inventory" below).
 - **`ClientEvent::Outgoing{frame}`**: send it now (a chat resync `open`).
 - **`ClientEvent::MembershipHead{head, pending_recovery}`**: as `fetch_to`.
 - **`ClientEvent::Fenced{code, detail}`**: the attachment is over
@@ -599,6 +602,57 @@ by itself is the builder's `bad_project`, `malformed` or `wrong_alg` too),
 key, `verify_host_enc_sig` on every `enc_sig` whose binding fields parse,
 and (Kotlin and Swift, whose providers see the request) the signing
 purposes.
+
+**The verifier's inventory** (**Atem's proposal, for Astation's
+agreement**; session-v1 R9.2 "How a verifier reports itself").
+`verifier_inventory()` returns `VerifierInventory{version, actions}` (JS
+`verifierInventory()`: `{version, actions}`). It describes this binding's
+own verifier: version 2, the sixteen actions `MembershipLog` accepts,
+sorted by bytes. A strict verifier refuses a chain at an entry of any
+other action, so a signer's gate counts each app's verifier by this.
+`WelcomeInfo.verifier` is the host's inventory when its `welcome` carried
+one. Atem hosts send one in every welcome from the first release that
+carries this change; hosts from v0.8.0 to v0.8.5 send none. It is the
+host's claim about itself and never opens the gate alone.
+
+How a signer's gate uses it (**Atem's proposal, for Astation's
+agreement**; session-v1 R9.2 "How the signing gate uses it"). It says when
+a verifier is confirmed, and it extends the gate to three scope ops:
+
+- Versions only widen. A version lists every action of the one before it
+  and accepts every entry that one accepts, with the same derived state.
+- A signer signs an entry that some released verifier refuses only when
+  every strict verifier of the account has a confirmed inventory, from
+  its latest welcome, that lists the entry's action, at a version at
+  least the first one that accepts the entry. Today those entries are the
+  five delegated host work actions (version 2), and a service `add` or
+  `set_roles` whose scope carries `launch`, `message` or `notify`
+  (version 1; v0.8.0 and v0.8.1 lack those ops). Every other entry is
+  accepted by every release from v0.8.0 to v0.8.5 and needs no inventory.
+- A verifier is unconfirmed when its latest welcome carries no
+  `verifier`, when it is offline, or when it isn't a host and the signer
+  has no report from it. It counts as a release that predates the report,
+  so none of those entries is signed while one exists. For the three scope
+  ops this is stricter than host-work-v1 §2's advice to upgrade every
+  verifier before enrolling: a v0.8.2 to v0.8.5 verifier accepts them, but
+  it can't be confirmed until it runs a release that reports.
+- A later welcome with a lower version, or with no `verifier`, makes the
+  verifier unconfirmed again.
+- Entries already signed stay signed.
+- How the signer learns the inventories of verifiers that aren't hosts
+  (each app calls `verifier_inventory()`) is Astation's.
+
+Tests:
+- All three suites check `verifier_inventory()` against
+  `r9-vectors-delegated-wire`'s `verifier`.
+- The end-to-end test (`check-atem-client-bindings.sh e2e`) checks
+  `WelcomeInfo.verifier`: the Kotlin phone and the Node browser read a
+  test host's report, and the Node bot gets `null` from a host that sends
+  none.
+- A malformed report refuses the welcome (`Invalid{malformed,
+  verifier}`). That case is checked natively, in the FFI's
+  `no_lock_during_signing.rs` and the core's `client_e2e.rs`, not by the
+  end-to-end test.
 
 ### Control records (delegated host work; planned)
 
@@ -1386,9 +1440,10 @@ and opens no gate.
 | call | what it does |
 |---|---|
 | `relay_decode_to_station(message)` | reads a host's call strictly (at most 256 KiB as received, one strict I-JSON parse, exact fields, never `null`): `ControlSync{request_id, origin, feed_id?, after}` (answer with its `request_id` and `after`), `ControlAck{ack}` or `MembershipFetch{after}`. Another relay message on the link (`push_hint`, `push_seen`, …) is `Invalid{wrong_message}`: dispatch it elsewhere. The calling host is never a field: take it from the link's verified association (below). An ack's `ControlEffectResult.why` (O5, **for Astation's sign-off**, amended for step 4; host-work-v1 §11.4 wire rule 10; the vocabulary is `control_why_codes()`, JS `controlWhyCodes()`) is why an effect `pending` or `refused` isn't in force, as the host wrote it, or `None` (JS `null`): read it as information only, never as a count or a request to re-sign, and treat a code you don't know as unrecognized (a later version's; the result stands). A reason that is `null`, not a text, empty, over 64 bytes, outside `[a-z0-9_]` or beside `applied` or `duplicate` refuses the whole ack, `Invalid{malformed}` |
+| `relay_control_sync_result(origin, feed_id, head, station_time, records)` | the page after the host's `after`: at most 64 `RelayFeedRecord{feed_seq, record_json}`, ascending, each `feed_seq` in `1..=head`, 256 KiB in all. Each record goes through the control parser first: one it refuses is `Invalid{code}` with its parse code, and the page isn't written. Serve only records you validated at intake and stored |
 | `relay_control_sync_result(request_id, origin, feed_id, after, head, station_time, records)` | the answer to the call `request_id` names, its `after` echoed, on the feed it named (or, for a call that named none, the account's current feed): at most 64 `RelayFeedRecord{feed_seq, record_json}`, ascending, each `feed_seq` strictly after `after` and at most `head` (gaps are legal; a `head` below `after`, a feed that went back under the same id, takes no record: the host rescans), 256 KiB in all. Never leave out earlier stored records to fill a page with later ones. Each record goes through the control parser first: one it refuses is `Invalid{code}` with its parse code, and the page isn't written. Serve only records you validated at intake and stored |
 | `relay_control_sync_answers(call, result)` | whether the `control_sync_result` text `result` answers the `control_sync` text `call` (each read strictly; `Invalid{code}` if either isn't one): `RelaySyncVerdict::Answers`, else the first field that differs, `RequestId`, `Origin`, `FeedId` or `After`. The shared matching decision of the host and the `:8080` proxy; the caller compares the link generation, account and genesis it captured with the call |
-| `relay_heads(feeds, membership)` | each covering feed's `RelayFeedHead{origin, feed_id, head, station_time}` (at most 64, a feed once) and the device list's `LogHead`. Send it on every (re)connection, every 30 seconds and at once when a record is stored |
+| `relay_heads(feeds, membership)` | each covering feed's `RelayFeedHead{origin, feed_id, head, station_time}` (at most 64, a feed once) and the device list's `LogHead`. Send it on every (re)connection, every 30 seconds and at once when a record is stored. `membership` is the stored log's `LogHead` exactly: the host compares `seq` and hash (**Atem's reading, for Astation**, step 4, 2026-11-13; host-work-v1 §11.4, "The gate") |
 | `relay_membership_fetch_result(head, entries)` | the device list's head and the entries after the host's `after` (signed objects' JSON), at most 64: an R9.3 carriage |
 | `relay_control_sync_refused(code)`, `relay_membership_fetch_refused(code)`, `relay_control_ack_refused(code)` | a refusal of that call on this link (`code`: `RelayRefusalCode::Forbidden`, the only one); never send an empty page or an ack instead. `relay_decode_to_host` reads them as `ControlSyncRefused{code}`, `MembershipFetchRefused{code}`, `ControlAckRefused{code}` |
 | `relay_control_sync(request_id, origin, feed_id, after)`, `relay_control_ack(ack)`, `relay_membership_fetch(after)`, `relay_decode_to_host(message)` | the host's side, for tests and other hosts (`request_id`: the caller's, a fresh lowercase UUID v4 for every call; `relay_decode_to_host` reads a page as `ControlSyncResult{request_id, origin, feed_id, after, head, station_time, records}`) |

@@ -1568,13 +1568,15 @@ authority it was accepted under only while that principal keeps `control`.
 - **Recovery** (broker restart, with worker adoption). Before anything is
   dispatched, every recovered `accepted` request not yet `executing` is
   resolved in this order, each resolution persisted:
-  1. on the refusal list (§I.3) → `rejected`, `detail:"acceptance not
-     confirmed"`;
+  1. on the refusal list (§I.3) → `rejected`, with the detail its entry
+     records: `acceptance not confirmed` for a failed admission write,
+     `withdrawn by the host` for the `host-work` principal's withdrawal
+     (R9.14 items 4 and 6);
   2. the previous run did **not** end with a clean close → `rejected`,
-     `detail:"authorization history unknown"`, for every principal,
-     whatever the journal holds (a fence on disk or not: a failed write
-     may have left it, so what reached the disk never changes the
-     outcome);
+     `detail:"authorization history unknown"`, for every principal but
+     `host-work` (R9.14 item 6, below), whatever the journal holds (a
+     fence on disk or not: a failed write may have left it, so what
+     reached the disk never changes the outcome);
   3. after a clean close: host trust changed → `host trust changed` (§6);
      `control_gen` below its principal's durable one → `control revoked`;
      the rest is dispatched only once its principal's control is
@@ -1586,8 +1588,12 @@ authority it was accepted under only while that principal keeps `control`.
      confirmed"`.
 
   `executing` work is unaffected: reconciled, else `outcome_unknown`
-  (§6). If a resolution can't be persisted, the host starts with remote
-  sessions disabled (`welcome.host_error`) and dispatches nothing.
+  (§6). The `host-work` principal's requests follow R9.14 item 6 instead
+  of steps 2 and 3: every other recovered `accepted` one is `rejected`,
+  `withdrawn at recovery`, and its `executing` prompts are reconciled
+  from the adopted worker's chat. If a resolution can't be persisted, the
+  host starts with remote sessions disabled (`welcome.host_error`) and
+  dispatches nothing.
   Requests already `rejected` in the journal keep their detail; the
   in-memory rejections of a failed revocation write (above) were never
   persisted, so the same requests come back `rejected` with step 2's
@@ -1664,10 +1670,21 @@ and every later append refused until the journal is reopened.
    request's immutable values (§6; no payload) go on the journal's refusal
    list (`<journal>/refused`, replaced atomically: temp, fsync, rename,
    directory fsync). Then the reply: `error{code:"busy", detail:"acceptance
-   not recorded"}`.
+   not recorded"}`. The list holds one entry per `request_id`: the first
+   one stays, whoever submitted it, and an entry for an id already listed
+   writes nothing. It never grows past what a restart reads back (its JSON
+   within 8 MiB, `MAX_RECORD_BYTES`): an entry that would is refused, and
+   nothing is written (R9.14 item 4 says what that means for a withdrawal;
+   a failed admission write has halted the journal first, so it never
+   meets a full list in practice). (**Changed agreed meaning, needs
+   Astation's agreement**: §I.2 named neither rule. Before them the only
+   writer was this one, which halts first, so neither changes r8's
+   outcomes.)
 3. **Resolved at restart, never executed.** When the journal reopens,
    before recovery dispatches anything, each request on the refusal list
-   is made durably `rejected`, `detail:"acceptance not confirmed"`: a
+   is made durably `rejected`, with the detail its entry records
+   (`acceptance not confirmed` for a failed admission write; `withdrawn by
+   the host` for the `host-work` principal's withdrawal, R9.14 item 4): a
    `Transition` when its `accepted` record is on disk after all (the write
    failed after a partial or complete write, or the rollback failed), else
    a receipt recorded directly as `rejected` (— → `rejected`, nothing
@@ -1709,7 +1726,9 @@ and every later append refused until the journal is reopened.
    refusal list) is resolved first and wins over §H's "authorization
    history unknown": the client was told `busy`, and the detail confirms
    that refusal. Both are `rejected`, final and never executed, so the
-   choice changes no outcome (§H, Recovery, gives the full order).
+   choice changes no outcome (§H, Recovery, gives the full order). A
+   withdrawal's entry wins the same way: `withdrawn by the host` over
+   `withdrawn at recovery` (R9.14 item 6, whose order is agreed).
 
 Fixtures: `r8-failed-persistence-changes-no-lease` (single failure, the
 retry with the same id while halted, then the restart: `rejected`, the
@@ -1986,7 +2005,104 @@ hosts, Station replicas, native controllers and other SDK consumers),
 starting with an enumerated test account; an unknown, offline or
 unconfirmed verifier keeps signing off, removing an obsolete verifier is
 an explicit manager action, and no feature flag alone is proof
-(delegated host work II.2.2 "The signing gate", I.8). Each is signed by a native manager, like every
+(delegated host work II.2.2 "The signing gate", I.8).
+
+*How a verifier reports itself* (**Atem's proposal, for Astation's
+agreement**). A verifier describes itself with an inventory
+`{version, actions}`, so a signer's gate can tell which verifiers accept
+which entries:
+
+- `actions`: the actions the verifier accepts, 1 to 64 names, sorted by
+  bytes, each once. A name is 1–32 bytes of `[a-z0-9_]`, the first a
+  letter.
+- `version`: an integer from 1 to 2^32 − 1 naming that action set and the
+  rules the verifier applies to it. Any change to either is a new version.
+  For the rules, that means any entry of a known action whose verdict or
+  derived state differs, whether or not a vector covered it before: an
+  entry accepted where it was refused, refused where it was accepted,
+  another refusal reason, or another derived state. The device-list
+  vectors (`r9-vectors-membership-log`, `r9-vectors-recovery`, the
+  `r9-chain-*` fixtures) then pin the new rule. Versions only widen (see
+  "How the signing gate uses it" below).
+  - Version 1 is the eleven actions (`genesis` to `k_backup`) with the
+    rules of v0.8.2 to v0.8.5, whose service scopes take ten ops: R9.6's
+    seven, and `launch`, `message` and `notify` (host-work-v1 §2 "Ops").
+    v0.8.0 and v0.8.1 lack the scope ops `launch`, `message` and
+    `notify`. No release from v0.8.0 to v0.8.5 reports an inventory, so an
+    absent inventory means any of them: the gate relies on neither the
+    five actions of this section nor those three scope ops for it.
+  - Version 2 adds the five actions of this section. It is the shared
+    core's today.
+- The shared core gives every consumer its own inventory:
+  `atem_client::membership::VERIFIER_VERSION` and `known_actions()`, and
+  `verifier_inventory()` in the bindings. (Informative: `known_actions()`
+  is built from an exhaustive match over the core's actions, so a new
+  action can't be left out of it.)
+- An Atem host reports its own verifier in every r9 `welcome` as
+  `verifier` (R9.8), from the first release that carries this change;
+  hosts from v0.8.0 to v0.8.5 send none. It is no feature: `features`
+  doesn't change. Released clients ignore the field, because the welcome
+  reader ignores unknown fields. (Atem's display, informative: `atem status` shows the
+  runtime's version on its `Device list:` line as `verifier v2`, and
+  `atem --version` shows this build's as `device-list verifier v2 (16
+  actions)`.)
+- A reader takes the field strictly. It is either absent (never `null`),
+  or exactly `version` and `actions` as above. Anything else refuses the
+  whole welcome.
+  - A reader checks the shape only. A name it doesn't know is no refusal,
+    because a newer verifier knows more, and it never checks a `version`
+    against the names listed.
+  - `verifier`'s shape and bounds are fixed: two fields, at most 64
+    names, the name grammar, a u32 version. A form that outgrows them goes
+    in a new welcome field, which released readers ignore. The host then
+    omits `verifier`, which reads as unconfirmed.
+- What it proves: the channel authenticates the welcome, so the relay can
+  neither forge nor strip it. It is the host's own claim about its own
+  verifier at that welcome. It says nothing about native controllers,
+  Station replicas or other SDK consumers, nor about the host after a later
+  update. The signer's gate keeps its rules: an unknown, offline or
+  unconfirmed verifier keeps signing off, and a host whose welcome carries
+  no `verifier` is unconfirmed.
+- *How the signing gate uses it* (**Atem's proposal, for Astation's
+  agreement**). This says when a verifier is confirmed, and it extends the
+  gate to three scope ops (below). It removes none of the rules above.
+  - Versions only widen. Version N lists every action of version N − 1,
+    and it accepts every entry N − 1 accepts, with the same derived state.
+    So a chain that verified still verifies the same way.
+  - A signer signs an entry that some released verifier refuses only when
+    every strict verifier of the account has a confirmed inventory that
+    lists the entry's action, at a `version` at least the first version
+    that accepts the entry. Today those entries are the five actions above
+    (version 2), and a service `add` or `set_roles` whose scope carries
+    `launch`, `message` or `notify` (version 1). Every other entry is
+    accepted by every release from v0.8.0 to v0.8.5 and needs no
+    inventory.
+  - A verifier's confirmed inventory is the one in its latest welcome.
+  - A verifier is unconfirmed when its latest welcome carries no
+    `verifier`, when it is offline, or when it isn't a host and the signer
+    has no report from it. An unconfirmed verifier counts as a release that
+    predates this report, so none of those entries is signed while one
+    exists. This extends the gate beyond the five actions to the three
+    scope ops, and it is stricter than host-work-v1 §2's advice ("upgrade
+    every verifier on the account before enrolling one"): a v0.8.2 to
+    v0.8.5 verifier accepts those ops, but it can't be confirmed until it
+    runs a release that reports.
+  - A later welcome with a lower `version`, or with no `verifier`, makes
+    the verifier unconfirmed again.
+  - Entries already signed stay signed. Removing an obsolete verifier
+    stays an explicit manager action.
+  - Hosts report in `welcome`. How the signer learns the inventories of
+    verifiers that aren't hosts (native controllers, Station replicas,
+    other SDK consumers, each of which can call `verifier_inventory()`) is
+    Astation's.
+- Vectors: `r9-vectors-delegated-wire`. Its `verifier` is this release's
+  own (version 2). Its `welcome` cases cover:
+  - a welcome with a `verifier`, and one without;
+  - a newer host's, naming an action this release doesn't know;
+  - the bounds, at versions above 2, each listing the sixteen actions;
+  - one refused case per rule.
+
+Each of the five is signed by a native manager, like every
 entry but `recovery_add` (the recovery key signing one is
 `recovery_signer_action`), with a fresh confirmation bound to the exact
 body (R9.6 rule 4). Every rule below is judged at `seq-1`, on the state
@@ -2430,7 +2546,14 @@ fenced). Atem sends every attachment `membership_head{head,
 pending_recovery}` (no `re`) when its head moves or a pending entry
 starts, takes effect or is cancelled, so clients fetch. Atem may also fetch the suffix
 from the relay over its own link; it gets no more trust than any
-carrier.
+carrier. **Amended in step 4, 2026-11-13 (Atem's proposal, for
+Astation's agreement):** Atem does so behind `host.delegated` until its
+activation (a host without it fetches nothing), with `membership_fetch{after}`
+(host-work-v1 §11.4) whenever its Station's `heads` name a device-list head
+beyond its own, the result applied as a carriage; a fetch that stops at a
+deferred entry (R9.5) asks nothing more while the host still defers that
+entry and the Station announces the same head, and it counts as fetched up
+to that entry for the revocation gate (delegated host-work I.4.3, I.5.8).
 
 **Control records on an open channel** (planned: feature `host.senders`,
 which no host advertises yet; the records are host-work-v1 §11.1). A native
@@ -2683,7 +2806,14 @@ estimate on the host's clock, recomputed on every report. The 100 ms
 `advance` pass checks the wait; while an entry is pending the host also
 asks the relay over its link for the suffix after its head every 15
 minutes and 5 minutes before `effective_at` (a fetch never delays
-activation: a relay that fails it gains nothing).
+activation: a relay that fails it gains nothing). **Amended in step 4,
+2026-11-13 (changed agreed meaning, needs Astation's agreement):** that
+fetch is R9.3's, run at its Station's `heads` (every (re)connection, every
+30 s, and at once when it stores a control record; host-work-v1 §11.4) in
+place of this schedule, and at once when a deferral it stopped at ends on
+this host (after a refusal's backoff, at the next `heads`); until
+`host.delegated` is activated a host doesn't fetch, and pending entries and
+their decisions reach it with carriers only.
 
 **During the wait the subject has no access** (not even `view`): a
 `hello` by it, or by a device added only by an entry deferred behind it,
@@ -3299,7 +3429,11 @@ sender. Between 2 and 4 MiB Atem applies the bound itself (the row above).
 Atem's `close` reasons: `closed` (Atem ended it: after a refusal or a
 fence), `unknown_channel`, `busy`, `too_large`, `malformed`,
 `handshake_failed` (a clear handshake error frame was sent first),
-`expired` (the channel's lifetime ended, R9.7 "Limits").
+`expired` (the channel's lifetime ended, R9.7 "Limits"). A service's or
+browser grant's expiry (which also fences the principal) and the records
+and bytes limits are lifetime ends: `expired`; a removal, a demotion, a
+revoked grant, a frozen list and a failed record are `closed`. (Atem's
+reading, for Astation.)
 
 **Clients and bindings.** A client implementation holds one
 `ClientConnection` (the shared core's per-channel state) per virtual
@@ -3554,7 +3688,7 @@ replaced key, also for a proof at an ancestor head; `relay_replies`:
 | op | dir | fields |
 |---|---|---|
 | `hello` | C→H (the `finish` plaintext) | `revision: 9` (required), `proof{principal, sig}` (`sig` = `sig_c`, b64u), `membership{head{seq,hash}, entries, more?}`, `grant?` (signed grant, browser only); no `resume` |
-| `welcome` | H→C (first record) | r8 fields (`revision: 9`, `features`) plus `principal` (string), `client_kind` (`native`/`service`/`browser`), `permissions`, `scope?` (service/browser: `{ops, sessions?, projects?}`), `head{seq,hash}` (after the carriage), `pending_recovery` (always present, possibly empty: `[{entry_hash, seq, action, subject, effective_at}]`, R9.5), `channel_id`, `authorization_ms_left` |
+| `welcome` | H→C (first record) | r8 fields (`revision: 9`, `features`) plus `principal` (string), `client_kind` (`native`/`service`/`browser`), `permissions`, `scope?` (service/browser: `{ops, sessions?, projects?}`), `head{seq,hash}` (after the carriage), `pending_recovery` (always present, possibly empty: `[{entry_hash, seq, action, subject, effective_at}]`, R9.5), `channel_id`, `authorization_ms_left`, `verifier?` (`{version, actions}`, the host verifier's inventory, read strictly, absent rather than `null`; R9.2 "How a verifier reports itself"; **Atem's proposal, for Astation's agreement**) |
 | `membership` | C→H | `entries` (R9.3) → `membership_head{re, head}` |
 | `membership_head` | H→C | `head`, `pending_recovery` (event when Atem's head moves or a pending entry changes state; reply with `re`) |
 | `revoke_grant` | C→H | `grant_id` → `grant_revoked{re}` (issuer or a member with `control`) |
@@ -3881,6 +4015,25 @@ it has neither `state` nor `session_id`, `process_gen` or `approval_id`:
   for an alert: nothing cancels a stage, and an alert's own state is read
   with `alert_list` (it lasts until its task is resolved). The daily reminder
   is Astation's. **Atem's choice, for Astation to confirm.**
+- **When Atem makes and sends it** (**Atem's choices, for Astation to
+  confirm**):
+  - The host makes an alert's hints once, when the alert is committed. Their
+    `created_at` is the alert's, and their window is exactly 900 000 ms.
+  - It resends them until acknowledged or until `expires_at + 300 000`. The
+    host applies no guard of its own; an approval's opens stop at `expires_at
+    − 15 000`, and the relay's guard still bounds every provider send.
+  - It signs them, and sends them the first time, only while its welcome
+    lists `host.alerts` (hosting on, and the feature on), and never while
+    push is suppressed. Hints already made are resent until acknowledged,
+    the alert ends, push is suppressed or `expires_at + 300 000`, whatever
+    the welcome lists then.
+  - A hint is never made again for an alert:
+    - raised while push was suppressed or `host.alerts` wasn't listed;
+    - raised before a broker restart;
+    - whose hint first reached the relay more than 120 000 ms after its
+      `created_at` (refused `skew`).
+  - For such an alert, `alert_list` and Astation's daily reminder are the
+    backstop.
 - **Collapse id.** An alert's notifications collapse on its `alert_id`
   (collapse id / FCM tag = `alert_id`), as an approval's do on its
   `approval_id`. So the hints of one alert to one device replace each other,
@@ -4063,7 +4216,7 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 | `unknown_session` | all | also: a session outside a service's or grant's scope |
 | `busy` | channel/session | also: `init` rate; a device list that exists but can't be opened (clear, at `init`); a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3) |
 | `unsupported_version` | session | also: `hello` without `revision: 9`; the removed outer `transportPolicy`/`transportPolicyAck` (R9.8a) |
-| `request_id_reused` | session | also: a `host_policy_set` reusing a `request_id` with another body (R9.8a); planned: a `request_id` recorded under another submitter when either is the `host-work` principal (R9.14) |
+| `request_id_reused` | session | also: a `host_policy_set` reusing a `request_id` with another body (R9.8a); a `request_id` recorded under another submitter when either is the `host-work` principal (R9.14 item 7; built, behind the unadvertised `host.delegated`) |
 | relay `push_hint` refusals | relay | `skew`, `invalid_times`, `duplicate`, `bad_signature`, `stale` |
 | relay `host_route` refusals | relay | `malformed`, `frozen`, `wrong_account`, `unknown_host`, `bad_signature`, `stale_log`, `fork`, `nonce_mismatch`, `room_mismatch`, `atem_id_mismatch` (R9.7b; the verifier's codes, sent to the host in `host_route_refused`) |
 
@@ -4075,9 +4228,10 @@ the crate's own dependencies and cross-checked independently):
 `r9-vectors-keys`, `r9-vectors-encoding`, `r9-vectors-membership-log`,
 `r9-vectors-recovery`, `r9-vectors-channel-handshake`,
 `r9-vectors-browser-grant`, `r9-vectors-push-hint`, `r9-vectors-pairing`,
-`r9-vectors-host-route`, and, planned, `r9-vectors-delegated-wire`
-(R9.14's shapes: `host_enc_key_get`, `host_enc_key`, receipts with and
-without provenance), `r9-vectors-host-work-control`
+`r9-vectors-host-route`, `r9-vectors-delegated-wire` (planned: R9.14's
+shapes, `host_enc_key_get`, `host_enc_key`, receipts with and without
+provenance; and, not planned, the r9 welcome's `verifier`, R9.2 and R9.8,
+with this release's own inventory), `r9-vectors-host-work-control`
 (control records, host-work-v1 §11.1: service records for each action,
 native managers' and a host principal's records, a record signed by a
 manager removed before the host received it, every verification reason
@@ -4309,22 +4463,30 @@ sets versus sequences (R9.2). Still open:
    compromise remedy (`retire_previous`) need a way to ask the host for a
    new key: a flag on the op, or a local command. Needed before step 4.
 
-### R9.14 Delegated host work (planned; not advertised)
+### R9.14 Delegated host work (items 1-7 built behind a debug-only hook; not advertised)
 
 The delegated host-work design ([../delegated-host-work.md](../delegated-host-work.md),
 agreed revision 6b, I.7) revises session-v1 so that Atem runs a delegated
 sender's task itself, under a host-local principal, while the sender is
 offline. Host-work's side (the task lifecycle, its states and details, the
 clocks) is [atem-host-work-v1.md](atem-host-work-v1.md) §11.6. **Nothing
-here is advertised or running in this version:** no host lists
-`host.delegated`, `host.alerts` or `host.senders`, no `host-work`
-principal exists, no receipt carries `task_id` or `sender`, and
-`host_enc_key_get` is refused (below). The host builds it in step 4 of the
-design's order of work. The shared core already has the wire: the
-principal's name, the receipt fields and their reader, and the op and its
-answer. Each choice that fills in the design is marked. Astation agreed R9.14
-(2026-11-11, #120 comment 6810116314), except the two questions still marked
-open (item 1's UI question, item 8's request for a new key).
+here is advertised in this version:** no host lists `host.delegated`,
+`host.alerts` or `host.senders`. Items 1 to 7 are built (step 4 of the
+design's order of work) behind a debug-only hook,
+`ATEM_TEST_HOST_FEATURES=host.delegated`, read once when the runtime
+starts. Release builds compile the hook out, so without it no `host-work`
+principal exists and no receipt carries `task_id` or `sender`. Item 8 is
+still refused (below). The shared core has the wire: the principal's name,
+the receipt fields and their reader, and the op and its answer. Each choice
+that fills in the design is marked. Astation agreed R9.14 (2026-11-11, #120
+comment 6810116314), except the two questions still marked open (item 1's
+UI question, item 8's request for a new key) and what step 4 added since,
+each marked where it is: item 1's leases (no prompt that doesn't acquire,
+none after a restart) and item 3's fail-closed rules (Atem's choices, for
+Astation to confirm); item 1's lease kept while a request is open, item
+4's refusal-list rules (with §I.2's), item 5's delivery after a restart
+and item 6's reconciliation of `executing` prompts (changed agreed
+meaning, needs Astation's agreement).
 
 1. **The `host-work` principal.** Its name is `host-work`
    (`atem_client::session::wire::HOST_WORK_PRINCIPAL`), a bare word like
@@ -4355,6 +4517,18 @@ open (item 1's UI question, item 8's request for a new key).
      item 2 say which task holds it. (**Needs Astation's agreement:**
      whether its UI needs to tell the host-work holder apart from a device;
      this revision adds no field for it.)
+   - **Leases, as built** (**Atem's choice, for Astation to confirm**). A
+     prompt it submits without `acquire: true`, or with `takeover`, is
+     `invalid_request`, and nothing is recorded. After a restart a turn
+     still running and rebound (item 6) holds no lease: leases aren't
+     persisted and host-work doesn't acquire again, so a native may
+     acquire it without a takeover.
+   - **How long it holds the lease, as built** (**changed agreed
+     meaning, needs Astation's agreement**: the agreed text above says it
+     holds the lease "for that turn"). It keeps the lease while any
+     request of its on that session is open (`accepted` or `executing`),
+     not only for one turn, and releases it at the first pass after the
+     last one settled.
    - **Approvals.** The runtime answers no approval through this
      attachment. A delegated turn's approval cards go, as today, to the
      attachments with `control` (§G; design I.4.2).
@@ -4408,6 +4582,13 @@ open (item 1's UI question, item 8's request for a new key).
    device list. The requests of every other principal keep §H's dispatch
    check only, which the `host-work` principal passes trivially (item 1).
 
+   As built (**Atem's choice, for Astation to confirm**): with no check
+   installed, every request of the `host-work` principal is withdrawn
+   (`withdrawn by the host`, fail closed). A refusal whose `rejected`
+   write fails halts the journal (§I), and the request goes on the refusal
+   list best effort, so the restart resolves it `withdrawn by the host`
+   (item 6; `withdrawn at recovery` if that listing failed too).
+
 4. **Host-internal withdrawal.** Host-work may ask the session host to
    withdraw its own request: after a revoke, a hold, a narrowing, a route
    change, or an interrupt intent (design I.5.6, I.5.7). The session host
@@ -4431,6 +4612,30 @@ open (item 1's UI question, item 8's request for a new key).
    settles the request. Withdrawal is never offered to a client: it
    applies only to the `host-work` principal's own requests, and is seen
    only as the receipt's `rejected` state.
+
+   As built (**changed agreed meaning, needs Astation's agreement**: the
+   refusal list's own rules, §I.2):
+   - **One entry per `request_id`.** The first entry stays, whoever
+     submitted it. A withdrawal of an id already listed writes nothing and
+     reports it listed.
+   - **An id recorded under another submitter.** Nothing is written or
+     changed (that request isn't host-work's). Host-work's own submit of
+     that id is `request_id_reused` (item 7), so its attempt never runs.
+   - **The bound.** The list never grows past what a restart reads back
+     (its JSON within 8 MiB). A withdrawal whose entry wouldn't fit writes
+     nothing, and the journal doesn't halt: a submit of that id in this run
+     is `busy`, `detail: "refusal list full"`, never admitted, and after a
+     restart the id is absent (never admitted; host-work never sends that
+     attempt id again). Past 4096 such ids in one run, the next one halts
+     the journal instead (§I), so memory stays bounded too.
+   - **A failed rejection write** of an `accepted` request halts the
+     journal and lists the request best effort, so the restart resolves it
+     `withdrawn by the host`.
+   - **Another submitter's late submit** of a listed id is
+     `request_id_reused` (item 7).
+   - **In the run**, a listed id reads as the restart will record it: its
+     receipt, by `receipt_query` too (a viewer of its target), is
+     `rejected`, `withdrawn by the host`, with its provenance.
 
 5. **Interrupt with host authority** (design I.5.7). An interrupt intent
    comes from a `revoke` with `interrupt_running`, a later
@@ -4488,7 +4693,37 @@ open (item 1's UI question, item 8's request for a new key).
        owner's choice.
      - After a restart a pending intent is carried out again, delivering
        once more if that turn is still the session's current turn; a
-       turn that has already ended makes it do nothing.
+       turn that has already ended makes it do nothing. **As built
+       (changed agreed meaning, needs Astation's agreement):** the host
+       knows that turn is still current only when the prompt's turn was
+       journaled (item 6's `turn_started`) and the adopted worker's chat
+       shows it running: then the attempt stays `executing`, rebound to
+       it, and the interrupt is delivered once more. Until that chat
+       arrives (at most 60 s, item 6) the turn check refuses, no turn
+       state yet, and the intent stays pending. In every other case the
+       start's reconciliation settles the attempt (item 6: `completed`
+       when its turn ended with a known outcome, else `outcome_unknown`)
+       and no Esc is written: a turn that may still run is not proven
+       current, and the host never writes a blind Esc. The owner learns of
+       an `outcome_unknown` attempt from its alert (`host.alerts`).
+
+   - **(as built; host-internal, no wire change)** The chat's half of
+     step 1's turn check is today's Esc rule: chat-v1 shows the session
+     `working` or `waiting`, and its current turn is the one the attempt's
+     prompt began; without chat, or in any other state, the interrupt is
+     dropped and nothing is written.
+     The repeated revocation is a call of its own, which writes nothing.
+     While an attempt's write waits for the worker's answer, the interrupt
+     runs only that revocation, so one attempt never has two writes in
+     flight. Each write's outcome is reported once: `ok` (written,
+     delivered), `consumed`, `dropped` or `no_effect` (nothing written:
+     written again on the next pass), or `error_after_queue` (counts as
+     delivered).
+   - **(as built; host-internal, no wire change)** `work_interrupt`
+     (host-work-v1 §11.2) uses this interrupt once, with no intent. Every
+     interrupt written to an attempt's turn is recorded, whichever wrote
+     it, so a turn gets one Esc in a run from requests and intents
+     together.
 
 6. **§H recovery.** The `host-work` principal's requests are never
    confirmed. Before anything is dispatched, each recovered `accepted`
@@ -4503,9 +4738,54 @@ open (item 1's UI question, item 8's request for a new key).
    This proves no side effect, and host-work queues the task again for a
    new attempt once the revocation gate opens (design I.6.2, I.6.3). Its
    `executing` requests are reconciled as §6 says (worker adoption, else
-   `outcome_unknown`, `agent exited`). The order (the refusal list first,
-   as §I.7 rules for every principal) is **Atem's choice, agreed with Astation
-   (2026-11-11, #120 comment 6810116314)**.
+   `outcome_unknown`, `agent exited`), as built below. The order (the
+   refusal list first, as §I.7 rules for every principal) is **Atem's
+   choice, agreed with Astation (2026-11-11, #120 comment 6810116314)**.
+
+   **The reconciliation, as built (changed agreed meaning, needs
+   Astation's agreement):**
+   - **The turn a prompt started is journaled** (`turn_started`): ids
+     only, the turn and the user message, written durably at the chat's
+     acceptance (after the paste, while `executing`), for the `host-work`
+     principal's prompts only. No other request has one, so other
+     journals are written as before.
+   - **An `executing` prompt of the `host-work` principal** is decided at
+     the start from the adopted worker's chat:
+     - its agent process gone (no live worker of the prompt's
+       `process_gen`) → `outcome_unknown`, `agent exited`;
+     - the chat not arrived yet → it stays `executing` and waits, at most
+       60 s after the start's recovery (as §H's confirmation window), then
+       `outcome_unknown`, `outcome could not be established`;
+     - no turn state (no chat-v1) → `outcome_unknown`, `outcome could not
+       be established`;
+     - its turn ended → `completed` with that turn's outcome and ids, or
+       `outcome_unknown`, `outcome could not be established`, when the
+       outcome isn't known;
+     - its turn still current → it stays `executing`, rebound to that
+       turn: the interrupt (item 5) and the turn's end find it again;
+     - another turn current, or none → `outcome_unknown`, `outcome could
+       not be established`;
+     - no turn journaled (a crash before `turn_started` was durable) →
+       `outcome_unknown`, `outcome could not be established`, at once.
+
+     Every other principal's `executing` requests keep §6
+     (`outcome_unknown`, `outcome could not be established`, as v1's
+     reconciliation has always written it).
+   - **Corrupt journals.** A record a journal can read but whose rules it
+     breaks (a provenance on anything but a `host-work` prompt, a turn
+     result on anything but a `completed` prompt, a turn started anywhere
+     but on an `executing` `host-work` prompt, or twice) ends that
+     session's log there, as an invalid transition always has, instead of
+     disabling remote sessions.
+     This changes what any host does with such a corrupt journal.
+   - **Downgrades.** An older build can't read `turn_started`: it ends
+     that session's log at the record, losing the later records of every
+     principal on that session (a retry of one of those ids could run
+     again). It also can't read a refusal list whose entries carry a
+     `detail` or a `provenance`, so its start disables remote sessions
+     until a newer build's start clears the list. Before running an older
+     build on a profile where the hook ran, move `runtime/journal/` aside.
+     There is no shim.
 
 7. **`request_id_reused` across submitters.** A `submit` whose
    `request_id` is recorded under another submitter, where the recorded
@@ -4614,8 +4894,11 @@ open (item 1's UI question, item 8's request for a new key).
        - Listed in R9.13 (item 8).
 
 **Errors and details (additions).** Receipt details: `withdrawn by the
-host` (items 3, 4), `withdrawn at recovery` (item 6). `request_id_reused`
-(item 7). `busy`, details `host encryption key unavailable` and `device
+host` (items 3, 4), `withdrawn at recovery` (item 6); `outcome_unknown`
+with `agent exited` or `outcome could not be established` for a
+reconciled `host-work` prompt (item 6). `request_id_reused` (item 7).
+`busy`, detail `refusal list full`, which only a submitter of an id
+withdrawn while the refusal list was full hears (item 4). `busy`, details `host encryption key unavailable` and `device
 list not reconciled` (item 8). `unsupported_version`, detail `host.senders
 is not advertised` (item 8, while unadvertised).
 
@@ -4633,5 +4916,13 @@ is not advertised` (item 8, while unadvertised).
   refused).
 - **The host's step 3 refusal:** tested in
   `src/session_protocol/r9/tests.rs` (`host_enc_key_get`).
-- **Scenario fixtures for items 1 to 7** come with the host (step 4), with
-  Astation.
+- **Scenario fixtures for items 1 to 7:** `fixtures/r9-delegated-*.json`
+  (`provenance`, `start-check-withdraws`, `withdrawal-refusal-list`,
+  `host-interrupt`, `recovery-withdrawn`,
+  `request-id-across-submitters`; `fixtures/schema.md` defines their
+  steps). Two host runners run them: Atem's in-process r9 host runner
+  (`membership::fixtures_tests`) and its real-runtime runner with the
+  drive hook (`ATEM_TEST_HOST_WORK_DRIVE`). No client-side runner runs
+  them: their host-work steps are host-internal, and what a client
+  observes is in their `expect` steps. Atem's unit tests pin what the
+  fixtures can't show (the turn check coming first, the 60 s bound).

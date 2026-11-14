@@ -30,6 +30,7 @@ claude_logs/
 
 # Test scratch files
 test.*.py
+__pycache__/
 
 # Superpowers planning docs (local only)
 docs/superpowers/

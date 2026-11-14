@@ -170,14 +170,25 @@ impl RuntimeClient {
         Self::connect_existing_at(&Locator::default_paths()).await
     }
 
+    /// [`RuntimeClient::connect_existing`] for the owner's own commands
+    /// (`atem task …`): `absent` says why none answering is an error.
+    pub async fn connect_existing_with(absent: &str) -> Result<Self> {
+        Self::connect_existing_as(&Locator::default_paths(), absent).await
+    }
+
     pub(crate) async fn connect_existing_at(locator: &Locator) -> Result<Self> {
+        Self::connect_existing_as(locator, "no Atem runtime is running; agents run inside one")
+            .await
+    }
+
+    async fn connect_existing_as(locator: &Locator, absent: &str) -> Result<Self> {
         match Self::connect(locator).await {
             Ok(client) if client.welcome.protocol != PROTOCOL => bail!(
                 "the Atem runtime speaks protocol {}, this atem speaks protocol {PROTOCOL}; use the atem that started the runtime",
                 client.welcome.protocol
             ),
             Ok(client) => Ok(client),
-            Err(Failure::Absent) => bail!("no Atem runtime is running; agents run inside one"),
+            Err(Failure::Absent) => bail!("{absent}"),
             Err(Failure::Restarting) => {
                 bail!("the Atem runtime is restarting; try again in a moment")
             }

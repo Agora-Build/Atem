@@ -976,6 +976,7 @@ fn accepted_record(n: u64, trust: u64) -> Record {
         updated_at: 1,
         principal: "c1".into(),
         control_gen: 1,
+        provenance: None,
     }
 }
 

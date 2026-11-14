@@ -26,6 +26,7 @@ fn welcome(features: &[&str]) -> Welcome {
         head: head(),
         pending_recovery: vec![],
         channel_id: "ch-1".into(),
+        verifier: None,
     }
 }
 

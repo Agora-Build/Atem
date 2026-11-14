@@ -137,7 +137,20 @@ impl App {
             hosted.relay.push_back((link, text));
             return;
         }
-        // Counted, never its content; rate-limited to powers of two.
+        self.relay_dropped(text.len());
+    }
+
+    /// A relay message dropped unread (over its bound, or past this pass's
+    /// count), `bytes` long: counted while the link carries r9 (as
+    /// `relay_message` takes them), never its content; logged at powers of
+    /// two.
+    pub(super) fn relay_dropped(&mut self, bytes: usize) {
+        if !self.r9_link_up() {
+            return;
+        }
+        let Some(hosted) = self.hosted.as_mut() else {
+            return;
+        };
         hosted.relay_dropped += 1;
         if hosted.relay_dropped.is_power_of_two() {
             eprintln!(
@@ -145,7 +158,7 @@ impl App {
                 hosted.relay_dropped,
                 RELAY_MESSAGE_BYTES / 1024,
                 RELAY_LIMIT,
-                text.len()
+                bytes
             );
         }
     }
@@ -315,6 +328,20 @@ pub fn error_detail_text(re: Option<String>, code: ErrorCode, detail: Option<&st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task 30 re-review N4: a relay message dropped unread is counted
+    /// only while the link carries r9, as `relay_message` takes them.
+    #[test]
+    fn a_relay_drop_counts_only_while_the_r9_link_is_up() {
+        let _profile = crate::test_profile::temp();
+        let mut app = App::new();
+        app.hosted = Some(Hosted::default());
+        app.relay_dropped(RELAY_MESSAGE_BYTES + 1);
+        assert_eq!(app.hosted.as_ref().unwrap().relay_dropped, 0);
+        app.astation_routed = true;
+        app.relay_dropped(RELAY_MESSAGE_BYTES + 1);
+        assert_eq!(app.hosted.as_ref().unwrap().relay_dropped, 1);
+    }
 
     /// §R9.7b: the reconnect after a pin waits for a running operation (or
     /// a session-family message waiting for admission); with no relay link

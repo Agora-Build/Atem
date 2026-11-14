@@ -234,7 +234,8 @@ pub struct ProjectScopes {
     checked: HashMap<String, Instant>,
 }
 
-fn kid_of(entry: &str) -> Option<&str> {
+/// The kid of a `projects` entry (`h1.<kid>.<hash>`).
+pub fn kid_of(entry: &str) -> Option<&str> {
     entry
         .strip_prefix("h1.")?
         .split_once('.')
@@ -440,6 +441,24 @@ impl ProjectScopes {
                     });
             let _ = tx.send((kid, recheck, done));
         });
+    }
+
+    /// Whether a comparison under `kid` is pending (session-v1 R9.6): some
+    /// session with a launch project has no hash under it yet (the cred
+    /// agent locked or absent, the account not encrypting, the kid not
+    /// held). A delegated task whose scope it decides waits, `waiting for
+    /// unlock`, and is never failed as narrowed (design I.4.3, "Locked
+    /// credentials").
+    pub fn pending_for(&self, kid: &str) -> bool {
+        self.keys
+            .keys()
+            .any(|sid| !self.hashes.contains_key(&(sid.clone(), kid.to_string())))
+    }
+
+    /// The hashes known now, by (session, kid): what the delegated start
+    /// check compares a scope's `projects` entries with (`StartView`).
+    pub fn known_hashes(&self) -> HashMap<(String, String), String> {
+        self.hashes.clone()
     }
 
     /// The last failure of `kid`, if its hashes are pending (tests).

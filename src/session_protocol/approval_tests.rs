@@ -841,6 +841,7 @@ fn unstarted_answer_after_restart(clean: bool) {
             updated_at: 1,
             principal: "c1".into(),
             control_gen: 1,
+            provenance: None,
         })
         .unwrap();
     let ctx = HostContext {
