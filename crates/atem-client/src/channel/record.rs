@@ -122,6 +122,16 @@ impl Channel {
         self.closed
     }
 
+    /// Moves this end's counters and byte totals as if that many records
+    /// had been sent and received, so a test reaches a limit (2^32 records,
+    /// 2^36 bytes) without sending them. Each pair is (records, bytes).
+    /// Test builds only: never in a shipped package.
+    #[cfg(any(test, feature = "test-vectors"))]
+    pub fn set_position_for_test(&mut self, sent: (u64, u64), received: (u64, u64)) {
+        (self.send.counter, self.send.bytes) = sent;
+        (self.recv.counter, self.recv.bytes) = received;
+    }
+
     /// Records sent and received so far.
     pub fn counters(&self) -> (u64, u64) {
         (self.send.counter, self.recv.counter)

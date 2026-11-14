@@ -1112,7 +1112,10 @@ fn attachments_are_fenced_alone_and_a_principal_together() {
     // The bot's expiry passes: both of its attachments (one left) go, the
     // phone stays.
     rig.advance(3_600_000);
-    assert_eq!(rig.refused("bot-2").0, "closed");
+    assert_eq!(
+        rig.refused("bot-2"),
+        ("closed".into(), Some("expired".into()))
+    );
     assert_eq!(rig.engine.status().attachments, 1);
     assert!(rig.rt.host.control_gen("service:svc-bot") >= 2);
     assert_eq!(rig.list("phone").len(), 2);
@@ -3795,6 +3798,302 @@ mod host_enc_key_get {
         );
         assert!(rig.engine.take_host_work().is_empty());
         assert!(rig.relay.is_empty());
+    }
+}
+
+/// How a channel ends (§R9.7a Atem's `close` reasons): `expired` when its
+/// lifetime ended (the 24 h or the principal's expiry, or a record or byte
+/// limit, §R9.7 "Limits"), `closed` for a fence that isn't an expiry or a
+/// failed record, `busy` for a queue past its bound.
+mod channel_end {
+    use super::*;
+    use atem_client::channel::{MAX_DIRECTION_BYTES, MAX_RECORDS};
+
+    const DAY: u64 = 24 * 60 * 60 * 1000;
+
+    fn attachment_of(rig: &Rig, handle: &str) -> String {
+        match &rig.engine.chans[handle].phase {
+            Phase::Open(a) => a.attachment.clone(),
+            _ => panic!("{handle} is open"),
+        }
+    }
+
+    /// The reason of Atem's one `close` of `handle`.
+    fn closed_with(rig: &Rig, handle: &str) -> Option<String> {
+        let all: Vec<_> = rig.closes.iter().filter(|(h, _)| h == handle).collect();
+        assert_eq!(all.len(), 1, "{handle}: {:?}", rig.closes);
+        all[0].1.clone()
+    }
+
+    /// The clocks move on with no pass in between (a record or a message
+    /// arrives as a lifetime ends, before the next 100 ms pass).
+    fn skip(rig: &mut Rig, ms: u64) {
+        rig.now.mono += ms;
+        rig.now.host.mono_ms += ms;
+        rig.now.host.wall_ms += ms;
+        rig.rt.set_now(rig.now.mono);
+    }
+
+    /// Atem has a message for `handle`'s client (a session-family record).
+    fn message_for(rig: &mut Rig, handle: &str, text: &str) {
+        let att = attachment_of(rig, handle);
+        let mono = rig.now.host.mono_ms;
+        rig.engine
+            .deliver_family(&att, SID, text, &NoProjects, HOST, mono);
+        rig.pump();
+    }
+
+    /// A phone's channel with a request sealed in time, not yet sent.
+    fn phone_with_a_request(rig: &mut Rig) -> Vec<u8> {
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        let mono = rig.now.host.mono_ms;
+        let (_, frame) = rig.attached("ch-phone").list(mono).unwrap();
+        frame
+    }
+
+    #[test]
+    fn an_inbound_record_at_the_channel_deadline_closes_expired() {
+        let mut rig = Rig::new();
+        let frame = phone_with_a_request(&mut rig);
+        // The record was sealed in time and reaches Atem as the lifetime
+        // ends: the channel's own check refuses it.
+        skip(&mut rig, DAY);
+        rig.send_frame("ch-phone", &frame);
+        assert_eq!(closed_with(&rig, "ch-phone").as_deref(), Some("expired"));
+        assert_eq!(rig.engine.status().attachments, 0);
+    }
+
+    #[test]
+    fn an_outbound_record_at_the_channel_deadline_closes_expired() {
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        // A second channel: it keeps going, the first one's lifetime ends
+        // while Atem has something to send on it.
+        rig.connect("ch-other", phone());
+        skip(&mut rig, DAY - 1000);
+        message_for(&mut rig, "ch-phone", "{}");
+        assert_eq!(closed_with(&rig, "ch-phone").as_deref(), Some("expired"));
+        assert_eq!(rig.engine.status().attachments, 1);
+        assert!(!rig.closes.iter().any(|(h, _)| h == "ch-other"));
+    }
+
+    /// A service's channel ends at its expiry (the principal's, wall and
+    /// monotonic): the close is `expired` for every attachment of the
+    /// principal; a browser grant the same; the phone stays. The rig's
+    /// clocks move in lockstep, so the channel's own deadline
+    /// (`mono + (expires_at - wall)`) is reached with the wall expiry and
+    /// its `unauthorized`/`expired` fence record can't be sealed: only
+    /// `close{expired}` goes out. The record is sent only when the wall
+    /// clock passes the expiry before the monotonic deadline (as the shared
+    /// fixture `r9-service-scope-and-expiry` steps it).
+    #[test]
+    fn a_service_channel_at_its_expiry_closes_expired() {
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("bot-1", bot());
+        rig.advance(1000);
+        rig.connect("bot-2", bot());
+        rig.advance(1000);
+        let browser = browser_of(&mut rig, 7);
+        rig.connect("ch-browser", browser);
+        rig.advance(1000);
+        // The grant's 50 minutes pass.
+        rig.advance(50 * 60_000);
+        assert_eq!(closed_with(&rig, "ch-browser").as_deref(), Some("expired"));
+        assert!(!rig.closes.iter().any(|(h, _)| h.starts_with("bot")));
+        // The service's hour passes (it was issued an hour from the rig's
+        // start).
+        rig.advance(3_600_000);
+        for bot in ["bot-1", "bot-2"] {
+            assert_eq!(closed_with(&rig, bot).as_deref(), Some("expired"), "{bot}");
+        }
+        assert_eq!(rig.engine.status().attachments, 1);
+        assert!(!rig.closes.iter().any(|(h, _)| h == "ch-phone"));
+        assert_eq!(rig.list("ch-phone").len(), 2);
+    }
+
+    /// A channel's record and byte limits (§R9.7 "Limits"), either way:
+    /// the side that reaches one sends nothing more and closes `expired`.
+    #[test]
+    fn the_record_and_byte_limits_close_expired() {
+        type Position = ((u64, u64), (u64, u64));
+        // (what the host channel has sent, what it has received).
+        let cases: [(&str, Position, bool); 4] = [
+            ("sent records", ((MAX_RECORDS, 0), (0, 0)), false),
+            ("sent bytes", ((0, MAX_DIRECTION_BYTES - 1), (0, 0)), false),
+            ("received records", ((0, 0), (MAX_RECORDS, 0)), true),
+            (
+                "received bytes",
+                ((0, 0), (0, MAX_DIRECTION_BYTES - 1)),
+                true,
+            ),
+        ];
+        for (name, (sent, received), inbound) in cases {
+            let mut rig = Rig::new();
+            let frame = phone_with_a_request(&mut rig);
+            let Phase::Open(a) = &mut rig.engine.chans.get_mut("ch-phone").unwrap().phase else {
+                panic!("open");
+            };
+            a.channel.set_position_for_test(sent, received);
+            if inbound {
+                rig.send_frame("ch-phone", &frame);
+            } else {
+                message_for(&mut rig, "ch-phone", "{}");
+            }
+            assert_eq!(
+                closed_with(&rig, "ch-phone").as_deref(),
+                Some("expired"),
+                "{name}"
+            );
+            assert_eq!(rig.engine.status().attachments, 0, "{name}");
+        }
+    }
+
+    /// A removal, a revoked grant and a failed record are not a lifetime
+    /// ending: they still close `closed`.
+    #[test]
+    fn a_fence_that_is_not_an_expiry_still_closes_closed() {
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-bot", bot());
+        rig.advance(1000);
+        let browser = browser_of(&mut rig, 8);
+        rig.connect("ch-browser", browser);
+        rig.advance(1000);
+        // The bot is removed by a carried entry.
+        let removal = rig.log.remove("svc-bot");
+        let mono = rig.now.host.mono_ms;
+        let entry = atem_client::SignedObject::parse(removal.to_string().as_bytes()).unwrap();
+        let (_, frame) = rig
+            .attached("ch-phone")
+            .send_membership(&[entry], mono)
+            .unwrap();
+        rig.send_frame("ch-phone", &frame);
+        assert_eq!(closed_with(&rig, "ch-bot").as_deref(), Some("closed"));
+        // The browser's grant is revoked.
+        revoke_from(&mut rig, "ch-phone", &revoked_grant_id(8));
+        assert_eq!(closed_with(&rig, "ch-browser").as_deref(), Some("closed"));
+        assert_eq!(rig.engine.status().attachments, 1);
+        // The phone's own channel went on, and a record that fails (a
+        // replay) closes it `closed` too, never `expired`.
+        let mono = rig.now.host.mono_ms;
+        let (_, frame) = rig.attached("ch-phone").list(mono).unwrap();
+        rig.send_frame("ch-phone", &frame);
+        rig.events("ch-phone");
+        rig.send_frame("ch-phone", &frame);
+        assert_eq!(closed_with(&rig, "ch-phone").as_deref(), Some("closed"));
+    }
+
+    /// A queue past its bound, and a record Atem can't seal for another
+    /// reason than a limit, still close `busy`.
+    #[test]
+    fn a_channel_queue_past_its_bound_still_closes_busy() {
+        let mut rig = Rig::new();
+        rig.engine = R9Host::new(
+            Limits {
+                queued_bytes: 8 * 1024,
+                ..Limits::default()
+            },
+            None,
+        );
+        rig.link_up();
+        rig.connect("slow", phone());
+        rig.advance(1000);
+        rig.stalled = true;
+        for _ in 0..40 {
+            let mono = rig.now.host.mono_ms;
+            let (_, frame) = rig.attached("slow").list(mono).unwrap();
+            let text = envelope::frame("slow", &frame);
+            rig.run(|e, p| ((), e.on_envelope(&text, p)));
+        }
+        rig.stalled = false;
+        rig.pump();
+        assert_eq!(closed_with(&rig, "slow").as_deref(), Some("busy"));
+        // A message over the record bound can't be sealed (not a limit).
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        let big = "x".repeat(atem_client::channel::MAX_PLAINTEXT + 1);
+        message_for(&mut rig, "ch-phone", &big);
+        assert_eq!(closed_with(&rig, "ch-phone").as_deref(), Some("busy"));
+    }
+
+    /// An idle native channel reaches its 24 h (monotonic only) at a pass:
+    /// the pass closes it `expired`, with no record first, and nothing else
+    /// goes.
+    #[test]
+    fn an_idle_native_channel_at_24_hours_closes_expired_at_the_pass() {
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-other", phone());
+        // The first channel's day ends (the second's, a second later, not).
+        rig.advance(DAY - 1000);
+        assert_eq!(closed_with(&rig, "ch-phone").as_deref(), Some("expired"));
+        assert!(!rig.closes.iter().any(|(h, _)| h == "ch-other"));
+        assert_eq!(rig.engine.status().attachments, 1);
+        assert_eq!(rig.list("ch-other").len(), 2);
+    }
+
+    /// When a principal's expiry and a fence that isn't an expiry meet in
+    /// one runtime pass, the first fence to close the attachment decides
+    /// the reason. The pass commits the device list (`membership_pass`)
+    /// before `r9.tick`, so a removal carried in the same pass as the
+    /// expiry closes `closed`; `expired` is noted only by `tick`, right
+    /// before its own fence, so a removal never inherits it.
+    #[test]
+    fn a_removal_in_the_pass_of_an_expiry_closes_closed() {
+        let mut rig = Rig::new();
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-bot", bot());
+        rig.advance(1000);
+        // The bot's hour is over, but no pass ran yet.
+        skip(&mut rig, 3_600_000);
+        let removal = rig.log.remove("svc-bot");
+        let entry = atem_client::SignedObject::parse(removal.to_string().as_bytes()).unwrap();
+        // The phone sealed the carriage in time (its day goes on).
+        let mono = rig.now.host.mono_ms;
+        let (_, frame) = rig
+            .attached("ch-phone")
+            .send_membership(&[entry], mono)
+            .unwrap();
+        rig.send_frame("ch-phone", &frame);
+        assert_eq!(closed_with(&rig, "ch-bot").as_deref(), Some("closed"));
+        // The pass that follows finds the bot gone: no second close.
+        rig.advance(1);
+        assert_eq!(closed_with(&rig, "ch-bot").as_deref(), Some("closed"));
+        assert_eq!(rig.engine.status().attachments, 1);
+    }
+
+    /// `close_reason` is what the inbound record and the welcome seal call:
+    /// every limit is a lifetime end; no other failure is.
+    #[test]
+    fn close_reason_maps_only_the_limits_to_expired() {
+        use atem_client::channel::Limit;
+        for limit in [Limit::Records, Limit::Bytes, Limit::Lifetime] {
+            assert_eq!(close_reason(&ChannelError::Limit(limit)), "expired");
+        }
+        for other in [
+            ChannelError::RecordRejected,
+            ChannelError::Closed,
+            ChannelError::TooLarge,
+            ChannelError::Busy,
+            ChannelError::StaleTarget,
+        ] {
+            assert_eq!(close_reason(&other), "closed", "{other:?}");
+        }
     }
 }
 
