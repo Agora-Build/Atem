@@ -269,6 +269,23 @@ impl Store {
         Ok(())
     }
 
+    /// A release lifted the hold that asked the withdrawal of the live
+    /// attempt `attempt_id` of `task_id`, in `tx` (the release record's own
+    /// transaction; review N2): its mark goes, so a later withdrawal for
+    /// another cause counts. Nothing for an attempt that ended.
+    pub fn release_withdrawal(
+        &self,
+        tx: &Transaction,
+        task_id: &str,
+        attempt_id: &str,
+    ) -> Result<()> {
+        tx.execute(
+            r#"UPDATE attempts SET counted=1 WHERE task_id=?1 AND attempt_id=?2 AND "end" IS NULL"#,
+            [task_id, attempt_id],
+        )?;
+        Ok(())
+    }
+
     /// Records how the attempt `attempt_id` of `task_id` ended, in `tx`.
     /// An end is final: the same end again changes nothing, another is an
     /// error. With a proof of no effect that makes [`MAX_ATTEMPTS`] counted

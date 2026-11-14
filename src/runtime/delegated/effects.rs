@@ -118,7 +118,7 @@ pub fn act(store: &Store, tx: &Transaction, actions: &[HostAction]) -> Result<Ve
                 });
             }
             HostAction::Hold(_) => stop(store, tx, tasks, Event::Held, &mut out)?,
-            HostAction::Release(_) => release(store, tasks)?,
+            HostAction::Release(_) => release(store, tx, tasks)?,
             HostAction::Interrupt { revocation, .. } => {
                 interrupt(store, tx, principal, tasks, revocation, &mut out)?
             }
@@ -182,13 +182,16 @@ fn stop(
 }
 
 /// A release of the principal whose tasks are `tasks`: its tasks paused
-/// (and not live) wait for an attempt again.
-fn release(store: &Store, tasks: &mut [Task]) -> Result<()> {
+/// (and not live) wait for an attempt again; a live attempt a hold had
+/// marked loses the mark (`Store::release_withdrawal`, review N2), so a
+/// later withdrawal for another cause counts.
+fn release(store: &Store, tx: &Transaction, tasks: &mut [Task]) -> Result<()> {
     for (r, live) in tasks.iter_mut() {
-        if live.is_some()
-            || r.status.state != WorkState::Blocked
-            || r.status.detail != details::PAUSED
-        {
+        if let Some(attempt) = live {
+            store.release_withdrawal(tx, &r.task.task_id, &attempt.attempt_id)?;
+            continue;
+        }
+        if r.status.state != WorkState::Blocked || r.status.detail != details::PAUSED {
             continue;
         }
         r.status.state = WorkState::Queued;

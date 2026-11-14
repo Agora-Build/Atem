@@ -1466,30 +1466,6 @@ impl R9Host {
         let pin = m.pin_of().clone();
         let now = parts.now.host.clone();
         let wall = now.wall_ms;
-        // A service while the control state can't be checked (ruling T35c:
-        // whether a record revoked it isn't known), then one a control
-        // record revoked here (design I.5.5 step 2: the host refuses all
-        // its future requests, its `hello` first).
-        if let Principal::Service { device_id } = &hello.proof.principal {
-            let refused = if self.services_unchecked {
-                Some(error(code::BUSY, re.as_deref(), Some(DETAIL_UNCHECKED)))
-            } else if self
-                .revoked_services
-                .contains(&format!("service:{device_id}"))
-            {
-                Some(error(
-                    code::UNAUTHORIZED,
-                    re.as_deref(),
-                    Some(DETAIL_REVOKED),
-                ))
-            } else {
-                None
-            };
-            if let Some(e) = refused {
-                refuse(self, keyed, e);
-                return effects;
-            }
-        }
         // A `hello` that would lift a hold (a manager's reconciliation)
         // does so only after its `sig_c` is verified below: nothing of the
         // hold changes for an unauthenticated `finish`.
@@ -1582,6 +1558,29 @@ impl R9Host {
                 return effects;
             }
         };
+        // A service the device list admits (its own final refusals first:
+        // removed, expired, out of scope; review N1): one a control record
+        // revoked here (design I.5.5 step 2: the host refuses all its
+        // future requests, its `hello` first), then any while the control
+        // state can't be checked (ruling T35c: whether a record revoked it
+        // isn't known).
+        if matches!(authority.principal, Principal::Service { .. }) {
+            let refused = if self.revoked_services.contains(&authority.name()) {
+                Some(error(
+                    code::UNAUTHORIZED,
+                    re.as_deref(),
+                    Some(DETAIL_REVOKED),
+                ))
+            } else if self.services_unchecked {
+                Some(error(code::BUSY, re.as_deref(), Some(DETAIL_UNCHECKED)))
+            } else {
+                None
+            };
+            if let Some(e) = refused {
+                refuse(self, keyed, e);
+                return effects;
+            }
+        }
         let mut channel = match keyed.admit(&authority.key, authority.channel_deadline_ms(&now)) {
             Ok(channel) => channel,
             Err(refusal) => {

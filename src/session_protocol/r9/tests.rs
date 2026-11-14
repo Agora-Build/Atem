@@ -1145,6 +1145,39 @@ fn services_are_busy_while_the_control_state_is_unchecked() {
     rig.attached("bot-3");
 }
 
+/// Review N1 (ruling T35d): while the control state is unchecked, the
+/// device list still decides first: an expired service gets its final
+/// `unauthorized`, never the retryable `busy`; a service the list admits
+/// gets `busy`. A revoked one gets its final `revoked` before the `busy`
+/// too.
+#[test]
+fn the_device_lists_refusal_comes_before_the_unchecked_busy() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.engine.start_services_unchecked(true);
+    rig.connect("bot-1", bot());
+    assert_eq!(
+        rig.refused("bot-1"),
+        ("busy".into(), Some(DETAIL_UNCHECKED.into()))
+    );
+    rig.engine
+        .set_revoked_services(HashSet::from(["service:svc-bot".to_string()]));
+    rig.advance(1000);
+    rig.connect("bot-2", bot());
+    assert_eq!(
+        rig.refused("bot-2"),
+        ("unauthorized".into(), Some(DETAIL_REVOKED.into()))
+    );
+    rig.engine.set_revoked_services(HashSet::new());
+    // The bot's grant expires: its own final refusal.
+    rig.advance(3_600_000);
+    rig.connect("bot-3", bot());
+    assert_eq!(
+        rig.refused("bot-3"),
+        ("unauthorized".into(), Some("expired".into()))
+    );
+}
+
 /// `revoke_grant` from the issuer: the browser is fenced ("grant revoked")
 /// and can't come back with that grant.
 #[test]

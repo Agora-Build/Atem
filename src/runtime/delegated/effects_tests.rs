@@ -1251,3 +1251,73 @@ fn a_holds_withdrawal_stays_uncounted_across_a_crash() {
         assert!(!input(&rig).contains("CRASH_HELD"));
     });
 }
+
+/// The bot's task with its attempt waiting `accepted` behind the phone's
+/// turn, then a hold and a release in one page (the hold's withdrawal asks
+/// nothing: it was lifted at once): the task and its attempt.
+async fn held_and_released(
+    rig: &mut LocalRig,
+    s: &Senders,
+    prompt: &str,
+    start: u64,
+) -> (String, String) {
+    phone_running(rig, s, &format!("{prompt}_PHONE"), start).await;
+    let task = bot_task(rig, s, prompt, start + HOUR);
+    blocked(rig, &task, BEHIND).await;
+    let attempt = attempt_behind_the_turn(rig, &task, prompt);
+    let hold = bot_record(&s.log, ControlAction::Hold, 2);
+    let release = bot_record(&s.log, ControlAction::Release, 3);
+    feed(rig, &s.log, &[&hold, &release]);
+    (task, attempt)
+}
+
+/// Review N2 (ruling T35d): a release lifts the hold's not-counted mark on
+/// the principal's live attempts in its transaction, so a later withdrawal
+/// of one of them, for another cause (here its route changed), is counted.
+#[test]
+fn a_release_makes_a_later_withdrawal_count_again() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = covered_bot(&mut rig, root, &os, start);
+        let (task, attempt) = held_and_released(&mut rig, &s, "RELEASED_ROUTE", start).await;
+        passes(&mut rig, 1);
+        assert_eq!(attempts(&rig, &task), [(attempt.clone(), None, true)]);
+        rig.bridge
+            .work
+            .config
+            .routes
+            .iter_mut()
+            .find(|r| r.id == "rs")
+            .unwrap()
+            .revision = 2;
+        rig.until(|r| settled(r, &task).0 == WorkState::Failed)
+            .await;
+        assert_eq!(
+            attempts(&rig, &task),
+            [(attempt, Some("withdrawn".into()), true)]
+        );
+    });
+}
+
+/// Review N2 across a restart: after a hold and its release, the runtime
+/// dies before the bridge saw the attempt again; the restart's withdrawal
+/// (`withdrawn at recovery`) is counted.
+#[test]
+fn a_release_makes_a_withdrawal_at_recovery_count() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = covered_bot(&mut rig, root, &os, start);
+        let (task, attempt) = held_and_released(&mut rig, &s, "RELEASED_CRASH", start).await;
+        rig.bridge.work.followups.clear();
+        restart(&mut rig, root, &os, false, true);
+        passes(&mut rig, 2);
+        assert_eq!(
+            attempts(&rig, &task),
+            [(attempt, Some("withdrawn".into()), true)]
+        );
+    });
+}
