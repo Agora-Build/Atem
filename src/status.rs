@@ -410,6 +410,12 @@ pub fn passive_device_list_line(
         text.push_str("; ");
         text.push_str(&crate::session_protocol::membership::capacity_text(&c));
     }
+    // This build's verifier (labelled: no runtime reported one), the one
+    // the runtime it starts judges the list with.
+    text.push_str(&format!(
+        "; verifier v{} (this build)",
+        atem_client::membership::VERIFIER_VERSION
+    ));
     for (subject, action, at) in pending {
         text.push_str(&format!(
             "; recovery pending: {subject} ({action}) takes effect at {} unless a managing device vetoes it",
@@ -420,7 +426,8 @@ pub fn passive_device_list_line(
 }
 
 /// `Device list:` from the running runtime (r9, §R9.3, §R9.5): pinned,
-/// held, frozen, paused or failed, with what to do, each pending
+/// held, frozen, paused or failed, with what to do, the runtime's
+/// device-list verifier version (`verifier v2`, R9.2), each pending
 /// recovery with when it takes effect, and the push hints and seens the
 /// relay hasn't acknowledged yet (§R9.9).
 pub fn device_list_line(look: &Look, hhmm: impl Fn(u64) -> String) -> Option<Line> {
@@ -433,6 +440,9 @@ pub fn device_list_line(look: &Look, hhmm: impl Fn(u64) -> String) -> Option<Lin
     };
     let list = status.device_list.as_ref()?;
     let mut text = list.text.clone();
+    if let Some(version) = list.verifier_version {
+        text.push_str(&format!("; verifier v{version}"));
+    }
     for p in &list.pending_recovery {
         text.push_str(&format!(
             "; recovery pending: {} ({}) takes effect at {} unless a managing device vetoes it",
@@ -879,6 +889,64 @@ pub(crate) mod tests {
         assert_eq!(device_list_line(&Look::NotRunning, |_| "?".into()), None);
     }
 
+    /// The runtime names its device-list verifier's version (R9.2 "How a
+    /// verifier reports itself"): `verifier v2` after what the list is,
+    /// before pending recoveries and push; a runtime that doesn't say
+    /// (an older build) shows none.
+    #[test]
+    fn status_shows_the_verifier_version() {
+        use crate::runtime::protocol::{DeviceListStatus, PendingRecoveryStatus, RuntimeStatus};
+        let look = |list: DeviceListStatus| Look::Running {
+            status: Some(RuntimeStatus {
+                device_list: Some(list),
+                ..Default::default()
+            }),
+            welcome: crate::runtime::client::Welcome {
+                protocol: 1,
+                build: "b".into(),
+                pid: 1,
+                astation: false,
+                host_error: None,
+                worker_protocol: None,
+                device_list: None,
+            },
+        };
+        let open = DeviceListStatus {
+            state: "open".into(),
+            text: "pinned at seq 4 (1 remote client); 4/1024 entries, 2/256 members, 1/64 hosts"
+                .into(),
+            pending_recovery: vec![PendingRecoveryStatus {
+                subject: "dev-new".into(),
+                action: "recovery_add".into(),
+                effective_at: 7,
+            }],
+            verifier_version: Some(2),
+            ..Default::default()
+        };
+        let line = device_list_line(&look(open.clone()), |ms| format!("@{ms}")).unwrap();
+        assert_eq!(
+            line.value,
+            "pinned at seq 4 (1 remote client); 4/1024 entries, 2/256 members, 1/64 hosts; verifier v2; recovery pending: dev-new (recovery_add) takes effect at @7 unless a managing device vetoes it"
+        );
+        let older = DeviceListStatus {
+            verifier_version: None,
+            ..open
+        };
+        let line = device_list_line(&look(older), |ms| format!("@{ms}")).unwrap();
+        assert!(!line.value.contains("verifier"), "{}", line.value);
+        // The runtime fills it with its own verifier's, whatever the
+        // list's state.
+        let now = crate::session_protocol::membership::host_now();
+        let failed =
+            crate::runtime::host_bridge::device_list_status_of(None, Some("x"), 0, &now).unwrap();
+        assert_eq!(
+            failed.verifier_version,
+            Some(atem_client::membership::VERIFIER_VERSION)
+        );
+        // From the files (no runtime), this build's verifier:
+        // `the_device_list_line_without_a_runtime_reads_the_files`.
+    }
+
     /// With no runtime running, the device list is read from the files
     /// (read only): pinned with a pending recovery, held, failed.
     #[test]
@@ -907,7 +975,8 @@ pub(crate) mod tests {
         .unwrap();
         let line = report(dir.path()).device_list.unwrap().value;
         // Three entries; the mac and the pending dev-new count as members.
-        assert!(line.starts_with("pinned at seq 3 (from disk; no runtime running); 3/1024 entries, 2/256 members, 1/64 hosts; recovery pending: dev-new (recovery_add) takes effect at "), "{line}");
+        // This build's verifier (the runtime it starts judges the list).
+        assert!(line.starts_with("pinned at seq 3 (from disk; no runtime running); 3/1024 entries, 2/256 members, 1/64 hosts; verifier v2 (this build); recovery pending: dev-new (recovery_add) takes effect at "), "{line}");
         // An unfinished write after a plain crash: replayed at the next
         // start, no managing device asked for (Astation's review of
         // 66ea556).

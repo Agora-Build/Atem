@@ -66,8 +66,8 @@ pub use capacity::{
 };
 pub use draft::{check_body, draft_on, sign_entry, sign_entry_cosigned};
 pub use entry::{
-    Action, Entry, HostRecord, KBackupRecord, KitMode, Member, MemberKind, RECOVERY_SIGNER, Role,
-    RolesChange, Scope,
+    Action, Entry, HostRecord, KBackupRecord, KitMode, MAX_VERIFIER_ACTIONS, Member, MemberKind,
+    RECOVERY_SIGNER, Role, RolesChange, Scope, VERIFIER_VERSION, action_name_ok, known_actions,
 };
 pub use host_enc_key::{
     EncKey, HostEncKeys, PreviousEncKey, host_enc_key, host_enc_sig_input, sign_host_enc_key,
@@ -84,6 +84,88 @@ pub use service::{
     service_set_roles,
 };
 pub use wait::{HostNow, RECOVERY_WAIT_MS, WaitClock};
+
+/// What a verifier reports about itself (R9.2 "How a verifier reports
+/// itself", the r9 `welcome`'s `verifier`, R9.8): its version and the
+/// actions it knows. Atem's proposal, for Astation's agreement. A signer
+/// reads it as a claim of the verifier that sent it, over the channel that
+/// authenticated it; it never opens the signing gate alone.
+///
+/// Built only through [`VerifierInventory::new`] (or [`ours`](Self::ours),
+/// [`from_json`](Self::from_json)), which checks what a reader checks: a
+/// host never writes an inventory its readers refuse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifierInventory {
+    version: u32,
+    actions: Vec<String>,
+}
+
+impl VerifierInventory {
+    /// `version` from 1; `actions` 1 to [`MAX_VERIFIER_ACTIONS`] names,
+    /// sorted by bytes, each once, each [`action_name_ok`] (names this
+    /// build doesn't know are kept). Anything else is `Err("verifier")`.
+    pub fn new(version: u32, actions: Vec<String>) -> Result<VerifierInventory, &'static str> {
+        let sorted_once = actions
+            .windows(2)
+            .all(|pair| pair[0].as_bytes() < pair[1].as_bytes());
+        if version == 0
+            || actions.is_empty()
+            || actions.len() > MAX_VERIFIER_ACTIONS
+            || !sorted_once
+            || !actions.iter().all(|a| action_name_ok(a))
+        {
+            return Err("verifier");
+        }
+        Ok(VerifierInventory { version, actions })
+    }
+
+    /// This build's: [`VERIFIER_VERSION`] and [`known_actions`].
+    pub fn ours() -> VerifierInventory {
+        let actions = known_actions().iter().map(|a| a.to_string()).collect();
+        VerifierInventory::new(VERIFIER_VERSION, actions)
+            .expect("this build's inventory follows its own rules")
+    }
+
+    /// From 1; [`VERIFIER_VERSION`] for this build.
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Sorted by bytes, each once.
+    pub fn actions(&self) -> &[String] {
+        &self.actions
+    }
+
+    /// `{"version": …, "actions": […]}`.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"version": self.version, "actions": self.actions})
+    }
+
+    /// Reads a report strictly: exactly `version` (an integer from 1 to
+    /// 2^32 − 1) and `actions`, as [`VerifierInventory::new`] takes them;
+    /// anything else is `Err("verifier")`. An action this build doesn't
+    /// know is no error.
+    pub fn from_json(value: &serde_json::Value) -> Result<VerifierInventory, &'static str> {
+        const WHAT: &str = "verifier";
+        let o = value.as_object().ok_or(WHAT)?;
+        if o.len() != 2 {
+            return Err(WHAT);
+        }
+        let version = o
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or(WHAT)?;
+        let actions = o
+            .get("actions")
+            .and_then(serde_json::Value::as_array)
+            .ok_or(WHAT)?
+            .iter()
+            .map(|a| a.as_str().map(str::to_owned).ok_or(WHAT))
+            .collect::<Result<Vec<_>, _>>()?;
+        VerifierInventory::new(version, actions)
+    }
+}
 
 /// Log limits (§R9.2). [`Membership::capacity`] reports a log's use of them.
 pub const MAX_ENTRIES: u64 = 1024;
@@ -2334,6 +2416,47 @@ mod tests {
             let body = m.draft("mac", 1, &action);
             let entry = sign_entry(&mac, &RecoveryKit::sign_id(), body).unwrap();
             assert_eq!(m.check_next(&entry), Check::Invalid(Invalid::LastManager));
+        }
+    }
+
+    /// One constructor checks what the reader checks, so a host can't write
+    /// an inventory its own reader refuses (the fields are private), and
+    /// what it writes reads back as it was.
+    #[test]
+    fn a_verifier_inventory_is_built_only_as_it_is_read() {
+        let names = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let ours = VerifierInventory::ours();
+        assert_eq!(ours.version(), VERIFIER_VERSION);
+        assert_eq!(ours.actions(), known_actions());
+        assert_eq!(
+            VerifierInventory::new(VERIFIER_VERSION, names(known_actions())),
+            Ok(ours.clone())
+        );
+        assert_eq!(VerifierInventory::from_json(&ours.to_json()), Ok(ours));
+        let newer = VerifierInventory::new(3, names(&["add", "zz_later_action"])).unwrap();
+        assert_eq!(VerifierInventory::from_json(&newer.to_json()), Ok(newer));
+        let many: Vec<String> = (0..65).map(|i| format!("a{i:02}")).collect();
+        for (why, version, actions) in [
+            ("version 0", 0, names(&["add"])),
+            ("no action", 2, vec![]),
+            ("65 actions", 2, many),
+            ("not sorted", 2, names(&["remove", "add"])),
+            ("a duplicate", 2, names(&["add", "add"])),
+            ("upper case", 2, names(&["Add"])),
+            ("a hyphen", 2, names(&["add-host"])),
+            ("33 bytes", 2, vec![format!("a{}", "_".repeat(32))]),
+        ] {
+            assert_eq!(
+                VerifierInventory::new(version, actions.clone()),
+                Err("verifier"),
+                "{why}"
+            );
+            let json = serde_json::json!({"version": version, "actions": actions});
+            assert_eq!(
+                VerifierInventory::from_json(&json),
+                Err("verifier"),
+                "{why}"
+            );
         }
     }
 }

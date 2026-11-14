@@ -2005,7 +2005,104 @@ hosts, Station replicas, native controllers and other SDK consumers),
 starting with an enumerated test account; an unknown, offline or
 unconfirmed verifier keeps signing off, removing an obsolete verifier is
 an explicit manager action, and no feature flag alone is proof
-(delegated host work II.2.2 "The signing gate", I.8). Each is signed by a native manager, like every
+(delegated host work II.2.2 "The signing gate", I.8).
+
+*How a verifier reports itself* (**Atem's proposal, for Astation's
+agreement**). A verifier describes itself with an inventory
+`{version, actions}`, so a signer's gate can tell which verifiers accept
+which entries:
+
+- `actions`: the actions the verifier accepts, 1 to 64 names, sorted by
+  bytes, each once. A name is 1–32 bytes of `[a-z0-9_]`, the first a
+  letter.
+- `version`: an integer from 1 to 2^32 − 1 naming that action set and the
+  rules the verifier applies to it. Any change to either is a new version.
+  For the rules, that means any entry of a known action whose verdict or
+  derived state differs, whether or not a vector covered it before: an
+  entry accepted where it was refused, refused where it was accepted,
+  another refusal reason, or another derived state. The device-list
+  vectors (`r9-vectors-membership-log`, `r9-vectors-recovery`, the
+  `r9-chain-*` fixtures) then pin the new rule. Versions only widen (see
+  "How the signing gate uses it" below).
+  - Version 1 is the eleven actions (`genesis` to `k_backup`) with the
+    rules of v0.8.2 to v0.8.5, whose service scopes take ten ops: R9.6's
+    seven, and `launch`, `message` and `notify` (host-work-v1 §2 "Ops").
+    v0.8.0 and v0.8.1 lack the scope ops `launch`, `message` and
+    `notify`. No release from v0.8.0 to v0.8.5 reports an inventory, so an
+    absent inventory means any of them: the gate relies on neither the
+    five actions of this section nor those three scope ops for it.
+  - Version 2 adds the five actions of this section. It is the shared
+    core's today.
+- The shared core gives every consumer its own inventory:
+  `atem_client::membership::VERIFIER_VERSION` and `known_actions()`, and
+  `verifier_inventory()` in the bindings. (Informative: `known_actions()`
+  is built from an exhaustive match over the core's actions, so a new
+  action can't be left out of it.)
+- An Atem host reports its own verifier in every r9 `welcome` as
+  `verifier` (R9.8), from the first release that carries this change;
+  hosts from v0.8.0 to v0.8.5 send none. It is no feature: `features`
+  doesn't change. Released clients ignore the field, because the welcome
+  reader ignores unknown fields. (Atem's display, informative: `atem status` shows the
+  runtime's version on its `Device list:` line as `verifier v2`, and
+  `atem --version` shows this build's as `device-list verifier v2 (16
+  actions)`.)
+- A reader takes the field strictly. It is either absent (never `null`),
+  or exactly `version` and `actions` as above. Anything else refuses the
+  whole welcome.
+  - A reader checks the shape only. A name it doesn't know is no refusal,
+    because a newer verifier knows more, and it never checks a `version`
+    against the names listed.
+  - `verifier`'s shape and bounds are fixed: two fields, at most 64
+    names, the name grammar, a u32 version. A form that outgrows them goes
+    in a new welcome field, which released readers ignore. The host then
+    omits `verifier`, which reads as unconfirmed.
+- What it proves: the channel authenticates the welcome, so the relay can
+  neither forge nor strip it. It is the host's own claim about its own
+  verifier at that welcome. It says nothing about native controllers,
+  Station replicas or other SDK consumers, nor about the host after a later
+  update. The signer's gate keeps its rules: an unknown, offline or
+  unconfirmed verifier keeps signing off, and a host whose welcome carries
+  no `verifier` is unconfirmed.
+- *How the signing gate uses it* (**Atem's proposal, for Astation's
+  agreement**). This says when a verifier is confirmed, and it extends the
+  gate to three scope ops (below). It removes none of the rules above.
+  - Versions only widen. Version N lists every action of version N − 1,
+    and it accepts every entry N − 1 accepts, with the same derived state.
+    So a chain that verified still verifies the same way.
+  - A signer signs an entry that some released verifier refuses only when
+    every strict verifier of the account has a confirmed inventory that
+    lists the entry's action, at a `version` at least the first version
+    that accepts the entry. Today those entries are the five actions above
+    (version 2), and a service `add` or `set_roles` whose scope carries
+    `launch`, `message` or `notify` (version 1). Every other entry is
+    accepted by every release from v0.8.0 to v0.8.5 and needs no
+    inventory.
+  - A verifier's confirmed inventory is the one in its latest welcome.
+  - A verifier is unconfirmed when its latest welcome carries no
+    `verifier`, when it is offline, or when it isn't a host and the signer
+    has no report from it. An unconfirmed verifier counts as a release that
+    predates this report, so none of those entries is signed while one
+    exists. This extends the gate beyond the five actions to the three
+    scope ops, and it is stricter than host-work-v1 §2's advice ("upgrade
+    every verifier on the account before enrolling one"): a v0.8.2 to
+    v0.8.5 verifier accepts those ops, but it can't be confirmed until it
+    runs a release that reports.
+  - A later welcome with a lower `version`, or with no `verifier`, makes
+    the verifier unconfirmed again.
+  - Entries already signed stay signed. Removing an obsolete verifier
+    stays an explicit manager action.
+  - Hosts report in `welcome`. How the signer learns the inventories of
+    verifiers that aren't hosts (native controllers, Station replicas,
+    other SDK consumers, each of which can call `verifier_inventory()`) is
+    Astation's.
+- Vectors: `r9-vectors-delegated-wire`. Its `verifier` is this release's
+  own (version 2). Its `welcome` cases cover:
+  - a welcome with a `verifier`, and one without;
+  - a newer host's, naming an action this release doesn't know;
+  - the bounds, at versions above 2, each listing the sixteen actions;
+  - one refused case per rule.
+
+Each of the five is signed by a native manager, like every
 entry but `recovery_add` (the recovery key signing one is
 `recovery_signer_action`), with a fresh confirmation bound to the exact
 body (R9.6 rule 4). Every rule below is judged at `seq-1`, on the state
@@ -3588,7 +3685,7 @@ replaced key, also for a proof at an ancestor head; `relay_replies`:
 | op | dir | fields |
 |---|---|---|
 | `hello` | C→H (the `finish` plaintext) | `revision: 9` (required), `proof{principal, sig}` (`sig` = `sig_c`, b64u), `membership{head{seq,hash}, entries, more?}`, `grant?` (signed grant, browser only); no `resume` |
-| `welcome` | H→C (first record) | r8 fields (`revision: 9`, `features`) plus `principal` (string), `client_kind` (`native`/`service`/`browser`), `permissions`, `scope?` (service/browser: `{ops, sessions?, projects?}`), `head{seq,hash}` (after the carriage), `pending_recovery` (always present, possibly empty: `[{entry_hash, seq, action, subject, effective_at}]`, R9.5), `channel_id`, `authorization_ms_left` |
+| `welcome` | H→C (first record) | r8 fields (`revision: 9`, `features`) plus `principal` (string), `client_kind` (`native`/`service`/`browser`), `permissions`, `scope?` (service/browser: `{ops, sessions?, projects?}`), `head{seq,hash}` (after the carriage), `pending_recovery` (always present, possibly empty: `[{entry_hash, seq, action, subject, effective_at}]`, R9.5), `channel_id`, `authorization_ms_left`, `verifier?` (`{version, actions}`, the host verifier's inventory, read strictly, absent rather than `null`; R9.2 "How a verifier reports itself"; **Atem's proposal, for Astation's agreement**) |
 | `membership` | C→H | `entries` (R9.3) → `membership_head{re, head}` |
 | `membership_head` | H→C | `head`, `pending_recovery` (event when Atem's head moves or a pending entry changes state; reply with `re`) |
 | `revoke_grant` | C→H | `grant_id` → `grant_revoked{re}` (issuer or a member with `control`) |
@@ -4129,9 +4226,10 @@ the crate's own dependencies and cross-checked independently):
 `r9-vectors-keys`, `r9-vectors-encoding`, `r9-vectors-membership-log`,
 `r9-vectors-recovery`, `r9-vectors-channel-handshake`,
 `r9-vectors-browser-grant`, `r9-vectors-push-hint`, `r9-vectors-pairing`,
-`r9-vectors-host-route`, and, planned, `r9-vectors-delegated-wire`
-(R9.14's shapes: `host_enc_key_get`, `host_enc_key`, receipts with and
-without provenance), `r9-vectors-host-work-control`
+`r9-vectors-host-route`, `r9-vectors-delegated-wire` (planned: R9.14's
+shapes, `host_enc_key_get`, `host_enc_key`, receipts with and without
+provenance; and, not planned, the r9 welcome's `verifier`, R9.2 and R9.8,
+with this release's own inventory), `r9-vectors-host-work-control`
 (control records, host-work-v1 §11.1: service records for each action,
 native managers' and a host principal's records, a record signed by a
 manager removed before the host received it, every verification reason

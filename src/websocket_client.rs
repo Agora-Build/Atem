@@ -692,9 +692,19 @@ pub(crate) fn relay_label(relay_url: &str, atem_id: &str) -> String {
     }
 }
 
-/// One encryption migration at a time per process: the runtime's link and
-/// an operation on it may both be asked to finish one.
-pub(crate) static MIGRATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// One encryption migration at a time per profile: the runtime's link and
+/// an operation on it may both be asked to finish one. Keyed by the
+/// profile's cred directory (`CredPaths::dir`), so profiles that share a
+/// process (one temp profile per test) never wait on or skip for each other.
+/// A runtime serves one profile, so the map holds one entry there and is
+/// never pruned.
+pub(crate) fn migration_lock(cred: &crate::paths::CredPaths) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS.get_or_init(Default::default).lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(cred.dir.clone()).or_default().clone()
+}
 
 /// Why a connection couldn't authenticate with the saved session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2404,15 +2414,16 @@ impl AstationClient {
     /// migration was pending, so there was nothing to run or report.
     async fn finish_encryption_migration(&self, astation_id: &str, kid: Option<String>) -> Result<Option<String>> {
         self.check_capture()?;
+        let src = self.profile_sources()?;
+        let lock = migration_lock(&src.paths.cred);
         let _one = if self.is_op_view {
-            MIGRATION.lock().await
+            lock.lock_owned().await
         } else {
-            match MIGRATION.try_lock() {
+            match lock.try_lock_owned() {
                 Ok(guard) => guard,
                 Err(_) => return Ok(Some("An encryption migration is already running".into())),
             }
         };
-        let src = self.profile_sources()?;
         let agent = self.cred_agent();
         let trust = crate::memory::trust::TrustStore::load_from(&src.paths.cred.trust)?;
         let epoch = crate::memory::verification::effective_state(&trust, astation_id)?
@@ -3432,6 +3443,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let device = crate::memory::fake_astation::UnlockedDevice::new(dir.path());
         let mut client = client_of(&device, dir.path());
+        let off = signed_mode(&device, crate::memory::crypto::EncryptionMode::Off, None, 5);
+        assert_eq!(client.handle_encryption_message(&off).await.unwrap(), Some(String::new()));
+    }
+
+    /// Another profile's migration holding the lock must not make this
+    /// profile's link skip (the process-wide lock did: parallel tests failed
+    /// on each other).
+    #[tokio::test]
+    async fn another_profiles_migration_does_not_hold_this_profiles_link() {
+        let _profile = crate::test_profile::temp();
+        let dir = tempfile::tempdir().unwrap();
+        let device = crate::memory::fake_astation::UnlockedDevice::new(dir.path());
+        let mut client = client_of(&device, dir.path());
+        let other = tempfile::tempdir().unwrap();
+        let _elsewhere = migration_lock(&crate::paths::ProfilePaths::in_dir(other.path()).cred).lock_owned().await;
         let off = signed_mode(&device, crate::memory::crypto::EncryptionMode::Off, None, 5);
         assert_eq!(client.handle_encryption_message(&off).await.unwrap(), Some(String::new()));
     }
