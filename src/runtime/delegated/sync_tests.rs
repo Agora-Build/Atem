@@ -230,11 +230,11 @@ impl Rig {
             .collect()
     }
 
-    /// The host restarts (a crash): the feed store loaded again from the
-    /// store, a new sync on a new link, the clocks going on.
-    fn restart(&mut self) {
+    /// The feed store loaded from the store, on the rig's clock, its own
+    /// Station [`ORIGIN`].
+    fn load_feeds(&self) -> FeedStore {
         let reading = self.os.clone();
-        self.feeds = FeedStore::load(&self.store, &self.log.log)
+        let mut feeds = FeedStore::load(&self.store, &self.log.log)
             .unwrap()
             .with_clock(move || {
                 let r = reading.lock().unwrap();
@@ -244,10 +244,42 @@ impl Rig {
                     boot_id: r.boot_id.clone(),
                 }
             });
-        self.feeds.set_own_origin(Some(ORIGIN.into()));
+        feeds.set_own_origin(Some(ORIGIN.into()));
+        feeds
+    }
+
+    /// The host restarts (a crash): the feed store loaded again from the
+    /// store, a new sync on a new link, the clocks going on.
+    fn restart(&mut self) {
+        self.feeds = self.load_feeds();
         self.sync = FeedSync::new();
         self.sync.on_link(Some(&link(9, ORIGIN)));
         self.pass(SEC);
+    }
+
+    /// `atem pair verify` on the live link (a new host identity, the next
+    /// trust generation, the same device list): the store replaced by a
+    /// fresh one bound to it, never read, as hosting's pass replaces it
+    /// (`work_store_ready`), the clock's record moved there and its feeds
+    /// loaded. The sync, its link generation and its live call go on.
+    fn new_identity(&mut self) {
+        let scratch = tempfile::tempdir().unwrap();
+        let old = std::mem::replace(&mut self.store, Store::open(scratch.path()).unwrap());
+        let next = HostTarget {
+            host_trust_gen: 2,
+            ..host()
+        };
+        let (store, _aside) = old
+            .replace(self.wall(), |fresh| {
+                fresh.bind(&next)?;
+                FeedStore::prepare(fresh)
+            })
+            .unwrap();
+        self.store = store;
+        self.clock.moved(&self.store);
+        self.feeds = self.load_feeds();
+        assert_eq!(self.feeds.identity(), Some(&next));
+        assert!(self.feeds.never_read());
     }
 
     /// Whether the durable reset mark of [`ORIGIN`] is stored.
@@ -1629,6 +1661,101 @@ fn a_reset_on_the_next_generation_never_takes_the_old_continuations_page() {
     );
     assert!(rig.feeds.standing(BOT).revoked.is_some());
     assert_eq!(rig.mark_row(), None);
+    assert!(rig.open(&native()));
+}
+
+/// A re-verify on a live link (a new host identity, the link generation
+/// kept, the call's account and genesis the same): hosting swaps in a fresh
+/// store while a continuation asked for the old one is in flight. Its page
+/// doesn't go on from the fresh store's own cursor (it has none), so it is
+/// drained, never the new store's first read, and the feed is asked afresh
+/// from 0 at once: the new identity's store reads its feed from 0
+/// (host-work-v1 §11.4), keeps the old revoke, and stays never read (its
+/// services unchecked) until then. The same when the new store's recovery
+/// restarted the sync in between (its gate then says so).
+#[test]
+fn a_fresh_store_never_takes_an_old_continuations_page_as_its_first_read() {
+    for recovered in [false, true] {
+        let mut rig = rig();
+        let cover = rig.record(FEED, ControlAction::Cover);
+        let revoke = rig.record(
+            FEED,
+            ControlAction::Revoke {
+                interrupt_running: false,
+            },
+        );
+        assert_eq!(rig.heads(FEED, 2), [sync_call(FEED, 0)]);
+        rig.page(FEED, 2, &[(1, &cover), (2, &revoke)]);
+        assert!(rig.feeds.standing(BOT).revoked.is_some());
+        // Record 3 stored: a continuation after 2 goes.
+        rig.pass(SEC);
+        assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)], "{recovered}");
+        let continuation = rig.last();
+        // The verification ends before its answer comes.
+        rig.new_identity();
+        if recovered {
+            rig.sync.restart();
+        }
+        let drained = rig.drained();
+        let hold = rig.record(FEED, ControlAction::Hold);
+        let synced = rig.answer(&continuation, 3, &[(3, &hold)]);
+        assert!(synced.applied.is_empty(), "{recovered}: nothing applies");
+        assert_eq!(rig.drained(), drained + 1, "{recovered}");
+        assert_eq!(rig.sync.dump()["faults"], 0, "{recovered}: no fault");
+        assert_eq!(rig.cursor(), None, "{recovered}");
+        assert!(rig.feeds.never_read(), "{recovered}: no first read");
+        assert_eq!(
+            rig.sync.closed(),
+            Some(if recovered {
+                Closed::Restarted
+            } else {
+                Closed::Behind {
+                    cursor: None,
+                    head: 3,
+                }
+            }),
+            "{recovered}"
+        );
+        assert!(!rig.open(&native()), "{recovered}");
+        // Asked afresh from 0, at once.
+        assert_eq!(synced.next, Some(sync_call(FEED, 0)), "{recovered}");
+        let from_0 = rig.last();
+        assert_ne!(from_0.request_id, continuation.request_id);
+        rig.answer(&from_0, 3, &[(1, &cover), (2, &revoke), (3, &hold)]);
+        assert!(
+            rig.feeds.standing(BOT).revoked.is_some(),
+            "{recovered}: the revoke kept"
+        );
+        assert!(!rig.feeds.never_read(), "{recovered}");
+        assert_eq!(rig.cursor(), Some((FEED.to_string(), 3)), "{recovered}");
+        assert!(rig.open(&native()), "{recovered}");
+    }
+}
+
+/// A read from 0 asked for the old identity's store and answered after a
+/// re-verify swapped in a fresh one applies there: it is a complete read of
+/// the account's feed whatever store asked it (positions are the host's own
+/// Station's, records verify against the same device list, the account and
+/// genesis captured with the call), so the new store is read in full, the
+/// revoke with it.
+#[test]
+fn a_read_from_0_asked_before_a_reverify_reads_the_fresh_store_in_full() {
+    let mut rig = rig();
+    let cover = rig.record(FEED, ControlAction::Cover);
+    let revoke = rig.record(
+        FEED,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    assert_eq!(rig.heads(FEED, 2), [sync_call(FEED, 0)]);
+    let from_0 = rig.last();
+    rig.new_identity();
+    let synced = rig.answer(&from_0, 2, &[(1, &cover), (2, &revoke)]);
+    assert_eq!(synced.applied.len(), 2);
+    assert!(rig.feeds.standing(BOT).revoked.is_some());
+    assert!(!rig.feeds.never_read());
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
     assert!(rig.open(&native()));
 }
 

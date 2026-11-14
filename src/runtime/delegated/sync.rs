@@ -77,7 +77,13 @@
 //!   and `after`), and the link generation and socket, and the account and
 //!   genesis, are those captured with the call; a discovery call's (no
 //!   `feed_id`; this host never makes one) only on the own feed this
-//!   generation's `heads` announced ([`Ask::judge`]). A call is retired by
+//!   generation's `heads` announced ([`Ask::judge`]). A continuation's page
+//!   applies only when its `after` is the committed cursor of the store it
+//!   reaches: a re-verify keeps the link generation, the account and the
+//!   genesis but swaps in a new identity's fresh store, and a continuation
+//!   asked for the old store is drained there (never its first read), the
+//!   feed asked afresh from 0. A read from 0 asked for the old store is a
+//!   complete read of the account's feed, and applies. A call is retired by
 //!   its id when it is answered, when it goes unanswered for 35 seconds
 //!   ([`SYNC_TIMEOUT_MS`]: the Station's agreed 30 and a 5-second grace;
 //!   an hourly Station-fault alert, and a new call with a fresh id goes at
@@ -845,6 +851,28 @@ impl FeedSync {
             return Ok(Synced::default());
         };
         self.observe(Some(cx.feeds));
+        // A continuation goes on from the cursor of the store it was asked
+        // for: one call is live at a time, and only its own page moves a
+        // store's cursor, so a legitimate one always finds it there. One
+        // that doesn't (the store was replaced since: a re-verify on the
+        // same link generation swapped in a new identity's fresh store) is
+        // drained, never that store's first read, and the feed asked
+        // afresh: the new store reads it from 0 (§11.4).
+        if !ask.restart {
+            let at = self
+                .synced
+                .as_ref()
+                .filter(|(feed_id, _)| *feed_id == page.feed_id)
+                .map(|(_, cursor)| *cursor);
+            if at != Some(ask.call.after) {
+                self.drained += 1;
+                let next = self.ask(false);
+                return Ok(Synced {
+                    next,
+                    ..Synced::default()
+                });
+            }
+        }
         // The feed went back under the same id: the answer's `head` below
         // its `after` (no records: the reader refuses any), or below the
         // cursor. A reset: marked (the bridge's next step), the cursor never
