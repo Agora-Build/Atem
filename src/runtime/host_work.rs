@@ -1265,7 +1265,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS intents (
                 task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, reason TEXT NOT NULL,
                 revocation TEXT, created_ms INTEGER NOT NULL, done_ms INTEGER,
-                delivered_turn TEXT);
+                delivered_turn TEXT, delivered_by TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS intents_one
                 ON intents(attempt_id, reason, ifnull(revocation, ''));
             CREATE INDEX IF NOT EXISTS intents_pending ON intents(task_id)
@@ -1274,7 +1274,6 @@ impl Store {
         track_kept_replies(&db)?;
         track_open_records(&db)?;
         track_waits(&db)?;
-        crate::runtime::delegated::intents::track_delivered_by(&db)?;
         std::fs::File::open(state)?.sync_all()?;
         let hints = crate::runtime::delegated::alerts::HintWatch::open(&db)?;
         Ok(Self {

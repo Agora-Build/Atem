@@ -149,26 +149,12 @@ pub struct Intent {
 }
 
 /// `intents.delivered_by`'s value for `work_interrupt`'s delivery (NULL:
-/// the intent's own).
+/// the intent's own; the column is in the table's `CREATE TABLE`, ruling
+/// T27a, with no migration: the table is step 4's and was never released).
 const BY_REQUEST: &str = "work_interrupt";
 
 const COLUMNS: &str = "rowid,task_id,attempt_id,reason,revocation,created_ms,done_ms,\
     delivered_turn,delivered_by IS NOT NULL";
-
-/// The intents table's `delivered_by` column (ruling T27a), added to a
-/// table without it (`ALTER TABLE … ADD COLUMN`, guarded by `pragma
-/// table_info`): NULL, or [`BY_REQUEST`].
-pub(crate) fn track_delivered_by(db: &rusqlite::Connection) -> Result<()> {
-    let there: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('intents') WHERE name='delivered_by')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !there {
-        db.execute_batch("ALTER TABLE intents ADD COLUMN delivered_by TEXT;")?;
-    }
-    Ok(())
-}
 
 fn intent(r: &rusqlite::Row) -> rusqlite::Result<(Intent, bool)> {
     let name: String = r.get(3)?;
