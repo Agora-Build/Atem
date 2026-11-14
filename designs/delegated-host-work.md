@@ -634,7 +634,7 @@ R4 bounds accepted tasks by their original deadline (at most 24 h after admissio
   - A receipt-database fault holds the intents, which live in that database, until the restart it asks for. Recovery
     step 3 (I.6.2) and the first pass carry them out then.
   - A runtime started while paused opens and recovers its store only once hosting is on.
-- **With `host.delegated` turned off after tasks were accepted** (step 4's Decision 10, a debug-only hook), a started
+- **With `host.delegated` turned off after tasks were accepted** (a debug-only hook in step 4), a started
   task's turn is still interrupted at its deadline. Atem-internal.
 
 ### I.4.5 Queries, cancel, complete, replies, and new operations
@@ -877,7 +877,7 @@ identity, `account_id` and `genesis_hash` (R9.2), carried as push hints carry th
 a count, plus the 32 most recent of each, persisted at most once a minute. Alerts for failed or conflicting records are
 rate-limited to one an hour per source, with the count: per origin for a feed, and per carrying principal for records
 that arrive over a channel (II.3.1), which have no origin. A Station or a carrier can't fill a host's storage or
-flood the owner with alerts this way. **Atem's reading (step 4, ruling T32a):** "at most once a minute" is for
+flood the owner with alerts this way. **Atem's reading (step 4):** "at most once a minute" is for
 evidence, which has no effect. A pending record is written in the transaction that applies it, with the cursor
 (I.5.5): it is a deferred effect past the cursor, and a crash before a later write would lose a stop the feed never
 serves again. Its 32-row bound still caps storage, and the cursor's write already costs the transaction.

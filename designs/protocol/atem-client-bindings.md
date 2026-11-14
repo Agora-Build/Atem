@@ -1174,7 +1174,7 @@ Station written in another language uses these exports, which are the
 same code and pass the same vectors and fixtures
 (`r9-vectors-host-work-control`, `r9-control-ack-*`, run by the Rust core
 and all three conformance suites). They are production exports, in the
-default UniFFI build and in the `wasm`-only package (plan decision 6). The
+default UniFFI build and in the `wasm`-only package. The
 wire they read and write is host-work-v1 §11.4 ("Station calls and
 acknowledgments").
 

@@ -1107,7 +1107,7 @@ The rules:
    while a `cover` or `release` is `refused`. A record kept pending or
    refused takes no `record_id`. **Bounded** (**Atem's proposal, agreed with Astation (2026-11-13, #120 comment 6848326392)**:
    stops are never blocked by it, and the floor complements O1 (rule 6),
-   never replaces it; plan decision 19, rulings T4a and T4d): a host
+   never replaces it): a host
    keeps at most 256 counted record ids per principal (`MAX_RECORD_IDS`),
    and the next evicts the oldest, never the record that revoked the
    principal nor the coverage's cover; the principal's **evicted floor**
@@ -1217,10 +1217,10 @@ principal (`ControlState::part`, `from_parts`; the bindings'
 at most its own principal's: the transition names it (`touched`), and the
 host writes only that part in the record's transaction (one row per
 principal), never the whole state. **Every part names its device list**
-(`account_id`, `genesis_hash`; ruling T4c). `from_parts` loads the parts
+(`account_id`, `genesis_hash`). `from_parts` loads the parts
 of the list it is given (the host's pinned device list, never inferred
 from the parts) and **skips every part of another account or genesis,
-reporting its principal for the host to delete** (ruling T4e): an earlier
+reporting its principal for the host to delete**: an earlier
 pairing's leftovers never load, so a service id that recurs in the new list
 inherits no revoke, hold or coverage, while the current list's parts beside
 them (a live re-pair whose old rows weren't deleted yet) load with their
@@ -1237,7 +1237,7 @@ A whole state (`from_json`) is one list's: a part of another list in it
 is refused. A part keeps its records that counted oldest
 first, `[record_id, digest, issued_at]` triples, its evicted floor, and
 what is in force for the principal; the order a release follows keeps
-**one feed per Station origin** (ruling T4b): another feed of the origin
+**one feed per Station origin**: another feed of the origin
 replaces it, never the covering feed's, the only one a release reads (a
 reset's new feed starts after its cover). **Host rule:** a position's
 `origin` is the host's own configured Station origin, the feed it syncs,
@@ -1269,7 +1269,7 @@ or `order`, `after_revoke`, `not_newer`, `possible_replay`,
 amended for step 4), or kept as evidence (`collision`, `possible_replay`):
 `Applied.why`, the host's for its pending store, evidence and alerts.
 
-**On the host (Atem's reading, step 4, rulings T32a and T32b).** A pending
+**On the host (Atem's reading, step 4).** A pending
 record is written in the transaction that applies it, with the cursor
 (design I.5.4's "at most once a minute" is evidence's). While the host's
 device list is frozen, held after a write fault, faulted or gone, a record
@@ -1284,8 +1284,8 @@ and a service sender is answered `busy` until it reads (every request it
 makes: its admission, its own tasks' queries and completion, a notice-only
 `message_publish`, `attachment_put`, `host_profiles`, `host_launch` and
 its query; the owner still reads): never as uncovered, which a revoke or
-hold wouldn't stop. (**Atem's reading**, step 4, Task 32 re-review N2;
-every request, PR 11.) Likewise a delegated sender's request about
+hold wouldn't stop. (**Atem's reading**, step 4.) Likewise a delegated
+sender's request about
 its own task (`work_query`, `reply_query`, `work_cancel`, `work_complete`,
 and `message_query` or a `message_publish` retry of its message) is `busy`
 while its current grant's `projects` comparison can't be made yet (a
@@ -1321,11 +1321,11 @@ applies again; what needs the session host comes after that commit.
   which the fence ends (`sender's authority changed`). The fence runs after
   the record's commit; a run that ends between the two loses it, so a
   loaded control state that shows a service revoked while the session
-  host still grants it `control` writes its fence then, once (Task 37
-  review I1): its v1 tasks end the same way, never holding their sessions
+  host still grants it `control` writes its fence then, once: its v1
+  tasks end the same way, never holding their sessions
   until their deadlines.
 - **No service holds session-v1 while the control state is unchecked**
-  (rulings T35c, T35d and T35e, **Atem's reading, for Astation**), on a
+  (**Atem's reading, for Astation**), on a
   host that keeps a control state: a host-work store whose control tables
   exist (read once when the store opens), whichever host identity it is
   bound to, or a store that exists and can't be opened or read. With
@@ -1346,19 +1346,19 @@ applies again; what needs the session host comes after that commit.
     short keeps the mark across a crash. Without a Station link, the state
     stays unread;
   - is another identity's: the store is still bound to the identity before
-    a re-verify or a re-pair (revoke is final, ruling T35e). This identity
+    a re-verify or a re-pair (revoke is final). This identity
     never read its feed: hosting replaces the store with this identity's,
     unread (above), at its next pass while on, or when it resumes; so does
     an owner's command that opens the store while hosting is paused
     (`atem task list --unknown`, `atem task resolve`, `atem message
-    status`; ruling T35f, m4). The new store is built whole beside the old
-    one and renamed over it, the old one kept aside (ruling T35f, m1): a
+    status`). The new store is built whole beside the old
+    one and renamed over it, the old one kept aside: a
     failure or a crash at any step leaves the old store or the whole new
     one, never no control state. Meanwhile the old identity's standings
     refuse nothing for it: a service it revoked is `busy` like every
     other. A store never bound yet (a fresh one, loaded while hosting was
     paused before its first use) is this identity's at its first use,
-    which binds it (ruling T35f, m3).
+    which binds it.
 
   Meanwhile every service's `hello` that the device list would admit is
   refused `busy`, `revocations not yet checked` (the device-list decision
@@ -1391,15 +1391,15 @@ applies again; what needs the session host comes after that commit.
 - **`cover`** changes no task: the service's later tasks are delegated.
 - **While hosting is paused** (stopped, or a `runtime.toml` that doesn't
   load), the control state still loads when the store is bound to the
-  host's current identity (ruling T35d, A): the store is opened for it, the
+  host's current identity: the store is opened for it, the
   records still apply with their effects, and the withdrawals and intents
   they ask for are carried out (a stop always wins); before the start's
   recovery they wait for it. A revoked service stays refused and the
   others are admitted. A store bound to another identity (hosting paused
   across a re-verify) is never loaded while paused, and the pass never
   moves it aside then; hosting replaces it when it resumes, and an
-  owner's command that opens the store does so meanwhile (above; ruling
-  T35f, m4), after which this identity's store loads and reads its feed
+  owner's command that opens the store does so meanwhile (above), after
+  which this identity's store loads and reads its feed
   while paused. Until then, and until the new store's first complete
   read, every service is `busy` (above).
 - **With `host.delegated` off** (the hook removed with delegated tasks
@@ -1895,7 +1895,7 @@ Vectors:
 - `fixtures/r9-vectors-push-hint.json`: the hints, and
   `outcome_unknown_invalid_facts` (a `local` and a browser grant's task,
   and, **for Astation** (amended for step 4: the deferred blank-reason
-  vector Astation's review of PR 2 asked for before phone hint support is
+  vector Astation's review of #156 asked for before phone hint support is
   accepted, #120 comment 6848326392), a delegated task whose `reason` is
   blank, a space, a no-break space and an ideographic space, with no
   control or format character, so only the blank rule refuses it: each
@@ -2079,7 +2079,7 @@ messages, not these rules):
       the caller). It keeps at most one live call per link generation. An
       id is a correlation value, never authorization: a retired, timed-out,
       unsolicited or old-generation result advances nothing and can't
-      reopen the gate. **Built on the host (step 4, C1b; Atem's reading
+      reopen the gate. **Built on the host (step 4; Atem's reading
       of the transition, for Astation, #120):** Astation asked to keep the
       one-owed-call-per-physical-socket rule until this amendment is built
       and jointly tested, and never to retry uncorrelated. Every retry is
@@ -2195,7 +2195,7 @@ host's call on the link with exactly one of:
   carries no request id (a `control_sync`'s `request_id` is never echoed in
   one: wire rule 11) and must not complete or correlate a request.
   (**Atem's reading, for Astation's agreement**, step 4, 2026-11-13; with
-  correlation, C1b: a refusal names a call kind, not a request: it
+  correlation: a refusal names a call kind, not a request: it
   completes and matches none; on that kind the host backs off (its
   device-list fetch 30 s, ended by the link's next generation) and retires
   what it had live of that kind on the link: a `control_sync` by its id,
@@ -2265,9 +2265,9 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
   later wire item. "Up to a deferred entry" is the host's fetch, under that
   same announced head, stopping at an entry its list still defers.)
 
-**On the host (Atem's readings, step 4, Task 33, for Astation's
-information unless marked; nothing on the wire changes).** The host syncs
-only its own Station's feed (step 4's Decision 14):
+**On the host (Atem's readings, step 4, for Astation's information
+unless marked; nothing on the wire changes).** The host syncs only its
+own Station's feed:
 
 - **What a `heads` announces** (**for Astation's agreement**: it narrows
   the table's "each feed covering a principal with work on this host").
@@ -2344,8 +2344,8 @@ only its own Station's feed (step 4's Decision 14):
   finds the host at that head (after a restart, a refusal or a fault)
   moves nothing as expected and pauses nothing, and so does a fetch's
   carriage that finds the list at its head (another carrier brought it
-  there) (Task 37: each delayed the next record or entry by up to 30
-  seconds, its gate closed meanwhile).
+  there) (a pause there would delay the next record or entry by up to
+  30 seconds, its gate closed meanwhile).
   **The head named for a call** (a `control_sync` or a
   `membership_fetch`) is the highest the Station has named since the call
   was sent, the same for both: the head the call was sent for, the head of
@@ -2353,8 +2353,8 @@ only its own Station's feed (step 4's Decision 14):
   those naming its feed), and the head of the answer itself, a page's or a
   result's. A `heads` that names a lower head in flight, the host's own
   included, lowers nothing: a Station can't skip the 30 seconds by
-  naming the host's head after it announced a higher one (Task 37
-  re-review N1). The gate keeps reading the last announced head: only the
+  naming the host's head after it announced a higher one. The gate
+  keeps reading the last announced head: only the
   pause is judged this way. A call sent while the host was already at the
   head (a resynchronization's) has nothing to be behind unless a later
   `heads` or its answer names more.
@@ -2364,7 +2364,7 @@ only its own Station's feed (step 4's Decision 14):
   until its read from 0 begins, so it costs at most one call per page the
   Station answers.
 - **Matching a page to its call** (wire rule 11; **Atem's reading of the
-  transition, for Astation**, C1b, see rule 11's "Built on the host").
+  transition, for Astation**, see rule 11's "Built on the host").
   - **A fresh id per call.** Every `control_sync` gets a fresh lowercase
     UUID v4 `request_id` from the host's CSPRNG: a retry and a new link
     generation's call too, even at the same cursor. One call is live at a
@@ -2376,7 +2376,7 @@ only its own Station's feed (step 4's Decision 14):
     were loaded for). For a discovery call (no `feed_id`, `after: 0`; this
     host never makes one) the page's feed must also be the own feed this
     generation's `heads` announced.
-  - **The deadline** (**Atem-internal**, step 4, C1b-b; nothing on the
+  - **The deadline** (**Atem-internal**, step 4; nothing on the
     wire changes). The Station's agreed deadline is 30 seconds (a bounded
     result, or the link fenced). The host retires a call 35 seconds after
     it asked it: a 5-second grace, so a result the Station writes just
@@ -2473,7 +2473,7 @@ only its own Station's feed (step 4's Decision 14):
   native-signed record until every effect it carries is in force on every
   host it covers.
 
-**On the host (step 4, Task 36; behind the debug-only `host.delegated`
+**On the host (step 4; behind the debug-only `host.delegated`
 hook, so no release build sends one).** The host's book of what it owes
 its own Station (`src/runtime/delegated/acks.rs`, the `control_acks`
 table of `host-work.sqlite`, made only with the hook on):
@@ -2554,7 +2554,8 @@ table of `host-work.sqlite`, made only with the hook on):
   of no record).
 - **A refusal** (**Atem's reading, for Astation**). A `control_ack_refused`
   advances nothing in the book (no result taken as delivered or dropped,
-  no resend's schedule moved) and closes the gates (Decision 20); the host
+  no resend's schedule moved) and closes the gate, as each of the three
+  refusals does on the host (above); the host
   sends no more acks on that connection, since an ack's claim is its
   link's association or it isn't, and resumes at the next connection,
   where every result sent on the refused one goes again, those that go
