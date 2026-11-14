@@ -225,6 +225,38 @@ impl Dev {
         r.close(&self.handle);
     }
 
+    /// Atem closes the channel (a fence): what it sent before the close
+    /// (the backlog first, a fence's `error` last), and the close's reason.
+    pub fn until_closed(mut self, r: &mut Router) -> (Vec<Value>, Option<String>) {
+        let mut seen = std::mem::take(&mut self.backlog);
+        loop {
+            match r.next(&self.handle) {
+                Out::Close(reason) => return (seen, reason),
+                Out::Frame(frame) => {
+                    let Ok(events) = self.a.on_frame(&frame, client_ms()) else {
+                        continue;
+                    };
+                    for e in events {
+                        match e {
+                            Event::Family(f) => seen.extend(f.data),
+                            Event::Session(m) => seen.push(
+                                atem_client::session::wire::to_value(
+                                    &atem_client::session::wire::Envelope::Session(m),
+                                )["data"]
+                                    .clone(),
+                            ),
+                            Event::Error(e) | Event::Fenced(e) => seen.push(
+                                serde_json::from_slice::<Value>(&e.to_bytes()).unwrap()["data"]
+                                    .clone(),
+                            ),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A session it launches on profile `backend`: its `launch` (session
     /// id and process generation).
     pub fn session(&mut self, r: &mut Router) -> Value {

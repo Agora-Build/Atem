@@ -4255,6 +4255,15 @@ impl<J: Journal> SessionHost<J> {
             // recorded either: the restart resolves it (it stays accepted).
             return;
         }
+        // Debug builds: the runtime is killed here, a host-work attempt's
+        // `executing` durable and its prompt not dispatched (VII.A test 7).
+        #[cfg(not(test))]
+        if is_host_work(&self.receipts[rid].stored.principal) {
+            crate::runtime::test_hooks::crash_point(
+                "crash_after_executing",
+                "after a host-work attempt's executing record, before its dispatch",
+            );
+        }
         let now = self.now;
         let e = self.receipts.get_mut(rid).unwrap();
         if matches!(e.stored.kind, ReceiptKind::Interrupt | ReceiptKind::Stop) {

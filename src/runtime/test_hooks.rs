@@ -127,6 +127,22 @@
 //! - `<ATEM_TEST_PTY_FAULTS dir>/crash_after_attempt_commit`: the runtime
 //!   kills itself (`SIGKILL`) right after the next delegated attempt's row
 //!   committed, before its submit (VII.A test 7).
+//! - VII.A test 7's other crash points (Task 37), each a marker in the same
+//!   directory, used once: the runtime kills itself (`SIGKILL`) at the
+//!   point, after a `runtime.log` line naming it (`crash_point`):
+//!   - `crash_after_executing`: right after a `host-work` attempt's
+//!     `executing` record is durable, before its prompt is dispatched;
+//!   - `crash_during_record_application`: in a control page's transaction,
+//!     right after its first record applied with its effects, before the
+//!     commit;
+//!   - `crash_after_page_commit`: right after a control page that applied a
+//!     record committed, before its followups (withdrawals, fences,
+//!     intents) and its acknowledgments;
+//!   - `crash_after_ack_handoff`: right after acknowledgments carrying a
+//!     result were handed to the link, before their sent marks are written.
+//!
+//!   While `<dir>/hold_crash` exists a crash point that fired waits before
+//!   the kill (the link's writer goes on), so a test can see what went out.
 //! - `<ATEM_TEST_PTY_FAULTS dir>/hold_host_work`: while it exists,
 //!   host-work's scheduling pass (`schedule_work`) doesn't run: requests
 //!   are still answered and the start's recovery still runs, but no task is
@@ -419,6 +435,10 @@ mod imp {
         faults_dir().is_some_and(|dir| dir.join("hold_host_work").exists())
     }
 
+    pub fn crash_held() -> bool {
+        faults_dir().is_some_and(|dir| dir.join("hold_crash").exists())
+    }
+
     pub fn no_init_limit() -> bool {
         static CELL: OnceLock<bool> = OnceLock::new();
         *CELL.get_or_init(|| std::env::var_os("ATEM_TEST_NO_INIT_LIMIT").is_some())
@@ -633,6 +653,23 @@ pub fn crash_after_attempt_commit() -> bool {
     return imp::take_fault("crash_after_attempt_commit");
     #[cfg(not(debug_assertions))]
     false
+}
+
+/// A crash point of VII.A test 7 (`<ATEM_TEST_PTY_FAULTS dir>/<name>`,
+/// once; the module docs): the runtime kills itself (`SIGKILL`) here, after
+/// a `runtime.log` line saying `what`, waiting first while
+/// `<dir>/hold_crash` exists. Release builds: never.
+#[cfg_attr(test, allow(dead_code))]
+pub fn crash_point(_name: &str, _what: &str) {
+    #[cfg(debug_assertions)]
+    if imp::take_fault(_name) {
+        eprintln!("atem runtime: test hook: killed {_what}");
+        while imp::crash_held() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // SAFETY: signals this process; nothing after it runs.
+        unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+    }
 }
 
 /// The next device-list write fault (`<file>:<step>`), once.

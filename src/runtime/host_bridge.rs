@@ -1720,6 +1720,15 @@ impl HostBridge {
                 acked.push(due);
             }
         }
+        // Debug builds: the runtime is killed here, results handed to the
+        // link and not marked sent (VII.A test 7).
+        #[cfg(not(test))]
+        if acked.iter().any(|due| !due.ack.results.is_empty()) {
+            crate::runtime::test_hooks::crash_point(
+                "crash_after_ack_handoff",
+                "after handing acknowledgments to the link, before their sent marks",
+            );
+        }
         self.acks_sent(&acked);
         self.publish_feed_gates();
         self.refresh_fetch_view();

@@ -1452,6 +1452,13 @@ fn apply_page(
                     followups.extend(act(store, &tx, &a.actions)?);
                     acked.push(Acked::of(&record, &a, Some(&at)));
                     applied.push((at, a));
+                    // Debug builds: the runtime is killed here, the record
+                    // applied in the open transaction (VII.A test 7).
+                    #[cfg(not(test))]
+                    crate::runtime::test_hooks::crash_point(
+                        "crash_during_record_application",
+                        "while applying a control record, before its transaction's commit",
+                    );
                     if revoked {
                         for again in feeds.reverify_pending(&tx, list, applied_seq)? {
                             followups.extend(act(store, &tx, &again.applied.actions)?);
@@ -1497,6 +1504,15 @@ fn apply_page(
     }
     feeds.acknowledge(&tx, &acked)?;
     feeds.commit(tx)?;
+    // Debug builds: the runtime is killed here, the page's records stored
+    // and nothing of their followups or acknowledgments done (VII.A test 7).
+    #[cfg(not(test))]
+    if !applied.is_empty() {
+        crate::runtime::test_hooks::crash_point(
+            "crash_after_page_commit",
+            "after a control page's commit, before its followups and acknowledgments",
+        );
+    }
     Ok(Synced {
         applied,
         reapplied,

@@ -19,8 +19,8 @@ mod support;
 use atem_client::connect::{Event as ClientEvent, Identity};
 use atem_client::control::relay::MAX_RELAY_MESSAGE_BYTES;
 use atem_client::control::{
-    CallRefused, ControlAction, ControlSync, ControlSyncResult, FeedEntry, MembershipFetch,
-    MembershipFetchResult, RefusalCode, RefusedCall, RelayError, ToStation,
+    AckResult, CallRefused, ControlAck, ControlAction, ControlSync, ControlSyncResult, FeedEntry,
+    MembershipFetch, MembershipFetchResult, RefusalCode, RefusedCall, RelayError, ToStation,
 };
 use atem_client::membership::ServiceScope;
 use serde_json::{Value, json};
@@ -34,9 +34,9 @@ use support::astation::{
 };
 use support::delegated::WAIT;
 use support::delegated::{
-    Dev, HostIds, HostRig, all_intents, complete_turn, enqueue, escs, host_db, hosting_toml,
-    in_turn, intents, never_ran, private, record, refused_hello, replace, stored, take_over, task,
-    uuid, wait_stored,
+    Dev, HostIds, HostRig, all_intents, complete_turn, enqueue, enqueue_data, escs, host_db,
+    hosting_toml, in_turn, input, intents, never_ran, private, record, refused_hello, replace,
+    stored, take_over, task, uuid, wait_stored,
 };
 use support::host_clock::HostClock;
 use support::r9::{Router, write_pin};
@@ -267,8 +267,12 @@ impl Rig {
         // A killed runtime's socket file and state dump aren't the new one's.
         let _ = std::fs::remove_file(self.sandbox.config().join("runtime.socket"));
         let _ = std::fs::remove_file(self.dump_file());
+        // The broker faults and crash points (`ATEM_TEST_PTY_FAULTS`):
+        // nothing acts until a test puts a marker there ([`Rig::fault`]).
+        std::fs::create_dir_all(self.faults()).unwrap();
         command
             .arg("runtime")
+            .env("ATEM_TEST_PTY_FAULTS", self.faults())
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &self.sandbox.home)
             .env("XDG_RUNTIME_DIR", &self.sandbox.run)
@@ -311,6 +315,34 @@ impl Rig {
         let mut child = self.runtime.take().expect("a runtime");
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    /// The runtime killed itself (a crash point, [`Rig::fault`]): it exited
+    /// on `SIGKILL` (within a minute: a crash point that never fired fails
+    /// the test, never hangs it).
+    fn died(&mut self) {
+        use std::os::unix::process::ExitStatusExt;
+        self.sandbox.track();
+        let child = self.runtime.as_mut().expect("a runtime");
+        let mut status = None;
+        within("the runtime to die", || {
+            status = child.try_wait().unwrap();
+            status.is_some()
+        });
+        self.runtime = None;
+        let status = status.unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+    }
+
+    /// The broker faults' directory (`ATEM_TEST_PTY_FAULTS`).
+    fn faults(&self) -> PathBuf {
+        self.sandbox.dir.path().join("faults")
+    }
+
+    /// Arms the broker fault or crash point `name` (its marker; a crash
+    /// point is used once).
+    fn fault(&self, name: &str) {
+        private(&self.faults().join(name), "");
     }
 
     /// A runtime again (after [`Rig::kill`]), on a new link.
@@ -1270,7 +1302,14 @@ fn a_remote_task_waits_revocations_not_yet_checked_until_the_gate_opens() {
         admission(&rig, &native["task_id"])["principal"],
         format!("member:{PHONE}")
     );
+    // Once the host dropped its channel: until a close reaches the host,
+    // the phone's caught-up channel would pass its gate (I.5.8, "Native
+    // senders"; C1b flake, its siblings).
+    let open = rig.dump()["channels"].as_u64().unwrap();
     phone.close(&mut r);
+    rig.within("the phone's channel closed", || {
+        rig.dump()["channels"].as_u64() == Some(open - 1)
+    });
     complete_turn(&rig, &busy["task_id"]);
     wait_stored(&rig, &native["task_id"], "blocked", GATE_CLOSED);
     rig.status_feeds(&format!("{GATE_CLOSED} (waiting for the Station's heads)"));
@@ -3013,4 +3052,748 @@ fn a_late_refusal_retires_the_live_call_and_costs_liveness_only() {
     rig.serve_until("open again", |rig| rig.gate_open());
     assert_ne!(rig.part(&principal), Some(covered), "the hold applied");
     assert_eq!(rig.syncs().last(), Some(&rig.sync(1)));
+}
+
+// ── VII.A against the fake Station (Task 37) ──
+
+/// The id of the record at `seq` of the fake Station's served feed.
+fn record_id_at(rig: &Rig, seq: u64) -> String {
+    let station = rig.station();
+    let records = station.records();
+    let (_, record) = records
+        .iter()
+        .find(|(at, _)| *at == seq)
+        .unwrap_or_else(|| panic!("no record at {seq}"));
+    record.record_id().to_owned()
+}
+
+/// A record of the Station's about `service`, stored at the feed's next
+/// position (announced only when the test says): its position and id.
+fn append_id(rig: &Rig, service: &str, action: ControlAction) -> (u64, String) {
+    let at = rig.append(service, action);
+    (at, record_id_at(rig, at))
+}
+
+/// What the Station's reference ledger counted of the host's results:
+/// (principal, effect, record id), in order, each for the host.
+fn counted(rig: &Rig) -> Vec<(String, String, String)> {
+    rig.station().acks().to_json()["done"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            assert_eq!(d["host"], HOST, "{d}");
+            let text = |k: &str| d[k].as_str().unwrap().to_string();
+            (text("principal"), text("effect"), text("record_id"))
+        })
+        .collect()
+}
+
+/// The effects and results of `record_id` in `ack`, as wire codes.
+fn result_in(ack: &ControlAck, record_id: &str) -> Option<Vec<(String, String)>> {
+    ack.results.iter().find_map(|r| match r {
+        AckResult::Record {
+            record_id: id,
+            effects,
+        } if id == record_id => Some(
+            effects
+                .iter()
+                .map(|e| (e.effect.code().to_string(), e.result.code().to_string()))
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
+/// How many of the host's acks the Station read so far carry a result for
+/// `record_id`.
+fn acks_naming(rig: &Rig, record_id: &str) -> usize {
+    rig.station()
+        .acks_sent()
+        .iter()
+        .filter(|ack| result_in(ack, record_id).is_some())
+        .count()
+}
+
+/// The host's next ack on `link` carrying a result for `record_id`, held
+/// uncounted (the acks before it counted, every call answered): the held
+/// ack and what it says.
+fn hold_ack_of(rig: &Rig, link: u64, record_id: &str) -> (Held, ControlAck) {
+    loop {
+        let held = rig.station().hold_ack(link);
+        let Ok(ToStation::ControlAck(ack)) = held.call() else {
+            panic!("not an ack");
+        };
+        if result_in(&ack, record_id).is_some() {
+            return (held, ack);
+        }
+        rig.station().answer_held(held).unwrap();
+    }
+}
+
+/// The host's own Station's feed cursor as stored (`control_feeds`), none
+/// before the feed was read.
+fn stored_cursor(rig: &Rig) -> Option<u64> {
+    rig.db()
+        .query_row(
+            "SELECT cursor FROM control_feeds WHERE origin=?1",
+            [rig.origin()],
+            |r| r.get::<_, i64>(0),
+        )
+        .ok()
+        .map(|c| c as u64)
+}
+
+/// The host's book row for `record_id` (`control_acks`): its effects and
+/// whether a send of it is marked; none without one.
+fn ack_row(rig: &Rig, record_id: &str) -> Option<(String, bool)> {
+    rig.db()
+        .query_row(
+            "SELECT effects, sent_gen IS NOT NULL FROM control_acks WHERE key=?1",
+            [record_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
+}
+
+/// The tasks the host's store holds (their ids).
+fn task_ids(rig: &Rig) -> Vec<String> {
+    let db = rig.db();
+    let mut q = db.prepare("SELECT id FROM work ORDER BY rowid").unwrap();
+    q.query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// VII.A test 3, its first half (design I.3.3 "Revocation", I.5.5 steps 1
+/// and 2; host-work-v1 §11.1, "The effects on tasks, as built in step 4"):
+/// the Station revokes the covered service without `interrupt_running`
+/// while its task's turn runs, a second of its tasks and the phone's task
+/// queued behind it. The service's queued task is cancelled (`sender
+/// revoked`), never run; its running turn is left alone (no intent, no
+/// Esc) and finishes. That task then awaits a result nobody may complete,
+/// and expires at its deadline. The phone's task, another sender's, runs
+/// once the turn ends. The revoke's result reaches the Station only once
+/// the service is fenced (Task 36 review note 3, as its re-review worded
+/// it: on the wire the `control_ack` may precede the channel's `close`
+/// within one pass, but nothing of the service's is admitted once the ack
+/// went): a task it sends when the Station holds the ack is never stored,
+/// its channel closes after `unauthorized`, `revoked`, and its next
+/// `hello` is refused so. The ledger counts the revocation once,
+/// `applied`.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn revoke_without_interrupt_lets_the_running_turn_finish() {
+    let rig = Rig::full(Via::Local);
+    let link = rig.link();
+    let mut r = Router::on(&rig.astation, link);
+    rig.cover_and_open();
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    let launch = svc.session(&mut r);
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let running = task(IDS, &launch, "REVOKED_TURN_RUNS", HOUR);
+    let queued = task(IDS, &launch, "REVOKED_QUEUED", HOUR);
+    let other = task(IDS, &launch, "ANOTHER_SENDERS", HOUR);
+    enqueue(&mut svc, &mut r, &running);
+    enqueue(&mut svc, &mut r, &queued);
+    enqueue(&mut phone, &mut r, &other);
+    in_turn(&rig, &running["task_id"], "REVOKED_TURN_RUNS");
+    for t in [&queued, &other] {
+        wait_stored(&rig, &t["task_id"], "blocked", BEHIND);
+    }
+    // The revoke: its page answered, its result's ack held.
+    let (at, revoke) = append_id(
+        &rig,
+        SVC,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    rig.clock.add_mono(1_000);
+    let sync = {
+        let mut station = rig.station();
+        station.heads_now();
+        station.hold_call(link)
+    };
+    assert_eq!(sync_of(&sync), rig.sync(1));
+    rig.station().answer_held(sync).unwrap();
+    let (held, ack) = hold_ack_of(&rig, link, &revoke);
+    assert_eq!(
+        result_in(&ack, &revoke).unwrap(),
+        [("revocation".to_string(), "applied".to_string())]
+    );
+    assert_eq!(ack.cursor, at);
+    // The service fenced by then: a task it sends now is never stored.
+    let late = task(IDS, &launch, "SENT_AFTER_THE_ACK", HOUR);
+    svc.send(&mut r, enqueue_data(IDS, &late));
+    let (seen, _) = svc.until_closed(&mut r);
+    let fence = seen
+        .iter()
+        .find(|v| v["code"] == "unauthorized")
+        .unwrap_or_else(|| panic!("no fence: {seen:?}"));
+    assert_eq!(fence["detail"], "revoked", "{fence}");
+    rig.two_passes();
+    let late_id = late["task_id"].as_str().unwrap().to_string();
+    assert!(
+        !task_ids(&rig).contains(&late_id),
+        "a revoked request stored"
+    );
+    assert_eq!(
+        refused_hello(&mut r, IDS, &rig.log, SVC, true),
+        ("unauthorized".to_string(), Some("revoked".to_string()))
+    );
+    // The ack counted: the revocation, once.
+    rig.station().answer_held(held).unwrap();
+    let principal = format!("service:{SVC}");
+    assert_eq!(
+        counted(&rig),
+        [(principal.clone(), "revocation".to_string(), revoke.clone())]
+    );
+    // The queued task cancelled; the running turn left alone.
+    wait_stored(&rig, &queued["task_id"], "cancelled", REVOKED);
+    let tid = &running["task_id"];
+    assert!(intents(&rig, tid).is_empty(), "no intent");
+    assert_eq!(escs(&rig), 0, "no interrupt");
+    assert_eq!(stored(&rig, tid)["state"], "submitted");
+    // It finishes, and awaits a result; the phone's task runs then.
+    complete_turn(&rig, tid);
+    in_turn(&rig, &other["task_id"], "ANOTHER_SENDERS");
+    complete_turn(&rig, &other["task_id"]);
+    // Nobody completes the revoked service's: it expires at its deadline.
+    rig.clock.add_mono(HOUR + MIN);
+    wait_stored(&rig, tid, "expired", "expired awaiting a result");
+    never_ran(&rig, &queued["task_id"], "REVOKED_QUEUED");
+    let text = input(&rig);
+    for prompt in ["REVOKED_TURN_RUNS", "ANOTHER_SENDERS"] {
+        assert_eq!(text.matches(prompt).count(), 1, "{prompt}");
+    }
+    assert!(!text.contains("SENT_AFTER_THE_ACK"));
+    assert_eq!(escs(&rig), 0);
+    // Nothing counted twice, none refused.
+    rig.station().serve(rig.link());
+    assert_eq!(
+        counted(&rig),
+        [(principal, "revocation".to_string(), revoke)]
+    );
+    assert!(rig.station().ack_refusals().is_empty());
+}
+
+/// VII.A test 3, its second half (design I.5.5 step 3, I.5.7; session-v1
+/// R9.14 item 5), on a host whose Station link is Astation's own (the
+/// routed twins are above): the phone, a native member holding `control`,
+/// takes the session's lease over from the covered service's running turn;
+/// the Station then revokes the service with `interrupt_running: true`.
+/// Its queued task is cancelled; an intent (`revoke`) is written for the
+/// running attempt and carried out with host authority: the phone's lease
+/// is revoked (`lease_changed`, `revoked`) and one Esc written. The turn
+/// ends interrupted: `turn interrupted`. The ledger counts the revocation
+/// and the interrupt, once each. A restart writes no second Esc (the
+/// intent is done), and the service stays refused.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn revoke_with_interrupt_after_a_native_takeover() {
+    let mut rig = Rig::full(Via::Local);
+    let principal = format!("service:{SVC}");
+    let (first, second, revoke) = {
+        let mut r = Router::on(&rig.astation, rig.link());
+        rig.cover_and_open();
+        let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+        let launch = svc.session(&mut r);
+        let sid = launch["session_id"].as_str().unwrap().to_string();
+        let first = task(IDS, &launch, "TAKEN_OVER_TURN", HOUR);
+        let second = task(IDS, &launch, "TAKEN_OVER_BEHIND", HOUR);
+        for t in [&first, &second] {
+            enqueue(&mut svc, &mut r, t);
+        }
+        in_turn(&rig, &first["task_id"], "TAKEN_OVER_TURN");
+        wait_stored(&rig, &second["task_id"], "blocked", BEHIND);
+        let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+        take_over(&mut phone, &mut r, &sid);
+        assert_eq!(escs(&rig), 0);
+        let (at, revoke) = append_id(
+            &rig,
+            SVC,
+            ControlAction::Revoke {
+                interrupt_running: true,
+            },
+        );
+        rig.clock.add_mono(1_000);
+        rig.announce();
+        rig.serve_until("the revoke read", |rig| rig.cursor() == Some(at));
+        wait_stored(&rig, &second["task_id"], "cancelled", REVOKED);
+        let tid = &first["task_id"];
+        within("the revoke's interrupt", || {
+            intents(&rig, tid)
+                .first()
+                .is_some_and(|i| i.delivered_turn.is_some())
+        });
+        let stored_intents = intents(&rig, tid);
+        let [intent] = stored_intents.as_slice() else {
+            panic!("one intent: {stored_intents:?}");
+        };
+        assert_eq!(
+            (intent.reason.as_str(), intent.revocation.as_deref()),
+            ("revoke", Some(revoke.as_str()))
+        );
+        assert_eq!(
+            intent.attempt_id,
+            stored(&rig, tid)["receipt_id"].as_str().unwrap()
+        );
+        within("the Esc", || escs(&rig) == 1);
+        takeover_revoked(&mut phone, &mut r);
+        // Counted: the revocation and its interrupt, each once.
+        rig.serve_until("both effects counted", |rig| counted(rig).len() == 2);
+        assert_eq!(
+            counted(&rig),
+            [
+                (principal.clone(), "revocation".to_string(), revoke.clone()),
+                (principal.clone(), "interrupt".to_string(), revoke.clone()),
+            ]
+        );
+        std::fs::write(rig.fake.join("interrupt"), "").unwrap();
+        wait_stored(&rig, tid, "awaiting_result", "turn interrupted");
+        within("the intent done", || intents(&rig, tid)[0].done);
+        (first, second, revoke)
+    };
+    // A restart: the intent stays done, no second Esc; still refused.
+    rig.kill();
+    rig.start_again();
+    rig.open_gate();
+    rig.two_passes();
+    let mut r = Router::on(&rig.astation, rig.link());
+    assert_eq!(
+        refused_hello(&mut r, IDS, &rig.log, SVC, true),
+        ("unauthorized".to_string(), Some("revoked".to_string()))
+    );
+    assert_eq!(escs(&rig), 1);
+    assert_eq!(intents(&rig, &first["task_id"]).len(), 1);
+    assert_eq!(
+        stored(&rig, &first["task_id"])["detail"],
+        "turn interrupted"
+    );
+    never_ran(&rig, &second["task_id"], "TAKEN_OVER_BEHIND");
+    assert_eq!(input(&rig).matches("TAKEN_OVER_TURN").count(), 1);
+    rig.serve_until("the results sent again", |rig| {
+        acks_naming(rig, &revoke) >= 2
+    });
+    assert_eq!(counted(&rig).len(), 2, "nothing counted twice");
+    assert!(rig.station().ack_refusals().is_empty());
+}
+
+/// VII.A test 4, its first half (design I.5.8 "When the gate closes",
+/// I.3.3 "Host cut off from its control feed"): the host goes offline (its
+/// link drops, and Astation refuses it for a while) with the covered
+/// service's task in its turn and another of its tasks queued behind it.
+/// Meanwhile the Station revokes the service and the turn ends: the queued
+/// task doesn't start (`revocations not yet checked`, the gate closed with
+/// the link). Back online, the gate stays closed until the host read the
+/// revoke, whose page cancels the queued task (`sender revoked`): it never
+/// started. The turn that ended awaits its result, and the revocation is
+/// counted once.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn revoke_while_offline_then_reconnect_never_starts() {
+    let rig = Rig::full(Via::Local);
+    let dropped = rig.link();
+    let (running, queued) = {
+        let mut r = Router::on(&rig.astation, dropped);
+        rig.cover_and_open();
+        let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+        let launch = svc.session(&mut r);
+        let running = task(IDS, &launch, "OFFLINE_RUNNING", HOUR);
+        let queued = task(IDS, &launch, "OFFLINE_QUEUED", HOUR);
+        for t in [&running, &queued] {
+            enqueue(&mut svc, &mut r, t);
+        }
+        in_turn(&rig, &running["task_id"], "OFFLINE_RUNNING");
+        wait_stored(&rig, &queued["task_id"], "blocked", BEHIND);
+        (running, queued)
+    };
+    // Offline, and kept so.
+    *rig.astation.auth.lock().unwrap() = AuthReply::Deny("not now".into());
+    rig.astation.close(dropped);
+    rig.until_station("the link down", |s| s["link"].is_null());
+    // Meanwhile: the Station's revoke, and the turn ends.
+    let (at, revoke) = append_id(
+        &rig,
+        SVC,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    complete_turn(&rig, &running["task_id"]);
+    wait_stored(&rig, &queued["task_id"], "blocked", GATE_CLOSED);
+    rig.two_passes();
+    assert!(rig.dump()["station"]["link"].is_null(), "still offline");
+    never_ran(&rig, &queued["task_id"], "OFFLINE_QUEUED");
+    // Back online: closed until the revoke is read.
+    *rig.astation.auth.lock().unwrap() = AuthReply::Authenticated;
+    let link = rig.next_link(dropped);
+    rig.link.set(link);
+    rig.until_station("the link back", |s| !s["link"].is_null());
+    rig.clock.add_mono(1_000);
+    let call = {
+        let mut station = rig.station();
+        station.on_link(link);
+        station.heads_now();
+        station.hold_call(link)
+    };
+    assert_eq!(sync_of(&call), rig.sync(at - 1));
+    rig.two_passes();
+    assert!(!rig.gate_open());
+    assert_eq!(stored(&rig, &queued["task_id"])["detail"], GATE_CLOSED);
+    never_ran(&rig, &queued["task_id"], "OFFLINE_QUEUED");
+    rig.station().answer_held(call).unwrap();
+    wait_stored(&rig, &queued["task_id"], "cancelled", REVOKED);
+    rig.serve_until("open again", |rig| rig.gate_open());
+    never_ran(&rig, &queued["task_id"], "OFFLINE_QUEUED");
+    assert_eq!(
+        stored(&rig, &running["task_id"])["state"],
+        "awaiting_result"
+    );
+    assert_eq!(input(&rig).matches("OFFLINE_RUNNING").count(), 1);
+    rig.serve_until("the revocation counted", |rig| !counted(rig).is_empty());
+    assert_eq!(
+        counted(&rig),
+        [(format!("service:{SVC}"), "revocation".to_string(), revoke)]
+    );
+}
+
+/// VII.A test 4, its second half ("Kill the runtime during the sync and
+/// repeat"; Task 35 review, notes for Task 37: no partial cursor, tasks or
+/// intents; a restart with a damaged control state and a revoked service
+/// holding a pre-cover v1 task): the runtime is killed (`SIGKILL`) during
+/// the sync that brings a revoke of the service, three times. The phone's
+/// task is in its turn; behind it wait a task of the service's admitted
+/// before its cover (v1) and a delegated one. The kills: with the `control_sync`
+/// in flight; while the revoke's page is applied (crash point
+/// `crash_during_record_application`, the record's effects written in the
+/// open transaction); and right after that page's commit, before its
+/// followups (the fence) and its acknowledgment (crash point
+/// `crash_after_page_commit`). The first two leave nothing of the page:
+/// the stored cursor, the service's control part, the tasks, the intents
+/// and the book as they were, nothing counted. The third leaves all of it:
+/// the cursor past the revoke, the service revoked, the delegated task
+/// cancelled, the revoke's result owed, unsent. Started again with that
+/// control state damaged: the service's `hello` is `busy`, and when the
+/// phone's turn ends the service's v1 task isn't dispatched (it waits for a
+/// channel the service can't get). Repaired: the revoke's result goes once
+/// (counted once, its row marked sent), the service's `hello` is refused
+/// as revoked, and neither queued task ever ran; the turn ran once.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn kill_during_the_sync_and_repeat() {
+    let mut rig = Rig::full(Via::Local);
+    let principal = format!("service:{SVC}");
+    let (running, v1, queued, covered, at, revoke) = {
+        let mut r = Router::on(&rig.astation, rig.link());
+        // The feed read once (empty): services are admitted.
+        rig.open_gate();
+        let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+        let launch = svc.session(&mut r);
+        let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+        let running = task(IDS, &launch, "SYNC_KILLED_RUNNING", HOUR);
+        enqueue(&mut phone, &mut r, &running);
+        in_turn(&rig, &running["task_id"], "SYNC_KILLED_RUNNING");
+        // Before its cover the service's task keeps v1.
+        let v1 = task(IDS, &launch, "SYNC_KILLED_V1", HOUR);
+        enqueue(&mut svc, &mut r, &v1);
+        assert!(admission(&rig, &v1["task_id"]).is_null(), "v1");
+        wait_stored(&rig, &v1["task_id"], "blocked", BEHIND);
+        // Covered: its next task is delegated.
+        rig.cover_and_open();
+        let queued = task(IDS, &launch, "SYNC_KILLED_QUEUED", HOUR);
+        enqueue(&mut svc, &mut r, &queued);
+        assert_eq!(admission(&rig, &queued["task_id"])["principal"], principal);
+        wait_stored(&rig, &queued["task_id"], "blocked", BEHIND);
+        let covered = rig.part(&principal).unwrap();
+        let (at, revoke) = append_id(
+            &rig,
+            SVC,
+            ControlAction::Revoke {
+                interrupt_running: false,
+            },
+        );
+        (running, v1, queued, covered, at, revoke)
+    };
+    let waits = |rig: &Rig, t: &Value, prompt: &str, when: &str| {
+        assert_eq!(stored(rig, &t["task_id"])["state"], "blocked", "{when}");
+        never_ran(rig, &t["task_id"], prompt);
+    };
+    // Nothing of the revoke's page: what a death before its commit leaves.
+    let nothing_of_the_page = |rig: &Rig, when: &str| {
+        assert_eq!(stored_cursor(rig), Some(at - 1), "{when}");
+        assert_eq!(rig.part(&principal), Some(covered.clone()), "{when}");
+        waits(rig, &queued, "SYNC_KILLED_QUEUED", when);
+        waits(rig, &v1, "SYNC_KILLED_V1", when);
+        assert!(all_intents(rig).is_empty(), "{when}");
+        assert!(ack_row(rig, &revoke).is_none(), "{when}");
+        assert!(
+            counted(rig)
+                .iter()
+                .all(|(_, effect, _)| effect != "revocation"),
+            "{when}"
+        );
+    };
+    // The host's next sync on its link: held.
+    let asked = |rig: &Rig| {
+        let link = rig.link();
+        rig.clock.add_mono(1_000);
+        let call = {
+            let mut station = rig.station();
+            station.on_link(link);
+            station.heads_now();
+            station.hold_call(link)
+        };
+        assert_eq!(sync_of(&call), rig.sync(at - 1));
+        call
+    };
+    // 1. Killed with the call in flight.
+    let call = asked(&rig);
+    rig.kill();
+    drop(call);
+    nothing_of_the_page(&rig, "the call in flight");
+    // 2. Killed while the page is applied.
+    rig.fault("crash_during_record_application");
+    rig.start_again();
+    let call = asked(&rig);
+    assert!(!rig.gate_open());
+    rig.station().answer_held(call).unwrap();
+    rig.died();
+    nothing_of_the_page(&rig, "during the application");
+    // 3. Killed after the page's commit.
+    rig.fault("crash_after_page_commit");
+    rig.start_again();
+    let call = asked(&rig);
+    rig.station().answer_held(call).unwrap();
+    rig.died();
+    assert_eq!(stored_cursor(&rig), Some(at));
+    let revoked = rig.part(&principal).unwrap();
+    assert_ne!(revoked, covered);
+    let status = stored(&rig, &queued["task_id"]);
+    assert_eq!(
+        (&status["state"], &status["detail"]),
+        (&json!("cancelled"), &json!(REVOKED))
+    );
+    waits(&rig, &v1, "SYNC_KILLED_V1", "after the commit");
+    assert_eq!(
+        ack_row(&rig, &revoke),
+        Some((
+            r#"[{"effect":"revocation","result":"applied"}]"#.to_string(),
+            false
+        ))
+    );
+    assert!(counted(&rig).is_empty(), "{:?}", counted(&rig));
+    // 4. Started with that control state damaged: the service is busy, and
+    // its v1 task isn't dispatched when the turn ends.
+    rig.set_part(&principal, "{damaged");
+    rig.start_again();
+    rig.status_feeds(DAMAGED);
+    {
+        let mut r = Router::on(&rig.astation, rig.link());
+        assert_eq!(
+            refused_hello(&mut r, IDS, &rig.log, SVC, true),
+            (
+                "busy".to_string(),
+                Some("revocations not yet checked".to_string())
+            )
+        );
+    }
+    complete_turn(&rig, &running["task_id"]);
+    rig.two_passes();
+    waits(&rig, &v1, "SYNC_KILLED_V1", "damaged");
+    assert!(counted(&rig).is_empty());
+    // 5. Repaired: the result goes once; the service stays refused.
+    rig.kill();
+    rig.set_part(&principal, &revoked);
+    rig.start_again();
+    rig.open_gate();
+    rig.serve_until("the revocation counted", |rig| !counted(rig).is_empty());
+    within("its row marked sent", || {
+        ack_row(&rig, &revoke).is_some_and(|(_, sent)| sent)
+    });
+    assert_eq!(
+        counted(&rig),
+        [(principal.clone(), "revocation".to_string(), revoke.clone())]
+    );
+    let mut r = Router::on(&rig.astation, rig.link());
+    assert_eq!(
+        refused_hello(&mut r, IDS, &rig.log, SVC, true),
+        ("unauthorized".to_string(), Some("revoked".to_string()))
+    );
+    rig.two_passes();
+    assert_eq!(input(&rig).matches("SYNC_KILLED_RUNNING").count(), 1);
+    never_ran(&rig, &queued["task_id"], "SYNC_KILLED_QUEUED");
+    waits(&rig, &v1, "SYNC_KILLED_V1", "repaired");
+    assert_eq!(acks_naming(&rig, &revoke), 1);
+    assert!(rig.station().ack_refusals().is_empty());
+}
+
+/// Station B, the host's other Station in [`relay_switch_waits_for_the_new_feed`].
+const OTHER_STATION: &str = "http://127.0.0.1:2";
+
+/// VII.A test 10, part 2 (design I.5.2, I.5.8; §11.4 "Only the announced
+/// feed"; Task 36 review notes 7 and 8): the host's relay changes to
+/// another Station, B (the selection changed and the runtime restarted).
+/// Station A had held the covered service, whose task waits paused, and
+/// revoked another (that own revoke's result kept for resending). B's feed
+/// is the account's at B: its snapshot covers and holds the service anew,
+/// and covers 70 other services. Until B's feed is read from 0 to its head
+/// the gate stays closed and the held task waits; no stop is lost: once
+/// read it is still paused, and it runs only when B releases it. A's
+/// results never go to B: B's acks name B's records only, and A's rows
+/// leave the book. After a restart, B gets every result the book holds
+/// again in acks of at most 64 results naming one cursor, all taken by its
+/// ledger, none refused.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn relay_switch_waits_for_the_new_feed() {
+    let mut rig = Rig::full(Via::Local);
+    // Station A: covers the service and holds it; covers and revokes
+    // another.
+    let (held, a_ids, other_revoke) = {
+        let mut r = Router::on(&rig.astation, rig.link());
+        rig.cover_and_open();
+        let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+        let launch = svc.session(&mut r);
+        append_id(&rig, "svc-other", ControlAction::Cover);
+        append_id(&rig, SVC, ControlAction::Hold);
+        let (at, other_revoke) = append_id(
+            &rig,
+            "svc-other",
+            ControlAction::Revoke {
+                interrupt_running: false,
+            },
+        );
+        rig.clock.add_mono(1_000);
+        rig.announce();
+        rig.serve_until("A's feed read", |rig| {
+            rig.cursor() == Some(at) && acks_naming(rig, &other_revoke) >= 1
+        });
+        let held = task(IDS, &launch, "HELD_ACROSS_THE_SWITCH", HOUR);
+        enqueue(&mut svc, &mut r, &held);
+        wait_stored(&rig, &held["task_id"], "blocked", PAUSED);
+        let a_ids: Vec<String> = (1..=at).map(|seq| record_id_at(&rig, seq)).collect();
+        (held, a_ids, other_revoke)
+    };
+    assert!(
+        ack_row(&rig, &other_revoke).is_some(),
+        "A's own revoke's result kept"
+    );
+    // The switch: Station B, its feed the account's snapshot there.
+    rig.kill();
+    let mut b = FakeStation::new(&rig.astation, OTHER_STATION, &rig.log, HOST, 1);
+    b.silence_heads(true);
+    for action in [ControlAction::Cover, ControlAction::Hold] {
+        let record = b.record_for(SVC, action);
+        b.append(record);
+    }
+    for n in 0..70 {
+        let record = b.record_for(&format!("svc-bulk-{n}"), ControlAction::Cover);
+        b.append(record);
+    }
+    let head = 72;
+    rig.station = Arc::new(Mutex::new(b));
+    rig.relay_url = OTHER_STATION.into();
+    rig.start_again();
+    rig.until_station("the link to B", |s| s["link"]["origin"] == OTHER_STATION);
+    rig.two_passes();
+    assert!(!rig.gate_open());
+    assert_eq!(stored(&rig, &held["task_id"])["state"], "blocked");
+    rig.status_feeds(GATE_CLOSED);
+    // B's feed read from 0, the gate closed until its head.
+    let link = rig.link();
+    rig.clock.add_mono(1_000);
+    let call = {
+        let mut station = rig.station();
+        station.on_link(link);
+        station.heads_now();
+        station.hold_call(link)
+    };
+    assert_eq!(sync_of(&call), rig.sync(0));
+    rig.two_passes();
+    assert!(!rig.gate_open());
+    never_ran(&rig, &held["task_id"], "HELD_ACROSS_THE_SWITCH");
+    rig.station().answer_held(call).unwrap();
+    rig.serve_until("B's feed read", |rig| {
+        rig.cursor() == Some(head) && rig.gate_open()
+    });
+    // No stop lost.
+    rig.two_passes();
+    wait_stored(&rig, &held["task_id"], "blocked", PAUSED);
+    never_ran(&rig, &held["task_id"], "HELD_ACROSS_THE_SWITCH");
+    // A's results never go to B, and leave the book.
+    within("A's rows gone", || {
+        rig.station().serve(link);
+        a_ids.iter().all(|id| ack_row(&rig, id).is_none())
+    });
+    let b_ids: Vec<String> = (1..=head).map(|seq| record_id_at(&rig, seq)).collect();
+    let check_b_acks = |rig: &Rig| {
+        for ack in rig.station().acks_sent() {
+            assert_eq!(ack.origin, OTHER_STATION);
+            for result in &ack.results {
+                let AckResult::Record { record_id, .. } = result else {
+                    panic!("no entry results in step 4");
+                };
+                assert!(b_ids.contains(record_id), "not B's: {record_id}");
+                assert!(!a_ids.contains(record_id), "A's sent to B: {record_id}");
+            }
+        }
+    };
+    check_b_acks(&rig);
+    // A restart: what the book holds goes again, in acks of at most 64
+    // naming one cursor.
+    let before = rig.station().acks_sent().len();
+    rig.kill();
+    rig.start_again();
+    rig.serve_until("B's results again", |rig| {
+        let acks = rig.station().acks_sent();
+        let again: std::collections::BTreeSet<String> = acks[before..]
+            .iter()
+            .flat_map(|ack| ack.results.iter())
+            .filter_map(|r| match r {
+                AckResult::Record { record_id, .. } => Some(record_id.clone()),
+                _ => None,
+            })
+            .collect();
+        again.len() == b_ids.len()
+    });
+    let acks = rig.station().acks_sent();
+    let again: Vec<&ControlAck> = acks[before..]
+        .iter()
+        .filter(|ack| !ack.results.is_empty())
+        .collect();
+    assert!(again.len() >= 2, "{}", again.len());
+    assert!(again.iter().all(|ack| ack.results.len() <= 64));
+    assert!(
+        again.iter().all(|ack| ack.cursor == head),
+        "{:?}",
+        again.iter().map(|a| a.cursor).collect::<Vec<_>>()
+    );
+    check_b_acks(&rig);
+    assert!(rig.station().ack_refusals().is_empty());
+    // B releases the service: its task runs.
+    rig.open_gate();
+    let at = rig.append(SVC, ControlAction::Release);
+    rig.clock.add_mono(1_000);
+    rig.announce();
+    rig.serve_until("the release read", |rig| rig.cursor() == Some(at));
+    in_turn(&rig, &held["task_id"], "HELD_ACROSS_THE_SWITCH");
+    assert_eq!(input(&rig).matches("HELD_ACROSS_THE_SWITCH").count(), 1);
 }
