@@ -3433,8 +3433,12 @@ fence), `unknown_channel`, `busy`, `too_large`, `malformed`,
 `expired` (the channel's lifetime ended, R9.7 "Limits"). A service's or
 browser grant's expiry (which also fences the principal) and the records
 and bytes limits are lifetime ends: `expired`; a removal, a demotion, a
-revoked grant, a frozen list and a failed record are `closed`. (Atem's
-reading, for Astation.)
+revoked grant, a frozen list and a failed record are `closed`. Behind the
+unadvertised `host.delegated`, so are a service a control record revoked
+(after `unauthorized`, `revoked`) and every service's channel when the
+host's control state becomes unchecked (after `busy`, `revocations not
+yet checked`): each a fence preceded by its error frame. (Atem's reading,
+for Astation.)
 
 **Clients and bindings.** A client implementation holds one
 `ClientConnection` (the shared core's per-channel state) per virtual
@@ -4216,7 +4220,7 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 | `unauthorized` | session | not a current member, removed, expired, grant revoked or issuer fenced (detail says which; the principal is authenticated); with the unadvertised `host.delegated` on, a service a control record revoked on this host (`revoked`: its attachments when it is fenced, and its later `hello`s; host-work-v1 §11.1, **Atem's reading, for Astation**) |
 | `forbidden` | session | also: an op outside a service's or grant's `ops` |
 | `unknown_session` | all | also: a session outside a service's or grant's scope |
-| `busy` | channel/session | also: `init` rate; a device list that exists but can't be opened (clear, at `init`); a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3); with the unadvertised `host.delegated` on, on a host that keeps a control state (a host-work store with the control tables, whichever identity it is bound to and whatever hosting's state; a host that never had one, hosting never enabled included, refuses no service), every service's `hello` the device list would admit while that state is damaged, doesn't load, was never read (a new store's, a first pairing's or a re-verify's, until its first complete read of the host's own Station's feed), or is another identity's (hosting paused across a re-verify or a re-pair: until hosting makes this identity's store and it reads in full; a service revoked under the old identity included), and its attachments when that state begins ("revocations not yet checked"; it comes after the device-list decision, so a removed or expired service gets its final `unauthorized`; host-work-v1 §11.1, **Atem's reading, for Astation**) |
+| `busy` | channel/session | also: `init` rate; a device list that exists but can't be opened (clear, at `init`); a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3); with the unadvertised `host.delegated` on, on a host that keeps a control state (a host-work store with the control tables, whichever identity it is bound to and whatever hosting's state; a host that never had one, hosting never enabled included, refuses no service), every service's `hello` the device list would admit while that state is damaged, doesn't load, was never read (a new store's, a first pairing's or a re-verify's, until its first complete read of the host's own Station's feed), is another identity's (hosting paused across a re-verify or a re-pair: until hosting makes this identity's store and it reads in full; a service revoked under the old identity included), or can't be checked because the host's receipt database faulted (until `atem runtime restart`), and its attachments when that state begins ("revocations not yet checked"; it comes after the device-list decision, so a removed or expired service gets its final `unauthorized`; host-work-v1 §11.1, **Atem's reading, for Astation**) |
 | `unsupported_version` | session | also: `hello` without `revision: 9`; the removed outer `transportPolicy`/`transportPolicyAck` (R9.8a) |
 | `request_id_reused` | session | also: a `host_policy_set` reusing a `request_id` with another body (R9.8a); a `request_id` recorded under another submitter when either is the `host-work` principal (R9.14 item 7; built, behind the unadvertised `host.delegated`) |
 | relay `push_hint` refusals | relay | `skew`, `invalid_times`, `duplicate`, `bad_signature`, `stale` |

@@ -241,8 +241,9 @@ owner's local consent in `runtime.toml`.
   query any delegated task, read its reply, resolve it and interrupt its
   turn. Every request of a revoked service is `forbidden`. On a host that
   keeps a control state, every request of a service, and its `hello`, is
-  `busy` while that state is unchecked (damaged, or not yet read for this
-  host identity), and a revoked service's `hello` is refused `unauthorized`,
+  `busy` while that state is unchecked (damaged, not yet read for this
+  host identity, or the receipt database faulted until `atem runtime
+  restart`), and a revoked service's `hello` is refused `unauthorized`,
   `revoked` (**Atem's readings, for Astation's agreement**; host-work-v1
   §11.1, session-v1 R9.11).
 - Memory or vault access gives no execution right. Vault `writer_id` and relay
@@ -755,3 +756,20 @@ its environment holds.
    - no Station call goes, and the control state refuses no service any
      more: a service a record revoked gets session-v1 back. Don't turn the
      hook off in the middle of a revocation check.
+6. **Known limits for the check.**
+   - **A runtime started paused** (hosting off in `runtime.toml`, or a file
+     that doesn't load) carries out no stop until hosting resumes. Control
+     records still apply and a revoked service is refused, but a revoke's
+     interrupt, the withdrawal of an attempt waiting `accepted` and the
+     deadline interrupt of a turn that was running before the start all
+     wait for the start's recovery, which runs once hosting is on
+     (`work_interrupt` is `busy` meanwhile). A runtime paused after it
+     started carries them out. Start the runtime with hosting on for the
+     stop checks.
+   - **A re-verify during the check** (`atem pair verify` on the dev host)
+     moves the host's records aside and starts a fresh store for the new
+     identity: every service is `busy` until that store has read its
+     Station's feed from position 0 (a page asked for the old store is
+     dropped there, and the feed asked again). A stop applied before is
+     applied again in the new store and acknowledged under the new
+     identity.

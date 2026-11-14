@@ -1358,7 +1358,12 @@ applies again; what needs the session host comes after that commit.
     refuse nothing for it: a service it revoked is `busy` like every
     other. A store never bound yet (a fresh one, loaded while hosting was
     paused before its first use) is this identity's at its first use,
-    which binds it.
+    which binds it;
+  - can't be checked against its feed: the host's receipt database
+    faulted. Hosting stops until `atem runtime restart`, and no page
+    applies meanwhile, so the committed standings may be stale (a revoke
+    the Station stored since never reaches them). Damage loosens nothing:
+    services wait for the restart, which loads the state again.
 
   Meanwhile every service's `hello` that the device list would admit is
   refused `busy`, `revocations not yet checked` (the device-list decision
@@ -1403,8 +1408,10 @@ applies again; what needs the session host comes after that commit.
   while paused. Until then, and until the new store's first complete
   read, every service is `busy` (above).
 - **With `host.delegated` off** (the hook removed with delegated tasks
-  left), a record still reaches the tasks the store holds, but nothing of
-  session-v1: no fence, and no `hello` refused for the control state.
+  left), there is no Station sync and no carried record: only a pending
+  record re-verified when the device list moves still acts, and it
+  reaches the tasks the store holds, but nothing of session-v1: no fence,
+  and no `hello` refused for the control state.
 
 **Resets** (**Atem's proposal, agreed with Astation (2026-11-11, #120
 comment 6810116314) and Auth/Portal (2026-11-12, #147 comment 6813332550)**: design I.5.2's snapshot re-issues "the latest revoke, hold or
@@ -2340,12 +2347,16 @@ own Station's feed:
   pass start are at most one a second, none for 30 seconds after a page
   that moved nothing while the host is still behind the head the Station
   named for that call, or that was refused; a continuation after a page
-  that moved the cursor goes at once. A resynchronization's page that
-  finds the host at that head (after a restart, a refusal or a fault)
-  moves nothing as expected and pauses nothing, and so does a fetch's
-  carriage that finds the list at its head (another carrier brought it
-  there) (a pause there would delay the next record or entry by up to
-  30 seconds, its gate closed meanwhile).
+  that moved the cursor goes at once. So does a reset's first
+  `control_sync{after: 0}`, unpaced, as soon as its mark is written
+  (nothing goes for a reset before it): it stays bounded because one call
+  is in flight at a time and a reset counts once until its read from 0
+  begins, so it costs at most one call per page the Station answers. A
+  resynchronization's page that finds the host at that head (after a
+  restart, a refusal or a fault) moves nothing as expected and pauses
+  nothing, and so does a fetch's carriage that finds the list at its head
+  (another carrier brought it there) (a pause there would delay the next
+  record or entry by up to 30 seconds, its gate closed meanwhile).
   **The head named for a call** (a `control_sync` or a
   `membership_fetch`) is the highest the Station has named since the call
   was sent, the same for both: the head the call was sent for, the head of
@@ -2358,11 +2369,6 @@ own Station's feed:
   pause is judged this way. A call sent while the host was already at the
   head (a resynchronization's) has nothing to be behind unless a later
   `heads` or its answer names more.
-  So does a reset's first `control_sync{after: 0}`, unpaced, as soon as
-  its mark is written (nothing goes for a reset before it): it stays
-  bounded because one call is in flight at a time and a reset counts once
-  until its read from 0 begins, so it costs at most one call per page the
-  Station answers.
 - **Matching a page to its call** (wire rule 11; **Atem's reading of the
   transition, for Astation**, see rule 11's "Built on the host").
   - **A fresh id per call.** Every `control_sync` gets a fresh lowercase
@@ -2376,6 +2382,14 @@ own Station's feed:
     were loaded for). For a discovery call (no `feed_id`, `after: 0`; this
     host never makes one) the page's feed must also be the own feed this
     generation's `heads` announced.
+  - **A new identity's store** (**Atem-internal**; nothing on the wire
+    changes). A re-verify on a live link keeps the link generation, the
+    account and the genesis, but hosting swaps in the new identity's
+    fresh store. A continuation's page applies only when its `after` is
+    the committed cursor of the store it reaches: one asked for the old
+    store is drained there (never that store's first read), and the feed
+    is asked again from 0 at once. A read from 0 asked for the old store
+    is a complete read of the account's feed, and applies.
   - **The deadline** (**Atem-internal**, step 4; nothing on the
     wire changes). The Station's agreed deadline is 30 seconds (a bounded
     result, or the link fenced). The host retires a call 35 seconds after
