@@ -525,7 +525,8 @@ impl HostBridge {
     /// (`service_refused`; ruling T35c). Only with `host.delegated` on;
     /// with it off nothing is refused for the control state, delegated rows
     /// or not (review m2: hook off = main for session-v1).
-    /// - **Unchecked** (`controls_unchecked`: damaged, or not loaded): every
+    /// - **Unchecked** (`controls_unchecked`: damaged, not loaded, never
+    ///   read, another identity's, or a receipt-database fault): every
     ///   service's `hello` is refused `busy`, `revocations not yet
     ///   checked`, and entering that state fences every live service
     ///   attachment (`R9Host::set_services_unchecked`). The engine starts
@@ -788,6 +789,9 @@ impl HostBridge {
         // out.
         let services = if !(self.features.delegated && self.controls_unchecked()) {
             String::new()
+        } else if self.work.error {
+            "; services are refused (busy) until `atem runtime restart` (the receipt database failed)"
+                .to_string()
         } else if matches!(self.work.kept, Some(super::KeptControls::Unreadable)) {
             format!(
                 "; services are refused (busy) until the control state loads: {} can't be opened (move it aside or restore it, then run `atem runtime restart`)",

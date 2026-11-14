@@ -1109,6 +1109,65 @@ fn every_services_hello_is_busy_while_the_control_state_is_unchecked() {
     });
 }
 
+/// A receipt-database fault fails closed for services too (host-work-v1
+/// §11.1): with it, no control page applies until `atem runtime restart`,
+/// so the committed standings may be stale (a revoke stored at the Station
+/// meanwhile never reaches them). With the hook on, the control state is
+/// unchecked then: the bot's live attachment is closed through the §H
+/// fence after `busy`, `revocations not yet checked`, and its `hello` is
+/// refused so, never kept on those standings. Natives are admitted
+/// throughout. With the hook off, nothing is refused for it (as on main).
+#[test]
+fn a_receipt_database_fault_leaves_every_service_unchecked() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = fed_bot(&mut rig, root, &os, start);
+        r9_link_up(&mut rig);
+        let mut bot = service_hello(&mut rig, &s.log, "bot-1", "svc-bot").unwrap();
+        hello_as(&mut rig, &s.log, "phone-1", phone_identity()).unwrap();
+        assert!(!rig.bridge.controls_unchecked());
+        let before = rig.bridge.host.control_gen(BOT);
+        rig.bridge.work_fail();
+        assert!(rig.bridge.controls_unchecked());
+        let _ = flushed(&mut rig, "bot-1");
+        passes(&mut rig, 1);
+        assert!(rig.bridge.r9.services_unchecked());
+        assert!(!attached(&rig, BOT), "closed");
+        assert!(attached(&rig, PHONE), "a native stays");
+        assert!(rig.bridge.host.control_gen(BOT) > before);
+        let (frames, closes) = flushed(&mut rig, "bot-1");
+        assert_eq!(closes.len(), 1, "{closes:?}");
+        let errors: Vec<_> = frames
+            .iter()
+            .flat_map(|f| bot.on_frame(f, 1).unwrap())
+            .filter_map(|e| match e {
+                atem_client::connect::Event::Error(e) => Some((e.code, e.detail)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors, [unchecked()]);
+        assert_eq!(
+            refusal(service_hello(&mut rig, &s.log, "bot-2", "svc-bot")),
+            unchecked()
+        );
+        hello_as(&mut rig, &s.log, "phone-2", phone_identity()).unwrap();
+        let line = rig.bridge.feeds_status().unwrap_or_default();
+        assert!(
+            line.ends_with(
+                "; services are refused (busy) until `atem runtime restart` (the receipt database failed)"
+            ),
+            "{line}"
+        );
+        // The hook off (as on main): nothing is refused for the fault.
+        rig.bridge.features = HostFeatures::default();
+        passes(&mut rig, 1);
+        assert!(!rig.bridge.r9.services_unchecked());
+        service_hello(&mut rig, &s.log, "bot-3", "svc-bot").unwrap();
+    });
+}
+
 /// Review I2 (D9, ruling T35c): the r9 engine's revoked services come back
 /// from the stored control state, never from memory. After a restart with
 /// hosting paused (probe B), the stored state loads anyway (ruling T35d,

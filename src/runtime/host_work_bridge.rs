@@ -616,13 +616,18 @@ impl HostBridge {
 
     /// The host's control state can't be checked for services (ruling
     /// T32b; T35d): where this host keeps one (`keeps_controls`, A), the
-    /// feeds aren't loaded, don't read, or were never read in full (B)
+    /// feeds aren't loaded, don't read, or were never read in full (B), or
+    /// the receipt database faulted (no page applies until a restart, so
+    /// the committed standings may be stale: damage loosens nothing)
     /// (tests: and no control view stands in for them). A service's
     /// revocation, hold and coverage are unknown then. A host that keeps
     /// none refuses nothing for it: services as on main.
     pub(super) fn controls_unchecked(&self) -> bool {
         if self.controls_stood_in() || !self.keeps_controls() {
             return false;
+        }
+        if self.work.error {
+            return true;
         }
         // Another identity's store: this identity never read its feed
         // (ruling T35e).
