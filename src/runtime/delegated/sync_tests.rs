@@ -1060,6 +1060,41 @@ fn the_recoverys_restart_waits_for_a_fresh_page() {
     assert!(rig.open(&native()));
 }
 
+/// Task 37 finding (VII.A test 7 against the fake Station): a
+/// resynchronization's page that finds the host at the announced head (the
+/// start's recovery, a refusal's) moves nothing, as expected: it pauses
+/// nothing, so a record announced a second later is asked for at once.
+/// The 30-second pause is for a page that leaves the host behind the head
+/// the Station announced (`syncs_are_paced_like_the_fetch`); taken after
+/// every resynchronization, it kept the first record after each restart
+/// unread for up to 30 seconds, its gate closed meanwhile.
+#[test]
+fn a_resync_page_at_the_head_pauses_nothing() {
+    let mut rig = rig();
+    rig.opened();
+    // The start's recovery: its page finds the host at the head.
+    rig.sync.restart();
+    assert_eq!(rig.pass(SEC), [sync_call(FEED, 2)]);
+    assert!(rig.page(FEED, 2, &[]).next.is_none());
+    assert!(rig.open(&native()));
+    // A record more, a second later: asked at once, and read.
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    let release = rig.record(FEED, ControlAction::Release);
+    rig.page(FEED, 3, &[(3, &release)]);
+    assert!(rig.open(&native()));
+    // A refusal's resynchronization, past its backoff: the same.
+    rig.pass(SEC);
+    rig.sync.on_refused(RefusedCall::ControlSync);
+    assert!(!rig.open(&native()));
+    rig.pass(REFUSAL_BACKOFF_MS);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 3)]);
+    assert!(rig.page(FEED, 3, &[]).next.is_none());
+    assert!(rig.open(&native()));
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 4), [sync_call(FEED, 3)]);
+}
+
 /// Task 33 review m5: a `station_time` the delegated clock can't record
 /// (here no clock at all) counts as no `station_time`: the gate closes until
 /// a `heads` whose time is recorded within the cap.

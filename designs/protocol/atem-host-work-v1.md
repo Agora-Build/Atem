@@ -2284,8 +2284,13 @@ only its own Station's feed (step 4's Decision 14):
   page to its call").
 - **Pacing** (as the device-list fetch's). One `control_sync` in flight at
   a time. The calls a `heads` or the host's pass start are at most one a
-  second, none for 30 seconds after a page that moved nothing or was
+  second, none for 30 seconds after a page that moved nothing while the
+  host is still behind the head the Station announced, or that was
   refused; a continuation after a page that moved the cursor goes at once.
+  A resynchronization's page that finds the host at the announced head
+  (after a restart, a refusal or a fault) moves nothing as expected and
+  pauses nothing (Task 37: it delayed the next record by up to 30 seconds,
+  its gate closed meanwhile).
   So does a reset's first `control_sync{after: 0}`, unpaced, as soon as
   its mark is written (nothing goes for a reset before it): it stays
   bounded because one call is in flight at a time and a reset counts once

@@ -58,8 +58,10 @@
 //!   11): one that doesn't is refused by the reader, a fault as above.
 //! - **Pacing** (as the device-list fetch's, Task 30 I1). One `control_sync`
 //!   in flight at a time. Those a `heads` or the pass start are at most one
-//!   a second, and none for 30 seconds after a page that moved nothing or
-//!   was refused. After a page that moved the cursor while the feed is
+//!   a second, and none for 30 seconds after a page that moved nothing and
+//!   left the host behind the head the Station announced, or was refused
+//!   (a resynchronization's page that finds the host at the head pauses
+//!   nothing: Task 37). After a page that moved the cursor while the feed is
 //!   still ahead, the next is asked at once (real records bound it), and
 //!   so is a reset's read from 0 once its mark is written (one call in
 //!   flight, and a reset counts once until its read begins, so it stays
@@ -462,7 +464,9 @@ pub struct FeedSync {
     unanswered: bool,
     refused_at: Option<u64>,
     /// The last ask a `heads` or the pass started, and the last page that
-    /// moved nothing (monotonic ms): the pacing, kept across generations.
+    /// moved nothing while the host stayed behind the announced head (or a
+    /// fault, or a page that couldn't apply; monotonic ms): the pacing,
+    /// kept across generations.
     paced_at: Option<u64>,
     stalled_at: Option<u64>,
     alerts: [Hourly; 4],
@@ -912,7 +916,16 @@ impl FeedSync {
         synced.next = if moved {
             self.ask(false)
         } else {
-            self.stalled_at = Some(self.now);
+            // A page that moved nothing pauses the calls only while the
+            // host is still behind the head the Station announced (pages
+            // that don't reach it). One that found the host at the head (a
+            // resynchronization's: the start's recovery, a refusal's, a
+            // fault's) is what was expected, and pauses nothing (Task 37
+            // finding: it kept the next record unread for 30 s, its gate
+            // closed meanwhile).
+            if self.behind() {
+                self.stalled_at = Some(self.now);
+            }
             None
         };
         Ok(synced)
@@ -1217,10 +1230,21 @@ impl FeedSync {
         );
     }
 
+    /// The host's read of the announced feed is behind its head (or of
+    /// another feed, or none).
+    fn behind(&self) -> bool {
+        self.announced.as_ref().is_some_and(|announced| {
+            self.synced
+                .as_ref()
+                .filter(|(feed_id, _)| *feed_id == announced.feed_id)
+                .is_none_or(|(_, cursor)| *cursor < announced.head)
+        })
+    }
+
     /// The `control_sync` the announced feed needs now, if any: one at a
     /// time, none in a refusal's backoff; `paced`: one a `heads` or the pass
     /// starts (at most one a second, none for 30 seconds after a page that
-    /// moved nothing).
+    /// moved nothing and left the host behind the announced head).
     fn ask(&mut self, paced: bool) -> Option<ControlSync> {
         let own = self.own.clone()?;
         let announced = self.announced.clone()?;
