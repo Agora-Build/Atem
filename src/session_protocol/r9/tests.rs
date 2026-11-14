@@ -1107,6 +1107,44 @@ fn a_service_a_control_record_revoked_is_fenced_and_refused() {
     rig.attached("bot-3");
 }
 
+/// Ruling T35c: while the runtime's control state can't be checked, every
+/// service's `hello` is refused `busy` (`revocations not yet checked`) and
+/// entering that state fences every live service attachment through §H;
+/// a native member is untouched. Leaving it admits services again.
+#[test]
+fn services_are_busy_while_the_control_state_is_unchecked() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("bot-1", bot());
+    rig.advance(1000);
+    rig.connect("phone", phone());
+    rig.attached("bot-1");
+    rig.attached("phone");
+    let before = rig.rt.host.control_gen("service:svc-bot");
+    rig.run(|e, p| ((), e.set_services_unchecked(true, p)));
+    rig.pump();
+    assert_eq!(rig.refused("bot-1").0, "closed");
+    assert!(rig.rt.host.control_gen("service:svc-bot") > before);
+    assert_eq!(rig.engine.status().attachments, 1, "the phone stays");
+    // Staying unchecked fences nothing more.
+    let fenced = rig.rt.host.control_gen("service:svc-bot");
+    rig.run(|e, p| ((), e.set_services_unchecked(true, p)));
+    assert_eq!(rig.rt.host.control_gen("service:svc-bot"), fenced);
+    rig.advance(1000);
+    rig.connect("bot-2", bot());
+    assert_eq!(
+        rig.refused("bot-2"),
+        ("busy".into(), Some(DETAIL_UNCHECKED.into()))
+    );
+    rig.advance(1000);
+    rig.connect("phone-2", phone());
+    rig.attached("phone-2");
+    rig.run(|e, p| ((), e.set_services_unchecked(false, p)));
+    rig.advance(1000);
+    rig.connect("bot-3", bot());
+    rig.attached("bot-3");
+}
+
 /// `revoke_grant` from the issuer: the browser is fenced ("grant revoked")
 /// and can't come back with that grant.
 #[test]

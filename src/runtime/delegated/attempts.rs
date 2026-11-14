@@ -255,11 +255,26 @@ impl Store {
         Ok(attempt)
     }
 
+    /// A hold asked the withdrawal of the live attempt `attempt_id` of
+    /// `task_id`, in `tx` (the hold record's own transaction; design I.5.5
+    /// step 4, I.6.4): written with the attempt, so its withdrawal isn't
+    /// counted whoever makes it, the start's recovery after a crash
+    /// included (`withdrawn at recovery`; review m5). Nothing for an
+    /// attempt that ended.
+    pub fn hold_withdrawal(&self, tx: &Transaction, task_id: &str, attempt_id: &str) -> Result<()> {
+        tx.execute(
+            r#"UPDATE attempts SET counted=0 WHERE task_id=?1 AND attempt_id=?2 AND "end" IS NULL"#,
+            [task_id, attempt_id],
+        )?;
+        Ok(())
+    }
+
     /// Records how the attempt `attempt_id` of `task_id` ended, in `tx`.
     /// An end is final: the same end again changes nothing, another is an
     /// error. With a proof of no effect that makes [`MAX_ATTEMPTS`] counted
     /// attempts, the task is `failed`, `too many attempts`, in the same
-    /// transaction.
+    /// transaction. A withdrawal of an attempt a hold asked to withdraw
+    /// ([`Store::hold_withdrawal`]) isn't counted, whatever `end` says.
     pub fn end_attempt(
         &self,
         tx: &Transaction,
@@ -276,6 +291,10 @@ impl Store {
             .optional()?;
         let Some((ended, counted)) = row else {
             bail!("no attempt {attempt_id} of task {task_id}");
+        };
+        let end = match end {
+            AttemptEnd::Withdrawn { .. } if !counted => AttemptEnd::Withdrawn { counted: false },
+            end => end,
         };
         if let Some(name) = ended {
             if AttemptEnd::read(&name, counted) == Some(end) {

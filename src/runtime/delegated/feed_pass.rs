@@ -317,9 +317,14 @@ impl HostBridge {
     /// transaction committed ([`Followup`], design I.5.5 to I.5.7), carried
     /// out after the Station's messages and in host-work's pass, hosting
     /// paused or not (a stop always wins), in their order:
-    /// - **a fence** at once: session-v1's §H fence of the revoked service
-    ///   where it has attachments, each closed after `unauthorized`,
-    ///   `revoked` (`R9Host::fence_revoked`);
+    /// - **the fences** first, at once (a later error drops none): with
+    ///   `host.delegated` on, session-v1's §H fence of the revoked service,
+    ///   each attachment closed after `unauthorized`, `revoked`
+    ///   (`R9Host::fence_revoked`, once per revoke); with it off a record
+    ///   still reaches the tasks it holds, but nothing of session-v1 (hook
+    ///   off = main);
+    /// - then the services' r9 admission as the control state stands
+    ///   ([`HostBridge::sync_services`]);
     /// - **a withdrawal and the intents** once the store was recovered
     ///   (before that, the start's recovery withdraws every attempt still
     ///   `accepted` and reconciles the rest, and they wait), with no
@@ -329,22 +334,28 @@ impl HostBridge {
     ///   scheduling pass does).
     ///
     /// A store write that fails is a receipt-database fault (`work_fail`).
-    /// Before them, the r9 engine's revoked services follow the committed
-    /// standings ([`HostBridge::sync_revoked`]).
     pub(in crate::runtime::host_bridge) fn effects_pass(&mut self, cx: &mut Cx) {
-        self.sync_revoked(cx);
-        if self.work.followups.is_empty() {
-            return;
-        }
         let followups = std::mem::take(&mut self.work.followups);
-        let mut later = Vec::new();
-        let mut intents = false;
+        let mut rest = Vec::new();
         for followup in followups {
             match followup {
                 Followup::Fence { principal } => {
-                    let effects = self.r9_call(|r9, parts| r9.fence_revoked(&principal, parts));
-                    self.r9_exec(effects, cx);
+                    if self.features.delegated {
+                        let effects = self.r9_call(|r9, parts| r9.fence_revoked(&principal, parts));
+                        self.r9_exec(effects, cx);
+                    }
                 }
+                other => rest.push(other),
+            }
+        }
+        self.sync_services(cx);
+        if rest.is_empty() {
+            return;
+        }
+        let mut later = Vec::new();
+        let mut intents = false;
+        for followup in rest {
+            match followup {
                 _ if self.work.error || self.work.store.is_none() => {}
                 f if !self.work.recovered => later.push(f),
                 Followup::Withdraw {
@@ -361,6 +372,7 @@ impl HostBridge {
                     }
                 }
                 Followup::Intents { .. } => intents = true,
+                Followup::Fence { .. } => {}
             }
         }
         self.work.followups = later;
@@ -369,12 +381,41 @@ impl HostBridge {
         }
     }
 
+    /// The services' r9 admission as the host's control state stands, so
+    /// it never disagrees with host work's answer to the same service
+    /// (`service_refused`; ruling T35c). Only with `host.delegated` on;
+    /// with it off nothing is refused for the control state, delegated rows
+    /// or not (review m2: hook off = main for session-v1).
+    /// - **Unchecked** (`controls_unchecked`: damaged, or not loaded): every
+    ///   service's `hello` is refused `busy`, `revocations not yet
+    ///   checked`, and entering that state fences every live service
+    ///   attachment (`R9Host::set_services_unchecked`). The engine starts
+    ///   so (`HostBridge::open`), and the runtime calls this before every
+    ///   pass's `hello`s, after a load and after the records' followups.
+    /// - **Checked** (loaded): the revoked services follow the committed
+    ///   standings ([`HostBridge::sync_revoked`]).
+    pub(in crate::runtime::host_bridge) fn sync_services(&mut self, cx: &mut Cx) {
+        let unchecked = self.features.delegated && self.controls_unchecked();
+        if unchecked != self.r9.services_unchecked() {
+            let effects = self.r9_call(|r9, parts| r9.set_services_unchecked(unchecked, parts));
+            self.r9_exec(effects, cx);
+        }
+        if !self.features.delegated {
+            if !self.r9.revoked_services().is_empty() {
+                self.r9.set_revoked_services(HashSet::new());
+            }
+            return;
+        }
+        if !unchecked {
+            self.sync_revoked(cx);
+        }
+    }
+
     /// The r9 engine's revoked services (their `hello`s refused, design
-    /// I.5.5 step 2) as the committed standings have them, with the control
-    /// feeds loaded (damaged or not loaded yet, the last ones stay: a
-    /// revoke is final; a new host identity clears them with its store). A
-    /// service revoked whose channel is live already (admitted before the
-    /// feeds loaded at a start) is fenced at once.
+    /// I.5.5 step 2) as the committed standings have them, the control
+    /// feeds loaded (a new host identity clears them with its store). A
+    /// service revoked whose channel is live when the loaded state is read
+    /// (one admitted before) is fenced then, once.
     fn sync_revoked(&mut self, cx: &mut Cx) {
         if !matches!(self.work.feeds, Feeds::Loaded(_)) || self.controls_stood_in() {
             return;

@@ -1272,11 +1272,20 @@ applies again; what needs the session host comes after that commit.
   nobody completes them, so one awaiting its result expires at its
   deadline). From the commit on, the host refuses every request of the
   service, `forbidden` whatever it asks (`busy` instead while the control
-  state doesn't read), and session-v1's §H fence runs where it has
+  state doesn't read), and session-v1's §H fence runs once where it has
   attachments: its `control_gen` is raised and each attachment closed after
   `unauthorized`, `revoked`; its later `hello`s are refused the same way
-  (session-v1 R9.11). A v1 task the service had (admitted before its cover)
-  follows v1's rules, which the fence ends (`sender's authority changed`).
+  (session-v1 R9.11), from the stored control state after a restart too. A
+  v1 task the service had (admitted before its cover) follows v1's rules,
+  which the fence ends (`sender's authority changed`).
+- **No service holds session-v1 while the control state is unchecked**
+  (ruling T35c): while it is damaged or not loaded (a runtime starts so, and
+  stays so while it starts with hosting paused or can't bind its store),
+  every service's `hello` is refused `busy`, `revocations not yet checked`,
+  as host work answers its requests, and entering that state closes every
+  live service attachment through the same §H fence, after the same error.
+  Natives, browser grants and `local` are unaffected. Once the state loads,
+  services are admitted again, those it revokes refused as above.
 - **The interrupt** (`interrupt_running: true` on the revoke, or a later
   `interrupt_running` record) writes an intent (reason `revoke`) for each
   task whose turn may run: one in its turn, or whose attempt is live (one
@@ -1287,13 +1296,22 @@ applies again; what needs the session host comes after that commit.
   deadline`, whatever other intents its attempt has.
 - **`hold`** puts unstarted tasks in `blocked`, `paused`; a live attempt is
   withdrawn after the commit (not counted), its task paused from it. A hold
-  lifted before that withdrawal asks nothing.
+  lifted before that withdrawal asks nothing. The hold's cause is written
+  with the attempt in the record's transaction, so its withdrawal isn't
+  counted whoever makes it: the start check, or the recovery after a crash
+  (`withdrawn at recovery`).
 - **`release`** puts the paused tasks back in `queued`; they get an attempt
   through the start check before their deadline.
 - **`cover`** changes no task: the service's later tasks are delegated.
-- **While hosting is paused** the records still apply with their effects,
-  and the withdrawals and intents they ask for are carried out (a stop
-  always wins); before the start's recovery they wait for it.
+- **While hosting is paused**, once the control feeds have loaded in this
+  run, the records still apply with their effects, and the withdrawals and
+  intents they ask for are carried out (a stop always wins); before the
+  start's recovery they wait for it. A runtime started with hosting paused
+  binds no store and loads no feed: nothing applies until hosting resumes,
+  and the state stays unchecked meanwhile (above).
+- **With `host.delegated` off** (the hook removed with delegated tasks
+  left), a record still reaches the tasks the store holds, but nothing of
+  session-v1: no fence, and no `hello` refused for the control state.
 
 **Resets** (**Atem's proposal, agreed with Astation (2026-11-11, #120
 comment 6810116314) and Auth/Portal (2026-11-12, #147 comment 6813332550)**: design I.5.2's snapshot re-issues "the latest revoke, hold or
@@ -3061,7 +3079,9 @@ The sender's channel and online status are not conditions.
   `rejected`. An attempt that reached `executing`, `completed` or
   `outcome_unknown` ends the task's attempts for good.
 - **The limit.** At most **8** attempts per task, then `failed`, `too
-  many attempts`. Attempts a hold withdrew don't count. Nor does an
+  many attempts`. Attempts a hold withdrew don't count (as built in step 4,
+  a crash before the withdrawal included: the hold's cause is written with
+  the attempt, §11.1). Nor does an
   attempt the session host answered `request_id_reused` (an id recorded
   under another submitter, session-v1 R9.14 item 7): it was never
   admitted, and the host takes a fresh id. The deadline bounds them

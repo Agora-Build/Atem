@@ -1609,6 +1609,21 @@ impl Store {
         )
     }
 
+    /// The delegated tasks of `principal` that wait or run (`queued`,
+    /// `blocked`, `submitting`, `submitted`), oldest first: what a control
+    /// record's effects act on (`delegated::effects::act`), the principal
+    /// filtered in SQL so no other sender's record is parsed. A row whose
+    /// record isn't JSON is left out here (the passes that read every task
+    /// settle it, `fail_unreadable`).
+    pub fn delegated_active_of(&self, principal: &str) -> Result<Vec<WorkRecord>> {
+        self.tasks(
+            "SELECT id,record FROM work WHERE state IN ('queued','blocked','submitting','submitted')
+            AND CASE WHEN json_valid(record) THEN json_extract(record,'$.delegated.principal') END=?1
+            ORDER BY rowid",
+            [principal],
+        )
+    }
+
     /// A task of unknown outcome holds `session_id`'s queue (until it
     /// expires or a reply proves its turn ran; a delegated one until its
     /// deadline, design I.4.6), through `work_waits`.

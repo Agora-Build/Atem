@@ -92,53 +92,79 @@ pub enum Followup {
 /// transaction can fail, so it returns a `Result`.)
 pub fn act(store: &Store, tx: &Transaction, actions: &[HostAction]) -> Result<Vec<Followup>> {
     let mut out = Vec::new();
+    // Each principal's tasks read once per record (a record's actions are
+    // its own principal's), and changed in place as its actions go (review
+    // m4).
+    let mut read: Vec<(String, Vec<Task>)> = Vec::new();
     for action in actions {
+        let principal = match action {
+            HostAction::Revoke(p) | HostAction::Hold(p) | HostAction::Release(p) => p,
+            HostAction::Interrupt { principal, .. } => principal,
+            HostAction::Cover { .. } => continue,
+        };
+        let i = match read.iter().position(|(p, _)| p == principal) {
+            Some(i) => i,
+            None => {
+                read.push((principal.clone(), tasks_of(store, principal)?));
+                read.len() - 1
+            }
+        };
+        let tasks = &mut read[i].1;
         match action {
-            HostAction::Revoke(principal) => {
-                stop(store, principal, Event::Revoked, &mut out)?;
+            HostAction::Revoke(_) => {
+                stop(store, tx, tasks, Event::Revoked, &mut out)?;
                 out.push(Followup::Fence {
                     principal: principal.clone(),
                 });
             }
-            HostAction::Hold(principal) => stop(store, principal, Event::Held, &mut out)?,
-            HostAction::Release(principal) => release(store, principal)?,
-            HostAction::Interrupt {
-                principal,
-                revocation,
-            } => interrupt(store, tx, principal, revocation, &mut out)?,
+            HostAction::Hold(_) => stop(store, tx, tasks, Event::Held, &mut out)?,
+            HostAction::Release(_) => release(store, tasks)?,
+            HostAction::Interrupt { revocation, .. } => {
+                interrupt(store, tx, principal, tasks, revocation, &mut out)?
+            }
             HostAction::Cover { .. } => {}
         }
     }
     Ok(out)
 }
 
+/// A delegated task a record acts on, with its live attempt.
+type Task = (WorkRecord, Option<Attempt>);
+
 /// `principal`'s delegated tasks that wait or run (`queued`, `blocked`,
-/// `submitting`, `submitted`), oldest first, each with its live attempt.
-fn tasks_of(store: &Store, principal: &str) -> Result<Vec<(WorkRecord, Option<Attempt>)>> {
+/// `submitting`, `submitted`), oldest first, each with its live attempt:
+/// one read, the principal filtered in SQL (`Store::delegated_active_of`).
+fn tasks_of(store: &Store, principal: &str) -> Result<Vec<Task>> {
     let mut out = Vec::new();
-    for r in store.active_tasks()? {
-        if r.delegated
-            .as_ref()
-            .is_none_or(|a| a.principal != principal)
-        {
-            continue;
-        }
+    for r in store.delegated_active_of(principal)? {
         let live = store.live_attempt(&r.task.task_id)?;
         out.push((r, live));
     }
     Ok(out)
 }
 
-/// A revoke or a hold (`event`) of `principal`: its unstarted tasks take
-/// the event's state now; a task with a live attempt gets its withdrawal
-/// asked; a started one goes on.
-fn stop(store: &Store, principal: &str, event: Event, out: &mut Vec<Followup>) -> Result<()> {
+/// A revoke or a hold (`event`) of the principal whose tasks are `tasks`:
+/// its unstarted tasks take the event's state now; a task with a live
+/// attempt gets its withdrawal asked; a started one goes on. A hold's
+/// cause is written with the attempt in `tx` (`Store::hold_withdrawal`), so
+/// the attempt's withdrawal isn't counted whoever makes it, the recovery
+/// after a crash included (review m5).
+fn stop(
+    store: &Store,
+    tx: &Transaction,
+    tasks: &mut [Task],
+    event: Event,
+    out: &mut Vec<Followup>,
+) -> Result<()> {
     let (state, detail) = event.outcome();
-    for (mut r, live) in tasks_of(store, principal)? {
+    for (r, live) in tasks.iter_mut() {
         if let Some(attempt) = live {
+            if event == Event::Held {
+                store.hold_withdrawal(tx, &r.task.task_id, &attempt.attempt_id)?;
+            }
             out.push(Followup::Withdraw {
                 task_id: r.task.task_id.clone(),
-                attempt_id: attempt.attempt_id,
+                attempt_id: attempt.attempt_id.clone(),
                 then: event,
             });
             continue;
@@ -150,15 +176,15 @@ fn stop(store: &Store, principal: &str, event: Event, out: &mut Vec<Followup>) -
         }
         r.status.state = state;
         r.status.detail = detail.into();
-        store.save_work(&r)?;
+        store.save_work(r)?;
     }
     Ok(())
 }
 
-/// A release of `principal`: its tasks paused (and not live) wait for an
-/// attempt again.
-fn release(store: &Store, principal: &str) -> Result<()> {
-    for (mut r, live) in tasks_of(store, principal)? {
+/// A release of the principal whose tasks are `tasks`: its tasks paused
+/// (and not live) wait for an attempt again.
+fn release(store: &Store, tasks: &mut [Task]) -> Result<()> {
+    for (r, live) in tasks.iter_mut() {
         if live.is_some()
             || r.status.state != WorkState::Blocked
             || r.status.detail != details::PAUSED
@@ -167,18 +193,19 @@ fn release(store: &Store, principal: &str) -> Result<()> {
         }
         r.status.state = WorkState::Queued;
         r.status.detail = WAITING_FOR_A_READY_AGENT.into();
-        store.save_work(&r)?;
+        store.save_work(r)?;
     }
     Ok(())
 }
 
 /// The interrupt for `principal`'s revocation `revocation`: an intent for
-/// each of its tasks whose turn may run (its live attempt, or the attempt
-/// it started).
+/// each of its tasks (`tasks`) whose turn may run (its live attempt, or the
+/// attempt it started).
 fn interrupt(
     store: &Store,
     tx: &Transaction,
     principal: &str,
+    tasks: &[Task],
     revocation: &str,
     out: &mut Vec<Followup>,
 ) -> Result<()> {
@@ -186,9 +213,9 @@ fn interrupt(
         revocation: revocation.to_string(),
     };
     let mut written = false;
-    for (r, live) in tasks_of(store, principal)? {
+    for (r, live) in tasks {
         let attempt = match (live, r.status.state) {
-            (Some(attempt), _) => attempt.attempt_id,
+            (Some(attempt), _) => attempt.attempt_id.clone(),
             // Its attempt started (the current one, `receipt_id`).
             (None, WorkState::Submitting | WorkState::Submitted) => r.status.receipt_id.clone(),
             _ => continue,
@@ -202,4 +229,141 @@ fn interrupt(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::delegated::{Admission, DelegatedSender};
+    use crate::session_protocol::wire::Target;
+    use atem_client::session::host_work::{self as hw, HostTarget, WorkStatus, WorkTask};
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// The statements this thread ran on a traced store.
+        static TRACED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn traced(sql: &str) {
+        TRACED.with(|t| t.borrow_mut().push(sql.to_string()));
+    }
+
+    fn uuid() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    /// `principal`'s delegated task, `queued`: its id.
+    fn task_of(store: &Store, principal: &str) -> String {
+        let task_id = uuid();
+        let device_id = principal.split_once(':').unwrap().1.to_string();
+        let r = WorkRecord {
+            principal: principal.into(),
+            attachment_owner: String::new(),
+            control_gen: 1,
+            route_id: "r".into(),
+            route_revision: 1,
+            profile_id: "p".into(),
+            profile_revision: 1,
+            project: "local:project".into(),
+            digest: hw::digest(task_id.as_bytes()),
+            task: WorkTask {
+                task_id: task_id.clone(),
+                workflow_id: uuid(),
+                target: Target {
+                    account_id: "acct".into(),
+                    atem_device_id: "host".into(),
+                    host_trust_gen: 1,
+                    session_id: "ses-aaaaaaaaaaaa".into(),
+                    process_gen: uuid(),
+                },
+                expires_at: u64::MAX / 2,
+                prompt: "do it".into(),
+                context: vec![],
+                attachments: vec![],
+            },
+            status: WorkStatus {
+                task_id: task_id.clone(),
+                receipt_id: uuid(),
+                state: WorkState::Queued,
+                detail: WAITING_FOR_A_READY_AGENT.into(),
+                result: None,
+                resolved: None,
+            },
+            turn_id: None,
+            authorization_expires_at: None,
+            message: None,
+            deadline_passed: false,
+            delegated: Some(Admission {
+                principal: principal.into(),
+                principal_key: "ab".repeat(32),
+                sender: DelegatedSender::Service {
+                    device_id,
+                    feed: crate::runtime::delegated::FeedRef {
+                        origin: "https://station-dev.agora.build".into(),
+                        feed_id: "feed-1".into(),
+                    },
+                },
+                feed: None,
+                route_id: "r".into(),
+                route_revision: 1,
+                ops_at_admission: vec!["notify".into(), "prompt".into()],
+                scope_at_admission: serde_json::Value::Null,
+                grant_expires_at: None,
+                device_list_seq: 3,
+                projects_matched: vec![],
+            }),
+        };
+        store.enqueue(&r).unwrap();
+        task_id
+    }
+
+    /// Review m4: a record's actions read the delegated tasks they act on
+    /// once, and only its principal's (filtered in SQL, not parsed and
+    /// dropped): one read of the work table for a revoke with its
+    /// interrupt, naming the principal; another principal's task is left
+    /// as it was.
+    #[test]
+    fn a_records_actions_read_their_principals_tasks_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store
+            .bind(&HostTarget {
+                account_id: "acct".into(),
+                atem_device_id: "host".into(),
+                host_trust_gen: 1,
+            })
+            .unwrap();
+        let mine = task_of(&store, "service:svc-bot");
+        let other = task_of(&store, "service:svc-other");
+        store.db.trace(Some(traced));
+        TRACED.with(|t| t.borrow_mut().clear());
+        let actions = [
+            HostAction::Revoke("service:svc-bot".into()),
+            HostAction::Interrupt {
+                principal: "service:svc-bot".into(),
+                revocation: "rec-1".into(),
+            },
+        ];
+        let tx = store.immediate().unwrap();
+        let followups = act(&store, &tx, &actions).unwrap();
+        tx.commit().unwrap();
+        let reads: Vec<String> = TRACED.with(|t| {
+            t.borrow()
+                .iter()
+                .filter(|sql| sql.contains("FROM work WHERE"))
+                .cloned()
+                .collect()
+        });
+        assert_eq!(reads.len(), 1, "{reads:?}");
+        assert!(reads[0].contains("service:svc-bot"), "{}", reads[0]);
+        assert_eq!(
+            followups,
+            [Followup::Fence {
+                principal: "service:svc-bot".into()
+            }]
+        );
+        let state = |id: &str| store.work(id).unwrap().unwrap().status.state;
+        assert_eq!(state(&mine), WorkState::Cancelled);
+        assert_eq!(state(&other), WorkState::Queued);
+    }
 }

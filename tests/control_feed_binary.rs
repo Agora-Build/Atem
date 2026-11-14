@@ -34,8 +34,8 @@ use support::astation::{
 };
 use support::delegated::WAIT;
 use support::delegated::{
-    Dev, HostIds, HostRig, all_intents, complete_turn, enqueue, enqueue_data, escs, host_db,
-    hosting_toml, in_turn, intents, never_ran, private, record, replace, stored, take_over, task,
+    Dev, HostIds, HostRig, all_intents, complete_turn, enqueue, escs, host_db, hosting_toml,
+    in_turn, intents, never_ran, private, record, refused_hello, replace, stored, take_over, task,
     uuid, wait_stored,
 };
 use support::host_clock::HostClock;
@@ -782,18 +782,6 @@ fn reauthenticate(rig: &Rig, n: u8) {
 }
 
 // ── r9 clients and their tasks ──
-
-/// Whether the store holds task `tid`.
-fn stored_at_all(rig: &Rig, tid: &Value) -> bool {
-    rig.db()
-        .query_row(
-            "SELECT COUNT(*) FROM work WHERE id=?1",
-            [tid.as_str().unwrap()],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap()
-        > 0
-}
 
 /// Task `tid`'s admission record (`None`: v1).
 fn admission(rig: &Rig, tid: &Value) -> Value {
@@ -1683,6 +1671,86 @@ fn a_later_interrupt_running_record_interrupts_a_routed_hosts_turn_after_a_takeo
     assert_eq!(intents(&rig, tid).len(), 1);
 }
 
+/// Ruling T35c (review I1, I2): what a revoked service and a native get
+/// from the host's r9 engine across restarts, in three states of the
+/// control state. Loaded: the revoked service's `hello` is refused
+/// (`unauthorized`, `revoked`), from the stored state alone (the last run's
+/// memory is gone). Damaged: every service's is `busy` (`revocations not
+/// yet checked`), as host work answers it. Not loaded, the runtime started
+/// with hosting paused: `busy` too. The phone, a native member, is admitted
+/// in all three.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_revoked_service_is_refused_across_restarts_and_every_service_is_busy_while_unchecked() {
+    let mut rig = Rig::full(Via::Local);
+    let principal = format!("service:{SVC}");
+    let busy = (
+        "busy".to_string(),
+        Some("revocations not yet checked".to_string()),
+    );
+    rig.cover_and_open();
+    let at = rig.append(
+        SVC,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    rig.clock.add_mono(1_000);
+    rig.announce();
+    rig.serve_until("the revoke read", |rig| rig.cursor() == Some(at));
+    let revoked = rig.part(&principal).unwrap();
+    // Loaded, after a restart.
+    rig.kill();
+    rig.start_again();
+    within("the feeds loaded", || rig.cursor() == Some(at));
+    {
+        let mut r = Router::on(&rig.astation, rig.link());
+        assert_eq!(
+            refused_hello(&mut r, IDS, &rig.log, SVC, true),
+            ("unauthorized".to_string(), Some("revoked".to_string()))
+        );
+        Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    }
+    // Damaged.
+    rig.kill();
+    rig.set_part(&principal, "{damaged");
+    rig.start_again();
+    rig.status_feeds(DAMAGED);
+    {
+        let mut r = Router::on(&rig.astation, rig.link());
+        assert_eq!(refused_hello(&mut r, IDS, &rig.log, SVC, true), busy);
+        Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    }
+    // Repaired, but started with hosting paused: never loaded.
+    rig.kill();
+    rig.set_part(&principal, &revoked);
+    let toml = rig.sandbox.config().join("runtime.toml");
+    let hosting = std::fs::read_to_string(&toml).unwrap();
+    replace(&toml, "version = 1\nenabled = maybe\n");
+    rig.start_again();
+    within("the pause", || {
+        rig.runtime_log()
+            .contains("agent hosting is off until it is fixed")
+    });
+    rig.two_passes();
+    {
+        let mut r = Router::on(&rig.astation, rig.link());
+        assert_eq!(refused_hello(&mut r, IDS, &rig.log, SVC, true), busy);
+        Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    }
+    // Hosting back: loaded, refused as revoked again.
+    replace(&toml, &hosting);
+    within("the feeds loaded", || rig.cursor() == Some(at));
+    let mut r = Router::on(&rig.astation, rig.link());
+    assert_eq!(
+        refused_hello(&mut r, IDS, &rig.log, SVC, true),
+        ("unauthorized".to_string(), Some("revoked".to_string()))
+    );
+}
+
 /// VII.A test 18 (design I.6.5, §11.4 "Station time"): a `heads` with a
 /// `station_time` a year ahead moves no clock floor, closes the gate of
 /// its origin and raises one owner alert ("Station clock ahead of this
@@ -1957,9 +2025,11 @@ fn rolled_back_across_a_crash() {
 }
 
 /// Task 32 review I1 (ruling T32b), whole runtime: a stored control part
-/// that doesn't read fails the feeds' load at the next start. A service's
-/// enqueue is then `busy` and stores nothing (never v1: its revocation,
-/// hold and coverage can't be checked), and `atem status` names the way
+/// that doesn't read fails the feeds' load at the next start. The service
+/// is then `busy` (never v1: its revocation, hold and coverage can't be
+/// checked): since ruling T35c its `hello` already (`revocations not yet
+/// checked`), so no request of it reaches host work (whose own `busy`, with
+/// nothing stored, is the bridge's tests'); `atem status` names the way
 /// out. The row repaired and the runtime started again, the same service
 /// is what its control state says: covered, so delegated.
 #[test]
@@ -1987,11 +2057,13 @@ fn a_damaged_control_part_keeps_a_services_requests_busy_until_repaired() {
                 .contains("the stored control state doesn't read")
         });
         rig.announce();
-        let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
-        let t = task(IDS, &launch, "WHILE_DAMAGED", HOUR);
-        let reply = svc.request(&mut r, enqueue_data(IDS, &t));
-        assert_eq!(reply["code"], "busy", "{reply}");
-        assert!(!stored_at_all(&rig, &t["task_id"]), "nothing stored");
+        assert_eq!(
+            refused_hello(&mut r, IDS, &rig.log, SVC, true),
+            (
+                "busy".to_string(),
+                Some("revocations not yet checked".to_string())
+            )
+        );
         let line = rig.status_feeds(DAMAGED);
         assert!(
             line.contains("host-work.sqlite from a backup, or pair this host again"),

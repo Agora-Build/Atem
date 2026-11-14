@@ -976,6 +976,10 @@ impl HostBridge {
         // moved (Task 32 review).
         self.ensure_feeds();
         self.feeds_reverify();
+        // A load that found the control state damaged (or a new identity's
+        // store not loaded yet) closes the services' r9 access at once
+        // (ruling T35c).
+        self.sync_services(cx);
         if !self.work.recovered {
             // Delegated tasks are recovered after the session journal (design
             // I.6.2 step 2: `SessionHost::recover`, run in this pass before

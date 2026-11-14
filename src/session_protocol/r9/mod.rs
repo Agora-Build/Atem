@@ -124,6 +124,11 @@ const DETAIL_CLOCK_BACK: &str = "host clock went back";
 /// (delegated host-work design I.5.5 step 2; behind `host.delegated`): its
 /// fenced attachments get it before their close, and its later `hello`s.
 pub const DETAIL_REVOKED: &str = "revoked";
+/// `busy` for every service while the host's control state can't be
+/// checked (damaged, or not loaded; ruling T35c, behind `host.delegated`):
+/// its `hello`s, and its attachments closed when that state begins. The
+/// start check's text for the same wait (host-work-v1 §11.6).
+pub const DETAIL_UNCHECKED: &str = "revocations not yet checked";
 
 /// What the pairing directory vouches for, for the revoked grants (§R9.6).
 pub struct PairingVouch {
@@ -390,6 +395,14 @@ pub struct R9Host {
     /// step 2), as the runtime's committed control state has them (only
     /// behind `host.delegated`): their `hello`s are refused.
     revoked_services: HashSet<String>,
+    /// Of those, the ones [`R9Host::fence_revoked`] fenced in this run: a
+    /// second fence of one with no attachment left does nothing (one §H
+    /// fence per revoke).
+    revoked_fenced: HashSet<String>,
+    /// The host's control state can't be checked (damaged, or not loaded:
+    /// ruling T35c; only behind `host.delegated`): every service's `hello`
+    /// is refused `busy`, as host work answers its requests.
+    services_unchecked: bool,
     /// Attachments whose channel Atem closed (overflow), for the session
     /// host to forget.
     dead: Vec<String>,
@@ -761,6 +774,8 @@ impl R9Host {
             seen: HashSet::new(),
             fence_errors: HashMap::new(),
             revoked_services: HashSet::new(),
+            revoked_fenced: HashSet::new(),
+            services_unchecked: false,
             dead: Vec::new(),
             flush_cursor: None,
             push: push::HostPush::default(),
@@ -1451,19 +1466,29 @@ impl R9Host {
         let pin = m.pin_of().clone();
         let now = parts.now.host.clone();
         let wall = now.wall_ms;
-        // A service a control record revoked here (design I.5.5 step 2):
-        // the host refuses all its future requests, its `hello` first.
-        if let Principal::Service { device_id } = &hello.proof.principal
-            && self
+        // A service while the control state can't be checked (ruling T35c:
+        // whether a record revoked it isn't known), then one a control
+        // record revoked here (design I.5.5 step 2: the host refuses all
+        // its future requests, its `hello` first).
+        if let Principal::Service { device_id } = &hello.proof.principal {
+            let refused = if self.services_unchecked {
+                Some(error(code::BUSY, re.as_deref(), Some(DETAIL_UNCHECKED)))
+            } else if self
                 .revoked_services
                 .contains(&format!("service:{device_id}"))
-        {
-            refuse(
-                self,
-                keyed,
-                error(code::UNAUTHORIZED, re.as_deref(), Some(DETAIL_REVOKED)),
-            );
-            return effects;
+            {
+                Some(error(
+                    code::UNAUTHORIZED,
+                    re.as_deref(),
+                    Some(DETAIL_REVOKED),
+                ))
+            } else {
+                None
+            };
+            if let Some(e) = refused {
+                refuse(self, keyed, e);
+                return effects;
+            }
         }
         // A `hello` that would lift a hold (a manager's reconciliation)
         // does so only after its `sig_c` is verified below: nothing of the
@@ -1782,6 +1807,7 @@ impl R9Host {
     /// refused `unauthorized`, `revoked`. A live one's attachments are
     /// fenced by [`R9Host::fence_revoked`].
     pub fn set_revoked_services(&mut self, revoked: HashSet<String>) {
+        self.revoked_fenced.retain(|p| revoked.contains(p));
         self.revoked_services = revoked;
     }
 
@@ -1795,17 +1821,78 @@ impl R9Host {
     /// `control_gen` raised, its leases revoked, its queued work rejected,
     /// each attachment closed after `unauthorized`, `revoked`), and its
     /// later `hello`s refused.
+    ///
+    /// Once per revoke in a run: a principal it fenced already, with no
+    /// attachment left, is fenced no more (its `control_gen` raised once;
+    /// review m1).
     pub fn fence_revoked<J: Journal>(
         &mut self,
         principal: &str,
         parts: &mut Parts<'_, J>,
     ) -> Vec<Effect> {
         self.revoked_services.insert(principal.to_string());
+        let live = self.attachments().iter().any(|(_, p)| p == principal);
+        if self.revoked_fenced.contains(principal) && !live {
+            return Vec::new();
+        }
+        self.revoked_fenced.insert(principal.to_string());
         self.fence_errors.insert(
             principal.to_string(),
             error(code::UNAUTHORIZED, None, Some(DETAIL_REVOKED)),
         );
         parts.host.fence_principal(principal, 0)
+    }
+
+    /// Whether every service's `hello` is refused `busy` now (the control
+    /// state can't be checked; ruling T35c).
+    pub fn services_unchecked(&self) -> bool {
+        self.services_unchecked
+    }
+
+    /// At construction, before any channel: whether the control state
+    /// starts unchecked (with `host.delegated` on it does, until the runtime
+    /// loads it: fail closed from the start).
+    pub fn start_services_unchecked(&mut self, unchecked: bool) {
+        self.services_unchecked = unchecked;
+    }
+
+    /// The host's control state can (`false`) or can't (`true`) be checked
+    /// now (ruling T35c; only behind `host.delegated`). While it can't,
+    /// every service's `hello` is refused `busy`, `revocations not yet
+    /// checked`; entering that state fences every live service attachment
+    /// through §H (its `control_gen` raised, its queued work rejected), each
+    /// closed after the same error. Natives and browser grants are
+    /// untouched. Leaving it lifts the refusal: the revoked services
+    /// ([`R9Host::set_revoked_services`]) decide again.
+    pub fn set_services_unchecked<J: Journal>(
+        &mut self,
+        unchecked: bool,
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        let entering = unchecked && !self.services_unchecked;
+        self.services_unchecked = unchecked;
+        if !entering {
+            return Vec::new();
+        }
+        let services: std::collections::BTreeSet<String> = self
+            .chans
+            .values()
+            .filter_map(|c| match &c.phase {
+                Phase::Open(a) if matches!(a.authority.principal, Principal::Service { .. }) => {
+                    Some(a.authority.name())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut effects = Vec::new();
+        for principal in services {
+            self.fence_errors.insert(
+                principal.clone(),
+                error(code::BUSY, None, Some(DETAIL_UNCHECKED)),
+            );
+            effects.extend(parts.host.fence_principal(&principal, 0));
+        }
+        effects
     }
 
     /// Every r9 attachment gets `membership_head` (the head moved, or a

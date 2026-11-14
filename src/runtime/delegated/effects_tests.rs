@@ -495,9 +495,19 @@ fn service_hello(
     handle: &str,
     device: &str,
 ) -> Result<atem_client::connect::Attached, atem_client::connect::ConnectError> {
+    hello_as(rig, log, handle, Identity::service(device, auth(device)))
+}
+
+/// `identity`'s `hello` on the bridge's r9 engine (channel `handle`, its
+/// carriage `log`'s suffix): the attached client, or what refused it.
+fn hello_as(
+    rig: &mut LocalRig,
+    log: &TestLog,
+    handle: &str,
+    identity: Identity,
+) -> Result<atem_client::connect::Attached, atem_client::connect::ConnectError> {
     rig.bridge.r9.reset_init_limiter();
     envelope_in(rig, &envelope::open(handle, Transport::Relay));
-    let identity = Identity::service(device, auth(device));
     let (connecting, init) = Connector::new("host").start(&log.log, 1).unwrap();
     envelope_in(rig, &envelope::frame(handle, &init));
     let accept = frames_for(rig, handle).remove(0);
@@ -507,6 +517,18 @@ fn service_hello(
     envelope_in(rig, &envelope::frame(handle, &finish));
     let welcome = frames_for(rig, handle).remove(0);
     welcoming.on_frame(&welcome, &log.log, 1)
+}
+
+/// What refused a `hello`: its code and detail.
+fn refusal(
+    hello: Result<atem_client::connect::Attached, atem_client::connect::ConnectError>,
+) -> (String, Option<String>) {
+    match hello {
+        Err(atem_client::connect::ConnectError::Refused { error, .. }) => {
+            (error.code, error.detail)
+        }
+        other => panic!("a refusal: {:?}", other.map(|_| ())),
+    }
 }
 
 /// The engine's frames and closes for `handle` since the last call.
@@ -946,5 +968,286 @@ fn a_revoke_leaves_awaiting_and_unknown_outcomes_alone() {
             assert!(ask(&mut rig, &mac, Q::Query(task)).is_ok(), "the owner");
             assert_eq!(ask(&mut rig, &bot, Q::Query(task)), forbidden());
         }
+    });
+}
+
+/// The feeds alone decide (no control view standing in), the bot covered by
+/// the host's own Station's feed: [`with_bot`]'s rig as a runtime has it.
+fn fed_bot(rig: &mut LocalRig, root: &Path, os: &ManualOs, start: u64) -> Senders {
+    let s = with_bot(rig, root, os, start + 3 * HOUR);
+    rig.bridge.work.controls = None;
+    rig.bridge.start_view().standings.clear();
+    feed(rig, &s.log, &[&bot_record(&s.log, ControlAction::Cover, 1)]);
+    assert!(matches!(
+        rig.bridge.sender_class(BOT),
+        SenderClass::Delegated(_)
+    ));
+    s
+}
+
+/// The stored control state stops reading (a damaged part, found when the
+/// feeds load again).
+fn damage(rig: &mut LocalRig) {
+    rig.bridge
+        .work
+        .store
+        .as_ref()
+        .unwrap()
+        .db
+        .execute(
+            "INSERT INTO control_principals(principal,part) VALUES('service:svc-x','{damaged')",
+            [],
+        )
+        .unwrap();
+    rig.bridge.work.feeds = Feeds::Unloaded;
+    rig.bridge.ensure_feeds();
+    assert!(matches!(rig.bridge.work.feeds, Feeds::Damaged));
+}
+
+/// The phone, a native member.
+fn phone_identity() -> Identity {
+    Identity::native("dev-phone", auth("dev-phone"))
+}
+
+/// What a service's `hello` and its closed attachments get while the
+/// control state is unchecked.
+fn unchecked() -> (String, Option<String>) {
+    (
+        "busy".into(),
+        Some(details::REVOCATIONS_NOT_YET_CHECKED.into()),
+    )
+}
+
+fn revoked_refusal() -> (String, Option<String>) {
+    ("unauthorized".into(), Some("revoked".into()))
+}
+
+/// Whether a principal holds a live r9 attachment.
+fn attached(rig: &LocalRig, principal: &str) -> bool {
+    rig.bridge
+        .r9
+        .attachments()
+        .iter()
+        .any(|(_, p)| p.as_str() == principal)
+}
+
+/// Ruling T35c (review I1): while the control state can't be checked, no
+/// service holds session-v1, as host-work answers it `busy`. A state found
+/// damaged closes every live service attachment (§H, after `busy`,
+/// `revocations not yet checked`) and refuses every service's `hello` the
+/// same way; so does one not loaded (a runtime started with hosting
+/// paused never loads it). Natives are admitted throughout. Once the
+/// feeds load, a service not revoked is admitted again.
+#[test]
+fn every_services_hello_is_busy_while_the_control_state_is_unchecked() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = fed_bot(&mut rig, root, &os, start);
+        r9_link_up(&mut rig);
+        let mut bot = service_hello(&mut rig, &s.log, "bot-1", "svc-bot").unwrap();
+        hello_as(&mut rig, &s.log, "phone-1", phone_identity()).unwrap();
+        let before = rig.bridge.host.control_gen(BOT);
+        damage(&mut rig);
+        let _ = flushed(&mut rig, "bot-1");
+        passes(&mut rig, 1);
+        assert!(!attached(&rig, BOT), "closed");
+        assert!(attached(&rig, PHONE), "a native stays");
+        assert!(rig.bridge.host.control_gen(BOT) > before);
+        let (frames, closes) = flushed(&mut rig, "bot-1");
+        assert_eq!(closes.len(), 1, "{closes:?}");
+        // A `busy` with no `re` (not a fence the client takes as final).
+        let errors: Vec<_> = frames
+            .iter()
+            .flat_map(|f| bot.on_frame(f, 1).unwrap())
+            .filter_map(|e| match e {
+                atem_client::connect::Event::Error(e) => Some((e.code, e.detail)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors, [unchecked()]);
+        assert_eq!(
+            refusal(service_hello(&mut rig, &s.log, "bot-2", "svc-bot")),
+            unchecked()
+        );
+        hello_as(&mut rig, &s.log, "phone-2", phone_identity()).unwrap();
+        // Repaired, but hosting paused when the feeds would load again:
+        // they don't, and the state stays unchecked.
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute(
+                "DELETE FROM control_principals WHERE principal='service:svc-x'",
+                [],
+            )
+            .unwrap();
+        let config = rig.bridge.work.config.clone();
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        rig.bridge.work.config = Config::default();
+        rig.bridge.work.config_problem = Some("expected a table".into());
+        passes(&mut rig, 2);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Unloaded));
+        assert_eq!(
+            refusal(service_hello(&mut rig, &s.log, "bot-3", "svc-bot")),
+            unchecked()
+        );
+        hello_as(&mut rig, &s.log, "phone-3", phone_identity()).unwrap();
+        // Hosting back: the feeds load, and the bot (not revoked) is in.
+        rig.bridge.work.config = config;
+        rig.bridge.work.config_problem = None;
+        passes(&mut rig, 2);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
+        service_hello(&mut rig, &s.log, "bot-4", "svc-bot").unwrap();
+    });
+}
+
+/// Review I2 (D9, ruling T35c): the r9 engine's revoked services come back
+/// from the stored control state, never from memory. After a restart the
+/// revoked bot's `hello` is `busy` while the feeds aren't loaded (hosting
+/// paused at the start: probe B), and refused `unauthorized`, `revoked`
+/// once they load. A channel of it live when the loaded state is first
+/// read (as one admitted before it) is fenced then, its `control_gen`
+/// raised once.
+#[test]
+fn a_revoked_services_hello_stays_refused_across_a_restart() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = fed_bot(&mut rig, root, &os, start);
+        feed(&mut rig, &s.log, &[&bot_record(&s.log, revoke(false), 2)]);
+        r9_link_up(&mut rig);
+        assert_eq!(
+            refusal(service_hello(&mut rig, &s.log, "bot-1", "svc-bot")),
+            revoked_refusal()
+        );
+        restart(&mut rig, root, &os, false, true);
+        r9_link_up(&mut rig);
+        // As the restart finds them while hosting is paused: the feeds not
+        // loaded, nothing of the last run's in memory.
+        let config = rig.bridge.work.config.clone();
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        rig.bridge
+            .r9
+            .set_revoked_services(std::collections::HashSet::new());
+        rig.bridge.work.config = Config::default();
+        rig.bridge.work.config_problem = Some("expected a table".into());
+        passes(&mut rig, 2);
+        assert_eq!(
+            refusal(service_hello(&mut rig, &s.log, "bot-2", "svc-bot")),
+            unchecked()
+        );
+        hello_as(&mut rig, &s.log, "phone-1", phone_identity()).unwrap();
+        rig.bridge.work.config = config;
+        rig.bridge.work.config_problem = None;
+        passes(&mut rig, 2);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
+        assert_eq!(
+            refusal(service_hello(&mut rig, &s.log, "bot-3", "svc-bot")),
+            revoked_refusal()
+        );
+        // A channel of it live when the loaded state is read: as one
+        // admitted before (the engine's set empty, its gate open).
+        rig.bridge
+            .r9
+            .set_revoked_services(std::collections::HashSet::new());
+        let _live = service_hello(&mut rig, &s.log, "bot-4", "svc-bot").unwrap();
+        let before = rig.bridge.host.control_gen(BOT);
+        passes(&mut rig, 2);
+        assert!(!attached(&rig, BOT), "fenced at the read");
+        assert_eq!(rig.bridge.host.control_gen(BOT), before + 1);
+        assert_eq!(
+            refusal(service_hello(&mut rig, &s.log, "bot-5", "svc-bot")),
+            revoked_refusal()
+        );
+    });
+}
+
+/// Review m1: a revoke fences the service's live attachment once: its
+/// `control_gen` raised by one, whatever reads the revoke first (the
+/// record's followup, or the engine's revoked services).
+#[test]
+fn a_revoke_fences_a_live_service_once() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = fed_bot(&mut rig, root, &os, start);
+        r9_link_up(&mut rig);
+        let _live = service_hello(&mut rig, &s.log, "bot-1", "svc-bot").unwrap();
+        let before = rig.bridge.host.control_gen(BOT);
+        feed(&mut rig, &s.log, &[&bot_record(&s.log, revoke(false), 2)]);
+        passes(&mut rig, 3);
+        assert!(!attached(&rig, BOT));
+        assert_eq!(rig.bridge.host.control_gen(BOT), before + 1);
+    });
+}
+
+/// Review m2 (ruling T35c): with `host.delegated` off the r9 engine refuses
+/// no service's `hello` for the control state, delegated rows in the store
+/// or not (their feeds still load: hook off = main for session-v1): the
+/// revoked bot is admitted, and so is it while the state doesn't read.
+#[test]
+fn with_the_hook_off_no_services_hello_is_refused_for_the_control_state() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = fed_bot(&mut rig, root, &os, start);
+        let task = bot_task(&mut rig, &s, "HOOK_OFF_ROW", start + HOUR);
+        assert!(stored_record(&rig, &task).delegated.is_some());
+        feed(&mut rig, &s.log, &[&bot_record(&s.log, revoke(false), 2)]);
+        // The hook removed: a restart's fresh engine, the feeds loaded again
+        // for the delegated rows.
+        rig.bridge.features = HostFeatures::default();
+        rig.bridge
+            .r9
+            .set_revoked_services(std::collections::HashSet::new());
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        r9_link_up(&mut rig);
+        passes(&mut rig, 2);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
+        service_hello(&mut rig, &s.log, "bot-1", "svc-bot").unwrap();
+        damage(&mut rig);
+        passes(&mut rig, 2);
+        service_hello(&mut rig, &s.log, "bot-2", "svc-bot").unwrap();
+    });
+}
+
+/// Review m5 (design I.5.5 step 4, I.6.4): the runtime dies after a hold's
+/// record committed and before the bridge withdrew the bot's attempt
+/// waiting `accepted`. The restart withdraws it (`withdrawn at recovery`),
+/// and it still isn't counted: the hold's cause was written with the
+/// record. The task waits `paused`.
+#[test]
+fn a_holds_withdrawal_stays_uncounted_across_a_crash() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = covered_bot(&mut rig, root, &os, start);
+        phone_running(&mut rig, &s, "CRASH_PHONE_RUNNING", start).await;
+        let task = bot_task(&mut rig, &s, "CRASH_HELD", start + HOUR);
+        blocked(&mut rig, &task, BEHIND).await;
+        let attempt = attempt_behind_the_turn(&mut rig, &task, "CRASH_HELD");
+        feed(
+            &mut rig,
+            &s.log,
+            &[&bot_record(&s.log, ControlAction::Hold, 2)],
+        );
+        // The crash: the record committed, its followups never ran.
+        rig.bridge.work.followups.clear();
+        restart(&mut rig, root, &os, false, true);
+        passes(&mut rig, 2);
+        assert_eq!(
+            attempts(&rig, &task),
+            [(attempt, Some("withdrawn".into()), false)]
+        );
+        assert_eq!(settled(&rig, &task), outcome(Event::Held));
+        assert!(!input(&rig).contains("CRASH_HELD"));
     });
 }

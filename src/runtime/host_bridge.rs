@@ -941,6 +941,9 @@ impl HostBridge {
             project_unread: HashMap::new(),
             r9: {
                 let mut r9 = R9Host::with_pairing(r9host::Limits::default(), Some(dir), vouch);
+                // With `host.delegated` on, no service holds session-v1 until
+                // the control state is loaded and read (ruling T35c).
+                r9.start_services_unchecked(features.delegated);
                 if let Some(pairing) = &pairing {
                     // §R9.8a: a pending policy write is rolled forward first.
                     r9.set_policy_paths(pairing.clone(), dir.to_path_buf());
@@ -1990,6 +1993,9 @@ impl HostBridge {
         }
         self.sync_r9_link(r9_app_link(app), &mut cx);
         self.sync_station_link(app);
+        // The services' r9 admission as the control state stands, before
+        // any `hello` of this pass (ruling T35c).
+        self.sync_services(&mut cx);
         if !adopting
             && app
                 .hosted
