@@ -2236,7 +2236,7 @@ fn an_unsent_call_is_dropped_by_its_id_and_a_retired_one_never_goes() {
     assert_ne!(a.request_id, b.request_id);
     // Only B goes.
     let sending = rig.sync.outgoing(vec![a.clone(), b.clone()]);
-    assert_eq!(sending, [b.clone()]);
+    assert_eq!(sending, std::slice::from_ref(&b));
     // A failed send of A (had it gone) leaves B live.
     rig.sync.unsent(&a.request_id);
     assert_eq!(rig.sync.live_call(), Some(b.clone()));
