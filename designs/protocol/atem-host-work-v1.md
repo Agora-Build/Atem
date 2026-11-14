@@ -1279,13 +1279,12 @@ applies again; what needs the session host comes after that commit.
   v1 task the service had (admitted before its cover) follows v1's rules,
   which the fence ends (`sender's authority changed`).
 - **No service holds session-v1 while the control state is unchecked**
-  (rulings T35c and T35d, **Atem's reading, for Astation**), on a host that
-  keeps a control state: a host-work store bound to the host's current
-  identity whose control tables exist (read once when the store opens), or
-  a store that exists and can't be opened or read. With hosting on, the
-  store makes its control tables as it opens, so a fresh one is unread
-  from then, and another identity's store counts too: hosting replaces it
-  with this identity's at its next pass. A host that never had a
+  (rulings T35c, T35d and T35e, **Atem's reading, for Astation**), on a
+  host that keeps a control state: a host-work store whose control tables
+  exist (read once when the store opens), whichever host identity it is
+  bound to, or a store that exists and can't be opened or read. With
+  hosting on, the store makes its control tables as it opens, so a fresh
+  one is unread from then. A host that never had a
   control state (hosting never configured, or never enabled, and no store)
   refuses no service: services keep session-v1 as without delegated tasks.
   This never depends on the advertised `host.delegated`. On such a host the
@@ -1299,7 +1298,13 @@ applies again; what needs the session host comes after that commit.
     reads the host's own Station's feed up to the head the Station announced
     (its `heads`, or the page's own if higher) clears it. A first read cut
     short keeps the mark across a crash. Without a Station link, the state
-    stays unread.
+    stays unread;
+  - is another identity's: the store is still bound to the identity before
+    a re-verify or a re-pair (revoke is final, ruling T35e). This identity
+    never read its feed: hosting replaces the store with this identity's,
+    unread (above), at its next pass while on, or when it resumes.
+    Meanwhile the old identity's standings refuse nothing for it: a service
+    it revoked is `busy` like every other.
 
   Meanwhile every service's `hello` that the device list would admit is
   refused `busy`, `revocations not yet checked` (the device-list decision
@@ -1309,7 +1314,7 @@ applies again; what needs the session host comes after that commit.
   through the same §H fence, after the same error. Natives, browser grants
   and `local` are unaffected. Once the state reads, services are admitted
   again, those it revokes refused as above. `atem status`'s `Control
-  feeds:` line says which of the three holds, with its way out.
+  feeds:` line says which of these holds, with its way out.
 - **The interrupt** (`interrupt_running: true` on the revoke, or a later
   `interrupt_running` record) writes an intent (reason `revoke`) for each
   task whose turn may run: one in its turn, or whose attempt is live (one
@@ -1337,9 +1342,9 @@ applies again; what needs the session host comes after that commit.
   they ask for are carried out (a stop always wins); before the start's
   recovery they wait for it. A revoked service stays refused and the
   others are admitted. A store bound to another identity (hosting paused
-  across a re-verify) isn't moved aside while paused: that is hosting's
-  business when it resumes, and until then this host keeps no control
-  state of its current identity (above).
+  across a re-verify) is neither moved aside nor loaded while paused: that
+  is hosting's business when it resumes. Until then, and until the new
+  store's first complete read, every service is `busy` (above).
 - **With `host.delegated` off** (the hook removed with delegated tasks
   left), a record still reaches the tasks the store holds, but nothing of
   session-v1: no fence, and no `hello` refused for the control state.

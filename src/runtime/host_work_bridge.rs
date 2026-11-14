@@ -611,26 +611,40 @@ impl HostBridge {
         if self.controls_stood_in() || !self.keeps_controls() {
             return false;
         }
+        // Another identity's store: this identity never read its feed
+        // (ruling T35e).
+        if self.kept_elsewhere() {
+            return true;
+        }
         match &self.work.feeds {
             Feeds::Loaded(feeds) => feeds.never_read(),
             _ => true,
         }
     }
 
-    /// Whether this host keeps a control state of its current identity
-    /// (ruling T35d, A): a store bound to it with control tables, or a store
-    /// that can't be read (fail closed). As read when the store opened
-    /// (`read_kept`), a load and a new identity's store. Another identity's
-    /// store counts while hosting is on: this pass's `work_pass` replaces it
-    /// with this identity's, unread (B).
+    /// Whether this host keeps a control state (ruling T35d, A): a store
+    /// with control tables, or a store that can't be read (fail closed). As
+    /// read when the store opened (`read_kept`), a load and a new identity's
+    /// store. A store bound to another identity counts at every hosting
+    /// state (ruling T35e, revoke is final): this identity never read its
+    /// feed, so its services wait for this identity's store and its first
+    /// complete read ([`HostBridge::kept_elsewhere`]).
     pub(super) fn keeps_controls(&self) -> bool {
         match &self.work.kept {
-            Some(KeptControls::Of(identity)) => {
-                *identity == self.work_host() || self.hosting_enabled()
-            }
-            Some(KeptControls::Unreadable) => true,
+            Some(KeptControls::Of(_)) | Some(KeptControls::Unreadable) => true,
             Some(KeptControls::None) | None => false,
         }
+    }
+
+    /// The control state kept is this identity's own (only that one loads).
+    pub(super) fn kept_here(&self) -> bool {
+        matches!(&self.work.kept, Some(KeptControls::Of(identity)) if *identity == self.work_host())
+    }
+
+    /// The control state kept is another identity's (a re-verify or a
+    /// re-pair since, its store not replaced yet: hosting does that when on).
+    pub(super) fn kept_elsewhere(&self) -> bool {
+        matches!(&self.work.kept, Some(KeptControls::Of(identity)) if *identity != self.work_host())
     }
 
     /// Whether the open store keeps a control state, and whose, read once
@@ -1048,7 +1062,7 @@ impl HostBridge {
             // here: another identity's store is hosting's business.
             if self.features.delegated {
                 self.read_kept();
-                if self.keeps_controls() {
+                if self.kept_here() {
                     self.ensure_feeds();
                     self.feeds_reverify();
                 }

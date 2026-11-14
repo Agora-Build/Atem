@@ -1540,6 +1540,131 @@ fn a_reverify_never_admits_a_revoked_service_in_between() {
     });
 }
 
+/// Ruling T35e: hosting paused across a re-verify. The store, bound to the
+/// old identity, keeps a control state at every hosting state, and the new
+/// identity never read its feed: every service's `hello` is `busy` (the
+/// revoked bot's and an unrevoked one's), a native's admitted, in the
+/// running process and as a start finds it. Once hosting resumes and the
+/// new store's first read completes, the unrevoked service is admitted and
+/// the revoked one refused.
+#[test]
+fn a_reverify_while_hosting_is_paused_keeps_every_service_busy() {
+    use crate::session_protocol::membership::r9log::secret;
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = fed_bot(&mut rig, root, &os, start);
+        let entry = s.log.add_service(
+            "svc-two",
+            &["host"],
+            None,
+            &["notify", "prompt", "view"],
+            start + 3 * HOUR,
+        );
+        carry(&mut rig, &s.log, entry);
+        let cover = bot_record(&s.log, ControlAction::Cover, 1);
+        let revoked = bot_record(&s.log, revoke(false), 2);
+        feed(&mut rig, &s.log, &[&revoked]);
+        r9_link_up(&mut rig);
+        assert_eq!(
+            refusal(service_hello(&mut rig, &s.log, "bot-1", "svc-bot")),
+            revoked_refusal()
+        );
+        service_hello(&mut rig, &s.log, "two-1", "svc-two").unwrap();
+        // Hosting paused, then `atem pair verify`: the host's next trust
+        // generation on the same list, pinned, the session host rebound.
+        rig.bridge.work.config.enabled = false;
+        passes(&mut rig, 1);
+        s.log.add_host("host", 2, &secret("delegated host"));
+        let pairing = crate::profile::Sources::in_dir(&root.join("profile"))
+            .paths
+            .pairing;
+        MembershipHost::pin(
+            &pairing,
+            &rig.bridge.dir,
+            &HostPin {
+                host_id: "host".into(),
+                host_trust_gen: 2,
+            },
+            &s.log.log,
+            &secret("delegated host"),
+        )
+        .unwrap();
+        let identity = crate::runtime::host_bridge::Identity {
+            account_id: "acct".into(),
+            atem_device_id: "host".into(),
+            host_trust_gen: 2,
+        };
+        {
+            let mut cx = Cx {
+                client: &rig.app.astation_client,
+                sessions: &mut rig.sessions,
+            };
+            rig.bridge.pairing = Some(pairing);
+            rig.bridge.reopen_list_if_changed(&mut cx);
+            rig.bridge.pairing = None;
+            assert!(rig.bridge.adopt_identity(&identity, &mut cx));
+        }
+        let hello = |rig: &mut LocalRig, handle: &str, device: &str| {
+            refusal(hello_at(
+                rig,
+                &s.log,
+                handle,
+                Identity::service(device, auth(device)),
+                2,
+            ))
+        };
+        passes(&mut rig, 2);
+        assert_eq!(hello(&mut rig, "bot-a", "svc-bot"), unchecked());
+        assert_eq!(hello(&mut rig, "two-a", "svc-two"), unchecked());
+        assert!(!attached(&rig, "service:svc-two"), "fenced");
+        hello_at(&mut rig, &s.log, "phone-1", phone_identity(), 2).unwrap();
+        // As a start finds it, hosting still paused: nothing of the run in
+        // memory, the old identity's store on disk.
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        rig.bridge.work.kept = None;
+        rig.bridge.r9.set_revoked_services(Default::default());
+        passes(&mut rig, 2);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Unloaded));
+        // `atem status` says why, with the way out.
+        let link = rig
+            .bridge
+            .station
+            .replace(crate::runtime::delegated::station::Station::new());
+        let line = rig.bridge.feeds_status().unwrap_or_default();
+        assert!(
+            line.contains("until this host identity's own store is made"),
+            "{line}"
+        );
+        rig.bridge.station = link;
+        assert_eq!(hello(&mut rig, "bot-b", "svc-bot"), unchecked());
+        assert_eq!(hello(&mut rig, "two-b", "svc-two"), unchecked());
+        hello_at(&mut rig, &s.log, "phone-2", phone_identity(), 2).unwrap();
+        // Hosting resumes: this identity's store, unread until the
+        // Station's feed is read from 0 into it.
+        rig.bridge.work.config.enabled = true;
+        passes(&mut rig, 1);
+        assert_eq!(
+            hello(&mut rig, "two-c", "svc-two"),
+            unchecked(),
+            "the new store, unread"
+        );
+        feed(&mut rig, &s.log, &[&cover, &revoked]);
+        passes(&mut rig, 1);
+        hello_at(
+            &mut rig,
+            &s.log,
+            "two-d",
+            Identity::service("svc-two", auth("svc-two")),
+            2,
+        )
+        .unwrap();
+        assert_eq!(hello(&mut rig, "bot-d", "svc-bot"), revoked_refusal());
+    });
+}
+
 /// Ruling T35d, B (hook off = main): with `host.delegated` off a store
 /// gets no control table and no unread mark, a pass and a new identity's
 /// store included.

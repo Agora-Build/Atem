@@ -411,6 +411,11 @@ impl HostBridge {
         }
         if !unchecked {
             self.sync_revoked(cx);
+        } else if self.kept_elsewhere() && !self.r9.revoked_services().is_empty() {
+            // Another identity's standings aren't this one's (a new
+            // identity, a new store): its services wait as unchecked
+            // (ruling T35e).
+            self.r9.set_revoked_services(HashSet::new());
         }
     }
 
@@ -629,6 +634,8 @@ impl HostBridge {
                 "; services are refused (busy) until the control state loads: {} can't be opened (move it aside or restore it, then run `atem runtime restart`)",
                 store.display()
             )
+        } else if self.kept_elsewhere() {
+            "; services are refused (busy) until this host identity's own store is made (hosting on: `enabled = true` in runtime.toml) and has read its Station's control feed in full".to_string()
         } else if matches!(self.work.feeds, Feeds::Loaded(_)) {
             "; services are refused (busy) until this host's first complete read of its Station's control feed (it needs the Station's heads)".to_string()
         } else {
