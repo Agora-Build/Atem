@@ -359,7 +359,9 @@ host that keeps a control state, every service is `busy` while that state is
 unchecked (damaged, not loaded, never read, another identity's), and a
 revoked one `unauthorized`, `revoked` (Atem's readings, for Astation's
 agreement). `atem status` adds `Clock:`, `Control feeds:` and `Delegated:`
-lines. Not built: host senders (`host.senders`, stage 3; the hook refuses
+lines. A dev host for the joint check turns it on as `designs/agent-hosting.md`
+§14 says (a debug build, the hook in the `env.sh` that runs `atem runtime`
+directly). Not built: host senders (`host.senders`, stage 3; the hook refuses
 it), cross-instance work (stage 2), disabled-account enforcement.
 
 **Local agent collaboration** (stage 1, released in v0.8.5; `designs/agent-collaboration.md`):

@@ -3,7 +3,8 @@
 Status: implemented and released (Atem v0.8.2; principals default to the paired Astation since v0.8.3).
 **Delegated work** (step 4 of [delegated-host-work.md](delegated-host-work.md), Part I: the host runs a
 native member's or a covered service's task while its sender is offline) is built behind a debug-only hook
-and advertised by no release build; sections 4, 7, 9 and 10 say where it differs.
+and advertised by no release build; sections 4, 7, 9 and 10 say where it differs, and section 14 how a
+debug dev host turns it on for the joint check.
 **Not implemented:** OS service installation and boot startup, automatic
 remote launch when work arrives, and durable delivery through the Station (outbox,
 replay, offline senders); section 12 lists the rest.
@@ -698,3 +699,59 @@ real Station and Astation are not exercised: that is the joint check.
 ```bash
 cargo test --test delegated_binary --test control_feed_binary -- --test-threads=1
 ```
+
+## 14. Delegated work on a dev host (debug builds only)
+
+For the joint dev check of delegated work (the delegated host-work design's
+VII.A, its V.2 step 7). A release build ignores all of this: it compiles the
+hook out, lists none of the features and makes no Station call, whatever
+its environment holds.
+
+1. **A debug build.** Build with `cargo build` (no `--release`), and use
+   that one binary for every `atem` command on the dev host's profile (put
+   it first on `PATH` in `env.sh`). A client of another build replaces the
+   running runtime with its own build ([agent-runtime.md](agent-runtime.md)),
+   which starts without the hook.
+2. **The hook, in `env.sh`.** `env.sh` exports
+   `ATEM_TEST_HOST_FEATURES=host.delegated,host.alerts` and runs `atem
+   runtime` directly, in the foreground (for example in a tmux window). The
+   runtime reads the variable once, from its own environment, when it
+   starts. No client passes `ATEM_TEST_*` on, so a runtime started by `atem
+   runtime start`, `atem runtime restart`, `atem agent launch` or bare `atem`
+   has no hook:
+   - start and restart the runtime only through `env.sh`, never with `atem
+     runtime restart`, even where `atem status` suggests it;
+   - a runtime already serving the profile without the hook keeps `atem
+     runtime` from starting: stop it first (SIGTERM to the pid in
+     `runtime.lock`); its workers are adopted by the next one.
+3. **What else it needs.**
+   - A verified pairing with a pinned device list (`atem pair`, then `atem
+     pair verify` if it isn't verified).
+   - Hosting enabled in `runtime.toml`, with the profiles and routes the
+     check uses (sections 2 and 4).
+   - The selected Station ([astation-connection.md](astation-connection.md)).
+     It must announce this host's own feed in `heads`, even an empty one,
+     and answer its `control_sync`. Until it does, every service is `busy`
+     and a native member's task waits (`revocations not yet checked`) unless
+     its own channel brought the host up to its head.
+4. **What to check.**
+   - At start the runtime prints `ATEM_TEST_HOST_FEATURES (debug build):
+     host.delegated on, host.alerts on` (a value it refuses: `… refused (…);
+     nothing turned on`). Its output goes to the terminal it runs in, not to
+     `runtime.log`, unless `env.sh` redirects it there.
+   - Its `welcome` lists `host.delegated` and `host.alerts`.
+   - `atem status` shows `Control feeds:` (`revocations checked (<origin>)`
+     once the gate opens, else why it is closed), `Delegated:` (the
+     unresolved outcomes) and, while the delegated clock holds deadlines
+     back, `Clock:`.
+5. **Turning it off.** Remove the variable and start the runtime again
+   through `env.sh`. The runtime then works as if the hook had never been
+   set, except for what its store already holds:
+   - delegated tasks already accepted aren't dispatched: unstarted ones
+     stay `blocked` (`host.delegated is off`) and expire at their deadlines;
+     started ones follow their receipts, and a turn still running at its
+     deadline is still interrupted;
+   - `atem task list --unknown` and `atem task resolve` still work;
+   - no Station call goes, and the control state refuses no service any
+     more: a service a record revoked gets session-v1 back. Don't turn the
+     hook off in the middle of a revocation check.

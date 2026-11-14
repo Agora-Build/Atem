@@ -100,13 +100,13 @@ Only a debug build's `atem runtime` started with `ATEM_TEST_HOST_FEATURES=host.d
 environment runs any of it, and only such a runtime lists `host.delegated` and `host.alerts` in its `welcome`. Release
 builds compile the hook out: no feature, no Station call, hosting as before. `host.senders` stays off (the hook refuses
 it), and the signing gate stays closed. Activation is a later owner decision, after the joint check (V.2 step 7,
-VII.A); a dev host turns the features on as [agent-hosting.md](agent-hosting.md) says. The contracts say what is built:
-host-work-v1 §11 (its "as built in step 4" passages) and session-v1 R9.14. Astation answered step 4's contract
-questions on 2026-11-13 (#120 comments 6848326392 and 6848463998, #164 comment 6858189009) and signed off O1 and O5
-(#156 comment 6858184397); marks written before those answers still read "for Astation" until a docs change marks
-them agreed. The readings written since (host-work-v1 §11.1's effects on tasks and service refusals, §11.4's
-acknowledgments) wait for its answer. The design text below changes only in I.5.5 step 2's fence sentence (marked
-"changed to match Atem's spec") and in IX.1 Q7's answer.
+VII.A); a dev host turns the features on as [agent-hosting.md](agent-hosting.md) section 14 says ("Delegated work
+on a dev host"). The contracts say what is built: host-work-v1 §11 (its "as built in step 4" passages) and session-v1
+R9.14. Astation answered step 4's contract questions on 2026-11-13 (#120 comments 6848326392 and 6848463998, #164
+comment 6858189009) and signed off O1 and O5 (#156 comment 6858184397); marks written before those answers still read
+"for Astation" until a docs change marks them agreed. The readings written since (host-work-v1 §11.1's effects on
+tasks and service refusals, §11.4's acknowledgments) wait for its answer. The design text below changes only in I.5.5
+step 2's fence sentence (marked "changed to match Atem's spec") and in IX.1 Q7's answer.
 
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256
