@@ -254,6 +254,11 @@ impl Rig {
         }
         // A stale socket file of a killed runtime isn't the new one's.
         let _ = std::fs::remove_file(self.sandbox.config().join("runtime.socket"));
+        // Nor is its state dump: a read right after the restart would see
+        // its state and its higher pass count (`two_passes`, `work_passes`).
+        if self.dump {
+            let _ = std::fs::remove_file(self.dump_file());
+        }
         self.runtime = Some(
             command
                 .arg("runtime")
@@ -722,6 +727,25 @@ fn two_passes(rig: &Rig) {
 /// The session host's receipt of `rid`, as the state dump shows it.
 fn receipt(rig: &Rig, rid: &str) -> Value {
     dumped(rig)["receipts"][rid].clone()
+}
+
+/// Waits until the state dump shows `field` of `rid`'s receipt as `value`.
+/// The dump is written at the end of a pass, after the store commits and
+/// the agent's input is written, so a read right after a wait on either
+/// can see the pass before (a slow runner): it is polled, never read once.
+fn receipt_becomes(rig: &Rig, rid: &str, field: &str, value: &str) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let seen = receipt(rig, rid);
+        if seen[field] == value {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{rid}'s receipt {field} never became {value}: {seen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// VII.A test 17 (design I.4.3 condition 2a, Decision 16; session-v1 R9.14
@@ -1232,7 +1256,7 @@ fn sigkill_at_each_crash_point() {
         attempt_rows(&rig, &held["task_id"]),
         [(withdrawn.clone(), Some("withdrawn".into()), false)]
     );
-    assert_eq!(receipt(&rig, &withdrawn)["detail"], "withdrawn at recovery");
+    receipt_becomes(&rig, &withdrawn, "detail", "withdrawn at recovery");
     within("the hold's result sent", || {
         results_of(&rig, &hold) == [[("hold".to_string(), "applied".to_string())]]
     });
@@ -1398,7 +1422,7 @@ fn sigkill_at_each_crash_point() {
             && ends(&rig, &held["task_id"]) == [None]
     });
     let accepted = attempts(&rig, &held["task_id"])[0].0.clone();
-    assert_eq!(receipt(&rig, &accepted)["state"], "accepted");
+    receipt_becomes(&rig, &accepted, "state", "accepted");
     crash(&rig, "crash_after_page_commit");
     let revoke = {
         let mut station = rig.station();
@@ -1443,7 +1467,7 @@ fn sigkill_at_each_crash_point() {
     rig.start();
     let mut r = Router::new(&rig.astation);
     wait_stored(&rig, &held["task_id"], "cancelled", REVOKED);
-    assert_eq!(receipt(&rig, &accepted)["detail"], "withdrawn at recovery");
+    receipt_becomes(&rig, &accepted, "detail", "withdrawn at recovery");
     assert_eq!(
         attempts(&rig, &held["task_id"]),
         [(accepted, Some("withdrawn".into()))]
@@ -3397,7 +3421,7 @@ fn a_record_against_a_live_attempt() {
     two_passes(&rig);
     std::fs::write(rig.fake.join("complete"), "").unwrap();
     within("its turn", || input(&rig).contains("REVOKED_AS_IT_STARTS"));
-    assert_eq!(receipt(&rig, &attempt)["state"], "executing");
+    receipt_becomes(&rig, &attempt, "state", "executing");
     assert_eq!(ends(&rig, &tid), [None], "host-work hasn't seen it start");
     // The revoke lands.
     control(
