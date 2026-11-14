@@ -2713,10 +2713,11 @@ activation: a relay that fails it gains nothing). **Amended in step 4,
 2026-11-13 (changed agreed meaning, needs Astation's agreement):** that
 fetch is R9.3's, run at its Station's `heads` (every (re)connection, every
 30 s, and at once when it stores a control record; host-work-v1 §11.4) in
-place of this schedule, and at once when a deferral it stopped at ends on
-this host (after a refusal's backoff, at the next `heads`); until
-`host.delegated` is activated a host doesn't fetch, and pending entries and
-their decisions reach it with carriers only.
+place of this schedule, and at once, with no `heads`, when a deferral it
+stopped at ends on this host (one that ends during a refusal's backoff:
+when the backoff ends); until `host.delegated` is activated a host doesn't
+fetch, and pending entries and their decisions reach it with carriers only
+(a debug build's runtime started with the hook fetches: R9.14).
 
 **During the wait the subject has no access** (not even `view`): a
 `hello` by it, or by a device added only by an entry deferred behind it,
@@ -3847,8 +3848,9 @@ Open envelope (signed by `host_channel_key`):
   (Astation r3 review 4); an object from another trust generation,
   session or process never matches.
 
-**`outcome_unknown` hint** (planned: part of feature `host.alerts`, which no
-host advertises yet; delegated host-work I.4.6, host-work-v1 §11.3; **new body, agreed with Astation (2026-11-11, #120 comment 6810116314)**). When a task's outcome becomes unknown, the
+**`outcome_unknown` hint** (part of feature `host.alerts`, built in step 4
+behind a debug-only hook and advertised by no release build, R9.14;
+delegated host-work I.4.6, host-work-v1 §11.3; **new body, agreed with Astation (2026-11-11, #120 comment 6810116314)**). When a task's outcome becomes unknown, the
 host signs one hint per recipient, as for an open approval hint, to tell the
 owner's devices that a person is needed. It is a second body of the same
 `type`, signed under the same label (`atem-push-hint-v1`) by
@@ -4368,15 +4370,20 @@ agreed revision 6b, I.7) revises session-v1 so that Atem runs a delegated
 sender's task itself, under a host-local principal, while the sender is
 offline. Host-work's side (the task lifecycle, its states and details, the
 clocks) is [atem-host-work-v1.md](atem-host-work-v1.md) §11.6. **Nothing
-here is advertised in this version:** no host lists `host.delegated`,
-`host.alerts` or `host.senders`. Items 1 to 7 are built (step 4 of the
-design's order of work) behind a debug-only hook,
-`ATEM_TEST_HOST_FEATURES=host.delegated`, read once when the runtime
-starts. Release builds compile the hook out, so without it no `host-work`
-principal exists and no receipt carries `task_id` or `sender`. Item 8 is
-still refused (below). The shared core has the wire: the principal's name,
-the receipt fields and their reader, and the op and its answer. Each choice
-that fills in the design is marked. Astation agreed R9.14 (2026-11-11, #120
+here is advertised in this version:** no release build lists
+`host.delegated`, `host.alerts` or `host.senders`. Items 1 to 7 are built
+(step 4 of the design's order of work, complete on 2026-11-14 with the
+lifecycle of host-work-v1 §11.6 that uses them) behind a debug-only hook,
+`ATEM_TEST_HOST_FEATURES=host.delegated[,host.alerts]`, which a debug
+build's runtime reads once, from its own environment, when it starts (no
+client passes `ATEM_TEST_*` to a runtime it starts); only such a runtime
+lists `host.delegated` (and `host.alerts`) in its `welcome`. Release builds
+compile the hook out, so without it no `host-work` principal exists and no
+receipt carries `task_id` or `sender`. Item 8 is still refused (below), and
+`host.senders` stays off (the hook refuses it). The shared core has the
+wire: the principal's name, the receipt fields and their reader, and the op
+and its answer. Each choice that fills in the design is marked. Astation
+agreed R9.14 (2026-11-11, #120
 comment 6810116314), except the two questions still marked open (item 1's
 UI question, item 8's request for a new key) and what step 4 added since,
 each marked where it is: item 1's leases (no prompt that doesn't acquire,
@@ -4384,7 +4391,11 @@ none after a restart) and item 3's fail-closed rules (Atem's choices, for
 Astation to confirm); item 1's lease kept while a request is open, item
 4's refusal-list rules (with §I.2's), item 5's delivery after a restart
 and item 6's reconciliation of `executing` prompts (changed agreed
-meaning, needs Astation's agreement).
+meaning, needs Astation's agreement). Astation then agreed items 1 to 7
+with those step-4 amendments, and answered item 1's UI question (a generic
+controller label until receipt provenance names the task; no holder
+field), on 2026-11-13 (#120 comment 6848326392): the marks below predate
+that answer. Item 8's request stays open.
 
 1. **The `host-work` principal.** Its name is `host-work`
    (`atem_client::session::wire::HOST_WORK_PRINCIPAL`), a bare word like

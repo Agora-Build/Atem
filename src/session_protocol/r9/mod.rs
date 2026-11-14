@@ -1816,10 +1816,11 @@ impl R9Host {
     }
 
     /// The service `principal` was revoked by a control record (design
-    /// I.5.5 step 2): session-v1's §H fence where it has attachments (its
-    /// `control_gen` raised, its leases revoked, its queued work rejected,
-    /// each attachment closed after `unauthorized`, `revoked`), and its
-    /// later `hello`s refused.
+    /// I.5.5 step 2): session-v1's §H fence, once, whether or not it has
+    /// attachments (its `control_gen` raised, its leases revoked, its queued
+    /// work rejected, and each attachment it has closed after
+    /// `unauthorized`, `revoked`; host-work-v1 §11.1), and its later
+    /// `hello`s refused.
     ///
     /// Once per revoke in a run: a principal it fenced already, with no
     /// attachment left, is fenced no more (its `control_gen` raised once;

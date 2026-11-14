@@ -30,10 +30,10 @@ before emitting that event; apps still inspect errors and each result state.
 | `host.reply` | `reply_query` | [Host work](atem-host-work-v1.md#reply) |
 | `host.messages` | `message_publish`, `message_query` | [Host work](atem-host-work-v1.md#5-messages) |
 | `host.attachments` | `attachment_put` | [Host work](atem-host-work-v1.md#6-attachments-and-mark) |
-| `host.delegated` (planned; no host advertises it yet) | `work_interrupt`, `work_resolve` | [Host work §11.2](atem-host-work-v1.md#112-work_interrupt-and-work_resolve) |
-| `host.alerts` (planned; no host advertises it yet) | `alert_list` | [Host work §11.3](atem-host-work-v1.md#113-alert_list-hostalerts) |
+| `host.delegated` (not advertised: only a debug build's runtime started with its debug-only hook lists it, step 4) | `work_interrupt`, `work_resolve` | [Host work §11.2](atem-host-work-v1.md#112-work_interrupt-and-work_resolve) |
+| `host.alerts` (not advertised: as `host.delegated`) | `alert_list` | [Host work §11.3](atem-host-work-v1.md#113-alert_list-hostalerts) |
 
-The two planned features' results are host-work results too:
+The two unadvertised features' results are host-work results too:
 - `alert_list` answers with an `alerts` result kind, and `work_resolve` with
   a `work` result that carries `resolved`.
 - Released readers reject both, so Atem and Astation enable these features

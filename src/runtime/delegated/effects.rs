@@ -17,9 +17,10 @@
 //!   cancelled when the attempt never ran, running when it reached
 //!   `executing`. So a task never shows `cancelled` while its turn runs
 //!   (VII.A test 21). A started task goes on. The principal is fenced
-//!   through session-v1's §H where it has attachments ([`Followup::Fence`]),
-//!   and its later requests are refused, by the bridge, from the committed
-//!   standings.
+//!   through session-v1's §H once, whether or not it has attachments
+//!   ([`Followup::Fence`]: its `control_gen` raised, each attachment it has
+//!   closed; host-work-v1 §11.1), and its later requests are refused, by
+//!   the bridge, from the committed standings.
 //! - **Interrupt** (step 3, I.5.7). A durable interrupt intent (reason
 //!   `revoke`, the revocation) for each task of the principal whose turn
 //!   may run: in its turn (`submitting`, `submitted`, its attempt started),
@@ -70,8 +71,9 @@ pub enum Followup {
         attempt_id: String,
         then: Event,
     },
-    /// `principal` was revoked: session-v1's §H fence where it has
-    /// attachments (its `control_gen` raised, its attachments fenced).
+    /// `principal` was revoked: session-v1's §H fence, once, whether or not
+    /// it has attachments (its `control_gen` raised, each attachment it has
+    /// fenced).
     Fence { principal: String },
     /// Interrupt intents were written for `principal`'s tasks for
     /// `revocation` (I.5.7): carried out at once.

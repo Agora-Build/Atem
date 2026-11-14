@@ -1,6 +1,9 @@
 # Agent hosting: remote launch, messages and notifications
 
 Status: implemented and released (Atem v0.8.2; principals default to the paired Astation since v0.8.3).
+**Delegated work** (step 4 of [delegated-host-work.md](delegated-host-work.md), Part I: the host runs a
+native member's or a covered service's task while its sender is offline) is built behind a debug-only hook
+and advertised by no release build; sections 4, 7, 9 and 10 say where it differs.
 **Not implemented:** OS service installation and boot startup, automatic
 remote launch when work arrives, and durable delivery through the Station (outbox,
 replay, offline senders); section 12 lists the rest.
@@ -204,6 +207,43 @@ owner's local consent in `runtime.toml`.
   grant doesn't revive it, and its sender can no longer read it (`forbidden`).
   A sender that merely has no authorized channel open waits, and its task holds
   its session's queue until the task's deadline.
+- **Delegated senders** (built behind a debug-only hook; advertised by no
+  release build). With `host.delegated` on, the task of a native member, or
+  of a service whose Station's control feed covers it, is delegated (decided
+  when it is admitted; [delegated-host-work.md](delegated-host-work.md)
+  I.1.3). For it, the start check replaces the checks above, made when an
+  attempt is created and again when it reaches `executing`
+  ([protocol/atem-host-work-v1.md](protocol/atem-host-work-v1.md) §11.6):
+  - no `revoke` record, no removal or hold, and no device-list update
+    deferred on this host; the list not frozen, held or faulted;
+  - its current grant still covers the target with `notify` and `prompt`,
+    and the route still lists it at the recorded revision;
+  - the revocation gate open: the host read its own Station's control feed
+    up to the head the Station announced in the last 60 seconds, and
+    fetched the device list up to its head. A native member's task may
+    instead pass on a caught-up channel of its own.
+
+  The sender's channel, key and `control_gen` are no conditions: expiry and
+  renewal change nothing, and the task runs while its sender is offline. A
+  narrowing or a route change fails only unstarted tasks (`sender's
+  authorization narrowed`, `route changed`), a removal or a revoke cancels
+  them (`sender revoked`), and a hold pauses them (`paused`). A task waiting
+  for the gate (`revocations not yet checked`), a hold or a deferred entry
+  (`device list update pending`) doesn't hold its session. Browser grants,
+  services no feed covers and `local` keep the rules above.
+- **Who may act on a delegated task.** Its sender, with its current
+  authority (still a member under the same key, no revoke, a grant that is
+  unexpired, holds `notify` and `prompt` and still covers the target), may
+  query, cancel and complete it, read its reply, resolve its unknown
+  outcome (`work_resolve`) and, holding `interrupt`, interrupt its turn
+  (`work_interrupt`). A native member holding `control`, the owner, may
+  query any delegated task, read its reply, resolve it and interrupt its
+  turn. Every request of a revoked service is `forbidden`. On a host that
+  keeps a control state, every request of a service, and its `hello`, is
+  `busy` while that state is unchecked (damaged, or not yet read for this
+  host identity), and a revoked service's `hello` is refused `unauthorized`,
+  `revoked` (**Atem's readings, for Astation's agreement**; host-work-v1
+  §11.1, session-v1 R9.11).
 - Memory or vault access gives no execution right. Vault `writer_id` and relay
   room names are labels, not authority.
 - **Security is at user authentication.** Who may reach an agent is decided
@@ -382,6 +422,40 @@ the turn and leaves the task awaiting its result). A task not submitted by its
 becomes `expired`; nothing is resubmitted. A task whose sender's authority or
 whose route approval changed fails before its deadline (section 4, section 2).
 
+**Delegated senders** (built behind a debug-only hook; advertised by no
+release build; [protocol/atem-host-work-v1.md](protocol/atem-host-work-v1.md)
+§11.6). A delegated sender's task (section 4) is dispatched by the host
+itself, not on its sender's channel:
+
+- **Attempts.** Each dispatch is an attempt with a fresh `receipt_id`,
+  committed before its submit. The host-local `host-work` principal submits
+  it with the sender's provenance on the receipt (`task_id`, `sender`;
+  session-v1 R9.14), acquiring the lease only while nobody holds it, and the
+  prompt is rendered anew with a fresh tag. An attempt that the start check
+  refuses while it waits `accepted` is withdrawn, never retried, and the
+  task takes the event's state (`cancelled`, `failed`, or `blocked` for a
+  hold). At most 8 attempts count (`too many attempts`); those a hold
+  withdrew don't.
+- **The deadline.** A turn still running at the task's deadline is
+  interrupted (`interrupted at deadline`), and the task then expires. An
+  attempt still waiting `accepted` then is withdrawn (`expired before
+  submission`). Deadlines are read on the delegated clock (§11.6,
+  "Clocks"): its elapsed time counts suspend, and setting the wall clock
+  back runs no expired task.
+- **Interrupts.** `work_interrupt` interrupts a running turn once. A
+  Station's `interrupt_running` writes a durable interrupt intent for each
+  turn of its principal that may run, carried out once per turn.
+- **Unknown outcomes** never expire. At its deadline such a task stops
+  holding its session (`deadline passed; outcome unknown`) and waits for a
+  person: an owner alert (`alert_list`, and with `host.alerts` a push hint
+  to the owner's devices), then `work_resolve` (`failed` or `done` with a
+  result snapshot) or the owner's `atem task resolve` on the host (`atem
+  task list --unknown` lists them). A sender with 64 unresolved outcomes,
+  or a host with 256, gets `busy`, `too many unresolved outcomes`, for new
+  remote tasks; `local` never does.
+- **Cancel** withdraws a live attempt first; it never interrupts a running
+  turn.
+
 ## 8. Screenshots and Chisel/mark
 
 Chisel/mark is a message with an `agent` recipient and a `mark` payload: page
@@ -445,6 +519,24 @@ collaboration](agent-collaboration.md) section 10 ("Records and retention") has
 the details. Files and the database are owner-private but not encrypted at
 rest; keep secrets out of screenshots and context.
 
+**Delegated work** (built behind a debug-only hook; advertised by no release
+build). The same database holds the delegated state: each delegated task's
+admission record (in its work record), its attempts (`attempts`), the
+interrupt intents (`intents`), the owner alerts (`alerts`), the delegated
+clock's record (`clock`), the control state, one part per principal, with
+the feed cursor and the reset and "never read" marks (`control_*`), and the
+acknowledgments owed to the Station (`control_acks`). A control record's
+effects on the tasks, its intents, its acknowledgment and the feed's cursor
+commit in one transaction. A delegated task's reply text and context are kept
+30 days after the task settles, past the day its own payloads go, in a 64 MiB
+budget per host: over it the oldest go first, with a `runtime.log` line. An
+unresolved unknown outcome drops its payloads a day after its deadline and
+keeps its alert. A new host identity's database starts with an empty control
+state and reads its Station's feed from position 0; until that read reaches
+the head the Station announced, and while a stored control state doesn't
+read, every service is `busy` (section 4; **Atem's reading, for Astation's
+agreement**).
+
 ## 10. Limits
 
 | Item | Limit |
@@ -459,6 +551,19 @@ rest; keep secrets out of screenshots and context.
 | Request size | 256 KiB; message envelope 240 KiB |
 | Request and task lifetime | ≤ 24 h |
 | Host-work requests waiting for the runtime's next pass | 64 |
+
+Delegated work adds these (built behind a debug-only hook; advertised by no
+release build):
+
+| Item | Limit |
+|---|---|
+| Unresolved delegated unknown outcomes | 64 per sender, 256 per host: new remote tasks are `busy`, `too many unresolved outcomes` (`local` never is) |
+| Attempts per delegated task | 8 counted (`too many attempts`); those a hold withdrew don't count |
+| Kept delegated replies | 30 days after the task settles, 64 MiB per host (oldest dropped first) |
+| Counted control record ids per principal | 256, oldest first (host-work-v1 §11.1 rule 1) |
+| Pending control records, evidence | the 32 most recent of each, with a count |
+| Acknowledgment results kept for resending | of `revoke` and `interrupt_running` records: a service's own revoke's until its `issued_at` + 25 h, every one that applied an effect, and at most 4 all-`duplicate` ones per principal; every other result goes once |
+| Station messages | 256 KiB each (larger ones dropped unread); a `control_sync` answered within 35 s or retired |
 
 ## 11. Other components
 
@@ -489,7 +594,9 @@ rest; keep secrets out of screenshots and context.
 - **Not implemented:** work from an offline sender. Dispatch uses the sender's
   live channel, so its tasks wait until it reconnects. There is no origin proof
   that would let the Station replay an envelope. Cross-instance sending is
-  planned in [delegated-host-work.md](delegated-host-work.md).
+  planned in [delegated-host-work.md](delegated-host-work.md). Behind the
+  debug-only hook, a delegated sender's accepted task runs while the sender
+  is offline (section 7); it still has to reach the host to send it.
 - **Not implemented:** remote selector routing and context subscriptions.
   Remote senders resolve recipients (host, route, session, process) themselves.
   Local collaboration expands selectors once and persists that resolution.
@@ -505,7 +612,9 @@ rest; keep secrets out of screenshots and context.
   its session's queue until it expires at its deadline ("expired with its
   outcome unknown"; nothing is resubmitted), unless its agent submits a reply
   first (the task becomes `awaiting_result`) or, for a local task, its sender
-  completes it.
+  completes it. Behind the debug-only hook, a delegated sender's unknown
+  outcome is resolved by hand (`work_resolve`, `atem task resolve`; section
+  7).
 - **Not implemented:** deleting, archiving or compacting records in
   `host-work.sqlite` (every receipt is kept and only payloads go, section 9),
   and dropping an upload that no task ever named.
@@ -574,4 +683,18 @@ and Station delivery are not exercised.
 
 ```bash
 cargo test --test host_work_binary -- --test-threads=1
+```
+
+Delegated work (debug builds; release builds ignore these tests) runs the
+same way, with `ATEM_TEST_HOST_FEATURES` and a fake Station
+(`tests/support/station.rs`) that speaks only the shared builders:
+`tests/delegated_binary.rs` covers the lifecycle (VII.A tests 1, 2, 5 to 7,
+9, 11 to 15, 17 and 19 to 21 of the delegated host-work design, and the
+owner's `atem task` commands), `tests/control_feed_binary.rs` the Station
+calls (the device-list fetch, the feed sync, the gate, resets, refusals,
+the records' effects and acknowledgments; VII.A 3, 4, 10, 16 and 18). The
+real Station and Astation are not exercised: that is the joint check.
+
+```bash
+cargo test --test delegated_binary --test control_feed_binary -- --test-threads=1
 ```

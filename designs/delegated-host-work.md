@@ -1,6 +1,7 @@
 # Delegated host work and host-to-host senders: one design
 
-Status: **planned, not implemented** (nothing is built). Agreed by Atem, Astation and Auth/Portal on 2026-11-08
+Status: **agreed; step 4 (Part I's host side) built behind a debug-only hook and advertised by no release build;
+the rest planned** (2026-11-14; "Step 4 built" below). Agreed by Atem, Astation and Auth/Portal on 2026-11-08
 (revision 6b); the owner decided every choice (Appendix A, and owner choice 20 on 2026-11-08). Astation's
 confirmation is [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6715069931); Portal PR #31
 records the agreement as D29. Nothing activates (features unadvertised, the signing gate closed) until the
@@ -82,13 +83,39 @@ Astation on the same day; **for its sign-off**): each effect `pending` or `refus
 bounded code of the shared vocabulary, information only (it never changes a result, counts nothing and asks for no
 re-signing; host-work-v1 §11.4 wire rule 10). The design text below is unchanged; the contract states the refinement.
 
+**Step 4 built, behind a debug-only hook (2026-11-14).** Atem built V.2's step 4, Part I's host side:
+- the session host's `host-work` principal (session-v1 R9.14 items 1 to 7; item 8 is still refused);
+- the lifecycle of host-work-v1 §11.6: who is delegated, the admission record, attempts and `receipt_id`, the start
+  check, recovery, the deadline interrupt and interrupt intents, `work_interrupt`, `work_resolve`, unknown outcomes
+  with their alerts, `alert_list` and push hints, the capacity limits, delegated launches at the spawn boundary, the
+  owner's `atem task list --unknown` and `atem task resolve`, and reply retention;
+- the delegated clock (I.6.5; host-work-v1 §11.6, "Clocks"), with real-OS checks;
+- the Station link and its calls (host-work-v1 §11.4): the host's own device-list fetch (IX.1 Q7), the sync of its own
+  Station's control feed with resets, correlation and the revocation gate, and the typed refusals;
+- the records' effects on tasks (host-work-v1 §11.1) and the acknowledgments with their resends (§11.4);
+- with them, R9.7a's `expired` at a channel's lifetime end and the device-list verifier's inventory in `welcome`. The
+  framing shipped before (PR #124, bindings #145).
+
+Only a debug build's `atem runtime` started with `ATEM_TEST_HOST_FEATURES=host.delegated[,host.alerts]` in its own
+environment runs any of it, and only such a runtime lists `host.delegated` and `host.alerts` in its `welcome`. Release
+builds compile the hook out: no feature, no Station call, hosting as before. `host.senders` stays off (the hook refuses
+it), and the signing gate stays closed. Activation is a later owner decision, after the joint check (V.2 step 7,
+VII.A); a dev host turns the features on as [agent-hosting.md](agent-hosting.md) says. The contracts say what is built:
+host-work-v1 §11 (its "as built in step 4" passages) and session-v1 R9.14. Astation answered step 4's contract
+questions on 2026-11-13 (#120 comments 6848326392 and 6848463998, #164 comment 6858189009) and signed off O1 and O5
+(#156 comment 6858184397); marks written before those answers still read "for Astation" until a docs change marks
+them agreed. The readings written since (host-work-v1 §11.1's effects on tasks and service refusals, §11.4's
+acknowledgments) wait for its answer. The design text below changes only in I.5.5 step 2's fence sentence (marked
+"changed to match Atem's spec") and in IX.1 Q7's answer.
+
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256
 `cc180912cd8d3afc11c20f77a3ebc4e8a81989ede1327afc90df52d09c39eb83`), changed only by this status block, Appendix B, the link to
 the diagram, the two Astation file references in XI (written so they are not read as paths in this repository), and
 one update marked "updated after agreement" in III.4 (the phone's login is live on dev, Auth #19), and the framing,
-host-mail and clock amendments above, the marks of step 3's agreements, and IX.1 Q7's answer (marked "answered in
-step 4"). The diagram is
+host-mail and clock amendments above, the marks of step 3's agreements, IX.1 Q7's answer (marked "answered in
+step 4"), I.5.5 step 2's fence sentence (marked "changed to match Atem's spec") and the note on step 4's status in the
+paragraph that says nothing here is built. The diagram is
 `delegated-host-work-flows.html` (frozen `flows.html`, SHA-256
 `587a4c74ca9c2645dd3a2c79908813da573451479c0a0a846896fd3ff909cf6a`), changed only in the phone's login in figures 1
 and 2, marked the same way, and, after step 3's agreements, in figure 1 (both hosts use the same Station) and
@@ -109,7 +136,9 @@ design; next to it stays only the diagram of the flows. It merges two designs:
 - Atem's host-to-host senders: stages 2 and 3 of agent collaboration ([agent-collaboration.md](agent-collaboration.md) on Atem's
   branch `feat/agent-collaboration`, `3e60fcc`).
 
-Nothing here is built. The owner has decided every choice: those of Appendix A on 2026-11-07, and owner choice 20,
+Nothing here is built. (**Status since agreement:** the prompt framing is built, and so is step 4, Part I's host side,
+behind a debug-only hook and advertised by no release build; see the status block.) The owner has decided every
+choice: those of Appendix A on 2026-11-07, and owner choice 20,
 which Astation's review raised, on 2026-11-08 (VIII.2). Nothing is built from this design until Atem, Astation and
 Auth/Portal have reviewed it independently and agreed the cross-team contract, and nothing is merged or deployed
 before that contract is agreed and validated. As the source's §10 says (V.3), it gets a new Atem branch and pull
@@ -859,9 +888,10 @@ Each record is applied in one `host-work.sqlite` transaction, together with the 
 
 1. **Idempotent.** `record_id` is unique. A record already stored is acknowledged and changes nothing.
 2. **Revoke is final.** The first `revoke` marks the principal revoked. The host refuses all its future requests,
-   and runs session-v1's §H fence for it where it has attachments: `control_gen` is raised and its attachments are
-   fenced. **Changed for host senders:** a host principal has no attachments, so there is nothing to fence. Every
-   unstarted task is cancelled (`cancelled`, detail `sender revoked`, held ones included), with any attempt not yet
+   and runs session-v1's §H fence for it once, whether or not it has attachments: its `control_gen` is raised, and
+   each attachment it has is fenced (**changed to match Atem's spec**, host-work-v1 §11.1, step 4: the raised
+   `control_gen` also ends a v1 task the service had before a feed covered it). **Changed for host senders:** a
+   host principal has no attachments, so there is nothing to fence. Every unstarted task is cancelled (`cancelled`, detail `sender revoked`, held ones included), with any attempt not yet
    `executing` withdrawn (I.5.6). A later `hold` or `release` for it is ignored.
 3. **Interrupt is monotonic.** An `interrupt_running: true` on a `revoke`, or a later `interrupt_running` record for a
    revoked principal, writes a durable **interrupt intent** for each of its started tasks. Nothing ever withdraws an
@@ -3292,7 +3322,8 @@ forced binding; the rooms the migration can't resolve are refused until claimed 
    place of "not implemented". It fetches when its Station's `heads` (every (re)connection, every 30 s, and at once
    when the Station stores a control record) name a head beyond its own, which takes the place of R9.5's 15-minute
    schedule (a Station that withholds `heads` could withhold the entries as well), and again at once when a deferral
-   it stopped at ends on this host (after a refusal's backoff, at the next `heads`). A fetch that stops at a deferred
+   it stopped at ends on this host, with no `heads` (one that ends during a refusal's backoff, when the backoff ends:
+   Astation, #164 comment 6858189009). A fetch that stops at a deferred
    entry asks nothing more while the deferral holds and the announced head is the same, and counts as fetched up to
    that entry for the gate (I.5.8). "The announced head" is the last `heads`' device-list head, which the host's list
    must hold as that very entry, `seq` and hash; a list that differs from the Station's keeps the gate closed

@@ -1,7 +1,9 @@
 # Host work v1: launch, directed work, messages and attachments
 
-Status: implemented and released (Atem v0.8.2). §11 (delegated work) is
-planned: its features are defined and advertised by no host.
+Status: implemented and released (Atem v0.8.2). §11 (delegated work):
+`host.delegated` and `host.alerts` are built (step 4, 2026-11-14) behind a
+debug-only hook and advertised by no release build; `host.senders` is
+planned.
 
 This extension of atem-session r9 lets an admitted client create sessions
 through launch profiles the host owner approved, queue directed work, publish
@@ -819,14 +821,17 @@ dropped.
 - **Not implemented:** store-and-forward. Channel records can't be replayed on
   a new channel, so a Station can't deliver a stored envelope for its sender,
   and dispatch needs the sender's live channel. There is no origin proof and no
-  host-to-host sender.
+  host-to-host sender (planned: §11.5, `host.senders`). Behind the debug-only
+  hook of §11, a delegated sender's task is dispatched by the host without
+  its sender's channel (§11.6); everyone else's still needs it.
 - **Not implemented:** resolving an `outcome_unknown` task by hand (a reply
   its agent submits moves it to `awaiting_result`; otherwise it expires at
-  `expires_at`; planned behind `host.delegated`: §11.2, §11.6), and deleting
-  or archiving the host's records (every record is kept; only payloads go,
-  §9).
+  `expires_at`), and deleting or archiving the host's records (every record
+  is kept; only payloads go, §9). A delegated sender's unknown outcome is
+  resolved by hand behind the debug-only hook of §11 (`work_resolve`, §11.2;
+  the owner's `atem task resolve`, §11.6 "On the host").
 
-## 11. Delegated work (planned; `host.delegated`, `host.alerts`, `host.senders`; not advertised)
+## 11. Delegated work (`host.delegated`, `host.alerts` built behind a debug-only hook; `host.senders` planned; not advertised)
 
 The delegated host-work design ([../delegated-host-work.md](../delegated-host-work.md),
 agreed revision 6b) gives tasks a lifecycle Atem owns, stops that reach
@@ -840,8 +845,14 @@ three features, defined in `atem_client::session::host_work`
 | `host.alerts` | `alert_list` (§11.3), and the push hint of kind `outcome_unknown` (session-v1 R9.9) |
 | `host.senders` | `control_records` (session-v1 R9.3, R9.8; §11.1), `host_enc_key_get` (session-v1 R9.8, R9.14) |
 
-**No host advertises them in this version**, and a host refuses each of
-their ops as it refuses any op of a feature it doesn't list: a session op
+**No release build advertises them in this version.** `host.delegated` and
+`host.alerts` are built (step 4 of the design's order of work, 2026-11-14)
+behind a debug-only hook: a debug build's `atem runtime` started with
+`ATEM_TEST_HOST_FEATURES=host.delegated[,host.alerts]` in its own
+environment (no client passes `ATEM_TEST_*` to a runtime it starts) lists
+them in its `welcome` and serves their ops. Release builds compile the hook
+out, and `host.senders` stays off (the hook refuses it). A host refuses
+each op of a feature it doesn't list as it refuses any such op: a session op
 (`control_records`, `host_enc_key_get`) is `unsupported_version` with no
 effect (session-v1 R9.8; **Atem's choice of code, agreed with Astation (2026-11-11, #120
 comment 6810116314)**), and a host-work request (`work_interrupt`, `work_resolve`,
@@ -849,8 +860,8 @@ comment 6810116314)**), and a host-work request (`work_interrupt`, `work_resolve
 `welcome.features` first; the client core
 refuses to send `control_records` or `host_enc_key_get` to a host that
 doesn't list `host.senders` (`host feature not available`). The lifecycle
-these ops serve (§11.6) and session-v1's side of it (R9.14) are planned
-with them.
+these ops serve (§11.6) and session-v1's side of it (R9.14) are built with
+them, behind the same hook; host senders' (§11.5 on the host) are planned.
 
 **Contract status (2026-11-12).** Step 3 of the design's order of work
 (PRs #145 to #150, the shared-core contracts behind this section) merged on
@@ -865,6 +876,34 @@ name. Open, or step 4 acceptance: the runtime's enforcement (the feed store,
 the host's gates and cursors), byte-level goldens for the relay messages,
 the clock provider's tests, `no_match`'s wire form and the status of a
 selector-resolved (UUID v5) task. The agreement activates nothing.
+
+**Step 4 status (2026-11-14).** The host side is built, behind the hook
+above: the session host's `host-work` principal (session-v1 R9.14 items 1
+to 7), §11.6's lifecycle and clocks, §11.2's and §11.3's ops, and §11.1's
+records applied to the tasks from the host's own Station's feed through
+§11.4's calls and acknowledgments. Of the acceptance items above:
+- the runtime's enforcement (the feed store, the host's gates and cursors)
+  is built and tested against a fake Station that speaks only the shared
+  builders;
+- the goldens are `fixtures/r9-vectors-station-calls.json` (agreed, as
+  marked in §11.4); O1 and O5, marked "for Astation's sign-off" below, were
+  signed off on 2026-11-13 (#156 comment 6858184397), and the correlation
+  amendment (wire rule 11), made on Astation's request, waits for its
+  sign-off on #156;
+- the clock provider's tests run on real OSes (`scripts/clock-real-os.py`,
+  `.github/workflows/clock-real-os.yml`);
+- `no_match`'s wire form and a selector-resolved task's status belong to
+  stage 3, before selector and mailbox execution is activated (agreed with
+  Astation, 2026-11-13, #120 comment 6848326392).
+
+Passages written in step 4 say "as built in step 4" or "step 4". Astation
+answered step 4's contract questions on 2026-11-13 (#120 comments
+6848326392 and 6848463998, #164 comment 6858189009); marks written before
+those answers still read "for Astation" until a docs change marks them
+agreed, as step 3's were. The readings written since (§11.1's effects on
+the tasks and its service refusals, §11.4's acknowledgments and pacing)
+wait for Astation's answer. The hook activates nothing outside a debug
+build.
 
 ### 11.1 Control records
 
@@ -1164,7 +1203,8 @@ The rules:
 7. **After a revoke**, `cover`, `hold` and `release` change nothing: a
    `duplicate` when they ask for what is recorded, else `refused`.
 
-**The state, per principal** (planned with the feeds; provisional
+**The state, per principal** (built with the feeds in step 4, behind the
+debug-only hook: the host's `control_principals` rows; provisional
 persistence `"v": 2`, `touched`, the parts, `standing`, `why` and
 `control_state_from_parts` **agreed with Astation (2026-11-13, #120 comment 6848326392)**, with these conditions: only a
 pairing change the host established itself permits a fresh state or the
@@ -1867,13 +1907,17 @@ A host reads each Station's control feed, acknowledges what it applied and
 fetches its own device list over its one link; the Station counts the
 acknowledgments and reports revocations to the Portal (design I.5.8,
 "Transport", "Which host is calling", "Heads", "Acknowledgment" and
-"Delivery progress is not application"; I.6.5). **Planned:** release
-builds make none of these calls in this version (**updated in step 4,
-2026-11-13:** behind the debug-only `host.delegated` hook the host makes
-`membership_fetch` and `control_sync`, and, from Task 36,
-`control_ack`). They are relay messages, not session ops, so no welcome
-feature gates them; they arrive with
-`host.senders` and delegated work. Types: `atem_client::control::relay`
+"Delivery progress is not application"; I.6.5). Release builds make none
+of these calls in this version. **Built in step 4 (2026-11-14), behind the
+debug-only hook:** with `host.delegated` on, the host makes all three of
+its calls, `membership_fetch`, `control_sync` and `control_ack`. They are
+relay messages, not session ops, so no welcome feature gates them: the
+host's own `host.delegated` does. (This section said they arrive "with
+`host.senders` and delegated work"; the design's V.2 puts the feeds and
+the host's own fetch in step 4, Part I, so they come with `host.delegated`
+alone: **Atem's reading, for Astation's agreement**. Astation agreed to the
+host's own fetch behind `host.delegated`, #164 comment 6858189009.) Types:
+`atem_client::control::relay`
 (every message, its reader and builder) and `atem_client::control::ledger`
 (the Station's reference acknowledgment ledger, `AckLedger`); for Station
 builders, the bindings' §9 ([atem-client-bindings.md](atem-client-bindings.md),
@@ -3149,7 +3193,7 @@ bounded at 512 KiB (owner decision 2026-11-07, choice 13); R9.9's rule that
 Atem drops a larger relay message unread exempts them (design II.4.2, a
 contract change that needs agreement).
 
-### 11.6 Delegated lifecycle (planned)
+### 11.6 Delegated lifecycle (built behind a debug-only hook; not advertised)
 
 Behind `host.delegated`, a task from a **delegated sender** has a lifecycle
 the host owns (design I.1 to I.6): it runs while the sender is offline,
@@ -3158,8 +3202,10 @@ signed data stops it. The delegated senders are a service its Station's
 control feed covers, a native member, and a host sender (`host:<host_id>`,
 on hosts that list `host.senders`). Browser grants, services no feed
 covers and `local` keep this document's v1 lifecycle (design I.1.3).
-Nothing here runs in this version. The host builds it in step 4 of the
-design's order of work, with the session-v1 revision of R9.14. What a
+No release build runs any of it in this version. The host built it in step
+4 of the design's order of work (2026-11-14), with the session-v1 revision
+of R9.14, behind the debug-only hook of §11; host senders' part waits for
+`host.senders` (stage 3). What a
 client reads changes only where marked: the per-attempt `receipt_id` and
 `resolved` (§11.2), the alerts (§11.3), the receipts' `task_id` and
 `sender` (session-v1 R9.14) and the `detail` texts below. The rest is
