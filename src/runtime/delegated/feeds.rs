@@ -61,9 +61,6 @@
 //! - **The standings** ([`ControlView`]) are the committed state's, and go
 //!   to the start view's publisher at each commit (Decision 16), whatever
 //!   host-work's pass does.
-// The feeds' sync (Task 33) applies records, re-verifies pending ones and
-// keeps unparsed ones; until it exists only the tests do.
-#![cfg_attr(not(test), allow(dead_code))]
 use super::acks::{AckBook, Acked, Claim, DueAck};
 use super::station::StationLink;
 use super::{ControlView, FeedRef, SenderStanding};
@@ -690,7 +687,8 @@ impl FeedStore {
         }
     }
 
-    /// The acknowledgments' state, for the state dump.
+    /// The acknowledgments' state, for the state dump (debug builds).
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub fn acks_dump(&self) -> Option<Value> {
         self.mem.acks.as_ref().map(AckBook::dump)
     }
@@ -752,7 +750,10 @@ impl FeedStore {
     }
 
     /// [`FeedStore::apply`] for a record `carrier` brought over a channel
-    /// (no position): its alerts are rate-limited per carrier.
+    /// (no position): its alerts are rate-limited per carrier. Channels
+    /// carry records only with `host.senders` (stage 3, not built): only the
+    /// tests apply one yet.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn apply_carried(
         &mut self,
         tx: &FeedTx,
@@ -1038,7 +1039,8 @@ impl FeedStore {
         serving(list).is_ok()
     }
 
-    /// The committed cursor of a feed.
+    /// The committed cursor of a feed (the tests read it).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn cursor(&self, origin: &str, feed_id: &str) -> Option<u64> {
         self.mem
             .cursors
@@ -1084,7 +1086,8 @@ impl FeedStore {
         self.mem.evidence.count
     }
 
-    /// Records kept pending, ever.
+    /// Records kept pending, ever (the tests read it).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pending_count(&self) -> u64 {
         self.mem.pending_count
     }
