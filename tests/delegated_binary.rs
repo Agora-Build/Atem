@@ -1061,7 +1061,16 @@ fn alerted(rig: &Rig, tid: &Value) -> bool {
 ///    revoke with `interrupt_running` while the service's turn runs and
 ///    another of its tasks waits: nothing of it stored (cursor, part,
 ///    tasks, intents, results); after the restart it applies once: the
-///    waiting task cancelled, never run, the turn interrupted once.
+///    waiting task cancelled, never run, the turn interrupted once;
+/// 7. between a revoke's commit and its followups (`crash_after_page_commit`,
+///    Task 37 review I2), on a host of its own: a revoke with
+///    `interrupt_running` while the service's turn runs and its attempt on
+///    another session waits `accepted`: at the death its intent is stored
+///    and undelivered, no Esc, the attempt live, the result owed unsent;
+///    after the restart the attempt is withdrawn at recovery and its task
+///    `cancelled`, never written, the intent carried out exactly once (one
+///    Esc, `turn interrupted`), each effect counted once, the service's
+///    `hello` refused as revoked.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -1231,8 +1240,10 @@ fn sigkill_at_each_crash_point() {
 
     // 5. Between handing a result to the link and its sent mark: the
     // release's, the Station reading it before the kill.
-    crash(&rig, "crash_after_ack_handoff");
+    // The hold first: an ack handed off before it would fire the crash
+    // point unheld (review M1).
     private(&rig.faults().join("hold_crash"), "");
+    crash(&rig, "crash_after_ack_handoff");
     let release = {
         let mut station = rig.station();
         let record = station.record_for(SVC, ControlAction::Release);
@@ -1359,6 +1370,116 @@ fn sigkill_at_each_crash_point() {
     assert!(status.get("resolved").is_none(), "{status}");
     assert!(alerted(&rig, &unknown["task_id"]));
     assert_eq!(escs(&rig), 1);
+    assert!(rig.station().ack_refusals().is_empty());
+    drop(r);
+    drop(rig);
+
+    // 7. Between a revoke's commit and its followups, with its interrupt
+    // (Task 35 review's notes for Task 37; Task 37 review I2), on a host of
+    // its own: the service's turn runs on one session while its attempt on
+    // another waits `accepted` (`hold_dispatch`).
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    rig.with_station();
+    rig.faults = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    rig.station_online(true);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    let (first, second) = (svc.session(&mut r), svc.session(&mut r));
+    let turn = task(IDS, &first, "REVOKED_AFTER_COMMIT_TURN", HOUR);
+    enqueue(&mut svc, &mut r, &turn);
+    in_turn(&rig, &turn["task_id"], "REVOKED_AFTER_COMMIT_TURN");
+    private(&rig.faults().join("hold_dispatch"), "");
+    two_passes(&rig);
+    let held = task(IDS, &second, "REVOKED_AFTER_COMMIT_ACCEPTED", HOUR);
+    enqueue(&mut svc, &mut r, &held);
+    within("its attempt accepted", || {
+        stored(&rig, &held["task_id"])["state"] == "submitted"
+            && ends(&rig, &held["task_id"]) == [None]
+    });
+    let accepted = attempts(&rig, &held["task_id"])[0].0.clone();
+    assert_eq!(receipt(&rig, &accepted)["state"], "accepted");
+    crash(&rig, "crash_after_page_commit");
+    let revoke = {
+        let mut station = rig.station();
+        let record = station.record_for(
+            SVC,
+            ControlAction::Revoke {
+                interrupt_running: true,
+            },
+        );
+        let at = station.append(record);
+        drop(station);
+        record_id_at(&rig, at)
+    };
+    drop((r, svc));
+    rig.died();
+    // At the death: the record's effects stored, its followups not run.
+    let stored_intents = intents(&rig, &turn["task_id"]);
+    let [intent] = stored_intents.as_slice() else {
+        panic!("one intent for the turn: {stored_intents:?}");
+    };
+    assert_eq!(
+        (
+            intent.reason.as_str(),
+            intent.revocation.as_deref(),
+            intent.done
+        ),
+        ("revoke", Some(revoke.as_str()), false)
+    );
+    assert!(intent.delivered_turn.is_none(), "never delivered");
+    assert_eq!(escs(&rig), 0);
+    assert_eq!(
+        attempt_rows(&rig, &held["task_id"]),
+        [(accepted.clone(), None, true)],
+        "the accepted attempt live"
+    );
+    assert!(ack_owed(&rig, &revoke), "the result stored");
+    assert!(results_of(&rig, &revoke).is_empty(), "and never sent");
+    assert!(!input(&rig).contains("REVOKED_AFTER_COMMIT_ACCEPTED"));
+    // The restart: the attempt withdrawn at recovery and its task cancelled;
+    // the intent carried out once.
+    std::fs::remove_file(rig.faults().join("hold_dispatch")).unwrap();
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    wait_stored(&rig, &held["task_id"], "cancelled", REVOKED);
+    assert_eq!(receipt(&rig, &accepted)["detail"], "withdrawn at recovery");
+    assert_eq!(
+        attempts(&rig, &held["task_id"]),
+        [(accepted, Some("withdrawn".into()))]
+    );
+    within("the intent delivered", || {
+        intents(&rig, &turn["task_id"])
+            .first()
+            .is_some_and(|i| i.delivered_turn.is_some())
+    });
+    within("the Esc", || escs(&rig) == 1);
+    std::fs::write(rig.fake.join("interrupt"), "").unwrap();
+    wait_stored(
+        &rig,
+        &turn["task_id"],
+        "awaiting_result",
+        "turn interrupted",
+    );
+    work_passes(&rig, 3);
+    assert_eq!(escs(&rig), 1, "carried out once");
+    assert_eq!(intents(&rig, &turn["task_id"]).len(), 1);
+    assert!(intents(&rig, &turn["task_id"])[0].done);
+    assert_eq!(
+        refused_hello(&mut r, IDS, &rig.log, SVC, true),
+        ("unauthorized".to_string(), Some("revoked".to_string()))
+    );
+    let principal = format!("service:{SVC}");
+    within("both effects counted", || counted(&rig).len() == 2);
+    assert_eq!(
+        counted(&rig),
+        [
+            (principal.clone(), "revocation".to_string(), revoke.clone()),
+            (principal, "interrupt".to_string(), revoke),
+        ]
+    );
+    assert_eq!(input(&rig).matches("REVOKED_AFTER_COMMIT_TURN").count(), 1);
+    assert!(!input(&rig).contains("REVOKED_AFTER_COMMIT_ACCEPTED"));
     assert!(rig.station().ack_refusals().is_empty());
 }
 
@@ -3029,8 +3150,8 @@ fn launch_waits(rig: &Rig, svc: &mut Dev, r: &mut Router, rid: &str, sid: &str, 
 }
 
 /// The launch `rid` ended `failed` with `detail` (runtime.log), never
-/// `outcome_unknown`, nothing spawned (read from the store: its sender's
-/// channel may be fenced by then).
+/// `outcome_unknown`, nothing spawned, no alert raised (read from the
+/// store: its sender's channel may be fenced by then).
 #[track_caller]
 fn launch_failed(rig: &Rig, rid: &str, sid: &str, detail: &str) {
     let state = |rig: &Rig| {
@@ -3052,6 +3173,12 @@ fn launch_failed(rig: &Rig, rid: &str, sid: &str, detail: &str) {
         log.contains(&format!("launch {rid} failed before its spawn: {detail}")),
         "{log}"
     );
+    // No alert (design I.4.3, "Launches"; review M5): the host's alerts
+    // hold none.
+    let alerts: i64 = host_db(rig)
+        .query_row("SELECT count(*) FROM alerts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(alerts, 0, "an alert for a failed launch");
 }
 
 /// VII.A test 19 (design I.4.3, "Launches"; host-work-v1 §11.6,
@@ -3094,8 +3221,35 @@ fn launch_at_the_spawn_boundary_waits_for_hold_gap_and_deferral_and_fails_on_rev
     control(&rig, ControlAction::Release);
     started(&mut svc, &mut r, &rid);
 
-    // No heads for 60 s on the host's clock, then the Station's heads.
+    // No heads for 60 s on the host's clock, then the Station's heads. A
+    // heads of the pump's may still be on its way, and one the host reads
+    // after the clock moves would start the 60 s again (review M2): a last
+    // heads, naming another origin's feed too, goes behind it on the link
+    // (which keeps their order); once the host counted that one, none of
+    // the pump's is left.
     drop(rig.pump.lock().unwrap().take());
+    let other = dumped(&rig)["station"]["feed"]["other_origin"]
+        .as_u64()
+        .unwrap();
+    {
+        let mut station = rig.station();
+        let own = atem_client::control::FeedHead {
+            origin: station.origin().to_string(),
+            feed_id: station.feed_id().to_string(),
+            head: station.records().last().map_or(0, |(seq, _)| *seq),
+            station_time: r9log::host_now().wall_ms,
+        };
+        let foreign = atem_client::control::FeedHead {
+            origin: "https://station-other.test".into(),
+            feed_id: uuid(),
+            head: 1,
+            station_time: r9log::host_now().wall_ms,
+        };
+        station.heads_with(vec![own, foreign]);
+    }
+    within("the last heads read", || {
+        dumped(&rig)["station"]["feed"]["other_origin"].as_u64() > Some(other)
+    });
     rig.clock().add_mono(61_000);
     within("the gate closed", || {
         dumped(&rig)["station"]["feed"]["open"] == false
