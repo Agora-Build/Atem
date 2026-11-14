@@ -6382,6 +6382,11 @@ async fn the_drive_hook_plays_host_works_side_through_the_bridge() {
         [json!({"report": r2, "outcome": "ok"})]
     );
     assert!(bridge.drive_reports().is_empty(), "once");
+    // Its own copy (Task 16b review m7): host-work's intents still get it.
+    assert_eq!(
+        bridge.host_interrupt_reports(),
+        [(r2.clone(), super::InterruptReport::Ok)]
+    );
     let unknown = drive(
         &mut bridge,
         &mut cx,

@@ -140,7 +140,8 @@ pub enum SessionAnswer<'a> {
     /// `SessionHost::withdraw` (R9.14 item 4).
     Withdrawal(Withdrawal),
     /// `SessionHost::host_interrupt` (R9.14 item 5).
-    // Answered once interrupt intents run (Task 26).
+    // The mapping's own: the interrupt intents decide from the attempt's
+    // receipt (`intents::AttemptNow`), never from an interrupt's answer.
     #[allow(dead_code)]
     Interrupt(&'a HostInterrupt),
 }
@@ -399,6 +400,7 @@ mod tests {
             turn_id: None,
             authorization_expires_at: None,
             message: None,
+            deadline_passed: false,
             delegated: delegated.then(|| Admission {
                 principal: "member:dev-phone".into(),
                 principal_key: "ab".repeat(32),

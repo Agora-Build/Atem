@@ -4,8 +4,8 @@ use crate::runtime::delegated::authority::Caller;
 use crate::runtime::delegated::{Admission, NoFeeds, SenderClass, classify, details};
 use crate::runtime::host_clock::HostClock;
 use crate::runtime::host_work::{
-    AUTHORIZATION_EXPIRED, Accepted, Config, LaunchRecord, MessageFrame, Profile, Store,
-    WorkRecord,
+    AUTHORIZATION_EXPIRED, Accepted, Config, KEPT_REPLY_BUDGET, LaunchRecord, MessageFrame,
+    Profile, Store, WorkRecord,
 };
 use crate::session_protocol::r9::{HostWorkError, ProjectScope};
 use atem_client::principal::{Authority, Need, Op};
@@ -53,6 +53,15 @@ mod collab_bridge;
 mod collab_launch_bridge;
 #[path = "delegated/dispatch.rs"]
 mod delegated_dispatch;
+#[path = "delegated/hints.rs"]
+mod delegated_hints;
+#[path = "delegated/interrupts.rs"]
+mod delegated_interrupts;
+#[path = "delegated/launches.rs"]
+mod delegated_launches;
+#[path = "delegated/owner.rs"]
+mod delegated_owner;
+pub use delegated_owner::OwnerDone;
 #[path = "delegated/recovery.rs"]
 mod delegated_recovery;
 #[path = "delegated/requests.rs"]
@@ -97,12 +106,17 @@ impl Sender {
     }
 }
 
+#[derive(Clone)]
 pub struct RemoteLaunch {
     pub request_id: String,
     pub profile: Profile,
     pub session_id: String,
     pub process_gen: String,
     pub guard: super::super::adopt::SpawnGuard,
+    /// A delegated sender's launch's check at the spawn boundary, in place
+    /// of `guard` there (design I.4.3, "Launches"); none for every other
+    /// launch, whose guard decides there as before.
+    pub check: Option<super::super::adopt::PreSpawnCheck>,
 }
 
 struct PendingLaunch {
@@ -113,6 +127,9 @@ struct PendingLaunch {
     expires_at: u64,
     permit: Arc<AtomicBool>,
     local_route: Option<crate::runtime::host_work::Route>,
+    /// A delegated sender's launch: checked at the spawn boundary, never
+    /// fenced by its sender's authority (`delegated_launches`).
+    delegated: Option<delegated_launches::DelegatedLaunch>,
 }
 
 /// What the authority, route and grant checks of tasks awaiting their
@@ -189,6 +206,13 @@ pub(super) struct State {
     /// When the next reading of `D` is due outside the scheduling pass
     /// (`take_reading`).
     read_due: Instant,
+    /// What this run delivered of the interrupt intents (memory only: a
+    /// restart delivers once more to a turn still current; design I.5.7).
+    intents: crate::runtime::delegated::intents::Runs,
+    /// Debug builds: host-work's scheduling passes (and paused stops) so
+    /// far, for the state dump (a test waits for passes, not ticks).
+    #[cfg(debug_assertions)]
+    pub(super) passes: u64,
     /// Tests: the control view senders are classified on in place of
     /// `NoFeeds` (a feed covering a service, as PR 10's will).
     #[cfg(test)]
@@ -197,6 +221,10 @@ pub(super) struct State {
     /// (`recover_delegated`), in their order.
     #[cfg(test)]
     recovery: Vec<delegated_recovery::RecoveryStep>,
+    /// Tests: the detail each delegated launch failed with before its
+    /// spawn (production only logs it).
+    #[cfg(test)]
+    failed_before_spawn: HashMap<String, &'static str>,
 }
 
 impl State {
@@ -232,10 +260,15 @@ impl State {
             clock_due: Instant::now(),
             clock_checked: false,
             read_due: Instant::now(),
+            intents: Default::default(),
+            #[cfg(debug_assertions)]
+            passes: 0,
             #[cfg(test)]
             controls: None,
             #[cfg(test)]
             recovery: Vec::new(),
+            #[cfg(test)]
+            failed_before_spawn: HashMap::new(),
         }
     }
 }
@@ -270,7 +303,10 @@ impl HostBridge {
             host,
             message: message.clone(),
         };
-        match self.message_request(&request, &Sender::Local, cx)? {
+        match self
+            .message_request(&request, &Sender::Local, cx)
+            .map_err(|e| e.code)?
+        {
             ResultBody::Message { message } => Ok(message),
             _ => Err("invalid_request"),
         }
@@ -297,6 +333,9 @@ impl HostBridge {
         }
         self.work_fence_launches();
         let paused = self.work.config_problem.is_some();
+        // A delegated sender's launch that isn't fenced: the check at the
+        // spawn boundary (design I.4.3, "Launches").
+        let delegated = self.delegated_handouts(paused);
         let pending = &self.work.pending;
         let waits = |id: &str| {
             paused
@@ -304,15 +343,22 @@ impl HostBridge {
                     .get(id)
                     .is_some_and(|p| p.permit.load(Ordering::SeqCst))
         };
-        let (mut ready, mut waiting) = (Vec::new(), VecDeque::new());
+        let (mut ready, mut waiting, mut failed) = (Vec::new(), VecDeque::new(), Vec::new());
         for launch in self.work.launches.drain(..) {
-            if waits(&launch.request_id) {
-                waiting.push_back(launch);
-            } else {
-                ready.push(launch);
+            match delegated.get(&launch.request_id) {
+                Some(delegated_launches::Handout::Now) => ready.push(launch),
+                Some(delegated_launches::Handout::Wait(_)) => waiting.push_back(launch),
+                Some(delegated_launches::Handout::Fail(detail)) => {
+                    failed.push((launch.request_id, *detail))
+                }
+                None if waits(&launch.request_id) => waiting.push_back(launch),
+                None => ready.push(launch),
             }
         }
         self.work.launches = waiting;
+        for (id, detail) in failed {
+            self.launch_failed_before_spawn(&id, detail);
+        }
         ready
     }
 
@@ -724,18 +770,37 @@ impl HostBridge {
             self.take_reading();
         }
         let identity = self.work_host();
+        // A stop always wins (ruling T27a): while hosting is paused the r9
+        // engine still takes `work_interrupt`, when it can be served.
+        let stops = self.stops_while_paused(&identity);
+        self.r9.enable_host_work_stops(stops);
         // An unverified host has no identity to keep records under yet.
         if !self.hosting_enabled() || identity.account_id == UNPAIRED {
             for request in self.r9.take_host_work() {
+                let reply = if stops && matches!(request.request, hw::Request::WorkInterrupt { .. })
+                {
+                    self.work_request(&request.attachment, &request.request, cx)
+                } else {
+                    Err("busy".into())
+                };
                 self.r9.host_work_reply(
                     &request.attachment,
                     &request.request,
-                    Err("busy".into()),
+                    reply,
                     self.clock.now(),
                 );
             }
             self.work_fence_launches();
-            self.pause_local_tasks();
+            if Instant::now() >= self.work.scheduled {
+                self.work.scheduled = Instant::now() + Duration::from_millis(100);
+                self.pause_local_tasks();
+                // A stop always wins: the deadline's interrupt and every
+                // pending intent still run (ruling T26a); host-work
+                // dispatches nothing.
+                if identity.account_id != UNPAIRED {
+                    self.paused_stops(cx);
+                }
+            }
             return;
         }
         if !self.work_store_ready(&identity) {
@@ -917,6 +982,16 @@ impl HostBridge {
         let paused = self.work.config_problem.is_some();
         let ids: Vec<String> = self.work.pending.keys().cloned().collect();
         for id in ids {
+            // A delegated sender's launch: hosting §5's fences only; what
+            // its sender's authority, its profile and its expiry say is the
+            // check's at the spawn boundary, which waits or fails it, never
+            // a fence (design I.4.3, "Launches"; `delegated_launches`).
+            if self.work.pending[&id].delegated.is_some() {
+                if self.delegated_launch_fenced(paused) {
+                    self.work.pending[&id].permit.store(false, Ordering::SeqCst);
+                }
+                continue;
+            }
             let attachment = self.work.pending[&id].attachment.clone();
             let remote = self.work.pending[&id].local_route.is_none();
             let authority = if remote {
@@ -983,8 +1058,30 @@ impl HostBridge {
     }
 
     /// [`HostBridge::work_request`] from `a`, the current authority of the
-    /// request's `attachment`, once the request names this host.
+    /// request's `attachment`, once the request names this host. A task's
+    /// `resolved` reaches the wire only behind `host.delegated`
+    /// (host-work-v1 §11.2, "Compatibility"; ruling T17b): a reader released
+    /// before it refuses a status that carries it and drops the channel, so
+    /// with the feature off (the hook gone after a task was resolved) a
+    /// `work` result leaves it out. The store keeps it.
     fn work_request_as(
+        &mut self,
+        attachment: &str,
+        req: &hw::Request,
+        a: Sender,
+        cx: &mut Cx,
+    ) -> Result<ResultBody, HostWorkError> {
+        let mut body = self.work_request_body(attachment, req, a, cx)?;
+        if !self.features.delegated
+            && let ResultBody::Work { work } = &mut body
+        {
+            work.resolved = None;
+        }
+        Ok(body)
+    }
+
+    /// [`HostBridge::work_request_as`]'s answer, as the store has it.
+    fn work_request_body(
         &mut self,
         attachment: &str,
         req: &hw::Request,
@@ -1026,7 +1123,7 @@ impl HostBridge {
             // Its tasks compare their sender's control generation with this
             // one: it is kept from now on (`schedule_work` renews the set).
             self.host.keep_principal(&principal);
-            return Ok(self.message_request(req, &a, cx)?);
+            return self.message_request(req, &a, cx);
         }
         let store = self.work.store.as_ref().ok_or("busy")?;
         match req {
@@ -1092,39 +1189,52 @@ impl HostBridge {
                     })
                     .map_err(|_| "busy")?;
                 let permit = Arc::new(AtomicBool::new(true));
-                let (flag, approved, dir, deadline) = (
-                    permit.clone(),
-                    p.clone(),
-                    self.work.dir.clone(),
-                    *expires_at,
-                );
-                let guard = Arc::new(move || {
-                    flag.load(Ordering::SeqCst)
-                        && host_now().wall_ms < deadline
-                        && Config::load(&dir)
-                            .is_ok_and(|c| c.enabled && c.profile(&approved.id) == Some(&approved))
-                        && crate::memory::project::project_key_for(&approved.cwd)
-                            == approved.project
-                });
+                // A delegated sender's: checked at the spawn boundary
+                // (design I.4.3, "Launches").
+                let delegated = self.delegated_launch(&a, &p, *expires_at, &permit);
+                let (guard, check, delegated) = match delegated {
+                    Some((launch, guard, check)) => (guard, Some(check), Some(launch)),
+                    None => {
+                        let (flag, approved, dir, deadline) = (
+                            permit.clone(),
+                            p.clone(),
+                            self.work.dir.clone(),
+                            *expires_at,
+                        );
+                        let guard: super::super::adopt::SpawnGuard = Arc::new(move || {
+                            flag.load(Ordering::SeqCst)
+                                && host_now().wall_ms < deadline
+                                && Config::load(&dir).is_ok_and(|c| {
+                                    c.enabled && c.profile(&approved.id) == Some(&approved)
+                                })
+                                && crate::memory::project::project_key_for(&approved.cwd)
+                                    == approved.project
+                        });
+                        (guard, None, None)
+                    }
+                };
+                let launch = RemoteLaunch {
+                    request_id: request_id.clone(),
+                    profile: p.clone(),
+                    session_id: status.session_id.clone(),
+                    process_gen: status.process_gen.clone(),
+                    guard,
+                    check,
+                };
                 self.work.pending.insert(
                     request_id.clone(),
                     PendingLaunch {
                         attachment: attachment.to_string(),
                         principal: principal.clone(),
                         control_gen: self.host.control_gen(&principal),
-                        profile: p.clone(),
+                        profile: p,
                         expires_at: *expires_at,
                         permit,
                         local_route: None,
+                        delegated: delegated.map(|d| Self::delegated_pending(d, &launch)),
                     },
                 );
-                self.work.launches.push_back(RemoteLaunch {
-                    request_id: request_id.clone(),
-                    profile: p,
-                    session_id: status.session_id.clone(),
-                    process_gen: status.process_gen.clone(),
-                    guard,
-                });
+                self.work.launches.push_back(launch);
                 Ok(ResultBody::Launch { launch: status })
             }
             Request::LaunchQuery { request_id, .. } => {
@@ -1159,6 +1269,7 @@ impl HostBridge {
                 );
                 let mut record = WorkRecord {
                     delegated: None,
+                    deadline_passed: false,
                     attachment_owner: attachment_owner(&a),
                     principal,
                     control_gen: self.host.control_gen(&a.name()),
@@ -1204,6 +1315,9 @@ impl HostBridge {
                 {
                     return Err("invalid_request".into());
                 }
+                // Too many unresolved outcomes (design I.4.6): a new task
+                // is refused, nothing recorded.
+                self.unresolved_capacity(&a)?;
                 // A delegated sender's task: its admission record, stored
                 // with it before the reply (design I.4.1).
                 record.delegated =
@@ -1284,7 +1398,7 @@ impl HostBridge {
                             }
                             r.status.state = WorkState::Completed;
                             r.status.result = Some(result.clone());
-                            r.status.detail = "explicit correlated result published".into();
+                            r.status.detail = crate::runtime::host_work::RESULT_PUBLISHED.into();
                         }
                     }
                     _ => return Ok(ResultBody::Work { work: r.status }),
@@ -1292,14 +1406,20 @@ impl HostBridge {
                 store.save_work(&r).map_err(|_| "busy")?;
                 Ok(ResultBody::Work { work: r.status })
             }
-            // `host.delegated`'s and `host.alerts`' ops: the channel takes
-            // them only while the host advertises the feature (the debug-only
-            // hook, step 4's Decision 10), and `delegated` answers them; one
-            // that got here otherwise is refused as before, never
-            // half-served.
-            Request::WorkInterrupt { .. }
-            | Request::WorkResolve { .. }
-            | Request::AlertList { .. } => crate::runtime::delegated::request(self.features, req),
+            // `host.alerts`' op (design I.4.6, §11.3): the unresolved
+            // alerts, for native members holding `control`.
+            Request::AlertList { after, .. } => self.alert_list(&a, req, after.as_deref()),
+            // `host.delegated`'s ops: the channel takes them only while the
+            // host advertises the feature (the debug-only hook, step 4's
+            // Decision 10); one that got here otherwise is refused as
+            // before, never half-served. `work_resolve` (design I.4.6) and
+            // `work_interrupt` (I.4.5) are served.
+            Request::WorkResolve {
+                task_id,
+                resolution,
+                ..
+            } => self.work_resolve(&a, req, task_id, resolution),
+            Request::WorkInterrupt { task_id, .. } => self.work_interrupt(&a, req, task_id, cx),
             Request::Publish { .. }
             | Request::MessageQuery { .. }
             | Request::AttachmentPut { .. } => unreachable!(),
@@ -1368,13 +1488,13 @@ impl HostBridge {
         req: &hw::Request,
         a: &Sender,
         cx: &Cx,
-    ) -> Result<ResultBody, &'static str> {
+    ) -> Result<ResultBody, HostWorkError> {
         use crate::runtime::host_work::MessageRecord;
         use atem_client::session::messages::{
             Delivery, Destination, MessageReceipt, RecipientReceipt,
         };
         if !a.allows(Need::Op(Op::Message)) || a.is_browser() {
-            return Err("forbidden");
+            return Err("forbidden".into());
         }
         let store = self.work.store.as_ref().ok_or("busy")?;
         let message_id = match req {
@@ -1386,15 +1506,15 @@ impl HostBridge {
                     || a.remote().is_some()
                         && (message.from_session.is_some() || message.reply_to.is_some())
                 {
-                    return Err("unsupported_version");
+                    return Err("unsupported_version".into());
                 }
                 if message.sender != a.name() {
-                    return Err("forbidden");
+                    return Err("forbidden".into());
                 }
                 &message.message_id
             }
             hw::Request::MessageQuery { message_id, .. } => message_id,
-            _ => return Err("invalid_request"),
+            _ => return Err("invalid_request".into()),
         };
         if let Some(old) = store.message(message_id).map_err(|_| "busy")? {
             // Its delegated tasks (a delegated sender's agent recipients):
@@ -1417,15 +1537,15 @@ impl HostBridge {
             };
             if delegated.is_empty() {
                 if old.message.sender != a.name() || old.sender_key != a.key_json() {
-                    return Err("forbidden");
+                    return Err("forbidden".into());
                 }
             } else {
                 match self.delegated_message_caller(a, &delegated) {
                     Some(Caller::Owner) if matches!(req, hw::Request::Publish { .. }) => {
-                        return Err("forbidden");
+                        return Err("forbidden".into());
                     }
                     Some(_) => {}
-                    None => return Err("forbidden"),
+                    None => return Err("forbidden".into()),
                 }
             }
             // By the digest recorded at acceptance, which stays when the
@@ -1433,7 +1553,7 @@ impl HostBridge {
             if let hw::Request::Publish { message, .. } = req
                 && old.receipt.digest != message.digest()
             {
-                return Err("request_id_reused");
+                return Err("request_id_reused".into());
             }
             // A delegated sender's message is judged wholly by its tasks'
             // rule (above), its notices too: a route change hides nothing
@@ -1449,7 +1569,7 @@ impl HostBridge {
                         && !matches!(p.delivery, Delivery::Refused { .. })
                 });
                 if accepted && !self.message_scope(r, a) {
-                    return Err("forbidden");
+                    return Err("forbidden".into());
                 }
             }
             return Ok(ResultBody::Message {
@@ -1457,11 +1577,11 @@ impl HostBridge {
             });
         }
         let hw::Request::Publish { message, .. } = req else {
-            return Err("forbidden");
+            return Err("forbidden".into());
         };
         let now = host_now().wall_ms;
         if message.created_at > now.saturating_add(60_000) || message.expires_at <= now {
-            return Err("invalid_request");
+            return Err("invalid_request".into());
         }
         let digest = message.digest();
         let mut tasks = Vec::new();
@@ -1486,6 +1606,7 @@ impl HostBridge {
                 let task = message.task(r).ok_or("invalid_request")?;
                 let mut record = WorkRecord {
                     delegated: None,
+                    deadline_passed: false,
                     attachment_owner: attachment_owner(a),
                     principal: a.name(),
                     control_gen: self.host.control_gen(&a.name()),
@@ -1543,6 +1664,12 @@ impl HostBridge {
                 delivery,
             });
         }
+        // Too many unresolved outcomes (design I.4.6): a message that would
+        // make a new task is refused whole, nothing recorded; one with none
+        // (notices only) never is.
+        if !tasks.is_empty() {
+            self.unresolved_capacity(a)?;
+        }
         let record = MessageRecord {
             sender_key: a.key_json(),
             message: message.clone(),
@@ -1563,12 +1690,9 @@ impl HostBridge {
     /// blocked local tasks wait with the reason as their detail. They keep
     /// their place and their return grants, and nothing is fenced: they go on
     /// as soon as the pause is over (spec section 9). Remote tasks are not
-    /// touched (their senders' authority is rechecked as before).
+    /// touched (their senders' authority is rechecked as before). Run on the
+    /// scheduling pass's cadence, as `work_pass` calls it.
     fn pause_local_tasks(&mut self) {
-        if Instant::now() < self.work.scheduled {
-            return;
-        }
-        self.work.scheduled = Instant::now() + Duration::from_millis(100);
         if self.work.error || !self.local_authorized() {
             return;
         }
@@ -1617,6 +1741,9 @@ impl HostBridge {
     /// About once a minute, after a scheduling pass: the payloads of
     /// host-work records settled a day past their deadline go, remote and
     /// local alike (`Store::drop_payloads`; every record stays, one
+    /// runtime.log line says how many), a delegated task's reply, kept 30
+    /// days after its task settled, then goes (`Store::drop_kept_replies`;
+    /// over the kept replies' budget the oldest go early, and one
     /// runtime.log line says how many), and collaboration counters whose
     /// windows passed.
     fn work_cleanup(&mut self) -> anyhow::Result<()> {
@@ -1637,6 +1764,10 @@ impl HostBridge {
                 count(dropped.uploads, "upload")
             );
         }
+        let kept = store.drop_kept_replies(now, KEPT_REPLY_BUDGET)?;
+        if kept.early > 0 {
+            eprintln!("atem runtime: host work: {}", kept_early_line(kept.early));
+        }
         crate::runtime::collab::prune_counters(&store.db, now)
     }
 
@@ -1644,12 +1775,21 @@ impl HostBridge {
     /// applies here (`pause_local_tasks` marks local tasks during one).
     fn schedule_work(&mut self, cx: &mut Cx) -> anyhow::Result<()> {
         let now = host_now().wall_ms;
+        #[cfg(debug_assertions)]
+        {
+            self.work.passes += 1;
+        }
         // `D`, read once a pass (each read is a full OS reading).
         let now_d = self.take_reading();
         self.refresh_start_view();
+        // What became of the interrupt intents' writes, before any receipt
+        // is reconciled below (design I.4.4's detail; Task 26 review M1).
+        self.take_interrupt_reports()?;
         // Awaiting a result, or of unknown outcome: past the deadline,
-        // expired, and past the sender's authorization, failed (their due
-        // times, through an index); under a sender's authority, a route or a
+        // expired (a delegated sender's of unknown outcome stays so,
+        // unresolved, and only stops holding its session: design I.4.6),
+        // and past the sender's authorization, failed (their due times,
+        // through an index); under a sender's authority, a route or a
         // profile approval that is gone, failed (every one of them read, but
         // only when what that depends on changed: `work_inputs`). Either
         // frees an unknown outcome's session queue.
@@ -1885,6 +2025,9 @@ impl HostBridge {
             };
             self.work.store.as_ref().unwrap().save_work(&r)?;
         }
+        // The interrupt intents (design I.5.7), after every task's record
+        // was settled above: what they change, they read fresh.
+        self.carry_out_intents(cx)?;
         Ok(())
     }
 
@@ -2017,10 +2160,17 @@ impl HostBridge {
         use crate::session_protocol::wire::ReceiptState;
         let Some(receipt) = self.task_receipt(r) else {
             // Submitted, and its receipt gone (evicted or lost): what became
-            // of it can't be known any more.
+            // of it can't be known any more. A delegated task says so with
+            // §11.6's reason, the one its alert names (no turn state proves
+            // its turn ran); a v1 task with v1's text.
             if r.status.state == WorkState::Submitted {
                 r.status.state = WorkState::OutcomeUnknown;
-                r.status.detail = RECEIPT_GONE.into();
+                r.status.detail = if r.delegated.is_some() {
+                    details::OUTCOME_NOT_ESTABLISHED
+                } else {
+                    RECEIPT_GONE
+                }
+                .into();
             }
             return Ok(());
         };
@@ -2047,7 +2197,8 @@ impl HostBridge {
         // A delegated task of unknown outcome says why, as its receipt does
         // (§11.6's `agent exited`, `outcome could not be established`,
         // `write interrupted`; session-v1 R9.14 item 6): the reason the
-        // owner's alert names (`host.alerts`).
+        // owner's alert names (`host.alerts`). Past its deadline it says
+        // that instead (design I.4.6).
         if let (true, ReceiptState::OutcomeUnknown, Some(reason)) = (
             r.delegated.is_some(),
             receipt.state,
@@ -2055,16 +2206,25 @@ impl HostBridge {
                 .into_iter()
                 .find(|reason| receipt.detail.as_deref() == Some(*reason)),
         ) {
-            r.status.detail = reason.into();
+            r.status.detail = if r.deadline_passed {
+                details::DEADLINE_PASSED_OUTCOME_UNKNOWN
+            } else {
+                reason
+            }
+            .into();
             if let Some(reply) = self.collab_reply_of(&r.task.task_id) {
                 collab_bridge::apply_reply(r, &reply);
             }
             self.collab_early_end(r)?;
             return Ok(());
         }
+        let interrupted = turn_interrupted(&receipt);
         r.status.detail = if r.status.state == WorkState::Submitted && r.turn_id.is_some() {
             collab_bridge::IN_TURN
-        } else if turn_interrupted(&receipt) {
+        } else if interrupted && self.interrupted_at_deadline(r, &receipt)? {
+            // Design I.4.4: the deadline's intent interrupted it.
+            details::INTERRUPTED_AT_DEADLINE
+        } else if interrupted {
             TURN_INTERRUPTED
         } else {
             "agent submission receipt reconciled; task completion requires an explicit result"
@@ -2075,6 +2235,32 @@ impl HostBridge {
         }
         self.collab_early_end(r)?;
         Ok(())
+    }
+
+    /// A delegated task's turn, ended interrupted (`receipt`), was the
+    /// deadline's (design I.4.4): its attempt's deadline intent delivered
+    /// the interrupt to that turn (`delivered_turn`, the receipt's own turn
+    /// when it names one). A turn interrupted otherwise (at the terminal,
+    /// by a controller) is v1's `turn interrupted` (Task 26 review M1).
+    fn interrupted_at_deadline(
+        &self,
+        r: &WorkRecord,
+        receipt: &wire::Receipt,
+    ) -> anyhow::Result<bool> {
+        if r.delegated.is_none() {
+            return Ok(false);
+        }
+        let delivered = self.work.store.as_ref().unwrap().delivered_turn(
+            &r.task.task_id,
+            &r.status.receipt_id,
+            &crate::runtime::delegated::intents::IntentReason::Deadline,
+        )?;
+        Ok(delivered.is_some_and(|turn| {
+            receipt
+                .result
+                .as_ref()
+                .is_none_or(|result| result.turn_id == turn)
+        }))
     }
 
     /// The task's prompt turn ended interrupted (its receipt's journaled
@@ -2146,6 +2332,17 @@ impl HostBridge {
     }
 }
 
+/// What runtime.log says when kept replies go before their 30 days, the
+/// kept replies' budget full (design I.4.7, step 4's open question 3).
+fn kept_early_line(n: usize) -> String {
+    format!(
+        "the replies kept for delegated tasks are over their {} MiB budget: dropped the text and context of {n} {} before {} 30 days, oldest first (records kept)",
+        KEPT_REPLY_BUDGET >> 20,
+        if n == 1 { "reply" } else { "replies" },
+        if n == 1 { "its" } else { "their" }
+    )
+}
+
 /// A prompt receipt completed with the outcome `interrupted` (journaled as
 /// its detail).
 fn turn_interrupted(receipt: &wire::Receipt) -> bool {
@@ -2174,6 +2371,12 @@ mod local_tests {
         include!("delegated/dispatch_tests.rs");
         include!("delegated/lifecycle_tests.rs");
         include!("delegated/recovery_tests.rs");
+        include!("delegated/alerts_tests.rs");
+        include!("delegated/resolve_tests.rs");
+        include!("delegated/owner_tests.rs");
+        include!("delegated/intents_tests.rs");
+        include!("delegated/work_interrupt_tests.rs");
+        include!("delegated/launch_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};
@@ -2806,6 +3009,7 @@ principals = ["local"]
         task.expires_at = expires_at;
         let record = WorkRecord {
             delegated: None,
+            deadline_passed: false,
             principal: principal.into(),
             attachment_owner: String::new(),
             control_gen,
@@ -3329,6 +3533,7 @@ principals = ["local"]
             task.expires_at = old;
             let record = WorkRecord {
                 delegated: None,
+                deadline_passed: false,
                 principal: "member:owner".into(),
                 attachment_owner: String::new(),
                 control_gen: 0,
@@ -3442,13 +3647,18 @@ principals = ["local"]
         });
     }
 
-    /// With the hook on (step 4, Decision 10) the bridge hands the ops to
-    /// `delegated`, after the checks every request has (the host triple,
-    /// the caller's authority): `busy`, saying the feature isn't served
-    /// yet, until their handlers exist; `alert_list` needs `host.alerts`.
+    /// With the hook on (step 4, Decision 10) the bridge hands
+    /// `host.delegated`'s ops to their handlers, after the checks every
+    /// request has (the host triple, the caller's authority):
+    /// `work_interrupt` (Task 27) and `work_resolve` answer a delegated
+    /// task's sender or owner only, so `local` is `forbidden` (their own
+    /// tests are in `delegated/work_interrupt_tests.rs` and
+    /// `delegated/resolve_tests.rs`). `alert_list` needs `host.alerts`, and
+    /// then answers native members holding `control` only: `local` is
+    /// `forbidden` (the alerts' own tests are in
+    /// `delegated/alerts_tests.rs`).
     #[test]
     fn delegated_ops_with_the_hook_are_handed_to_delegated() {
-        use crate::runtime::delegated::{ALERTS_NOT_SERVED, DELEGATED_NOT_SERVED};
         use crate::runtime::test_hooks::HostFeatures;
         local_test(async |root| {
             let mut rig = LocalRig::new(root).await;
@@ -3472,11 +3682,11 @@ principals = ["local"]
             };
             let [interrupt, resolve, alerts] = delegated_requests(&host);
             rig.bridge.features = HostFeatures::parse("host.delegated").unwrap();
-            assert_eq!(ask(&mut rig, &interrupt), busy(Some(DELEGATED_NOT_SERVED)));
-            assert_eq!(ask(&mut rig, &resolve), busy(Some(DELEGATED_NOT_SERVED)));
+            assert_eq!(ask(&mut rig, &interrupt), Err("forbidden".into()), "local");
+            assert_eq!(ask(&mut rig, &resolve), Err("forbidden".into()), "local");
             assert_eq!(ask(&mut rig, &alerts), busy(None), "host.alerts is off");
             rig.bridge.features = HostFeatures::parse("host.delegated,host.alerts").unwrap();
-            assert_eq!(ask(&mut rig, &alerts), busy(Some(ALERTS_NOT_SERVED)));
+            assert_eq!(ask(&mut rig, &alerts), Err("forbidden".into()), "local");
             // The checks every request has come first.
             let mut other = host.clone();
             other.host_trust_gen += 1;
@@ -5025,6 +5235,7 @@ launch = "on_message"
             task.prompt = "x".repeat(prompt);
             let record = WorkRecord {
                 delegated: None,
+                deadline_passed: false,
                 principal: "local".into(),
                 attachment_owner: Sender::Local.owner(),
                 control_gen,
@@ -5789,6 +6000,7 @@ launch = "on_message"
                 store
                     .enqueue(&WorkRecord {
                         delegated: None,
+                        deadline_passed: false,
                         principal: "browser:b".into(),
                         attachment_owner: String::new(),
                         control_gen: 2,

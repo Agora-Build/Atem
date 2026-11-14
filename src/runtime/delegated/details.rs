@@ -31,18 +31,13 @@ pub const ROUTE_CHANGED: &str = "route changed";
 pub const AUTHORITY_CHANGED: &str = "sender's authority changed";
 /// `failed`: 8 attempts.
 pub const TOO_MANY_ATTEMPTS: &str = "too many attempts";
-/// `failed`: a launch still waiting at the spawn boundary at its expiry.
-// Used by Task 28: delegated launches.
-#[allow(dead_code)]
+/// `failed`: a launch still waiting at the spawn boundary at its expiry
+/// (`start::launch_check`).
 pub const EXPIRED_BEFORE_THE_SPAWN: &str = "expired before the spawn";
 /// `awaiting_result`: a running turn interrupted at the task's deadline
 /// (then `expired`, as in v1).
-// Used by Task 26: the deadline interrupt.
-#[allow(dead_code)]
 pub const INTERRUPTED_AT_DEADLINE: &str = "interrupted at deadline";
 /// `outcome_unknown`: its deadline passed unresolved.
-// Used by Task 23: unresolved outcomes.
-#[allow(dead_code)]
 pub const DEADLINE_PASSED_OUTCOME_UNKNOWN: &str = "deadline passed; outcome unknown";
 /// `outcome_unknown`, as its attempt's receipt says (session-v1 R9.14
 /// item 6, design I.6.3; Atem's addition): its agent exited; no turn state
@@ -58,13 +53,23 @@ pub const UNKNOWN_OUTCOME_REASONS: [&str; 3] =
     [AGENT_EXITED, OUTCOME_NOT_ESTABLISHED, WRITE_INTERRUPTED];
 /// A `work_interrupt` result: the task's turn isn't the session's current
 /// turn (§11.2); that result only, never stored.
-// Used by Task 27: `work_interrupt`.
-#[allow(dead_code)]
 pub const NOT_RUNNING: &str = "not running";
 /// An error, `busy`: the 64 (per sender) or 256 (per host) limit.
-// Used by Task 22: the capacity limits.
-#[allow(dead_code)]
 pub const TOO_MANY_UNRESOLVED_OUTCOMES: &str = "too many unresolved outcomes";
+/// `alert_list`'s `stale_target` for an `after` the host has no unresolved
+/// alert for (host-work-v1 §11.3, "An unknown cursor"). Not a row of
+/// §11.6's table: it names no task's state.
+pub const UNKNOWN_ALERT: &str = "unknown alert";
+/// The note a new alert's reason ends with at 32 unresolved outcomes on the
+/// host, after `; <count> ` (host-work-v1 §11.3's example, `agent exited;
+/// 32 outcomes unresolved on this host`). Not a row of §11.6's table: it
+/// is part of an alert's reason, no task's detail.
+pub const OUTCOMES_UNRESOLVED_ON_THIS_HOST: &str = "outcomes unresolved on this host";
+/// The detail `atem task resolve <task_id> failed` gives a task when the
+/// owner gives none (step 4's open question 2, owner-approved). Not a row
+/// of §11.6's table: a `failed` resolution's detail is the resolver's own
+/// (§11.2), and this is the one the host's own command gives for the owner.
+pub const RESOLVED_AS_FAILED_ON_THE_HOST: &str = "resolved as failed on the host";
 /// A receipt (session-v1 R9.14 item 6): an `accepted` attempt found at
 /// recovery; the session host's own text.
 pub use crate::session_protocol::host::DETAIL_WITHDRAWN_AT_RECOVERY as WITHDRAWN_AT_RECOVERY;
@@ -175,5 +180,66 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), ALL.len(), "no text twice");
+    }
+
+    /// The alerts' own texts are §11.3's, byte for byte: the unknown
+    /// cursor's detail and the 32-on-host note (its example), and neither
+    /// is a row of §11.6's table.
+    #[test]
+    fn alert_texts_match_section_11_3() {
+        let (_, section) = CONTRACT
+            .split_once("\n### 11.3 `alert_list` (`host.alerts`)\n")
+            .expect("§11.3");
+        let section = section.split("\n### ").next().unwrap();
+        let text = section.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            text.contains(&format!("is `stale_target`, detail `{UNKNOWN_ALERT}`")),
+            "{UNKNOWN_ALERT}"
+        );
+        assert!(
+            text.contains(&format!(
+                "`agent exited; 32 {OUTCOMES_UNRESOLVED_ON_THIS_HOST}`"
+            )),
+            "{OUTCOMES_UNRESOLVED_ON_THIS_HOST}"
+        );
+        for text in [UNKNOWN_ALERT, OUTCOMES_UNRESOLVED_ON_THIS_HOST] {
+            assert!(!ALL.contains(&text), "{text}");
+        }
+    }
+
+    /// Ruling T25a (review I2): the owner's command's default `failed`
+    /// detail, which a sender reads with `work_query`, is §11.6 "On the
+    /// host"'s, byte for byte (not a row of the Details table: a
+    /// resolution's detail is the resolver's own, §11.2); so are the kept
+    /// replies' 30 days and 64 MiB (design I.4.7, which names them too).
+    #[test]
+    fn owner_texts_match_section_11_6_on_the_host() {
+        use crate::runtime::host_work::{KEPT_REPLY_BUDGET, KEPT_REPLY_MS, PAYLOAD_RETENTION_MS};
+        let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let (_, section) = CONTRACT
+            .split_once("\n#### On the host\n")
+            .expect("§11.6 On the host");
+        let section = words(section.split("\n## ").next().unwrap());
+        assert!(
+            section.contains(&format!(
+                "without one the task's `detail` is `{RESOLVED_AS_FAILED_ON_THE_HOST}`"
+            )),
+            "{RESOLVED_AS_FAILED_ON_THE_HOST}"
+        );
+        assert!(!ALL.contains(&RESOLVED_AS_FAILED_ON_THE_HOST));
+        let days = KEPT_REPLY_MS / PAYLOAD_RETENTION_MS;
+        let mib = KEPT_REPLY_BUDGET >> 20;
+        assert_eq!(KEPT_REPLY_BUDGET, mib << 20);
+        let kept = format!("kept {days} days after the task settles");
+        let budget = format!("{mib} MiB per host");
+        for text in [&kept, &budget] {
+            assert!(section.contains(text.as_str()), "§11.6: {text}");
+        }
+        let design = words(include_str!("../../../designs/delegated-host-work.md"));
+        let (_, replies) = design.split_once("### I.4.7 Replies").expect("I.4.7");
+        let replies = replies.split("## I.5").next().unwrap();
+        for text in [&format!("kept for **{days} days**"), &budget] {
+            assert!(replies.contains(text.as_str()), "I.4.7: {text}");
+        }
     }
 }

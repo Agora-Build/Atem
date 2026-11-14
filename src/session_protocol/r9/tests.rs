@@ -583,6 +583,50 @@ fn a_phone_a_bot_and_a_browser_are_admitted_on_one_link() {
     assert_eq!(rig.list("ch-browser"), vec![SID.to_string()]);
 }
 
+/// Every welcome names the host's device-list verifier (R9.2 "How a
+/// verifier reports itself", R9.8; Atem's proposal, for Astation's
+/// agreement): its
+/// version and the actions it knows, the shared core's own, for a native
+/// member, a service and a browser alike. It is no feature: the features
+/// are what they were.
+#[test]
+fn welcome_names_the_verifier_inventory() {
+    use atem_client::membership::{VERIFIER_VERSION, VerifierInventory, known_actions};
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.connect("ch-phone", phone());
+    rig.advance(1000);
+    rig.connect("ch-bot", bot());
+    rig.advance(1000);
+    let wall = rig.now.host.wall_ms;
+    let (grant, key) = rig.log.grant(
+        "dev-phone",
+        "aaaaaaaa-1111-4111-8111-000000000002",
+        HOST,
+        1,
+        Some(SID),
+        &["view"],
+        wall,
+        wall + 600_000,
+    );
+    rig.connect("ch-browser", Identity::browser(grant, key).unwrap());
+    for handle in ["ch-phone", "ch-bot", "ch-browser"] {
+        let w = welcome(&mut rig, handle);
+        let verifier = w
+            .verifier()
+            .unwrap_or_else(|| panic!("{handle}: no verifier"));
+        assert_eq!(verifier, &VerifierInventory::ours(), "{handle}");
+        assert_eq!(verifier.version(), VERIFIER_VERSION);
+        assert_eq!(verifier.version(), 2);
+        assert_eq!(verifier.actions(), known_actions());
+        assert!(
+            !w.features.iter().any(|f| f.contains("verifier")),
+            "{handle}"
+        );
+        assert_eq!(w.to_json()["data"]["verifier"], verifier.to_json());
+    }
+}
+
 /// Step 3 teaches the host the new device-list entries (project grants,
 /// host-sender revocation, host encryption keys) and advertises nothing: a
 /// welcome after the host carried them lists the features it listed before,
@@ -3467,13 +3511,96 @@ mod delegated_work_ops {
         assert_eq!(rig.engine.take_host_work().len(), 1);
     }
 
+    /// Ruling T27a: `work_interrupt` is a stop, so while hosting is paused
+    /// (host work off) the engine still takes it and queues it for the
+    /// runtime, but only while the runtime says it can serve it
+    /// (`enable_host_work_stops`: the hook on, its store recovered, no
+    /// receipt-database fault). Nothing else is taken (`work_resolve`,
+    /// `alert_list`, `work_query` stay `busy`), and no welcome lists more.
+    /// With the hook off, the stops change nothing.
+    #[test]
+    fn work_interrupt_is_taken_while_hosting_is_paused() {
+        let take = |rig: &mut Rig, handle: &str, op: &str| {
+            let plain = message(rig, handle, op);
+            let (att, authority) = match &rig.engine.chans[handle].phase {
+                Phase::Open(a) => (a.attachment.clone(), a.authority.clone()),
+                _ => panic!("open"),
+            };
+            rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
+            rig.pump();
+        };
+        let mut rig = Rig::new();
+        rig.engine.set_delegated_features(true, true);
+        rig.engine.enable_host_work(true);
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        // Paused, the runtime unable to serve a stop: refused as before.
+        rig.engine.enable_host_work(false);
+        assert_eq!(
+            refusal(&mut rig, "ch-phone", "work_interrupt"),
+            not_advertised("work_interrupt")
+        );
+        // It can serve it: queued, unanswered until it answers.
+        rig.engine.enable_host_work_stops(true);
+        take(&mut rig, "ch-phone", "work_interrupt");
+        assert!(rig.events("ch-phone").is_empty(), "queued, not answered");
+        let queued: Vec<_> = rig
+            .engine
+            .take_host_work()
+            .into_iter()
+            .map(|q| {
+                matches!(
+                    q.request,
+                    atem_client::session::host_work::Request::WorkInterrupt { .. }
+                )
+            })
+            .collect();
+        assert_eq!(queued, [true], "work_interrupt, once");
+        for op in ["work_resolve", "alert_list"] {
+            assert_eq!(
+                refusal(&mut rig, "ch-phone", op),
+                not_advertised(op),
+                "{op}"
+            );
+        }
+        assert!(rig.engine.take_host_work().is_empty());
+        // A new channel's welcome lists no host-work feature meanwhile.
+        rig.advance(1000);
+        rig.connect("ch-new", phone());
+        let features = welcome(&mut rig, "ch-new").features;
+        for feature in ["host.work", DELEGATED_FEATURE, ALERTS_FEATURE] {
+            assert!(!features.iter().any(|f| f == feature), "{feature}");
+        }
+        // Task 27 review I1: that channel wasn't offered `host.delegated`,
+        // so its `work_interrupt` (sent raw, as a client ignoring its
+        // welcome would) is refused, the stops on or not; the channel
+        // welcomed before the pause still gets its own taken.
+        assert_eq!(
+            refusal(&mut rig, "ch-new", "work_interrupt"),
+            not_advertised("work_interrupt")
+        );
+        assert!(rig.engine.take_host_work().is_empty());
+        take(&mut rig, "ch-phone", "work_interrupt");
+        assert_eq!(rig.engine.take_host_work().len(), 1);
+        // The hook off: nothing is taken, whatever the runtime says.
+        rig.engine.set_delegated_features(false, false);
+        assert_eq!(
+            refusal(&mut rig, "ch-phone", "work_interrupt"),
+            not_advertised("work_interrupt")
+        );
+        assert!(rig.engine.take_host_work().is_empty());
+        assert!(rig.relay.is_empty());
+    }
+
     /// Step 4, Decision 10: the runtime hands the engine the hook's
     /// features (`HostFeatures`, read once when it starts). `host.delegated`
     /// and `host.alerts` are listed only when the hook turns them on, and
     /// only while hosting is on (they are host-work features: a host lists
     /// those only then, §1); `host.senders` never. Listed, their ops are
     /// taken: decoded, queued for the runtime, and answered with what it
-    /// says (`busy` until their handlers exist, with its detail).
+    /// says (`host.delegated`'s `busy` until their handlers exist, with its
+    /// detail; `alert_list` here with `delegated::request`'s plain `busy`:
+    /// the bridge serves it, and its tests are the bridge's).
     #[test]
     fn welcome_lists_delegated_and_alerts_only_with_the_hook() {
         use crate::runtime::test_hooks::HostFeatures;
@@ -3551,12 +3678,11 @@ mod delegated_work_ops {
                 .host_work_reply(&q.attachment, &q.request, reply, mono);
             rig.pump();
             let events = rig.events("ch-2");
+            let detail = (q.request.feature() == DELEGATED_FEATURE)
+                .then(|| format!("{} is not served yet", q.request.feature()));
             assert_eq!(
                 Rig::last_error(&events),
-                Some((
-                    "busy".into(),
-                    Some(format!("{} is not served yet", q.request.feature()))
-                )),
+                Some(("busy".into(), detail)),
                 "{events:?}"
             );
         }

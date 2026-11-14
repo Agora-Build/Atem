@@ -82,6 +82,9 @@ pub struct StatusReport {
     /// it holds deadlines back, while its record is damaged, and for a day
     /// after a repair or a lowering.
     pub clock: Option<Line>,
+    /// The runtime's delegated tasks (`Delegated:`, host-work-v1 §11.6 "On
+    /// the host"): only while something is delegated.
+    pub delegated: Option<Line>,
     /// Printed after the block (e.g. the reset steps for broken key files).
     pub notes: Vec<String>,
 }
@@ -344,6 +347,13 @@ pub fn gather_full(
         } => status.clock.clone().map(Line::new),
         _ => None,
     };
+    let delegated = match runtime {
+        Look::Running {
+            status: Some(status),
+            ..
+        } => status.delegated.as_ref().map(delegated_line),
+        _ => None,
+    };
     let connected =
         matches!(runtime, Look::Running { status: Some(status), .. } if status.astation);
     if paired.as_ref().is_some_and(|p| p.relay_only) && !connected {
@@ -359,8 +369,19 @@ pub fn gather_full(
         local_agents,
         device_list,
         clock,
+        delegated,
         notes,
     }
+}
+
+/// `Delegated:` (host-work-v1 §11.6 "On the host"): how many delegated
+/// tasks' outcomes are unknown and unresolved, and where to see them.
+fn delegated_line(status: &crate::runtime::protocol::DelegatedStatus) -> Line {
+    Line::new(match status.unresolved {
+        0 => "no unresolved outcomes".to_string(),
+        1 => "1 unresolved outcome (atem task list --unknown)".to_string(),
+        n => format!("{n} unresolved outcomes (atem task list --unknown)"),
+    })
 }
 
 /// `Device list:` from the files when no runtime runs (read only; held is
@@ -376,6 +397,12 @@ pub fn passive_device_list_line(
         text.push_str("; ");
         text.push_str(&crate::session_protocol::membership::capacity_text(&c));
     }
+    // This build's verifier (labelled: no runtime reported one), the one
+    // the runtime it starts judges the list with.
+    text.push_str(&format!(
+        "; verifier v{} (this build)",
+        atem_client::membership::VERIFIER_VERSION
+    ));
     for (subject, action, at) in pending {
         text.push_str(&format!(
             "; recovery pending: {subject} ({action}) takes effect at {} unless a managing device vetoes it",
@@ -386,7 +413,8 @@ pub fn passive_device_list_line(
 }
 
 /// `Device list:` from the running runtime (r9, §R9.3, §R9.5): pinned,
-/// held, frozen, paused or failed, with what to do, each pending
+/// held, frozen, paused or failed, with what to do, the runtime's
+/// device-list verifier version (`verifier v2`, R9.2), each pending
 /// recovery with when it takes effect, and the push hints and seens the
 /// relay hasn't acknowledged yet (§R9.9).
 pub fn device_list_line(look: &Look, hhmm: impl Fn(u64) -> String) -> Option<Line> {
@@ -399,6 +427,9 @@ pub fn device_list_line(look: &Look, hhmm: impl Fn(u64) -> String) -> Option<Lin
     };
     let list = status.device_list.as_ref()?;
     let mut text = list.text.clone();
+    if let Some(version) = list.verifier_version {
+        text.push_str(&format!("; verifier v{version}"));
+    }
     for p in &list.pending_recovery {
         text.push_str(&format!(
             "; recovery pending: {} ({}) takes effect at {} unless a managing device vetoes it",
@@ -450,7 +481,7 @@ fn local_hhmm(at: u64) -> String {
 }
 
 /// A Unix ms time as local `YYYY-MM-DD HH:MM`.
-fn local_datetime(at: u64) -> String {
+pub(crate) fn local_datetime(at: u64) -> String {
     let t = (at / 1000) as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
@@ -614,6 +645,9 @@ pub fn render(report: &StatusReport) -> String {
     }
     if let Some(line) = &report.clock {
         out.push_str(&format!("{:<16}{}\n", "Clock:", line.value));
+    }
+    if let Some(line) = &report.delegated {
+        out.push_str(&format!("{:<16}{}\n", "Delegated:", line.value));
     }
     for note in &report.notes {
         out.push_str(note);
@@ -817,6 +851,7 @@ pub(crate) mod tests {
             local_agents: Line::new("l"),
             device_list: Some(line),
             clock: None,
+            delegated: None,
             notes: Vec::new(),
         };
         assert!(render(&report).contains("\nDevice list:    held ("));
@@ -835,6 +870,64 @@ pub(crate) mod tests {
         report.device_list = None;
         assert!(!render(&report).contains("Device list"));
         assert_eq!(device_list_line(&Look::NotRunning, |_| "?".into()), None);
+    }
+
+    /// The runtime names its device-list verifier's version (R9.2 "How a
+    /// verifier reports itself"): `verifier v2` after what the list is,
+    /// before pending recoveries and push; a runtime that doesn't say
+    /// (an older build) shows none.
+    #[test]
+    fn status_shows_the_verifier_version() {
+        use crate::runtime::protocol::{DeviceListStatus, PendingRecoveryStatus, RuntimeStatus};
+        let look = |list: DeviceListStatus| Look::Running {
+            status: Some(RuntimeStatus {
+                device_list: Some(list),
+                ..Default::default()
+            }),
+            welcome: crate::runtime::client::Welcome {
+                protocol: 1,
+                build: "b".into(),
+                pid: 1,
+                astation: false,
+                host_error: None,
+                worker_protocol: None,
+                device_list: None,
+            },
+        };
+        let open = DeviceListStatus {
+            state: "open".into(),
+            text: "pinned at seq 4 (1 remote client); 4/1024 entries, 2/256 members, 1/64 hosts"
+                .into(),
+            pending_recovery: vec![PendingRecoveryStatus {
+                subject: "dev-new".into(),
+                action: "recovery_add".into(),
+                effective_at: 7,
+            }],
+            verifier_version: Some(2),
+            ..Default::default()
+        };
+        let line = device_list_line(&look(open.clone()), |ms| format!("@{ms}")).unwrap();
+        assert_eq!(
+            line.value,
+            "pinned at seq 4 (1 remote client); 4/1024 entries, 2/256 members, 1/64 hosts; verifier v2; recovery pending: dev-new (recovery_add) takes effect at @7 unless a managing device vetoes it"
+        );
+        let older = DeviceListStatus {
+            verifier_version: None,
+            ..open
+        };
+        let line = device_list_line(&look(older), |ms| format!("@{ms}")).unwrap();
+        assert!(!line.value.contains("verifier"), "{}", line.value);
+        // The runtime fills it with its own verifier's, whatever the
+        // list's state.
+        let now = crate::session_protocol::membership::host_now();
+        let failed =
+            crate::runtime::host_bridge::device_list_status_of(None, Some("x"), 0, &now).unwrap();
+        assert_eq!(
+            failed.verifier_version,
+            Some(atem_client::membership::VERIFIER_VERSION)
+        );
+        // From the files (no runtime), this build's verifier:
+        // `the_device_list_line_without_a_runtime_reads_the_files`.
     }
 
     /// With no runtime running, the device list is read from the files
@@ -865,7 +958,8 @@ pub(crate) mod tests {
         .unwrap();
         let line = report(dir.path()).device_list.unwrap().value;
         // Three entries; the mac and the pending dev-new count as members.
-        assert!(line.starts_with("pinned at seq 3 (from disk; no runtime running); 3/1024 entries, 2/256 members, 1/64 hosts; recovery pending: dev-new (recovery_add) takes effect at "), "{line}");
+        // This build's verifier (the runtime it starts judges the list).
+        assert!(line.starts_with("pinned at seq 3 (from disk; no runtime running); 3/1024 entries, 2/256 members, 1/64 hosts; verifier v2 (this build); recovery pending: dev-new (recovery_add) takes effect at "), "{line}");
         // An unfinished write after a plain crash: replayed at the next
         // start, no managing device asked for (Astation's review of
         // 66ea556).
@@ -906,6 +1000,7 @@ pub(crate) mod tests {
             local_agents: Line::new("2 running (claude ready, codex ready)"),
             device_list: None,
             clock: None,
+            delegated: None,
             notes: Vec::new(),
         };
         assert_eq!(
@@ -998,6 +1093,58 @@ pub(crate) mod tests {
         );
         // No runtime, no line.
         assert_eq!(report(dir.path()).clock, None);
+    }
+
+    /// Host-work-v1 §11.6 "On the host" ("`atem status` shows the number of
+    /// unresolved outcomes"), design I.4.6: the runtime's `Delegated:` line,
+    /// after the others, only while something is delegated (the runtime
+    /// sends it then: `HostBridge::delegated_status`). Without it the block
+    /// is byte for byte what it was before the line existed, the runtime
+    /// running or not.
+    #[test]
+    fn status_shows_unresolved_outcomes() {
+        use crate::runtime::protocol::DelegatedStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        let with = |delegated: Option<DelegatedStatus>| {
+            gather_full(
+                &src,
+                None,
+                &running(RuntimeStatus {
+                    delegated,
+                    ..Default::default()
+                }),
+            )
+        };
+        // Nothing delegated: no line, and the block is exactly the one
+        // before the line existed.
+        let quiet = with(None);
+        assert_eq!(quiet.delegated, None);
+        let before_the_line = StatusReport {
+            delegated: None,
+            ..quiet.clone()
+        };
+        assert_eq!(render(&quiet), render(&before_the_line));
+        assert!(!render(&quiet).contains("Delegated"));
+        assert_eq!(report(dir.path()).delegated, None);
+        for (unresolved, text) in [
+            (0, "no unresolved outcomes"),
+            (1, "1 unresolved outcome (atem task list --unknown)"),
+            (2, "2 unresolved outcomes (atem task list --unknown)"),
+        ] {
+            let report = with(Some(DelegatedStatus { unresolved }));
+            assert_eq!(report.delegated, Some(Line::new(text)));
+            let rendered = render(&report);
+            assert!(
+                rendered.ends_with(&format!("\nDelegated:      {text}\n")),
+                "{rendered}"
+            );
+            // Only the line is added.
+            assert_eq!(
+                rendered.replace(&format!("Delegated:      {text}\n"), ""),
+                { render(&quiet) }
+            );
+        }
     }
 
     #[test]

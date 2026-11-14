@@ -1,8 +1,9 @@
 //! The requests about a delegated sender's task, in the bridge (design
-//! I.4.5, I.5.5, I.5.6; host-work-v1 §11.2 "Authority"; step 4's Decision
-//! 15): who may query, cancel or complete it and read its reply (the
-//! interaction rule, [`interaction`]), and a cancel that withdraws a live
-//! attempt in the session host before the task is cancelled.
+//! I.4.5, I.4.6, I.5.5, I.5.6; host-work-v1 §11.2 "Authority"; step 4's
+//! Decision 15): who may query, cancel, complete or resolve it and read its
+//! reply (the interaction rule, [`interaction`]), a cancel that withdraws a
+//! live attempt in the session host before the task is cancelled, and
+//! `work_resolve` ([`resolve`]).
 //!
 //! v1 tasks never come here: `work_request_as` keeps host-work v1's caller
 //! rule for them, byte for byte.
@@ -10,6 +11,7 @@ use super::*;
 use crate::runtime::delegated::Admission;
 use crate::runtime::delegated::attempts::{AttemptEnd, SessionAnswer, attempt_end};
 use crate::runtime::delegated::authority::{Caller, Grounds, Refused, interaction};
+use crate::runtime::delegated::resolve::{ResolveRefusal, resolve};
 use crate::runtime::delegated::start::Event;
 use crate::session_protocol::host::{Immutable, Provenance, Withdrawal};
 use crate::session_protocol::wire::ReceiptState;
@@ -39,6 +41,18 @@ impl HostBridge {
         r: &WorkRecord,
         adm: &Admission,
     ) -> Result<Caller, Refused> {
+        self.delegated_caller_by(a, r, adm, interaction)
+    }
+
+    /// [`HostBridge::delegated_caller`] under `rule` ([`interaction`], or
+    /// `work_interrupt`'s `interrupter`), on the same grounds.
+    pub(super) fn delegated_caller_by(
+        &self,
+        a: &Sender,
+        r: &WorkRecord,
+        adm: &Admission,
+        rule: crate::runtime::delegated::authority::Rule,
+    ) -> Result<Caller, Refused> {
         let Some(authority) = a.remote() else {
             return Err(Refused::NotTheSender);
         };
@@ -54,7 +68,7 @@ impl HostBridge {
         let now_d = self.start_view().now_d_ms.unwrap_or(0);
         let host_id = self.host.context().atem_device_id.clone();
         let session = r.task.target.session_id.as_str();
-        interaction(
+        rule(
             &authority.name(),
             authority.key.as_bytes(),
             adm,
@@ -180,5 +194,100 @@ impl HostBridge {
         )
         .map_err(|_| "busy")?;
         Ok(r.status)
+    }
+
+    /// `work_resolve` (feature `host.delegated`; design I.4.5, I.4.6,
+    /// host-work-v1 §11.2) of `task_id` as `resolution`, from `a`. Only
+    /// with `host.delegated` on (with it off, `busy` as before the hook:
+    /// [`crate::runtime::delegated::request`]). A delegated task its caller
+    /// may name, the task's sender with current authority or the owner (the
+    /// interaction rule, `delegated_caller`), else `forbidden`: a v1 task,
+    /// one the host doesn't have, `local` (the host's own command is not
+    /// this op). Then [`resolve`]'s rule, in one `BEGIN IMMEDIATE`
+    /// transaction committed before the answer: the task and its alert's
+    /// end are durable before anything shows them.
+    pub(super) fn work_resolve(
+        &self,
+        a: &Sender,
+        req: &hw::Request,
+        task_id: &str,
+        resolution: &hw::Resolution,
+    ) -> Result<ResultBody, HostWorkError> {
+        if !self.features.delegated {
+            return crate::runtime::delegated::request(self.features, req);
+        }
+        let store = self.work.store.as_ref().ok_or("busy")?;
+        let r = store
+            .work(task_id)
+            .map_err(|_| "busy")?
+            .ok_or("forbidden")?;
+        let adm = r.delegated.as_ref().ok_or("forbidden")?;
+        self.delegated_caller(a, &r, adm).map_err(|_| "forbidden")?;
+        let tx = store.immediate().map_err(|_| "busy")?;
+        let work = resolve(
+            store,
+            &tx,
+            task_id,
+            &a.name(),
+            resolution,
+            host_now().wall_ms,
+        )
+        .map_err(ResolveRefusal::error)?;
+        tx.commit().map_err(|_| "busy")?;
+        Ok(ResultBody::Work { work })
+    }
+
+    /// `alert_list` (feature `host.alerts`; design I.4.6, host-work-v1
+    /// §11.3) from `a`: the page of unresolved alerts after `after`. Only
+    /// with `host.alerts` on (with it off, `busy` as before the hook:
+    /// [`crate::runtime::delegated::request`]). It answers native members
+    /// holding `control` at the host's head, the members that get approval
+    /// hints: the channel refuses everyone else before decoding
+    /// (`Need::Alerts`), and so does this, `local` included (the owner's
+    /// own view is the host's command, not this op). An `after` the host has
+    /// no unresolved alert for is `stale_target`, `unknown alert`. Read
+    /// only: it records nothing.
+    pub(super) fn alert_list(
+        &self,
+        a: &Sender,
+        req: &hw::Request,
+        after: Option<&str>,
+    ) -> Result<ResultBody, HostWorkError> {
+        if !(self.features.delegated && self.features.alerts) {
+            return crate::runtime::delegated::request(self.features, req);
+        }
+        if !a.remote().is_some_and(|a| a.allows(Need::Alerts)) {
+            return Err("forbidden".into());
+        }
+        let store = self.work.store.as_ref().ok_or("busy")?;
+        let (alerts, more) = store
+            .alert_page(after, atem_client::session::alerts::MAX_PAGE)
+            .map_err(|refused| refused.error())?;
+        Ok(ResultBody::Alerts { alerts, more })
+    }
+
+    /// The capacity limits on unresolved outcomes (design I.4.6,
+    /// host-work-v1 §11.6 "Capacity"), for a request of `a` that would make
+    /// a new task (`work_enqueue`, `message_publish` with an agent
+    /// recipient): at 64 of its own unresolved, or 256 on the host, a remote
+    /// sender is refused `busy`, `too many unresolved outcomes`, until the
+    /// owner resolves some. `local` never is. Only with `host.delegated`
+    /// on: with it off nothing is counted, as on main.
+    pub(super) fn unresolved_capacity(&self, a: &Sender) -> Result<(), HostWorkError> {
+        let Some(sender) = a.remote() else {
+            return Ok(());
+        };
+        if !self.features.delegated {
+            return Ok(());
+        }
+        let store = self.work.store.as_ref().ok_or("busy")?;
+        match store.over_capacity(&sender.name()) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(HostWorkError {
+                code: "busy",
+                detail: Some(details::TOO_MANY_UNRESOLVED_OUTCOMES),
+            }),
+            Err(_) => Err("busy".into()),
+        }
     }
 }

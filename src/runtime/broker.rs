@@ -1187,17 +1187,16 @@ impl Launcher {
         request: SpawnRequest,
         env: LaunchEnv,
         guard: adopt::SpawnGuard,
+        check: Option<adopt::PreSpawnCheck>,
     ) -> anyhow::Result<(WorkerHandle, u64)> {
         let state = self.state().to_path_buf();
         let handle = match self {
             Launcher::Process(paths) => {
-                adopt::spawn_guarded(&paths, &request, Some(env), Some(guard)).await?
+                adopt::spawn_guarded(&paths, &request, Some(env), Some(guard), check).await?
             }
             #[cfg(test)]
             Launcher::InProcess(in_process) => {
-                if !guard() {
-                    anyhow::bail!("remote launch authorization changed");
-                }
+                adopt::before_spawn(Some(&guard), check.as_ref())?;
                 in_process.spawn(request.clone(), env).await?
             }
         };

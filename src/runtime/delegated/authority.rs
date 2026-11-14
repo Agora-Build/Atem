@@ -15,8 +15,11 @@
 //! - **The owner** ([`Caller::Owner`]): a native member holding `control`
 //!   at the host's current head, under its own key. It reads any delegated
 //!   task, a revoked or removed sender's included (Decision 15); what it may
-//!   do beyond reading is the bridge's (`work_query` and `reply_query` here;
-//!   `work_resolve` and `work_interrupt` come with their tasks).
+//!   do beyond reading is the bridge's (`work_query`, `reply_query`,
+//!   `work_resolve` and `work_interrupt` here).
+//! - **`work_interrupt`** ([`interrupter`], host-work-v1 §11.2): the same
+//!   rule, and the sender's current grant also holds `interrupt`; the
+//!   owner needs nothing more (`control` holds it).
 //!
 //! v1 tasks never come here: they keep host-work v1's caller rule.
 //! Anything refused is `forbidden`, with no detail (host-work-v1 §7: §11.6
@@ -56,6 +59,9 @@ pub enum Refused {
     /// The sender, its current grant without `notify` and `prompt`, or no
     /// longer covering the task's target (host, session, project).
     NotCovered,
+    /// The sender, asking `work_interrupt` with no `interrupt` in its
+    /// current grant (host-work-v1 §11.2).
+    NoInterrupt,
 }
 
 /// What [`interaction`] reads besides the caller and the task.
@@ -77,6 +83,10 @@ pub struct Grounds<'a> {
     pub projects: &'a dyn Fn(&str) -> Option<bool>,
 }
 
+/// A caller rule ([`interaction`] or [`interrupter`]), as the bridge
+/// applies one on the host's grounds.
+pub type Rule = fn(&str, &[u8], &Admission, &str, &Grounds<'_>) -> Result<Caller, Refused>;
+
 /// Who `caller_principal`, under the raw auth key `caller_key`, is to the
 /// delegated task admitted as `task` on session `session_id` (see the
 /// module doc): the sender when its current authority holds, else the owner
@@ -89,9 +99,35 @@ pub fn interaction(
     session_id: &str,
     at: &Grounds<'_>,
 ) -> Result<Caller, Refused> {
+    caller(caller_principal, caller_key, task, session_id, at, false)
+}
+
+/// [`interaction`] for `work_interrupt` (design I.4.5, host-work-v1 §11.2):
+/// the sender's current grant must also hold `interrupt`, else it is
+/// refused ([`Refused::NoInterrupt`]) unless it is the owner too.
+pub fn interrupter(
+    caller_principal: &str,
+    caller_key: &[u8],
+    task: &Admission,
+    session_id: &str,
+    at: &Grounds<'_>,
+) -> Result<Caller, Refused> {
+    caller(caller_principal, caller_key, task, session_id, at, true)
+}
+
+/// [`interaction`], and with `interrupt` the sender's grant holding
+/// `interrupt` too.
+fn caller(
+    caller_principal: &str,
+    caller_key: &[u8],
+    task: &Admission,
+    session_id: &str,
+    at: &Grounds<'_>,
+    interrupt: bool,
+) -> Result<Caller, Refused> {
     let refused = if caller_principal == task.principal && digest(caller_key) == task.principal_key
     {
-        match sender_authority(caller_key, task, session_id, at) {
+        match sender_authority(caller_key, task, session_id, at, interrupt) {
             Ok(()) => return Ok(Caller::Sender),
             Err(why) => why,
         }
@@ -104,12 +140,14 @@ pub fn interaction(
     Err(refused)
 }
 
-/// The sender's current authority over its task (design I.4.5).
+/// The sender's current authority over its task (design I.4.5), and with
+/// `interrupt` its grant's `interrupt` (§11.2).
 fn sender_authority(
     caller_key: &[u8],
     task: &Admission,
     session_id: &str,
     at: &Grounds<'_>,
+    interrupt: bool,
 ) -> Result<(), Refused> {
     let (device_id, principal) = match &task.sender {
         DelegatedSender::Native { device_id } => (
@@ -151,6 +189,9 @@ fn sender_authority(
         || !grant.session_in_scope(at.host_id, session_id, &projects)
     {
         return Err(Refused::NotCovered);
+    }
+    if interrupt && !grant.allows(Need::Op(Op::Interrupt)) {
+        return Err(Refused::NoInterrupt);
     }
     Ok(())
 }
@@ -458,6 +499,91 @@ mod tests {
             },
         );
         assert_eq!(s2, Err(Refused::NotCovered));
+    }
+
+    /// Host-work-v1 §11.2 "Authority": for `work_interrupt` the sender also
+    /// holds `interrupt` in its current grant (a `set_roles` adding or
+    /// dropping it counts at once); its other requests don't need it. The
+    /// owner needs nothing more, and a native sender holding `control` has
+    /// it.
+    #[test]
+    fn work_interrupt_needs_interrupt_from_the_sender() {
+        use atem_client::membership::ServiceScope;
+        let mut log = log(later());
+        let bot = admitted(&log, "service:svc-bot");
+        let phone = admitted(&log, "member:dev-phone");
+        let none = SenderStanding::default();
+        let interrupt = |log: &TestLog, who: &str, device: &str, task: &Admission| {
+            interrupter(
+                who,
+                &key(log, device),
+                task,
+                S1,
+                &Grounds {
+                    list: &log.log,
+                    standing: &none,
+                    host_id: HOST,
+                    now_ms: 0,
+                    projects: &|_| Some(false),
+                },
+            )
+        };
+        assert_eq!(
+            interrupt(&log, "service:svc-bot", "svc-bot", &bot),
+            Err(Refused::NoInterrupt)
+        );
+        assert_eq!(
+            ask(&log, "service:svc-bot", "svc-bot", &bot, &none, 0),
+            Ok(Caller::Sender),
+            "its other requests"
+        );
+        assert_eq!(
+            interrupt(&log, "member:dev-phone", "dev-phone", &bot),
+            Ok(Caller::Owner)
+        );
+        assert_eq!(
+            interrupt(&log, "member:dev-phone", "dev-phone", &phone),
+            Ok(Caller::Sender)
+        );
+        assert_eq!(
+            interrupt(&log, "member:dev-viewer", "dev-viewer", &bot),
+            Err(Refused::NotTheSender)
+        );
+        let with = |ops: &[&str]| {
+            ServiceScope::new([HOST])
+                .sessions(Some([S1, S2]))
+                .ops(ops.iter().copied())
+        };
+        log.set_service(
+            "svc-bot",
+            &with(&["interrupt", "notify", "prompt", "view"]),
+            later(),
+        );
+        assert_eq!(
+            interrupt(&log, "service:svc-bot", "svc-bot", &bot),
+            Ok(Caller::Sender)
+        );
+        log.narrow_service("svc-bot", &with(&["notify", "prompt", "view"]), None);
+        assert_eq!(
+            interrupt(&log, "service:svc-bot", "svc-bot", &bot),
+            Err(Refused::NoInterrupt)
+        );
+        // Revoked: its own reason first, as for every request.
+        let revoked = SenderStanding {
+            revoked: Some("rec-1".into()),
+            ..SenderStanding::default()
+        };
+        let at = Grounds {
+            list: &log.log,
+            standing: &revoked,
+            host_id: HOST,
+            now_ms: 0,
+            projects: &|_| Some(false),
+        };
+        assert_eq!(
+            interrupter("service:svc-bot", &key(&log, "svc-bot"), &bot, S1, &at),
+            Err(Refused::Revoked)
+        );
     }
 
     /// Task 20 review I1: the `projects` entries the task's project matched

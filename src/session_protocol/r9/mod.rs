@@ -255,6 +255,11 @@ struct Attached {
     /// I.5.8, "Native senders"): its delegated tasks pass the revocation
     /// gate while this channel is open.
     caught_up: bool,
+    /// Its welcome listed `host.delegated`: while hosting is paused, the
+    /// host takes `work_interrupt` only from such a channel (ruling T27a,
+    /// Task 27 review I1). With hosting on, host-work ops are judged by the
+    /// host's current features, not the channel's welcome.
+    offered_delegated: bool,
 }
 
 enum Phase {
@@ -316,6 +321,9 @@ impl From<&'static str> for HostWorkError {
 
 pub struct R9Host {
     host_work_enabled: bool,
+    /// While host work is off (hosting paused), `work_interrupt` is still
+    /// taken: a stop (ruling T27a), when the runtime can serve it.
+    host_work_stops: bool,
     /// `host.delegated` and `host.alerts` (`alerts` only with `delegated`),
     /// as the runtime's debug-only hook turned them on (step 4, Decision
     /// 10); listed only with hosting on.
@@ -563,6 +571,27 @@ impl R9Host {
         self.host_work_enabled = enabled;
     }
 
+    /// While host work is off (hosting paused), whether `work_interrupt` of
+    /// `host.delegated` (when the runtime's hook turned it on) is still
+    /// taken and queued for the runtime: a stop always wins (ruling T27a,
+    /// like the deadline's interrupt, T26a). The runtime says so only while
+    /// it can serve it (its store recovered, no receipt-database fault).
+    /// Only from a channel whose welcome listed `host.delegated` (one
+    /// welcomed before the pause; Task 27 review I1). Nothing else is
+    /// taken, and no welcome lists more for it.
+    pub fn enable_host_work_stops(&mut self, enabled: bool) {
+        self.host_work_stops = enabled;
+    }
+
+    /// The open channel of `attachment` was offered `host.delegated` in its
+    /// welcome.
+    fn offered_delegated(&self, attachment: &str) -> bool {
+        self.by_attachment
+            .get(attachment)
+            .and_then(|handle| self.chans.get(handle))
+            .is_some_and(|c| matches!(&c.phase, Phase::Open(a) if a.offered_delegated))
+    }
+
     /// The delegated features the runtime runs (`host.delegated`,
     /// `host.alerts`): off unless its debug-only hook turned them on (step 4
     /// of delegated host work, Decision 10; never in a release build).
@@ -570,6 +599,16 @@ impl R9Host {
     pub fn set_delegated_features(&mut self, delegated: bool, alerts: bool) {
         self.delegated = delegated;
         self.alerts = alerts && delegated;
+    }
+
+    /// Whether this host's welcome lists `host.alerts`: hosting on, and the
+    /// hook's `host.delegated` and `host.alerts`. The one rule for both the
+    /// welcome and the making (signing and first send) of `outcome_unknown`
+    /// hints (host-work-v1 §11.3: "only behind `host.alerts`"), so the two
+    /// can't disagree; hints already made are resent whatever it says then
+    /// (session-v1 R9.9).
+    fn alerts_advertised(&self) -> bool {
+        self.host_work_enabled && self.delegated && self.alerts
     }
 
     /// The features a welcome lists: the one source of what this host takes
@@ -595,7 +634,7 @@ impl R9Host {
             if self.delegated {
                 features.push(atem_client::session::host_work::DELEGATED_FEATURE.to_owned());
             }
-            if self.alerts {
+            if self.alerts_advertised() {
                 features.push(atem_client::session::host_work::ALERTS_FEATURE.to_owned());
             }
         }
@@ -697,6 +736,7 @@ impl R9Host {
         let revoked_path = journal_dir.map(|d| d.join(REVOKED_GRANTS_FILE));
         let mut host = R9Host {
             host_work_enabled: false,
+            host_work_stops: false,
             delegated: false,
             alerts: false,
             host_work_requests: VecDeque::new(),
@@ -1588,6 +1628,9 @@ impl R9Host {
         effects.extend(parts.host.take_effects());
         let ctx = parts.host.context().clone();
         let features = self.advertised_features();
+        let offered_delegated = features
+            .iter()
+            .any(|f| f == atem_client::session::host_work::DELEGATED_FEATURE);
         let welcome = Welcome {
             id: new_id(),
             re: re.clone(),
@@ -1613,6 +1656,10 @@ impl R9Host {
                 .map(PendingRecovery::of)
                 .collect(),
             channel_id: channel.channel_id().to_owned(),
+            // The host's device-list verifier, in every welcome (R9.2 "How
+            // a verifier reports itself"; Atem's proposal, for Astation's
+            // agreement).
+            verifier: Some(atem_client::membership::VerifierInventory::ours()),
         };
         let frame = match channel.seal(&welcome.to_bytes(), mono) {
             Ok(frame) => frame,
@@ -1639,6 +1686,7 @@ impl R9Host {
             authority,
             grant: hello.grant.clone(),
             caught_up,
+            offered_delegated,
         }));
         self.by_attachment.insert(attachment, handle.to_string());
         effects
@@ -1798,11 +1846,17 @@ impl R9Host {
             // advertise, if the op is one: after the authority check (a
             // principal outside the op's right still learns `forbidden`),
             // before anything is read.
+            let stop_while_paused = !self.host_work_enabled
+                && self.host_work_stops
+                && self.delegated
+                && data.get("op").and_then(Value::as_str) == Some("work_interrupt")
+                && self.offered_delegated(att);
             let unadvertised = data
                 .get("op")
                 .and_then(Value::as_str)
                 .and_then(delegated_feature_of)
-                .filter(|feature| !self.advertised_features().iter().any(|f| f == feature));
+                .filter(|feature| !self.advertised_features().iter().any(|f| f == feature))
+                .filter(|_| !stop_while_paused);
             if matches!(
                 data.get("op").and_then(Value::as_str),
                 Some(
@@ -1834,7 +1888,9 @@ impl R9Host {
                         code::BUSY,
                         Some(&format!("{feature} is not advertised")),
                     );
-                } else if !self.host_work_enabled || self.host_work_requests.len() >= 64 {
+                } else if !(self.host_work_enabled || stop_while_paused)
+                    || self.host_work_requests.len() >= 64
+                {
                     refuse(self, code::BUSY, Some("agent hosting is disabled or busy"));
                 } else {
                     match atem_client::session::host_work::Request::decode(plain) {
@@ -2392,6 +2448,50 @@ impl R9Host {
         let wall = parts.now.host.wall_ms;
         self.push
             .resolved(approval_id, &reason, signer_of(&parts.list), wall);
+    }
+
+    /// An alert was raised (host-work-v1 §11.3; the bridge hands it over
+    /// once its row is committed, so it is durable before any hint shows
+    /// it): its `outcome_unknown` hints, one per native member holding
+    /// `control` at the head, the task, session, sender and the alert's own
+    /// reason sealed to each (R9.9). Only while the welcome lists
+    /// `host.alerts` ([`R9Host::alerts_advertised`]: hosting on, the
+    /// hook's features on; host-work-v1 §11.3 "Compatibility"), and never
+    /// while push is suppressed (`push_suppressed`). An alert raised while
+    /// either holds is never hinted later.
+    pub fn alert_opened<J: Journal>(
+        &mut self,
+        alert: &atem_client::session::alerts::Alert,
+        parts: &mut Parts<'_, J>,
+    ) {
+        if !self.alerts_advertised() {
+            return;
+        }
+        self.push.suppress(push_suppressed(parts));
+        let wall = parts.now.host.wall_ms;
+        let Some(key) = alert_push_key(&parts.list, &alert.alert_id) else {
+            return;
+        };
+        let plain = atem_client::push::AlertPlain {
+            task_id: alert.task_id.clone(),
+            session_id: alert.session_id.clone(),
+            sender: alert.sender.clone(),
+            reason: alert.reason.clone(),
+        };
+        self.push
+            .alert_opened(key, alert.created_at, &plain, signer_of(&parts.list), wall);
+    }
+
+    /// An alert ended (its task resolved, or a reply moved it): its hints
+    /// are not sent again (an alert has no resolved hint, R9.9).
+    pub fn alert_ended(&mut self, alert_id: &str) {
+        self.push.alert_ended(alert_id);
+    }
+
+    /// The alerts whose hints still wait for the relay (what the bridge
+    /// asks the store about: one that ended stops its hints).
+    pub fn hinted_alerts(&self) -> Vec<String> {
+        self.push.alert_ids()
     }
 
     /// A relay message on Atem's link (`{"type":"relay",…}`): a `push_ack`
@@ -3093,6 +3193,22 @@ fn approval_key(
         &request.session_id,
         &request.process_gen,
         &request.approval_id,
+    ))
+}
+
+/// An alert's push identity on this host (R9.9, "`outcome_unknown` hint"):
+/// the pinned list's account and genesis, this host and its trust
+/// generation, the alert's id.
+fn alert_push_key(list: &DeviceList<'_>, alert_id: &str) -> Option<atem_client::push::AlertKey> {
+    let DeviceList::Open { m, .. } = list else {
+        return None;
+    };
+    let pin = m.pin_of();
+    Some(atem_client::push::AlertKey::new(
+        m.membership(),
+        &pin.host_id,
+        pin.host_trust_gen,
+        alert_id,
     ))
 }
 
