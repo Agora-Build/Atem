@@ -1886,11 +1886,16 @@ fn the_owner_lists_and_resolves_unknown_outcomes_from_the_terminal() {
     let listed = owner(&rig, &["task", "list", "--unknown"]);
     let lines: Vec<&str> = listed.lines().collect();
     assert_eq!(lines.len(), 2, "{listed}");
-    for (line, (tid, launch)) in lines.iter().zip([(one_id, &first), (two_id, &second)]) {
+    // Both agents exit at once: their alerts are raised in either order.
+    for (tid, launch) in [(one_id, &first), (two_id, &second)] {
         let head = format!(
             "{tid}  {}  member:{PHONE}  agent exited  ",
             launch["session_id"].as_str().unwrap()
         );
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with(tid))
+            .unwrap_or_else(|| panic!("{tid} not listed: {listed}"));
         assert!(line.starts_with(&head), "{line}");
         // When: the local `YYYY-MM-DD HH:MM`.
         assert_eq!(line.len(), head.len() + 16, "{line}");

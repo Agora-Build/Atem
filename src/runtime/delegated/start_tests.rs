@@ -910,3 +910,49 @@ fn a_damaged_control_state_holds_a_services_launch_not_a_natives() {
         );
     }
 }
+
+/// Design I.4.3 "Launches" with I.5.8: a launch's spawn-boundary check
+/// reads the same gate as a task's start, its device-list part included.
+/// With only a Station's feed part open, a launch covered by that Station
+/// (the bot's) or the host's own (the phone's, no caught-up channel) waits;
+/// once the host's own fetch on its link holds the head that Station
+/// announced, both may be spawned.
+#[test]
+fn a_launch_waits_for_the_gates_device_list_part_too() {
+    use crate::runtime::delegated::details;
+    use crate::runtime::delegated::fetch::DeviceListFetch;
+    let log = log_of(&["launch", "notify", "prompt", "view"], |_| {});
+    let profile = config(1).profile("p").unwrap().clone();
+    let key = profile.scope_key();
+    let launch = |principal: &str| StartLaunch {
+        admission: task(&log, principal, LATER).admission,
+        profile: profile.clone(),
+        expires_at: 1_000,
+    };
+    let (phone, bot) = (launch(PHONE), launch(BOT));
+    let mut v = view(&log);
+    v.scopes
+        .hashes
+        .insert((key.clone(), KID.into()), PROJECT.into());
+    // The feed part alone (the sync's), no device-list part, and no
+    // caught-up channel: closed.
+    v.gates = Gates::default();
+    v.gates.open_feed(ORIGIN);
+    for l in [&phone, &bot] {
+        assert_eq!(
+            launch_check(&v, l, 0),
+            LaunchVerdict::Wait(details::REVOCATIONS_NOT_YET_CHECKED)
+        );
+    }
+    // The host's own fetch: the Station announces the list's own head.
+    let head = log.log.head();
+    let mut f = DeviceListFetch::default();
+    assert_eq!(f.on_heads(&head, &head, None), None);
+    v.fetch = Some(StationFetch {
+        origin: Some(ORIGIN.into()),
+        part: f.part(),
+    });
+    for l in [&phone, &bot] {
+        assert_eq!(launch_check(&v, l, 0), LaunchVerdict::Go);
+    }
+}
