@@ -2164,12 +2164,10 @@ fn a_turn_running_at_its_deadline_is_interrupted_and_expires() {
     // The agent's turn ends interrupted, as after an Esc.
     std::fs::write(rig.fake.join("interrupt"), "").unwrap();
     wait_stored(&rig, tid, "expired", "expired awaiting a result");
-    let rc = receipt(&rig, &attempt);
-    assert_eq!(
-        (&rc["state"], &rc["detail"]),
-        (&json!("completed"), &json!("interrupted")),
-        "{rc}"
-    );
+    // The expiry is in the store mid-pass; the dump comes at the pass's
+    // end: polled.
+    receipt_becomes(&rig, &attempt, "state", "completed");
+    assert_eq!(receipt(&rig, &attempt)["detail"], "interrupted");
     let stored_intents = intents(&rig, tid);
     let [intent] = stored_intents.as_slice() else {
         panic!("one intent: {stored_intents:?}");
