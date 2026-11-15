@@ -4112,3 +4112,332 @@ fn relay_switch_waits_for_the_new_feed() {
     in_turn(&rig, &held["task_id"], "HELD_ACROSS_THE_SWITCH");
     assert_eq!(input(&rig).matches("HELD_ACROSS_THE_SWITCH").count(), 1);
 }
+
+// ── A re-verify on a live link (Astation's item 15 on #120) ──
+
+/// The relay's record of the host route proof the runtime sent on
+/// connection `link` (§R9.7b): (nonce, room, its `atem_id`, the message).
+type Proof = ([u8; 32], String, String, String);
+
+/// The host route proof on connection `link`, as the fake relay saw it
+/// (the proofs of other connections skipped).
+#[track_caller]
+fn proof_on(rig: &Rig, link: u64) -> Proof {
+    let events = rig.relay_events.as_ref().expect("a relay");
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match events.recv_timeout(left) {
+            Ok(RelayEvent::Proof {
+                link: on,
+                query,
+                nonce,
+                room,
+                message,
+            }) if on == link => {
+                let atem_id = query
+                    .iter()
+                    .find(|(k, _)| k == "atem_id")
+                    .map(|(_, v)| v.clone())
+                    .expect("the link's atem_id");
+                return (nonce, room, atem_id, message);
+            }
+            Ok(_) => {}
+            Err(_) => panic!("no route proof on connection {link}\n{}", rig.runtime_log()),
+        }
+    }
+}
+
+/// `proof` checked by the relay's shared verifier against `log`: the head
+/// it was made at.
+fn route_head(
+    log: &TestLog,
+    proof: &Proof,
+) -> Result<u64, atem_client::host_route::HostRouteRefusal> {
+    let (nonce, room, atem_id, message) = proof;
+    atem_client::host_route::verify_host_route_message(
+        &log.log,
+        message.as_bytes(),
+        nonce,
+        room,
+        atem_id,
+    )
+    .map(|route| {
+        assert_eq!(route.host_id, HOST);
+        route.head.seq
+    })
+}
+
+/// The P-256 generator, uncompressed: a valid Astation signing key for the
+/// fake's `verifyKeys`.
+const SIGN_PUB: &str = "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
+
+/// The next message of type `kind` Atem sent the fake Astation, on the
+/// link it came on (others skipped).
+#[track_caller]
+fn astation_saw(rig: &Rig, kind: &str) -> (u64, Value) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rig.astation.events.recv_timeout(left) {
+            Ok(Event::Message(on, v)) if v["type"] == kind => return (on, v),
+            Ok(_) => {}
+            Err(_) => panic!("Astation never got {kind}\n{}", rig.runtime_log()),
+        }
+    }
+}
+
+/// `atem pair verify` run in a terminal against the rig's runtime (its
+/// trust state unverified first, so the ceremony runs) on the runtime's
+/// live link. Before its `verifyCommit` the operation moves the pairing to
+/// the next host trust generation on that link (`OpCall::Rebind`); the
+/// fake answers with its keys, and the operation waits at the safety-code
+/// question, with no deadline, until the test answers it
+/// ([`end_reverify`]).
+fn start_reverify(rig: &Rig) -> support::Frontend {
+    use base64::Engine;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    support::astation::write_unverified_trust(&rig.sandbox.config());
+    let cli = rig
+        .sandbox
+        .spawn(&["pair", "verify"], &rig.sandbox.home, &[]);
+    let (on, commit) = astation_saw(rig, "verifyCommit");
+    assert_eq!(on, rig.link(), "on the live link");
+    assert_eq!(commit["data"]["host_trust_gen"], 2, "{commit}");
+    let sign_pub: Vec<u8> = (0..SIGN_PUB.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&SIGN_PUB[i..i + 2], 16).unwrap())
+        .collect();
+    let keys = json!({"type": "verifyKeys", "data": {
+        "sign_pub": b64(&sign_pub), "enc_pub": b64(&[5; 32]),
+        "recovery_sign_pub": b64(&[6; 32]), "nonce": b64(&[7; 32]),
+        "genesis_hash": "ab".repeat(32)}});
+    rig.astation.send(on, keys.to_string());
+    let (on, _) = astation_saw(rig, "verifyReveal");
+    assert_eq!(on, rig.link());
+    cli.shows("Does the code on your Mac match?");
+    cli
+}
+
+/// The safety code refused at the terminal: the operation ends
+/// (`verifyAbort` on the link it ran on).
+fn end_reverify(rig: &Rig, mut cli: support::Frontend, link: u64) {
+    cli.send(b"n\r");
+    let (on, _) = astation_saw(rig, "verifyAbort");
+    assert_eq!(on, link);
+    assert!(!cli.exits(), "a refused code fails the command");
+}
+
+/// What the ceremony's `deviceVerified` writes, as the fake can't sign
+/// Astation's side: the device list grown with this host's `add_host` in
+/// trust generation 2 (a fresh `host_channel_key`), pinned so, and the
+/// device verified again; the fake Station holds the same list. The
+/// runtime opens the list again and takes the new identity on its live
+/// link.
+fn finish_reverify(rig: &mut Rig) {
+    let seed = secret("control feed host, verified again");
+    rig.log.add_host(HOST, 2, &seed);
+    write_pin(&rig.sandbox.config(), &rig.log, HOST, 2, &seed);
+    support::astation::write_verified_trust(&rig.sandbox.config(), ACCOUNT, HOST);
+    rig.station().set_log(&rig.log);
+    let opened = format!(
+        "device list: opened at seq {} for {HOST}",
+        rig.log.log.head().seq
+    );
+    rig.within("the re-pinned list", || rig.runtime_log().contains(&opened));
+}
+
+/// Astation's item 15 (#120): `atem pair verify` on a live relay link
+/// (Astation in the room; the link's route proof made at connect) while a
+/// `control_sync` and an ack are held. The ceremony moves the pairing to
+/// the next host trust generation on that link and pins the list grown
+/// with the host's new `add_host` (the fake can't sign Astation's side, so
+/// the test writes what `deviceVerified` applies). The host never relabels
+/// the old association the new identity's: its call is retired, the
+/// delayed page drained (nothing applies to the new identity's fresh
+/// store), and nothing more is asked or acknowledged on that link. The
+/// delayed ack reaches a Station that ended the old association: refused,
+/// metadata-free, nothing counted. Once the operation ends the link
+/// reconnects, once: a new connection, authenticated again, whose new
+/// route proof verifies against the grown list (the old one no longer
+/// does: its key isn't the host's now). Under it the feed is read from 0
+/// with a fresh id, and only then the gate opens; its acks are trust
+/// generation 2's, and the revoke is counted once.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_reverify_on_a_live_link_starts_a_fresh_authenticated_link_generation() {
+    use atem_client::control::AckRefusal;
+    let mut rig = Rig::full(Via::Relay);
+    let old_link = rig.link();
+    let old_proof = proof_on(&rig, old_link);
+    let old_head = rig.log.log.head().seq;
+    assert_eq!(route_head(&rig.log, &old_proof), Ok(old_head));
+    rig.cover_and_open();
+    // The revoke's result, held by the Station uncounted.
+    let (_, revoke_id) = append_id(
+        &rig,
+        SVC,
+        ControlAction::Revoke {
+            interrupt_running: false,
+        },
+    );
+    rig.clock.add_mono(1_000);
+    rig.announce();
+    let (held_ack, ack) = hold_ack_of(&rig, old_link, &revoke_id);
+    assert_eq!(ack.host_trust_gen, 1);
+    // The next page's call, held.
+    rig.append("svc-third", ControlAction::Cover);
+    rig.clock.add_mono(1_000);
+    let held_call = {
+        let mut station = rig.station();
+        station.heads_now();
+        station.hold_call(old_link)
+    };
+    assert_eq!(sync_of(&held_call), rig.sync(2));
+    let old_id = request_id(&held_call);
+    let old_gen = rig.dump()["station"]["link"]["gen"].clone();
+    // `atem pair verify` on the live link.
+    let verify = start_reverify(&rig);
+    finish_reverify(&mut rig);
+    rig.until_feed("the old association ended", |f| f["identity_moves"] == 1);
+    let feed = rig.feed();
+    assert_eq!(feed["identity_moved"], true, "{feed}");
+    assert_eq!(feed["in_flight"], Value::Null, "retired");
+    assert_eq!(
+        feed["closed"],
+        "this host's identity changed; waiting for a link authenticated under it"
+    );
+    assert_eq!(
+        rig.dump()["station"]["link"]["gen"],
+        old_gen,
+        "the same link"
+    );
+    // The old delayed result: drained.
+    let drained = feed["drained"].as_u64().unwrap();
+    rig.station().answer_held(held_call).unwrap();
+    rig.until_feed("the old page drained", |f| {
+        f["drained"].as_u64() == Some(drained + 1)
+    });
+    assert_eq!(rig.feed()["faults"], 0);
+    assert_eq!(stored_cursor(&rig), None, "the new store took nothing");
+    assert!(!rig.gate_open());
+    // The old delayed ack: the Station ended the old association.
+    rig.station().reassociate(2, old_link + 1);
+    rig.station().answer_held(held_ack).unwrap();
+    rig.until_station("the old ack refused", |s| s["refusals"]["control_ack"] == 1);
+    assert!(matches!(
+        rig.station().ack_refusals(),
+        [AckRefusal::NotTheLink]
+    ));
+    assert!(
+        !counted(&rig).iter().any(|(_, _, id)| *id == revoke_id),
+        "nothing counted"
+    );
+    // Nothing more on the old association, its `heads` included.
+    let sent_before = rig.station().sent_on(old_link).len();
+    rig.clock.add_mono(2_000);
+    rig.station().heads_now();
+    rig.two_passes();
+    rig.station().serve(old_link);
+    assert_eq!(rig.station().sent_on(old_link).len(), sent_before);
+    assert!(!rig.gate_open());
+    // The operation ends: the link reconnects, once.
+    end_reverify(&rig, verify, old_link);
+    let new_link = rig.next_link(old_link);
+    rig.link.set(new_link);
+    let new_proof = proof_on(&rig, new_link);
+    assert_eq!(route_head(&rig.log, &new_proof), Ok(old_head + 1));
+    assert_eq!(
+        route_head(&rig.log, &old_proof),
+        Err(atem_client::host_route::HostRouteRefusal::BadSignature),
+        "the old link's proof isn't the host's now"
+    );
+    assert!(
+        rig.runtime_log()
+            .contains("this host's identity changed on its Astation link; reconnecting")
+    );
+    // Its full read from 0, then the gate opens.
+    rig.clock.add_mono(1_000);
+    let from_0 = {
+        let mut station = rig.station();
+        station.on_link(new_link);
+        station.heads_now();
+        station.hold_call(new_link)
+    };
+    assert_eq!(sync_of(&from_0), rig.sync(0));
+    assert_ne!(request_id(&from_0), old_id);
+    rig.two_passes();
+    assert!(!rig.gate_open(), "closed until the read");
+    rig.station().answer_held(from_0).unwrap();
+    rig.serve_until("the new store read", |rig| {
+        rig.cursor() == Some(3)
+            && rig.gate_open()
+            && counted(rig).iter().any(|(_, _, id)| *id == revoke_id)
+    });
+    let acks: Vec<ControlAck> = rig
+        .station()
+        .sent_on(new_link)
+        .iter()
+        .filter_map(|bytes| match ToStation::decode(bytes.as_bytes()) {
+            Ok(ToStation::ControlAck(ack)) => Some(ack),
+            _ => None,
+        })
+        .collect();
+    assert!(!acks.is_empty());
+    assert!(acks.iter().all(|ack| ack.host_trust_gen == 2));
+    assert_eq!(
+        counted(&rig)
+            .iter()
+            .filter(|(_, _, id)| *id == revoke_id)
+            .count(),
+        1
+    );
+    assert_eq!(rig.station().ack_refusals().len(), 1);
+    // Once: no third connection.
+    let quiet = Instant::now() + Duration::from_secs(2);
+    while let Ok(event) = rig
+        .astation
+        .events
+        .recv_timeout(quiet.saturating_duration_since(Instant::now()))
+    {
+        assert!(
+            !matches!(event, Event::Authenticated(n) if n > new_link),
+            "reconnected again"
+        );
+    }
+}
+
+/// Hook off = main: the same re-verify on a live relay link keeps the link.
+/// As on main, the runtime takes the new identity on the socket the old one
+/// authenticated, its route proof made under the old one (which no longer
+/// verifies against the grown list).
+#[test]
+fn with_the_hook_off_a_reverify_keeps_the_link_as_main_does() {
+    let mut rig = Rig::start(Via::Relay, false, false);
+    let old_link = rig.link();
+    let old_proof = proof_on(&rig, old_link);
+    let verify = start_reverify(&rig);
+    finish_reverify(&mut rig);
+    end_reverify(&rig, verify, old_link);
+    let quiet = Instant::now() + Duration::from_secs(3);
+    while let Ok(event) = rig
+        .astation
+        .events
+        .recv_timeout(quiet.saturating_duration_since(Instant::now()))
+    {
+        assert!(
+            !matches!(event, Event::Authenticated(n) if n > old_link),
+            "reconnected\n{}",
+            rig.runtime_log()
+        );
+    }
+    assert!(!rig.runtime_log().contains("this host's identity changed"));
+    assert_eq!(
+        route_head(&rig.log, &old_proof),
+        Err(atem_client::host_route::HostRouteRefusal::BadSignature),
+        "the live link's proof isn't the host's now"
+    );
+}

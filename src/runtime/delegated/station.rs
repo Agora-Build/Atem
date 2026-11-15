@@ -15,6 +15,12 @@
 //! fetch's pacing carries over ([`DeviceListFetch::next_generation`]), and
 //! so does the sync's.
 //!
+//! The host's identity changing while the link is up (a re-verify on the
+//! live link: host-work-v1 §11.4, "An identity change") ends the link's
+//! association: the fetch in flight is dropped, the feed sync's call
+//! retired, and nothing more is fetched or asked on that socket
+//! ([`Station::on_identity`]) until a link on a new socket.
+//!
 //! Here: the device list's fetch ([`super::fetch`]) and its part of the
 //! revocation gate ([`Station::list_fetch`]), the sync of the host's own
 //! Station's control feed and the gate's feed part ([`super::sync`]: the
@@ -215,6 +221,10 @@ impl Station {
         deferred: Option<u64>,
     ) -> Option<MembershipFetch> {
         self.now = now_mono;
+        // Nothing on a socket of another identity's association.
+        if self.feed.moved_socket().is_some() {
+            return None;
+        }
         self.fetch.tick(now_mono, applied.as_ref(), deferred)
     }
 
@@ -233,7 +243,11 @@ impl Station {
         match ToHost::decode(bytes.as_bytes()) {
             Ok(ToHost::Heads(heads)) => {
                 self.heads += 1;
+                // Another identity's association: nothing fetched, no head
+                // announced for the gate.
+                let moved = self.feed.moved_socket().is_some();
                 let fetch = applied
+                    .filter(|_| !moved)
                     .and_then(|applied| self.fetch.on_heads(&heads.membership, &applied, deferred));
                 Inbound::Heads(heads, fetch)
             }
@@ -270,6 +284,19 @@ impl Station {
                 }
                 Inbound::Nothing
             }
+        }
+    }
+
+    /// The host's identity now, before every Station step (host-work-v1
+    /// §11.4, "An identity change"): one other than the link's socket was
+    /// authenticated under ends that association ([`FeedSync::on_identity`]),
+    /// and with it the device list's fetch in flight (a result that comes
+    /// is carried nowhere; its pacing kept): nothing more is fetched on
+    /// that socket, and the gate's device-list part is closed until a link
+    /// on a new socket has its `heads`.
+    pub fn on_identity(&mut self, identity: super::sync::HostIdentity) {
+        if self.feed.on_identity(identity) {
+            self.fetch = self.fetch.next_generation();
         }
     }
 
@@ -392,6 +419,80 @@ mod tests {
         assert_eq!(s.link().unwrap().origin.as_deref(), Some("https://s.test"));
         s.sync_link(None, 0, || LinkKind::Relay, || None);
         assert!(s.link().is_none());
+    }
+
+    /// The host identity in trust generation `host_trust_gen`.
+    fn identity(host_trust_gen: u64) -> crate::runtime::delegated::sync::HostIdentity {
+        crate::runtime::delegated::sync::HostIdentity {
+            host: atem_client::session::host_work::HostTarget {
+                account_id: "acct".into(),
+                atem_device_id: "host".into(),
+                host_trust_gen,
+            },
+            genesis: Some(Hash32([9; 32])),
+        }
+    }
+
+    /// Astation's item 15 (#120): the host's identity changes on the live
+    /// link (a re-verify). Its device-list fetch in flight is dropped (a
+    /// result that comes is carried nowhere), nothing more is fetched on
+    /// that socket (neither at a `heads` nor at a tick), and the gate's
+    /// device-list part is closed with no head announced; the link's socket
+    /// is the one to reconnect. A link on a new socket fetches again.
+    #[test]
+    fn an_identity_change_ends_the_links_fetch() {
+        let mut s = Station::new();
+        s.on_identity(identity(1));
+        up(&mut s, 1);
+        s.tick(1_000, Some(head(3)), None);
+        assert_eq!(
+            fetched(s.receive(&heads(5), Some(head(3)), None)),
+            Some(MembershipFetch { after: 3 })
+        );
+        s.on_identity(identity(2));
+        assert_eq!(s.feed.moved_socket(), Some(1));
+        assert_eq!(s.dump()["fetch"]["in_flight"], Value::Null);
+        assert_eq!(s.fetch.part().announced, None);
+        let result = MembershipFetchResult {
+            head: head(5),
+            entries: Vec::new(),
+        }
+        .to_json()
+        .unwrap()
+        .to_string();
+        assert_eq!(s.receive(&result, Some(head(3)), None), Inbound::Nothing);
+        s.tick(
+            1_000 + 2 * HEADS_PACE_MS + STALL_PAUSE_MS,
+            Some(head(3)),
+            None,
+        );
+        assert_eq!(fetched(s.receive(&heads(5), Some(head(3)), None)), None);
+        assert_eq!(s.fetch.part().announced, None);
+        assert_eq!(
+            s.tick(
+                1_000 + 3 * HEADS_PACE_MS + STALL_PAUSE_MS,
+                Some(head(3)),
+                None
+            ),
+            None
+        );
+        // A new socket: fetched again.
+        s.sync_link(
+            Some(2),
+            2,
+            || LinkKind::Relay,
+            || Some("https://s.test".into()),
+        );
+        assert_eq!(s.feed.moved_socket(), None);
+        s.tick(
+            1_000 + 4 * HEADS_PACE_MS + STALL_PAUSE_MS,
+            Some(head(3)),
+            None,
+        );
+        assert_eq!(
+            fetched(s.receive(&heads(5), Some(head(3)), None)),
+            Some(MembershipFetch { after: 3 })
+        );
     }
 
     /// Without a device list nothing is fetched; a result is carried only

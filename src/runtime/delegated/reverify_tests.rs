@@ -1,0 +1,284 @@
+// A host identity change on the live link in the bridge (host-work-v1
+// §11.4, "An identity change"; Astation's item 15 on #120): `atem pair
+// verify` rebinding the host to its next trust generation while its Station
+// link is up. The old association is never relabelled the new identity's:
+// its call is retired and its late page drained, nothing more is asked or
+// acknowledged on that socket, and the App reconnects it once, so the next
+// link is authenticated, and proves its route, under the new identity; that
+// link reads the feed from 0 before the gate opens, and its acks are the
+// new identity's. Included beside the effects' tests, whose helpers and
+// imports it shares.
+
+/// The page of the own feed answering `call` (its `request_id` and
+/// `after`), holding `records` at their positions, at `head`.
+fn rv_page(
+    call: &atem_client::control::ControlSync,
+    head: u64,
+    records: &[(u64, &ControlRecord)],
+) -> String {
+    use atem_client::control::{ControlSyncResult, FeedEntry};
+    ControlSyncResult {
+        request_id: call.request_id.clone(),
+        origin: ORIGIN.into(),
+        feed_id: OWN_FEED.into(),
+        after: call.after,
+        head,
+        station_time: host_now().wall_ms,
+        records: records.iter().map(|(n, r)| FeedEntry::new(*n, r)).collect(),
+    }
+    .to_json()
+    .unwrap()
+    .to_string()
+}
+
+/// The live `control_sync` of the host's Station link.
+fn rv_live(rig: &LocalRig) -> Option<atem_client::control::ControlSync> {
+    rig.bridge
+        .station
+        .as_ref()
+        .and_then(|station| station.feed.live_call())
+}
+
+/// The `control_sync`s among `texts`, as the shared reader reads them.
+fn rv_syncs(texts: &[String]) -> Vec<atem_client::control::ControlSync> {
+    use atem_client::control::ToStation;
+    texts
+        .iter()
+        .filter_map(|text| match ToStation::decode(text.as_bytes()) {
+            Ok(ToStation::ControlSync(sync)) => Some(sync),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The host's own Station's gate, its feed part: why it is closed.
+fn rv_closed(rig: &LocalRig) -> Option<crate::runtime::delegated::sync::Closed> {
+    rig.bridge.station.as_ref().unwrap().feed.closed()
+}
+
+/// The rig's r9 link up as a routed relay link on socket `socket`, link
+/// generation `link_gen`, and the bridge's Station link with it to
+/// [`ORIGIN`] (the rig's profile selects no Station: its link is set by
+/// hand, as the pass then finds it), a pass.
+fn rv_link(rig: &mut LocalRig, link_gen: u64, socket: u64) {
+    use crate::runtime::delegated::station::{LinkKind, Station};
+    rig.app.astation_routed = true;
+    rig.app.astation_link_gen = link_gen;
+    rig.app.astation_client.socket_id_for_test(socket);
+    rig.bridge
+        .station
+        .get_or_insert_with(Station::new)
+        .sync_link(
+            Some(link_gen),
+            socket,
+            || LinkKind::Routed,
+            || Some(ORIGIN.to_string()),
+        );
+    passes(rig, 1);
+    let link = rig
+        .bridge
+        .station
+        .as_ref()
+        .unwrap()
+        .link()
+        .cloned()
+        .unwrap();
+    assert_eq!((link.link_gen, link.socket), (link_gen, socket));
+}
+
+/// The bot covered at 1 (read through the bridge's sync, its result owed),
+/// on [`with_bot`]'s rig with the feeds alone deciding: the cover.
+fn rv_covered(
+    rig: &mut LocalRig,
+    root: &Path,
+    os: &ManualOs,
+    start: u64,
+) -> (Senders, ControlRecord) {
+    let s = with_bot(rig, root, os, start + 3 * HOUR);
+    rig.bridge.work.controls = None;
+    rig.bridge.start_view().standings.clear();
+    let cover = bot_record(&s.log, ControlAction::Cover, 1);
+    feed(rig, &s.log, &[&cover]);
+    (s, cover)
+}
+
+/// Item 15 (#120): `atem pair verify` on the live link while a
+/// `control_sync` is in flight. The host's identity moves to its next trust
+/// generation on the same link generation and socket: the call is retired
+/// and its page, coming late, drained (nothing applies into the fresh
+/// store, which stays never read); the link's `heads` ask nothing, no ack
+/// goes on it, and the gate stays closed, `atem status` saying why. The App
+/// is asked to reconnect that socket, once; the next link (a new socket)
+/// asks the feed from 0 at its `heads`, and only that read opens the gate.
+/// Its acks are the new identity's (trust generation 2), the cover applied
+/// again under it; the old store's owed results went aside with it.
+#[test]
+fn a_reverify_on_the_live_link_retires_its_call_and_reconnects_for_the_new_identity() {
+    use atem_client::control::AckResult;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (mut s, cover) = rv_covered(&mut rig, root, &os, start);
+        rv_link(&mut rig, 7, 41);
+        let mut sent = rig.app.astation_client.capture_sent_for_test();
+        let hold = bot_record(&s.log, ControlAction::Hold, 2);
+        let heads = heads_text(&[(ORIGIN, OWN_FEED, 2)], s.log.log.head());
+        station_pass(&mut rig, 0, vec![heads.clone()]);
+        let old = rv_live(&rig).expect("a call in flight");
+        assert_eq!(old.after, 1);
+        let before = sent.texts();
+        assert_eq!(rv_syncs(&before).len(), 1);
+        assert!(acks_in(&before).iter().all(|ack| ack.host_trust_gen == 1));
+        // `atem pair verify` ends on the live link: the next trust
+        // generation, pinned, the session host rebound to it.
+        reverify(&mut rig, root, &mut s);
+        passes(&mut rig, 1);
+        assert_eq!(rv_live(&rig), None, "retired");
+        assert_eq!(
+            rig.app.identity_reconnect.map(|(_, socket)| socket),
+            Some(41)
+        );
+        assert_eq!(
+            rv_closed(&rig),
+            Some(crate::runtime::delegated::sync::Closed::IdentityMoved)
+        );
+        // The old call's page, late, and the old link's heads: drained,
+        // nothing asked, nothing acknowledged there.
+        let drained = rig.bridge.station.as_ref().unwrap().feed.dump()["drained"].clone();
+        station_pass(
+            &mut rig,
+            1_100,
+            vec![rv_page(&old, 2, &[(2, &hold)]), heads.clone()],
+        );
+        let feed = rig.bridge.station.as_ref().unwrap().feed.dump();
+        assert_eq!(feed["drained"], drained.as_u64().unwrap() + 1);
+        assert_eq!(feed["faults"], 0);
+        assert!(sent.texts().is_empty(), "nothing on the old association");
+        match &rig.bridge.work.feeds {
+            Feeds::Loaded(feeds) => {
+                assert_eq!(feeds.identity().map(|i| i.host_trust_gen), Some(2));
+                assert!(feeds.never_read(), "the fresh store took nothing");
+                assert_eq!(feeds.cursor(ORIGIN, OWN_FEED), None);
+            }
+            _ => panic!("the new identity's feeds loaded"),
+        }
+        let line = rig.bridge.feeds_status().unwrap();
+        assert!(
+            line.starts_with(&format!(
+                "revocations not yet checked ({}); ",
+                crate::runtime::delegated::sync::IDENTITY_MOVED
+            )),
+            "{line}"
+        );
+        // The App reconnects that socket, once.
+        assert!(rig.app.identity_reconnect_due(false, false));
+        assert!(!rig.app.r9_link_up(), "dropped");
+        assert_eq!(rig.app.identity_reconnect, None);
+        assert!(!rig.app.identity_reconnect_due(false, false), "once");
+        passes(&mut rig, 1);
+        // The next link: a new socket, authenticated under the new identity.
+        rv_link(&mut rig, 8, 42);
+        assert_eq!(rig.app.identity_reconnect, None);
+        let mut sent = rig.app.astation_client.capture_sent_for_test();
+        assert_ne!(rv_closed(&rig), None);
+        station_pass(&mut rig, 2_200, vec![heads]);
+        let asked = rv_syncs(&sent.texts());
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        assert_eq!(asked[0].after, 0, "read from 0");
+        assert_ne!(asked[0].request_id, old.request_id);
+        assert_ne!(rv_closed(&rig), None, "closed until the read");
+        station_pass(
+            &mut rig,
+            2_300,
+            vec![rv_page(&asked[0], 2, &[(1, &cover), (2, &hold)])],
+        );
+        assert_eq!(rv_closed(&rig), None, "open after the full read");
+        let acks = acks_in(&sent.texts());
+        assert!(!acks.is_empty());
+        assert!(acks.iter().all(|ack| ack.host_trust_gen == 2), "{acks:?}");
+        let acked: Vec<&str> = acks
+            .iter()
+            .flat_map(|ack| &ack.results)
+            .filter_map(|r| match r {
+                AckResult::Record { record_id, .. } => Some(record_id.as_str()),
+                AckResult::Entry { .. } => None,
+            })
+            .collect();
+        assert!(acked.contains(&cover.record_id()), "{acked:?}");
+        assert!(acked.contains(&hold.record_id()), "{acked:?}");
+    });
+}
+
+/// Item 15 (#120), the acknowledgments: a result owed under the old
+/// identity (the cover's, read with no send) is never sent after the
+/// identity moved, neither on the old association nor on the new link;
+/// the new link sends only what the new identity's store applied itself.
+#[test]
+fn an_ack_owed_under_the_old_identity_never_goes_under_the_new_one() {
+    use atem_client::control::AckResult;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (mut s, cover) = rv_covered(&mut rig, root, &os, start);
+        rv_link(&mut rig, 7, 41);
+        let owed = |rig: &LocalRig| -> i64 {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .query_row(
+                    "SELECT count(*) FROM control_acks WHERE sent_gen IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(owed(&rig), 1, "the cover's result, owed");
+        let mut sent = rig.app.astation_client.capture_sent_for_test();
+        reverify(&mut rig, root, &mut s);
+        passes(&mut rig, 1);
+        let heads = heads_text(&[(ORIGIN, OWN_FEED, 1)], s.log.log.head());
+        station_pass(&mut rig, 0, vec![heads.clone()]);
+        assert!(sent.texts().is_empty(), "nothing on the old association");
+        assert_eq!(owed(&rig), 0, "the old store's results went aside");
+        rv_link(&mut rig, 8, 42);
+        let mut sent = rig.app.astation_client.capture_sent_for_test();
+        station_pass(&mut rig, 1_000, vec![heads]);
+        let asked = rv_syncs(&sent.texts());
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].after, 0);
+        station_pass(&mut rig, 1_100, vec![rv_page(&asked[0], 1, &[(1, &cover)])]);
+        let acks = acks_in(&sent.texts());
+        assert_eq!(acks.len(), 1, "{acks:?}");
+        assert_eq!(acks[0].host_trust_gen, 2);
+        let AckResult::Record { record_id, .. } = &acks[0].results[0] else {
+            panic!("a record's result");
+        };
+        assert_eq!(record_id, cover.record_id(), "applied again under gen 2");
+    });
+}
+
+/// Hook off = main: with `host.delegated` off there is no Station link, and
+/// a re-verify on the live link asks the App for no reconnect; the link
+/// stays, as on main.
+#[test]
+fn with_the_hook_off_a_reverify_keeps_the_link() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        rig.bridge.features = HostFeatures::default();
+        r9_link_up(&mut rig);
+        assert!(rig.bridge.station.is_none());
+        reverify(&mut rig, root, &mut s);
+        passes(&mut rig, 2);
+        assert_eq!(rig.app.identity_reconnect, None);
+        assert!(!rig.app.identity_reconnect_due(false, false));
+        assert!(rig.app.r9_link_up(), "the link stays");
+    });
+}

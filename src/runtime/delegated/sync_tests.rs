@@ -261,7 +261,9 @@ impl Rig {
     /// trust generation, the same device list): the store replaced by a
     /// fresh one bound to it, never read, as hosting's pass replaces it
     /// (`work_store_ready`), the clock's record moved there and its feeds
-    /// loaded. The sync, its link generation and its live call go on.
+    /// loaded. The sync isn't told ([`FeedSync::on_identity`] is the
+    /// bridge's): its link generation and its live call go on unless the
+    /// test says.
     fn new_identity(&mut self) {
         let scratch = tempfile::tempdir().unwrap();
         let old = std::mem::replace(&mut self.store, Store::open(scratch.path()).unwrap());
@@ -1732,15 +1734,35 @@ fn a_fresh_store_never_takes_an_old_continuations_page_as_its_first_read() {
     }
 }
 
-/// A read from 0 asked for the old identity's store and answered after a
-/// re-verify swapped in a fresh one applies there: it is a complete read of
-/// the account's feed whatever store asked it (positions are the host's own
-/// Station's, records verify against the same device list, the account and
-/// genesis captured with the call), so the new store is read in full, the
-/// revoke with it.
+/// The host identity the rig's links are authenticated under, in trust
+/// generation `host_trust_gen`: [`host`]'s account and device, and the
+/// device list's genesis.
+fn identity(log: &TestLog, host_trust_gen: u64) -> HostIdentity {
+    HostIdentity {
+        host: HostTarget {
+            host_trust_gen,
+            ..host()
+        },
+        genesis: Some(log.log.genesis_hash()),
+    }
+}
+
+/// Astation's item 15 (#120): a read from 0 asked under the old identity
+/// and answered after a re-verify on the live link (a new host identity on
+/// the same link generation and socket, a fresh store swapped in) is
+/// drained, never applied there, though it is a full page: the identity
+/// change retired it. Nothing more is asked on that link (its `heads` and
+/// the pass ask nothing), and the gate stays closed. The feed is asked again
+/// from 0 under the new association, on a new link (its socket
+/// authenticated under the new identity), and only that read opens the
+/// gate.
 #[test]
-fn a_read_from_0_asked_before_a_reverify_reads_the_fresh_store_in_full() {
+fn an_old_identitys_read_from_0_is_drained_and_asked_again_on_the_new_link() {
     let mut rig = rig();
+    assert!(
+        !rig.sync.on_identity(identity(&rig.log, 1)),
+        "the link's own"
+    );
     let cover = rig.record(FEED, ControlAction::Cover);
     let revoke = rig.record(
         FEED,
@@ -1751,12 +1773,105 @@ fn a_read_from_0_asked_before_a_reverify_reads_the_fresh_store_in_full() {
     assert_eq!(rig.heads(FEED, 2), [sync_call(FEED, 0)]);
     let from_0 = rig.last();
     rig.new_identity();
+    assert!(rig.sync.on_identity(identity(&rig.log, 2)), "moved");
+    assert!(!rig.sync.on_identity(identity(&rig.log, 2)), "once");
+    assert_eq!(rig.sync.moved_socket(), Some(SOCKET));
+    let drained = rig.drained();
     let synced = rig.answer(&from_0, 2, &[(1, &cover), (2, &revoke)]);
+    assert!(synced.applied.is_empty(), "a full page, never applied");
+    assert_eq!(synced.next, None, "nothing asked on this link");
+    assert_eq!(rig.drained(), drained + 1);
+    assert_eq!(rig.sync.dump()["faults"], 0);
+    assert!(rig.feeds.never_read());
+    assert_eq!(rig.cursor(), None);
+    assert!(rig.feeds.standing(BOT).revoked.is_none());
+    assert_eq!(rig.sync.closed(), Some(Closed::IdentityMoved));
+    assert!(!rig.open(&native()));
+    // Nothing more on this link: its `heads` and the pass ask nothing.
+    rig.pass(2 * SEC);
+    assert!(rig.heads(FEED, 2).is_empty());
+    assert!(rig.pass(2 * SEC).is_empty());
+    assert_eq!(rig.sync.closed(), Some(Closed::IdentityMoved));
+    // A new link, its socket authenticated under the new identity.
+    rig.sync.on_link(Some(&link_on(2, 2, ORIGIN)));
+    assert_eq!(rig.sync.moved_socket(), None);
+    assert_eq!(rig.sync.closed(), Some(Closed::NoHeads));
+    assert_eq!(rig.heads(FEED, 2), [sync_call(FEED, 0)]);
+    let again = rig.last();
+    assert_ne!(again.request_id, from_0.request_id);
+    let synced = rig.answer(&again, 2, &[(1, &cover), (2, &revoke)]);
     assert_eq!(synced.applied.len(), 2);
     assert!(rig.feeds.standing(BOT).revoked.is_some());
     assert!(!rig.feeds.never_read());
     assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
     assert!(rig.open(&native()));
+}
+
+/// Item 15 (#120): an identity change on the live link retires its call
+/// whatever store it reaches. A continuation in flight (here the store it
+/// was asked for still in place, so the cursor guard alone would take it)
+/// is drained when it comes: nothing applies, the cursor stays. A refusal
+/// that comes late on that link advances nothing either.
+#[test]
+fn an_old_calls_late_page_and_refusal_advance_nothing_after_an_identity_change() {
+    let mut rig = rig();
+    rig.sync.on_identity(identity(&rig.log, 1));
+    let (_cover, _hold) = rig.opened();
+    let release = rig.record(FEED, ControlAction::Release);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    let continuation = rig.last();
+    assert!(rig.sync.on_identity(identity(&rig.log, 2)));
+    assert_eq!(rig.sync.dump()["in_flight"], Value::Null, "retired");
+    let drained = rig.drained();
+    let synced = rig.answer(&continuation, 3, &[(3, &release)]);
+    assert!(synced.applied.is_empty());
+    assert_eq!(synced.next, None);
+    assert_eq!(rig.drained(), drained + 1);
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
+    assert!(rig.feeds.standing(BOT).held, "the release never applied");
+    rig.sync.on_refused(RefusedCall::ControlAck);
+    assert_eq!(rig.cursor(), Some((FEED.to_string(), 2)));
+    assert_eq!(rig.sync.dump()["in_flight"], Value::Null);
+    assert!(!rig.open(&native()));
+}
+
+/// Item 15 (#120): after an identity change the gate stays closed until a
+/// link authenticated under the new identity has its `heads` and a full
+/// read. A new link generation on the same socket (Astation authenticating
+/// it again: no new route proof) is still the old association's: closed,
+/// nothing asked. On a new socket: closed with no `heads`, then while the
+/// read is short of the head, open only once it reaches it.
+#[test]
+fn the_gate_stays_closed_until_the_new_links_heads_and_full_read() {
+    let mut rig = rig();
+    rig.sync.on_identity(identity(&rig.log, 1));
+    let (cover, hold) = rig.opened();
+    rig.new_identity();
+    assert!(rig.sync.on_identity(identity(&rig.log, 2)));
+    rig.sync.on_link(Some(&link(2, ORIGIN)));
+    assert_eq!(rig.sync.moved_socket(), Some(SOCKET), "the same socket");
+    rig.pass(2 * SEC);
+    assert!(rig.heads(FEED, 2).is_empty());
+    assert_eq!(rig.sync.closed(), Some(Closed::IdentityMoved));
+    rig.sync.on_link(Some(&link_on(3, 2, ORIGIN)));
+    assert_eq!(rig.sync.closed(), Some(Closed::NoHeads));
+    rig.pass(2 * SEC);
+    assert_eq!(rig.heads(FEED, 2), [sync_call(FEED, 0)]);
+    assert_eq!(
+        rig.sync.closed(),
+        Some(Closed::Behind {
+            cursor: None,
+            head: 2
+        })
+    );
+    // A page short of the head: still closed; the rest asked at once.
+    let synced = rig.page(FEED, 2, &[(1, &cover)]);
+    assert_eq!(synced.next, Some(sync_call(FEED, 1)));
+    assert!(!rig.open(&native()));
+    rig.page(FEED, 2, &[(2, &hold)]);
+    assert!(rig.open(&native()), "{:?}", rig.sync.closed());
+    assert!(!rig.feeds.never_read());
 }
 
 /// Ruling C1b-a (Astation's "a reset between call and result"): the feed

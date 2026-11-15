@@ -79,11 +79,8 @@
 //!   `feed_id`; this host never makes one) only on the own feed this
 //!   generation's `heads` announced ([`Ask::judge`]). A continuation's page
 //!   applies only when its `after` is the committed cursor of the store it
-//!   reaches: a re-verify keeps the link generation, the account and the
-//!   genesis but swaps in a new identity's fresh store, and a continuation
-//!   asked for the old store is drained there (never its first read), the
-//!   feed asked afresh from 0. A read from 0 asked for the old store is a
-//!   complete read of the account's feed, and applies. A call is retired by
+//!   reaches (a defence: a store replaced since never takes another
+//!   store's continuation as its first read). A call is retired by
 //!   its id when it is answered, when it goes unanswered for 35 seconds
 //!   ([`SYNC_TIMEOUT_MS`]: the Station's agreed 30 and a 5-second grace;
 //!   an hourly Station-fault alert, and a new call with a fresh id goes at
@@ -91,7 +88,8 @@
 //!   its backoff; `atem status` says it was asked again only while that
 //!   retry is live), and when the link generation changes (the Station
 //!   cancels the old generation's jobs; bytes written before may still
-//!   come). A call retired before it went (in the pass that asked it) is
+//!   come), and when the host's identity changes on the live link
+//!   ([`FeedSync::on_identity`]). A call retired before it went (in the pass that asked it) is
 //!   never sent ([`FeedSync::outgoing`]), and one the link didn't take is
 //!   dropped by its id ([`FeedSync::unsent`]). A
 //!   page with a retired id is drained: counted, nothing advanced, no gate
@@ -103,6 +101,24 @@
 //!   call's answer). A page with the live id whose `head` is below its
 //!   `after` (no records: the reader refuses any) is a reset: marked, the
 //!   cursor never moved on it.
+//! - **An identity change** (host-work-v1 §11.4; Astation's item 15 on
+//!   #120). A link's association with its Station is the host identity
+//!   its socket was authenticated under, and its route proof that
+//!   identity's (session-v1 R9.7b): the account, device and trust
+//!   generation, and the device list's genesis ([`HostIdentity`]). When
+//!   the host's identity changes while the link is up (`atem pair verify`
+//!   rebinding on the live link, a new trust generation, account or
+//!   genesis), the old association is never relabelled the new one's: the
+//!   live call is retired, its page drained when it comes, a read from 0
+//!   included (never the new identity's store's first read, however full),
+//!   and nothing more is asked or applied on that socket, a new generation
+//!   on it included (an Astation re-authentication proves no new route).
+//!   The gate stays closed ([`Closed::IdentityMoved`]); the bridge has the
+//!   App reconnect the link once no Astation operation runs
+//!   ([`FeedSync::moved_socket`]), and the new socket's link reads the feed
+//!   from 0 at its own `heads` (the new identity's store has never read it)
+//!   before the gate opens. Its acknowledgments wait for it too (the
+//!   bridge's `acks_due`).
 //! - **Refusals** (Decision 20). Any refusal on the link
 //!   (`control_sync_refused`, `membership_fetch_refused`,
 //!   `control_ack_refused`) closes every gate the link serves: nothing
@@ -121,7 +137,8 @@
 //!   announced is read up to its head. The device-list part is the host's
 //!   own fetch's ([`super::fetch::ListPart`]): [`GateView`] ANDs them. The
 //!   native gate is the host's own Station's. Closed on any disconnect (a
-//!   new link generation starts afresh), on a reset, after 60 seconds
+//!   new link generation starts afresh), on an identity change until a new
+//!   socket's link has read the feed, on a reset, after 60 seconds
 //!   without `heads`, on a Station clock beyond the cap, on any refusal or
 //!   Station fault (until a page asked after it reads), and while the feed
 //!   isn't read to the announced head.
@@ -142,6 +159,8 @@ use atem_client::control::{
     Applied, ControlSync, ControlSyncResult, FeedPos, Heads, HostAction, RefusedCall, RelayError,
     SyncMismatch,
 };
+use atem_client::encoding::Hash32;
+use atem_client::session::host_work::HostTarget;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -205,6 +224,10 @@ pub enum Closed {
     Restarted,
     /// The feed isn't read up to the announced head yet.
     Behind { cursor: Option<u64>, head: u64 },
+    /// The host's identity changed since the link's socket was
+    /// authenticated: nothing more on it, until a link authenticated under
+    /// the new identity.
+    IdentityMoved,
 }
 
 impl Closed {
@@ -233,6 +256,7 @@ impl Closed {
             Closed::Behind { cursor: None, head } => {
                 format!("reading the control feed (0 of {head})")
             }
+            Closed::IdentityMoved => IDENTITY_MOVED.into(),
         }
     }
 }
@@ -243,6 +267,21 @@ pub const REFUSED_STATUS: &str = "Station refused feed access (forbidden); retry
 /// 35 s is live (rulings C1b-a, C1b-b).
 pub const UNANSWERED: &str =
     "a control_sync went unanswered for 35 s; asked again with a new request id";
+
+/// The status while the link's socket was authenticated under another host
+/// identity than the host's now (host-work-v1 §11.4, "An identity change").
+pub const IDENTITY_MOVED: &str =
+    "this host's identity changed; waiting for a link authenticated under it";
+
+/// The host identity a Station association is made under (host-work-v1
+/// §11.4, "An identity change"): the session host's account, device and
+/// trust generation, and the pinned device list's genesis (none without
+/// one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostIdentity {
+    pub host: HostTarget,
+    pub genesis: Option<Hash32>,
+}
 
 /// Decision 12's alert for a page that isn't strict JSON.
 pub const NOT_STRICT: &str = "Station sent a page that isn't strict JSON";
@@ -467,6 +506,15 @@ pub struct FeedSync {
     /// seen (a call is asked under it).
     list_id: Option<ListId>,
     loaded: bool,
+    /// The host's identity, as the bridge last handed it over, and the one
+    /// the link's socket was authenticated under (its first: a new socket
+    /// takes the identity then; §11.4 "An identity change").
+    identity: Option<HostIdentity>,
+    socket_identity: Option<HostIdentity>,
+    /// The host's identity moved since the link's socket was authenticated:
+    /// nothing is asked or applied on it again, whatever link generation
+    /// it carries, until a new socket.
+    moved: bool,
     /// The live call (ruling C1b-a).
     in_flight: Option<Ask>,
     /// The ids of the calls retired, the latest [`RETIRED_KEPT`]: their
@@ -506,6 +554,8 @@ pub struct FeedSync {
     drained: u64,
     /// Pages of calls never made (a Station fault).
     unsolicited: u64,
+    /// Identity changes that ended a link's association.
+    identity_moves: u64,
 }
 
 impl Default for FeedSync {
@@ -532,6 +582,9 @@ impl FeedSync {
             synced: None,
             list_id: None,
             loaded: false,
+            identity: None,
+            socket_identity: None,
+            moved: false,
             in_flight: None,
             retired: std::collections::VecDeque::new(),
             unanswered: false,
@@ -554,6 +607,7 @@ impl FeedSync {
             timeouts: 0,
             drained: 0,
             unsolicited: 0,
+            identity_moves: 0,
         }
     }
 
@@ -574,6 +628,13 @@ impl FeedSync {
         }
         self.retire_live();
         self.fresh_generation();
+        // A new socket is authenticated under the identity now; a new
+        // generation on the same one (Astation authenticating it again)
+        // keeps the socket's (§11.4 "An identity change").
+        if self.socket != Some(link.socket) {
+            self.socket_identity = self.identity.clone();
+            self.moved = false;
+        }
         self.link_gen = Some(link.link_gen);
         self.socket = Some(link.socket);
         self.own = link.origin.clone();
@@ -586,6 +647,8 @@ impl FeedSync {
         self.fresh_generation();
         self.link_gen = None;
         self.socket = None;
+        self.socket_identity = None;
+        self.moved = false;
         self.own = None;
     }
 
@@ -613,6 +676,51 @@ impl FeedSync {
             self.retired.pop_front();
         }
         self.retired.push_back(request_id);
+    }
+
+    /// The host's identity now (host-work-v1 §11.4, "An identity change";
+    /// Astation's item 15 on #120): the bridge hands it over before every
+    /// Station step. While the link is up, an identity other than the one
+    /// its socket was authenticated under (a re-verify on the live link, a
+    /// new trust generation, account or genesis) ends that association for
+    /// the sync: the live call is retired by its id (its page, a read from
+    /// 0 included, drained when it comes), the generation's `heads`, the
+    /// announced feed and any refusal's backoff go, and nothing is asked on
+    /// that socket again (its `heads` ask nothing; the gate stays closed,
+    /// [`Closed::IdentityMoved`]) until a link on a new socket, which the
+    /// bridge has the App reconnect for ([`FeedSync::moved_socket`]).
+    /// `true` when it did so now. The first identity a socket sees is its
+    /// own (a link up before any identity was handed over).
+    pub fn on_identity(&mut self, identity: HostIdentity) -> bool {
+        if self.identity.as_ref() == Some(&identity) {
+            return false;
+        }
+        self.identity = Some(identity.clone());
+        if self.link_gen.is_none() || self.moved {
+            return false;
+        }
+        match &self.socket_identity {
+            None => {
+                self.socket_identity = Some(identity);
+                false
+            }
+            Some(own) if *own == identity => false,
+            Some(_) => {
+                self.moved = true;
+                self.identity_moves += 1;
+                self.retire_live();
+                self.fresh_generation();
+                true
+            }
+        }
+    }
+
+    /// The link's socket, while its association is another host identity's
+    /// than the host's now ([`FeedSync::on_identity`]): the App reconnects
+    /// it, so the next link is authenticated, and proves its route, under
+    /// the new identity.
+    pub fn moved_socket(&self) -> Option<u64> {
+        self.socket.filter(|_| self.moved)
     }
 
     /// The start's recovery (design I.6.2 step 7): the gate closes until a
@@ -704,6 +812,11 @@ impl FeedSync {
             return Vec::new();
         }
         self.heads += 1;
+        // Another identity's association: no `heads` counts there (§11.4
+        // "An identity change").
+        if self.moved {
+            return Vec::new();
+        }
         self.heads_at = Some(Clocks {
             mono_ms: self.now,
             boot_ms: self.boot,
@@ -1078,6 +1191,9 @@ impl FeedSync {
         if self.link_gen.is_none() || self.own.is_none() {
             return Some(Closed::NoLink);
         }
+        if self.moved {
+            return Some(Closed::IdentityMoved);
+        }
         match self.resync {
             Some(Resync::Refused) => return Some(Closed::Refused),
             Some(Resync::Fault(code)) => return Some(Closed::Fault(code)),
@@ -1167,6 +1283,8 @@ impl FeedSync {
             "retired": self.retired.len(),
             "reset": self.reset.as_ref().map(|r| json!({"begun": r.begun, "durable": r.durable})),
             "other_origin": self.other_origin,
+            "identity_moved": self.moved,
+            "identity_moves": self.identity_moves,
         })
     }
 
@@ -1291,7 +1409,7 @@ impl FeedSync {
     fn ask(&mut self, paced: bool) -> Option<ControlSync> {
         let own = self.own.clone()?;
         let announced = self.announced.clone()?;
-        if !self.loaded || self.in_flight.is_some() {
+        if !self.loaded || self.in_flight.is_some() || self.moved {
             return None;
         }
         // Nothing for a reset before its mark is written (ruling T33c).

@@ -140,6 +140,30 @@ impl HostBridge {
         }
     }
 
+    /// The host's identity as its Station association names it
+    /// (host-work-v1 §11.4, "An identity change"; Astation's item 15 on
+    /// #120): the session host's account, device and trust generation and
+    /// the pinned device list's genesis, handed to the Station link before
+    /// each of its steps (the pass's first, its Station step, its end). One
+    /// its link's socket wasn't authenticated under (a re-verify on the
+    /// live link, a new trust generation, account or genesis) ends that
+    /// link's association: its call retired, nothing more asked, fetched or
+    /// acknowledged on it, its gate closed (`Station::on_identity`), and
+    /// the App asked to reconnect it at the pass's end.
+    pub(crate) fn station_identity(&mut self) {
+        let identity = crate::runtime::delegated::sync::HostIdentity {
+            host: self.work_host(),
+            genesis: self
+                .membership
+                .as_ref()
+                .filter(|m| !m.unpaired())
+                .map(|m| m.membership().genesis_hash()),
+        };
+        if let Some(station) = self.station.as_mut() {
+            station.on_identity(identity);
+        }
+    }
+
     /// The pass's clocks: the gate follows them (60 s without `heads`)
     /// with no call; the start view gets the change.
     pub(crate) fn feed_advance(&mut self, now: Clocks) {
@@ -345,12 +369,23 @@ impl HostBridge {
     /// The acknowledgments due to the host's own Station now (Task 36,
     /// host-work-v1 §11.4 "Acknowledgments"; [`super::acks`]): only from a
     /// feed store that may be acknowledged ([`loaded`]: this identity's,
-    /// for the committed list, healthy), on the Station link, at `D`. The
+    /// for the committed list, healthy), on a Station link authenticated
+    /// under this identity (none after an identity change until the next
+    /// link), at `D`. The
     /// bridge hands them to the link at the end of its Station step, after
     /// the records' followups (a revoke's session-v1 fence, then a hold's in
     /// `sync_services`), so a result goes once its effects are durable and
     /// its fence ran.
     pub(crate) fn acks_due(&self) -> Vec<DueAck> {
+        // None on a link whose association is another identity's (§11.4
+        // "An identity change"): its acks wait for the next link.
+        if self
+            .station
+            .as_ref()
+            .is_some_and(|station| station.feed.moved_socket().is_some())
+        {
+            return Vec::new();
+        }
         let list = self.start_view().list.clone();
         let Some(feeds) = loaded(&self.work, list.as_ref(), &self.work_host()) else {
             return Vec::new();

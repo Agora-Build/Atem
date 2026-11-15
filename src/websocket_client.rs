@@ -1076,6 +1076,13 @@ impl AstationClient {
         self.authenticate_after_challenge(auth_required, false).await
     }
 
+    /// Pretend the client's socket is `socket_id` (a reconnect makes a new
+    /// one).
+    #[cfg(test)]
+    pub(crate) fn socket_id_for_test(&mut self, socket_id: u64) {
+        self.socket_id = socket_id;
+    }
+
     /// Pretend this is a relay link that answered no challenge (an
     /// operation's link, §R9.7b).
     #[cfg(test)]

@@ -1529,6 +1529,10 @@ impl HostBridge {
             return;
         }
         let link_gen = self.r9_link;
+        self.station.get_or_insert_with(Station::new);
+        // The identity first: a new socket is authenticated under the
+        // host's identity now (§11.4 "An identity change").
+        self.station_identity();
         self.station.get_or_insert_with(Station::new).sync_link(
             link_gen,
             app.astation_client.socket_id(),
@@ -1582,6 +1586,10 @@ impl HostBridge {
     /// `membership_head`). Calls go on the link's control queue, as the
     /// relay's push messages.
     fn station_pass_at(&mut self, messages: Vec<String>, now: Clocks, cx: &mut Cx) {
+        // An identity the pass took before its Station messages (a re-pin
+        // read with the pass's first requests) ends the link's association
+        // before any of them is read (§11.4 "An identity change").
+        self.station_identity();
         let applied = self.membership.as_ref().map(MembershipHost::head);
         let deferred = self.list_deferral();
         let Some(station) = self.station.as_mut() else {
@@ -2153,6 +2161,20 @@ impl HostBridge {
         // able to again (pinned, reconciled): its link proves its route.
         if crate::session_protocol::r9::route::set(&app.host_route, self.route_state()) {
             app.route_reconnect = Some(std::time::Instant::now());
+        }
+        // §11.4 "An identity change" (`host.delegated` only: the Station
+        // link is there only then): the host's identity moved while its link
+        // was up (a re-verify on the live link, this pass's re-pin
+        // included): that socket is reconnected once, so the next link is
+        // authenticated, and proves its route, under the new identity.
+        self.station_identity();
+        if let Some(socket) = self
+            .station
+            .as_ref()
+            .and_then(|station| station.feed.moved_socket())
+            && app.identity_reconnect.is_none_or(|(_, s)| s != socket)
+        {
+            app.identity_reconnect = Some((std::time::Instant::now(), socket));
         }
         for relay_only in policy_changes {
             app.host_policy_changed(relay_only);

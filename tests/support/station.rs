@@ -253,8 +253,13 @@ pub struct FakeStation {
     /// The link served, and when it last got `heads`.
     link: Option<u64>,
     last_heads: Option<Instant>,
-    /// Every call the host sent, as its bytes.
+    /// Every call the host sent, as its bytes, and the link it came on.
     sent: Vec<String>,
+    sent_on: Vec<u64>,
+    /// Links before this one were associated with an identity of the host
+    /// that has moved on ([`FakeStation::reassociate`]): their acks are
+    /// refused.
+    retired_below: u64,
     /// Records signed so far (their `record_id`s).
     minted: u64,
 }
@@ -295,6 +300,8 @@ impl FakeStation {
             link: None,
             last_heads: None,
             sent: Vec::new(),
+            sent_on: Vec::new(),
+            retired_below: 0,
             minted: 0,
         }
     }
@@ -338,6 +345,28 @@ impl FakeStation {
     /// `"membership_fetch"`); a binary frame never does.
     pub fn sent(&self) -> Vec<String> {
         self.sent.clone()
+    }
+
+    /// [`FakeStation::sent`], only the calls that came on `link`.
+    pub fn sent_on(&self, link: u64) -> Vec<String> {
+        self.sent
+            .iter()
+            .zip(&self.sent_on)
+            .filter(|(_, on)| **on == link)
+            .map(|(bytes, _)| bytes.clone())
+            .collect()
+    }
+
+    /// The host's identity moved on (a re-verify: its next trust
+    /// generation in the device list, `host_trust_gen`), as a Station
+    /// applies it (Astation's item 15 on #120): a link from `from_link` on
+    /// is associated with the new identity; an older link's association is
+    /// never relabelled, and its acks are refused for it from now on
+    /// (`control_ack_refused`, metadata-free; [`FakeStation::ack_refusals`]
+    /// says `NotTheLink`), nothing counted.
+    pub fn reassociate(&mut self, host_trust_gen: u64, from_link: u64) {
+        self.host_trust_gen = host_trust_gen;
+        self.retired_below = from_link;
     }
 
     /// Serves `link`: `heads` when it is a link not served yet, or when
@@ -412,6 +441,7 @@ impl FakeStation {
                 .expect("the host sent no such Station call");
             if held(&ToStation::decode(bytes.as_bytes())) {
                 self.sent.push(bytes.clone());
+                self.sent_on.push(from);
                 return Held { link: from, bytes };
             }
             let _ = self.answer(from, bytes);
@@ -789,6 +819,7 @@ impl FakeStation {
     /// Reads the host's call and answers it on its link.
     fn answer(&mut self, link: u64, bytes: String) -> Result<ToStation, RelayError> {
         self.sent.push(bytes.clone());
+        self.sent_on.push(link);
         self.reply(link, &bytes)
     }
 
@@ -869,6 +900,13 @@ impl FakeStation {
     fn counted(&mut self, link: u64, ack: &ControlAck) -> Option<Value> {
         if self.refusing[slot(RefusedCall::ControlAck)] {
             return Some(refusal(RefusedCall::ControlAck));
+        }
+        if link < self.retired_below {
+            // An association of the host's old identity: refused for it.
+            let refused = AckRefusal::NotTheLink;
+            let reply = refused.reply().map(|r| r.to_json().expect("a refusal"));
+            self.ack_refusals.push(refused);
+            return reply;
         }
         let association = LinkAssociation {
             account_id: self.own.account_id.clone(),

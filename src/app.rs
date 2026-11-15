@@ -96,6 +96,14 @@ pub struct App {
     /// Astation operation runs (`hosted::App::route_reconnect_due`): when
     /// that happened.
     pub route_reconnect: Option<Instant>,
+    /// With `host.delegated` on, the host's identity changed while its link
+    /// was up (a re-verify on the live link, a new trust generation,
+    /// account or genesis): that link's socket is reconnected once, so the
+    /// next one is authenticated, and proves its route, under the new
+    /// identity (host-work-v1 §11.4, "An identity change";
+    /// `hosted::App::identity_reconnect_due`): when that happened, and the
+    /// socket (`AstationClient::socket_id`).
+    pub identity_reconnect: Option<(Instant, u64)>,
     /// Astation instance ID when currently connected (from CredentialSync or auth flow).
     pub connected_astation_id: Option<String>,
     pub force_terminal_redraw: bool,
@@ -162,6 +170,7 @@ impl App {
             hosted: None,
             host_route: crate::session_protocol::r9::route::new_handle(),
             route_reconnect: None,
+            identity_reconnect: None,
             connected_astation_id: None,
             force_terminal_redraw: false,
             show_certificates: false,
