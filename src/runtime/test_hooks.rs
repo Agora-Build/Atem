@@ -314,6 +314,14 @@ fn drive_action(kind: &str, text: &str) -> Result<DriveAction, String> {
     })
 }
 
+/// A hook's line and its `\n` (the `carried`, `used` and `done` files) in
+/// one write: `writeln!` on a `File` writes the text and the `\n` in two,
+/// so a test reading the file between them read a line without its end.
+#[cfg(any(debug_assertions, test))]
+fn write_line(to: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
+    to.write_all(format!("{line}\n").as_bytes())
+}
+
 #[cfg(debug_assertions)]
 mod imp {
     use std::path::PathBuf;
@@ -322,6 +330,18 @@ mod imp {
     fn env_path(name: &str, cell: &'static OnceLock<Option<PathBuf>>) -> Option<&'static PathBuf> {
         cell.get_or_init(|| std::env::var_os(name).map(PathBuf::from))
             .as_ref()
+    }
+
+    /// Appends `line` to `path` (created when missing) in one write
+    /// ([`super::write_line`]); a hook's errors are ignored.
+    fn append_line(path: &std::path::Path, line: &str) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = super::write_line(&mut file, line);
+        }
     }
 
     fn clock_file() -> Option<&'static PathBuf> {
@@ -366,14 +386,7 @@ mod imp {
     }
 
     fn used(dir: &std::path::Path, name: &str) {
-        use std::io::Write;
-        if let Ok(mut used) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("used"))
-        {
-            let _ = writeln!(used, "{name}");
-        }
+        append_line(&dir.join("used"), name);
     }
 
     /// Takes `<dir>/<name>`'s content (the marker is removed).
@@ -387,15 +400,8 @@ mod imp {
     }
 
     pub fn membership_log(line: &str) {
-        use std::io::Write;
         let Some(dir) = membership_dir() else { return };
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("carried"))
-        {
-            let _ = writeln!(f, "{line}");
-        }
+        append_line(&dir.join("carried"), line);
     }
 
     /// `None` when the hook isn't set; `Some(None)` while its file has no
@@ -532,32 +538,18 @@ mod imp {
     }
 
     pub fn host_work_driven(line: &serde_json::Value) {
-        use std::io::Write;
         let Some(dir) = drive_dir() else { return };
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("done"))
-        {
-            let _ = writeln!(f, "{line}");
-        }
+        append_line(&dir.join("done"), &line.to_string());
     }
 
     pub fn take_fault(name: &str) -> bool {
-        use std::io::Write;
         let Some(dir) = faults_dir() else {
             return false;
         };
         if std::fs::remove_file(dir.join(name)).is_err() {
             return false;
         }
-        if let Ok(mut used) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("used"))
-        {
-            let _ = writeln!(used, "{name}");
-        }
+        append_line(&dir.join("used"), name);
         true
     }
 }
@@ -899,6 +891,28 @@ pub fn context_dir() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hook's line goes out in one write, its `\n` included, so a test
+    /// reading the file while the runtime appends to it (the carriage
+    /// hook's `carried`, the faults' `used`, the drive hook's `done`) never
+    /// reads a line without its end: the writer is asked once, for the
+    /// whole line.
+    #[test]
+    fn a_hook_line_is_one_write() {
+        struct Writes(Vec<Vec<u8>>);
+        impl std::io::Write for Writes {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.push(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writes = Writes(Vec::new());
+        write_line(&mut writes, "Frozen at seq 4").unwrap();
+        assert_eq!(writes.0, [b"Frozen at seq 4\n".to_vec()]);
+    }
 
     fn on(delegated: bool, alerts: bool) -> HostFeatures {
         HostFeatures { delegated, alerts }
