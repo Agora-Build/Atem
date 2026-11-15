@@ -3082,7 +3082,7 @@ substitute chain `SUB1`–`SUB3`) and the kits in `r9-vectors-keys`
 
 | kind | proof | principal | permissions |
 |---|---|---|---|
-| `native` | member of kind `native` at Atem's head; `sig_c` by its `auth_key` | `member:<device_id>` | `view`; `control` if in its roles (`manage` gives the host nothing but the host policy, R9.8a, and, planned, `host_enc_key_get`, R9.14) |
+| `native` | member of kind `native` at Atem's head; `sig_c` by its `auth_key` | `member:<device_id>` | `view`; `control` if in its roles (`manage` gives the host nothing but the host policy, R9.8a, and `host_enc_key_get`, R9.14, built behind the debug-only hook's `host.senders` and advertised by no release build) |
 | `service` | member of kind `service`, not expired, host in `scope.hosts`; `sig_c` by its `auth_key` | `service:<device_id>` | `view`; `control` if `scope.ops` has any of `prompt`, `interrupt`, `stop`, `terminal`, `approval`, `rule_revoke`; each op checked separately |
 | `browser` | grant (below) whose issuer is a native member with `control` at Atem's head; `sig_c` by the grant's `browser_key` | `browser:<grant_id>` (issuer recorded) | `view`; `control` if the grant's `ops` have a control op; never more than the issuer |
 | `host` | newest `add_host` of `host_id`; `sig_h` | — (never a client). **Planned** (delegated host work, step 3; nothing advertised): `host:<host_id>`, a sender in envelopes and route principals only | — |
@@ -3708,7 +3708,7 @@ replaced key, also for a proof at an ancestor head; `relay_replies`:
 | `host_policy_changed` | H→C | event: `policy`, `account_id`, `atem_device_id`, `host_trust_gen`, `head`, `channel_id`, `attachment_gen` (R9.8a; other manager attachments, after a commit) |
 | `control_records` | C→H | `id`, `records` (one to 64 signed control records of host principals, ≤ 256 KiB; a service's record refuses the whole message `invalid_request`) → `control_records_result{re}` (planned, feature `host.senders`; native members only; R9.3) |
 | `control_records_result` | H→C | `re`, `results`: one `{record_id, result, effects}` per record in the order sent, `result` and each effect's `result` `applied`, `duplicate`, `pending` or `refused`, `effects` `[{effect, result}]` with `effect` `revocation`, `interrupt`, `hold`, `release` or `cover` (host-work-v1 §11.1) |
-| `host_enc_key_get` | C→H | `id` → `host_enc_key{re}` (planned, feature `host.senders`; native members holding `manage`, checked by the host as in R9.8a; R9.14) |
+| `host_enc_key_get` | C→H | `id` → `host_enc_key{re}` (feature `host.senders`: built behind the debug-only hook, listed only with hosting on, by no release build; native members holding `manage`, checked by the host as in R9.8a; R9.14) |
 | `host_enc_key` | H→C | `re`, `host_id`, `host_trust_gen`, `enc_key{alg:"x25519",pub}`, `enc_sig`: the host's encryption key and its binding, what a manager drafts the `host_enc_key` entry from (R9.14) |
 
 - A `hello` without `revision: 9` gets `error{code:"unsupported_version",
@@ -3721,8 +3721,10 @@ replaced key, also for a proof at an ancestor head; `relay_replies`:
   `unsupported_version` with no effect (as §A refuses an op of a feature
   it doesn't list; **Atem's choice of code, agreed with Astation (2026-11-11,
   #120 comment 6810116314)**):
-  today `control_records` and `host_enc_key_get`, whose feature
-  `host.senders` no host advertises (detail `host.senders is not
+  `control_records` and `host_enc_key_get` on a host that doesn't list
+  `host.senders` (no release build does; a debug build lists it only with
+  the hook's `host.senders` and hosting on, and still refuses
+  `control_records` so there) (detail `host.senders is not
   advertised`). The host-work ops of a feature it doesn't list are
   host-work-v1's (`busy`, detail naming the feature, host-work-v1 §11.2
   and §11.3; `busy` also while hosting is off, §1).
@@ -4491,7 +4493,7 @@ sets versus sequences (R9.2). Still open:
    compromise remedy (`retire_previous`) need a way to ask the host for a
    new key: a flag on the op, or a local command. Needed before step 4.
 
-### R9.14 Delegated host work (items 1-7 built behind a debug-only hook; not advertised)
+### R9.14 Delegated host work (items 1-7 and item 8's `host_enc_key_get` built behind a debug-only hook; not advertised by release builds)
 
 The delegated host-work design ([../delegated-host-work.md](../delegated-host-work.md),
 agreed revision 6b, I.7) revises session-v1 so that Atem runs a delegated
@@ -4888,16 +4890,21 @@ that answer. Item 8's request stays open.
        the entry the answer is for.
      - **Read-only.** The host makes and rotates nothing for the
        request. It answers with the key it holds, whether or not the
-       device list already has it. Before the answer goes, the key's id is
-       in the host's record of the keys it made (design II.4.1, amended
-       for step 4): a record that lacks it (lost, say) gets it first, and
-       a write that fails is `busy`, detail `host encryption key
-       unavailable`, nothing handed out. A host with no key (the file missing
+       device list already has it. A host with no key (the file missing
        and not made, or unreadable) answers `busy`, detail `host
        encryption key unavailable`. A held device list answers `busy`,
-       detail `device list not reconciled`, as for the host policy. Both
-       details are **Atem's choice, agreed with Astation (2026-11-11, #120
-       comment 6810116314)**.
+       detail `device list not reconciled`, as for the host policy. These
+       two details are **Atem's choice, agreed with Astation (2026-11-11,
+       #120 comment 6810116314)**.
+     - **The record first.** Before the answer goes, the key's id is
+       durable in the host's record of the keys it made: a record that
+       lacks it (lost, say) gets it first, one that lists it is synced, and
+       a write or sync that fails is `busy`, detail `host encryption key
+       unavailable`, nothing handed out (**changed to match the design's
+       amendment for step 4, agreed with Astation 2026-11-13, #120 comment
+       6848326392; this op's handling of it, a record written on request
+       and `busy` when that write fails, is Atem's reading, for
+       Astation**).
      - **The client** takes an answer only for a request it sent on that
        channel, from the channel's host (`atem_device_id`) at its trust
        generation. Anything else is a malformed host message (`unbound
@@ -4958,8 +4965,20 @@ is not advertised` (item 8, while unadvertised).
   module (an answer drafts an entry the drafting guard accepts; unbound
   answers, the bound of 64 and an id pending in another request map are
   refused).
-- **The host's step 3 refusal:** tested in
-  `src/session_protocol/r9/tests.rs` (`host_enc_key_get`).
+- **The host's refusal** (no `host.senders` listed, and a native without
+  `manage` while it is): `src/session_protocol/r9/tests.rs`
+  (`host_enc_key_get`). **The host's answer** behind the hook:
+  `src/session_protocol/r9/host_enc_tests.rs` (the key made with the pin
+  and at a start, kept, replaced at a new generation, removed by `atem
+  unpair` and a new pin; its record, written and synced first, rebuilt
+  when lost; and over channels: a manager's answer, its `enc_sig`
+  verified and its drafted entry accepted, `manage` per request, the
+  others `forbidden`, `busy` without a key or when the record's write or
+  sync fails, main's refusal with the hook off), and
+  `tests/delegated_binary.rs`
+  (`host_senders_hand_a_manager_the_host_encryption_key`: the real
+  runtime makes the key at start, a manager gets it, a restart keeps
+  it).
 - **Scenario fixtures for items 1 to 7:** `fixtures/r9-delegated-*.json`
   (`provenance`, `start-check-withdraws`, `withdrawal-refusal-list`,
   `host-interrupt`, `recovery-withdrawn`,

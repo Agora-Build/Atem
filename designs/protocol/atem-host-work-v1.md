@@ -3,8 +3,8 @@
 Status: implemented and released (Atem v0.8.2). §11 (delegated work):
 `host.delegated` and `host.alerts` are built (step 4, 2026-11-14) behind a
 debug-only hook and advertised by no release build; `host.senders` is
-planned (behind the same hook a debug build lists it and answers
-`host_enc_key_get`; nothing else of it is built).
+planned (behind the same hook a debug build lists it with hosting on and
+answers `host_enc_key_get`; nothing else of it is built).
 
 This extension of atem-session r9 lets an admitted client create sessions
 through launch profiles the host owner approved, queue directed work, publish
