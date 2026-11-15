@@ -2391,10 +2391,11 @@ thread_local! {
 /// `atem unpair` (§R9.3): a frozen list's genesis goes on
 /// `frozen_genesis` (≤ 16, oldest dropped), then `membership.json` is
 /// removed first, then every other r9 file (the carriage record, intent,
-/// freeze and fault records, the host channel key, the host encryption key
-/// and its record (`DELETE_ONLY`), the journal's `membership_applied`). `frozen_genesis` stays. Until `membership.json`
+/// freeze and fault records, the host channel key, the host encryption
+/// key and its record (`DELETE_ONLY`), the journal's
+/// `membership_applied`). `frozen_genesis` stays. Until `membership.json`
 /// is gone nothing changed (an error leaves the host paired as it was);
-/// after that, any file left makes the next start fail closed.
+/// after that, any leftover makes the next start fail closed.
 pub fn forget_on_unpair(pairing: &PairingPaths) -> Result<(), ForgetError> {
     let state = store::read_private(&pairing.membership)
         .ok()
@@ -2711,6 +2712,14 @@ pub fn list_stamp(pairing: &PairingPaths) -> Vec<Option<(u64, u64, i64, i64)>> {
 pub fn has_device_list_files(pairing: &PairingPaths) -> bool {
     let store = Store::new(pairing, &journal_of(pairing));
     store::present(&pairing.membership) || LEFTOVERS.into_iter().any(|f| store.present(f))
+}
+
+/// Whether the profile holds a file removed with a device list that is no
+/// leftover (`DELETE_ONLY`: the host encryption key, its record): only
+/// `atem unpair` asks, to remove them where nothing else would.
+pub fn has_delete_only_files(pairing: &PairingPaths) -> bool {
+    let store = Store::new(pairing, &journal_of(pairing));
+    DELETE_ONLY.into_iter().any(|f| store.present(f))
 }
 
 /// The journal directory of the runtime this profile's `atem runtime`

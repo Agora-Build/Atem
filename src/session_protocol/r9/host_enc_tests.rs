@@ -127,7 +127,7 @@ fn made_with_the_pin_and_anew_at_each_trust_generation() {
 }
 
 /// With the hook off a pin makes no key (as on main), and a pin removes
-/// the key and record an earlier one left (a device-list leftover).
+/// the key and record an earlier one left.
 #[test]
 fn the_hook_off_makes_none_and_a_new_pin_removes_an_earlier_key() {
     let (_dir, src) = profile();
@@ -192,6 +192,42 @@ fn unpair_deletes_the_key_and_its_record() {
     assert!(!p.host_enc_key.exists());
 }
 
+/// A pin taken back (a verification that failed after its pin) takes the
+/// key made with it and its record too.
+#[test]
+fn a_pin_taken_back_takes_the_key_with_it() {
+    let (_dir, src) = profile();
+    let p = &src.paths.pairing;
+    let log = log_at(1, "enc host 1");
+    pin_at_pairing_locked(p, &log.log, HOST, 1, &secret("enc host 1"), true).unwrap();
+    assert!(p.host_enc_key.exists() && p.host_enc_generated.exists());
+    crate::session_protocol::membership::pairing::unpin_locked(p);
+    assert!(!p.membership.exists());
+    assert!(!p.host_enc_key.exists(), "the key went with the pin");
+    assert!(!p.host_enc_generated.exists(), "its record too");
+}
+
+/// Each of `atem unpair`'s two removals takes the key and its record on its
+/// own: the list's removal (`forget_on_unpair`) and the leftovers' removal
+/// after the next generation is committed (`forget_leftovers`).
+#[test]
+fn each_unpair_removal_takes_the_key_on_its_own() {
+    use crate::session_protocol::membership::{forget_leftovers, forget_on_unpair};
+    for removal in ["forget_on_unpair", "forget_leftovers"] {
+        let (_dir, src) = profile();
+        let p = &src.paths.pairing;
+        let log = log_at(1, "enc host 1");
+        pin_at_pairing_locked(p, &log.log, HOST, 1, &secret("enc host 1"), true).unwrap();
+        assert!(p.host_enc_key.exists() && p.host_enc_generated.exists());
+        match removal {
+            "forget_on_unpair" => forget_on_unpair(p).unwrap(),
+            _ => forget_leftovers(p).unwrap(),
+        }
+        assert!(!p.host_enc_key.exists(), "{removal}");
+        assert!(!p.host_enc_generated.exists(), "{removal}");
+    }
+}
+
 /// What an older build's `atem unpair` leaves (it doesn't know the two
 /// files): a stray encryption key and record without the list grant
 /// nothing, so they are no device-list leftover. The list opens as none
@@ -231,7 +267,9 @@ fn stray_key_files_without_the_list_are_no_leftover_and_go_at_the_next_pin_or_un
     assert!(!crate::session_protocol::membership::has_device_list_files(
         p
     ));
-    // `atem unpair` (this build) removes them.
+    // `atem unpair` (this build) on this paired profile removes them; on an
+    // unpaired one too (`pairing::tests::
+    // unpair_removes_a_host_encryption_key_an_older_unpair_left`).
     crate::pairing::unpair(&src).unwrap();
     assert!(!p.host_enc_key.exists() && !p.host_enc_generated.exists());
     // So does the next pin, with the hook off.
