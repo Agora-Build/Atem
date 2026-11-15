@@ -123,7 +123,7 @@ src/
 │   ├── ops.rs           #   Astation operations on the broker's link: pair, pair verify, cred unlock/projects, paired-token refresh
 │   ├── op_client.rs     #   the CLI side of an operation: print/ask/answer/done (answers from /dev/tty)
 │   ├── project_scope.rs #   r9 service `projects` scopes: keyed hashes of each session's launch project key from the cred agent, cached; pending = out of scope
-│   ├── test_hooks.rs    #   debug builds only: the fixture clock and PTY write faults (ATEM_TEST_CLOCK_FILE, ATEM_TEST_PTY_FAULTS), r9: host clock, membership faults/carriage, state dump, project hashes (ATEM_TEST_HOST_CLOCK, _MEMBERSHIP_FAULTS, _STATE_DUMP, _PROJECT_HASHES, _NO_INIT_LIMIT); `<ATEM_TEST_PTY_FAULTS dir>/hold_dispatch` and `hold_launches` keep accepted work queued and reserved launches unstarted; delegated host work (step 4, advertised nowhere): `ATEM_TEST_HOST_FEATURES` (`host.delegated[,host.alerts]`, read once at start), `ATEM_TEST_HOST_WORK_DRIVE` (the `r9-delegated-*` fixtures play host-work's side: `submit-*`, `verdict`, `withdraw-*`, `interrupt-*` command files, results in `<dir>/done`), `<ATEM_TEST_PTY_FAULTS dir>/crash_after_attempt_commit` (the runtime SIGKILLs itself after an attempt's commit, before its submit), VII.A test 7's other crash points, each a marker used once (`crash_point`: a runtime.log line naming it, then SIGKILL): `crash_after_executing` (a `host-work` attempt's `executing` durable, its prompt not dispatched), `crash_during_record_application` (in a control page's transaction, after its first record's effects), `crash_after_page_commit` (a page that applied a record committed, before its followups and acknowledgments) and `crash_after_ack_handoff` (acknowledgments handed to the link, before their sent marks), with `<…>/hold_crash` (a fired crash point waits while it exists, so a test sees what went out), and `<…>/hold_host_work` (host-work's scheduling pass waits while it exists: requests and the start's recovery still run, nothing is dispatched, settled or withdrawn and no interrupt intent is carried out, so a test sees the start check act first; the start view's standings, gates and scopes stay as last read, while `D` and the halt are still read every 100 ms); read once per process, so unit tests run without them
+│   ├── test_hooks.rs    #   debug builds only: the fixture clock and PTY write faults (ATEM_TEST_CLOCK_FILE, ATEM_TEST_PTY_FAULTS), r9: host clock, membership faults/carriage, state dump, project hashes (ATEM_TEST_HOST_CLOCK, _MEMBERSHIP_FAULTS, _STATE_DUMP, _PROJECT_HASHES, _NO_INIT_LIMIT); `<ATEM_TEST_PTY_FAULTS dir>/hold_dispatch` and `hold_launches` keep accepted work queued and reserved launches unstarted; delegated host work (step 4, advertised nowhere): `ATEM_TEST_HOST_FEATURES` (`host.delegated[,host.alerts][,host.senders]`, read once at start; `host.alerts` or `host.senders` without `host.delegated` ignored), `ATEM_TEST_HOST_WORK_DRIVE` (the `r9-delegated-*` fixtures play host-work's side: `submit-*`, `verdict`, `withdraw-*`, `interrupt-*` command files, results in `<dir>/done`), `<ATEM_TEST_PTY_FAULTS dir>/crash_after_attempt_commit` (the runtime SIGKILLs itself after an attempt's commit, before its submit), VII.A test 7's other crash points, each a marker used once (`crash_point`: a runtime.log line naming it, then SIGKILL): `crash_after_executing` (a `host-work` attempt's `executing` durable, its prompt not dispatched), `crash_during_record_application` (in a control page's transaction, after its first record's effects), `crash_after_page_commit` (a page that applied a record committed, before its followups and acknowledgments) and `crash_after_ack_handoff` (acknowledgments handed to the link, before their sent marks), with `<…>/hold_crash` (a fired crash point waits while it exists, so a test sees what went out), and `<…>/hold_host_work` (host-work's scheduling pass waits while it exists: requests and the start's recovery still run, nothing is dispatched, settled or withdrawn and no interrupt intent is carried out, so a test sees the start check act first; the start view's standings, gates and scopes stay as last read, while `D` and the halt are still read every 100 ms); read once per process, so unit tests run without them
 │   └── *_tests.rs       #   (test-only) server, ops, adoption, broker and host bridge (in-process workers, fake Astation peer)
 ├── session_protocol/    # atem-session v1 (r8; r9 host side), transport-independent (designs/protocol/atem-session-v1.md)
 │   ├── revision.rs      #   re-exports atem_client::session::revision: r8 revision (8), the nine feature names, FEATURES, R8_FIXTURE_NEEDS, R9_NOT_RUN
@@ -331,10 +331,11 @@ origin proofs and direct Atem host senders.
 **Delegated host work** (step 4 of `designs/delegated-host-work.md`, Part I;
 wire host-work-v1 §11 and session-v1 R9.14; `runtime/delegated/`,
 `runtime/host_clock/`): built behind the debug-only hook
-`ATEM_TEST_HOST_FEATURES=host.delegated[,host.alerts]`, which only a debug
-build's `atem runtime` reads, once, from its own environment (a client never
-passes `ATEM_TEST_*` to a runtime it starts, so `atem runtime restart` or a
-client of another build brings up one without it). Release builds compile it
+`ATEM_TEST_HOST_FEATURES=host.delegated[,host.alerts][,host.senders]`,
+which only a debug build's `atem runtime` reads, once, from its own
+environment (a client never passes `ATEM_TEST_*` to a runtime it starts, so
+`atem runtime restart` or a client of another build brings up one without
+it). Release builds compile it
 out: no welcome lists `host.delegated`, `host.alerts` or `host.senders`, no
 Station call goes and hosting is as above. With it on, hosting enabled and a
 pinned device list, a native member's task, or a service's whose Station's
@@ -380,9 +381,12 @@ proves its route, under the new identity and reads the feed from 0 (Atem's
 reading that implements Astation's item 15, #120). `atem status` adds `Clock:`,
 `Control feeds:` and `Delegated:` lines. A dev host for the joint check
 turns it on as `designs/agent-hosting.md` §14 says (a debug build, the hook
-in the `env.sh` that runs `atem runtime` directly). Not built: host senders
-(`host.senders`, stage 3; the hook refuses it), cross-instance work (stage
-2), disabled-account enforcement.
+in the `env.sh` that runs `atem runtime` directly). Host senders (stage 3)
+start behind the same hook: `host.senders` (ignored without
+`host.delegated`) is listed in the welcome with hosting on, and its ops
+(`control_records`, `host_enc_key_get`) are still refused as while it isn't
+listed. Not built: the rest of host senders, cross-instance work (stage 2),
+disabled-account enforcement.
 
 **Local agent collaboration** (stage 1, released in v0.8.5; `designs/agent-collaboration.md`):
 `atem agent tag add|remove|list` and `atem message send|reply` identify the

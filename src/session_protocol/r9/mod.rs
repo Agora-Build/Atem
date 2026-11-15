@@ -5,9 +5,9 @@
 //! r9 `welcome`, `membership`/`membership_head`, `revoke_grant`,
 //! `approval_seen`, and the fences: each attachment is fenced on its own
 //! (its `attachment_gen`), a principal's attachments together (its §H
-//! `control_gen`). An op of a feature the welcome doesn't list (today
-//! `control_records` and `host_enc_key_get`, of `host.senders`) is
-//! `unsupported_version`.
+//! `control_gen`). An op of a feature the welcome doesn't list (such as
+//! `control_records` and `host_enc_key_get`, of `host.senders`, which only
+//! the debug-only hook lists) is `unsupported_version`.
 //!
 //! Sans-I/O. The transport seam is the channel envelope ([`envelope`]):
 //! [`R9Host::link_up`]/[`R9Host::link_down`] for Atem's link, every
@@ -341,11 +341,12 @@ pub struct R9Host {
     /// While host work is off (hosting paused), `work_interrupt` is still
     /// taken: a stop (ruling T27a), when the runtime can serve it.
     host_work_stops: bool,
-    /// `host.delegated` and `host.alerts` (`alerts` only with `delegated`),
-    /// as the runtime's debug-only hook turned them on (step 4, Decision
-    /// 10); listed only with hosting on.
+    /// `host.delegated`, `host.alerts` and `host.senders` (the last two
+    /// only with `delegated`), as the runtime's debug-only hook turned them
+    /// on (step 4, Decision 10); listed only with hosting on.
     delegated: bool,
     alerts: bool,
+    senders: bool,
     host_work_requests: VecDeque<HostWorkRequest>,
     limits: Limits,
     /// The live link generation.
@@ -550,6 +551,16 @@ fn close_reason(e: &ChannelError) -> &'static str {
     }
 }
 
+/// `host.senders`'s session ops this host doesn't serve yet, even with the
+/// feature listed (only the debug-only hook lists it): refused as while it
+/// isn't (`unsupported_version`, `host.senders is not advertised`), nothing
+/// read or recorded. `control_records` carries host senders' stops
+/// (session-v1 R9.8, host-work-v1 §11.1), which a later change serves;
+/// `host_enc_key_get` waits for the host encryption key.
+fn senders_op_unserved(op: &str) -> bool {
+    matches!(op, "control_records" | "host_enc_key_get")
+}
+
 /// The feature of an op that exists only for delegated host work (plan
 /// decision 4): `control_records` and `host_enc_key_get` are
 /// `host.senders`'s; `work_interrupt` and `work_resolve` are
@@ -634,6 +645,21 @@ impl R9Host {
         self.alerts = alerts && delegated;
     }
 
+    /// `host.senders` (host senders, delegated host-work design Part II):
+    /// off unless the runtime's debug-only hook turned it on with
+    /// `host.delegated` (never in a release build). It counts only with
+    /// `delegated` ([`R9Host::set_delegated_features`]), whichever is set
+    /// first.
+    pub fn set_senders_feature(&mut self, senders: bool) {
+        self.senders = senders;
+    }
+
+    /// Whether this host's welcome lists `host.senders`: hosting on, and the
+    /// hook's `host.delegated` and `host.senders`.
+    fn senders_advertised(&self) -> bool {
+        self.host_work_enabled && self.delegated && self.senders
+    }
+
     /// Whether this host's welcome lists `host.alerts`: hosting on, and the
     /// hook's `host.delegated` and `host.alerts`. The one rule for both the
     /// welcome and the making (signing and first send) of `outcome_unknown`
@@ -646,10 +672,9 @@ impl R9Host {
 
     /// The features a welcome lists: the one source of what this host takes
     /// (an op of a feature not listed here is `unsupported_version`,
-    /// session-v1 §A). `host.delegated` and `host.alerts` only as the
-    /// runtime's debug-only hook turned them on, and like the other
-    /// host-work features only with hosting on; `host.senders` never in
-    /// step 4 of delegated host work.
+    /// session-v1 §A). `host.delegated`, `host.alerts` and `host.senders`
+    /// only as the runtime's debug-only hook turned them on, and like the
+    /// other host-work features only with hosting on.
     pub(crate) fn advertised_features(&self) -> Vec<String> {
         let mut features: Vec<String> = crate::session_protocol::revision::FEATURES
             .iter()
@@ -669,6 +694,9 @@ impl R9Host {
             }
             if self.alerts_advertised() {
                 features.push(atem_client::session::host_work::ALERTS_FEATURE.to_owned());
+            }
+            if self.senders_advertised() {
+                features.push(atem_client::session::host_work::SENDERS_FEATURE.to_owned());
             }
         }
         features
@@ -772,6 +800,7 @@ impl R9Host {
             host_work_stops: false,
             delegated: false,
             alerts: false,
+            senders: false,
             host_work_requests: VecDeque::new(),
             limits,
             link: None,
@@ -2103,11 +2132,13 @@ impl R9Host {
                 && self.delegated
                 && data.get("op").and_then(Value::as_str) == Some("work_interrupt")
                 && self.offered_delegated(att);
-            let unadvertised = data
-                .get("op")
-                .and_then(Value::as_str)
+            let op = data.get("op").and_then(Value::as_str);
+            let unadvertised = op
                 .and_then(delegated_feature_of)
-                .filter(|feature| !self.advertised_features().iter().any(|f| f == feature))
+                .filter(|feature| {
+                    !self.advertised_features().iter().any(|f| f == feature)
+                        || op.is_some_and(senders_op_unserved)
+                })
                 .filter(|_| !stop_while_paused);
             if matches!(
                 data.get("op").and_then(Value::as_str),

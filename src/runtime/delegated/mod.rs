@@ -630,6 +630,7 @@ mod tests {
         let alerts_only = HostFeatures {
             delegated: false,
             alerts: true,
+            senders: true,
         };
         for req in &ops() {
             assert_eq!(request(HostFeatures::default(), req), busy(), "{req:?}");
@@ -669,10 +670,11 @@ mod tests {
     }
 
     /// Release builds compile the hook out (step 4, Decision 10): with the
-    /// variable set, the runtime reads no features, the engine lists none of
-    /// `host.delegated`, `host.alerts` and `host.senders` with hosting on,
-    /// nobody is delegated and the ops are answered as before. Run by every
-    /// release test job (`.github/workflows/test.yml`).
+    /// variable set (every feature named), the runtime reads no features,
+    /// the engine lists none of `host.delegated`, `host.alerts` and
+    /// `host.senders` with hosting on, nobody is delegated and the ops are
+    /// answered as before. Run by every release test job
+    /// (`.github/workflows/test.yml`).
     #[cfg(not(debug_assertions))]
     #[test]
     fn release_builds_never_turn_on_host_features() {
@@ -680,12 +682,19 @@ mod tests {
         // SAFETY: the tests that write this variable (this one and
         // `test_hooks::tests::host_features_are_off_in_release`) write this
         // one value, and release builds never read it at all.
-        unsafe { std::env::set_var("ATEM_TEST_HOST_FEATURES", "host.delegated,host.alerts") };
+        unsafe {
+            std::env::set_var(
+                "ATEM_TEST_HOST_FEATURES",
+                "host.delegated,host.alerts,host.senders",
+            )
+        };
         let features = crate::runtime::test_hooks::host_features();
         assert_eq!(features, HostFeatures::default());
+        assert!(!features.senders);
         let mut r9 = R9Host::default();
         r9.enable_host_work(true);
         r9.set_delegated_features(features.delegated, features.alerts);
+        r9.set_senders_feature(features.senders);
         let advertised = r9.advertised_features();
         assert!(
             advertised.iter().any(|f| f == hw::WORK_FEATURE),

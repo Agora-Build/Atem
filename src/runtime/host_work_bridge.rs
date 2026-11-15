@@ -567,11 +567,13 @@ impl HostBridge {
             self.projects
                 .session(&p.scope_key(), Some(p.project.clone()));
         }
-        // `host.delegated` and `host.alerts` as the debug-only hook turned
-        // them on when the runtime started (step 4, Decision 10): listed
-        // with the other host-work features, so only with hosting on.
+        // `host.delegated`, `host.alerts` and `host.senders` as the
+        // debug-only hook turned them on when the runtime started (step 4,
+        // Decision 10): listed with the other host-work features, so only
+        // with hosting on.
         self.r9
             .set_delegated_features(self.features.delegated, self.features.alerts);
+        self.r9.set_senders_feature(self.features.senders);
         self.r9
             .enable_host_work(self.hosting_enabled() && self.work.store.is_some());
     }
