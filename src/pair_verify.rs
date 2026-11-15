@@ -305,6 +305,23 @@ pub(crate) struct HostPinning<'a> {
     pub enc_key: bool,
 }
 
+impl<'a> HostPinning<'a> {
+    /// What a ceremony in a runtime whose hook turned on `features` pins.
+    pub(crate) fn new(
+        astation: &'a crate::memory::verification::AstationKeys,
+        host_id: &'a str,
+        host_seed: &'a [u8; 32],
+        features: crate::runtime::test_hooks::HostFeatures,
+    ) -> Self {
+        HostPinning {
+            astation,
+            host_id,
+            host_seed,
+            enc_key: features.senders,
+        }
+    }
+}
+
 /// Applies Astation's `deviceVerified` only while the pairing the
 /// verification started under is current, under the pairing lock: a
 /// certificate that arrives after `atem unpair` (or a new `atem pair`) is
@@ -478,6 +495,34 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
+
+    /// The host encryption key is made with the pin only when the
+    /// runtime's debug hook turned `host.senders` on (with
+    /// `host.delegated`); never with the hook off, as on main.
+    #[test]
+    fn the_pin_makes_the_host_encryption_key_only_with_host_senders() {
+        use crate::runtime::test_hooks::HostFeatures;
+        let astation = crate::memory::verification::AstationKeys {
+            sign_pub: vec![4; 65],
+            enc_pub: [5; 32],
+            recovery_sign_pub: [6; 32],
+            nonce_s: [7; 32],
+            genesis_hash: [8; 32],
+        };
+        for (hook, enc_key) in [
+            ("", false),
+            ("host.delegated", false),
+            ("host.delegated,host.alerts", false),
+            ("host.senders", false),
+            ("host.delegated,host.senders", true),
+            ("host.delegated,host.alerts,host.senders", true),
+        ] {
+            let features = HostFeatures::parse(hook).unwrap();
+            let pinning = HostPinning::new(&astation, "host-1", &[9; 32], features);
+            assert_eq!(pinning.enc_key, enc_key, "{hook:?}");
+            assert_eq!(pinning.host_id, "host-1");
+        }
+    }
 
     /// A terminal with keys typed before the prompt (`pending`) and keys
     /// typed after it (`fresh`).

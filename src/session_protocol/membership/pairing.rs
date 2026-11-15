@@ -5,7 +5,7 @@
 //! verifies the whole chain and the pairing checks, then pins it (the list,
 //! the key and the applied head) before it reports success. A verification
 //! that fails after the pin takes the pin back.
-use super::{HostPin, LEFTOVERS, MembershipHost, frozen_genesis, journal_of, store};
+use super::{DELETE_ONLY, HostPin, LEFTOVERS, MembershipHost, frozen_genesis, journal_of, store};
 use crate::paths::PairingPaths;
 use atem_client::canonical::StrictValue;
 use atem_client::encoding::Hash32;
@@ -136,7 +136,7 @@ pub fn unpin_locked(pairing: &PairingPaths) {
         eprintln!("atem: device list: cannot take the pin back: {e}");
         return;
     }
-    for file in LEFTOVERS {
+    for file in LEFTOVERS.into_iter().chain(DELETE_ONLY) {
         if let Err(e) = store.remove(file) {
             eprintln!("atem: device list: cannot take the pin back: {e}");
         }

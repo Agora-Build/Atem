@@ -192,17 +192,13 @@ fn unpair_deletes_the_key_and_its_record() {
     assert!(!p.host_enc_key.exists());
 }
 
-/// A key or record without the device list is a leftover: the list's start
-/// fails closed, as for `host_channel_key`.
+/// What an older build's `atem unpair` leaves (it doesn't know the two
+/// files): a stray encryption key and record without the list grant
+/// nothing, so they are no device-list leftover. The list opens as none
+/// (r8 not refused for them), nothing counts them, and the next pin or
+/// `atem unpair` removes them.
 #[test]
-fn a_key_without_the_list_is_a_leftover() {
-    let (_dir, src) = profile();
-    let p = &src.paths.pairing;
-    pinned(p, 1);
-    host_enc::ensure(p, &journal_of(p), 1);
-    std::fs::remove_file(&p.membership).unwrap();
-    std::fs::remove_file(&p.host_channel_key).unwrap();
-    std::fs::remove_file(journal_of(p).join("membership_applied")).unwrap();
+fn stray_key_files_without_the_list_are_no_leftover_and_go_at_the_next_pin_or_unpair() {
     struct NoFences;
     impl crate::session_protocol::membership::Fences for NoFences {
         fn fence(&mut self, _: &str, _: u64) {}
@@ -211,6 +207,19 @@ fn a_key_without_the_list_is_a_leftover() {
             Vec::new()
         }
     }
+    let older_unpair = |p: &PairingPaths| {
+        pinned(p, 1);
+        host_enc::ensure(p, &journal_of(p), 1);
+        std::fs::remove_file(&p.membership).unwrap();
+        std::fs::remove_file(&p.host_channel_key).unwrap();
+        std::fs::remove_file(journal_of(p).join("membership_applied")).unwrap();
+        assert!(p.host_enc_key.exists() && p.host_enc_generated.exists());
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let captured = crate::pairing::tests::bound_profile(dir.path(), ASTATION);
+    let src = captured.sources().clone();
+    let p = &src.paths.pairing;
+    older_unpair(p);
     let opened = MembershipHost::open(
         p,
         &journal_of(p),
@@ -218,11 +227,18 @@ fn a_key_without_the_list_is_a_leftover() {
         &crate::session_protocol::membership::r9log::host_now(),
         &mut NoFences,
     );
-    let Err(error) = opened else {
-        panic!("fails closed");
-    };
-    assert!(error.contains("host_enc_key"), "{error}");
-    assert!(error.contains("host_enc_generated"), "{error}");
+    assert!(matches!(opened, Ok(None)), "opens as no list");
+    assert!(!crate::session_protocol::membership::has_device_list_files(
+        p
+    ));
+    // `atem unpair` (this build) removes them.
+    crate::pairing::unpair(&src).unwrap();
+    assert!(!p.host_enc_key.exists() && !p.host_enc_generated.exists());
+    // So does the next pin, with the hook off.
+    older_unpair(p);
+    let log = log_at(2, "enc host 2");
+    pin_at_pairing_locked(p, &log.log, HOST, 2, &secret("enc host 2"), false).unwrap();
+    assert!(!p.host_enc_key.exists() && !p.host_enc_generated.exists());
 }
 
 /// At a start on a pinned host that has none (paired before the key
@@ -373,6 +389,30 @@ fn the_record_is_written_before_the_key() {
     host_enc::ensure_with(&mut store, p, 1);
     assert!(!p.host_enc_key.exists());
     assert_eq!(record(p).unwrap()["kids"].as_array().unwrap().len(), 1);
+}
+
+/// A record that lists the key held is synced (file and directory) before
+/// it counts: a rename whose directory fsync failed isn't durable yet.
+#[test]
+fn a_listed_record_is_synced_before_it_counts() {
+    let (_dir, src) = profile();
+    let p = &src.paths.pairing;
+    pinned(p, 1);
+    host_enc::ensure(p, &journal_of(p), 1);
+    for step in [Step::TempFsync, Step::DirectoryFsync] {
+        let mut store = Store::new(p, &journal_of(p));
+        store.inject(Injected {
+            file: DlFile::HostEncGenerated,
+            step,
+        });
+        let lines = host_enc::ensure_with(&mut store, p, 1);
+        assert_eq!(lines.len(), 1, "{step:?}: {lines:?}");
+        assert!(
+            lines[0].starts_with("cannot record the id of the key held"),
+            "{lines:?}"
+        );
+    }
+    assert!(host_enc::ensure(p, &journal_of(p), 1).is_empty());
 }
 
 /// A profile paired with `ASTATION` at `generation` and verified as `HOST`.
@@ -694,6 +734,48 @@ mod op {
         let (answers, _) = replies(&mut rig, "ch-mac");
         let kid = enc_kid(&answers[0].enc_key).unwrap();
         assert_eq!(record(&rig.pairing), Some(record_of(1, &[&kid])));
+    }
+
+    /// A record whose rename landed but whose directory fsync failed isn't
+    /// durable: the retry finds the id listed and syncs the record and its
+    /// directory before the key goes; a sync that fails is `busy` again.
+    #[test]
+    fn a_record_not_yet_synced_is_synced_before_the_key_goes() {
+        let mut rig = rig();
+        std::fs::remove_file(&rig.pairing.host_enc_generated).unwrap();
+        rig.engine.inject_enc_fault(Injected {
+            file: DlFile::HostEncGenerated,
+            step: Step::DirectoryFsync,
+        });
+        ask(&mut rig, "ch-mac");
+        assert_eq!(replies(&mut rig, "ch-mac"), busy());
+        assert!(rig.pairing.host_enc_generated.exists(), "the rename landed");
+        for step in [Step::DirectoryFsync, Step::TempFsync] {
+            rig.engine.inject_enc_fault(Injected {
+                file: DlFile::HostEncGenerated,
+                step,
+            });
+            ask(&mut rig, "ch-mac");
+            assert_eq!(replies(&mut rig, "ch-mac"), busy(), "{step:?}");
+        }
+        ask(&mut rig, "ch-mac");
+        assert_eq!(replies(&mut rig, "ch-mac").0.len(), 1);
+    }
+
+    /// A manager asking a host that can't answer (here: no key) gets `busy`
+    /// each time, and runtime.log gets the cause within the r9 limit for
+    /// input-driven lines, never a line per request.
+    #[test]
+    fn failures_are_logged_within_the_input_limit() {
+        let mut rig = rig();
+        std::fs::remove_file(&rig.pairing.host_enc_key).unwrap();
+        let before = rig.engine.input_lines_written();
+        for _ in 0..40 {
+            ask(&mut rig, "ch-mac");
+            assert_eq!(replies(&mut rig, "ch-mac"), busy());
+        }
+        let lines = rig.engine.input_lines_written() - before;
+        assert!((1..=20).contains(&lines), "{lines}");
     }
 
     /// No key for the host's generation (none made, damaged, or another

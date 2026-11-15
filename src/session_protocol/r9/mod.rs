@@ -2287,7 +2287,10 @@ impl R9Host {
         let (enc, enc_sig, line) = match handed {
             Ok(handed) => handed,
             Err(why) => {
-                log(&format!("host encryption key: {why}"));
+                // A client may ask again and again: the r9 limit for
+                // input-driven lines.
+                self.input_log
+                    .log(mono, || format!("host encryption key: {why}"));
                 return refuse(self, code::BUSY, Some(host_enc::DETAIL_UNAVAILABLE));
             }
         };

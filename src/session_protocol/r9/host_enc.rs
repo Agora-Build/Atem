@@ -20,13 +20,15 @@
 //!   new `host_channel_key`), and at a runtime start (or a reopen of the
 //!   list) on a pinned host that holds none for its generation. One of an
 //!   earlier generation is replaced then; one that can't be read is left as
-//!   it is (the op answers `busy`, and the start says why). Every pin and
-//!   `atem unpair` delete both files: they are device-list leftovers, so one
-//!   without the list fails closed.
+//!   it is (the op answers `busy`, and the start says why). Every pin, a pin
+//!   taken back and `atem unpair` delete both files; one left without the
+//!   list (by a build that doesn't know them) grants nothing and is no
+//!   device-list leftover: it doesn't fail the list's start closed.
 //! - **The record.** The `enc_kid` (R9.9's, `atem_client::keys::enc_kid`) of
 //!   every key made at the current generation, written (fsync, rename)
-//!   before the key file, and checked again before a key is handed out:
-//!   II.4.2's receiver refuses for good mail sealed to a key id the host
+//!   before the key file, and checked again before a key is handed out (one
+//!   that lists it already is synced, file and directory, first): II.4.2's
+//!   receiver refuses for good mail sealed to a key id the host
 //!   made but the record lacks. Only the current generation is kept. A lost
 //!   or unreadable record, or one of another generation, is rebuilt from
 //!   the key the host holds, with a runtime.log line.
@@ -121,19 +123,24 @@ impl HostEncKey {
 }
 
 /// `host_enc_key`'s bytes: the secret and its public half (base64url), with
-/// the generation it was made for. No `serde_json::Value` in between: every
-/// copy of the secret is wiped (base64url needs no JSON escaping).
+/// the generation it was made for. No `serde_json::Value` in between, and
+/// one buffer of the exact size: the copies made here are wiped (base64url
+/// needs no JSON escaping).
 fn key_bytes(host_trust_gen: u64, secret: &[u8; 32], public: &[u8; 32]) -> Zeroizing<Vec<u8>> {
+    let head = format!(r#"{{"v":1,"host_trust_gen":{host_trust_gen},"secret":""#);
+    const MIDDLE: &[u8] = br#"","pub":""#;
+    const TAIL: &[u8] = br#""}"#;
     let secret = Zeroizing::new(b64u(secret));
     let public = b64u(public);
-    let mut out = Zeroizing::new(Vec::with_capacity(secret.len() + public.len() + 64));
-    out.extend_from_slice(
-        format!(r#"{{"v":1,"host_trust_gen":{host_trust_gen},"secret":""#).as_bytes(),
-    );
+    // Its exact size: the buffer never grows (a reallocation would leave an
+    // unwiped copy of the secret's text).
+    let len = head.len() + secret.len() + MIDDLE.len() + public.len() + TAIL.len();
+    let mut out = Zeroizing::new(Vec::with_capacity(len));
+    out.extend_from_slice(head.as_bytes());
     out.extend_from_slice(secret.as_bytes());
-    out.extend_from_slice(br#"","pub":""#);
+    out.extend_from_slice(MIDDLE);
     out.extend_from_slice(public.as_bytes());
-    out.extend_from_slice(br#""}"#);
+    out.extend_from_slice(TAIL);
     out
 }
 
@@ -247,7 +254,8 @@ fn record_bytes(host_trust_gen: u64, kids: &[[u8; 8]]) -> Vec<u8> {
 /// What the record held before [`record_kid`] made it list a key's id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Prior {
-    /// It listed it already: nothing was written.
+    /// It listed it already: nothing was written; the file and its
+    /// directory were synced.
     Listed,
     /// The generation's record without it: the id was added.
     Added,
@@ -278,7 +286,9 @@ impl Prior {
 }
 
 /// Makes the record of generation `generation` list `kid`, durably (fsync,
-/// rename, directory fsync), unless it does already.
+/// rename, directory fsync). One that lists it already is synced (the file,
+/// then the directory): a record left visible by a failed directory fsync
+/// isn't durable yet, and the id must be before a key goes.
 fn record_kid(store: &mut Store, generation: u64, kid: [u8; 8]) -> Result<Prior, WriteError> {
     let (prior, mut kids) = match read_record(store) {
         Record::Of {
@@ -286,6 +296,7 @@ fn record_kid(store: &mut Store, generation: u64, kid: [u8; 8]) -> Result<Prior,
             kids,
         } if host_trust_gen == generation => {
             if kids.contains(&kid) {
+                store.sync(DlFile::HostEncGenerated)?;
                 return Ok(Prior::Listed);
             }
             (Prior::Added, kids)
@@ -513,4 +524,22 @@ pub fn recipient(src: &crate::profile::Sources) -> Result<HostRecipient, String>
         },
         provider,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The key file's bytes are built in one buffer of their exact size:
+    /// no reallocation leaves an unwiped copy of the secret's text behind,
+    /// whatever the generation's digits.
+    #[test]
+    fn the_key_files_bytes_fit_their_buffer() {
+        for generation in [1, 42, u64::MAX] {
+            let bytes = key_bytes(generation, &[1; 32], &[2; 32]);
+            assert_eq!(bytes.capacity(), bytes.len(), "{generation}");
+            let file: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(file["host_trust_gen"], generation);
+        }
+    }
 }

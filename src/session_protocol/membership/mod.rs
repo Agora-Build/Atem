@@ -101,19 +101,23 @@ const EVIDENCE_PERSIST_MS: u64 = 60_000;
 const CHECKPOINT_MS: u64 = 60_000;
 /// r9 files that exist only with a device list (§R9.3): one of them
 /// without `membership.json` is a damaged or half-removed list.
-const LEFTOVERS: [DlFile; 11] = [
+const LEFTOVERS: [DlFile; 9] = [
     DlFile::Carriage,
     DlFile::Intent,
     DlFile::Freeze,
     DlFile::Fault,
     DlFile::FaultMirror,
     DlFile::HostChannelKey,
-    DlFile::HostEncKey,
-    DlFile::HostEncGenerated,
     DlFile::HostPolicy,
     DlFile::HostPolicyPending,
     DlFile::Applied,
 ];
+/// Files removed with a device list (every pin, a pin taken back, `atem
+/// unpair`, its leftovers' removal) that are no leftover: the host
+/// encryption key and its record (`r9::host_enc`) grant nothing without the
+/// list, so ones left behind (by a build that doesn't know them) don't fail
+/// the list's start closed and count as no device-list file.
+pub(super) const DELETE_ONLY: [DlFile; 2] = [DlFile::HostEncKey, DlFile::HostEncGenerated];
 /// A device-list write fault is recorded: `membership.fault` or its mirror
 /// in the journal's directory, in any state.
 fn fault_recorded(store: &Store) -> bool {
@@ -694,7 +698,7 @@ impl MembershipHost {
         // `membership.json` first: a pin interrupted after it fails closed
         // (a leftover without the list) until the next pin or unpair.
         store.remove(DlFile::State).map_err(|e| e.to_string())?;
-        for file in LEFTOVERS {
+        for file in LEFTOVERS.into_iter().chain(DELETE_ONLY) {
             store.remove(file).map_err(|e| e.to_string())?;
         }
         // An earlier list's deferral names nothing of this one (and is
@@ -2388,7 +2392,7 @@ thread_local! {
 /// `frozen_genesis` (≤ 16, oldest dropped), then `membership.json` is
 /// removed first, then every other r9 file (the carriage record, intent,
 /// freeze and fault records, the host channel key, the host encryption key
-/// and its record, the journal's `membership_applied`). `frozen_genesis` stays. Until `membership.json`
+/// and its record (`DELETE_ONLY`), the journal's `membership_applied`). `frozen_genesis` stays. Until `membership.json`
 /// is gone nothing changed (an error leaves the host paired as it was);
 /// after that, any file left makes the next start fail closed.
 pub fn forget_on_unpair(pairing: &PairingPaths) -> Result<(), ForgetError> {
@@ -2460,7 +2464,7 @@ pub fn forget_on_unpair(pairing: &PairingPaths) -> Result<(), ForgetError> {
             message: e.to_string(),
         });
     }
-    for file in LEFTOVERS {
+    for file in LEFTOVERS.into_iter().chain(DELETE_ONLY) {
         if file == DlFile::Applied {
             continue;
         }
@@ -2481,7 +2485,7 @@ pub fn forget_leftovers(pairing: &PairingPaths) -> Result<(), String> {
     if let Some(injected) = FORGET_FAULT.with(|f| f.take()) {
         store.inject(injected);
     }
-    for file in LEFTOVERS {
+    for file in LEFTOVERS.into_iter().chain(DELETE_ONLY) {
         store.remove(file).map_err(|e| e.to_string())?;
     }
     // Not a leftover (a stale one is dropped when a list opens): best effort.

@@ -281,7 +281,9 @@ pub fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
     if meta.len() > MAX_FILE {
         return Err(io::Error::other("too large"));
     }
-    let mut bytes = Vec::new();
+    // Sized once: a key file's bytes never sit in a buffer that grew and
+    // was freed unwiped.
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
     file.read_to_end(&mut bytes)?;
     Ok(Some(bytes))
 }
@@ -452,6 +454,37 @@ impl Store {
             });
             io(Step::DirectoryFsync, e)
         })
+    }
+
+    /// Makes `file` as it is durable: the file's fsync, then its
+    /// directory's (a rename whose directory fsync failed is visible but
+    /// may not be durable). Each step can fail on purpose like a write's:
+    /// the file's fsync as `TempFsync`, the directory's as `DirectoryFsync`.
+    pub fn sync(&mut self, file: DlFile) -> Result<(), WriteError> {
+        let path = self.path(file);
+        let dir = self.dir_of(file);
+        let io = |step, e: io::Error| Self::failure(file, step, e.to_string());
+        if self.fails(file, Step::TempFsync) {
+            return Err(Self::failure(
+                file,
+                Step::TempFsync,
+                "injected fsync failure",
+            ));
+        }
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| io(Step::TempFsync, e))?;
+        if self.fails(file, Step::DirectoryFsync) {
+            return Err(Self::failure(
+                file,
+                Step::DirectoryFsync,
+                "injected directory fsync failure",
+            ));
+        }
+        sync_dir(&dir).map_err(|e| io(Step::DirectoryFsync, e))
     }
 
     /// Removes `file` (if present), then fsyncs its directory.
