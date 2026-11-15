@@ -751,9 +751,8 @@ impl FeedStore {
 
     /// [`FeedStore::apply`] for a record `carrier` brought over a channel
     /// (no position): its alerts are rate-limited per carrier. Channels
-    /// carry records only with `host.senders` (stage 3, not built): only the
-    /// tests apply one yet.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// carry records only with `host.senders` (host principals' records:
+    /// `HostBridge::apply_carried_records`).
     pub fn apply_carried(
         &mut self,
         tx: &FeedTx,

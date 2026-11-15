@@ -217,10 +217,11 @@ pub(super) struct State {
     /// the pinned device list before the start's recovery and any
     /// dispatch.
     pub(super) feeds: crate::runtime::delegated::feeds::Feeds,
-    /// The device list's head (`seq`, hash) the pending control records
-    /// were last applied again at (`feeds_reverify`): none since the feeds
-    /// loaded, so once at start.
-    reverified: Option<(u64, atem_client::encoding::Hash32)>,
+    /// The device list's head (`seq`, hash) and host-work's applied
+    /// device-list `seq` the pending control records were last applied
+    /// again at (`feeds_reverify`): none since the feeds loaded, so once at
+    /// start.
+    reverified: Option<(u64, atem_client::encoding::Hash32, u64)>,
     /// Pending control records a re-verification applied, their effects
     /// written with them, kept for Task 36's acknowledgments
     /// (`keep_reapplied`).
@@ -1122,6 +1123,9 @@ impl HostBridge {
                     self.host_senders_pass();
                     self.feeds_reverify();
                 }
+                // Host senders' later interrupts carried on channels: stops,
+                // served while paused (answered `busy` when they can't be).
+                self.control_records_pass();
             }
             // A stop always wins: what control records' effects asked once
             // they committed is carried out while paused too.
@@ -1153,6 +1157,10 @@ impl HostBridge {
         // sender's revoke sees its effects.
         self.host_senders_pass();
         self.feeds_reverify();
+        // Host senders' later interrupts carried on channels, after their
+        // revokes' effects (their intents wait for the recovery as the
+        // feed's do).
+        self.control_records_pass();
         // A load that found the control state damaged (or a new identity's
         // store not loaded yet) closes the services' r9 access at once
         // (ruling T35c).

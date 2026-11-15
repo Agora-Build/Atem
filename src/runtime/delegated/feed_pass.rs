@@ -17,11 +17,19 @@
 //! - **Re-verification** (Task 32 review). The pending records are applied
 //!   again once at start after the load, and whenever the device list the
 //!   start view holds moved (its head, every commit path alike: carriages,
-//!   the host's own fetch, recovery approvals and vetoes), in their own
-//!   transaction; after a record whose revocation applied, in that
-//!   record's own (the sync does it). Host-work's applied device-list
-//!   `seq` is 0 in step 4: no host sender's revoke entry is applied here
-//!   (`host.senders` isn't served), so a host principal's interrupt waits.
+//!   the host's own fetch, recovery approvals and vetoes) or host-work's
+//!   applied device-list `seq` did, in their own transaction; after a
+//!   record whose revocation applied, in that record's own (the sync does
+//!   it). Host-work's applied device-list `seq` is the one host senders'
+//!   device-list effects are written up to (`host_senders_pass`), with
+//!   `host.senders` on; with it off it is 0, so a host principal's
+//!   interrupt waits, as in step 4.
+//! - **Records carried on channels** (design II.3.1, host-work-v1 §11.1
+//!   "Carriage"), with `host.senders` on: a native member's
+//!   `control_records`, host principals' records only (the r9 engine
+//!   refused anything else), applied as a feed's records are, in one
+//!   transaction with their effects, and answered on the channel
+//!   ([`HostBridge::control_records_pass`]).
 //! - **What the feed store sees** (Task 33 review I1). The sync runs
 //!   whether or not host-work's pass does (a pause skips it), so each step
 //!   gives the store the Station link's own origin itself (positions name
@@ -51,8 +59,10 @@ use crate::runtime::delegated::sync::{Clocks, Closed, PageCx};
 use crate::session_protocol::membership::ListState;
 use atem_client::control::{ControlSyncResult, Heads, RelayError};
 
-/// Host-work's applied device-list `seq` in step 4 (see the module docs).
-const APPLIED_SEQ: u64 = 0;
+/// Why a `control_records` call isn't applied now (`busy`): the hook off,
+/// the device list not serving, the control state not loaded, or its
+/// transaction failed. The carrier delivers it again.
+const RECORDS_NOT_APPLIED: &str = "control records not applied now";
 
 /// The re-verified records kept for Task 35 at most (`keep_reapplied`).
 pub(crate) const KEPT_REAPPLIED: usize = 64;
@@ -90,6 +100,26 @@ pub(crate) fn sync_clocks() -> Clocks {
 }
 
 impl HostBridge {
+    /// Host-work's applied device-list `seq` for `list` (design II.3.1): host
+    /// senders' device-list effects are durable up to it
+    /// (`host_senders_pass`), with `host.senders` on; 0 otherwise, as in step
+    /// 4 (nothing writes them: a host principal's interrupt waits). A row
+    /// that can't be read counts as 0: the interrupt waits (fail closed),
+    /// and the next pass of host senders' effects faults on it.
+    fn host_applied_seq(&self, list: &ListState) -> u64 {
+        if !(self.features.delegated && self.features.senders) {
+            return 0;
+        }
+        let genesis = list.membership.genesis_hash();
+        self.work
+            .store
+            .as_ref()
+            .and_then(|store| {
+                crate::runtime::delegated::host_senders::applied_seq(&store.db, &genesis).ok()
+            })
+            .unwrap_or(0)
+    }
+
     /// The committed device list (copied out of the start view), and the
     /// feed store given the Station link's own origin: positions name it
     /// only, and the sync hands the store pages and `heads` whether or not
@@ -249,6 +279,7 @@ impl HostBridge {
         // Copied out: a commit publishes the standings into the view.
         let list = self.sync_list();
         let fits = loaded(&self.work, list.as_ref(), &self.work_host()).is_some();
+        let applied_seq = list.as_ref().map_or(0, |l| self.host_applied_seq(l));
         let State {
             feeds,
             store,
@@ -262,7 +293,7 @@ impl HostBridge {
                 store,
                 feeds: feeds.as_mut(),
                 list,
-                applied_seq: APPLIED_SEQ,
+                applied_seq,
             }),
             _ => None,
         };
@@ -309,7 +340,8 @@ impl HostBridge {
             return;
         }
         let head = list.membership.head();
-        let key = (head.seq, head.hash);
+        let applied_seq = self.host_applied_seq(&list);
+        let key = (head.seq, head.hash, applied_seq);
         if self.work.reverified == Some(key) {
             return;
         }
@@ -330,7 +362,7 @@ impl HostBridge {
             // taken only once it committed.
             let again = (|| -> anyhow::Result<(Vec<Reapplied>, Vec<Followup>)> {
                 let tx = feeds.begin(store)?;
-                let again = feeds.reverify_pending(&tx, &list, APPLIED_SEQ)?;
+                let again = feeds.reverify_pending(&tx, &list, applied_seq)?;
                 let mut followups = Vec::new();
                 let mut acked = Vec::new();
                 for r in &again {
@@ -350,6 +382,85 @@ impl HostBridge {
             self.keep_reapplied(again);
         }
         self.work.reverified = Some(key);
+    }
+
+    /// The `control_records` calls the r9 engine took from native members'
+    /// channels, each applied ([`HostBridge::apply_carried_records`]) and
+    /// answered on its channel: its `control_records_result`, or `busy` when
+    /// it couldn't be applied now. A stop: served while hosting is paused
+    /// too.
+    pub(crate) fn control_records_pass(&mut self) {
+        for call in self.r9.take_control_records() {
+            let reply = self.apply_carried_records(&call.carrier, &call.request.records);
+            let now = self.clock.now();
+            self.r9
+                .control_records_reply(&call.attachment, &call.request.id, reply, now);
+        }
+    }
+
+    /// `records` (host principals' `interrupt_running`, design II.3.1, "A
+    /// later interrupt"), carried by `carrier` (no authority from carrying):
+    /// applied in one transaction, verified against the device list as it
+    /// committed, as the feed's records are (`FeedStore::apply_carried`:
+    /// pending until host-work's applied device-list `seq` reaches the
+    /// revoke, a duplicate for a revoke already interrupted), with their
+    /// effects on the tasks (`effects::act`: an intent for each of the
+    /// host's tasks admitted before that revoke whose turn may run). Their
+    /// results, in order, once committed; what the effects ask after the
+    /// commit goes with the feed's. `busy` with nothing applied: the hook
+    /// off, the list not serving, the control state not loaded for it, or a
+    /// transaction that failed.
+    pub(crate) fn apply_carried_records(
+        &mut self,
+        carrier: &str,
+        records: &[atem_client::control::ControlRecord],
+    ) -> Result<Vec<atem_client::session::r9::RecordResult>, HostWorkError> {
+        use atem_client::session::r9::RecordResult;
+        let busy = HostWorkError {
+            code: "busy",
+            detail: Some(RECORDS_NOT_APPLIED),
+        };
+        if !(self.features.delegated && self.features.senders) {
+            return Err(busy);
+        }
+        let list = self.start_view().list.clone().ok_or(busy)?;
+        if !FeedStore::serves(&list) || loaded(&self.work, Some(&list), &self.work_host()).is_none()
+        {
+            return Err(busy);
+        }
+        let applied_seq = self.host_applied_seq(&list);
+        let State {
+            feeds: Feeds::Loaded(feeds),
+            store: Some(store),
+            ..
+        } = &mut self.work
+        else {
+            return Err(busy);
+        };
+        let applied = (|| -> anyhow::Result<(Vec<RecordResult>, Vec<Followup>)> {
+            let tx = feeds.begin(store)?;
+            let mut results = Vec::new();
+            let mut followups = Vec::new();
+            for record in records {
+                let applied = feeds.apply_carried(&tx, record, &list, carrier, applied_seq)?;
+                followups.extend(act(store, &tx, &applied.actions)?);
+                results.push(RecordResult::of(record, &applied));
+            }
+            feeds.commit(tx)?;
+            Ok((results, followups))
+        })();
+        match applied {
+            Ok((results, followups)) => {
+                self.work.followups.extend(followups);
+                Ok(results)
+            }
+            Err(error) => {
+                eprintln!(
+                    "atem runtime: control records carried by {carrier} couldn't be applied ({error:#}); nothing of them applied"
+                );
+                Err(busy)
+            }
+        }
     }
 
     /// Records a re-verification applied (Task 33 review m4), their

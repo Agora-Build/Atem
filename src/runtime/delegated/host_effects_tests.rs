@@ -491,3 +491,235 @@ fn without_host_senders_no_effects_table_is_made() {
         assert_eq!(applied(&rig), 0);
     });
 }
+
+// ── A native manager's later `interrupt_running` about a host sender ──
+
+/// A native manager's (the Mac's) `interrupt_running` record about host B,
+/// for its revoke at `revoke_seq` (design II.3.1, "A later interrupt"):
+/// bound to no feed, no principal key.
+fn host_interrupt(log: &TestLog, revoke_seq: u64) -> atem_client::control::ControlRecord {
+    use atem_client::control::{
+        ControlAbout, ControlAction, ControlBody, ControlPrincipal, ControlRecord, ControlSigner,
+        build_control,
+    };
+    let body = ControlBody {
+        account_id: log.account.clone(),
+        genesis_hash: log.genesis_hash(),
+        feed: None,
+        principal: ControlPrincipal::Host("host-b".into()),
+        principal_key: None,
+        signer: ControlSigner::Member(MAC.into()),
+        action: ControlAction::InterruptRunning {
+            revoke_seq: Some(revoke_seq),
+        },
+        record_id: uuid::Uuid::new_v4().to_string(),
+        issued_at: host_now().wall_ms,
+        about: ControlAbout {
+            integration_id: None,
+            by: "owner".into(),
+        },
+    };
+    ControlRecord::from_signed(build_control(&log.keys, &auth(MAC), &body).unwrap()).unwrap()
+}
+
+/// What the host answered `records`, carried on the phone's channel: each
+/// record's result and its interrupt effect's.
+fn interrupt_results(
+    results: &[atem_client::session::r9::RecordResult],
+) -> Vec<(
+    atem_client::control::ApplicationResult,
+    atem_client::control::ApplicationResult,
+)> {
+    results
+        .iter()
+        .map(|r| {
+            assert_eq!(r.effects.len(), 1, "{r:?}");
+            (r.result, r.effects[0].result)
+        })
+        .collect()
+}
+
+/// Design II.3.1 ("A later interrupt"), I.5.7, VII.B test 27: after a
+/// revoke without `interrupt_running` and a readmit, a native manager's
+/// `interrupt_running` for that revoke, carried over a channel, writes an
+/// intent for B's started task admitted before the revoke, and none for its
+/// task admitted after the readmit (whose attempt waits `accepted`): the
+/// first turn is interrupted once, then the later task runs. The same
+/// record again, and another for the same revoke, are duplicates: nothing
+/// more is written.
+#[test]
+fn a_later_interrupt_record_interrupts_only_tasks_admitted_before_the_revoke() {
+    use crate::runtime::delegated::intents::IntentReason;
+    use atem_client::control::ApplicationResult::{Applied, Duplicate};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let running = host_running(&mut rig, &s, "HS_LATER_RUNNING", start).await;
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        let revoke_seq = s.log.log.head().seq;
+        sign_and_carry(&mut rig, &mut s, host_sender_readmit("host-b", 0).unwrap());
+        passes(&mut rig, 1);
+        assert_eq!(settled(&rig, &running).0, WorkState::Submitted);
+        let after = host_task(&mut rig, &s, "HS_LATER_AFTER", start + HOUR);
+        blocked(&mut rig, &after, BEHIND).await;
+        let attempt = attempt_behind_the_turn(&mut rig, &after, "HS_LATER_AFTER");
+        let record = host_interrupt(&s.log, revoke_seq);
+        let results = rig
+            .bridge
+            .apply_carried_records("member:dev-phone", std::slice::from_ref(&record))
+            .unwrap();
+        assert_eq!(results[0].record_id, record.record_id());
+        assert_eq!(interrupt_results(&results), [(Applied, Applied)]);
+        let stored = intents(&rig, &running);
+        assert_eq!(
+            stored.iter().map(|i| &i.reason).collect::<Vec<_>>(),
+            [&IntentReason::Revoke {
+                revocation: revoke_seq.to_string()
+            }]
+        );
+        assert!(
+            intents(&rig, &after).is_empty(),
+            "admitted after the readmit"
+        );
+        passes(&mut rig, 2);
+        escs_reach(&rig, 1).await;
+        settle(&mut rig).await;
+        turn_interrupted(&mut rig, &running).await;
+        rig.until(|r| settled(r, &running).0 == WorkState::AwaitingResult)
+            .await;
+        assert_eq!(settled(&rig, &running).1, "turn interrupted");
+        let again = rig
+            .bridge
+            .apply_carried_records(
+                "member:dev-phone",
+                &[record, host_interrupt(&s.log, revoke_seq)],
+            )
+            .unwrap();
+        assert_eq!(
+            interrupt_results(&again),
+            [(Duplicate, Duplicate), (Duplicate, Duplicate)]
+        );
+        assert_eq!(intents(&rig, &running).len(), 1);
+        // The later task's attempt starts once the turn ended: it runs.
+        rig.until(|r| input(r).contains("HS_LATER_AFTER")).await;
+        assert_eq!(
+            attempts(&rig, &after)[0].0,
+            attempt,
+            "its own attempt, never withdrawn"
+        );
+        assert_eq!(escs(&rig), 1);
+    });
+}
+
+/// Host-work-v1 §11.1 rule 4 (design II.3.1): a host principal's interrupt
+/// waits until host-work's applied device-list `seq` reaches its revoke,
+/// whose cancellations are durable then: carried before the revoke's
+/// effects were written, it is `pending`, and applies (its intent written)
+/// in the pass that writes them. A revoke that carried `interrupt_running`
+/// itself makes a later record for it a duplicate.
+#[test]
+fn an_interrupt_record_waits_for_its_revokes_effects() {
+    use atem_client::control::ApplicationResult::{Duplicate, Pending};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let running = host_running(&mut rig, &s, "HS_WAIT_RUNNING", start).await;
+        hold_host_work(&mut rig);
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        let revoke_seq = s.log.log.head().seq;
+        assert!(applied(&rig) < revoke_seq);
+        let results = rig
+            .bridge
+            .apply_carried_records("member:dev-phone", &[host_interrupt(&s.log, revoke_seq)])
+            .unwrap();
+        assert_eq!(interrupt_results(&results), [(Pending, Pending)]);
+        assert!(intents(&rig, &running).is_empty());
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), revoke_seq);
+        assert_eq!(intents(&rig, &running).len(), 1, "applied once it may");
+        // A revoke that asked for the interrupt itself.
+        sign_and_carry(&mut rig, &mut s, host_sender_readmit("host-b", 0).unwrap());
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", true, 0).unwrap(),
+        );
+        let second = s.log.log.head().seq;
+        ticks(&mut rig, 1);
+        let results = rig
+            .bridge
+            .apply_carried_records("member:dev-phone", &[host_interrupt(&s.log, second)])
+            .unwrap();
+        assert_eq!(interrupt_results(&results), [(Duplicate, Duplicate)]);
+    });
+}
+
+/// Session-v1 R9.8, host-work-v1 §11.1 ("Carriage"): with `host.senders`
+/// on, a native member's `control_records` reaches the runtime over its
+/// channel and is answered there, `control_records_result` with one result
+/// per record, after the records applied (the intent written).
+#[test]
+fn control_records_on_a_natives_channel_are_answered() {
+    use atem_client::connect::Event as CEvent;
+    use atem_client::control::ApplicationResult::Applied;
+    use atem_client::session::r9::ControlRecordsResult;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        rig.bridge.r9.set_delegated_features(true, false);
+        rig.bridge.r9.set_senders_feature(true);
+        rig.bridge.r9.enable_host_work(true);
+        r9_link_up(&mut rig);
+        let running = host_running(&mut rig, &s, "HS_CHANNEL_RUNNING", start).await;
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        passes(&mut rig, 1);
+        let mut ch = channel(&mut rig, &s.log, "ph-1", "dev-phone");
+        assert!(
+            ch.welcome()
+                .features
+                .iter()
+                .any(|f| f == atem_client::session::host_work::SENDERS_FEATURE)
+        );
+        let record = host_interrupt(&s.log, s.log.log.head().seq);
+        let (id, frame) = ch
+            .send_control_records(std::slice::from_ref(&record), 2)
+            .unwrap();
+        envelope_in(&mut rig, &envelope::frame("ph-1", &frame));
+        passes(&mut rig, 1);
+        let mut answers = Vec::new();
+        for frame in frames_for(&mut rig, "ph-1") {
+            for event in ch.on_frame(&frame, 3).unwrap() {
+                if let CEvent::Family(message) = event
+                    && let Some(data) = message.data
+                    && let Ok(result) = ControlRecordsResult::from_data(&data)
+                {
+                    answers.push(result);
+                }
+            }
+        }
+        let [answer] = answers.as_slice() else {
+            panic!("one answer: {answers:?}");
+        };
+        assert_eq!(answer.re, id);
+        assert_eq!(interrupt_results(&answer.results), [(Applied, Applied)]);
+        assert_eq!(intents(&rig, &running).len(), 1);
+    });
+}

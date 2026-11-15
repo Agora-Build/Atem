@@ -7,7 +7,9 @@
 //! (its `attachment_gen`), a principal's attachments together (its §H
 //! `control_gen`). An op of a feature the welcome doesn't list (such as
 //! `control_records` and `host_enc_key_get`, of `host.senders`, which only
-//! the debug-only hook lists) is `unsupported_version`.
+//! the debug-only hook lists) is `unsupported_version`; with it listed,
+//! `control_records` is handed to the runtime ([`ControlRecordsCall`]) and
+//! `host_enc_key_get` served.
 //!
 //! Sans-I/O. The transport seam is the channel envelope ([`envelope`]):
 //! [`R9Host::link_up`]/[`R9Host::link_down`] for Atem's link, every
@@ -339,6 +341,22 @@ impl From<&'static str> for HostWorkError {
     }
 }
 
+/// A native member's `control_records` (session-v1 R9.3, R9.8; host-work-v1
+/// §11.1 "Carriage"), with `host.senders` listed: read strictly and waiting
+/// for the runtime, which holds the control state and answers it
+/// ([`R9Host::control_records_reply`]).
+pub struct ControlRecordsCall {
+    pub attachment: String,
+    /// The carrier's principal: it gets no authority from carrying; it only
+    /// names where the records came from (their alerts' rate limits).
+    pub carrier: String,
+    pub request: atem_client::session::r9::ControlRecordsRequest,
+}
+
+/// The most `control_records` calls waiting for the runtime; one more is
+/// `busy`.
+const MAX_CONTROL_RECORDS_CALLS: usize = 16;
+
 pub struct R9Host {
     host_work_enabled: bool,
     /// While host work is off (hosting paused), `work_interrupt` is still
@@ -351,6 +369,7 @@ pub struct R9Host {
     alerts: bool,
     senders: bool,
     host_work_requests: VecDeque<HostWorkRequest>,
+    control_records: VecDeque<ControlRecordsCall>,
     limits: Limits,
     /// The live link generation.
     link: Option<u64>,
@@ -557,15 +576,6 @@ fn close_reason(e: &ChannelError) -> &'static str {
     }
 }
 
-/// `host.senders`'s session ops this host doesn't serve yet, even with the
-/// feature listed (only the debug-only hook lists it): refused as while it
-/// isn't (`unsupported_version`, `host.senders is not advertised`), nothing
-/// read or recorded. `control_records` carries host senders' stops
-/// (session-v1 R9.8, host-work-v1 §11.1), which a later change serves.
-fn senders_op_unserved(op: &str) -> bool {
-    op == "control_records"
-}
-
 /// The feature of an op that exists only for delegated host work (plan
 /// decision 4): `control_records` and `host_enc_key_get` are
 /// `host.senders`'s; `work_interrupt` and `work_resolve` are
@@ -711,6 +721,33 @@ impl R9Host {
         self.host_work_requests.drain(..).collect()
     }
 
+    /// The `control_records` calls waiting for the runtime, oldest first.
+    pub fn take_control_records(&mut self) -> Vec<ControlRecordsCall> {
+        self.control_records.drain(..).collect()
+    }
+
+    /// The runtime's answer to the `control_records` `re` that came on
+    /// `attachment`: its `control_records_result` (one result per record, in
+    /// order), or a refusal naming the request. Nothing when the attachment
+    /// is gone.
+    pub fn control_records_reply(
+        &mut self,
+        attachment: &str,
+        re: &str,
+        result: Result<Vec<atem_client::session::r9::RecordResult>, HostWorkError>,
+        now: u64,
+    ) {
+        let bytes = match result {
+            Ok(results) => {
+                atem_client::session::r9::control_records_result(&new_id(), re, &results)
+                    .to_string()
+                    .into_bytes()
+            }
+            Err(e) => error(e.code, Some(re), e.detail).to_bytes(),
+        };
+        self.seal_to(attachment, &bytes, now);
+    }
+
     pub fn current_work_authority<J: Journal>(
         &self,
         attachment: &str,
@@ -807,6 +844,7 @@ impl R9Host {
             alerts: false,
             senders: false,
             host_work_requests: VecDeque::new(),
+            control_records: VecDeque::new(),
             limits,
             link: None,
             chans: BTreeMap::new(),
@@ -2149,10 +2187,7 @@ impl R9Host {
             let op = data.get("op").and_then(Value::as_str);
             let unadvertised = op
                 .and_then(delegated_feature_of)
-                .filter(|feature| {
-                    !self.advertised_features().iter().any(|f| f == feature)
-                        || op.is_some_and(senders_op_unserved)
-                })
+                .filter(|feature| !self.advertised_features().iter().any(|f| f == feature))
                 .filter(|_| !stop_while_paused);
             if matches!(
                 data.get("op").and_then(Value::as_str),
@@ -2211,6 +2246,26 @@ impl R9Host {
             }
             match data.get("op").and_then(Value::as_str) {
                 Some("membership") => return self.membership_op(att, plain, re.as_deref(), parts),
+                // `host.senders` listed (else refused above): a native
+                // member's (the authority check above) host principals'
+                // records, read strictly, one that doesn't parse or a
+                // service's spoiling the whole message (host-work-v1 §11.1,
+                // "Carriage"); the runtime applies them and answers.
+                Some("control_records") => {
+                    if self.control_records.len() >= MAX_CONTROL_RECORDS_CALLS {
+                        refuse(self, code::BUSY, None);
+                        return Vec::new();
+                    }
+                    match atem_client::session::r9::ControlRecordsRequest::decode(plain) {
+                        Ok(request) => self.control_records.push_back(ControlRecordsCall {
+                            attachment: att.to_owned(),
+                            carrier: authority.name(),
+                            request,
+                        }),
+                        Err(why) => refuse(self, code::INVALID_REQUEST, Some(why)),
+                    }
+                    return Vec::new();
+                }
                 Some("revoke_grant") => {
                     return self.revoke_grant(att, authority, &data, re.as_deref(), parts);
                 }
