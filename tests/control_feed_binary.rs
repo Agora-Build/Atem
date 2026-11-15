@@ -4272,6 +4272,14 @@ fn a_reverify_on_a_live_link_starts_a_fresh_authenticated_link_generation() {
     use atem_client::control::AckRefusal;
     let mut rig = Rig::full(Via::Relay);
     let old_link = rig.link();
+    // Every connection the fake takes, whatever event a helper skips:
+    // its numbers only grow.
+    let connections = rig.astation.sender();
+    assert_eq!(
+        connections.latest(),
+        Some(old_link),
+        "the runtime's one link"
+    );
     let old_proof = proof_on(&rig, old_link);
     let old_head = rig.log.log.head().seq;
     assert_eq!(route_head(&rig.log, &old_proof), Ok(old_head));
@@ -4347,6 +4355,7 @@ fn a_reverify_on_a_live_link_starts_a_fresh_authenticated_link_generation() {
     // The operation ends: the link reconnects, once.
     end_reverify(&rig, verify, old_link);
     let new_link = rig.next_link(old_link);
+    assert_eq!(new_link, old_link + 1, "no other connection between");
     rig.link.set(new_link);
     let new_proof = proof_on(&rig, new_link);
     assert_eq!(route_head(&rig.log, &new_proof), Ok(old_head + 1));
@@ -4396,7 +4405,9 @@ fn a_reverify_on_a_live_link_starts_a_fresh_authenticated_link_generation() {
         1
     );
     assert_eq!(rig.station().ack_refusals().len(), 1);
-    // Once: no third connection.
+    // Once: no third connection, over the whole test (the fake's own
+    // count, a connection that never authenticated included), after 2 s
+    // more for a late one; and the new socket was never marked moved.
     let quiet = Instant::now() + Duration::from_secs(2);
     while let Ok(event) = rig
         .astation
@@ -4408,6 +4419,13 @@ fn a_reverify_on_a_live_link_starts_a_fresh_authenticated_link_generation() {
             "reconnected again"
         );
     }
+    assert_eq!(
+        connections.latest(),
+        Some(new_link),
+        "two connections in all"
+    );
+    assert_eq!(rig.feed()["identity_moves"], 1, "{}", rig.feed());
+    assert_eq!(rig.feed()["identity_moved"], false, "{}", rig.feed());
 }
 
 /// Hook off = main: the same re-verify on a live relay link keeps the link.
