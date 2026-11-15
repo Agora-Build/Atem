@@ -234,6 +234,11 @@ pub(super) struct State {
     /// senders' device-list effects were last written up to
     /// (`host_senders_pass`): a pass where neither moved reads nothing.
     host_applied: Option<(HostTarget, u64, atem_client::encoding::Hash32)>,
+    /// Host-work's applied device-list `seq` as last written or read, with
+    /// the identity and the list's genesis it counts for
+    /// (`host_senders_pass`; `host_applied_seq` reads it, the store only
+    /// while it is unknown).
+    applied_seq: Option<(HostTarget, atem_client::encoding::Hash32, u64)>,
     /// Acknowledgments whose `sent` mark failed to write, and those the
     /// shared builder refused, in this run (their log lines: the first,
     /// then at powers of two).
@@ -326,6 +331,7 @@ impl State {
             reapplied: Vec::new(),
             followups: Vec::new(),
             host_applied: None,
+            applied_seq: None,
             ack_failures: 0,
             ack_unbuilt: 0,
             kept: None,

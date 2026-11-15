@@ -105,12 +105,20 @@ impl HostBridge {
     /// (`host_senders_pass`), with `host.senders` on; 0 otherwise, as in step
     /// 4 (nothing writes them: a host principal's interrupt waits). A row
     /// that can't be read counts as 0: the interrupt waits (fail closed),
-    /// and the next pass of host senders' effects faults on it.
-    fn host_applied_seq(&self, list: &ListState) -> u64 {
+    /// and the next pass of host senders' effects faults on it. Kept in
+    /// memory once that pass wrote or read it, for this identity and list;
+    /// the store is read only while it is unknown.
+    pub(crate) fn host_applied_seq(&self, list: &ListState) -> u64 {
         if !(self.features.delegated && self.features.senders) {
             return 0;
         }
         let genesis = list.membership.genesis_hash();
+        if let Some((identity, kept, seq)) = &self.work.applied_seq
+            && *kept == genesis
+            && *identity == self.work_host()
+        {
+            return *seq;
+        }
         self.work
             .store
             .as_ref()

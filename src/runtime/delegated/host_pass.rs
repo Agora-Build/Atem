@@ -47,10 +47,10 @@ impl HostBridge {
             return;
         }
         let genesis = list.membership.genesis_hash();
-        let done = (|| -> anyhow::Result<Vec<Followup>> {
+        let done = (|| -> anyhow::Result<(u64, Vec<Followup>)> {
             let after = host_senders::applied_seq(&store.db, &genesis)?;
             if after >= head.seq {
-                return Ok(Vec::new());
+                return Ok((after, Vec::new()));
             }
             let tx = store.immediate()?;
             let followups = host_senders::list_effects(
@@ -62,12 +62,15 @@ impl HostBridge {
             )?;
             host_senders::set_applied_seq(&tx, &genesis, head.seq)?;
             tx.commit()?;
-            Ok(followups)
+            Ok((head.seq, followups))
         })();
         match done {
-            Ok(followups) => {
+            Ok((applied, followups)) => {
                 self.work.followups.extend(followups);
                 self.work.host_applied = Some(key);
+                // Kept in memory from its commit (or its read): the sync and
+                // the re-verification read it from here.
+                self.work.applied_seq = Some((identity, genesis, applied));
             }
             Err(error) => {
                 eprintln!(

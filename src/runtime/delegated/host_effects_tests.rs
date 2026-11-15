@@ -809,3 +809,52 @@ fn a_carried_records_result_goes_to_its_channel_only() {
         assert_eq!(acks_owed_for_host_b(&rig), 0);
     });
 }
+
+thread_local! {
+    /// The statements this thread ran on a traced store.
+    static HS_TRACED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn hs_traced(sql: &str) {
+    HS_TRACED.with(|t| t.borrow_mut().push(sql.to_string()));
+}
+
+/// Host-work's applied device-list `seq` is kept in memory once a pass
+/// wrote (or read) it: a pass where the device list didn't move, and the
+/// sync's and re-verification's reads of it, run no statement on its row.
+#[test]
+fn the_applied_seq_is_read_from_memory() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        hold_host_work(&mut rig);
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), s.log.log.head().seq);
+        rig.bridge
+            .work
+            .store
+            .as_mut()
+            .unwrap()
+            .db
+            .trace(Some(hs_traced));
+        HS_TRACED.with(|t| t.borrow_mut().clear());
+        ticks(&mut rig, 3);
+        let list = rig.bridge.start_view().list.clone().unwrap();
+        assert_eq!(rig.bridge.host_applied_seq(&list), s.log.log.head().seq);
+        let reads: Vec<String> = HS_TRACED.with(|t| {
+            t.borrow()
+                .iter()
+                .filter(|sql| sql.contains("host_senders_applied"))
+                .cloned()
+                .collect()
+        });
+        assert!(reads.is_empty(), "{reads:?}");
+    });
+}
