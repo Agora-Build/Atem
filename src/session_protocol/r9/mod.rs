@@ -31,6 +31,8 @@
 pub mod envelope;
 #[cfg(test)]
 mod fixtures_tests;
+#[cfg(test)]
+mod hold_tests;
 pub mod host_policy;
 #[cfg(test)]
 mod host_policy_host_tests;
@@ -129,6 +131,11 @@ pub const DETAIL_REVOKED: &str = "revoked";
 /// its `hello`s, and its attachments closed when that state begins. The
 /// start check's text for the same wait (host-work-v1 §11.6).
 pub const DETAIL_UNCHECKED: &str = "revocations not yet checked";
+/// `busy` for a service a control record holds on this host (a `hold` not
+/// released since; behind `host.delegated`): its attachments get it before
+/// their close, and its later `hello`s, until a `release`. The start
+/// check's text for its held tasks (host-work-v1 §11.6).
+pub const DETAIL_PAUSED: &str = "paused";
 
 /// What the pairing directory vouches for, for the revoked grants (§R9.6).
 pub struct PairingVouch {
@@ -403,6 +410,10 @@ pub struct R9Host {
     /// ruling T35c; only behind `host.delegated`): every service's `hello`
     /// is refused `busy`, as host work answers its requests.
     services_unchecked: bool,
+    /// The services a control record holds on this host, as the runtime's
+    /// committed control state has them (only behind `host.delegated`):
+    /// their `hello`s and requests are refused `busy`, `paused`.
+    held_services: HashSet<String>,
     /// The `close` reason of an attachment the session host is about to
     /// close for a fence that ends its channel's lifetime (a service's or
     /// a browser grant's expiry): `expired`, not `closed`. Noted before the
@@ -792,6 +803,7 @@ impl R9Host {
             revoked_services: HashSet::new(),
             revoked_fenced: HashSet::new(),
             services_unchecked: false,
+            held_services: HashSet::new(),
             closing: HashMap::new(),
             dead: Vec::new(),
             flush_cursor: None,
@@ -1590,6 +1602,10 @@ impl R9Host {
                 ))
             } else if self.services_unchecked {
                 Some(error(code::BUSY, re.as_deref(), Some(DETAIL_UNCHECKED)))
+            } else if self.held_services.contains(&authority.name()) {
+                // A control record holds it (host-work-v1 §11.1, the hold's
+                // fence): until its release.
+                Some(error(code::BUSY, re.as_deref(), Some(DETAIL_PAUSED)))
             } else {
                 None
             };
@@ -1917,6 +1933,64 @@ impl R9Host {
         effects
     }
 
+    /// The services a control record holds on this host (a `hold` not
+    /// released since), as the runtime's committed control state has them
+    /// (only behind `host.delegated`, so empty otherwise; a revoked one is
+    /// never held: its revoke wins). The hold's reversible session-v1 fence
+    /// (host-work-v1 §11.1, **Atem's reading of Astation's item 7 on #120,
+    /// 2026-11-14**):
+    /// - a service newly held that the session host knows as a remote
+    ///   principal (an attachment, a lease, accepted work, or `control`) is
+    ///   fenced through §H, once per hold: its `control_gen` raised (so
+    ///   nothing it queued is dispatched: its accepted work is rejected,
+    ///   `control revoked`, and its raw input queued at the PTY writer is
+    ///   dropped at the write boundary, its lease revoked), each attachment
+    ///   it has closed after `busy`, `paused`;
+    /// - while held, its `hello`s are refused `busy`, `paused` (after the
+    ///   device list's own refusals, a revoke and the unchecked control
+    ///   state), and any request of an attachment of it is refused so before
+    ///   anything of it is read;
+    /// - a release (the service gone from the set) lifts the refusal: a
+    ///   fresh `hello` is admitted after the normal checks; no attachment,
+    ///   lease or command of before comes back.
+    ///
+    /// Only services: a native member or a browser grant named here is
+    /// ignored (a hold is signed by the service's own key). Nothing here
+    /// touches a delegated task: their attempts run under the `host-work`
+    /// principal, which no fence names, and the hold's own effects on them
+    /// are the record's.
+    pub fn set_held_services<J: Journal>(
+        &mut self,
+        held: HashSet<String>,
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        let held: HashSet<String> = held
+            .into_iter()
+            .filter(|p| p.starts_with("service:"))
+            .collect();
+        let newly: std::collections::BTreeSet<String> =
+            held.difference(&self.held_services).cloned().collect();
+        self.held_services = held;
+        if newly.is_empty() {
+            return Vec::new();
+        }
+        let remote: HashSet<String> = parts.host.remote_principals().into_iter().collect();
+        let mut effects = Vec::new();
+        for principal in newly.into_iter().filter(|p| remote.contains(p)) {
+            self.fence_errors.insert(
+                principal.clone(),
+                error(code::BUSY, None, Some(DETAIL_PAUSED)),
+            );
+            effects.extend(parts.host.fence_principal(&principal, 0));
+        }
+        effects
+    }
+
+    /// The services whose `hello`s are refused as held.
+    pub fn held_services(&self) -> &HashSet<String> {
+        &self.held_services
+    }
+
     /// Every r9 attachment gets `membership_head` (the head moved, or a
     /// pending entry changed state).
     pub fn announce<J: Journal>(&mut self, parts: &mut Parts<'_, J>) {
@@ -1948,6 +2022,15 @@ impl R9Host {
             };
             me.seal_to(att, &bytes, mono);
         };
+        // A service a control record holds: nothing of it is admitted,
+        // whatever it asks (its fence closes its attachments; this refuses
+        // what reaches the host before that close: host-work-v1 §11.1).
+        if matches!(authority.principal, Principal::Service { .. })
+            && self.held_services.contains(&authority.name())
+        {
+            refuse(self, code::BUSY, Some(DETAIL_PAUSED));
+            return Vec::new();
+        }
         // The one authority check for every request (§R9.6), before any
         // field is decoded: the named session first, then the op.
         let need = match Need::of_request(&family, &data) {

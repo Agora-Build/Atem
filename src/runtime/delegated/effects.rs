@@ -36,7 +36,11 @@
 //! - **Hold** (step 4). Unstarted tasks are `blocked`, `paused`; a live
 //!   attempt's withdrawal is asked, not counted toward the attempt limit
 //!   (I.6.4), and its task paused from it. A hold doesn't hold the session
-//!   (§11.6, "Waiting doesn't hold the session").
+//!   (§11.6, "Waiting doesn't hold the session"). Its session-v1 fence
+//!   (host-work-v1 §11.1, reversible) is no followup: the bridge fences a
+//!   held service from the committed standings, after the followups and
+//!   before the record's result goes (`HostBridge::sync_held`), and again at
+//!   the next load if a crash came between the commit and that pass.
 //! - **Release** (step 4). Tasks `blocked`, `paused` are `queued` again,
 //!   and get an attempt through the start check before their deadline (one
 //!   past it expires there).

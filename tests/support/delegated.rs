@@ -158,6 +158,15 @@ impl Dev {
         id
     }
 
+    /// Sends a message of `family` (terminal-v1, chat-v1) as built.
+    pub fn send_family(&mut self, r: &mut Router, family: &str, data: Value) {
+        let frame = self
+            .a
+            .send(&json!({"type": family, "data": data}), client_ms())
+            .unwrap();
+        r.frame(&self.handle, &frame);
+    }
+
     /// The first message (in the backlog, or arriving) `matches` takes.
     pub fn wait(&mut self, r: &mut Router, matches: impl Fn(&Value) -> bool) -> Value {
         let deadline = Instant::now() + WAIT;

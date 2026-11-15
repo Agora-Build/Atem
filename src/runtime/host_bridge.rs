@@ -1667,11 +1667,13 @@ impl HostBridge {
         // records are applied again.
         self.feeds_reverify();
         // What the records' effects asked once they committed (design
-        // I.5.5): withdrawals, fences, intents.
+        // I.5.5): withdrawals, fences, intents; then the services' admission
+        // as the committed standings have it (a hold's fence).
         self.effects_pass(cx);
         // The acknowledgments due (Task 36, §11.4): after the records'
-        // commits and their followups (a revoke's session-v1 fence), so a
-        // result goes once its effects are durable and its fence ran.
+        // commits and their followups (a revoke's or a hold's session-v1
+        // fence), so a result goes once its effects are durable and its
+        // fence ran.
         let acks = self.acks_due();
         let Some(station) = self.station.as_mut() else {
             return;

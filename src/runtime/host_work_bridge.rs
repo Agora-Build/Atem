@@ -2818,6 +2818,7 @@ mod local_tests {
         include!("delegated/work_interrupt_tests.rs");
         include!("delegated/launch_tests.rs");
         include!("delegated/effects_tests.rs");
+        include!("delegated/hold_fence_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};

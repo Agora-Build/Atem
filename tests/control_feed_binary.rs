@@ -50,6 +50,8 @@ const PHONE: &str = "dev-phone";
 /// The service the tests launch sessions with; delegated only while the
 /// fake Station's feed covers it.
 const SVC: &str = "svc-work";
+/// [`SVC`]'s ops in [`Rig::full`].
+const SVC_OPS: [&str; 5] = ["launch", "message", "notify", "prompt", "view"];
 /// The local link's relay setting (refused: the link is Astation's
 /// `:8080`); the selected Station's origin is this, normalized.
 const NO_RELAY: &str = "http://127.0.0.1:1";
@@ -153,16 +155,22 @@ impl Rig {
     /// `phone`) a native member; `delegated`: the `host.delegated` hook on.
     /// The fake Station holds the same list until the test grows it.
     fn start(via: Via, delegated: bool, phone: bool) -> Rig {
-        Rig::with(via, delegated, phone, false)
+        Rig::with(via, delegated, phone, None)
     }
 
     /// [`Rig::start`] with `host.delegated` on, the phone and [`SVC`]
-    /// (`launch`, `message`, `notify`, `prompt`, `view`, for four hours).
+    /// ([`SVC_OPS`], for four hours).
     fn full(via: Via) -> Rig {
-        Rig::with(via, true, true, true)
+        Rig::with(via, true, true, Some(&SVC_OPS))
     }
 
-    fn with(via: Via, delegated: bool, phone: bool, service: bool) -> Rig {
+    /// [`Rig::full`], [`SVC`]'s grant holding `ops` instead.
+    fn full_ops(via: Via, ops: &[&str]) -> Rig {
+        Rig::with(via, true, true, Some(ops))
+    }
+
+    /// `service`: [`SVC`] enrolled with these ops.
+    fn with(via: Via, delegated: bool, phone: bool, service: Option<&[&str]>) -> Rig {
         let sandbox = Sandbox::new();
         write_verified_pairing(&sandbox.config(), ACCOUNT, HOST, 1);
         let host_seed = secret("control feed host");
@@ -171,10 +179,10 @@ impl Rig {
         if phone {
             log.add_native(PHONE, &["control", "view"]);
         }
-        if service {
+        if let Some(ops) = service {
             log.enroll_service(
                 SVC,
-                &ServiceScope::new([HOST]).ops(["launch", "message", "notify", "prompt", "view"]),
+                &ServiceScope::new([HOST]).ops(ops.iter().copied()),
                 r9log::host_now().wall_ms + 4 * HOUR,
             );
         }
@@ -2165,13 +2173,16 @@ fn restored_from_backup(mode: StaleFeed) {
     rig.cover_and_open();
     let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let launch = svc.session(&mut r);
-    // A hold: the service's task waits, paused.
+    // A hold: the service's task waits, paused. Enqueued before the hold
+    // is read (a held service has no channel: its hold fences it), host
+    // work's scheduling held meanwhile so it stays queued.
+    let held_task = task(IDS, &launch, "HELD_THROUGH_THE_RESTORE", HOUR);
+    queued_before_the_hold(&rig, &mut svc, &mut r, &held_task);
     rig.append(SVC, ControlAction::Hold);
     rig.clock.add_mono(1_000);
     rig.announce();
     rig.serve_until("the hold read", |rig| rig.cursor() == Some(2));
-    let held_task = task(IDS, &launch, "HELD_THROUGH_THE_RESTORE", HOUR);
-    enqueue(&mut svc, &mut r, &held_task);
+    resume_host_work(&rig);
     wait_stored(&rig, &held_task["task_id"], "blocked", PAUSED);
     // A record more: the host's call for it in flight when the Station is
     // restored from a backup.
@@ -3166,6 +3177,21 @@ fn task_ids(rig: &Rig) -> Vec<String> {
         .collect()
 }
 
+/// Host-work's scheduling held (`hold_host_work`), then `svc` enqueues `t`:
+/// it stays `queued` until [`resume_host_work`], so a hold read meanwhile
+/// finds it unstarted (a held service can't enqueue after its hold: the
+/// hold fences its channel, host-work-v1 §11.1).
+fn queued_before_the_hold(rig: &Rig, svc: &mut Dev, r: &mut Router, t: &Value) {
+    rig.fault("hold_host_work");
+    rig.two_passes();
+    assert_eq!(enqueue(svc, r, t)["state"], "queued");
+}
+
+/// Host-work's scheduling goes on (`hold_host_work` removed).
+fn resume_host_work(rig: &Rig) {
+    std::fs::remove_file(rig.faults().join("hold_host_work")).unwrap();
+}
+
 /// VII.A test 3, its first half (design I.3.3 "Revocation", I.5.5 steps 1
 /// and 2; host-work-v1 §11.1, "The effects on tasks, as built in step 4"):
 /// the Station revokes the covered service without `interrupt_running`
@@ -3655,6 +3681,211 @@ fn kill_during_the_sync_and_repeat() {
     assert!(rig.station().ack_refusals().is_empty());
 }
 
+/// The session host's durable control state of `principal` (the
+/// journal's `principals` file: `<len> <crc> <json>`): `control` and
+/// `control_gen`.
+fn control_state(rig: &Rig, principal: &str) -> Option<(bool, u64)> {
+    let path = rig.sandbox.config().join("runtime/journal/principals");
+    let text = std::fs::read_to_string(path).ok()?;
+    let json = text.splitn(3, ' ').nth(2)?.trim_end();
+    let file: Value = serde_json::from_str(json).ok()?;
+    let p = file["principals"].get(principal)?;
+    Some((p["control"].as_bool()?, p["control_gen"].as_u64()?))
+}
+
+/// What a held service's `hello` and its closed attachments get
+/// (host-work-v1 §11.1, session-v1 R9.11).
+fn paused() -> (String, Option<String>) {
+    ("busy".to_string(), Some(PAUSED.to_string()))
+}
+
+/// Item 7 of Astation's review of the delegated build (#120, 2026-11-14;
+/// host-work-v1 §11.1, session-v1 R9.11), in the real runtime: a hold
+/// fences the covered service's session-v1, reversibly.
+/// - **The existing attachment.** Once the hold is read, the service's live
+///   channel is closed after `busy`, `paused`.
+/// - **Queued and direct input.** Its prompt, accepted with the lease
+///   before the hold and held back from dispatch (`hold_dispatch`), and the
+///   raw terminal input it sends on its old channel after the hold, never
+///   reach the agent, the dispatch let go.
+/// - **A new `hello`** is refused `busy`, `paused`; the phone (a native) is
+///   admitted.
+/// - **Release.** A fresh `hello` is admitted; nothing of before comes
+///   back: a fresh `acquire` is granted (no lease held), the old prompt
+///   never runs.
+/// - **Crash and reload.** Held again, the runtime is killed after the
+///   hold's commit, before the pass that fences (crash point
+///   `crash_after_page_commit`): the service's control state still grants
+///   `control`. Restarted, the fence is written at the load, before any
+///   service is admitted: its first `hello` is refused, `busy` (the control
+///   state unchecked until the load, `paused` after it), its control state
+///   fenced (`control: false`, `control_gen` raised by one); its prompt
+///   queued before the crash never runs; a release admits it again.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_PTY_FAULTS and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_hold_fences_the_services_session_v1_until_its_release_and_across_a_crash() {
+    let mut rig = Rig::full_ops(
+        Via::Local,
+        &["launch", "message", "notify", "prompt", "terminal", "view"],
+    );
+    let principal = format!("service:{SVC}");
+    let hold_dispatch = rig.faults().join("hold_dispatch");
+    {
+        let mut r = Router::on(&rig.astation, rig.link());
+        rig.cover_and_open();
+        let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+        let launch = svc.session(&mut r);
+        let sid = launch["session_id"].as_str().unwrap().to_string();
+        svc.list(&mut r, &sid);
+        // Its prompt, accepted with the lease, held back from dispatch.
+        private(&hold_dispatch, "");
+        rig.two_passes();
+        let accepted = svc.request(
+            &mut r,
+            json!({"op":"submit","binding":svc.read(&sid),"kind":"prompt","request_id":uuid(),
+                "acquire":true,"payload":{"text":"QUEUED_BEFORE_THE_HOLD"}}),
+        );
+        assert_eq!(
+            (&accepted["op"], &accepted["state"]),
+            (&json!("receipt"), &json!("accepted")),
+            "{accepted}"
+        );
+        let mut lease = svc.read(&sid);
+        lease["lease_epoch"] = accepted["lease"]["lease_epoch"].clone();
+        assert!(lease["lease_epoch"].is_u64(), "{accepted}");
+        // Its terminal stream, for raw input.
+        svc.send_family(
+            &mut r,
+            "terminal",
+            json!({"v":1,"op":"subscribe","terminal_id":sid,
+                "generation":launch["process_gen"],"binding":svc.read(&sid)}),
+        );
+        let stream = svc.wait(&mut r, |v| v["op"] == "attached")["stream_id"].clone();
+        // The hold, read.
+        let at = rig.append(SVC, ControlAction::Hold);
+        rig.clock.add_mono(1_000);
+        rig.announce();
+        rig.serve_until("the hold read", |rig| rig.cursor() == Some(at));
+        // Direct input on its old channel, after the hold.
+        svc.send_family(
+            &mut r,
+            "terminal",
+            json!({"v":1,"op":"input","terminal_id":sid,"generation":launch["process_gen"],
+                "stream_id":stream,"sequence":0,"bytes":"RElSRUNUX0FGVEVSX1RIRV9IT0xE",
+                "binding":lease}),
+        );
+        // The existing attachment: closed after `busy`, `paused`.
+        let (seen, reason) = svc.until_closed(&mut r);
+        assert!(
+            seen.iter()
+                .any(|v| v["op"] == "error" && v["code"] == "busy" && v["detail"] == PAUSED),
+            "{seen:?}"
+        );
+        assert!(reason.is_some(), "{seen:?}");
+        // A new hello: `busy`, `paused`; a native is admitted.
+        assert_eq!(refused_hello(&mut r, IDS, &rig.log, SVC, true), paused());
+        Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+        // The dispatch let go: neither reaches the agent.
+        std::fs::remove_file(&hold_dispatch).unwrap();
+        rig.two_passes();
+        rig.two_passes();
+        let text = input(&rig);
+        assert!(!text.contains("QUEUED_BEFORE_THE_HOLD"), "{text}");
+        assert!(!text.contains("DIRECT_AFTER_THE_HOLD"), "{text}");
+        assert!(stored_tasks_none(&rig), "no host-work task was made");
+        // Released: a fresh hello; no lease held, nothing of before runs.
+        let at = rig.append(SVC, ControlAction::Release);
+        rig.clock.add_mono(1_000);
+        rig.announce();
+        rig.serve_until("the release read", |rig| rig.cursor() == Some(at));
+        let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
+        svc.list(&mut r, &sid);
+        let lease = svc.request(
+            &mut r,
+            json!({"op":"acquire","binding":svc.read(&sid),"takeover":false}),
+        );
+        assert_eq!(lease["op"], "lease", "no lease held: {lease}");
+        rig.two_passes();
+        assert!(!input(&rig).contains("QUEUED_BEFORE_THE_HOLD"));
+        // Its next prompt, queued (held back from dispatch) before the
+        // crash below.
+        private(&hold_dispatch, "");
+        rig.two_passes();
+        let mut binding = svc.read(&sid);
+        binding["lease_epoch"] = lease["binding"]["lease_epoch"].clone();
+        let accepted = svc.request(
+            &mut r,
+            json!({"op":"submit","binding":binding,"kind":"prompt","request_id":uuid(),
+                "payload":{"text":"QUEUED_BEFORE_THE_CRASH"}}),
+        );
+        assert_eq!(accepted["state"], "accepted", "{accepted}");
+    }
+    // Crash and reload: held again, killed after the hold's commit.
+    let (control, generation) = control_state(&rig, &principal).expect("its control state");
+    assert!(control, "welcomed again with control");
+    rig.fault("crash_after_page_commit");
+    let at = rig.append(SVC, ControlAction::Hold);
+    let link = rig.link();
+    rig.clock.add_mono(1_000);
+    let call = {
+        let mut station = rig.station();
+        station.on_link(link);
+        station.heads_now();
+        station.hold_call(link)
+    };
+    rig.station().answer_held(call).unwrap();
+    rig.died();
+    assert_eq!(stored_cursor(&rig), Some(at), "the hold committed");
+    assert_eq!(
+        control_state(&rig, &principal),
+        Some((true, generation)),
+        "its fence not written"
+    );
+    rig.start_again();
+    rig.until_station("the Station link", |s| !s["link"].is_null());
+    {
+        let mut r = Router::on(&rig.astation, rig.link());
+        // Never admitted: unchecked until the load, held after it.
+        let first = refused_hello(&mut r, IDS, &rig.log, SVC, true);
+        assert!(
+            first == paused() || first == ("busy".to_string(), Some(GATE_CLOSED.to_string())),
+            "{first:?}"
+        );
+        within("the feeds loaded", || rig.cursor() == Some(at));
+        assert_eq!(refused_hello(&mut r, IDS, &rig.log, SVC, true), paused());
+        assert_eq!(
+            control_state(&rig, &principal),
+            Some((false, generation + 1)),
+            "fenced at the load"
+        );
+        Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+        std::fs::remove_file(&hold_dispatch).unwrap();
+        rig.two_passes();
+        rig.two_passes();
+        assert!(!input(&rig).contains("QUEUED_BEFORE_THE_CRASH"));
+        // Released: admitted again.
+        rig.open_gate();
+        let at = rig.append(SVC, ControlAction::Release);
+        rig.clock.add_mono(1_000);
+        rig.announce();
+        rig.serve_until("the release read", |rig| rig.cursor() == Some(at));
+        Dev::new(&mut r, IDS, &rig.log, SVC, true);
+        assert_eq!(
+            control_state(&rig, &principal).map(|(_, g)| g),
+            Some(generation + 1),
+            "once"
+        );
+    }
+}
+
+/// No host-work task in the store (a session-v1 prompt is none).
+fn stored_tasks_none(rig: &Rig) -> bool {
+    task_ids(rig).is_empty()
+}
+
 /// Station B, the host's other Station in [`relay_switch_waits_for_the_new_feed`].
 const OTHER_STATION: &str = "http://127.0.0.1:2";
 
@@ -3685,6 +3916,10 @@ fn relay_switch_waits_for_the_new_feed() {
         rig.cover_and_open();
         let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
         let launch = svc.session(&mut r);
+        // Enqueued before the hold is read (a held service has no channel:
+        // its hold fences it), host work's scheduling held meanwhile.
+        let held = task(IDS, &launch, "HELD_ACROSS_THE_SWITCH", HOUR);
+        queued_before_the_hold(&rig, &mut svc, &mut r, &held);
         append_id(&rig, "svc-other", ControlAction::Cover);
         append_id(&rig, SVC, ControlAction::Hold);
         let (at, other_revoke) = append_id(
@@ -3699,8 +3934,7 @@ fn relay_switch_waits_for_the_new_feed() {
         rig.serve_until("A's feed read", |rig| {
             rig.cursor() == Some(at) && acks_naming(rig, &other_revoke) >= 1
         });
-        let held = task(IDS, &launch, "HELD_ACROSS_THE_SWITCH", HOUR);
-        enqueue(&mut svc, &mut r, &held);
+        resume_host_work(&rig);
         wait_stored(&rig, &held["task_id"], "blocked", PAUSED);
         let a_ids: Vec<String> = (1..=at).map(|seq| record_id_at(&rig, seq)).collect();
         (held, a_ids, other_revoke)

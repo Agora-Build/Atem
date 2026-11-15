@@ -38,7 +38,8 @@
 //! - **Acknowledgments** (Task 36, [`super::acks`]): each record's result
 //!   is written in its transaction (`apply_page`, `feeds_reverify`); the
 //!   bridge hands the acks due to the link at the end of its Station step,
-//!   after the records' followups ([`HostBridge::acks_due`],
+//!   after the records' followups and the services' admission they move (a
+//!   revoke's and a hold's session-v1 fences: [`HostBridge::acks_due`],
 //!   [`HostBridge::acks_sent`]); a `control_ack_refused` holds them for the
 //!   connection ([`HostBridge::ack_refused`]).
 use super::*;
@@ -346,8 +347,9 @@ impl HostBridge {
     /// feed store that may be acknowledged ([`loaded`]: this identity's,
     /// for the committed list, healthy), on the Station link, at `D`. The
     /// bridge hands them to the link at the end of its Station step, after
-    /// the records' followups (a revoke's session-v1 fence), so a result
-    /// goes once its effects are durable and its fence ran.
+    /// the records' followups (a revoke's session-v1 fence, then a hold's in
+    /// `sync_services`), so a result goes once its effects are durable and
+    /// its fence ran.
     pub(crate) fn acks_due(&self) -> Vec<DueAck> {
         let list = self.start_view().list.clone();
         let Some(feeds) = loaded(&self.work, list.as_ref(), &self.work_host()) else {
@@ -463,7 +465,8 @@ impl HostBridge {
     ///   still reaches the tasks it holds, but nothing of session-v1 (hook
     ///   off = main);
     /// - then the services' r9 admission as the control state stands
-    ///   ([`HostBridge::sync_services`]);
+    ///   ([`HostBridge::sync_services`]): a held service's fence among it
+    ///   (`HostBridge::sync_held`), so a hold's result goes after it too;
     /// - **a withdrawal and the intents** once the store was recovered
     ///   (before that, the start's recovery withdraws every attempt still
     ///   `accepted` and reconciles the rest, and they wait), with no
@@ -533,7 +536,13 @@ impl HostBridge {
     ///   so (`HostBridge::open`), and the runtime calls this before every
     ///   pass's `hello`s, after a load and after the records' followups.
     /// - **Checked** (loaded): the revoked services follow the committed
-    ///   standings ([`HostBridge::sync_revoked`]).
+    ///   standings ([`HostBridge::sync_revoked`]), and so do the held ones
+    ///   ([`HostBridge::sync_held`]), in that order: a revoke wins.
+    ///
+    /// The order of a service's `hello` refusals is the r9 engine's
+    /// (session-v1 R9.11): the device list's own, then `unauthorized`,
+    /// `revoked`, then `busy`, `revocations not yet checked`, then `busy`,
+    /// `paused`.
     pub(in crate::runtime::host_bridge) fn sync_services(&mut self, cx: &mut Cx) {
         if self.features.delegated {
             self.read_kept();
@@ -547,16 +556,72 @@ impl HostBridge {
             if !self.r9.revoked_services().is_empty() {
                 self.r9.set_revoked_services(HashSet::new());
             }
+            self.clear_held(cx);
             return;
         }
         if !unchecked {
             self.sync_revoked(cx);
-        } else if self.kept_elsewhere() && !self.r9.revoked_services().is_empty() {
+            self.sync_held(cx);
+        } else if self.kept_elsewhere() {
             // Another identity's standings aren't this one's (a new
             // identity, a new store): its services wait as unchecked
             // (ruling T35e).
-            self.r9.set_revoked_services(HashSet::new());
+            if !self.r9.revoked_services().is_empty() {
+                self.r9.set_revoked_services(HashSet::new());
+            }
+            self.clear_held(cx);
         }
+    }
+
+    /// The r9 engine's held services (host-work-v1 §11.1, the hold's
+    /// session-v1 fence; **Atem's reading of Astation's item 7 on #120,
+    /// 2026-11-14**) as the committed standings have them: a service a
+    /// `hold` holds and no `revoke` revoked (the revoke wins), the control
+    /// feeds loaded. Never from memory alone: after a restart the stored
+    /// state loads first, and this runs before any service's `hello` (the
+    /// engine refuses every service as unchecked until then).
+    ///
+    /// The engine fences a service newly held that the session host knows
+    /// (an attachment, a lease, accepted work or `control`) through §H, once
+    /// per hold, each attachment closed after `busy`, `paused`
+    /// (`R9Host::set_held_services`); its later `hello`s are refused so. Run
+    /// from the records' followups (`effects_pass`) before their results go
+    /// to the Station, so a hold is reported applied only once its fence
+    /// ran. A run that ended between the hold's commit and that pass left
+    /// the service granted `control` with no fence: the first read of the
+    /// loaded state fences it then, before admission. A release lifts the
+    /// refusal; nothing of before comes back. A hold changes no delegated
+    /// task here (the record's own effects did); a v1 task the service had
+    /// from before its cover ends as any §H fence ends it (`sender's
+    /// authority changed`).
+    fn sync_held(&mut self, cx: &mut Cx) {
+        if !matches!(self.work.feeds, Feeds::Loaded(_)) || self.controls_stood_in() {
+            return;
+        }
+        let held: HashSet<String> = self
+            .start_view()
+            .standings
+            .iter()
+            .filter(|(principal, standing)| {
+                standing.held && standing.revoked.is_none() && principal.starts_with("service:")
+            })
+            .map(|(principal, _)| principal.clone())
+            .collect();
+        if &held == self.r9.held_services() {
+            return;
+        }
+        let effects = self.r9_call(|r9, parts| r9.set_held_services(held, parts));
+        self.r9_exec(effects, cx);
+    }
+
+    /// No service held in the r9 engine (the hook off, as on main; or
+    /// another identity's standings): nothing is fenced for it.
+    fn clear_held(&mut self, cx: &mut Cx) {
+        if self.r9.held_services().is_empty() {
+            return;
+        }
+        let effects = self.r9_call(|r9, parts| r9.set_held_services(HashSet::new(), parts));
+        self.r9_exec(effects, cx);
     }
 
     /// The r9 engine's revoked services (their `hello`s refused, design

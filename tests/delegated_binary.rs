@@ -2442,13 +2442,16 @@ fn never_spawned(rig: &Rig, sid: &str) -> bool {
 }
 
 /// VII.A test 19, its launch half (design I.4.3, "Launches"; host-work-v1
-/// §11.6): in the real runtime, a covered service's `host_launch` while the
-/// fake Station's feed holds it waits at the spawn boundary through
-/// host-work's passes: `starting`, no worker spawned, its reason in
-/// `runtime.log`. The feed's release lets it start. Held again, a launch
-/// waits; the feed's revoke then ends it `failed` (`sender revoked`),
-/// nothing spawned, never `outcome_unknown`, read from the store and
-/// `runtime.log`: the revoke fenced the service's channel (design I.5.5
+/// §11.6): in the real runtime, a covered service's `host_launch` that
+/// reaches the spawn boundary while the fake Station's feed holds the
+/// service waits there through host-work's passes: `starting`, no worker
+/// spawned, its reason in `runtime.log`. The hold fences the service's
+/// channel (host-work-v1 §11.1), so it asks before the hold, and its new
+/// `hello` is refused (`busy`, `paused`) while held. The feed's release
+/// lets the launch start, and the service is admitted afresh. Held again,
+/// a launch waits; the feed's revoke then ends it `failed` (`sender
+/// revoked`), nothing spawned, never `outcome_unknown`, read from the store
+/// and `runtime.log`: the revoke fenced the service's channel (design I.5.5
 /// step 2), and a new `hello` of it is refused (`unauthorized`, `revoked`),
 /// so no later request of it reaches the host (one that did would be
 /// `forbidden`: the bridge's tests).
@@ -2460,6 +2463,7 @@ fn never_spawned(rig: &Rig, sid: &str) -> bool {
 fn a_held_senders_launch_waits_and_a_revoked_ones_fails() {
     let mut rig = Rig::prepared(4 * HOUR, false);
     rig.with_station();
+    rig.faults = true;
     rig.start();
     let log = rig.sandbox.dir.path().join("runtime.log");
     let logged = |text: &str| {
@@ -2469,27 +2473,30 @@ fn a_held_senders_launch_waits_and_a_revoked_ones_fails() {
     };
     let mut r = Router::new(&rig.astation);
     rig.station_online(true);
-    control(&rig, ControlAction::Hold);
     let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
-    let (held, sid) = launch_backend(&mut svc, &mut r);
+    let (held, sid) = launch_then_hold(&rig, &mut svc, &mut r);
     within("the wait logged", || {
         logged(&format!(
             "launch {held} waits at the spawn boundary: paused"
         ))
     });
     work_passes(&rig, 5);
-    assert_eq!(launch_state(&mut svc, &mut r, &held), "starting");
+    assert_eq!(stored_launch(&rig, &held), "starting");
     assert!(never_spawned(&rig, &sid), "nothing spawned while held");
-    // Released: it starts.
+    assert_eq!(
+        refused_hello(&mut r, IDS, &rig.log, SVC, true),
+        ("busy".to_string(), Some("paused".to_string()))
+    );
+    // Released: it starts; the service is admitted afresh.
     control(&rig, ControlAction::Release);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     within("the released launch started", || {
         launch_state(&mut svc, &mut r, &held) == "started"
     });
     // Held again, a launch waits at the spawn boundary; revoked: it fails
     // there, nothing spawned (its sender's channel is fenced by then: its
     // state is the store's and runtime.log's).
-    control(&rig, ControlAction::Hold);
-    let (waiting, sid) = launch_backend(&mut svc, &mut r);
+    let (waiting, sid) = launch_then_hold(&rig, &mut svc, &mut r);
     within("the second wait logged", || {
         logged(&format!(
             "launch {waiting} waits at the spawn boundary: paused"
@@ -2600,10 +2607,12 @@ fn counted(rig: &Rig) -> Vec<(String, String, String)> {
 /// Station holds the covered service while its task waits behind the
 /// phone's turn: the task waits `paused`, and doesn't hold its session: the
 /// phone's next task and a local agent's task, queued after it, run past
-/// it. The release lets it run. The Station holds the service again (its
-/// next task waits `paused`), then serves the earlier release again at a
-/// later position: the same record, a `duplicate` the host ignores, so the
-/// task stays paused until a new release. Each ran once.
+/// it. The release lets it run. The hold fenced the service's channel
+/// (host-work-v1 §11.1): released, it is admitted afresh and queues its
+/// next task behind its own turn. The Station holds the service again (that
+/// task waits `paused`), then serves the earlier release again at a later
+/// position: the same record, a `duplicate` the host ignores, so the task
+/// stays paused until a new release. Each ran once.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -2654,12 +2663,17 @@ fn pause_holds_and_resume_releases() {
     // The release: it runs.
     let release = control_kept(&rig, ControlAction::Release);
     in_turn(&rig, &held["task_id"], "PAUSE_HELD");
-    complete_turn(&rig, &held["task_id"]);
-    // Held again; the earlier release served again is ignored.
-    control(&rig, ControlAction::Hold);
+    // Held again; the earlier release served again is ignored. The hold
+    // fenced the service's channel (host-work-v1 §11.1): released, it is
+    // admitted afresh, and its next task, queued behind its own turn, is
+    // held with the next hold.
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     let again = task(IDS, &launch, "PAUSE_HELD_AGAIN", HOUR);
     enqueue(&mut svc, &mut r, &again);
+    wait_stored(&rig, &again["task_id"], "blocked", BEHIND);
+    control(&rig, ControlAction::Hold);
     wait_stored(&rig, &again["task_id"], "blocked", PAUSED);
+    complete_turn(&rig, &held["task_id"]);
     let release_id = {
         let record = atem_client::control::ControlRecord::from_signed(release.clone()).unwrap();
         record.record_id().to_owned()
@@ -3162,10 +3176,11 @@ fn stored_tasks(rig: &Rig) -> i64 {
 }
 
 /// Launch `rid` waits at the spawn boundary for `reason` (its runtime.log
-/// line), never spawned, `starting` to its sender, through host-work's
-/// passes.
+/// line), never spawned, `starting` in the store, through host-work's
+/// passes (read from the store: a held sender's channel is fenced,
+/// host-work-v1 §11.1).
 #[track_caller]
-fn launch_waits(rig: &Rig, svc: &mut Dev, r: &mut Router, rid: &str, sid: &str, reason: &str) {
+fn launch_waits(rig: &Rig, rid: &str, sid: &str, reason: &str) {
     let log = rig.sandbox.dir.path().join("runtime.log");
     let line = format!("launch {rid} waits at the spawn boundary: {reason}");
     within(&line, || {
@@ -3174,8 +3189,34 @@ fn launch_waits(rig: &Rig, svc: &mut Dev, r: &mut Router, rid: &str, sid: &str, 
             .contains(&line)
     });
     work_passes(rig, 3);
-    assert_eq!(launch_state(svc, r, rid), "starting");
+    assert_eq!(stored_launch(rig, rid), "starting");
     assert!(never_spawned(rig, sid), "nothing spawned while it waits");
+}
+
+/// Launch `rid`'s state as the store holds it.
+fn stored_launch(rig: &Rig, rid: &str) -> Value {
+    host_db(rig)
+        .query_row("SELECT record FROM launches WHERE id=?1", [rid], |row| {
+            row.get::<_, String>(0)
+        })
+        .map(|text| serde_json::from_str::<Value>(&text).unwrap()["status"]["state"].clone())
+        .unwrap()
+}
+
+/// `svc`'s `host_launch` of profile `backend`, asked while no reserved
+/// launch is handed to the launcher (`hold_launches`), then the Station's
+/// `hold` of the service read, then the launcher let go: the launch reaches
+/// the spawn boundary held. A held service has no channel to ask on (its
+/// hold fences it: host-work-v1 §11.1), so it asks before the hold. Its
+/// request id and session id.
+fn launch_then_hold(rig: &Rig, svc: &mut Dev, r: &mut Router) -> (String, String) {
+    let hold_launches = rig.faults().join("hold_launches");
+    private(&hold_launches, "");
+    two_passes(rig);
+    let launched = launch_backend(svc, r);
+    control(rig, ControlAction::Hold);
+    std::fs::remove_file(&hold_launches).unwrap();
+    launched
 }
 
 /// The launch `rid` ended `failed` with `detail` (runtime.log), never
@@ -3183,16 +3224,8 @@ fn launch_waits(rig: &Rig, svc: &mut Dev, r: &mut Router, rid: &str, sid: &str, 
 /// store: its sender's channel may be fenced by then).
 #[track_caller]
 fn launch_failed(rig: &Rig, rid: &str, sid: &str, detail: &str) {
-    let state = |rig: &Rig| {
-        host_db(rig)
-            .query_row("SELECT record FROM launches WHERE id=?1", [rid], |row| {
-                row.get::<_, String>(0)
-            })
-            .map(|text| serde_json::from_str::<Value>(&text).unwrap()["status"]["state"].clone())
-            .unwrap()
-    };
     within("the launch failed", || {
-        let state = state(rig);
+        let state = stored_launch(rig, rid);
         assert_ne!(state, "outcome_unknown");
         state == "failed"
     });
@@ -3233,6 +3266,7 @@ fn launch_at_the_spawn_boundary_waits_for_hold_gap_and_deferral_and_fails_on_rev
     let mut rig = Rig::prepared(4 * HOUR, false);
     rig.with_station();
     rig.with_clock();
+    rig.faults = true;
     rig.start();
     let mut r = Router::new(&rig.astation);
     rig.station_online(true);
@@ -3243,11 +3277,11 @@ fn launch_at_the_spawn_boundary_waits_for_hold_gap_and_deferral_and_fails_on_rev
         });
     };
 
-    // A hold, then the release.
-    control(&rig, ControlAction::Hold);
-    let (rid, sid) = launch_backend(&mut svc, &mut r);
-    launch_waits(&rig, &mut svc, &mut r, &rid, &sid, "paused");
+    // A hold, then the release (the service admitted afresh after it).
+    let (rid, sid) = launch_then_hold(&rig, &mut svc, &mut r);
+    launch_waits(&rig, &rid, &sid, "paused");
     control(&rig, ControlAction::Release);
+    let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
     started(&mut svc, &mut r, &rid);
 
     // No heads for 60 s on the host's clock, then the Station's heads. A
@@ -3284,14 +3318,7 @@ fn launch_at_the_spawn_boundary_waits_for_hold_gap_and_deferral_and_fails_on_rev
         dumped(&rig)["station"]["feed"]["open"] == false
     });
     let (rid, sid) = launch_backend(&mut svc, &mut r);
-    launch_waits(
-        &rig,
-        &mut svc,
-        &mut r,
-        &rid,
-        &sid,
-        "revocations not yet checked",
-    );
+    launch_waits(&rig, &rid, &sid, "revocations not yet checked");
     let station = rig.station.clone().expect("the fake Station");
     *rig.pump.lock().unwrap() = Some(Pump::start(station));
     started(&mut svc, &mut r, &rid);
@@ -3308,14 +3335,7 @@ fn launch_at_the_spawn_boundary_waits_for_hold_gap_and_deferral_and_fails_on_rev
         s["fetch"]["stopped"] == pinned + 2
     });
     let (rid, sid) = launch_backend(&mut svc, &mut r);
-    launch_waits(
-        &rig,
-        &mut svc,
-        &mut r,
-        &rid,
-        &sid,
-        "device list update pending",
-    );
+    launch_waits(&rig, &rid, &sid, "device list update pending");
     let approve = rig
         .log
         .append(MAC, Action::RecoveryApprove { target: recovery });
@@ -3326,9 +3346,8 @@ fn launch_at_the_spawn_boundary_waits_for_hold_gap_and_deferral_and_fails_on_rev
     started(&mut svc, &mut r, &rid);
 
     // Held again, waiting; the revoke fails it.
-    control(&rig, ControlAction::Hold);
-    let (rid, sid) = launch_backend(&mut svc, &mut r);
-    launch_waits(&rig, &mut svc, &mut r, &rid, &sid, "paused");
+    let (rid, sid) = launch_then_hold(&rig, &mut svc, &mut r);
+    launch_waits(&rig, &rid, &sid, "paused");
     control(
         &rig,
         ControlAction::Revoke {
@@ -3342,13 +3361,13 @@ fn launch_at_the_spawn_boundary_waits_for_hold_gap_and_deferral_and_fails_on_rev
     let mut rig = Rig::prepared(4 * HOUR, false);
     rig.with_station();
     rig.membership = true;
+    rig.faults = true;
     rig.start();
     let mut r = Router::new(&rig.astation);
     rig.station_online(true);
     let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
-    control(&rig, ControlAction::Hold);
-    let (rid, sid) = launch_backend(&mut svc, &mut r);
-    launch_waits(&rig, &mut svc, &mut r, &rid, &sid, "paused");
+    let (rid, sid) = launch_then_hold(&rig, &mut svc, &mut r);
+    launch_waits(&rig, &rid, &sid, "paused");
     let conflict = rig.log.conflicting_add("dev-other");
     replace(
         &rig.membership_dir().join("carry.json"),
