@@ -101,13 +101,15 @@ const EVIDENCE_PERSIST_MS: u64 = 60_000;
 const CHECKPOINT_MS: u64 = 60_000;
 /// r9 files that exist only with a device list (§R9.3): one of them
 /// without `membership.json` is a damaged or half-removed list.
-const LEFTOVERS: [DlFile; 9] = [
+const LEFTOVERS: [DlFile; 11] = [
     DlFile::Carriage,
     DlFile::Intent,
     DlFile::Freeze,
     DlFile::Fault,
     DlFile::FaultMirror,
     DlFile::HostChannelKey,
+    DlFile::HostEncKey,
+    DlFile::HostEncGenerated,
     DlFile::HostPolicy,
     DlFile::HostPolicyPending,
     DlFile::Applied,
@@ -2385,8 +2387,8 @@ thread_local! {
 /// `atem unpair` (§R9.3): a frozen list's genesis goes on
 /// `frozen_genesis` (≤ 16, oldest dropped), then `membership.json` is
 /// removed first, then every other r9 file (the carriage record, intent,
-/// freeze and fault records, the host channel key, the journal's
-/// `membership_applied`). `frozen_genesis` stays. Until `membership.json`
+/// freeze and fault records, the host channel key, the host encryption key
+/// and its record, the journal's `membership_applied`). `frozen_genesis` stays. Until `membership.json`
 /// is gone nothing changed (an error leaves the host paired as it was);
 /// after that, any file left makes the next start fail closed.
 pub fn forget_on_unpair(pairing: &PairingPaths) -> Result<(), ForgetError> {
@@ -2709,7 +2711,7 @@ pub fn has_device_list_files(pairing: &PairingPaths) -> bool {
 
 /// The journal directory of the runtime this profile's `atem runtime`
 /// uses (`<config>/runtime/journal`).
-fn journal_of(pairing: &PairingPaths) -> std::path::PathBuf {
+pub(crate) fn journal_of(pairing: &PairingPaths) -> std::path::PathBuf {
     pairing
         .dir()
         .parent()

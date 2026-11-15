@@ -91,7 +91,7 @@ fn the_ceremonys_list_is_verified_then_pinned_with_its_host_key() {
     for file in LEFTOVERS {
         std::fs::write(store.path(file), b"old").unwrap();
     }
-    pin_at_pairing_locked(&case.pairing, &m, HOST, 2, &case.host_seed).unwrap();
+    pin_at_pairing_locked(&case.pairing, &m, HOST, 2, &case.host_seed, false).unwrap();
     for file in [
         DlFile::Carriage,
         DlFile::Intent,
@@ -198,7 +198,7 @@ fn a_host_key_that_isnt_the_lists_fails() {
     let m = case.verify(Some(&case.membership()), |_| {}).unwrap();
     let journal = journal_of(&case.pairing);
     store::private_dir(&journal).unwrap();
-    pin_at_pairing_locked(&case.pairing, &m, HOST, 2, &[3; 32]).unwrap();
+    pin_at_pairing_locked(&case.pairing, &m, HOST, 2, &[3; 32], false).unwrap();
     let e = host_channel_seed(&case.pairing, &m, HOST).unwrap_err();
     assert!(e.contains("isn't the key the device list names"), "{e}");
     std::fs::remove_file(&case.pairing.host_channel_key).unwrap();
@@ -220,7 +220,7 @@ fn an_interrupted_pin_fails_closed() {
             step: store::Step::TempWrite,
         }))
     });
-    assert!(pin_at_pairing_locked(&case.pairing, &m, HOST, 2, &case.host_seed).is_err());
+    assert!(pin_at_pairing_locked(&case.pairing, &m, HOST, 2, &case.host_seed, false).is_err());
     let opened = MembershipHost::open(
         &case.pairing,
         &journal,

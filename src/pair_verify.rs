@@ -300,6 +300,9 @@ pub(crate) struct HostPinning<'a> {
     pub host_id: &'a str,
     /// The `host_channel_key` seed this ceremony revealed.
     pub host_seed: &'a [u8; 32],
+    /// Make the host encryption key with the pin (the runtime's debug hook
+    /// turned `host.senders` on).
+    pub enc_key: bool,
 }
 
 /// Applies Astation's `deviceVerified` only while the pairing the
@@ -344,8 +347,15 @@ pub(crate) fn apply_device_verified(
         };
         let log = pin::verify_pairing_log(reply.membership.as_ref(), &inputs, pairing, &host_now())
             .map_err(|e| anyhow!("{e}"))?;
-        pin::pin_at_pairing_locked(pairing, &log, host.host_id, host_trust_gen, host.host_seed)
-            .map_err(|e| anyhow!("couldn't pin the device list: {e}"))?;
+        pin::pin_at_pairing_locked(
+            pairing,
+            &log,
+            host.host_id,
+            host_trust_gen,
+            host.host_seed,
+            host.enc_key,
+        )
+        .map_err(|e| anyhow!("couldn't pin the device list: {e}"))?;
         crate::memory::verification::complete_verification(
             paths,
             agent,
@@ -862,6 +872,7 @@ mod tests {
                 astation: &astation,
                 host_id: "host-1",
                 host_seed: &[9; 32],
+                enc_key: true,
             };
             let error = apply_device_verified(
                 &capture,

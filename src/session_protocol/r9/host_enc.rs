@@ -1,0 +1,456 @@
+//! The host encryption key (delegated host-work design II.4.1, option (b);
+//! session-v1 R9.14 item 8; host-work-v1 §11.5, "The recipient's keys"), on
+//! the host, behind the debug-only hook's `host.senders`: the X25519 key
+//! other hosts seal host-sender mail to, the record of every key id this
+//! host made at its trust generation, and this host as the receiver of that
+//! mail. With the hook off nothing here runs: no file is made.
+//!
+//! ```text
+//! <profile>/pairing/host_enc_key        {"v":1,"host_trust_gen":N,"secret":"<b64u>","pub":"<b64u>"}
+//! <profile>/pairing/host_enc_generated  {"v":1,"host_trust_gen":N,"kids":["<16 hex>",…]}
+//! ```
+//!
+//! - **The key.** Plain, 0600, replaced whole like `host_channel_key`
+//!   (`membership::store`), so a host whose cred agent is locked still opens
+//!   its mail. One key per trust generation in this version (no rotation
+//!   within a generation): made with the device list's pin when a pairing
+//!   is verified and at `atem pair verify` (the next generation, beside the
+//!   new `host_channel_key`), and at a runtime start (or a reopen of the
+//!   list) on a pinned host that holds none for its generation. One of an
+//!   earlier generation is replaced then; one that can't be read is left as
+//!   it is (the op answers `busy`, and the start says why). Every pin and
+//!   `atem unpair` delete both files: they are device-list leftovers, so one
+//!   without the list fails closed.
+//! - **The record.** The `enc_kid` (R9.9's, `atem_client::keys::enc_kid`) of
+//!   every key made at the current generation, written (fsync, rename)
+//!   before the key file, and checked again before a key is handed out:
+//!   II.4.2's receiver refuses for good mail sealed to a key id the host
+//!   made but the record lacks. Only the current generation is kept. A lost
+//!   or unreadable record, or one of another generation, is rebuilt from
+//!   the key the host holds, with a runtime.log line.
+//! - **The receiver's view** ([`recipient`]): this host's id and pairing
+//!   generation, the generation's key and the record, as II.4.2's receiver
+//!   takes them (`atem_client::host_mail::Recipient`).
+use atem_client::encoding::{b64u, hex, hex_decode_array};
+use atem_client::host_mail::Recipient;
+use atem_client::keys::enc_kid_bytes;
+use atem_client::{KeyId, KeyProvider, PublicKey, SoftwareKeys};
+use rand::RngCore;
+use serde::Deserialize;
+use zeroize::Zeroizing;
+
+use crate::paths::PairingPaths;
+use crate::session_protocol::membership::journal_of;
+use crate::session_protocol::membership::store::{self, DlFile, Store, WriteError};
+
+/// The key's name behind its provider.
+const KEY_NAME: &str = "host_enc_key";
+
+/// A host encryption key, as made or read: its generation, its public half
+/// and id, and the private key behind a provider.
+pub struct HostEncKey {
+    pub host_trust_gen: u64,
+    /// X25519.
+    pub public: PublicKey,
+    /// Its `enc_kid` (8 bytes; the hex is the 16-character id).
+    pub kid: [u8; 8],
+    keys: SoftwareKeys,
+}
+
+impl std::fmt::Debug for HostEncKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostEncKey")
+            .field("host_trust_gen", &self.host_trust_gen)
+            .field("kid", &hex(&self.kid))
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostEncKey {
+    fn from_secret(host_trust_gen: u64, secret: &[u8; 32]) -> Self {
+        let mut keys = SoftwareKeys::new();
+        keys.insert_x25519(Self::key_id(), secret);
+        let public = keys
+            .public_key(&Self::key_id())
+            .expect("an X25519 key has a public half");
+        let kid = enc_kid_bytes(&public).expect("an X25519 key has an enc_kid");
+        HostEncKey {
+            host_trust_gen,
+            public,
+            kid,
+            keys,
+        }
+    }
+
+    /// A new random key for `host_trust_gen`, and its secret (for the file).
+    fn generate(host_trust_gen: u64) -> (Self, Zeroizing<[u8; 32]>) {
+        let mut secret = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(secret.as_mut());
+        (Self::from_secret(host_trust_gen, &secret), secret)
+    }
+
+    /// The name of the private key behind its provider.
+    pub fn key_id() -> KeyId {
+        KeyId::new(KEY_NAME)
+    }
+
+    /// The 32 bytes of the public half.
+    pub fn enc_pub(&self) -> &[u8; 32] {
+        self.public.as_32().expect("an X25519 key is 32 bytes")
+    }
+
+    /// The key's id as the record and the mail carry it.
+    pub fn enc_kid(&self) -> String {
+        hex(&self.kid)
+    }
+}
+
+/// `host_enc_key`'s bytes: the secret and its public half (base64url), with
+/// the generation it was made for. No `serde_json::Value` in between: every
+/// copy of the secret is wiped (base64url needs no JSON escaping).
+fn key_bytes(host_trust_gen: u64, secret: &[u8; 32], public: &[u8; 32]) -> Zeroizing<Vec<u8>> {
+    let secret = Zeroizing::new(b64u(secret));
+    let public = b64u(public);
+    let mut out = Zeroizing::new(Vec::with_capacity(secret.len() + public.len() + 64));
+    out.extend_from_slice(
+        format!(r#"{{"v":1,"host_trust_gen":{host_trust_gen},"secret":""#).as_bytes(),
+    );
+    out.extend_from_slice(secret.as_bytes());
+    out.extend_from_slice(br#"","pub":""#);
+    out.extend_from_slice(public.as_bytes());
+    out.extend_from_slice(br#""}"#);
+    out
+}
+
+/// `host_enc_key` as read: the secret's text is wiped on drop.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyFile {
+    v: u64,
+    host_trust_gen: u64,
+    secret: Zeroizing<String>,
+    #[serde(rename = "pub")]
+    public: String,
+}
+
+/// What `host_enc_key` holds.
+enum Held {
+    Missing,
+    Key(HostEncKey),
+    /// It can't be read, or isn't a key file (why).
+    Unreadable(String),
+}
+
+fn read_key(store: &Store) -> Held {
+    let path = store.path(DlFile::HostEncKey);
+    let bytes = match store.read(DlFile::HostEncKey) {
+        Ok(None) => return Held::Missing,
+        Ok(Some(bytes)) => Zeroizing::new(bytes),
+        Err(e) => return Held::Unreadable(format!("cannot read {}: {e}", path.display())),
+    };
+    let damaged = || Held::Unreadable(format!("{} is damaged", path.display()));
+    let Ok(file) = serde_json::from_slice::<KeyFile>(&bytes) else {
+        return damaged();
+    };
+    if file.v != 1 || file.host_trust_gen == 0 {
+        return damaged();
+    }
+    let Some(secret) = atem_client::encoding::b64u_decode(&file.secret)
+        .ok()
+        .map(Zeroizing::new)
+    else {
+        return damaged();
+    };
+    let Ok(secret) = <[u8; 32]>::try_from(secret.as_slice()).map(Zeroizing::new) else {
+        return damaged();
+    };
+    let key = HostEncKey::from_secret(file.host_trust_gen, &secret);
+    if b64u(key.enc_pub()) != file.public {
+        return damaged();
+    }
+    Held::Key(key)
+}
+
+/// `host_enc_generated` as stored.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordFile {
+    v: u64,
+    host_trust_gen: u64,
+    kids: Vec<String>,
+}
+
+/// What `host_enc_generated` holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Record {
+    Missing,
+    /// It can't be read, or isn't a record (why).
+    Unreadable(String),
+    Of {
+        host_trust_gen: u64,
+        kids: Vec<[u8; 8]>,
+    },
+}
+
+fn read_record(store: &Store) -> Record {
+    let path = store.path(DlFile::HostEncGenerated);
+    let bytes = match store.read(DlFile::HostEncGenerated) {
+        Ok(None) => return Record::Missing,
+        Ok(Some(bytes)) => bytes,
+        Err(e) => return Record::Unreadable(format!("cannot read {}: {e}", path.display())),
+    };
+    let damaged = || Record::Unreadable(format!("{} is damaged", path.display()));
+    let Ok(file) = serde_json::from_slice::<RecordFile>(&bytes) else {
+        return damaged();
+    };
+    let mut kids = Vec::with_capacity(file.kids.len());
+    for kid in &file.kids {
+        let Ok(kid) = hex_decode_array::<8>(kid) else {
+            return damaged();
+        };
+        if kids.contains(&kid) {
+            return damaged();
+        }
+        kids.push(kid);
+    }
+    if file.v != 1 || file.host_trust_gen == 0 {
+        return damaged();
+    }
+    Record::Of {
+        host_trust_gen: file.host_trust_gen,
+        kids,
+    }
+}
+
+fn record_bytes(host_trust_gen: u64, kids: &[[u8; 8]]) -> Vec<u8> {
+    let kids: Vec<String> = kids.iter().map(|k| hex(k)).collect();
+    serde_json::json!({"v": 1, "host_trust_gen": host_trust_gen, "kids": kids})
+        .to_string()
+        .into_bytes()
+}
+
+/// What the record held before [`record_kid`] made it list a key's id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Prior {
+    /// It listed it already: nothing was written.
+    Listed,
+    /// The generation's record without it: the id was added.
+    Added,
+    /// None, one of another generation, or one that can't be read: a new
+    /// record with this id only.
+    Missing,
+    Other(u64),
+    Unreadable(String),
+}
+
+impl Prior {
+    /// Why a record listing a key already held was rebuilt (a runtime.log
+    /// line), if it was.
+    fn rebuilt(&self, key: &HostEncKey) -> Option<String> {
+        let was = match self {
+            Prior::Listed => return None,
+            Prior::Added => "without its id".to_string(),
+            Prior::Missing => "missing".to_string(),
+            Prior::Other(generation) => format!("of trust generation {generation}"),
+            Prior::Unreadable(why) => format!("unreadable ({why})"),
+        };
+        Some(format!(
+            "the record of keys made was {was}; rebuilt from the key held (enc_kid {}, trust generation {})",
+            key.enc_kid(),
+            key.host_trust_gen
+        ))
+    }
+}
+
+/// Makes the record of generation `generation` list `kid`, durably (fsync,
+/// rename, directory fsync), unless it does already.
+fn record_kid(store: &mut Store, generation: u64, kid: [u8; 8]) -> Result<Prior, WriteError> {
+    let (prior, mut kids) = match read_record(store) {
+        Record::Of {
+            host_trust_gen,
+            kids,
+        } if host_trust_gen == generation => {
+            if kids.contains(&kid) {
+                return Ok(Prior::Listed);
+            }
+            (Prior::Added, kids)
+        }
+        Record::Of { host_trust_gen, .. } => (Prior::Other(host_trust_gen), Vec::new()),
+        Record::Missing => (Prior::Missing, Vec::new()),
+        Record::Unreadable(why) => (Prior::Unreadable(why), Vec::new()),
+    };
+    kids.push(kid);
+    store.replace(DlFile::HostEncGenerated, &record_bytes(generation, &kids))?;
+    Ok(prior)
+}
+
+/// Makes a new key for `generation`: its id recorded first, then the key
+/// file. The caller holds `trust_gen.lock`. What the record held before.
+fn make(store: &mut Store, generation: u64) -> Result<(HostEncKey, Prior), WriteError> {
+    let (key, secret) = HostEncKey::generate(generation);
+    let prior = record_kid(store, generation, key.kid)?;
+    store.replace(
+        DlFile::HostEncKey,
+        &key_bytes(generation, &secret, key.enc_pub()),
+    )?;
+    Ok((key, prior))
+}
+
+/// The line for a key made (`replaced`: the generation of the one it
+/// replaced), and for a record it couldn't carry over.
+fn made_lines(key: &HostEncKey, replaced: Option<u64>, prior: &Prior) -> Vec<String> {
+    let mut lines = vec![match replaced {
+        Some(old) => format!(
+            "made for trust generation {} (enc_kid {}), replacing the key of trust generation {old}",
+            key.host_trust_gen,
+            key.enc_kid()
+        ),
+        None => format!(
+            "made for trust generation {} (enc_kid {})",
+            key.host_trust_gen,
+            key.enc_kid()
+        ),
+    }];
+    if let Prior::Unreadable(why) = prior {
+        lines.push(format!(
+            "the record of keys made was unreadable ({why}); it now lists this key only"
+        ));
+    }
+    lines
+}
+
+/// With the device list's pin (`atem pair` and `atem pair verify`; the
+/// caller holds `trust_gen.lock` and just pinned the list, which removed
+/// any earlier key and record): the key of the pin's `generation`, beside
+/// its new `host_channel_key`. What happened, as runtime.log lines.
+pub fn make_at_pin_locked(pairing: &PairingPaths, generation: u64) -> Result<Vec<String>, String> {
+    let mut store = Store::new(pairing, &journal_of(pairing));
+    #[cfg(test)]
+    if let Some(fault) = PIN_FAULT.with(|f| f.take()) {
+        store.inject(fault);
+    }
+    let (key, prior) = make(&mut store, generation).map_err(|e| format!("cannot make it: {e}"))?;
+    Ok(made_lines(&key, None, &prior))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the next write at a pin that fails.
+    pub(crate) static PIN_FAULT: std::cell::Cell<Option<store::Injected>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// At a runtime start, or a reopen of the pinned device list, with the
+/// hook's `host.senders` on: the host's key for its trust generation
+/// `generation`, made when it holds none (or one of an earlier generation),
+/// and its id in the record (a lost record rebuilt). Under `trust_gen.lock`,
+/// and only while the list is still pinned (an `atem unpair` racing it
+/// leaves no key behind). What happened, as runtime.log lines.
+pub fn ensure(
+    pairing: &PairingPaths,
+    journal_dir: &std::path::Path,
+    generation: u64,
+) -> Vec<String> {
+    let mut store = Store::new(pairing, journal_dir);
+    ensure_with(&mut store, pairing, generation)
+}
+
+pub(crate) fn ensure_with(
+    store: &mut Store,
+    pairing: &PairingPaths,
+    generation: u64,
+) -> Vec<String> {
+    // Pinned, checked first without the lock (whose file a host without a
+    // list never gets from here), then again under it.
+    let pinned = || store::present(&pairing.membership) && generation > 0;
+    if !pinned() {
+        return Vec::new();
+    }
+    let _lock = match store.lock() {
+        Ok(lock) => lock,
+        Err(e) => return vec![format!("not checked: {e:#}")],
+    };
+    if !pinned() {
+        return Vec::new();
+    }
+    let replaced = match read_key(store) {
+        Held::Key(key) if key.host_trust_gen == generation => {
+            return match record_kid(store, generation, key.kid) {
+                Ok(prior) => prior.rebuilt(&key).into_iter().collect(),
+                Err(e) => vec![format!("cannot record the id of the key held: {e}")],
+            };
+        }
+        Held::Key(key) if key.host_trust_gen > generation => {
+            return vec![format!(
+                "{} is of trust generation {}, beyond this host's {generation}; none is handed out",
+                pairing.host_enc_key.display(),
+                key.host_trust_gen
+            )];
+        }
+        Held::Key(key) => Some(key.host_trust_gen),
+        Held::Missing => None,
+        Held::Unreadable(why) => {
+            return vec![format!(
+                "{why}; none is handed out (move it aside and restart the runtime to make a new one)"
+            )];
+        }
+    };
+    match make(store, generation) {
+        Ok((key, prior)) => made_lines(&key, replaced, &prior),
+        Err(e) => vec![format!("cannot make it: {e}")],
+    }
+}
+
+/// This host as the receiver of host-sender mail (design II.4.2;
+/// host-work-v1 §11.5), for the receiving side of host senders (nothing
+/// calls it yet): the [`Recipient`] and the provider behind its keys.
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct HostRecipient {
+    pub recipient: Recipient,
+    pub provider: SoftwareKeys,
+}
+
+/// This host as the receiver of host-sender mail at its current trust
+/// generation: its `host_id` (the device id its pairing was verified with)
+/// and `host_trust_gen` from its own pairing (`pairing/trust_gen`, as
+/// `pairing::load` reads it), never from its device list, which may lag
+/// behind its own new `add_host`; `keys` the generation's private key (none
+/// when the key held is of another generation, or there is none);
+/// `generated` the record's ids for the generation (none for a record of
+/// another generation or one that can't be read: the key held still counts
+/// as made). `Err` for a profile that isn't paired and verified.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn recipient(src: &crate::profile::Sources) -> Result<HostRecipient, String> {
+    let state = crate::pairing::load(src).map_err(|e| format!("{e:#}"))?;
+    let binding = state.binding.ok_or("not paired")?;
+    let trust = crate::memory::trust::TrustStore::load_from(&src.paths.cred.trust)
+        .map_err(|e| format!("{e:#}"))?;
+    let host_id = trust
+        .verified(&binding.astation_id)
+        .map(|entry| entry.device_id.clone())
+        .ok_or("this device isn't verified")?;
+    let generation = state.host_trust_gen;
+    let store = Store::new(&src.paths.pairing, &journal_of(&src.paths.pairing));
+    let (keys, provider) = match read_key(&store) {
+        Held::Key(key) if key.host_trust_gen == generation => {
+            (vec![(HostEncKey::key_id(), key.kid)], key.keys)
+        }
+        _ => (Vec::new(), SoftwareKeys::new()),
+    };
+    let generated = match read_record(&store) {
+        Record::Of {
+            host_trust_gen,
+            kids,
+        } if host_trust_gen == generation => kids,
+        _ => Vec::new(),
+    };
+    Ok(HostRecipient {
+        recipient: Recipient {
+            host_id,
+            host_trust_gen: generation,
+            keys,
+            generated,
+        },
+        provider,
+    })
+}

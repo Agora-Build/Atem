@@ -717,6 +717,9 @@ pub(crate) async fn verify_device<U: OpUi>(
                 astation: &astation,
                 host_id: &host_id,
                 host_seed: &host_seed,
+                // Host senders (the debug hook only): the host encryption
+                // key is made with the pin.
+                enc_key: crate::runtime::test_hooks::host_features().senders,
             };
             crate::pair_verify::apply_device_verified(
                 &capture,

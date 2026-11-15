@@ -33,6 +33,9 @@ pub mod envelope;
 mod fixtures_tests;
 #[cfg(test)]
 mod hold_tests;
+pub mod host_enc;
+#[cfg(test)]
+mod host_enc_tests;
 pub mod host_policy;
 #[cfg(test)]
 mod host_policy_host_tests;
