@@ -112,10 +112,11 @@ pub struct App {
     /// A device verification's certificate (`deviceVerified`) went to its
     /// operation over a relay link: if that link drops (the Station closes
     /// it with 1013 so the host proves its route under the new device
-    /// list), its reconnect waits until the operation ended and, when it
-    /// ended ok, until the broker's next pass read the list it pinned, so
-    /// the new link proves its route with the new `host_channel_key` at the
-    /// new head (§R9.7b); at most `op_route::VERIFY_HOLD`.
+    /// list), the next connect attempt (the whole attempt, its local step
+    /// too) waits until the operation ended and, when it ended ok, until the
+    /// broker's next pass read the list it pinned, so the new link proves
+    /// its route with the new `host_channel_key` at the new head (§R9.7b);
+    /// at most `op_route::VERIFY_HOLD`.
     pub verify_hold: Option<op_route::VerifyHold>,
     /// Astation instance ID when currently connected (from CredentialSync or auth flow).
     pub connected_astation_id: Option<String>,

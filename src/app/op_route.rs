@@ -8,13 +8,13 @@ use crate::websocket_client::{AstationClient, AstationMessage};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
-/// How long a verification's relay reconnect waits at most for its
-/// operation to end (`App::verify_hold`): far beyond its tail on a closed
-/// link (the apply, then sends that fail at once), well below the 30 s
-/// retry a proof under the old key would cost.
+/// How long the next connect attempt waits at most for a verification to
+/// end (`App::verify_hold`): far beyond its tail on a closed link (the
+/// apply, then sends that fail at once), well below the 30 s retry a proof
+/// under the old key would cost.
 pub const VERIFY_HOLD: Duration = Duration::from_secs(10);
 
-/// A verification's relay reconnect waits (`App::verify_hold`).
+/// The next connect attempt waits for a verification (`App::verify_hold`).
 #[derive(Debug, Clone, Copy)]
 pub struct VerifyHold {
     /// When its certificate went to the operation.

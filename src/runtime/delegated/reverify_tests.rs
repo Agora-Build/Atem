@@ -283,13 +283,44 @@ fn with_the_hook_off_a_reverify_keeps_the_link() {
     });
 }
 
+/// The broker's loop around the App's link, for the hook-on tests below:
+/// the sockets the App reconnected to, and the links the identity
+/// reconnect dropped.
+struct RvLoop {
+    next: (u64, u64),
+    reconnects: Vec<u64>,
+    drops: usize,
+}
+
+/// One broker tick in the rig: the bridge's pass, the release of a
+/// verification's hold after it (`Server::host_pass`), the identity
+/// reconnect (`op_running` while the operation runs), and at the next
+/// tick's start the App's reconnect, when one is due and not held: the
+/// next link comes up on the next socket (as `rv_link`).
+fn rv_tick(rig: &mut LocalRig, l: &mut RvLoop, op_running: bool) {
+    passes(rig, 1);
+    rig.app.verify_hold_pass();
+    if rig.app.identity_reconnect_due(op_running, false) {
+        l.drops += 1;
+    }
+    let due = !rig.app.r9_link_up() && rig.app.astation_reconnect_at.is_some();
+    if due && !rig.app.reconnect_held() {
+        rig.app.astation_reconnect_at = None;
+        let (link_gen, socket) = l.next;
+        rv_link(rig, link_gen, socket);
+        l.reconnects.push(socket);
+        l.next = (link_gen + 1, socket + 1);
+    }
+}
+
 /// Astation PR #81 with the hook on: the Station closes the re-verified
-/// host's socket with 1013. Seen before the re-pin, the identity change
-/// finds no link, so no identity reconnect is asked; seen after it, the
-/// identity reconnect asked for the old socket ends unused once the
-/// operation ended. Either way the one reconnect is the normal one, which
-/// the verification's hold (`App::verify_hold`) keeps until the operation
-/// ended and the pass after it ran.
+/// host's socket with 1013, and the verification's hold
+/// (`App::verify_hold`) keeps the reconnect until the operation ended and
+/// the pass after it read the new list. Seen before the re-pin, the close
+/// leaves the identity change no link, so no identity reconnect is asked
+/// (without the hold the next link would come up under the old identity and
+/// be dropped again); seen after it, the identity reconnect asked for the
+/// old socket ends unused. Either way: one reconnect, on a link that stays.
 #[test]
 fn a_station_close_after_a_reverify_reconnects_once_with_the_hook_on() {
     for close_first in [true, false] {
@@ -299,6 +330,11 @@ fn a_station_close_after_a_reverify_reconnects_once_with_the_hook_on() {
             let os = ManualOs::at(start);
             let (mut s, _) = rv_covered(&mut rig, root, &os, start);
             rv_link(&mut rig, 7, 41);
+            let mut l = RvLoop {
+                next: (8, 42),
+                reconnects: Vec::new(),
+                drops: 0,
+            };
             // The certificate went to the operation over the relay.
             rig.app.verify_hold = Some(crate::app::op_route::VerifyHold {
                 since: Instant::now(),
@@ -309,33 +345,42 @@ fn a_station_close_after_a_reverify_reconnects_once_with_the_hook_on() {
                 rig.app.astation_routed = false;
                 rig.app.astation_client = crate::websocket_client::AstationClient::new();
                 rig.app.astation_reconnect_at = Some(Instant::now());
-                passes(rig, 1);
             };
             if close_first {
                 close(&mut rig);
-            }
-            reverify(&mut rig, root, &mut s);
-            passes(&mut rig, 1);
-            if close_first {
-                assert_eq!(rig.app.identity_reconnect, None, "no link to move");
+                rv_tick(&mut rig, &mut l, true);
             } else {
+                // The 100 ms pass read the pin while the operation ran.
+                reverify(&mut rig, root, &mut s);
+                rv_tick(&mut rig, &mut l, true);
                 assert_eq!(
                     rig.app.identity_reconnect.map(|(_, socket)| socket),
                     Some(41)
                 );
                 close(&mut rig);
+                rv_tick(&mut rig, &mut l, true);
             }
-            // The operation ends ok; the pass after it ran.
+            // The operation's tail: nothing reconnects meanwhile.
+            assert!(l.reconnects.is_empty(), "held: {:?}", l.reconnects);
+            // The operation ends ok; the next pass reads the list it
+            // pinned (`check_list`), then the hold is released.
             assert!(rig.app.verification_ended(true));
-            passes(&mut rig, 1);
-            rig.app.verify_hold_pass();
-            assert!(rig.app.verify_hold.is_none(), "released");
-            assert!(
-                !rig.app.identity_reconnect_due(false, false),
-                "close_first {close_first}: no second drop"
+            if close_first {
+                reverify(&mut rig, root, &mut s);
+            }
+            for _ in 0..4 {
+                rv_tick(&mut rig, &mut l, false);
+            }
+            assert_eq!(
+                l.reconnects,
+                [42],
+                "close_first {close_first}: one reconnect"
             );
+            assert_eq!(l.drops, 0, "close_first {close_first}: no identity drop");
+            assert!(rig.app.r9_link_up(), "the next link stays");
+            assert_eq!(rig.app.astation_client.socket_id(), 42);
             assert_eq!(rig.app.identity_reconnect, None);
-            assert!(rig.app.astation_reconnect_at.is_some(), "the one reconnect");
+            assert!(rig.app.verify_hold.is_none(), "released");
         });
     }
 }

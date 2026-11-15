@@ -1024,9 +1024,16 @@ fn a_lost_link_fails_the_verification_without_replay() {
 /// flushes it and closes the socket with 1013, so the host reconnects and
 /// proves its route under the new device list. The certificate came before
 /// the close: it is applied and the verification succeeds; nothing is
-/// aborted.
+/// aborted. Also behind 40 other messages (more than the App's pump takes
+/// in one pass).
 #[test]
 fn a_certificate_then_a_1013_close_still_verifies() {
+    for ahead in [0, 40] {
+        a_certificate_then_a_1013_close_verifies(ahead);
+    }
+}
+
+fn a_certificate_then_a_1013_close_verifies(ahead: usize) {
     local(async {
         let dir = Rc::new(short_dir());
         paired(&dir.path().join("profile"));
@@ -1037,9 +1044,16 @@ fn a_certificate_then_a_1013_close_still_verifies() {
             verify_until_the_question(&rt, &mut peer, "acct-op").await;
         op.answer(question, AnswerValue::Yes).await;
         op.printed("Waiting for your Mac").await;
+        for n in 0..ahead {
+            peer.send(&AstationMessage::Heartbeat {
+                timestamp: n.to_string(),
+            });
+        }
         peer.send(&certificate);
         peer.close_again();
-        op.done().await.unwrap();
+        op.done()
+            .await
+            .unwrap_or_else(|error| panic!("{ahead} ahead: {error}"));
         assert!(
             op.printed.iter().any(|l| l.contains("Device verified")),
             "{:?}",
@@ -1122,36 +1136,83 @@ fn unverify(keys: &CredPaths) {
     std::fs::write(&keys.trust, trust.to_string()).unwrap();
 }
 
+/// What the fake relay saw, in order.
+#[derive(Debug)]
+enum RelayEvent {
+    /// Connection `n` (from 1) opened.
+    Connected(usize),
+    /// Connection `n`'s `host_route` answer, with its challenge.
+    Proof(usize, atem_client::host_route::HostChallenge, String),
+    /// Connection `n` closed.
+    Closed(usize),
+}
+
+/// The fake relay's next event.
+async fn relay_event(relay: &mut mpsc::UnboundedReceiver<RelayEvent>) -> RelayEvent {
+    tokio::time::timeout(WAIT, relay.recv())
+        .await
+        .expect("a relay event")
+        .unwrap()
+}
+
 /// A fake relay at the URL returned: every connection gets a
-/// `host_challenge` for `ASTATION`'s room at once (§R9.7b), and each
-/// `host_route` answer comes back with its challenge.
-async fn challenging_relay() -> (
-    String,
-    mpsc::UnboundedReceiver<(atem_client::host_route::HostChallenge, String)>,
-) {
+/// `host_challenge` for `ASTATION`'s room at once (§R9.7b). Each
+/// `host_route` answer is checked against `log` (once set) and answered
+/// `host_route_ok` or `host_route_refused`, as the relay does, so a proved
+/// link is held routed. Everything it sees is reported.
+async fn challenging_relay(
+    log: Rc<std::cell::RefCell<Option<atem_client::membership::Membership>>>,
+) -> (String, mpsc::UnboundedReceiver<RelayEvent>) {
+    use atem_client::host_route::{HostChallenge, RelayReply, verify_host_route_message};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::task::spawn_local(async move {
+        let mut n = 0;
         while let Ok((stream, _)) = listener.accept().await {
-            let tx = tx.clone();
+            n += 1;
+            let (tx, log) = (tx.clone(), log.clone());
             tokio::task::spawn_local(async move {
                 let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
                     return;
                 };
-                let challenge = atem_client::host_route::HostChallenge::new(ASTATION);
+                let _ = tx.send(RelayEvent::Connected(n));
+                let challenge = HostChallenge::new(ASTATION);
                 let text = challenge.to_json().to_string();
-                if socket.send(WsMessage::Text(text)).await.is_err() {
-                    return;
-                }
-                while let Some(Ok(message)) = socket.next().await {
-                    if let WsMessage::Text(text) = message
-                        && serde_json::from_str::<Value>(&text)
+                if socket.send(WsMessage::Text(text)).await.is_ok() {
+                    while let Some(Ok(message)) = socket.next().await {
+                        let WsMessage::Text(text) = message else {
+                            continue;
+                        };
+                        if !serde_json::from_str::<Value>(&text)
                             .is_ok_and(|v| v["op"] == "host_route")
-                    {
-                        let _ = tx.send((challenge.clone(), text));
+                        {
+                            continue;
+                        }
+                        let reply = log.borrow().as_ref().map(|log| {
+                            let verdict = verify_host_route_message(
+                                log,
+                                text.as_bytes(),
+                                &challenge.nonce,
+                                ASTATION,
+                                ATEM_ID,
+                            );
+                            match verdict {
+                                Ok(route) => RelayReply::ok(&route),
+                                Err(refusal) => RelayReply::refused(&refusal),
+                            }
+                            .to_json()
+                            .to_string()
+                        });
+                        let _ = tx.send(RelayEvent::Proof(n, challenge.clone(), text));
+                        if let Some(reply) = reply
+                            && socket.send(WsMessage::Text(reply)).await.is_err()
+                        {
+                            break;
+                        }
                     }
                 }
+                let _ = tx.send(RelayEvent::Closed(n));
             });
         }
     });
@@ -1190,8 +1251,10 @@ fn the_reconnect_after_a_reverify_proves_its_route_with_the_new_key() {
         rt.shutdown().await;
         let _ = std::fs::remove_file(dir.path().join("rt.sock"));
         unverify(&keys);
-        // No local Astation; the relay challenges every connection at once.
-        let (relay_url, mut proofs) = challenging_relay().await;
+        // No local Astation; the relay challenges every connection at once
+        // and routes a host whose proof its log verifies.
+        let relay_log = Rc::new(std::cell::RefCell::new(None));
+        let (relay_url, mut seen) = challenging_relay(relay_log.clone()).await;
         std::fs::write(
             profile.join("config.toml"),
             format!(
@@ -1211,33 +1274,42 @@ fn the_reconnect_after_a_reverify_proves_its_route_with_the_new_key() {
         let certificate = verifier
             .certificate(&mut peer, trust_gen(&rt.profile))
             .await;
+        // The relay holds the grown list (Astation published the add_host).
+        let new_head = verifier.log.borrow().log.head();
+        *relay_log.borrow_mut() = Some(verifier.log.into_inner().log);
         let (question, _, _) = op.ask().await;
         op.answer(question, AnswerValue::Yes).await;
         op.printed("Waiting for your Mac").await;
         peer.send(&certificate);
         peer.close_again();
         op.done().await.unwrap();
-        let (challenge, answer) = tokio::time::timeout(WAIT, proofs.recv())
-            .await
-            .expect("the reconnect answered the relay's challenge")
-            .unwrap();
-        let log = verifier.log.into_inner().log;
+        let first = relay_event(&mut seen).await;
+        assert!(matches!(first, RelayEvent::Connected(1)), "{first:?}");
+        let RelayEvent::Proof(1, challenge, answer) = relay_event(&mut seen).await else {
+            panic!("the reconnect answered the relay's challenge");
+        };
         let route = atem_client::host_route::verify_host_route_message(
-            &log,
+            relay_log.borrow().as_ref().unwrap(),
             answer.as_bytes(),
             &challenge.nonce,
             ASTATION,
             ATEM_ID,
         )
         .unwrap_or_else(|refusal| panic!("refused: {}", refusal.code()));
-        assert_eq!(route.head, log.head(), "at the new head");
+        assert_eq!(route.head, new_head, "at the new head");
         assert_ne!(route.head, old_head);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(300), proofs.recv())
-                .await
-                .is_err(),
-            "one reconnect"
-        );
+        // One reconnect: the routed link stays (a second reconnect would
+        // close it, or open another connection, within a pass or two).
+        let more = tokio::time::timeout(Duration::from_secs(2), seen.recv()).await;
+        assert!(more.is_err(), "one reconnect: {more:?}");
+        let mut status = rt.client().await;
+        status.send(&ClientMsg::Status).await.unwrap();
+        let status = expect(&mut status, |m| match m {
+            RuntimeMsg::Status { status } => Some(status),
+            _ => None,
+        })
+        .await;
+        assert!(status.routed, "held routed on its proof");
         rt.shutdown().await;
     });
 }

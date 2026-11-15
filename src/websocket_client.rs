@@ -2492,8 +2492,11 @@ impl AstationClient {
     /// down; a caller that reads at most so many a pass leaves the rest to
     /// its next pass.
     pub fn is_ws_closed(&self) -> bool {
-        let drained = self.receiver.as_ref().is_none_or(|r| r.is_empty());
-        self.ws_closed || (self.transport_ended() && drained)
+        link_down(
+            self.ws_closed,
+            || self.transport_ended(),
+            || self.receiver.as_ref().is_none_or(|r| r.is_empty()),
+        )
     }
 
     /// The socket is gone: `recv_message()` found the channel closed, or a
@@ -2749,6 +2752,20 @@ impl Drop for AstationClient {
 }
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// [`AstationClient::is_ws_closed`]: down once the transport `ended` and
+/// its queue is `drained`, read in that order. A reader task that finished
+/// made all its sends first, so a queue read empty after it is empty for
+/// good; read the other way, the reader could queue its last message and
+/// finish between the two reads, and the link would be called down with it
+/// still queued.
+fn link_down(
+    ws_closed: bool,
+    ended: impl FnOnce() -> bool,
+    drained: impl FnOnce() -> bool,
+) -> bool {
+    ws_closed || (ended() && drained())
+}
 
 pub(crate) fn resolved_atem_id(hostname: &str) -> String {
     if let Some(existing) = AtemConfig::stored_atem_id() {
@@ -3297,6 +3314,40 @@ mod tests {
         assert!(matches!(&got[2], AstationMessage::RelayTooLarge(n) if *n > RELAY_MESSAGE_BYTES), "{:?}", got[2..].iter().map(|m| format!("{m:?}").len()).collect::<Vec<_>>());
         assert!(matches!(&got[3], AstationMessage::Channel(t) if t.contains("\"h2\"")), "{got:?}");
         server.abort();
+    }
+
+    /// The race at a close, pinned: the reader queues its last message and
+    /// finishes right after the first of `is_ws_closed`'s two reads. The
+    /// link isn't called down with that message queued: it is read at the
+    /// next pass, and only then is the link down.
+    #[test]
+    fn a_message_queued_as_the_reader_ends_is_never_dropped() {
+        use std::cell::Cell;
+        let (finished, queued, raced) = (Cell::new(false), Cell::new(0), Cell::new(false));
+        // The reader's last step: queue the message, then finish (once).
+        let reader_ends = || {
+            if !raced.replace(true) {
+                queued.set(1);
+                finished.set(true);
+            }
+        };
+        let ended = || {
+            let ended = finished.get();
+            reader_ends();
+            ended
+        };
+        let drained = || {
+            let drained = queued.get() == 0;
+            reader_ends();
+            drained
+        };
+        let racing = super::link_down(false, ended, drained);
+        assert!(!racing, "not down with it queued");
+        let down = || super::link_down(false, || finished.get(), || queued.get() == 0);
+        assert!(!down());
+        // The next pass reads it: then the link is down.
+        queued.set(0);
+        assert!(down());
     }
 
     /// The socket closing ends the transport at once, but the link counts
