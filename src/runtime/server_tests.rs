@@ -865,6 +865,31 @@ fn a_held_lock_that_never_answers_is_named() {
     });
 }
 
+/// The wait for an exiting runtime's lock and the wait for the started one
+/// share one budget (re-review N5): a lock held for most of it, then a
+/// start that never answers, fails at the budget, not at twice it.
+#[test]
+fn a_start_after_a_lock_wait_keeps_one_budget() {
+    local(async {
+        let dir = short_dir();
+        let locator = super::client::Locator::in_dir(dir.path());
+        let held = crate::daemon::lock_exclusive_with_pid(&locator.lock)
+            .unwrap()
+            .expect("the exiting runtime's lock");
+        let exiting = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            drop(held);
+        });
+        let began = Instant::now();
+        let result =
+            RuntimeClient::connect_or_start_with(&locator, || Ok(()), Duration::from_secs(1)).await;
+        let took = began.elapsed();
+        exiting.join().unwrap();
+        assert!(result.is_err(), "nothing answers");
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+    });
+}
+
 /// A client whose peer ended reads as hung up before its reader sees the
 /// close, unread bytes or not, on Linux's and macOS's semantics alike
 /// (cleanup review, minor 5; re-review N1).

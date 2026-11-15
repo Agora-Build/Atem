@@ -237,6 +237,7 @@ impl RuntimeClient {
         // still hold `runtime.lock`: one started now would find it held and
         // exit at once. Wait for the lock first, or for an answer after all
         // (a runtime between taking its lock and listening).
+        // One budget for this wait and the start's below.
         let deadline = tokio::time::Instant::now() + wait;
         while crate::daemon::lock_is_held(&locator.lock) == Some(true) {
             match Self::connect(locator).await {
@@ -249,7 +250,6 @@ impl RuntimeClient {
             }
         }
         start()?;
-        let deadline = tokio::time::Instant::now() + wait;
         loop {
             tokio::time::sleep(Duration::from_millis(50)).await;
             match Self::connect(locator).await {
