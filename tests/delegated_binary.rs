@@ -837,10 +837,7 @@ fn a_freeze_at_the_start_fails_the_attempt() {
         &rig.membership_dir().join("carry.json"),
         &json!({"entries": [conflict]}).to_string(),
     );
-    within("the carriage applied", || {
-        rig.membership_dir().join("carried").exists()
-    });
-    let carried = std::fs::read_to_string(rig.membership_dir().join("carried")).unwrap();
+    let carried = carried_line(&rig);
     assert!(carried.starts_with("Frozen"), "{carried}");
     // The Mac's turn ends: the session host asks the start check.
     std::fs::write(rig.fake.join("complete"), "").unwrap();
@@ -3417,12 +3414,22 @@ fn launch_at_the_spawn_boundary_waits_for_hold_gap_and_deferral_and_fails_on_rev
         &rig.membership_dir().join("carry.json"),
         &json!({"entries": [conflict]}).to_string(),
     );
-    within("the carriage applied", || {
-        rig.membership_dir().join("carried").exists()
-    });
-    let carried = std::fs::read_to_string(rig.membership_dir().join("carried")).unwrap();
+    let carried = carried_line(&rig);
     assert!(carried.starts_with("Frozen"), "{carried}");
     launch_failed(&rig, &rid, &sid, "sender's authority changed");
+}
+
+/// The debug carriage hook's line for the carriage the test handed it
+/// (`carry.json`), once written: the hook creates its `carried` file, then
+/// writes the line, so a file that exists may be empty a moment longer.
+fn carried_line(rig: &Rig) -> String {
+    let path = rig.membership_dir().join("carried");
+    let mut line = String::new();
+    within("the carriage applied", || {
+        line = std::fs::read_to_string(&path).unwrap_or_default();
+        line.ends_with('\n')
+    });
+    line
 }
 
 /// VII.A test 21 (design I.5.5 "A task with a live attempt", I.5.6;
