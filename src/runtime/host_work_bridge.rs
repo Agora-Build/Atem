@@ -847,6 +847,9 @@ impl HostBridge {
             SenderClass::V1 => return Ok(None),
             // Its class can't be decided now (ruling T32b): nothing stored.
             SenderClass::Unchecked => return Err("busy"),
+            // A host sender that may not send (none reaches a channel: no
+            // channel principal is a `host:` one).
+            SenderClass::Refused => return Err("forbidden"),
         };
         let Some(list) = self.open_list() else {
             return Ok(None);

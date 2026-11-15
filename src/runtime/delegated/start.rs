@@ -351,6 +351,9 @@ fn in_effect<'v>(view: &'v StartView, adm: &Admission) -> Result<InEffect<'v>, E
                 device_id: device_id.clone(),
             },
         ),
+        // Not a member of the list: a host sender's own check (fail closed
+        // until it is built).
+        DelegatedSender::Host { .. } => return Err(Event::Removed),
     };
     let member = list
         .membership
@@ -449,7 +452,7 @@ fn waits(
     // Station's gate needs its device-list part too (I.5.8).
     let fetched = view.fetched(sender.list);
     let gate_of = match &adm.sender {
-        DelegatedSender::Native { .. } => Some(adm.sender.clone()),
+        DelegatedSender::Native { .. } | DelegatedSender::Host { .. } => Some(adm.sender.clone()),
         DelegatedSender::Service { device_id, .. } => {
             sender
                 .standing

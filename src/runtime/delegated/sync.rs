@@ -1542,7 +1542,7 @@ impl GateView for FeedSync {
     /// open; a native's is that one.
     fn open_for(&self, sender: &DelegatedSender, fetched: Option<&str>) -> bool {
         let origin = match sender {
-            DelegatedSender::Native { .. } => self.own.as_deref(),
+            DelegatedSender::Native { .. } | DelegatedSender::Host { .. } => self.own.as_deref(),
             DelegatedSender::Service { feed, .. } => Some(feed.origin.as_str()),
         };
         origin.is_some_and(|origin| {

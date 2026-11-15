@@ -120,6 +120,14 @@ impl GateView for Gates {
                     || self.caught_up.contains(&format!("member:{device_id}"))
             }
             DelegatedSender::Service { feed, .. } => self.station_open(&feed.origin, fetched),
+            // The host's own Station's gate (design II.5): its feed and its
+            // device list, which carry every stop of a host sender. No
+            // channel opens it: a host sender has none, and a native's
+            // caught-up channel speaks for that native only.
+            DelegatedSender::Host { .. } => self
+                .own
+                .as_deref()
+                .is_some_and(|own| self.station_open(own, fetched)),
         }
     }
 }
@@ -195,5 +203,28 @@ mod tests {
         // The fetch's part with no feed part: closed.
         let gates = Gates::default();
         assert!(!gates.open_for(&service(ORIGIN), Some(ORIGIN)));
+    }
+
+    /// Design II.5: a host sender waits for the host's own Station's gate,
+    /// its feed and device-list parts both (its stops come with them); no
+    /// channel opens it, a caught-up native's included.
+    #[test]
+    fn a_host_sender_waits_for_the_own_stations_gate() {
+        let host = DelegatedSender::Host {
+            host_id: "host-b".into(),
+            generation: 3,
+            epoch: 3,
+        };
+        let mut gates = Gates::default();
+        gates.set_caught_up(BTreeSet::from(["member:dev-phone".to_string()]));
+        assert!(!gates.open_for(&host, None));
+        gates.open_feed(ORIGIN);
+        assert!(!gates.open_for(&host, None), "the feed part alone");
+        assert!(!gates.open_for(&host, Some("https://other.example")));
+        assert!(gates.open_for(&host, Some(ORIGIN)));
+        gates.close_stations();
+        assert!(!gates.open_for(&host, Some(ORIGIN)));
+        gates.open_own_station(ORIGIN);
+        assert!(gates.open_for(&host, None));
     }
 }
