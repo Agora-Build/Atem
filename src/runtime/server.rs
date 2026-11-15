@@ -392,6 +392,19 @@ pub(super) fn hung_up(fd: std::os::fd::BorrowedFd<'_>) -> bool {
     read == 0
 }
 
+/// Whether a client still in the map went away: its process ended (its
+/// start time no longer `started`), or its socket hung up (`hung_up`), as
+/// a process killed and not yet reaped leaves it, whose start time still
+/// reads.
+pub(super) fn client_gone(
+    peer: Option<(u32, u64)>,
+    socket: Option<std::os::fd::BorrowedFd<'_>>,
+    start_time: impl Fn(u32) -> Option<u64>,
+) -> bool {
+    peer.is_some_and(|(pid, started)| start_time(pid) != Some(started))
+        || socket.is_some_and(hung_up)
+}
+
 /// Refuses a peer whose process can't be verified.
 const UNVERIFIED: &str =
     "the calling process could not be verified (it ended or was replaced); run the command again";
@@ -729,18 +742,15 @@ impl Server {
     /// relay: unlike `atem message reply`, which commits its reply before it
     /// answers, `done` keeps nothing until it resolves.
     fn owner_done_published(&mut self, done: OwnerDonePublished) {
-        // Gone: removed already, or its process ended, or its socket was
-        // hung up, though the reader hasn't seen the close yet (both arrive
-        // at this loop in either order: a Ctrl-C just before the snapshot
-        // came back). The socket covers a process killed and not yet
-        // reaped, whose start time still reads.
+        // Gone: removed already, or gone though the reader hasn't seen the
+        // close yet (`client_gone`; both arrive at this loop in either
+        // order: a Ctrl-C just before the snapshot came back).
         let gone = self.clients.get(&done.client).is_none_or(|client| {
-            client.peer.is_some_and(|(pid, started)| {
-                super::adopt::process_start_time(pid) != Some(started)
-            }) || client
-                .socket
-                .as_ref()
-                .is_some_and(|fd| hung_up(std::os::fd::AsFd::as_fd(fd)))
+            client_gone(
+                client.peer,
+                client.socket.as_ref().map(std::os::fd::AsFd::as_fd),
+                super::adopt::process_start_time,
+            )
         });
         if gone {
             eprintln!(

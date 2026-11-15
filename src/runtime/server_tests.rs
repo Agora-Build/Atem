@@ -895,6 +895,31 @@ fn a_socket_whose_peer_ended_reads_hung_up() {
     assert!(super::server::hung_up(ours.as_fd()), "end of stream");
 }
 
+/// The gone-client check of a `done` whose snapshot came back (re-review
+/// N2): a client still in the map, its process alive (this test's own),
+/// is gone once its socket hung up, and only then.
+#[test]
+fn a_live_client_whose_socket_hung_up_is_gone() {
+    use std::os::fd::AsFd;
+    let pid = std::process::id();
+    let started = super::adopt::process_start_time(pid).expect("this process");
+    let alive = |p: u32| (p == pid).then_some(started);
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let gone = || super::server::client_gone(Some((pid, started)), Some(ours.as_fd()), alive);
+    assert!(!gone(), "connected, alive");
+    drop(theirs);
+    assert!(gone(), "hung up, its process still alive");
+    // Its process ended (another start time): gone, whatever the socket.
+    let (open, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(super::server::client_gone(
+        Some((pid, started)),
+        Some(open.as_fd()),
+        |_| None
+    ));
+    // No peer credentials and no socket copy: nothing says it went.
+    assert!(!super::server::client_gone(None, None, alive));
+}
+
 #[test]
 fn the_runtime_environment_is_sanitized() {
     use std::ffi::OsString;
