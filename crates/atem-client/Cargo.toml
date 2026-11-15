@@ -21,6 +21,9 @@ ed25519-dalek = { version = "2", features = ["zeroize"] }
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 chacha20poly1305 = "0.10"
 hpke = { version = "0.12", default-features = false, features = ["alloc", "x25519"] }
+# UUID v5 (SHA-1, RFC 9562) for the derived ids the core checks: a reply's
+# `result_id` (`session::host_work::result_id`). Name-based only: no RNG.
+uuid = { version = "1", default-features = false, features = ["v5"] }
 # Prompt framing (`session::framing`, delegated host-work design III.2):
 # NFKC and NFD, General_Category Cf and the UTS #39 confusables skeleton, all
 # of one pinned Unicode version (18.0.0; the framing's tests check that the
