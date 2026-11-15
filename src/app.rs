@@ -852,7 +852,10 @@ impl App {
         self.check_relay_only_drop();
         self.check_station_switch();
 
-        // Detect WebSocket disconnect (channel closed after draining remaining messages)
+        // Detect WebSocket disconnect: only once everything the reader queued
+        // before the socket closed was handled above (over as many passes as
+        // it takes), so a reply just before the close (a `deviceVerified`
+        // before the Station's 1013) is never dropped with the client.
         if self.astation_routed && self.astation_client.is_ws_closed() {
             // The routed link dropped: reconnect as today.
             self.astation_routed = false;

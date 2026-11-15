@@ -2464,9 +2464,22 @@ impl AstationClient {
         }
     }
 
-    /// Returns true if the WebSocket connection has been closed: `recv_message()`
-    /// found the channel closed, or a transport task (reader or writer) ended.
+    /// Returns true once the link is down and nothing it decoded is left to
+    /// read: `recv_message()` found the channel closed, or a transport task
+    /// (reader or writer) ended and its queue is empty. What the reader
+    /// queued before the socket closed (a `deviceVerified` just before the
+    /// Station's close) is still read, in order, before the link counts as
+    /// down; a caller that reads at most so many a pass leaves the rest to
+    /// its next pass.
     pub fn is_ws_closed(&self) -> bool {
+        let drained = self.receiver.as_ref().is_none_or(|r| r.is_empty());
+        self.ws_closed || (self.transport_ended() && drained)
+    }
+
+    /// The socket is gone: `recv_message()` found the channel closed, or a
+    /// transport task (reader or writer) ended, whatever the reader queued
+    /// before it.
+    pub(crate) fn transport_ended(&self) -> bool {
         self.ws_closed || self.transport_tasks.iter().any(|task| task.is_finished())
     }
 
@@ -3167,7 +3180,7 @@ mod tests {
         let mut client = AstationClient::new();
         client.connect_raw(&format!("ws://{address}")).await.unwrap();
         tokio::time::timeout(WAIT, async {
-            while !client.is_ws_closed() {
+            while !client.transport_ended() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.expect("the link ends at a message over its cap");
@@ -3266,8 +3279,11 @@ mod tests {
         server.abort();
     }
 
+    /// The socket closing ends the transport at once, but the link counts
+    /// as down only once what the reader queued before the close was read:
+    /// a message just before the close is never lost to it.
     #[tokio::test]
-    async fn closed_transport_is_detected_before_buffered_input_is_drained() {
+    async fn the_link_is_down_only_once_input_buffered_before_the_close_was_read() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -3279,11 +3295,14 @@ mod tests {
         let mut client = AstationClient::new();
         client.connect_raw(&format!("ws://{address}")).await.unwrap();
         tokio::time::timeout(WAIT, async {
-            while !client.is_ws_closed() {
+            while !client.transport_ended() {
                 tokio::task::yield_now().await;
             }
         }).await.unwrap();
+        assert!(!client.is_ws_closed(), "a message is still queued");
         assert!(matches!(client.recv_message(), Some(AstationMessage::SessionWire(text)) if text.contains("subscribe")));
+        assert!(client.is_ws_closed(), "down once it was read");
+        assert!(client.recv_message().is_none());
         server.await.unwrap();
     }
 

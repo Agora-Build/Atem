@@ -35,6 +35,10 @@ const ATEM_ID: &str = "atem-op-test";
 const WAIT: Duration = Duration::from_secs(60);
 /// Sent to the peer task: close the WebSocket.
 const CLOSE: &str = "\u{0}close";
+/// Sent to the peer task: close the WebSocket with 1013, as the Station
+/// closes a just-verified host's socket so it reconnects and proves its
+/// route under the new device list.
+const CLOSE_AGAIN: &str = "\u{0}close-1013";
 
 fn short_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -128,6 +132,17 @@ impl Peer {
                         let Some(text) = message else { break };
                         if text == CLOSE {
                             let _ = socket.close(None).await;
+                            break;
+                        }
+                        if text == CLOSE_AGAIN {
+                            use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+                            use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+                            let _ = socket
+                                .close(Some(CloseFrame {
+                                    code: CloseCode::Again,
+                                    reason: "reconnect/reprove".into(),
+                                }))
+                                .await;
                             break;
                         }
                         if socket.send(WsMessage::Text(text)).await.is_err() { break; }
@@ -248,6 +263,11 @@ impl Peer {
 
     fn close(&self) {
         let _ = self.to_atem.send(CLOSE.into());
+    }
+
+    /// Closes the WebSocket with 1013 ("try again later").
+    fn close_again(&self) {
+        let _ = self.to_atem.send(CLOSE_AGAIN.into());
     }
 
     /// The first message from `from` on that `pick` accepts; its index.
@@ -968,6 +988,94 @@ fn a_lost_link_fails_the_verification_without_replay() {
         let error = again.done().await.unwrap_err();
         assert!(error.contains("isn't connected to Astation"), "{error}");
         rt.shutdown().await;
+    });
+}
+
+/// Astation PR #81: on a re-verify the Station delivers `deviceVerified`,
+/// flushes it and closes the socket with 1013, so the host reconnects and
+/// proves its route under the new device list. The certificate came before
+/// the close: it is applied and the verification succeeds; nothing is
+/// aborted.
+#[test]
+fn a_certificate_then_a_1013_close_still_verifies() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let (mut op, question, certificate, _) =
+            verify_until_the_question(&rt, &mut peer, "acct-op").await;
+        op.answer(question, AnswerValue::Yes).await;
+        op.printed("Waiting for your Mac").await;
+        peer.send(&certificate);
+        peer.close_again();
+        op.done().await.unwrap();
+        assert!(
+            op.printed.iter().any(|l| l.contains("Device verified")),
+            "{:?}",
+            op.printed
+        );
+        assert!(verified_as(&rt.keys(), "acct-op"));
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+        assert!(pairing.membership.exists(), "the device list is pinned");
+        assert!(
+            pairing.host_channel_key.exists(),
+            "with the host channel key"
+        );
+        assert!(!pending(&rt.keys()), "no pending pin");
+        assert!(peer.drain(Duration::from_millis(200)).await, "closed");
+        assert!(
+            !peer.seen.iter().any(|m| m["type"] == "verifyAbort"),
+            "{:#?}",
+            peer.seen
+        );
+        rt.shutdown().await;
+    });
+}
+
+/// The App's pump hands on every message the reader decoded before the
+/// socket closed, in order, before it calls the link down: a certificate
+/// behind 40 others (more than one pass takes) still reaches its
+/// operation; each pass takes at most 32, the rest waits for the next.
+#[test]
+fn the_pump_routes_a_certificate_queued_behind_a_backlog() {
+    local(async {
+        let profile = crate::config::AtemConfig::config_dir();
+        paired(&profile);
+        let (mut app, peer) = linked_app(&profile, relay()).await;
+        let mut op = op_on_link(&mut app);
+        for n in 0..40 {
+            peer.send(&AstationMessage::Heartbeat {
+                timestamp: n.to_string(),
+            });
+        }
+        let signer = FakeAstation::new();
+        peer.send(&AstationMessage::DeviceVerified {
+            device_verified: signer.sign(b"x"),
+            account_state: signer.sign(b"y"),
+            grants: Vec::new(),
+            membership: None,
+        });
+        peer.close_again();
+        // The reader has queued all 41 and read the close.
+        tokio::time::timeout(WAIT, async {
+            while !app.astation_client.transport_ended() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the socket closed");
+        pass(&mut app).await;
+        assert!(app.astation_connected, "9 messages are still queued");
+        assert!(op.try_recv().is_err(), "the certificate is the 41st");
+        pass(&mut app).await;
+        assert!(
+            matches!(op.try_recv(), Ok(AstationMessage::DeviceVerified { .. })),
+            "the certificate reached the operation"
+        );
+        assert!(!app.astation_connected, "then the link is down");
+        assert!(app.astation_reconnect_at.is_some(), "the normal reconnect");
     });
 }
 
