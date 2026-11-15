@@ -734,6 +734,56 @@ fn connect_or_start_starts_a_runtime_when_none_answers() {
     });
 }
 
+/// A runtime that dies with the hello unread resets the connection
+/// (`ECONNRESET`): the client takes it for none answering and starts one,
+/// as after a refused connect.
+#[test]
+fn a_runtime_that_dies_under_the_hello_counts_as_none() {
+    local(async {
+        let dir = short_dir();
+        let locator = super::client::Locator::in_dir(dir.path());
+        let socket = locator.socket.clone();
+        let root = dir.path().to_path_buf();
+        let dying = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::task::spawn_local(async move {
+            let (stream, _) = dying.accept().await.unwrap();
+            // The hello is in, unread: closing now resets the client.
+            stream.readable().await.unwrap();
+            drop(stream);
+            drop(dying);
+        });
+        let (_stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let stopped = std::cell::RefCell::new(Some(stopped));
+        let start = || {
+            let stopped = stopped.borrow_mut().take().expect("started once");
+            // The dead runtime's socket file is left behind.
+            std::fs::remove_file(&socket)?;
+            let listener = tokio::net::UnixListener::bind(&socket)?;
+            tokio::task::spawn_local(serve(
+                app(&root),
+                listener,
+                Options {
+                    idle: Duration::from_secs(600),
+                    uid: own_uid(),
+                    launcher: launcher(&root),
+                    profile: None,
+                    clock: Default::default(),
+                    ops: crate::runtime::ops::OpEnv::unavailable(),
+                },
+                async {
+                    let _ = stopped.await;
+                },
+            ));
+            Ok(())
+        };
+        let client = RuntimeClient::connect_or_start_with(&locator, start, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(client.welcome.pid, std::process::id());
+        assert!(stopped.borrow().is_none(), "a runtime was started");
+    });
+}
+
 #[test]
 fn the_runtime_environment_is_sanitized() {
     use std::ffi::OsString;

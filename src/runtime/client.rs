@@ -138,7 +138,8 @@ fn start_runtime(log: &Path) -> Result<()> {
 
 /// Why connecting failed.
 enum Failure {
-    /// Nothing answers: start one.
+    /// Nothing answers: start one. Also a runtime that went away while we
+    /// connected or greeted it (`gone`).
     Absent,
     /// The runtime is restarting for another protocol: start one once it's gone.
     Restarting,
@@ -279,11 +280,12 @@ impl RuntimeClient {
     async fn connect_as(locator: &Locator, passive: bool) -> Result<Self, Failure> {
         match dial(locator).await {
             Ok(stream) => Self::greet(stream, passive).await,
+            // Reset at the connect: queued on a dying runtime's socket.
             Err(error)
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) =>
+                ) || gone(error.kind()) =>
             {
                 Err(Failure::Absent)
             }
@@ -351,6 +353,11 @@ impl RuntimeClient {
             ))),
             // Closed without a word: it was going away.
             Ok(None) => Err(Failure::Absent),
+            // Reset, or closed before the hello was written: it died with
+            // the hello unread (a dying runtime's socket still takes a
+            // connection until its last thread closes it), as absent as a
+            // refused connect.
+            Err(error) if went_away(&error) => Err(Failure::Absent),
             Err(error) => Err(Failure::Other(error)),
         }
     }
@@ -421,6 +428,24 @@ impl RuntimeWriter {
             .await
             .context("the atem runtime closed the connection")
     }
+}
+
+/// A connection the runtime's end dropped with our bytes unread
+/// (`ECONNRESET`) or before we wrote (`EPIPE`): the runtime went away.
+fn gone(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+    )
+}
+
+/// [`gone`] anywhere in `error`'s chain.
+fn went_away(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| gone(e.kind()))
+    })
 }
 
 /// The recorded socket, else the derived one.
@@ -871,7 +896,7 @@ pub fn look(locator: &Locator, timeout: Duration) -> Look {
             if matches!(
                 error.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
+            ) || gone(error.kind()) =>
         {
             return Look::NotRunning;
         }
@@ -895,6 +920,8 @@ pub fn look(locator: &Locator, timeout: Duration) -> Look {
         match reader.read_line(&mut line) {
             Ok(0) => Ok(None),
             Ok(_) => decode_runtime(&line).map(Some).map_err(|e| e.to_string()),
+            // Reset: closed with our bytes unread, as `Ok(0)`.
+            Err(error) if gone(error.kind()) => Ok(None),
             Err(_) => Err("it didn't answer in time".into()),
         }
     };
@@ -905,7 +932,12 @@ pub fn look(locator: &Locator, timeout: Duration) -> Look {
         passive: true,
     };
     if let Err(error) = writer.write_all(encode_client(&hello).as_bytes()) {
-        return Look::Unreachable(error.to_string());
+        // A runtime that went away before the hello (`gone`) runs no more.
+        return if gone(error.kind()) {
+            Look::NotRunning
+        } else {
+            Look::Unreachable(error.to_string())
+        };
     }
     let welcome = match next(&mut reader) {
         Ok(Some(RuntimeMsg::Welcome {
@@ -962,4 +994,32 @@ fn other_op(message: &RuntimeMsg) -> String {
         .ok()
         .and_then(|v| v["op"].as_str().map(str::to_string))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::went_away;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn a_reset_or_a_broken_pipe_is_a_runtime_gone() {
+        for kind in [ErrorKind::ConnectionReset, ErrorKind::BrokenPipe] {
+            let error = anyhow::Error::from(Error::from(kind))
+                .context("the atem runtime closed the connection");
+            assert!(went_away(&error), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(
+                !went_away(&anyhow::Error::from(Error::from(kind))),
+                "{kind:?}"
+            );
+        }
+        assert!(!went_away(&anyhow::anyhow!(
+            "the runtime sent invalid text"
+        )));
+    }
 }
