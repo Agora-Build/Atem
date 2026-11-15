@@ -4507,8 +4507,11 @@ build's runtime reads once, from its own environment, when it starts (no
 client passes `ATEM_TEST_*` to a runtime it starts); only such a runtime
 lists `host.delegated` (and `host.alerts`) in its `welcome`. Release builds
 compile the hook out, so without it no `host-work` principal exists and no
-receipt carries `task_id` or `sender`. Item 8 is still refused (below), and
-`host.senders` stays off (the hook refuses it). The shared core has the
+receipt carries `task_id` or `sender`. Item 8 is refused by every release
+build (below). The same hook takes `host.senders` (only with
+`host.delegated`): a debug build then lists it with hosting on and answers
+`host_enc_key_get`; `control_records` is still refused there as on a host
+that doesn't list the feature. The shared core has the
 wire: the principal's name, the receipt fields and their reader, and the op
 and its answer. Each choice that fills in the design is marked. Astation
 agreed R9.14 (2026-11-11, #120
@@ -4883,9 +4886,13 @@ that answer. Item 8's request stays open.
        decoding. **Atem's choice, agreed with Astation (2026-11-11, #120 comment
        6810116314)**: the design says "a session op for native members", and only a manager signs
        the entry the answer is for.
-     - **Read-only.** The host makes, rotates and records nothing for
-       the request. It answers with the key it holds, whether or not the
-       device list already has it. A host with no key (the file missing
+     - **Read-only.** The host makes and rotates nothing for the
+       request. It answers with the key it holds, whether or not the
+       device list already has it. Before the answer goes, the key's id is
+       in the host's record of the keys it made (design II.4.1, amended
+       for step 4): a record that lacks it (lost, say) gets it first, and
+       a write that fails is `busy`, detail `host encryption key
+       unavailable`, nothing handed out. A host with no key (the file missing
        and not made, or unreadable) answers `busy`, detail `host
        encryption key unavailable`. A held device list answers `busy`,
        detail `device list not reconciled`, as for the host policy. Both
