@@ -369,7 +369,7 @@ impl HostBridge {
         #[cfg(test)]
         {
             use atem_client::control::AckResult;
-            let ids = due
+            let ids: Vec<String> = due
                 .ack
                 .results
                 .iter()
@@ -384,6 +384,9 @@ impl HostBridge {
                 .into_iter()
                 .map(|(_, principal)| principal)
                 .collect();
+            self.work
+                .acks_remote
+                .push((ids.clone(), self.host.remote_principals()));
             self.work.acks_handed.push((ids, attached));
         }
         match due.ack.to_json() {
@@ -461,12 +464,15 @@ impl HostBridge {
     /// - **the fences** first, at once (a later error drops none): with
     ///   `host.delegated` on, session-v1's §H fence of the revoked service,
     ///   each attachment closed after `unauthorized`, `revoked`
-    ///   (`R9Host::fence_revoked`, once per revoke); with it off a record
+    ///   (`R9Host::fence_revoked`, once per revoke), and of the held one,
+    ///   each closed after `busy`, `paused` (`R9Host::fence_held`, when the
+    ///   session host knows it), checked or not, released since or not, so
+    ///   a hold's result goes only after its fence; with it off a record
     ///   still reaches the tasks it holds, but nothing of session-v1 (hook
     ///   off = main);
     /// - then the services' r9 admission as the control state stands
-    ///   ([`HostBridge::sync_services`]): a held service's fence among it
-    ///   (`HostBridge::sync_held`), so a hold's result goes after it too;
+    ///   ([`HostBridge::sync_services`]: the held services' `hello`s
+    ///   refused, `HostBridge::sync_held`);
     /// - **a withdrawal and the intents** once the store was recovered
     ///   (before that, the start's recovery withdraws every attempt still
     ///   `accepted` and reconciles the rest, and they wait), with no
@@ -484,6 +490,12 @@ impl HostBridge {
                 Followup::Fence { principal } => {
                     if self.features.delegated {
                         let effects = self.r9_call(|r9, parts| r9.fence_revoked(&principal, parts));
+                        self.r9_exec(effects, cx);
+                    }
+                }
+                Followup::HoldFence { principal } => {
+                    if self.features.delegated {
+                        let effects = self.r9_call(|r9, parts| r9.fence_held(&principal, parts));
                         self.r9_exec(effects, cx);
                     }
                 }
@@ -514,7 +526,7 @@ impl HostBridge {
                     }
                 }
                 Followup::Intents { .. } => intents = true,
-                Followup::Fence { .. } => {}
+                Followup::Fence { .. } | Followup::HoldFence { .. } => {}
             }
         }
         self.work.followups = later;
@@ -581,19 +593,20 @@ impl HostBridge {
     /// state loads first, and this runs before any service's `hello` (the
     /// engine refuses every service as unchecked until then).
     ///
-    /// The engine fences a service newly held that the session host knows
-    /// (an attachment, a lease, accepted work or `control`) through §H, once
-    /// per hold, each attachment closed after `busy`, `paused`
-    /// (`R9Host::set_held_services`); its later `hello`s are refused so. Run
-    /// from the records' followups (`effects_pass`) before their results go
-    /// to the Station, so a hold is reported applied only once its fence
-    /// ran. A run that ended between the hold's commit and that pass left
-    /// the service granted `control` with no fence: the first read of the
-    /// loaded state fences it then, before admission. A release lifts the
-    /// refusal; nothing of before comes back. A hold changes no delegated
-    /// task here (the record's own effects did); a v1 task the service had
-    /// from before its cover ends as any §H fence ends it (`sender's
-    /// authority changed`).
+    /// The live fence is the hold's own followup (`Followup::HoldFence`,
+    /// `R9Host::fence_held`), carried out in `effects_pass` before the
+    /// record's result goes, whatever the standings show by then (a release
+    /// in the same page) and checked or not. Here the engine's refusal set
+    /// follows the standings (its later `hello`s refused `busy`, `paused`),
+    /// and a service newly in it that the session host still knows (an
+    /// attachment, a lease, accepted work or `control`) is fenced through
+    /// §H: a fence a run that ended between the hold's commit and its
+    /// followup lost, written at the first read of the loaded state, before
+    /// admission. One fenced already is known no more: nothing twice. A
+    /// release lifts the refusal; nothing of before comes back. A hold
+    /// changes no delegated task here (the record's own effects did); a v1
+    /// task the service had from before its cover ends as any §H fence ends
+    /// it (`sender's authority changed`).
     fn sync_held(&mut self, cx: &mut Cx) {
         if !matches!(self.work.feeds, Feeds::Loaded(_)) || self.controls_stood_in() {
             return;

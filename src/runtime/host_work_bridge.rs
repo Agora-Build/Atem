@@ -260,6 +260,11 @@ pub(super) struct State {
     /// ids) with the principals the r9 engine held attachments of then.
     #[cfg(test)]
     acks_handed: Vec<(Vec<String>, Vec<String>)>,
+    /// Tests: each ack as it was handed to the link (its results' record
+    /// ids) with the session host's remote principals then (attachments,
+    /// leases, accepted work, `control`): a fenced one is none of them.
+    #[cfg(test)]
+    acks_remote: Vec<(Vec<String>, Vec<String>)>,
 }
 
 /// Whether the host keeps a control state, and whose (ruling T35d, A): the
@@ -327,6 +332,8 @@ impl State {
             failed_before_spawn: HashMap::new(),
             #[cfg(test)]
             acks_handed: Vec::new(),
+            #[cfg(test)]
+            acks_remote: Vec::new(),
         }
     }
 }

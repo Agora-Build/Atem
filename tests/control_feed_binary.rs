@@ -586,17 +586,31 @@ impl Rig {
     /// `expected` (the runtime's look is passive and may lag a pass).
     #[track_caller]
     fn status_feeds(&self, expected: &str) -> String {
-        let mut last = String::new();
-        within(&format!("Control feeds: {expected}"), || {
+        let deadline = Instant::now() + WAIT;
+        // Every distinct line seen, in order (with when), for the failure.
+        let started = Instant::now();
+        let mut seen: Vec<(u128, String)> = Vec::new();
+        loop {
             let (out, err, _) = self.sandbox.atem(&["status"]);
-            last = out
+            let last = out
                 .lines()
                 .find_map(|l| l.strip_prefix("Control feeds:"))
                 .map(|v| v.trim().to_string())
                 .unwrap_or_else(|| format!("(no line) {out}{err}"));
-            last.starts_with(expected)
-        });
-        last
+            if last.starts_with(expected) {
+                return last;
+            }
+            if seen.last().is_none_or(|(_, l)| *l != last) {
+                seen.push((started.elapsed().as_millis(), last));
+            }
+            // The lines seen, and the Station state, in the failure.
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for Control feeds: {expected}\nseen (ms, line): {seen:#?}\nstation: {}",
+                self.dump()["station"]
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// `atem status` has no `Control feeds:` line (the hook off: as main).
@@ -1335,9 +1349,10 @@ fn a_remote_task_waits_revocations_not_yet_checked_until_the_gate_opens() {
     assert!(!rig.gate_open(), "{}", rig.dump()["station"]);
     assert_eq!(stored(&rig, &native["task_id"])["detail"], GATE_CLOSED);
     never_ran(&rig, &native["task_id"], "GATE_NATIVE");
-    rig.status_feeds(&format!(
-        "{GATE_CLOSED} (reading the control feed (0 of 0))"
-    ));
+    // Reading the feed: "(0 of 0)", or "again since the start" when the
+    // start's recovery (which closes every Station's gate until its feed is
+    // read again) came after the link (a slow start under load).
+    rig.status_feeds(&format!("{GATE_CLOSED} (reading the control feed"));
     // The page: the gate opens, the task runs.
     rig.station().answer_held(held).unwrap();
     in_turn(&rig, &native["task_id"], "GATE_NATIVE");
@@ -2289,6 +2304,9 @@ fn rolled_back_across_a_crash() {
         rig.serve_until("the feed read to 3", |rig| {
             rig.cursor() == Some(3) && rig.gate_open()
         });
+        // The hold fenced the service's channel though the release came in
+        // the same read (host-work-v1 §11.1): it is admitted afresh.
+        let mut svc = Dev::new(&mut r, IDS, &rig.log, SVC, true);
         feed = rig.station().feed_id().to_string();
         // Rolled back to 1 under the same feed_id: marked, then read from 0.
         rig.station().truncate(1);
@@ -3702,25 +3720,28 @@ fn paused() -> (String, Option<String>) {
 /// Item 7 of Astation's review of the delegated build (#120, 2026-11-14;
 /// host-work-v1 §11.1, session-v1 R9.11), in the real runtime: a hold
 /// fences the covered service's session-v1, reversibly.
-/// - **The existing attachment.** Once the hold is read, the service's live
-///   channel is closed after `busy`, `paused`.
-/// - **Queued and direct input.** Its prompt, accepted with the lease
-///   before the hold and held back from dispatch (`hold_dispatch`), and the
-///   raw terminal input it sends on its old channel after the hold, never
-///   reach the agent, the dispatch let go.
+/// - **Queued and direct input.** The service's prompt, accepted with the
+///   lease before the hold (held back from dispatch by `hold_dispatch`, then
+///   let go with nothing to pump the queue), and the new prompt and the raw
+///   input it sends on its old channel after the hold, never reach the
+///   agent, though its lease was renewed just before the hold (unfenced, it
+///   would still stand, and the new prompt would pump the queue). The
+///   phone's prompt then pumps it (a takeover if a lease is left), so a
+///   prompt still queued would be written before it. The held prompt's
+///   receipt reads `rejected`, `control revoked`.
+/// - **The existing attachment** was closed after `busy`, `paused`.
 /// - **A new `hello`** is refused `busy`, `paused`; the phone (a native) is
-///   admitted.
-/// - **Release.** A fresh `hello` is admitted; nothing of before comes
-///   back: a fresh `acquire` is granted (no lease held), the old prompt
-///   never runs.
+///   admitted throughout.
+/// - **Release.** A fresh `hello` is admitted and may take the lease;
+///   nothing of before comes back (the old prompt stays rejected, unwritten).
 /// - **Crash and reload.** Held again, the runtime is killed after the
 ///   hold's commit, before the pass that fences (crash point
 ///   `crash_after_page_commit`): the service's control state still grants
 ///   `control`. Restarted, the fence is written at the load, before any
 ///   service is admitted: its first `hello` is refused, `busy` (the control
-///   state unchecked until the load, `paused` after it), its control state
-///   fenced (`control: false`, `control_gen` raised by one); its prompt
-///   queued before the crash never runs; a release admits it again.
+///   state unchecked until the load, `paused` after it), and its control
+///   state is fenced (`control: false`, `control_gen` raised by one, once).
+///   A release admits it again.
 #[test]
 #[cfg_attr(
     not(debug_assertions),
@@ -3743,9 +3764,10 @@ fn a_hold_fences_the_services_session_v1_until_its_release_and_across_a_crash() 
         // Its prompt, accepted with the lease, held back from dispatch.
         private(&hold_dispatch, "");
         rig.two_passes();
+        let queued = uuid();
         let accepted = svc.request(
             &mut r,
-            json!({"op":"submit","binding":svc.read(&sid),"kind":"prompt","request_id":uuid(),
+            json!({"op":"submit","binding":svc.read(&sid),"kind":"prompt","request_id":queued,
                 "acquire":true,"payload":{"text":"QUEUED_BEFORE_THE_HOLD"}}),
         );
         assert_eq!(
@@ -3764,12 +3786,29 @@ fn a_hold_fences_the_services_session_v1_until_its_release_and_across_a_crash() 
                 "generation":launch["process_gen"],"binding":svc.read(&sid)}),
         );
         let stream = svc.wait(&mut r, |v| v["op"] == "attached")["stream_id"].clone();
+        // The dispatch let go before the hold: nothing pumps the queue yet,
+        // so the prompt waits `accepted`, unwritten.
+        std::fs::remove_file(&hold_dispatch).unwrap();
+        rig.two_passes();
+        let accepted_state = json!({"state": "accepted", "detail": null});
+        assert_eq!(rig.dump()["receipts"][&queued], accepted_state);
+        // Its lease renewed just before the hold: without a fence it would
+        // stand through what follows (15 s).
+        let renewed = svc.request(&mut r, json!({"op":"renew","binding":lease}));
+        assert_eq!(renewed["op"], "lease", "{renewed}");
         // The hold, read.
         let at = rig.append(SVC, ControlAction::Hold);
         rig.clock.add_mono(1_000);
         rig.announce();
         rig.serve_until("the hold read", |rig| rig.cursor() == Some(at));
-        // Direct input on its old channel, after the hold.
+        // On its old channel, after the hold: a new prompt under its lease,
+        // then direct input. Unfenced, both would go in: the prompt pumping
+        // the queue (its held prompt first, pasted before the input).
+        svc.send(
+            &mut r,
+            json!({"op":"submit","binding":lease,"kind":"prompt","request_id":uuid(),
+                "payload":{"text":"SECOND_AFTER_THE_HOLD"}}),
+        );
         svc.send_family(
             &mut r,
             "terminal",
@@ -3777,6 +3816,59 @@ fn a_hold_fences_the_services_session_v1_until_its_release_and_across_a_crash() 
                 "stream_id":stream,"sequence":0,"bytes":"RElSRUNUX0FGVEVSX1RIRV9IT0xE",
                 "binding":lease}),
         );
+        // The queue pumps: the phone's prompt goes in (with `acquire`, or a
+        // takeover if a lease is left: one a missing fence would leave),
+        // behind anything still queued.
+        let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+        phone.list(&mut r, &sid);
+        let mut submit = json!({"op":"submit","binding":phone.read(&sid),"kind":"prompt",
+            "request_id":uuid(),"acquire":true,"payload":{"text":"PHONE_AFTER_THE_HOLD"}});
+        let mut pumped = phone.request(&mut r, submit.clone());
+        if pumped["code"] == "lease_held" {
+            submit["request_id"] = json!(uuid());
+            submit["takeover"] = json!(true);
+            submit["expected_controller"] = pumped["controller"].clone();
+            pumped = phone.request(&mut r, submit);
+        }
+        assert_eq!(pumped["state"], "accepted", "{pumped}");
+        let held = [
+            "QUEUED_BEFORE_THE_HOLD",
+            "DIRECT_AFTER_THE_HOLD",
+            "SECOND_AFTER_THE_HOLD",
+        ];
+        // The phone's prompt, or the held prompt before it: the queue's
+        // order.
+        within("the phone's prompt, or the held one", || {
+            let text = input(&rig);
+            text.contains("PHONE_AFTER_THE_HOLD") || text.contains(held[0])
+        });
+        let text = input(&rig);
+        let written: Vec<&str> = held.into_iter().filter(|h| text.contains(h)).collect();
+        assert!(
+            written.is_empty(),
+            "written after the hold: {written:?} in {text:?}"
+        );
+        assert!(text.contains("PHONE_AFTER_THE_HOLD"), "{text:?}");
+        let rejected = json!({"state": "rejected", "detail": "control revoked"});
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let seen = rig.dump()["receipts"][&queued].clone();
+            if seen == rejected {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the held prompt's receipt: {seen}"
+            );
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        assert!(stored_tasks_none(&rig), "no host-work task was made");
+        // The phone gives the lease back; its turn ends.
+        let mut binding = phone.read(&sid);
+        binding["lease_epoch"] = pumped["lease"]["lease_epoch"].clone();
+        let released = phone.request(&mut r, json!({"op":"release","binding":binding}));
+        assert_eq!(released["op"], "lease_released", "{released}");
+        std::fs::write(rig.fake.join("complete"), "").unwrap();
         // The existing attachment: closed after `busy`, `paused`.
         let (seen, reason) = svc.until_closed(&mut r);
         assert!(
@@ -3788,15 +3880,8 @@ fn a_hold_fences_the_services_session_v1_until_its_release_and_across_a_crash() 
         // A new hello: `busy`, `paused`; a native is admitted.
         assert_eq!(refused_hello(&mut r, IDS, &rig.log, SVC, true), paused());
         Dev::new(&mut r, IDS, &rig.log, PHONE, false);
-        // The dispatch let go: neither reaches the agent.
-        std::fs::remove_file(&hold_dispatch).unwrap();
-        rig.two_passes();
-        rig.two_passes();
-        let text = input(&rig);
-        assert!(!text.contains("QUEUED_BEFORE_THE_HOLD"), "{text}");
-        assert!(!text.contains("DIRECT_AFTER_THE_HOLD"), "{text}");
-        assert!(stored_tasks_none(&rig), "no host-work task was made");
-        // Released: a fresh hello; no lease held, nothing of before runs.
+        // Released: a fresh hello, which may take the lease; nothing of
+        // before runs.
         let at = rig.append(SVC, ControlAction::Release);
         rig.clock.add_mono(1_000);
         rig.announce();
@@ -3807,21 +3892,10 @@ fn a_hold_fences_the_services_session_v1_until_its_release_and_across_a_crash() 
             &mut r,
             json!({"op":"acquire","binding":svc.read(&sid),"takeover":false}),
         );
-        assert_eq!(lease["op"], "lease", "no lease held: {lease}");
+        assert_eq!(lease["op"], "lease", "{lease}");
         rig.two_passes();
+        assert_eq!(rig.dump()["receipts"][&queued], rejected);
         assert!(!input(&rig).contains("QUEUED_BEFORE_THE_HOLD"));
-        // Its next prompt, queued (held back from dispatch) before the
-        // crash below.
-        private(&hold_dispatch, "");
-        rig.two_passes();
-        let mut binding = svc.read(&sid);
-        binding["lease_epoch"] = lease["binding"]["lease_epoch"].clone();
-        let accepted = svc.request(
-            &mut r,
-            json!({"op":"submit","binding":binding,"kind":"prompt","request_id":uuid(),
-                "payload":{"text":"QUEUED_BEFORE_THE_CRASH"}}),
-        );
-        assert_eq!(accepted["state"], "accepted", "{accepted}");
     }
     // Crash and reload: held again, killed after the hold's commit.
     let (control, generation) = control_state(&rig, &principal).expect("its control state");
@@ -3846,39 +3920,33 @@ fn a_hold_fences_the_services_session_v1_until_its_release_and_across_a_crash() 
     );
     rig.start_again();
     rig.until_station("the Station link", |s| !s["link"].is_null());
-    {
-        let mut r = Router::on(&rig.astation, rig.link());
-        // Never admitted: unchecked until the load, held after it.
-        let first = refused_hello(&mut r, IDS, &rig.log, SVC, true);
-        assert!(
-            first == paused() || first == ("busy".to_string(), Some(GATE_CLOSED.to_string())),
-            "{first:?}"
-        );
-        within("the feeds loaded", || rig.cursor() == Some(at));
-        assert_eq!(refused_hello(&mut r, IDS, &rig.log, SVC, true), paused());
-        assert_eq!(
-            control_state(&rig, &principal),
-            Some((false, generation + 1)),
-            "fenced at the load"
-        );
-        Dev::new(&mut r, IDS, &rig.log, PHONE, false);
-        std::fs::remove_file(&hold_dispatch).unwrap();
-        rig.two_passes();
-        rig.two_passes();
-        assert!(!input(&rig).contains("QUEUED_BEFORE_THE_CRASH"));
-        // Released: admitted again.
-        rig.open_gate();
-        let at = rig.append(SVC, ControlAction::Release);
-        rig.clock.add_mono(1_000);
-        rig.announce();
-        rig.serve_until("the release read", |rig| rig.cursor() == Some(at));
-        Dev::new(&mut r, IDS, &rig.log, SVC, true);
-        assert_eq!(
-            control_state(&rig, &principal).map(|(_, g)| g),
-            Some(generation + 1),
-            "once"
-        );
-    }
+    let mut r = Router::on(&rig.astation, rig.link());
+    // Never admitted: unchecked until the load, held after it.
+    let first = refused_hello(&mut r, IDS, &rig.log, SVC, true);
+    assert!(
+        first == paused() || first == ("busy".to_string(), Some(GATE_CLOSED.to_string())),
+        "{first:?}"
+    );
+    within("the feeds loaded", || rig.cursor() == Some(at));
+    assert_eq!(refused_hello(&mut r, IDS, &rig.log, SVC, true), paused());
+    assert_eq!(
+        control_state(&rig, &principal),
+        Some((false, generation + 1)),
+        "fenced at the load"
+    );
+    Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    // Released: admitted again, the fence written once.
+    rig.open_gate();
+    let at = rig.append(SVC, ControlAction::Release);
+    rig.clock.add_mono(1_000);
+    rig.announce();
+    rig.serve_until("the release read", |rig| rig.cursor() == Some(at));
+    Dev::new(&mut r, IDS, &rig.log, SVC, true);
+    assert_eq!(
+        control_state(&rig, &principal).map(|(_, g)| g),
+        Some(generation + 1),
+        "once"
+    );
 }
 
 /// No host-work task in the store (a session-v1 prompt is none).

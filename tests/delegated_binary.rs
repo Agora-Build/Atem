@@ -2152,7 +2152,9 @@ fn a_turn_running_at_its_deadline_is_interrupted_and_expires() {
         (attempt.as_str(), "deadline", false)
     );
     // The fake agent appends what it read on its own poll.
-    within("the Esc", || escs(&rig) == 1);
+    // The agent's Esc and the dump's count are written apart (the dump at
+    // the end of the pass that handed the write): both polled.
+    within("the Esc", || escs(&rig) == 1 && interrupt_writes(&rig) == 1);
     assert_eq!(escs(&rig), 1);
     assert_eq!(interrupt_writes(&rig), 1);
     // The turn goes on (the fake agent ignores the Esc): only the lease
@@ -2369,7 +2371,11 @@ fn work_interrupt_is_served_while_hosting_is_paused() {
         (&json!("submitted"), &json!("in the agent's turn")),
         "{reply}"
     );
-    within("the Esc while paused", || escs(&rig) == 1);
+    // The agent's Esc and the dump's count are written apart (the dump at
+    // the end of the pass that handed the write): both polled.
+    within("the Esc while paused", || {
+        escs(&rig) == 1 && interrupt_writes(&rig) == 1
+    });
     assert_eq!(interrupt_writes(&rig), 1);
     // Reported and taken in, then asked again: nothing written.
     work_passes(&rig, 2);
@@ -2441,6 +2447,28 @@ fn never_spawned(rig: &Rig, sid: &str) -> bool {
         && !workers.join(format!("{sid}.json")).exists()
 }
 
+/// What a failed [`never_spawned`] check needs to be read: the workers
+/// directory's names and runtime.log's lines naming the launch `rid` or its
+/// session `sid`.
+fn spawn_evidence(rig: &Rig, rid: &str, sid: &str) -> String {
+    let workers = rig.sandbox.config().join("runtime/workers");
+    let mut names: Vec<String> = std::fs::read_dir(&workers)
+        .map(|dir| {
+            dir.filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    let log =
+        std::fs::read_to_string(rig.sandbox.dir.path().join("runtime.log")).unwrap_or_default();
+    let lines: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains(rid) || l.contains(sid))
+        .collect();
+    format!("workers: {names:?}; runtime.log: {lines:#?}")
+}
+
 /// VII.A test 19, its launch half (design I.4.3, "Launches"; host-work-v1
 /// §11.6): in the real runtime, a covered service's `host_launch` that
 /// reaches the spawn boundary while the fake Station's feed holds the
@@ -2482,7 +2510,11 @@ fn a_held_senders_launch_waits_and_a_revoked_ones_fails() {
     });
     work_passes(&rig, 5);
     assert_eq!(stored_launch(&rig, &held), "starting");
-    assert!(never_spawned(&rig, &sid), "nothing spawned while held");
+    assert!(
+        never_spawned(&rig, &sid),
+        "nothing spawned while held: {}",
+        spawn_evidence(&rig, &held, &sid)
+    );
     assert_eq!(
         refused_hello(&mut r, IDS, &rig.log, SVC, true),
         ("busy".to_string(), Some("paused".to_string()))
@@ -2523,7 +2555,11 @@ fn a_held_senders_launch_waits_and_a_revoked_ones_fails() {
         assert_ne!(state, "outcome_unknown");
         state == "failed"
     });
-    assert!(never_spawned(&rig, &sid), "nothing spawned when revoked");
+    assert!(
+        never_spawned(&rig, &sid),
+        "nothing spawned when revoked: {}",
+        spawn_evidence(&rig, &waiting, &sid)
+    );
     assert!(logged(&format!(
         "launch {waiting} failed before its spawn: sender revoked"
     )));
@@ -3190,7 +3226,11 @@ fn launch_waits(rig: &Rig, rid: &str, sid: &str, reason: &str) {
     });
     work_passes(rig, 3);
     assert_eq!(stored_launch(rig, rid), "starting");
-    assert!(never_spawned(rig, sid), "nothing spawned while it waits");
+    assert!(
+        never_spawned(rig, sid),
+        "nothing spawned while it waits: {}",
+        spawn_evidence(rig, rid, sid)
+    );
 }
 
 /// Launch `rid`'s state as the store holds it.
@@ -3229,7 +3269,11 @@ fn launch_failed(rig: &Rig, rid: &str, sid: &str, detail: &str) {
         assert_ne!(state, "outcome_unknown");
         state == "failed"
     });
-    assert!(never_spawned(rig, sid), "nothing spawned");
+    assert!(
+        never_spawned(rig, sid),
+        "nothing spawned: {}",
+        spawn_evidence(rig, rid, sid)
+    );
     let log = std::fs::read_to_string(rig.sandbox.dir.path().join("runtime.log")).unwrap();
     assert!(
         log.contains(&format!("launch {rid} failed before its spawn: {detail}")),

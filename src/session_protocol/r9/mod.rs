@@ -1939,13 +1939,15 @@ impl R9Host {
     /// never held: its revoke wins). The hold's reversible session-v1 fence
     /// (host-work-v1 §11.1, **Atem's reading of Astation's item 7 on #120,
     /// 2026-11-14**):
-    /// - a service newly held that the session host knows as a remote
-    ///   principal (an attachment, a lease, accepted work, or `control`) is
-    ///   fenced through §H, once per hold: its `control_gen` raised (so
-    ///   nothing it queued is dispatched: its accepted work is rejected,
-    ///   `control revoked`, and its raw input queued at the PTY writer is
-    ///   dropped at the write boundary, its lease revoked), each attachment
-    ///   it has closed after `busy`, `paused`;
+    /// - a service newly held that the session host still knows as a
+    ///   remote principal (an attachment, a lease, accepted work, or
+    ///   `control`) is fenced ([`R9Host::fence_held`]): normally the hold's
+    ///   followup fenced it already, so this writes only a fence a crash
+    ///   lost (its `control_gen` raised, so nothing it queued is
+    ///   dispatched: its accepted work is rejected, `control revoked`, and
+    ///   its raw input queued at the PTY writer is dropped at the write
+    ///   boundary, its lease revoked; each attachment it has closed after
+    ///   `busy`, `paused`);
     /// - while held, its `hello`s are refused `busy`, `paused` (after the
     ///   device list's own refusals, a revoke and the unchecked control
     ///   state), and any request of an attachment of it is refused so before
@@ -1974,16 +1976,40 @@ impl R9Host {
         if newly.is_empty() {
             return Vec::new();
         }
-        let remote: HashSet<String> = parts.host.remote_principals().into_iter().collect();
         let mut effects = Vec::new();
-        for principal in newly.into_iter().filter(|p| remote.contains(p)) {
-            self.fence_errors.insert(
-                principal.clone(),
-                error(code::BUSY, None, Some(DETAIL_PAUSED)),
-            );
-            effects.extend(parts.host.fence_principal(&principal, 0));
+        for principal in newly {
+            effects.extend(self.fence_held(&principal, parts));
         }
         effects
+    }
+
+    /// A control record held the service `principal` (its record's
+    /// followup, at once after the commit and before its result goes, held
+    /// still or released since): session-v1's §H fence when the session
+    /// host knows it as a remote principal (an attachment, a lease,
+    /// accepted work or `control`), each attachment closed after `busy`,
+    /// `paused`; nothing for one it doesn't know (fenced already, or never
+    /// seen), so a hold raises its `control_gen` at most once. Its refusal
+    /// is [`R9Host::set_held_services`]'s, from the committed standings.
+    pub fn fence_held<J: Journal>(
+        &mut self,
+        principal: &str,
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        if !principal.starts_with("service:")
+            || !parts
+                .host
+                .remote_principals()
+                .iter()
+                .any(|p| p == principal)
+        {
+            return Vec::new();
+        }
+        self.fence_errors.insert(
+            principal.to_string(),
+            error(code::BUSY, None, Some(DETAIL_PAUSED)),
+        );
+        parts.host.fence_principal(principal, 0)
     }
 
     /// The services whose `hello`s are refused as held.

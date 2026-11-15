@@ -353,3 +353,178 @@ fn with_the_hook_off_a_hold_fences_nothing() {
         assert_eq!(rig.bridge.host.control_gen(BOT), before);
     });
 }
+
+/// The bot's prompt on the rig's session, accepted with the lease (its
+/// `acquire`) and held back from dispatch (`hold_dispatch`): its request id.
+fn hf_queued_prompt(
+    rig: &mut LocalRig,
+    channel: &mut atem_client::connect::Attached,
+    handle: &str,
+    text: &str,
+) -> String {
+    hf_list(rig, channel, handle);
+    rig.bridge.host.hold_dispatch(true);
+    let rid = uuid::Uuid::new_v4().to_string();
+    let sid = rig.sid.as_str().to_string();
+    let (_, frame) = channel.submit_prompt(&sid, &rid, text, 1).unwrap();
+    hf_send(rig, handle, &frame);
+    assert_eq!(
+        rig.bridge.host.receipt(&rid).map(|r| r.state),
+        Some(crate::session_protocol::wire::ReceiptState::Accepted)
+    );
+    assert!(rig.bridge.host.lease_holder(&sid).is_some(), "its lease");
+    rid
+}
+
+/// The hold's ack as it was handed to the link: the r9 attachments' and
+/// the session host's remote principals then.
+fn hf_hold_ack(rig: &LocalRig, hold: &str) -> (Vec<String>, Vec<String>) {
+    let attached = rig
+        .bridge
+        .work
+        .acks_handed
+        .iter()
+        .find(|(ids, _)| ids.iter().any(|id| id == hold))
+        .expect("the hold's ack handed to the link")
+        .1
+        .clone();
+    let remote = rig
+        .bridge
+        .work
+        .acks_remote
+        .iter()
+        .find(|(ids, _)| ids.iter().any(|id| id == hold))
+        .expect("the hold's ack handed to the link")
+        .1
+        .clone();
+    (attached, remote)
+}
+
+/// The bot's prompt `rid` was rejected by the fence, never written.
+fn hf_rejected(rig: &LocalRig, rid: &str, text: &str) {
+    let receipt = rig.bridge.host.receipt(rid).unwrap();
+    assert_eq!(
+        (receipt.state, receipt.detail.as_deref()),
+        (
+            crate::session_protocol::wire::ReceiptState::Rejected,
+            Some("control revoked")
+        )
+    );
+    assert!(!input(rig).contains(text));
+}
+
+/// Items 7 and 16 (#120): a hold and its release read in one page. Both
+/// commit and the standings end released, but the hold was in force: its
+/// fence runs before its result goes to the Station (the bot's attachment
+/// closed, its `control_gen` raised once, its lease revoked, its accepted
+/// prompt rejected `control revoked`, never written), and the release then
+/// admits a fresh `hello`.
+#[test]
+fn a_hold_released_in_its_own_page_is_fenced_before_its_ack() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = fed_bot_ops(
+            &mut rig,
+            root,
+            &os,
+            start,
+            &["message", "notify", "prompt", "stop", "view"],
+        );
+        r9_link_up(&mut rig);
+        let mut channel = service_hello(&mut rig, &s.log, "bot-1", "svc-bot").unwrap();
+        let rid = hf_queued_prompt(&mut rig, &mut channel, "bot-1", "HELD_AND_RELEASED");
+        let before = rig.bridge.host.control_gen(BOT);
+        let _sent = station_up(&mut rig, 7);
+        let hold = bot_record(&s.log, ControlAction::Hold, 2);
+        let release = bot_record(&s.log, ControlAction::Release, 3);
+        let heads = heads_text(&[(ORIGIN, OWN_FEED, 3)], s.log.log.head());
+        station_pass(&mut rig, 0, vec![heads]);
+        let page = page_text(&rig, 3, &[(2, &hold), (3, &release)]);
+        station_pass(&mut rig, 100, vec![page]);
+        assert!(!rig.bridge.start_view().standings[BOT].held, "released");
+        let (attached_then, remote_then) = hf_hold_ack(&rig, hold.record_id());
+        assert!(
+            !attached_then.iter().any(|p| p == BOT),
+            "fenced before its ack: {attached_then:?}"
+        );
+        assert!(
+            !remote_then.iter().any(|p| p == BOT),
+            "fenced before its ack: {remote_then:?}"
+        );
+        assert_eq!(rig.bridge.host.control_gen(BOT), before + 1);
+        assert_eq!(rig.bridge.host.lease_holder(rig.sid.as_str()), None);
+        rig.bridge.host.hold_dispatch(false);
+        passes(&mut rig, 3);
+        hf_rejected(&rig, &rid, "HELD_AND_RELEASED");
+        // Released: a fresh hello.
+        service_hello(&mut rig, &s.log, "bot-2", "svc-bot").unwrap();
+        assert_eq!(rig.bridge.host.control_gen(BOT), before + 1);
+    });
+}
+
+/// Items 7 and 16 (#120): a hold read during the store's first read (the
+/// control state never read in full, so every service is refused as
+/// unchecked, and the page short of the announced head). The bot, gone
+/// from its channel, still holds `control` and an accepted prompt: the
+/// hold's fence runs before its result goes, though the state stays
+/// unchecked (its `control_gen` raised once, its prompt rejected `control
+/// revoked`, never written).
+#[test]
+fn a_hold_read_during_the_first_read_is_fenced_before_its_ack() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = fed_bot_ops(
+            &mut rig,
+            root,
+            &os,
+            start,
+            &["message", "notify", "prompt", "stop", "view"],
+        );
+        r9_link_up(&mut rig);
+        let mut channel = service_hello(&mut rig, &s.log, "bot-1", "svc-bot").unwrap();
+        let rid = hf_queued_prompt(&mut rig, &mut channel, "bot-1", "HELD_IN_THE_FIRST_READ");
+        envelope_in(&mut rig, &envelope::close("bot-1", Some("client_gone")));
+        passes(&mut rig, 1);
+        assert!(!attached(&rig, BOT));
+        assert!(rig.bridge.host.grants_control(BOT));
+        // The control state never read in full (a fresh store's mark).
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute("INSERT INTO control_unread(one) VALUES(1)", [])
+            .unwrap();
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        rig.bridge.ensure_feeds();
+        assert!(rig.bridge.controls_unchecked());
+        let before = rig.bridge.host.control_gen(BOT);
+        let _sent = station_up(&mut rig, 7);
+        let hold = bot_record(&s.log, ControlAction::Hold, 2);
+        let heads = heads_text(&[(ORIGIN, OWN_FEED, 3)], s.log.log.head());
+        station_pass(&mut rig, 0, vec![heads]);
+        let page = page_text(&rig, 3, &[(2, &hold)]);
+        station_pass(&mut rig, 100, vec![page]);
+        let cursor = match &rig.bridge.work.feeds {
+            Feeds::Loaded(feeds) => feeds.cursor(ORIGIN, OWN_FEED),
+            _ => None,
+        };
+        assert_eq!(cursor, Some(2), "short of the head");
+        assert!(rig.bridge.start_view().standings[BOT].held);
+        assert!(rig.bridge.controls_unchecked(), "still unchecked");
+        let (_, remote_then) = hf_hold_ack(&rig, hold.record_id());
+        assert!(
+            !remote_then.iter().any(|p| p == BOT),
+            "fenced before its ack: {remote_then:?}"
+        );
+        assert_eq!(rig.bridge.host.control_gen(BOT), before + 1);
+        rig.bridge.host.hold_dispatch(false);
+        passes(&mut rig, 3);
+        hf_rejected(&rig, &rid, "HELD_IN_THE_FIRST_READ");
+    });
+}

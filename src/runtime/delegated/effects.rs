@@ -37,10 +37,12 @@
 //!   attempt's withdrawal is asked, not counted toward the attempt limit
 //!   (I.6.4), and its task paused from it. A hold doesn't hold the session
 //!   (§11.6, "Waiting doesn't hold the session"). Its session-v1 fence
-//!   (host-work-v1 §11.1, reversible) is no followup: the bridge fences a
-//!   held service from the committed standings, after the followups and
-//!   before the record's result goes (`HostBridge::sync_held`), and again at
-//!   the next load if a crash came between the commit and that pass.
+//!   (host-work-v1 §11.1, reversible) is asked after the commit
+//!   ([`Followup::HoldFence`]), for every hold applied, so it runs before
+//!   the record's result goes even when a release in the same page or pass
+//!   lifted it, or the control state is still unchecked. The bridge's
+//!   refusal of the held service's `hello`s follows the committed standings
+//!   (`HostBridge::sync_held`), which also write a fence a crash lost.
 //! - **Release** (step 4). Tasks `blocked`, `paused` are `queued` again,
 //!   and get an attempt through the start check before their deadline (one
 //!   past it expires there).
@@ -79,6 +81,12 @@ pub enum Followup {
     /// it has attachments (its `control_gen` raised, each attachment it has
     /// fenced).
     Fence { principal: String },
+    /// `principal` was held: session-v1's §H fence when the session host
+    /// knows it (an attachment, a lease, accepted work or `control`), each
+    /// attachment closed after `busy`, `paused`; reversible (a release
+    /// admits its next `hello`). Carried out at once, before the record's
+    /// result goes, whether or not a later record released it.
+    HoldFence { principal: String },
     /// Interrupt intents were written for `principal`'s tasks for
     /// `revocation` (I.5.7): carried out at once.
     Intents {
@@ -123,7 +131,12 @@ pub fn act(store: &Store, tx: &Transaction, actions: &[HostAction]) -> Result<Ve
                     principal: principal.clone(),
                 });
             }
-            HostAction::Hold(_) => stop(store, tx, tasks, Event::Held, &mut out)?,
+            HostAction::Hold(_) => {
+                stop(store, tx, tasks, Event::Held, &mut out)?;
+                out.push(Followup::HoldFence {
+                    principal: principal.clone(),
+                });
+            }
             HostAction::Release(_) => release(store, tx, tasks)?,
             HostAction::Interrupt { revocation, .. } => {
                 interrupt(store, tx, principal, tasks, revocation, &mut out)?
