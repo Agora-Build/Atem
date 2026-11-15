@@ -176,6 +176,51 @@ fn an_idle_runtime_exits_by_itself() {
     );
 }
 
+/// A SIGTERM as soon as `runtime.lock` names the runtime (before it serves:
+/// its journal and device list still opening) is an orderly stop, never the
+/// default action: it exits successfully, its journal closed cleanly.
+#[test]
+fn a_stop_while_the_runtime_starts_is_an_orderly_one() {
+    let dir = tempfile::Builder::new()
+        .prefix("atem-rb")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let (home, run) = (dir.path().join("home"), dir.path().join("run"));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let lock = home.join(".config/atem/runtime.lock");
+    let mut child = Running(runtime(&home, &run));
+    let pid = child.0.id();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&lock)
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        != Some(pid)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the runtime never took its lock"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    assert!(
+        within(15, || child.0.try_wait().unwrap().is_some()),
+        "the runtime ignored SIGTERM"
+    );
+    let status = child.0.wait().unwrap();
+    assert!(status.success(), "{status:?}");
+    let journal = home.join(".config/atem/runtime/journal");
+    let epoch = std::fs::read_to_string(journal.join("runtime_epoch")).unwrap();
+    let clean: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(journal.join("clean_close")).unwrap()).unwrap();
+    assert_eq!(
+        clean,
+        serde_json::json!({"runtime_epoch": epoch.trim().parse::<u64>().unwrap()})
+    );
+}
+
 /// Whether `listener` gets a connection within `secs`.
 fn accepted(listener: &std::net::TcpListener, secs: u64) -> bool {
     listener.set_nonblocking(true).unwrap();

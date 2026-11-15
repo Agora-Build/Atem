@@ -73,17 +73,25 @@ fn idle_timeout() -> Duration {
         .unwrap_or(server::IDLE_EXIT)
 }
 
-async fn shutdown_signal() {
+/// SIGTERM or SIGINT, handled from this call on: one that comes before
+/// the returned future is first polled is kept (tokio records it), so a
+/// stop sent while the runtime starts (its lock taken, the device list
+/// opening) ends it in order once it serves, never by the default action
+/// (which would leave no clean close).
+fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut term), Ok(mut int)) = (
+    let signals = (
         signal(SignalKind::terminate()),
         signal(SignalKind::interrupt()),
-    ) else {
-        return std::future::pending().await;
-    };
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
+    );
+    async move {
+        let (Ok(mut term), Ok(mut int)) = signals else {
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
     }
 }
 
@@ -94,6 +102,8 @@ async fn shutdown_signal() {
 pub async fn run_runtime(config_dir: PathBuf) -> Result<()> {
     // Taken now, before a rebuild can replace the executable on disk.
     let build = crate::memory::cred_agent::build_id();
+    // Before the lock: whoever sees this runtime's pid there may stop it.
+    let shutdown = shutdown_signal();
     IN_RUNTIME.store(true, std::sync::atomic::Ordering::SeqCst);
     if let Some(home) = dirs::home_dir() {
         let _ = std::env::set_current_dir(home);
@@ -131,7 +141,7 @@ pub async fn run_runtime(config_dir: PathBuf) -> Result<()> {
         clock: host_bridge::Clock::default(),
         ops: ops::OpEnv::for_user(),
     };
-    let served = server::serve(app, listener, options, shutdown_signal()).await;
+    let served = server::serve(app, listener, options, shutdown).await;
     // A clean exit takes its pid out of the lock and removes its socket.
     daemon::clear_held_pids();
     daemon::remove_socket(&files);
