@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Builds atem-client-ffi and runs the binding conformance suites over the
-# shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) and the
+# shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json), the
 # host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
-# framing-size-v1.json):
+# framing-size-v1.json) and the host-work result_id vectors
+# (fixtures/host-work/requests-v1.json):
 #
 #   kotlin  UniFFI-generated Kotlin + JNA on the JVM (Linux, macOS)
 #   wasm    the wasm-bindgen build under Node (vectors, then the stateful flows)

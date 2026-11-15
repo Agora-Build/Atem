@@ -329,6 +329,15 @@ pub fn verifier_inventory() -> JsResult<JsValue> {
     to_js(&crate::log::verifier_inventory())
 }
 
+// --------------------------------------------------------- host work
+
+/// A task's one `result_id` (host-work-v1 §11.5): the shared core's
+/// `UUIDv5(NAMESPACE_OID, "result:" + taskId)`.
+#[wasm_bindgen(js_name = hostWorkResultId)]
+pub fn host_work_result_id(task_id: String) -> String {
+    crate::host_work::host_work_result_id(task_id)
+}
+
 // ------------------------------------------------------------ framing
 
 #[wasm_bindgen(js_name = framingUnicodeVersion)]

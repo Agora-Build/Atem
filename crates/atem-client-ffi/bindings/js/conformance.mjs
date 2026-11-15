@@ -1,6 +1,8 @@
-// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) and the
+// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json), the
 // host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
-// framing-size-v1.json) run through the WASM binding under Node. Usage:
+// framing-size-v1.json) and the host-work result_id vectors
+// (fixtures/host-work/requests-v1.json) run through the WASM binding under
+// Node. Usage:
 //   node conformance.mjs <wasm-bindgen nodejs pkg dir> <fixtures dir>
 // The same checks run through Kotlin (bindings/kotlin/Conformance.kt) and
 // Swift (bindings/swift/Tests/…/ConformanceTests.swift).
@@ -1525,6 +1527,23 @@ check("framing: every framing-size-v1 case with its complete inputs", () => {
     throwsCode(() => m.framingCheckedLen("t", undefined, context), "malformed");
   }
   for (const mark of ["null", "{}", "[]", '{"mark_id":"m"}']) throwsCode(() => m.framingCheckedLen("t", mark, "[]"), "malformed");
+});
+
+// --------------------------------------------------------------- host work
+// A task's result_id (host-work-v1 §11.5) over
+// designs/protocol/fixtures/host-work/requests-v1.json: the known answers
+// (`result_ids`) and an app's own reply check on each `answers` case (a reply
+// answers its reply_query only with the asked task's result_id; no reply yet
+// always does). The connection applies the same check to every result it reads.
+const requests = loadWork("requests-v1");
+check("host work: result_id known answers and the reply check (§11.5)", () => {
+  eq(requests.result_ids.length, 2);
+  for (const c of requests.result_ids) eq(m.hostWorkResultId(c.task_id), c.result_id, c.name);
+  eq(requests.answers.length, 3);
+  for (const c of requests.answers) {
+    const reply = c.result.result.reply;
+    eq(reply === null || reply.result_id === m.hostWorkResultId(c.request.data.task_id), c.answers, c.name);
+  }
 });
 
 console.log(`wasm conformance: ${passed} passed, ${failures.length} failed`);
