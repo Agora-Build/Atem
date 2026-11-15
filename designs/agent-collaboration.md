@@ -184,8 +184,9 @@ device list is its `atem_id`. Each receiving host expands the labels and
 answers `no_match` when nothing matches; `/<route_id>` with `--launch` may
 start an agent there, as on one host. A send may reach this instance's
 agents and other hosts' at once, with one budget of 32 agents across both
-(proposed). Only label discovery and display wait for the vault directory. `host:<host_id>` is a principal (route consent),
-never a selector. See [delegated-host-work.md](delegated-host-work.md), II.6.
+(proposed). Only label discovery and display wait for the vault directory.
+`host:<host_id>` is a principal (route consent), never a selector. See
+[delegated-host-work.md](delegated-host-work.md), II.6.
 
 **When no agent runs.** Only a sender that asks for it (`atem message send
 --launch`, with an `atem:<atem_id>/<route_id>` selector) gets a session

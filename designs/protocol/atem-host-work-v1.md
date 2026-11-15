@@ -3341,7 +3341,8 @@ stage-3 item, written with Astation. Each call carries one object and is
 bounded at 512 KiB (owner decision 2026-11-07, choice 13); R9.9's rule that
 Atem drops a larger relay message unread exempts them (design II.4.2, a
 contract change that needs agreement). **Proposed (2026-11-15), for
-Astation's agreement:** "The mailbox calls" below.
+Astation's agreement:** "The mailbox calls" below, where `heads` keeps the
+256 KiB bound (its rule 9).
 
 **Proposed for Astation's agreement (2026-11-15).** The owner decided on
 2026-11-15 that Atem hosts reach each other only as host senders, that the
@@ -3763,9 +3764,10 @@ with hyphens): a UUID v4 (a task's, or an agent recipient's) or a UUID v5
   only as `true` (omitted when false, so each meaning has one encoding),
   set only by a send with `--launch`. As in stage 1 (collaboration §5,
   "When no agent runs"), the receiving host starts a session for the
-  message only when `launch` is `true`, and only on a route that an
-  `atem:<its atem_id>/<route_id>` selector of the recipient names and whose
-  owner allows it (`launch = "on_message"`); a host sender also needs the
+  message only when `launch` is `true`, and only on a route that a
+  selector of the recipient names in the form `atem:<atem_id>/<route_id>`,
+  its `atem_id` naming this host, and whose owner allows it
+  (`launch = "on_message"`); a host sender also needs the
   project's `launch` op (design II.2.3). `launch: true` beside no such
   selector is an invalid Message (`invalid_request`).
 

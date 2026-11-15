@@ -150,9 +150,10 @@ different Atem instances reach each other:
   Appendix A keeps the owner's words of 2026-11-07.
 
 Each changed passage is marked "Amended by owner decision, 2026-11-15" (in the Part II bullet of "How to read this
-document", I.1.3, II.1, II.2.1, II.4.1, II.4.3, II.6, IV rows 11 and 14, V.1, V.2 and VII.B tests 37a to 37h), and
-Atem's proposed refinements "Proposed refinement (2026-11-15, Atem's proposal, for Astation's agreement)" or "Atem's
-proposal, for Astation's agreement" (in II.4.2, II.4.3 and II.6).
+document", I.1.3, II.1, II.2.1, II.4.1, II.4.3, II.6, IV rows 11 and 14, V.1 and V.2), and Atem's proposed
+refinements "Proposed refinement (2026-11-15, Atem's proposal, for Astation's agreement)" or "Atem's proposal, for
+Astation's agreement" (in II.4.2, II.4.3 and II.6). VII.B's tests 37a to 37l are marked "Proposed tests for the
+proposals (2026-11-15, for Astation's agreement)".
 
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256
@@ -161,8 +162,10 @@ the diagram, the two Astation file references in XI (written so they are not rea
 one update marked "updated after agreement" in III.4 (the phone's login is live on dev, Auth #19), and the framing,
 host-mail and clock amendments above, the marks of step 3's agreements, IX.1 Q7's answer (marked "answered in
 step 4"), I.5.5 step 2's fence sentence (marked "changed to match Atem's spec"), the note on step 4's status in the
-paragraph that says nothing here is built, and the owner's amendments of 2026-11-15 above (marked "Amended by owner
-decision, 2026-11-15"). The diagram is
+paragraph that says nothing here is built, the owner's amendments of 2026-11-15 above (marked "Amended by owner
+decision, 2026-11-15"), and Atem's proposed refinements and tests of the same day, for Astation's agreement (marked
+"Proposed refinement (2026-11-15, Atem's proposal, for Astation's agreement)", "Atem's proposal, for Astation's
+agreement" or "Proposed tests for the proposals (2026-11-15, for Astation's agreement)"). The diagram is
 `delegated-host-work-flows.html` (frozen `flows.html`, SHA-256
 `587a4c74ca9c2645dd3a2c79908813da573451479c0a0a846896fd3ff909cf6a`), changed only in the phone's login in figures 1
 and 2, marked the same way, and, after step 3's agreements, in figure 1 (both hosts use the same Station) and
@@ -1985,8 +1988,8 @@ document calls the key `enc_key`.
   signs the `add_host`, appends the host's `host_enc_key` right after it. A newly verified host can then open
   host-sender mail at once. While the account's signing gate is closed (II.2.2), Astation appends only the
   `add_host`, as before. If the `add_host` is committed but the `host_enc_key` append fails, Astation retries the
-  same signed body; if it can't, the ceremony still succeeds with no key entry yet. In both cases the key gets its
-  entry later through `host_enc_key_get` and a manager's own fresh confirmation.
+  same signed body; if it can't, the ceremony still succeeds with no key entry yet. In the first and last case the
+  key gets its entry later through `host_enc_key_get` and a manager's own fresh confirmation.
 - **What stays.** (b) stays the representation: the key is still a separate `host_enc_key` entry, verified as R9.2
   says. `host_enc_key_get` stays, for rotation and for hosts paired earlier. The commitment and the safety code don't
   change: `enc_sig` is made with `host_key`, which they already cover. The host records the new key's `enc_kid`
@@ -2167,9 +2170,9 @@ most 24 h retention, quotas, acknowledgments and deduplication").
   mailbox is kept. **Atem's proposal, for Astation's agreement:** its wire is host-work-v1 §11.5, "The mailbox calls".
   With it Atem proposes one refinement of II.4.2: an object the host drops undecided over the pending limits is
   still marked done, so that the sender's resend of the same bytes is stored and delivered again (II.4.2 said such an
-  object "isn't marked done"; it still gets no verdict and claims no `id`), and two refinements of "Putting" above
-  (§11.5's rule 3): identical bytes are compared in canonical form, and a resend after an object was done is stored,
-  and charged, again.
+  object "isn't marked done"; it still gets no verdict and claims no `id`), and two refinements of "Putting" and
+  "Limits" above (§11.5's rule 3): identical bytes are compared in canonical form, and a resend after an object was
+  done is stored, and charged, again. Of the calls listed here, `heads` keeps the 256 KiB bound (§11.5's rule 9).
 
 ### II.4.4 Status and results back
 
@@ -3196,8 +3199,8 @@ Nothing is merged or deployed before step 1.
     account.
 37. **Limits.** A host sender hits `per_workflow` on the receiving host, and the mailbox quotas.
 
-**Amended by owner decision, 2026-11-15: tests for the proposals, each proposed with what it tests (for Astation's
-agreement; host-work-v1 §11.5).**
+**Proposed tests for the proposals (2026-11-15, for Astation's agreement).** They test the owner's amendments of
+2026-11-15 and Atem's proposals with them (host-work-v1 §11.5), and each is agreed with what it tests.
 
 37a. **The key in the ceremony.** On an account whose signing gate is open, `atem unpair`, then `atem pair` on host B
      takes one fresh confirmation, and the device list then holds B's new `add_host` and, at the next `seq`, its
@@ -3237,6 +3240,22 @@ agreement; host-work-v1 §11.5).**
 37h. **`heads.mailbox` only toward `host.senders` hosts.** The Station adds `mailbox` to the `heads` of a host whose
      `welcome` lists `host.senders`, and never to a host without it, such as a step-4 debug host of the Part I joint
      check (VII.A), whose gate keeps opening as before.
+
+37i. **Canonical identity and the re-charge.** The same object put again serialized differently (other key order or
+     whitespace) is answered `mailbox_stored` and charged nothing while the first copy is stored; once that copy is
+     marked done, the identical resend is stored at a new position and charged again, and B takes it as a duplicate.
+
+37j. **One message, two hosts.** One message to hosts B and C puts two envelopes with the same `id`: each is stored in
+     its own recipient's mailbox, neither is refused `id_reused`, and each host judges its own.
+
+37k. **Puts the Station can't read, and answers nobody asked for.** A put with no body the Station parses (or no
+     `id`) gets no `mailbox_put_refused`: the Station drops and counts it, and the sender's live put retires at the
+     deadline and goes again with a fresh id. A `mailbox_stored` or `mailbox_done_result` with an id the host never sent
+     changes nothing and raises no Station fault; a retired id older than the latest 256 reads as unsolicited.
+
+37l. **`launch` needs a route selector.** A host-sender Message whose `select` recipient carries `launch: true` and no
+     `atem:<atem_id>/<route_id>` selector naming that host is invalid: the shared core refuses to build it, and a
+     receiving host refuses it (`invalid_request`) and starts nothing.
 
 ### VII.C Framing and vectors
 
