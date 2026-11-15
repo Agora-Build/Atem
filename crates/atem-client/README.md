@@ -14,7 +14,9 @@ Sans-I/O: no networking, no filesystem and no clocks (tests read the fixture
 files). Secret keys stay behind the `KeyProvider` trait. Crypto comes only
 from the workspace's reviewed dependencies (`p256`, `ed25519-dalek`,
 `x25519-dalek`, `hkdf`, `hmac`, `sha2`, `hpke`); comparisons of hashes and tags
-are constant-time and secrets are wiped on drop.
+are constant-time and secrets are wiped on drop. `uuid` (only `v5`,
+name-based SHA-1) derives the ids the core checks against their task (a
+reply's `result_id`); it is no security primitive.
 
 Status: r9 is implemented and released (Atem v0.8.0): encodings and signatures (§R9.1–§R9.2), the membership-log verifier
 and its writers (§R9.2–§R9.5), the `atem-ch1` channel in both roles
@@ -41,7 +43,7 @@ Atem runtime (`tests/r9_runner/` in the workspace root).
 | `backup_writer` | `KBackupWriter`: version allocation, seal, put-if-absent upload, `k_backup` publication and their `409` paths; resumable |
 | `restore` | the Recovery Kit restore over the fetched log, envelope and host-signed heads (`RestoreFlow`; no recovery on a stale head) |
 | `channel` | `atem-ch1` (SIGMA-I): initiator and responder, transcript, key schedule, records, counters, limits, carriage inside the handshake |
-| `session` | r8's session-v1 wire and client machines (re-exported by atem), `revision`, and r9's `hello`/`welcome`/errors/new ops (`r9`) |
+| `session` | r8's session-v1 wire and client machines (re-exported by atem), `revision`, and r9's `hello`/`welcome`/errors/new ops (`r9`); host work (`host_work`, `messages`): `host_work::result_id`, the one derivation of a reply's `result_id`, checked by `Response::answers` against the task a `reply_query` asked about (a null reply still answers), and `Message::valid`, which refuses a channel sender's Message with a `select` recipient (decoded `invalid_request`, never built by `publications()`; the `local` sender and host senders keep `select`). Both are Astation's SDK points of 2026-11-07 (host-work-v1 §11.5, proposed) |
 | `connect` | a client's connection: handshake, carriage, the checked welcome, then r8's lease, registry and chat machines inside the channel |
 | `principal` | native, service and browser principals: scope, ops, expiry, browser grants |
 | `push` | sealed push hints, `seen`, acks, the relay's schedule from the signed `created_at`, a reference `RelayLedger`, the host's per-approval state and `Outbox` |
