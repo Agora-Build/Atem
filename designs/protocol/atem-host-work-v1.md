@@ -27,6 +27,9 @@ remote host admission refuses selector destinations, the `local` sender,
 local UUIDv5 task references and `result` context snapshots. Remote admission
 still requires the contract below. Cross-instance selector/result support waits for
 the stage-2 agreement ([../delegated-host-work.md](../delegated-host-work.md), II.1).
+**Amended by owner decision, 2026-11-15:** stage 2 isn't used between Atem
+hosts, so it waits for host senders' agreement instead (§11.5, proposed
+2026-11-15; design II.6).
 
 ## 1. Features and transport
 
@@ -2893,8 +2896,8 @@ Auth/Portal's agreement**, except the two marked agreed with Astation):
 
 Every relay message, in either direction, is at most 256 KiB as sent
 (R9.9), and Atem drops a larger one unread. Stage 3's mailbox calls (II.4.3:
-put, stored, sync, done and the heads' mailbox head) carry one object each
-and may be up to 512 KiB (owner choice 13, so a host sender's Message keeps
+put, stored, sync, done; `heads` keeps 256 KiB, §11.5 rule 9) carry one
+object each and may be up to 512 KiB (owner choice 13, so a host sender's Message keeps
 §5's 240 KiB bound): R9.9's drop-unread rule then exempts them up to that
 bound (**changed agreed meaning, needs Astation's agreement**; session-v1
 R9.9). Their wire is proposed in §11.5 ("The mailbox calls", 2026-11-15),
@@ -3200,7 +3203,10 @@ storage and its receipts are the host's.
   gate). **Agreed with Astation:** an object that arrives over either limit is no
   verdict: it is dropped undecided, with no refusal and no evidence record,
   it claims no id and isn't marked done, so the sender's resend is judged
-  anew.
+  anew. **Proposed refinement (2026-11-15, Atem's proposal, for Astation's
+  agreement):** such an object is marked done all the same (still no
+  verdict, no evidence, no id), so that the mailbox frees its key and stores
+  the sender's identical resend again ("The mailbox calls", rule 5).
 - **Verify before waiting.** When this list already holds the `add_host` of
   the claimed `(host_id, host_trust_gen)` (a current host at its newest
   generation, or a removed host's result), the copy is verified before it
@@ -3433,8 +3439,10 @@ moves to 11, and position 12 comes with the next call, `after: 11`.
    limits to the encoded bytes before it parses anything, and never opens
    or judges the sealed part.
    - **`mailbox_stored`** goes only once the object is durably stored.
-   - **Idempotency.** An object's key is `(calling host_id, body.id)`, the
-     design's `(sender host, id)`, and its identity is `object_hash =
+   - **Idempotency.** Within its recipient's mailbox, an object's key is
+     `(calling host_id, body.id)`, the design's `(sender host, id)` (so one
+     message's envelopes to several hosts, which share its `id`, never
+     collide), and its identity is `object_hash =
      SHA-256(enc([jcs(body), sig, enc, ct]))` (`sig`, `enc` and `ct` as
      decoded bytes), the evidence hash of the verdicts above, so a copy
      serialized again is the same object. While an object is stored, a put
@@ -3442,8 +3450,17 @@ moves to 11, and position 12 comes with the next call, `after: 11`.
      and charged no second time, and one with another `object_hash` is
      refused `id_reused`, the first staying. Once the object is removed
      (done or expired), its key is free: a resend of the same bytes is
-     stored again, at a new position, and the receiving host takes it as a
-     duplicate ("Which copies claim an id", above).
+     stored again, at a new position, and charged again, and the receiving
+     host takes it as a duplicate ("Which copies claim an id", above).
+     **Two refinements of design II.4.3 (Atem's proposal, for Astation's
+     agreement):** "identical bytes" are compared in this canonical form,
+     not as received; and "charged no second time" holds while the object
+     is stored, since a resend after its removal is a new delivery.
+   - **A put the Station can't read** (no body it parses, or no `id` in
+     it) gets no `mailbox_put_refused`, which names the `id`: the Station
+     drops it and counts it, and the sender's live put is retired at the
+     deadline, as an unanswered call (rule 8). A sender's own shared-core
+     builder never makes one.
    - **Refusals** (`mailbox_put_refused`, naming the put's `request_id` and
      its object's `id`). `quota`: a limit of design II.4.3 is reached; the
      object isn't stored and never counts as stored or accepted, and the
@@ -3489,10 +3506,12 @@ moves to 11, and position 12 comes with the next call, `after: 11`.
    each object it judged (opened, refused or a duplicate) and for each it
    dropped undecided over the pending limits: that one gets no verdict and
    claims no `id` (design II.4.2), and with it removed its key is free, so
-   the sender's resend is stored again and judged anew (**a refinement of
-   the design's "isn't marked done" for such an object**: without it, the
-   copy left behind the cursor would keep the resend from being stored
-   until it expired). The host never marks done an object it keeps pending:
+   the sender's resend is stored again and judged anew (**Atem's proposed
+   refinement, for Astation's agreement**, of the agreed "isn't marked
+   done" for such an object in design II.4.2 and in "Pending" above:
+   without it, the copy left behind the cursor would keep the identical
+   resend from being stored until it expired, and the object would never
+   be judged). The host never marks done an object it keeps pending:
    that one stays in the mailbox until it expires or the host decides it
    later. The Station removes the object at `position`, frees its quota and
    its key, and answers `mailbox_done_result`. It answers the same when
@@ -3501,15 +3520,17 @@ moves to 11, and position 12 comes with the next call, `after: 11`.
    generation until it is answered; a reset drops those owed to the old
    mailbox.
 6. **Heads.** `heads` gains `mailbox: {mailbox_id, head}`, the calling
-   host's own mailbox, in every `heads` a Station that serves mailboxes
-   sends: on each (re)connection, every 30 seconds, and at once when it
-   stores an object in that mailbox. It is optional at the reader: a
-   `heads` without it announces no mailbox, so host senders' gate stays
-   closed (design II.5) and the host syncs nothing. A `heads` keeps the
-   256 KiB bound. (§11.4's reader refuses the field today, and the shared
-   core's reader learns it with this wire. Every host that reads `heads`
-   runs `host.delegated`, which only a debug build has, so no released host
-   is affected.)
+   host's own mailbox: on each (re)connection, every 30 seconds, and at once
+   when the Station stores an object in that mailbox. **The Station adds
+   `mailbox` only for a host whose `welcome` lists `host.senders`**; every
+   other host gets `heads` exactly as §11.4 has it. §11.4's strict reader
+   refuses the field, so a host without `host.senders`, such as the step-4
+   debug hosts of the Part I joint check (design VII.A), never sees it; a
+   host that lists the feature reads it with the shared core's reader, which
+   learns it with this wire. It is optional at that reader: a `heads`
+   without it announces no mailbox, so host senders' gate stays closed
+   (design II.5) and the host syncs nothing. A `heads` keeps the 256 KiB
+   bound.
 7. **Resets** (design II.4.3; as §11.4's "Resets"). An announced
    `mailbox_id` other than the one the host read, or a head below the
    host's cursor (in a `heads` or a page), is a reset: the host marks it
@@ -3541,7 +3562,11 @@ moves to 11, and position 12 comes with the next call, `after: 11`.
      and `id`, and `mailbox_done_result` only to a live done with that
      `request_id`, `mailbox_id` and `position`; an answer to a retired call
      is drained. A put or done whose answer didn't come is sent again with
-     a fresh id: both are idempotent.
+     a fresh id: both are idempotent. An answer with an id the host never
+     sent (unsolicited) changes nothing and is counted; it is no Station
+     fault, since no page or gate rests on it. The host keeps the latest
+     256 retired ids of each kind, as for `control_sync`; an older one reads
+     as unsolicited.
    - **An identity change** on the live link (§11.4, "An identity change")
      retires every live mailbox call, and nothing more is put, synced or
      marked done on that socket.
@@ -3700,8 +3725,8 @@ with hyphens): a UUID v4 (a task's, or an agent recipient's) or a UUID v5
 - **Planning** (design II.6, the first version: the device list, no
   directory). The sending host plans the hosts from its own verified device
   list, with stage 1's selectors and no new one:
-  - a selector's `project:<name>` terms reach the hosts that the signed
-    project of each name lists;
+  - a selector's `project:<name>` terms reach the hosts that every named
+    signed project lists;
   - `atem:<atem_id>[/<route_id>]` reaches one host: the current host whose
     `host_id` is that `atem_id`. A host's `host_id` is its `atem_id`
     (Atem verifies under its fixed relay identity, sent as `verifyCommit`'s
@@ -3716,11 +3741,21 @@ with hyphens): a UUID v4 (a task's, or an agent recipient's) or a UUID v5
   sum). A selector with neither a `project:` term nor another host's `atem:`
   reaches no other host. Only label discovery and display (which labels,
   routes and agents a host has) wait for the directory.
+- **A send that reaches both this host's agents and other hosts' is
+  allowed** (proposed, 2026-11-15, Atem's proposal for Astation's
+  agreement). The local part keeps stage 1's path: a Message from `local`
+  with its `select` recipient. The remote part is one host-sender Message
+  (sender `host:<host_id>`) whose recipients are the other hosts' only, and
+  every planned host gets that whole Message in its own envelope (design
+  II.4.2). Both carry the send's one `message_id` (each mailbox keeps its
+  own keys, rule 3), and **one budget of 32 agents covers every recipient
+  of the send, local and remote**: design II.6's split includes the local
+  part.
 - **`host:<host_id>` is never a selector.** It stays a principal form, for
   route consent (design II.2.3).
 - **Matching on the receiving host**, as in stage 1: `atem:<atem_id>`
-  matches every agent when `atem_id` is its own (and nothing otherwise),
-  `/<route_id>` narrows it to that route's agents, and a `project:<name>`
+  matches every agent when it names this host, as design II.6 defines it
+  (and nothing otherwise), `/<route_id>` narrows it to that route's agents, and a `project:<name>`
   term is matched against its own `project:` labels, with `tag:` and
   `self:` terms narrowing (design II.6). Route consent and the project grant
   still decide (design II.2.3).
@@ -3736,16 +3771,16 @@ with hyphens): a UUID v4 (a task's, or an agent recipient's) or a UUID v5
 
 ```json
 {"kind":"request","message":{"message_id":"3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b",
-  "workflow_id":"55aa5bab-e253-4b6c-a83f-c86e6b028aa1","sender":"host:host-a",
+  "workflow_id":"9770a92f-61fe-4ce0-9d41-cf96ae048f8d","sender":"host:host-a",
   "created_at":1793620800000,"expires_at":1793624400000,
   "recipients":[{"recipient_id":"7c6b5a49-3827-4e16-9d05-f4e3d2c1b0a9",
     "host":{"account_id":"acct-test-1","atem_device_id":"host-b","host_trust_gen":1},
     "destination":{"kind":"select","selectors":["project:astation+tag:auth"],"budget":16}}],
   "text":"The orders contract changed: adapt the client","context":[]}}
-{"kind":"request","message":{"message_id":"45047d3a-40df-4209-9e06-ea0e57b607fa",
-  "workflow_id":"55aa5bab-e253-4b6c-a83f-c86e6b028aa1","sender":"host:host-a",
+{"kind":"request","message":{"message_id":"f995d876-07cd-45a6-b238-be41356bdab6",
+  "workflow_id":"9770a92f-61fe-4ce0-9d41-cf96ae048f8d","sender":"host:host-a",
   "created_at":1793620800000,"expires_at":1793624400000,
-  "recipients":[{"recipient_id":"b06daa5d-9f48-4512-8a98-c6d98b159d8e",
+  "recipients":[{"recipient_id":"6d920fd0-c97f-432e-9932-fb9b3b361918",
     "host":{"account_id":"acct-test-1","atem_device_id":"host-b","host_trust_gen":1},
     "destination":{"kind":"select","selectors":["atem:host-b/auth"],"budget":1,"launch":true}}],
   "text":"Review the token scopes change","context":[]}}
@@ -3767,54 +3802,68 @@ R9.2's ("Pairing (ceremony changes)"):
   "nonce":"<base64>","genesis_hash":"<hex>","account_id":"acct-test-1"}}
 {"type":"verifyReveal","data":{"device_pub":"<base64>","device_sign_pub":"<base64>",
   "unlock_auth_pub":"<base64>","host_channel_pub":"<b64u, 32 bytes>","nonce":"<base64>",
-  "host_enc_pub":"<b64u, 32 bytes>","host_enc_sig":"<b64u, 64 bytes>"}}
+  "host_enc_key":{"host_id":"host-a","host_trust_gen":2,
+    "enc_key":{"alg":"x25519","pub":"<b64u, 32 bytes>"},"enc_sig":"<b64u, 64 bytes>"}}}
 {"type":"atem-membership-entry","v":1,"account_id":"acct-test-1","genesis_hash":"<hex>",
  "seq":32,"prev_hash":"<hex of entry 31, the add_host>","action":"host_enc_key","signer":"<the Astation's device id>",
  "signed_at":1793620800000,"host_id":"host-a","host_trust_gen":2,
- "enc_key":{"alg":"x25519","pub":"<host_enc_pub>"},"enc_sig":"<host_enc_sig>"}
+ "enc_key":{"alg":"x25519","pub":"<the reveal's enc_key.pub>"},"enc_sig":"<the reveal's enc_sig>"}
 ```
 
 - **`verifyKeys` gains `account_id`**, the account whose device list
   `genesis_hash` names. The host needs it to sign `enc_sig` before it
   reveals; today it learns the account only from `deviceVerified`. Atem
   refuses a `deviceVerified` that names another account.
-- **`verifyReveal` gains `host_enc_pub`** (the new X25519 public key, 32
-  bytes, base64url without padding) **and `host_enc_sig`** (64 bytes,
-  base64url): R9.2's `enc_sig`, pure Ed25519 by the new `host_channel_key`
-  over `enc(["atem-host-enc-key-v1", account_id, genesis_hash, host_id,
-  u64(host_trust_gen), enc_pub])`, with `account_id` and `genesis_hash`
-  from `verifyKeys`, `host_id` the `verifyCommit`'s `device_id` and
-  `host_trust_gen` its `host_trust_gen`. Both stay outside the commitment:
-  `enc_sig` binds the key to `host_channel_pub`, which the commitment and
-  the safety code already cover, so neither changes. Both are required (no
-  compatibility, as for `host_trust_gen`): Astation refuses (`verifyAbort`)
-  a reveal without them, or whose `host_enc_sig` doesn't verify
-  (`verify_host_enc_sig`).
+- **`verifyReveal` gains `host_enc_key`**, in the agreed shape of session-v1
+  R9.14's `host_enc_key` answer without its `id` and `re`: `{host_id,
+  host_trust_gen, enc_key{alg:"x25519", pub}, enc_sig}`, the entry's own
+  forms, so Astation copies them into the entry as a manager does from
+  `host_enc_key_get` (`HostEncKey::action`). `host_id` and `host_trust_gen`
+  equal the `verifyCommit`'s `device_id` and `host_trust_gen`. `enc_sig` is
+  R9.2's: pure Ed25519 by the new `host_channel_key` over
+  `enc(["atem-host-enc-key-v1", account_id, genesis_hash, host_id,
+  u64(host_trust_gen), enc_pub])`, with `account_id` and `genesis_hash` from
+  `verifyKeys`. The object stays outside the commitment: `enc_sig` binds
+  the key to `host_channel_pub`, which the commitment and the safety code
+  already cover, so neither changes. It is required (no compatibility, as
+  for `host_trust_gen`): Astation refuses (`verifyAbort`) a reveal without
+  it, with a `host_id` or `host_trust_gen` other than the commit's, or whose
+  `enc_sig` doesn't verify (`verify_host_enc_sig`).
 - **The host** makes the key with its new `host_channel_key`, records its
   `enc_kid` durably (the `generated` record, "The recipient's keys" above)
   before it sends the reveal, and keeps the private key as
   `pairing/host_enc_key` when it pins the device list.
 - **Astation**, after the one fresh confirmation, appends the `add_host`
-  and then, at the next `seq`, the host's
-  `host_enc_key{host_id, host_trust_gen, enc_key{alg:"x25519", pub}, enc_sig}`
-  from `host_enc_pub` and `host_enc_sig` (session-v1 R9.4's
-  compare-and-swap for each), and `deviceVerified`'s `membership.entries`
-  run from the genesis to that `host_enc_key`. While the account's signing
-  gate is closed (R9.2, "Host senders and projects"), it appends only the
-  `add_host`, as today, and the entries end there; the key then gets its
-  entry later, through `host_enc_key_get`.
+  and then the host's `host_enc_key` entry, at the `add_host`'s `seq` + 1
+  (session-v1 R9.4's compare-and-swap for each), and `deviceVerified`'s
+  `membership.entries` run from the genesis to that `host_enc_key`. While
+  the account's signing gate is closed (R9.2, "Host senders and
+  projects"), it appends only the `add_host`, as today, and the entries end
+  there.
+- **When the `add_host` is committed but the `host_enc_key` append
+  fails.** Astation retries appending the same signed `host_enc_key` body:
+  it was signed under the same confirmation, and its `seq` and `prev_hash`
+  still follow the committed `add_host`. If it can't (another entry took
+  that `seq`, so the body would change and need a fresh confirmation, or
+  Astation stopped), the ceremony still succeeds: `deviceVerified`'s
+  entries end at the `add_host`, and the host simply has no key entry yet.
+  The normal path then applies: a manager gets the key through
+  `host_enc_key_get`, which returns the same key, and signs its entry with
+  its own fresh confirmation.
 - **One confirmation for both entries.** Session-v1 R9.6 rule 4 gains: in a
   verification ceremony, one fresh confirmation covers the `add_host` and
-  the `host_enc_key` after it, the two bodies shown together (the host, its
-  generation, its key, and the encryption key's `enc_kid`). A body that
-  changes (a conflict at the compare-and-swap) needs a fresh confirmation,
-  as before.
+  the `host_enc_key` at the next `seq`, the two bodies shown together (the
+  host, its generation, its key, and the encryption key's `enc_kid`). A
+  body that changes (a conflict at the compare-and-swap) needs a fresh
+  confirmation, as before.
 - **Atem** verifies the whole chain and its `add_host` as today, and takes
   entries that end either at its `add_host`, as today, or at a
-  `host_enc_key` of its own key at its generation after it; anything else
-  fails the verification (`verifyAbort`), and nothing is pinned.
+  `host_enc_key` of its own key at its generation, at its `add_host`'s
+  `seq` + 1; anything else fails the verification (`verifyAbort`), and
+  nothing is pinned.
 - **What stays:** R9.2's rules for the entry, and `host_enc_key_get`, for
-  rotation and for hosts paired before this change.
+  rotation, for hosts paired before this change, and for the two cases
+  above with no key entry.
 
 ### 11.6 Delegated lifecycle (built behind a debug-only hook; not advertised)
 

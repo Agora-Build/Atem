@@ -136,15 +136,23 @@ different Atem instances reach each other:
   principal form (route consent, II.2.3), never a selector.
 - **The mailbox is kept** (II.4.3). Its wire, the status forms of a selector's resolution, the `result_id` check and
   `select` from host senders are proposed in host-work-v1 §11.5, for Astation's agreement.
-- **No in-place re-verify of a verified host** (answered on #120, comment 6899199958). The way to give a host a new
+- **Atem's proposals with them, for Astation's agreement** (not owner decisions; each marked where it changes agreed
+  text): an object dropped undecided over the pending limits is marked done, so the sender's identical resend is
+  stored again (II.4.2, II.4.3); the mailbox compares identical bytes in canonical form, and stores and charges a
+  resend after an object was done (II.4.3); a send that reaches both local and remote agents keeps one budget of 32
+  agents across both (II.6); and `select` carries a `launch` flag for launch on message across hosts (II.6).
+- **No in-place re-verify of a verified host** (Atem's answer on #120, comment 6899199958, which Astation accepted). The way to give a host a new
   key is `atem unpair`, then `atem pair`. The host keeps its `host_id`, its fixed `atem_id`, so the device list gets a
-  newer `add_host` of the same host with no removal between. Where the text below names `atem pair verify`, or
-  re-verification, as the way a verified host gets a newer `add_host` (the summary of revision 4, II.2.1, II.3.1,
-  II.4.1, II.8, VII.B tests 26 and 32), read `atem unpair`, then `atem pair`: the device list sees the same kind of
-  entry, with the same effects. Appendix A keeps the owner's words of 2026-11-07.
+  newer `add_host` of the same host with no removal between. Wherever the text below names `atem pair verify`, or
+  re-verification, as the way a verified host gets a newer `add_host` (for example the summary of revision 4, I.8,
+  II.2.1, II.2.2, II.3.1, II.4.1, II.8, III.1's vectors, VI, VII.B tests 26 and 32, VII.D row 4 and VIII.1 item
+  12), read `atem unpair`, then `atem pair`: the device list sees the same kind of entry, with the same effects.
+  Appendix A keeps the owner's words of 2026-11-07.
 
 Each changed passage is marked "Amended by owner decision, 2026-11-15" (in the Part II bullet of "How to read this
-document", I.1.3, II.1, II.2.1, II.4.1, II.4.3, II.6, IV rows 11 and 14, V.1 and V.2).
+document", I.1.3, II.1, II.2.1, II.4.1, II.4.3, II.6, IV rows 11 and 14, V.1, V.2 and VII.B tests 37a to 37h), and
+Atem's proposed refinements "Proposed refinement (2026-11-15, Atem's proposal, for Astation's agreement)" or "Atem's
+proposal, for Astation's agreement" (in II.4.2, II.4.3 and II.6).
 
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256
@@ -1972,11 +1980,13 @@ document calls the key `enc_key`.
   device list until a native manager signs a `host_enc_key` with a second fresh confirmation, and the host can open no
   host-sender mail in between ((b)'s cost above).
 - **How.** The host makes its new key with its new `host_channel_key` and offers `{enc_pub, enc_sig}` for the new
-  trust generation in the verification ceremony. Astation checks `enc_sig` against the `host_channel_key` the
-  ceremony authenticates, and, under the same fresh confirmation that signs the `add_host`, appends the host's
-  `host_enc_key` right after it. A newly verified host can then open host-sender mail at once. While the account's
-  signing gate is closed (II.2.2), Astation appends only the `add_host`, as before, and the key gets its entry later
-  through `host_enc_key_get`.
+  trust generation in the verification ceremony, in the shape of the `host_enc_key_get` answer. Astation checks
+  `enc_sig` against the `host_channel_key` the ceremony authenticates, and, under the same fresh confirmation that
+  signs the `add_host`, appends the host's `host_enc_key` right after it. A newly verified host can then open
+  host-sender mail at once. While the account's signing gate is closed (II.2.2), Astation appends only the
+  `add_host`, as before. If the `add_host` is committed but the `host_enc_key` append fails, Astation retries the
+  same signed body; if it can't, the ceremony still succeeds with no key entry yet. In both cases the key gets its
+  entry later through `host_enc_key_get` and a manager's own fresh confirmation.
 - **What stays.** (b) stays the representation: the key is still a separate `host_enc_key` entry, verified as R9.2
   says. `host_enc_key_get` stays, for rotation and for hosts paired earlier. The commitment and the safety code don't
   change: `enc_sig` is made with `host_key`, which they already cover. The host records the new key's `enc_kid`
@@ -2087,8 +2097,11 @@ with the sealed part beside it.
   again after each device-list advance and each change of the keys it accepts, until it expires. At most 64 objects stay
   pending per claimed `(host_id, host_trust_gen)` and 256 in all; more are dropped undecided (it read: "more are refused
   and kept as evidence"): an overflow is no verdict, records nothing, claims no `id` and isn't marked done, so the
-  sender's resend is judged anew. **Pending objects don't hold the gate** (II.5): an object this host can't verify yet
-  can't stop its other work. **New rule.**
+  sender's resend is judged anew. **Proposed refinement (2026-11-15, Atem's proposal, for Astation's agreement):** an
+  overflowed object is marked done all the same (it still gets no verdict and claims no `id`), so that the mailbox
+  frees its key and stores the sender's identical resend again (host-work-v1 §11.5, "The mailbox calls", rule 5).
+  **Pending objects don't hold the gate** (II.5): an object this host can't verify yet can't stop its other work.
+  **New rule.**
 - **Steps 5 and 6, once step 4 passed:** the sender is authenticated, so the refusal is reported back to it as a
   status naming the object's `id`, `refused` with `invalid_request` (II.4.4); its outbox doesn't stay `sent` until
   expiry. **Amended for step 4, agreed with Astation.** The refusal names that sender, `(host_id, host_trust_gen)`.
@@ -2150,11 +2163,13 @@ most 24 h retention, quotas, acknowledgments and deduplication").
   `cancel`, `complete` and status objects are small, requests and results larger. This version doesn't pad
   plaintexts to size classes.
 - **Wire.** The relay calls (put, stored, sync, done, heads) are an **open Atem spec item**, written with Astation,
-  with the message bound of owner choice 13 (512 KiB mailbox calls). **Amended by owner decision, 2026-11-15 (the
-  mailbox is kept; the wire proposed, for Astation's agreement):** host-work-v1 §11.5, "The mailbox calls". It
-  proposes one refinement of II.4.2: an object the host drops undecided over the pending limits is still removed
-  from the mailbox, so that the sender's resend of the same bytes is stored and delivered again (II.4.2 says such an
-  object "isn't marked done"; it still gets no verdict and claims no `id`).
+  with the message bound of owner choice 13 (512 KiB mailbox calls). **Amended by owner decision, 2026-11-15:** the
+  mailbox is kept. **Atem's proposal, for Astation's agreement:** its wire is host-work-v1 §11.5, "The mailbox calls".
+  With it Atem proposes one refinement of II.4.2: an object the host drops undecided over the pending limits is
+  still marked done, so that the sender's resend of the same bytes is stored and delivered again (II.4.2 said such an
+  object "isn't marked done"; it still gets no verdict and claims no `id`), and two refinements of "Putting" above
+  (§11.5's rule 3): identical bytes are compared in canonical form, and a resend after an object was done is stored,
+  and charged, again.
 
 ### II.4.4 Status and results back
 
@@ -2232,11 +2247,13 @@ device list, without the directory.** A project already lists its hosts in the s
 host plans which hosts to address from its own verified list, and reads no vault to send:
 - **`project:<name>`** fans out to the hosts the signed project of that name lists (II.2.2), other than the sending
   host, whose own agents are matched locally as in stage 1. A selector with several `project:` terms reaches the hosts
-  that all of their projects list.
+  that every named project lists.
 - **`atem:<atem_id>[/<route_id>]`**, stage 1's selector, names one host: the current host of the sending host's
   device list whose `host_id` is that `atem_id`. A host's `host_id` is its `atem_id`: Atem verifies under its fixed
   relay identity, sent as `verifyCommit`'s `device_id`, and Astation checks it equals the id the connection
-  authenticated as, so the `add_host` names it. With `/<route_id>` it names one route there. As in stage 1, a message starts an agent only when its
+  authenticated as, so the `add_host` names it. The receiving host matches the selector's id against its own
+  `host_id` in its pinned device list (which equals its configured `atem_id`), so sender and receiver read it the
+  same way. With `/<route_id>` it names one route there. As in stage 1, a message starts an agent only when its
   send asked for it (`--launch`), and only on a route such a selector names whose owner allows it (collaboration §5,
   "When no agent runs"); a host sender also needs the project's `launch` op (II.2.3). An `atem_id` no current host
   of the list has reaches no other host.
@@ -2248,13 +2265,18 @@ host plans which hosts to address from its own verified list, and reads no vault
   reaches only the sending host's own agents. `host:<host_id>` stays a principal form (II.2.3), never a selector.
 - **Who can receive** is unchanged: only hosts the device list gives an encryption key (below). The sending host still
   splits one budget of 32 agents across the hosts it plans (below).
-- **The wire:** `select` inside host-sender envelopes, with its launch flag, and the status forms of a selector's
-  resolution are proposed in host-work-v1 §11.5.
+- **A send that reaches both local and remote agents** is allowed (**proposed, 2026-11-15, Atem's proposal, for
+  Astation's agreement**). The local part keeps stage 1's path; the remote part goes as host-sender envelopes, one
+  Message listing only the other hosts' recipients. One budget of 32 agents covers every recipient of the message,
+  local and remote: the split above includes the local part.
+- **The wire:** `select` inside host-sender envelopes, with its `launch` flag (Atem's proposal, for Astation's
+  agreement), and the status forms of a selector's resolution are proposed in host-work-v1 §11.5.
 
 The directory below stays planned: only label discovery and display (which labels, routes and agents each host has)
 wait for it. Until it is built, the planning above replaces the records' part in planning, and "Limitation" below
 doesn't apply: planning never waits for the cred agent, `atem:<atem_id>` included (context snapshots still need it, as
-in stage 1).
+in stage 1). Its parenthetical, that an `atem:<atem_id>` selector needs a record to map the `atem_id` to a `host_id`,
+is superseded: a host's `host_id` is its `atem_id` (above).
 
 - **Records** (collaboration §5). Each instance publishes a directory record to a per-account directory in the vault:
   its `atem_id`, its host identity `{account_id, atem_device_id, host_trust_gen}`, its labels, its routes with their
@@ -3173,6 +3195,48 @@ Nothing is merged or deployed before step 1.
     or readmit while any strict verifier of the account is older; an old verifier stops at such an entry in a test
     account.
 37. **Limits.** A host sender hits `per_workflow` on the receiving host, and the mailbox quotas.
+
+**Amended by owner decision, 2026-11-15: tests for the proposals, each proposed with what it tests (for Astation's
+agreement; host-work-v1 §11.5).**
+
+37a. **The key in the ceremony.** On an account whose signing gate is open, `atem unpair`, then `atem pair` on host B
+     takes one fresh confirmation, and the device list then holds B's new `add_host` and, at the next `seq`, its
+     `host_enc_key`. An envelope host A seals to that key right after the ceremony opens on B, with no second
+     confirmation. With the gate closed, the ceremony appends only the `add_host`, and B's key gets its entry later
+     through `host_enc_key_get`.
+
+37b. **The append fails after the `add_host`.** The relay fails the `host_enc_key` append once: Astation appends the
+     same signed body again and the ceremony ends with both entries. When another entry takes that `seq`, the
+     ceremony still succeeds, `deviceVerified` ends at the `add_host`, B has no key entry, and `host_enc_key_get`
+     returns the same key, whose entry a manager signs with its own fresh confirmation. A certificate whose entries end
+     at anything else after B's `add_host` fails the verification.
+
+37c. **`atem:` through the device list.** `atem message send --to atem:<B's atem_id>/<route>` from A, with no
+     directory, reaches that route's agents on B; with `--launch` and `launch = "on_message"` on that route (and the
+     project's `launch` op), B starts an agent for it, and without `--launch` it starts none. B matches the selector
+     against its own `host_id`. An `atem_id` that no current host has reaches no other host.
+
+37d. **`project:` fans out; labels decide on each host.** `--to project:astation` reaches every host the signed
+     project lists; a host whose routes carry no `project:astation` label answers `no_match`, final for that message,
+     and a host that matches reports `resolved` tasks with their UUID v5 ids, which later `cancel`, `complete` and
+     result objects name. A send that also matches A's own agents runs those through stage 1, and one budget of 32
+     agents covers both parts.
+
+37e. **No `select` from a channel.** The shared core refuses to build a channel `message_publish` with a `select`
+     destination, and a host refuses one sent by hand (`forbidden`). A reply or result whose `result_id` isn't its
+     task's is no answer to a `reply_query` and is refused `result_id_mismatch` by the sending host.
+
+37f. **An overflowed object comes back.** With B's pending limits full, an object over them is dropped undecided and
+     marked done; A's identical resend is stored again, delivered and judged. An identical put while the first copy is
+     still stored is answered `mailbox_stored` and charged nothing.
+
+37g. **The mailbox wire.** A page leaves no hole before the cursor; a reset (a new `mailbox_id`, or a head below the
+     cursor) reads the mailbox from 0, with nothing applied twice; a late page of a retired call is drained; another
+     link's `mailbox_sync` or `mailbox_done` is refused `forbidden`; a `quota` refusal never counts as stored.
+
+37h. **`heads.mailbox` only toward `host.senders` hosts.** The Station adds `mailbox` to the `heads` of a host whose
+     `welcome` lists `host.senders`, and never to a host without it, such as a step-4 debug host of the Part I joint
+     check (VII.A), whose gate keeps opening as before.
 
 ### VII.C Framing and vectors
 

@@ -182,8 +182,9 @@ above: `project:<name>` reaches the hosts the signed project lists, and
 `atem:<atem_id>[/<route_id>]` one host, since a host's `host_id` in the
 device list is its `atem_id`. Each receiving host expands the labels and
 answers `no_match` when nothing matches; `/<route_id>` with `--launch` may
-start an agent there, as on one host. Only label discovery and display wait
-for the vault directory. `host:<host_id>` is a principal (route consent),
+start an agent there, as on one host. A send may reach this instance's
+agents and other hosts' at once, with one budget of 32 agents across both
+(proposed). Only label discovery and display wait for the vault directory. `host:<host_id>` is a principal (route consent),
 never a selector. See [delegated-host-work.md](delegated-host-work.md), II.6.
 
 **When no agent runs.** Only a sender that asks for it (`atem message send
@@ -1177,9 +1178,11 @@ fencing.
 
 These are runtime and protocol tests with fake providers. They do not claim a
 live Claude/Codex conversation, native app acceptance or deployed cross-host
-delivery. Stages 2 and 3, the directory in the vault, cross-instance return
-grants, Station typed adapters/capacity, mailbox and signed projects remain
-outside this implementation ([delegated-host-work.md](delegated-host-work.md)).
+delivery. Cross-instance delivery (host senders: the mailbox, signed
+projects, results across hosts), and later the directory in the vault, remain
+outside this implementation ([delegated-host-work.md](delegated-host-work.md));
+the Station's typed adapters and capacity were stage 2's, which Atem hosts
+don't use between themselves (owner decision 2026-11-15).
 
 ### Known limits
 
