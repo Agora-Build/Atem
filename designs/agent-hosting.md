@@ -117,9 +117,10 @@ on a debug build's runtime started with `host.senders` in its
 | `host:<host_id>` | That host only | The ops of every project in effect that lists both hosts |
 
 `<name>` is 1 to 32 of `a-z`, `0-9` and `-`; `<host_id>` is the host's id in
-the device list. A profile never takes either. Without the hook, a file that
-names one doesn't load (`runtime.log` and `atem runtime check` say it needs
-`host.senders`), as before the forms existed. Labels never authorize:
+the device list. A profile never takes either. Without the hook, and in every release build, a
+file that names one doesn't load, with the message any principal the file
+doesn't know gets (`… is not a principal: use …`), exactly as before the
+forms existed. Labels never authorize:
 `labels = ["project:astation"]` addresses agents, `principals =
 ["project:astation"]` consents to the signed project's hosts; `atem runtime
 check` prints them on separate lines and says so for a route that names one.

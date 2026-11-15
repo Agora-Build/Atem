@@ -219,8 +219,9 @@ fn principal_ok(principal: &str) -> bool {
 /// What is wrong with a profile's or route's principals (after the paired
 /// Astation filled an empty list), if anything. With `senders`
 /// (`host.senders` on), a route also takes the host-sender consents
-/// `project:<name>` and `host:<host_id>` (design II.2.3); with it off they
-/// are refused, saying why, and the rest is main's.
+/// `project:<name>` and `host:<host_id>` (design II.2.3); with it off (and
+/// in every release build) they are principals it doesn't know, refused
+/// with main's message: hook off is main.
 fn principals_problem(principals: &[String], route: bool, senders: bool) -> Option<String> {
     use super::delegated::host_senders::Consent;
     if principals.is_empty() {
@@ -237,15 +238,8 @@ fn principals_problem(principals: &[String], route: bool, senders: bool) -> Opti
         if principal_ok(p) || route && p.as_str() == "local" {
             return None;
         }
-        if route && let Some(consent) = Consent::parse(p) {
-            return match consent {
-                _ if !senders => Some(format!(
-                    "`{p}` names host senders, which need `host.senders` (a debug-only hook \
-                     this runtime doesn't run); remove it"
-                )),
-                Ok(_) => None,
-                Err(why) => Some(format!("`{p}`: {why}")),
-            };
+        if route && senders && let Some(consent) = Consent::parse(p) {
+            return consent.err().map(|why| format!("`{p}`: {why}"));
         }
         Some(format!(
             "`{p}` is not a principal: use {} (`atem runtime check` lists them)",
@@ -5427,9 +5421,10 @@ profile_id = "backend-codex"
     /// Design II.2.3: a route's `principals` take `project:<name>` (the
     /// hosts a signed project lists, when this host is in it too) and
     /// `host:<host_id>` (that host) only with `host.senders` on (the
-    /// debug-only hook's, which needs `host.delegated`). With it off both
-    /// are refused when the file loads, saying why: hook off is main.
-    /// Names follow the shared core's project grammar, ids the device
+    /// debug-only hook's, which needs `host.delegated`). With it off (and in
+    /// every release build) both are refused when the file loads with
+    /// exactly main's message for a principal it doesn't know: hook off is
+    /// main. Names follow the shared core's project grammar, ids the device
     /// list's; a profile never takes either.
     #[test]
     fn host_sender_route_principals_need_the_hook() {
@@ -5439,19 +5434,24 @@ profile_id = "backend-codex"
             HostFeatures::default(),
             HostFeatures::parse("host.delegated").unwrap(),
         ] {
-            let error = ok.validate_for(features).unwrap_err().to_string();
-            assert_eq!(
-                error,
-                "route `backend`: `project:astation` names host senders, which need `host.senders` \
-                 (a debug-only hook this runtime doesn't run); remove it",
-                "{features:?}"
-            );
-            let host = route_principals(r#"["host:host-b"]"#);
-            assert_eq!(
-                host.validate_for(features).unwrap_err().to_string(),
-                "route `backend`: `host:host-b` names host senders, which need `host.senders` \
-                 (a debug-only hook this runtime doesn't run); remove it"
-            );
+            for (principals, refused) in [
+                (r#"["project:astation"]"#, "project:astation"),
+                (r#"["host:host-b"]"#, "host:host-b"),
+                (r#"["local", "project:A b"]"#, "project:A b"),
+            ] {
+                assert_eq!(
+                    route_principals(principals)
+                        .validate_for(features)
+                        .unwrap_err()
+                        .to_string(),
+                    format!(
+                        "route `backend`: `{refused}` is not a principal: use `member:<id>`, \
+                         `service:<id>`, `browser:<id>` or `local` (this runtime's own agents) \
+                         (`atem runtime check` lists them)"
+                    ),
+                    "{features:?}"
+                );
+            }
         }
         let too_long = format!("[\"project:{}\"]", "a".repeat(33));
         for (principals, problem) in [
@@ -5538,7 +5538,10 @@ profile_id = "backend-codex"
             &format!("{text}principals = [\"project:astation\"]\n"),
         );
         let error = load_error(dir.path());
-        assert!(error.contains("need `host.senders`"), "{error}");
+        assert!(
+            error.starts_with("route `backend`: `project:astation` is not a principal: use"),
+            "{error}"
+        );
         let config = Config::load_for(dir.path(), senders_on()).unwrap();
         assert_eq!(config.routes[0].principals, ["project:astation"]);
     }
