@@ -858,3 +858,299 @@ fn the_applied_seq_is_read_from_memory() {
         assert!(reads.is_empty(), "{reads:?}");
     });
 }
+
+// ── Atem's reading of project entries; the effects while paused; replay ──
+
+/// Atem's reading (host-work-v1 §11.6, design II.2.2): project entries are
+/// judged once per catch-up against the committed head, as Part I judges
+/// every narrowing at `executing`. A narrowing and a re-widening that reach
+/// host-work's pass together fail nothing; a narrowing and a revoke of the
+/// same sender together give the revoke's `cancelled`, `sender revoked`.
+#[test]
+fn project_entries_are_judged_once_per_catch_up_against_the_head() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let queued = host_task(&mut rig, &s, "HS_ONCE_QUEUED", start + HOUR);
+        hold_host_work(&mut rig);
+        ticks(&mut rig, 1);
+        let narrow = |s: &mut HostSenders, rig: &mut LocalRig| {
+            sign_and_carry(
+                rig,
+                s,
+                project_set("build", ["host", "host-b"], [ProjectOp::Message], 0).unwrap(),
+            );
+        };
+        narrow(&mut s, &mut rig);
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            project_set("build", ["host", "host-b"], task_ops(), 0).unwrap(),
+        );
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), s.log.log.head().seq);
+        assert_eq!(
+            settled(&rig, &queued).0,
+            WorkState::Queued,
+            "undone in time"
+        );
+        narrow(&mut s, &mut rig);
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        ticks(&mut rig, 1);
+        assert_eq!(settled(&rig, &queued), outcome(Event::Revoked));
+    });
+}
+
+/// Design II.3.1, I.4.4 ("a stop always wins"): with hosting paused
+/// (`enabled = false`), host senders' device-list effects are still
+/// written and their stops carried out: a revoke with `interrupt_running`
+/// cancels a queued task and interrupts the running turn.
+#[test]
+fn device_list_effects_run_while_hosting_is_paused() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let running = host_running(&mut rig, &s, "HS_PAUSED_RUNNING", start).await;
+        let queued = host_task(&mut rig, &s, "HS_PAUSED_QUEUED", start + HOUR);
+        blocked(&mut rig, &queued, BEHIND).await;
+        rig.bridge.work.config.enabled = false;
+        passes(&mut rig, 1);
+        assert!(!rig.bridge.hosting_enabled());
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", true, 0).unwrap(),
+        );
+        passes(&mut rig, 1);
+        assert_eq!(applied(&rig), s.log.log.head().seq);
+        assert_eq!(settled(&rig, &queued), outcome(Event::Revoked));
+        assert_eq!(intents(&rig, &running).len(), 1);
+        passes(&mut rig, 2);
+        escs_reach(&rig, 1).await;
+        settle(&mut rig).await;
+        turn_interrupted(&mut rig, &running).await;
+        assert_eq!(escs(&rig), 1);
+    });
+}
+
+/// A `control_records` call taken from a native's channel before hosting
+/// paused is applied and answered while it is paused (a stop always wins).
+#[test]
+fn a_carried_record_is_answered_while_hosting_is_paused() {
+    use atem_client::connect::Event as CEvent;
+    use atem_client::control::ApplicationResult::Applied;
+    use atem_client::session::r9::ControlRecordsResult;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        rig.bridge.r9.set_delegated_features(true, false);
+        rig.bridge.r9.set_senders_feature(true);
+        rig.bridge.r9.enable_host_work(true);
+        r9_link_up(&mut rig);
+        let running = host_running(&mut rig, &s, "HS_PAUSED_CARRIED", start).await;
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        passes(&mut rig, 1);
+        let mut ch = channel(&mut rig, &s.log, "ph-1", "dev-phone");
+        let record = host_interrupt(&s.log, s.log.log.head().seq);
+        let (id, frame) = ch
+            .send_control_records(std::slice::from_ref(&record), 2)
+            .unwrap();
+        envelope_in(&mut rig, &envelope::frame("ph-1", &frame));
+        rig.bridge.work.config.enabled = false;
+        passes(&mut rig, 1);
+        assert!(!rig.bridge.hosting_enabled());
+        let mut answers = Vec::new();
+        for frame in frames_for(&mut rig, "ph-1") {
+            for event in ch.on_frame(&frame, 3).unwrap() {
+                if let CEvent::Family(message) = event
+                    && let Some(data) = message.data
+                    && let Ok(result) = ControlRecordsResult::from_data(&data)
+                {
+                    answers.push(result);
+                }
+            }
+        }
+        let [answer] = answers.as_slice() else {
+            panic!("one answer: {answers:?}");
+        };
+        assert_eq!(answer.re, id);
+        assert_eq!(interrupt_results(&answer.results), [(Applied, Applied)]);
+        assert_eq!(intents(&rig, &running).len(), 1);
+    });
+}
+
+/// The recovery step a task was settled in, if any (its `Reconcile` list).
+fn reconciled_at_recovery(steps: &[RecoveryStep], task: &str) -> bool {
+    steps.iter().any(|step| match step {
+        RecoveryStep::Reconcile(tasks) => tasks.iter().any(|t| t.task_id == task),
+        _ => false,
+    })
+}
+
+/// Design II.3.1, "Crash safety", for every entry kind: a narrowing, a
+/// `remove_host`, and a revoke with its readmit, each committed in the
+/// device list with the runtime killed before host-work wrote its effects:
+/// the next start replays them from host-work's applied `seq`, before the
+/// recovery (which then finds the tasks settled already).
+#[test]
+fn every_entry_kind_is_replayed_after_a_crash() {
+    type Change = fn(&mut HostSenders, &mut LocalRig);
+    let cases: [(&str, Change, Event); 3] = [
+        (
+            "a narrowing",
+            |s, rig| {
+                sign_and_carry(
+                    rig,
+                    s,
+                    project_set("build", ["host", "host-b"], [ProjectOp::Message], 0).unwrap(),
+                )
+            },
+            Event::Narrowed,
+        ),
+        (
+            "a removal",
+            |s, rig| {
+                sign_and_carry(
+                    rig,
+                    s,
+                    ListAction::RemoveHost {
+                        host_id: "host-b".into(),
+                    },
+                )
+            },
+            Event::Removed,
+        ),
+        (
+            "a revoke and a readmit",
+            |s, rig| {
+                sign_and_carry(rig, s, host_sender_revoke("host-b", false, 0).unwrap());
+                sign_and_carry(rig, s, host_sender_readmit("host-b", 0).unwrap());
+            },
+            Event::Revoked,
+        ),
+    ];
+    for (what, change, event) in cases {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let start = host_now().wall_ms;
+            let os = ManualOs::at(start);
+            let mut s = host_senders_host(&mut rig, root, &os);
+            let queued = host_task(&mut rig, &s, "HS_REPLAY_QUEUED", start + HOUR);
+            hold_host_work(&mut rig);
+            ticks(&mut rig, 1);
+            let before = applied(&rig);
+            change(&mut s, &mut rig);
+            assert_eq!(applied(&rig), before, "{what}");
+            let steps = restart(&mut rig, root, &os, false, true);
+            assert_eq!(applied(&rig), s.log.log.head().seq, "{what}");
+            assert_eq!(settled(&rig, &queued), outcome(event), "{what}");
+            assert!(
+                !reconciled_at_recovery(&steps, &queued),
+                "{what}: settled by the replay, before the recovery"
+            );
+        });
+    }
+}
+
+/// Design II.3.1 ("admitted before"): replaying an older revoke or removal
+/// leaves the sender's tasks admitted after its readmit or re-add alone.
+#[test]
+fn a_replay_leaves_tasks_admitted_after_a_readmit_or_a_re_add() {
+    use crate::session_protocol::membership::r9log::secret;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        hold_host_work(&mut rig);
+        ticks(&mut rig, 1);
+        // A revoke and its readmit committed, host-work's pass not run yet:
+        // a task admitted after the readmit, then the pass.
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", true, 0).unwrap(),
+        );
+        sign_and_carry(&mut rig, &mut s, host_sender_readmit("host-b", 0).unwrap());
+        let after_readmit = host_task(&mut rig, &s, "HS_AFTER_READMIT", start + HOUR);
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), s.log.log.head().seq);
+        assert_eq!(settled(&rig, &after_readmit).0, WorkState::Queued);
+        assert!(intents(&rig, &after_readmit).is_empty());
+        // A removal and a re-add (with a project listing it again).
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            ListAction::RemoveHost {
+                host_id: "host-b".into(),
+            },
+        );
+        s.log.add_host("host-b", 2, &secret("host b re-added"));
+        let entry = s.log.entries.last().unwrap().object().to_json();
+        carry(&mut rig, &s.log, entry);
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            project_set("build", ["host", "host-b"], task_ops(), 0).unwrap(),
+        );
+        let after_re_add = host_task(&mut rig, &s, "HS_AFTER_RE_ADD", start + HOUR);
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), s.log.log.head().seq);
+        assert_eq!(settled(&rig, &after_re_add).0, WorkState::Queued);
+        // The earlier one, admitted before the removal, is cancelled.
+        assert_eq!(settled(&rig, &after_readmit), outcome(Event::Removed));
+        // Host-work's scheduling back: the task admitted after the re-add
+        // runs.
+        rig.bridge.work.scheduled = Instant::now();
+        rig.until(|r| input(r).contains("HS_AFTER_RE_ADD")).await;
+    });
+}
+
+/// A `host_senders_applied` row naming another device list is damage (a
+/// store is one identity's, its list's): host senders' pass refuses it as
+/// a receipt-database fault, writing nothing, never restarting the count.
+#[test]
+fn another_lists_applied_seq_is_a_fault() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let queued = host_task(&mut rig, &s, "HS_OTHER_LIST", start + HOUR);
+        {
+            let store = rig.bridge.work.store.as_ref().unwrap();
+            let tx = store.immediate().unwrap();
+            let other = atem_client::encoding::Hash32([9; 32]);
+            host_senders::set_applied_seq(&tx, &other, 1).unwrap();
+            tx.commit().unwrap();
+        }
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        hold_host_work(&mut rig);
+        ticks(&mut rig, 1);
+        assert!(rig.bridge.work.error, "a receipt-database fault");
+        assert_ne!(settled(&rig, &queued), outcome(Event::Revoked));
+        let genesis = s.log.log.genesis_hash();
+        assert!(
+            host_senders::applied_seq(&rig.bridge.work.store.as_ref().unwrap().db, &genesis)
+                .is_err()
+        );
+    });
+}
