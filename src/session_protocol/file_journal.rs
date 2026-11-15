@@ -592,12 +592,12 @@ fn euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// `dir` exists (created 0700 if missing), is a real directory owned by this
-/// user that nobody else can write to, and is 0700.
 /// Why `FileJournal::open` gave up on a lock held elsewhere: the runtime
 /// was asked to stop meanwhile.
 pub const STOPPING: &str = "the runtime was asked to stop while it waited for the journal's lock";
 
+/// `dir` exists (created 0700 if missing), is a real directory owned by this
+/// user that nobody else can write to, and is 0700.
 fn private_dir(dir: &Path) -> Result<(), JournalError> {
     match fs::symlink_metadata(dir) {
         Ok(meta) => {
