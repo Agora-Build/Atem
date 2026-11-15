@@ -626,6 +626,9 @@ pub struct HostBridge {
     considered: Option<u64>,
     link: Option<Link>,
     last_advance: u64,
+    /// The device list is read again in the next pass, whatever its
+    /// 100 ms cadence (`check_list`).
+    list_due: bool,
     /// The host clock (§R9.5) at the last 100 ms pass: a pass also runs
     /// when it moved 100 ms (the device list's waits, service expiry and
     /// push resends are on it; the fixtures move it alone).
@@ -978,6 +981,7 @@ impl HostBridge {
             considered: None,
             link: None,
             last_advance: 0,
+            list_due: false,
             last_host: (0, 0),
             capture_checked: Instant::now(),
             recovered: false,
@@ -1889,6 +1893,13 @@ impl HostBridge {
         self.r9.admitting()
     }
 
+    /// A verification just pinned a device list: the next pass reads it
+    /// (its device-list check, whatever its 100 ms cadence), so the route
+    /// state that pass leaves is the new list's (§R9.7b).
+    pub fn check_list(&mut self) {
+        self.list_due = true;
+    }
+
     /// The link may attach now (its pairing was just verified): it is
     /// considered again at the next pass, unless it is attached already.
     pub fn reconsider(&mut self) {
@@ -2111,7 +2122,12 @@ impl HostBridge {
             self.membership_pass(&mut cx);
             let effects = self.r9_call(|r9, parts| r9.tick(parts));
             self.r9_exec(effects, &mut cx);
+        } else if self.list_due {
+            // A verification just pinned a list (`check_list`): this pass's
+            // route state is made from it.
+            self.membership_pass(&mut cx);
         }
+        self.list_due = false;
         if self.host_work.is_some() {
             self.renew_host_work_leases();
             let effects = self.host.take_effects();

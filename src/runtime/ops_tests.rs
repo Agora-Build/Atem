@@ -422,6 +422,28 @@ fn trust_gen(dir: &Path) -> u64 {
 impl Verifier {
     /// Waits for `verifyCommit`, answers with `verifyKeys`.
     async fn keys(peer: &mut Peer, account: &str) -> Self {
+        let fake = FakeAstation::new();
+        let log = crate::session_protocol::membership::r9log::TestLog::genesis(
+            account,
+            &fake.sign_secret_bytes(),
+        );
+        Self::answer_commit(peer, fake, log, account).await
+    }
+
+    /// A re-verify with the same Astation: waits for the next
+    /// `verifyCommit` and answers it with the same keys and the account's
+    /// device list as it stands (this ceremony's `add_host` grows it).
+    async fn again(self, peer: &mut Peer) -> Self {
+        let account = self.account.clone();
+        Self::answer_commit(peer, self.fake, self.log.into_inner(), &account).await
+    }
+
+    async fn answer_commit(
+        peer: &mut Peer,
+        fake: FakeAstation,
+        log: crate::session_protocol::membership::r9log::TestLog,
+        account: &str,
+    ) -> Self {
         let commit = peer.next("verifyCommit").await;
         let commitment: [u8; 32] = STANDARD
             .decode(commit["data"]["commitment"].as_str().unwrap())
@@ -432,12 +454,7 @@ impl Verifier {
         let advertised =
             atem_client::ceremony::verify_commit_host_trust_gen(commit.to_string().as_bytes())
                 .expect("verifyCommit carries host_trust_gen");
-        let fake = FakeAstation::new();
         let nonce_s = [7u8; 32];
-        let log = crate::session_protocol::membership::r9log::TestLog::genesis(
-            account,
-            &fake.sign_secret_bytes(),
-        );
         peer.send(&AstationMessage::VerifyKeys {
             sign_pub: STANDARD.encode(fake.sign_pub()),
             enc_pub: STANDARD.encode(fake.enc_pub()),
@@ -558,6 +575,17 @@ impl Runtime {
         peer_url: Option<&str>,
         agent: Arc<dyn CredAgentApi>,
     ) -> Self {
+        Self::start_with(dir, peer_url, agent, |_| {}).await
+    }
+
+    /// [`Runtime::start`], with `configure` applied to the App before it is
+    /// served.
+    async fn start_with(
+        dir: Rc<tempfile::TempDir>,
+        peer_url: Option<&str>,
+        agent: Arc<dyn CredAgentApi>,
+        configure: impl FnOnce(&mut App),
+    ) -> Self {
         let root = dir.path();
         let profile = root.join("profile");
         std::fs::create_dir_all(&profile).unwrap();
@@ -577,6 +605,7 @@ impl Runtime {
             app.astation_connected = true;
             app.astation_link_gen = 1;
         }
+        configure(&mut app);
         let socket = root.join("rt.sock");
         let unix = tokio::net::UnixListener::bind(&socket).unwrap();
         let options = Options {
@@ -1076,6 +1105,140 @@ fn the_pump_routes_a_certificate_queued_behind_a_backlog() {
         );
         assert!(!app.astation_connected, "then the link is down");
         assert!(app.astation_reconnect_at.is_some(), "the normal reconnect");
+    });
+}
+
+/// The profile's verification with `ASTATION` forgotten (its device list
+/// and host channel key stay), so `atem pair verify` runs the ceremony
+/// again, as Astation's re-verify of a route-proved host does.
+fn unverify(keys: &CredPaths) {
+    let mut trust: Value =
+        serde_json::from_str(&std::fs::read_to_string(&keys.trust).unwrap()).unwrap();
+    trust["astations"]
+        .as_object_mut()
+        .unwrap()
+        .remove(ASTATION)
+        .expect("verified");
+    std::fs::write(&keys.trust, trust.to_string()).unwrap();
+}
+
+/// A fake relay at the URL returned: every connection gets a
+/// `host_challenge` for `ASTATION`'s room at once (§R9.7b), and each
+/// `host_route` answer comes back with its challenge.
+async fn challenging_relay() -> (
+    String,
+    mpsc::UnboundedReceiver<(atem_client::host_route::HostChallenge, String)>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::task::spawn_local(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::task::spawn_local(async move {
+                let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                let challenge = atem_client::host_route::HostChallenge::new(ASTATION);
+                let text = challenge.to_json().to_string();
+                if socket.send(WsMessage::Text(text)).await.is_err() {
+                    return;
+                }
+                while let Some(Ok(message)) = socket.next().await {
+                    if let WsMessage::Text(text) = message
+                        && serde_json::from_str::<Value>(&text)
+                            .is_ok_and(|v| v["op"] == "host_route")
+                    {
+                        let _ = tx.send((challenge.clone(), text));
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{address}"), rx)
+}
+
+/// Astation PR #81: a re-verify of a host whose list is pinned, on a relay
+/// link; the Station delivers `deviceVerified`, then closes the socket with
+/// 1013, and the host reconnects. The new link answers the relay's
+/// challenge with the new `host_channel_key` at the new head (the list the
+/// verification pinned), never the old ones: the reconnect waits for the
+/// operation to end and for the host's next pass to read the new list.
+#[test]
+fn the_reconnect_after_a_reverify_proves_its_route_with_the_new_key() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        let profile = dir.path().join("profile");
+        paired(&profile);
+        let keys = CredPaths::in_dir(&profile);
+        let agent: Arc<dyn CredAgentApi> = Arc::new(test_agent(&keys));
+        // A first verification pins the list with this host's first key.
+        let (url, mut peer) = Peer::listen().await;
+        let rt = Runtime::start(dir.clone(), Some(&url), agent.clone()).await;
+        let (mut op, question, certificate, verifier) =
+            verify_until_the_question(&rt, &mut peer, "acct-op").await;
+        op.answer(question, AnswerValue::Yes).await;
+        op.printed("Waiting for your Mac").await;
+        peer.send(&certificate);
+        peer.next("storageKeyRotate").await;
+        peer.send(&AstationMessage::StorageKeyRejected {
+            reason: "not now".into(),
+            pending_kid: None,
+        });
+        op.done().await.unwrap();
+        let old_head = verifier.log.borrow().log.head();
+        rt.shutdown().await;
+        let _ = std::fs::remove_file(dir.path().join("rt.sock"));
+        unverify(&keys);
+        // No local Astation; the relay challenges every connection at once.
+        let (relay_url, mut proofs) = challenging_relay().await;
+        std::fs::write(
+            profile.join("config.toml"),
+            format!(
+                "astation_ws = \"ws://127.0.0.1:1/ws\"\nastation_relay_url = \"{relay_url}\"\natem_id = \"{ATEM_ID}\"\n"
+            ),
+        )
+        .unwrap();
+        // The runtime on a relay link that reconnects as in production.
+        let (url, mut peer) = Peer::listen().await;
+        let rt = Runtime::start_with(dir, Some(&url), agent, |app| {
+            app.astation_reconnect = true;
+            app.astation_client.set_via_for_test(relay());
+        })
+        .await;
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        let verifier = verifier.again(&mut peer).await;
+        let certificate = verifier
+            .certificate(&mut peer, trust_gen(&rt.profile))
+            .await;
+        let (question, _, _) = op.ask().await;
+        op.answer(question, AnswerValue::Yes).await;
+        op.printed("Waiting for your Mac").await;
+        peer.send(&certificate);
+        peer.close_again();
+        op.done().await.unwrap();
+        let (challenge, answer) = tokio::time::timeout(WAIT, proofs.recv())
+            .await
+            .expect("the reconnect answered the relay's challenge")
+            .unwrap();
+        let log = verifier.log.into_inner().log;
+        let route = atem_client::host_route::verify_host_route_message(
+            &log,
+            answer.as_bytes(),
+            &challenge.nonce,
+            ASTATION,
+            ATEM_ID,
+        )
+        .unwrap_or_else(|refusal| panic!("refused: {}", refusal.code()));
+        assert_eq!(route.head, log.head(), "at the new head");
+        assert_ne!(route.head, old_head);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), proofs.recv())
+                .await
+                .is_err(),
+            "one reconnect"
+        );
+        rt.shutdown().await;
     });
 }
 
@@ -2025,6 +2188,123 @@ fn op_on_link(app: &mut App) -> mpsc::Receiver<AstationMessage> {
         credentials: false,
     });
     rx
+}
+
+/// A `deviceVerified` as the App's pump sees it (its signatures are the
+/// operation's to check).
+fn any_certificate() -> AstationMessage {
+    let signer = FakeAstation::new();
+    AstationMessage::DeviceVerified {
+        device_verified: signer.sign(b"x"),
+        account_state: signer.sign(b"y"),
+        grants: Vec::new(),
+        membership: None,
+    }
+}
+
+/// The profile's config.toml names no reachable Astation (local or relay),
+/// so a reconnect the App starts goes nowhere.
+fn nothing_reachable(profile: &Path) {
+    std::fs::write(
+        profile.join("config.toml"),
+        format!(
+            "astation_ws = \"ws://127.0.0.1:1/ws\"\nastation_relay_url = \"http://127.0.0.1:1\"\natem_id = \"{ATEM_ID}\"\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// A verification's certificate went to its operation over a relay link:
+/// when that link drops (the Station's 1013 close), its reconnect waits
+/// until the operation ended and, when it ended ok, until the host's next
+/// pass (which reads the list it pinned); a failed operation releases it
+/// at once, and so does the hold's bound when the operation doesn't end. A
+/// local link, or a drop with no certificate routed (nothing finishing, or
+/// an operation that waits for a link), reconnects at once as before.
+#[test]
+fn a_verifications_relay_reconnect_waits_for_the_operation() {
+    for case in ["ok", "failed", "never ends", "local", "no certificate"] {
+        local(async {
+            let profile = crate::config::AtemConfig::config_dir();
+            paired(&profile);
+            nothing_reachable(&profile);
+            let via = if case == "local" {
+                local_via()
+            } else {
+                relay()
+            };
+            let (mut app, peer) = linked_app(&profile, via).await;
+            app.astation_reconnect = true;
+            let mut op = op_on_link(&mut app);
+            if case != "no certificate" {
+                peer.send(&any_certificate());
+            }
+            peer.close_again();
+            pass_until_dropped(&mut app, WAIT).await;
+            if case != "no certificate" {
+                assert!(
+                    matches!(op.try_recv(), Ok(AstationMessage::DeviceVerified { .. })),
+                    "{case}"
+                );
+            }
+            app.close_op_route();
+            app.check_astation_reconnect();
+            let held = matches!(case, "ok" | "failed" | "never ends");
+            assert_eq!(app.astation_connect_rx.is_none(), held, "{case}");
+            if !held {
+                return;
+            }
+            match case {
+                "ok" => {
+                    assert!(app.verification_ended(true), "the list is checked");
+                    app.check_astation_reconnect();
+                    assert!(app.astation_connect_rx.is_none(), "until the pass");
+                    app.verify_hold_pass();
+                }
+                "failed" => assert!(!app.verification_ended(false), "nothing to check"),
+                _ => {
+                    let hold = app.verify_hold.as_mut().expect("held");
+                    hold.since -= crate::app::op_route::VERIFY_HOLD;
+                }
+            }
+            app.check_astation_reconnect();
+            assert!(app.astation_connect_rx.is_some(), "{case}: reconnecting");
+            assert!(app.verify_hold.is_none(), "{case}");
+        });
+    }
+}
+
+/// The Station's 1013 close right after a verification's certificate on a
+/// relay link (it asks the host to prove its route under the new device
+/// list) reconnects at once, even when the link was up less than 10 s; any
+/// other short-lived link still backs off 30 s: a 1013 with no certificate,
+/// a plain close after one.
+#[test]
+fn a_reproof_close_skips_the_short_link_backoff() {
+    for case in ["1013 after a certificate", "1013 alone", "plain close"] {
+        local(async {
+            let profile = crate::config::AtemConfig::config_dir();
+            paired(&profile);
+            let (mut app, peer) = linked_app(&profile, relay()).await;
+            app.astation_connected_at = Some(Instant::now());
+            let _op = op_on_link(&mut app);
+            if case != "1013 alone" {
+                peer.send(&any_certificate());
+            }
+            if case == "plain close" {
+                peer.close();
+            } else {
+                peer.close_again();
+            }
+            pass_until_dropped(&mut app, WAIT).await;
+            let retry = app.astation_reconnect_at.expect("a reconnect");
+            let at_once = retry <= Instant::now();
+            assert_eq!(at_once, case == "1013 after a certificate", "{case}");
+            if !at_once {
+                assert!(retry >= Instant::now() + Duration::from_secs(25), "{case}");
+            }
+        });
+    }
 }
 
 /// A result never written (the writer holds it), or never even handed to

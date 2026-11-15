@@ -577,6 +577,9 @@ pub struct AstationClient {
     local_token_path_override: Option<std::path::PathBuf>,
     /// Set to true when the WebSocket reader task exits (connection dropped).
     ws_closed: bool,
+    /// The current socket's peer close code (0 until its reader read a
+    /// close frame with one).
+    peer_close: Option<std::sync::Arc<std::sync::atomic::AtomicU16>>,
     /// Counts the sockets this client opened (`connect_raw`): a link
     /// generation's channels live on one socket only (§R9.7a).
     socket_gen: u64,
@@ -763,6 +766,7 @@ impl AstationClient {
             #[cfg(test)]
             local_token_path_override: None,
             ws_closed: false,
+            peer_close: None,
             socket_gen: 0,
             socket_id: 0,
             connected_astation_id: None,
@@ -1298,6 +1302,9 @@ impl AstationClient {
 
         let route_tx = msg_tx.clone();
         let mut route_ignored = false;
+        // The peer's close code, once the reader read its close frame.
+        let close_code = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+        self.peer_close = Some(close_code.clone());
         // Spawn task to handle incoming messages
         let reader_task = tokio::spawn(async move {
             while let Some(message) = read.next().await {
@@ -1396,7 +1403,11 @@ impl AstationClient {
                             break; // Receiver has been dropped
                         }
                     }
-                    Ok(Message::Close(_)) => {
+                    Ok(Message::Close(frame)) => {
+                        if let Some(frame) = frame {
+                            close_code
+                                .store(frame.code.into(), std::sync::atomic::Ordering::SeqCst);
+                        }
                         break;
                     }
                     Err(_) => {
@@ -1416,6 +1427,15 @@ impl AstationClient {
         self.socket_id = NEXT_SOCKET_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         Ok(())
+    }
+
+    /// The code of the close frame the peer sent on this socket, once the
+    /// reader read it (`None` before, or for a close without one).
+    pub(crate) fn peer_close_code(&self) -> Option<u16> {
+        self.peer_close
+            .as_ref()
+            .map(|code| code.load(std::sync::atomic::Ordering::SeqCst))
+            .filter(|&code| code != 0)
     }
 
     /// The socket the client uses now (a new one after every reconnect).

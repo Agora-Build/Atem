@@ -282,3 +282,60 @@ fn with_the_hook_off_a_reverify_keeps_the_link() {
         assert!(rig.app.r9_link_up(), "the link stays");
     });
 }
+
+/// Astation PR #81 with the hook on: the Station closes the re-verified
+/// host's socket with 1013. Seen before the re-pin, the identity change
+/// finds no link, so no identity reconnect is asked; seen after it, the
+/// identity reconnect asked for the old socket ends unused once the
+/// operation ended. Either way the one reconnect is the normal one, which
+/// the verification's hold (`App::verify_hold`) keeps until the operation
+/// ended and the pass after it ran.
+#[test]
+fn a_station_close_after_a_reverify_reconnects_once_with_the_hook_on() {
+    for close_first in [true, false] {
+        local_test(async |root| {
+            let mut rig = LocalRig::new(root).await;
+            let start = host_now().wall_ms;
+            let os = ManualOs::at(start);
+            let (mut s, _) = rv_covered(&mut rig, root, &os, start);
+            rv_link(&mut rig, 7, 41);
+            // The certificate went to the operation over the relay.
+            rig.app.verify_hold = Some(crate::app::op_route::VerifyHold {
+                since: Instant::now(),
+                ended: false,
+            });
+            // The App's pump calls the closed link down.
+            let close = |rig: &mut LocalRig| {
+                rig.app.astation_routed = false;
+                rig.app.astation_client = crate::websocket_client::AstationClient::new();
+                rig.app.astation_reconnect_at = Some(Instant::now());
+                passes(rig, 1);
+            };
+            if close_first {
+                close(&mut rig);
+            }
+            reverify(&mut rig, root, &mut s);
+            passes(&mut rig, 1);
+            if close_first {
+                assert_eq!(rig.app.identity_reconnect, None, "no link to move");
+            } else {
+                assert_eq!(
+                    rig.app.identity_reconnect.map(|(_, socket)| socket),
+                    Some(41)
+                );
+                close(&mut rig);
+            }
+            // The operation ends ok; the pass after it ran.
+            assert!(rig.app.verification_ended(true));
+            passes(&mut rig, 1);
+            rig.app.verify_hold_pass();
+            assert!(rig.app.verify_hold.is_none(), "released");
+            assert!(
+                !rig.app.identity_reconnect_due(false, false),
+                "close_first {close_first}: no second drop"
+            );
+            assert_eq!(rig.app.identity_reconnect, None);
+            assert!(rig.app.astation_reconnect_at.is_some(), "the one reconnect");
+        });
+    }
+}
