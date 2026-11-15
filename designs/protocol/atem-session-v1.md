@@ -3435,10 +3435,12 @@ browser grant's expiry (which also fences the principal) and the records
 and bytes limits are lifetime ends: `expired`; a removal, a demotion, a
 revoked grant, a frozen list and a failed record are `closed`. Behind the
 unadvertised `host.delegated`, so are a service a control record revoked
-(after `unauthorized`, `revoked`) and every service's channel when the
-host's control state becomes unchecked (after `busy`, `revocations not
-yet checked`): each a fence preceded by its error frame. (Atem's reading,
-for Astation.)
+(after `unauthorized`, `revoked`), a service a control record holds (after
+`busy`, `paused`; reversible: its `hello` is admitted again after a
+`release`; **Atem's reading that implements Astation's item 7, #120,
+2026-11-14**), and every service's channel when the host's control state
+becomes unchecked (after `busy`, `revocations not yet checked`): each a
+fence preceded by its error frame. (Atem's reading, for Astation.)
 
 **Clients and bindings.** A client implementation holds one
 `ClientConnection` (the shared core's per-channel state) per virtual

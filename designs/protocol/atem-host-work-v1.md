@@ -1392,42 +1392,71 @@ applies again; what needs the session host comes after that commit.
 - **A hold also fences the service's session-v1, reversibly** (**Atem's
   reading that implements Astation's item 7, #120, 2026-11-14**), so a held
   integration can't go around the delegated queue through the channel it
-  already has. From the committed control state (never from memory alone),
-  behind `host.delegated`:
-  - **The fence.** A service newly held that the session host knows (an
-    attachment, a lease, accepted work, or `control`) goes through
-    session-v1's §H fence once per hold: its `control_gen` is raised and
-    `control: false` written durably, its leases revoked, each attachment
-    it has closed after `busy`, `paused`. What it queued never runs after
-    the hold: its accepted requests not yet executing (prompts, interrupts,
-    stops, approval answers, rule revokes, chat-v1 submits) are rejected
-    (`control revoked`), the dispatch check refuses anything of an older
-    `control_gen`, and its raw input queued at the PTY writer is dropped at
-    the write boundary (the input epoch moved with its lease). A request of
-    its attachment that reaches the host before the close is refused
-    `busy`, `paused`, before anything of it is read.
-  - **Its `hello`s** are refused `busy`, `paused` while it is held
-    (session-v1 R9.11, which gives the order of a service's refusals: the
-    device list's own, then a revoke's `unauthorized`, `revoked`, then
-    `busy`, `revocations not yet checked`, then `busy`, `paused`).
+  already has. Behind `host.delegated`:
+  - **The fence.** Every hold applied asks for it after its commit, like a
+    revoke's fence, and the host carries it out at once. A service the
+    session host knows (an attachment, a lease, accepted work, or
+    `control`) goes through session-v1's §H fence: its `control_gen` is
+    raised and `control: false` written durably, its leases revoked, each
+    attachment it has closed after `busy`, `paused`. One it doesn't know
+    (fenced already, or never seen) gets nothing, so a hold raises its
+    `control_gen` at most once. What it queued never runs after the hold:
+    its accepted work not yet executing (prompts queued behind a turn, and
+    anything waiting for its principal's confirmation after a restart) is
+    rejected (`control revoked`), the dispatch check refuses anything of an
+    older `control_gen`, and its raw input queued at the PTY writer is
+    dropped at the write boundary (the input epoch moved with its lease).
+    Other requests (interrupts, stops, approval answers, rule revokes) start
+    when they are admitted, so none waits. A request of its attachment that
+    reaches the host before the close is refused `busy`, `paused`, before
+    anything of it is read.
+  - **Its `hello`s** are refused `busy`, `paused` while the committed
+    control state holds it, never from memory alone (session-v1 R9.11,
+    which gives the order of a service's refusals: the device list's own,
+    then a revoke's `unauthorized`, `revoked`, then `busy`, `revocations not
+    yet checked`, then `busy`, `paused`).
   - **Before the hold is reported applied.** The fence runs after the
-    hold's commit and before its result goes to the Station; a run that
-    ends between the two leaves the service granted `control` with no
-    fence, so the loaded control state writes it at the next start, before
-    any service is admitted (services are refused as unchecked until the
-    state loads).
+    hold's commit and before its result goes to the Station, on every path:
+    a release read in the same page or pass (the fence still runs; the
+    release then admits a fresh `hello`), and a hold read while the control
+    state is still unchecked (the store's first read, a page short of the
+    announced head: the fence runs though every service is refused as
+    unchecked). A run that ends between a hold's commit and its fence
+    leaves the service granted `control` with no fence; while the committed
+    state still holds it, the loaded state writes the fence at the next
+    start, before any service is admitted (services are refused as
+    unchecked until the state loads).
+  - **The residual** (**Atem's reading, for Astation**): a run that ends
+    between the commit of a hold and of its release (one page or pass) and
+    their fence leaves no fence at all. After the restart the committed
+    state shows the service released, so nothing is fenced, and the hold's
+    result goes once as applied. Its attachments, closed by the restart,
+    don't survive it; a command it queued before the hold is ended by the
+    restart's recovery (no clean close: `authorization history unknown`).
+    The same shape as "a hold lifted before that withdrawal asks nothing"
+    for attempts.
   - **Not a revocation.** It cancels no delegated task and uses up no
     attempt (they wait `blocked`, `paused`, as above: their attempts run
     under `host-work`, which no fence names), interrupts no running turn,
-    and is undone by a `release`. A v1 task the service had (admitted
-    before its cover) follows v1's rules, which the fence ends (`sender's
-    authority changed`), as a revoke's or the unchecked state's does.
-    Natives, browser grants and `local` are unaffected; a revoke wins over
-    a hold and stays final.
-  - **Reads.** Astation's answer lets reads and results go on through the
-    authorized Station API where its lifecycle permits them. On the host,
-    with its attachments closed and its `hello`s refused, a held service
-    reads nothing over r9 while it is held (Atem's reading).
+    and is undone by a `release`. Natives, browser grants and `local` are
+    unaffected; a revoke wins over a hold and stays final.
+  - **v1 work the service had** (**Atem's reading of Astation's item 7**):
+    the fence is session-v1's §H, so v1 work follows v1's rules, as with a
+    revoke's or the unchecked state's fence, and nothing of it waits for
+    the release. A v1 task admitted before the service's cover ends
+    `failed`, `sender's authority changed` (never `cancelled`); one whose
+    turn is running is marked so while the turn goes on, never interrupted.
+    A v1 launch reserved and not yet started is fenced the same way at the
+    spawn boundary.
+  - **What a held service can't do over r9** (**Atem's reading**).
+    Astation's answer lets reads and results go on through the authorized
+    Station API where its lifecycle permits them. On the host, with its
+    attachments closed and its `hello`s refused, a held service reads
+    nothing over r9 while it is held, and can't send results or its own
+    stops there either (`work_complete`, `work_cancel`, `work_interrupt`).
+    Deadlines keep running meanwhile: a task awaiting its result can expire
+    during a long hold. The owner's interrupt and the Station's revoke still
+    apply, and the host's own stops all run (a stop always wins).
 - **`release`** puts the paused tasks back in `queued`; they get an attempt
   through the start check before their deadline. It also ends the hold's
   mark on its principal's live attempts (a hold lifted before its
