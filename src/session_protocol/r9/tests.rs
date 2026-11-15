@@ -1225,6 +1225,76 @@ fn the_device_lists_refusal_comes_before_the_unchecked_busy() {
     );
 }
 
+/// Astation's condition on #120 (its final answers, item 1, 2026-11-14):
+/// a service's `hello` refusals sent before its `sig_c` is verified
+/// (`unauthorized` `revoked`, `busy` `revocations not yet checked`, `busy`
+/// `paused`) come only once the channel's account and the principal's
+/// membership are resolved, so they never answer for a principal of
+/// another account (no cross-account revocation oracle). The control
+/// state's sets here name services another account's list holds, as a
+/// stale state of another account's would, and this list's `svc-bot`:
+/// - a client of another account names its own list's genesis at `init`
+///   and is refused there, `stale_target` (clear): no `hello` is read, for
+///   a service only its list holds or one with this list's service id;
+/// - a `hello` on this host's target naming a service this list doesn't
+///   hold gets the device list's own `unauthorized`, `not a member`, never
+///   `revoked` or `paused`, and never `busy` while the control state is
+///   unchecked;
+/// - the sets do act on this list's own service: `svc-bot` is `revoked`.
+#[test]
+fn a_hello_for_another_accounts_service_learns_no_revocation_or_hold() {
+    let wall = r9log::host_now().wall_ms;
+    let mut other = TestLog::genesis("acct-other", &secret("other astation"));
+    other.add_host(HOST, 1, &secret("other host seed"));
+    for id in ["svc-other", "svc-held", "svc-bot"] {
+        other.add_service(id, &[HOST], None, &["prompt", "view"], wall + 3_600_000);
+    }
+    let mut rig = Rig::new();
+    for id in ["svc-other", "svc-held"] {
+        rig.log
+            .keys
+            .insert_ed25519(r9log::auth(id), &secret(&format!("{id} auth")));
+    }
+    let service = |id: &str| Identity::service(id, r9log::auth(id));
+    rig.link_up();
+    rig.engine.set_revoked_services(HashSet::from([
+        "service:svc-other".to_string(),
+        "service:svc-bot".to_string(),
+    ]));
+    let held = HashSet::from(["service:svc-held".to_string()]);
+    rig.run(|e, p| ((), e.set_held_services(held, p)));
+    // Another account's clients: refused at their target.
+    for (handle, id) in [
+        ("o-other", "svc-other"),
+        ("o-held", "svc-held"),
+        ("o-bot", "svc-bot"),
+    ] {
+        rig.advance(1000);
+        rig.connect_with(handle, service(id), Some(&other.log));
+        assert_eq!(rig.refused(handle), ("stale_target".into(), None), "{id}");
+    }
+    // On this host's target: the device list decides first.
+    let not_a_member = ("unauthorized".to_string(), Some("not a member".to_string()));
+    for (handle, id) in [("t-other", "svc-other"), ("t-held", "svc-held")] {
+        rig.advance(1000);
+        rig.connect(handle, service(id));
+        assert_eq!(rig.refused(handle), not_a_member, "{id}");
+    }
+    rig.engine.start_services_unchecked(true);
+    rig.advance(1000);
+    rig.connect("t-unchecked", service("svc-other"));
+    assert_eq!(rig.refused("t-unchecked"), not_a_member);
+    rig.engine.start_services_unchecked(false);
+    // This list's own service, named in the same set.
+    rig.advance(1000);
+    rig.connect("t-bot", bot());
+    assert_eq!(
+        rig.refused("t-bot"),
+        ("unauthorized".into(), Some(DETAIL_REVOKED.into()))
+    );
+    assert_eq!(rig.rt.host.welcomed_attachments(), 0);
+}
+
 /// `revoke_grant` from the issuer: the browser is fenced ("grant revoked")
 /// and can't come back with that grant.
 #[test]
