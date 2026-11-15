@@ -467,7 +467,10 @@ impl HostBridge {
     ///   (`R9Host::fence_revoked`, once per revoke), and of the held one,
     ///   each closed after `busy`, `paused` (`R9Host::fence_held`, when the
     ///   session host knows it), checked or not, released since or not, so
-    ///   a hold's result goes only after its fence; with it off a record
+    ///   a hold's result goes only after its fence; a hold of a service the
+    ///   same batch revokes (one page or pass, either order) asks none: the
+    ///   revoke's fence wins and closes after `unauthorized`, `revoked`;
+    ///   with it off a record
     ///   still reaches the tasks it holds, but nothing of session-v1 (hook
     ///   off = main);
     /// - then the services' r9 admission as the control state stands
@@ -484,6 +487,18 @@ impl HostBridge {
     /// A store write that fails is a receipt-database fault (`work_fail`).
     pub(in crate::runtime::host_bridge) fn effects_pass(&mut self, cx: &mut Cx) {
         let followups = std::mem::take(&mut self.work.followups);
+        // A revoke wins over a hold of the same service in the same batch
+        // (one page or one pass, in either order): only the revoke's fence
+        // runs, so the service's channels close after `unauthorized`,
+        // `revoked` (session-v1 R9.7a); it covers all the hold's would, and
+        // also runs before either record's result goes.
+        let revoked: HashSet<String> = followups
+            .iter()
+            .filter_map(|followup| match followup {
+                Followup::Fence { principal } => Some(principal.clone()),
+                _ => None,
+            })
+            .collect();
         let mut rest = Vec::new();
         for followup in followups {
             match followup {
@@ -494,7 +509,7 @@ impl HostBridge {
                     }
                 }
                 Followup::HoldFence { principal } => {
-                    if self.features.delegated {
+                    if self.features.delegated && !revoked.contains(&principal) {
                         let effects = self.r9_call(|r9, parts| r9.fence_held(&principal, parts));
                         self.r9_exec(effects, cx);
                     }

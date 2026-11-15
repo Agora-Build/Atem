@@ -366,7 +366,8 @@ refused so until a `release`, which admits a fresh `hello` and restores no
 attachment, lease or command; done before the hold's result goes to the
 Station on every path (a release in the same page, a hold read while the
 state is unchecked), and at the next load when a crash came between the
-two; no delegated task cancelled, no attempt counted, no turn
+two; a revoke read with it (one page or pass, either order) wins, its
+fence alone closing after `unauthorized`, `revoked`; no delegated task cancelled, no attempt counted, no turn
 interrupted; pre-cover v1 work ends as v1's rules say (`failed`, never
 `cancelled`). Held, a service reads nothing and sends no result or stop
 of its own over r9; deadlines keep running. `atem status` adds `Clock:`,

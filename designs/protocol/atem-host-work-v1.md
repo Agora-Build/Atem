@@ -1421,12 +1421,15 @@ applies again; what needs the session host comes after that commit.
     release then admits a fresh `hello`), and a hold read while the control
     state is still unchecked (the store's first read, a page short of the
     announced head: the fence runs though every service is refused as
-    unchecked). A run that ends between a hold's commit and its fence
-    leaves the service granted `control` with no fence; while the committed
-    state still holds it, the loaded state writes the fence at the next
-    start, before any service is admitted (services are refused as
-    unchecked until the state loads).
-  - **The residual** (**Atem's reading, for Astation**): a run that ends
+    unchecked). A hold and a revoke of the same service read in one page
+    or pass, in either order, run only the revoke's fence: the revoke
+    wins, its channels close after `unauthorized`, `revoked` (session-v1
+    R9.7a), before either record's result goes. A run that ends between a
+    hold's commit and its fence leaves the service granted `control` with
+    no fence; while the committed state still holds it, the loaded state
+    writes the fence at the next start, before any service is admitted
+    (services are refused as unchecked until the state loads).
+  - **The residual** (**Atem's reading, for Astation**): a crash
     between the commit of a hold and of its release (one page or pass) and
     their fence leaves no fence at all. After the restart the committed
     state shows the service released, so nothing is fenced, and the hold's

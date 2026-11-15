@@ -319,6 +319,77 @@ fn a_hold_then_a_revoke_is_final() {
     });
 }
 
+/// A hold and a revoke of the bot read in one batch (`two_pages`: two pages
+/// whose followups one Station step carries out; else one page), the hold
+/// first in the feed when `hold_first`: the revoke wins. Only its fence
+/// runs (the bot's `control_gen` raised once), so its live channel closes
+/// after `unauthorized`, `revoked` (session-v1 R9.7a), never `busy`,
+/// `paused`, and before either record's result goes; its next `hello` is
+/// refused `revoked`.
+fn hold_and_revoke_in_one_batch(two_pages: bool, hold_first: bool) {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = fed_bot(&mut rig, root, &os, start);
+        r9_link_up(&mut rig);
+        let mut channel = service_hello(&mut rig, &s.log, "bot-1", "svc-bot").unwrap();
+        let before = rig.bridge.host.control_gen(BOT);
+        let _sent = station_up(&mut rig, 7);
+        let (first, second) = if hold_first {
+            (ControlAction::Hold, revoke(false))
+        } else {
+            (revoke(false), ControlAction::Hold)
+        };
+        let first = bot_record(&s.log, first, 2);
+        let second = bot_record(&s.log, second, 3);
+        let heads = heads_text(&[(ORIGIN, OWN_FEED, 3)], s.log.log.head());
+        station_pass(&mut rig, 0, vec![heads]);
+        if two_pages {
+            // Each page read as it comes; their followups wait for the
+            // Station step that carries them out together.
+            bridge_page(&mut rig, 3, &[(2, &first)]);
+            bridge_page(&mut rig, 3, &[(3, &second)]);
+            station_pass(&mut rig, 100, Vec::new());
+        } else {
+            let page = page_text(&rig, 3, &[(2, &first), (3, &second)]);
+            station_pass(&mut rig, 100, vec![page]);
+        }
+        let what = format!("two pages {two_pages}, hold first {hold_first}");
+        let (errors, closes) = hf_errors(&mut rig, &mut channel, "bot-1");
+        assert_eq!(errors, [revoked_refusal()], "{what}");
+        assert_eq!(closes, 1, "{what}");
+        assert_eq!(rig.bridge.host.control_gen(BOT), before + 1, "{what}");
+        for record in [&first, &second] {
+            let (attached_then, remote_then) = hf_hold_ack(&rig, record.record_id());
+            assert!(!attached_then.iter().any(|p| p == BOT), "{what}");
+            assert!(!remote_then.iter().any(|p| p == BOT), "{what}");
+        }
+        assert_eq!(
+            refusal(service_hello(&mut rig, &s.log, "bot-2", "svc-bot")),
+            revoked_refusal(),
+            "{what}"
+        );
+    });
+}
+
+/// The revoke wins over a hold read with it in one page, in either order
+/// (the follow-up to item 7 on #120). With the revoke first the hold is
+/// refused after it and asks no fence of its own.
+#[test]
+fn a_revoke_in_the_holds_page_closes_the_channel_revoked() {
+    hold_and_revoke_in_one_batch(false, true);
+    hold_and_revoke_in_one_batch(false, false);
+}
+
+/// The revoke wins over a hold read in an earlier page of the same Station
+/// step, in either order.
+#[test]
+fn a_revoke_in_the_holds_pass_closes_the_channel_revoked() {
+    hold_and_revoke_in_one_batch(true, true);
+    hold_and_revoke_in_one_batch(true, false);
+}
+
 /// Hook off = main (review m2's rule for session-v1): with `host.delegated`
 /// off, a held service's records still reach its tasks, but nothing of
 /// session-v1 is fenced or refused for the hold: its `hello` is admitted,

@@ -3438,7 +3438,9 @@ unadvertised `host.delegated`, so are a service a control record revoked
 (after `unauthorized`, `revoked`), a service a control record holds (after
 `busy`, `paused`; reversible: its `hello` is admitted again after a
 `release`; **Atem's reading that implements Astation's item 7, #120,
-2026-11-14**), and every service's channel when the host's control state
+2026-11-14**; a service held and revoked in one page or pass, in either
+order, gets only the revoke's close, after `unauthorized`, `revoked`), and
+every service's channel when the host's control state
 becomes unchecked (after `busy`, `revocations not yet checked`): each a
 fence preceded by its error frame. (Atem's reading, for Astation.)
 
