@@ -356,17 +356,40 @@ pub async fn serve(
 }
 
 /// Whether the peer of the socket `fd` hung up (closed its end, as a
-/// process that ended does), polled without waiting or reading.
+/// process that ended does), polled without waiting and never consuming:
+/// a hang-up (`POLLHUP`/`POLLERR`), or a readable socket whose next read
+/// is the end of the stream (peeked). Data waiting, or nothing ready, is
+/// no hang-up. Polled for `POLLIN`: macOS reports a hang-up only for a
+/// descriptor polled for some event.
 pub(super) fn hung_up(fd: std::os::fd::BorrowedFd<'_>) -> bool {
     use std::os::fd::AsRawFd;
     let mut poll = libc::pollfd {
         fd: fd.as_raw_fd(),
-        events: 0,
+        events: libc::POLLIN,
         revents: 0,
     };
     // SAFETY: one valid pollfd, no wait.
-    let ready = unsafe { libc::poll(&mut poll, 1, 0) };
-    ready > 0 && poll.revents & (libc::POLLHUP | libc::POLLERR) != 0
+    if unsafe { libc::poll(&mut poll, 1, 0) } <= 0 {
+        return false;
+    }
+    if poll.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+        return true;
+    }
+    if poll.revents & libc::POLLIN == 0 {
+        return false;
+    }
+    let mut byte = 0u8;
+    // SAFETY: a one-byte buffer we own; MSG_PEEK leaves the data for the
+    // reader, MSG_DONTWAIT never blocks.
+    let read = unsafe {
+        libc::recv(
+            fd.as_raw_fd(),
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    read == 0
 }
 
 /// Refuses a peer whose process can't be verified.

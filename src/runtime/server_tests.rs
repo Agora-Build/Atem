@@ -866,17 +866,33 @@ fn a_held_lock_that_never_answers_is_named() {
 }
 
 /// A client whose peer ended reads as hung up before its reader sees the
-/// close, unread bytes or not (cleanup review, minor 5).
+/// close, unread bytes or not, on Linux's and macOS's semantics alike
+/// (cleanup review, minor 5; re-review N1).
 #[test]
 fn a_socket_whose_peer_ended_reads_hung_up() {
     use std::io::Write;
     use std::os::fd::AsFd;
+    for unread in [false, true] {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(!super::server::hung_up(ours.as_fd()), "unread {unread}");
+        if unread {
+            (&theirs).write_all(b"unread").unwrap();
+            assert!(!super::server::hung_up(ours.as_fd()), "data is no hang-up");
+        }
+        drop(theirs);
+        assert!(super::server::hung_up(ours.as_fd()), "unread {unread}");
+        if unread {
+            // Peeked, never consumed: the reader still gets the bytes.
+            let mut got = Vec::new();
+            std::io::Read::read_to_end(&mut &ours, &mut got).unwrap();
+            assert_eq!(got, b"unread");
+        }
+    }
+    // Only its sending side shut: readable at the end of the stream, which
+    // the peek sees (no POLLHUP on Linux here).
     let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
-    assert!(!super::server::hung_up(ours.as_fd()));
-    (&theirs).write_all(b"unread").unwrap();
-    assert!(!super::server::hung_up(ours.as_fd()), "data is no hang-up");
-    drop(theirs);
-    assert!(super::server::hung_up(ours.as_fd()));
+    theirs.shutdown(std::net::Shutdown::Write).unwrap();
+    assert!(super::server::hung_up(ours.as_fd()), "end of stream");
 }
 
 #[test]

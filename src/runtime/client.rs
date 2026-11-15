@@ -1055,6 +1055,9 @@ mod tests {
     /// A runtime that welcomes a passive look and then dies with its
     /// `status` request unread resets the look: no runtime answers, not "a
     /// runtime from before `status`" (cleanup review, minor 4).
+    // Linux only: a macOS AF_UNIX peer closing with unread data gives EOF,
+    // not a reset, so there a dying runtime reads as one from before `status`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_runtime_reset_after_its_welcome_is_not_running() {
         use super::super::protocol::{PROTOCOL, RuntimeMsg, encode_runtime};
