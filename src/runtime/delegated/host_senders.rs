@@ -92,7 +92,7 @@ impl Consent<'_> {
 
 /// [`super::classify`] of a `host:` principal (see there).
 pub fn classify_host(principal: &str, list: &Membership, features: HostFeatures) -> SenderClass {
-    if !(features.delegated && features.senders) || !is_delegated_sender(principal) {
+    if !features.delegated || !features.senders || !is_delegated_sender(principal) {
         return SenderClass::Refused;
     }
     let Some(host_id) = parse_host_principal(principal) else {
