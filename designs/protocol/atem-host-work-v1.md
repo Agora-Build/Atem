@@ -1073,12 +1073,18 @@ frozen (R9.4) or the host is held after a write fault (R9.3).
   welcomed before the pause); a welcome during the pause lists no
   host-work feature, and the host refuses it from such a channel
   (`unsupported_version`, `host.senders is not advertised`). **One rule for its results (Atem's
-  reading, for Astation):** a record a channel carried is reported on that
-  channel only, and never acknowledged to the Station, whether it applied
-  at once or was `pending` and applied at a later re-verification; §11.4's
-  acknowledgments are for what the host's own Station's feed delivered,
-  and if that feed delivers the same record later, that delivery's ack
-  reports it. A carried record left `pending` gets no later answer on its
+  reading, for Astation):** §11.4's acknowledgments are for what the
+  host's own Station's feed delivered, so a record only a channel carried
+  is reported on that channel only and never acknowledged to the Station,
+  whether it applied at once or was `pending` and applied at a later
+  re-verification. When that feed delivers the same record (the same body)
+  too: while the carried copy is still `pending`, the feed's delivery
+  adopts it (the record kept pending takes the feed's source and
+  position), so the delivery's ack reports it `pending` and its final
+  result is acknowledged to the Station when it applies, as any feed
+  record's is; once it is final, the feed's delivery is acknowledged at
+  that delivery (a `duplicate`). The channel's answer is unchanged either
+  way. A carried record left `pending` gets no later answer on its
   channel: delivering it again reports where it stands (a `duplicate` once
   applied).
 

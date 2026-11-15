@@ -1289,7 +1289,11 @@ impl Mem {
     }
 
     /// `rec` kept pending (once: the same record again is the one kept),
-    /// the oldest beyond [`KEPT`] dropped, the count raised.
+    /// the oldest beyond [`KEPT`] dropped, the count raised. A record a
+    /// channel carried that a feed now delivers is adopted by the feed: the
+    /// one kept takes the feed's source and position, so its final result
+    /// is acknowledged to the Station as any feed record's is (host-work-v1
+    /// §11.1 "Carriage"; the channel had its answer).
     fn keep_pending(
         &mut self,
         tx: &Connection,
@@ -1301,7 +1305,15 @@ impl Mem {
     ) -> Result<()> {
         let text = record_text(rec);
         let principal = rec.principal().name();
-        if self.pending.iter().any(|p| p.text == text) {
+        if let Some(kept) = self.pending.iter_mut().find(|p| p.text == text) {
+            if matches!(kept.source, Source::Carrier(_)) && matches!(source, Source::Feed(_)) {
+                tx.execute(
+                    "UPDATE control_pending SET pos=?2, source=?3 WHERE n=?1",
+                    params![kept.n, pos.as_ref().map(pos_text), source.stored()],
+                )?;
+                kept.pos = pos;
+                kept.source = source.clone();
+            }
             return Ok(());
         }
         tx.execute(

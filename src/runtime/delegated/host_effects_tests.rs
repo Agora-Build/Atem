@@ -1211,3 +1211,82 @@ fn a_carried_record_sent_during_the_pause_is_answered() {
         assert_eq!(intents(&rig, &running).len(), 1);
     });
 }
+
+/// Host B's results owed the host's own Station: each row's `effects` as
+/// the book keeps them.
+fn acks_for_host_b(rig: &LocalRig) -> Vec<String> {
+    let db = &rig.bridge.work.store.as_ref().unwrap().db;
+    let mut q = db
+        .prepare("SELECT effects FROM control_acks WHERE principal=?1")
+        .unwrap();
+    q.query_map([HOST_B], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// Host-work-v1 §11.1 "Carriage": the host's own Station's feed delivering
+/// a record a channel carried. While that record is still `pending` from
+/// the carrier, the feed's delivery adopts it (its source and position are
+/// the feed's from then on), so its final result is acknowledged to the
+/// Station as any feed record's is; once it is final, the feed's delivery
+/// is acknowledged at that delivery (a `duplicate`). The channel had its
+/// answer either way.
+#[test]
+fn a_feed_delivery_of_a_carried_record_is_acknowledged() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let running = host_running(&mut rig, &s, "HS_FEED_ADOPTS", start).await;
+        hold_host_work(&mut rig);
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        let revoke_seq = s.log.log.head().seq;
+        // Carried while its revoke's effects aren't written: pending.
+        let record = host_interrupt(&s.log, revoke_seq);
+        rig.bridge
+            .apply_carried_records("member:dev-phone", std::slice::from_ref(&record))
+            .unwrap();
+        assert!(acks_for_host_b(&rig).is_empty());
+        // The Station's feed delivers it, still pending: that delivery's
+        // ack says so.
+        feed(&mut rig, &s.log, &[&record]);
+        let acks = acks_for_host_b(&rig);
+        assert_eq!(acks.len(), 1, "{acks:?}");
+        assert!(acks[0].contains("pending"), "{acks:?}");
+        // It applies at the re-verification: its final result is owed the
+        // Station.
+        ticks(&mut rig, 1);
+        assert_eq!(intents(&rig, &running).len(), 1);
+        let acks = acks_for_host_b(&rig);
+        assert_eq!(acks.len(), 1, "{acks:?}");
+        assert!(
+            acks[0].contains("\"applied\"") && !acks[0].contains("pending"),
+            "{acks:?}"
+        );
+        // Carried once final (applied at once: a duplicate), then delivered
+        // by the feed: acknowledged at that delivery.
+        let later = host_interrupt(&s.log, revoke_seq);
+        let results = rig
+            .bridge
+            .apply_carried_records("member:dev-phone", std::slice::from_ref(&later))
+            .unwrap();
+        assert_eq!(
+            interrupt_results(&results),
+            [(
+                atem_client::control::ApplicationResult::Duplicate,
+                atem_client::control::ApplicationResult::Duplicate
+            )]
+        );
+        assert_eq!(acks_for_host_b(&rig).len(), 1, "not for the channel's");
+        feed(&mut rig, &s.log, &[&later]);
+        let acks = acks_for_host_b(&rig);
+        assert_eq!(acks.len(), 2, "{acks:?}");
+        assert!(acks.iter().any(|a| a.contains("duplicate")), "{acks:?}");
+    });
+}
