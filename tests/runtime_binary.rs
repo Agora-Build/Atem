@@ -221,6 +221,66 @@ fn a_stop_while_the_runtime_starts_is_an_orderly_one() {
     );
 }
 
+/// A stop while the runtime starts never waits out a start-up step: with
+/// the session journal's lock held elsewhere (its open waits up to 2 s for
+/// it), a SIGTERM as soon as `runtime.lock` names the runtime ends it at
+/// once and successfully. The journal never opened and no resolution ran,
+/// so nothing is closed cleanly (cleanup review, minor 7).
+#[test]
+fn a_stop_while_the_journal_lock_waits_exits_at_once() {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::io::AsRawFd;
+    let dir = tempfile::Builder::new()
+        .prefix("atem-rb")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let (home, run) = (dir.path().join("home"), dir.path().join("run"));
+    let journal = home.join(".config/atem/runtime/journal");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&journal)
+        .unwrap();
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Held here for the whole test, as by a broker still exiting.
+    let held = std::fs::File::create(journal.join("journal.lock")).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let lock = home.join(".config/atem/runtime.lock");
+    let mut child = Running(runtime(&home, &run));
+    let pid = child.0.id();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(&lock)
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        != Some(pid)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the runtime never took its lock"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let stopped = std::time::Instant::now();
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    assert!(
+        within(15, || child.0.try_wait().unwrap().is_some()),
+        "the runtime ignored SIGTERM"
+    );
+    let took = stopped.elapsed();
+    let status = child.0.wait().unwrap();
+    assert!(status.success(), "{status:?}");
+    assert!(
+        took < Duration::from_millis(1000),
+        "the stop waited for the journal's lock: {took:?}"
+    );
+    assert!(!journal.join("clean_close").exists(), "nothing resolved");
+    drop(held);
+}
+
 /// Whether `listener` gets a connection within `secs`.
 fn accepted(listener: &std::net::TcpListener, secs: u64) -> bool {
     listener.set_nonblocking(true).unwrap();

@@ -244,6 +244,14 @@ pub async fn serve(
     let (bridge, host_error) =
         match HostBridge::open(&journal, options.profile.as_ref(), options.clock.clone()) {
             Ok(bridge) => (Some(bridge), None),
+            // Stopped while it waited for the journal's lock: nothing was
+            // opened, so nothing closes cleanly; the loop ends at once.
+            Err(_) if super::stop_requested() => {
+                eprintln!(
+                    "atem runtime: stopped while starting; the session journal wasn't opened"
+                );
+                (None, None)
+            }
             Err(error) => {
                 // Never repaired behind the user's back: remote sessions stay
                 // off until the cause is fixed and the runtime restarts.

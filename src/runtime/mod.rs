@@ -73,25 +73,49 @@ fn idle_timeout() -> Duration {
         .unwrap_or(server::IDLE_EXIT)
 }
 
-/// SIGTERM or SIGINT, handled from this call on: one that comes before
-/// the returned future is first polled is kept (tokio records it), so a
-/// stop sent while the runtime starts (its lock taken, the device list
-/// opening) ends it in order once it serves, never by the default action
-/// (which would leave no clean close).
+/// A SIGTERM or SIGINT reached this runtime (set by the watcher
+/// `shutdown_signal` starts): start-up steps that wait (the session
+/// journal's lock) give up at once, so a stop during start is prompt.
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process is an `atem runtime` that was asked to stop.
+pub fn stop_requested() -> bool {
+    STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// SIGTERM or SIGINT, handled from this call on: a task watches for them
+/// on the runtime's worker threads, so one that comes while the runtime
+/// starts is never the default action (which would leave no clean close).
+/// It marks the stop at once (`stop_requested`, read by the waits of the
+/// start) and ends the returned future, polled by the serve loop. With no
+/// signal handler the future never ends, as before.
 fn shutdown_signal() -> impl std::future::Future<Output = ()> {
     use tokio::signal::unix::{SignalKind, signal};
-    let signals = (
+    let watched = match (
         signal(SignalKind::terminate()),
         signal(SignalKind::interrupt()),
-    );
-    async move {
-        let (Ok(mut term), Ok(mut int)) = signals else {
-            return std::future::pending().await;
-        };
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = int.recv() => {}
+    ) {
+        (Ok(mut term), Ok(mut int)) => {
+            let (stopped, watch) = tokio::sync::watch::channel(false);
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = int.recv() => {}
+                }
+                STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = stopped.send(true);
+            });
+            Some(watch)
         }
+        _ => None,
+    };
+    async move {
+        if let Some(mut watch) = watched
+            && watch.wait_for(|stop| *stop).await.is_ok()
+        {
+            return;
+        }
+        std::future::pending().await
     }
 }
 
