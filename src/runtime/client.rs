@@ -939,7 +939,9 @@ pub fn look(locator: &Locator, timeout: Duration) -> Look {
         Err(error) => return Look::Unreachable(error.to_string()),
     };
     let mut writer = stream;
-    /// What one read of the look got.
+    /// What one read of the look got (one short-lived value per read:
+    /// boxing the message buys nothing).
+    #[allow(clippy::large_enum_variant)]
     enum Read {
         Message(RuntimeMsg),
         /// Closed without a word.
