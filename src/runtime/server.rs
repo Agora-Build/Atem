@@ -248,8 +248,9 @@ pub async fn serve(
         match HostBridge::open(&journal, options.profile.as_ref(), options.clock.clone()) {
             Ok(bridge) => (Some(bridge), None),
             // Stopped while it waited for the journal's lock: nothing was
-            // opened, so nothing closes cleanly; the loop ends at once.
-            Err(_) if super::stop_requested() => {
+            // opened, so nothing closes cleanly; the loop ends at once. Any
+            // other failure is logged as such, a stop pending or not.
+            Err(error) if error.to_string() == crate::session_protocol::file_journal::STOPPING => {
                 eprintln!(
                     "atem runtime: stopped while starting; the session journal wasn't opened"
                 );
