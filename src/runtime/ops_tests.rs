@@ -1300,8 +1300,11 @@ fn the_reconnect_after_a_reverify_proves_its_route_with_the_new_key() {
         assert_ne!(route.head, old_head);
         // One reconnect: the routed link stays (a second reconnect would
         // close it, or open another connection, within a pass or two).
-        let more = tokio::time::timeout(Duration::from_secs(2), seen.recv()).await;
-        assert!(more.is_err(), "one reconnect: {more:?}");
+        match tokio::time::timeout(Duration::from_secs(2), seen.recv()).await {
+            Err(_) => {}
+            Ok(Some(RelayEvent::Closed(n))) => panic!("one reconnect: connection {n} closed"),
+            Ok(event) => panic!("one reconnect: {event:?}"),
+        }
         let mut status = rt.client().await;
         status.send(&ClientMsg::Status).await.unwrap();
         let status = expect(&mut status, |m| match m {
