@@ -907,7 +907,15 @@ pub fn look(locator: &Locator, timeout: Duration) -> Look {
         Err(error) => return Look::Unreachable(error.to_string()),
     };
     let mut writer = stream;
-    let next = |reader: &mut BufReader<StdStream>| -> Result<Option<RuntimeMsg>, String> {
+    /// What one read of the look got.
+    enum Read {
+        Message(RuntimeMsg),
+        /// Closed without a word.
+        Closed,
+        /// Reset (`gone`): the runtime went away with our bytes unread.
+        Gone,
+    }
+    let next = |reader: &mut BufReader<StdStream>| -> Result<Read, String> {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
             return Err("it didn't answer in time".into());
@@ -918,10 +926,11 @@ pub fn look(locator: &Locator, timeout: Duration) -> Look {
             .map_err(|e| e.to_string())?;
         let mut line = String::new();
         match reader.read_line(&mut line) {
-            Ok(0) => Ok(None),
-            Ok(_) => decode_runtime(&line).map(Some).map_err(|e| e.to_string()),
-            // Reset: closed with our bytes unread, as `Ok(0)`.
-            Err(error) if gone(error.kind()) => Ok(None),
+            Ok(0) => Ok(Read::Closed),
+            Ok(_) => decode_runtime(&line)
+                .map(Read::Message)
+                .map_err(|e| e.to_string()),
+            Err(error) if gone(error.kind()) => Ok(Read::Gone),
             Err(_) => Err("it didn't answer in time".into()),
         }
     };
@@ -940,7 +949,7 @@ pub fn look(locator: &Locator, timeout: Duration) -> Look {
         };
     }
     let welcome = match next(&mut reader) {
-        Ok(Some(RuntimeMsg::Welcome {
+        Ok(Read::Message(RuntimeMsg::Welcome {
             protocol,
             build,
             pid,
@@ -957,33 +966,41 @@ pub fn look(locator: &Locator, timeout: Duration) -> Look {
             worker_protocol,
             device_list,
         },
-        Ok(Some(RuntimeMsg::Error { text, .. })) => return Look::Unreachable(text),
-        Ok(Some(other)) => {
+        Ok(Read::Message(RuntimeMsg::Error { text, .. })) => return Look::Unreachable(text),
+        Ok(Read::Message(other)) => {
             return Look::Unreachable(format!("unexpected reply {}", other_op(&other)));
         }
-        // Closed without a word: it was going away.
-        Ok(None) => return Look::NotRunning,
+        // Closed without a word, or reset: it was going away.
+        Ok(Read::Closed | Read::Gone) => return Look::NotRunning,
         Err(error) => return Look::Unreachable(error),
     };
     if let Err(error) = writer.write_all(encode_client(&ClientMsg::Status).as_bytes()) {
-        return Look::Unreachable(error.to_string());
+        // Gone after its welcome: it runs no more.
+        return if gone(error.kind()) {
+            Look::NotRunning
+        } else {
+            Look::Unreachable(error.to_string())
+        };
     }
     loop {
         match next(&mut reader) {
-            Ok(Some(RuntimeMsg::Status { status })) => {
+            Ok(Read::Message(RuntimeMsg::Status { status })) => {
                 return Look::Running {
                     welcome,
                     status: Some(status),
                 };
             }
             // A runtime from before `status` refuses the unknown op.
-            Ok(Some(RuntimeMsg::Error { .. })) | Ok(None) => {
+            Ok(Read::Message(RuntimeMsg::Error { .. }) | Read::Closed) => {
                 return Look::Running {
                     welcome,
                     status: None,
                 };
             }
-            Ok(Some(_)) => {}
+            // Reset after its welcome: it went away while we looked, no
+            // runtime of an older build.
+            Ok(Read::Gone) => return Look::NotRunning,
+            Ok(Read::Message(_)) => {}
             Err(error) => return Look::Unreachable(error),
         }
     }
@@ -1000,6 +1017,57 @@ fn other_op(message: &RuntimeMsg) -> String {
 mod tests {
     use super::went_away;
     use std::io::{Error, ErrorKind};
+
+    /// A runtime that welcomes a passive look and then dies with its
+    /// `status` request unread resets the look: no runtime answers, not "a
+    /// runtime from before `status`" (cleanup review, minor 4).
+    #[test]
+    fn a_runtime_reset_after_its_welcome_is_not_running() {
+        use super::super::protocol::{PROTOCOL, RuntimeMsg, encode_runtime};
+        use super::{Locator, Look, look};
+        use std::io::{BufRead, Write};
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::Builder::new()
+            .prefix("atem-look")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let locator = Locator::in_dir(dir.path());
+        let listener = std::os::unix::net::UnixListener::bind(&locator.socket).unwrap();
+        let runtime = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut hello = String::new();
+            reader.read_line(&mut hello).unwrap();
+            let welcome = RuntimeMsg::Welcome {
+                protocol: PROTOCOL,
+                build: "a build".into(),
+                pid: 1,
+                astation: false,
+                host_error: None,
+                worker_protocol: None,
+                device_list: None,
+            };
+            (&stream)
+                .write_all(encode_runtime(&welcome).as_bytes())
+                .unwrap();
+            // The `status` request is in, unread: closing now resets it.
+            let mut poll = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut poll, 1, 5_000) }, 1);
+        });
+        let seen = look(&locator, std::time::Duration::from_secs(5));
+        runtime.join().unwrap();
+        let what = match seen {
+            Look::NotRunning => "not running",
+            Look::Unreachable(_) => "unreachable",
+            Look::Running { status: None, .. } => "running, from before status",
+            Look::Running { .. } => "running",
+        };
+        assert_eq!(what, "not running");
+    }
 
     #[test]
     fn a_reset_or_a_broken_pipe_is_a_runtime_gone() {
