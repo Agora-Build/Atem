@@ -175,12 +175,28 @@ impl std::fmt::Display for NotOwnStation {
 impl std::error::Error for NotOwnStation {}
 
 /// A pending record applied again ([`FeedStore::reverify_pending`]): the
-/// record, where it was read, and what it did now.
+/// record, where it was read, what it did now, and whether a channel
+/// carried it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reapplied {
     pub record: ControlRecord,
     pub pos: Option<FeedPos>,
     pub applied: Applied,
+    /// A native member's channel carried it (`control_records`, design
+    /// II.3.1): its result is reported on that channel only, never
+    /// acknowledged to the Station ([`Reapplied::acked`]).
+    pub carried: bool,
+}
+
+impl Reapplied {
+    /// Its result owed the host's own Station (§11.4 "Acknowledgments":
+    /// what that Station's feed delivered): none for a record a channel
+    /// carried, whose result goes on its channel only (if the Station
+    /// delivers the same record later, that delivery's ack reports it).
+    pub fn acked(&self) -> Option<super::acks::Acked> {
+        (!self.carried)
+            .then(|| super::acks::Acked::of(&self.record, &self.applied, self.pos.as_ref()))
+    }
 }
 
 /// Where records come from: what alerts are rate-limited by (I.5.4).
@@ -1208,6 +1224,7 @@ impl Mem {
                     record: p.record,
                     pos: p.pos,
                     applied: t.applied,
+                    carried: matches!(p.source, Source::Carrier(_)),
                 });
                 changed = true;
             }

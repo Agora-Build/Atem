@@ -1624,11 +1624,8 @@ fn apply_page(
                     if revoked {
                         for again in feeds.reverify_pending(&tx, list, applied_seq)? {
                             followups.extend(act(store, &tx, &again.applied.actions)?);
-                            acked.push(Acked::of(
-                                &again.record,
-                                &again.applied,
-                                again.pos.as_ref(),
-                            ));
+                            // A channel's record: answered there only.
+                            acked.extend(again.acked());
                             reapplied.push(again);
                         }
                     }

@@ -51,7 +51,7 @@
 //!   [`HostBridge::acks_sent`]); a `control_ack_refused` holds them for the
 //!   connection ([`HostBridge::ack_refused`]).
 use super::*;
-use crate::runtime::delegated::acks::{Acked, DueAck};
+use crate::runtime::delegated::acks::DueAck;
 use crate::runtime::delegated::effects::{Followup, act};
 use crate::runtime::delegated::feeds::Reapplied;
 use crate::runtime::delegated::station::Call;
@@ -367,7 +367,9 @@ impl HostBridge {
                 let mut acked = Vec::new();
                 for r in &again {
                     followups.extend(act(store, &tx, &r.applied.actions)?);
-                    acked.push(Acked::of(&r.record, &r.applied, r.pos.as_ref()));
+                    // A channel's record is answered there only (never
+                    // acknowledged to the Station).
+                    acked.extend(r.acked());
                 }
                 // Their results, owed the Station (Task 36), in the same
                 // transaction.

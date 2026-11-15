@@ -746,3 +746,66 @@ fn a_host_sender_is_refused_without_an_open_list() {
         ));
     });
 }
+
+/// Host B's results owed the Station (`control_acks`): none may be, by
+/// host-work-v1 §11.4's acknowledgments (what the host's own Station's feed
+/// delivered) and this rule: a record carried on a channel is answered on
+/// its channel only.
+fn acks_owed_for_host_b(rig: &LocalRig) -> i64 {
+    rig.bridge
+        .work
+        .store
+        .as_ref()
+        .unwrap()
+        .db
+        .query_row(
+            "SELECT count(*) FROM control_acks WHERE principal=?1",
+            [HOST_B],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+/// One rule for a record carried on a native's channel (design II.3.1,
+/// host-work-v1 §11.4): its result is reported on that channel only, never
+/// acknowledged to the Station, whether it applied at once or was pending
+/// and applied at a later re-verification (the Station's own delivery of
+/// the same record, if any, is acknowledged by that delivery).
+#[test]
+fn a_carried_records_result_goes_to_its_channel_only() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        let _running = host_running(&mut rig, &s, "HS_ACK_RUNNING", start).await;
+        hold_host_work(&mut rig);
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        let revoke_seq = s.log.log.head().seq;
+        // Pending (the revoke's effects not written yet), then applied by
+        // the pass's re-verification.
+        let pending = host_interrupt(&s.log, revoke_seq);
+        rig.bridge
+            .apply_carried_records("member:dev-phone", std::slice::from_ref(&pending))
+            .unwrap();
+        ticks(&mut rig, 1);
+        assert_eq!(applied(&rig), revoke_seq);
+        assert!(
+            rig.bridge
+                .work
+                .reapplied
+                .iter()
+                .any(|r| r.record.record_id() == pending.record_id()),
+            "applied at the re-verification"
+        );
+        // Applied at once.
+        rig.bridge
+            .apply_carried_records("member:dev-phone", &[host_interrupt(&s.log, revoke_seq)])
+            .unwrap();
+        assert_eq!(acks_owed_for_host_b(&rig), 0);
+    });
+}
