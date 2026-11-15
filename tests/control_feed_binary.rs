@@ -1158,11 +1158,13 @@ fn no_station_call_without_host_delegated() {
 /// The host's Station calls equal the shared vectors' bytes (PR 2's
 /// `r9-vectors-station-calls.json`), byte for byte: its `membership_fetch`
 /// (case `membership_fetch`, a host whose list is at `seq` 2), and every
-/// `control_sync` it makes (case `control_sync_with_feed_id`, the fake's
-/// feed named as the vectors name it): the first read of a feed it never
-/// read (`after: 0`), a continuation (`after: 2`), and the read from 0
-/// after the Station rolled the feed back under the same `feed_id` (§11.4
-/// "Resets": `after: 0`, the same `feed_id`). Only the calls' bytes are
+/// `control_sync` it makes (the fake's feed named as the vectors name it):
+/// the first read of a feed it never read (case
+/// `control_sync_with_feed_id_from_0`: `after: 0`, the feed named), a
+/// continuation (case `control_sync_with_feed_id`: `after: 2`), and the
+/// read from 0 after the Station rolled the feed back under the same
+/// `feed_id` (§11.4 "Resets": `control_sync_with_feed_id_from_0` again).
+/// Only the calls' bytes are
 /// pinned here: that the read from 0 goes unpaced once its mark is written
 /// is pinned by `sync_tests` (the host clock can't be frozen here, so a
 /// call held back by the 1 s pace would still arrive within the wait). The
@@ -1191,25 +1193,25 @@ fn the_hosts_station_calls_match_the_goldens() {
     };
     let fetch_case = case("membership_fetch");
     assert_eq!(fetch_case["fields"], json!({"after": 2}));
-    let sync_case = case("control_sync_with_feed_id");
-    assert_eq!(sync_case["fields"]["after"], 2);
-    let golden_feed = sync_case["fields"]["feed_id"].as_str().unwrap().to_string();
-    let golden_origin = sync_case["fields"]["origin"].as_str().unwrap().to_string();
-    let wire = sync_case["wire"].as_str().unwrap();
-    let golden_id = sync_case["fields"]["request_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let origin_field = format!("\"origin\":\"{golden_origin}\"");
-    let id_field = format!("\"request_id\":\"{golden_id}\"");
-    assert_eq!(wire.matches(&origin_field).count(), 1, "{wire}");
-    assert_eq!(wire.matches(&id_field).count(), 1, "{wire}");
-    assert_eq!(wire.matches("\"after\":2,").count(), 1, "{wire}");
-    // The vector's wire with the host's origin, `after` and `request_id`
-    // (its own, fresh for every call: wire rule 11).
-    let sync_wire = |after: u64, request_id: &str| {
+    let from_0 = case("control_sync_with_feed_id_from_0");
+    let after_2 = case("control_sync_with_feed_id");
+    assert_eq!(from_0["fields"]["after"], 0);
+    assert_eq!(after_2["fields"]["after"], 2);
+    for field in ["feed_id", "origin"] {
+        assert_eq!(from_0["fields"][field], after_2["fields"][field], "{field}");
+    }
+    let golden_feed = after_2["fields"]["feed_id"].as_str().unwrap().to_string();
+    let golden_origin = after_2["fields"]["origin"].as_str().unwrap().to_string();
+    // A case's wire with the host's origin and `request_id` (its own,
+    // fresh for every call: wire rule 11).
+    let sync_wire = |case: &Value, request_id: &str| {
+        let wire = case["wire"].as_str().unwrap();
+        let golden_id = case["fields"]["request_id"].as_str().unwrap();
+        let origin_field = format!("\"origin\":\"{golden_origin}\"");
+        let id_field = format!("\"request_id\":\"{golden_id}\"");
+        assert_eq!(wire.matches(&origin_field).count(), 1, "{wire}");
+        assert_eq!(wire.matches(&id_field).count(), 1, "{wire}");
         wire.replace(&origin_field, &format!("\"origin\":\"{NO_RELAY}\""))
-            .replace("\"after\":2,", &format!("\"after\":{after},"))
             .replace(&id_field, &format!("\"request_id\":\"{request_id}\""))
     };
 
@@ -1272,9 +1274,9 @@ fn the_hosts_station_calls_match_the_goldens() {
         sent,
         [
             fetch_case["wire"].as_str().unwrap().to_string(),
-            sync_wire(0, &ids[0]),
-            sync_wire(2, &ids[1]),
-            sync_wire(0, &ids[2]),
+            sync_wire(&from_0, &ids[0]),
+            sync_wire(&after_2, &ids[1]),
+            sync_wire(&from_0, &ids[2]),
         ]
     );
     // And as the shared reader reads them.

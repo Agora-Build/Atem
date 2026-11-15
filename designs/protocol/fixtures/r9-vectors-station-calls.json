@@ -70,6 +70,19 @@
     {
       "direction": "to_station",
       "fields": {
+        "after": 0,
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "origin": "https://station-dev.agora.build",
+        "request_id": "0cb10941-c6ca-4311-9bfb-73b40d44a900"
+      },
+      "name": "control_sync_with_feed_id_from_0",
+      "note": "the host knows the feed and reads it from position 0: its first read of the announced feed (a new store's) or a rescan after the feed went back under the same feed_id; the result echoes both, and only a page on the named feed answers it",
+      "op": "control_sync",
+      "wire": "{\"after\":0,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"0cb10941-c6ca-4311-9bfb-73b40d44a900\",\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_station",
+      "fields": {
         "after": 9007199254740991,
         "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
         "origin": "https://station-dev.agora.build",
@@ -204,6 +217,114 @@
       "note": "the answer to control_sync_with_feed_id (its request_id, the feed it named, its after 2): three records of the control vectors strictly after position 2, ascending, the last at the head",
       "op": "control_sync_result",
       "wire": "{\"after\":2,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"87b0db11-7508-437c-82de-658f0edace06\",\"station_time\":1793620940000,\"type\":\"relay\"}"
+    },
+    {
+      "direction": "to_host",
+      "fields": {
+        "after": 0,
+        "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+        "head": 5,
+        "origin": "https://station-dev.agora.build",
+        "records": [
+          {
+            "feed_seq": 3,
+            "record": {
+              "body": {
+                "about": {
+                  "by": "station",
+                  "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+                },
+                "account_id": "acct-test-1",
+                "action": "cover",
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+                "issued_at": 1793620901000,
+                "origin": "https://station-dev.agora.build",
+                "principal": "service:svc-discord",
+                "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+                "record_id": "00000000-0000-4000-8000-000000000001",
+                "signer": "service:svc-discord",
+                "type": "atem-host-work-control",
+                "v": 1
+              },
+              "sig": "rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw"
+            }
+          },
+          {
+            "feed_seq": 4,
+            "record": {
+              "body": {
+                "about": {
+                  "by": "owner",
+                  "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+                },
+                "account_id": "acct-test-1",
+                "action": "revoke",
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+                "interrupt_running": false,
+                "issued_at": 1793620904000,
+                "origin": "https://station-dev.agora.build",
+                "principal": "service:svc-discord",
+                "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+                "record_id": "00000000-0000-4000-8000-000000000004",
+                "signer": "service:svc-discord",
+                "type": "atem-host-work-control",
+                "v": 1
+              },
+              "sig": "5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ"
+            }
+          },
+          {
+            "feed_seq": 5,
+            "record": {
+              "body": {
+                "about": {
+                  "by": "owner",
+                  "integration_id": "i-01jc5zq9x8w7v6t5s4r3q2p1n0"
+                },
+                "account_id": "acct-test-1",
+                "action": "revoke",
+                "feed_id": "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b",
+                "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+                "interrupt_running": false,
+                "issued_at": 1793620920000,
+                "origin": "https://station-dev.agora.build",
+                "principal": "service:svc-discord",
+                "principal_key": "5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5",
+                "record_id": "00000000-0000-4000-8000-000000000014",
+                "signer": "member:dev-mac",
+                "type": "atem-host-work-control",
+                "v": 1
+              },
+              "sig": "wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ"
+            }
+          }
+        ],
+        "request_id": "0cb10941-c6ca-4311-9bfb-73b40d44a900",
+        "station_time": 1793620940000
+      },
+      "judged": [
+        {
+          "feed_seq": 3,
+          "parses": true,
+          "record_id": "00000000-0000-4000-8000-000000000001"
+        },
+        {
+          "feed_seq": 4,
+          "parses": true,
+          "record_id": "00000000-0000-4000-8000-000000000004"
+        },
+        {
+          "feed_seq": 5,
+          "parses": true,
+          "record_id": "00000000-0000-4000-8000-000000000014"
+        }
+      ],
+      "name": "control_sync_result_from_0",
+      "note": "the answer to control_sync_with_feed_id_from_0 (its request_id, the feed it named, its after 0): the records strictly after 0 up to the head, here the three at 3 to 5 (positions may have gaps)",
+      "op": "control_sync_result",
+      "wire": "{\"after\":0,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"0cb10941-c6ca-4311-9bfb-73b40d44a900\",\"station_time\":1793620940000,\"type\":\"relay\"}"
     },
     {
       "direction": "to_host",
@@ -2867,6 +2988,28 @@
     },
     {
       "calls": [
+        "{\"after\":0,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"0cb10941-c6ca-4311-9bfb-73b40d44a900\",\"type\":\"relay\"}"
+      ],
+      "name": "a_named_feed_read_from_0_answers_on_its_feed",
+      "note": "control_sync_result_from_0 answers control_sync_with_feed_id_from_0: a call that named its feed and asked from 0 is answered by a page on that feed that echoes its request_id and after 0",
+      "result": "{\"after\":0,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"head\":5,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[{\"feed_seq\":3,\"record\":{\"body\":{\"about\":{\"by\":\"station\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"cover\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"issued_at\":1793620901000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000001\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"rGhGsqs1HyaGly7W8q77wShMZQSuYCeYv1IVYOc_oQO1dUbjQe_N8LIg0zJJcjSW7liNf7tmwmiSAoyo_hzKDw\"}},{\"feed_seq\":4,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620904000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000004\",\"signer\":\"service:svc-discord\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"5BYmOh8hL_07ngLynVjubWBpSZfNaR0CFOHJ9GHhNKVCgjpgugRfk2Mbfz1V4kQ7YYhefX_AADhlR98m1iwVCQ\"}},{\"feed_seq\":5,\"record\":{\"body\":{\"about\":{\"by\":\"owner\",\"integration_id\":\"i-01jc5zq9x8w7v6t5s4r3q2p1n0\"},\"account_id\":\"acct-test-1\",\"action\":\"revoke\",\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"interrupt_running\":false,\"issued_at\":1793620920000,\"origin\":\"https://station-dev.agora.build\",\"principal\":\"service:svc-discord\",\"principal_key\":\"5db949c5704087fea26ecf19d2ef09fda3adb44e485cf6346d23b837f7aff7f5\",\"record_id\":\"00000000-0000-4000-8000-000000000014\",\"signer\":\"member:dev-mac\",\"type\":\"atem-host-work-control\",\"v\":1},\"sig\":\"wYVOULdoGOVtGii3_MjvgNNG2oVknyPx3aC9bhxxjQ4lz-nkQuHd-RYPTFlB482LGKfBY17yI2b7SM4CPpHQnQ\"}}],\"request_id\":\"0cb10941-c6ca-4311-9bfb-73b40d44a900\",\"station_time\":1793620940000,\"type\":\"relay\"}",
+      "verdicts": [
+        "answers"
+      ]
+    },
+    {
+      "calls": [
+        "{\"after\":0,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"0cb10941-c6ca-4311-9bfb-73b40d44a900\",\"type\":\"relay\"}"
+      ],
+      "name": "a_named_feed_read_from_0_is_answered_on_that_feed_only",
+      "note": "after 0 is no discovery when the call names its feed: the page that answers a discovery call (control_sync_result_empty_feed, on A2), under this call's id, answers nothing",
+      "result": "{\"after\":0,\"feed_id\":\"9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d\",\"head\":0,\"op\":\"control_sync_result\",\"origin\":\"https://station-dev.agora.build\",\"records\":[],\"request_id\":\"0cb10941-c6ca-4311-9bfb-73b40d44a900\",\"station_time\":1793620940000,\"type\":\"relay\"}",
+      "verdicts": [
+        "feed_id"
+      ]
+    },
+    {
+      "calls": [
         "{\"after\":9007199254740991,\"feed_id\":\"6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b\",\"op\":\"control_sync\",\"origin\":\"https://station-dev.agora.build\",\"request_id\":\"d1529b7f-b923-461b-9be0-141fb7b87913\",\"type\":\"relay\"}"
       ],
       "name": "a_feed_gone_back_answers_its_call",
@@ -2958,7 +3101,7 @@
   ],
   "max_message_bytes": 262144,
   "name": "r9-vectors-station-calls",
-  "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", agreed with Astation on 2026-11-13, #120 comment 6848326392: a strict-JSON page may hold individually invalid records, whose evidence is kept, which aren't applied, and whose delivery is no application evidence). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. `why_codes` is the shared vocabulary of typed reasons (O5, host-work-v1 §11.4 wire rule 10, for Astation's sign-off), in the core's order: a well-formed reason outside it is a later version's, read as unrecognized. Correlation (amended in place on Astation's request, #164 comment 6858189009; unshipped, so no new version): a `control_sync` carries `request_id`, a lowercase UUID v4 the host makes fresh for every call (a timeout's retry and a new link generation's call included; here test ids), and its `control_sync_result` carries the same `request_id` and echoes the call's `after`; a page's records are strictly after its `after`, ascending and none above `head` (gaps legal), so a page whose `head` is below its `after` (the feed went back on the same id: the host rescans) holds none. `matching`: whether a result answers a call, by the shared helper (`ControlSyncResult::answers`, the bindings' `relay_control_sync_answers`) `{name, note, calls, result, verdicts}`: `calls` are call texts, `result` a result text (each a builder's), and `verdicts`, parallel to `calls`, is the helper's verdict on the result for each: `answers` (the same `request_id`, origin, feed when the call named one, and `after`), else the first field that differs, in that order (`request_id`, `origin`, `feed_id`, `after`). The link generation, account and genesis the host captured with its call are the caller's to compare, and only its one live call counts: a retired call's late page answers nothing live. The three refusals stay metadata-free: no id, no cursor. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
+  "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", agreed with Astation on 2026-11-13, #120 comment 6848326392: a strict-JSON page may hold individually invalid records, whose evidence is kept, which aren't applied, and whose delivery is no application evidence). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. `why_codes` is the shared vocabulary of typed reasons (O5, host-work-v1 §11.4 wire rule 10, for Astation's sign-off), in the core's order: a well-formed reason outside it is a later version's, read as unrecognized. Correlation (amended in place on Astation's request, #164 comment 6858189009; unshipped, so no new version): a `control_sync` carries `request_id`, a lowercase UUID v4 the host makes fresh for every call (a timeout's retry and a new link generation's call included; here test ids), and its `control_sync_result` carries the same `request_id` and echoes the call's `after`; a page's records are strictly after its `after`, ascending and none above `head` (gaps legal), so a page whose `head` is below its `after` (the feed went back on the same id: the host rescans) holds none. `matching`: whether a result answers a call, by the shared helper (`ControlSyncResult::answers`, the bindings' `relay_control_sync_answers`) `{name, note, calls, result, verdicts}`: `calls` are call texts, `result` a result text (each a builder's), and `verdicts`, parallel to `calls`, is the helper's verdict on the result for each: `answers` (the same `request_id`, origin, feed when the call named one, and `after`), else the first field that differs, in that order (`request_id`, `origin`, `feed_id`, `after`); a call that names its feed is answered on that feed only, from 0 too (the host's first read of the announced feed or its rescan: `control_sync_with_feed_id_from_0`), and only a call that names none is discovery. The link generation, account and genesis the host captured with its call are the caller's to compare, and only its one live call counts: a retired call's late page answers nothing live. The three refusals stay metadata-free: no id, no cursor. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
   "requires": "r9",
   "why_codes": [
     "principal_unknown",

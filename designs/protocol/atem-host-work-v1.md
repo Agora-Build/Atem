@@ -2931,7 +2931,9 @@ are **agreed with Astation (2026-11-13, #120 comment 6848326392)**.)
 a custom Station and Astation's `:8080` proxy have known answers: every
 message of the six calls and the three refusals as the shared core's
 builders write it (compact, keys in RFC 8785 order, no whitespace), with its
-decoded fields: `control_sync` with and without `feed_id`,
+decoded fields: `control_sync` with and without `feed_id` (with it after
+a position and from 0: the host's first read of the announced feed and its
+rescan, answered on the named feed only),
 `control_sync_result` answering each (a page whose `head` is below its
 call's `after` among them), with records and with records the control parser
 refuses (each record judged on its own, the page standing; that page is

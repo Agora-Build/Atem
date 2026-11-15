@@ -7859,6 +7859,8 @@ fn station_calls_match_results_to_their_calls() {
         "two_calls_at_the_same_cursor",
         "a_late_reply_to_a_retired_call",
         "discovery_answered_on_the_current_feed",
+        "a_named_feed_read_from_0_answers_on_its_feed",
+        "a_named_feed_read_from_0_is_answered_on_that_feed_only",
     ] {
         assert!(names.contains(name), "no matching case {name}");
     }
@@ -7974,6 +7976,7 @@ fn station_call_vectors() -> Value {
     let request = |label: &str| mail_uuid(&format!("station-calls {label}"), 4);
     let r_known = request("a known feed after 2");
     let r_first = request("discovery");
+    let r_from_0 = request("a known feed from 0");
     let r_largest = request("the largest position");
     let r_next = request("the next page after 5");
     let r_bound = request("a page at the bound");
@@ -8004,6 +8007,17 @@ fn station_call_vectors() -> Value {
         "the host doesn't know the feed yet (initial discovery): no feed_id, and a cursor belongs to a feed, so after is 0; the result names the account's current feed",
         json!({"request_id": r_first, "origin": origin, "after": 0}),
         sync(&r_first, None, 0),
+    );
+    // Asked by Astation with its sign-off of the correlation (#156 comment
+    // 6885246159): the host's own first read and its rescan name the feed
+    // and ask from 0.
+    g.valid(
+        "control_sync_with_feed_id_from_0",
+        "control_sync",
+        "to_station",
+        "the host knows the feed and reads it from position 0: its first read of the announced feed (a new store's) or a rescan after the feed went back under the same feed_id; the result echoes both, and only a page on the named feed answers it",
+        json!({"request_id": r_from_0, "origin": origin, "feed_id": feed, "after": 0}),
+        sync(&r_from_0, Some(&feed), 0),
     );
     g.valid(
         "control_sync_at_the_largest_position",
@@ -8051,6 +8065,26 @@ fn station_call_vectors() -> Value {
             &r_known,
             &feed,
             2,
+            5,
+            vec![
+                feed_entry(3, "S1_cover"),
+                feed_entry(4, "S4_revoke"),
+                feed_entry(5, "M1_revoke"),
+            ],
+        ),
+    );
+    g.valid(
+        "control_sync_result_from_0",
+        "control_sync_result",
+        "to_host",
+        "the answer to control_sync_with_feed_id_from_0 (its request_id, the feed it named, its after 0): the records strictly after 0 up to the head, here the three at 3 to 5 (positions may have gaps)",
+        json!({"request_id": r_from_0, "origin": origin, "feed_id": feed, "after": 0, "head": 5,
+            "station_time": STATION_TIME,
+            "records": [wire_record(3, "S1_cover"), wire_record(4, "S4_revoke"), wire_record(5, "M1_revoke")]}),
+        page(
+            &r_from_0,
+            &feed,
+            0,
             5,
             vec![
                 feed_entry(3, "S1_cover"),
@@ -9263,6 +9297,23 @@ fn station_call_vectors() -> Value {
             &["answers"],
         ),
         matching(
+            "a_named_feed_read_from_0_answers_on_its_feed",
+            "control_sync_result_from_0 answers control_sync_with_feed_id_from_0: a call that named its feed and asked from 0 is answered by a page on that feed that echoes its request_id and after 0",
+            vec![call("control_sync_with_feed_id_from_0")],
+            answer("control_sync_result_from_0"),
+            &["answers"],
+        ),
+        matching(
+            "a_named_feed_read_from_0_is_answered_on_that_feed_only",
+            "after 0 is no discovery when the call names its feed: the page that answers a discovery call (control_sync_result_empty_feed, on A2), under this call's id, answers nothing",
+            vec![call("control_sync_with_feed_id_from_0")],
+            json!(rebuilt(
+                "control_sync_result_empty_feed",
+                &|v| v["request_id"] = json!(r_from_0)
+            )),
+            &["feed_id"],
+        ),
+        matching(
             "a_feed_gone_back_answers_its_call",
             "a page whose head is below the call's after on the same feed answers its call: it is empty, and the host rescans the feed from 0 instead of moving its cursor",
             vec![call("control_sync_at_the_largest_position")],
@@ -9324,7 +9375,7 @@ fn station_call_vectors() -> Value {
         "name": STATION_CALLS,
         "kind": "vectors",
         "requires": "r9",
-        "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", agreed with Astation on 2026-11-13, #120 comment 6848326392: a strict-JSON page may hold individually invalid records, whose evidence is kept, which aren't applied, and whose delivery is no application evidence). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. `why_codes` is the shared vocabulary of typed reasons (O5, host-work-v1 §11.4 wire rule 10, for Astation's sign-off), in the core's order: a well-formed reason outside it is a later version's, read as unrecognized. Correlation (amended in place on Astation's request, #164 comment 6858189009; unshipped, so no new version): a `control_sync` carries `request_id`, a lowercase UUID v4 the host makes fresh for every call (a timeout's retry and a new link generation's call included; here test ids), and its `control_sync_result` carries the same `request_id` and echoes the call's `after`; a page's records are strictly after its `after`, ascending and none above `head` (gaps legal), so a page whose `head` is below its `after` (the feed went back on the same id: the host rescans) holds none. `matching`: whether a result answers a call, by the shared helper (`ControlSyncResult::answers`, the bindings' `relay_control_sync_answers`) `{name, note, calls, result, verdicts}`: `calls` are call texts, `result` a result text (each a builder's), and `verdicts`, parallel to `calls`, is the helper's verdict on the result for each: `answers` (the same `request_id`, origin, feed when the call named one, and `after`), else the first field that differs, in that order (`request_id`, `origin`, `feed_id`, `after`). The link generation, account and genesis the host captured with its call are the caller's to compare, and only its one live call counts: a retired call's late page answers nothing live. The three refusals stay metadata-free: no id, no cursor. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
+        "note": "The six Station calls (control_sync, control_sync_result, heads, control_ack, membership_fetch, membership_fetch_result) and the three refusals (control_sync_refused, membership_fetch_refused, control_ack_refused) of host-work-v1 §11.4, as the shared core's own builders write them (planned; nothing advertises them). `calls`: each valid message `{name, op, direction, note, fields, wire, judged?, hand_assembled?}`. `wire` is the exact text: compact, keys in RFC 8785 order (the builders' order), no whitespace; `direction` says who reads it (`to_station`: a host's call, `to_host`: a Station's message; the other reader refuses it as another message); `fields` are what it decodes to (an absent optional field is absent; every value as sent, a page's record as a value). `judged`, for a page: the control parser's verdict on each record, parallel to the records (`parses` with the `record_id`, or not with its parse `error`): a record the parser refuses never costs the page, the feed's position or the records after it. A Station builder can't write such a record (a Station serves only what it stored), so that page's text is a builder's page with the records put in their slots and its case says `hand_assembled: true`: a Station builder given its `fields` refuses it, with the parse code of the first record the parser refuses (that a null or a string record is a record the parser refuses, and the page stands, is Atem's reading of \"any JSON type\", agreed with Astation on 2026-11-13, #120 comment 6848326392: a strict-JSON page may hold individually invalid records, whose evidence is kept, which aren't applied, and whose delivery is no application evidence). `at_the_bound`: valid texts of exactly `max_message_bytes` bytes, as `wire_fill` recipes `{name, op, direction, note, wire_fill, accepts}` (`accepts`: what the reader gives back: the head, the number of records or entries and, for a page, whether each record parses: `records_parse`), one for each call that can carry a large page (a page's record, a fetch result's entry): the bound is the same for both, `membership_fetch_result` included. `invalid`: texts a reader refuses `{name, op, reader, code, wire}` with the code it gives (`too_large`, `not_strict`, `wrong_message`, `unknown_field` or `malformed`); each has one fault (a text with two is refused by whichever the reader reaches first: the size bound, the strict parse, the message and its op, unknown fields, then the fields' values); `wire_fill` stands for a text of `bytes` bytes written as `prefix`, `count` times `fill`, then `suffix`; the over-the-bound texts of both large-page calls are 262,145 and 300,000 bytes. `max_message_bytes` is R9.9's bound for every relay message, in bytes as sent, checked before any parse. `why_codes` is the shared vocabulary of typed reasons (O5, host-work-v1 §11.4 wire rule 10, for Astation's sign-off), in the core's order: a well-formed reason outside it is a later version's, read as unrecognized. Correlation (amended in place on Astation's request, #164 comment 6858189009; unshipped, so no new version): a `control_sync` carries `request_id`, a lowercase UUID v4 the host makes fresh for every call (a timeout's retry and a new link generation's call included; here test ids), and its `control_sync_result` carries the same `request_id` and echoes the call's `after`; a page's records are strictly after its `after`, ascending and none above `head` (gaps legal), so a page whose `head` is below its `after` (the feed went back on the same id: the host rescans) holds none. `matching`: whether a result answers a call, by the shared helper (`ControlSyncResult::answers`, the bindings' `relay_control_sync_answers`) `{name, note, calls, result, verdicts}`: `calls` are call texts, `result` a result text (each a builder's), and `verdicts`, parallel to `calls`, is the helper's verdict on the result for each: `answers` (the same `request_id`, origin, feed when the call named one, and `after`), else the first field that differs, in that order (`request_id`, `origin`, `feed_id`, `after`); a call that names its feed is answered on that feed only, from 0 too (the host's first read of the announced feed or its rescan: `control_sync_with_feed_id_from_0`), and only a call that names none is discovery. The link generation, account and genesis the host captured with its call are the caller's to compare, and only its one live call counts: a retired call's late page answers nothing live. The three refusals stay metadata-free: no id, no cursor. Every valid text is strict I-JSON; `scripts/check-r9-vectors.py` reads every text, valid and invalid, with a reader written from the spec.",
         "max_message_bytes": RELAY_MAX_BYTES,
         // The shared vocabulary of reasons (O5), written out by hand in the
         // core's order; the runner holds it equal to `Why::vocabulary`.

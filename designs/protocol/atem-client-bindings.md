@@ -1053,7 +1053,7 @@ jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (70 checks in JS, 72 in Kotlin and in Swift: the same 70
+- **Conformance** (73 checks in JS, 75 in Kotlin and in Swift: the same 73
   in each language, plus two in Kotlin and Swift, whose provider sees the
   signing request and so the purposes of the five device-list actions and
   of control records; over `designs/protocol/fixtures/r9-vectors-*.json`,
@@ -1462,7 +1462,8 @@ missing, `null`, upper case or not a v4 UUID, a result without its `after`,
 a record at or below `after`, and a `head` below `after` with records),
 the `matching` cases (a result read against one or more calls by
 `relay_control_sync_answers`: a match, a discovery answered on the current
-feed, a feed gone back, mismatches on the id, the origin, the feed and the
+feed, a named feed read from 0 answered on that feed only, a feed gone
+back, mismatches on the id, the origin, the feed and the
 `after`, two calls at the same cursor that differ only by their ids, and a
 retired call's late reply, each with its verdict),
 and the byte bound for each call

@@ -2850,6 +2850,10 @@ def check_station_calls(file, data, report, context):
             any(c["op"] == "control_sync_result" and c["fields"]["head"] < c["fields"]["after"] for c in data["calls"]),
             "a page whose head is below its after (a feed gone back)",
         )
+        case.check(
+            any(c["op"] == "control_sync" and "feed_id" in c["fields"] and c["fields"]["after"] == 0 for c in data["calls"]),
+            "a call that names its feed and asks from 0 (a first read or a rescan; asked by Astation, #156 comment 6885246159)",
+        )
 
     # Correlation (amended in place on Astation's request, #164 comment
     # 6858189009): each case's calls and result read by this file's readers,
@@ -2881,10 +2885,21 @@ def check_station_calls(file, data, report, context):
     with report.case(file, "matching: coverage") as case:
         case.equal(seen_verdicts, SYNC_VERDICTS, "every verdict: answers and each field that can differ")
         case.check(
-            {"two_calls_at_the_same_cursor", "a_late_reply_to_a_retired_call", "discovery_answered_on_the_current_feed", "another_feed"} <= matched,
-            "two calls at one cursor, a retired call's late reply, discovery, a result on another feed",
+            {"two_calls_at_the_same_cursor", "a_late_reply_to_a_retired_call", "discovery_answered_on_the_current_feed", "another_feed",
+             "a_named_feed_read_from_0_answers_on_its_feed", "a_named_feed_read_from_0_is_answered_on_that_feed_only"} <= matched,
+            "two calls at one cursor, a retired call's late reply, discovery, a result on another feed, a named feed read from 0 (answered on that feed only)",
             f"got {sorted(matched)}",
         )
+        # A named feed's read from 0 is no discovery: the page that answers
+        # a discovery call, on another feed, answers it nothing.
+        named_0 = [m for m in data["matching"] if m["name"] == "a_named_feed_read_from_0_is_answered_on_that_feed_only"]
+        if named_0:
+            calls = [read_relay(t, "to_station")[0] for t in named_0[0]["calls"]]
+            case.check(
+                len(calls) == 1 and calls[0] is not None and "feed_id" in calls[0] and calls[0]["after"] == 0
+                and named_0[0]["verdicts"] == ["feed_id"],
+                "a call naming its feed from 0, refused on another feed",
+            )
         same_cursor = [m for m in data["matching"] if m["name"] == "two_calls_at_the_same_cursor"]
         if same_cursor:
             calls = [read_relay(t, "to_station")[0] for t in same_cursor[0]["calls"]]
