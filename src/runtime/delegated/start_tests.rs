@@ -396,8 +396,8 @@ fn gate_device_list_part_needs_the_announced_head_or_a_deferred_stop() {
     let phone = task(&log, PHONE, LATER);
     let head = log.log.head();
     let mut v = view(&log);
-    // The feed part alone (the stand-in's, PR 10's feeds): closed.
-    v.gates = Gates::closed_until_feeds();
+    // The feed part alone (the sync's), no device-list part: closed.
+    v.gates = Gates::default();
     v.gates.open_feed(ORIGIN);
     assert_eq!(may_start(&v, &bot, Some(0)), Err(Event::GateClosed));
     assert_eq!(may_start(&v, &phone, Some(0)), Err(Event::GateClosed));
@@ -637,7 +637,7 @@ fn conditions_2_to_5_withdraw_at_executing() {
             "the gate closed (5)",
             // The phone's channel closed, no Station gate open (this
             // version's gates).
-            Box::new(|v| v.gates = Gates::closed_until_feeds()),
+            Box::new(|v| v.gates = Gates::default()),
             Event::GateClosed,
         ),
     ];
@@ -870,6 +870,47 @@ fn the_launch_check_gives_may_starts_events_for_a_launch() {
     );
 }
 
+/// Ruling T35a (PR 11 setup review m1): a control state that doesn't read
+/// makes a service's launch wait at the spawn boundary (`revocations not
+/// yet checked`: its revocation and hold can't be checked), never a
+/// native's, whose authority is the device list's. Tasks are unchanged:
+/// every delegated task, a native's included, waits on it.
+#[test]
+fn a_damaged_control_state_holds_a_services_launch_not_a_natives() {
+    use crate::runtime::delegated::details;
+    let log = log_of(&["launch", "notify", "prompt", "view"], |_| {});
+    let profile = config(1).profile("p").unwrap().clone();
+    let key = profile.scope_key();
+    let launch = |principal: &str| StartLaunch {
+        admission: task(&log, principal, LATER).admission,
+        profile: profile.clone(),
+        expires_at: 1_000,
+    };
+    let (phone, bot) = (launch(PHONE), launch(BOT));
+    let mut v = view(&log);
+    v.scopes
+        .hashes
+        .insert((key.clone(), KID.into()), PROJECT.into());
+    v.scopes
+        .hashes
+        .insert((S1.into(), KID.into()), PROJECT.into());
+    assert_eq!(launch_check(&v, &phone, 0), LaunchVerdict::Go);
+    assert_eq!(launch_check(&v, &bot, 0), LaunchVerdict::Go);
+    v.controls_damaged = true;
+    assert_eq!(launch_check(&v, &phone, 0), LaunchVerdict::Go);
+    assert_eq!(
+        launch_check(&v, &bot, 0),
+        LaunchVerdict::Wait(details::REVOCATIONS_NOT_YET_CHECKED)
+    );
+    for principal in [PHONE, BOT] {
+        assert_eq!(
+            may_start(&v, &task(&log, principal, LATER), Some(0)),
+            Err(Event::GateClosed),
+            "{principal}'s task"
+        );
+    }
+}
+
 /// Design I.4.3 "Launches" with I.5.8: a launch's spawn-boundary check
 /// reads the same gate as a task's start, its device-list part included.
 /// With only a Station's feed part open, a launch covered by that Station
@@ -893,7 +934,9 @@ fn a_launch_waits_for_the_gates_device_list_part_too() {
     v.scopes
         .hashes
         .insert((key.clone(), KID.into()), PROJECT.into());
-    v.gates = Gates::closed_until_feeds();
+    // The feed part alone (the sync's), no device-list part, and no
+    // caught-up channel: closed.
+    v.gates = Gates::default();
     v.gates.open_feed(ORIGIN);
     for l in [&phone, &bot] {
         assert_eq!(

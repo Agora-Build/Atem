@@ -3,11 +3,11 @@
 //! gate is open.
 //!
 //! - **A Station's gate** has two parts (I.5.8): its feed, applied up to
-//!   the announced head (PR 10's feeds; until then only a stand-in opens
-//!   it), and the device list, fetched up to the head that Station announced
-//!   or up to a deferred entry (`StartView::fetched`, from the host's own
-//!   fetch on its link, so only the host's own Station's gate can have it).
-//!   It opens only with both.
+//!   the announced head (the host's sync, [`super::sync`]), and the device
+//!   list, fetched up to the head that Station announced or up to a
+//!   deferred entry (`StartView::fetched`, from the host's own fetch on its
+//!   link, so only the host's own Station's gate can have it). It opens
+//!   only with both.
 //! - **A covered service** waits for the gate of the origin of its
 //!   principal's **current** coverage (step 4's Decision 14).
 //! - **A native member** waits for the gate of the host's own Station (the
@@ -18,9 +18,11 @@
 //!   host reached only on a local network, with no Station, still runs a
 //!   connected native's work (VII.A test 20).
 //!
-//! This version syncs no feed: every Station's gate is closed
-//! ([`Gates::closed_until_feeds`]) until the feeds exist (PR 10), so only a
-//! native with a caught-up channel passes.
+//! The feed part is the host's sync's ([`super::sync::FeedSync`]): it
+//! syncs only its own Station's feed (Decision 14), so only that Station's
+//! gate opens. The start view holds a copy ([`Gates`]), given at each
+//! change ([`Gates::set_feeds`], Decision 16), beside the natives'
+//! caught-up channels.
 use super::DelegatedSender;
 use std::collections::BTreeSet;
 
@@ -30,15 +32,15 @@ pub trait GateView {
     fn open_for(&self, sender: &DelegatedSender, fetched: Option<&str>) -> bool;
 }
 
-/// The gates as the host knows them.
+/// The gates as the start view holds them: all closed by default.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Gates {
-    /// The Station origins whose feed part is open (design I.5.8): none
-    /// until the host syncs feeds.
+    /// The Station origins whose feed part is open (design I.5.8): the
+    /// host's own, or none ([`super::sync::FeedSync::take_gates`]).
     open: BTreeSet<String>,
-    /// The Station origins whose whole gate a stand-in for the feeds opened
-    /// (tests, and the debug-only `ATEM_TEST_HOST_CONTROLS` unless it leaves
-    /// the device-list part to the fetch): their device-list part too.
+    /// Tests only: the Station origins whose whole gate is open, its
+    /// device-list part too, with no fetch.
+    #[cfg(test)]
     stood_in: BTreeSet<String>,
     /// The host's own Station's origin: a native member's gate.
     own: Option<String>,
@@ -48,25 +50,27 @@ pub struct Gates {
 }
 
 impl Gates {
-    /// Every Station's gate closed: the host syncs no feed yet (PR 10), so
-    /// a native member passes only with its own caught-up channel and a
-    /// service never does.
-    pub fn closed_until_feeds() -> Gates {
-        Gates::default()
-    }
-
     /// The native members holding a caught-up channel, as the r9 engine
     /// has them now.
     pub fn set_caught_up(&mut self, natives: BTreeSet<String>) {
         self.caught_up = natives;
     }
 
+    /// The feed part as the host's sync has it now: its own Station's
+    /// origin, and the origins whose feed part is open.
+    pub fn set_feeds(&mut self, own: Option<String>, open: BTreeSet<String>) {
+        self.own = own;
+        self.open = open;
+    }
+
     /// Every Station's gate closed (design I.6.2 step 7, at a start's
     /// recovery): a delegated sender's remote tasks wait until its feed is
-    /// synced again. The natives' caught-up channels stay: each one's
-    /// carriage was applied in this run.
+    /// synced again (the sync is told too, `FeedSync::restart`). The
+    /// natives' caught-up channels stay: each one's carriage was applied in
+    /// this run.
     pub fn close_stations(&mut self) {
         self.open.clear();
+        #[cfg(test)]
         self.stood_in.clear();
     }
 
@@ -76,19 +80,9 @@ impl Gates {
         !self.open.is_empty()
     }
 
-    /// The Station gates as the debug-only stand-in for the feeds says
-    /// (`ATEM_TEST_HOST_CONTROLS`): the host's own Station's origin and the
-    /// origins whose feed part is open; with `whole`, their device-list
-    /// part too (else it is the host's own fetch's).
-    #[cfg(debug_assertions)]
-    pub fn set_stations(&mut self, own: Option<String>, open: BTreeSet<String>, whole: bool) {
-        self.own = own;
-        self.stood_in = if whole { open.clone() } else { BTreeSet::new() };
-        self.open = open;
-    }
-
     /// Tests: `origin`'s whole gate is open, and it is the host's own
-    /// Station's (what the feeds and the fetch will make it, PR 10).
+    /// Station's, with no feed sync and no fetch (unit tests of the
+    /// lifecycle; the binary tests go through both).
     #[cfg(test)]
     pub fn open_own_station(&mut self, origin: &str) {
         self.open_feed(origin);
@@ -104,9 +98,15 @@ impl Gates {
     }
 
     /// `origin`'s gate: its feed part, and its device-list part (`fetched`
-    /// names it, or a stand-in opened the whole gate).
+    /// names it).
     fn station_open(&self, origin: &str, fetched: Option<&str>) -> bool {
-        self.open.contains(origin) && (fetched == Some(origin) || self.stood_in.contains(origin))
+        #[cfg(test)]
+        let fetched = if self.stood_in.contains(origin) {
+            Some(origin)
+        } else {
+            fetched
+        };
+        self.open.contains(origin) && fetched == Some(origin)
     }
 }
 
@@ -147,14 +147,13 @@ mod tests {
         }
     }
 
-    /// This version's gates (VII.A test 20, design I.5.8): every Station's
-    /// closed, so a service never passes and a native passes only while it
-    /// holds a caught-up channel, its own; once the feeds open the host's
-    /// own Station's gate, every native passes and a service whose current
-    /// coverage names that origin does.
+    /// The gates closed (VII.A test 20, design I.5.8): a service never
+    /// passes and a native passes only while it holds a caught-up channel,
+    /// its own; once the host's own Station's gate opens, every native
+    /// passes and a service whose current coverage names that origin does.
     #[test]
-    fn closed_until_feeds_passes_only_a_caught_up_native() {
-        let mut gates = Gates::closed_until_feeds();
+    fn closed_gates_pass_only_a_caught_up_native() {
+        let mut gates = Gates::default();
         assert!(!gates.open_for(&native("dev-phone"), None));
         assert!(!gates.open_for(&service(ORIGIN), None));
         gates.set_caught_up(BTreeSet::from(["member:dev-phone".to_string()]));
@@ -186,7 +185,7 @@ mod tests {
 
         // The feed part alone: the device-list part is the fetch's, and
         // only for the Station it names.
-        let mut gates = Gates::closed_until_feeds();
+        let mut gates = Gates::default();
         gates.open_feed(ORIGIN);
         assert!(!gates.open_for(&service(ORIGIN), None));
         assert!(!gates.open_for(&native("dev-tablet"), None));
@@ -194,7 +193,7 @@ mod tests {
         assert!(gates.open_for(&service(ORIGIN), Some(ORIGIN)));
         assert!(gates.open_for(&native("dev-tablet"), Some(ORIGIN)));
         // The fetch's part with no feed part: closed.
-        let gates = Gates::closed_until_feeds();
+        let gates = Gates::default();
         assert!(!gates.open_for(&service(ORIGIN), Some(ORIGIN)));
     }
 }

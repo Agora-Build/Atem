@@ -488,6 +488,11 @@ pub struct RuntimeStatus {
     /// record is damaged, and for a day after a repair or a lowering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock: Option<String>,
+    /// The control feeds' line (host-work-v1 §11.4, `HostBridge::
+    /// feeds_status`): with `host.delegated` on, or a control state that
+    /// doesn't read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feeds: Option<String>,
     /// The delegated tasks' line (host-work-v1 §11.6 "On the host"): only
     /// while something is delegated (`host.delegated` on, a delegated task
     /// open, or an outcome unresolved).

@@ -151,7 +151,7 @@ impl HostBridge {
         }
         steps.push(RecoveryStep::Deadlines(expired));
         if self.features.delegated {
-            self.start_view().gates.close_stations();
+            self.feeds_restart();
         }
         steps.push(RecoveryStep::GatesClosed);
         Ok(steps)

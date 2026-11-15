@@ -10,7 +10,7 @@
 use super::*;
 use crate::runtime::delegated::Admission;
 use crate::runtime::delegated::attempts::{AttemptEnd, SessionAnswer, attempt_end};
-use crate::runtime::delegated::authority::{Caller, Grounds, Refused, interaction};
+use crate::runtime::delegated::authority::{Caller, Grounds, Refused, every_caller, interaction};
 use crate::runtime::delegated::resolve::{ResolveRefusal, resolve};
 use crate::runtime::delegated::start::Event;
 use crate::session_protocol::host::{Immutable, Provenance, Withdrawal};
@@ -29,8 +29,47 @@ impl HostBridge {
         self.features.delegated || self.work.clock.is_some()
     }
 
+    /// A service sender's requests while its control standing decides
+    /// them (design I.5.5 step 2, ruling T32b; only with `host.delegated`
+    /// on): `busy` while the control state can't be read (its revocation
+    /// and hold are unknown: I1's answer, before any other refusal), and
+    /// `forbidden` once a control record revoked it: the host refuses all
+    /// its future requests, whatever they ask (a new task or a notice, an
+    /// attachment, a launch or its query, the profiles, its own tasks),
+    /// from the standings committed (Decision 16). Natives, browser grants
+    /// and `local` don't depend on control records: nothing.
+    pub(super) fn service_refused(&self, a: &Sender) -> Result<(), HostWorkError> {
+        if !self.features.delegated {
+            return Ok(());
+        }
+        let Some(authority) = a.remote() else {
+            return Ok(());
+        };
+        let principal = authority.name();
+        let Some(list) = self.open_list() else {
+            return Ok(());
+        };
+        if crate::runtime::delegated::active_service(&principal, list).is_none() {
+            return Ok(());
+        }
+        if self.controls_unchecked() {
+            return Err("busy".into());
+        }
+        let revoked = self
+            .start_view()
+            .standings
+            .get(&principal)
+            .is_some_and(|standing| standing.revoked.is_some());
+        if revoked {
+            return Err("forbidden".into());
+        }
+        Ok(())
+    }
+
     /// Who `a` is to the delegated task `r`, admitted as `adm` (design
     /// I.4.5, Decision 15): its sender with current authority, or the owner.
+    /// A service sender is `Refused::Unchecked` (`busy`) while the control
+    /// state can't be read (ruling T32b); the owner still reads.
     /// Read on the host's device list while it is open and serving, the
     /// sender's control standing, and a grant's expiry against the later of
     /// the wall clock (what resolved the caller's channel authority) and the
@@ -76,9 +115,19 @@ impl HostBridge {
             &Grounds {
                 list,
                 standing: &standing,
+                // A service's standing can't be checked (ruling T32b).
+                unchecked: self.controls_unchecked(),
                 host_id: &host_id,
                 now_ms: host_now().wall_ms.max(now_d),
-                projects: &|entry| self.projects.matches(session, entry),
+                // The session's hash, else the task's launch project's
+                // (ruling T20c: kept host-private with its record, hashed
+                // under a new kid without the session).
+                projects: &|entry| {
+                    let task = crate::runtime::project_scope::task_project_key(&r.project);
+                    self.projects
+                        .matches(session, entry)
+                        .or_else(|| self.projects.matches(&task, entry))
+                },
             },
         )
     }
@@ -86,22 +135,19 @@ impl HostBridge {
     /// Who `a` is to a message whose agent recipients include delegated
     /// tasks (`tasks`, each with its admission), for `message_query` and a
     /// `message_publish` retry: the tasks' caller rule, every one of them
-    /// (the owner, or the sender with current authority over each); `None`
-    /// when it may not.
+    /// (the owner, or the sender with current authority over each); why
+    /// not when it may not: a refusal that stands (`forbidden`) before one
+    /// that can't be decided yet (`busy`), whatever the recipients' order
+    /// (`every_caller`, Task 32 re-review N3).
     pub(super) fn delegated_message_caller(
         &self,
         a: &Sender,
         tasks: &[WorkRecord],
-    ) -> Option<Caller> {
-        let mut caller = Caller::Sender;
-        for t in tasks {
-            let adm = t.delegated.as_ref()?;
-            match self.delegated_caller(a, t, adm).ok()? {
-                Caller::Owner => caller = Caller::Owner,
-                Caller::Sender => {}
-            }
-        }
-        Some(caller)
+    ) -> Result<Caller, Refused> {
+        every_caller(tasks.iter().map(|t| {
+            let adm = t.delegated.as_ref().ok_or(Refused::NotTheSender)?;
+            self.delegated_caller(a, t, adm)
+        }))
     }
 
     /// `work_cancel` of the delegated task `r` by its sender (design I.4.5,
@@ -203,11 +249,16 @@ impl HostBridge {
     /// may name, the task's sender with current authority or the owner (the
     /// interaction rule, `delegated_caller`), else `forbidden`: a v1 task,
     /// one the host doesn't have, `local` (the host's own command is not
-    /// this op). Then [`resolve`]'s rule, in one `BEGIN IMMEDIATE`
+    /// this op); `busy` while the rule can't be decided yet (a service while
+    /// the control state doesn't read, ruling T32b; a `projects` comparison
+    /// not made yet), as for the task's other requests. Its launch project
+    /// is registered first, as `work_query` registers it (ruling T20c): an
+    /// unresolved task's record closes a day after its deadline, so a start
+    /// doesn't. Then [`resolve`]'s rule, in one `BEGIN IMMEDIATE`
     /// transaction committed before the answer: the task and its alert's
     /// end are durable before anything shows them.
     pub(super) fn work_resolve(
-        &self,
+        &mut self,
         a: &Sender,
         req: &hw::Request,
         task_id: &str,
@@ -216,13 +267,18 @@ impl HostBridge {
         if !self.features.delegated {
             return crate::runtime::delegated::request(self.features, req);
         }
-        let store = self.work.store.as_ref().ok_or("busy")?;
-        let r = store
+        let r = self
+            .work
+            .store
+            .as_ref()
+            .ok_or("busy")?
             .work(task_id)
             .map_err(|_| "busy")?
             .ok_or("forbidden")?;
         let adm = r.delegated.as_ref().ok_or("forbidden")?;
-        self.delegated_caller(a, &r, adm).map_err(|_| "forbidden")?;
+        self.keep_task_project(&r);
+        self.delegated_caller(a, &r, adm).map_err(Refused::code)?;
+        let store = self.work.store.as_ref().ok_or("busy")?;
         let tx = store.immediate().map_err(|_| "busy")?;
         let work = resolve(
             store,

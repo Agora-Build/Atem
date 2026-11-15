@@ -307,6 +307,10 @@ pub async fn serve(
                 let op_running = server.op.is_some() || server.op_waiting.is_some();
                 let admitting = server.bridge.as_ref().is_some_and(HostBridge::r9_admitting);
                 server.app.route_reconnect_due(op_running, admitting);
+                // §11.4 "An identity change": the host's identity moved on
+                // its live link (`host.delegated` only), once no operation
+                // runs.
+                server.app.identity_reconnect_due(op_running, admitting);
             }
             Some(call) = op_called.recv() => server.op_call(call),
             Some(done) = owner_published.recv() => server.owner_done_published(done),
@@ -1606,6 +1610,7 @@ impl Server {
                 .as_ref()
                 .and_then(HostBridge::device_list_status),
             clock: self.bridge.as_ref().and_then(HostBridge::clock_status),
+            feeds: self.bridge.as_ref().and_then(HostBridge::feeds_status),
             delegated: self.bridge.as_ref().and_then(HostBridge::delegated_status),
         }
     }

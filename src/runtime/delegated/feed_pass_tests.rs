@@ -1,0 +1,1233 @@
+// The control-feed sync in the bridge (Task 33; design I.5.2, I.5.4,
+// I.5.8; host-work-v1 §11.4; step 4's Decisions 12, 16, 20): the rig's
+// host with the bot and no control view standing in for the feeds, its
+// Station link to [`ORIGIN`] set by hand (the rig has no r9 link, so these
+// tests drive the bridge's feed steps between passes, never a pass), the
+// Station's messages read by the Station link's reader. The transport and
+// the passes are the binary tests' (`delegated_binary`,
+// `control_feed_binary`). Included beside the dispatch's tests, whose
+// helpers it shares.
+
+/// The pass's clocks `ms` past the monotonic clock now (no boot-time
+/// reading).
+fn clocks_after(ms: u64) -> crate::runtime::delegated::sync::Clocks {
+    crate::runtime::delegated::sync::Clocks {
+        mono_ms: host_now().mono_ms + ms,
+        boot_ms: None,
+    }
+}
+
+/// The feed of the host's own Station in these tests.
+const OWN_FEED: &str = "33333333-3333-4333-8333-333333333333";
+
+/// [`with_bot`] with the feeds alone deciding (no control view standing in,
+/// every gate closed, the standings the feeds'), and the host's Station
+/// link to [`ORIGIN`], up.
+fn fed_host(rig: &mut LocalRig, root: &Path, os: &ManualOs) -> Senders {
+    use crate::runtime::delegated::feeds::Feeds;
+    use crate::runtime::delegated::station::{LinkKind, Station};
+    let s = with_bot(rig, root, os, host_now().wall_ms + 3 * HOUR);
+    rig.bridge.work.controls = None;
+    rig.bridge.start_view().gates = Gates::default();
+    if let Feeds::Loaded(feeds) = &mut rig.bridge.work.feeds {
+        feeds.publish();
+    }
+    let mut station = Station::new();
+    station.sync_link(Some(1), 1, || LinkKind::Routed, || Some(ORIGIN.to_string()));
+    rig.bridge.station = Some(station);
+    rig.bridge.ensure_feeds();
+    rig.bridge.sync_list_view();
+    // What a pass does first: the sync sees the link, the time, the feeds.
+    rig.bridge.feed_advance(clocks_after(0));
+    assert!(rig.bridge.start_view().list.is_some());
+    s
+}
+
+/// Another Station's origin.
+const OTHER_ORIGIN: &str = "https://station-other.agora.build";
+
+/// The Station's `heads` (its own feed at `head`, the device list at
+/// `membership`), read by the link's reader and handed to the bridge: the
+/// sync's calls.
+fn bridge_heads(
+    rig: &mut LocalRig,
+    head: u64,
+    membership: atem_client::membership::Head,
+) -> Vec<crate::runtime::delegated::station::Call> {
+    bridge_heads_with(rig, &[(ORIGIN, OWN_FEED, head)], membership)
+}
+
+/// The Station's `heads` naming `feeds` (origin, feed, head) and the
+/// device list at `membership`, as it sends them.
+fn heads_text(feeds: &[(&str, &str, u64)], membership: atem_client::membership::Head) -> String {
+    use atem_client::control::{FeedHead, Heads};
+    let heads = Heads {
+        feeds: feeds
+            .iter()
+            .map(|(origin, feed_id, head)| FeedHead {
+                origin: (*origin).into(),
+                feed_id: (*feed_id).into(),
+                head: *head,
+                station_time: host_now().wall_ms,
+            })
+            .collect(),
+        membership,
+    };
+    heads.to_json().unwrap().to_string()
+}
+
+/// [`bridge_heads`] naming `feeds` (origin, feed, head).
+fn bridge_heads_with(
+    rig: &mut LocalRig,
+    feeds: &[(&str, &str, u64)],
+    membership: atem_client::membership::Head,
+) -> Vec<crate::runtime::delegated::station::Call> {
+    use crate::runtime::delegated::station::Inbound;
+    let text = heads_text(feeds, membership);
+    let applied = rig.bridge.membership.as_ref().map(|m| m.head());
+    let deferred = rig.bridge.list_deferral();
+    let inbound = rig
+        .bridge
+        .station
+        .as_mut()
+        .unwrap()
+        .receive(&text, applied, deferred);
+    let Inbound::Heads(heads, _) = inbound else {
+        panic!("heads: {inbound:?}");
+    };
+    let calls = rig.bridge.feed_heads(&heads);
+    rig.bridge.publish_feed_gates();
+    rig.bridge.refresh_fetch_view();
+    calls
+}
+
+/// A page of the own feed (`records`: positions and records), read by the
+/// link's reader and handed to the bridge: the sync's next call.
+fn bridge_page(
+    rig: &mut LocalRig,
+    head: u64,
+    records: &[(u64, &atem_client::control::ControlRecord)],
+) -> Vec<crate::runtime::delegated::station::Call> {
+    use crate::runtime::delegated::station::Inbound;
+    let text = page_text(rig, head, records);
+    let inbound = rig
+        .bridge
+        .station
+        .as_mut()
+        .unwrap()
+        .receive(&text, None, None);
+    let Inbound::Page(page) = inbound else {
+        panic!("a page: {inbound:?}");
+    };
+    let calls = rig.bridge.feed_page(page);
+    rig.bridge.feeds_reverify();
+    rig.bridge.publish_feed_gates();
+    calls
+}
+
+/// A page of the own feed (`records`: positions and records) at `head`, as
+/// the Station sends it: the answer to the sync's call in flight (its
+/// `request_id` and `after`, wire rule 11), or with none, to a call never
+/// asked (a fresh id, `after` just before its first record, or its head).
+fn page_text(
+    rig: &LocalRig,
+    head: u64,
+    records: &[(u64, &atem_client::control::ControlRecord)],
+) -> String {
+    use atem_client::control::{ControlSyncResult, FeedEntry};
+    let live = rig
+        .bridge
+        .station
+        .as_ref()
+        .and_then(|station| station.feed.live_call());
+    let (request_id, after) = match live {
+        Some(call) => (call.request_id, call.after),
+        None => (
+            uuid::Uuid::new_v4().to_string(),
+            records.first().map_or(head, |(n, _)| n - 1),
+        ),
+    };
+    let page = ControlSyncResult {
+        request_id,
+        origin: ORIGIN.into(),
+        feed_id: OWN_FEED.into(),
+        after,
+        head,
+        station_time: host_now().wall_ms,
+        records: records.iter().map(|(n, r)| FeedEntry::new(*n, r)).collect(),
+    };
+    page.to_json().unwrap().to_string()
+}
+
+/// The calls with each `control_sync`'s `request_id` (a lowercase UUID v4,
+/// checked) blanked, to compare with expected calls.
+fn blank(
+    calls: Vec<crate::runtime::delegated::station::Call>,
+) -> Vec<crate::runtime::delegated::station::Call> {
+    use crate::runtime::delegated::station::Call;
+    calls
+        .into_iter()
+        .map(|call| match call {
+            Call::Sync(mut sync) => {
+                let id = uuid::Uuid::parse_str(&sync.request_id).expect("a UUID");
+                assert_eq!(id.get_version_num(), 4);
+                assert_eq!(id.hyphenated().to_string(), sync.request_id);
+                sync.request_id = String::new();
+                Call::Sync(sync)
+            }
+            other => other,
+        })
+        .collect()
+}
+
+/// A record of `service` in the own feed, signed with its key.
+fn own_record(
+    log: &TestLog,
+    service: &str,
+    action: atem_client::control::ControlAction,
+    n: u64,
+) -> atem_client::control::ControlRecord {
+    crate::runtime::delegated::feeds::signed_record(
+        log,
+        service,
+        service,
+        action,
+        uuid::Uuid::new_v4().to_string(),
+        (ORIGIN, OWN_FEED),
+        host_now().wall_ms + n,
+    )
+}
+
+/// Task 33 (Decisions 13, 16): a `heads` and its page through the bridge,
+/// with no pass: the cover makes the bot a delegated sender of the own
+/// Station's feed, the standings are in the start view at the page's
+/// commit, and the gate's feed part with them; the device-list part is the
+/// fetch's (the list holds the announced head), so the start check's gate
+/// is open for the bot and for a native.
+#[test]
+fn a_page_through_the_bridge_reaches_the_start_view_at_its_commit() {
+    use crate::runtime::delegated::station::Call;
+    use crate::runtime::delegated::{DelegatedSender, gate::GateView};
+    use atem_client::control::{ControlAction, ControlSync};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        // Never read in full yet (ruling T35d, B): unchecked, never v1.
+        assert_eq!(rig.bridge.sender_class(BOT), SenderClass::Unchecked);
+        let head = s.log.log.head();
+        let calls = bridge_heads(&mut rig, 1, head);
+        assert_eq!(
+            blank(calls),
+            [Call::Sync(ControlSync {
+                request_id: String::new(),
+                origin: ORIGIN.into(),
+                feed_id: Some(OWN_FEED.into()),
+                after: 0
+            })]
+        );
+        let native = DelegatedSender::Native {
+            device_id: "dev-phone".into(),
+        };
+        let fetched = |rig: &LocalRig| {
+            let view = rig.bridge.start_view();
+            let list = view.list.clone().unwrap();
+            view.fetched(&list).map(str::to_string)
+        };
+        assert_eq!(fetched(&rig).as_deref(), Some(ORIGIN), "the list holds it");
+        assert!(
+            !rig.bridge
+                .start_view()
+                .gates
+                .open_for(&native, Some(ORIGIN)),
+            "nothing read yet"
+        );
+        let cover = own_record(&s.log, "svc-bot", ControlAction::Cover, 1);
+        assert_eq!(bridge_page(&mut rig, 1, &[(1, &cover)]), []);
+        let coverage = rig.bridge.start_view().standings[BOT].coverage.clone();
+        assert_eq!(coverage.map(|c| c.feed_id).as_deref(), Some(OWN_FEED));
+        let SenderClass::Delegated(DelegatedSender::Service { feed, .. }) =
+            rig.bridge.sender_class(BOT)
+        else {
+            panic!("a covered bot is delegated");
+        };
+        assert_eq!(feed.origin, ORIGIN);
+        let view = rig.bridge.start_view();
+        assert!(view.gates.open_for(&native, Some(ORIGIN)));
+        assert!(view.gates.open_for(
+            &DelegatedSender::Service {
+                device_id: "svc-bot".into(),
+                feed
+            },
+            Some(ORIGIN)
+        ));
+        drop(view);
+        // Hosting paused (a `runtime.toml` that doesn't load): the sync
+        // goes on, and a revoke is in the start view at its commit (ledger
+        // carry: a sender revoked during a pause keeps no standing).
+        rig.bridge.work.config_problem = Some("paused by the test".into());
+        // A second on: the sync's pace.
+        rig.bridge.feed_advance(clocks_after(2_000));
+        bridge_heads(&mut rig, 2, head);
+        let revoke = own_record(
+            &s.log,
+            "svc-bot",
+            ControlAction::Revoke {
+                interrupt_running: false,
+            },
+            2,
+        );
+        bridge_page(&mut rig, 2, &[(2, &revoke)]);
+        assert!(rig.bridge.start_view().standings[BOT].revoked.is_some());
+    });
+}
+
+/// Task 32 review (Task 33's call sites): pending control records are
+/// applied again once at start after the feeds load (a list advance that
+/// committed before a crash), and whenever the device list moved.
+#[test]
+fn pending_records_are_reverified_at_load_and_when_the_list_moves() {
+    use crate::runtime::delegated::feeds::Feeds;
+    use crate::session_protocol::membership::r9log::{auth, secret};
+    use atem_client::control::ControlAction;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut s = fed_host(&mut rig, root, &os);
+        let head = s.log.log.head();
+        bridge_heads(&mut rig, 2, head);
+        // Two services the list doesn't hold yet: their records wait.
+        for service in ["svc-new", "svc-late"] {
+            s.log
+                .keys
+                .insert_ed25519(auth(service), &secret(&format!("{service} auth")));
+        }
+        let new = own_record(&s.log, "svc-new", ControlAction::Cover, 1);
+        let late = own_record(&s.log, "svc-late", ControlAction::Cover, 2);
+        bridge_page(&mut rig, 2, &[(1, &new), (2, &late)]);
+        let pending = |rig: &LocalRig| match &rig.bridge.work.feeds {
+            Feeds::Loaded(feeds) => feeds.pending_len(),
+            _ => panic!("loaded"),
+        };
+        assert_eq!(pending(&rig), 2);
+        // The list moves: the one it now holds applies.
+        let expiry = host_now().wall_ms + 3 * HOUR;
+        let entry = s.log.add_service(
+            "svc-new",
+            &["host"],
+            None,
+            &["notify", "prompt", "view"],
+            expiry,
+        );
+        carry(&mut rig, &s.log, entry);
+        rig.bridge.feeds_reverify();
+        assert_eq!(pending(&rig), 1);
+        assert!(
+            rig.bridge.start_view().standings["service:svc-new"]
+                .coverage
+                .is_some()
+        );
+        // Kept for Task 35 to act on (Task 33 review m4).
+        let kept = |rig: &LocalRig| {
+            rig.bridge
+                .work
+                .reapplied
+                .iter()
+                .map(|r| r.record.principal().name())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kept(&rig), ["service:svc-new"]);
+        // The other's list advance commits while the feeds aren't loaded
+        // (as before a crash): the load re-verifies once, whatever head the
+        // last re-verification saw.
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        let entry = s.log.add_service(
+            "svc-late",
+            &["host"],
+            None,
+            &["notify", "prompt", "view"],
+            expiry,
+        );
+        carry(&mut rig, &s.log, entry);
+        rig.bridge.feeds_reverify();
+        let head = s.log.log.head();
+        rig.bridge.work.reverified = Some((head.seq, head.hash));
+        rig.bridge.ensure_feeds();
+        assert_eq!(pending(&rig), 1, "loaded, not yet re-verified");
+        rig.bridge.feeds_reverify();
+        assert_eq!(pending(&rig), 0);
+        assert_eq!(kept(&rig), ["service:svc-new", "service:svc-late"]);
+        assert!(
+            rig.bridge.start_view().standings["service:svc-late"]
+                .coverage
+                .is_some()
+        );
+    });
+}
+
+/// `atem status`'s `Control feeds:` line (host-work-v1 §11.4, Decisions 12
+/// and 20): none with the hook off; a damaged control state with the way
+/// out; the host's own Station's gate in the start check's order, why it is
+/// closed (a refusal: Decision 20's text; a device list that differs from
+/// the Station's at the announced `seq`), with the evidence and pending
+/// counts.
+#[test]
+fn the_control_feeds_status_line() {
+    use crate::runtime::delegated::feeds::Feeds;
+    use crate::runtime::delegated::sync::REFUSED_STATUS;
+    use crate::session_protocol::membership::r9log::{auth, secret};
+    use atem_client::control::{CallRefused, ControlAction, RefusalCode, RefusedCall};
+    use atem_client::encoding::Hash32;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        assert_eq!(rig.bridge.feeds_status(), None, "the hook off: as main");
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut s = fed_host(&mut rig, root, &os);
+        assert_eq!(
+            rig.bridge.feeds_status().unwrap(),
+            "revocations not yet checked (waiting for the Station's heads); 0 kept as evidence, 0 pending; services are refused (busy) until this host's first complete read of its Station's control feed (it needs the Station's heads)"
+        );
+        let head = s.log.log.head();
+        bridge_heads(&mut rig, 1, head);
+        let cover = own_record(&s.log, "svc-bot", ControlAction::Cover, 1);
+        bridge_page(&mut rig, 1, &[(1, &cover)]);
+        assert_eq!(
+            rig.bridge.feeds_status().unwrap(),
+            format!("revocations checked ({ORIGIN}); 0 kept as evidence, 0 pending")
+        );
+        // A record that fails verification (Task 33 review m7: the feed
+        // store's alerts are in the summary too).
+        s.log
+            .keys
+            .insert_ed25519(auth("svc-forger"), &secret("forger"));
+        let forged = crate::runtime::delegated::feeds::signed_record(
+            &s.log,
+            "svc-bot",
+            "svc-forger",
+            ControlAction::Hold,
+            uuid::Uuid::new_v4().to_string(),
+            (ORIGIN, OWN_FEED),
+            host_now().wall_ms + 2,
+        );
+        rig.bridge.feed_advance(clocks_after(2_000));
+        bridge_heads(&mut rig, 2, head);
+        bridge_page(&mut rig, 2, &[(2, &forged)]);
+        let line = rig.bridge.feeds_status().unwrap();
+        assert!(
+            line.starts_with(&format!(
+                "revocations checked ({ORIGIN}); 1 kept as evidence, 0 pending; 1 alert(s) since the start, the latest: a control record from the feed of {ORIGIN} kept as evidence (bad_signature"
+            )),
+            "{line}"
+        );
+        // The feeds loaded again (ruling T33c, N3): the run's count stays.
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        rig.bridge.ensure_feeds();
+        assert_eq!(rig.bridge.feeds_status().unwrap(), line);
+        // The Station announces another entry at the list's head `seq`.
+        let fork = atem_client::membership::Head {
+            seq: head.seq,
+            hash: Hash32([9; 32]),
+        };
+        bridge_heads(&mut rig, 2, fork);
+        let line = rig.bridge.feeds_status().unwrap();
+        assert!(
+            line.starts_with(&format!(
+                "revocations not yet checked (the device list differs from the Station's at seq {}); 1 kept as evidence, 0 pending",
+                head.seq
+            )),
+            "{line}"
+        );
+        // A refusal on the link: the gate's reason and an alert.
+        let refused = CallRefused {
+            call: RefusedCall::ControlAck,
+            code: RefusalCode::Forbidden,
+        }
+        .to_json()
+        .unwrap()
+        .to_string();
+        rig.bridge
+            .station
+            .as_mut()
+            .unwrap()
+            .receive(&refused, None, None);
+        assert_eq!(
+            rig.bridge.feeds_status().unwrap(),
+            format!(
+                "revocations not yet checked ({REFUSED_STATUS}); 1 kept as evidence, 0 pending; 2 alert(s) since the start, the latest: {REFUSED_STATUS}"
+            )
+        );
+        // An alert of the sync's: counted, the latest named.
+        bridge_heads_with(
+            &mut rig,
+            &[(ORIGIN, OWN_FEED, 2), (OTHER_ORIGIN, OWN_FEED, 1)],
+            head,
+        );
+        let line = rig.bridge.feeds_status().unwrap();
+        assert!(
+            line.ends_with(&format!(
+                "; 3 alert(s) since the start, the latest: the Station's heads named 1 control feed(s) of another origin than this host's own Station ({ORIGIN}); ignored"
+            )),
+            "{line}"
+        );
+        // A deferral comes first (the start check's order).
+        if let Some(list) = rig.bridge.start_view().list.as_mut() {
+            list.deferred = Some(crate::session_protocol::membership::DeferredStop {
+                seq: head.seq + 1,
+                until_ms: 0,
+                on: None,
+            });
+        }
+        assert!(
+            rig.bridge
+                .feeds_status()
+                .unwrap()
+                .starts_with("device list update pending;"),
+            "{:?}",
+            rig.bridge.feeds_status()
+        );
+        // A control state that doesn't read: the way out.
+        rig.bridge.work.feeds = Feeds::Damaged;
+        let line = rig.bridge.feeds_status().unwrap();
+        assert!(line.contains("no delegated task starts"), "{line}");
+        assert!(line.contains("pair this host again"), "{line}");
+        assert!(line.contains("host-work.sqlite"), "{line}");
+    });
+}
+
+/// Task 33 review I1, the probe's sequence through the bridge: the link
+/// drops in an unpaused pass (the feed store's origin goes with it), hosting
+/// pauses, the link comes back and the Station rolls its feed back under
+/// the same `feed_id`. The sync's page is placed at the link's own Station
+/// (the bridge gives the store the link's origin, pause or not), so the
+/// gate never opens with the cursor anywhere but the announced head.
+#[test]
+fn a_reset_read_during_a_pause_lowers_the_cursor_before_the_gate_opens() {
+    use crate::runtime::delegated::feeds::Feeds;
+    use crate::runtime::delegated::station::LinkKind;
+    use crate::runtime::delegated::{DelegatedSender, gate::GateView};
+    use atem_client::control::ControlAction;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        let head = s.log.log.head();
+        bridge_heads(&mut rig, 2, head);
+        let cover = own_record(&s.log, "svc-bot", ControlAction::Cover, 1);
+        let hold = own_record(&s.log, "svc-bot", ControlAction::Hold, 2);
+        bridge_page(&mut rig, 2, &[(1, &cover), (2, &hold)]);
+        let native = DelegatedSender::Native {
+            device_id: "dev-phone".into(),
+        };
+        let open = |rig: &LocalRig| {
+            rig.bridge
+                .start_view()
+                .gates
+                .open_for(&native, Some(ORIGIN))
+        };
+        let cursor = |rig: &LocalRig| match &rig.bridge.work.feeds {
+            Feeds::Loaded(feeds) => feeds.current_feed(ORIGIN),
+            _ => panic!("loaded"),
+        };
+        assert!(open(&rig));
+        // The link drops in an unpaused pass.
+        let station = rig.bridge.station.as_mut().unwrap();
+        station.sync_link(None, 0, || LinkKind::Routed, || None);
+        rig.bridge.ensure_feeds();
+        rig.bridge.feed_advance(clocks_after(2_000));
+        // Hosting pauses; the link comes back (what each pass does with it).
+        rig.bridge.work.config_problem = Some("paused by the test".into());
+        let station = rig.bridge.station.as_mut().unwrap();
+        station.sync_link(Some(2), 2, || LinkKind::Routed, || Some(ORIGIN.to_string()));
+        rig.bridge.feed_advance(clocks_after(4_000));
+        // The Station rolled its feed back to position 1.
+        bridge_heads(&mut rig, 1, head);
+        assert!(!open(&rig));
+        bridge_page(&mut rig, 1, &[(1, &cover)]);
+        assert_eq!(cursor(&rig), Some((OWN_FEED.to_string(), 1)), "read from 0");
+        assert!(open(&rig));
+    });
+}
+
+/// Task 33 fix round 1 (another path where the sync runs while host-work's
+/// pass doesn't): the feeds loaded for a device list that is no longer the
+/// committed one (a re-pin while hosting is paused, before the pass moves
+/// the store aside) take no page and open no gate.
+#[test]
+fn feeds_of_another_list_than_the_committed_one_take_no_page() {
+    use crate::runtime::delegated::{DelegatedSender, gate::GateView};
+    use crate::session_protocol::membership::r9log::secret;
+    use atem_client::control::ControlAction;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        // Another list is committed (another genesis), the feeds not yet
+        // loaded for it.
+        let mut other = TestLog::genesis("acct", &secret("another astation"));
+        other.add_host("host", 1, &secret("delegated host"));
+        {
+            let mut view = rig.bridge.start_view();
+            let list = view.list.as_mut().unwrap();
+            list.membership = std::sync::Arc::new(other.log.clone());
+        }
+        rig.bridge.feed_advance(clocks_after(0));
+        let calls = bridge_heads(&mut rig, 1, other.log.head());
+        assert_eq!(calls, [], "nothing asked of a store of another list");
+        let cover = own_record(&s.log, "svc-bot", ControlAction::Cover, 1);
+        bridge_page(&mut rig, 1, &[(1, &cover)]);
+        assert!(
+            rig.bridge
+                .start_view()
+                .standings
+                .get(BOT)
+                .is_none_or(|s| s.coverage.is_none())
+        );
+        let native = DelegatedSender::Native {
+            device_id: "dev-phone".into(),
+        };
+        assert!(
+            !rig.bridge
+                .start_view()
+                .gates
+                .open_for(&native, Some(ORIGIN))
+        );
+    });
+}
+
+/// Ruling T33c: the durable reset mark comes with the feeds' tables, so a
+/// host with the hook off (as main) has no such table, and no row; nor any
+/// Station link, sync or status line, and the pass's Station step does
+/// nothing with a Station's messages (ruling T33e: hook off = main).
+#[test]
+fn the_reset_mark_is_no_table_with_the_hook_off() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        assert!(!rig.bridge.features.delegated);
+        passes(&mut rig, 3);
+        assert!(rig.bridge.station.is_none());
+        let page = page_text(&rig, 1, &[]);
+        let mut cx = Cx {
+            client: &rig.app.astation_client,
+            sessions: &mut rig.sessions,
+        };
+        rig.bridge.station_pass(vec![page], &mut cx);
+        assert!(rig.bridge.station.is_none());
+        assert_eq!(rig.bridge.feeds_status(), None);
+        let store = rig.bridge.work.store.as_ref().expect("hosting on");
+        let tables: u32 = store
+            .db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name LIKE 'control%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
+    });
+}
+
+/// Task 33 re-review 2, R2-2 (ruling T33d): the read from 0 a reset's mark
+/// lets go is asked at once, never dropped into a 30 s stall: after a mark
+/// write that failed (it is written again at the next pass), and for a
+/// reset found as the feeds load (the pass's first step finds it).
+#[test]
+fn the_read_a_mark_lets_go_is_asked_at_the_pass() {
+    use crate::runtime::delegated::feeds::Feeds;
+    use crate::runtime::delegated::station::Call;
+    use atem_client::control::{ControlAction, ControlSync};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        let head = s.log.log.head();
+        bridge_heads(&mut rig, 2, head);
+        let cover = own_record(&s.log, "svc-bot", ControlAction::Cover, 1);
+        let hold = own_record(&s.log, "svc-bot", ControlAction::Hold, 2);
+        bridge_page(&mut rig, 2, &[(1, &cover), (2, &hold)]);
+        let from_0 = Call::Sync(ControlSync {
+            request_id: String::new(),
+            origin: ORIGIN.into(),
+            feed_id: Some(OWN_FEED.into()),
+            after: 0,
+        });
+        // A rollback whose mark can't be written: nothing asked.
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute_batch(
+                "CREATE TRIGGER no_mark BEFORE INSERT ON control_resets
+                 BEGIN SELECT RAISE(ABORT, 'no mark'); END;",
+            )
+            .unwrap();
+        rig.bridge.feed_advance(clocks_after(2_000));
+        assert_eq!(bridge_heads(&mut rig, 1, head), []);
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute_batch("DROP TRIGGER no_mark;")
+            .unwrap();
+        // The next pass: its first step, then its tick, which asks.
+        rig.bridge.feed_advance(clocks_after(2_100));
+        assert_eq!(
+            blank(rig.bridge.feed_tick(clocks_after(2_100))),
+            std::slice::from_ref(&from_0)
+        );
+
+        // A reset found as the feeds load: the feed rolled back while they
+        // weren't loaded.
+        bridge_page(&mut rig, 1, &[(1, &cover)]);
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        rig.bridge.feed_advance(clocks_after(4_000));
+        bridge_heads(&mut rig, 0, head);
+        rig.bridge.ensure_feeds();
+        rig.bridge.feed_advance(clocks_after(4_100));
+        assert_eq!(blank(rig.bridge.feed_tick(clocks_after(4_100))), [from_0]);
+    });
+}
+
+/// Task 33 re-review 3, m1 (ruling T33e): the pass takes the Station's
+/// messages before the sync's tick, so a page that came before the 30 s
+/// deadline but is handled at the first pass after it answers its call:
+/// applied, with no timeout and no alert, and the gate open.
+#[test]
+fn a_page_handled_after_the_deadline_is_taken_before_the_tick() {
+    use crate::runtime::delegated::sync::SYNC_TIMEOUT_MS;
+    use atem_client::control::ControlAction;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        let head = s.log.log.head();
+        assert_eq!(bridge_heads(&mut rig, 1, head).len(), 1, "asked");
+        let alerts = rig.bridge.station.as_ref().unwrap().feed.alerts().0;
+        let cover = own_record(&s.log, "svc-bot", ControlAction::Cover, 1);
+        let page = page_text(&rig, 1, &[(1, &cover)]);
+        // The page came just before the deadline; the pass that handles it
+        // runs just after: its first step, then the Station's messages and
+        // the sync's tick.
+        let late = clocks_after(SYNC_TIMEOUT_MS + 1);
+        rig.bridge.feed_advance(late);
+        let mut cx = Cx {
+            client: &rig.app.astation_client,
+            sessions: &mut rig.sessions,
+        };
+        rig.bridge.station_pass_at(vec![page], late, &mut cx);
+        let feed = &rig.bridge.station.as_ref().unwrap().feed;
+        assert_eq!(feed.dump()["timeouts"], 0, "{}", feed.dump());
+        assert_eq!(feed.dump()["pages"], 1, "{}", feed.dump());
+        assert_eq!(feed.alerts().0, alerts, "no Station-fault alert");
+        assert_eq!(feed.closed(), None);
+        let coverage = rig.bridge.start_view().standings[BOT].coverage.clone();
+        assert_eq!(coverage.map(|c| c.feed_id).as_deref(), Some(OWN_FEED));
+    });
+}
+
+/// Ruling C1b-a: a call unanswered for 30 s is retired at the pass's tick,
+/// which asks again at once with a fresh id; `atem status`'s `Control
+/// feeds:` line says the call went unanswered, and names no way out (the
+/// sync goes on by itself).
+#[test]
+fn an_unanswered_sync_is_asked_again_and_the_status_line_says_so() {
+    use crate::runtime::delegated::station::Call;
+    use crate::runtime::delegated::sync::{SYNC_TIMEOUT_MS, UNANSWERED};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        let first = bridge_heads(&mut rig, 1, s.log.log.head());
+        let late = clocks_after(SYNC_TIMEOUT_MS + 1);
+        rig.bridge.feed_advance(late);
+        let again = rig.bridge.feed_tick(late);
+        let (Some(Call::Sync(first)), Some(Call::Sync(again))) = (first.first(), again.first())
+        else {
+            panic!("two calls: {first:?} {again:?}");
+        };
+        assert_eq!((&again.feed_id, again.after), (&first.feed_id, first.after));
+        assert_ne!(again.request_id, first.request_id, "a fresh id");
+        let line = rig.bridge.feeds_status().unwrap();
+        assert!(
+            line.starts_with(&format!("revocations not yet checked ({UNANSWERED}); ")),
+            "{line}"
+        );
+        assert!(!line.contains("atem runtime restart"), "{line}");
+    });
+}
+
+/// The bridge's Station step at the clocks `ms` past now, after the pass's
+/// first step (`feed_advance`), with the Station's `messages`: what it
+/// hands the link (sent when the rig's link is up: `r9_link`).
+fn station_pass(rig: &mut LocalRig, ms: u64, messages: Vec<String>) {
+    let now = clocks_after(ms);
+    rig.bridge.feed_advance(now);
+    let mut cx = Cx {
+        client: &rig.app.astation_client,
+        sessions: &mut rig.sessions,
+    };
+    rig.bridge.station_pass_at(messages, now, &mut cx);
+}
+
+/// The `control_ack`s among `texts`, as the shared reader reads them.
+fn acks_in(texts: &[String]) -> Vec<atem_client::control::ControlAck> {
+    use atem_client::control::ToStation;
+    texts
+        .iter()
+        .filter_map(|text| match ToStation::decode(text.as_bytes()) {
+            Ok(ToStation::ControlAck(ack)) => Some(ack),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Task 36 (host-work-v1 §11.4 "Acknowledgments": durable before
+/// acknowledged): a page's results are written in its own transaction, and
+/// an ack goes only once that transaction committed. A page whose
+/// transaction fails (here at its ack row) applies nothing and sends
+/// nothing; asked again, it commits, and the same pass hands the link one
+/// ack: the host's claim, its own Station's feed and the cursor the page
+/// committed, each record's result as its application gave it. Committed
+/// with the link down, a page's ack waits, durably: after a restart (the
+/// feeds loaded again) the next pass with the link sends it.
+#[test]
+fn an_ack_goes_only_after_its_commit() {
+    use atem_client::control::{
+        AckResult, ApplicationResult, ControlAction, EffectKind, EffectResult,
+    };
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        let head = s.log.log.head();
+        let mut sent = rig.app.astation_client.capture_sent_for_test();
+        rig.bridge.r9_link = Some(1);
+        fn db(rig: &LocalRig) -> &rusqlite::Connection {
+            &rig.bridge.work.store.as_ref().unwrap().db
+        }
+        let stored = |rig: &LocalRig| -> i64 {
+            db(rig)
+                .query_row("SELECT count(*) FROM control_acks", [], |r| r.get(0))
+                .unwrap()
+        };
+        let cover = own_record(&s.log, "svc-bot", ControlAction::Cover, 1);
+        let revoke = own_record(
+            &s.log,
+            "svc-bot",
+            ControlAction::Revoke {
+                interrupt_running: true,
+            },
+            2,
+        );
+        let heads = heads_text(&[(ORIGIN, OWN_FEED, 2)], head);
+        station_pass(&mut rig, 0, vec![heads.clone()]);
+        assert!(acks_in(&sent.texts()).is_empty());
+        // The page's transaction fails at its ack row: nothing applies.
+        db(&rig)
+            .execute_batch(
+                "CREATE TRIGGER no_ack BEFORE INSERT ON control_acks
+                 BEGIN SELECT RAISE(ABORT, 'no ack'); END;",
+            )
+            .unwrap();
+        let page = page_text(&rig, 2, &[(1, &cover), (2, &revoke)]);
+        station_pass(&mut rig, 100, vec![page]);
+        assert!(acks_in(&sent.texts()).is_empty(), "nothing sent");
+        assert_eq!(stored(&rig), 0);
+        let feed = rig.bridge.station.as_ref().unwrap().feed.dump();
+        assert_eq!(
+            feed["synced"],
+            serde_json::Value::Null,
+            "nothing applied: {feed}"
+        );
+        assert!(!rig.bridge.start_view().standings.contains_key(BOT));
+        db(&rig).execute_batch("DROP TRIGGER no_ack;").unwrap();
+        // Asked again (past the failure's pause): it commits, and the same
+        // pass sends its ack.
+        station_pass(&mut rig, 31_000, vec![heads.clone()]);
+        let page = page_text(&rig, 2, &[(1, &cover), (2, &revoke)]);
+        station_pass(&mut rig, 31_100, vec![page]);
+        let acks = acks_in(&sent.texts());
+        assert_eq!(acks.len(), 1, "{acks:?}");
+        let ack = &acks[0];
+        assert_eq!(
+            (
+                ack.account_id.as_str(),
+                ack.genesis_hash,
+                ack.host_id.as_str(),
+                ack.host_trust_gen
+            ),
+            ("acct", s.log.genesis_hash(), "host", 1)
+        );
+        assert_eq!(
+            (ack.origin.as_str(), ack.feed_id.as_str(), ack.cursor),
+            (ORIGIN, OWN_FEED, 2)
+        );
+        let applied = |effect| EffectResult {
+            effect,
+            result: ApplicationResult::Applied,
+            why: None,
+        };
+        assert_eq!(
+            ack.results,
+            [
+                AckResult::Record {
+                    record_id: cover.record_id().into(),
+                    effects: vec![applied(EffectKind::Cover)],
+                },
+                AckResult::Record {
+                    record_id: revoke.record_id().into(),
+                    effects: vec![
+                        applied(EffectKind::Revocation),
+                        applied(EffectKind::Interrupt)
+                    ],
+                },
+            ]
+        );
+        assert!(rig.bridge.start_view().standings[BOT].revoked.is_some());
+        // Committed with the link down (a hold after the revoke: refused,
+        // `after_revoke`): the ack waits in the table.
+        // Read outside a Station step (no send loop runs), as when the
+        // link drops right after a commit.
+        let hold = own_record(&s.log, "svc-bot", ControlAction::Hold, 3);
+        rig.bridge.feed_advance(clocks_after(33_000));
+        bridge_heads(&mut rig, 3, head);
+        bridge_page(&mut rig, 3, &[(3, &hold)]);
+        assert!(acks_in(&sent.texts()).is_empty());
+        assert_eq!(
+            stored(&rig),
+            3,
+            "the cover's (sent once, kept while its connection lasts), the revoke's and the hold's"
+        );
+        assert_eq!(
+            rig.bridge.station.as_ref().unwrap().feed.dump()["synced"]["cursor"],
+            3
+        );
+        // A restart: the feeds loaded again; the link up, the next pass
+        // sends what the table holds: the cover's once more (a restart
+        // can't know whether its connection was refused, review m1), the
+        // revoke's (in force, owed at every connection) and the hold's,
+        // never sent.
+        rig.bridge.work.feeds = crate::runtime::delegated::feeds::Feeds::Unloaded;
+        rig.bridge.ensure_feeds();
+        station_pass(&mut rig, 33_100, vec![]);
+        let acks = acks_in(&sent.texts());
+        let ids: Vec<String> = acks
+            .iter()
+            .flat_map(|a| a.results.iter())
+            .map(|r| match r {
+                AckResult::Record { record_id, .. } => record_id.clone(),
+                AckResult::Entry { .. } => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            [cover.record_id(), revoke.record_id(), hold.record_id()],
+            "{acks:?}"
+        );
+        assert_eq!(acks[0].cursor, 3);
+    });
+}
+
+/// Task 36 (hook off = main): with `host.delegated` off (the hook removed
+/// with delegated tasks left: the feeds still load, and a pending record
+/// still applies when the device list moves) no acknowledgment table is
+/// made and no result is kept; a pass sends no ack (there is no Station
+/// link).
+#[test]
+fn with_the_hook_off_no_acknowledgment_is_kept_or_sent() {
+    use crate::runtime::delegated::feeds::Feeds;
+    use crate::session_protocol::membership::r9log::{auth, secret};
+    use atem_client::control::ControlAction;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut s = fed_host(&mut rig, root, &os);
+        let head = s.log.log.head();
+        bridge_heads(&mut rig, 1, head);
+        // A service the list doesn't hold yet: its record waits.
+        s.log
+            .keys
+            .insert_ed25519(auth("svc-new"), &secret("svc-new auth"));
+        let new = own_record(&s.log, "svc-new", ControlAction::Cover, 1);
+        bridge_page(&mut rig, 1, &[(1, &new)]);
+        // The hook removed, as a runtime started without it finds a store
+        // that never had it.
+        let db = |rig: &LocalRig| -> i64 {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name='control_acks'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute_batch("DROP TABLE control_acks;")
+            .unwrap();
+        rig.bridge.features = HostFeatures::default();
+        rig.bridge.station = None;
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        rig.bridge.ensure_feeds();
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
+        let pending = |rig: &LocalRig| match &rig.bridge.work.feeds {
+            Feeds::Loaded(feeds) => feeds.pending_len(),
+            _ => panic!("loaded"),
+        };
+        assert_eq!(pending(&rig), 1);
+        // The list moves: the record applies, and nothing is owed for it.
+        let entry = s.log.add_service(
+            "svc-new",
+            &["host"],
+            None,
+            &["notify", "prompt", "view"],
+            host_now().wall_ms + 3 * HOUR,
+        );
+        carry(&mut rig, &s.log, entry);
+        rig.bridge.feeds_reverify();
+        assert_eq!(pending(&rig), 0, "applied");
+        assert_eq!(db(&rig), 0, "no acknowledgment table");
+        let mut sent = rig.app.astation_client.capture_sent_for_test();
+        passes(&mut rig, 2);
+        assert!(acks_in(&sent.texts()).is_empty());
+        assert!(rig.bridge.station.is_none());
+        assert_eq!(db(&rig), 0);
+    });
+}
+
+/// Review m5 (ruling T36a): when the acks' sent mark can't be written, the
+/// sends are kept in memory all the same: nothing goes again on that
+/// connection pass after pass (the Station gets no stream of duplicates);
+/// a kept result goes at the next connection as usual.
+#[test]
+fn a_failed_sent_mark_sends_nothing_again_on_that_connection() {
+    use atem_client::control::{AckResult, ControlAction};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        let head = s.log.log.head();
+        let mut sent = rig.app.astation_client.capture_sent_for_test();
+        rig.bridge.r9_link = Some(1);
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute_batch(
+                "CREATE TRIGGER no_mark BEFORE UPDATE ON control_acks
+                 BEGIN SELECT RAISE(ABORT, 'no mark'); END;",
+            )
+            .unwrap();
+        let revoke = own_record(
+            &s.log,
+            "svc-bot",
+            ControlAction::Revoke {
+                interrupt_running: false,
+            },
+            1,
+        );
+        station_pass(
+            &mut rig,
+            0,
+            vec![heads_text(&[(ORIGIN, OWN_FEED, 1)], head)],
+        );
+        let page = page_text(&rig, 1, &[(1, &revoke)]);
+        station_pass(&mut rig, 100, vec![page]);
+        let first = acks_in(&sent.texts());
+        assert_eq!(first.len(), 1, "{first:?}");
+        for n in 0..5 {
+            station_pass(&mut rig, 200 + n * 100, vec![]);
+        }
+        assert!(acks_in(&sent.texts()).is_empty(), "nothing again");
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute_batch("DROP TRIGGER no_mark;")
+            .unwrap();
+        // The next connection: the revoke's result, kept, goes again.
+        rig.bridge.station.as_mut().unwrap().sync_link(
+            Some(2),
+            2,
+            || crate::runtime::delegated::station::LinkKind::Routed,
+            || Some(ORIGIN.to_string()),
+        );
+        rig.bridge.r9_link = Some(2);
+        station_pass(&mut rig, 1_000, vec![]);
+        let again = acks_in(&sent.texts());
+        assert!(
+            again.iter().any(|ack| ack.results.iter().any(|r| matches!(
+                r,
+                AckResult::Record { record_id, .. } if record_id == revoke.record_id()
+            ))),
+            "{again:?}"
+        );
+    });
+}
+
+/// C1b re-review, observation 1 (ruling C1b-b, m2): the bridge's send loop
+/// hands the link only the live `control_sync` (`FeedSync::outgoing` at its
+/// call site). In one pass, a `heads` below the cursor (the feed rolled
+/// back: a reset, marked, its read from 0 asked at once) and then a page
+/// the reader refuses (a Station fault: the live call retired): the read
+/// from 0 was asked and retired in that pass, so no `control_sync` goes. A
+/// later pass's call, past the fault's pause, goes.
+#[test]
+fn a_pass_hands_the_link_only_the_live_control_sync() {
+    use atem_client::control::{ControlAction, ToStation};
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        let head = s.log.log.head();
+        bridge_heads(&mut rig, 2, head);
+        let cover = own_record(&s.log, "svc-bot", ControlAction::Cover, 1);
+        let hold = own_record(&s.log, "svc-bot", ControlAction::Hold, 2);
+        bridge_page(&mut rig, 2, &[(1, &cover), (2, &hold)]);
+        let mut sent = rig.app.astation_client.capture_sent_for_test();
+        rig.bridge.r9_link = Some(1);
+        let syncs = |texts: Vec<String>| {
+            texts
+                .iter()
+                .filter(|text| {
+                    matches!(
+                        ToStation::decode(text.as_bytes()),
+                        Ok(ToStation::ControlSync(_))
+                    )
+                })
+                .count()
+        };
+        let rolled_back = heads_text(&[(ORIGIN, OWN_FEED, 1)], head);
+        let refused = r#"{"type":"relay","op":"control_sync_result"}"#.to_string();
+        station_pass(&mut rig, 2_000, vec![rolled_back.clone(), refused]);
+        let feed = rig.bridge.station.as_ref().unwrap().feed.dump();
+        assert_eq!(feed["faults"], 1, "{feed}");
+        assert_eq!(
+            feed["reset"]["durable"], true,
+            "marked, its read asked: {feed}"
+        );
+        // The cover's call; the read from 0, never sent, leaves the
+        // retired ids (`FeedSync::unsent`).
+        assert_eq!(feed["retired"], 1, "{feed}");
+        assert_eq!(feed["in_flight"], serde_json::Value::Null, "{feed}");
+        assert_eq!(syncs(sent.texts()), 0, "retired in the pass that asked it");
+        // Past the fault's pause, the next heads asks again: it goes.
+        station_pass(&mut rig, 40_000, vec![rolled_back]);
+        assert_eq!(syncs(sent.texts()), 1);
+    });
+}
+
+/// Task 34 (found by `control_feed_binary` under load): in a pass the
+/// Station link's messages come before host-work's pass, which builds the
+/// delegated clock (`ensure_clock`); after a restart, the passes adopting
+/// surviving workers skip both, so a `heads` that came meanwhile is handled
+/// in the first pass that isn't adopting, before the clock exists. Its
+/// `station_time` still goes through the clock, built for it: never taken
+/// as one the clock couldn't record (that closes the gate until the
+/// Station's next `heads`, up to its 30-second heartbeat, and `atem status`
+/// would blame the host clock).
+#[test]
+fn a_heads_before_host_works_pass_finds_the_delegated_clock() {
+    use crate::runtime::delegated::sync::Closed;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let s = fed_host(&mut rig, root, &os);
+        // A restart's first pass: the store open, the clock not built yet.
+        rig.bridge.work.clock = None;
+        let head = s.log.log.head();
+        bridge_heads(&mut rig, 0, head);
+        let closed = |rig: &LocalRig| rig.bridge.station.as_ref().unwrap().feed.closed();
+        assert_ne!(closed(&rig), Some(Closed::ClockUnrecorded));
+        assert!(rig.bridge.work.clock.is_some(), "built for the heads");
+        // The feed (empty) read: open.
+        bridge_page(&mut rig, 0, &[]);
+        assert_eq!(closed(&rig), None);
+    });
+}
+
+/// PR 11 (PR 7's alerts beside PR 10's control alerts): the two kinds stay
+/// apart. A control record that fails verification is kept as evidence
+/// and raises a control alert (Decision 12: `runtime.log`, at most hourly;
+/// counted on the `Control feeds:` line); a delegated task of unknown
+/// outcome raises an owner's alert (I.4.6, §11.3: `alert_list`, the
+/// `Delegated:` count, its push hint). Neither shows where the other does.
+#[test]
+fn control_alerts_and_unknown_outcome_alerts_stay_apart() {
+    use crate::runtime::protocol::DelegatedStatus;
+    use crate::session_protocol::membership::r9log::{auth, secret};
+    use atem_client::control::ControlAction;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut s = fed_host(&mut rig, root, &os);
+        alerts_on(&mut rig);
+        // An unknown outcome of the phone's (its task never started: the
+        // gate is closed until the Station's heads).
+        let template = phone_task(
+            &mut rig,
+            &s.phone,
+            "AN_UNKNOWN_OUTCOME",
+            host_now().wall_ms + HOUR,
+        );
+        let template = stored_record(&rig, &template);
+        let unknown = unknown_outcomes(&rig, &template, PHONE, 1);
+        // The Station's feed: a cover, then a record that fails
+        // verification.
+        let head = s.log.log.head();
+        bridge_heads(&mut rig, 1, head);
+        let cover = own_record(&s.log, "svc-bot", ControlAction::Cover, 1);
+        bridge_page(&mut rig, 1, &[(1, &cover)]);
+        s.log
+            .keys
+            .insert_ed25519(auth("svc-forger"), &secret("forger"));
+        let forged = crate::runtime::delegated::feeds::signed_record(
+            &s.log,
+            "svc-bot",
+            "svc-forger",
+            ControlAction::Hold,
+            uuid::Uuid::new_v4().to_string(),
+            (ORIGIN, OWN_FEED),
+            host_now().wall_ms + 2,
+        );
+        rig.bridge.feed_advance(clocks_after(2_000));
+        bridge_heads(&mut rig, 2, head);
+        bridge_page(&mut rig, 2, &[(2, &forged)]);
+        // The control alert: one, on the `Control feeds:` line only.
+        let line = rig.bridge.feeds_status().unwrap();
+        assert!(
+            line.contains(&format!(
+                "; 1 alert(s) since the start, the latest: a control record from the feed of {ORIGIN} kept as evidence"
+            )),
+            "{line}"
+        );
+        // The owner's alerts: the unknown outcome only.
+        let (alerts, more) = page_for(&mut rig, &s.phone, None);
+        assert!(!more);
+        assert_eq!(
+            alerts.iter().map(|a| a.task_id.clone()).collect::<Vec<_>>(),
+            unknown
+        );
+        assert_eq!(alert_rows(&rig).len(), 1, "no row for the control alert");
+        assert_eq!(
+            rig.bridge.delegated_status(),
+            Some(DelegatedStatus { unresolved: 1 })
+        );
+    });
+}

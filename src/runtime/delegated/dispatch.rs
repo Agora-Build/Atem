@@ -47,7 +47,7 @@ use crate::session_protocol::host::{
 };
 
 /// A task that waits for its first attempt (host-work v1's text).
-pub(super) const WAITING_FOR_A_READY_AGENT: &str = "waiting for a ready agent";
+pub(super) use crate::runtime::delegated::start::WAITING_FOR_A_READY_AGENT;
 /// The dispatch intent is durable (host-work v1's text).
 const DISPATCH_INTENT: &str = "dispatch intent persisted";
 

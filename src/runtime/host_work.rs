@@ -1159,10 +1159,47 @@ fn holds_a_wait(state: &str, r: &str) -> String {
     format!("NOT ({state}='outcome_unknown' AND json_extract({r},'{WAITS_RULE}') IS 1)")
 }
 
+// Tests: the step of a store's replacement (`Store::replace`, and what its
+// caller makes the new store with) that fails, as a crash or an I/O error
+// there would.
+#[cfg(test)]
+thread_local! {
+    static REPLACE_FAULT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests: `step` of a store's replacement fails from now on (`None`: none).
+#[cfg(test)]
+pub(crate) fn fail_replace_at(step: Option<&'static str>) {
+    REPLACE_FAULT.with(|fault| fault.set(step));
+}
+
+/// A step of a store's replacement (`Store::replace`): an error when a test
+/// makes it fail ([`fail_replace_at`]); nothing in a build.
+pub(crate) fn replace_step(step: &'static str) -> Result<()> {
+    #[cfg(test)]
+    if REPLACE_FAULT.with(std::cell::Cell::get) == Some(step) {
+        bail!("a test's fault at the replacement's {step} step");
+    }
+    let _ = step;
+    Ok(())
+}
+
+/// The store's file in the runtime's state directory.
+const STORE_FILE: &str = "host-work.sqlite";
+
+/// The name a new identity's store is built under before it replaces the
+/// current one ([`Store::replace`]).
+const NEXT_STORE_FILE: &str = "host-work.sqlite.next";
+
 impl Store {
     pub fn open(state: &Path) -> Result<Self> {
+        Self::open_file(state, STORE_FILE)
+    }
+
+    /// The store in the file `name` of `state` (made if missing).
+    fn open_file(state: &Path, name: &str) -> Result<Self> {
         super::worker::private_dir(state)?;
-        let path = state.join("host-work.sqlite");
+        let path = state.join(name);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1228,7 +1265,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS intents (
                 task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, reason TEXT NOT NULL,
                 revocation TEXT, created_ms INTEGER NOT NULL, done_ms INTEGER,
-                delivered_turn TEXT);
+                delivered_turn TEXT, delivered_by TEXT);
             CREATE UNIQUE INDEX IF NOT EXISTS intents_one
                 ON intents(attempt_id, reason, ifnull(revocation, ''));
             CREATE INDEX IF NOT EXISTS intents_pending ON intents(task_id)
@@ -1237,7 +1274,6 @@ impl Store {
         track_kept_replies(&db)?;
         track_open_records(&db)?;
         track_waits(&db)?;
-        crate::runtime::delegated::intents::track_delivered_by(&db)?;
         std::fs::File::open(state)?.sync_all()?;
         let hints = crate::runtime::delegated::alerts::HintWatch::open(&db)?;
         Ok(Self {
@@ -1384,6 +1420,60 @@ impl Store {
         }
         std::fs::File::open(&state)?.sync_all()?;
         Ok(aside)
+    }
+
+    /// [`Store::retire`] and the next store in one step, for a host whose
+    /// identity changed while it keeps a control state (ruling T35f, m1):
+    /// the new store is built whole at a temporary path (`make` binds it and
+    /// makes its tables), closed, and only then renamed over
+    /// `host-work.sqlite`, the directory synced; the old one is kept aside
+    /// (a hard link, as `retire`'s), its hot journal with it. A failure at
+    /// any step, or a crash there, leaves `host-work.sqlite` the old store
+    /// or the whole new one, never none and never one `make` didn't finish;
+    /// what an earlier attempt left at the temporary path is removed first.
+    /// The new store, opened again at its path, and where the old one went.
+    pub fn replace(
+        self,
+        at_ms: u64,
+        make: impl FnOnce(&Store) -> Result<()>,
+    ) -> Result<(Store, PathBuf)> {
+        let state = self.state.clone();
+        let path = state.join(STORE_FILE);
+        let next = state.join(NEXT_STORE_FILE);
+        for leftover in [
+            next.clone(),
+            state.join(format!("{NEXT_STORE_FILE}-journal")),
+        ] {
+            match std::fs::remove_file(&leftover) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
+        replace_step("build")?;
+        let built = Self::open_file(&state, NEXT_STORE_FILE)?;
+        make(&built)?;
+        replace_step("close")?;
+        built.db.close().map_err(|(_, e)| e)?;
+        let Self { db, .. } = self;
+        db.close().map_err(|(_, e)| e)?;
+        let aside = state.join(format!("{STORE_FILE}.retired-{at_ms}"));
+        replace_step("link")?;
+        std::fs::hard_link(&path, &aside)?;
+        // A hot journal belongs to the retired file, never to the next one.
+        replace_step("journal")?;
+        let journal = state.join(format!("{STORE_FILE}-journal"));
+        if journal.exists() {
+            std::fs::rename(
+                &journal,
+                state.join(format!("{STORE_FILE}.retired-{at_ms}-journal")),
+            )?;
+        }
+        replace_step("rename")?;
+        std::fs::rename(&next, &path)?;
+        replace_step("sync")?;
+        std::fs::File::open(&state)?.sync_all()?;
+        replace_step("reopen")?;
+        Ok((Self::open(&state)?, aside))
     }
 
     pub fn launch(&self, id: &str) -> Result<Option<LaunchRecord>> {
@@ -1609,6 +1699,21 @@ impl Store {
         )
     }
 
+    /// The delegated tasks of `principal` that wait or run (`queued`,
+    /// `blocked`, `submitting`, `submitted`), oldest first: what a control
+    /// record's effects act on (`delegated::effects::act`), the principal
+    /// filtered in SQL so no other sender's record is parsed. A row whose
+    /// record isn't JSON is left out here (the passes that read every task
+    /// settle it, `fail_unreadable`).
+    pub fn delegated_active_of(&self, principal: &str) -> Result<Vec<WorkRecord>> {
+        self.tasks(
+            "SELECT id,record FROM work WHERE state IN ('queued','blocked','submitting','submitted')
+            AND CASE WHEN json_valid(record) THEN json_extract(record,'$.delegated.principal') END=?1
+            ORDER BY rowid",
+            [principal],
+        )
+    }
+
     /// A task of unknown outcome holds `session_id`'s queue (until it
     /// expires or a reply proves its turn ran; a delegated one until its
     /// deadline, design I.4.6), through `work_waits`.
@@ -1793,6 +1898,25 @@ impl Store {
             [],
             |r| r.get(0),
         )?)
+    }
+
+    /// The launch projects (`project`, host-private) of the open delegated
+    /// tasks admitted under a `projects` scope (ruling T20c): what the
+    /// bridge has hashed under every kid in use, whatever became of their
+    /// sessions. Read through `open_records`, so closed records cost
+    /// nothing.
+    pub fn delegated_projects(&self) -> Result<BTreeSet<String>> {
+        let mut st = self.db.prepare(
+            "SELECT DISTINCT json_extract(w.record,'$.project') FROM open_records o
+            CROSS JOIN work w ON w.id=o.id
+            WHERE o.kind='work'
+            AND json_type(w.record,'$.delegated.scope_at_admission.projects')='array'",
+        )?;
+        let projects = st
+            .query_map([], |r| r.get::<_, Option<String>>(0))?
+            .filter_map(|p| p.transpose())
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(projects)
     }
 
     /// Before its deadline, a task awaiting its result or of unknown
@@ -2532,6 +2656,45 @@ mod tests {
         assert_eq!(tasks, 1);
     }
 
+    /// Ruling T35f, m1: `replace` keeps the old store aside, as `retire`
+    /// does, and puts the new one, as `make` made it, at the store's path;
+    /// what an earlier attempt left at the temporary path goes first.
+    #[test]
+    fn a_replaced_store_is_kept_aside_and_the_new_one_is_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.bind(&host()).unwrap();
+        assert!(store.enqueue(&task()).unwrap());
+        std::fs::write(dir.path().join(NEXT_STORE_FILE), b"an earlier attempt's").unwrap();
+        let mut other = host();
+        other.host_trust_gen += 1;
+        let (store, aside) = store
+            .replace(7, |next| {
+                next.bind(&other)?;
+                next.db.execute_batch("CREATE TABLE made (one INTEGER)")?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(aside, dir.path().join("host-work.sqlite.retired-7"));
+        assert_eq!(store.bound().unwrap(), Some(other));
+        assert!(store.open_tasks().unwrap().is_empty());
+        let made: bool = store
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='made')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(made);
+        assert!(!dir.path().join(NEXT_STORE_FILE).exists());
+        let kept = Connection::open(&aside).unwrap();
+        let tasks: i64 = kept
+            .query_row("SELECT count(*) FROM work", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tasks, 1);
+    }
+
     #[test]
     fn queue_deduplicates_and_never_replays_interrupted_dispatch_intent() {
         let dir = tempfile::tempdir().unwrap();
@@ -2690,6 +2853,67 @@ mod tests {
         // Nothing more is due: nothing is written.
         assert_eq!(store.settle_overdue(1_999, |_| None).unwrap(), 0);
         assert_eq!(store.settle_overdue(2_000, |_| None).unwrap(), 1);
+    }
+
+    /// Ruling T20c (Task 32 review m1): the launch projects hashed for
+    /// delegated tasks at a start are those of every delegated task with a
+    /// `projects` scope whose record is open: settled ones too, until their
+    /// payloads (the reply among them) are dropped and the record closes.
+    #[test]
+    fn delegated_projects_include_settled_tasks_until_their_payloads_drop() {
+        use crate::runtime::delegated::{Admission, DelegatedSender, FeedRef};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        store.bind(&host()).unwrap();
+        let put = |project: &str, state: WorkState, scope: Option<serde_json::Value>| {
+            let mut r = task();
+            r.project = project.into();
+            r.status.state = state;
+            r.delegated = scope.map(|scope| Admission {
+                principal: "service:bot".into(),
+                principal_key: "ab".repeat(32),
+                sender: DelegatedSender::Service {
+                    device_id: "bot".into(),
+                    feed: FeedRef {
+                        origin: "https://s.test".into(),
+                        feed_id: "f".into(),
+                    },
+                },
+                feed: None,
+                route_id: "backend".into(),
+                route_revision: 1,
+                ops_at_admission: vec!["notify".into(), "prompt".into()],
+                scope_at_admission: scope,
+                grant_expires_at: Some(100),
+                device_list_seq: 3,
+                projects_matched: vec![],
+            });
+            store
+                .db
+                .execute(
+                    "INSERT INTO work(id,record,state) VALUES(?1,?2,?3)",
+                    params![
+                        r.task.task_id,
+                        serde_json::to_string(&r).unwrap(),
+                        serde_json::to_value(state).unwrap().as_str().unwrap()
+                    ],
+                )
+                .unwrap();
+        };
+        let projects =
+            serde_json::json!({"ops": ["notify"], "hosts": ["host"], "projects": ["h1.k.aa"]});
+        let hosts = serde_json::json!({"ops": ["notify"], "hosts": ["host"]});
+        put("local:open", WorkState::Queued, Some(projects.clone()));
+        put("local:done", WorkState::Completed, Some(projects));
+        put("local:unscoped", WorkState::Queued, Some(hosts));
+        put("local:v1", WorkState::Queued, None);
+        let want = |p: &[&str]| p.iter().map(|p| p.to_string()).collect::<BTreeSet<_>>();
+        assert_eq!(
+            store.delegated_projects().unwrap(),
+            want(&["local:done", "local:open"])
+        );
+        store.drop_payloads(100 + PAYLOAD_RETENTION_MS).unwrap();
+        assert_eq!(store.delegated_projects().unwrap(), want(&["local:open"]));
     }
 
     /// The admission record of a task of [`task`]'s sender, a native

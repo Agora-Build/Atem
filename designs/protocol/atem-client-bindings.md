@@ -30,10 +30,10 @@ before emitting that event; apps still inspect errors and each result state.
 | `host.reply` | `reply_query` | [Host work](atem-host-work-v1.md#reply) |
 | `host.messages` | `message_publish`, `message_query` | [Host work](atem-host-work-v1.md#5-messages) |
 | `host.attachments` | `attachment_put` | [Host work](atem-host-work-v1.md#6-attachments-and-mark) |
-| `host.delegated` (planned; no host advertises it yet) | `work_interrupt`, `work_resolve` | [Host work §11.2](atem-host-work-v1.md#112-work_interrupt-and-work_resolve) |
-| `host.alerts` (planned; no host advertises it yet) | `alert_list` | [Host work §11.3](atem-host-work-v1.md#113-alert_list-hostalerts) |
+| `host.delegated` (not advertised: only a debug build's runtime started with its debug-only hook lists it, step 4) | `work_interrupt`, `work_resolve` | [Host work §11.2](atem-host-work-v1.md#112-work_interrupt-and-work_resolve) |
+| `host.alerts` (not advertised: as `host.delegated`) | `alert_list` | [Host work §11.3](atem-host-work-v1.md#113-alert_list-hostalerts) |
 
-The two planned features' results are host-work results too:
+The two unadvertised features' results are host-work results too:
 - `alert_list` answers with an `alerts` result kind, and `work_resolve` with
   a `work` result that carries `resolved`.
 - Released readers reject both, so Atem and Astation enable these features
@@ -1053,7 +1053,7 @@ jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (70 checks in JS, 72 in Kotlin and in Swift: the same 70
+- **Conformance** (73 checks in JS, 75 in Kotlin and in Swift: the same 73
   in each language, plus two in Kotlin and Swift, whose provider sees the
   signing request and so the purposes of the five device-list actions and
   of control records; over `designs/protocol/fixtures/r9-vectors-*.json`,
@@ -1174,7 +1174,7 @@ Station written in another language uses these exports, which are the
 same code and pass the same vectors and fixtures
 (`r9-vectors-host-work-control`, `r9-control-ack-*`, run by the Rust core
 and all three conformance suites). They are production exports, in the
-default UniFFI build and in the `wasm`-only package (plan decision 6). The
+default UniFFI build and in the `wasm`-only package. The
 wire they read and write is host-work-v1 §11.4 ("Station calls and
 acknowledgments").
 
@@ -1253,7 +1253,9 @@ synchronized clock: it orders covers (below).
    that can't be read is `malformed`: it names no list, so nothing may
    start empty. Parts name their device list, so a store of parts
    loads the current list's parts and skips the others, reporting them
-   in `foreign` (delete those rows): an old list's leftovers never load,
+   in `foreign` (delete those rows only when your own pairing changed;
+   under the same pairing they are damage: stop the work, as Astation
+   answered on #120, 2026-11-13): an old list's leftovers never load,
    so a service id that recurs in the new list inherits no revoke, hold or
    coverage, and the current list's stops beside them stay in force. At a
    live re-pair, delete the old list's rows in the transaction that adopts
@@ -1353,12 +1355,15 @@ trust model"):
   possible replay (rule 1), and a release lifts only holds issued before
   it (O1, rule 6), so a hold you sign with an older time than a release
   you already signed could be lifted by that release served late. What
-  it can't close: a hold another signer (another Station, a native
-  manager's device) issued with a clock behind your release can still be
+  it can't close: a hold another holder of the service's key (such as
+  another Station) issued with a clock behind your release can still be
   lifted by it, within that clock skew (no regression: before O1 any
   release in feed order could); and your release is refused
-  `not_after_hold` while your clock is behind another signer's hold,
-  until it passes it (fails safe; the ack's reason says so).
+  `not_after_hold` while your clock is behind that hold, until it passes
+  it (fails safe; the ack's reason says so). Only the service's own key
+  signs a hold or a release; a native manager signs `revoke` and
+  `interrupt_running` only (corrected on Astation's request on #120,
+  2026-11-14).
 - Your covers' `issued_at` only
   rises: each cover you sign for a
   principal is newer than any cover issued for it before, a handed-over
@@ -1440,7 +1445,6 @@ and opens no gate.
 | call | what it does |
 |---|---|
 | `relay_decode_to_station(message)` | reads a host's call strictly (at most 256 KiB as received, one strict I-JSON parse, exact fields, never `null`): `ControlSync{request_id, origin, feed_id?, after}` (answer with its `request_id` and `after`), `ControlAck{ack}` or `MembershipFetch{after}`. Another relay message on the link (`push_hint`, `push_seen`, …) is `Invalid{wrong_message}`: dispatch it elsewhere. The calling host is never a field: take it from the link's verified association (below). An ack's `ControlEffectResult.why` (O5, **for Astation's sign-off**, amended for step 4; host-work-v1 §11.4 wire rule 10; the vocabulary is `control_why_codes()`, JS `controlWhyCodes()`) is why an effect `pending` or `refused` isn't in force, as the host wrote it, or `None` (JS `null`): read it as information only, never as a count or a request to re-sign, and treat a code you don't know as unrecognized (a later version's; the result stands). A reason that is `null`, not a text, empty, over 64 bytes, outside `[a-z0-9_]` or beside `applied` or `duplicate` refuses the whole ack, `Invalid{malformed}` |
-| `relay_control_sync_result(origin, feed_id, head, station_time, records)` | the page after the host's `after`: at most 64 `RelayFeedRecord{feed_seq, record_json}`, ascending, each `feed_seq` in `1..=head`, 256 KiB in all. Each record goes through the control parser first: one it refuses is `Invalid{code}` with its parse code, and the page isn't written. Serve only records you validated at intake and stored |
 | `relay_control_sync_result(request_id, origin, feed_id, after, head, station_time, records)` | the answer to the call `request_id` names, its `after` echoed, on the feed it named (or, for a call that named none, the account's current feed): at most 64 `RelayFeedRecord{feed_seq, record_json}`, ascending, each `feed_seq` strictly after `after` and at most `head` (gaps are legal; a `head` below `after`, a feed that went back under the same id, takes no record: the host rescans), 256 KiB in all. Never leave out earlier stored records to fill a page with later ones. Each record goes through the control parser first: one it refuses is `Invalid{code}` with its parse code, and the page isn't written. Serve only records you validated at intake and stored |
 | `relay_control_sync_answers(call, result)` | whether the `control_sync_result` text `result` answers the `control_sync` text `call` (each read strictly; `Invalid{code}` if either isn't one): `RelaySyncVerdict::Answers`, else the first field that differs, `RequestId`, `Origin`, `FeedId` or `After`. The shared matching decision of the host and the `:8080` proxy; the caller compares the link generation, account and genesis it captured with the call |
 | `relay_heads(feeds, membership)` | each covering feed's `RelayFeedHead{origin, feed_id, head, station_time}` (at most 64, a feed once) and the device list's `LogHead`. Send it on every (re)connection, every 30 seconds and at once when a record is stored. `membership` is the stored log's `LogHead` exactly: the host compares `seq` and hash (**Atem's reading, for Astation**, step 4, 2026-11-13; host-work-v1 §11.4, "The gate") |
@@ -1461,7 +1465,8 @@ missing, `null`, upper case or not a v4 UUID, a result without its `after`,
 a record at or below `after`, and a `head` below `after` with records),
 the `matching` cases (a result read against one or more calls by
 `relay_control_sync_answers`: a match, a discovery answered on the current
-feed, a feed gone back, mismatches on the id, the origin, the feed and the
+feed, a named feed read from 0 answered on that feed only, a feed gone
+back, mismatches on the id, the origin, the feed and the
 `after`, two calls at the same cursor that differ only by their ids, and a
 retired call's late reply, each with its verdict),
 and the byte bound for each call

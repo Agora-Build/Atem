@@ -31,9 +31,12 @@
 pub mod envelope;
 #[cfg(test)]
 mod fixtures_tests;
+#[cfg(test)]
+mod hold_tests;
 pub mod host_policy;
 #[cfg(test)]
 mod host_policy_host_tests;
+pub mod peek;
 pub mod push;
 #[cfg(test)]
 mod push_tests;
@@ -119,6 +122,20 @@ const DETAIL_REVOKED_UNREADABLE: &str = "revoked grants unreadable";
 /// `busy` for a browser while the host's wall clock is below the revoked
 /// grants' bound, `max(until, high_water)` (the clock went back).
 const DETAIL_CLOCK_BACK: &str = "host clock went back";
+/// `unauthorized` for a service a control record revoked on this host
+/// (delegated host-work design I.5.5 step 2; behind `host.delegated`): its
+/// fenced attachments get it before their close, and its later `hello`s.
+pub const DETAIL_REVOKED: &str = "revoked";
+/// `busy` for every service while the host's control state can't be
+/// checked (damaged, or not loaded; ruling T35c, behind `host.delegated`):
+/// its `hello`s, and its attachments closed when that state begins. The
+/// start check's text for the same wait (host-work-v1 §11.6).
+pub const DETAIL_UNCHECKED: &str = "revocations not yet checked";
+/// `busy` for a service a control record holds on this host (a `hold` not
+/// released since; behind `host.delegated`): its attachments get it before
+/// their close, and its later `hello`s, until a `release`. The start
+/// check's text for its held tasks (host-work-v1 §11.6).
+pub const DETAIL_PAUSED: &str = "paused";
 
 /// What the pairing directory vouches for, for the revoked grants (§R9.6).
 pub struct PairingVouch {
@@ -381,6 +398,22 @@ pub struct R9Host {
     seen: HashSet<(String, String)>,
     /// The error a fenced principal's attachments get before their close.
     fence_errors: HashMap<String, SessionError>,
+    /// The services a control record revoked on this host (design I.5.5
+    /// step 2), as the runtime's committed control state has them (only
+    /// behind `host.delegated`): their `hello`s are refused.
+    revoked_services: HashSet<String>,
+    /// Of those, the ones [`R9Host::fence_revoked`] fenced in this run: a
+    /// second fence of one with no attachment left does nothing (one §H
+    /// fence per revoke).
+    revoked_fenced: HashSet<String>,
+    /// The host's control state can't be checked (damaged, or not loaded:
+    /// ruling T35c; only behind `host.delegated`): every service's `hello`
+    /// is refused `busy`, as host work answers its requests.
+    services_unchecked: bool,
+    /// The services a control record holds on this host, as the runtime's
+    /// committed control state has them (only behind `host.delegated`):
+    /// their `hello`s and requests are refused `busy`, `paused`.
+    held_services: HashSet<String>,
     /// The `close` reason of an attachment the session host is about to
     /// close for a fence that ends its channel's lifetime (a service's or
     /// a browser grant's expiry): `expired`, not `closed`. Noted before the
@@ -481,7 +514,7 @@ impl LineLimit {
 }
 
 /// A Station's message to a host (host-work-v1 §11.4), by its `op`.
-fn is_station_message(op: &str) -> bool {
+pub(crate) fn is_station_message(op: &str) -> bool {
     use atem_client::control::relay::op;
     [
         op::CONTROL_SYNC_RESULT,
@@ -767,6 +800,10 @@ impl R9Host {
             quarantine_retry_at: 0,
             seen: HashSet::new(),
             fence_errors: HashMap::new(),
+            revoked_services: HashSet::new(),
+            revoked_fenced: HashSet::new(),
+            services_unchecked: false,
+            held_services: HashSet::new(),
             closing: HashMap::new(),
             dead: Vec::new(),
             flush_cursor: None,
@@ -1550,6 +1587,33 @@ impl R9Host {
                 return effects;
             }
         };
+        // A service the device list admits (its own final refusals first:
+        // removed, expired, out of scope; review N1): one a control record
+        // revoked here (design I.5.5 step 2: the host refuses all its
+        // future requests, its `hello` first), then any while the control
+        // state can't be checked (ruling T35c: whether a record revoked it
+        // isn't known).
+        if matches!(authority.principal, Principal::Service { .. }) {
+            let refused = if self.revoked_services.contains(&authority.name()) {
+                Some(error(
+                    code::UNAUTHORIZED,
+                    re.as_deref(),
+                    Some(DETAIL_REVOKED),
+                ))
+            } else if self.services_unchecked {
+                Some(error(code::BUSY, re.as_deref(), Some(DETAIL_UNCHECKED)))
+            } else if self.held_services.contains(&authority.name()) {
+                // A control record holds it (host-work-v1 §11.1, the hold's
+                // fence): until its release.
+                Some(error(code::BUSY, re.as_deref(), Some(DETAIL_PAUSED)))
+            } else {
+                None
+            };
+            if let Some(e) = refused {
+                refuse(self, keyed, e);
+                return effects;
+            }
+        }
         let mut channel = match keyed.admit(&authority.key, authority.channel_deadline_ms(&now)) {
             Ok(channel) => channel,
             Err(refusal) => {
@@ -1774,6 +1838,185 @@ impl R9Host {
         self.closing.clear();
     }
 
+    /// The services a control record revoked on this host, as the
+    /// runtime's committed control state has them (design I.5.5 step 2;
+    /// only behind `host.delegated`, so empty otherwise): their `hello`s are
+    /// refused `unauthorized`, `revoked`. A live one's attachments are
+    /// fenced by [`R9Host::fence_revoked`].
+    pub fn set_revoked_services(&mut self, revoked: HashSet<String>) {
+        self.revoked_fenced.retain(|p| revoked.contains(p));
+        self.revoked_services = revoked;
+    }
+
+    /// The services whose `hello`s are refused as revoked.
+    pub fn revoked_services(&self) -> &HashSet<String> {
+        &self.revoked_services
+    }
+
+    /// The service `principal` was revoked by a control record (design
+    /// I.5.5 step 2): session-v1's §H fence, once, whether or not it has
+    /// attachments (its `control_gen` raised, its leases revoked, its queued
+    /// work rejected, and each attachment it has closed after
+    /// `unauthorized`, `revoked`; host-work-v1 §11.1), and its later
+    /// `hello`s refused.
+    ///
+    /// Once per revoke in a run: a principal it fenced already, with no
+    /// attachment left, is fenced no more (its `control_gen` raised once;
+    /// review m1).
+    pub fn fence_revoked<J: Journal>(
+        &mut self,
+        principal: &str,
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        self.revoked_services.insert(principal.to_string());
+        let live = self.attachments().iter().any(|(_, p)| p == principal);
+        if self.revoked_fenced.contains(principal) && !live {
+            return Vec::new();
+        }
+        self.revoked_fenced.insert(principal.to_string());
+        self.fence_errors.insert(
+            principal.to_string(),
+            error(code::UNAUTHORIZED, None, Some(DETAIL_REVOKED)),
+        );
+        parts.host.fence_principal(principal, 0)
+    }
+
+    /// Whether every service's `hello` is refused `busy` now (the control
+    /// state can't be checked; ruling T35c).
+    pub fn services_unchecked(&self) -> bool {
+        self.services_unchecked
+    }
+
+    /// At construction, before any channel: whether the control state
+    /// starts unchecked (with `host.delegated` on it does, until the runtime
+    /// loads it: fail closed from the start).
+    pub fn start_services_unchecked(&mut self, unchecked: bool) {
+        self.services_unchecked = unchecked;
+    }
+
+    /// The host's control state can (`false`) or can't (`true`) be checked
+    /// now (ruling T35c; only behind `host.delegated`). While it can't,
+    /// every service's `hello` is refused `busy`, `revocations not yet
+    /// checked`; entering that state fences every live service attachment
+    /// through §H (its `control_gen` raised, its queued work rejected), each
+    /// closed after the same error. Natives and browser grants are
+    /// untouched. Leaving it lifts the refusal: the revoked services
+    /// ([`R9Host::set_revoked_services`]) decide again.
+    pub fn set_services_unchecked<J: Journal>(
+        &mut self,
+        unchecked: bool,
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        let entering = unchecked && !self.services_unchecked;
+        self.services_unchecked = unchecked;
+        if !entering {
+            return Vec::new();
+        }
+        let services: std::collections::BTreeSet<String> = self
+            .chans
+            .values()
+            .filter_map(|c| match &c.phase {
+                Phase::Open(a) if matches!(a.authority.principal, Principal::Service { .. }) => {
+                    Some(a.authority.name())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut effects = Vec::new();
+        for principal in services {
+            self.fence_errors.insert(
+                principal.clone(),
+                error(code::BUSY, None, Some(DETAIL_UNCHECKED)),
+            );
+            effects.extend(parts.host.fence_principal(&principal, 0));
+        }
+        effects
+    }
+
+    /// The services a control record holds on this host (a `hold` not
+    /// released since), as the runtime's committed control state has them
+    /// (only behind `host.delegated`, so empty otherwise; a revoked one is
+    /// never held: its revoke wins). The hold's reversible session-v1 fence
+    /// (host-work-v1 §11.1, **Atem's reading of Astation's item 7 on #120,
+    /// 2026-11-14**):
+    /// - a service newly held that the session host still knows as a
+    ///   remote principal (an attachment, a lease, accepted work, or
+    ///   `control`) is fenced ([`R9Host::fence_held`]): normally the hold's
+    ///   followup fenced it already, so this writes only a fence a crash
+    ///   lost (its `control_gen` raised, so nothing it queued is
+    ///   dispatched: its accepted work is rejected, `control revoked`, and
+    ///   its raw input queued at the PTY writer is dropped at the write
+    ///   boundary, its lease revoked; each attachment it has closed after
+    ///   `busy`, `paused`);
+    /// - while held, its `hello`s are refused `busy`, `paused` (after the
+    ///   device list's own refusals, a revoke and the unchecked control
+    ///   state), and any request of an attachment of it is refused so before
+    ///   anything of it is read;
+    /// - a release (the service gone from the set) lifts the refusal: a
+    ///   fresh `hello` is admitted after the normal checks; no attachment,
+    ///   lease or command of before comes back.
+    ///
+    /// Only services: a native member or a browser grant named here is
+    /// ignored (a hold is signed by the service's own key). Nothing here
+    /// touches a delegated task: their attempts run under the `host-work`
+    /// principal, which no fence names, and the hold's own effects on them
+    /// are the record's.
+    pub fn set_held_services<J: Journal>(
+        &mut self,
+        held: HashSet<String>,
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        let held: HashSet<String> = held
+            .into_iter()
+            .filter(|p| p.starts_with("service:"))
+            .collect();
+        let newly: std::collections::BTreeSet<String> =
+            held.difference(&self.held_services).cloned().collect();
+        self.held_services = held;
+        if newly.is_empty() {
+            return Vec::new();
+        }
+        let mut effects = Vec::new();
+        for principal in newly {
+            effects.extend(self.fence_held(&principal, parts));
+        }
+        effects
+    }
+
+    /// A control record held the service `principal` (its record's
+    /// followup, at once after the commit and before its result goes, held
+    /// still or released since): session-v1's §H fence when the session
+    /// host knows it as a remote principal (an attachment, a lease,
+    /// accepted work or `control`), each attachment closed after `busy`,
+    /// `paused`; nothing for one it doesn't know (fenced already, or never
+    /// seen), so a hold raises its `control_gen` at most once. Its refusal
+    /// is [`R9Host::set_held_services`]'s, from the committed standings.
+    pub fn fence_held<J: Journal>(
+        &mut self,
+        principal: &str,
+        parts: &mut Parts<'_, J>,
+    ) -> Vec<Effect> {
+        if !principal.starts_with("service:")
+            || !parts
+                .host
+                .remote_principals()
+                .iter()
+                .any(|p| p == principal)
+        {
+            return Vec::new();
+        }
+        self.fence_errors.insert(
+            principal.to_string(),
+            error(code::BUSY, None, Some(DETAIL_PAUSED)),
+        );
+        parts.host.fence_principal(principal, 0)
+    }
+
+    /// The services whose `hello`s are refused as held.
+    pub fn held_services(&self) -> &HashSet<String> {
+        &self.held_services
+    }
+
     /// Every r9 attachment gets `membership_head` (the head moved, or a
     /// pending entry changed state).
     pub fn announce<J: Journal>(&mut self, parts: &mut Parts<'_, J>) {
@@ -1805,6 +2048,15 @@ impl R9Host {
             };
             me.seal_to(att, &bytes, mono);
         };
+        // A service a control record holds: nothing of it is admitted,
+        // whatever it asks (its fence closes its attachments; this refuses
+        // what reaches the host before that close: host-work-v1 §11.1).
+        if matches!(authority.principal, Principal::Service { .. })
+            && self.held_services.contains(&authority.name())
+        {
+            refuse(self, code::BUSY, Some(DETAIL_PAUSED));
+            return Vec::new();
+        }
         // The one authority check for every request (§R9.6), before any
         // field is decoded: the named session first, then the op.
         let need = match Need::of_request(&family, &data) {
@@ -2499,6 +2751,30 @@ impl R9Host {
     /// (host-work-v1 §11.4) goes to the Station link, as received
     /// ([`R9Host::take_station_messages`]).
     pub fn relay_message(&mut self, text: &str) {
+        // With `host.delegated` on, the `op` alone is peeked with no
+        // whole-value parse: a Station page that isn't strict JSON elsewhere
+        // (a lone surrogate) still reaches the Station link, whose strict
+        // reader refuses it as a Station fault (host-work-v1 §11.4; Task 30
+        // review 5); one the peek can't read (a duplicate `op` key, a page
+        // cut short) by its top-level names, scanned (`peek`, Task 33 review
+        // m2). With it off (as on main, and in every release build: ruling
+        // T33c, N1) a relay message is read exactly as main reads it: a
+        // whole-value parse, its last `op` winning.
+        if self.delegated {
+            #[derive(serde::Deserialize)]
+            struct Peek {
+                op: Option<String>,
+            }
+            let station = match serde_json::from_str::<Peek>(text) {
+                Ok(Peek { op }) => op.as_deref().is_some_and(is_station_message),
+                Err(_) => peek::relay_op(text, is_station_message),
+            };
+            if station {
+                // At most the App's relay messages of a pass (`RELAY_LIMIT`).
+                self.station_inbox.push(text.to_owned());
+                return;
+            }
+        }
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             return;
         };

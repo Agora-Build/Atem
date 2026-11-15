@@ -1,6 +1,7 @@
 # Delegated host work and host-to-host senders: one design
 
-Status: **planned, not implemented** (nothing is built). Agreed by Atem, Astation and Auth/Portal on 2026-11-08
+Status: **agreed; step 4 (Part I's host side) built behind a debug-only hook and advertised by no release build;
+the rest planned** (2026-11-14; "Step 4 built" below). Agreed by Atem, Astation and Auth/Portal on 2026-11-08
 (revision 6b); the owner decided every choice (Appendix A, and owner choice 20 on 2026-11-08). Astation's
 confirmation is [Atem #120](https://github.com/Agora-Build/Atem/issues/120#issuecomment-6715069931); Portal PR #31
 records the agreement as D29. Nothing activates (features unadvertised, the signing gate closed) until the
@@ -76,19 +77,47 @@ newer hold; the host keeps that hold's time in the principal's part, and no evic
 erases it. The Station's signing duty (agreed in the same comment) makes every record a Station signs for a principal,
 holds included, strictly newer than every record it signed for it before, its high-water mark kept durably before
 publishing, carried at handover and across restart and snapshot generation, waiting rather than bypassing it; what O1
-leaves (a hold another signer issued with a clock behind, and a release refused until the Station's clock passes
-another signer's hold) is stated as its residuals. I.5.8's acknowledgment gains typed reasons (O5, requested by
+leaves (a hold another holder of the service's key, such as another Station, issued with a clock behind, and a release
+refused until the Station's clock passes that hold) is stated as its residuals. Only the service's own key signs a hold
+or a release: native managers sign `revoke` and `interrupt_running` only (I.5.4; corrected on Astation's request on
+#120, 2026-11-14). I.5.8's acknowledgment gains typed reasons (O5, requested by
 Astation on the same day; **for its sign-off**): each effect `pending` or `refused` in a `control_ack` may say why, a
 bounded code of the shared vocabulary, information only (it never changes a result, counts nothing and asks for no
 re-signing; host-work-v1 §11.4 wire rule 10). The design text below is unchanged; the contract states the refinement.
+
+**Step 4 built, behind a debug-only hook (2026-11-14).** Atem built V.2's step 4, Part I's host side:
+- the session host's `host-work` principal (session-v1 R9.14 items 1 to 7; item 8 is still refused);
+- the lifecycle of host-work-v1 §11.6: who is delegated, the admission record, attempts and `receipt_id`, the start
+  check, recovery, the deadline interrupt and interrupt intents, `work_interrupt`, `work_resolve`, unknown outcomes
+  with their alerts, `alert_list` and push hints, the capacity limits, delegated launches at the spawn boundary, the
+  owner's `atem task list --unknown` and `atem task resolve`, and reply retention;
+- the delegated clock (I.6.5; host-work-v1 §11.6, "Clocks"), with real-OS checks;
+- the Station link and its calls (host-work-v1 §11.4): the host's own device-list fetch (IX.1 Q7), the sync of its own
+  Station's control feed with resets, correlation and the revocation gate, and the typed refusals;
+- the records' effects on tasks (host-work-v1 §11.1) and the acknowledgments with their resends (§11.4);
+- with them, R9.7a's `expired` at a channel's lifetime end and the device-list verifier's inventory in `welcome`. The
+  framing shipped before (PR #124, bindings #145).
+
+Only a debug build's `atem runtime` started with `ATEM_TEST_HOST_FEATURES=host.delegated[,host.alerts]` in its own
+environment runs any of it, and only such a runtime lists `host.delegated` and `host.alerts` in its `welcome`. Release
+builds compile the hook out: no feature, no Station call, hosting as before. `host.senders` stays off (the hook refuses
+it), and the signing gate stays closed. Activation is a later owner decision, after the joint check (V.2 step 7,
+VII.A); a dev host turns the features on as [agent-hosting.md](agent-hosting.md) section 14 says ("Delegated work
+on a dev host"). The contracts say what is built: host-work-v1 §11 (its "as built in step 4" passages) and session-v1
+R9.14. Astation answered step 4's contract questions on 2026-11-13 (#120 comments 6848326392 and 6848463998, #164
+comment 6858189009) and signed off O1 and O5 (#156 comment 6858184397); marks written before those answers still read
+"for Astation" until a docs change marks them agreed. The readings written since (host-work-v1 §11.1's effects on
+tasks and service refusals, §11.4's acknowledgments) wait for its answer. The design text below changes only in I.5.5
+step 2's fence sentence (marked "changed to match Atem's spec") and in IX.1 Q7's answer.
 
 **Record of the agreed text.** This file is the proposal as agreed. Its text is
 `proposals/delegated-host-work/delegated-host-work-and-host-senders.md` (outside this repository, frozen; SHA-256
 `cc180912cd8d3afc11c20f77a3ebc4e8a81989ede1327afc90df52d09c39eb83`), changed only by this status block, Appendix B, the link to
 the diagram, the two Astation file references in XI (written so they are not read as paths in this repository), and
 one update marked "updated after agreement" in III.4 (the phone's login is live on dev, Auth #19), and the framing,
-host-mail and clock amendments above, the marks of step 3's agreements, and IX.1 Q7's answer (marked "answered in
-step 4"). The diagram is
+host-mail and clock amendments above, the marks of step 3's agreements, IX.1 Q7's answer (marked "answered in
+step 4"), I.5.5 step 2's fence sentence (marked "changed to match Atem's spec") and the note on step 4's status in the
+paragraph that says nothing here is built. The diagram is
 `delegated-host-work-flows.html` (frozen `flows.html`, SHA-256
 `587a4c74ca9c2645dd3a2c79908813da573451479c0a0a846896fd3ff909cf6a`), changed only in the phone's login in figures 1
 and 2, marked the same way, and, after step 3's agreements, in figure 1 (both hosts use the same Station) and
@@ -109,7 +138,9 @@ design; next to it stays only the diagram of the flows. It merges two designs:
 - Atem's host-to-host senders: stages 2 and 3 of agent collaboration ([agent-collaboration.md](agent-collaboration.md) on Atem's
   branch `feat/agent-collaboration`, `3e60fcc`).
 
-Nothing here is built. The owner has decided every choice: those of Appendix A on 2026-11-07, and owner choice 20,
+Nothing here is built. (**Status since agreement:** the prompt framing is built, and so is step 4, Part I's host side,
+behind a debug-only hook and advertised by no release build; see the status block.) The owner has decided every
+choice: those of Appendix A on 2026-11-07, and owner choice 20,
 which Astation's review raised, on 2026-11-08 (VIII.2). Nothing is built from this design until Atem, Astation and
 Auth/Portal have reviewed it independently and agreed the cross-team contract, and nothing is merged or deployed
 before that contract is agreed and validated. As the source's §10 says (V.3), it gets a new Atem branch and pull
@@ -407,8 +438,8 @@ they can only be interrupted.
 | Pure renewal (only the expiry moves later) | Allowed again | No effect | No effect | Kept | Readable |
 | Widening | Allowed | No effect | No effect | Kept | Readable |
 | Narrowing (less scope, fewer ops, other roles) | Per the new grant | Those no longer covered fail `sender's authorization narrowed` | Continue | Kept; completable within the new grant | Readable within the new grant |
-| Pause, admin pause, owner disabled (`hold` record) | Refused (Auth issues no tokens; the Station refuses) | Held: `blocked`, detail `paused`, until `release` or the deadline | Continue | Kept | Kept |
-| Resume, owner enabled (`release` record) | Allowed again | Run again, if before their deadline | n/a | Kept | Readable |
+| Pause, admin pause, owner disabled (`hold` record) | Refused (Auth issues no tokens; the Station refuses). On the host the hold also fences the service's session-v1, reversibly (**Atem's reading that implements Astation's item 7, #120, 2026-11-14**; host-work-v1 §11.1): its attachments are closed through session-v1's §H fence before the hold is reported applied (a revoke read with it, in one page or pass, wins: only its fence runs, closing after `unauthorized`, `revoked`), so nothing it queued there runs after the hold, and its `hello`s are refused `busy`, `paused`, so over R9 it reads nothing and sends no result or stop of its own while held, its tasks' deadlines running meanwhile; reads and results may go on through the Station API where its lifecycle permits them. v1 work it had from before its cover ends as v1's rules say (`failed`, `sender's authority changed`, never `cancelled`; a v1 launch not yet started is fenced) | Held: `blocked`, detail `paused`, until `release` or the deadline | Continue | Kept | Kept |
+| Resume, owner enabled (`release` record) | Allowed again: a fresh `hello` after the normal checks; no attachment, lease or command of before the hold comes back | Run again, if before their deadline | n/a | Kept | Readable |
 | Revocation (`revoke` record), or R9 removal of the sender | Refused for good | Cancelled: `cancelled`, detail `sender revoked` | Continue, or are interrupted if the record asks | Kept; the owner can query them, interrupt their turn and resolve an `outcome_unknown` one (I.4.5); nobody completes them, so one `awaiting_result` expires at its deadline (**amended 2026-11-13, #120 comment 6848463998**: it said "only the owner can complete or resolve them", but I.4.5 gives the owner no `work_complete`) | Kept; readable by the owner, not the sender |
 | Route revision, principals or profile changed | Per the new route | Fail `route changed` | Continue | Kept | Readable |
 | Device list frozen or faulted | Refused | Fail `sender's authority changed` (as today) | Continue | Kept | Kept |
@@ -605,7 +636,7 @@ R4 bounds accepted tasks by their original deadline (at most 24 h after admissio
   - A receipt-database fault holds the intents, which live in that database, until the restart it asks for. Recovery
     step 3 (I.6.2) and the first pass carry them out then.
   - A runtime started while paused opens and recovers its store only once hosting is on.
-- **With `host.delegated` turned off after tasks were accepted** (step 4's Decision 10, a debug-only hook), a started
+- **With `host.delegated` turned off after tasks were accepted** (a debug-only hook in step 4), a started
   task's turn is still interrupted at its deadline. Atem-internal.
 
 ### I.4.5 Queries, cancel, complete, replies, and new operations
@@ -848,7 +879,10 @@ identity, `account_id` and `genesis_hash` (R9.2), carried as push hints carry th
 a count, plus the 32 most recent of each, persisted at most once a minute. Alerts for failed or conflicting records are
 rate-limited to one an hour per source, with the count: per origin for a feed, and per carrying principal for records
 that arrive over a channel (II.3.1), which have no origin. A Station or a carrier can't fill a host's storage or
-flood the owner with alerts this way.
+flood the owner with alerts this way. **Atem's reading (step 4):** "at most once a minute" is for
+evidence, which has no effect. A pending record is written in the transaction that applies it, with the cursor
+(I.5.5): it is a deferred effect past the cursor, and a crash before a later write would lose a stop the feed never
+serves again. Its 32-row bound still caps storage, and the cursor's write already costs the transaction.
 
 ### I.5.5 Applying a record on the host
 
@@ -856,9 +890,10 @@ Each record is applied in one `host-work.sqlite` transaction, together with the 
 
 1. **Idempotent.** `record_id` is unique. A record already stored is acknowledged and changes nothing.
 2. **Revoke is final.** The first `revoke` marks the principal revoked. The host refuses all its future requests,
-   and runs session-v1's §H fence for it where it has attachments: `control_gen` is raised and its attachments are
-   fenced. **Changed for host senders:** a host principal has no attachments, so there is nothing to fence. Every
-   unstarted task is cancelled (`cancelled`, detail `sender revoked`, held ones included), with any attempt not yet
+   and runs session-v1's §H fence for it once, whether or not it has attachments: its `control_gen` is raised, and
+   each attachment it has is fenced (**changed to match Atem's spec**, host-work-v1 §11.1, step 4: the raised
+   `control_gen` also ends a v1 task the service had before a feed covered it). **Changed for host senders:** a
+   host principal has no attachments, so there is nothing to fence. Every unstarted task is cancelled (`cancelled`, detail `sender revoked`, held ones included), with any attempt not yet
    `executing` withdrawn (I.5.6). A later `hold` or `release` for it is ignored.
 3. **Interrupt is monotonic.** An `interrupt_running: true` on a `revoke`, or a later `interrupt_running` record for a
    revoked principal, writes a durable **interrupt intent** for each of its started tasks. Nothing ever withdraws an
@@ -911,11 +946,22 @@ restart; interrupting a turn that has already ended does nothing.
   - **On the relay**, the host calls `control_sync{request_id, origin, feed_id?, after}` over its own authenticated
     relay connection, and gets `{request_id, origin, feed_id, after, head, station_time, records}`. **Amended in
     place on Astation's request (#164 comment 6858189009):** `request_id` (a fresh UUID v4 for every call) and the
-    echoed `after` let the host match each result to its live call (host-work-v1 §11.4, wire rule 11).
+    echoed `after` let the host match each result to its live call (host-work-v1 §11.4, wire rule 11). A result of a
+    retired call (one unanswered for 35 seconds, refused, or of an earlier link generation) advances nothing and opens
+    no gate (§11.4, "Matching a page to its call").
   - **On `:8080`**, Astation proxies the same calls and announcements to the Station unchanged. Records are signed,
     and Astation is a native manager. **New rule:** the host's own device-list fetch (below) and the mailbox calls
     (II.4.3) are proxied the same way.
   - **With neither path**, the gate stays closed.
+  - **An identity change. Astation's item 15, #120 (Atem's reading that implements it, host-work-v1 §11.4).** A
+    link's association is the host identity its socket was authenticated under (its account, device and trust
+    generation, and the device list's genesis), and on the relay the route proof that identity made (R9.7b). When
+    that identity changes while the link is up (`atem pair verify` on the live link, or a new trust generation,
+    account or genesis), the host never relabels the old association. Its calls and its acknowledgments are retired:
+    a late page is drained, a read from 0 included, however full, and nothing more is asked, fetched or acknowledged
+    on that socket. Once no Astation operation runs, the host reconnects, so the new link is authenticated, and
+    proves its route, under the new identity; the gate stays closed until that link's heads and the new identity's
+    read of the feed from 0.
   - **Which host is calling. Changed after Astation's review.** A routed call uses its link's verified root, host and
     connection binding. A carrier-A call (R9.7b) and a call through `:8080` keep the authenticated transport's host
     association, never a host id the caller picks. Where that association can't be verified, the Station requires a
@@ -948,7 +994,9 @@ restart; interrupting a turn that has already ended does nothing.
   way"). Atem builds it with this work. The announced device-list head is the Station's word, not signed authority: a
   Station that announces a stale head delays a removal. That is R9.3's accepted residual risk ("Revocation is
   eventual, not bounded").
-- **When the gate closes.** On any disconnect, on a reset, and when no head has arrived for 60 seconds.
+- **When the gate closes.** On any disconnect, on a reset, when the host's identity changes (until a link
+  authenticated under the new one has read the feed: "An identity change", above), and when no head has arrived for
+  60 seconds.
 - **While it is closed,** no unstarted remote task of a principal that feed covers starts. Those tasks show `blocked`,
   detail `revocations not yet checked`, and don't hold their session. Local tasks and other senders are unaffected.
 - **Acknowledgment.** The host acknowledges its scan cursor and, per record, its application result (below), and the
@@ -3287,7 +3335,8 @@ forced binding; the rooms the migration can't resolve are refused until claimed 
    place of "not implemented". It fetches when its Station's `heads` (every (re)connection, every 30 s, and at once
    when the Station stores a control record) name a head beyond its own, which takes the place of R9.5's 15-minute
    schedule (a Station that withholds `heads` could withhold the entries as well), and again at once when a deferral
-   it stopped at ends on this host (after a refusal's backoff, at the next `heads`). A fetch that stops at a deferred
+   it stopped at ends on this host, with no `heads` (one that ends during a refusal's backoff, when the backoff ends:
+   Astation, #164 comment 6858189009). A fetch that stops at a deferred
    entry asks nothing more while the deferral holds and the announced head is the same, and counts as fetched up to
    that entry for the gate (I.5.8). "The announced head" is the last `heads`' device-list head, which the host's list
    must hold as that very entry, `seq` and hash; a list that differs from the Station's keeps the gate closed

@@ -232,20 +232,7 @@ impl App {
         let Some(since) = self.route_reconnect else {
             return false;
         };
-        let waiting = self.hosted.as_ref().is_some_and(|h| {
-            !h.inbox.is_empty() || !h.channels.is_empty() || !h.channel_overflow.is_empty()
-        });
-        let unwritten =
-            self.astation_client.channel_unwritten() > 0 && since.elapsed() < ROUTE_RECONNECT_FLUSH;
-        let admitting_now = admitting && since.elapsed() < ROUTE_RECONNECT_ADMISSION;
-        if op_running
-            || self.op_route.is_some()
-            || self.astation_connect_rx.is_some()
-            || self.astation_reauth.is_some()
-            || waiting
-            || unwritten
-            || admitting_now
-        {
+        if self.reconnect_waits(since, op_running, admitting) {
             return false;
         }
         self.route_reconnect = None;
@@ -267,6 +254,62 @@ impl App {
         }
         eprintln!("atem runtime: r9: relay link reconnecting to prove its route");
         self.drop_astation_link("The relay link reconnects to prove its route".into());
+        true
+    }
+
+    /// Whether a reconnect for an event at `since` waits: an Astation
+    /// operation runs (`op_running`, or its route is open), a connect or a
+    /// re-authentication is under way, a session-family message waits for
+    /// admission, for up to [`ROUTE_RECONNECT_FLUSH`] a channel envelope is
+    /// still unwritten, or for up to [`ROUTE_RECONNECT_ADMISSION`] an r9
+    /// channel is mid-admission (`admitting`).
+    fn reconnect_waits(&self, since: Instant, op_running: bool, admitting: bool) -> bool {
+        let waiting = self.hosted.as_ref().is_some_and(|h| {
+            !h.inbox.is_empty() || !h.channels.is_empty() || !h.channel_overflow.is_empty()
+        });
+        let unwritten =
+            self.astation_client.channel_unwritten() > 0 && since.elapsed() < ROUTE_RECONNECT_FLUSH;
+        let admitting_now = admitting && since.elapsed() < ROUTE_RECONNECT_ADMISSION;
+        op_running
+            || self.op_route.is_some()
+            || self.astation_connect_rx.is_some()
+            || self.astation_reauth.is_some()
+            || waiting
+            || unwritten
+            || admitting_now
+    }
+
+    /// host-work-v1 §11.4 "An identity change" (Astation's item 15 on
+    /// #120; `host.delegated` only: the broker asks only then,
+    /// `identity_reconnect`): the host's identity moved while its link was
+    /// up, so that socket's association (Astation's authentication of it,
+    /// and on the relay the route proof its challenge got) is the old
+    /// identity's, and the host never relabels it the new one's. Once
+    /// nothing is in flight (the waits of the route reconnect, above: the
+    /// re-verify's own operation first), the link is dropped and the normal
+    /// reconnect opens a new socket, which Astation authenticates and whose
+    /// challenge the host answers under the new identity; its Station link
+    /// then reads the feed from 0. Once per event: no link, or a link on
+    /// another socket already (a reconnect came first), ends it unused. Any
+    /// link kind: a local link (`:8080`) has no route proof, but its
+    /// authentication is the socket's too.
+    pub fn identity_reconnect_due(&mut self, op_running: bool, admitting: bool) -> bool {
+        let Some((since, socket)) = self.identity_reconnect else {
+            return false;
+        };
+        if self.reconnect_waits(since, op_running, admitting) {
+            return false;
+        }
+        self.identity_reconnect = None;
+        if !self.r9_link_up() || self.astation_client.socket_id() != socket {
+            return false;
+        }
+        eprintln!(
+            "atem runtime: this host's identity changed on its Astation link; reconnecting, so the link is authenticated, and proves its route, under the new identity"
+        );
+        self.drop_astation_link(
+            "This host's identity changed; the Astation link reconnects under it".into(),
+        );
         true
     }
 
@@ -371,6 +414,60 @@ mod tests {
             "no link to reconnect"
         );
         assert!(app.route_reconnect.is_none(), "consumed");
+        assert!(app.astation_reconnect_at.is_none());
+    }
+
+    /// host-work-v1 §11.4 "An identity change": the reconnect after the
+    /// host's identity moved on its live link waits for a running
+    /// operation (the re-verify's own) or a request waiting for admission,
+    /// then drops that socket's link, once; an event for a socket the
+    /// client no longer runs on (a reconnect came first), or with no link,
+    /// ends unused and leaves the link alone.
+    #[test]
+    fn the_identity_reconnect_waits_and_drops_only_its_own_socket_once() {
+        let _profile = crate::test_profile::temp();
+        let linked = |socket: u64| {
+            let mut app = App::new();
+            app.hosted = Some(Hosted::default());
+            app.astation_client.relay_link_for_test();
+            app.astation_client.socket_id_for_test(socket);
+            app.astation_connected = true;
+            app
+        };
+        let mut app = linked(41);
+        assert!(!app.identity_reconnect_due(false, false), "no event");
+        app.identity_reconnect = Some((Instant::now(), 41));
+        assert!(!app.identity_reconnect_due(true, false));
+        assert!(
+            app.identity_reconnect.is_some(),
+            "kept while an operation runs"
+        );
+        app.hosted
+            .as_mut()
+            .unwrap()
+            .inbox
+            .push_back((1, "{}".into()));
+        assert!(!app.identity_reconnect_due(false, false));
+        assert!(
+            app.identity_reconnect.is_some(),
+            "kept while a request waits"
+        );
+        app.hosted.as_mut().unwrap().inbox.clear();
+        assert!(app.identity_reconnect_due(false, false), "reconnected");
+        assert!(!app.astation_connected);
+        assert!(app.astation_reconnect_at.is_some());
+        assert!(app.identity_reconnect.is_none(), "consumed");
+        // Another socket already: unused, the link stays.
+        let mut app = linked(42);
+        app.identity_reconnect = Some((Instant::now(), 41));
+        assert!(!app.identity_reconnect_due(false, false));
+        assert!(app.identity_reconnect.is_none() && app.astation_connected);
+        // No link: unused.
+        let mut app = App::new();
+        app.hosted = Some(Hosted::default());
+        app.identity_reconnect = Some((Instant::now(), 0));
+        assert!(!app.identity_reconnect_due(false, false));
+        assert!(app.identity_reconnect.is_none());
         assert!(app.astation_reconnect_at.is_none());
     }
 

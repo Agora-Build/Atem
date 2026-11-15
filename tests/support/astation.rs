@@ -67,6 +67,11 @@ impl LinkSender {
             let _ = tx.send(Cmd::Send(text));
         }
     }
+
+    /// The newest link the fake took (connection numbers only grow).
+    pub fn latest(&self) -> Option<u64> {
+        self.0.lock().unwrap().keys().max().copied()
+    }
 }
 
 impl FakeAstation {
@@ -300,6 +305,13 @@ async fn answer_auth(
 /// `trust_gen` and verified as `account` / `device`, with a saved session.
 pub fn write_verified_pairing(config: &Path, account: &str, device: &str, trust_gen: u64) {
     super::profile::write_pairing(config, ASTATION, trust_gen);
+    write_verified_trust(config, account, device);
+}
+
+/// Writes `config`'s trust state as verified with `ASTATION` as `account` /
+/// `device` (the pairing left as it is): what a verification's
+/// `deviceVerified` leaves there, for the fields the runtime reads.
+pub fn write_verified_trust(config: &Path, account: &str, device: &str) {
     let entry = json!({
         "device_id": device, "data_account": account, "sign_gen": 1,
         "astation_sign_pub": "", "astation_enc_pub": "", "recovery_sign_pub": "",
@@ -310,6 +322,17 @@ pub fn write_verified_pairing(config: &Path, account: &str, device: &str, trust_
     std::fs::write(
         super::profile::CredPaths::in_dir(config).trust,
         json!({"version": 1, "astations": {ASTATION: entry}}).to_string(),
+    )
+    .unwrap();
+}
+
+/// Writes `config`'s trust state with no Astation verified (the pairing
+/// left as it is): `atem pair verify` then runs its ceremony.
+pub fn write_unverified_trust(config: &Path) {
+    std::fs::create_dir_all(super::profile::CredPaths::in_dir(config).dir).unwrap();
+    std::fs::write(
+        super::profile::CredPaths::in_dir(config).trust,
+        json!({"version": 1, "astations": {}}).to_string(),
     )
     .unwrap();
 }

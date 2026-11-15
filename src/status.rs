@@ -82,6 +82,11 @@ pub struct StatusReport {
     /// it holds deadlines back, while its record is damaged, and for a day
     /// after a repair or a lowering.
     pub clock: Option<Line>,
+    /// The runtime's control feeds (`Control feeds:`, host-work-v1 §11.4;
+    /// step 4's Decisions 12 and 20), with `host.delegated` on or a
+    /// control state that doesn't read: the host's own Station's gate and
+    /// why it is closed, a refusal included.
+    pub feeds: Option<Line>,
     /// The runtime's delegated tasks (`Delegated:`, host-work-v1 §11.6 "On
     /// the host"): only while something is delegated.
     pub delegated: Option<Line>,
@@ -347,6 +352,13 @@ pub fn gather_full(
         } => status.clock.clone().map(Line::new),
         _ => None,
     };
+    let feeds = match runtime {
+        Look::Running {
+            status: Some(status),
+            ..
+        } => status.feeds.clone().map(Line::new),
+        _ => None,
+    };
     let delegated = match runtime {
         Look::Running {
             status: Some(status),
@@ -369,6 +381,7 @@ pub fn gather_full(
         local_agents,
         device_list,
         clock,
+        feeds,
         delegated,
         notes,
     }
@@ -646,6 +659,9 @@ pub fn render(report: &StatusReport) -> String {
     if let Some(line) = &report.clock {
         out.push_str(&format!("{:<16}{}\n", "Clock:", line.value));
     }
+    if let Some(line) = &report.feeds {
+        out.push_str(&format!("{:<16}{}\n", "Control feeds:", line.value));
+    }
     if let Some(line) = &report.delegated {
         out.push_str(&format!("{:<16}{}\n", "Delegated:", line.value));
     }
@@ -851,6 +867,7 @@ pub(crate) mod tests {
             local_agents: Line::new("l"),
             device_list: Some(line),
             clock: None,
+            feeds: None,
             delegated: None,
             notes: Vec::new(),
         };
@@ -1000,6 +1017,7 @@ pub(crate) mod tests {
             local_agents: Line::new("2 running (claude ready, codex ready)"),
             device_list: None,
             clock: None,
+            feeds: None,
             delegated: None,
             notes: Vec::new(),
         };
@@ -1093,6 +1111,70 @@ pub(crate) mod tests {
         );
         // No runtime, no line.
         assert_eq!(report(dir.path()).clock, None);
+    }
+
+    /// The control feeds' line (host-work-v1 §11.4, step 4's Decisions 12
+    /// and 20), when the runtime reports one: after the clock's.
+    #[test]
+    fn the_control_feeds_line_shows_what_the_runtime_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        let quiet = gather_full(&src, None, &running(RuntimeStatus::default()));
+        assert_eq!(quiet.feeds, None);
+        assert!(!render(&quiet).contains("Control feeds:"));
+        let text =
+            "revocations not yet checked (Station refused feed access (forbidden); retrying)";
+        let refused = gather_full(
+            &src,
+            None,
+            &running(RuntimeStatus {
+                clock: Some("c".into()),
+                feeds: Some(text.into()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(refused.feeds, Some(Line::new(text)));
+        assert!(
+            render(&refused).contains(&format!("\nClock:          c\nControl feeds:  {text}\n")),
+            "{}",
+            render(&refused)
+        );
+        assert_eq!(report(dir.path()).feeds, None);
+    }
+
+    /// PR 11 (PR 7's `Delegated:` line and PR 10's `Control feeds:` line
+    /// together): each appears only when the runtime sends it, and with
+    /// both the order is Clock, Control feeds, Delegated: the host's own
+    /// state (its clock, its Station's gate and control alerts), then its
+    /// tasks' (the unresolved outcomes, PR 7's alerts).
+    #[test]
+    fn the_control_feeds_and_delegated_lines_come_in_order() {
+        use crate::runtime::protocol::DelegatedStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        let with = |feeds: Option<&str>, delegated: Option<u32>| {
+            render(&gather_full(
+                &src,
+                None,
+                &running(RuntimeStatus {
+                    clock: Some("c".into()),
+                    feeds: feeds.map(Into::into),
+                    delegated: delegated.map(|unresolved| DelegatedStatus { unresolved }),
+                    ..Default::default()
+                }),
+            ))
+        };
+        let clock = "\nClock:          c\n";
+        let feeds = "Control feeds:  revocations checked\n";
+        let delegated = "Delegated:      1 unresolved outcome (atem task list --unknown)\n";
+        let both = with(Some("revocations checked"), Some(1));
+        assert!(
+            both.ends_with(&format!("{clock}{feeds}{delegated}")),
+            "{both}"
+        );
+        assert!(with(Some("revocations checked"), None).ends_with(&format!("{clock}{feeds}")));
+        assert!(with(None, Some(1)).ends_with(&format!("{clock}{delegated}")));
+        assert!(with(None, None).ends_with(clock));
     }
 
     /// Host-work-v1 §11.6 "On the host" ("`atem status` shows the number of

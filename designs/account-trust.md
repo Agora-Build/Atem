@@ -27,12 +27,12 @@ signatures that chain back to what it pinned.
 | Piece | Where it lives | What it is |
 |---|---|---|
 | Device key | each native Astation (Secure Enclave / platform keystore) | P-256 signing key + X25519 key; never leaves the device; on a manager the signing key requires Face ID / Touch ID (key policy, not protocol) |
-| Membership log | relay stores it (untrusted storage), every trusted device and Atem keep copies | append-only list of signed entries |
+| Membership log | relay stores it (untrusted storage), every trusted device and Atem keep copies; behind the debug-only `host.delegated` hook (delegated host work, step 4) Atem also fetches it from its Station over its own link (§3.4) | append-only list of signed entries |
 | Log entry | in the log | `{account_id, seq, prev_hash, action: add\|remove\|set_roles, device_id, device_sign_pub, device_enc_pub, roles, signer_device_id, signed_at}` + signature by a device whose roles include `manage` at `seq-1` |
 | Genesis | entry `seq = 1` | `add` of the first Astation by itself, roles `manage, view, control`, plus the Recovery Kit's public key (`recovery_sign_pub`) |
 | Recovery Kit | offline, saved by the user (password manager, printed QR + phrase, or another device) | Astation account-recovery feature: a mandatory Ed25519 key created at account setup; never a member; used only in Astation's restore-account flow when every Astation device is lost |
 | Atem pin | Atem's `pairing/membership.json`, beside `pairing/pairing.enc` and `pairing/trust_gen` | `{account_id, genesis_hash, host_trust_gen, recovery_sign_pub, head:{seq, hash}, entries, evidence, frozen?}`; the head only moves forward and is made durable before anything depends on it |
-| Host keys | Atem's `pairing/host_channel_key` (0600, plain, so a host whose cred agent is locked still uses it); planned: `pairing/host_enc_key` beside it | `host_channel_key` (Ed25519) is the `host_key` of the host's `add_host`, new at every pairing and `atem pair verify`; it signs channel acceptances, push hints, seen records and route proofs and never encrypts. **Planned** (delegated host work II.4.1, option (b); signed only behind the signing gate, session-v1 R9.2 "Host senders and projects"): an X25519 `enc_key`, the only key a host could receive mail with. The host makes it with each new `host_channel_key` (and, on a host paired earlier, at the first start of a build that knows it), vouches for it with `enc_sig` by its `host_key`, and a native manager installs it with a `host_enc_key` entry (fresh confirmation); host senders' envelopes and results are sealed to it (II.4). A rotation keeps the previous key 24 h on the host's clock unless `retire_previous` retires it at once; a newer `add_host` or `remove_host` voids both; `atem unpair` deletes the file |
+| Host keys | Atem's `pairing/host_channel_key` (0600, plain, so a host whose cred agent is locked still uses it); planned: `pairing/host_enc_key` beside it | `host_channel_key` (Ed25519) is the `host_key` of the host's `add_host`, new at every pairing and `atem pair verify`; it signs channel acceptances, push hints (approval hints, and `outcome_unknown` hints behind the debug-only `host.alerts` hook, delegated host work step 4), seen records and route proofs and never encrypts. **Planned** (delegated host work II.4.1, option (b), stage 3: step 4 doesn't make it; signed only behind the signing gate, session-v1 R9.2 "Host senders and projects"): an X25519 `enc_key`, the only key a host could receive mail with. The host makes it with each new `host_channel_key` (and, on a host paired earlier, at the first start of a build that knows it), vouches for it with `enc_sig` by its `host_key`, and a native manager installs it with a `host_enc_key` entry (fresh confirmation); host senders' envelopes and results are sealed to it (II.4). A rotation keeps the previous key 24 h on the host's clock unless `retire_previous` retires it at once; a newer `add_host` or `remove_host` voids both; `atem unpair` deletes the file |
 
 Roles: `view` (see sessions/output), `control` (take the lease, type, submit;
 answer the agent's permission prompts without the lease, r8 §G), `manage` (add/remove devices).
@@ -88,8 +88,10 @@ no revocation acknowledgements.
 **Updated in step 4 (2026-11-13; delegated host-work IX.1 Q7):** Atem also
 fetches the log from its Station itself, over its one link (§R9.3, delegated
 host-work I.5.8), behind `host.delegated` until that is activated; until
-then a host gets entries only from devices that connect (and, in debug
-builds, a test hook).
+then a release build gets entries only from devices that connect. A debug
+build fetches when its runtime was started with the debug-only hook that
+turns `host.delegated` on (`ATEM_TEST_HOST_FEATURES`), and debug builds
+also have a carriage test hook.
 
 ### 3.5 Freshness and forks (user decision, 2026-10-19)
 

@@ -2810,10 +2810,11 @@ activation: a relay that fails it gains nothing). **Amended in step 4,
 2026-11-13 (changed agreed meaning, needs Astation's agreement):** that
 fetch is R9.3's, run at its Station's `heads` (every (re)connection, every
 30 s, and at once when it stores a control record; host-work-v1 §11.4) in
-place of this schedule, and at once when a deferral it stopped at ends on
-this host (after a refusal's backoff, at the next `heads`); until
-`host.delegated` is activated a host doesn't fetch, and pending entries and
-their decisions reach it with carriers only.
+place of this schedule, and at once, with no `heads`, when a deferral it
+stopped at ends on this host (one that ends during a refusal's backoff:
+when the backoff ends); until `host.delegated` is activated a host doesn't
+fetch, and pending entries and their decisions reach it with carriers only
+(a debug build's runtime started with the hook fetches: R9.14).
 
 **During the wait the subject has no access** (not even `view`): a
 `hello` by it, or by a device added only by an entry deferred behind it,
@@ -3432,8 +3433,16 @@ fence), `unknown_channel`, `busy`, `too_large`, `malformed`,
 `expired` (the channel's lifetime ended, R9.7 "Limits"). A service's or
 browser grant's expiry (which also fences the principal) and the records
 and bytes limits are lifetime ends: `expired`; a removal, a demotion, a
-revoked grant, a frozen list and a failed record are `closed`. (Atem's
-reading, for Astation.)
+revoked grant, a frozen list and a failed record are `closed`. Behind the
+unadvertised `host.delegated`, so are a service a control record revoked
+(after `unauthorized`, `revoked`), a service a control record holds (after
+`busy`, `paused`; reversible: its `hello` is admitted again after a
+`release`; **Atem's reading that implements Astation's item 7, #120,
+2026-11-14**; a service held and revoked in one page or pass, in either
+order, gets only the revoke's close, after `unauthorized`, `revoked`), and
+every service's channel when the host's control state
+becomes unchecked (after `busy`, `revocations not yet checked`): each a
+fence preceded by its error frame. (Atem's reading, for Astation.)
 
 **Clients and bindings.** A client implementation holds one
 `ClientConnection` (the shared core's per-channel state) per virtual
@@ -3948,8 +3957,9 @@ Open envelope (signed by `host_channel_key`):
   (Astation r3 review 4); an object from another trust generation,
   session or process never matches.
 
-**`outcome_unknown` hint** (planned: part of feature `host.alerts`, which no
-host advertises yet; delegated host-work I.4.6, host-work-v1 §11.3; **new body, agreed with Astation (2026-11-11, #120 comment 6810116314)**). When a task's outcome becomes unknown, the
+**`outcome_unknown` hint** (part of feature `host.alerts`, built in step 4
+behind a debug-only hook and advertised by no release build, R9.14;
+delegated host-work I.4.6, host-work-v1 §11.3; **new body, agreed with Astation (2026-11-11, #120 comment 6810116314)**). When a task's outcome becomes unknown, the
 host signs one hint per recipient, as for an open approval hint, to tell the
 owner's devices that a person is needed. It is a second body of the same
 `type`, signed under the same label (`atem-push-hint-v1`) by
@@ -4211,14 +4221,32 @@ key, head and fences don't depend on the Mac or the cred agent. Fixtures:
 | `recovery_pending` | session | the principal is the subject of a `recovery_add` pending on this host, or is added only behind one; carries `entry_hash`, `effective_at` (R9.5) |
 | `membership_invalid` | session | a carried entry failed (R9.3); carries `head` (after the valid prefix), `index`, `detail` (e.g. `signer_not_manager`, `recovery_key_retired`, `kit_sig_missing`, `self_approval`, `not_a_recovery_entry`, `blob_version_not_increasing`, `array_not_canonical`; planned actions: the details of R9.2 "Host senders and projects"), and `need_before` when the window starts after a divergence |
 | `membership_incomplete` | session | `more` and the principal isn't in the chain yet; carries `head`; reconnect with the next window |
-| `unauthorized` | session | not a current member, removed, expired, grant revoked or issuer fenced (detail says which; the principal is authenticated) |
+| `unauthorized` | session | not a current member, removed, expired, grant revoked or issuer fenced (detail says which; the principal is authenticated); with the unadvertised `host.delegated` on, a service a control record revoked on this host (`revoked`: its attachments when it is fenced, and its later `hello`s; host-work-v1 §11.1, **Atem's reading, for Astation**) |
 | `forbidden` | session | also: an op outside a service's or grant's `ops` |
 | `unknown_session` | all | also: a session outside a service's or grant's scope |
-| `busy` | channel/session | also: `init` rate; a device list that exists but can't be opened (clear, at `init`); a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3) |
+| `busy` | channel/session | also: `init` rate; a device list that exists but can't be opened (clear, at `init`); a failed device-list write ("device list not recorded"), then the journal halt; a held host (a recorded device-list fault, or a carriage record the start can't reconcile): every `hello` but a manager's reconciliation ("device list not reconciled", R9.3); with the unadvertised `host.delegated` on, on a host that keeps a control state (a host-work store with the control tables, whichever identity it is bound to and whatever hosting's state; a host that never had one, hosting never enabled included, refuses no service), every service's `hello` the device list would admit while that state is damaged, doesn't load, was never read (a new store's, a first pairing's or a re-verify's, until its first complete read of the host's own Station's feed), is another identity's (hosting paused across a re-verify or a re-pair: until hosting makes this identity's store and it reads in full; a service revoked under the old identity included), or can't be checked because the host's receipt database faulted (until `atem runtime restart`), and its attachments when that state begins ("revocations not yet checked"; it comes after the device-list decision, so a removed or expired service gets its final `unauthorized`; host-work-v1 §11.1, **Atem's reading, for Astation**); with it on, a service a control record holds on this host (a `hold` not released since), its `hello`s and its attachments when the hold is applied, and any request of such an attachment that reaches the host before its close ("paused"; reversible: a `release` admits its next `hello`; host-work-v1 §11.1, **Atem's reading that implements Astation's item 7, #120, 2026-11-14**) |
 | `unsupported_version` | session | also: `hello` without `revision: 9`; the removed outer `transportPolicy`/`transportPolicyAck` (R9.8a) |
 | `request_id_reused` | session | also: a `host_policy_set` reusing a `request_id` with another body (R9.8a); a `request_id` recorded under another submitter when either is the `host-work` principal (R9.14 item 7; built, behind the unadvertised `host.delegated`) |
 | relay `push_hint` refusals | relay | `skew`, `invalid_times`, `duplicate`, `bad_signature`, `stale` |
 | relay `host_route` refusals | relay | `malformed`, `frozen`, `wrong_account`, `unknown_host`, `bad_signature`, `stale_log`, `fork`, `nonce_mismatch`, `room_mismatch`, `atem_id_mismatch` (R9.7b; the verifier's codes, sent to the host in `host_route_refused`) |
+
+**The order of a service's `hello` refusals** (with the unadvertised
+`host.delegated` on; **Atem's reading that implements Astation's item 7,
+#120, 2026-11-14**): the device list's own first (a removed, expired or
+out-of-scope service gets its final `unauthorized`), then a control
+record's revoke (`unauthorized`, `revoked`: final, it wins over a hold),
+then the unchecked control state (`busy`, `revocations not yet checked`:
+whether a record revoked or holds the service isn't known then, so it
+keeps its own detail), then a hold (`busy`, `paused`). Natives and browser
+grants get none of the last three. Like the device list's own, these
+three go before `sig_c` is verified (R9.7 step 6), and only once the
+channel's account and the principal are resolved: the `init` named this
+host's pinned list (another account's list, a different genesis, is `stale_target` at
+`init`, clear, and no `hello` is read), and the principal is a service
+that list admits at its committed head, after the carriage. The control
+state they come from is the current identity's. So they never answer for
+a principal of another account (Astation's condition on #120, 2026-11-14:
+no cross-account revocation oracle; **Atem's reading, as built**).
 
 ### R9.12 Fixtures
 
@@ -4470,15 +4498,20 @@ agreed revision 6b, I.7) revises session-v1 so that Atem runs a delegated
 sender's task itself, under a host-local principal, while the sender is
 offline. Host-work's side (the task lifecycle, its states and details, the
 clocks) is [atem-host-work-v1.md](atem-host-work-v1.md) §11.6. **Nothing
-here is advertised in this version:** no host lists `host.delegated`,
-`host.alerts` or `host.senders`. Items 1 to 7 are built (step 4 of the
-design's order of work) behind a debug-only hook,
-`ATEM_TEST_HOST_FEATURES=host.delegated`, read once when the runtime
-starts. Release builds compile the hook out, so without it no `host-work`
-principal exists and no receipt carries `task_id` or `sender`. Item 8 is
-still refused (below). The shared core has the wire: the principal's name,
-the receipt fields and their reader, and the op and its answer. Each choice
-that fills in the design is marked. Astation agreed R9.14 (2026-11-11, #120
+here is advertised in this version:** no release build lists
+`host.delegated`, `host.alerts` or `host.senders`. Items 1 to 7 are built
+(step 4 of the design's order of work, complete on 2026-11-14 with the
+lifecycle of host-work-v1 §11.6 that uses them) behind a debug-only hook,
+`ATEM_TEST_HOST_FEATURES=host.delegated[,host.alerts]`, which a debug
+build's runtime reads once, from its own environment, when it starts (no
+client passes `ATEM_TEST_*` to a runtime it starts); only such a runtime
+lists `host.delegated` (and `host.alerts`) in its `welcome`. Release builds
+compile the hook out, so without it no `host-work` principal exists and no
+receipt carries `task_id` or `sender`. Item 8 is still refused (below), and
+`host.senders` stays off (the hook refuses it). The shared core has the
+wire: the principal's name, the receipt fields and their reader, and the op
+and its answer. Each choice that fills in the design is marked. Astation
+agreed R9.14 (2026-11-11, #120
 comment 6810116314), except the two questions still marked open (item 1's
 UI question, item 8's request for a new key) and what step 4 added since,
 each marked where it is: item 1's leases (no prompt that doesn't acquire,
@@ -4486,7 +4519,11 @@ none after a restart) and item 3's fail-closed rules (Atem's choices, for
 Astation to confirm); item 1's lease kept while a request is open, item
 4's refusal-list rules (with §I.2's), item 5's delivery after a restart
 and item 6's reconciliation of `executing` prompts (changed agreed
-meaning, needs Astation's agreement).
+meaning, needs Astation's agreement). Astation then agreed items 1 to 7
+with those step-4 amendments, and answered item 1's UI question (a generic
+controller label until receipt provenance names the task; no holder
+field), on 2026-11-13 (#120 comment 6848326392): the marks below predate
+that answer. Item 8's request stays open.
 
 1. **The `host-work` principal.** Its name is `host-work`
    (`atem_client::session::wire::HOST_WORK_PRINCIPAL`), a bare word like

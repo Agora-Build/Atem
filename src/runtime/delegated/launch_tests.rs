@@ -759,3 +759,80 @@ fn delegated_launch_failures_leave_local_reasons_alone() {
         assert_eq!(rig.bridge.work.refused, before, "local reasons untouched");
     });
 }
+
+/// PR 11 (PR 8's launches under PR 10's ruling T32b): while the control
+/// state doesn't read, a covered service's class can't be decided, so its
+/// `host_launch` is `busy` before anything is stored, as its `work_enqueue`
+/// is: never a v1 launch (fenced by its channel, not checked at the spawn
+/// boundary), never `starting`. Once the state reads again (repaired, then
+/// a restart) the same service's launch is a delegated one.
+#[test]
+fn a_damaged_control_state_makes_a_services_launch_busy_storing_nothing() {
+    use crate::runtime::delegated::feeds::Feeds;
+    use atem_client::control::ControlAction;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = delegated_host(
+            &mut rig,
+            root,
+            &os,
+            start + 3 * HOUR_MS,
+            BotScope::Host,
+            &["launch", "message", "notify", "prompt", "view"],
+        );
+        // The rig's profile `p`, which the bot may launch.
+        configure(&mut rig, root, &phone_toml(root, 1).replace(PHONE, BOT));
+        commit_bot_records(&rig, &s.log, &[ControlAction::Cover]);
+        let db = |rig: &LocalRig, sql: &str| {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .execute(sql, [])
+                .unwrap();
+        };
+        db(
+            &rig,
+            "INSERT INTO control_principals(principal,part) VALUES('service:svc-x','{damaged')",
+        );
+        restart(&mut rig, root, &os, false, true);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Damaged));
+        let launch = |rig: &LocalRig| {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let req = hw::Request::Launch {
+                v: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                host: rig.bridge.work_host(),
+                request_id: request_id.clone(),
+                profile_id: "p".into(),
+                profile_revision: 1,
+                expires_at: host_now().wall_ms + HOUR_MS,
+            };
+            (request_id, req)
+        };
+        let (id, req) = launch(&rig);
+        assert_eq!(ask_req(&mut rig, &s.bot, &req), busy());
+        let store = rig.bridge.work.store.as_ref().unwrap();
+        assert!(store.launch(&id).unwrap().is_none(), "nothing stored");
+        assert!(!rig.bridge.work.pending.contains_key(&id));
+        assert!(rig.bridge.work.launches.is_empty());
+
+        // Repaired, the next start: a delegated launch.
+        db(
+            &rig,
+            "DELETE FROM control_principals WHERE principal='service:svc-x'",
+        );
+        restart(&mut rig, root, &os, false, true);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
+        let (id, req) = launch(&rig);
+        let Ok(ResultBody::Launch { launch }) = ask_req(&mut rig, &s.bot, &req) else {
+            panic!("a launch result");
+        };
+        assert_eq!(launch.state, LaunchState::Starting);
+        assert!(rig.bridge.work.pending[&id].delegated.is_some());
+    });
+}

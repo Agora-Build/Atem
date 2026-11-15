@@ -58,10 +58,12 @@ impl ControlView for CoversBot {
 }
 
 /// How the bot's grant is scoped: the rig's session and [`OTHER_SESSION`],
-/// or these `projects` entries.
+/// these `projects` entries, or the whole host (what a launch needs: no
+/// `sessions`).
 enum BotScope<'a> {
     Sessions,
     Projects(&'a [&'a str]),
+    Host,
 }
 
 /// The rig as a delegated host (`host.delegated` on, the delegated clock on
@@ -160,6 +162,7 @@ fn delegated_host(
         BotScope::Projects(projects) => {
             log.add_service_projects("svc-bot", &["host"], Some(projects), None, ops, bot_expiry)
         }
+        BotScope::Host => log.add_service("svc-bot", &["host"], None, ops, bot_expiry),
     };
     let pairing = crate::profile::Sources::in_dir(&root.join("profile"))
         .paths
@@ -200,6 +203,9 @@ fn delegated_host(
             });
     }
     manual_clock(rig, os);
+    // The control feeds load as at a runtime's first pass (the tests'
+    // control view stands in for them).
+    rig.bridge.ensure_feeds();
     rig.bridge.start_view().gates.open_own_station(ORIGIN);
     rig.bridge.start_view().standings.insert(
         BOT.into(),
@@ -506,7 +512,7 @@ fn expiry_neither_fails_nor_stops_accepted_tasks() {
             .unwrap()
             .save_work(&record)
             .unwrap();
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let second = bot_task(&mut rig, &s, "EXPIRY_SECOND", start + 3 * HOUR);
         blocked(&mut rig, &second, details::REVOCATIONS_NOT_YET_CHECKED).await;
         // The grant expires: `D` passes it.
@@ -620,7 +626,7 @@ fn control_gen_change_doesnt_forbid_reads() {
         let first = phone_task(&mut rig, &phone, "GEN_FIRST", start + HOUR);
         run(&mut rig, &first, "GEN_FIRST").await;
         reply(&mut rig, &first, "GEN_REPLY", &[]).unwrap();
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let second = phone_task(&mut rig, &phone, "GEN_SECOND", start + HOUR);
         blocked(&mut rig, &second, details::REVOCATIONS_NOT_YET_CHECKED).await;
         rig.bridge.features = HostFeatures::default();
@@ -674,7 +680,7 @@ fn narrowing_fails_only_uncovered_unstarted_tasks() {
         let mut s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
         let first = bot_task(&mut rig, &s, "NARROW_FIRST", start + HOUR);
         run(&mut rig, &first, "NARROW_FIRST").await;
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let second = bot_task(&mut rig, &s, "NARROW_SECOND", start + HOUR);
         let bot = s.bot.clone();
         let (message, message_task) = message_from(&rig, BOT, "rs", "NARROW_MESSAGE", None);
@@ -742,12 +748,12 @@ fn narrowing_fails_only_uncovered_unstarted_tasks() {
         assert_eq!(
             rig.bridge
                 .delegated_message_caller(&as_bot, std::slice::from_ref(&covered)),
-            Some(Caller::Sender)
+            Ok(Caller::Sender)
         );
         assert_eq!(
             rig.bridge
                 .delegated_message_caller(&as_bot, &[covered, left_out]),
-            None
+            Err(crate::runtime::delegated::authority::Refused::NotCovered)
         );
         assert_eq!(settled(&rig, &phones).0, WorkState::Blocked);
         rig.bridge.start_view().gates.open_own_station(ORIGIN);
@@ -770,7 +776,7 @@ fn widening_and_renewal_change_nothing() {
         let mut s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
         let first = bot_task(&mut rig, &s, "WIDEN_FIRST", start + HOUR);
         run(&mut rig, &first, "WIDEN_FIRST").await;
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let second = bot_task(&mut rig, &s, "WIDEN_SECOND", start + HOUR);
         blocked(&mut rig, &second, details::REVOCATIONS_NOT_YET_CHECKED).await;
         let bot = s.bot.clone();
@@ -823,7 +829,7 @@ fn route_change_fails_unstarted_keeps_awaiting_and_unknown() {
         let first = phone_task(&mut rig, &phone, "ROUTE_FIRST", start + HOUR);
         run(&mut rig, &first, "ROUTE_FIRST").await;
         reply(&mut rig, &first, "ROUTE_REPLY", &[]).unwrap();
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         // Of unknown outcome (its agent exited mid-turn, say).
         let unknown = phone_task(&mut rig, &phone, "ROUTE_UNKNOWN", start + HOUR);
         let mut record = stored_record(&rig, &unknown);
@@ -1111,7 +1117,7 @@ fn revoked_senders_reply_readable_by_the_owner_not_the_sender() {
         let first = bot_task(&mut rig, &s, "REVOKED_FIRST", start + HOUR);
         run(&mut rig, &first, "REVOKED_FIRST").await;
         reply(&mut rig, &first, "REVOKED_REPLY", &[]).unwrap();
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let second = bot_task(&mut rig, &s, "REVOKED_SECOND", start + HOUR);
         blocked(&mut rig, &second, details::REVOCATIONS_NOT_YET_CHECKED).await;
         rig.bridge
@@ -1507,7 +1513,7 @@ fn a_projects_scoped_grant_expiring_with_a_task_queued_still_runs() {
         let os = ManualOs::at(start);
         let agent = TableAgent::new(true);
         let s = with_project_bot(&mut rig, root, &os, start + HOUR, &[PROJECT], &agent).await;
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let task = bot_task(&mut rig, &s, "PROJECTS_EXPIRY", start + 3 * HOUR);
         assert_eq!(
             stored_record(&rig, &task)
@@ -1624,7 +1630,7 @@ fn a_narrowing_that_drops_the_project_is_forbidden() {
         .await;
         let first = bot_task(&mut rig, &s, "PROJECTS_FIRST", start + HOUR);
         run(&mut rig, &first, "PROJECTS_FIRST").await;
-        rig.bridge.start_view().gates = Gates::closed_until_feeds();
+        rig.bridge.start_view().gates = Gates::default();
         let second = bot_task(&mut rig, &s, "PROJECTS_SECOND", start + HOUR);
         blocked(&mut rig, &second, details::REVOCATIONS_NOT_YET_CHECKED).await;
         let out = s.log.narrow_service(
@@ -1646,6 +1652,374 @@ fn a_narrowing_that_drops_the_project_is_forbidden() {
         assert_eq!(
             status(ask(&mut rig, &mac, Q::Query(&first))).state,
             WorkState::AwaitingResult
+        );
+    });
+}
+
+/// The feed the control feeds' tests sign records in: the host's own
+/// Station's.
+const FEED_ID: &str = "22222222-2222-4222-8222-222222222222";
+
+/// The bot's records with `actions`, signed with its key as its Station
+/// issues them, applied by a feed store over the rig's store (as a sync
+/// applies them) in one transaction, at positions 1, 2, …, and committed.
+/// The bridge's own feed store doesn't see them until it loads again.
+fn commit_bot_records(
+    rig: &LocalRig,
+    log: &TestLog,
+    actions: &[atem_client::control::ControlAction],
+) {
+    use crate::runtime::delegated::feeds::{FeedStore, signed_record};
+    let store = rig.bridge.work.store.as_ref().unwrap();
+    let mut feeds = FeedStore::load(store, &log.log).unwrap();
+    feeds.set_own_origin(Some(ORIGIN.into()));
+    let list = rig.bridge.membership.as_ref().unwrap().list_state();
+    let tx = feeds.begin(store).unwrap();
+    for (i, action) in actions.iter().enumerate() {
+        let rec = signed_record(
+            log,
+            "svc-bot",
+            "svc-bot",
+            *action,
+            uuid::Uuid::new_v4().to_string(),
+            (ORIGIN, FEED_ID),
+            host_now().wall_ms + i as u64,
+        );
+        let pos = feeds.position(FEED_ID, i as u64 + 1).unwrap();
+        feeds.apply(&tx, &rec, &list, pos, 0).unwrap();
+    }
+    // As a sync's read of the feed up to its head (ruling T35d, B).
+    feeds.clear_unread(&tx).unwrap();
+    feeds.commit(tx).unwrap();
+}
+
+/// Decisions 13 and 16 with the control feeds (PR 10): the bridge's feed
+/// store loads with the device list; a service is delegated once a cover
+/// record covers it (`sender_class` reads the feeds, not `NoFeeds`); and
+/// what a record commits is in the start view at its commit, with no pass
+/// of host-work's in between (a pause included).
+#[test]
+fn the_feeds_cover_a_service_and_reach_the_start_view_at_commit() {
+    use crate::runtime::delegated::feeds::{Feeds, signed_record};
+    use atem_client::control::ControlAction;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let s = with_bot(&mut rig, root, &os, start + 3 * HOUR);
+        // The feeds, not the tests' stand-in.
+        rig.bridge.work.controls = None;
+        rig.bridge.start_view().standings.clear();
+        passes(&mut rig, 1);
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Loaded(_)));
+        // Never read in full yet (ruling T35d, B): unchecked, never v1.
+        assert_eq!(rig.bridge.sender_class(BOT), SenderClass::Unchecked);
+        let list = rig.bridge.membership.as_ref().unwrap().list_state();
+        let apply = |rig: &mut LocalRig, action: ControlAction, seq: u64| {
+            let rec = signed_record(
+                &s.log,
+                "svc-bot",
+                "svc-bot",
+                action,
+                uuid::Uuid::new_v4().to_string(),
+                (ORIGIN, FEED_ID),
+                start + seq,
+            );
+            let State { feeds, store, .. } = &mut rig.bridge.work;
+            let (Feeds::Loaded(feeds), Some(store)) = (feeds, store.as_ref()) else {
+                panic!("the feeds loaded");
+            };
+            feeds.set_own_origin(Some(ORIGIN.into()));
+            let tx = feeds.begin(store).unwrap();
+            let pos = feeds.position(FEED_ID, seq).unwrap();
+            feeds.apply(&tx, &rec, &list, pos, 0).unwrap();
+            // As a sync's read of the feed up to its head.
+            feeds.clear_unread(&tx).unwrap();
+            feeds.commit(tx).unwrap();
+        };
+        apply(&mut rig, ControlAction::Cover, 1);
+        let feed = FeedRef {
+            origin: ORIGIN.into(),
+            feed_id: FEED_ID.into(),
+        };
+        assert_eq!(
+            rig.bridge.start_view().standings[BOT].coverage,
+            Some(feed.clone()),
+            "at the commit"
+        );
+        assert_eq!(
+            rig.bridge.sender_class(BOT),
+            SenderClass::Delegated(crate::runtime::delegated::DelegatedSender::Service {
+                device_id: "svc-bot".into(),
+                feed,
+            })
+        );
+        let task = bot_task(&mut rig, &s, "COVERED_BY_A_RECORD", start + HOUR);
+        run(&mut rig, &task, "COVERED_BY_A_RECORD").await;
+        apply(&mut rig, ControlAction::Hold, 2);
+        assert!(rig.bridge.start_view().standings[BOT].held);
+
+        // A store whose state doesn't read, loaded as after a new identity
+        // (Task 32 review m5, I1): the standings shown so far go, the bot
+        // is unchecked (never v1), and nothing delegated starts.
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute(
+                "INSERT INTO control_principals(principal,part) VALUES('service:svc-x','{damaged')",
+                [],
+            )
+            .unwrap();
+        rig.bridge.work.feeds = Feeds::Unloaded;
+        rig.bridge.ensure_feeds();
+        assert!(matches!(rig.bridge.work.feeds, Feeds::Damaged));
+        assert!(rig.bridge.start_view().standings.is_empty());
+        assert!(rig.bridge.start_view().controls_damaged);
+        assert_eq!(rig.bridge.sender_class(BOT), SenderClass::Unchecked);
+        assert!(matches!(
+            rig.bridge.sender_class(PHONE),
+            SenderClass::Delegated(crate::runtime::delegated::DelegatedSender::Native { .. })
+        ));
+    });
+}
+
+/// Task 32 review m1 (ruling T20c): a task whose launch project was never
+/// hashed in this run (its record closed before a restart: only open
+/// records are registered at the start) is registered when its sender asks
+/// about it; while that hash isn't made the sender gets `busy`, never a
+/// `forbidden` that would stand, and then reads it.
+#[test]
+fn a_task_whose_project_isnt_hashed_yet_is_busy_until_it_is() {
+    const NEW_KID: &str = "0e0f0a0c";
+    const NEW_PROJECT: &str =
+        "h1.0e0f0a0c.4444444444444444444444444444444444444444444444444444444444444444";
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let agent = TableAgent::new(true);
+        let mut s =
+            with_project_bot(&mut rig, root, &os, start + 3 * HOUR, &[PROJECT], &agent).await;
+        let task = bot_task(&mut rig, &s, "PROJECTS_NOT_HASHED", start + HOUR);
+        run(&mut rig, &task, "PROJECTS_NOT_HASHED").await;
+        // As a restart finds it once its record closed: not registered.
+        rig.bridge
+            .projects
+            .forget(&crate::runtime::project_scope::task_project_key(
+                RIG_PROJECT,
+            ));
+        let session = rig.sessions.remove(&rig.sid).unwrap();
+        let _ = session.stop();
+        passes(&mut rig, 3);
+        agent
+            .table
+            .lock()
+            .unwrap()
+            .insert((RIG_PROJECT.into(), NEW_KID.into()), NEW_PROJECT.into());
+        let change = s.log.set_service(
+            "svc-bot",
+            &ServiceScope::new(["host"])
+                .projects(Some([NEW_PROJECT]))
+                .ops(["message", "notify", "prompt", "stop"]),
+            start + 3 * HOUR,
+        );
+        carry(&mut rig, &s.log, change);
+        let bot = s.bot.clone();
+        assert_eq!(
+            ask(&mut rig, &bot, Q::Query(&task)),
+            busy(),
+            "not yet hashed"
+        );
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut asked = ask(&mut rig, &bot, Q::Query(&task));
+        while asked.is_err() && Instant::now() < deadline {
+            assert_eq!(asked, busy(), "busy until hashed, never forbidden");
+            passes(&mut rig, 1);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            asked = ask(&mut rig, &bot, Q::Query(&task));
+        }
+        assert_eq!(status(asked).state, WorkState::AwaitingResult);
+    });
+}
+
+/// Ruling T35a (PR 11 setup review m2): a `work_enqueue` retry of a
+/// delegated task registers the task's launch project, as `work_query`
+/// does (ruling T20c): the retry of a task whose record closed before a
+/// restart (its project not registered then), its session gone, is `busy`
+/// while its project isn't hashed under the grant's new kid, never for
+/// good, and then answers the task's status.
+#[test]
+fn an_enqueue_retry_whose_tasks_project_isnt_hashed_yet_is_busy_until_it_is() {
+    const NEW_KID: &str = "0e0f0a0e";
+    const NEW_PROJECT: &str =
+        "h1.0e0f0a0e.6666666666666666666666666666666666666666666666666666666666666666";
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let agent = TableAgent::new(true);
+        let mut s =
+            with_project_bot(&mut rig, root, &os, start + 3 * HOUR, &[PROJECT], &agent).await;
+        let mut req = phone_enqueue(&rig, "PROJECTS_RETRY");
+        if let hw::Request::Enqueue { route_id, task, .. } = &mut req {
+            *route_id = "rs".into();
+            task.expires_at = start + HOUR;
+        }
+        let bot = s.bot.clone();
+        ask_req(&mut rig, &bot, &req).unwrap();
+        let task = enqueued(&req);
+        assert!(stored_record(&rig, &task).delegated.is_some());
+        run(&mut rig, &task, "PROJECTS_RETRY").await;
+        // As a restart finds it once its record closed: not registered.
+        rig.bridge
+            .projects
+            .forget(&crate::runtime::project_scope::task_project_key(
+                RIG_PROJECT,
+            ));
+        let session = rig.sessions.remove(&rig.sid).unwrap();
+        let _ = session.stop();
+        passes(&mut rig, 3);
+        agent
+            .table
+            .lock()
+            .unwrap()
+            .insert((RIG_PROJECT.into(), NEW_KID.into()), NEW_PROJECT.into());
+        let change = s.log.set_service(
+            "svc-bot",
+            &ServiceScope::new(["host"])
+                .projects(Some([NEW_PROJECT]))
+                .ops(["message", "notify", "prompt", "stop"]),
+            start + 3 * HOUR,
+        );
+        carry(&mut rig, &s.log, change);
+        assert_eq!(ask_req(&mut rig, &bot, &req), busy(), "not yet hashed");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut asked = ask_req(&mut rig, &bot, &req);
+        while asked.is_err() && Instant::now() < deadline {
+            assert_eq!(asked, busy(), "busy until hashed, never forbidden");
+            passes(&mut rig, 1);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            asked = ask_req(&mut rig, &bot, &req);
+        }
+        assert_eq!(status(asked).state, WorkState::AwaitingResult);
+    });
+}
+
+/// Task 32 re-review N1: the same for a `message_query` of the bot's
+/// message whose delegated task closed before a restart (its project not
+/// registered then) and whose session is gone: `busy` while its project
+/// isn't hashed under the grant's new kid, never for good: the query
+/// registers the task's project, which is then hashed.
+#[test]
+fn a_message_whose_tasks_project_isnt_hashed_yet_is_busy_until_it_is() {
+    const NEW_KID: &str = "0e0f0a0d";
+    const NEW_PROJECT: &str =
+        "h1.0e0f0a0d.5555555555555555555555555555555555555555555555555555555555555555";
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let agent = TableAgent::new(true);
+        let mut s =
+            with_project_bot(&mut rig, root, &os, start + 3 * HOUR, &[PROJECT], &agent).await;
+        let (publish, task) = message_from(&rig, BOT, "rs", "PROJECTS_MESSAGE", None);
+        let bot = s.bot.clone();
+        ask_req(&mut rig, &bot, &publish).unwrap();
+        assert!(stored_record(&rig, &task).delegated.is_some());
+        run(&mut rig, &task, "PROJECTS_MESSAGE").await;
+        // As a restart finds it once its record closed: not registered.
+        rig.bridge
+            .projects
+            .forget(&crate::runtime::project_scope::task_project_key(
+                RIG_PROJECT,
+            ));
+        let session = rig.sessions.remove(&rig.sid).unwrap();
+        let _ = session.stop();
+        passes(&mut rig, 3);
+        agent
+            .table
+            .lock()
+            .unwrap()
+            .insert((RIG_PROJECT.into(), NEW_KID.into()), NEW_PROJECT.into());
+        let change = s.log.set_service(
+            "svc-bot",
+            &ServiceScope::new(["host"])
+                .projects(Some([NEW_PROJECT]))
+                .ops(["message", "notify", "prompt", "stop"]),
+            start + 3 * HOUR,
+        );
+        carry(&mut rig, &s.log, change);
+        assert_eq!(
+            ask(&mut rig, &bot, Q::Message(&publish)),
+            busy(),
+            "not yet hashed"
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut asked = ask(&mut rig, &bot, Q::Message(&publish));
+        while asked.is_err() && Instant::now() < deadline {
+            assert_eq!(asked, busy(), "busy until hashed, never forbidden");
+            passes(&mut rig, 1);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            asked = ask(&mut rig, &bot, Q::Message(&publish));
+        }
+        assert!(matches!(asked, Ok(ResultBody::Message { .. })), "{asked:?}");
+    });
+}
+
+/// Task 20 re-review M1, ruling T20c (the first PR that covers services):
+/// the bot's grant is re-issued under a kid its task's admission didn't
+/// see (a K rotation) after the task's session stopped. Its task stays
+/// readable and completable by the bot: the task's launch project
+/// (host-private, kept with its record) is hashed under the new kid through
+/// the cred agent, without the session.
+#[test]
+fn a_projects_scoped_task_is_compared_under_a_new_kid_without_its_session() {
+    const NEW_KID: &str = "0e0f0a0b";
+    const NEW_PROJECT: &str =
+        "h1.0e0f0a0b.3333333333333333333333333333333333333333333333333333333333333333";
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let agent = TableAgent::new(true);
+        let mut s =
+            with_project_bot(&mut rig, root, &os, start + 3 * HOUR, &[PROJECT], &agent).await;
+        let task = bot_task(&mut rig, &s, "PROJECTS_NEW_KID", start + HOUR);
+        run(&mut rig, &task, "PROJECTS_NEW_KID").await;
+        // The session stops: its hashes leave with it.
+        let session = rig.sessions.remove(&rig.sid).unwrap();
+        let _ = session.stop();
+        passes(&mut rig, 3);
+        assert_eq!(rig.bridge.projects.matches(rig.sid.as_str(), PROJECT), None);
+        // A K rotation: the grant re-issued under the new kid.
+        agent
+            .table
+            .lock()
+            .unwrap()
+            .insert((RIG_PROJECT.into(), NEW_KID.into()), NEW_PROJECT.into());
+        let change = s.log.set_service(
+            "svc-bot",
+            &ServiceScope::new(["host"])
+                .projects(Some([NEW_PROJECT]))
+                .ops(["message", "notify", "prompt", "stop"]),
+            start + 3 * HOUR,
+        );
+        carry(&mut rig, &s.log, change);
+        let bot = s.bot.clone();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut asked = ask(&mut rig, &bot, Q::Query(&task));
+        while asked.is_err() && Instant::now() < deadline {
+            passes(&mut rig, 1);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            asked = ask(&mut rig, &bot, Q::Query(&task));
+        }
+        assert_eq!(status(asked).state, WorkState::AwaitingResult);
+        assert_eq!(
+            status(ask(&mut rig, &bot, Q::Complete(&task, "done"))).state,
+            WorkState::Completed
         );
     });
 }

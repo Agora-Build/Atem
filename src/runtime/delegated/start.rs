@@ -52,6 +52,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 /// delegated tasks keep (§11.6 adds none for it).
 pub const EXPIRED_BEFORE_SUBMISSION: &str = "expired before submission";
 
+/// A task that waits for its (next) attempt: host-work v1's text (§4).
+pub const WAITING_FOR_A_READY_AGENT: &str = "waiting for a ready agent";
+
 /// What stops a delegated task from starting now (design I.3.3, I.4.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
@@ -142,12 +145,17 @@ pub struct ScopeHashes {
 }
 
 impl ScopeHashes {
-    /// Whether `session` is in `entry`'s project: `None` while pending.
-    fn matches(&self, session: &str, entry: &str) -> Option<bool> {
+    /// Whether a task on `session`, whose launch project is `project` (its
+    /// record's, host-private), is in `entry`'s project: the session's hash
+    /// under the entry's kid, else the task's project's (ruling T20c: it
+    /// outlives the session); `None` while pending.
+    fn matches(&self, session: &str, project: &str, entry: &str) -> Option<bool> {
         let Some(kid) = crate::runtime::project_scope::kid_of(entry) else {
             return Some(false);
         };
-        match self.hashes.get(&(session.to_string(), kid.to_string())) {
+        let task = crate::runtime::project_scope::task_project_key(project);
+        let hash = |key: &str| self.hashes.get(&(key.to_string(), kid.to_string()));
+        match hash(session).or_else(|| hash(&task)) {
             Some(hash) => Some(hash == entry),
             None if self.pending.contains(kid) => None,
             // No launch project recorded: never in a `projects` scope.
@@ -173,9 +181,14 @@ pub struct StartView {
     pub list: Option<ListState>,
     /// The session journal halted.
     pub halted: bool,
-    /// The senders' standings by principal: none until the host syncs
-    /// feeds (`NoFeeds`; PR 10 fills them as records apply).
+    /// The senders' standings by principal, as the control feeds
+    /// committed them (`FeedStore`'s publisher, Decision 16).
     pub standings: BTreeMap<String, SenderStanding>,
+    /// The stored control state couldn't be read (`Feeds::Damaged`): no
+    /// sender's revocations can be checked, so no delegated task starts,
+    /// `revocations not yet checked`, a native's caught-up channel
+    /// included (fail closed, never an empty state in its place).
+    pub controls_damaged: bool,
     /// The `runtime.toml` that last loaded.
     pub config: Config,
     pub gates: Gates,
@@ -202,8 +215,9 @@ impl StartView {
             list: None,
             halted: false,
             standings: BTreeMap::new(),
+            controls_damaged: false,
             config: Config::default(),
-            gates: Gates::closed_until_feeds(),
+            gates: Gates::default(),
             fetch: None,
             scopes: ScopeHashes::default(),
             host_id: host_id.to_string(),
@@ -266,8 +280,9 @@ impl StartView {
 ///    then revoked: `cancelled`, `sender revoked` (2);
 /// 3. the route or profile changed (4), the grant narrowed (3): `failed`;
 /// 4. the deadline passed: `expired`;
-/// 5. the journal halted (2a), the sender held (2), a deferred entry (2),
-///    the gate closed (5), a project scope pending (3): `blocked`.
+/// 5. the journal halted (2a), a control state that doesn't read (5), the
+///    sender held (2), a deferred entry (2), the gate closed (5), a
+///    project scope pending (3): `blocked`.
 ///
 /// Expiry alone is ignored: a lapsed grant is judged as it stood (3).
 pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> Result<(), Event> {
@@ -280,11 +295,17 @@ pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> R
     if !authority.allows(Need::Op(Op::Notify)) || !authority.allows(Need::Op(Op::Prompt)) {
         return Err(Event::Narrowed);
     }
-    let scope_pending = scope_pending(view, adm, &authority, &task.target.session_id)?;
+    let scope_pending = scope_pending(
+        view,
+        adm,
+        &authority,
+        &task.target.session_id,
+        &task.accepted.project,
+    )?;
     if now_d_ms.is_some_and(|d| d >= task.deadline) {
         return Err(Event::Expired);
     }
-    waits(view, &sender, adm, scope_pending)
+    waits(view, &sender, adm, scope_pending, false)
 }
 
 /// A delegated sender as the committed device list and control state have
@@ -366,18 +387,21 @@ fn in_effect<'v>(view: &'v StartView, adm: &Admission) -> Result<InEffect<'v>, E
 }
 
 /// Condition 3's scope for `key` (a task's session, or a launch's profile
-/// scope key): `Narrowed` when it is out of `authority`'s scope whatever
-/// the comparisons still pending say; else whether one is pending (in
-/// scope only if they match: waiting for unlock, never narrowed).
+/// scope key) whose launch project is `project` (the task's record's, or
+/// the launch's profile's; its hashes outlive the session, ruling T20c):
+/// `Narrowed` when it is out of `authority`'s scope whatever the
+/// comparisons still pending say; else whether one is pending (in scope
+/// only if they match: waiting for unlock, never narrowed).
 fn scope_pending(
     view: &StartView,
     adm: &Admission,
     authority: &Authority,
     key: &str,
+    project: &str,
 ) -> Result<bool, Event> {
     // An entry the task's project matched at admission decides without a
     // hash (Task 20 review I1); the hashes only for a kid it didn't see.
-    let live = |entry: &str| view.scopes.matches(key, entry);
+    let live = |entry: &str| view.scopes.matches(key, project, entry);
     let pending = !authority.session_in_scope(&view.host_id, key, &|entry| {
         adm.project_matches(entry, &live)
     });
@@ -394,17 +418,26 @@ fn scope_pending(
     Ok(pending)
 }
 
-/// What makes it wait: the journal halted (2a), the sender held (2), a
-/// deferred entry (2), the gate closed (5), then a project scope pending
-/// (3).
+/// What makes it wait: the journal halted (2a), a control state that
+/// doesn't read (5), the sender held (2), a deferred entry (2), the gate
+/// closed (5), then a project scope pending (3). The control state that
+/// doesn't read holds every task (fail closed), but of launches (`launch`)
+/// a service's only: a native's authority is the device list's, never a
+/// control record's (ruling T35a).
 fn waits(
     view: &StartView,
     sender: &InEffect<'_>,
     adm: &Admission,
     scope_pending: bool,
+    launch: bool,
 ) -> Result<(), Event> {
     if view.halted {
         return Err(Event::Halted);
+    }
+    // No sender's revocations can be checked (fail closed).
+    let native = matches!(adm.sender, DelegatedSender::Native { .. });
+    if view.controls_damaged && !(launch && native) {
+        return Err(Event::GateClosed);
     }
     if sender.standing.held {
         return Err(Event::Held);
@@ -478,7 +511,10 @@ pub struct StartLaunch {
 /// The events and their order are [`may_start`]'s, condition 4 being the
 /// profile it was approved under and the deadline its expiry; what settles
 /// a task fails the launch with the event's detail, what blocks one makes it
-/// wait, and an expiry passed is `expired before the spawn`.
+/// wait, and an expiry passed is `expired before the spawn`. One
+/// difference: a control state that doesn't read makes a service's launch
+/// wait, never a native's (ruling T35a: a native's authority is the device
+/// list's).
 ///
 /// Hosting §5's fences come first and are its callers': a receipt-database
 /// fault, a halted session journal alone and hosting switched off fence a
@@ -508,11 +544,17 @@ fn launch_event(view: &StartView, launch: &StartLaunch, now_d_ms: u64) -> Result
     if !launch.profile.permits(&authority) {
         return Err(Event::Narrowed);
     }
-    let scope_pending = scope_pending(view, adm, &authority, &launch.profile.scope_key())?;
+    let scope_pending = scope_pending(
+        view,
+        adm,
+        &authority,
+        &launch.profile.scope_key(),
+        &launch.profile.project,
+    )?;
     if now_d_ms >= launch.expires_at {
         return Err(Event::Expired);
     }
-    waits(view, &sender, adm, scope_pending)
+    waits(view, &sender, adm, scope_pending, true)
 }
 
 /// Host-work's start check in the session host (session-v1 R9.14 item 3):

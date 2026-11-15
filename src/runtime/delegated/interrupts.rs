@@ -265,7 +265,7 @@ impl HostBridge {
                 if let Some(sid) = self.intent_session(intent)
                     && self.host_interrupt(&sid, attempt, cx) == Interrupted::Written
                 {
-                    runs.written(attempt, &turn);
+                    runs.written(attempt, &turn, intent.id);
                 }
             }
             Decision::RevokeOnly => {
@@ -339,7 +339,11 @@ impl HostBridge {
     /// [`crate::runtime::delegated::request`]). Only a delegated task, and
     /// only its sender holding `interrupt` with current authority or the
     /// owner ([`interrupter`]): anything else is `forbidden` (a v1 task,
-    /// one the host doesn't have, `local`).
+    /// one the host doesn't have, `local`), or `busy` while the rule can't
+    /// be decided yet (a service while the control state doesn't read,
+    /// ruling T32b; a `projects` comparison not made yet, its launch
+    /// project registered first, ruling T20c), as for the task's other
+    /// requests.
     ///
     /// When the task's current attempt (`receipt_id`) runs the session's
     /// current turn (`attempt_state`'s `Running`: executing, rebound, and
@@ -386,14 +390,21 @@ impl HostBridge {
         if self.work.error {
             return Err("busy".into());
         }
-        let store = self.work.store.as_ref().ok_or("busy")?;
-        let r = store
+        let r = self
+            .work
+            .store
+            .as_ref()
+            .ok_or("busy")?
             .work(task_id)
             .map_err(|_| "busy")?
             .ok_or("forbidden")?;
         let adm = r.delegated.as_ref().ok_or("forbidden")?;
+        // As every request about the task (PR 11): its launch project
+        // registered first (ruling T20c), and the rule's own code, `busy`
+        // while it can't be decided yet (ruling T32b).
+        self.keep_task_project(&r);
         self.delegated_caller_by(a, &r, adm, interrupter)
-            .map_err(|_| "forbidden")?;
+            .map_err(crate::runtime::delegated::authority::Refused::code)?;
         let status = r.status;
         let attempt = status.receipt_id.clone();
         let now = self

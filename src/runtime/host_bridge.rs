@@ -65,7 +65,10 @@
 //! none until then), and a rebind or trust change drops them all.
 use super::broker::{BrokerSession, SessionState as BrokerState, WriteOutcome, WriteTag};
 use super::delegated::start::{DelegatedStart, StartView};
-use super::delegated::station::{Inbound as StationInbound, LinkKind, Station};
+use super::delegated::station::{
+    Call as StationCall, Inbound as StationInbound, LinkKind, Station,
+};
+use super::delegated::sync::Clocks;
 use super::project_scope::{AgentHasher, ProjectHasher, ProjectScopes};
 use super::refusal_log::{self, RefusalLog, Request};
 use super::worker_approvals::Event as ApprovalEvent;
@@ -769,6 +772,18 @@ impl HostBridge {
         profile: Option<&crate::profile::Sources>,
         clock: Clock,
     ) -> anyhow::Result<Self> {
+        Self::open_with_features(dir, profile, clock, super::test_hooks::host_features())
+    }
+
+    /// [`HostBridge::open`] with the delegated host-work features `features`
+    /// (the debug-only hook's, read once when the runtime starts; tests give
+    /// their own).
+    pub(super) fn open_with_features(
+        dir: &Path,
+        profile: Option<&crate::profile::Sources>,
+        clock: Clock,
+        features: super::test_hooks::HostFeatures,
+    ) -> anyhow::Result<Self> {
         let journal = FileJournal::open(dir).map_err(|e| anyhow::anyhow!(e.0))?;
         // r8 §H: the previous run ended cleanly only if the journal's
         // clean-close record names its epoch, read before this run takes
@@ -813,7 +828,6 @@ impl HostBridge {
         // installed would withdraw them all). The drive hook (debug builds)
         // replaces it with its own verdicts once host-work's attachment
         // exists.
-        let features = super::test_hooks::host_features();
         let start_view = Arc::new(std::sync::Mutex::new(StartView::new(
             &identity.atem_device_id,
         )));
@@ -938,6 +952,9 @@ impl HostBridge {
             project_unread: HashMap::new(),
             r9: {
                 let mut r9 = R9Host::with_pairing(r9host::Limits::default(), Some(dir), vouch);
+                // With `host.delegated` on, no service holds session-v1 until
+                // the control state is loaded and read (ruling T35c).
+                r9.start_services_unchecked(features.delegated);
                 if let Some(pairing) = &pairing {
                     // §R9.8a: a pending policy write is rolled forward first.
                     r9.set_policy_paths(pairing.clone(), dir.to_path_buf());
@@ -1512,11 +1529,19 @@ impl HostBridge {
             return;
         }
         let link_gen = self.r9_link;
+        self.station.get_or_insert_with(Station::new);
+        // The identity first: a new socket is authenticated under the
+        // host's identity now (§11.4 "An identity change").
+        self.station_identity();
         self.station.get_or_insert_with(Station::new).sync_link(
             link_gen,
+            app.astation_client.socket_id(),
             || station_link_kind(app),
             || app.astation_client.selected_station_origin(),
         );
+        // The gate follows the link and the time (60 s without `heads`)
+        // at every pass, whatever the Station sends.
+        self.feed_advance(host_work_bridge::sync_clocks());
         self.refresh_fetch_view();
     }
 
@@ -1541,22 +1566,39 @@ impl HostBridge {
             .map(|d| d.seq)
     }
 
-    /// The Station's messages of this pass, as received (none while
-    /// `host.delegated` is off: dropped), and the host's calls: the device
-    /// list's fetch (design I.5.8, session-v1 R9.3). A fetch result is
-    /// applied as any carriage, with no more trust than any carrier: the
-    /// list's own verification (`carry`), then the r9 engine's effects
-    /// (`R9Host::carried`: fences, push recipients, `membership_head`).
-    /// Calls go on the link's control queue, as the relay's push messages.
+    /// The Station's messages of this pass, as received, and the host's
+    /// calls ([`Self::station_pass_at`], at the pass's clocks). Nothing while
+    /// `host.delegated` is off (no Station: the messages are dropped, and no
+    /// clock is read).
     fn station_pass(&mut self, messages: Vec<String>, cx: &mut Cx) {
+        if self.station.is_none() {
+            return;
+        }
+        self.station_pass_at(messages, host_work_bridge::sync_clocks(), cx);
+    }
+
+    /// The Station's messages of this pass, as received, at the pass's
+    /// clocks `now`, and the host's calls: the device list's fetch (design
+    /// I.5.8, session-v1 R9.3) and the feed sync's (its tick after the
+    /// messages). A fetch result is applied as any carriage, with no more
+    /// trust than any carrier: the list's own verification (`carry`), then
+    /// the r9 engine's effects (`R9Host::carried`: fences, push recipients,
+    /// `membership_head`). Calls go on the link's control queue, as the
+    /// relay's push messages.
+    fn station_pass_at(&mut self, messages: Vec<String>, now: Clocks, cx: &mut Cx) {
+        // An identity the pass took before its Station messages (a re-pin
+        // read with the pass's first requests) ends the link's association
+        // before any of them is read (§11.4 "An identity change").
+        self.station_identity();
         let applied = self.membership.as_ref().map(MembershipHost::head);
         let deferred = self.list_deferral();
         let Some(station) = self.station.as_mut() else {
             return;
         };
-        let mut calls: Vec<atem_client::control::MembershipFetch> = station
-            .tick(host_now().mono_ms, applied, deferred)
+        let mut calls: Vec<StationCall> = station
+            .tick(now.mono_ms, applied, deferred)
             .into_iter()
+            .map(StationCall::Fetch)
             .collect();
         for text in messages {
             let applied = self.membership.as_ref().map(MembershipHost::head);
@@ -1566,11 +1608,27 @@ impl HostBridge {
             };
             let inbound = station.receive(&text, applied, deferred);
             // A `heads` may name a head beyond the list: the gate's
-            // device-list part follows before anything else runs.
+            // device-list part follows before anything else runs; so does
+            // its feed part after a refusal (Decision 16).
             self.refresh_fetch_view();
+            self.publish_feed_gates();
             match inbound {
                 StationInbound::Nothing => {}
-                StationInbound::Send(call) => calls.push(call),
+                // The gates closed already (Decision 20); the
+                // acknowledgments' book holds what it owes (Task 36).
+                StationInbound::AckRefused => self.ack_refused(),
+                // The fetch took the announced list head; the feed sync
+                // takes its feeds (§11.4).
+                StationInbound::Heads(heads, fetch) => {
+                    calls.extend(fetch.map(StationCall::Fetch));
+                    calls.extend(self.feed_heads(&heads));
+                    self.publish_feed_gates();
+                }
+                StationInbound::Page(page) => {
+                    calls.extend(self.feed_page(page));
+                    // The page's gate, as it committed (Decision 16).
+                    self.publish_feed_gates();
+                }
                 StationInbound::Carry(entries) => {
                     // Every entry or none: a carriage is never shortened.
                     let carried: Result<Vec<StrictValue>, _> = entries
@@ -1604,23 +1662,85 @@ impl HostBridge {
                         (applied, after, self.station.as_mut())
                         && let Some(call) = station.fetch.carried(&before, &after, stopped_at)
                     {
-                        calls.push(call);
+                        calls.push(StationCall::Fetch(call));
                     }
                 }
             }
         }
+        // The feed sync's tick after the pass's messages: a page that came
+        // before its call's 35 s deadline answers it first, never drained
+        // as a retired call's (Task 33 re-review 3, m1; ruling C1b-a).
+        calls.extend(self.feed_tick(now));
+        // The device list may have moved (a carriage): pending control
+        // records are applied again.
+        self.feeds_reverify();
+        // What the records' effects asked once they committed (design
+        // I.5.5): withdrawals, fences, intents; then the services' admission
+        // as the committed standings have it (a hold's fence).
+        self.effects_pass(cx);
+        // The acknowledgments due (Task 36, §11.4): after the records'
+        // commits and their followups (a revoke's or a hold's session-v1
+        // fence), so a result goes once its effects are durable and its
+        // fence ran.
+        let acks = self.acks_due();
         let Some(station) = self.station.as_mut() else {
             return;
         };
+        // A `control_sync` goes only while it is the live call: one retired
+        // in this same pass is never sent (ruling C1b-b, m2).
+        let mut syncs = Vec::new();
+        let mut calls: Vec<StationCall> = calls
+            .into_iter()
+            .filter_map(|call| match call {
+                StationCall::Sync(sync) => {
+                    syncs.push(sync);
+                    None
+                }
+                fetch => Some(fetch),
+            })
+            .collect();
+        calls.extend(
+            station
+                .feed
+                .outgoing(syncs)
+                .into_iter()
+                .map(StationCall::Sync),
+        );
         for call in calls {
             let sent = self.r9_link.is_some()
                 && call
                     .to_json()
-                    .is_ok_and(|text| cx.client.try_send_wire(text.to_string(), false).is_ok());
+                    .is_some_and(|text| cx.client.try_send_wire(text.to_string(), false).is_ok());
             if !sent {
-                station.fetch.unsent();
+                match call {
+                    StationCall::Fetch(_) => station.fetch.unsent(),
+                    StationCall::Sync(sync) => station.feed.unsent(&sync.request_id),
+                }
             }
         }
+        // The acks the link took are marked sent; one it didn't take, or
+        // the shared builder refuses (logged: the first, then at powers of
+        // two), stays due.
+        let mut acked = Vec::new();
+        for due in acks {
+            let Some(text) = self.ack_text(&due) else {
+                continue;
+            };
+            if self.r9_link.is_some() && cx.client.try_send_wire(text, false).is_ok() {
+                acked.push(due);
+            }
+        }
+        // Debug builds: the runtime is killed here, results handed to the
+        // link and not marked sent (VII.A test 7).
+        #[cfg(not(test))]
+        if acked.iter().any(|due| !due.ack.results.is_empty()) {
+            crate::runtime::test_hooks::crash_point(
+                "crash_after_ack_handoff",
+                "after handing acknowledgments to the link, before their sent marks",
+            );
+        }
+        self.acks_sent(&acked);
+        self.publish_feed_gates();
         self.refresh_fetch_view();
     }
 
@@ -1923,6 +2043,9 @@ impl HostBridge {
         }
         self.sync_r9_link(r9_app_link(app), &mut cx);
         self.sync_station_link(app);
+        // The services' r9 admission as the control state stands, before
+        // any `hello` of this pass (ruling T35c).
+        self.sync_services(&mut cx);
         if !adopting
             && app
                 .hosted
@@ -2039,6 +2162,20 @@ impl HostBridge {
         if crate::session_protocol::r9::route::set(&app.host_route, self.route_state()) {
             app.route_reconnect = Some(std::time::Instant::now());
         }
+        // §11.4 "An identity change" (`host.delegated` only: the Station
+        // link is there only then): the host's identity moved while its link
+        // was up (a re-verify on the live link, this pass's re-pin
+        // included): that socket is reconnected once, so the next link is
+        // authenticated, and proves its route, under the new identity.
+        self.station_identity();
+        if let Some(socket) = self
+            .station
+            .as_ref()
+            .and_then(|station| station.feed.moved_socket())
+            && app.identity_reconnect.is_none_or(|(_, s)| s != socket)
+        {
+            app.identity_reconnect = Some((std::time::Instant::now(), socket));
+        }
         for relay_only in policy_changes {
             app.host_policy_changed(relay_only);
         }
@@ -2109,6 +2246,10 @@ impl HostBridge {
                 dump["list_part"] = json!(self.membership.as_ref().is_some_and(|m| {
                     station.fetch.part().holds(m.membership(), self.list_deferral())
                 }));
+                // The acknowledgments' book (Task 36), as committed.
+                if let super::delegated::feeds::Feeds::Loaded(feeds) = &self.work.feeds {
+                    dump["acks"] = json!(feeds.acks_dump());
+                }
                 dump
             }),
         });

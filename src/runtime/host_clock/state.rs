@@ -370,6 +370,8 @@ pub struct Step {
 pub struct StationStep {
     pub next: ClockState,
     pub within_cap: bool,
+    /// The floor rose to the Station time: written before it counts.
+    pub raised: bool,
     pub events: Vec<ClockEvent>,
 }
 
@@ -416,6 +418,7 @@ impl ClockState {
             return StationStep {
                 next,
                 within_cap: false,
+                raised: false,
                 events,
             };
         }
@@ -423,7 +426,7 @@ impl ClockState {
             .floor
             .as_ref()
             .map(|f| (f.since(r), predict(f, Crossing::Same, r)));
-        match floor {
+        let raised = match floor {
             Some((since, now)) if st <= now => {
                 // At most 500 ppm of the boot time since the floor last
                 // changed, never below the Station's time.
@@ -431,6 +434,7 @@ impl ClockState {
                 if lowered != now {
                     next.floor = Some(Stamp::at(lowered, r));
                 }
+                false
             }
             _ => {
                 next.floor = Some(Stamp::at(st, r));
@@ -445,11 +449,13 @@ impl ClockState {
                         anchor.station = Some(Stamp::at(st, r));
                     }
                 }
+                true
             }
-        }
+        };
         StationStep {
             next,
             within_cap: true,
+            raised,
             events,
         }
     }
@@ -484,6 +490,7 @@ impl ClockState {
             return StationStep {
                 next,
                 within_cap: false,
+                raised: false,
                 events,
             };
         }
@@ -497,6 +504,7 @@ impl ClockState {
         StationStep {
             next: fresh,
             within_cap: true,
+            raised: true,
             events,
         }
     }
