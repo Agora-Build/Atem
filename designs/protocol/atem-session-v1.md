@@ -2322,7 +2322,13 @@ that entry). Atem verifies the whole chain, that the signer of its
 `add_host` is the verified Astation (`member.auth_key` equals the pinned
 `astation_sign_pub`) and that the entry names its own key and trust
 generation, and pins it (R9.3) before reporting success. Atem refuses a
-log whose genesis is in its `frozen_genesis` list (R9.4).
+log whose genesis is in its `frozen_genesis` list (R9.4). **Proposed
+(owner decision 2026-11-15, for Astation's agreement):** the ceremony also
+hands over the host's new encryption key, so that the same confirmation
+signs its `host_enc_key` right after the `add_host` (`verifyKeys` gains
+`account_id`, `verifyReveal` gains `host_enc_pub` and `host_enc_sig`, and
+rule 4 of R9.6 lets one confirmation cover both entries; host-work-v1
+§11.5, "The host encryption key in the ceremony").
 
 ### R9.3 What Atem stores; carrying suffixes
 
@@ -4086,7 +4092,9 @@ each and may be up to 524,288 bytes (512 KiB) as sent, so a host sender's
 Message keeps host-work-v1 §5's 240 KiB bound; the drop-unread rule
 exempts them up to that bound, and drops a larger one unread as any other.
 Every other relay message, the Station calls of host-work-v1 §11.4
-included, keeps the 256 KiB bound.
+included, keeps the 256 KiB bound. (Their wire, `mailbox_*` relay
+messages, is proposed in host-work-v1 §11.5, "The mailbox calls",
+2026-11-15, for Astation's agreement.)
 
 What Atem keeps for delivery is bounded, and a bound never cuts a
 lifecycle the relay may already hold: once an approval's open hints were
