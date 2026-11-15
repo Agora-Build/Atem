@@ -2,8 +2,10 @@
 //! session-v1 R9.14 item 8; host-work-v1 §11.5, "The recipient's keys"), on
 //! the host, behind the debug-only hook's `host.senders`: the X25519 key
 //! other hosts seal host-sender mail to, the record of every key id this
-//! host made at its trust generation, and this host as the receiver of that
-//! mail. With the hook off nothing here runs: no file is made.
+//! host made at its trust generation, what `host_enc_key_get` answers a
+//! native manager, and this host as the receiver of that mail. With the
+//! hook off nothing here runs: no file is made and the op keeps its
+//! refusal.
 //!
 //! ```text
 //! <profile>/pairing/host_enc_key        {"v":1,"host_trust_gen":N,"secret":"<b64u>","pub":"<b64u>"}
@@ -28,20 +30,33 @@
 //!   made but the record lacks. Only the current generation is kept. A lost
 //!   or unreadable record, or one of another generation, is rebuilt from
 //!   the key the host holds, with a runtime.log line.
+//! - **`host_enc_key_get`** (`R9Host`'s handler, [`hand_out`]): the key the
+//!   host holds for the welcome's trust generation and its `enc_sig`, the
+//!   host vouching for it with its `host_channel_key` (the shared core's
+//!   `sign_host_enc_key`). Nothing is made or rotated for a request; the
+//!   key's id is recorded first when the record lacks it, and a failed
+//!   write is `busy`, nothing handed out.
 //! - **The receiver's view** ([`recipient`]): this host's id and pairing
 //!   generation, the generation's key and the record, as II.4.2's receiver
 //!   takes them (`atem_client::host_mail::Recipient`).
 use atem_client::encoding::{b64u, hex, hex_decode_array};
 use atem_client::host_mail::Recipient;
 use atem_client::keys::enc_kid_bytes;
+use atem_client::membership::{Membership, sign_host_enc_key};
 use atem_client::{KeyId, KeyProvider, PublicKey, SoftwareKeys};
 use rand::RngCore;
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
+use super::HostKey;
 use crate::paths::PairingPaths;
 use crate::session_protocol::membership::journal_of;
 use crate::session_protocol::membership::store::{self, DlFile, Store, WriteError};
+
+/// `busy` detail of `host_enc_key_get` (session-v1 R9.14 item 8): the host
+/// holds no key for its trust generation (none made, or the file can't be
+/// read), or couldn't record the key's id before handing it out.
+pub const DETAIL_UNAVAILABLE: &str = "host encryption key unavailable";
 
 /// The key's name behind its provider.
 const KEY_NAME: &str = "host_enc_key";
@@ -399,6 +414,51 @@ pub(crate) fn ensure_with(
         Ok((key, prior)) => made_lines(&key, replaced, &prior),
         Err(e) => vec![format!("cannot make it: {e}")],
     }
+}
+
+/// What `host_enc_key_get` hands out at `generation` (the welcome's trust
+/// generation): the key the host holds for it, its id durably in the
+/// record first, and `enc_sig` by the host's `host_channel_key` over the
+/// key at this list's account and genesis for `host_id`. Nothing is made.
+/// `Err`: why none is handed out (the op answers `busy`,
+/// [`DETAIL_UNAVAILABLE`]). The line says a record was rebuilt.
+pub(super) fn hand_out(
+    store: &mut Store,
+    pairing: &PairingPaths,
+    m: &Membership,
+    host_key: &HostKey,
+    host_id: &str,
+    generation: u64,
+) -> Result<(HostEncKey, Vec<u8>, Option<String>), String> {
+    let _lock = store.lock().map_err(|e| format!("{e:#}"))?;
+    if !store::present(&pairing.membership) {
+        return Err("the device list is gone".into());
+    }
+    let key = match read_key(store) {
+        Held::Key(key) if key.host_trust_gen == generation => key,
+        Held::Key(key) => {
+            return Err(format!(
+                "the key held is of trust generation {}, not {generation}",
+                key.host_trust_gen
+            ));
+        }
+        Held::Missing => return Err(format!("no key for trust generation {generation}")),
+        Held::Unreadable(why) => return Err(why),
+    };
+    let prior = record_kid(store, generation, key.kid)
+        .map_err(|e| format!("cannot record the key's id: {e}"))?;
+    let sig = sign_host_enc_key(
+        &host_key.keys,
+        &host_key.id,
+        m.account_id(),
+        &m.genesis_hash(),
+        host_id,
+        generation,
+        key.enc_pub(),
+    )
+    .map_err(|e| format!("cannot sign it: {e}"))?;
+    let line = prior.rebuilt(&key);
+    Ok((key, sig, line))
 }
 
 /// This host as the receiver of host-sender mail (design II.4.2;

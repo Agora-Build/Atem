@@ -2325,7 +2325,7 @@ fn revoked_grant_id(n: u32) -> String {
 }
 
 /// A browser grant from the phone, issued now, 50 min long.
-fn browser_of(rig: &mut Rig, n: u32) -> Identity {
+pub(super) fn browser_of(rig: &mut Rig, n: u32) -> Identity {
     let wall = rig.now.host.wall_ms;
     let (g, k) = rig.log.grant(
         "dev-phone",
@@ -3963,7 +3963,7 @@ mod delegated_work_ops {
 
 /// `host_enc_key_get` (delegated host-work design II.4.1, feature
 /// `host.senders`): refused like `control_records` until the host
-/// advertises the feature.
+/// advertises the feature (served: `host_enc_tests`).
 mod host_enc_key_get {
     use super::*;
     use atem_client::session::host_work::SENDERS_FEATURE;
@@ -4037,11 +4037,12 @@ mod host_enc_key_get {
         assert!(rig.relay.is_empty());
     }
 
-    /// `host.senders` on (with `host.delegated`, hosting on): listed, but
-    /// the op keeps its refusal until the host has an encryption key to
-    /// hand out; a service or a browser still gets `forbidden`.
+    /// `host.senders` on (with `host.delegated`, hosting on): listed, and
+    /// the op is the host's to answer (`host_enc_tests`): a native member
+    /// without `manage` is `forbidden` there, a service already at the
+    /// channel's authority check.
     #[test]
-    fn refused_with_host_senders_on_until_served() {
+    fn listed_with_host_senders_on() {
         let mut rig = Rig::new();
         rig.engine.enable_host_work(true);
         rig.engine.set_delegated_features(true, false);
@@ -4055,13 +4056,7 @@ mod host_enc_key_get {
             features.iter().any(|f| f == SENDERS_FEATURE),
             "{features:?}"
         );
-        assert_eq!(
-            refusal(&mut rig, "ch-phone"),
-            (
-                "unsupported_version".into(),
-                Some("host.senders is not advertised".into())
-            )
-        );
+        assert_eq!(refusal(&mut rig, "ch-phone"), ("forbidden".into(), None));
         assert_eq!(refusal(&mut rig, "ch-bot").0, "forbidden");
         assert!(rig.engine.take_host_work().is_empty());
         assert!(rig.relay.is_empty());

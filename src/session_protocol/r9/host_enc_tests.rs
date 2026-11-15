@@ -469,3 +469,306 @@ fn no_recipient_without_a_verified_pairing() {
     );
     assert!(host_enc::recipient(&Sources::in_dir(dir.path())).is_err());
 }
+
+// ── `host_enc_key_get` over real channels (session-v1 R9.14 item 8) ──
+
+mod op {
+    use super::super::tests::{
+        ACCOUNT as R9_ACCOUNT, HOST as R9_HOST, Rig, bot, browser_of, phone,
+    };
+    use super::*;
+    use crate::session_protocol::membership::r9log;
+    use atem_client::connect::{Event as CEvent, Identity};
+    use atem_client::session::host_work::SENDERS_FEATURE;
+    use atem_client::session::r9::HostEncKey as Answer;
+
+    fn mac() -> Identity {
+        Identity::native(r9log::MAC, r9log::auth(r9log::MAC))
+    }
+
+    /// The r9 rig with hosting and the hook's `host.delegated` and
+    /// `host.senders` on, the pairing paths handed to the engine (as the
+    /// runtime does), the host's key made as a start makes it, and the Mac
+    /// (a manager), the phone (control, no manage) and the bot attached.
+    fn rig() -> Rig {
+        let mut rig = Rig::new();
+        rig.engine
+            .set_policy_paths(rig.pairing.clone(), rig.journal.clone());
+        rig.engine.enable_host_work(true);
+        rig.engine.set_delegated_features(true, false);
+        rig.engine.set_senders_feature(true);
+        assert_eq!(host_enc::ensure(&rig.pairing, &rig.journal, 1).len(), 1);
+        rig.link_up();
+        rig.connect("ch-mac", mac());
+        rig.advance(1000);
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-bot", bot());
+        rig
+    }
+
+    /// `handle` asks for the key through the client core: the request's id.
+    fn ask(rig: &mut Rig, handle: &str) -> String {
+        let mono = rig.now.host.mono_ms;
+        let (id, frame) = rig.attached(handle).send_host_enc_key_get(mono).unwrap();
+        rig.send_frame(handle, &frame);
+        id
+    }
+
+    /// The answers and errors `handle` got since the last call.
+    fn replies(rig: &mut Rig, handle: &str) -> (Vec<Answer>, Vec<(String, Option<String>)>) {
+        let mut answers = Vec::new();
+        let mut errors = Vec::new();
+        for event in rig.events(handle) {
+            match event {
+                CEvent::Family(f) if f.data.as_ref().is_some_and(|d| d["op"] == "host_enc_key") => {
+                    answers.push(Answer::from_data(f.data.as_ref().unwrap()).unwrap());
+                }
+                CEvent::Error(e) => errors.push((e.code, e.detail)),
+                other => panic!("{handle}: {other:?}"),
+            }
+        }
+        (answers, errors)
+    }
+
+    fn busy() -> (Vec<Answer>, Vec<(String, Option<String>)>) {
+        (
+            Vec::new(),
+            vec![(
+                "busy".into(),
+                Some("host encryption key unavailable".into()),
+            )],
+        )
+    }
+
+    fn forbidden() -> (Vec<Answer>, Vec<(String, Option<String>)>) {
+        (Vec::new(), vec![("forbidden".into(), None)])
+    }
+
+    /// The public half the key file holds (b64u).
+    fn held(rig: &Rig) -> String {
+        key_of(&rig.pairing).unwrap().1
+    }
+
+    /// A manager gets the key the host holds, bound to this channel's host
+    /// and trust generation (the client core takes it), with an `enc_sig`
+    /// the shared core verifies with the host's `host_key`; drafted into a
+    /// `host_enc_key` entry, the device list accepts it.
+    #[test]
+    fn a_manager_gets_the_key_with_its_enc_sig() {
+        let mut rig = rig();
+        let features = rig.attached("ch-mac").welcome().features.clone();
+        assert!(
+            features.iter().any(|f| f == SENDERS_FEATURE),
+            "{features:?}"
+        );
+        let id = ask(&mut rig, "ch-mac");
+        let (answers, errors) = replies(&mut rig, "ch-mac");
+        assert!(errors.is_empty(), "{errors:?}");
+        let [answer] = answers.as_slice() else {
+            panic!("one answer: {answers:?}");
+        };
+        assert_eq!(answer.re, id);
+        assert!(answer.answers(&id, R9_HOST, 1));
+        assert_eq!(answer.host_id, R9_HOST);
+        assert_eq!(answer.host_trust_gen, 1);
+        assert_eq!(
+            atem_client::encoding::b64u(answer.enc_key.as_bytes()),
+            held(&rig)
+        );
+        // `enc_sig` verifies with the host's `host_key` (its add_host's).
+        let host_key = rig.log.log.host(R9_HOST).unwrap().host_key.clone();
+        atem_client::membership::verify_host_enc_sig(
+            &host_key,
+            R9_ACCOUNT,
+            &rig.log.log.genesis_hash(),
+            R9_HOST,
+            1,
+            answer.enc_key.as_32().unwrap(),
+            &answer.enc_sig,
+        )
+        .expect("enc_sig verifies");
+        // A manager drafts the entry from it; the chain takes it.
+        let action = answer.action(false, r9log::host_now().wall_ms).unwrap();
+        rig.log.append(r9log::MAC, action);
+        let current = rig
+            .log
+            .log
+            .host_enc_key(R9_HOST)
+            .expect("set")
+            .current
+            .clone();
+        assert_eq!(current.key, answer.enc_key);
+        // Its id is the record's; asked again, the same key, nothing written.
+        assert_eq!(
+            record(&rig.pairing),
+            Some(record_of(1, &[&hex(&current.kid)]))
+        );
+        let recorded = std::fs::metadata(&rig.pairing.host_enc_generated)
+            .unwrap()
+            .modified()
+            .unwrap();
+        ask(&mut rig, "ch-mac");
+        let (again, _) = replies(&mut rig, "ch-mac");
+        assert_eq!(again[0].enc_key, answer.enc_key);
+        assert_eq!(again[0].enc_sig, answer.enc_sig, "Ed25519 is deterministic");
+        assert_eq!(
+            std::fs::metadata(&rig.pairing.host_enc_generated)
+                .unwrap()
+                .modified()
+                .unwrap(),
+            recorded
+        );
+        assert!(rig.engine.take_host_work().is_empty());
+        assert!(rig.relay.is_empty());
+    }
+
+    /// Only a native member holding `manage` at the head: a native without
+    /// it, a service and a browser are `forbidden`, and the record and key
+    /// are untouched.
+    #[test]
+    fn others_are_forbidden() {
+        let mut rig = rig();
+        rig.advance(1000);
+        let browser = browser_of(&mut rig, 1);
+        rig.connect("ch-browser", browser);
+        std::fs::remove_file(&rig.pairing.host_enc_generated).unwrap();
+        for handle in ["ch-phone", "ch-browser"] {
+            ask(&mut rig, handle);
+            assert_eq!(replies(&mut rig, handle), forbidden(), "{handle}");
+        }
+        // The client core sends it for a service too; the channel refuses.
+        ask(&mut rig, "ch-bot");
+        assert_eq!(replies(&mut rig, "ch-bot"), forbidden());
+        assert!(!rig.pairing.host_enc_generated.exists(), "nothing written");
+    }
+
+    /// `manage` is checked when each request is handled (R9.8a): the phone
+    /// made a manager gets the key; demoted, `forbidden` again.
+    #[test]
+    fn manage_is_checked_at_each_request() {
+        let mut rig = rig();
+        for (roles, served) in [
+            (&["control", "manage", "view"][..], true),
+            (&["control", "view"][..], false),
+        ] {
+            let entry = rig.log.set_native_roles("dev-phone", roles);
+            let entry = atem_client::SignedObject::parse(entry.to_string().as_bytes()).unwrap();
+            let mono = rig.now.host.mono_ms;
+            let (_, frame) = rig
+                .attached("ch-mac")
+                .send_membership(&[entry], mono)
+                .unwrap();
+            rig.send_frame("ch-mac", &frame);
+            rig.events("ch-mac");
+            rig.advance(1000);
+            let handle = format!("ch-phone-{served}");
+            rig.connect(&handle, phone());
+            ask(&mut rig, &handle);
+            let (answers, errors) = replies(&mut rig, &handle);
+            if served {
+                assert_eq!(answers.len(), 1, "{errors:?}");
+            } else {
+                assert_eq!((answers, errors), forbidden());
+            }
+        }
+    }
+
+    /// The record is written before the reply: lost, it is rebuilt by the
+    /// request (the answer's key in it); a write that fails is `busy` and
+    /// hands nothing out.
+    #[test]
+    fn the_record_is_written_before_the_reply() {
+        let mut rig = rig();
+        std::fs::remove_file(&rig.pairing.host_enc_generated).unwrap();
+        for step in [Step::TempWrite, Step::TempFsync, Step::Rename] {
+            rig.engine.inject_enc_fault(Injected {
+                file: DlFile::HostEncGenerated,
+                step,
+            });
+            ask(&mut rig, "ch-mac");
+            assert_eq!(replies(&mut rig, "ch-mac"), busy(), "{step:?}");
+            assert!(!rig.pairing.host_enc_generated.exists(), "{step:?}");
+        }
+        ask(&mut rig, "ch-mac");
+        let (answers, _) = replies(&mut rig, "ch-mac");
+        let kid = enc_kid(&answers[0].enc_key).unwrap();
+        assert_eq!(record(&rig.pairing), Some(record_of(1, &[&kid])));
+    }
+
+    /// No key for the host's generation (none made, damaged, or another
+    /// generation's): `busy`, nothing made for the request.
+    #[test]
+    fn no_key_is_busy() {
+        let mut rig = rig();
+        let bytes = std::fs::read(&rig.pairing.host_enc_key).unwrap();
+        std::fs::remove_file(&rig.pairing.host_enc_key).unwrap();
+        ask(&mut rig, "ch-mac");
+        assert_eq!(replies(&mut rig, "ch-mac"), busy());
+        assert!(
+            !rig.pairing.host_enc_key.exists(),
+            "never made for a request"
+        );
+        std::fs::write(&rig.pairing.host_enc_key, b"{damaged").unwrap();
+        ask(&mut rig, "ch-mac");
+        assert_eq!(replies(&mut rig, "ch-mac"), busy());
+        let mut other: Value = serde_json::from_slice(&bytes).unwrap();
+        other["host_trust_gen"] = json!(2);
+        std::fs::write(&rig.pairing.host_enc_key, other.to_string()).unwrap();
+        ask(&mut rig, "ch-mac");
+        assert_eq!(replies(&mut rig, "ch-mac"), busy());
+        std::fs::write(&rig.pairing.host_enc_key, &bytes).unwrap();
+        ask(&mut rig, "ch-mac");
+        assert_eq!(replies(&mut rig, "ch-mac").0.len(), 1);
+    }
+
+    /// The hook's `host.senders` off (or hosting off): the welcome doesn't
+    /// list it and the op is refused as on main, `unsupported_version`, with
+    /// nothing read or written; the key held changes nothing.
+    #[test]
+    fn without_host_senders_refused_as_on_main() {
+        for (delegated, senders, hosting) in [
+            (false, false, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let mut rig = Rig::new();
+            rig.engine
+                .set_policy_paths(rig.pairing.clone(), rig.journal.clone());
+            rig.engine.enable_host_work(hosting);
+            rig.engine.set_delegated_features(delegated, false);
+            rig.engine.set_senders_feature(senders);
+            host_enc::ensure(&rig.pairing, &rig.journal, 1);
+            std::fs::remove_file(&rig.pairing.host_enc_generated).unwrap();
+            rig.link_up();
+            rig.connect("ch-mac", mac());
+            let features = rig.attached("ch-mac").welcome().features.clone();
+            assert!(!features.iter().any(|f| f == SENDERS_FEATURE));
+            // The client core refuses to send it to such a host.
+            let mono = rig.now.host.mono_ms;
+            assert!(rig.attached("ch-mac").send_host_enc_key_get(mono).is_err());
+            // Handed to the host anyway (a newer or misbehaving client).
+            let plain =
+                atem_client::session::r9::host_enc_key_get("aaaaaaaa-0000-4000-8000-0000000000e2")
+                    .to_string()
+                    .into_bytes();
+            let (att, authority) = match &rig.engine.chans["ch-mac"].phase {
+                super::super::Phase::Open(a) => (a.attachment.clone(), a.authority.clone()),
+                _ => panic!("ch-mac is open"),
+            };
+            rig.run(|e, p| ((), e.on_record(&att, &authority, &plain, p)));
+            rig.pump();
+            assert_eq!(
+                replies(&mut rig, "ch-mac"),
+                (
+                    Vec::new(),
+                    vec![(
+                        "unsupported_version".into(),
+                        Some("host.senders is not advertised".into())
+                    )]
+                )
+            );
+            assert!(!rig.pairing.host_enc_generated.exists());
+        }
+    }
+}

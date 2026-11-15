@@ -453,6 +453,9 @@ pub struct R9Host {
     /// Tests (in-process fixtures): the next host-policy write fails here.
     #[cfg(test)]
     policy_fault: Option<store::Injected>,
+    /// Tests: the next host-encryption-key write of a request fails here.
+    #[cfg(test)]
+    enc_fault: Option<store::Injected>,
 }
 
 fn log(line: &str) {
@@ -558,10 +561,9 @@ fn close_reason(e: &ChannelError) -> &'static str {
 /// feature listed (only the debug-only hook lists it): refused as while it
 /// isn't (`unsupported_version`, `host.senders is not advertised`), nothing
 /// read or recorded. `control_records` carries host senders' stops
-/// (session-v1 R9.8, host-work-v1 §11.1), which a later change serves;
-/// `host_enc_key_get` waits for the host encryption key.
+/// (session-v1 R9.8, host-work-v1 §11.1), which a later change serves.
 fn senders_op_unserved(op: &str) -> bool {
-    matches!(op, "control_records" | "host_enc_key_get")
+    op == "control_records"
 }
 
 /// The feature of an op that exists only for delegated host work (plan
@@ -851,6 +853,8 @@ impl R9Host {
             revoked_crash: None,
             #[cfg(test)]
             policy_fault: None,
+            #[cfg(test)]
+            enc_fault: None,
         };
         host.load_revoked(pairing.and_then(|p| p.pin_floor));
         host
@@ -872,6 +876,13 @@ impl R9Host {
     #[cfg(test)]
     pub fn inject_policy_fault(&mut self, fault: store::Injected) {
         self.policy_fault = Some(fault);
+    }
+
+    /// Tests: the next host-encryption-key write of a `host_enc_key_get`
+    /// fails at `fault`.
+    #[cfg(test)]
+    pub fn inject_enc_fault(&mut self, fault: store::Injected) {
+        self.enc_fault = Some(fault);
     }
 
     /// The relay-only values committed since the last call, in order.
@@ -2211,10 +2222,87 @@ impl R9Host {
                     self.host_policy_op(att, authority, &data, re.as_deref(), parts);
                     return Vec::new();
                 }
+                // Only with `host.senders` listed (refused above otherwise).
+                Some("host_enc_key_get") => {
+                    self.host_enc_key_op(att, authority, plain, re.as_deref(), parts);
+                    return Vec::new();
+                }
                 _ => {}
             }
         }
         parts.host.receive(att, plain, parts.now.mono)
+    }
+
+    /// `host_enc_key_get` → `host_enc_key{re}` (session-v1 R9.14 item 8;
+    /// only while the welcome lists `host.senders`): the host encryption key
+    /// of the welcome's trust generation and its `enc_sig`, for a native
+    /// member holding `manage` at the current head, checked here on every
+    /// request as the host policy checks it (R9.8a; services and browsers
+    /// never reach here, `forbidden` before decoding). Its id is in the
+    /// record before the answer goes ([`host_enc::hand_out`]); no key, or a
+    /// record that couldn't be written, is `busy`, nothing handed out.
+    fn host_enc_key_op<J: Journal>(
+        &mut self,
+        att: &str,
+        authority: &Authority,
+        plain: &[u8],
+        re: Option<&str>,
+        parts: &mut Parts<'_, J>,
+    ) {
+        let mono = parts.now.host.mono_ms;
+        let refuse = |me: &mut Self, code: &str, detail: Option<&str>| {
+            me.seal_to(att, &error(code, re, detail).to_bytes(), mono);
+        };
+        let request = match atem_client::session::r9::HostEncKeyGet::decode(plain) {
+            Ok(request) => request,
+            Err(_) => return refuse(self, code::INVALID_REQUEST, None),
+        };
+        let DeviceList::Open { m, key } = &parts.list else {
+            return refuse(self, code::BUSY, Some(DETAIL_UNPAIRED));
+        };
+        if m.held().is_some() {
+            return refuse(self, code::BUSY, Some(DETAIL_NOT_RECONCILED));
+        }
+        if !holds_manage(m, authority) {
+            return refuse(self, code::FORBIDDEN, None);
+        }
+        let Some((pairing, journal)) = self.policy_paths.clone() else {
+            return refuse(self, code::BUSY, Some(host_enc::DETAIL_UNAVAILABLE));
+        };
+        let ctx = parts.host.context();
+        let (host_id, generation) = (ctx.atem_device_id.clone(), ctx.host_trust_gen);
+        let mut store = Store::new(&pairing, &journal);
+        #[cfg(test)]
+        if let Some(fault) = self.enc_fault.take() {
+            store.inject(fault);
+        }
+        let handed = host_enc::hand_out(
+            &mut store,
+            &pairing,
+            m.membership(),
+            key,
+            &host_id,
+            generation,
+        );
+        let (enc, enc_sig, line) = match handed {
+            Ok(handed) => handed,
+            Err(why) => {
+                log(&format!("host encryption key: {why}"));
+                return refuse(self, code::BUSY, Some(host_enc::DETAIL_UNAVAILABLE));
+            }
+        };
+        if let Some(line) = line {
+            log(&format!("host encryption key: {line}"));
+        }
+        let answer = atem_client::session::r9::HostEncKey {
+            id: new_id(),
+            re: request.id,
+            host_id,
+            host_trust_gen: generation,
+            enc_key: enc.public,
+            enc_sig,
+        };
+        self.seal_to(att, answer.to_json().to_string().as_bytes(), mono);
     }
 
     /// `host_policy_set`/`host_policy_get` → `host_policy_result{re}`
