@@ -3682,8 +3682,8 @@ with hyphens): a UUID v4 (a task's, or an agent recipient's) or a UUID v5
 #### `select` from host senders (proposed, for Astation's agreement)
 
 - **Only inside host-sender envelopes, on hosts with `host.senders`.** A
-  `request` envelope's Message may carry `select{selectors, budget}`
-  recipients (`Message::valid_from_host`). Only a host with `host.senders`
+  `request` envelope's Message may carry `select{selectors, budget,
+  launch?}` recipients (`Message::valid_from_host`; `launch` below). Only a host with `host.senders`
   takes them; senders tell such a host by its encryption key in the device
   list (design V.1). It expands each one ("Status forms" above) and commits
   the resolution with the object's verdict and its cursor (design II.4.2
@@ -3699,20 +3699,40 @@ with hyphens): a UUID v4 (a task's, or an agent recipient's) or a UUID v5
   stage-1 boundary".
 - **Planning** (design II.6, the first version: the device list, no
   directory). The sending host plans the hosts from its own verified device
-  list: a selector's `project:<name>` terms reach the hosts that the signed
-  project of each name lists, and `host:<host_id>` one host, in each case
-  only hosts with a current `host_enc_key`. Each planned host gets one
-  `select` recipient whose `host` is its triple, whose `selectors` are the
-  ones that planned it, and whose `budget` is its share of the message's 32
-  agents (a Message's own check already bounds the sum). A selector with neither
-  term reaches no other host, and `atem:<atem_id>` waits for the directory.
-- **The `host:<host_id>` selector** (new): `host:` and a host id in the
-  device list's id grammar (R9.2), on its own like `atem:<atem_id>` (no
-  `+`). On a receiving host it matches every agent when `host_id` is its
-  own, and nothing otherwise; route consent still decides (design II.2.3).
-- **Labels** are matched by each receiving host, as in stage 1: a
-  `project:<name>` term against its own `project:` labels, with `tag:` and
-  `self:` terms narrowing (design II.6).
+  list, with stage 1's selectors and no new one:
+  - a selector's `project:<name>` terms reach the hosts that the signed
+    project of each name lists;
+  - `atem:<atem_id>[/<route_id>]` reaches one host: the current host whose
+    `host_id` is that `atem_id`. A host's `host_id` is its `atem_id`
+    (Atem verifies under its fixed relay identity, sent as `verifyCommit`'s
+    `device_id`, which Astation checks against the connection, so the
+    `add_host` names it), and this needs no directory. An `atem_id` no
+    current host of the list has reaches no other host;
+  - in each case only hosts with a current `host_enc_key`.
+
+  Each planned host gets one `select` recipient whose `host` is its triple,
+  whose `selectors` are the ones that planned it, and whose `budget` is its
+  share of the message's 32 agents (a Message's own check already bounds the
+  sum). A selector with neither a `project:` term nor another host's `atem:`
+  reaches no other host. Only label discovery and display (which labels,
+  routes and agents a host has) wait for the directory.
+- **`host:<host_id>` is never a selector.** It stays a principal form, for
+  route consent (design II.2.3).
+- **Matching on the receiving host**, as in stage 1: `atem:<atem_id>`
+  matches every agent when `atem_id` is its own (and nothing otherwise),
+  `/<route_id>` narrows it to that route's agents, and a `project:<name>`
+  term is matched against its own `project:` labels, with `tag:` and
+  `self:` terms narrowing (design II.6). Route consent and the project grant
+  still decide (design II.2.3).
+- **Launch on message.** The `select` destination gains `launch`, present
+  only as `true` (omitted when false, so each meaning has one encoding),
+  set only by a send with `--launch`. As in stage 1 (collaboration §5,
+  "When no agent runs"), the receiving host starts a session for the
+  message only when `launch` is `true`, and only on a route that an
+  `atem:<its atem_id>/<route_id>` selector of the recipient names and whose
+  owner allows it (`launch = "on_message"`); a host sender also needs the
+  project's `launch` op (design II.2.3). `launch: true` beside no such
+  selector is an invalid Message (`invalid_request`).
 
 ```json
 {"kind":"request","message":{"message_id":"3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b",
@@ -3722,7 +3742,18 @@ with hyphens): a UUID v4 (a task's, or an agent recipient's) or a UUID v5
     "host":{"account_id":"acct-test-1","atem_device_id":"host-b","host_trust_gen":1},
     "destination":{"kind":"select","selectors":["project:astation+tag:auth"],"budget":16}}],
   "text":"The orders contract changed: adapt the client","context":[]}}
+{"kind":"request","message":{"message_id":"45047d3a-40df-4209-9e06-ea0e57b607fa",
+  "workflow_id":"55aa5bab-e253-4b6c-a83f-c86e6b028aa1","sender":"host:host-a",
+  "created_at":1793620800000,"expires_at":1793624400000,
+  "recipients":[{"recipient_id":"b06daa5d-9f48-4512-8a98-c6d98b159d8e",
+    "host":{"account_id":"acct-test-1","atem_device_id":"host-b","host_trust_gen":1},
+    "destination":{"kind":"select","selectors":["atem:host-b/auth"],"budget":1,"launch":true}}],
+  "text":"Review the token scopes change","context":[]}}
 ```
+
+The first reaches the agents of host B labelled `project:astation` and
+`tag:auth`; the second, the `auth` route's agent on host B, starting one if
+none runs and the route allows it.
 
 #### The host encryption key in the ceremony (proposed, for Astation's agreement)
 

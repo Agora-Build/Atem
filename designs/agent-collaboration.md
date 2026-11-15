@@ -153,7 +153,8 @@ agent at most once; the sending agent never receives its own message.
    an hour. A record is a hint, never authority. The plan names each target
    host by its exact identity, never by a label or `atem_id`, and the channel's
    `welcome` must match it. (Cross-instance, planned: the first version plans
-   from the signed device list instead, with no records; see below.)
+   from the signed device list instead, with no records; see below. A host's
+   `host_id` is its `atem_id`, so `atem:<atem_id>` needs no record.)
 2. The sender splits one budget of at most **32 agents per message** across
    the planned hosts (`budget` per host, totals at most 32), so the bound holds
    for the whole message, not per host.
@@ -176,10 +177,14 @@ The shared types include a new host-work destination,
 `host.select`). Stage 1 uses it internally: `host.select` is not advertised and
 remote host admission refuses `select`. **Cross-instance (planned):** host
 senders' envelopes carry `select`, never a channel, and the first version
-addresses other hosts through the signed device list: `project:<name>` (the
-hosts the signed project lists) and `host:<host_id>` (one host), with no
-vault directory yet; see [delegated-host-work.md](delegated-host-work.md),
-II.6.
+addresses other hosts through the signed device list with the selectors
+above: `project:<name>` reaches the hosts the signed project lists, and
+`atem:<atem_id>[/<route_id>]` one host, since a host's `host_id` in the
+device list is its `atem_id`. Each receiving host expands the labels and
+answers `no_match` when nothing matches; `/<route_id>` with `--launch` may
+start an agent there, as on one host. Only label discovery and display wait
+for the vault directory. `host:<host_id>` is a principal (route consent),
+never a selector. See [delegated-host-work.md](delegated-host-work.md), II.6.
 
 **When no agent runs.** Only a sender that asks for it (`atem message send
 --launch`, with an `atem:<atem_id>/<route_id>` selector) gets a session
@@ -904,8 +909,10 @@ tasks keep section 10's lifecycle.
 **Cross-instance (planned):** see
 [delegated-host-work.md](delegated-host-work.md), Part II (the mailbox:
 II.4.3; its wire, proposed: [atem-host-work-v1.md](protocol/atem-host-work-v1.md)
-§11.5). A Station integration (the agreed stage 2) isn't a transport between
-Atem instances: the owner decided (2026-11-15) that they use only host senders.
+§11.5). Its envelopes are addressed with `project:<name>` and
+`atem:<atem_id>[/<route_id>]` through the signed device list (section 5). A
+Station integration (the agreed stage 2) isn't a transport between Atem
+instances: the owner decided (2026-11-15) that they use only host senders.
 
 ## 13. Commands and configuration
 
