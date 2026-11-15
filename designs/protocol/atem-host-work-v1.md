@@ -2332,7 +2332,9 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
 - **The gate**, per origin, opens only after the host applied that feed up
   to the announced head and fetched the device list up to its head (or up
   to a deferred entry, I.4.3), and, for host senders only (stage 3), its
-  mailbox up to its head. It closes on any disconnect, on a reset, and when
+  mailbox up to its head. It closes on any disconnect, on a reset, when
+  the host's identity changes (until a link authenticated under the new
+  identity has read the feed: "An identity change", below), and when
   no head arrived for 60 seconds. While it is closed no unstarted remote
   task of a principal that feed covers starts (`blocked`, `revocations not
   yet checked`). (**Atem's reading, for Astation**, step 4, 2026-11-13:
@@ -2457,14 +2459,39 @@ own Station's feed:
     were loaded for). For a discovery call (no `feed_id`, `after: 0`; this
     host never makes one) the page's feed must also be the own feed this
     generation's `heads` announced.
-  - **A new identity's store** (**Atem-internal**; nothing on the wire
-    changes). A re-verify on a live link keeps the link generation, the
-    account and the genesis, but hosting swaps in the new identity's
-    fresh store. A continuation's page applies only when its `after` is
-    the committed cursor of the store it reaches: one asked for the old
-    store is drained there (never that store's first read), and the feed
-    is asked again from 0 at once. A read from 0 asked for the old store
-    is a complete read of the account's feed, and applies.
+  - **An identity change** (**Atem's reading that implements Astation's
+    item 15, #120, 2026-11-14**; nothing on the wire changes). A link's
+    association with its Station is the host identity its socket was
+    authenticated under, and on the relay the route proof its challenge
+    got (session-v1 R9.7b): the host's account, device and trust
+    generation, and its device list's genesis. The host never relabels
+    that association another identity's. When its identity changes
+    while the link is up (`atem pair verify` rebinding it to its next
+    trust generation on the live link, or a new trust generation,
+    account or genesis applied there):
+    - the live call is retired by its id, so its page is drained when it
+      comes. A read from 0 is drained too, however full: it is never the
+      new identity's first read, and the feed is asked again under the
+      new association;
+    - the device-list fetch in flight is dropped, and nothing more is
+      asked, fetched or acknowledged on that socket. That includes a
+      later link generation on it: Astation authenticating it again
+      proves no new route;
+    - the gate stays closed (`atem status`: `this host's identity
+      changed; waiting for a link authenticated under it`);
+    - once no Astation operation runs (the re-verify's own first), the
+      host drops the link and reconnects, once: a new socket,
+      authenticated again and, on the relay, answering its challenge
+      with a proof made under the new identity. That link's `heads` and
+      the new identity's read of the feed from 0 (its store has never
+      read it) open the gate.
+
+    A local link (`:8080`) is reconnected the same way: its
+    authentication is the socket's too. As a defence besides, a
+    continuation's page applies only when its `after` is the committed
+    cursor of the store it reaches, so a store replaced since (hosting
+    swaps in the new identity's fresh store) never takes another
+    store's continuation as its first read.
   - **The deadline** (**Atem-internal**, step 4; nothing on the
     wire changes). The Station's agreed deadline is 30 seconds (a bounded
     result, or the link fenced). The host retires a call 35 seconds after
@@ -2473,7 +2500,8 @@ own Station's feed:
   - **Retired calls.** A call is retired by its id when its page comes,
     at the deadline, when the link generation changes (Astation
     re-authenticating the link, a routed link's upgrade, the link
-    dropping: the Station cancels the old generation's jobs) and at a
+    dropping: the Station cancels the old generation's jobs), when the
+    host's identity changes on the live link (above), and at a
     `control_sync_refused`. A page with a retired id (bytes the Station
     wrote before the retirement reached it) is drained: counted in the
     state dump, it advances nothing, opens no gate and is no Station
@@ -2618,6 +2646,16 @@ table of `host-work.sqlite`, made only with the hook on):
   its first use) takes no page either: its first use (hosting on, or an
   owner command that opens the store) binds it. Until then services stay
   `busy` (§11.1): fail closed, a cost in liveness only.
+- **An identity change on the live link** (**Atem's reading that
+  implements Astation's item 15, #120**; "Matching a page to its call").
+  An ack owed under the old identity never goes under the new one: the
+  old store's results go aside with it, unsent ones included, and nothing
+  is acknowledged on the old association after the change, the new
+  identity's store included. The new link's acks carry the new identity's
+  claim, for what its store applied itself. A late `control_ack_refused`
+  on the old link (the Station refusing an old-association ack,
+  metadata-free) advances nothing: no result is taken as delivered, and
+  the new link starts its own connection.
 - **Resends, bounded** (**Atem's reading, for Astation**). A service's own
   revoke's in-force result: on every connection (a link generation on its
   socket: a restart, a reconnection or a re-authentication starts one) and

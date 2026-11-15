@@ -768,8 +768,30 @@ its environment holds.
      stop checks.
    - **A re-verify during the check** (`atem pair verify` on the dev host)
      moves the host's records aside and starts a fresh store for the new
-     identity: every service is `busy` until that store has read its
-     Station's feed from position 0 (a page asked for the old store is
-     dropped there, and the feed asked again). A stop applied before is
-     applied again in the new store and acknowledged under the new
-     identity.
+     identity. The live link is never carried over to the new identity
+     (host-work-v1 §11.4, "An identity change", Atem's reading of
+     Astation's item 15 on #120): once the verification's operation ends,
+     the runtime drops its Astation link and reconnects (`runtime.log`:
+     `this host's identity changed on its Astation link; reconnecting …`),
+     so the new link is authenticated, and proves its route, under the new
+     identity. Until that link's `heads` and the new store's read of the
+     feed from position 0, the gate stays closed and every service is
+     `busy`; meanwhile `atem status` says `this host's identity changed;
+     waiting for a link authenticated under it`, and a page asked on the
+     old link, a read from 0 included, is dropped, nothing more is asked or
+     acknowledged there. A stop applied before is applied again in the new
+     store and acknowledged under the new identity.
+     - Covered against the fake Station (`control_feed_binary`): the real
+       `atem pair verify` on a live relay link up to its `verifyCommit`
+       (its rebind to the next trust generation on that link), the list
+       `deviceVerified` would pin written by the test, a held
+       `control_sync` and ack answered late (the page dropped; the ack
+       refused by a Station that ended the old association, nothing
+       counted), the one reconnect, its new route proof (which verifies
+       against the grown list, the old one no longer does), the read from
+       0, then the gate open and the acks under the new trust generation.
+     - Owed in the joint check: a real ceremony with Astation's
+       `deviceVerified`; the real Station ending the old association (its
+       jobs cancelled, its acks refused metadata-free) and checking the
+       new route proof against its applied device list; the same over
+       Astation's `:8080`.

@@ -951,6 +951,15 @@ restart; interrupting a turn that has already ended does nothing.
     and Astation is a native manager. **New rule:** the host's own device-list fetch (below) and the mailbox calls
     (II.4.3) are proxied the same way.
   - **With neither path**, the gate stays closed.
+  - **An identity change. Astation's item 15, #120 (Atem's reading that implements it, host-work-v1 §11.4).** A
+    link's association is the host identity its socket was authenticated under (its account, device and trust
+    generation, and the device list's genesis), and on the relay the route proof that identity made (R9.7b). When
+    that identity changes while the link is up (`atem pair verify` on the live link, or a new trust generation,
+    account or genesis), the host never relabels the old association. Its calls and its acknowledgments are retired:
+    a late page is drained, a read from 0 included, however full, and nothing more is asked, fetched or acknowledged
+    on that socket. Once no Astation operation runs, the host reconnects, so the new link is authenticated, and
+    proves its route, under the new identity; the gate stays closed until that link's heads and the new identity's
+    read of the feed from 0.
   - **Which host is calling. Changed after Astation's review.** A routed call uses its link's verified root, host and
     connection binding. A carrier-A call (R9.7b) and a call through `:8080` keep the authenticated transport's host
     association, never a host id the caller picks. Where that association can't be verified, the Station requires a
@@ -983,7 +992,9 @@ restart; interrupting a turn that has already ended does nothing.
   way"). Atem builds it with this work. The announced device-list head is the Station's word, not signed authority: a
   Station that announces a stale head delays a removal. That is R9.3's accepted residual risk ("Revocation is
   eventual, not bounded").
-- **When the gate closes.** On any disconnect, on a reset, and when no head has arrived for 60 seconds.
+- **When the gate closes.** On any disconnect, on a reset, when the host's identity changes (until a link
+  authenticated under the new one has read the feed: "An identity change", above), and when no head has arrived for
+  60 seconds.
 - **While it is closed,** no unstarted remote task of a principal that feed covers starts. Those tasks show `blocked`,
   detail `revocations not yet checked`, and don't hold their session. Local tasks and other senders are unaffected.
 - **Acknowledgment.** The host acknowledges its scan cursor and, per record, its application result (below), and the
