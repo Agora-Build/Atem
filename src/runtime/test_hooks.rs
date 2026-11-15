@@ -143,6 +143,10 @@
 //!
 //!   While `<dir>/hold_crash` exists a crash point that fired waits before
 //!   the kill (the link's writer goes on), so a test can see what went out.
+//! - `<ATEM_TEST_PTY_FAULTS dir>/hold_reopen`: while it exists, a
+//!   device-list reopen (`reopen_list_if_changed`, the list changed on
+//!   disk) waits after reading the pin and before opening the list, having
+//!   written `<dir>/reopen_held`: a test finishes a pin's writes in between.
 //! - `<ATEM_TEST_PTY_FAULTS dir>/hold_host_work`: while it exists,
 //!   host-work's scheduling pass (`schedule_work`) doesn't run: requests
 //!   are still answered and the start's recovery still runs, but no task is
@@ -443,6 +447,20 @@ mod imp {
 
     pub fn crash_held() -> bool {
         faults_dir().is_some_and(|dir| dir.join("hold_crash").exists())
+    }
+
+    pub fn reopen_hold() {
+        let Some(dir) = faults_dir() else {
+            return;
+        };
+        let hold = dir.join("hold_reopen");
+        if !hold.exists() {
+            return;
+        }
+        let _ = std::fs::write(dir.join("reopen_held"), b"");
+        while hold.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     pub fn no_init_limit() -> bool {
@@ -840,6 +858,15 @@ pub fn hold_dispatch() -> Option<bool> {
 #[cfg(debug_assertions)]
 pub fn launches_held() -> bool {
     imp::launches_held()
+}
+
+/// A device-list reopen that found the list changed on disk waits between
+/// reading its pin and opening the list while `<pty faults>/hold_reopen`
+/// exists, having written `<pty faults>/reopen_held` (a test finishes a
+/// pin's writes in that window). Release builds: never.
+pub fn reopen_hold() {
+    #[cfg(debug_assertions)]
+    imp::reopen_hold();
 }
 
 /// Host-work's scheduling pass waits (`<pty faults>/hold_host_work`):
