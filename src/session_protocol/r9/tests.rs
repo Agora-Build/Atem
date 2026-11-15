@@ -3646,6 +3646,65 @@ mod control_records {
         assert!(rig.engine.take_host_work().is_empty());
     }
 
+    /// A stop always wins (as `work_interrupt`'s ruling T27a): while hosting
+    /// is paused, `control_records` is still taken and handed to the
+    /// runtime, but only while the runtime says it can serve stops
+    /// (`enable_host_work_stops`), and only from a channel whose welcome
+    /// listed `host.senders` (one welcomed before the pause). A channel
+    /// welcomed during the pause lists no more and is refused as before;
+    /// so is everyone with the stops off, or with the hook's `host.senders`
+    /// off.
+    #[test]
+    fn control_records_is_taken_while_hosting_is_paused() {
+        let mut rig = senders_rig();
+        let records = [record(1)];
+        let send = |rig: &mut Rig, handle: &str| {
+            let message = control_records_op(ID, &records).unwrap();
+            send_plain(rig, handle, &message)
+        };
+        let not_advertised = || {
+            Some((
+                "unsupported_version".to_string(),
+                Some("host.senders is not advertised".to_string()),
+            ))
+        };
+        rig.engine.enable_host_work(false);
+        // Paused, the runtime unable to serve a stop: refused as before.
+        assert_eq!(
+            Rig::last_error(&send(&mut rig, "ch-phone")),
+            not_advertised()
+        );
+        assert!(rig.engine.take_control_records().is_empty());
+        // It can serve it: handed to the runtime, unanswered until it
+        // answers.
+        rig.engine.enable_host_work_stops(true);
+        assert!(send(&mut rig, "ch-phone").is_empty(), "the runtime answers");
+        let calls = rig.engine.take_control_records();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].request.records, records);
+        // A service: a native's op, as ever.
+        assert_eq!(refusal(&mut rig, "ch-bot").0, "forbidden");
+        // A channel welcomed during the pause lists no `host.senders`, so
+        // its `control_records` is refused, the stops on or not.
+        rig.advance(1000);
+        rig.connect("ch-new", phone());
+        let features = welcome(&mut rig, "ch-new").features;
+        assert!(
+            !features.iter().any(|f| f == SENDERS_FEATURE),
+            "{features:?}"
+        );
+        assert_eq!(Rig::last_error(&send(&mut rig, "ch-new")), not_advertised());
+        assert!(rig.engine.take_control_records().is_empty());
+        // The hook's `host.senders` off: nothing is taken.
+        rig.engine.set_senders_feature(false);
+        assert_eq!(
+            Rig::last_error(&send(&mut rig, "ch-phone")),
+            not_advertised()
+        );
+        assert!(rig.engine.take_control_records().is_empty());
+        assert!(rig.relay.is_empty());
+    }
+
     /// Host-work-v1 §11.1, "Carriage": a service's record travels only in
     /// its Station's feed, so a message holding one (alone or beside a host
     /// principal's) is refused whole, `invalid_request`; so is one holding a

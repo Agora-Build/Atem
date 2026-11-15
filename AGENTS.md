@@ -420,7 +420,9 @@ one transaction with host-work's applied device-list `seq`, so a crash
 between an entry and its effects is replayed at the next pass or start; and
 `control_records` serves a native manager's later `interrupt_running` about
 a host principal (only its tasks admitted before that revoke; its result
-goes on the channel only, never acknowledged to the Station). Project
+goes on the channel only, never acknowledged to the Station; served while
+hosting is paused, as `work_interrupt` is, from a channel welcomed with
+`host.senders`). Project
 entries are judged once per catch-up against the committed head (Atem's
 reading, host-work-v1 §11.6). Not built: the rest of host senders (the
 mailbox, their envelopes and admission), a host sender's revoke reported as

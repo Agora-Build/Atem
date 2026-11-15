@@ -1154,3 +1154,60 @@ fn another_lists_applied_seq_is_a_fault() {
         );
     });
 }
+
+/// A stop always wins (as `work_interrupt`'s): while hosting is paused, a
+/// native's `interrupt_running` about host B, sent during the pause on its
+/// channel welcomed with `host.senders` before it, is answered and its
+/// intent written.
+#[test]
+fn a_carried_record_sent_during_the_pause_is_answered() {
+    use atem_client::connect::Event as CEvent;
+    use atem_client::control::ApplicationResult::Applied;
+    use atem_client::session::r9::ControlRecordsResult;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let mut s = host_senders_host(&mut rig, root, &os);
+        rig.bridge.r9.set_delegated_features(true, false);
+        rig.bridge.r9.set_senders_feature(true);
+        rig.bridge.r9.enable_host_work(true);
+        r9_link_up(&mut rig);
+        let running = host_running(&mut rig, &s, "HS_DURING_PAUSE", start).await;
+        sign_and_carry(
+            &mut rig,
+            &mut s,
+            host_sender_revoke("host-b", false, 0).unwrap(),
+        );
+        passes(&mut rig, 1);
+        let mut ch = channel(&mut rig, &s.log, "ph-1", "dev-phone");
+        // Hosting paused (the runtime's `work_config` does both).
+        rig.bridge.work.config.enabled = false;
+        rig.bridge.r9.enable_host_work(false);
+        passes(&mut rig, 1);
+        assert!(!rig.bridge.hosting_enabled());
+        let record = host_interrupt(&s.log, s.log.log.head().seq);
+        let (id, frame) = ch
+            .send_control_records(std::slice::from_ref(&record), 2)
+            .unwrap();
+        envelope_in(&mut rig, &envelope::frame("ph-1", &frame));
+        passes(&mut rig, 1);
+        let mut answers = Vec::new();
+        for frame in frames_for(&mut rig, "ph-1") {
+            for event in ch.on_frame(&frame, 3).unwrap() {
+                if let CEvent::Family(message) = event
+                    && let Some(data) = message.data
+                    && let Ok(result) = ControlRecordsResult::from_data(&data)
+                {
+                    answers.push(result);
+                }
+            }
+        }
+        let [answer] = answers.as_slice() else {
+            panic!("one answer: {answers:?}");
+        };
+        assert_eq!(answer.re, id);
+        assert_eq!(interrupt_results(&answer.results), [(Applied, Applied)]);
+        assert_eq!(intents(&rig, &running).len(), 1);
+    });
+}

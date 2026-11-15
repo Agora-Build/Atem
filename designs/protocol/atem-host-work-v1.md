@@ -1066,8 +1066,13 @@ frozen (R9.4) or the host is held after a write fault (R9.3).
   feed's, verified against the committed device list, then answers
   `control_records_result`, one result per record; `busy` with nothing
   applied when the list doesn't serve, the control state isn't loaded or
-  the transaction fails (the carrier delivers it again). It is a stop:
-  served while hosting is paused too. **One rule for its results (Atem's
+  the transaction fails (the carrier delivers it again). It is a stop,
+  served while hosting is paused too, exactly as `work_interrupt` is
+  (§11.2, "While hosting is paused"): taken while the runtime can serve
+  stops, only from a channel whose welcome listed `host.senders` (one
+  welcomed before the pause); a welcome during the pause lists no
+  host-work feature, and the host refuses it from such a channel
+  (`unsupported_version`, `host.senders is not advertised`). **One rule for its results (Atem's
   reading, for Astation):** a record a channel carried is reported on that
   channel only, and never acknowledged to the Station, whether it applied
   at once or was `pending` and applied at a later re-verification; §11.4's
@@ -1815,7 +1820,10 @@ not name is `forbidden`, as for `work_query`.
     nothing, and the host refuses it from such a channel (`busy`,
     `host.delegated is not advertised`). With hosting on, the host judges
     every host-work op by its current features, as before.
-  - **What else.** Every other host-work request stays `busy`.
+  - **What else.** Every other host-work request stays `busy`. The
+    session op `control_records` (host senders' later interrupts) is taken
+    the same way, from a channel whose welcome listed `host.senders`
+    (§11.1 "Carriage", as built).
   - **Still `busy`:** after a receipt-database fault, before the store is
     recovered (a runtime started while paused), and with a halted session
     journal.

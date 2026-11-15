@@ -282,6 +282,10 @@ struct Attached {
     /// Task 27 review I1). With hosting on, host-work ops are judged by the
     /// host's current features, not the channel's welcome.
     offered_delegated: bool,
+    /// Its welcome listed `host.senders`: while hosting is paused, the host
+    /// takes `control_records` only from such a channel (a stop, as
+    /// `work_interrupt` is).
+    offered_senders: bool,
 }
 
 enum Phase {
@@ -636,8 +640,10 @@ impl R9Host {
     /// like the deadline's interrupt, T26a). The runtime says so only while
     /// it can serve it (its store recovered, no receipt-database fault).
     /// Only from a channel whose welcome listed `host.delegated` (one
-    /// welcomed before the pause; Task 27 review I1). Nothing else is
-    /// taken, and no welcome lists more for it.
+    /// welcomed before the pause; Task 27 review I1). `control_records` of
+    /// `host.senders` is a stop too (host senders' later interrupts): taken
+    /// the same way, from a channel whose welcome listed `host.senders`.
+    /// Nothing else is taken, and no welcome lists more for it.
     pub fn enable_host_work_stops(&mut self, enabled: bool) {
         self.host_work_stops = enabled;
     }
@@ -649,6 +655,15 @@ impl R9Host {
             .get(attachment)
             .and_then(|handle| self.chans.get(handle))
             .is_some_and(|c| matches!(&c.phase, Phase::Open(a) if a.offered_delegated))
+    }
+
+    /// The open channel of `attachment` was offered `host.senders` in its
+    /// welcome.
+    fn offered_senders(&self, attachment: &str) -> bool {
+        self.by_attachment
+            .get(attachment)
+            .and_then(|handle| self.chans.get(handle))
+            .is_some_and(|c| matches!(&c.phase, Phase::Open(a) if a.offered_senders))
     }
 
     /// The delegated features the runtime runs (`host.delegated`,
@@ -1776,6 +1791,9 @@ impl R9Host {
         let offered_delegated = features
             .iter()
             .any(|f| f == atem_client::session::host_work::DELEGATED_FEATURE);
+        let offered_senders = features
+            .iter()
+            .any(|f| f == atem_client::session::host_work::SENDERS_FEATURE);
         let welcome = Welcome {
             id: new_id(),
             re: re.clone(),
@@ -1832,6 +1850,7 @@ impl R9Host {
             grant: hello.grant.clone(),
             caught_up,
             offered_delegated,
+            offered_senders,
         }));
         self.by_attachment.insert(attachment, handle.to_string());
         effects
@@ -2179,12 +2198,19 @@ impl R9Host {
             // advertise, if the op is one: after the authority check (a
             // principal outside the op's right still learns `forbidden`),
             // before anything is read.
+            let op = data.get("op").and_then(Value::as_str);
+            // A stop always wins: while hosting is paused, `work_interrupt`
+            // and `control_records` (host senders' later interrupts) are
+            // still taken when the runtime can serve them, from a channel
+            // whose welcome listed their feature.
             let stop_while_paused = !self.host_work_enabled
                 && self.host_work_stops
                 && self.delegated
-                && data.get("op").and_then(Value::as_str) == Some("work_interrupt")
-                && self.offered_delegated(att);
-            let op = data.get("op").and_then(Value::as_str);
+                && match op {
+                    Some("work_interrupt") => self.offered_delegated(att),
+                    Some("control_records") => self.senders && self.offered_senders(att),
+                    _ => false,
+                };
             let unadvertised = op
                 .and_then(delegated_feature_of)
                 .filter(|feature| !self.advertised_features().iter().any(|f| f == feature))
