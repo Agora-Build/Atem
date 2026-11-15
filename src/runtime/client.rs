@@ -233,6 +233,21 @@ impl RuntimeClient {
             }
             Err(Failure::Absent) => {}
         }
+        // A runtime still exiting (its connection reset or refused) can
+        // still hold `runtime.lock`: one started now would find it held and
+        // exit at once. Wait for the lock first, or for an answer after all
+        // (a runtime between taking its lock and listening).
+        let deadline = tokio::time::Instant::now() + wait;
+        while crate::daemon::lock_is_held(&locator.lock) == Some(true) {
+            match Self::connect(locator).await {
+                Ok(client) => return Ok(client),
+                Err(Failure::Other(error)) => return Err(error),
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(_) => return Err(not_started(locator)),
+            }
+        }
         start()?;
         let deadline = tokio::time::Instant::now() + wait;
         loop {
@@ -241,10 +256,7 @@ impl RuntimeClient {
                 Ok(client) => return Ok(client),
                 Err(Failure::Other(error)) => return Err(error),
                 Err(_) if tokio::time::Instant::now() < deadline => {}
-                Err(_) => bail!(
-                    "the atem runtime didn't start; see {}",
-                    locator.log.display()
-                ),
+                Err(_) => return Err(not_started(locator)),
             }
         }
     }
@@ -428,6 +440,26 @@ impl RuntimeWriter {
             .await
             .context("the atem runtime closed the connection")
     }
+}
+
+/// Why no runtime answers after a start: one whose `runtime.lock` is still
+/// held (by a runtime that neither answers nor exits) is named, as the
+/// started one found it held and exited.
+fn not_started(locator: &Locator) -> anyhow::Error {
+    if crate::daemon::lock_is_held(&locator.lock) == Some(true) {
+        let holder = crate::daemon::read_lock_pid(&locator.lock)
+            .map_or_else(|| "another process".to_string(), |pid| format!("pid {pid}"));
+        return anyhow!(
+            "the atem runtime didn't start: {} is held by {holder}, which doesn't answer at {}; see {}",
+            locator.lock.display(),
+            locator.socket.display(),
+            locator.log.display()
+        );
+    }
+    anyhow!(
+        "the atem runtime didn't start; see {}",
+        locator.log.display()
+    )
 }
 
 /// A connection the runtime's end dropped with our bytes unread

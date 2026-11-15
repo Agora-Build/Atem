@@ -784,6 +784,87 @@ fn a_runtime_that_dies_under_the_hello_counts_as_none() {
     });
 }
 
+/// A runtime still exiting holds `runtime.lock` after its socket stopped
+/// answering (a reset, or refused): the client waits for the lock before
+/// it starts one, which would otherwise find the lock held and exit, and
+/// the start then answers (cleanup review, minor 3).
+#[test]
+fn a_start_waits_for_a_runtime_still_exiting() {
+    local(async {
+        let dir = short_dir();
+        let locator = super::client::Locator::in_dir(dir.path());
+        let held = crate::daemon::lock_exclusive_with_pid(&locator.lock)
+            .unwrap()
+            .expect("the exiting runtime's lock");
+        let exiting = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let (socket, lock) = (locator.socket.clone(), locator.lock.clone());
+        let root = dir.path().to_path_buf();
+        let (_stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let start = move || {
+            // As `atem runtime` does: a held lock is another runtime's.
+            if crate::daemon::lock_is_held(&lock) == Some(true) {
+                return Ok(());
+            }
+            let listener = tokio::net::UnixListener::bind(&socket)?;
+            tokio::task::spawn_local(serve(
+                app(&root),
+                listener,
+                Options {
+                    idle: Duration::from_secs(600),
+                    uid: own_uid(),
+                    launcher: launcher(&root),
+                    profile: None,
+                    clock: Default::default(),
+                    ops: crate::runtime::ops::OpEnv::unavailable(),
+                },
+                async {
+                    let _ = stopped.await;
+                },
+            ));
+            Ok(())
+        };
+        let client = RuntimeClient::connect_or_start_with(&locator, start, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(client.welcome.pid, std::process::id());
+        exiting.join().unwrap();
+    });
+}
+
+/// A lock whose holder never answers nor exits: no start is tried (it
+/// would lose the lock), and the error names the holder.
+#[test]
+fn a_held_lock_that_never_answers_is_named() {
+    local(async {
+        let dir = short_dir();
+        let locator = super::client::Locator::in_dir(dir.path());
+        let _held = crate::daemon::lock_exclusive_with_pid(&locator.lock)
+            .unwrap()
+            .expect("the lock");
+        let started = std::cell::Cell::new(false);
+        let error = RuntimeClient::connect_or_start_with(
+            &locator,
+            || {
+                started.set(true);
+                Ok(())
+            },
+            Duration::from_millis(300),
+        )
+        .await
+        .err()
+        .expect("nothing answers");
+        assert!(!started.get(), "no start against a held lock");
+        let text = error.to_string();
+        assert!(
+            text.contains(&format!("is held by pid {}", std::process::id())),
+            "{text}"
+        );
+    });
+}
+
 /// A client whose peer ended reads as hung up before its reader sees the
 /// close, unread bytes or not (cleanup review, minor 5).
 #[test]
