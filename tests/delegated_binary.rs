@@ -2048,7 +2048,20 @@ fn a_done_whose_client_goes_away_resolves_nothing_and_says_so() {
         context.join(format!("{name}.held")).exists()
     });
     cli.kill().unwrap();
-    cli.wait().unwrap();
+    // Dead and not reaped (a zombie, its start time still read): its
+    // socket's hang-up says it went away.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                cli.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        },
+        0
+    );
     std::fs::remove_file(context.join(format!("{name}.hold"))).unwrap();
     let log = rig.sandbox.dir.path().join("runtime.log");
     let line = format!(
@@ -2059,6 +2072,7 @@ fn a_done_whose_client_goes_away_resolves_nothing_and_says_so() {
             .unwrap_or_default()
             .contains(&line)
     });
+    cli.wait().unwrap();
     let status = stored(&rig, &t["task_id"]);
     assert_eq!(
         (status["state"].as_str(), status.get("resolved")),

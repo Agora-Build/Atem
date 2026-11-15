@@ -784,6 +784,20 @@ fn a_runtime_that_dies_under_the_hello_counts_as_none() {
     });
 }
 
+/// A client whose peer ended reads as hung up before its reader sees the
+/// close, unread bytes or not (cleanup review, minor 5).
+#[test]
+fn a_socket_whose_peer_ended_reads_hung_up() {
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(!super::server::hung_up(ours.as_fd()));
+    (&theirs).write_all(b"unread").unwrap();
+    assert!(!super::server::hung_up(ours.as_fd()), "data is no hang-up");
+    drop(theirs);
+    assert!(super::server::hung_up(ours.as_fd()));
+}
+
 #[test]
 fn the_runtime_environment_is_sanitized() {
     use std::ffi::OsString;

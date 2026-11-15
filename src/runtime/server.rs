@@ -106,6 +106,9 @@ struct Client {
     /// from this client meanwhile.
     held: Option<Incoming>,
     closing: bool,
+    /// A copy of its socket's descriptor, polled (never read) to tell
+    /// whether the peer hung up before the reader saw the close.
+    socket: Option<std::os::fd::OwnedFd>,
 }
 
 impl Client {
@@ -351,6 +354,20 @@ pub async fn serve(
     Ok(())
 }
 
+/// Whether the peer of the socket `fd` hung up (closed its end, as a
+/// process that ended does), polled without waiting or reading.
+pub(super) fn hung_up(fd: std::os::fd::BorrowedFd<'_>) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, no wait.
+    let ready = unsafe { libc::poll(&mut poll, 1, 0) };
+    ready > 0 && poll.revents & (libc::POLLHUP | libc::POLLERR) != 0
+}
+
 /// Refuses a peer whose process can't be verified.
 const UNVERIFIED: &str =
     "the calling process could not be verified (it ended or was replaced); run the command again";
@@ -496,6 +513,7 @@ impl Server {
             });
         let id = self.next_client;
         self.next_client += 1;
+        let socket = std::os::fd::AsFd::as_fd(&stream).try_clone_to_owned().ok();
         let (read, mut write) = stream.into_split();
         let (in_tx, rx) = mpsc::channel(CLIENT_QUEUE);
         let (tx, mut out_rx) = mpsc::unbounded_channel::<Outgoing>();
@@ -565,6 +583,7 @@ impl Server {
                 pending: None,
                 held: None,
                 closing: false,
+                socket,
             },
         );
     }
@@ -686,13 +705,18 @@ impl Server {
     /// relay: unlike `atem message reply`, which commits its reply before it
     /// answers, `done` keeps nothing until it resolves.
     fn owner_done_published(&mut self, done: OwnerDonePublished) {
-        // Gone: removed already, or its process ended though the close of
-        // its socket isn't read yet (both arrive at this loop in either
-        // order: a Ctrl-C just before the snapshot came back).
+        // Gone: removed already, or its process ended, or its socket was
+        // hung up, though the reader hasn't seen the close yet (both arrive
+        // at this loop in either order: a Ctrl-C just before the snapshot
+        // came back). The socket covers a process killed and not yet
+        // reaped, whose start time still reads.
         let gone = self.clients.get(&done.client).is_none_or(|client| {
             client.peer.is_some_and(|(pid, started)| {
                 super::adopt::process_start_time(pid) != Some(started)
-            })
+            }) || client
+                .socket
+                .as_ref()
+                .is_some_and(|fd| hung_up(std::os::fd::AsFd::as_fd(fd)))
         });
         if gone {
             eprintln!(
