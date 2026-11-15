@@ -77,8 +77,10 @@ newer hold; the host keeps that hold's time in the principal's part, and no evic
 erases it. The Station's signing duty (agreed in the same comment) makes every record a Station signs for a principal,
 holds included, strictly newer than every record it signed for it before, its high-water mark kept durably before
 publishing, carried at handover and across restart and snapshot generation, waiting rather than bypassing it; what O1
-leaves (a hold another signer issued with a clock behind, and a release refused until the Station's clock passes
-another signer's hold) is stated as its residuals. I.5.8's acknowledgment gains typed reasons (O5, requested by
+leaves (a hold another holder of the service's key, such as another Station, issued with a clock behind, and a release
+refused until the Station's clock passes that hold) is stated as its residuals. Only the service's own key signs a hold
+or a release: native managers sign `revoke` and `interrupt_running` only (I.5.4; corrected on Astation's request on
+#120, 2026-11-14). I.5.8's acknowledgment gains typed reasons (O5, requested by
 Astation on the same day; **for its sign-off**): each effect `pending` or `refused` in a `control_ack` may say why, a
 bounded code of the shared vocabulary, information only (it never changes a result, counts nothing and asks for no
 re-signing; host-work-v1 §11.4 wire rule 10). The design text below is unchanged; the contract states the refinement.

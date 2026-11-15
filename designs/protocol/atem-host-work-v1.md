@@ -1198,8 +1198,12 @@ The rules:
      Astation, 2026-11-13): every record it signs for a principal, holds
      included, is issued strictly after every record it signed for that
      principal before. What that duty can't cover, a hold signed by
-     another signer whose clock is behind, is the residual below the
-     duties ("The residuals of O1").
+     another holder of the service's own key (such as another Station)
+     whose clock is behind, is the residual below the duties ("The
+     residuals of O1"). Only the service's own key signs a hold or a
+     release: a native manager signs `revoke` and `interrupt_running`
+     only ("Signers and verification"), so its records never meet this
+     rule.
 7. **After a revoke**, `cover`, `hold` and `release` change nothing: a
    `duplicate` when they ask for what is recorded, else `refused`.
 
@@ -1544,18 +1548,25 @@ ordering can't stop a key holder. The Station's duties:
 - A revoke is final whoever holds the key.
 
 **The residuals of O1** (amended for step 4, beside rule 1's; the
-duty above closes them for a Station's own records, not across signers):
+duty above closes them for a Station's own records, not across the
+holders of a service's key). A hold and a release are signed only with the
+service's own key, so the other signer is another holder of that key,
+such as another Station; a native manager signs only `revoke` and
+`interrupt_running`, never a hold (corrected on Astation's request on
+#120, 2026-11-14: this text named a native manager's device as a hold's
+signer before):
 
 - **Liveness, which fails safe.** A Station's release is refused
-  `not_after_hold` while its clock is behind a hold another signer issued
-  (another Station, or a native manager's device), until its clock passes
-  that hold. The hold stays, and the host's acknowledgment says why (§11.4
-  wire rule 10).
-- **Safety, narrowed, not closed.** A hold another signer issued with a
-  clock behind a release a Station already signed can still be lifted by
-  that release, withheld and served after it. O1 narrows this to the clock
-  skew between the two signers: before O1, any release taken in feed
-  order could lift any hold, so this is no regression.
+  `not_after_hold` while its clock is behind a hold another holder of the
+  service's key issued (such as another Station), until its clock passes
+  that hold. The hold stays, and the host's acknowledgment says why
+  (§11.4 wire rule 10).
+- **Safety, narrowed, not closed.** A hold another holder of the
+  service's key issued with a clock behind a release a Station already
+  signed can still be lifted by that release, withheld and served after
+  it. O1 narrows this to the clock skew between the two signers: before
+  O1, any release taken in feed order could lift any hold, so this is no
+  regression.
 
 A cover that isn't newer than the coverage's cover (a Station whose clock
 is behind that cover's `issued_at`, say) takes nothing: from the covering

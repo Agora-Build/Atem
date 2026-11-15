@@ -1355,12 +1355,15 @@ trust model"):
   possible replay (rule 1), and a release lifts only holds issued before
   it (O1, rule 6), so a hold you sign with an older time than a release
   you already signed could be lifted by that release served late. What
-  it can't close: a hold another signer (another Station, a native
-  manager's device) issued with a clock behind your release can still be
+  it can't close: a hold another holder of the service's key (such as
+  another Station) issued with a clock behind your release can still be
   lifted by it, within that clock skew (no regression: before O1 any
   release in feed order could); and your release is refused
-  `not_after_hold` while your clock is behind another signer's hold,
-  until it passes it (fails safe; the ack's reason says so).
+  `not_after_hold` while your clock is behind that hold, until it passes
+  it (fails safe; the ack's reason says so). Only the service's own key
+  signs a hold or a release; a native manager signs `revoke` and
+  `interrupt_running` only (corrected on Astation's request on #120,
+  2026-11-14).
 - Your covers' `issued_at` only
   rises: each cover you sign for a
   principal is newer than any cover issued for it before, a handed-over
