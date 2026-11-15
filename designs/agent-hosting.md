@@ -790,8 +790,18 @@ its environment holds.
        counted), the one reconnect, its new route proof (which verifies
        against the grown list, the old one no longer does), the read from
        0, then the gate open and the acks under the new trust generation.
-     - Owed in the joint check: a real ceremony with Astation's
-       `deviceVerified`; the real Station ending the old association (its
-       jobs cancelled, its acks refused metadata-free) and checking the
-       new route proof against its applied device list; the same over
-       Astation's `:8080`.
+     - Owed in the joint check:
+       - a real ceremony with Astation's `deviceVerified`;
+       - the real Station ending the old association (its jobs cancelled,
+         its acks refused metadata-free) and checking the new route proof
+         against its applied device list;
+       - the same over Astation's `:8080`;
+       - the relay's handling of a host connection's route binding once
+         the device list grows with the host's new `add_host`, hook or
+         no hook. Atem's reading of a local relay checkout, which may not
+         be what is deployed: the relay checks the binding again at each
+         delivery and closes a host connection whose proof no longer
+         verifies (`host route changed`). If Astation publishes the new
+         `add_host` before it delivers `deviceVerified`, that close could
+         come during the ceremony and fail it. Check which behaviour the
+         deployed relay has, and the order of the two.
