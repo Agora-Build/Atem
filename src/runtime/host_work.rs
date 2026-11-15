@@ -352,6 +352,7 @@ impl Config {
     }
 
     /// [`Config::validate_for`] with this process's hook.
+    #[cfg(test)]
     pub fn validate(&self) -> Result<()> {
         self.validate_for(crate::runtime::test_hooks::host_features())
     }
@@ -463,6 +464,14 @@ impl Config {
     /// another revision or project (host-work v1, and the delegated start
     /// check's condition 4).
     pub fn route_changed(&self, a: &Accepted) -> bool {
+        self.route_changed_as(a, &a.principal)
+    }
+
+    /// [`Config::route_changed`], with `consent` the route principal the
+    /// task was admitted under ([`WorkRecord::consent`]: its sender, or the
+    /// `project:<name>` or `host:<host_id>` entry that admitted a host
+    /// sender, design II.2.3) in place of the sender.
+    pub fn route_changed_as(&self, a: &Accepted, consent: &str) -> bool {
         let Some(route) = self.route(&a.route_id) else {
             return true;
         };
@@ -470,7 +479,7 @@ impl Config {
             return true;
         };
         route.revision != a.route_revision
-            || !route.principals.contains(&a.principal)
+            || !route.principals.iter().any(|p| p == consent)
             || profile.id != a.profile_id
             || profile.revision != a.profile_revision
             || profile.project != a.project
@@ -662,6 +671,16 @@ pub struct Accepted {
 }
 
 impl WorkRecord {
+    /// The route principal the task was admitted under (condition 4 of the
+    /// start check): its sender, or for a host sender the route entry that
+    /// consented (`project:<name>` or `host:<host_id>`, design II.2.3).
+    pub fn consent(&self) -> &str {
+        self.delegated
+            .as_ref()
+            .and_then(|a| a.host.as_ref())
+            .map_or(self.principal.as_str(), |grant| grant.consent.as_str())
+    }
+
     pub fn accepted(&self) -> Accepted {
         Accepted {
             principal: self.principal.clone(),
@@ -2965,6 +2984,7 @@ mod tests {
                 grant_expires_at: Some(100),
                 device_list_seq: 3,
                 projects_matched: vec![],
+                host: None,
             });
             store
                 .db
@@ -3012,6 +3032,7 @@ mod tests {
             grant_expires_at: None,
             device_list_seq: 3,
             projects_matched: vec![],
+            host: None,
         }
     }
 

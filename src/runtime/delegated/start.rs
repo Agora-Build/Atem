@@ -35,6 +35,7 @@
 use super::details;
 use super::fetch::ListPart;
 use super::gate::{GateView, Gates};
+use super::host_senders::{HostOp, HostSender, host_sender_permits, host_standing};
 use super::{Admission, DelegatedSender, SenderStanding};
 use crate::runtime::host_work::{Accepted, Config, Profile, WorkRecord};
 use crate::session_protocol::host::{StartCheck, StartRequest, StartVerdict};
@@ -196,8 +197,12 @@ pub struct StartView {
     /// one): set when the link changes and after each of its messages.
     pub fetch: Option<StationFetch>,
     pub scopes: ScopeHashes,
-    /// This host's id (a service scope's `hosts`).
+    /// This host's id (a service scope's `hosts`; a host sender's
+    /// receiving host, design II.2.3).
     pub host_id: String,
+    /// `host.senders` is on (the debug-only hook's): a host sender's tasks
+    /// may start only then; off, they wait (their stops aren't read).
+    pub senders: bool,
     /// `D`, the delegated clock's reading of this pass (none: no clock, or
     /// a damaged one; deadlines aren't compared then, and the dispatch
     /// waits).
@@ -221,6 +226,7 @@ impl StartView {
             fetch: None,
             scopes: ScopeHashes::default(),
             host_id: host_id.to_string(),
+            senders: false,
             now_d_ms: None,
             live: HashMap::new(),
             refused: HashMap::new(),
@@ -287,6 +293,9 @@ impl StartView {
 /// Expiry alone is ignored: a lapsed grant is judged as it stood (3).
 pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> Result<(), Event> {
     let adm = &task.admission;
+    if matches!(adm.sender, DelegatedSender::Host { .. }) {
+        return host_may_start(view, task, now_d_ms);
+    }
     let sender = in_effect(view, adm)?;
     if view.config.route_changed(&task.accepted) {
         return Err(Event::RouteChanged);
@@ -305,7 +314,97 @@ pub fn may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> R
     if now_d_ms.is_some_and(|d| d >= task.deadline) {
         return Err(Event::Expired);
     }
-    waits(view, &sender, adm, scope_pending, false)
+    waits(
+        view,
+        sender.list,
+        &sender.standing,
+        adm,
+        scope_pending,
+        false,
+    )
+}
+
+/// [`may_start`] for a host sender's task (design I.4.3, "Changed for host
+/// senders"; II.2.3, II.5), in the same order:
+///
+/// 1. the device list usable (2a): else `AuthorityChanged`;
+/// 2. its standing (2): a current host at the epoch its admission recorded,
+///    authorized at the generation it recorded; else `Removed` or
+///    `Revoked` (`cancelled`, `sender revoked`). A new key changes nothing;
+///    a host sender is never held;
+/// 3. the route (4): at its revision, its profile unchanged, still naming
+///    the entry that consented (`project:<name>` or `host:<host_id>`): else
+///    `RouteChanged`;
+/// 4. the grant (3): that entry's projects still list both hosts with
+///    `message`, `notify` and `prompt` ([`host_sender_permits`]): else
+///    `Narrowed`;
+/// 5. the deadline, then the waits: the journal halted, a control state
+///    that doesn't read, `host.senders` off (its stops aren't read then, so
+///    it waits as for a closed gate), a deferred entry, the host's own
+///    Station's gate (II.5: its feed and device-list parts; the mailbox's
+///    part comes with the mailbox).
+///
+/// A record that names a host sender without its grant can't be checked:
+/// `Narrowed` (fail closed).
+fn host_may_start(view: &StartView, task: &StartTask, now_d_ms: Option<u64>) -> Result<(), Event> {
+    let adm = &task.admission;
+    let list = usable(view)?;
+    let Some((host_id, admitted)) = adm.host_admitted() else {
+        return Err(Event::Narrowed);
+    };
+    host_standing(
+        &list.membership,
+        host_id,
+        Some((admitted.generation, admitted.epoch)),
+    )?;
+    if view
+        .config
+        .route_changed_as(&task.accepted, admitted.consent)
+    {
+        return Err(Event::RouteChanged);
+    }
+    let route = view
+        .config
+        .route(&task.accepted.route_id)
+        .ok_or(Event::RouteChanged)?;
+    let sender = HostSender {
+        host_id,
+        admitted: Some(admitted),
+    };
+    host_sender_permits(
+        &list.membership,
+        &view.host_id,
+        &sender,
+        route,
+        HostOp::Task,
+    )?;
+    if now_d_ms.is_some_and(|d| d >= task.deadline) {
+        return Err(Event::Expired);
+    }
+    if !view.senders {
+        // `host.senders` off: its device-list effects and records aren't
+        // carried out, so it waits, never runs (fail closed).
+        if view.halted {
+            return Err(Event::Halted);
+        }
+        return Err(Event::GateClosed);
+    }
+    // Its stops are the device list's and interrupts: never held, never
+    // covered (no control record holds a host principal, host-work-v1
+    // §11.1, `not_for_host_principal`).
+    waits(view, list, &SenderStanding::default(), adm, false, false)
+}
+
+/// Condition 2a: the device list as it committed, usable (not frozen,
+/// held, faulted or removed): else `AuthorityChanged`.
+fn usable(view: &StartView) -> Result<&ListState, Event> {
+    let Some(list) = &view.list else {
+        return Err(Event::AuthorityChanged);
+    };
+    if list.frozen || list.held || list.faulted || list.unpaired {
+        return Err(Event::AuthorityChanged);
+    }
+    Ok(list)
 }
 
 /// A delegated sender as the committed device list and control state have
@@ -332,12 +431,7 @@ impl InEffect<'_> {
 /// it was admitted with, else `Removed`; then no `revoke` record, else
 /// `Revoked`.
 fn in_effect<'v>(view: &'v StartView, adm: &Admission) -> Result<InEffect<'v>, Event> {
-    let Some(list) = &view.list else {
-        return Err(Event::AuthorityChanged);
-    };
-    if list.frozen || list.held || list.faulted || list.unpaired {
-        return Err(Event::AuthorityChanged);
-    }
+    let list = usable(view)?;
     let (device_id, principal) = match &adm.sender {
         DelegatedSender::Native { device_id } => (
             device_id,
@@ -351,8 +445,8 @@ fn in_effect<'v>(view: &'v StartView, adm: &Admission) -> Result<InEffect<'v>, E
                 device_id: device_id.clone(),
             },
         ),
-        // Not a member of the list: a host sender's own check (fail closed
-        // until it is built).
+        // Not a member of the list: `may_start` and `launch_check` take a
+        // host sender apart (never here; fail closed).
         DelegatedSender::Host { .. } => return Err(Event::Removed),
     };
     let member = list
@@ -429,7 +523,8 @@ fn scope_pending(
 /// control record's (ruling T35a).
 fn waits(
     view: &StartView,
-    sender: &InEffect<'_>,
+    list: &ListState,
+    standing: &SenderStanding,
     adm: &Admission,
     scope_pending: bool,
     launch: bool,
@@ -442,20 +537,20 @@ fn waits(
     if view.controls_damaged && !(launch && native) {
         return Err(Event::GateClosed);
     }
-    if sender.standing.held {
+    if standing.held {
         return Err(Event::Held);
     }
-    if sender.list.deferred.is_some() {
+    if list.deferred.is_some() {
         return Err(Event::Deferred);
     }
     // A service's gate is its current coverage's origin (Decision 14); a
-    // Station's gate needs its device-list part too (I.5.8).
-    let fetched = view.fetched(sender.list);
+    // Station's gate needs its device-list part too (I.5.8). A host
+    // sender's is the host's own Station's (II.5).
+    let fetched = view.fetched(list);
     let gate_of = match &adm.sender {
         DelegatedSender::Native { .. } | DelegatedSender::Host { .. } => Some(adm.sender.clone()),
         DelegatedSender::Service { device_id, .. } => {
-            sender
-                .standing
+            standing
                 .coverage
                 .clone()
                 .map(|feed| DelegatedSender::Service {
@@ -537,6 +632,12 @@ pub fn launch_check(view: &StartView, launch: &StartLaunch, now_d_ms: u64) -> La
 /// [`launch_check`]'s event, as [`may_start`] gives a task's.
 fn launch_event(view: &StartView, launch: &StartLaunch, now_d_ms: u64) -> Result<(), Event> {
     let adm = &launch.admission;
+    // A host never opens a channel (session-v1 R9.6), so no `host_launch`
+    // is a host sender's; its launch on message comes with the mailbox.
+    // One here fails closed.
+    if matches!(adm.sender, DelegatedSender::Host { .. }) {
+        return Err(Event::Narrowed);
+    }
     let sender = in_effect(view, adm)?;
     if view.config.profile(&launch.profile.id) != Some(&launch.profile) {
         return Err(Event::RouteChanged);
@@ -557,7 +658,14 @@ fn launch_event(view: &StartView, launch: &StartLaunch, now_d_ms: u64) -> Result
     if now_d_ms >= launch.expires_at {
         return Err(Event::Expired);
     }
-    waits(view, &sender, adm, scope_pending, true)
+    waits(
+        view,
+        sender.list,
+        &sender.standing,
+        adm,
+        scope_pending,
+        true,
+    )
 }
 
 /// Host-work's start check in the session host (session-v1 R9.14 item 3):

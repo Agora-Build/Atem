@@ -179,9 +179,90 @@ pub struct Admission {
     /// kept: the live comparison is the rule then.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projects_matched: Vec<String>,
+    /// A host sender's grant at admission (design I.4.1, II.2.3): the route
+    /// entry that consented and the projects whose ops admitted it. None
+    /// for every other sender (written as before: no field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostGrant>,
+}
+
+/// What admitted a host sender's task (design I.4.1, "Changed for host
+/// senders"): the route entry that consented (`host:<host_id>` or
+/// `project:<name>`) and the projects whose ops admitted it. Its authority
+/// has no expiry (projects never expire, II.2.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostGrant {
+    pub consent: String,
+    pub projects: Vec<String>,
 }
 
 impl Admission {
+    /// The record of a host sender's task (design I.4.1, II.3.1) admitted
+    /// through `route_id` at `route_revision` under `permit`
+    /// ([`host_senders::host_sender_permits`]) on `list`: its principal
+    /// `host:<host_id>` and principal key (the hex SHA-256 of its newest
+    /// `add_host` key, kept for audit: authorization follows the `host_id`),
+    /// its generation and epoch, the consent and projects, their ops, no
+    /// feed and no expiry. None when `host_id` isn't a current host of
+    /// `list`. Mailbox admission (planned) is its caller; tests make host
+    /// senders' tasks with it meanwhile.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn for_host(
+        list: &Membership,
+        host_id: &str,
+        permit: &host_senders::HostPermit,
+        route_id: &str,
+        route_revision: u64,
+    ) -> Option<Admission> {
+        use atem_client::host_principal::{host_principal, host_principal_key};
+        let key = &list.host(host_id)?.host_key;
+        Some(Admission {
+            principal: host_principal(host_id),
+            principal_key: host_principal_key(key).to_hex(),
+            sender: DelegatedSender::Host {
+                host_id: host_id.to_owned(),
+                generation: permit.generation,
+                epoch: permit.epoch,
+            },
+            feed: None,
+            route_id: route_id.to_owned(),
+            route_revision,
+            ops_at_admission: permit.ops.iter().map(|op| op.as_str().to_owned()).collect(),
+            scope_at_admission: Value::Null,
+            grant_expires_at: None,
+            device_list_seq: list.head().seq,
+            projects_matched: Vec::new(),
+            host: Some(HostGrant {
+                consent: permit.consent.clone(),
+                projects: permit.projects.clone(),
+            }),
+        })
+    }
+
+    /// A host sender's task: its `host_id` and what its admission recorded
+    /// (the generation, epoch and consent [`host_senders`] compares). None
+    /// for every other sender, and for a host sender's record without its
+    /// grant (unreadable as one: fail closed).
+    pub fn host_admitted(&self) -> Option<(&str, host_senders::Admitted<'_>)> {
+        let DelegatedSender::Host {
+            host_id,
+            generation,
+            epoch,
+        } = &self.sender
+        else {
+            return None;
+        };
+        let grant = self.host.as_ref()?;
+        Some((
+            host_id,
+            host_senders::Admitted {
+                generation: *generation,
+                epoch: *epoch,
+                consent: &grant.consent,
+            },
+        ))
+    }
+
     /// The record of a task `authority` enqueued through `route_id` at
     /// `route_revision`, its sender classified `sender` ([`classify`]) on
     /// the device list whose head is `device_list_seq`.
@@ -228,6 +309,7 @@ impl Admission {
             grant_expires_at: authority.expires_at,
             device_list_seq,
             projects_matched: Vec::new(),
+            host: None,
         }
     }
 
@@ -692,6 +774,7 @@ mod tests {
                 grant_expires_at: None,
                 device_list_seq: head,
                 projects_matched: vec![],
+                host: None,
             }
         );
 

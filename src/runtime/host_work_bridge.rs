@@ -1046,8 +1046,10 @@ impl HostBridge {
                 .collect(),
         };
         let config = self.work.config.clone();
+        let senders = self.features.senders;
         let mut view = self.start_view();
         view.host_id = host_id;
+        view.senders = senders;
         view.scopes = scopes;
         // As `work_config` gave it when it loaded (a pass runs only with a
         // file that loaded and hosting on).
@@ -4332,6 +4334,7 @@ principals = ["local"]
                 grant_expires_at: None,
                 device_list_seq: seq,
                 projects_matched: vec![],
+                host: None,
             };
             assert_eq!(record.delegated.as_ref(), Some(&admission));
             let hw::Request::Enqueue { task, .. } = &req else {
