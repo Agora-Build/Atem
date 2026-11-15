@@ -3226,7 +3226,7 @@ Nothing is merged or deployed before step 1.
      agents covers both parts.
 
 37e. **No `select` from a channel.** The shared core refuses to build a channel `message_publish` with a `select`
-     destination, and a host refuses one sent by hand (`forbidden`). A reply or result whose `result_id` isn't its
+     destination, and a host refuses one sent by hand as `invalid_request`, like the other local-only fields. A reply or result whose `result_id` isn't its
      task's is no answer to a `reply_query` and is refused `result_id_mismatch` by the sending host.
 
 37f. **An overflowed object comes back.** With B's pending limits full, an object over them is dropped undecided and

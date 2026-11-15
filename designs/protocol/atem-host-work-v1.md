@@ -3714,11 +3714,13 @@ with hyphens): a UUID v4 (a task's, or an agent recipient's) or a UUID v5
   list (design V.1). It expands each one ("Status forms" above) and commits
   the resolution with the object's verdict and its cursor (design II.4.2
   step 7).
-- **Never from a channel, as today.** A channel's `message_publish` with a
-  `select` recipient is refused `forbidden`, as today: no channel feature
-  admits it, and `host.select` stays unadvertised. The shared core refuses
-  to build a channel `message_publish` with a `select` destination: a
-  channel sender's Message (`Message::valid`) with one is invalid, so
+- **Never from a channel.** No channel feature admits a `select` recipient,
+  and `host.select` stays unadvertised. A channel sender's Message
+  (`Message::valid`) with one is invalid in the shared core, like the other
+  local-only fields (`from_session`, `reply_to`): the host's decoder answers
+  such a `message_publish` `invalid_request`, nothing is stored and a message
+  that mixes it with other recipients is refused whole (until now the host
+  stored the message and refused that recipient `forbidden`), and
   `Message::publications()` never builds one. This is Astation's SDK point
   2 of 2026-11-07 (#120 comment 6701618182), in its words: "Align SDK
   remote selector validation/feature negotiation with the local-only
