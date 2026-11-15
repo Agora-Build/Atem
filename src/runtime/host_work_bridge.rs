@@ -60,6 +60,8 @@ mod delegated_feed_pass;
 pub(super) use delegated_feed_pass::sync_clocks;
 #[path = "delegated/hints.rs"]
 mod delegated_hints;
+#[path = "delegated/host_pass.rs"]
+mod delegated_host_pass;
 #[path = "delegated/owner.rs"]
 mod delegated_owner;
 pub use delegated_owner::OwnerDone;
@@ -224,8 +226,13 @@ pub(super) struct State {
     /// (`keep_reapplied`).
     reapplied: Vec<crate::runtime::delegated::feeds::Reapplied>,
     /// What control records' effects asked of the bridge once their
-    /// transaction committed, not carried out yet (`effects_pass`).
+    /// transaction committed, not carried out yet (`effects_pass`); host
+    /// senders' device-list effects add theirs (`host_senders_pass`).
     followups: Vec<crate::runtime::delegated::effects::Followup>,
+    /// The identity and committed device-list head (`seq`, hash) host
+    /// senders' device-list effects were last written up to
+    /// (`host_senders_pass`): a pass where neither moved reads nothing.
+    host_applied: Option<(HostTarget, u64, atem_client::encoding::Hash32)>,
     /// Acknowledgments whose `sent` mark failed to write, and those the
     /// shared builder refused, in this run (their log lines: the first,
     /// then at powers of two).
@@ -317,6 +324,7 @@ impl State {
             reverified: None,
             reapplied: Vec::new(),
             followups: Vec::new(),
+            host_applied: None,
             ack_failures: 0,
             ack_unbuilt: 0,
             kept: None,
@@ -1109,6 +1117,9 @@ impl HostBridge {
                 self.read_kept();
                 if self.kept_here() {
                     self.ensure_feeds();
+                    // Host senders' device-list effects first, so a record
+                    // waiting for them sees them.
+                    self.host_senders_pass();
                     self.feeds_reverify();
                 }
             }
@@ -1136,6 +1147,11 @@ impl HostBridge {
         // records applied again once loaded and whenever the device list
         // moved (Task 32 review).
         self.ensure_feeds();
+        // Host senders' device-list effects after host-work's applied
+        // `seq` (design II.3.1): at a start, replayed before the recovery
+        // below; before the pending records, so one waiting for a host
+        // sender's revoke sees its effects.
+        self.host_senders_pass();
         self.feeds_reverify();
         // A load that found the control state damaged (or a new identity's
         // store not loaded yet) closes the services' r9 access at once
@@ -2837,6 +2853,7 @@ mod local_tests {
         include!("delegated/effects_tests.rs");
         include!("delegated/hold_fence_tests.rs");
         include!("delegated/reverify_tests.rs");
+        include!("delegated/host_effects_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};

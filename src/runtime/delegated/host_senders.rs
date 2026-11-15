@@ -21,14 +21,37 @@
 //!   ([`HostSender::admitted`]). Mailbox admission takes the permit's
 //!   values into the task's record ([`super::Admission::for_host`]); the
 //!   start check asks it again before every attempt.
+//! - **What the device list's entries do to its tasks** ([`list_effects`],
+//!   II.2.2, II.3.1, II.8): a `host_sender_revoke` or a `remove_host` of the
+//!   sender cancels its unstarted tasks admitted before it (`sender
+//!   revoked`), a revoke with `interrupt_running` writes an interrupt intent
+//!   for each of them that started; a project entry fails the unstarted
+//!   tasks it no longer covers (`sender's authorization narrowed`); a
+//!   readmit and a newer `add_host` do nothing. They are written in one
+//!   transaction with host-work's own applied device-list `seq`
+//!   ([`applied_seq`], in `host-work.sqlite`), so a crash between an entry's
+//!   commit and its effects loses none: the next pass, and the start before
+//!   its recovery, replay every entry after it, keyed by the entry's `seq`.
+use super::effects::{self, Followup};
 use super::start::Event;
 use super::{DelegatedSender, SenderClass};
-use crate::runtime::host_work::Route;
+use crate::runtime::host_work::{Route, Store};
 use crate::runtime::test_hooks::HostFeatures;
+use anyhow::{Result, bail};
+use atem_client::encoding::Hash32;
 use atem_client::host_principal::{host_principal, parse_host_principal};
+use atem_client::membership::entry::Action;
 use atem_client::membership::{HostSenderState, Membership, ProjectOp, project_name_ok};
+use atem_client::session::host_work::WorkState;
 use atem_client::session::wire::is_delegated_sender;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::BTreeSet;
+
+/// Host-work's applied device-list `seq` (II.3.1, "Crash safety"): one row,
+/// naming the list it counts in. Made by the first pass that writes it,
+/// only with `host.senders` on (hook off: no table, as on main).
+const APPLIED_TABLE: &str = "CREATE TABLE IF NOT EXISTS host_senders_applied (
+    id INTEGER PRIMARY KEY CHECK (id = 1), genesis TEXT NOT NULL, seq INTEGER NOT NULL)";
 
 /// The prefix of a route principal naming a signed project (II.2.3).
 const PROJECT_PREFIX: &str = "project:";
@@ -226,7 +249,6 @@ pub fn host_sender_permits(
 /// standing, and its recorded consent's grant now. What the device list's
 /// own entries do to such a task (`list_effects`): `Removed` or `Revoked`
 /// (cancelled), `Narrowed` (failed); no route is read.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn host_task_covered(
     list: &Membership,
     this_host: &str,
@@ -306,6 +328,161 @@ fn grant(
         .flat_map(|project| project.ops.iter().copied())
         .collect();
     Some((projects, ops))
+}
+
+/// Host-work's applied device-list `seq` in `db` for the list whose genesis
+/// is `genesis`: the last entry whose effects on host senders' tasks are
+/// durable; 0 when none was written (the table not made yet). A row of
+/// another list is damage (a store is one identity's, its list's): an
+/// error, never a count restarted.
+pub fn applied_seq(db: &Connection, genesis: &Hash32) -> Result<u64> {
+    let made: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='host_senders_applied')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !made {
+        return Ok(0);
+    }
+    let row: Option<(String, u64)> = db
+        .query_row(
+            "SELECT genesis, seq FROM host_senders_applied WHERE id=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        None => Ok(0),
+        Some((stored, seq)) if stored == genesis.to_hex() => Ok(seq),
+        Some(_) => bail!("host senders' applied device-list seq names another device list"),
+    }
+}
+
+/// Writes `seq` as host-work's applied device-list `seq` for the list of
+/// `genesis`, in `tx` (the effects' own transaction).
+pub fn set_applied_seq(tx: &Transaction, genesis: &Hash32, seq: u64) -> Result<()> {
+    tx.execute_batch(APPLIED_TABLE)?;
+    tx.execute(
+        "INSERT INTO host_senders_applied(id, genesis, seq) VALUES(1, ?1, ?2)
+        ON CONFLICT(id) DO UPDATE SET genesis=excluded.genesis, seq=excluded.seq",
+        params![genesis.to_hex(), seq],
+    )?;
+    Ok(())
+}
+
+/// The effects on host senders' tasks of `list`'s entries after `after`
+/// (host-work's applied `seq`) up to its head, in `tx`, entry by entry
+/// (design II.2.2, II.3.1, II.8); what must wait for the commit is returned
+/// (a live attempt's withdrawal, the intents carried out). The caller
+/// writes the new applied `seq` in the same transaction.
+///
+/// - **`host_sender_revoke`** at `seq` (II.3.1): the sender's tasks
+///   admitted before it (their generation below `seq`) stop as a revoke
+///   stops them (`effects::stop`: unstarted ones `cancelled`, `sender
+///   revoked`; a live attempt's withdrawal asked, the task settling from
+///   it; a started one goes on). With `interrupt_running`, an intent
+///   (reason `revoke`, the revocation the entry's `seq` in decimal, as the
+///   control state names a host principal's) for each of those whose turn
+///   may run (`effects::interrupt`).
+/// - **`remove_host`** of a sender at `seq`: its tasks admitted before it
+///   (their epoch below `seq`) stop the same way (`Removed`: `cancelled`,
+///   `sender revoked`). This host's own removal is the device list's
+///   (every principal fenced, a new identity's store).
+/// - **`project_set`, `project_remove`**: once per call, after the other
+///   entries, each host sender's unstarted task is judged on `list` as it
+///   committed ([`host_task_covered`]): one no longer covered stops with
+///   the event (`Narrowed`: `failed`, `sender's authorization narrowed`).
+///   Tasks awaiting their result or of unknown outcome are kept.
+/// - **`host_sender_readmit`, `add_host`**: nothing (cancelled tasks stay
+///   cancelled; a new key changes no authorization).
+///
+/// Idempotent, keyed by the entry's `seq`: a task already in the state
+/// the entry gives is left, an intent already written isn't written again,
+/// so entries applied again (a replay) add nothing.
+pub fn list_effects(
+    store: &Store,
+    tx: &Transaction,
+    list: &Membership,
+    this_host: &str,
+    after: u64,
+) -> Result<Vec<Followup>> {
+    let mut out = Vec::new();
+    let mut projects = false;
+    for seq in after.saturating_add(1)..=list.head().seq {
+        let Some(entry) = list.entry(seq) else {
+            continue;
+        };
+        match &entry.action {
+            Action::HostSenderRevoke {
+                host_id,
+                interrupt_running,
+            } => {
+                let principal = host_principal(host_id);
+                let mut tasks =
+                    admitted_before(store, &principal, |generation, _| generation < seq)?;
+                effects::stop(store, tx, &mut tasks, Event::Revoked, &mut out)?;
+                if *interrupt_running {
+                    effects::interrupt(store, tx, &principal, &tasks, &seq.to_string(), &mut out)?;
+                }
+            }
+            Action::RemoveHost { host_id } if host_id != this_host => {
+                let principal = host_principal(host_id);
+                let mut tasks = admitted_before(store, &principal, |_, epoch| epoch < seq)?;
+                effects::stop(store, tx, &mut tasks, Event::Removed, &mut out)?;
+            }
+            Action::ProjectSet { .. } | Action::ProjectRemove { .. } => projects = true,
+            _ => {}
+        }
+    }
+    if projects {
+        narrowed(store, tx, list, this_host, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// `principal`'s (a host sender's) tasks that wait or run, each with its
+/// live attempt, whose admission's generation and epoch `before` takes.
+fn admitted_before(
+    store: &Store,
+    principal: &str,
+    before: impl Fn(u64, u64) -> bool,
+) -> Result<Vec<effects::Task>> {
+    let mut tasks = effects::tasks_of(store, principal)?;
+    tasks.retain(|(r, _)| {
+        r.delegated
+            .as_ref()
+            .and_then(|a| a.host_admitted())
+            .is_some_and(|(_, admitted)| before(admitted.generation, admitted.epoch))
+    });
+    Ok(tasks)
+}
+
+/// A project entry's effect: every host sender's task that waits (or whose
+/// attempt is live) and that `list` no longer covers stops with the event
+/// [`host_task_covered`] gives (a narrowing; a revoke or removal applied
+/// above already settled theirs). One read of the active tasks.
+fn narrowed(
+    store: &Store,
+    tx: &Transaction,
+    list: &Membership,
+    this_host: &str,
+    out: &mut Vec<Followup>,
+) -> Result<()> {
+    for r in store.active_tasks()? {
+        let Some((host_id, admitted)) = r.delegated.as_ref().and_then(|a| a.host_admitted()) else {
+            continue;
+        };
+        let Err(event) = host_task_covered(list, this_host, host_id, admitted, HostOp::Task) else {
+            continue;
+        };
+        let live = store.live_attempt(&r.task.task_id)?;
+        if live.is_none() && !matches!(r.status.state, WorkState::Queued | WorkState::Blocked) {
+            continue;
+        }
+        let mut one = [(r, live)];
+        effects::stop(store, tx, &mut one, event, out)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

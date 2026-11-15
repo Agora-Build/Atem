@@ -148,12 +148,12 @@ pub fn act(store: &Store, tx: &Transaction, actions: &[HostAction]) -> Result<Ve
 }
 
 /// A delegated task a record acts on, with its live attempt.
-type Task = (WorkRecord, Option<Attempt>);
+pub(super) type Task = (WorkRecord, Option<Attempt>);
 
 /// `principal`'s delegated tasks that wait or run (`queued`, `blocked`,
 /// `submitting`, `submitted`), oldest first, each with its live attempt:
 /// one read, the principal filtered in SQL (`Store::delegated_active_of`).
-fn tasks_of(store: &Store, principal: &str) -> Result<Vec<Task>> {
+pub(super) fn tasks_of(store: &Store, principal: &str) -> Result<Vec<Task>> {
     let mut out = Vec::new();
     for r in store.delegated_active_of(principal)? {
         let live = store.live_attempt(&r.task.task_id)?;
@@ -168,7 +168,7 @@ fn tasks_of(store: &Store, principal: &str) -> Result<Vec<Task>> {
 /// cause is written with the attempt in `tx` (`Store::hold_withdrawal`), so
 /// the attempt's withdrawal isn't counted whoever makes it, the recovery
 /// after a crash included (review m5).
-fn stop(
+pub(super) fn stop(
     store: &Store,
     tx: &Transaction,
     tasks: &mut [Task],
@@ -223,7 +223,7 @@ fn release(store: &Store, tx: &Transaction, tasks: &mut [Task]) -> Result<()> {
 /// The interrupt for `principal`'s revocation `revocation`: an intent for
 /// each of its tasks (`tasks`) whose turn may run (its live attempt, or the
 /// attempt it started).
-fn interrupt(
+pub(super) fn interrupt(
     store: &Store,
     tx: &Transaction,
     principal: &str,
