@@ -4241,7 +4241,7 @@ keeps its own detail), then a hold (`busy`, `paused`). Natives and browser
 grants get none of the last three. Like the device list's own, these
 three go before `sig_c` is verified (R9.7 step 6), and only once the
 channel's account and the principal are resolved: the `init` named this
-host's pinned list (another account's or genesis is `stale_target` at
+host's pinned list (another account's list, a different genesis, is `stale_target` at
 `init`, clear, and no `hello` is read), and the principal is a service
 that list admits at its committed head, after the carriage. The control
 state they come from is the current identity's. So they never answer for

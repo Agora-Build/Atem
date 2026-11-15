@@ -1552,9 +1552,7 @@ duty above closes them for a Station's own records, not across the
 holders of a service's key). A hold and a release are signed only with the
 service's own key, so the other signer is another holder of that key,
 such as another Station; a native manager signs only `revoke` and
-`interrupt_running`, never a hold (corrected on Astation's request on
-#120, 2026-11-14: this text named a native manager's device as a hold's
-signer before):
+`interrupt_running`, never a hold:
 
 - **Liveness, which fails safe.** A Station's release is refused
   `not_after_hold` while its clock is behind a hold another holder of the
@@ -2975,8 +2973,9 @@ result's `after` missing or `null`, a record at or below `after`, a `head`
 below `after` with records; and `matching`, results read against calls by
 the shared helper with each verdict: a match, discovery answered on the
 current feed, a feed gone back, a mismatch on the id, the origin, the feed
-and the `after`, a discovery call answered from 0 only, two calls at the
-same cursor that differ only by their ids, and a retired call's late reply.
+and the `after`, a discovery call answered from 0 only, a named feed read
+from 0 answered on that feed only, two calls at the same cursor that differ
+only by their ids, and a retired call's late reply.
 The checker reads the new fields with its own reader and matches each case
 with its own matcher.) The 256 KiB bound is pinned for each call
 that can carry a large page, `control_sync_result` and
