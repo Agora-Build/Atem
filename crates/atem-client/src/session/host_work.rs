@@ -953,6 +953,21 @@ mod tests {
                 "{name}"
             );
         }
+        // A channel Message never carries `select` (host-work-v1 §11.5): the
+        // decoder refuses it, alone or beside another recipient, as it does
+        // the other local-only fields.
+        for (name, valid) in [
+            ("message_select_is_local_only", false),
+            ("message_select_beside_a_host_is_refused_whole", false),
+            ("message_from_session_is_local_only", false),
+        ] {
+            assert!(
+                cases
+                    .iter()
+                    .any(|c| c["name"] == name && c["valid"] == valid),
+                "{name}"
+            );
+        }
         for (name, valid) in [
             ("alert_list_first_page", true),
             ("alert_list_after", true),

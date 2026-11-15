@@ -31,7 +31,9 @@ pub enum Destination {
     /// Store a notice for this host without submitting agent input.
     Host,
     /// Expanded once by the receiving host and persisted before acceptance.
-    /// Stage 1 uses this internally; remote admission requires host.select.
+    /// Only the runtime's own `local` sender (stage 1) and a host sender's
+    /// envelope (delegated host work II.4.2) carry it: a channel sender's
+    /// Message with one is invalid ([`Message::valid`]).
     Select { selectors: Vec<String>, budget: u32 },
     /// Store context for an approved project route without submitting input.
     Project {
@@ -111,7 +113,11 @@ pub struct Message {
 impl Message {
     /// A remote sender's envelope. The sending session, the reply link and
     /// kinds other than `request` belong to the runtime's own `local` sender
-    /// (`valid_local`): a remote envelope carrying one is invalid.
+    /// (`valid_local`): a remote envelope carrying one is invalid. So is a
+    /// `select` recipient: no channel admits one (host-work-v1 §11.5;
+    /// `select` stays the `local` sender's and a host sender's), so
+    /// [`Message::publications`] never builds such a `message_publish` and
+    /// a host's decoder refuses it (`invalid_request`).
     pub fn valid(&self) -> bool {
         let sender_ok = ["member:", "service:"]
             .iter()
@@ -120,6 +126,10 @@ impl Message {
             && self.kind == MessageKind::Request
             && self.reply_to.is_none()
             && self.from_session.is_none()
+            && !self
+                .recipients
+                .iter()
+                .any(|r| matches!(r.destination, Destination::Select { .. }))
             && self.valid_body(false)
     }
 
@@ -531,6 +541,76 @@ mod tests {
         }
     }
 
+    /// A channel sender's Message never carries `select` (host-work-v1
+    /// §11.5; Astation's SDK point 2 of 2026-11-07): `valid` refuses a
+    /// `select` recipient, alone or beside others, from a member or a
+    /// service, so `publications()` never builds a channel
+    /// `message_publish` with one, and a host's decoder refuses it
+    /// `invalid_request`, as it does the other local-only fields.
+    #[test]
+    fn a_channel_message_with_select_is_invalid() {
+        let select = Destination::Select {
+            selectors: vec!["tag:a".into()],
+            budget: 1,
+        };
+        for sender in ["member:phone", "service:svc-bot"] {
+            let mut alone = message();
+            alone.sender = sender.into();
+            assert!(alone.valid(), "{sender}");
+            let mut mixed = alone.clone();
+            alone.recipients[0].destination = select.clone();
+            let mut other = mixed.recipients[0].clone();
+            other.recipient_id = new_id();
+            other.host.atem_device_id = "other".into();
+            other.destination = select.clone();
+            mixed.recipients.push(other);
+            for m in [&alone, &mixed] {
+                assert!(!m.valid(), "{sender}: {m:?}");
+                assert_eq!(m.publications(), Err("invalid_request"), "{sender}");
+                let request = Request::Publish {
+                    v: 1,
+                    id: new_id(),
+                    host: m.recipients[0].host.clone(),
+                    message: m.clone(),
+                };
+                assert_eq!(
+                    Request::decode(request.to_json().to_string().as_bytes()),
+                    Err("invalid_request"),
+                    "{sender}"
+                );
+            }
+        }
+    }
+
+    /// `select` stays a destination outside channels: the runtime's own
+    /// `local` sender (stage 1) and a host sender's Message (an envelope's,
+    /// delegated host work II.4.2) keep it, under the same body rules; the
+    /// same Message from a channel sender is invalid.
+    #[test]
+    fn a_local_and_a_host_message_keep_select() {
+        let mut m = message();
+        m.recipients[0].destination = Destination::Select {
+            selectors: vec!["project:astation+tag:auth".into(), "atem:backend/r".into()],
+            budget: 32,
+        };
+        let mut local = m.clone();
+        local.sender = "local".into();
+        local.from_session = Some("ses-abcdefghijkl".into());
+        assert!(local.valid_local());
+        let mut host = m.clone();
+        host.sender = "host:host-a".into();
+        assert!(host.valid_from_host("host-a"));
+        assert!(!m.valid());
+        // Their body rules still apply: one agent past the budget.
+        let mut over = m.recipients[0].clone();
+        over.recipient_id = new_id();
+        over.destination = Destination::Host;
+        local.recipients.push(over.clone());
+        host.recipients.push(over);
+        assert!(!local.valid_local());
+        assert!(!host.valid_from_host("host-a"));
+    }
+
     /// An agent recipient of `host` for the host-sender tests.
     fn agent_recipient(host: &HostTarget, c: char) -> Recipient {
         Recipient {
@@ -693,9 +773,13 @@ mod tests {
         assert!(select.valid_from_host("host-a"), "select is a destination");
     }
 
+    /// The budgets of a Message's `select` recipients total at most 32 (a
+    /// body rule: the `local` sender's here, a host sender's alike).
     #[test]
     fn select_budgets_total_at_most_32() {
         let mut m = message();
+        m.sender = "local".into();
+        m.from_session = Some("ses-abcdefghijkl".into());
         m.recipients[0].destination = Destination::Select {
             selectors: vec!["tag:a".into()],
             budget: 20,
@@ -708,11 +792,11 @@ mod tests {
             budget: 13,
         };
         m.recipients.push(other);
-        assert!(!m.valid());
+        assert!(!m.valid_local());
         if let Destination::Select { budget, .. } = &mut m.recipients[1].destination {
             *budget = 12;
         }
-        assert!(m.valid());
+        assert!(m.valid_local());
         for (selectors, budget) in [
             (vec![], 1),
             (vec!["tag:".into()], 1),
@@ -720,7 +804,7 @@ mod tests {
             (vec!["tag:a".into()], 0),
         ] {
             m.recipients[0].destination = Destination::Select { selectors, budget };
-            assert!(!m.valid());
+            assert!(!m.valid_local());
         }
     }
 
