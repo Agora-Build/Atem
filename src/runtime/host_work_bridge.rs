@@ -615,6 +615,11 @@ impl HostBridge {
     /// don't depend on control records.
     pub(super) fn sender_class(&self, principal: &str) -> SenderClass {
         let Some(list) = self.open_list() else {
+            // A host sender is never v1 (design II.2.1): with no list to
+            // classify it on, it is refused (fail closed).
+            if principal.starts_with("host:") {
+                return SenderClass::Refused;
+            }
             return SenderClass::V1;
         };
         // Tests: a control view covering a service, in place of the feeds.

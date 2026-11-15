@@ -723,3 +723,26 @@ fn control_records_on_a_natives_channel_are_answered() {
         assert_eq!(intents(&rig, &running).len(), 1);
     });
 }
+
+/// Design I.1.3, II.2.1 (never v1): with no device list open (none pinned
+/// here; a frozen, held or faulted one isn't open either), a host sender is
+/// refused, not v1, whatever the hook says; every other principal is v1
+/// there, as on main.
+#[test]
+fn a_host_sender_is_refused_without_an_open_list() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        for features in ["", "host.delegated", "host.delegated,host.senders"] {
+            rig.bridge.features = HostFeatures::parse(features).unwrap();
+            assert!(rig.bridge.open_list().is_none());
+            assert_eq!(rig.bridge.sender_class(HOST_B), SenderClass::Refused);
+            assert_eq!(rig.bridge.sender_class("member:dev-phone"), SenderClass::V1);
+        }
+        let os = ManualOs::at(host_now().wall_ms);
+        let _s = host_senders_host(&mut rig, root, &os);
+        assert!(matches!(
+            rig.bridge.sender_class(HOST_B),
+            SenderClass::Delegated(DelegatedSender::Host { .. })
+        ));
+    });
+}
