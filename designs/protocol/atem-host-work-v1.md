@@ -3,8 +3,10 @@
 Status: implemented and released (Atem v0.8.2). §11 (delegated work):
 `host.delegated` and `host.alerts` are built (step 4, 2026-11-14) behind a
 debug-only hook and advertised by no release build; `host.senders` is
-planned (behind the same hook a debug build lists it with hosting on and
-answers `host_enc_key_get`; nothing else of it is built).
+planned (behind the same hook a debug build lists it with hosting on,
+answers `host_enc_key_get` and `control_records`, and judges what a host
+sender may do on the receiving host, §11.6 "Host senders on the receiving
+host"; the mailbox and its envelopes are not built).
 
 This extension of atem-session r9 lets an admitted client create sessions
 through launch profiles the host owner approved, queue directed work, publish
@@ -832,7 +834,7 @@ dropped.
   resolved by hand behind the debug-only hook of §11 (`work_resolve`, §11.2;
   the owner's `atem task resolve`, §11.6 "On the host").
 
-## 11. Delegated work (`host.delegated`, `host.alerts` built behind a debug-only hook; `host.senders` planned; not advertised)
+## 11. Delegated work (`host.delegated`, `host.alerts` built behind a debug-only hook; `host.senders` partly built behind it; not advertised)
 
 The delegated host-work design ([../delegated-host-work.md](../delegated-host-work.md),
 agreed revision 6b) gives tasks a lifecycle Atem owns, stops that reach
@@ -854,8 +856,8 @@ environment (no client passes `ATEM_TEST_*` to a runtime it starts) lists
 them in its `welcome` and serves their ops. Release builds compile the hook
 out. The same hook takes `host.senders` (only with `host.delegated`): a
 debug build then lists it with hosting on, holds its host encryption key
-(design II.4.1) and answers `host_enc_key_get` (session-v1 R9.14 item 8);
-`control_records` is still refused there as below. A host refuses
+(design II.4.1) and answers `host_enc_key_get` (session-v1 R9.14 item 8)
+and `control_records` (§11.1 "Carriage", as built). A host refuses
 each op of a feature it doesn't list as it refuses any such op: a session op
 (`control_records`, `host_enc_key_get`) is `unsupported_version` with no
 effect (session-v1 R9.8; **Atem's choice of code, agreed with Astation (2026-11-11, #120
@@ -865,7 +867,10 @@ comment 6810116314)**), and a host-work request (`work_interrupt`, `work_resolve
 refuses to send `control_records` or `host_enc_key_get` to a host that
 doesn't list `host.senders` (`host feature not available`). The lifecycle
 these ops serve (§11.6) and session-v1's side of it (R9.14) are built with
-them, behind the same hook; host senders' (§11.5 on the host) are planned.
+them, behind the same hook; of host senders' part, the receiving host's
+authority and the device list's effects on their tasks are built behind it
+(§11.6 "Host senders on the receiving host"), and the envelopes and the
+mailbox (§11.5 on the host) are planned.
 
 **Contract status (2026-11-12).** Step 3 of the design's order of work
 (PRs #145 to #150, the shared-core contracts behind this section) merged on
@@ -1053,6 +1058,24 @@ frozen (R9.4) or the host is held after a write fault (R9.3).
   6810116314)**; in a feed, by contrast, a
   record that doesn't parse is refused on its own and kept as evidence). A
   carrier gets no authority from carrying.
+- **Channels, as built behind the debug-only hook** (`host.senders`, a
+  debug build only). The r9 engine reads the message strictly with the
+  shared core and hands it to the runtime, which holds the control state
+  (at most 16 calls waiting; one more is `busy`). The runtime applies its
+  records in one `host-work.sqlite` transaction with their effects, as a
+  feed's, verified against the committed device list, then answers
+  `control_records_result`, one result per record; `busy` with nothing
+  applied when the list doesn't serve, the control state isn't loaded or
+  the transaction fails (the carrier delivers it again). It is a stop:
+  served while hosting is paused too. **One rule for its results (Atem's
+  reading, for Astation):** a record a channel carried is reported on that
+  channel only, and never acknowledged to the Station, whether it applied
+  at once or was `pending` and applied at a later re-verification; §11.4's
+  acknowledgments are for what the host's own Station's feed delivered,
+  and if that feed delivers the same record later, that delivery's ack
+  reports it. A carried record left `pending` gets no later answer on its
+  channel: delivering it again reports where it stands (a `duplicate` once
+  applied).
 
 #### Application and per-effect results
 
@@ -3348,8 +3371,10 @@ on hosts that list `host.senders`). Browser grants, services no feed
 covers and `local` keep this document's v1 lifecycle (design I.1.3).
 No release build runs any of it in this version. The host built it in step
 4 of the design's order of work (2026-11-14), with the session-v1 revision
-of R9.14, behind the debug-only hook of §11; host senders' part waits for
-`host.senders` (stage 3). What a
+of R9.14, behind the debug-only hook of §11; of host senders' part, the
+receiving host's side is built behind the same hook's `host.senders`
+("Host senders on the receiving host" below), and their mail is planned
+(§11.5, stage 3). What a
 client reads changes only where marked: the per-attempt `receipt_id` and
 `resolved` (§11.2), the alerts (§11.3), the receipts' `task_id` and
 `sender` (session-v1 R9.14) and the `detail` texts below. The rest is
@@ -3419,6 +3444,90 @@ The sender's channel and online status are not conditions.
     the spawn its guard only fences, as every launch's. A restart turns a
     launch still waiting into `outcome_unknown`, as §3 says of every
     `starting` launch.
+
+#### Host senders on the receiving host
+
+As built behind the debug-only hook's `host.senders` (with
+`host.delegated`; a debug build only, advertised by no release build).
+Nothing sends as a host sender yet: the mailbox, its envelopes and their
+admission are planned (§11.5), so only these rules exist, for that
+admission to use and for the start check.
+
+- **Who.** `host:<host_id>` is a delegated sender while it is a current
+  host of the committed device list (an `add_host`, no `remove_host`
+  since) and authorized as a sender (design II.3.1), at the authorization
+  generation and membership epoch it has then, which its task records at
+  admission (design I.4.1, with the route entry that consented and the
+  projects whose ops admitted it). Otherwise it is refused, never v1: a
+  host sender has no v1 path.
+- **Both locks** (design II.2.3). The route consents: its `principals`
+  name `host:<sender>`, or `project:<name>` of a project in effect listing
+  both hosts (`runtime.toml` takes those forms only with `host.senders`:
+  with it off, and in every release build, the file doesn't load, with
+  the message any principal it doesn't know gets). The grant covers the
+  op: `host:<sender>` gives the ops of every project in effect listing
+  both hosts, `project:<name>` that project's ops; each entry on its own
+  (`host:` first, then the route's `project:` entries in order), the
+  first that covers the op admitting. A task needs `message`, `notify`
+  and `prompt`, a launch on message also `launch`, a notice `message`. No
+  host sends to itself.
+- **The start check** (condition 2, 3 and 4 for a host sender). A sender
+  removed, or added again since (another epoch), is `cancelled`, `sender
+  revoked`; so is one revoked, or revoked and readmitted since (another
+  generation): a readmit admits only work signed after it. A new key
+  changes none of it. The route must still name the entry that consented,
+  at its revision (`route changed`), and that entry's grant must still
+  cover the task (`sender's authorization narrowed`). A host sender is
+  never held. Its gate is the host's own Station's, both parts (design
+  II.5; the mailbox's part comes with the mailbox), which no channel
+  opens. With `host.senders` off its tasks wait, `revocations not yet
+  checked` (their stops aren't read then); what settles a task still
+  settles it. No launch of a host sender exists (a host opens no
+  channel): one fails closed.
+- **The device list's effects** (design II.2.2, II.3.1, II.8). A
+  `host_sender_revoke` at `seq` cancels the sender's unstarted tasks
+  admitted before it (generation below `seq`), a live attempt withdrawn
+  first; with `interrupt_running` it writes an interrupt intent for each
+  of those whose turn may run (reason `revoke`, the revocation the
+  entry's `seq` in decimal). A `remove_host` of the sender at `seq`
+  cancels its unstarted tasks admitted before it (epoch below `seq`). A
+  `project_set` or `project_remove` fails the unstarted tasks no longer
+  covered. A readmit and a newer `add_host` do nothing. Tasks awaiting
+  their result or of unknown outcome are kept.
+- **Crash safety** (design II.3.1). Host-work keeps its own applied
+  device-list `seq` in `host-work.sqlite`, naming its list's genesis, and
+  writes the effects of every entry after it with the new `seq` in one
+  transaction, in its pass just before the pending control records are
+  applied again (so a host principal's interrupt waiting for its revoke
+  sees it), and at a start before the recovery of delegated tasks (so the
+  recovery's interrupt-intent step sees its intents). A crash between an
+  entry's commit and its effects is replayed from that `seq`, keyed by
+  the entry's `seq`, idempotently. **Atem's reading, for Astation:** the
+  design places these effects inside R9.3's step 4, before
+  `membership_applied`; Atem writes them in host-work's own pass instead,
+  so they can lag the device list's commit by one pass, while the start
+  check already refuses from the committed list.
+- **Project entries are judged once per catch-up, against the head.
+  Atem's reading, for Astation** (design II.2.2 "Effects on a receiving
+  host", II.3.1 "Crash safety"): the revoke and removal effects follow
+  each entry (by its `seq`), but the project entries' narrowing is judged
+  once per pass, after them, on the committed head, as Part I judges every
+  narrowing at `executing` (design I.4.3). Two differences can be seen: a
+  narrowing undone before host-work's pass (a narrowing and a re-widening
+  arriving together, or replayed together after a crash) fails nothing;
+  and a narrowing and a revoke or removal of the same sender arriving
+  together give the revoke's `cancelled`, `sender revoked`, not `failed`,
+  narrowed. Neither lets work run that the committed head doesn't cover.
+- **A later interrupt** (design II.3.1, §11.1 rule 4). A native manager's
+  `interrupt_running` about `host:<host_id>`, from a feed or a native's
+  channel, writes intents only for the host's tasks admitted before the
+  revoke at its `revoke_seq`, never one admitted after a readmit; it
+  waits (`pending`) until host-work's applied device-list `seq` reaches
+  that revoke.
+- **Not built:** the host's report of a host sender's revoke as applied to
+  its Station (§11.4 rule 4's entry form, with the applied `seq`), and a
+  later answer on its channel for a carried record left `pending` (§11.1
+  "Carriage").
 
 #### Attempts and `receipt_id`
 
