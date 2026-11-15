@@ -1772,6 +1772,11 @@ impl HostBridge {
                     && m.pin_of() == pin
                     && m.membership().genesis_hash().to_hex() == *genesis
                     && (self.host_key.is_none() || host_pub == self.host_pub)
+                    // The host runs under the pin's trust generation: a pin
+                    // read while it was still being written (its key first,
+                    // the list last) can open finished after the older
+                    // generation was taken, and is taken again here.
+                    && self.host.context().host_trust_gen >= pin.host_trust_gen
             }
             (None, None) => {
                 self.membership_error.is_none() && !membership::has_device_list_files(&pairing)

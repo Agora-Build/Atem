@@ -2464,6 +2464,26 @@ fn spawn_evidence(rig: &Rig, rid: &str, sid: &str) -> String {
     format!("workers: {names:?}; runtime.log: {lines:#?}")
 }
 
+/// Waits until runtime.log has `line`. A launch's failure is stored before
+/// it is logged (`launch_failed_before_spawn`), so a read right after a
+/// wait on the store can miss the line: it is polled, never read once.
+#[track_caller]
+fn log_shows(rig: &Rig, line: &str) {
+    let path = rig.sandbox.dir.path().join("runtime.log");
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let log = std::fs::read_to_string(&path).unwrap_or_default();
+        if log.contains(line) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runtime.log never had {line:?}:\n{log}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// VII.A test 19, its launch half (design I.4.3, "Launches"; host-work-v1
 /// §11.6): in the real runtime, a covered service's `host_launch` that
 /// reaches the spawn boundary while the fake Station's feed holds the
@@ -2555,9 +2575,10 @@ fn a_held_senders_launch_waits_and_a_revoked_ones_fails() {
         "nothing spawned when revoked: {}",
         spawn_evidence(&rig, &waiting, &sid)
     );
-    assert!(logged(&format!(
-        "launch {waiting} failed before its spawn: sender revoked"
-    )));
+    log_shows(
+        &rig,
+        &format!("launch {waiting} failed before its spawn: sender revoked"),
+    );
     // At the request: the revoked service can't come back.
     assert_eq!(
         refused_hello(&mut r, IDS, &rig.log, SVC, true),
@@ -2978,9 +2999,17 @@ fn alert_list(dev: &mut Dev, r: &mut Router) -> Vec<Value> {
 }
 
 /// `n` unresolved outcomes of `sender` recorded in the host's store (their
-/// alerts: what the capacity limits count), on session `sid`.
+/// alerts: what the capacity limits count), on session `sid`. One
+/// transaction: the runtime writes this database at every pass, waiting at
+/// most SQLite's 5 s busy timeout for its lock; `n` commits back to back
+/// (each an fsync) can keep it out longer on a loaded machine, and the
+/// runtime then stops hosting (a receipt-database fault).
 fn unresolved_outcomes(rig: &Rig, sender: &str, sid: &str, n: u32) {
-    let db = host_db(rig);
+    let mut db = host_db(rig);
+    // Immediate: the write lock first (waiting), never a read upgraded.
+    let db = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
     let base: i64 = db
         .query_row("SELECT coalesce(max(seq),0) FROM alerts", [], |r| r.get(0))
         .unwrap();
@@ -2999,6 +3028,7 @@ fn unresolved_outcomes(rig: &Rig, sender: &str, sid: &str, n: u32) {
         )
         .unwrap();
     }
+    db.commit().unwrap();
 }
 
 /// A task of the phone's on a session of its own whose agent exits in its
@@ -3269,10 +3299,9 @@ fn launch_failed(rig: &Rig, rid: &str, sid: &str, detail: &str) {
         "nothing spawned: {}",
         spawn_evidence(rig, rid, sid)
     );
-    let log = std::fs::read_to_string(rig.sandbox.dir.path().join("runtime.log")).unwrap();
-    assert!(
-        log.contains(&format!("launch {rid} failed before its spawn: {detail}")),
-        "{log}"
+    log_shows(
+        rig,
+        &format!("launch {rid} failed before its spawn: {detail}"),
     );
     // No alert (design I.4.3, "Launches"; review M5): the host's alerts
     // hold none.

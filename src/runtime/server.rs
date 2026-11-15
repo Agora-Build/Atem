@@ -678,7 +678,15 @@ impl Server {
     /// relay: unlike `atem message reply`, which commits its reply before it
     /// answers, `done` keeps nothing until it resolves.
     fn owner_done_published(&mut self, done: OwnerDonePublished) {
-        if !self.clients.contains_key(&done.client) {
+        // Gone: removed already, or its process ended though the close of
+        // its socket isn't read yet (both arrive at this loop in either
+        // order: a Ctrl-C just before the snapshot came back).
+        let gone = self.clients.get(&done.client).is_none_or(|client| {
+            client.peer.is_some_and(|(pid, started)| {
+                super::adopt::process_start_time(pid) != Some(started)
+            })
+        });
+        if gone {
             eprintln!(
                 "atem runtime: task {}: `atem task resolve … done` ended before its snapshot was read back; nothing was resolved (a memory may already be on the relay)",
                 done.task_id
