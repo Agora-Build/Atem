@@ -853,6 +853,31 @@ mod tests {
         assert_eq!(covered(&log, "host:host-b"), Err(Event::Revoked));
     }
 
+    /// Every host id the device list allows (1 to 128 characters) is one a
+    /// receipt's `sender` can name too (`is_opaque_id`, the same bound):
+    /// the longest classifies, and its consent parses; one longer is no
+    /// host id at all.
+    #[test]
+    fn the_longest_host_id_classifies() {
+        let senders = HostFeatures::parse("host.delegated,host.senders").unwrap();
+        let mut log = list();
+        let longest = "h".repeat(128);
+        log.add_host(&longest, 1, &secret("hs longest"));
+        let principal = host_principal(&longest);
+        assert!(matches!(
+            classify_host(&principal, &log.log, senders),
+            SenderClass::Delegated(DelegatedSender::Host { .. })
+        ));
+        assert_eq!(
+            Consent::parse(&principal),
+            Some(Ok(Consent::Host(longest.as_str())))
+        );
+        assert!(matches!(
+            Consent::parse(&host_principal(&"h".repeat(129))),
+            Some(Err(_))
+        ));
+    }
+
     /// The consent forms' grammar (II.2.3), as `runtime.toml` reads them.
     #[test]
     fn consents_parse() {
