@@ -29,6 +29,11 @@ use crate::websocket_client::{AstationClient, AstationMessage};
 /// Why the connect loop tried nothing: the pairing record can't be read.
 pub const PAIRING_UNREADABLE: &str = "the pairing record can't be read; not connecting to Astation (neither locally nor through the relay). Restore it from a backup, or run `atem unpair`, then `atem pair`";
 
+/// The close code ("try again later") the Station closes a just-verified
+/// host's socket with, so it reconnects and proves its route under the new
+/// device list (Astation PR #81).
+pub const REPROOF_CLOSE: u16 = 1013;
+
 /// Legacy ID-only notifications cannot authenticate a task sender or transfer files.
 pub const MARK_UPGRADE_REQUIRED: &str =
     "Chisel/mark requires message_publish with a mark payload and uploaded screenshot; upgrade the Astation/Chisel sender";
@@ -104,6 +109,15 @@ pub struct App {
     /// `hosted::App::identity_reconnect_due`): when that happened, and the
     /// socket (`AstationClient::socket_id`).
     pub identity_reconnect: Option<(Instant, u64)>,
+    /// A device verification's certificate (`deviceVerified`) went to its
+    /// operation over a relay link: if that link drops (the Station closes
+    /// it with 1013 so the host proves its route under the new device
+    /// list), the next connect attempt (the whole attempt, its local step
+    /// too) waits until the operation ended and, when it ended ok, until the
+    /// broker's next pass read the list it pinned, so the new link proves
+    /// its route with the new `host_channel_key` at the new head (§R9.7b);
+    /// at most `op_route::VERIFY_HOLD`.
+    pub verify_hold: Option<op_route::VerifyHold>,
     /// Astation instance ID when currently connected (from CredentialSync or auth flow).
     pub connected_astation_id: Option<String>,
     pub force_terminal_redraw: bool,
@@ -171,6 +185,7 @@ impl App {
             host_route: crate::session_protocol::r9::route::new_handle(),
             route_reconnect: None,
             identity_reconnect: None,
+            verify_hold: None,
             connected_astation_id: None,
             force_terminal_redraw: false,
             show_certificates: false,
@@ -852,7 +867,10 @@ impl App {
         self.check_relay_only_drop();
         self.check_station_switch();
 
-        // Detect WebSocket disconnect (channel closed after draining remaining messages)
+        // Detect WebSocket disconnect: only once everything the reader queued
+        // before the socket closed was handled above (over as many passes as
+        // it takes), so a reply just before the close (a `deviceVerified`
+        // before the Station's 1013) is never dropped with the client.
         if self.astation_routed && self.astation_client.is_ws_closed() {
             // The routed link dropped: reconnect as today.
             self.astation_routed = false;
@@ -861,12 +879,21 @@ impl App {
             self.status_message = Some("The relay route dropped — reconnecting…".to_string());
         }
         if self.astation_connected && self.astation_client.is_ws_closed() {
+            // The Station's 1013 right after a verification's certificate
+            // (`verify_hold`) asks the host to reconnect and prove its route
+            // under the new device list: no short-link backoff for it.
+            let reproof = self.verify_hold.is_some()
+                && self.astation_client.peer_close_code() == Some(REPROOF_CLOSE);
             self.astation_connected = false;
             self.on_astation_disconnect();
             self.astation_client = crate::websocket_client::AstationClient::new();
             self.rebuild_menu();
             // A short-lived link backs off instead of flickering repeatedly.
-            self.astation_reconnect_at = Some(self.connected_retry_at());
+            self.astation_reconnect_at = Some(if reproof {
+                Instant::now()
+            } else {
+                self.connected_retry_at()
+            });
             self.status_message = Some("Astation disconnected — reconnecting…".to_string());
         }
 
@@ -915,11 +942,14 @@ impl App {
         if !self.astation_reconnect {
             return;
         }
-        if let Some(reconnect_at) = self.astation_reconnect_at {
-            if Instant::now() >= reconnect_at {
-                self.astation_reconnect_at = None;
-                self.spawn_astation_connect();
-            }
+        let due = self
+            .astation_reconnect_at
+            .is_some_and(|reconnect_at| Instant::now() >= reconnect_at);
+        // A verification's relay link: after its operation and the list it
+        // pinned (`verify_hold`), so the new link proves its route under it.
+        if due && !self.reconnect_held() {
+            self.astation_reconnect_at = None;
+            self.spawn_astation_connect();
         }
     }
 }

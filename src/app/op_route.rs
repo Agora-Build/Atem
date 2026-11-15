@@ -5,8 +5,23 @@
 
 use super::App;
 use crate::websocket_client::{AstationClient, AstationMessage};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+/// How long the next connect attempt waits at most for a verification to
+/// end (`App::verify_hold`): far beyond its tail on a closed link (the
+/// apply, then sends that fail at once), well below the 30 s retry a proof
+/// under the old key would cost.
+pub const VERIFY_HOLD: Duration = Duration::from_secs(10);
+
+/// The next connect attempt waits for a verification (`App::verify_hold`).
+#[derive(Debug, Clone, Copy)]
+pub struct VerifyHold {
+    /// When its certificate went to the operation.
+    pub since: Instant,
+    /// The operation ended ok: released after the broker's next pass.
+    pub ended: bool,
+}
 
 /// Where the running operation's replies go.
 pub struct OpRoute {
@@ -67,8 +82,22 @@ impl App {
                     || (credentials && route.credentials) =>
             {
                 let what = kind(&message);
+                let certificate = matches!(message, AstationMessage::DeviceVerified { .. });
                 if route.tx.try_send(message).is_err() {
                     eprintln!("atem: dropped a {what}: the Astation operation isn't reading");
+                } else if certificate
+                    && matches!(
+                        self.astation_client.via(),
+                        Some(crate::websocket_client::LinkVia::Relay { .. })
+                    )
+                {
+                    // The operation pins the new device list next: a relay
+                    // reconnect meanwhile would prove its route under the
+                    // old one (`verify_hold`).
+                    self.verify_hold = Some(VerifyHold {
+                        since: Instant::now(),
+                        ended: false,
+                    });
                 }
                 None
             }
@@ -107,6 +136,49 @@ impl App {
     /// from now on.
     pub(crate) fn close_op_route(&mut self) {
         self.op_route = None;
+    }
+
+    /// The verification operation ended (`ok`: a pairing or verification
+    /// that succeeded): whether the broker's next pass must read the
+    /// device list (it pinned one) before the held reconnect goes on.
+    pub(crate) fn verification_ended(&mut self, ok: bool) -> bool {
+        match self.verify_hold.as_mut() {
+            Some(hold) if ok => {
+                hold.ended = true;
+                true
+            }
+            _ => {
+                self.verify_hold = None;
+                false
+            }
+        }
+    }
+
+    /// The broker's pass ran: a hold waiting for it (its operation ended
+    /// ok, and this pass read the list it pinned) ends.
+    pub(crate) fn verify_hold_pass(&mut self) {
+        if self.verify_hold.is_some_and(|hold| hold.ended) {
+            self.verify_hold = None;
+        }
+    }
+
+    /// Whether a reconnect waits for a verification (`verify_hold`); past
+    /// [`VERIFY_HOLD`] the hold ends, and the reconnect goes on as before.
+    pub(crate) fn reconnect_held(&mut self) -> bool {
+        let Some(hold) = self.verify_hold else {
+            return false;
+        };
+        if hold.since.elapsed() < VERIFY_HOLD {
+            return true;
+        }
+        self.verify_hold = None;
+        if !hold.ended {
+            eprintln!(
+                "atem runtime: the device verification didn't end within {} s; reconnecting anyway",
+                VERIFY_HOLD.as_secs()
+            );
+        }
+        false
     }
 
     /// The link the running operation uses, if its route is still open.

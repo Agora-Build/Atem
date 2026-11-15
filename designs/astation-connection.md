@@ -39,7 +39,8 @@ The runtime connects when it starts and whenever it has no link (`App::spawn_ast
 3. Relay: only with a pairing record. Join the paired Astation's identity room on the chosen Station and authenticate without pairing, or be routed (r9). A selected Station that is down never falls back to another one.
 4. Both fail: no link, and another attempt in 30 s.
 
-- A dropped authenticated link reconnects at once after it stayed up for ten seconds; shorter-lived links retry after 30 seconds to avoid flicker. Deliberate selected-Station migrations reconnect at once.
+- A link whose socket ended counts as dropped only once its reader's queue is empty: what it read before the close is handled first, in order (at most 32 a pass, the rest at the next). A reply just before a close, such as `deviceVerified` before the Station's 1013, is never lost to it.
+- A dropped authenticated link reconnects at once after it stayed up for ten seconds; shorter-lived links retry after 30 seconds to avoid flicker. Deliberate selected-Station migrations reconnect at once, and so does the Station's 1013 close right after a verification's certificate on a relay link (see [Pairing](#pairing)).
 - Retry timers run on the monotonic clock, so they count awake time only.
 - Without a pairing record only the local step runs.
 - The order applies at each connect. An established relay link stays when local becomes reachable again.
@@ -88,6 +89,8 @@ The saved session:
 - Device verification is commit-then-reveal: a 12-character safety code the user compares, Touch ID on the Mac, then the signed `deviceVerified` applied atomically. A failure keeps the pairing, and `atem pair verify` retries. See AGENTS.md ("SSO auth") and [e2e-encryption.md](e2e-encryption.md#devices).
 - `atem pair verify` runs on the runtime's link, authenticated with the saved session. It first moves the pairing to a new binding in the next host trust generation (`pairing::rebind_for_verification`, durable before `verifyCommit`), because every ceremony reveals a fresh `host_channel_key`. The Astation, session and shared login stay.
 - Verification pins the account's signed device list. Relay only and the host route proof build on it. See [account-trust.md](account-trust.md).
+- On a re-verify the Station delivers `deviceVerified`, then closes that socket with 1013, so the host reconnects and proves its route under the new list (Astation PR #81). The certificate is applied as on a live link and the verification succeeds; only its tail (the escrow, `keyRequest`) fails on the closed socket, as a warning.
+- While a pair or `pair verify` whose certificate came over the relay is finishing, the next connect attempt waits, at most 10 s. The whole attempt waits, its local step too, not only the relay. It starts at the certificate, so it never waits on an operation that is itself waiting for a link. Once the operation ends ok, the runtime's next pass reads the device list it pinned, and only then does the reconnect start: the new link answers the relay's challenge with the new `host_channel_key` at the new head, never the old ones. A failed operation releases it at once. A certificate that came over a local link holds nothing.
 - `atem pair verify` on a pairing the Astation already verified prints `Already verified (safety code …)` and connects to nothing, whether or not a device list is pinned. **Planned (owner decision 2026-11-08), not implemented:** it runs the ceremony again when the verified pairing has no pinned list, so a host verified before device lists were pinned can pin one (see [Remote sessions need r9](#remote-sessions-need-r9-planned)).
 - `atem unpair` commits the next host trust generation, removes the pairing record and tells a running runtime, which drops that pairing's link with its attachments.
 
@@ -168,6 +171,7 @@ Astation can pick the Station for this Atem. This is station-route v1, released 
 - The verdict counts in either order relative to Astation's `auth_required`.
 - Astation's later `auth_required` upgrades a routed link with the connect path's semantics (300 s). A denial keeps it routed.
 - After enrollment or a reconciliation, a relay link that proved no route reconnects once, so it proves its route. It waits for a running operation and a pending admission (≤ 30 s). A local link never does.
+- After a re-verify the reconnect proves its route under the new list: it waits for the verification and the list it pinned (see [Pairing](#pairing)).
 - `atem status` shows `Authorization: r9 routed (no Astation)`.
 
 ## Re-authentication

@@ -336,7 +336,15 @@ exits with `done`. `unlock.rs`'s `AstationLink` abstraction is the model.
 - **Connection lost mid-operation.** The operation fails (best-effort
   `verifyAbort` if the socket is still writable); the runtime reconnects for
   its sessions only. The ceremony is never resumed or replayed; the user runs
-  `atem pair` again.
+  `atem pair` again. A reply read before the socket closed still reaches the
+  operation: the link counts as down only once what it read was handled. So
+  a `deviceVerified` followed by the Station's 1013 close (it asks a
+  re-verified host to prove its route under the new device list) is applied
+  and the verification succeeds; only its tail (the escrow, `keyRequest`)
+  warns on the closed socket. When that certificate came over the relay, the
+  next connect attempt (its local step too) waits until the operation ended
+  and the next pass read the list it pinned, at most 10 s, and that 1013
+  close skips the 30 s short-link backoff.
 - **`atem pair` cases.**
   1. Already paired and connected to the same Astation: the runtime runs
      device verification on its current authenticated connection; sessions,

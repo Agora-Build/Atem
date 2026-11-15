@@ -1745,6 +1745,21 @@ impl Server {
                         kind.as_str(),
                         if ok { "done" } else { "failed" }
                     );
+                    // A verification whose certificate came over the relay
+                    // holds that link's reconnect (`App::verify_hold`): ended
+                    // ok, the next pass reads the list it pinned first, so
+                    // the reconnect proves its route with the new
+                    // host_channel_key at the new head.
+                    let verified = ok
+                        && matches!(
+                            kind,
+                            super::protocol::OpKind::Pair | super::protocol::OpKind::PairVerify
+                        );
+                    if self.app.verification_ended(verified)
+                        && let Some(bridge) = self.bridge.as_mut()
+                    {
+                        bridge.check_list();
+                    }
                     // A verification makes the link a verified pairing: the
                     // host may attach it now.
                     if ok
@@ -1913,6 +1928,9 @@ impl Server {
                 }
             }
         }
+        // The route state now holds the list a verification pinned: a
+        // reconnect it held goes on at the next tick.
+        self.app.verify_hold_pass();
         let launches = self
             .bridge
             .as_mut()

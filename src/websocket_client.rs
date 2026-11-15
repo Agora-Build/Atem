@@ -577,6 +577,9 @@ pub struct AstationClient {
     local_token_path_override: Option<std::path::PathBuf>,
     /// Set to true when the WebSocket reader task exits (connection dropped).
     ws_closed: bool,
+    /// The current socket's peer close code (0 until its reader read a
+    /// close frame with one).
+    peer_close: Option<std::sync::Arc<std::sync::atomic::AtomicU16>>,
     /// Counts the sockets this client opened (`connect_raw`): a link
     /// generation's channels live on one socket only (§R9.7a).
     socket_gen: u64,
@@ -763,6 +766,7 @@ impl AstationClient {
             #[cfg(test)]
             local_token_path_override: None,
             ws_closed: false,
+            peer_close: None,
             socket_gen: 0,
             socket_id: 0,
             connected_astation_id: None,
@@ -1298,6 +1302,9 @@ impl AstationClient {
 
         let route_tx = msg_tx.clone();
         let mut route_ignored = false;
+        // The peer's close code, once the reader read its close frame.
+        let close_code = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(0));
+        self.peer_close = Some(close_code.clone());
         // Spawn task to handle incoming messages
         let reader_task = tokio::spawn(async move {
             while let Some(message) = read.next().await {
@@ -1396,7 +1403,11 @@ impl AstationClient {
                             break; // Receiver has been dropped
                         }
                     }
-                    Ok(Message::Close(_)) => {
+                    Ok(Message::Close(frame)) => {
+                        if let Some(frame) = frame {
+                            close_code
+                                .store(frame.code.into(), std::sync::atomic::Ordering::SeqCst);
+                        }
                         break;
                     }
                     Err(_) => {
@@ -1416,6 +1427,15 @@ impl AstationClient {
         self.socket_id = NEXT_SOCKET_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         Ok(())
+    }
+
+    /// The code of the close frame the peer sent on this socket, once the
+    /// reader read it (`None` before, or for a close without one).
+    pub(crate) fn peer_close_code(&self) -> Option<u16> {
+        self.peer_close
+            .as_ref()
+            .map(|code| code.load(std::sync::atomic::Ordering::SeqCst))
+            .filter(|&code| code != 0)
     }
 
     /// The socket the client uses now (a new one after every reconnect).
@@ -2464,9 +2484,25 @@ impl AstationClient {
         }
     }
 
-    /// Returns true if the WebSocket connection has been closed: `recv_message()`
-    /// found the channel closed, or a transport task (reader or writer) ended.
+    /// Returns true once the link is down and nothing it decoded is left to
+    /// read: `recv_message()` found the channel closed, or a transport task
+    /// (reader or writer) ended and its queue is empty. What the reader
+    /// queued before the socket closed (a `deviceVerified` just before the
+    /// Station's close) is still read, in order, before the link counts as
+    /// down; a caller that reads at most so many a pass leaves the rest to
+    /// its next pass.
     pub fn is_ws_closed(&self) -> bool {
+        link_down(
+            self.ws_closed,
+            || self.transport_ended(),
+            || self.receiver.as_ref().is_none_or(|r| r.is_empty()),
+        )
+    }
+
+    /// The socket is gone: `recv_message()` found the channel closed, or a
+    /// transport task (reader or writer) ended, whatever the reader queued
+    /// before it.
+    pub(crate) fn transport_ended(&self) -> bool {
         self.ws_closed || self.transport_tasks.iter().any(|task| task.is_finished())
     }
 
@@ -2716,6 +2752,20 @@ impl Drop for AstationClient {
 }
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// [`AstationClient::is_ws_closed`]: down once the transport `ended` and
+/// its queue is `drained`, read in that order. A reader task that finished
+/// made all its sends first, so a queue read empty after it is empty for
+/// good; read the other way, the reader could queue its last message and
+/// finish between the two reads, and the link would be called down with it
+/// still queued.
+fn link_down(
+    ws_closed: bool,
+    ended: impl FnOnce() -> bool,
+    drained: impl FnOnce() -> bool,
+) -> bool {
+    ws_closed || (ended() && drained())
+}
 
 pub(crate) fn resolved_atem_id(hostname: &str) -> String {
     if let Some(existing) = AtemConfig::stored_atem_id() {
@@ -3167,7 +3217,7 @@ mod tests {
         let mut client = AstationClient::new();
         client.connect_raw(&format!("ws://{address}")).await.unwrap();
         tokio::time::timeout(WAIT, async {
-            while !client.is_ws_closed() {
+            while !client.transport_ended() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.expect("the link ends at a message over its cap");
@@ -3266,8 +3316,45 @@ mod tests {
         server.abort();
     }
 
+    /// The race at a close, pinned: the reader queues its last message and
+    /// finishes right after the first of `is_ws_closed`'s two reads. The
+    /// link isn't called down with that message queued: it is read at the
+    /// next pass, and only then is the link down.
+    #[test]
+    fn a_message_queued_as_the_reader_ends_is_never_dropped() {
+        use std::cell::Cell;
+        let (finished, queued, raced) = (Cell::new(false), Cell::new(0), Cell::new(false));
+        // The reader's last step: queue the message, then finish (once).
+        let reader_ends = || {
+            if !raced.replace(true) {
+                queued.set(1);
+                finished.set(true);
+            }
+        };
+        let ended = || {
+            let ended = finished.get();
+            reader_ends();
+            ended
+        };
+        let drained = || {
+            let drained = queued.get() == 0;
+            reader_ends();
+            drained
+        };
+        let racing = super::link_down(false, ended, drained);
+        assert!(!racing, "not down with it queued");
+        let down = || super::link_down(false, || finished.get(), || queued.get() == 0);
+        assert!(!down());
+        // The next pass reads it: then the link is down.
+        queued.set(0);
+        assert!(down());
+    }
+
+    /// The socket closing ends the transport at once, but the link counts
+    /// as down only once what the reader queued before the close was read:
+    /// a message just before the close is never lost to it.
     #[tokio::test]
-    async fn closed_transport_is_detected_before_buffered_input_is_drained() {
+    async fn the_link_is_down_only_once_input_buffered_before_the_close_was_read() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -3279,11 +3366,14 @@ mod tests {
         let mut client = AstationClient::new();
         client.connect_raw(&format!("ws://{address}")).await.unwrap();
         tokio::time::timeout(WAIT, async {
-            while !client.is_ws_closed() {
+            while !client.transport_ended() {
                 tokio::task::yield_now().await;
             }
         }).await.unwrap();
+        assert!(!client.is_ws_closed(), "a message is still queued");
         assert!(matches!(client.recv_message(), Some(AstationMessage::SessionWire(text)) if text.contains("subscribe")));
+        assert!(client.is_ws_closed(), "down once it was read");
+        assert!(client.recv_message().is_none());
         server.await.unwrap();
     }
 
