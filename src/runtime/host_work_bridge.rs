@@ -495,7 +495,9 @@ impl HostBridge {
         // An invalid file turns hosting off only while it lasts: launches
         // not started wait, requests are `busy` and queued local tasks wait
         // as `paused` (`work_pass`); nothing is fenced.
-        let config = match Config::load(&self.work.dir) {
+        // Checked with the runtime's own host features (a route's
+        // host-sender principals load only with `host.senders`).
+        let config = match Config::load_for(&self.work.dir, self.features) {
             Ok(config) => {
                 if self.work.config_problem.take().is_some() {
                     eprintln!(
@@ -1591,16 +1593,17 @@ impl HostBridge {
                 let (guard, check, delegated) = match delegated {
                     Some((launch, guard, check)) => (guard, Some(check), Some(launch)),
                     None => {
-                        let (flag, approved, dir, deadline) = (
+                        let (flag, approved, dir, deadline, features) = (
                             permit.clone(),
                             p.clone(),
                             self.work.dir.clone(),
                             *expires_at,
+                            self.features,
                         );
                         let guard: super::super::adopt::SpawnGuard = Arc::new(move || {
                             flag.load(Ordering::SeqCst)
                                 && host_now().wall_ms < deadline
-                                && Config::load(&dir).is_ok_and(|c| {
+                                && Config::load_for(&dir, features).is_ok_and(|c| {
                                     c.enabled && c.profile(&approved.id) == Some(&approved)
                                 })
                                 && crate::memory::project::project_key_for(&approved.cwd)
