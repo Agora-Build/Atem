@@ -322,8 +322,11 @@ fn names_a_route_of(selectors: &[String], host: &HostTarget) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Delivery {
-    /// Durable inbox acceptance; does not mean read or task completion.
-    Stored,
+    /// Durable inbox acceptance; does not mean read or task completion. A
+    /// struct variant with no fields, as [`Delivery::NoMatch`], so its
+    /// reader refuses any field beside `state` (an internally tagged unit
+    /// variant would take them).
+    Stored {},
     /// No input was queued for this recipient.
     Refused { code: String },
     /// Progress is the ordinary task receipt, independently per recipient.
@@ -444,7 +447,7 @@ fn receipts_valid(recipients: &[RecipientReceipt], status: bool) -> bool {
             is_uuid_v4(&r.recipient_id)
                 && ids.insert(&r.recipient_id)
                 && match &r.delivery {
-                    Delivery::Stored => true,
+                    Delivery::Stored {} => true,
                     Delivery::Refused { code } => {
                         matches!(code.as_str(), "forbidden" | "stale_target")
                     }
@@ -1003,7 +1006,7 @@ mod tests {
                     .filter(|r| &r.host == req.host())
                     .map(|r| RecipientReceipt {
                         recipient_id: r.recipient_id.clone(),
-                        delivery: Delivery::Stored,
+                        delivery: Delivery::Stored {},
                     })
                     .collect(),
             };
@@ -1224,7 +1227,7 @@ mod tests {
         }
         let stored = RecipientReceipt {
             recipient_id: new_id(),
-            delivery: Delivery::Stored,
+            delivery: Delivery::Stored {},
         };
         assert!(status_recipients_valid(&[stored.clone(), two.clone()]));
         assert!(recipients_valid(std::slice::from_ref(&stored)));
@@ -1273,6 +1276,48 @@ mod tests {
                 "{extra}"
             );
         }
+    }
+
+    #[test]
+    fn a_stored_delivery_is_exactly_its_state() {
+        // A channel receipt is read strictly: `stored` has no field beside
+        // `state`, as `no_match` hasn't.
+        let stored = serde_json::json!({"state": "stored"});
+        assert_eq!(
+            serde_json::from_value::<Delivery>(stored.clone()).unwrap(),
+            Delivery::Stored {}
+        );
+        assert_eq!(serde_json::to_value(Delivery::Stored {}).unwrap(), stored);
+        for extra in [
+            serde_json::json!({"state": "stored", "extra": 1}),
+            serde_json::json!({"state": "stored", "code": "forbidden"}),
+            serde_json::json!({"state": "stored", "tasks": []}),
+            serde_json::json!({"state": "stored", "work": null}),
+        ] {
+            assert!(
+                serde_json::from_value::<Delivery>(extra.clone()).is_err(),
+                "{extra}"
+            );
+        }
+        // Through the channel's reader: a `message` result whose receipt
+        // stores a recipient with an extra field is no host-work result.
+        let recipient = new_id();
+        let result = |delivery: serde_json::Value| {
+            serde_json::json!({
+                "v": 1, "op": "host_work_result", "id": new_id(), "re": new_id(),
+                "host": {"account_id": "acct-test-1", "atem_device_id": "host-b",
+                    "host_trust_gen": 1},
+                "attachment_gen": new_id(), "channel_id": "channel-1",
+                "result": {"kind": "message", "message": {
+                    "message_id": new_id(), "digest": host_work::digest(b"message"),
+                    "sender": "member:phone",
+                    "recipients": [{"recipient_id": recipient, "delivery": delivery}],
+                }},
+            })
+        };
+        assert!(host_work::Response::from_data(&result(stored)).is_ok());
+        let extra = serde_json::json!({"state": "stored", "extra": 1});
+        assert!(host_work::Response::from_data(&result(extra)).is_err());
     }
 
     #[test]

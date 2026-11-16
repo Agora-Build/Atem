@@ -675,7 +675,7 @@ mod tests {
                 message_id: ID.into(),
                 recipients: vec![crate::session::messages::RecipientReceipt {
                     recipient_id: ID2.into(),
-                    delivery: crate::session::messages::Delivery::Stored,
+                    delivery: crate::session::messages::Delivery::Stored {},
                 }],
             },
             ResultPlain::Refusal {

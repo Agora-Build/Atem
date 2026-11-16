@@ -2162,7 +2162,7 @@ impl HostBridge {
                     }
                 }
             } else {
-                Delivery::Stored
+                Delivery::Stored {}
             };
             recipients.push(RecipientReceipt {
                 recipient_id: r.recipient_id.clone(),

@@ -949,7 +949,7 @@ mod tests {
             ResultPlain::Status {
                 message_id: ID.into(),
                 recipients: vec![
-                    receipt(ID2, Delivery::Stored),
+                    receipt(ID2, Delivery::Stored {}),
                     receipt(
                         ID,
                         Delivery::Refused {
@@ -1071,11 +1071,11 @@ mod tests {
         let status = |recipients: Value| {
             jcs(&json!({"kind": "status", "message_id": ID, "recipients": recipients})).unwrap()
         };
-        let ok = serde_json::to_value(vec![receipt(ID2, Delivery::Stored)]).unwrap();
+        let ok = serde_json::to_value(vec![receipt(ID2, Delivery::Stored {})]).unwrap();
         assert!(ResultPlain::parse(status(ok.clone()).as_bytes()).is_ok());
         let twice = serde_json::to_value(vec![
-            receipt(ID2, Delivery::Stored),
-            receipt(ID2, Delivery::Stored),
+            receipt(ID2, Delivery::Stored {}),
+            receipt(ID2, Delivery::Stored {}),
         ])
         .unwrap();
         let none = json!([]);
@@ -1084,7 +1084,7 @@ mod tests {
                 .map(|i| {
                     receipt(
                         &format!("6f1c2a4e-3b7d-4e8a-9c01-2d5f7a9b3c{i:02}"),
-                        Delivery::Stored,
+                        Delivery::Stored {},
                     )
                 })
                 .collect::<Vec<_>>(),

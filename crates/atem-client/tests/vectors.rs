@@ -10612,7 +10612,7 @@ fn host_envelope_vectors(book: &Book) -> Value {
         message_id: mail_id("request"),
         recipients: vec![RecipientReceipt {
             recipient_id: mail_id("request recipient"),
-            delivery: Delivery::Stored,
+            delivery: Delivery::Stored {},
         }],
     };
     let f = ba(&g, "status");
