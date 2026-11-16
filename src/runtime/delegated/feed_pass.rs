@@ -180,12 +180,13 @@ impl HostBridge {
 
     /// The host's identity as its Station association names it
     /// (host-work-v1 §11.4, "An identity change"; Astation's item 15 on
-    /// #120): the session host's account, device and trust generation and
-    /// the pinned device list's genesis, handed to the Station link before
-    /// each of its steps (the pass's first, its Station step, its end). One
-    /// its link's socket wasn't authenticated under (a re-verify on the
-    /// live link, a new trust generation, account or genesis) ends that
-    /// link's association: its call retired, nothing more asked, fetched or
+    /// #120): the session host's account, device and trust generation, the
+    /// pinned device list's genesis and the host's `host_channel_key`,
+    /// handed to the Station link before each of its steps (the pass's
+    /// first, its Station step, its end). One its link's socket wasn't
+    /// authenticated under (a re-verify on the live link, a new trust
+    /// generation, account, genesis or key, while the link is up or while
+    /// Astation authenticates it again) ends that link's association: its call retired, nothing more asked, fetched or
     /// acknowledged on it, its gate closed (`Station::on_identity`), and
     /// the App asked to reconnect it at the pass's end.
     pub(crate) fn station_identity(&mut self) {
@@ -196,6 +197,7 @@ impl HostBridge {
                 .as_ref()
                 .filter(|m| !m.unpaired())
                 .map(|m| m.membership().genesis_hash()),
+            host_key: self.host_key.as_ref().and_then(|key| key.public_key()),
         };
         if let Some(station) = self.station.as_mut() {
             station.on_identity(identity);

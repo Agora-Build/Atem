@@ -430,6 +430,7 @@ mod tests {
                 host_trust_gen,
             },
             genesis: Some(Hash32([9; 32])),
+            host_key: None,
         }
     }
 

@@ -1735,15 +1735,49 @@ fn a_fresh_store_never_takes_an_old_continuations_page_as_its_first_read() {
 }
 
 /// The host identity the rig's links are authenticated under, in trust
-/// generation `host_trust_gen`: [`host`]'s account and device, and the
-/// device list's genesis.
+/// generation `host_trust_gen`: [`host`]'s account and device, the device
+/// list's genesis and the host's key.
 fn identity(log: &TestLog, host_trust_gen: u64) -> HostIdentity {
+    identity_keyed(log, host_trust_gen, "sync host")
+}
+
+/// [`identity`] with the host's key from `seed`.
+fn identity_keyed(log: &TestLog, host_trust_gen: u64, seed: &str) -> HostIdentity {
     HostIdentity {
         host: HostTarget {
             host_trust_gen,
             ..host()
         },
         genesis: Some(log.log.genesis_hash()),
+        host_key: crate::session_protocol::r9::HostKey::new(&secret(seed)).public_key(),
+    }
+}
+
+/// The host's `host_channel_key` is part of the identity: a new key alone
+/// (the same account, device, trust generation and genesis) ends the
+/// link's association as any other move does, while the link is up and
+/// while it is down with its socket kept.
+#[test]
+fn a_new_host_key_alone_moves_the_identity() {
+    for down in [false, true] {
+        let mut rig = rig();
+        assert!(!rig.sync.on_identity(identity(&rig.log, 1)));
+        rig.opened();
+        if down {
+            rig.sync.on_link(None);
+        }
+        assert!(
+            rig.sync
+                .on_identity(identity_keyed(&rig.log, 1, "sync host, a new key")),
+            "down {down}"
+        );
+        assert_eq!(rig.sync.moved_socket(), Some(SOCKET), "down {down}");
+        rig.sync.on_link(Some(&link(2, ORIGIN)));
+        assert_eq!(
+            rig.sync.closed(),
+            Some(Closed::IdentityMoved),
+            "down {down}"
+        );
     }
 }
 

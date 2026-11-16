@@ -105,10 +105,10 @@
 //!   #120). A link's association with its Station is the host identity
 //!   its socket was authenticated under, and its route proof that
 //!   identity's (session-v1 R9.7b): the account, device and trust
-//!   generation, and the device list's genesis ([`HostIdentity`]). When
-//!   the host's identity changes while the link is up (`atem pair verify`
-//!   rebinding on the live link, a new trust generation, account or
-//!   genesis), or while Astation authenticates it again (the link is down
+//!   generation, the device list's genesis and the host's
+//!   `host_channel_key` ([`HostIdentity`]). When the host's identity
+//!   changes while the link is up (`atem pair verify` rebinding on the
+//!   live link, a new trust generation, account, genesis or key), or while Astation authenticates it again (the link is down
 //!   until Astation answers, then back on the same socket: the socket and
 //!   its identity are kept across the drop, so the change counts against
 //!   it), the old association is never relabelled the new one's: the
@@ -278,12 +278,14 @@ pub const IDENTITY_MOVED: &str =
 
 /// The host identity a Station association is made under (host-work-v1
 /// §11.4, "An identity change"): the session host's account, device and
-/// trust generation, and the pinned device list's genesis (none without
-/// one).
+/// trust generation, the pinned device list's genesis (none without one),
+/// and the public half of the host's `host_channel_key` (none without one),
+/// whose route proof a relay link's association is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostIdentity {
     pub host: HostTarget,
     pub genesis: Option<Hash32>,
+    pub host_key: Option<atem_client::PublicKey>,
 }
 
 /// Decision 12's alert for a page that isn't strict JSON.
@@ -691,15 +693,16 @@ impl FeedSync {
     /// Astation's item 15 on #120): the bridge hands it over before every
     /// Station step. An identity other than the one the link's socket was
     /// authenticated under (a re-verify on the live link, a new trust
-    /// generation, account or genesis) ends that association for the sync,
-    /// while the link is up and while it is down with its socket kept
-    /// (Astation authenticating it again, which brings it back on the same
-    /// socket): the live call is retired by its id (its page, a read from 0
-    /// included, drained when it comes), the generation's `heads`, the
-    /// announced feed and any refusal's backoff go, and nothing is asked on
-    /// that socket again (its `heads` ask nothing; the gate stays closed,
-    /// [`Closed::IdentityMoved`]) until a link on a new socket, which the
-    /// bridge has the App reconnect for ([`FeedSync::moved_socket`]).
+    /// generation, account, genesis or `host_channel_key`) ends that
+    /// association for the sync, while the link is up and while it is down
+    /// with its socket kept (Astation authenticating it again, which brings
+    /// it back on the same socket): the live call is retired by its id (its
+    /// page, a read from 0 included, drained when it comes), the
+    /// generation's `heads`, the announced feed and any refusal's backoff
+    /// go, and nothing is asked on that socket again (its `heads` ask
+    /// nothing; the gate stays closed, [`Closed::IdentityMoved`]) until a
+    /// link on a new socket, which the bridge has the App reconnect for
+    /// ([`FeedSync::moved_socket`]).
     /// `true` when it did so now. The first identity a socket sees is its
     /// own (a link up before any identity was handed over).
     pub fn on_identity(&mut self, identity: HostIdentity) -> bool {

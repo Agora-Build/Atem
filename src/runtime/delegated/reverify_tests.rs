@@ -740,3 +740,84 @@ fn a_reauthentication_with_no_identity_change_keeps_the_link() {
         });
     }
 }
+
+/// The device list re-pinned with this host's `add_host` in trust
+/// generation `host_trust_gen` under the key `seed` names, read by the
+/// bridge as a pin is (`reopen_list_if_changed`), the session host taking
+/// the pin's identity (as `reverify`, whose key is the rig's own).
+fn rv_pin(rig: &mut LocalRig, root: &Path, s: &mut Senders, host_trust_gen: u64, seed: &str) {
+    use crate::session_protocol::membership::r9log::secret;
+    use crate::session_protocol::membership::{HostPin, MembershipHost};
+    s.log.add_host("host", host_trust_gen, &secret(seed));
+    let pairing = crate::profile::Sources::in_dir(&root.join("profile"))
+        .paths
+        .pairing;
+    MembershipHost::pin(
+        &pairing,
+        &rig.bridge.dir,
+        &HostPin {
+            host_id: "host".into(),
+            host_trust_gen,
+        },
+        &s.log.log,
+        &secret(seed),
+    )
+    .unwrap();
+    let identity = crate::runtime::host_bridge::Identity {
+        account_id: "acct".into(),
+        atem_device_id: "host".into(),
+        host_trust_gen,
+    };
+    let mut cx = Cx {
+        client: &rig.app.astation_client,
+        sessions: &mut rig.sessions,
+    };
+    rig.bridge.pairing = Some(pairing);
+    rig.bridge.reopen_list_if_changed(&mut cx);
+    rig.bridge.pairing = None;
+    assert!(rig.bridge.adopt_identity(&identity, &mut cx));
+}
+
+/// The host's `host_channel_key` is part of the identity a Station link's
+/// socket was authenticated under (on the relay its route proof is that
+/// key's): a new key alone ends the association as a new trust generation,
+/// account or genesis does. Here the host already runs in trust generation
+/// 2 on a socket authenticated under it (the move to 2 reconnected the
+/// first), and the device list is then re-pinned with this host's new key
+/// in that same generation: that socket's association ends, nothing more
+/// is asked there, and the App reconnects it, once.
+#[test]
+fn a_new_host_channel_key_alone_ends_the_association() {
+    use crate::runtime::delegated::sync::Closed;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (mut s, _) = rv_covered(&mut rig, root, &os, start);
+        rv_astation_link(&mut rig, 7, 41, false);
+        rv_trust_gen(&mut rig, 2);
+        passes(&mut rig, 1);
+        assert!(
+            rig.app.identity_reconnect_due(false, false),
+            "the move to 2"
+        );
+        passes(&mut rig, 1);
+        rv_astation_link(&mut rig, 8, 42, false);
+        assert_eq!(rig.app.identity_reconnect, None);
+        assert_ne!(rv_closed(&rig), Some(Closed::IdentityMoved));
+        // The same trust generation, a new key.
+        rv_pin(&mut rig, root, &mut s, 2, "delegated host, a new key");
+        passes(&mut rig, 1);
+        assert_eq!(rv_closed(&rig), Some(Closed::IdentityMoved));
+        assert_eq!(
+            rig.app.identity_reconnect.map(|(_, socket)| socket),
+            Some(42)
+        );
+        let mut sent = rig.app.astation_client.capture_sent_for_test();
+        let heads = heads_text(&[(ORIGIN, OWN_FEED, 1)], s.log.log.head());
+        station_pass(&mut rig, 1_000, vec![heads]);
+        assert!(sent.texts().is_empty(), "nothing on the old association");
+        assert!(rig.app.identity_reconnect_due(false, false));
+        assert!(!rig.app.identity_reconnect_due(false, false), "once");
+    });
+}
