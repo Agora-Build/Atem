@@ -1245,7 +1245,8 @@ fn lost_done_results_send_the_done_again_and_a_late_page_is_drained() {
     );
     let ids: BTreeSet<&str> = dones.iter().map(|(_, d)| d.request_id.as_str()).collect();
     assert_eq!(ids.len(), 3, "a fresh id each time");
-    assert_eq!(rig.mailbox()["dones_answered"], 1);
+    // (The dump is written at the end of the pass the store changed in.)
+    rig.until_mailbox("the answer counted", |m| m["dones_answered"] == 1);
     // A late page: the sync held past its deadline, asked again and
     // answered; then the late one.
     rig.put(&rig.sender.cancel(&to, head));
@@ -1467,7 +1468,9 @@ fn a_results_flood_leaves_the_gate_open_and_a_skipped_request_closes_it() {
         [65],
         "left on the Station"
     );
-    let mailbox = rig.until_mailbox("the gate", |m| m["announced"]["head"] == 65);
+    let mailbox = rig.until_mailbox("the dump read to the head", |m| {
+        m["cursor"]["cursor"] == 65 && m["owed"] == json!([])
+    });
     assert_eq!(mailbox["open"], true, "{mailbox}");
     // 33 requests: 32 into the inbox, the 33rd left on the Station.
     {
@@ -1717,7 +1720,9 @@ fn an_identity_change_on_the_live_link_sends_no_done_under_the_new_identity() {
         .map(|(_, d)| (d.mailbox_id.clone(), d.position))
         .collect();
     assert_eq!(under_new, [(new.clone(), 1)]);
-    assert_eq!(rig.mailbox()["identity_moved"], false);
+    rig.until_mailbox("the new socket's state", |m| {
+        m["cursor"]["mailbox_id"] == new.as_str() && m["identity_moved"] == false
+    });
 }
 
 // ── The hook off ──
