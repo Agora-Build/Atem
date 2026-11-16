@@ -41,7 +41,7 @@ use support::delegated::{
 use support::host_clock::HostClock;
 use support::r9::{Router, write_pin};
 use support::r9log::{self, MAC, TestLog, auth, secret};
-use support::station::{FakeStation, Held, OTHER_ACCOUNT, Pump, StaleFeed};
+use support::station::{FakeStation, Held, OTHER_ACCOUNT, ProofSeen, Pump, StaleFeed};
 use support::{Sandbox, within};
 
 const ACCOUNT: &str = "acct-control-feed";
@@ -299,19 +299,22 @@ impl Rig {
     /// The runtime's next link after `after` (a connection number): the
     /// one Astation authenticated, or the one the relay routed.
     fn next_link(&self, after: u64) -> u64 {
+        // One deadline in all: the link's other messages never extend it.
+        let deadline = Instant::now() + WAIT;
+        let left = || deadline.saturating_duration_since(Instant::now());
         match self.via {
             Via::Local | Via::Relay => loop {
-                match self.astation.events.recv_timeout(WAIT) {
+                match self.astation.events.recv_timeout(left()) {
                     Ok(Event::Authenticated(link)) if link > after => break link,
-                    Ok(_) => {}
-                    Err(_) => panic!("the runtime's link never authenticated"),
+                    Ok(_) if !left().is_zero() => {}
+                    _ => panic!("the runtime's link never authenticated"),
                 }
             },
             Via::Routed => loop {
-                match self.relay_events.as_ref().unwrap().recv_timeout(WAIT) {
+                match self.relay_events.as_ref().unwrap().recv_timeout(left()) {
                     Ok(RelayEvent::Proof { link, .. }) if link > after => break link,
-                    Ok(_) => {}
-                    Err(_) => panic!("no route proof"),
+                    Ok(_) if !left().is_zero() => {}
+                    _ => panic!("no route proof"),
                 }
             },
         }
@@ -442,6 +445,43 @@ impl Rig {
     fn gate_open(&self) -> bool {
         let station = self.dump()["station"].clone();
         station["feed"]["open"] == true && station["list_part"] == true
+    }
+
+    /// A round trip on the host's link that a release build observes too
+    /// (no state dump): a session `hello` the host must answer (an r9 host
+    /// with a pinned list refuses it, `unsupported_version`), sent again
+    /// each second until its answer comes back. The link is one ordered
+    /// socket: whatever the host sent for an earlier message on it (a
+    /// `host_route` for a challenge) came before that answer, so once the
+    /// answer is here the fake Station's tap holds it too.
+    #[track_caller]
+    fn round_trip(&self) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let id = uuid();
+            let hello = json!({"type": "session",
+                "data": {"v": 1, "op": "hello", "id": id, "revision": 8}});
+            self.astation.send(self.link(), hello.to_string());
+            let answered = Instant::now() + Duration::from_secs(1);
+            while let Ok(event) = self
+                .astation
+                .events
+                .recv_timeout(answered.saturating_duration_since(Instant::now()))
+            {
+                if let Event::Message(link, reply) = event
+                    && link == self.link()
+                    && reply["type"] == "session"
+                    && reply["data"]["re"] == id.as_str()
+                {
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the host never answered a hello\n{}",
+                self.runtime_log()
+            );
+        }
     }
 
     /// Waits for two passes of the broker begun after now.
@@ -611,6 +651,32 @@ impl Rig {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// This host's `atem_id`, as its config.toml keeps it (its connect
+    /// resolved it: the relay link's URL and both links' route proofs).
+    fn atem_id(&self) -> String {
+        let text = std::fs::read_to_string(self.sandbox.config().join("config.toml")).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        value["atem_id"].as_str().expect("an atem_id").to_owned()
+    }
+
+    /// The host's first `host_route` on `link` among the fake Station's
+    /// proofs from `after` on, the Station serving that link meanwhile (at
+    /// most a minute).
+    #[track_caller]
+    fn proof_seen(&self, link: u64, after: usize) -> ProofSeen {
+        let mut found = None;
+        self.within(&format!("a route proof on connection {link}"), || {
+            let mut station = self.station();
+            station.serve(link);
+            found = station.proofs()[after..]
+                .iter()
+                .find(|proof| proof.link == link)
+                .cloned();
+            found.is_some()
+        });
+        found.unwrap()
     }
 
     /// `atem status` has no `Control feeds:` line (the hook off: as main).
@@ -848,6 +914,15 @@ fn next_fetch(station: &mut FakeStation, link: u64) -> ToStation {
 /// is spent).
 fn reauthenticate(rig: &Rig, n: u8) {
     let generation = rig.dump()["station"]["link"]["gen"].as_u64().unwrap();
+    auth_required_again(rig, n);
+    rig.until_station("the next link generation", |s| {
+        s["link"]["gen"].as_u64() > Some(generation)
+    });
+}
+
+/// Astation's `auth_required` on the host's link again, with challenge `n`
+/// (a new one: one answered is spent), answered as the fake's `auth` says.
+fn auth_required_again(rig: &Rig, n: u8) {
     let transport = match rig.via {
         Via::Local => "lan",
         Via::Relay | Via::Routed => "relay",
@@ -856,9 +931,6 @@ fn reauthenticate(rig: &Rig, n: u8) {
         "data": {"astation_id": ASTATION, "challenge": format!("{n:x}").repeat(64),
                  "transport": transport, "protocol": "2"}}});
     rig.astation.send(rig.link(), challenge.to_string());
-    rig.until_station("the next link generation", |s| {
-        s["link"]["gen"].as_u64() > Some(generation)
-    });
 }
 
 // ── r9 clients and their tasks ──
@@ -4460,4 +4532,403 @@ fn with_the_hook_off_a_reverify_keeps_the_link_as_main_does() {
         Err(atem_client::host_route::HostRouteRefusal::BadSignature),
         "the live link's proof isn't the host's now"
     );
+}
+
+// ── Which host is calling, through Astation's local proxy (design I.5.8) ──
+
+/// The runtime.log line of a local link's challenge ignored once the
+/// host's identity changed on its socket (`route.rs`).
+const IDENTITY_IGNORED: &str = "host_challenge ignored: this host's identity changed on this link";
+
+/// Design I.5.8, "Which host is calling", through Astation's local `:8080`
+/// proxy (session-v1 R9.7b, Atem's reading for a local link; behind
+/// `host.delegated`), on a real local transport: a Station that requires a
+/// fresh host-key challenge proof sends its challenge through the fake
+/// Astation's authenticated local link; the host answers it with the relay
+/// link's proof (the relay room, the pairing's Astation id, and its
+/// `atem_id`), which the Station verifies with the shared verifier against
+/// its own device list; only then does the Station serve the link's calls,
+/// and the feed is read to its head and the gate opens. The verdict leaves
+/// the link Astation's local link. Then a re-verify on the live link
+/// retires the old proof (a fresh challenge on the old socket gets no
+/// answer, and nothing more is asked there); once the operation ends the
+/// link reconnects, once, the new socket proves itself under the new
+/// identity (the old proof no longer verifies: its key isn't the host's
+/// now), and the new identity's store reads the feed from 0 before the
+/// gate opens.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn through_astations_local_proxy_the_host_proves_itself_to_a_station_that_requires_it() {
+    use atem_client::host_route::{
+        HostRouteRefusal, RouteKind, verify_host_route_message, verify_host_route_message_as,
+    };
+    let mut rig = Rig::full(Via::Local);
+    let old_link = rig.link();
+    let atem_id = rig.atem_id();
+    rig.station().require_proof(ASTATION, &atem_id);
+    // The Station's challenge, through Astation's local link.
+    rig.station().on_link(old_link);
+    // The host answers; the Station verifies it against its own list.
+    let old_proof = rig.proof_seen(old_link, 0);
+    let old_head = rig.log.log.head();
+    let route = old_proof.verdict.clone().expect("the Station verified it");
+    assert_eq!((route.host_id.as_str(), route.head), (HOST, old_head));
+    // A proxy proof: the relay's verifier refuses it, so whoever holds the
+    // host's local link can't route a relay connection as this host with it.
+    assert_eq!(
+        verify_host_route_message(
+            &rig.log.log,
+            old_proof.message.as_bytes(),
+            &old_proof.nonce.unwrap(),
+            ASTATION,
+            &atem_id,
+        )
+        .map(|_| ()),
+        Err(HostRouteRefusal::Malformed("type")),
+        "never a relay route"
+    );
+    assert!(rig.station().sent().is_empty(), "no call before the proof");
+    assert!(!rig.gate_open());
+    // Only then the calls: the feed read to its head, the gate open.
+    rig.cover_and_open();
+    assert!(
+        rig.runtime_log().contains(&format!(
+            "host_route ok at head {} through Astation's local link",
+            old_head.seq
+        )),
+        "{}",
+        rig.runtime_log()
+    );
+    assert_eq!(
+        rig.dump()["station"]["link"]["kind"],
+        "local",
+        "never routed"
+    );
+    // A re-verify on the live link.
+    let verify = start_reverify(&rig);
+    finish_reverify(&mut rig);
+    rig.until_feed("the old association ended", |f| f["identity_moves"] == 1);
+    // The old proof is retired: a fresh challenge on the old socket gets
+    // no answer, and nothing more is asked there.
+    let seen = rig.station().proofs().len();
+    let sent_before = rig.station().sent_on(old_link).len();
+    rig.station().challenge(old_link);
+    rig.within("the challenge ignored", || {
+        rig.runtime_log().contains(IDENTITY_IGNORED)
+    });
+    rig.clock.add_mono(2_000);
+    rig.station().heads_now();
+    rig.two_passes();
+    rig.station().serve(old_link);
+    assert_eq!(rig.station().proofs().len(), seen, "nothing answered there");
+    assert_eq!(rig.station().sent_on(old_link).len(), sent_before);
+    assert!(!rig.gate_open());
+    // The operation ends: the link reconnects, once.
+    end_reverify(&rig, verify, old_link);
+    let new_link = rig.next_link(old_link);
+    assert_eq!(new_link, old_link + 1, "no other connection between");
+    rig.link.set(new_link);
+    rig.station().reassociate(2, new_link);
+    // The new socket proves itself under the new identity.
+    rig.station().on_link(new_link);
+    let new_proof = rig.proof_seen(new_link, seen);
+    assert_eq!(
+        new_proof.verdict.as_ref().map(|route| route.head.seq),
+        Ok(old_head.seq + 1)
+    );
+    assert_eq!(
+        verify_host_route_message_as(
+            RouteKind::Proxy,
+            &rig.log.log,
+            old_proof.message.as_bytes(),
+            &old_proof.nonce.unwrap(),
+            ASTATION,
+            &atem_id,
+        )
+        .map(|_| ()),
+        Err(HostRouteRefusal::BadSignature),
+        "the old link's proof isn't the host's now"
+    );
+    // The new identity's store reads the feed from 0, then the gate opens.
+    rig.clock.add_mono(1_000);
+    let from_0 = {
+        let mut station = rig.station();
+        station.heads_now();
+        station.hold_call(new_link)
+    };
+    assert_eq!(sync_of(&from_0), rig.sync(0));
+    rig.two_passes();
+    assert!(!rig.gate_open(), "closed until the read");
+    rig.station().answer_held(from_0).unwrap();
+    rig.serve_until("the new store read", |rig| {
+        rig.cursor() == Some(1) && rig.gate_open()
+    });
+    assert_eq!(
+        rig.station().proofs().len(),
+        seen + 1,
+        "one proof per socket"
+    );
+}
+
+/// The Station refusing the local link's proof (here: another `atem_id`
+/// than it expects): the link is kept, since it is owner-present
+/// Astation's (no reconnect, one runtime.log line), and the Station
+/// refuses the link's calls as before, so the gate stays closed and `atem
+/// status` says why.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_refused_local_proof_keeps_the_link_and_its_calls_are_refused() {
+    use atem_client::host_route::HostRouteRefusal;
+    let rig = Rig::full(Via::Local);
+    let link = rig.link();
+    rig.station().require_proof(ASTATION, "another-atem-id");
+    rig.station().on_link(link);
+    let proof = rig.proof_seen(link, 0);
+    assert_eq!(proof.verdict, Err(HostRouteRefusal::AtemIdMismatch));
+    rig.within("the refusal's line", || {
+        rig.runtime_log().contains(
+            "host_route refused through Astation's local link: atem_id_mismatch; the link stays",
+        )
+    });
+    // The Station's calls on the link: refused, the gate closed.
+    rig.announce();
+    rig.serve_until("the link's call refused", |rig| {
+        rig.dump()["station"]["refusals"]["control_sync"].as_u64() >= Some(1)
+    });
+    rig.status_feeds(&format!("{GATE_CLOSED} ({REFUSED})"));
+    assert!(!rig.gate_open());
+    assert_eq!(rig.dump()["station"]["link"]["kind"], "local");
+    // Kept: no other connection.
+    let quiet = Instant::now() + Duration::from_secs(2);
+    while let Ok(event) = rig
+        .astation
+        .events
+        .recv_timeout(quiet.saturating_duration_since(Instant::now()))
+    {
+        assert!(
+            !matches!(event, Event::Authenticated(n) if n > link),
+            "reconnected\n{}",
+            rig.runtime_log()
+        );
+    }
+    assert_eq!(rig.astation.sender().latest(), Some(link));
+}
+
+/// Hook off = main: a challenge Astation's proxy forwards on the local link
+/// is ignored as on main (its runtime.log line), nothing answered. Observed
+/// through the link itself, so a release build runs it too: a round trip
+/// after the challenge on the same ordered socket ([`Rig::round_trip`]),
+/// then nothing reached the fake Station.
+#[test]
+fn with_the_hook_off_a_local_link_ignores_the_stations_challenge_as_main_does() {
+    let rig = Rig::start(Via::Local, false, false);
+    let atem_id = rig.atem_id();
+    rig.station().require_proof(ASTATION, &atem_id);
+    rig.station().on_link(rig.link());
+    rig.round_trip();
+    rig.within("the challenge ignored", || {
+        rig.runtime_log()
+            .contains("a host_challenge on a link that isn't a relay identity link was ignored")
+    });
+    rig.station().serve(rig.link());
+    assert!(rig.station().proofs().is_empty(), "nothing answered");
+    assert!(!rig.runtime_log().contains("host_challenge answered"));
+}
+
+// ── An identity change while Astation authenticates the link again ──
+
+/// Astation's item 15 (#120) across a re-authentication, on the relay
+/// (Astation in the room) and on Astation's local `:8080` link (the
+/// Station requiring the host's proof through its proxy). `atem pair
+/// verify` on the live link moves the pairing to trust generation 2 before
+/// its `verifyCommit` (`OpCall::Rebind`); the code is refused, so the
+/// ceremony ends with no new list or key, and nothing reads the host's
+/// identity again on the live link: it hasn't moved. Then Astation
+/// authenticates the link again and holds its answer (the link offline,
+/// its Station link down), and in that window the trust generation alone
+/// moves: the device list re-pinned in trust generation 2 with the same
+/// `host_channel_key` (the same account, device, genesis and key; on the
+/// relay the old socket's proof still verifies against the grown list)
+/// and the device verified again, as a `deviceVerified` still in flight
+/// leaves them. The move counts against the re-authenticating socket.
+/// Once Astation answers, the link comes back on that socket with the
+/// Station's `heads` right behind it (and on the local link a fresh
+/// challenge): nothing is asked, acknowledged or proved there, and the link
+/// reconnects once, after Astation's answer. The new
+/// socket proves itself at the grown list's head and the new identity's
+/// store reads the feed from 0 before the gate opens; its acks are trust
+/// generation 2's.
+fn an_identity_moving_in_a_reauthentication_window(via: Via) {
+    let mut rig = Rig::full(via);
+    let old_link = rig.link();
+    let connections = rig.astation.sender();
+    let old_head = rig.log.log.head().seq;
+    let seed = secret("control feed host");
+    let old_proof = match via {
+        Via::Relay => Some(proof_on(&rig, old_link)),
+        _ => {
+            let atem_id = rig.atem_id();
+            rig.station().require_proof(ASTATION, &atem_id);
+            rig.station().on_link(old_link);
+            assert!(rig.proof_seen(old_link, 0).verdict.is_ok());
+            None
+        }
+    };
+    rig.cover_and_open();
+    let verify = start_reverify(&rig);
+    end_reverify(&rig, verify, old_link);
+    rig.two_passes();
+    assert_eq!(rig.feed()["identity_moves"], 0, "{}", rig.feed());
+    // Astation authenticates the link again, its answer held: the window.
+    *rig.astation.auth.lock().unwrap() = AuthReply::Withhold;
+    auth_required_again(&rig, 0xc);
+    rig.until_station("the Station link down", |s| s["link"].is_null());
+    // The trust generation alone moves in the window.
+    rig.log.add_host(HOST, 2, &seed);
+    write_pin(&rig.sandbox.config(), &rig.log, HOST, 2, &seed);
+    support::astation::write_verified_trust(&rig.sandbox.config(), ACCOUNT, HOST);
+    rig.station().set_log(&rig.log);
+    let opened = format!("device list: opened at seq {} for {HOST}", old_head + 1);
+    rig.within("the re-pinned list", || rig.runtime_log().contains(&opened));
+    let feed = rig.until_feed("the move, in the window", |f| f["identity_moves"] == 1);
+    assert_eq!(feed["identity_moved"], true, "{feed}");
+    assert!(
+        rig.dump()["station"]["link"].is_null(),
+        "still in the window"
+    );
+    // Astation answers: the link back on the same socket, the Station's
+    // `heads` right behind.
+    *rig.astation.auth.lock().unwrap() = AuthReply::Authenticated;
+    let sent_before = rig.station().sent_on(old_link).len();
+    // Through Astation's local link the Station challenges the old socket
+    // again, right behind the answer (read with it, before the pass that
+    // reconnects): never answered there.
+    let answer = support::astation::authenticated().to_string();
+    match via {
+        Via::Local => rig.station().challenge_behind(old_link, answer),
+        _ => rig.astation.send(old_link, answer),
+    }
+    rig.station().heads_now();
+    // The link reconnects, once, after Astation's answer.
+    let new_link = rig.next_link(old_link);
+    assert_eq!(new_link, old_link + 1, "no other connection between");
+    assert!(
+        rig.runtime_log()
+            .contains("this host's identity changed on its Astation link; reconnecting")
+    );
+    rig.station().serve(old_link);
+    assert_eq!(
+        rig.station().sent_on(old_link).len(),
+        sent_before,
+        "nothing asked or acknowledged on the old association"
+    );
+    if via == Via::Local {
+        rig.within("the old socket's challenge ignored", || {
+            rig.runtime_log().contains(IDENTITY_IGNORED)
+        });
+    }
+    rig.link.set(new_link);
+    rig.station().reassociate(2, new_link);
+    // The new socket proves itself at the grown list's head.
+    match old_proof {
+        Some(old_proof) => {
+            let new_proof = proof_on(&rig, new_link);
+            assert_eq!(route_head(&rig.log, &new_proof), Ok(old_head + 1));
+            assert_eq!(
+                route_head(&rig.log, &old_proof),
+                Ok(old_head),
+                "the same key: the old proof alone doesn't tell"
+            );
+            rig.station().on_link(new_link);
+        }
+        None => {
+            let seen = rig.station().proofs().len();
+            rig.station().on_link(new_link);
+            let new_proof = rig.proof_seen(new_link, seen);
+            assert_eq!(
+                new_proof.verdict.as_ref().map(|route| route.head.seq),
+                Ok(old_head + 1)
+            );
+            assert_eq!(
+                rig.station()
+                    .proofs()
+                    .iter()
+                    .filter(|proof| proof.link == old_link)
+                    .count(),
+                1,
+                "one proof on the old socket: the challenge after the window unanswered"
+            );
+        }
+    }
+    // The new identity's store reads the feed from 0, then the gate opens.
+    rig.clock.add_mono(1_000);
+    let from_0 = {
+        let mut station = rig.station();
+        station.heads_now();
+        station.hold_call(new_link)
+    };
+    assert_eq!(sync_of(&from_0), rig.sync(0));
+    rig.two_passes();
+    assert!(!rig.gate_open(), "closed until the read");
+    rig.station().answer_held(from_0).unwrap();
+    rig.serve_until("the new store read", |rig| {
+        rig.cursor() == Some(1) && rig.gate_open()
+    });
+    let acks: Vec<ControlAck> = rig
+        .station()
+        .sent_on(new_link)
+        .iter()
+        .filter_map(|bytes| match ToStation::decode(bytes.as_bytes()) {
+            Ok(ToStation::ControlAck(ack)) => Some(ack),
+            _ => None,
+        })
+        .collect();
+    assert!(!acks.is_empty());
+    assert!(acks.iter().all(|ack| ack.host_trust_gen == 2), "{acks:?}");
+    // Once: no third connection, after 2 s more for a late one.
+    let quiet = Instant::now() + Duration::from_secs(2);
+    while let Ok(event) = rig
+        .astation
+        .events
+        .recv_timeout(quiet.saturating_duration_since(Instant::now()))
+    {
+        assert!(
+            !matches!(event, Event::Authenticated(n) if n > new_link),
+            "reconnected again"
+        );
+    }
+    assert_eq!(
+        connections.latest(),
+        Some(new_link),
+        "two connections in all"
+    );
+    assert_eq!(rig.feed()["identity_moves"], 1, "{}", rig.feed());
+    assert_eq!(rig.feed()["identity_moved"], false, "{}", rig.feed());
+}
+
+/// [`an_identity_moving_in_a_reauthentication_window`] on the relay.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_trust_generation_moving_while_astation_reauthenticates_the_relay_link_reconnects_it() {
+    an_identity_moving_in_a_reauthentication_window(Via::Relay);
+}
+
+/// [`an_identity_moving_in_a_reauthentication_window`] on Astation's local
+/// link.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES, ATEM_TEST_HOST_CLOCK and ATEM_TEST_STATE_DUMP hooks"
+)]
+fn a_trust_generation_moving_while_astation_reauthenticates_the_local_link_reconnects_it() {
+    an_identity_moving_in_a_reauthentication_window(Via::Local);
 }

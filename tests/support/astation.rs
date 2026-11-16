@@ -24,6 +24,8 @@ pub enum Event {
 
 enum Cmd {
     Send(String),
+    /// These, in order, in one write: the host reads them together.
+    SendAll(Vec<String>),
     Close,
 }
 
@@ -37,6 +39,15 @@ pub enum AuthReply {
     Grant { session_id: String, token: String },
     /// `auth{status: denied}` with this message.
     Deny(String),
+    /// No reply: the `auth` arrives as an `Event::Message`, and the test
+    /// answers it when it likes ([`authenticated`]): Astation slow to accept
+    /// a re-authentication.
+    Withhold,
+}
+
+/// Astation's `authenticated`, as the fake answers an accepted `auth`.
+pub fn authenticated() -> Value {
+    json!({"type": "statusUpdate", "data": {"status": "authenticated", "data": {}}})
 }
 
 pub struct FakeAstation {
@@ -51,7 +62,8 @@ pub struct FakeAstation {
 }
 
 /// The host's Station calls (host-work-v1 §11.4: `control_sync`,
-/// `control_ack`, `membership_fetch`) once a fake Station took them
+/// `control_ack`, `membership_fetch`; and a `host_route` answering the
+/// Station's challenge on a local link) once a fake Station took them
 /// ([`FakeAstation::station_calls`]): each with its link, as the bytes Atem
 /// sent, instead of an `Event::Message`.
 type StationTap = Arc<Mutex<Option<mpsc::Sender<(u64, String)>>>>;
@@ -65,6 +77,14 @@ impl LinkSender {
     pub fn send(&self, link: u64, text: String) {
         if let Some(tx) = self.0.lock().unwrap().get(&link) {
             let _ = tx.send(Cmd::Send(text));
+        }
+    }
+
+    /// `texts`, in order, in one write on `link` (one flush): the host
+    /// reads them together.
+    pub fn send_all(&self, link: u64, texts: Vec<String>) {
+        if let Some(tx) = self.0.lock().unwrap().get(&link) {
+            let _ = tx.send(Cmd::SendAll(texts));
         }
     }
 
@@ -206,6 +226,16 @@ async fn serve(
                         return;
                     }
                 }
+                Some(Cmd::SendAll(texts)) => {
+                    for text in texts {
+                        if socket.feed(Message::Text(text)).await.is_err() {
+                            return;
+                        }
+                    }
+                    if socket.flush().await.is_err() {
+                        return;
+                    }
+                }
                 Some(Cmd::Close) | None => {
                     let _ = socket.close(None).await;
                     return;
@@ -233,8 +263,14 @@ fn deliver(
     use atem_client::control::relay::op;
     const CALLS: [&str; 3] = [op::CONTROL_SYNC, op::CONTROL_ACK, op::MEMBERSHIP_FETCH];
     let call = match &value {
+        // A `host_route` past the relay's own challenge too: the proof a
+        // Station's challenge got through Astation's local proxy (design
+        // I.5.8), for the fake Station to verify.
         Some(value) => {
-            value["type"] == "relay" && value["op"].as_str().is_some_and(|op| CALLS.contains(&op))
+            value["type"] == "relay"
+                && value["op"]
+                    .as_str()
+                    .is_some_and(|op| CALLS.contains(&op) || op == "host_route")
         }
         // Not JSON, but naming a call: its bytes reach the fake Station
         // (whose strict reader refuses them), for the goldens.
@@ -275,10 +311,7 @@ async fn answer_auth(
     AUTHS.lock().unwrap().push(value["data"]["data"].clone());
     let answer = auth.lock().unwrap().clone();
     let (reply, accepted) = match answer {
-        AuthReply::Authenticated => (
-            json!({"type": "statusUpdate", "data": {"status": "authenticated", "data": {}}}),
-            true,
-        ),
+        AuthReply::Authenticated => (authenticated(), true),
         AuthReply::Grant { session_id, token } => (
             json!({"type": "statusUpdate", "data": {"status": "auth", "data": {"status": "granted",
                 "session_id": session_id, "token": token}}}),
@@ -289,6 +322,10 @@ async fn answer_auth(
                 "message": message}}}),
             false,
         ),
+        AuthReply::Withhold => {
+            let _ = events.send(Event::Message(n, value));
+            return true;
+        }
     };
     if socket.send(Message::Text(reply.to_string())).await.is_err() {
         return false;

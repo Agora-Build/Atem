@@ -3021,7 +3021,9 @@ fn pairing() {
 #[test]
 fn host_route() {
     use atem_client::host_route::{
-        HostChallenge, HostRouteBody, verify_host_route, verify_host_route_message,
+        HostChallenge, HostRouteBody, HostRouteRefusal, RouteKind, sign_host_route_as,
+        verify_host_route, verify_host_route_as, verify_host_route_message,
+        verify_host_route_message_as,
     };
     let mut run = Run::new("r9-vectors-host-route");
     let book = Book::load();
@@ -3102,9 +3104,104 @@ fn host_route() {
             atem_client::host_route::sign_host_route(&book.provider, &book.signer(signer), &body)
                 .unwrap();
         assert_eq!(resigned, object, "{label}");
+        // Never a proxy proof (the kinds are domain separated).
+        assert_eq!(
+            verify_host_route_message_as(
+                RouteKind::Proxy,
+                &log,
+                message.as_bytes(),
+                &nonce,
+                &room,
+                &atem_id
+            ),
+            Err(HostRouteRefusal::Malformed("type")),
+            "{label}"
+        );
         run.pass(format!(
-            "{label}: verifies; signing input and signature reproduced"
+            "{label}: verifies; signing input and signature reproduced; refused as a proxy proof"
         ));
+    }
+
+    // The proxy kind (a Station's challenge through Astation's `:8080`;
+    // proposed, for Astation's agreement): the same cases under their own
+    // type and label, and the refusals across the kinds.
+    let proxy = run.get("proxy");
+    for case in proxy["valid"].as_array().unwrap() {
+        let label = s(case, "label");
+        let log = chain(&case["chain"]);
+        let message = case["message"].to_string();
+        let route = verify_host_route_message_as(
+            RouteKind::Proxy,
+            &log,
+            message.as_bytes(),
+            &nonce,
+            &room,
+            &atem_id,
+        )
+        .unwrap_or_else(|e| panic!("proxy {label}: {e}"));
+        assert_eq!(route.host_id, s(&case["expect"], "host_id"), "{label}");
+        assert_eq!(route.head.to_json(), case["expect"]["head"], "{label}");
+        let proof = case["message"]["proof"].to_string();
+        assert_eq!(
+            verify_host_route_as(
+                RouteKind::Proxy,
+                &log,
+                proof.as_bytes(),
+                &nonce,
+                &room,
+                &atem_id
+            ),
+            Ok(route)
+        );
+        assert_eq!(
+            verify_host_route_message(&log, message.as_bytes(), &nonce, &room, &atem_id),
+            Err(HostRouteRefusal::Malformed("type")),
+            "proxy {label}: never a relay route"
+        );
+        let object = SignedObject::from_strict(&strict(&case["message"]["proof"])).unwrap();
+        assert_eq!(object.label(), SignLabel::HostRouteProxy);
+        assert_eq!(object.body()["type"], "atem-host-route-proxy");
+        assert_eq!(object.jcs(), s(case, "jcs"));
+        assert_eq!(
+            hex(object.signing_input().as_bytes()),
+            s(case, "signing_input_hex")
+        );
+        let host = s(&case["expect"], "host_id");
+        let key = log.host(host).unwrap().host_key.clone();
+        let signer = ["host-a", "host-evil"]
+            .into_iter()
+            .find(|k| book.signer_public(k) == key)
+            .unwrap();
+        let body = HostRouteBody {
+            head: Head::from_json(&object.body()["head"]).unwrap(),
+            ..HostRouteBody::at(&log, host, &atem_id, &parsed)
+        };
+        let resigned = sign_host_route_as(
+            RouteKind::Proxy,
+            &book.provider,
+            &book.signer(signer),
+            &body,
+        )
+        .unwrap();
+        assert_eq!(resigned, object, "proxy {label}");
+        run.pass(format!(
+            "proxy {label}: verifies as a proxy proof only; signing input and signature reproduced"
+        ));
+    }
+    for case in proxy["cross"].as_array().unwrap() {
+        let label = s(case, "label");
+        let kind = match s(case, "verifier") {
+            "relay" => RouteKind::Relay,
+            "proxy" => RouteKind::Proxy,
+            other => panic!("{label}: verifier {other}"),
+        };
+        let log = chain(&case["chain"]);
+        let message = case["message"].to_string();
+        let refusal =
+            verify_host_route_message_as(kind, &log, message.as_bytes(), &nonce, &room, &atem_id)
+                .expect_err(label);
+        assert_eq!(refusal.code(), s(case, "code"), "{label}: {refusal}");
+        run.pass(format!("cross {label}: refused {}", s(case, "code")));
     }
 
     for case in run.get("invalid").as_array().unwrap() {
@@ -3157,6 +3254,102 @@ fn host_route() {
         run.pass(format!("relay reply {label}: refused"));
     }
     run.finish();
+}
+
+/// The proxy kind's cases of `r9-vectors-host-route` (`proxy`): each valid
+/// relay case's body as `atem-host-route-proxy`, signed by the same host key
+/// over the proxy label (Ed25519 is deterministic), and the refusals across
+/// the kinds: a proof of one kind given to the other's verifier
+/// (`malformed`, its type), and one relabelled to the other kind with its
+/// signature kept (`bad_signature`: the label and the type both changed).
+fn host_route_proxy_vectors(book: &Book, file: &Value) -> Value {
+    use atem_client::host_route::{
+        HostRouteBody, RouteKind, host_route_message, sign_host_route_as,
+    };
+    use serde_json::json;
+    let challenge = atem_client::host_route::HostChallenge::parse(
+        file["challenge"]["message"].to_string().as_bytes(),
+    )
+    .unwrap();
+    let atem_id = s(&file["challenge"], "atem_id");
+    let mut valid = Vec::new();
+    for case in file["valid"].as_array().unwrap() {
+        let relay = SignedObject::from_strict(&strict(&case["message"]["proof"])).unwrap();
+        let signer = ["host-a", "host-evil"]
+            .into_iter()
+            .find(|k| relay.verify(&book.signer_public(k)).is_ok())
+            .expect("a known host key");
+        let body = HostRouteBody {
+            account_id: s(relay.body(), "account_id").to_owned(),
+            genesis_hash: Hash32::from_hex(s(relay.body(), "genesis_hash")).unwrap(),
+            host_id: s(relay.body(), "host_id").to_owned(),
+            atem_id: atem_id.to_owned(),
+            room: challenge.room.clone(),
+            nonce: challenge.nonce,
+            head: Head::from_json(&relay.body()["head"]).unwrap(),
+        };
+        let proof = sign_host_route_as(
+            RouteKind::Proxy,
+            &book.provider,
+            &book.signer(signer),
+            &body,
+        )
+        .unwrap();
+        valid.push(json!({
+            "label": s(case, "label"),
+            "note": format!("{} (the proxy kind)", s(case, "note")),
+            "chain": case["chain"],
+            "expect": case["expect"],
+            "jcs": proof.jcs(),
+            "signing_input_hex": hex(proof.signing_input().as_bytes()),
+            "message": host_route_message(&proof),
+        }));
+    }
+    let relay_at_head = file["valid"][0]["message"].clone();
+    let proxy_at_head = valid[0]["message"].clone();
+    let relabelled = |message: &Value, to: &str| {
+        let mut message = message.clone();
+        message["proof"]["body"]["type"] = json!(to);
+        message
+    };
+    let cross = json!([
+        {"label": "proxy_proof_to_the_relay_verifier", "verifier": "relay", "chain": [],
+         "message": proxy_at_head, "code": "malformed",
+         "reason": "a proxy proof (at_head) is never a relay route: its type"},
+        {"label": "relay_proof_to_the_proxy_verifier", "verifier": "proxy", "chain": [],
+         "message": relay_at_head, "code": "malformed",
+         "reason": "a relay proof (at_head) is never a proxy proof: its type"},
+        {"label": "proxy_body_relabelled_relay", "verifier": "relay", "chain": [],
+         "message": relabelled(&proxy_at_head, "atem-host-route"), "code": "bad_signature",
+         "reason": "the proxy at_head proof with its type changed to atem-host-route, its signature kept: signed over the other label and type"},
+        {"label": "relay_body_relabelled_proxy", "verifier": "proxy", "chain": [],
+         "message": relabelled(&relay_at_head, "atem-host-route-proxy"), "code": "bad_signature",
+         "reason": "the relay at_head proof with its type changed to atem-host-route-proxy, its signature kept"},
+    ]);
+    json!({
+        "note": "R9.7b through Astation's :8080 proxy (the delegated host-work design I.5.8; proposed, for Astation's agreement): the proof's fields under their own type atem-host-route-proxy, signed by the host's host_channel_key over enc([\"atem-host-route-proxy-v1\", jcs(body)]), against the same log, chain, challenge and atem_id as the relay cases. Each `valid` case verifies as the proxy kind only (the relay verifier refuses it, malformed, its type); every relay `valid` case is refused by the proxy verifier the same way. `cross` cases are refused by the verifier of the kind they name (`verifier`), with `code`. A Station accepts a proxy proof only on Astation's native-bound forwarding connection, never as a relay route.",
+        "valid": valid,
+        "cross": cross,
+    })
+}
+
+/// Writes `proxy` into `r9-vectors-host-route` (the rest of the file as it
+/// is: the file is serde's sorted pretty form, checked first).
+#[test]
+#[ignore = "writes the host route proxy-kind vectors"]
+fn write_host_route_proxy_vectors() {
+    let path = fixtures_dir().join("r9-vectors-host-route.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let mut file: Value = serde_json::from_str(&text).unwrap();
+    let mut before = file.clone();
+    before.as_object_mut().unwrap().remove("proxy");
+    let proxy = host_route_proxy_vectors(&Book::load(), &before);
+    let unchanged = serde_json::to_string_pretty(&before).unwrap() + "\n";
+    if file.get("proxy").is_none() {
+        assert_eq!(unchanged, text, "the file is serde's pretty form");
+    }
+    file["proxy"] = proxy;
+    std::fs::write(path, serde_json::to_string_pretty(&file).unwrap() + "\n").unwrap();
 }
 
 // ------------------------------------- delegated host-work: device-list actions

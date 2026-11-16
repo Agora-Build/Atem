@@ -179,11 +179,14 @@ pub fn describe(input: &SigningInput) -> (SigningPurpose, Option<String>) {
         SignLabel::ChannelClient => (SigningPurpose::Channel, None),
         // A host's `enc_sig` signs fields, not a body (II.4.1).
         SignLabel::ChannelHost | SignLabel::HostEncKey => (SigningPurpose::HostSigning, None),
-        // Signed bodies the host makes with its `host_key`: an envelope and
-        // a result between hosts (II.4.2, II.4.4) too.
+        // Signed bodies the host makes with its `host_key`: a host route
+        // proof of either kind (the relay's, or a Station's challenge
+        // through Astation's `:8080`), an envelope and a result between
+        // hosts (II.4.2, II.4.4) too.
         SignLabel::PushHint
         | SignLabel::Seen
         | SignLabel::HostRoute
+        | SignLabel::HostRouteProxy
         | SignLabel::Envelope
         | SignLabel::Result => (SigningPurpose::HostSigning, body()),
         SignLabel::BrowserGrant => (SigningPurpose::BrowserGrant, body()),
@@ -457,6 +460,7 @@ impl AppKeyProvider for SoftwareKeyStore {
             SignLabel::ChannelHost,
             SignLabel::ChannelClient,
             SignLabel::HostRoute,
+            SignLabel::HostRouteProxy,
             SignLabel::HostEncKey,
             SignLabel::HostWorkControl,
             // A host's mail (delegated host work II.4.2, II.4.4; host role,
@@ -585,6 +589,9 @@ mod tests {
             (SignLabel::PushHint, SigningPurpose::HostSigning),
             (SignLabel::Seen, SigningPurpose::HostSigning),
             (SignLabel::ChannelHost, SigningPurpose::HostSigning),
+            // A host route proof of either kind: the host's own signing.
+            (SignLabel::HostRoute, SigningPurpose::HostSigning),
+            (SignLabel::HostRouteProxy, SigningPurpose::HostSigning),
             // A control record whose body can't be read asks the owner.
             (SignLabel::HostWorkControl, SigningPurpose::ControlRecord),
         ] {
@@ -665,11 +672,12 @@ mod tests {
         let mut unlabelled = good;
         unlabelled.input = atem_client::encoding::enc(&[b"not-a-label", b"{}"]);
         assert!(AppKeyProvider::sign(&*store, unlabelled).is_err());
-        // Every label the core signs with: a control record, a host route,
-        // and a host's enc_sig over several fields.
+        // Every label the core signs with: a control record, a host route
+        // of either kind, and a host's enc_sig over several fields.
         for input in [
             SigningInput::new(SignLabel::HostWorkControl, b"{}"),
             SigningInput::new(SignLabel::HostRoute, b"{}"),
+            SigningInput::new(SignLabel::HostRouteProxy, b"{}"),
             SigningInput::fields(SignLabel::HostEncKey, &[b"acct", &[7u8; 32], b"host-a"]),
         ] {
             let request = sign_request(&KeyId::new("k"), &input);

@@ -160,6 +160,25 @@ impl App {
         self.relay_dropped(text.len());
     }
 
+    /// A `host_challenge` or a verdict the Station sent through Astation's
+    /// local link (`host.delegated` on; design I.5.8, "Which host is
+    /// calling"): answered or checked by the link's route, in order with
+    /// Astation's messages, only while Astation has authenticated the link
+    /// (otherwise ignored, with the route's runtime.log line). A verdict is
+    /// informational on the host: it changes nothing but that line. An ok
+    /// is the Station's association for the link's calls (the link stays
+    /// Astation's, never routed); a refusal keeps the link, which is
+    /// owner-present Astation's, and the Station refuses the link's calls
+    /// as it does today, so its gate stays closed.
+    pub(super) fn local_route_message(&mut self, text: &str) {
+        if !self.astation_connected || self.astation_reauth.is_some() {
+            // Not authenticated now: ignored, with the route's line.
+            self.astation_client.local_route_ignored(text);
+            return;
+        }
+        let _ = self.astation_client.local_route_message(text);
+    }
+
     /// A relay message dropped unread (over its bound, or past this pass's
     /// count), `bytes` long: counted while the link carries r9 (as
     /// `relay_message` takes them), never its content; logged at powers of
@@ -302,17 +321,21 @@ impl App {
     /// host-work-v1 §11.4 "An identity change" (Astation's item 15 on
     /// #120; `host.delegated` only: the broker asks only then,
     /// `identity_reconnect`): the host's identity moved while its link was
-    /// up, so that socket's association (Astation's authentication of it,
-    /// and on the relay the route proof its challenge got) is the old
-    /// identity's, and the host never relabels it the new one's. Once
-    /// nothing is in flight (the waits of the route reconnect, above: the
-    /// re-verify's own operation first), the link is dropped and the normal
+    /// up, or while Astation authenticated it again (the same socket), so
+    /// that socket's association (Astation's authentication of it, and on
+    /// the relay the route proof its challenge got) is the old identity's,
+    /// and the host never relabels it the new one's. Once nothing is in
+    /// flight (the waits of the route reconnect, above: the re-verify's own
+    /// operation first, and a re-authentication until Astation answered,
+    /// then the link is up again), the link is dropped and the normal
     /// reconnect opens a new socket, which Astation authenticates and whose
     /// challenge the host answers under the new identity; its Station link
     /// then reads the feed from 0. Once per event: no link, or a link on
     /// another socket already (a reconnect came first), ends it unused. Any
-    /// link kind: a local link (`:8080`) has no route proof, but its
-    /// authentication is the socket's too.
+    /// link kind: a local link's (`:8080`) authentication is the socket's
+    /// too, and so is the route proof it gave the Station through
+    /// Astation's proxy (design I.5.8), which answers nothing more on that
+    /// socket meanwhile.
     pub fn identity_reconnect_due(&mut self, op_running: bool, admitting: bool) -> bool {
         let Some((since, socket)) = self.identity_reconnect else {
             return false;

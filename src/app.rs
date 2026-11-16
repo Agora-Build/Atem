@@ -59,6 +59,14 @@ pub enum MenuAction {
     Exit,
 }
 
+/// Whether the runtime's local link answers the Station's challenge that
+/// Astation's proxy forwards ([`App::local_route_proof`], design I.5.8):
+/// only with `host.delegated` on, the debug-only hook, which no release
+/// build turns on.
+pub fn local_route_proof_for(features: crate::runtime::test_hooks::HostFeatures) -> bool {
+    features.delegated
+}
+
 pub struct App {
     pub last_session_refresh: Option<Instant>,
     pub mode: AppMode,
@@ -95,6 +103,12 @@ pub struct App {
     /// The host route state the broker keeps current (§R9.7b): the relay
     /// link answers the relay's `host_challenge` from it.
     pub host_route: crate::session_protocol::r9::route::RouteHandle,
+    /// Inside `atem runtime` with `host.delegated` on (the debug-only hook,
+    /// [`local_route_proof_for`]): the local link (Astation's `:8080`) answers
+    /// the Station's `host_challenge` that Astation's proxy forwards, from
+    /// `host_route` (§R9.7b; the delegated host-work design I.5.8, "Which
+    /// host is calling"). Off, a local link ignores it, as before.
+    pub local_route_proof: bool,
     /// The host became able to answer the relay's challenge (a device list
     /// pinned, a held one reconciled) while its relay link may have answered
     /// none: the link reconnects once to prove its route (§R9.7b), when no
@@ -183,6 +197,7 @@ impl App {
             astation_reconnect: true,
             hosted: None,
             host_route: crate::session_protocol::r9::route::new_handle(),
+            local_route_proof: false,
             route_reconnect: None,
             identity_reconnect: None,
             verify_hold: None,
@@ -453,6 +468,7 @@ impl App {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.astation_connect_rx = Some(rx);
         let host_route = self.host_route.clone();
+        let local_route_proof = self.local_route_proof;
         let src = crate::profile::Sources {
             config: config.clone(),
             paths: crate::paths::ProfilePaths::default_paths(),
@@ -505,10 +521,18 @@ impl App {
                     return;
                 }
             };
+            // The paired Astation's identity room: the relay link's room,
+            // and the one a local link's route proof is made for.
+            let room = record.map(|record| record.astation_id);
 
             // Local first: the pairing's saved session, else the loopback
-            // bootstrap proof (never pairing).
+            // bootstrap proof (never pairing). With `host.delegated` on it
+            // answers the Station's challenge that Astation's proxy forwards
+            // (§R9.7b; design I.5.8), with the relay link's inputs.
             if local_allowed {
+                if local_route_proof && let Some(room) = &room {
+                    client = client.with_local_host_route(host_route.clone(), room);
+                }
                 match client.connect_without_pairing(local_url).await {
                     Ok(()) => {
                         let _ = tx.send(Ok((client, Some("local".to_string()))));
@@ -520,7 +544,7 @@ impl App {
 
             // Local unavailable or not allowed: the paired Astation's
             // identity room on the relay (no pairing, no relay connection).
-            if let Some(relay_code) = record.map(|record| record.astation_id) {
+            if let Some(relay_code) = room {
                 let mut relay_client = crate::websocket_client::AstationClient::new()
                     .with_profile(src)
                     .with_host_route(host_route);
@@ -774,6 +798,9 @@ impl App {
             AstationMessage::Relay(text) => {
                 self.relay_message(text);
             }
+            AstationMessage::LocalRoute(text) => {
+                self.local_route_message(&text);
+            }
             AstationMessage::RelayTooLarge(bytes) => {
                 self.relay_dropped(bytes);
             }
@@ -1018,5 +1045,151 @@ mod tests {
         app.rebuild_menu();
         assert_eq!(app.main_menu_items[3], "\u{1f916} Agent Sessions (2 running)");
         assert_eq!(app.selected_index, 6); // clamped to last valid index
+    }
+
+    /// Design I.5.8 (`host.delegated` on: `local_route_proof`): the
+    /// runtime's connect gives its local link (Astation's `:8080`) the
+    /// relay link's route inputs, the relay room (the pairing's Astation id)
+    /// and this host's `atem_id`, and once Astation authenticated the link
+    /// the App answers the Station's challenge Astation's proxy forwards
+    /// with a proof the shared verifier takes for them. With the hook off,
+    /// as on main, the local link ignores it.
+    #[test]
+    fn the_runtimes_local_link_answers_the_stations_challenge_only_with_the_hook() {
+        use crate::session_protocol::membership::r9log::{TestLog, secret};
+        use crate::session_protocol::r9::route::{self, RouteIdentity, RouteState};
+        use atem_client::host_route::{
+            HostChallenge, HostRouteRefusal, RouteKind, verify_host_route_message,
+            verify_host_route_message_as,
+        };
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        const ASTATION: &str = "astation-local-route";
+        const ATEM_ID: &str = "atem-app-local-route";
+        let mut log = TestLog::genesis("acct-1", &secret("app astation"));
+        log.add_host("host-1", 1, &secret("app host"));
+        for hook in [true, false] {
+            let (dir, _profile) = crate::test_profile::temp();
+            let cred = crate::paths::ProfilePaths::in_dir(dir.path()).cred;
+            let _agent = crate::test_profile::use_agent(std::sync::Arc::new(
+                crate::memory::cred_agent::test_agent(&cred),
+            ));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let routes = runtime.block_on(async {
+                crate::pairing::tests::write_bound(
+                    dir.path(),
+                    ASTATION,
+                    1,
+                    "binding-1",
+                    ("session-1", "token-1"),
+                );
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                std::fs::write(
+                    dir.path().join("config.toml"),
+                    format!(
+                        "astation_ws = \"ws://{}/ws\"\nastation_relay_url = \"http://127.0.0.1:1\"\natem_id = \"{ATEM_ID}\"\n",
+                        listener.local_addr().unwrap()
+                    ),
+                )
+                .unwrap();
+                // Astation authenticates the link, then its proxy forwards
+                // the Station's challenge; what Atem answered comes back.
+                let challenge = HostChallenge::new(ASTATION);
+                let forwarded = challenge.to_json().to_string();
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let auth_required = serde_json::json!({"type": "statusUpdate",
+                        "data": {"status": "auth_required", "data": {"astation_id": ASTATION,
+                        "challenge": "a".repeat(64), "transport": "lan", "protocol": "2"}}});
+                    socket.send(WsMessage::Text(auth_required.to_string())).await.unwrap();
+                    let mut routes = Vec::new();
+                    let mut deadline = None;
+                    loop {
+                        // With the hook on, until its answer; then (and with
+                        // it off) 1.5 s more for one that shouldn't come.
+                        let within = deadline.map_or(Duration::from_secs(60), |at: tokio::time::Instant| {
+                            at.saturating_duration_since(tokio::time::Instant::now())
+                        });
+                        let Ok(Some(Ok(WsMessage::Text(text)))) =
+                            tokio::time::timeout(within, socket.next()).await
+                        else {
+                            break;
+                        };
+                        let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+                        if value["data"]["status"] == "auth" {
+                            let authenticated = serde_json::json!({"type": "statusUpdate",
+                                "data": {"status": "authenticated", "data": {}}});
+                            socket.send(WsMessage::Text(authenticated.to_string())).await.unwrap();
+                            socket.send(WsMessage::Text(forwarded.clone())).await.unwrap();
+                            if !hook {
+                                deadline = Some(tokio::time::Instant::now() + Duration::from_millis(1_500));
+                            }
+                        } else if value["op"] == "host_route" {
+                            routes.push(text);
+                            deadline = Some(tokio::time::Instant::now() + Duration::from_millis(1_500));
+                        }
+                    }
+                    routes
+                });
+                let mut app = App::new();
+                app.local_route_proof = hook;
+                let host_key = std::sync::Arc::new(crate::session_protocol::r9::HostKey::new(&secret("app host")));
+                route::set(
+                    &app.host_route,
+                    RouteState::Ready {
+                        id: RouteIdentity {
+                            account_id: "acct-1".into(),
+                            genesis_hash: log.log.genesis_hash(),
+                            host_id: "host-1".into(),
+                            head: log.log.head(),
+                            chain: std::sync::Arc::new(log.log.entries().iter().map(|e| e.hash()).collect()),
+                        },
+                        key: host_key,
+                    },
+                );
+                app.spawn_astation_connect();
+                while !server.is_finished() {
+                    app.poll_astation_connect();
+                    if app.astation_connected {
+                        app.process_astation_messages().await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(app.astation_connected, "hook {hook}: the local link");
+                let routes = server.await.unwrap();
+                (routes, challenge)
+            });
+            let (routes, challenge) = routes;
+            if hook {
+                assert_eq!(routes.len(), 1, "{routes:?}");
+                assert_eq!(
+                    verify_host_route_message(
+                        &log.log,
+                        routes[0].as_bytes(),
+                        &challenge.nonce,
+                        ASTATION,
+                        ATEM_ID,
+                    ),
+                    Err(HostRouteRefusal::Malformed("type")),
+                    "a proxy proof: never a relay route"
+                );
+                let route = verify_host_route_message_as(
+                    RouteKind::Proxy,
+                    &log.log,
+                    routes[0].as_bytes(),
+                    &challenge.nonce,
+                    ASTATION,
+                    ATEM_ID,
+                )
+                .unwrap();
+                assert_eq!(route.host_id, "host-1");
+            } else {
+                assert!(routes.is_empty(), "the hook off: ignored, as on main");
+            }
+        }
     }
 }
