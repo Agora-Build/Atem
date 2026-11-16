@@ -3332,8 +3332,8 @@ verified with the key its sender last held (a removed host's newest
 authenticated); and the plaintext must answer the row (a
 status names the row's `message_id`, a refusal the request's id or one of
 its cancel or complete envelopes', a result a task of the resolution; else
-`does_not_answer_outbox_row`, refused authenticated). **Atem's reading, for
-Astation:** the `result_id` check runs with the plaintext, after its strict
+`does_not_answer_outbox_row`, refused authenticated). **Atem's reading, agreed with Astation 2026-11-16,
+#173 comment 6919736991:** the `result_id` check runs with the plaintext, after its strict
 reading and before the row's, whatever the sender's standing: a result
 failing both is `result_id_mismatch`, and a revoked or removed host's
 mismatched result is refused, never kept as data.
@@ -3520,7 +3520,7 @@ moves to 11, and position 12 comes with the next call, `after: 11`.
      it) gets no `mailbox_put_refused`, which names the `id`: the Station
      drops it and counts it, and the sender's live put is retired at the
      deadline, as an unanswered call (rule 8). A sender's own shared-core
-     builder never makes one. **Atem's reading, for Astation:** the shared
+     builder never makes one. **Atem's reading, agreed with Astation 2026-11-16, #173 comment 6919736991:** the shared
      core's reader also refuses a put whose object's sealed part isn't of
      the right shape (`enc` and `ct` base64url, `enc` 32 bytes, `ct` at
      least a tag), so the Station drops that put too; it still never opens
@@ -3529,7 +3529,7 @@ moves to 11, and position 12 comes with the next call, `after: 11`.
      its object's `id`). `quota`: a limit of design II.4.3 is reached; the
      object isn't stored and never counts as stored or accepted, and the
      sender keeps it and puts it again later. `id_reused`: final for those
-     bytes. `expired`: final; **Atem's reading, for Astation:** also the
+     bytes. `expired`: final; **Atem's reading, agreed with Astation 2026-11-16, #173 comment 6919736991:** also the
      code of an `expires_at` more than 24 h after `created_at`, or not after
      it (checked above, with no code of its own). `forbidden`: rule 1, or a recipient that isn't
      a current host at that generation; final on this link generation (the

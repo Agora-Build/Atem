@@ -216,7 +216,7 @@ impl MailboxMismatch {
 /// `id`) is refused by this reader, and the Station drops it unanswered. So
 /// is one whose sealed part isn't of the right shape (`enc` and `ct`
 /// base64url, `enc` 32 bytes, `ct` at least a tag): Atem's reading of rule 3,
-/// for Astation. The sealed part is never opened or judged.
+/// agreed with Astation (2026-11-16). The sealed part is never opened or judged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxPut {
     pub request_id: String,
@@ -344,7 +344,7 @@ pub enum PutRefusal {
     /// Another object is stored under the key `(calling host, id)`: final
     /// for those bytes; the first stays.
     IdReused,
-    /// The object has expired: final. Also, Atem's reading for Astation
+    /// The object has expired: final. Also, Atem's reading agreed with Astation (2026-11-16)
     /// (host-work-v1 §11.5 rule 3 names no code for them): an `expires_at`
     /// more than 24 h after its `created_at`, or not after it.
     Expired,

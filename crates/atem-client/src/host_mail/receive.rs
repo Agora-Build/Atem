@@ -3183,7 +3183,7 @@ mod tests {
         );
     }
 
-    /// The `result_id` check's place (Atem's reading, host-work-v1 §11.5):
+    /// The `result_id` check's place (Atem's reading, agreed with Astation 2026-11-16; host-work-v1 §11.5):
     /// with the plaintext, before the outbox row, whatever the sender's
     /// standing. A result failing both checks is `result_id_mismatch`, and a
     /// removed host's mismatched result is refused, never kept as data.
