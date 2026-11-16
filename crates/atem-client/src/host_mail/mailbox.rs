@@ -36,8 +36,9 @@
 //! **Objects.** A put carries one `atem-envelope` or `atem-result`
 //! ([`MailboxPut::mail`]: the body the Station routes, checks and charges,
 //! never trusts; the sealed part it never opens). A page keeps each object
-//! as the Station sent it, of any JSON type ([`MailboxEntry::raw`]), judged
-//! on its own by the receiving host ([`MailboxEntry::parse_object`], then
+//! as the Station sent it, of any JSON type ([`MailboxEntry::raw`]) and as
+//! its exact bytes ([`MailboxEntry::bytes`]), judged on its own by the
+//! receiving host ([`MailboxEntry::parse_object`], then
 //! [`super::open_envelope`] or [`super::accept_result`]): one that doesn't
 //! parse never costs the page. A page that isn't strict I-JSON is refused
 //! whole: a Station fault, as in §11.4.
@@ -212,7 +213,10 @@ impl MailboxMismatch {
 /// `atem-envelope` or `atem-result` of the calling host, in the mailbox its
 /// `recipient` names (rule 3). The Station reads the body only
 /// ([`MailboxPut::mail`]); a put whose object has no body it reads (or no
-/// `id`) is refused by this reader, and the Station drops it unanswered.
+/// `id`) is refused by this reader, and the Station drops it unanswered. So
+/// is one whose sealed part isn't of the right shape (`enc` and `ct`
+/// base64url, `enc` 32 bytes, `ct` at least a tag): Atem's reading of rule 3,
+/// for Astation. The sealed part is never opened or judged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxPut {
     pub request_id: String,
@@ -340,7 +344,9 @@ pub enum PutRefusal {
     /// Another object is stored under the key `(calling host, id)`: final
     /// for those bytes; the first stays.
     IdReused,
-    /// The object has expired, or its lifetime is longer than 24 h: final.
+    /// The object has expired: final. Also, Atem's reading for Astation
+    /// (host-work-v1 §11.5 rule 3 names no code for them): an `expires_at`
+    /// more than 24 h after its `created_at`, or not after it.
     Expired,
     /// Rule 1, or a recipient that isn't a current host at that generation:
     /// final on this link generation.
@@ -470,20 +476,28 @@ impl MailboxSync {
 }
 
 /// One object of a page at its position. The object is the value the
-/// Station sent, of any JSON type, kept as it came;
-/// [`MailboxEntry::parse_object`] is check 1's verdict on it.
+/// Station sent, of any JSON type, kept as it came, and beside it its exact
+/// bytes as received ([`MailboxEntry::bytes`]): an object that doesn't parse
+/// is refused with the SHA-256 of its bytes as fetched (host-work-v1 §11.5's
+/// check 1), and a value alone can't give them back (its keys are re-sorted,
+/// its spacing and escapes gone). [`MailboxEntry::parse_object`] is check
+/// 1's verdict on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxEntry {
     pub position: u64,
     object: Value,
+    bytes: Vec<u8>,
 }
 
 impl MailboxEntry {
-    /// A Station's entry for an object it stored, at `position`.
+    /// A Station's entry for an object it stored, at `position`: its bytes
+    /// are its compact JSON, what the page's builder writes.
     pub fn new(position: u64, object: &SignedObject) -> Self {
+        let object = object.to_json();
         MailboxEntry {
             position,
-            object: object.to_json(),
+            bytes: object.to_string().into_bytes(),
+            object,
         }
     }
 
@@ -491,6 +505,13 @@ impl MailboxEntry {
     /// [`MailboxEntry::parse_object`]).
     pub fn raw(&self) -> &Value {
         &self.object
+    }
+
+    /// The object's exact bytes as the page carried them (the text of its
+    /// value in the message, from its first to its last byte): what the host
+    /// hashes as evidence when the object doesn't parse.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 
     /// The object as a mailbox object (host-work-v1 §11.5's check 1: the
@@ -502,6 +523,30 @@ impl MailboxEntry {
         MailBody::from_object(&object)?;
         Ok(object)
     }
+}
+
+/// The exact text of each page object's value in `bytes`, in order: a second
+/// read of a message the strict parse has already taken, so it only finds
+/// where each object's text starts and ends.
+fn object_bytes(bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    use serde::Deserialize;
+    use serde_json::value::RawValue;
+    #[derive(Deserialize)]
+    struct Page<'a> {
+        #[serde(borrow)]
+        objects: Vec<Item<'a>>,
+    }
+    #[derive(Deserialize)]
+    struct Item<'a> {
+        #[serde(borrow)]
+        object: &'a RawValue,
+    }
+    let page: Page = serde_json::from_slice(bytes).map_err(|_| RelayError::NotStrict)?;
+    Ok(page
+        .objects
+        .iter()
+        .map(|item| item.object.get().as_bytes().to_vec())
+        .collect())
 }
 
 /// `mailbox_sync_result{request_id, mailbox_id, after, head, through,
@@ -597,15 +642,17 @@ impl MailboxSyncResult {
         finish(m)
     }
 
-    /// Reads received bytes, strictly.
+    /// Reads received bytes, strictly. Each object keeps its exact bytes
+    /// as received ([`MailboxEntry::bytes`]).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        Self::read(parse(bytes)?.value())
+        Self::read(parse(bytes)?.value(), bytes)
     }
 
-    fn read(root: &Value) -> Result<Self> {
+    /// `root` is the strict parse of `bytes`.
+    fn read(root: &Value, bytes: &[u8]) -> Result<Self> {
         let f = Fields::message(root, op::MAILBOX_SYNC_RESULT, &Self::FIELDS)?;
-        let objects = f
-            .array("objects", MAX_PAGE_OBJECTS)?
+        let items = f.array("objects", MAX_PAGE_OBJECTS)?;
+        let mut objects = items
             .iter()
             .map(|item| {
                 let e = Fields::of(item, &["position", "object"], "objects")?;
@@ -613,9 +660,19 @@ impl MailboxSyncResult {
                     position: e.uint("position")?,
                     // Any strict-JSON value, of any type: judged on its own.
                     object: e.get("object")?.clone(),
+                    bytes: Vec::new(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        if !objects.is_empty() {
+            let texts = object_bytes(bytes)?;
+            if texts.len() != objects.len() {
+                return Err(RelayError::NotStrict);
+            }
+            for (entry, text) in objects.iter_mut().zip(texts) {
+                entry.bytes = text;
+            }
+        }
         let page = MailboxSyncResult {
             request_id: f.text("request_id")?.to_owned(),
             mailbox_id: f.text("mailbox_id")?.to_owned(),
@@ -883,7 +940,9 @@ impl MailboxToHost {
         match op_of(root) {
             Some(op::MAILBOX_STORED) => MailboxStored::read(root).map(Self::Stored),
             Some(op::MAILBOX_PUT_REFUSED) => MailboxPutRefused::read(root).map(Self::PutRefused),
-            Some(op::MAILBOX_SYNC_RESULT) => MailboxSyncResult::read(root).map(Self::SyncResult),
+            Some(op::MAILBOX_SYNC_RESULT) => {
+                MailboxSyncResult::read(root, bytes).map(Self::SyncResult)
+            }
             Some(op::MAILBOX_DONE_RESULT) => MailboxDoneResult::read(root).map(Self::DoneResult),
             Some(op) => match MailboxRefusedCall::of_op(op) {
                 Some(call) => MailboxCallRefused::read(root, call).map(|r| match r.call {
@@ -1455,6 +1514,33 @@ mod tests {
                 "{bad:?}"
             );
         }
+        // The reader refuses the same forms on the wire: `through` other
+        // than `head`, or an object listed.
+        for (through, objects) in [
+            (json!(12), json!([])),
+            (json!(2), json!([])),
+            (
+                json!(3),
+                json!([{"position": 3, "object": object().to_json()}]),
+            ),
+            (
+                json!(3),
+                json!([{"position": 13, "object": object().to_json()}]),
+            ),
+        ] {
+            let mut wire = wire.clone();
+            wire["through"] = through.clone();
+            wire["objects"] = objects;
+            let read = MailboxSyncResult::decode(&bytes(&wire));
+            assert!(
+                matches!(read, Err(RelayError::Malformed(_))),
+                "through {through}: {read:?}"
+            );
+            assert!(matches!(
+                MailboxToHost::decode(&bytes(&wire)),
+                Err(RelayError::Malformed(_))
+            ));
+        }
     }
 
     #[test]
@@ -1479,6 +1565,77 @@ mod tests {
             MailboxSyncResult::decode(duplicate.as_bytes()),
             Err(RelayError::NotStrict)
         );
+    }
+
+    /// A page's text with `object` written as is at position 11.
+    fn page_text(object: &str) -> String {
+        format!(
+            r#"{{"type":"relay","op":"mailbox_sync_result","request_id":"{REQUEST}","mailbox_id":"{MAILBOX}","after":9,"head":12,"through":11,"objects":[ {{ "position" : 11 , "object" :  {object} }} ]}}"#
+        )
+    }
+
+    #[test]
+    fn a_page_keeps_each_objects_exact_bytes_as_received() {
+        // An object that doesn't parse is refused with the SHA-256 of its
+        // bytes as fetched (check 1): the reader keeps them exactly, beside
+        // the value, whatever their spacing, key order or escapes.
+        let odd = r#"{ "z" : 1,"a":[1, 2 ] ,"\u0062":"x\/y"}"#;
+        let text = page_text(odd);
+        for page in [
+            MailboxSyncResult::decode(text.as_bytes()).unwrap(),
+            match MailboxToHost::decode(text.as_bytes()).unwrap() {
+                MailboxToHost::SyncResult(page) => page,
+                other => panic!("{other:?}"),
+            },
+        ] {
+            let entry = &page.objects[0];
+            assert_eq!(entry.bytes(), odd.as_bytes());
+            assert_eq!(entry.raw(), &json!({"z": 1, "a": [1, 2], "b": "x/y"}));
+            assert!(entry.parse_object().is_err());
+        }
+        for odd in ["\"not an object\"", "7", "[ ]", "null"] {
+            let page = MailboxSyncResult::decode(page_text(odd).as_bytes()).unwrap();
+            assert_eq!(page.objects[0].bytes(), odd.as_bytes());
+        }
+        // A mailbox object sent pretty-printed, keys in another order: its
+        // bytes as sent, and it parses.
+        let wire = object().to_json();
+        let mut reordered = Map::new();
+        for key in ["sig", "ct", "body", "enc"] {
+            reordered.insert(key.to_owned(), wire[key].clone());
+        }
+        let pretty = serde_json::to_string_pretty(&Value::Object(reordered)).unwrap();
+        let page = MailboxSyncResult::decode(page_text(&pretty).as_bytes()).unwrap();
+        assert_eq!(page.objects[0].bytes(), pretty.as_bytes());
+        assert_eq!(page.objects[0].parse_object().unwrap(), object());
+        // A Station's builder writes the object compactly, and those are its
+        // bytes.
+        let built = MailboxEntry::new(11, &object());
+        assert_eq!(built.bytes(), object().to_json().to_string().as_bytes());
+        let read = MailboxSyncResult::decode(&bytes(&page_of(9, 12, 11, &[11]).to_json().unwrap()))
+            .unwrap();
+        assert_eq!(read.objects[0], built);
+        // Nested as deep as the strict parse takes, the bytes are kept too.
+        let mut deepest = None;
+        for depth in 100..200 {
+            let nested = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+            match MailboxSyncResult::decode(page_text(&nested).as_bytes()) {
+                Ok(page) => {
+                    assert_eq!(page.objects[0].bytes(), nested.as_bytes());
+                    deepest = Some(depth);
+                }
+                Err(e) => {
+                    // The strict parse's own bound, not the second read's.
+                    assert_eq!(e, RelayError::NotStrict, "{depth}");
+                    let text = page_text(&nested);
+                    assert!(
+                        StrictValue::parse(text.as_bytes(), MAX_MAILBOX_MESSAGE_BYTES).is_err()
+                    );
+                    break;
+                }
+            }
+        }
+        assert!(deepest.is_some_and(|d| d > 100 && d < 199), "{deepest:?}");
     }
 
     // ----------------------------------------------------------- bounds
@@ -1527,16 +1684,19 @@ mod tests {
         wire["object"]["ct"] = json!(b64u(&vec![0u8; ct + 3]));
         let big = MailboxPut::decode(&put_of_size(MAX_MAILBOX_MESSAGE_BYTES - 4)).unwrap();
         assert!(big.to_json().is_ok());
+        // The put's builder refuses an object that takes it over the bound.
+        let too_big = MailboxPut {
+            request_id: REQUEST.into(),
+            object: SignedObject::from_value(&wire["object"]).unwrap(),
+        };
+        assert_eq!(too_big.to_json(), Err(RelayError::TooLarge));
         let over = MailboxSyncResult {
             request_id: REQUEST.into(),
             mailbox_id: MAILBOX.into(),
             after: 0,
             head: 1,
             through: 1,
-            objects: vec![MailboxEntry {
-                position: 1,
-                object: wire["object"].clone(),
-            }],
+            objects: vec![MailboxEntry::new(1, &too_big.object)],
         };
         assert_eq!(over.to_json(), Err(RelayError::TooLarge));
     }
