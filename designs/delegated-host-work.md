@@ -1010,9 +1010,11 @@ restart; interrupting a turn that has already ended does nothing.
   - **With neither path**, the gate stays closed.
   - **An identity change. Astation's item 15, #120 (Atem's reading that implements it, host-work-v1 §11.4).** A
     link's association is the host identity its socket was authenticated under (its account, device and trust
-    generation, and the device list's genesis), and on the relay the route proof that identity made (R9.7b). When
-    that identity changes while the link is up (`atem pair verify` on the live link, or a new trust generation,
-    account or genesis), the host never relabels the old association. Its calls and its acknowledgments are retired:
+    generation, the device list's genesis and its `host_channel_key`), and on the relay the route proof that
+    identity made (R9.7b). When that identity changes while the link is up (`atem pair verify` on the live link, or a
+    new trust generation, account, genesis or key), or while Astation authenticates the link again (the link comes
+    back on the same socket, whose identity the host keeps across the window), the host never relabels the old
+    association. Its calls and its acknowledgments are retired:
     a late page is drained, a read from 0 included, however full, and nothing more is asked, fetched or acknowledged
     on that socket. Once no Astation operation runs, the host reconnects, so the new link is authenticated, and
     proves its route, under the new identity; the gate stays closed until that link's heads and the new identity's

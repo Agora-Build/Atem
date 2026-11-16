@@ -16,9 +16,10 @@
 //! so does the sync's.
 //!
 //! The host's identity changing while the link is up (a re-verify on the
-//! live link: host-work-v1 §11.4, "An identity change") ends the link's
-//! association: the fetch in flight is dropped, the feed sync's call
-//! retired, and nothing more is fetched or asked on that socket
+//! live link: host-work-v1 §11.4, "An identity change"), or while Astation
+//! authenticates it again (the link down until the same socket comes back),
+//! ends the link's association: the fetch in flight is dropped, the feed
+//! sync's call retired, and nothing more is fetched or asked on that socket
 //! ([`Station::on_identity`]) until a link on a new socket.
 //!
 //! Here: the device list's fetch ([`super::fetch`]) and its part of the
