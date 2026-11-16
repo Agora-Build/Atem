@@ -272,15 +272,23 @@ impl HostBridge {
             }
         }
         // Room freed since an object was left on the Station for want of
-        // it (ruling R31): the cursor rewound durably, then read again.
-        if self
-            .station
-            .as_ref()
-            .is_some_and(|station| station.mailbox.rewind_due())
-        {
+        // it (ruling R31), or `D` past the expiry of every such object
+        // (review P4: the Station has dropped them): the cursor rewound
+        // durably, then read again.
+        let now_d = self.start_view().now_d_ms;
+        let due = self.station.as_ref().is_some_and(|station| {
+            station.mailbox.rewind_due()
+                || station
+                    .mailbox
+                    .skip_expires()
+                    .zip(now_d)
+                    .is_some_and(|(expires, now)| expires <= now)
+        });
+        if due {
+            let now = now_d.unwrap_or(0);
             let rewound = self
                 .mail_store()
-                .map(|(store, identity)| mailbox_store::rewind_if_room(store, &identity));
+                .map(|(store, identity)| mailbox_store::rewind_if_room(store, &identity, now));
             match rewound {
                 Some(Ok(true)) => {
                     self.mail_observe();
@@ -320,7 +328,10 @@ impl HostBridge {
                 .mail_rejudge_at
                 .is_some_and(|at| at.elapsed() < MAIL_REJUDGE_EVERY);
             let expired = view.now_d_ms.is_some_and(|now| earliest <= now) && !throttled;
-            let key = (identity.host, head.seq, head.hash);
+            // Room freed since moves it too (review P1): a waiting object
+            // that decided to open with no room is judged again then.
+            let freed = mailbox_store::freed(store).unwrap_or(0);
+            let key = (identity.host, head.seq, head.hash, freed);
             let moved = self.work.mail_rejudged.as_ref() != Some(&key)
                 && !(self.work.mail_rejudge_failed && throttled);
             (expired || moved).then_some(key)

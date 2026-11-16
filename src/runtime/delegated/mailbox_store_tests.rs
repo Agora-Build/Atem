@@ -943,7 +943,7 @@ fn a_result_over_its_limits_waits_on_the_station_until_room_frees() {
     );
     assert_eq!(observed.cursor, Some((MAILBOX.into(), 3)));
     assert!(
-        !rewind_if_room(&b.store, &identity(1)).unwrap(),
+        !rewind_if_room(&b.store, &identity(1), cx.now_ms).unwrap(),
         "no room yet"
     );
     // Room frees (the sending host's check took the first).
@@ -952,7 +952,7 @@ fn a_result_over_its_limits_waits_on_the_station_until_room_frees() {
         .execute("DELETE FROM mailbox_results", [])
         .unwrap();
     assert!(read(&b.store, &identity(1)).unwrap().rewind_due);
-    assert!(rewind_if_room(&b.store, &identity(1)).unwrap());
+    assert!(rewind_if_room(&b.store, &identity(1), cx.now_ms).unwrap());
     let observed = read(&b.store, &identity(1)).unwrap();
     assert_eq!(observed.cursor, Some((MAILBOX.into(), 1)));
     assert!(!observed.skipped);
@@ -1106,4 +1106,221 @@ fn unauthenticated_refusals_are_capped_by_count() {
         3,
         "the reported one not counted"
     );
+}
+
+/// Review P2: a later skip keeps the room freed since an earlier one: the
+/// rewind stays due.
+#[test]
+fn a_later_skip_keeps_the_room_freed_since_an_earlier_one() {
+    let mail = Mail::new();
+    let mut b = Box::new();
+    let cx = DecideCx {
+        limits: Limits {
+            results: 2,
+            inbox_per_sender: 0,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    for _ in 0..2 {
+        assert_eq!(
+            decided(b.put_with(&cx, &result_from(&mail, "host-b").to_json())),
+            Decision::Result
+        );
+    }
+    assert_eq!(
+        decided(b.put_with(&cx, &result_from(&mail, "host-b").to_json())),
+        Decision::Skipped
+    );
+    b.store
+        .db
+        .execute("DELETE FROM mailbox_results WHERE position=1", [])
+        .unwrap();
+    assert!(read(&b.store, &identity(1)).unwrap().rewind_due);
+    assert_eq!(
+        decided(b.put_with(&cx, &mail.cancel().to_json())),
+        Decision::Skipped
+    );
+    assert!(
+        read(&b.store, &identity(1)).unwrap().rewind_due,
+        "still due"
+    );
+    assert!(rewind_if_room(&b.store, &identity(1), cx.now_ms).unwrap());
+    assert_eq!(
+        read(&b.store, &identity(1)).unwrap().cursor,
+        Some((MAILBOX.into(), 2))
+    );
+}
+
+/// Review P3: the lowest skipped position is kept across pages, and the
+/// rewind goes to just before it.
+#[test]
+fn the_lowest_skipped_position_is_kept() {
+    let mail = Mail::new();
+    let mut b = Box::new();
+    let cx = DecideCx {
+        limits: Limits {
+            results: 1,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    decided(b.put_with(&cx, &result_from(&mail, "host-b").to_json()));
+    assert_eq!(
+        decided(b.put_with(&cx, &result_from(&mail, "host-b").to_json())),
+        Decision::Skipped
+    );
+    decided(b.put_with(&cx, &serde_json::json!("junk")));
+    assert_eq!(
+        decided(b.put_with(&cx, &result_from(&mail, "host-b").to_json())),
+        Decision::Skipped
+    );
+    b.store
+        .db
+        .execute("DELETE FROM mailbox_results", [])
+        .unwrap();
+    assert!(rewind_if_room(&b.store, &identity(1), cx.now_ms).unwrap());
+    assert_eq!(
+        read(&b.store, &identity(1)).unwrap().cursor,
+        Some((MAILBOX.into(), 1))
+    );
+}
+
+/// Review P3: the inbox's total holds every sender (another sender's
+/// object waits though its own share is empty), and an inbox object left
+/// on the Station owes no done.
+#[test]
+fn the_inbox_total_holds_every_sender() {
+    let mut mail = Mail::new();
+    mail.log.add_host("host-c", 1, &secret("mail host c"));
+    let mut b = Box::new();
+    let cx = DecideCx {
+        limits: Limits {
+            inbox: 1,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    assert_eq!(
+        decided(b.put_with(&cx, &mail.cancel().to_json())),
+        Decision::Opened
+    );
+    let mut c = SoftwareKeys::new();
+    c.insert_ed25519(KeyId::new("host-c"), &secret("mail host c"));
+    let fields = mail.fields("host-c", mail.log.log.head(), now_ms() + HOUR);
+    let from_c = seal_envelope(
+        &c,
+        &KeyId::new("host-c"),
+        &fields,
+        &EnvelopePlain::Cancel { task_id: uuid() },
+        &mail.enc_pub,
+    )
+    .unwrap();
+    assert_eq!(
+        decided(b.put_with(&cx, &from_c.to_json())),
+        Decision::Skipped
+    );
+    assert_eq!(b.owed(), [1], "no done for the one left on the Station");
+    assert!(read(&b.store, &identity(1)).unwrap().skipped);
+}
+
+/// Review P3: the results' bytes in all hold too.
+#[test]
+fn the_results_bytes_hold() {
+    let mail = Mail::new();
+    let mut b = Box::new();
+    let first = result_from(&mail, "host-b");
+    let size = first.to_json().to_string().len() as u64;
+    let cx = DecideCx {
+        limits: Limits {
+            result_bytes: size + 10,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    assert_eq!(decided(b.put_with(&cx, &first.to_json())), Decision::Result);
+    assert_eq!(
+        decided(b.put_with(&cx, &result_from(&mail, "host-c").to_json())),
+        Decision::Skipped
+    );
+}
+
+/// Review P3: a reset forgets every position left on the Station (they
+/// belonged to the old read): no skip, no rewind into the new mailbox.
+#[test]
+fn a_reset_forgets_the_skip() {
+    let mail = Mail::new();
+    let mut b = Box::new();
+    let cx = DecideCx {
+        limits: Limits {
+            results: 1,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    decided(b.put_with(&cx, &result_from(&mail, "host-b").to_json()));
+    decided(b.put_with(&cx, &result_from(&mail, "host-b").to_json()));
+    assert!(read(&b.store, &identity(1)).unwrap().skipped);
+    mark_reset(&b.store, &identity(1), MAILBOX_2).unwrap();
+    b.store
+        .db
+        .execute("DELETE FROM mailbox_results", [])
+        .unwrap();
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert!(!observed.skipped && !observed.rewind_due);
+    assert!(!rewind_if_room(&b.store, &identity(1), cx.now_ms).unwrap());
+    assert_eq!(observed.cursor, Some((MAILBOX_2.into(), 0)));
+}
+
+/// Review P4: a skip ends with its object: once `D` passes the expiry of
+/// the objects left on the Station (the Station has dropped them), the
+/// rewind is due whatever the room, and the re-read finds nothing there.
+#[test]
+fn a_skip_ends_once_its_object_expires() {
+    let mail = Mail::new();
+    let mut b = Box::new();
+    let cx = DecideCx {
+        limits: Limits {
+            results: 1,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    decided(b.put_with(&cx, &result_from(&mail, "host-b").to_json()));
+    let second = result_from(&mail, "host-b");
+    let expires_at = atem_client::host_mail::MailBody::from_object(&second)
+        .unwrap()
+        .1
+        .expires_at;
+    decided(b.put_with(&cx, &second.to_json()));
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert_eq!(observed.skip_expires, Some(expires_at));
+    assert!(!rewind_if_room(&b.store, &identity(1), expires_at - 1).unwrap());
+    assert!(rewind_if_room(&b.store, &identity(1), expires_at).unwrap());
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert!(!observed.skipped);
+    assert_eq!(observed.cursor, Some((MAILBOX.into(), 1)));
+}
+
+/// Review P5: a cursor table of an earlier shape gets the columns it
+/// lacks when the tables are made.
+#[test]
+fn an_older_cursor_table_gets_its_new_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store
+        .db
+        .execute_batch(
+            "CREATE TABLE mailbox_cursor (one INTEGER PRIMARY KEY CHECK (one = 1),
+                identity TEXT NOT NULL, mailbox_id TEXT NOT NULL, cursor INTEGER NOT NULL)
+                WITHOUT ROWID;",
+        )
+        .unwrap();
+    prepare(&store).unwrap();
+    let tx = store.immediate().unwrap();
+    set_cursor(&tx, &identity(1), MAILBOX, 4).unwrap();
+    tx.commit().unwrap();
+    let observed = read(&store, &identity(1)).unwrap();
+    assert_eq!(observed.cursor, Some((MAILBOX.into(), 4)));
+    assert!(!observed.skipped);
 }

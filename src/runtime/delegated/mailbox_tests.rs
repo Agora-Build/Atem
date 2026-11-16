@@ -60,6 +60,7 @@ fn observed(cursor: Option<(&str, u64)>) -> Observed {
         owed_count: 0,
         skipped: false,
         rewind_due: false,
+        skip_expires: None,
     }
 }
 

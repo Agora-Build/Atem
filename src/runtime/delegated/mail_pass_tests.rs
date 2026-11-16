@@ -709,3 +709,99 @@ fn nothing_is_pruned_while_a_clock_anchor_is_pending() {
         assert_eq!(claims(&rig), 0);
     });
 }
+
+/// Review P1 (ruling R31's "never loss"): a waiting object that decides
+/// to open while the inbox is full keeps waiting (no done), and is judged
+/// again as soon as room frees: it opens then, and its done is owed.
+#[test]
+fn a_waiting_object_with_no_room_is_judged_again_when_room_frees() {
+    use crate::session_protocol::membership::r9log::secret;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = mb_host(&mut rig, root, &os);
+        rig.bridge.work.mail_limits.inbox = 1;
+        let count = |rig: &LocalRig, table: &str| -> u64 {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        mb_heads(&mut rig, MB_MAILBOX, 2);
+        let (syncs, _) = mb_out(&mut rig);
+        let head = rig.bridge.membership.as_ref().unwrap().head();
+        let from_b = mb_cancel(&rig, &host, "host-b", &host.sender, head);
+        mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[from_b]));
+        // C signs at a head this host doesn't hold yet: it waits.
+        let entry = host.s.log.add_host("host-c", 1, &secret("host c"));
+        let mut c = atem_client::SoftwareKeys::new();
+        c.insert_ed25519(atem_client::KeyId::new("host-b"), &secret("host c"));
+        let from_c = mb_cancel(&rig, &host, "host-c", &c, host.s.log.log.head());
+        let (syncs, _) = mb_out(&mut rig);
+        mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[from_c]));
+        assert_eq!(count(&rig, "mailbox_pending"), 1);
+        // The list moves: C's object would open, but the inbox is full.
+        carry(&mut rig, &host.s.log, entry);
+        rig.bridge.sync_list_view();
+        mb_tick(&mut rig, &mut host, 2_000);
+        assert_eq!(
+            (count(&rig, "mailbox_pending"), count(&rig, "mailbox_inbox")),
+            (1, 1)
+        );
+        assert_eq!(mb_store(&rig).owed, [1], "no done while it waits");
+        // Room frees: judged again at once, opened, its done owed.
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute("DELETE FROM mailbox_inbox", [])
+            .unwrap();
+        mb_tick(&mut rig, &mut host, 2_000);
+        assert_eq!(
+            (count(&rig, "mailbox_pending"), count(&rig, "mailbox_inbox")),
+            (0, 1)
+        );
+        assert_eq!(mb_store(&rig).owed, [1, 2]);
+    });
+}
+
+/// Review P4: a skip ends once its object expires: with no room ever
+/// freed, the rewind still comes once `D` passes the skipped object's
+/// expiry, and the gate's mailbox part no longer waits for it.
+#[test]
+fn a_skip_ends_in_the_bridge_once_its_object_expires() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = mb_host(&mut rig, root, &os);
+        rig.bridge.work.mail_limits.results = 1;
+        mb_heads(&mut rig, MB_MAILBOX, 2);
+        let (syncs, _) = mb_out(&mut rig);
+        let first = mb_result(&rig, &host);
+        mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[first]));
+        let (syncs, _) = mb_out(&mut rig);
+        let second = mb_result(&rig, &host);
+        mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[second]));
+        assert!(mb_store(&rig).skipped);
+        mb_tick(&mut rig, &mut host, 2_000);
+        assert!(mb_store(&rig).skipped, "no room, not expired: it waits");
+        // `D` passes its expiry (an hour): the Station has dropped it.
+        rig.bridge.start_view().now_d_ms = Some(host_now().wall_ms + 2 * HOUR);
+        mb_tick(&mut rig, &mut host, 2_000);
+        let observed = mb_store(&rig);
+        assert!(!observed.skipped);
+        assert_eq!(observed.cursor, Some((MB_MAILBOX.into(), 1)));
+        let (syncs, _) = mb_out(&mut rig);
+        assert_eq!(syncs[0].after, 1);
+        // The Station no longer lists it: read to the head, the gate open
+        // once the kept result goes.
+        mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[]));
+        assert!(!mb_store(&rig).skipped);
+    });
+}

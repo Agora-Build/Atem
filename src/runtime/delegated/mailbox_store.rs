@@ -47,11 +47,13 @@
 //! - **Back-pressure, never loss** (ruling R31, [`Limits`]): an opened
 //!   envelope or a result that doesn't fit its inbox (its sender's share,
 //!   or all) is left on the Station, charged to its sender's own Station
-//!   quota: no row, no claim, no done. The page records its position;
-//!   once room has freed since (an inbox row or a kept result gone), the
-//!   cursor is rewound durably to just before it ([`rewind_if_room`]) and
-//!   it is read again. Until then it isn't committed: the gate's mailbox
-//!   part stays closed.
+//!   quota: no row, no claim, no done. The page records the lowest such
+//!   position (and the room freed when the first of them was left, and
+//!   when the last of them expires); once room has freed since (an inbox
+//!   row or a kept result gone), or `D` passed that expiry (the Station has
+//!   dropped them), the cursor is rewound durably to just before it
+//!   ([`rewind_if_room`]) and it is read again. Until then it isn't
+//!   committed: the gate's mailbox part stays closed.
 //! - **Bounded** ([`Limits`], [`prune`]): refusals keep their bytes within
 //!   a budget (unauthenticated first, then unreported, the oldest first;
 //!   the evidence hash stays) and unauthenticated refusal rows within a
@@ -64,7 +66,8 @@
 //!   judged again after the device list advances or its expiry passes
 //!   ([`rejudge_pending`]); decided, it owes a done only at a position of
 //!   the mailbox read now: a reset detaches it from its old one. One that
-//!   decides to open with no room for it keeps waiting.
+//!   decides to open with no room for it keeps waiting, and is judged
+//!   again once room frees ([`freed`] moves).
 //! - **A reset** ([`mark_reset`], rule 7): marked durably before anything
 //!   is asked for it, as the cursor itself (the announced mailbox at
 //!   position 0), the dones owed to the old mailbox dropped, every waiting
@@ -160,7 +163,8 @@ const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS mailbox_cursor (
         one INTEGER PRIMARY KEY CHECK (one = 1), identity TEXT NOT NULL,
         mailbox_id TEXT NOT NULL, cursor INTEGER NOT NULL, skip_at INTEGER,
-        skip_freed INTEGER NOT NULL DEFAULT 0, freed INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
+        skip_freed INTEGER NOT NULL DEFAULT 0, freed INTEGER NOT NULL DEFAULT 0,
+        skip_expires INTEGER) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS mailbox_dones (
         mailbox_id TEXT NOT NULL, position INTEGER NOT NULL,
         PRIMARY KEY(mailbox_id, position)) WITHOUT ROWID;
@@ -211,9 +215,33 @@ const TABLES: &str = "
         UPDATE mailbox_cursor SET freed=freed+1 WHERE one=1;
     END;";
 
-/// The mailbox's tables in `store`, made if missing.
+/// The columns `mailbox_cursor` gained after its first shape (review P5: a
+/// store made by an earlier build of this mailbox gets them when its
+/// tables are made).
+const CURSOR_COLUMNS: [(&str, &str); 4] = [
+    ("skip_at", "INTEGER"),
+    ("skip_freed", "INTEGER NOT NULL DEFAULT 0"),
+    ("freed", "INTEGER NOT NULL DEFAULT 0"),
+    ("skip_expires", "INTEGER"),
+];
+
+/// The mailbox's tables in `store`, made if missing (a cursor table of an
+/// earlier shape gets its new columns first).
 pub fn prepare(store: &Store) -> Result<()> {
     let tx = store.immediate()?;
+    for (column, kind) in CURSOR_COLUMNS {
+        let (table, present): (bool, bool) = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mailbox_cursor'),
+                EXISTS(SELECT 1 FROM pragma_table_info('mailbox_cursor') WHERE name=?1)",
+            [column],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if table && !present {
+            tx.execute_batch(&format!(
+                "ALTER TABLE mailbox_cursor ADD COLUMN {column} {kind}"
+            ))?;
+        }
+    }
     tx.execute_batch(TABLES)?;
     tx.commit()?;
     Ok(())
@@ -273,16 +301,17 @@ pub fn read(store: &Store, identity: &HostIdentity) -> Result<Observed> {
     let inbox = store
         .db
         .query_row("SELECT count(*) FROM mailbox_inbox", [], |r| r.get(0))?;
-    let (skipped, rewind_due) = store
+    let (skipped, rewind_due, skip_expires) = store
         .db
         .query_row(
-            "SELECT skip_at IS NOT NULL, skip_at IS NOT NULL AND freed > skip_freed
+            "SELECT skip_at IS NOT NULL, skip_at IS NOT NULL AND freed > skip_freed,
+                CASE WHEN skip_at IS NOT NULL THEN skip_expires END
             FROM mailbox_cursor WHERE one=1",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?
-        .unwrap_or((false, false));
+        .unwrap_or((false, false, None));
     let owed_count = match &cursor {
         Some((mailbox_id, _)) => store.db.query_row(
             "SELECT count(*) FROM mailbox_dones WHERE mailbox_id=?1",
@@ -299,6 +328,7 @@ pub fn read(store: &Store, identity: &HostIdentity) -> Result<Observed> {
         owed_count,
         skipped,
         rewind_due,
+        skip_expires,
     })
 }
 
@@ -322,7 +352,10 @@ pub fn mark_reset(store: &Store, identity: &HostIdentity, mailbox_id: &str) -> R
     let tx = store.immediate()?;
     own_cursor(&tx, identity)?;
     set_cursor(&tx, identity, mailbox_id, 0)?;
-    tx.execute("UPDATE mailbox_cursor SET skip_at=NULL WHERE one=1", [])?;
+    tx.execute(
+        "UPDATE mailbox_cursor SET skip_at=NULL, skip_expires=NULL WHERE one=1",
+        [],
+    )?;
     tx.execute("DELETE FROM mailbox_dones", [])?;
     tx.execute("UPDATE mailbox_pending SET mailbox_id=''", [])?;
     tx.commit()?;
@@ -330,18 +363,22 @@ pub fn mark_reset(store: &Store, identity: &HostIdentity, mailbox_id: &str) -> R
 }
 
 /// Ruling R31: once room has freed (an inbox row or a kept result gone)
-/// since an object was left on the Station for want of it, the cursor is
-/// rewound durably to just before the lowest such position, under the
-/// same mailbox (its positions and owed dones stand), so the next page
-/// reads it again: objects decided meanwhile come back as duplicates and
-/// are done again, waiting ones are re-pointed. Whether it did.
-pub fn rewind_if_room(store: &Store, identity: &HostIdentity) -> Result<bool> {
+/// since an object was left on the Station for want of it, or once `D`
+/// (`now_ms`) passed the expiry of every object left there (review P4: the
+/// Station has dropped them), the cursor is rewound durably to just before
+/// the lowest such position, under the same mailbox (its positions and
+/// owed dones stand), so the next page reads it again: objects decided
+/// meanwhile come back as duplicates and are done again, waiting ones are
+/// re-pointed, gone ones are no longer listed. Whether it did.
+pub fn rewind_if_room(store: &Store, identity: &HostIdentity, now_ms: u64) -> Result<bool> {
     let tx = store.immediate()?;
     own_cursor(&tx, identity)?;
     let rewound = tx.execute(
-        "UPDATE mailbox_cursor SET cursor=min(cursor, skip_at - 1), skip_at=NULL
-        WHERE one=1 AND skip_at IS NOT NULL AND freed > skip_freed",
-        [],
+        "UPDATE mailbox_cursor SET cursor=min(cursor, skip_at - 1), skip_at=NULL,
+            skip_expires=NULL
+        WHERE one=1 AND skip_at IS NOT NULL
+            AND (freed > skip_freed OR skip_expires <= ?1)",
+        [now_ms],
     )?;
     tx.commit()?;
     Ok(rewound > 0)
@@ -478,7 +515,9 @@ pub fn commit_page(
         return Ok(Commit::Stale);
     }
     let mut decided = Vec::new();
-    let mut skipped = None;
+    // The lowest position left on the Station, and when the last of them
+    // expires.
+    let mut skipped: Option<(u64, u64)> = None;
     for entry in &page.objects {
         let Some(cx) = decide else {
             return Ok(Commit::Undecided);
@@ -489,20 +528,37 @@ pub fn commit_page(
         match decision {
             Decision::Pending => {}
             Decision::Skipped => {
-                skipped = Some(skipped.map_or(entry.position, |at: u64| at.min(entry.position)))
+                // Never past the longest life after now (as `keep_until`).
+                let longest = decide.map_or(0, |cx| cx.now_ms.saturating_add(LONGEST_LIFE_MS));
+                let expires = entry
+                    .parse_object()
+                    .ok()
+                    .and_then(|o| MailBody::from_object(&o).ok())
+                    .map_or(longest, |(_, body)| body.expires_at.min(longest));
+                skipped = Some(match skipped {
+                    None => (entry.position, expires),
+                    Some((at, until)) => (at.min(entry.position), until.max(expires)),
+                });
             }
             _ => owe_done(&tx, &page.mailbox_id, entry.position)?,
         }
         decided.push(decision);
     }
     set_cursor(&tx, identity, &page.mailbox_id, page.through)?;
-    if let Some(at) = skipped {
-        // The lowest position left on the Station, with the room freed so
-        // far: only room freed after it rewinds to it.
+    if let Some((at, expires)) = skipped {
+        // The lowest position left on the Station; the room freed so far
+        // when the first of them was left (review P2: a later skip keeps
+        // the room freed since an earlier one: only room freed after the
+        // first rewinds); the latest expiry of them (P4). SQLite reads
+        // every right-hand side on the row as it was.
         tx.execute(
-            "UPDATE mailbox_cursor SET skip_at=min(coalesce(skip_at, ?1), ?1), skip_freed=freed
+            "UPDATE mailbox_cursor SET
+                skip_freed=CASE WHEN skip_at IS NULL THEN freed ELSE skip_freed END,
+                skip_expires=CASE WHEN skip_at IS NULL THEN ?2
+                    ELSE max(coalesce(skip_expires, 0), ?2) END,
+                skip_at=min(coalesce(skip_at, ?1), ?1)
             WHERE one=1",
-            [at],
+            [at, expires],
         )?;
     }
     tx.commit()?;
@@ -571,6 +627,19 @@ pub fn rejudge_pending(
     }
     tx.commit()?;
     Ok(decided)
+}
+
+/// The room freed so far (every inbox row and kept result gone counts):
+/// a waiting object that decided to open with no room for it is judged
+/// again once it moved (review P1).
+pub fn freed(store: &Store) -> Result<u64> {
+    Ok(store
+        .db
+        .query_row("SELECT freed FROM mailbox_cursor WHERE one=1", [], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .unwrap_or(0))
 }
 
 /// The earliest expiry of a waiting object (a waiting object is judged

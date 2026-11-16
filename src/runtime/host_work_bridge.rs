@@ -244,9 +244,10 @@ pub(super) struct State {
     /// The identity whose store has host senders' mailbox tables
     /// (`mail_observe`, with `host.senders` on).
     mail_prepared: Option<HostTarget>,
-    /// The device-list head the mailbox's waiting objects were last judged
-    /// again at (`mail_rejudge`).
-    mail_rejudged: Option<(HostTarget, u64, atem_client::encoding::Hash32)>,
+    /// The device-list head and the room freed (`mailbox_store::freed`)
+    /// the mailbox's waiting objects were last judged again at
+    /// (`mail_rejudge`).
+    mail_rejudged: Option<(HostTarget, u64, atem_client::encoding::Hash32, u64)>,
     /// When the waiting objects were last judged again for an expiry
     /// (at most every `MAIL_REJUDGE_EVERY` while the list stands still).
     mail_rejudge_at: Option<Instant>,

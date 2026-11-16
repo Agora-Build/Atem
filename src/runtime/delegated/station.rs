@@ -698,6 +698,7 @@ mod tests {
             owed_count: 0,
             skipped: false,
             rewind_due: false,
+            skip_expires: None,
         };
         s.mailbox.observe(Some(observed(1)));
         s.mailbox.tick(10_000);

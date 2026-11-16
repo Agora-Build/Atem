@@ -92,6 +92,9 @@ pub struct Observed {
     /// Room freed since: the store's cursor is to be rewound to just before
     /// it (`mailbox_store::rewind_if_room`).
     pub rewind_due: bool,
+    /// When every object left on the Station has expired (the Station drops
+    /// them then): the rewind is due once `D` passes it, whatever the room.
+    pub skip_expires: Option<u64>,
 }
 
 /// What a page is to the live call ([`MailboxClient::on_page`]).
@@ -481,6 +484,11 @@ impl MailboxClient {
     /// cursor is due to be rewound to it (ruling R31).
     pub fn rewind_due(&self) -> bool {
         self.observed.as_ref().is_some_and(|o| o.rewind_due)
+    }
+
+    /// When every object left on the Station has expired (none: none left).
+    pub fn skip_expires(&self) -> Option<u64> {
+        self.observed.as_ref().and_then(|o| o.skip_expires)
     }
 
     /// The store's cursor was rewound to re-read an object left on the
