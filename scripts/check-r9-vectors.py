@@ -15,7 +15,11 @@ ephemeral to the same bytes). It derives no verifier's verdict, but for
 derives from the bytes, and `r9-vectors-host-route`'s refusals across the
 two kinds of proof (relay and proxy), which follow from a proof's type and
 signature, the device list and the receiver (II.4.2's checks 1
-to 6 and II.4.4's, written here from host-work-v1 §11.5). The other files'
+to 6 and II.4.4's, written here from host-work-v1 §11.5), and
+`r9-vectors-mailbox-calls`, whose refusal codes and scenario outcomes,
+answers and states it derives with readers and a model of the Station's
+mailbox written here from host-work-v1 §11.5 ("The mailbox calls"), not
+from the shared core's reference mailbox. The other files'
 `expect` and each `reason` are checked by the Rust runner
 (`crates/atem-client/tests/vectors.rs`) and the binding suites.
 It also recomputes every Station report id of the acknowledgment fixtures

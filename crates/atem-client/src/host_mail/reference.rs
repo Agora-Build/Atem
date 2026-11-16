@@ -4,8 +4,8 @@
 //! acknowledgments, it is a model of the Station's side, sans-I/O, pure and
 //! deterministic: no clock (`now_ms` is a parameter), no storage, no
 //! network and no randomness (its `mailbox_id`s come from a seed it is
-//! given). Atem's fake Station and Astation's Station are checked against
-//! it, through the shared vectors `r9-vectors-mailbox-calls`.
+//! given). Atem's fake Station and Astation's Station can both be checked
+//! against it, through the shared vectors `r9-vectors-mailbox-calls`.
 //!
 //! **A transition never changes the mailbox it is called on.**
 //! [`ReferenceMailbox::call`], [`ReferenceMailbox::heads`],
@@ -24,7 +24,9 @@
 //! The Station's copy of the device list is the [`CurrentHosts`] it was
 //! last given.
 //!
-//! **What the model does** (rule numbers are §11.5's):
+//! **What the model does** (rule numbers are §11.5's; where the rules leave
+//! a choice, its "reference mailbox's readings", Atem's, for Astation's
+//! agreement):
 //! - **Mailboxes** (rule 2): one per receiving `(account_id, genesis_hash,
 //!   host_id, host_trust_gen)` of this device list, minted on the first put
 //!   to it or the first `heads` of its host, with a `mailbox_id` that is

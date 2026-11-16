@@ -3454,17 +3454,19 @@ and for the ceremony's fields. Each is **agreed with Astation 2026-11-16**.
 **Built in the shared core:** the mailbox calls' readers and builders,
 `object_hash` and `heads`' mailbox head behind explicit feature handling
 ("The mailbox calls"), the status forms and the selector task id, and
-`result_id` with both of its checks; `select`'s channel rule. **Built on the
-receiving host, behind the debug-only hook:** its mailbox client ("The
-mailbox calls", "On the receiving host"). **Built on the sending host,
-behind the same hook:** its planning, sealing and puts ("On the sending
-host"), and `select`'s `launch` in the shared core. Nothing else in them is
-built (`cancel` and `complete` across hosts, the admission of what the
-mailbox delivers and the status objects and results back, the Station's
-side, the ceremony's fields). The status forms and the
-sending host's `result_id` check have their shared vectors in
-`fixtures/r9-vectors-host-envelope.json`; the mailbox calls' shared vectors
-come with a later change.
+`result_id` with both of its checks; `select`'s channel rule; and a
+reference mailbox in the shared core, a sans-I/O model of the Station's
+side ("The mailbox calls" below). **Built on the receiving host, behind the
+debug-only hook:** its mailbox client ("The mailbox calls", "On the
+receiving host"). **Built on the sending host, behind the same hook:** its
+planning, sealing and puts ("On the sending host"), and `select`'s `launch`
+in the shared core. Nothing else in them is built (`cancel` and `complete`
+across hosts, the admission of what the mailbox delivers and the status
+objects and results back, a Station's side, the ceremony's fields). The
+status forms and the sending host's `result_id` check have their shared
+vectors in `fixtures/r9-vectors-host-envelope.json` (a result failing both
+the `result_id` check and the row's included); the mailbox calls' are
+`fixtures/r9-vectors-mailbox-calls.json`.
 
 #### The mailbox calls (agreed with Astation 2026-11-16)
 
@@ -3475,8 +3477,47 @@ differs) and `object_hash`; a page keeps each object's exact bytes as
 received beside its value (`MailboxEntry::bytes`), the evidence of one that
 doesn't parse (check 1); `heads`' `mailbox` in `control::relay`, read
 only with `Accept { mailbox: true }` (`Heads::decode_with`,
-`ToHost::decode_with`), refused by every other reader. Not built:
-admission on the receiving host and the Station's side.
+`ToHost::decode_with`), refused by every other reader; and **a reference
+mailbox in the shared core** (`atem_client::host_mail::reference`,
+`ReferenceMailbox`), the Station's side of rules 1 to 9 as a pure state
+machine, as `control::ledger` is for §11.4's acknowledgments: the clock and
+the link's verified association passed in, every call read by the readers
+above and every answer built by the builders, each transition returning the
+next state, the answer and what happened. Atem's fake Station and
+Astation's Station can both be checked against it. Shared vectors:
+`fixtures/r9-vectors-mailbox-calls.json`: one valid case of every call and
+answer, every refused form, the `heads` mailbox head accepted and refused,
+`object_hash` known answers, and scenarios run against the reference
+mailbox (each event's outcome, exact answer and state), checked by the
+Rust runner (`crates/atem-client/tests/mailbox_calls.rs`) and
+independently by `scripts/check-r9-vectors.py`, which models the mailbox
+from these rules. Not built: admission on the receiving host, the results back on the
+sending host, and a Station's side.
+
+**The reference mailbox's readings** (Atem's, **for Astation's
+agreement**; where the rules below leave a choice, a Station that answers
+otherwise doesn't match the vectors):
+- **An object no page could carry is dropped.** A page's own fields take
+  178 bytes more than a put's (rule 9 bounds both at 512 KiB), so a put
+  can carry an object whose compact JSON is over 524,013 bytes that no page
+  could serve at any position; stored, it would keep every later object
+  behind it (rule 4). The Station drops such a put as one it can't read,
+  unanswered and counted. No builder makes one: the largest sealed object
+  is about 328 KB.
+- **What the quotas count.** An object counts its encoded bytes as stored
+  and served (its compact JSON, what a page carries): a sending host's
+  quota counts its objects in every mailbox (the calling `host_id`), a
+  receiving host's its mailbox (the host at its generation) and the
+  account's every mailbox of its device list.
+- **The body's sender generation isn't the Station's.** Rule 1 names the
+  calling host: the Station checks `body.sender.host_id` (and that the
+  caller is a current host at its link's generation), and the receiver
+  judges the generation (`stale_sender_generation`, `generation_ahead`).
+- **A sync or done the reader refuses** gets no answer either, as a put
+  the Station can't read: dropped and counted, retired by the host at its
+  deadline (rule 8).
+- **A page's scan boundary** is the position before the next stored
+  object after the one it lists, or the head: the largest rule 4 allows.
 
 **On the receiving host** (built behind the debug-only hook's
 `host.senders`, which needs `host.delegated`; `runtime/delegated/mailbox.rs`,
