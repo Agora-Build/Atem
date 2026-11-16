@@ -3450,6 +3450,8 @@ exactly as without this section):
   fresh id after 35 seconds and on each new link generation until
   answered; a `mailbox_done_refused` holds them to the next generation);
   owed dones survive a restart, and none goes for another identity's state;
+  while more than 256 dones are owed, no page is asked (a Station that
+  never answers dones can't grow them without end);
 - **Atem's reading (for Astation's agreement):** a reset's durable mark is
   the cursor itself, the announced mailbox at position 0, written before
   anything is asked for it, with the dones owed to the old mailbox dropped
@@ -3470,8 +3472,24 @@ exactly as without this section):
   sending host's own check (`accept_result`, design II.4.4) with its exact
   bytes, `object_hash`, sender, id and mailbox position, committed with the
   cursor and owing its done like any other object, and holds no gate (it
-  starts no work); at most 256 results or 64 MiB are kept, one over them
-  dropped undecided and marked done, like a pending overflow;
+  starts no work);
+- **back-pressure, never loss (Atem's reading, for Astation's
+  agreement):** an opened request, cancel or complete waiting for
+  admission, or a kept result, that doesn't fit is never marked done and
+  never dropped. Each sender host has its own share and there is a total
+  (requests, cancels and completes: 32 per sender host, 128 in all;
+  results: 64 per sender host, 256 and 64 MiB in all), so one host can't
+  crowd out another. An object that doesn't fit gets no row and no claim
+  and stays in the mailbox, charged to its sender's own Station quota
+  (design II.4.3); its page still commits, recording the lowest such
+  position durably with it. Once room has freed since, the host rewinds
+  its cursor durably to just before that position, under the same
+  `mailbox_id`, and reads on from there (rule 4 doesn't forbid an `after`
+  below an earlier cursor): objects decided meanwhile come back as
+  duplicates and are marked done again, waiting ones are re-pointed. Until
+  then host senders' gate stays closed: the object isn't committed. Unlike
+  a pending overflow, which a sender's resend makes safe to mark done, a
+  result is never resent once stored (design II.4.4);
 - **bounded storage (Atem's reading, for Astation's agreement):** anything
   a sender or the Station can make this host keep is bounded. Refusals keep
   their exact bytes within 16 MiB, those not reported dropped first, oldest
@@ -3481,11 +3499,22 @@ exactly as without this section):
   arrival counts as that): a claim must outlive every copy that can still
   arrive, and the Station keeps an object until its `expires_at` on its own
   clock, which this host bounds only from above, so the margin covers a
-  Station or sender clock up to a day behind; a copy arriving later still is
-  judged anew (refused `expired`);
+  Station or sender clock up to a day behind. A copy arriving 24 hours or
+  more after its expiry is marked done as expired, evidence only: it
+  claims no id and reports nothing, so no late copy contradicts a first
+  verdict. Nothing is pruned while the delegated clock holds a forward
+  jump's anchor (`D` may still come back down); a forward step the OS
+  reports synchronized makes no anchor, so the admission of a request
+  dedupes `(sender host, message id)` against its own permanent records,
+  never only against the claims. Unauthenticated refusal rows are capped
+  at 1,024 (the oldest dropped: the same bytes again are refused again,
+  unreported), and the evidence budget drops unauthenticated bytes first
+  (a reused id's, the sender's own signature over two sealed parts, is
+  kept longest after the reported ones);
 - host senders' gate also needs the mailbox read to the announced head with
-  no refusal, fault or reset waiting and every inbox row admitted (design
-  II.5); until admission is built an inbox row keeps it closed. `atem
+  no refusal, fault or reset waiting, no object left on the Station for
+  want of room, and every inbox row admitted (design II.5); until admission
+  is built an inbox row keeps it closed. `atem
   status`'s `Control feeds:` line names this part.
 
 The receiving host's mailbox on the Station (design II.4.3): a sending host
