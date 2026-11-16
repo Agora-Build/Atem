@@ -460,6 +460,12 @@ impl HostClock {
         status_text(&self.state, self.last.as_ref()?, cfg!(target_os = "macos"))
     }
 
+    /// A forward jump's anchor is pending (§11.6 "Automatic repair"): `D`
+    /// may still be lowered, so nothing is pruned on it meanwhile.
+    pub fn anchored(&self) -> bool {
+        self.state.anchored()
+    }
+
     /// The stored record was damaged and the clock hasn't started afresh:
     /// delegated work waits.
     pub fn damaged(&self) -> bool {

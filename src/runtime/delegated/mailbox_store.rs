@@ -5,19 +5,21 @@
 //! ([`prepare`]), so a store of a host without it is main's.
 //!
 //! - **The cursor** (`mailbox_cursor`, one row): the mailbox read, its
-//!   last position processed, and the host identity it belongs to
-//!   (account, device, trust generation and the device list's genesis).
-//!   A new identity's store is a new file (host-work's store is moved
-//!   aside), so it starts empty; a row of another identity in this store
-//!   doesn't load ([`read`]: fail closed) and owes nothing.
+//!   last position processed, the lowest position left on the Station for
+//!   want of room (below), and the host identity it belongs to (account,
+//!   device, trust generation and the device list's genesis). A new
+//!   identity's store is a new file (host-work's store is moved aside), so
+//!   it starts empty; a row of another identity in this store doesn't load
+//!   ([`read`]: fail closed) and owes nothing.
 //! - **Each page in one transaction** ([`commit_page`], `BEGIN IMMEDIATE`,
 //!   Astation's ask on #120): only from the store's own cursor (a page
 //!   continuing another cursor or mailbox commits nothing:
 //!   [`Commit::Stale`]), each object's decision with its row, the objects
-//!   kept waiting, the dones owed and the cursor moved to the page's
-//!   `through`. Only after that commit does the bridge send a done; the
-//!   dones owed are rows (`mailbox_dones`) until their answer, so a crash
-//!   between the commit and the done sends them after the restart.
+//!   kept waiting, the dones owed, the position of one left on the Station
+//!   and the cursor moved to the page's `through`. Only after that commit
+//!   does the bridge send a done; the dones owed are rows (`mailbox_dones`)
+//!   until their answer, so a crash between the commit and the done sends
+//!   them after the restart.
 //! - **The decisions** (the shared core's [`open_envelope`], with this
 //!   host's own identity, keys, committed device list and the delegated
 //!   clock): an opened `request`, `cancel` or `complete` is an inbox row
@@ -31,31 +33,45 @@
 //!   `object_hash`, never done. An `atem-result` is never judged here
 //!   (ruling R28): it is kept (`mailbox_results`: its exact bytes,
 //!   `object_hash`, sender, id and position) for the sending host's
-//!   `accept_result`, committed and done like any object, never counted
-//!   as inbox (it starts no work).
-//! - **Bounded** ([`Limits`], [`prune`]): refusals keep their bytes within
-//!   a budget (the oldest first, those not reported before those reported;
-//!   the evidence hash stays), results within their own limits (over them
-//!   dropped undecided, done); claims, refusals and results are pruned
-//!   [`KEEP_MARGIN_MS`] after their object's expiry. A copy that claims an id
-//!   (opened or refused authenticated) records its claim (`mailbox_claims`,
-//!   `(sender host, id)` and its `sealed_hash`): the sender's object again
-//!   is a duplicate with the first verdict, its id with another sealed
-//!   part a refusal (`id_reused`) kept as evidence, the first standing; an
+//!   `accept_result`, committed and done like any object, never counted as
+//!   inbox (it starts no work). A copy arriving [`KEEP_MARGIN_MS`] or more
+//!   after its object's expiry is done as expired, evidence only: it claims
+//!   nothing and reports nothing.
+//! - **Claims** (`mailbox_claims`): a copy that claims an id (opened or
+//!   refused authenticated) records `(sender host, id)` and its
+//!   `sealed_hash`: the sender's object again is a duplicate with the first
+//!   verdict, its id with another sealed part a refusal (`id_reused`, its
+//!   sender and id kept, unreported), the first standing; an
 //!   unauthenticated refusal's same bytes again are a duplicate of it.
 //!   Duplicates are marked done and record nothing.
+//! - **Back-pressure, never loss** (ruling R31, [`Limits`]): an opened
+//!   envelope or a result that doesn't fit its inbox (its sender's share,
+//!   or all) is left on the Station, charged to its sender's own Station
+//!   quota: no row, no claim, no done. The page records its position;
+//!   once room has freed since (an inbox row or a kept result gone), the
+//!   cursor is rewound durably to just before it ([`rewind_if_room`]) and
+//!   it is read again. Until then it isn't committed: the gate's mailbox
+//!   part stays closed.
+//! - **Bounded** ([`Limits`], [`prune`]): refusals keep their bytes within
+//!   a budget (unauthenticated first, then unreported, the oldest first;
+//!   the evidence hash stays) and unauthenticated refusal rows within a
+//!   count; claims, refusals and results are pruned [`KEEP_MARGIN_MS`]
+//!   after their object's expiry.
 //! - **The pending limits** (design II.4.2): 64 per claimed `(host_id,
 //!   host_trust_gen)` and 256 in all; one over either is dropped undecided
 //!   (no verdict, no row, no id) and marked done all the same (Atem's
 //!   refinement, agreed with Astation 2026-11-16). A waiting object is
 //!   judged again after the device list advances or its expiry passes
 //!   ([`rejudge_pending`]); decided, it owes a done only at a position of
-//!   the mailbox read now: a reset detaches it from its old one.
+//!   the mailbox read now: a reset detaches it from its old one. One that
+//!   decides to open with no room for it keeps waiting.
 //! - **A reset** ([`mark_reset`], rule 7): marked durably before anything
 //!   is asked for it, as the cursor itself (the announced mailbox at
-//!   position 0), the dones owed to the old mailbox dropped and every
-//!   waiting object detached from its position, in one transaction. A start finds it and reads on from there; the gate's
-//!   mailbox part stays closed until the read reaches the announced head.
+//!   position 0), the dones owed to the old mailbox dropped, every waiting
+//!   object detached from its position and any position left on the
+//!   Station forgotten, in one transaction. A start finds it and reads on
+//!   from there; the gate's mailbox part stays closed until the read
+//!   reaches the announced head.
 //! - **An object that can't be decided now** (the key provider failed):
 //!   nothing of its page commits ([`Commit::Undecided`]); asked again.
 use super::mailbox::Observed;
@@ -65,7 +81,7 @@ use anyhow::{Result, anyhow};
 use atem_client::KeyProvider;
 use atem_client::encoding::Hash32;
 use atem_client::host_mail::mailbox::{MailboxEntry, MailboxSyncResult};
-use atem_client::host_mail::receive::reason::MALFORMED;
+use atem_client::host_mail::receive::reason::{EXPIRED, MALFORMED};
 use atem_client::host_mail::{
     EnvelopePlain, EnvelopeVerdict, MailBody, MailKind, Recipient, object_hash, open_envelope,
     parse_object,
@@ -96,24 +112,41 @@ pub const KEEP_MARGIN_MS: u64 = 24 * 60 * 60 * 1000;
 /// parse), counts as this.
 const LONGEST_LIFE_MS: u64 = 24 * 60 * 60 * 1000 + 60_000;
 
-/// What the mailbox keeps at most (review finding 2: anything a sender or
-/// the Station can make this host keep is bounded).
+/// What the mailbox keeps at most (anything a sender or the Station can
+/// make this host keep is bounded). An object that doesn't fit an inbox is
+/// left on the Station (ruling R31: never done, never dropped), charged to
+/// its sender's own Station quota, and read again once room frees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// The exact bytes refusals keep, in all: beyond it the oldest go
-    /// first, those not reported before those reported (their evidence
-    /// hash stays).
+    /// first, unauthenticated before authenticated, unreported before
+    /// reported (their evidence hash stays).
     pub evidence_bytes: u64,
-    /// Results kept for the sending host's own check, at most.
+    /// Unauthenticated refusal rows kept, at most (the oldest go first:
+    /// the same bytes again are refused again, unreported).
+    pub unauthenticated: u64,
+    /// Opened requests, cancels and completes waiting for admission, per
+    /// sender host and in all.
+    pub inbox_per_sender: u64,
+    pub inbox: u64,
+    /// Results kept for the sending host's own check, per (claimed) sender
+    /// host and in all, and their bytes in all.
+    pub results_per_sender: u64,
     pub results: u64,
-    /// Their bytes, at most.
     pub result_bytes: u64,
 }
 
 impl Default for Limits {
+    /// 16 MiB of evidence and 1,024 unauthenticated refusals; the inbox 32
+    /// per sender, 128 in all (about 48 MiB at the 240 KiB Message bound);
+    /// results 64 per sender, 256 and 64 MiB in all.
     fn default() -> Self {
         Limits {
             evidence_bytes: 16 << 20,
+            unauthenticated: 1024,
+            inbox_per_sender: 32,
+            inbox: 128,
+            results_per_sender: 64,
             results: 256,
             result_bytes: 64 << 20,
         }
@@ -126,7 +159,8 @@ impl Default for Limits {
 const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS mailbox_cursor (
         one INTEGER PRIMARY KEY CHECK (one = 1), identity TEXT NOT NULL,
-        mailbox_id TEXT NOT NULL, cursor INTEGER NOT NULL) WITHOUT ROWID;
+        mailbox_id TEXT NOT NULL, cursor INTEGER NOT NULL, skip_at INTEGER,
+        skip_freed INTEGER NOT NULL DEFAULT 0, freed INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS mailbox_dones (
         mailbox_id TEXT NOT NULL, position INTEGER NOT NULL,
         PRIMARY KEY(mailbox_id, position)) WITHOUT ROWID;
@@ -143,8 +177,14 @@ const TABLES: &str = "
         sender_host TEXT, object_id TEXT, report INTEGER NOT NULL, bytes BLOB,
         keep_until INTEGER NOT NULL, at_ms INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS mailbox_refused_keep ON mailbox_refused(keep_until);
-    CREATE INDEX IF NOT EXISTS mailbox_refused_bytes ON mailbox_refused(report, n)
-        WHERE bytes IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS mailbox_refused_bytes
+        ON mailbox_refused((sender_host IS NOT NULL), report, n) WHERE bytes IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS mailbox_refused_unauthenticated ON mailbox_refused(n)
+        WHERE sender_host IS NULL;
+    CREATE INDEX IF NOT EXISTS mailbox_inbox_sender ON mailbox_inbox(sender_host);
+    CREATE TRIGGER IF NOT EXISTS mailbox_inbox_freed AFTER DELETE ON mailbox_inbox BEGIN
+        UPDATE mailbox_cursor SET freed=freed+1 WHERE one=1;
+    END;
     CREATE TABLE IF NOT EXISTS mailbox_kept (
         one INTEGER PRIMARY KEY CHECK (one = 1), bytes INTEGER NOT NULL) WITHOUT ROWID;
     INSERT OR IGNORE INTO mailbox_kept(one, bytes) VALUES(1, 0);
@@ -165,7 +205,11 @@ const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS mailbox_results (
         object_hash TEXT PRIMARY KEY, sender_host TEXT NOT NULL, object_id TEXT NOT NULL,
         mailbox_id TEXT NOT NULL, position INTEGER NOT NULL, bytes BLOB NOT NULL,
-        keep_until INTEGER NOT NULL, at_ms INTEGER NOT NULL) WITHOUT ROWID;";
+        keep_until INTEGER NOT NULL, at_ms INTEGER NOT NULL) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS mailbox_results_sender ON mailbox_results(sender_host);
+    CREATE TRIGGER IF NOT EXISTS mailbox_results_freed AFTER DELETE ON mailbox_results BEGIN
+        UPDATE mailbox_cursor SET freed=freed+1 WHERE one=1;
+    END;";
 
 /// The mailbox's tables in `store`, made if missing.
 pub fn prepare(store: &Store) -> Result<()> {
@@ -229,11 +273,32 @@ pub fn read(store: &Store, identity: &HostIdentity) -> Result<Observed> {
     let inbox = store
         .db
         .query_row("SELECT count(*) FROM mailbox_inbox", [], |r| r.get(0))?;
+    let (skipped, rewind_due) = store
+        .db
+        .query_row(
+            "SELECT skip_at IS NOT NULL, skip_at IS NOT NULL AND freed > skip_freed
+            FROM mailbox_cursor WHERE one=1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or((false, false));
+    let owed_count = match &cursor {
+        Some((mailbox_id, _)) => store.db.query_row(
+            "SELECT count(*) FROM mailbox_dones WHERE mailbox_id=?1",
+            [mailbox_id],
+            |r| r.get(0),
+        )?,
+        None => 0,
+    };
     Ok(Observed {
         identity: identity.clone(),
         cursor,
         inbox,
         owed: owed_dones(store, identity)?,
+        owed_count,
+        skipped,
+        rewind_due,
     })
 }
 
@@ -257,10 +322,29 @@ pub fn mark_reset(store: &Store, identity: &HostIdentity, mailbox_id: &str) -> R
     let tx = store.immediate()?;
     own_cursor(&tx, identity)?;
     set_cursor(&tx, identity, mailbox_id, 0)?;
+    tx.execute("UPDATE mailbox_cursor SET skip_at=NULL WHERE one=1", [])?;
     tx.execute("DELETE FROM mailbox_dones", [])?;
     tx.execute("UPDATE mailbox_pending SET mailbox_id=''", [])?;
     tx.commit()?;
     Ok(())
+}
+
+/// Ruling R31: once room has freed (an inbox row or a kept result gone)
+/// since an object was left on the Station for want of it, the cursor is
+/// rewound durably to just before the lowest such position, under the
+/// same mailbox (its positions and owed dones stand), so the next page
+/// reads it again: objects decided meanwhile come back as duplicates and
+/// are done again, waiting ones are re-pointed. Whether it did.
+pub fn rewind_if_room(store: &Store, identity: &HostIdentity) -> Result<bool> {
+    let tx = store.immediate()?;
+    own_cursor(&tx, identity)?;
+    let rewound = tx.execute(
+        "UPDATE mailbox_cursor SET cursor=min(cursor, skip_at - 1), skip_at=NULL
+        WHERE one=1 AND skip_at IS NOT NULL AND freed > skip_freed",
+        [],
+    )?;
+    tx.commit()?;
+    Ok(rewound > 0)
 }
 
 /// The dones owed to `identity`'s mailbox, by position (none for another
@@ -345,6 +429,9 @@ pub enum Decision {
     Overflow,
     /// An `atem-result`, kept for the sending host's own check.
     Result,
+    /// No room for it (ruling R31): left on the Station, not done, no row
+    /// and no claim; read again once room frees.
+    Skipped,
 }
 
 /// What objects are decided with: this host's committed device list, its
@@ -391,6 +478,7 @@ pub fn commit_page(
         return Ok(Commit::Stale);
     }
     let mut decided = Vec::new();
+    let mut skipped = None;
     for entry in &page.objects {
         let Some(cx) = decide else {
             return Ok(Commit::Undecided);
@@ -398,12 +486,25 @@ pub fn commit_page(
         let Some(decision) = decide_entry(&tx, entry, cx, &page.mailbox_id)? else {
             return Ok(Commit::Undecided);
         };
-        if decision != Decision::Pending {
-            owe_done(&tx, &page.mailbox_id, entry.position)?;
+        match decision {
+            Decision::Pending => {}
+            Decision::Skipped => {
+                skipped = Some(skipped.map_or(entry.position, |at: u64| at.min(entry.position)))
+            }
+            _ => owe_done(&tx, &page.mailbox_id, entry.position)?,
         }
         decided.push(decision);
     }
     set_cursor(&tx, identity, &page.mailbox_id, page.through)?;
+    if let Some(at) = skipped {
+        // The lowest position left on the Station, with the room freed so
+        // far: only room freed after it rewinds to it.
+        tx.execute(
+            "UPDATE mailbox_cursor SET skip_at=min(coalesce(skip_at, ?1), ?1), skip_freed=freed
+            WHERE one=1",
+            [at],
+        )?;
+    }
     tx.commit()?;
     Ok(Commit::Committed(Committed { decided }))
 }
@@ -433,22 +534,34 @@ pub fn rejudge_pending(
     let mut decided = Vec::new();
     for (hash, mailbox_id, position, bytes) in waiting {
         let decision = match parse_object(&bytes) {
-            Err(_) => refuse(&tx, cx, &Hash32::of(&bytes), MALFORMED, None, &bytes, None)?,
-            Ok(object) => {
-                let verdict = open_envelope(&object, cx.list, cx.recipient, cx.provider, cx.now_ms);
-                if matches!(
-                    verdict,
-                    EnvelopeVerdict::Pending { .. } | EnvelopeVerdict::Unavailable { .. }
-                ) {
-                    continue;
+            Err(_) => refuse(
+                &tx,
+                cx,
+                &Hash32::of(&bytes),
+                MALFORMED,
+                None,
+                false,
+                &bytes,
+                None,
+            )?,
+            Ok(object) => match too_late(&tx, cx, &object, &bytes)? {
+                Some(decision) => decision,
+                None => {
+                    let verdict =
+                        open_envelope(&object, cx.list, cx.recipient, cx.provider, cx.now_ms);
+                    if matches!(
+                        verdict,
+                        EnvelopeVerdict::Pending { .. } | EnvelopeVerdict::Unavailable { .. }
+                    ) {
+                        continue;
+                    }
+                    match record(&tx, cx, &object, &bytes, verdict, &mailbox_id, position)? {
+                        // No room for it: it keeps waiting (never done).
+                        None | Some(Decision::Skipped) => continue,
+                        Some(decision) => decision,
+                    }
                 }
-                let Some(decision) =
-                    record(&tx, cx, &object, &bytes, verdict, &mailbox_id, position)?
-                else {
-                    continue;
-                };
-                decision
-            }
+            },
         };
         tx.execute("DELETE FROM mailbox_pending WHERE object_hash=?1", [&hash])?;
         if mailbox_id == current {
@@ -499,9 +612,22 @@ fn decide_entry(
         // Check 1: not a signed object at all, refused under the SHA-256
         // of the bytes as fetched.
         Err(_) => {
-            return refuse(tx, cx, &Hash32::of(bytes), MALFORMED, None, bytes, None).map(Some);
+            return refuse(
+                tx,
+                cx,
+                &Hash32::of(bytes),
+                MALFORMED,
+                None,
+                false,
+                bytes,
+                None,
+            )
+            .map(Some);
         }
     };
+    if let Some(decision) = too_late(tx, cx, &object, bytes)? {
+        return Ok(Some(decision));
+    }
     let (kind, body) = MailBody::from_object(&object)?;
     if kind == MailKind::Result {
         return keep_result(tx, cx, &object, &body, bytes, mailbox_id, entry.position).map(Some);
@@ -510,10 +636,39 @@ fn decide_entry(
     record(tx, cx, &object, bytes, verdict, mailbox_id, entry.position)
 }
 
+/// A copy arriving [`KEEP_MARGIN_MS`] or more after its object's expiry
+/// (review O3): done as expired, not judged: evidence only, no claim, no
+/// report (its claim may have been pruned; one made now would contradict
+/// the first verdict). Admission still dedupes a request's `(sender host,
+/// message id)` against its own permanent records.
+fn too_late(
+    tx: &Transaction,
+    cx: &DecideCx,
+    object: &atem_client::SignedObject,
+    bytes: &[u8],
+) -> Result<Option<Decision>> {
+    let (_, body) = MailBody::from_object(object)?;
+    if body.expires_at.saturating_add(KEEP_MARGIN_MS) > cx.now_ms {
+        return Ok(None);
+    }
+    let evidence = object_hash(object);
+    refuse(
+        tx,
+        cx,
+        &evidence,
+        EXPIRED,
+        None,
+        false,
+        bytes,
+        Some(body.expires_at),
+    )
+    .map(Some)
+}
+
 /// An `atem-result` kept (ruling R28): its exact bytes, `object_hash`,
 /// sender, id and position, for the sending host's `accept_result`; the
-/// same object again is a duplicate; over [`Limits`] it is dropped
-/// undecided (marked done).
+/// same object again is a duplicate; with no room for it in its sender's
+/// share or in all ([`Limits`]) it is left on the Station (ruling R31).
 fn keep_result(
     tx: &Transaction,
     cx: &DecideCx,
@@ -532,13 +687,17 @@ fn keep_result(
     if present {
         return Ok(Decision::Duplicate);
     }
-    let (count, kept): (u64, u64) = tx.query_row(
-        "SELECT count(*), coalesce(sum(length(bytes)), 0) FROM mailbox_results",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+    let (count, of_sender, kept): (u64, u64, u64) = tx.query_row(
+        "SELECT count(*), count(CASE WHEN sender_host=?1 THEN 1 END),
+            coalesce(sum(length(bytes)), 0) FROM mailbox_results",
+        [&body.sender.host_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    if count >= cx.limits.results || kept + bytes.len() as u64 > cx.limits.result_bytes {
-        return Ok(Decision::Overflow);
+    if count >= cx.limits.results
+        || of_sender >= cx.limits.results_per_sender
+        || kept + bytes.len() as u64 > cx.limits.result_bytes
+    {
+        return Ok(Decision::Skipped);
     }
     tx.execute(
         "INSERT INTO mailbox_results(object_hash, sender_host, object_id, mailbox_id, position,
@@ -573,7 +732,7 @@ fn record(
     Ok(Some(match verdict {
         EnvelopeVerdict::Unavailable { .. } => return Ok(None),
         EnvelopeVerdict::Refused { reason, evidence } => {
-            refuse(tx, cx, &evidence, reason, None, bytes, expires)?
+            refuse(tx, cx, &evidence, reason, None, false, bytes, expires)?
         }
         EnvelopeVerdict::Pending {
             host_id,
@@ -588,9 +747,13 @@ fn record(
             position,
             bytes,
         )?,
-        EnvelopeVerdict::Open { plain, .. } => match claim(tx, cx, &body, &hash, bytes)? {
+        EnvelopeVerdict::Open { plain, .. } => match claimed(tx, cx, &body, &hash, bytes)? {
             Some(other) => other,
+            // No room in its sender's share or in all: left on the Station,
+            // unclaimed (ruling R31).
+            None if !inbox_room(tx, cx, &body.sender.host_id)? => Decision::Skipped,
             None => {
+                claim(tx, cx, &body)?;
                 let kind = match &plain {
                     EnvelopePlain::Request { .. } => "request",
                     EnvelopePlain::Cancel { .. } => "cancel",
@@ -612,18 +775,22 @@ fn record(
             }
         },
         EnvelopeVerdict::RefusedAuthenticated { reason, .. } => {
-            match claim(tx, cx, &body, &hash, bytes)? {
+            match claimed(tx, cx, &body, &hash, bytes)? {
                 Some(other) => other,
-                None => refuse(tx, cx, &hash, reason, Some(&body), bytes, expires)?,
+                None => {
+                    claim(tx, cx, &body)?;
+                    refuse(tx, cx, &hash, reason, Some(&body), true, bytes, expires)?
+                }
             }
         }
     }))
 }
 
-/// The claim of the sender's verified copy, `(sender host, id)`: none when
-/// it is new (claimed now; the caller writes its row), else what the copy
-/// is: a duplicate (the same sealed part), or a reused id (another).
-fn claim(
+/// What the sender's verified copy is when its `(sender host, id)` is
+/// claimed already: a duplicate (the same sealed part), or a reused id
+/// (another: evidence with its sender and id, unreported); none when it
+/// isn't claimed.
+fn claimed(
     tx: &Transaction,
     cx: &DecideCx,
     body: &MailBody,
@@ -638,47 +805,75 @@ fn claim(
         )
         .optional()?;
     match sealed {
+        None => Ok(None),
         Some(sealed) if sealed == body.sealed_hash.to_hex() => Ok(Some(Decision::Duplicate)),
-        Some(_) => refuse(tx, cx, hash, ID_REUSED, None, bytes, Some(body.expires_at)).map(Some),
-        None => {
-            tx.execute(
-                "INSERT INTO mailbox_claims(sender_host, object_id, sealed_hash, keep_until)
-                VALUES(?1, ?2, ?3, ?4)",
-                params![
-                    body.sender.host_id,
-                    body.id,
-                    body.sealed_hash.to_hex(),
-                    cx.keep_until(Some(body.expires_at))
-                ],
-            )?;
-            Ok(None)
-        }
+        Some(_) => refuse(
+            tx,
+            cx,
+            hash,
+            ID_REUSED,
+            Some(body),
+            false,
+            bytes,
+            Some(body.expires_at),
+        )
+        .map(Some),
     }
 }
 
+/// The claim of the sender's verified copy, `(sender host, id)`.
+fn claim(tx: &Transaction, cx: &DecideCx, body: &MailBody) -> Result<()> {
+    tx.execute(
+        "INSERT INTO mailbox_claims(sender_host, object_id, sealed_hash, keep_until)
+        VALUES(?1, ?2, ?3, ?4)",
+        params![
+            body.sender.host_id,
+            body.id,
+            body.sealed_hash.to_hex(),
+            cx.keep_until(Some(body.expires_at))
+        ],
+    )?;
+    Ok(())
+}
+
+/// Whether the inbox has room for one more of `sender`'s objects: within
+/// its share and in all ([`Limits`]).
+fn inbox_room(tx: &Transaction, cx: &DecideCx, sender: &str) -> Result<bool> {
+    let (all, of_sender): (u64, u64) = tx.query_row(
+        "SELECT count(*), count(CASE WHEN sender_host=?1 THEN 1 END) FROM mailbox_inbox",
+        [sender],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(all < cx.limits.inbox && of_sender < cx.limits.inbox_per_sender)
+}
+
 /// A refusal row under `evidence`, its bytes within the evidence budget
-/// ([`Limits::evidence_bytes`]): `body` for a refusal of the sender's own
-/// copy, reported by admission. The same evidence again is a duplicate,
-/// unless this is the sender's own copy claiming its id now while that
-/// row says nothing to report (the same bytes refused before they could
-/// be verified): the row is upgraded to report it (review finding 4).
+/// ([`Limits::evidence_bytes`]): `body` for the sender's own verified copy
+/// (its sender and id recorded), `report` when admission reports it. The
+/// same evidence again is a duplicate, unless this is the sender's own copy
+/// claiming its id now, to report, while that row says nothing to report
+/// (the same bytes refused before they could be verified): the row is
+/// upgraded to report it (review finding 4). Unauthenticated rows are
+/// capped by count ([`Limits::unauthenticated`]), the oldest dropped.
+#[allow(clippy::too_many_arguments)]
 fn refuse(
     tx: &Transaction,
     cx: &DecideCx,
     evidence: &Hash32,
     reason: &'static str,
     body: Option<&MailBody>,
+    report: bool,
     bytes: &[u8],
     expires_at: Option<u64>,
 ) -> Result<Decision> {
-    let report: Option<bool> = tx
+    let reported: Option<bool> = tx
         .query_row(
             "SELECT report FROM mailbox_refused WHERE evidence=?1",
             [evidence.to_hex()],
             |r| r.get(0),
         )
         .optional()?;
-    match (report, body) {
+    match (reported, body.filter(|_| report)) {
         (None, _) => {
             tx.execute(
                 "INSERT INTO mailbox_refused(evidence, reason, sender_host, object_id, report,
@@ -688,12 +883,20 @@ fn refuse(
                     reason,
                     body.map(|b| b.sender.host_id.as_str()),
                     body.map(|b| b.id.as_str()),
-                    body.is_some(),
+                    report,
                     bytes,
                     cx.keep_until(expires_at),
                     now_ms()
                 ],
             )?;
+            if body.is_none() {
+                tx.execute(
+                    "DELETE FROM mailbox_refused WHERE sender_host IS NULL AND n NOT IN
+                    (SELECT n FROM mailbox_refused WHERE sender_host IS NULL
+                        ORDER BY n DESC LIMIT ?1)",
+                    [cx.limits.unauthenticated],
+                )?;
+            }
         }
         (Some(false), Some(body)) => {
             tx.execute(
@@ -714,8 +917,10 @@ fn refuse(
     Ok(Decision::Refused(reason))
 }
 
-/// The refusals' kept bytes within `budget`: the oldest go first, those
-/// not reported before those reported; their evidence hash stays.
+/// The refusals' kept bytes within `budget`: unauthenticated before
+/// authenticated (review O4: a reused id's bytes are the sender's own
+/// signature over two sealed parts), unreported before reported, the
+/// oldest first; their evidence hash stays.
 fn keep_within(tx: &Transaction, budget: u64) -> Result<()> {
     loop {
         let kept: u64 = tx.query_row("SELECT bytes FROM mailbox_kept WHERE one=1", [], |r| {
@@ -726,7 +931,7 @@ fn keep_within(tx: &Transaction, budget: u64) -> Result<()> {
         }
         let dropped = tx.execute(
             "UPDATE mailbox_refused SET bytes=NULL WHERE n=(SELECT n FROM mailbox_refused
-                WHERE bytes IS NOT NULL ORDER BY report, n LIMIT 1)",
+                WHERE bytes IS NOT NULL ORDER BY (sender_host IS NOT NULL), report, n LIMIT 1)",
             [],
         )?;
         if dropped == 0 {

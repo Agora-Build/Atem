@@ -802,15 +802,27 @@ fn claims_and_evidence_are_pruned_a_margin_after_their_expiry() {
     );
     assert_eq!(prune(&b.store, late).unwrap(), 1, "the claim");
     assert_eq!(b.count("mailbox_claims"), 0);
+    // Review O3: a copy that late is done as expired, not judged: it
+    // claims nothing and reports nothing.
     let cx = DecideCx {
         now_ms: late,
         ..mail.cx()
     };
     assert_eq!(
         decided(b.put_with(&cx, &open.to_json())),
-        Decision::Refused(reason::EXPIRED),
-        "judged anew"
+        Decision::Refused(reason::EXPIRED)
     );
+    assert_eq!(b.count("mailbox_claims"), 0, "no claim");
+    let report: i64 = b
+        .store
+        .db
+        .query_row(
+            "SELECT report FROM mailbox_refused WHERE reason=?1",
+            [reason::EXPIRED],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(report, 0, "nothing reported");
     assert!(prune(&b.store, now_ms() + 3 * KEEP_MARGIN_MS).unwrap() >= 2);
     assert_eq!(b.count("mailbox_refused") + b.count("mailbox_claims"), 0);
 }
@@ -820,7 +832,7 @@ fn claims_and_evidence_are_pruned_a_margin_after_their_expiry() {
 /// exact bytes, `object_hash`, sender, id and position), committed with
 /// the cursor and owing its done, never counted as inbox (it starts no
 /// work); the same object again is a duplicate; one over the results'
-/// limits is dropped undecided and marked done.
+/// limits is left on the Station, not done (ruling R31).
 #[test]
 fn a_result_is_kept_and_marked_done() {
     use atem_client::host_mail::{ResultPlain, seal_result};
@@ -873,7 +885,225 @@ fn a_result_is_kept_and_marked_done() {
     };
     assert_eq!(
         decided(b.put_with(&cx, &result(&mail).0.to_json())),
-        Decision::Overflow
+        Decision::Skipped
     );
-    assert_eq!((b.count("mailbox_results"), b.owed()), (1, vec![1, 2, 3]));
+    assert_eq!((b.count("mailbox_results"), b.owed()), (1, vec![1, 2]));
+}
+
+/// A result from `sender` (claimed: kept results aren't verified here).
+fn result_from(mail: &Mail, sender: &str) -> SignedObject {
+    use atem_client::host_mail::{ResultPlain, seal_result};
+    let fields = mail.fields(sender, mail.log.log.head(), now_ms() + HOUR);
+    let plain = ResultPlain::Refusal {
+        object_id: uuid(),
+        refused: "invalid_request".into(),
+    };
+    seal_result(
+        &mail.sender,
+        &KeyId::new("host-b"),
+        &fields,
+        &plain,
+        &mail.enc_pub,
+    )
+    .unwrap()
+}
+
+/// Ruling R31 (review O1): a result over the results' limits is never
+/// marked done and never dropped: no row, no claim, no done; its page
+/// commits (the cursor moves on) with the lowest skipped position, which
+/// survives a restart. Once room frees, the cursor is rewound durably to
+/// just before it, and the re-read keeps it and owes its done.
+#[test]
+fn a_result_over_its_limits_waits_on_the_station_until_room_frees() {
+    let mail = Mail::new();
+    let mut b = Box::new();
+    let cx = DecideCx {
+        limits: Limits {
+            results: 1,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    let first = result_from(&mail, "host-b");
+    let second = result_from(&mail, "host-b");
+    assert_eq!(decided(b.put_with(&cx, &first.to_json())), Decision::Result);
+    assert_eq!(
+        decided(b.put_with(&cx, &second.to_json())),
+        Decision::Skipped
+    );
+    decided(b.put_with(&cx, &serde_json::json!("junk")));
+    assert_eq!(b.owed(), [1, 3], "no done for the skipped one");
+    assert_eq!(b.count("mailbox_results"), 1);
+    let dir = b._dir.path().to_path_buf();
+    let reopened = Store::open(&dir).unwrap();
+    let observed = read(&reopened, &identity(1)).unwrap();
+    assert!(
+        observed.skipped && !observed.rewind_due,
+        "kept across a restart"
+    );
+    assert_eq!(observed.cursor, Some((MAILBOX.into(), 3)));
+    assert!(
+        !rewind_if_room(&b.store, &identity(1)).unwrap(),
+        "no room yet"
+    );
+    // Room frees (the sending host's check took the first).
+    b.store
+        .db
+        .execute("DELETE FROM mailbox_results", [])
+        .unwrap();
+    assert!(read(&b.store, &identity(1)).unwrap().rewind_due);
+    assert!(rewind_if_room(&b.store, &identity(1)).unwrap());
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert_eq!(observed.cursor, Some((MAILBOX.into(), 1)));
+    assert!(!observed.skipped);
+    b.at = 1;
+    assert_eq!(
+        decided(b.put_with(&cx, &second.to_json())),
+        Decision::Result
+    );
+    assert_eq!(b.owed(), [1, 2, 3]);
+}
+
+/// Ruling R31: each sender host has its own share of both inboxes: one
+/// filling its share leaves the next of its objects on the Station
+/// (skipped), and another sender's still fit.
+#[test]
+fn one_sender_filling_its_share_doesnt_block_another() {
+    let mut mail = Mail::new();
+    let mut b = Box::new();
+    let cx = DecideCx {
+        limits: Limits {
+            results_per_sender: 1,
+            inbox_per_sender: 1,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    assert_eq!(
+        decided(b.put_with(&cx, &result_from(&mail, "host-b").to_json())),
+        Decision::Result
+    );
+    assert_eq!(
+        decided(b.put_with(&cx, &result_from(&mail, "host-b").to_json())),
+        Decision::Skipped
+    );
+    assert_eq!(
+        decided(b.put_with(&cx, &result_from(&mail, "host-c").to_json())),
+        Decision::Result
+    );
+    // The inbox: B's second open waits; C's first fits.
+    mail.log.add_host("host-c", 1, &secret("mail host c"));
+    let cx = DecideCx {
+        limits: Limits {
+            inbox_per_sender: 1,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    assert_eq!(
+        decided(b.put_with(&cx, &mail.cancel().to_json())),
+        Decision::Opened
+    );
+    let second = mail.cancel();
+    assert_eq!(
+        decided(b.put_with(&cx, &second.to_json())),
+        Decision::Skipped
+    );
+    let mut c = SoftwareKeys::new();
+    c.insert_ed25519(KeyId::new("host-c"), &secret("mail host c"));
+    let fields = mail.fields("host-c", mail.log.log.head(), now_ms() + HOUR);
+    let from_c = seal_envelope(
+        &c,
+        &KeyId::new("host-c"),
+        &fields,
+        &EnvelopePlain::Cancel { task_id: uuid() },
+        &mail.enc_pub,
+    )
+    .unwrap();
+    assert_eq!(
+        decided(b.put_with(&cx, &from_c.to_json())),
+        Decision::Opened
+    );
+    assert_eq!(
+        b.count("mailbox_claims"),
+        2,
+        "the skipped one claims nothing"
+    );
+    assert_eq!(read(&b.store, &identity(1)).unwrap().inbox, 2);
+}
+
+/// Review O4: the evidence budget drops unauthenticated bytes first: a
+/// reused id's (the sender's own signature over two sealed parts, its
+/// sender and id recorded, unreported) outlives junk.
+#[test]
+fn a_reused_ids_evidence_outlives_junk() {
+    let mail = Mail::new();
+    let mut b = Box::new();
+    let cx = DecideCx {
+        limits: Limits {
+            evidence_bytes: 2_000,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    let open = mail.cancel();
+    decided(b.put_with(&cx, &open.to_json()));
+    let body = atem_client::host_mail::MailBody::from_object(&open)
+        .unwrap()
+        .1;
+    let mut fields = body.fields();
+    fields.expires_at -= 1;
+    assert_eq!(
+        decided(b.put_with(&cx, &mail.seal(&fields).to_json())),
+        Decision::Refused(ID_REUSED)
+    );
+    for c in ['a', 'b', 'c'] {
+        decided(b.put_with(&cx, &serde_json::json!(c.to_string().repeat(698))));
+    }
+    let (sender, report, kept): (String, i64, bool) = b
+        .store
+        .db
+        .query_row(
+            "SELECT sender_host, report, bytes IS NOT NULL FROM mailbox_refused WHERE reason=?1",
+            [ID_REUSED],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((sender.as_str(), report, kept), ("host-b", 0, true));
+}
+
+/// Review O5: unauthenticated refusal rows are capped by count, the oldest
+/// dropped first (the same bytes again are refused again, unreported);
+/// authenticated ones don't count.
+#[test]
+fn unauthenticated_refusals_are_capped_by_count() {
+    let mail = Mail::new();
+    let mut b = Box::new();
+    let cx = DecideCx {
+        limits: Limits {
+            unauthenticated: 2,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    for c in ['a', 'b', 'c'] {
+        assert_eq!(
+            decided(b.put_with(&cx, &serde_json::json!(c.to_string()))),
+            Decision::Refused(reason::MALFORMED)
+        );
+    }
+    assert_eq!(b.count("mailbox_refused"), 2);
+    assert_eq!(
+        decided(b.put_with(&cx, &serde_json::json!("a"))),
+        Decision::Refused(reason::MALFORMED),
+        "the oldest went: refused again"
+    );
+    let mut fields = mail.fields("host-b", mail.log.log.head(), cx.now_ms - 1);
+    fields.created_at = cx.now_ms - HOUR;
+    decided(b.put_with(&cx, &mail.seal(&fields).to_json()));
+    assert_eq!(
+        b.count("mailbox_refused"),
+        3,
+        "the reported one not counted"
+    );
 }
