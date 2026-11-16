@@ -340,20 +340,9 @@ impl MailboxClient {
             self.reset = true;
             return PageCheck::Reset;
         }
-        PageCheck::Apply(Applying {
-            page,
-            epoch: ask.epoch,
-        })
-    }
-
-    /// `applying` committed (the bridge observed the store since): the
-    /// page's head counts as announced, a resynchronization asked before it
-    /// ends, and the next page is asked at once when the cursor moved and
-    /// the host is still behind; after a page that moved nothing while it
-    /// is, none for 30 s.
-    pub fn committed(&mut self, applying: Applying) {
-        self.pages += 1;
-        let page = applying.page;
+        // Its head is the Station's word, as fresh as a `heads`'s: the gate
+        // needs that much read, and a cursor moved past the head the last
+        // `heads` named is no reset.
         if let Some(a) = self
             .announced
             .as_mut()
@@ -361,6 +350,19 @@ impl MailboxClient {
         {
             a.head = a.head.max(page.head);
         }
+        PageCheck::Apply(Applying {
+            page,
+            epoch: ask.epoch,
+        })
+    }
+
+    /// `applying` committed (the bridge observed the store since): a
+    /// resynchronization asked before it ends, and the next page is asked at once when the cursor moved and
+    /// the host is still behind; after a page that moved nothing while it
+    /// is, none for 30 s.
+    pub fn committed(&mut self, applying: Applying) {
+        self.pages += 1;
+        let page = applying.page;
         if applying.epoch == self.epoch {
             self.resync = None;
         }

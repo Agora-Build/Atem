@@ -236,23 +236,33 @@ impl HostBridge {
 
     /// The waiting objects judged again, in one transaction, after the
     /// committed device list moved or once one's expiry passed (design
-    /// II.4.2): those decided owe their dones.
+    /// II.4.2): those decided owe their dones. Nothing is read beyond the
+    /// store while nothing waits or neither changed.
     fn mail_rejudge(&mut self) {
+        let due = {
+            let Some((store, identity)) = self.mail_store() else {
+                return;
+            };
+            let Ok(Some(earliest)) = mailbox_store::pending_expiry(store) else {
+                return;
+            };
+            let view = self.start_view();
+            let Some(head) = view.list.as_ref().map(|l| l.membership.head()) else {
+                return;
+            };
+            let expired = view.now_d_ms.is_some_and(|now| earliest <= now);
+            let key = (identity.host, head.seq, head.hash);
+            (expired || self.work.mail_rejudged.as_ref() != Some(&key)).then_some(key)
+        };
+        let Some(key) = due else {
+            return;
+        };
         let Some((list, receiver, now_ms)) = self.mail_receiver() else {
             return;
         };
         let Some((store, identity)) = self.mail_store() else {
             return;
         };
-        let head = list.membership.head();
-        let key = (identity.host.clone(), head.seq, head.hash);
-        let expired = mailbox_store::pending_expiry(store)
-            .ok()
-            .flatten()
-            .is_some_and(|at| at <= now_ms);
-        if self.work.mail_rejudged.as_ref() == Some(&key) && !expired {
-            return;
-        }
         let cx = mailbox_store::DecideCx {
             list: &list.membership,
             recipient: &receiver.recipient,
@@ -262,7 +272,7 @@ impl HostBridge {
         match mailbox_store::rejudge_pending(store, &identity, &cx) {
             Ok(_) => self.work.mail_rejudged = Some(key),
             Err(error) => eprintln!(
-                "atem runtime: host senders' waiting mailbox objects couldn't be judged again ({error:#})"
+                "atem runtime: host senders' waiting mailbox objects not judged again ({error:#})"
             ),
         }
     }

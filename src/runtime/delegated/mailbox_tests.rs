@@ -381,3 +381,18 @@ fn an_identity_change_retires_every_mailbox_call() {
     let out = c.take_outgoing();
     assert_eq!((out.sync.len(), positions(&out.dones)), (1, vec![1]));
 }
+
+/// Rule 4: a page's head is the Station's word, as fresh as a `heads`'s: a
+/// page read past the head the last `heads` announced is no reset (its
+/// cursor beyond the announced head), and the gate needs that much read.
+#[test]
+fn a_page_beyond_the_announced_head_is_no_reset() {
+    let mut c = client(10 * SEC, None);
+    c.on_heads(head(MAILBOX, 2));
+    let call = sent(&mut c).unwrap();
+    commit(&mut c, page(&call, 6, 5));
+    assert_eq!(c.reset_due(), None);
+    assert!(!c.open(), "behind the page's head");
+    let call = sent(&mut c).expect("asked at once");
+    assert_eq!(call.after, 5);
+}
