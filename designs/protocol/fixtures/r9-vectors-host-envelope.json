@@ -2299,6 +2299,53 @@
         "M10_add_host_evil"
       ],
       "expect": {
+        "object_id": "ab027163-acce-4c80-9f86-94293606fbbc",
+        "reason": "result_id_mismatch",
+        "sender": {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        "verdict": "refused_authenticated"
+      },
+      "label": "result_id_mismatch",
+      "note": "a result whose reply's result_id isn't the derivation from its task_id (host-work-v1 §11.5, \"result_id\"): refused authenticated, nothing reported back",
+      "now": 1793620801000,
+      "object": "result_id_mismatch",
+      "outbox": {
+        "cancel_complete_ids": [
+          "5708ecb4-c190-4bb2-b98d-c3752e859ffd",
+          "d04169ed-60c8-4915-8978-12f97a27b8a9"
+        ],
+        "message_id": "24fcff6b-c10f-47e2-ba6b-b2dd08bf02f7",
+        "recipient": {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        "task_ids": [
+          "2f72a9f3-a5a6-449c-b712-744927dcb0dd"
+        ]
+      },
+      "receiver": {
+        "generated": [
+          "host-a-enc-1",
+          "host-a-enc-2"
+        ],
+        "host_id": "host-a",
+        "host_trust_gen": 1,
+        "keys": [
+          "host-a-enc-1"
+        ]
+      }
+    },
+    {
+      "call": "accept_result",
+      "chain": [
+        "M7_add_host_b",
+        "M8_enc_a",
+        "M9_enc_b",
+        "M10_add_host_evil"
+      ],
+      "expect": {
         "object_id": "abfc0bda-2277-440a-b4b9-17fb9782d82a",
         "reason": "does_not_answer_outbox_row",
         "sender": {
@@ -2801,7 +2848,7 @@
   "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
   "kind": "vectors",
   "name": "r9-vectors-host-envelope",
-  "note": "Envelopes and results between hosts (delegated host-work II.4.2, II.4.4; host-work-v1 §11.5). Each object is {body, sig, enc, ct}: the body signed by the sender's host_key (Ed25519) over enc([\"atem-envelope-v1\" or \"atem-result-v1\", jcs(body)]); the plaintext sealed with RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, to the recipient's host encryption key, info = enc([\"atem-envelope-seal-v1\" or \"atem-result-seal-v1\", account_id, genesis_hash (32 bytes), sender.host_id, u64(sender.host_trust_gen), recipient.host_id, u64(recipient.host_trust_gen), enc_kid, id, u64(created_at), u64(expires_at)]); sealed_hash = SHA-256(enc([enc, ct])). The sender's ephemeral is DeriveKeyPair(ikmE), ikmE = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Device lists: log L of r9-vectors-membership-log followed by `chain`, labels of `entries` (signed by dev-mac); the objects are signed at B = L + M7..M10 (head 10) unless their signed_at_head says otherwise. Objects: `signed_with` names the r9-vectors-keys host key whose signature `sig` is; `built` objects are what seal_envelope / seal_result make from the body's fields, `sealed.plaintext` and ikmE; `sealed` gives the seal's inputs and outputs (`plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB); `sealed_from` names the object whose sealed part it carries, `edited_from` the object it is after a change made after signing. Checks: `call` (open_envelope, or accept_result with `outbox`, the sending host's row) on L + `chain`, by `receiver` (its host_id, current host_trust_gen, the keys it accepts and every key it made at that generation, `generated`; r9-vectors-keys names), at `now`; `expect` is the verdict: open or accepted (with `sender`; the plaintext is the object's), not_delivered (with `sender` and the return grant's detail as `reason`), pending (the claimed host_id and host_trust_gen), refused (before the copy is shown to be the sender's, signed and intact (step 4): `reason` and `evidence` = SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent; it claims no id) or refused_authenticated (after it: the object's id, `reason` and `sender`, the {host_id, host_trust_gen} whose key verified it; it claims the id for that sender, (sender.host_id, id)). A key in neither `keys` nor `generated` is refused enc_key_not_accepted even beyond the receiver's head, after the checks that settle at any head, the times and a known generation's signature; one in `generated` only waits there.",
+  "note": "Envelopes and results between hosts (delegated host-work II.4.2, II.4.4; host-work-v1 §11.5). Each object is {body, sig, enc, ct}: the body signed by the sender's host_key (Ed25519) over enc([\"atem-envelope-v1\" or \"atem-result-v1\", jcs(body)]); the plaintext sealed with RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, to the recipient's host encryption key, info = enc([\"atem-envelope-seal-v1\" or \"atem-result-seal-v1\", account_id, genesis_hash (32 bytes), sender.host_id, u64(sender.host_trust_gen), recipient.host_id, u64(recipient.host_trust_gen), enc_kid, id, u64(created_at), u64(expires_at)]); sealed_hash = SHA-256(enc([enc, ct])). The sender's ephemeral is DeriveKeyPair(ikmE), ikmE = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Device lists: log L of r9-vectors-membership-log followed by `chain`, labels of `entries` (signed by dev-mac); the objects are signed at B = L + M7..M10 (head 10) unless their signed_at_head says otherwise. Objects: `signed_with` names the r9-vectors-keys host key whose signature `sig` is; `built` objects are what seal_envelope / seal_result make from the body's fields, `sealed.plaintext` and ikmE; `sealed` gives the seal's inputs and outputs (`plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB); `sealed_from` names the object whose sealed part it carries, `edited_from` the object it is after a change made after signing. Checks: `call` (open_envelope, or accept_result with `outbox`, the sending host's row) on L + `chain`, by `receiver` (its host_id, current host_trust_gen, the keys it accepts and every key it made at that generation, `generated`; r9-vectors-keys names), at `now`; `expect` is the verdict: open or accepted (with `sender`; the plaintext is the object's), not_delivered (with `sender` and the return grant's detail as `reason`), pending (the claimed host_id and host_trust_gen), refused (before the copy is shown to be the sender's, signed and intact (step 4): `reason` and `evidence` = SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent; it claims no id) or refused_authenticated (after it: the object's id, `reason` and `sender`, the {host_id, host_trust_gen} whose key verified it; it claims the id for that sender, (sender.host_id, id)). A key in neither `keys` nor `generated` is refused enc_key_not_accepted even beyond the receiver's head, after the checks that settle at any head, the times and a known generation's signature; one in `generated` only waits there. A result's reply carries its task's result_id = UUIDv5(NAMESPACE_OID 6ba7b812-9dad-11d1-80b4-00c04fd430c8, \"result:\" + task_id) (host-work-v1 §11.5, \"result_id\"): accept_result refuses another authenticated as result_id_mismatch, after the plaintext's strict reading and before the outbox row.",
   "now": 1793620801000,
   "objects": [
     {
@@ -4268,10 +4315,10 @@
     },
     {
       "built": true,
-      "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"279abd3e-277d-4e77-836a-573ee79ba077\",\"recipient\":{\"enc_kid\":\"f7b299b3a3dc69cc\",\"host_id\":\"host-a\",\"host_trust_gen\":1},\"sealed_hash\":\"5555b7075e380fc2c95a71e872d25654c20650f712ec3ba67cb06c4fbee8ba96\",\"sender\":{\"host_id\":\"host-b\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e\",\"seq\":10},\"type\":\"atem-result\",\"v\":1}",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"279abd3e-277d-4e77-836a-573ee79ba077\",\"recipient\":{\"enc_kid\":\"f7b299b3a3dc69cc\",\"host_id\":\"host-a\",\"host_trust_gen\":1},\"sealed_hash\":\"330a6bfad031022676e0d3b19856d15ecb813ae8038a8606697e3b9fcd40b107\",\"sender\":{\"host_id\":\"host-b\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e\",\"seq\":10},\"type\":\"atem-result\",\"v\":1}",
       "kind": "result",
       "label": "result",
-      "note": "the agent's reply to the request's task, as reply_query returns it once submitted",
+      "note": "the agent's reply to the request's task, as reply_query returns it once submitted; its result_id is the task's, UUIDv5(NAMESPACE_OID, \"result:\" + task_id)",
       "object": {
         "body": {
           "account_id": "acct-test-1",
@@ -4284,7 +4331,7 @@
             "host_id": "host-a",
             "host_trust_gen": 1
           },
-          "sealed_hash": "5555b7075e380fc2c95a71e872d25654c20650f712ec3ba67cb06c4fbee8ba96",
+          "sealed_hash": "330a6bfad031022676e0d3b19856d15ecb813ae8038a8606697e3b9fcd40b107",
           "sender": {
             "host_id": "host-b",
             "host_trust_gen": 1
@@ -4296,20 +4343,65 @@
           "type": "atem-result",
           "v": 1
         },
-        "ct": "kSJV0ibHZu87-wtUF2KZUptH8sScfr1zkcA5eE1aJNAzGg__2Af_NM1oQ4tUl1xubw2Ajw9hNBNpr46MDndrUO3Q6JyJzkelnELuOnxW1Rck0svj8UXBT-UT3f3jwqBxjKp9UBAD5Gbsy2InQRiWHb_D77IgmOcD0ANaLTDpOUtlDrNhJ9V15nypt9x2WoB7XT0RQwW7T1nlDn6RFf9lEqn5IVy0whjo-JKy0hEkBAxuE1cYqTFPNYW5G1LShj8nJHgit7Ja6NK-rlQY2v3vdFA_8O6r1-anz6QT4buFHbG-FVLyYYRT0YXj9rBRlWYqDfCtjaUDAoWNf_1MF1uZxWh2gWvgu7CN3mE15qcJz8o5bbpZyQXiCCGQcX2uPg-1-sV9k97SETOa57G1GgaPVPiYN53VWOV5oR1MUCplGM5COcvxG4fg9_-vbt5v2UPy8g",
+        "ct": "kSJV0ibHZu87-wtUF2KZUptH8sScfr1zkcA5eE1aJNAzGg__2Af_NM1oQ4tUl1xubw2Ajw9hNBNpr46MDndrUO3Q6JyJzkelnELuOnxW1Rck0svj8UXBT-UT3f3jwqBxjKp9UBAD5Gbsy2InQRiWHb_D77IgmOcD0ANaLTDpOUtlDrNhJ9V15nypt9x2WoB7WGkWHQXvHADlCyjCE_9lR_qlIVy1kh_o9ca1hRdyBFRuFgFKqTFPNYW5G1LShj8nJHgit7Ja6NK-rlQY2v3vdFA_8O6r1-anz6QT4buFHbG-FVLyYYRT0YXj9rBRlWYqDfCtjaUDAoWNf_1MF1uZxWh2gWvgu7CN3mE15qcJz8o5bbpZyQXiCCGQcX2uPg-1-sV9k97SETOa57G1GgaPVPiYN53VWOV5oR1MUCplGM5C-tmNmIwONiVF2V7Y7u_HRg",
         "enc": "bvEv8uDIKYGix5kzCga7uDTqyKxRd0Q03yomnGGZU0s",
-        "sig": "Eyw_HI2VmibOs1uwesQCJCGJ7_WLvQSf046YdY4-1yb9XeED30HnHaXI_PXduE4r_ohdKsYAKrP2BNeMxIhJAA"
+        "sig": "3GSF0-PN9r2y-3wd0-7xxMDRsdg1VjqOrh-k4Q2dFFv5QbXLALexdFvHK_dgpTFWzncd208jqTm_DnHGUatiDg"
       },
       "sealed": {
         "ikmE_hex": "b303a27492afde64d8fd1e26521aff610991dc63977063f8803ac9243aaded9a",
         "ikm_label": "host-envelope result",
         "info_hex": "000000136174656d2d726573756c742d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d6200000008000000000000000100000006686f73742d6100000008000000000000000100000010663762323939623361336463363963630000002432373961626433652d323737642d346537372d383336612d35373365653739626130373700000008000001a19c21720000000008000001a19c586080",
-        "plaintext": "{\"kind\":\"result\",\"reply\":{\"context\":[],\"digest\":\"45bb2d26f42e32da03e3d131f18e8ff34dc2af1c13ac2ea9fabff57db6e64724\",\"dropped\":false,\"result_id\":\"02e8ef78-34f1-5779-a0e6-8756d5c91dfb\",\"state\":\"submitted\",\"submitted_at\":1793620860000,\"text\":\"Done: the contract reads well.\"},\"task_id\":\"2f72a9f3-a5a6-449c-b712-744927dcb0dd\"}",
-        "sealed_hash": "5555b7075e380fc2c95a71e872d25654c20650f712ec3ba67cb06c4fbee8ba96",
+        "plaintext": "{\"kind\":\"result\",\"reply\":{\"context\":[],\"digest\":\"45bb2d26f42e32da03e3d131f18e8ff34dc2af1c13ac2ea9fabff57db6e64724\",\"dropped\":false,\"result_id\":\"5fbfe2da-6b57-5bde-a151-5c2abcca1a00\",\"state\":\"submitted\",\"submitted_at\":1793620860000,\"text\":\"Done: the contract reads well.\"},\"task_id\":\"2f72a9f3-a5a6-449c-b712-744927dcb0dd\"}",
+        "sealed_hash": "330a6bfad031022676e0d3b19856d15ecb813ae8038a8606697e3b9fcd40b107",
         "to": "host-a-enc-1"
       },
       "signed_with": "host-b",
-      "signing_input_hex": "0000000e6174656d2d726573756c742d7631000002247b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2232373961626433652d323737642d346537372d383336612d353733656537396261303737222c22726563697069656e74223a7b22656e635f6b6964223a2266376232393962336133646336396363222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2235353535623730373565333830666332633935613731653837326432353635346332303635306637313265633362613637636230366334666265653862613936222c2273656e646572223a7b22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2233343933386334333063653136636130636265333564366231663762626166303733623139353136656231313461396136353261386362396130633638323865222c22736571223a31307d2c2274797065223a226174656d2d726573756c74222c2276223a317d"
+      "signing_input_hex": "0000000e6174656d2d726573756c742d7631000002247b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2232373961626433652d323737642d346537372d383336612d353733656537396261303737222c22726563697069656e74223a7b22656e635f6b6964223a2266376232393962336133646336396363222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2233333061366266616430333130323236373665306433623139383536643135656362383133616538303338613836303636393765336239666364343062313037222c2273656e646572223a7b22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2233343933386334333063653136636130636265333564366231663762626166303733623139353136656231313461396136353261386362396130633638323865222c22736571223a31307d2c2274797065223a226174656d2d726573756c74222c2276223a317d"
+    },
+    {
+      "built": true,
+      "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"ab027163-acce-4c80-9f86-94293606fbbc\",\"recipient\":{\"enc_kid\":\"f7b299b3a3dc69cc\",\"host_id\":\"host-a\",\"host_trust_gen\":1},\"sealed_hash\":\"90f88e9b11fd61c290d4c611e24f1fa70355a7493bdd14194d39fcd051ab1af0\",\"sender\":{\"host_id\":\"host-b\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e\",\"seq\":10},\"type\":\"atem-result\",\"v\":1}",
+      "kind": "result",
+      "label": "result_id_mismatch",
+      "note": "a reply to the request's task whose result_id is another task's: a builder seals it (the plaintext alone is well formed); the sending host refuses it",
+      "object": {
+        "body": {
+          "account_id": "acct-test-1",
+          "created_at": 1793620800000,
+          "expires_at": 1793624400000,
+          "genesis_hash": "93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89",
+          "id": "ab027163-acce-4c80-9f86-94293606fbbc",
+          "recipient": {
+            "enc_kid": "f7b299b3a3dc69cc",
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "sealed_hash": "90f88e9b11fd61c290d4c611e24f1fa70355a7493bdd14194d39fcd051ab1af0",
+          "sender": {
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "signed_at_head": {
+            "hash": "34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e",
+            "seq": 10
+          },
+          "type": "atem-result",
+          "v": 1
+        },
+        "ct": "jwrSbbg-nT6_vPg3ZfrHoxte4HJvpydH3dw8I7Tds_USEvCfFEzNS0P1nDlueUcNPJSM7zXq3xg8FL4jvyndXg3XT5nApdYjA_0DTrwCtNXNa6LBK_VHa1CLtp1MV0QmTTLjY32A3q9rBJJt_OpNuWhWYWHHPg2QJAhd_iUZC8Khq1o_jYuGPR_I5UOiZQIj2EqPlCZW1vd0CLfya5I8k5u0Gzek1xpmkLEewP7YZ1pdjoaodpm6MDNGmQmGR8VdS20iFHIC6ucCKSotbtS1TnDldrI3X1HOzy05ESWnIYWWNJccMZpmLfMEQoSGQb83vgPjC5kcbFjivRLNKQGNXLjFQB9gOZDfTMlXz8u7cogQ7bkzCjW9p3PXGC8XFnhaC1j6Mk000ugRVBAYX7MOmmUC87nqI_dGn-ZOc4pr9D-pBXXoFsbDk3UmtvvrQ7KeLA",
+        "enc": "11GPb5-oJ5wJmuCMGuIHJNm-5jtkIoxkU3MqqfYeoQ4",
+        "sig": "0yC5wG5RJefjI50FE86BJRmOxJircYAuxyJ97xemkD4-NEojZHOpMKy1tAfu_thYl5lWJ-qcjqPUZblFsTGhDA"
+      },
+      "sealed": {
+        "ikmE_hex": "1aa5655fc5bd81bd1e0dc7369e716869287bf0b34fb91fe9e54dbd5c365d356d",
+        "ikm_label": "host-envelope result_id_mismatch",
+        "info_hex": "000000136174656d2d726573756c742d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d6200000008000000000000000100000006686f73742d6100000008000000000000000100000010663762323939623361336463363963630000002461623032373136332d616363652d346338302d396638362d39343239333630366662626300000008000001a19c21720000000008000001a19c586080",
+        "plaintext": "{\"kind\":\"result\",\"reply\":{\"context\":[],\"digest\":\"45bb2d26f42e32da03e3d131f18e8ff34dc2af1c13ac2ea9fabff57db6e64724\",\"dropped\":false,\"result_id\":\"da2d2949-a7cb-556b-82ea-d1dfdbaf340f\",\"state\":\"submitted\",\"submitted_at\":1793620860000,\"text\":\"Done: the contract reads well.\"},\"task_id\":\"2f72a9f3-a5a6-449c-b712-744927dcb0dd\"}",
+        "sealed_hash": "90f88e9b11fd61c290d4c611e24f1fa70355a7493bdd14194d39fcd051ab1af0",
+        "to": "host-a-enc-1"
+      },
+      "signed_with": "host-b",
+      "signing_input_hex": "0000000e6174656d2d726573756c742d7631000002247b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2261623032373136332d616363652d346338302d396638362d393432393336303666626263222c22726563697069656e74223a7b22656e635f6b6964223a2266376232393962336133646336396363222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2239306638386539623131666436316332393064346336313165323466316661373033353561373439336264643134313934643339666364303531616231616630222c2273656e646572223a7b22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2233343933386334333063653136636130636265333564366231663762626166303733623139353136656231313461396136353261386362396130633638323865222c22736571223a31307d2c2274797065223a226174656d2d726573756c74222c2276223a317d"
     },
     {
       "built": true,
@@ -4448,7 +4540,7 @@
     },
     {
       "built": false,
-      "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"2abc5b68-16a7-4e4d-81e3-24a45350b28b\",\"recipient\":{\"enc_kid\":\"f7b299b3a3dc69cc\",\"host_id\":\"host-a\",\"host_trust_gen\":1},\"sealed_hash\":\"6c213f62a9dc9eb9297c683895a495bd87da3a14f15488749b32c68a47e8ea9e\",\"sender\":{\"host_id\":\"host-b\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e\",\"seq\":10},\"type\":\"atem-result\",\"v\":1}",
+      "jcs": "{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"2abc5b68-16a7-4e4d-81e3-24a45350b28b\",\"recipient\":{\"enc_kid\":\"f7b299b3a3dc69cc\",\"host_id\":\"host-a\",\"host_trust_gen\":1},\"sealed_hash\":\"a768ce25175e0d6dc02adbebda68203b824e8fc1592631ae0854fc39ac18971c\",\"sender\":{\"host_id\":\"host-b\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"34938c430ce16ca0cbe35d6b1f7bbaf073b19516eb114a9a652a8cb9a0c6828e\",\"seq\":10},\"type\":\"atem-result\",\"v\":1}",
       "kind": "result",
       "label": "dropped_reply",
       "note": "a result whose reply the host dropped (no text left); no builder seals it",
@@ -4464,7 +4556,7 @@
             "host_id": "host-a",
             "host_trust_gen": 1
           },
-          "sealed_hash": "6c213f62a9dc9eb9297c683895a495bd87da3a14f15488749b32c68a47e8ea9e",
+          "sealed_hash": "a768ce25175e0d6dc02adbebda68203b824e8fc1592631ae0854fc39ac18971c",
           "sender": {
             "host_id": "host-b",
             "host_trust_gen": 1
@@ -4476,20 +4568,20 @@
           "type": "atem-result",
           "v": 1
         },
-        "ct": "u2CV2OHJc1FWxabJBBZqVm0j6EE_qM9eVqBQjR-mVHwvl5aivz5iL24antnyID-2mWs_uw7pGI_nMi7Iisjt_AyRNKUNxlw_sqhSgTMSOXcUZEpgFiBVTBbtgplSXWmElKEXozRUVnbDcPj0I6IT3vi-rCQmOk12lNr-zMf6WcY56YHvJj62dQp-ROC9cIEpfIrDKrAbEp8eVnr0ZitRCNy4qsviYHzmKW-1MO_fZ7OQTrOZ0026xs0Xp2fm5DYorxYhtH8N-oh9ebK-mwupV1NxaJKnL4rl5bdftgv5kS2gNWWWpSWSCEEtBZGHtrJPv1Ara5iY2WuA5JiwJtF4fKLz4t9yQqblEl9ooM49I-FGTlxGrgcUs8c211MbWqs1I7NLuUpdSBaFxetGZ9kkLWo0",
+        "ct": "u2CV2OHJc1FWxabJBBZqVm0j6EE_qM9eVqBQjR-mVHwvl5aivz5iL24antnyID-2mWs_uw7pGI_nMi7Iisjt_AyRNKUNxlw_sqhSgTMSOXcUZEpgFiBVTBbtgplSXWmElKEXozRUVnbDcPj0I6IT3vi-rCQmOk12lNr-zMf6WcY56YHvJj62dQp-ROC9cIEsKI2dKuRIS58bACnyZisEW4C4qsqyZ3zrfWjiNrnfP7OVGOGZ0026xs0Xp2fm5DYorxYhtH8N-oh9ebK-mwupV1NxaJKnL4rl5bdftgv5kS2gNWWWpSWSCEEtBZGHtrJPv1Ara5iY2WuA5JiwJtF4fKLz4t9yQqblEl9ooM49I-FGTlxGrgcUs8c211MbWqs1I7P6KbXWsSRX-dkcX80fA-1Z",
         "enc": "q9dyb6RAkYatppktE-tHYdGYOVQuzYazNcqRnQCD1E4",
-        "sig": "4Okxe6SUOprbP5udSpTkJPRhyuk-w3vR-JsGavwVWSPcEMnZT7F2oxD5nNMO21JozDDsi2P3YEp7eKITuZsiAg"
+        "sig": "LkpjRhMozmgUSBqvVixRVc36HoT5ZReJawm8PsmoUpPOTNnUWqkoCsZ5oHnKUuCpZ_wnMtqHyH22E1j7z5F6Dg"
       },
       "sealed": {
         "ikmE_hex": "13c95cc987bd9ddcfce377ea86ea569856544b518c4db50f97a93680e18d713a",
         "ikm_label": "host-envelope dropped_reply",
         "info_hex": "000000136174656d2d726573756c742d7365616c2d76310000000b616363742d746573742d310000002093501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd8900000006686f73742d6200000008000000000000000100000006686f73742d6100000008000000000000000100000010663762323939623361336463363963630000002432616263356236382d313661372d346534642d383165332d32346134353335306232386200000008000001a19c21720000000008000001a19c586080",
-        "plaintext": "{\"kind\":\"result\",\"reply\":{\"context\":[],\"digest\":\"45bb2d26f42e32da03e3d131f18e8ff34dc2af1c13ac2ea9fabff57db6e64724\",\"dropped\":true,\"result_id\":\"02e8ef78-34f1-5779-a0e6-8756d5c91dfb\",\"state\":\"submitted\",\"submitted_at\":1793620860000,\"text\":\"\"},\"task_id\":\"2f72a9f3-a5a6-449c-b712-744927dcb0dd\"}",
-        "sealed_hash": "6c213f62a9dc9eb9297c683895a495bd87da3a14f15488749b32c68a47e8ea9e",
+        "plaintext": "{\"kind\":\"result\",\"reply\":{\"context\":[],\"digest\":\"45bb2d26f42e32da03e3d131f18e8ff34dc2af1c13ac2ea9fabff57db6e64724\",\"dropped\":true,\"result_id\":\"5fbfe2da-6b57-5bde-a151-5c2abcca1a00\",\"state\":\"submitted\",\"submitted_at\":1793620860000,\"text\":\"\"},\"task_id\":\"2f72a9f3-a5a6-449c-b712-744927dcb0dd\"}",
+        "sealed_hash": "a768ce25175e0d6dc02adbebda68203b824e8fc1592631ae0854fc39ac18971c",
         "to": "host-a-enc-1"
       },
       "signed_with": "host-b",
-      "signing_input_hex": "0000000e6174656d2d726573756c742d7631000002247b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2232616263356236382d313661372d346534642d383165332d323461343533353062323862222c22726563697069656e74223a7b22656e635f6b6964223a2266376232393962336133646336396363222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2236633231336636326139646339656239323937633638333839356134393562643837646133613134663135343838373439623332633638613437653865613965222c2273656e646572223a7b22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2233343933386334333063653136636130636265333564366231663762626166303733623139353136656231313461396136353261386362396130633638323865222c22736571223a31307d2c2274797065223a226174656d2d726573756c74222c2276223a317d"
+      "signing_input_hex": "0000000e6174656d2d726573756c742d7631000002247b226163636f756e745f6964223a22616363742d746573742d31222c22637265617465645f6174223a313739333632303830303030302c22657870697265735f6174223a313739333632343430303030302c2267656e657369735f68617368223a2239333530313534326635663966346137636533643038663739653236376434643830646633663865333561653835326634373231366533636335353963643839222c226964223a2232616263356236382d313661372d346534642d383165332d323461343533353062323862222c22726563697069656e74223a7b22656e635f6b6964223a2266376232393962336133646336396363222c22686f73745f6964223a22686f73742d61222c22686f73745f74727573745f67656e223a317d2c227365616c65645f68617368223a2261373638636532353137356530643664633032616462656264613638323033623832346538666331353932363331616530383534666333396163313839373163222c2273656e646572223a7b22686f73745f6964223a22686f73742d62222c22686f73745f74727573745f67656e223a317d2c227369676e65645f61745f68656164223a7b2268617368223a2233343933386334333063653136636130636265333564366231663762626166303733623139353136656231313461396136353261386362396130633638323865222c22736571223a31307d2c2274797065223a226174656d2d726573756c74222c2276223a317d"
     }
   ],
   "requires": "r9"

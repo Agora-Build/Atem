@@ -9941,12 +9941,13 @@ fn mail_message_of_size(
     m
 }
 
-/// A submitted reply (`dropped`: the host no longer keeps its text).
-fn mail_reply(dropped: bool) -> atem_client::session::host_work::ResultReply {
-    use atem_client::session::host_work::{ReplyState, ResultReply, digest};
+/// A submitted reply to `task` (`dropped`: the host no longer keeps its
+/// text); its `result_id` is the task's (host-work-v1 §11.5, "`result_id`").
+fn mail_reply(task: &str, dropped: bool) -> atem_client::session::host_work::ResultReply {
+    use atem_client::session::host_work::{ReplyState, ResultReply, digest, result_id};
     let text = "Done: the contract reads well.";
     ResultReply {
-        result_id: mail_uuid("host-envelope reply", 5),
+        result_id: result_id(task),
         state: ReplyState::Submitted,
         digest: digest(text.as_bytes()),
         text: if dropped { String::new() } else { text.into() },
@@ -10444,13 +10445,26 @@ fn host_envelope_vectors(book: &Book) -> Value {
     let f = ba(&g, "result");
     let result = ResultPlain::Result {
         task_id: task.clone(),
-        reply: mail_reply(false),
+        reply: mail_reply(&task, false),
     };
     g.seal(
         "result",
-        "the agent's reply to the request's task, as reply_query returns it once submitted",
+        "the agent's reply to the request's task, as reply_query returns it once submitted; its result_id is the task's, UUIDv5(NAMESPACE_OID, \"result:\" + task_id)",
         f,
         MailPlain::Result(result),
+        "host-a-enc-1",
+    );
+    let f = ba(&g, "result_id_mismatch");
+    let mut reply = mail_reply(&task, false);
+    reply.result_id = atem_client::session::host_work::result_id(&mail_id("another task"));
+    g.seal(
+        "result_id_mismatch",
+        "a reply to the request's task whose result_id is another task's: a builder seals it (the plaintext alone is well formed); the sending host refuses it",
+        f,
+        MailPlain::Result(ResultPlain::Result {
+            task_id: task.clone(),
+            reply,
+        }),
         "host-a-enc-1",
     );
     let f = g.fields("evil_status", MAIL_EVIL, MAIL_A1, "host-a-enc-1", &b);
@@ -10493,7 +10507,7 @@ fn host_envelope_vectors(book: &Book) -> Value {
     let text = jcs(&serde_json::json!({
         "kind": "result",
         "task_id": &task,
-        "reply": serde_json::to_value(mail_reply(true)).unwrap(),
+        "reply": serde_json::to_value(mail_reply(&task, true)).unwrap(),
     }))
     .unwrap();
     g.seal_raw(
@@ -11194,6 +11208,17 @@ fn host_envelope_vectors(book: &Book) -> Value {
         Some(outbox(&request_id)),
         e,
     );
+    let e = g.refused_authenticated("result_id_mismatch", "result_id_mismatch");
+    g.check(
+        "result_id_mismatch",
+        "a result whose reply's result_id isn't the derivation from its task_id (host-work-v1 §11.5, \"result_id\"): refused authenticated, nothing reported back",
+        "result_id_mismatch",
+        &b,
+        to_a,
+        MAIL_NOW,
+        Some(outbox(&request_id)),
+        e,
+    );
     let e = g.refused_authenticated("status", "does_not_answer_outbox_row");
     g.check(
         "does_not_answer_outbox_row",
@@ -11221,7 +11246,7 @@ fn host_envelope_vectors(book: &Book) -> Value {
         "name": "r9-vectors-host-envelope",
         "kind": "vectors",
         "requires": "r9",
-        "note": "Envelopes and results between hosts (delegated host-work II.4.2, II.4.4; host-work-v1 §11.5). Each object is {body, sig, enc, ct}: the body signed by the sender's host_key (Ed25519) over enc([\"atem-envelope-v1\" or \"atem-result-v1\", jcs(body)]); the plaintext sealed with RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, to the recipient's host encryption key, info = enc([\"atem-envelope-seal-v1\" or \"atem-result-seal-v1\", account_id, genesis_hash (32 bytes), sender.host_id, u64(sender.host_trust_gen), recipient.host_id, u64(recipient.host_trust_gen), enc_kid, id, u64(created_at), u64(expires_at)]); sealed_hash = SHA-256(enc([enc, ct])). The sender's ephemeral is DeriveKeyPair(ikmE), ikmE = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Device lists: log L of r9-vectors-membership-log followed by `chain`, labels of `entries` (signed by dev-mac); the objects are signed at B = L + M7..M10 (head 10) unless their signed_at_head says otherwise. Objects: `signed_with` names the r9-vectors-keys host key whose signature `sig` is; `built` objects are what seal_envelope / seal_result make from the body's fields, `sealed.plaintext` and ikmE; `sealed` gives the seal's inputs and outputs (`plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB); `sealed_from` names the object whose sealed part it carries, `edited_from` the object it is after a change made after signing. Checks: `call` (open_envelope, or accept_result with `outbox`, the sending host's row) on L + `chain`, by `receiver` (its host_id, current host_trust_gen, the keys it accepts and every key it made at that generation, `generated`; r9-vectors-keys names), at `now`; `expect` is the verdict: open or accepted (with `sender`; the plaintext is the object's), not_delivered (with `sender` and the return grant's detail as `reason`), pending (the claimed host_id and host_trust_gen), refused (before the copy is shown to be the sender's, signed and intact (step 4): `reason` and `evidence` = SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent; it claims no id) or refused_authenticated (after it: the object's id, `reason` and `sender`, the {host_id, host_trust_gen} whose key verified it; it claims the id for that sender, (sender.host_id, id)). A key in neither `keys` nor `generated` is refused enc_key_not_accepted even beyond the receiver's head, after the checks that settle at any head, the times and a known generation's signature; one in `generated` only waits there.",
+        "note": "Envelopes and results between hosts (delegated host-work II.4.2, II.4.4; host-work-v1 §11.5). Each object is {body, sig, enc, ct}: the body signed by the sender's host_key (Ed25519) over enc([\"atem-envelope-v1\" or \"atem-result-v1\", jcs(body)]); the plaintext sealed with RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305, empty AAD, to the recipient's host encryption key, info = enc([\"atem-envelope-seal-v1\" or \"atem-result-seal-v1\", account_id, genesis_hash (32 bytes), sender.host_id, u64(sender.host_trust_gen), recipient.host_id, u64(recipient.host_trust_gen), enc_kid, id, u64(created_at), u64(expires_at)]); sealed_hash = SHA-256(enc([enc, ct])). The sender's ephemeral is DeriveKeyPair(ikmE), ikmE = SHA-256(enc([\"atem-r9-test-ikm\", ikm_label])). Device lists: log L of r9-vectors-membership-log followed by `chain`, labels of `entries` (signed by dev-mac); the objects are signed at B = L + M7..M10 (head 10) unless their signed_at_head says otherwise. Objects: `signed_with` names the r9-vectors-keys host key whose signature `sig` is; `built` objects are what seal_envelope / seal_result make from the body's fields, `sealed.plaintext` and ikmE; `sealed` gives the seal's inputs and outputs (`plaintext`, or `plaintext_bytes` and `plaintext_sha256` over 4 KiB); `sealed_from` names the object whose sealed part it carries, `edited_from` the object it is after a change made after signing. Checks: `call` (open_envelope, or accept_result with `outbox`, the sending host's row) on L + `chain`, by `receiver` (its host_id, current host_trust_gen, the keys it accepts and every key it made at that generation, `generated`; r9-vectors-keys names), at `now`; `expect` is the verdict: open or accepted (with `sender`; the plaintext is the object's), not_delivered (with `sender` and the return grant's detail as `reason`), pending (the claimed host_id and host_trust_gen), refused (before the copy is shown to be the sender's, signed and intact (step 4): `reason` and `evidence` = SHA-256(enc([jcs(body), sig, enc, ct])), enc and ct empty when absent; it claims no id) or refused_authenticated (after it: the object's id, `reason` and `sender`, the {host_id, host_trust_gen} whose key verified it; it claims the id for that sender, (sender.host_id, id)). A key in neither `keys` nor `generated` is refused enc_key_not_accepted even beyond the receiver's head, after the checks that settle at any head, the times and a known generation's signature; one in `generated` only waits there. A result's reply carries its task's result_id = UUIDv5(NAMESPACE_OID 6ba7b812-9dad-11d1-80b4-00c04fd430c8, \"result:\" + task_id) (host-work-v1 §11.5, \"result_id\"): accept_result refuses another authenticated as result_id_mismatch, after the plaintext's strict reading and before the outbox row.",
         "account_id": "acct-test-1",
         "genesis_hash": g.genesis.to_hex(),
         "now": MAIL_NOW,

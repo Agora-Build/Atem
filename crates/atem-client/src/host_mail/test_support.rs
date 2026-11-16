@@ -136,6 +136,15 @@ pub(crate) fn message_of_size(fields: &MailFields, target: usize) -> Message {
     m
 }
 
+/// [`reply`] to the task `task_id`: its `result_id` is the task's
+/// (host-work-v1 §11.5, "`result_id`"), as the sending host takes it.
+pub(crate) fn reply_to(task_id: &str, contexts: usize) -> ResultReply {
+    ResultReply {
+        result_id: crate::session::host_work::result_id(task_id),
+        ..reply(contexts)
+    }
+}
+
 /// A submitted reply carrying `contexts` snapshots of 128 KiB each.
 pub(crate) fn reply(contexts: usize) -> ResultReply {
     let text = "Done: the contract reads well.".to_owned();

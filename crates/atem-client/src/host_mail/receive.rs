@@ -87,8 +87,10 @@
 //! refuse a result: a result of a host this list holds revoked, or has
 //! removed, is verified (with the key that host last held, a removed host's
 //! from [`Membership::removed_host`]) and returned as
-//! [`ResultVerdict::NotDelivered`], to be kept as data (II.4.4); and step 6's
-//! plaintext must answer the row. A result that doesn't verify is refused.
+//! [`ResultVerdict::NotDelivered`], to be kept as data (II.4.4); step 6's
+//! plaintext must be consistent (a reply's `result_id` its task's, else
+//! `result_id_mismatch`) and answer the row. A result that doesn't verify is
+//! refused.
 //! The delivery rule itself (the return grant, route and project) stays in
 //! the host.
 //!
@@ -104,7 +106,7 @@ use crate::host_principal::host_principal;
 use crate::keys::{PublicKey, enc_kid_bytes};
 use crate::membership::{Action, HostSenderState, Membership};
 use crate::provider::{KeyId, KeyProvider};
-use crate::session::host_work::MAX_LIFETIME_MS;
+use crate::session::host_work::{MAX_LIFETIME_MS, result_id};
 use crate::signed::SignedObject;
 
 /// `created_at` may be at most this far ahead of the host's clock at first
@@ -193,6 +195,10 @@ pub mod reason {
     pub const INVALID_MESSAGE: &str = "invalid_message";
     /// A result's plaintext doesn't answer the outbox row.
     pub const DOES_NOT_ANSWER_OUTBOX_ROW: &str = "does_not_answer_outbox_row";
+    /// A result's reply whose `result_id` isn't its task's
+    /// ([`crate::session::host_work::result_id`]; host-work-v1 §11.5,
+    /// "`result_id`"): refused authenticated, nothing reported back.
+    pub const RESULT_ID_MISMATCH: &str = "result_id_mismatch";
     /// A verified result of a host this list holds `revoked`: kept as data
     /// (II.4.4's return-grant detail).
     pub const NOT_DELIVERED_SENDER_REVOKED: &str = "result not delivered: sender revoked";
@@ -201,7 +207,7 @@ pub mod reason {
     pub const NOT_DELIVERED_SENDER_REMOVED: &str = "result not delivered: sender removed";
 
     /// Every reason above, once (the shared vectors have a check for each).
-    pub const ALL: [&str; 30] = [
+    pub const ALL: [&str; 31] = [
         MALFORMED,
         WRONG_KIND,
         PIN_MISMATCH,
@@ -230,6 +236,7 @@ pub mod reason {
         ATTACHMENTS_NOT_ALLOWED,
         INVALID_MESSAGE,
         DOES_NOT_ANSWER_OUTBOX_ROW,
+        RESULT_ID_MISMATCH,
         NOT_DELIVERED_SENDER_REVOKED,
         NOT_DELIVERED_SENDER_REMOVED,
     ];
@@ -489,8 +496,10 @@ pub fn open_envelope(
 
 /// The sending host's check of an `atem-result` (II.4.4): checks 1 to 6 as
 /// for an envelope (with a result's labels, a result's sender and
-/// `authorized` rule, see the module documentation), then that the plaintext
-/// answers `outbox`: a status names its `message_id`, a refusal names the
+/// `authorized` rule, see the module documentation), then that a result's
+/// reply carries its task's `result_id` (`result_id_mismatch` otherwise,
+/// host-work-v1 §11.5) and that the plaintext answers `outbox`: a status
+/// names its `message_id`, a refusal names the
 /// request's or one of its cancel or complete envelopes' ids, a result names
 /// a task of the recorded resolution. A verified result of a revoked or
 /// removed host is [`ResultVerdict::NotDelivered`] (kept as data), one that
@@ -545,6 +554,13 @@ pub fn accept_result(
         Err(Failed::Refused(reason)) => return refuse(reason),
         Err(Failed::Unavailable(error)) => return ResultVerdict::Unavailable { error },
     };
+    // A reply names its task: its `result_id` is the task's (host-work-v1
+    // §11.5, "`result_id`"), checked with the plaintext, before the row.
+    if let ResultPlain::Result { task_id, reply } = &plain
+        && reply.result_id != result_id(task_id)
+    {
+        return refuse(RESULT_ID_MISMATCH);
+    }
     let answers = match &plain {
         ResultPlain::Status { message_id, .. } => *message_id == outbox.message_id,
         ResultPlain::Refusal { object_id, .. } => {
@@ -890,7 +906,9 @@ mod tests {
     use super::reason::*;
     use super::*;
     use crate::encoding::{Hash32, b64u};
-    use crate::host_mail::test_support::{CREATED_AT, ID, ID2, REPLY_ID, message, reply, snapshot};
+    use crate::host_mail::test_support::{
+        CREATED_AT, ID, ID2, REPLY_ID, message, reply_to, snapshot,
+    };
     use crate::host_mail::{
         EnvelopePlain, HostRef, MailBody, MailFields, MailKind, ResultPlain, seal_envelope,
         seal_info, seal_result,
@@ -2963,7 +2981,7 @@ mod tests {
             },
             ResultPlain::Result {
                 task_id: REPLY_ID.into(),
-                reply: reply(0),
+                reply: reply_to(REPLY_ID, 0),
             },
         ];
         for plain in plains {
@@ -3023,7 +3041,7 @@ mod tests {
             },
             ResultPlain::Result {
                 task_id: other.into(),
-                reply: reply(0),
+                reply: reply_to(other, 0),
             },
         ];
         for plain in plains {
@@ -3109,6 +3127,62 @@ mod tests {
         ));
     }
 
+    /// host-work-v1 §11.5, "`result_id`": the sending host takes a result
+    /// only when its reply's `result_id` is the derivation from the object's
+    /// `task_id`; any other is refused authenticated, `result_id_mismatch`.
+    #[test]
+    fn a_results_reply_carries_its_tasks_result_id() {
+        let mut w = World::new();
+        let f = w.fields("host-b", "host-a");
+        let outbox = expected(&w);
+        // A recipient's UUID v4 task and a selector's UUID v5 task.
+        for task in [ID2, REPLY_ID] {
+            let plain = ResultPlain::Result {
+                task_id: task.into(),
+                reply: reply_to(task, 0),
+            };
+            let object = result(&w, &f, &plain);
+            assert_eq!(
+                accept(&w, &object, &outbox),
+                ResultVerdict::Accepted {
+                    plain,
+                    sender: "host:host-b".into(),
+                }
+            );
+        }
+        // Another task's result_id (one the row holds too), or one of no
+        // task of the row.
+        let mismatched = |result_id: String| {
+            let mut reply = reply_to(REPLY_ID, 0);
+            reply.result_id = result_id;
+            ResultPlain::Result {
+                task_id: REPLY_ID.into(),
+                reply,
+            }
+        };
+        for other in [
+            crate::session::host_work::result_id(ID2),
+            crate::session::host_work::result_id("8b3e4c60-5d9f-4a0c-9e23-4f7b9c1d5e60"),
+        ] {
+            let object = result(&w, &f, &mismatched(other));
+            assert_eq!(
+                accept(&w, &object, &outbox),
+                result_refused_authenticated(RESULT_ID_MISMATCH)
+            );
+        }
+        // Refused whoever sent it: a revoked host's is no data to keep.
+        w.revoke("host-b");
+        let object = result(
+            &w,
+            &w.fields("host-b", "host-a"),
+            &mismatched(crate::session::host_work::result_id(ID2)),
+        );
+        assert_eq!(
+            accept(&w, &object, &outbox),
+            result_refused_authenticated(RESULT_ID_MISMATCH)
+        );
+    }
+
     /// II.4.4: a result of a host this list holds revoked is not delivered
     /// but kept as data.
     #[test]
@@ -3121,7 +3195,7 @@ mod tests {
             status(ID),
             ResultPlain::Result {
                 task_id: REPLY_ID.into(),
-                reply: reply(0),
+                reply: reply_to(REPLY_ID, 0),
             },
         ] {
             let object = result(&w, &f, &plain);

@@ -1795,6 +1795,28 @@ MAIL_HOST_ID = r"[A-Za-z0-9._:-]{1,128}"
 HEX64 = r"[0-9a-f]{64}"
 
 
+def uuid_v5(namespace, name):
+    """RFC 9562 UUID version 5: SHA-1 of the namespace's 16 bytes and the
+    name, its first 16 bytes with the version (5) and the variant (10) set,
+    written lowercase with hyphens."""
+    b = bytearray(hashlib.sha1(bytes.fromhex(namespace.replace("-", "")) + name).digest()[:16])
+    b[6] = (b[6] & 0x0F) | 0x50
+    b[8] = (b[8] & 0x3F) | 0x80
+    h = b.hex()
+    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+
+# RFC 9562's NAMESPACE_OID: a reply's result_id and a selector's task ids
+# (host-work-v1 §11.5).
+NAMESPACE_OID = "6ba7b812-9dad-11d1-80b4-00c04fd430c8"
+
+
+def result_id_of(task_id):
+    """host-work-v1 §11.5, "result_id": UUIDv5(NAMESPACE_OID, "result:" +
+    task_id)."""
+    return uuid_v5(NAMESPACE_OID, ("result:" + task_id).encode())
+
+
 def is_uuid(text, version):
     pattern = UUID_V5 if version == 5 else r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
     return isinstance(text, str) and re.fullmatch(pattern, text) is not None
@@ -2163,6 +2185,10 @@ def mail_verdict(wire, call, hosts, receiver_keys, generated, receiver, now, out
             if message.get("kind", "request") != "request" or "reply_to" in message or "from_session" in message:
                 return authenticated("invalid_message")
         return {"verdict": "open", "sender": principal}, plain
+    # A reply names its task (host-work-v1 §11.5, "result_id"): checked with
+    # the plaintext, before the outbox row.
+    if value["kind"] == "result" and value["reply"]["result_id"] != result_id_of(value["task_id"]):
+        return authenticated("result_id_mismatch")
     answers = (
         value.get("message_id") == outbox["message_id"]
         if value["kind"] == "status" and "message_id" in value
@@ -2302,7 +2328,15 @@ def check_host_envelope(file, data, report, context):
         reasons = {c["expect"].get("reason") for c in data["checks"]} - {None}
         verdicts = {c["expect"]["verdict"] for c in data["checks"]}
         case.equal(verdicts, {"open", "pending", "refused", "refused_authenticated", "accepted", "not_delivered"}, "every verdict")
-        case.check(len(reasons) >= 30, f"{len(reasons)} reasons")
+        case.check(len(reasons) >= 31, f"{len(reasons)} reasons")
+        case.check("result_id_mismatch" in reasons, "result_id_mismatch")
+    with report.case(file, "result_id") as case:
+        # host-work-v1 §11.5's examples of the derivation.
+        case.equal(
+            [result_id_of("22222222-2222-4222-8222-222222222222"), result_id_of("80160896-4fcd-5e6e-adac-98bac5497321")],
+            ["005c9723-949b-57f6-bfb1-db9b896dcfed", "996a448a-cf99-5e86-aa67-7f9a582a7eaa"],
+            "UUIDv5(NAMESPACE_OID, \"result:\" + task_id), the contract's examples",
+        )
 
 
 # ------------------------------------------------ r9-vectors-station-calls
