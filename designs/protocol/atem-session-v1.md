@@ -2322,7 +2322,13 @@ that entry). Atem verifies the whole chain, that the signer of its
 `add_host` is the verified Astation (`member.auth_key` equals the pinned
 `astation_sign_pub`) and that the entry names its own key and trust
 generation, and pins it (R9.3) before reporting success. Atem refuses a
-log whose genesis is in its `frozen_genesis` list (R9.4).
+log whose genesis is in its `frozen_genesis` list (R9.4). **Proposed
+(owner decision 2026-11-15, agreed with Astation 2026-11-16):** the ceremony also
+hands over the host's new encryption key, so that the same confirmation
+signs its `host_enc_key` right after the `add_host` (`verifyKeys` gains
+`account_id`, `verifyReveal` gains `host_enc_key` in the shape of R9.14's
+`host_enc_key` answer, and rule 4 of R9.6 lets one confirmation cover both
+entries; host-work-v1 §11.5, "The host encryption key in the ceremony").
 
 ### R9.3 What Atem stores; carrying suffixes
 
@@ -3190,7 +3196,10 @@ observe them; the shared core exposes signing as an effect):
    `revoke_seq`), its action and `interrupt_running`);
    a confirmation never covers a
    changed body (R9.4 rule 3) and is never given in the background or a
-   notification extension.
+   notification extension. **Proposed (owner decision 2026-11-15, agreed with Astation 2026-11-16):** in a verification ceremony, one fresh
+   confirmation covers the `add_host` and the host's `host_enc_key` at the
+   next `seq`, shown together (host-work-v1 §11.5, "The host encryption key
+   in the ceremony").
 5. Services hold a software key in their own secret store; their
    enrollment shows what they may do and that output posted to a third
    party (Discord) is disclosed to it.
@@ -4089,7 +4098,9 @@ each and may be up to 524,288 bytes (512 KiB) as sent, so a host sender's
 Message keeps host-work-v1 §5's 240 KiB bound; the drop-unread rule
 exempts them up to that bound, and drops a larger one unread as any other.
 Every other relay message, the Station calls of host-work-v1 §11.4
-included, keeps the 256 KiB bound.
+included, keeps the 256 KiB bound. (Their wire, `mailbox_*` relay
+messages, is proposed in host-work-v1 §11.5, "The mailbox calls",
+2026-11-15, agreed with Astation 2026-11-16.)
 
 What Atem keeps for delivery is bounded, and a bound never cuts a
 lifecycle the relay may already hold: once an approval's open hints were
