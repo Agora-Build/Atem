@@ -1106,6 +1106,8 @@ mod tests {
                     let mut routes = Vec::new();
                     let mut deadline = None;
                     loop {
+                        // With the hook on, until its answer; then (and with
+                        // it off) 1.5 s more for one that shouldn't come.
                         let within = deadline.map_or(Duration::from_secs(60), |at: tokio::time::Instant| {
                             at.saturating_duration_since(tokio::time::Instant::now())
                         });
@@ -1120,9 +1122,12 @@ mod tests {
                                 "data": {"status": "authenticated", "data": {}}});
                             socket.send(WsMessage::Text(authenticated.to_string())).await.unwrap();
                             socket.send(WsMessage::Text(forwarded.clone())).await.unwrap();
-                            deadline = Some(tokio::time::Instant::now() + Duration::from_millis(1_500));
+                            if !hook {
+                                deadline = Some(tokio::time::Instant::now() + Duration::from_millis(1_500));
+                            }
                         } else if value["op"] == "host_route" {
                             routes.push(text);
+                            deadline = Some(tokio::time::Instant::now() + Duration::from_millis(1_500));
                         }
                     }
                     routes

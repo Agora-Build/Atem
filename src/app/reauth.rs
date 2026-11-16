@@ -945,6 +945,30 @@ mod tests {
         handle
     }
 
+    /// Runs the App's Astation step until Atem sent a `host_route` (at most
+    /// 3 s, as [`next_auth`]), skipping anything else; its text. Panics if
+    /// the socket closes.
+    async fn next_route(app: &mut App, peer: &mut Peer) -> String {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                app.process_astation_messages().await;
+                while let Ok(frame) = peer.recv.try_recv() {
+                    match frame {
+                        Some(frame) => {
+                            if let Some(route) = routes(&[Some(frame)]).pop() {
+                                return route;
+                            }
+                        }
+                        None => panic!("Atem closed the socket"),
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("no host_route reached Astation")
+    }
+
     /// The `host_route` texts among what Atem sent.
     fn routes(frames: &[Option<AstationMessage>]) -> Vec<String> {
         frames
@@ -990,9 +1014,8 @@ mod tests {
         };
         let first = HostChallenge::new(ASTATION);
         peer.raw.send(first.to_json().to_string()).unwrap();
-        let sent = routes(&pump(&mut app, &mut peer).await);
-        assert_eq!(sent.len(), 1, "answered once authenticated");
-        assert_eq!(verified(&sent[0], &first).as_deref(), Ok("host-1"));
+        let sent = next_route(&mut app, &mut peer).await;
+        assert_eq!(verified(&sent, &first).as_deref(), Ok("host-1"));
         // A second one in this authentication: ignored.
         peer.raw
             .send(HostChallenge::new(ASTATION).to_json().to_string())
@@ -1014,14 +1037,24 @@ mod tests {
             .send(status("authenticated", &[("method", "session_proof")]))
             .unwrap();
         // (`send` and `raw` are two channels: one after the other.)
-        pump(&mut app, &mut peer).await;
-        assert!(app.astation_connected);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !app.astation_connected {
+                app.process_astation_messages().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("re-authenticated");
         assert_eq!(app.astation_link_gen, link + 1);
         let fresh = HostChallenge::new(ASTATION);
         peer.raw.send(fresh.to_json().to_string()).unwrap();
-        let sent = routes(&pump(&mut app, &mut peer).await);
-        assert_eq!(sent.len(), 1, "a fresh one after the re-authentication");
-        assert_eq!(verified(&sent[0], &fresh).as_deref(), Ok("host-1"));
+        let sent = next_route(&mut app, &mut peer).await;
+        assert_eq!(
+            verified(&sent, &fresh).as_deref(),
+            Ok("host-1"),
+            "a fresh one after the re-authentication"
+        );
+        assert!(routes(&pump(&mut app, &mut peer).await).is_empty(), "one");
         // The Station refuses the proof: the link stays, not routed, no
         // reconnect.
         peer.raw
