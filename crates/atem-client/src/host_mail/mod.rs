@@ -74,12 +74,12 @@ pub use body::{
     EnvelopePlain, HostRef, MailBody, MailFields, MailKind, REFUSAL_CODES, ResultPlain,
 };
 pub use mailbox::object_hash;
-pub use reference::{
-    CurrentHosts, MailboxTransition, Quota, Quotas, ReferenceMailbox, Reset, Usage,
-};
 pub use receive::{
     EnvelopeVerdict, ExpectedResult, Recipient, ResultVerdict, accept_result, evidence_hash,
     open_envelope,
+};
+pub use reference::{
+    CurrentHosts, MailboxTransition, Quota, Quotas, ReferenceMailbox, Reset, Usage,
 };
 pub use seal::{seal_envelope, seal_info, seal_result, unseal_envelope, unseal_result};
 #[cfg(feature = "test-vectors")]
