@@ -33,6 +33,14 @@ fn log_limited(count: &AtomicU64, line: impl FnOnce() -> String) {
 
 static UNPREPARED: AtomicU64 = AtomicU64::new(0);
 static UNREADABLE: AtomicU64 = AtomicU64::new(0);
+static UNJUDGED: AtomicU64 = AtomicU64::new(0);
+static UNPRUNED: AtomicU64 = AtomicU64::new(0);
+
+/// While the device list stands still, the waiting objects are judged
+/// again for a passed expiry at most this often.
+const MAIL_REJUDGE_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+/// The mailbox's claims and evidence are pruned at most this often.
+const MAIL_PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl HostBridge {
     /// The host's identity as the mailbox binds it: the session host's
@@ -191,13 +199,27 @@ impl HostBridge {
             None => Ok(Commit::Undecided),
         };
         // Debug builds: the runtime is killed here, the page's decisions
-        // and owed dones durable, no done sent yet.
-        #[cfg(not(test))]
+        // and owed dones durable, no done sent yet (tests: what the store
+        // owes and which dones are live at that point).
         if matches!(&committed, Ok(Commit::Committed(c)) if !c.decided.is_empty()) {
+            #[cfg(not(test))]
             crate::runtime::test_hooks::crash_point(
                 "crash_after_mailbox_commit",
                 "after a mailbox page's commit, before its dones",
             );
+            #[cfg(test)]
+            {
+                let owed = self
+                    .mail_store()
+                    .and_then(|(store, identity)| mailbox_store::owed_dones(store, &identity).ok())
+                    .unwrap_or_default();
+                let live = self
+                    .station
+                    .as_ref()
+                    .map(|station| station.mailbox.live_done_positions())
+                    .unwrap_or_default();
+                self.work.mail_crash_probe.push((owed, live));
+            }
         }
         self.mail_observe();
         let Some(station) = self.station.as_mut() else {
@@ -266,13 +288,18 @@ impl HostBridge {
             let Some(head) = view.list.as_ref().map(|l| l.membership.head()) else {
                 return;
             };
-            let expired = view.now_d_ms.is_some_and(|now| earliest <= now);
+            let expired = view.now_d_ms.is_some_and(|now| earliest <= now)
+                && self
+                    .work
+                    .mail_rejudge_at
+                    .is_none_or(|at| at.elapsed() >= MAIL_REJUDGE_EVERY);
             let key = (identity.host, head.seq, head.hash);
             (expired || self.work.mail_rejudged.as_ref() != Some(&key)).then_some(key)
         };
         let Some(key) = due else {
             return;
         };
+        self.work.mail_rejudge_at = Some(std::time::Instant::now());
         let Some((list, receiver, now_ms)) = self.mail_receiver() else {
             return;
         };
@@ -288,10 +315,37 @@ impl HostBridge {
         };
         match mailbox_store::rejudge_pending(store, &identity, &cx) {
             Ok(_) => self.work.mail_rejudged = Some(key),
-            Err(error) => eprintln!(
-                "atem runtime: host senders' waiting mailbox objects not judged again ({error:#})"
-            ),
+            Err(error) => log_limited(&UNJUDGED, || {
+                format!(
+                    "atem runtime: host senders' waiting mailbox objects not judged again ({error:#})"
+                )
+            }),
         }
+    }
+
+    /// The claims, evidence and kept results whose time is over (a margin
+    /// after their object's expiry, on the delegated clock's `D`), at most
+    /// once a minute.
+    fn mail_prune(&mut self) {
+        if self
+            .work
+            .mail_pruned_at
+            .is_some_and(|at| at.elapsed() < MAIL_PRUNE_EVERY)
+        {
+            return;
+        }
+        let Some(now_ms) = self.start_view().now_d_ms else {
+            return;
+        };
+        let Some((store, _)) = self.mail_store() else {
+            return;
+        };
+        if let Err(error) = mailbox_store::prune(store, now_ms) {
+            log_limited(&UNPRUNED, || {
+                format!("atem runtime: host senders' mailbox records not pruned ({error:#})")
+            });
+        }
+        self.work.mail_pruned_at = Some(std::time::Instant::now());
     }
 
     /// The pass's tick, after its messages: the waiting objects judged
@@ -302,6 +356,7 @@ impl HostBridge {
             return;
         }
         self.mail_rejudge();
+        self.mail_prune();
         self.mail_observe();
         if let Some(station) = self.station.as_mut() {
             station.mailbox.tick(now_mono);
@@ -311,11 +366,16 @@ impl HostBridge {
 
     /// The gate's mailbox part into the start view (host senders only,
     /// design II.5).
+    /// The mailbox's alert lines go to runtime.log here.
     pub(crate) fn publish_mail_gate(&mut self) {
-        let open = self
-            .station
-            .as_ref()
-            .is_some_and(|station| station.mailbox.open());
+        let Some(station) = self.station.as_mut() else {
+            self.start_view().gates.set_mailbox(false);
+            return;
+        };
+        for line in station.mailbox.take_lines() {
+            eprintln!("{line}");
+        }
+        let open = station.mailbox.open();
         self.start_view().gates.set_mailbox(open);
     }
 
@@ -326,9 +386,15 @@ impl HostBridge {
             return None;
         }
         let station = self.station.as_ref()?;
-        Some(match station.mailbox.closed() {
-            None => "host senders' mailbox read to its head".into(),
+        let part = match station.mailbox.closed() {
+            None => "host senders' mailbox read to its head".to_string(),
             Some(why) => format!("host senders' mailbox not checked ({why})"),
+        };
+        Some(match station.mailbox.alerts() {
+            (0, _) | (_, None) => part,
+            (n, Some(latest)) => {
+                format!("{part}; {n} mailbox alert(s) since the start, the latest: {latest}")
+            }
         })
     }
 

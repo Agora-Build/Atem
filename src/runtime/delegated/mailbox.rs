@@ -578,6 +578,12 @@ impl MailboxClient {
         None
     }
 
+    /// The positions of the live dones (tests).
+    #[cfg(test)]
+    pub fn live_done_positions(&self) -> Vec<u64> {
+        self.dones.iter().map(|d| d.call.position).collect()
+    }
+
     /// The runtime.log lines not taken yet (alerts).
     pub fn take_lines(&mut self) -> Vec<String> {
         std::mem::take(&mut self.lines)
