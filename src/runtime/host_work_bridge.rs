@@ -62,6 +62,8 @@ pub(super) use delegated_feed_pass::sync_clocks;
 mod delegated_hints;
 #[path = "delegated/host_pass.rs"]
 mod delegated_host_pass;
+#[path = "delegated/mail_pass.rs"]
+mod delegated_mail_pass;
 #[path = "delegated/owner.rs"]
 mod delegated_owner;
 pub use delegated_owner::OwnerDone;
@@ -239,6 +241,28 @@ pub(super) struct State {
     /// (`host_senders_pass`; `host_applied_seq` reads it, the store only
     /// while it is unknown).
     applied_seq: Option<(HostTarget, atem_client::encoding::Hash32, u64)>,
+    /// The identity whose store has host senders' mailbox tables
+    /// (`mail_observe`, with `host.senders` on).
+    mail_prepared: Option<HostTarget>,
+    /// The device-list head and the room freed (`mailbox_store::freed`)
+    /// the mailbox's waiting objects were last judged again at
+    /// (`mail_rejudge`).
+    mail_rejudged: Option<(HostTarget, u64, atem_client::encoding::Hash32, u64)>,
+    /// When the waiting objects were last judged again for an expiry
+    /// (at most every `MAIL_REJUDGE_EVERY` while the list stands still).
+    mail_rejudge_at: Option<Instant>,
+    /// The last re-judging failed: tried again only after the throttle.
+    mail_rejudge_failed: bool,
+    /// When the mailbox's claims and evidence were last pruned.
+    mail_pruned_at: Option<Instant>,
+    /// What the mailbox keeps at most (`mailbox_store::Limits`; tests lower
+    /// them).
+    mail_limits: crate::runtime::delegated::mailbox_store::Limits,
+    /// Tests: at the mailbox's crash point (after a page's commit, before
+    /// its dones), the dones the store owed and the positions of the dones
+    /// live then.
+    #[cfg(test)]
+    mail_crash_probe: Vec<(Vec<u64>, Vec<u64>)>,
     /// Acknowledgments whose `sent` mark failed to write, and those the
     /// shared builder refused, in this run (their log lines: the first,
     /// then at powers of two).
@@ -332,6 +356,14 @@ impl State {
             followups: Vec::new(),
             host_applied: None,
             applied_seq: None,
+            mail_prepared: None,
+            mail_rejudged: None,
+            mail_rejudge_at: None,
+            mail_rejudge_failed: false,
+            mail_pruned_at: None,
+            mail_limits: Default::default(),
+            #[cfg(test)]
+            mail_crash_probe: Vec::new(),
             ack_failures: 0,
             ack_unbuilt: 0,
             kept: None,
@@ -2875,6 +2907,7 @@ mod local_tests {
         include!("delegated/hold_fence_tests.rs");
         include!("delegated/reverify_tests.rs");
         include!("delegated/host_effects_tests.rs");
+        include!("delegated/mail_pass_tests.rs");
     }
     use crate::runtime::adopt::SpawnRequest;
     use crate::runtime::broker::{InProcess, Launcher};

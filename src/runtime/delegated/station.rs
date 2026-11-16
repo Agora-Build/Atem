@@ -34,12 +34,14 @@
 //! JSON is still known as one): that page is a Station fault the sync
 //! answers ([`Inbound::Page`] with the reader's error).
 use super::fetch::{DeviceListFetch, FetchApply};
+use super::mailbox::MailboxClient;
 use super::start::StationFetch;
 use super::sync::FeedSync;
 use atem_client::SignedObject;
 use atem_client::control::{
-    ControlSync, ControlSyncResult, Heads, MembershipFetch, RefusedCall, RelayError, ToHost,
+    Accept, ControlSync, ControlSyncResult, Heads, MembershipFetch, RefusedCall, RelayError, ToHost,
 };
+use atem_client::host_mail::mailbox::{MailboxDone, MailboxSync, MailboxToHost, op as mailbox_op};
 use atem_client::membership::Head;
 use serde_json::{Value, json};
 
@@ -103,6 +105,10 @@ pub enum Inbound {
     /// `control_ack_refused`: the gates closed ([`FeedSync::on_refused`]);
     /// for the acknowledgments' book too (`AckBook::on_refused`).
     AckRefused,
+    /// A mailbox message, with `host.senders` on (host-work-v1 §11.5), or
+    /// a `mailbox_sync_result` the reader refused (a Station fault): for
+    /// the mailbox client.
+    Mailbox(Result<MailboxToHost, RelayError>),
 }
 
 /// A call the host sends its Station on the link.
@@ -110,6 +116,9 @@ pub enum Inbound {
 pub enum Call {
     Fetch(MembershipFetch),
     Sync(ControlSync),
+    /// The host's own mailbox (host-work-v1 §11.5), with `host.senders`.
+    MailboxSync(MailboxSync),
+    MailboxDone(MailboxDone),
 }
 
 impl Call {
@@ -118,6 +127,8 @@ impl Call {
         match self {
             Call::Fetch(fetch) => fetch.to_json().ok(),
             Call::Sync(sync) => sync.to_json().ok(),
+            Call::MailboxSync(sync) => sync.to_json().ok(),
+            Call::MailboxDone(done) => done.to_json().ok(),
         }
     }
 }
@@ -129,6 +140,12 @@ pub struct Station {
     pub fetch: DeviceListFetch,
     /// The sync of the host's own Station's control feed.
     pub feed: FeedSync,
+    /// `host.senders` (the hook's, with `host.delegated`): `heads` is read
+    /// with its mailbox head (host-work-v1 §11.5 rule 6). Off, the link
+    /// reads exactly as main.
+    senders: bool,
+    /// The host's own mailbox (host senders' mail), only with `senders`.
+    pub mailbox: MailboxClient,
     /// The host's monotonic clock at the last tick (ms).
     now: u64,
     /// `heads` read.
@@ -159,8 +176,20 @@ fn call_name(call: RefusedCall) -> &'static str {
 }
 
 impl Station {
+    /// A host's link without `host.senders` (tests; the bridge says which:
+    /// [`Station::with_senders`]).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new() -> Station {
         Station::default()
+    }
+
+    /// A Station link of a host that runs `host.senders` (`senders`), or
+    /// not ([`Station::new`]).
+    pub fn with_senders(senders: bool) -> Station {
+        Station {
+            senders,
+            ..Station::default()
+        }
     }
 
     /// The link as the App has it now (`link_gen`: the r9 link generation, none
@@ -179,6 +208,7 @@ impl Station {
             if self.link.take().is_some() {
                 self.fetch = self.fetch.next_generation();
                 self.feed.on_link_down();
+                self.mailbox.on_link(None);
             }
             return;
         };
@@ -193,6 +223,7 @@ impl Station {
                 });
                 self.fetch = self.fetch.next_generation();
                 self.feed.on_link(self.link.as_ref());
+                self.mailbox.on_link(self.link.as_ref());
             }
         }
     }
@@ -241,9 +272,33 @@ impl Station {
         if self.link.is_none() {
             return Inbound::Nothing;
         }
-        match ToHost::decode(bytes.as_bytes()) {
-            Ok(ToHost::Heads(heads)) => {
+        // The mailbox's messages only with `host.senders`.
+        if self.senders
+            && let Some(op) = top_level_op(
+                bytes,
+                crate::session_protocol::r9::is_mailbox_message_to_host,
+            )
+        {
+            return match MailboxToHost::decode(bytes.as_bytes()) {
+                Ok(message) => Inbound::Mailbox(Ok(message)),
+                Err(e) if op == mailbox_op::MAILBOX_SYNC_RESULT => Inbound::Mailbox(Err(e)),
+                Err(e) => {
+                    self.unread(e);
+                    Inbound::Nothing
+                }
+            };
+        }
+        // `heads.mailbox` only with `host.senders` (rule 6): every other
+        // host reads `heads` exactly as §11.4 has it.
+        let accept = Accept {
+            mailbox: self.senders,
+        };
+        match ToHost::decode_with(bytes.as_bytes(), accept) {
+            Ok((ToHost::Heads(heads), mailbox)) => {
                 self.heads += 1;
+                if self.senders {
+                    self.mailbox.on_heads(mailbox);
+                }
                 // Another identity's association: nothing fetched, no head
                 // announced for the gate.
                 let moved = self.feed.moved_socket().is_some();
@@ -252,39 +307,43 @@ impl Station {
                     .and_then(|applied| self.fetch.on_heads(&heads.membership, &applied, deferred));
                 Inbound::Heads(heads, fetch)
             }
-            Ok(ToHost::MembershipFetchResult(result)) => match self.fetch.on_result(result) {
+            Ok((ToHost::MembershipFetchResult(result), _)) => match self.fetch.on_result(result) {
                 FetchApply::Carry(entries) => Inbound::Carry(entries),
                 FetchApply::Unasked => Inbound::Nothing,
             },
-            Ok(ToHost::MembershipFetchRefused(_)) => {
+            Ok((ToHost::MembershipFetchRefused(_), _)) => {
                 self.refused(RefusedCall::MembershipFetch);
                 self.fetch.on_refused();
                 Inbound::Nothing
             }
-            Ok(ToHost::ControlSyncRefused(_)) => {
+            Ok((ToHost::ControlSyncRefused(_), _)) => {
                 self.refused(RefusedCall::ControlSync);
                 Inbound::Nothing
             }
-            Ok(ToHost::ControlAckRefused(_)) => {
+            Ok((ToHost::ControlAckRefused(_), _)) => {
                 self.refused(RefusedCall::ControlAck);
                 Inbound::AckRefused
             }
-            Ok(ToHost::ControlSyncResult(page)) => Inbound::Page(Ok(page)),
+            Ok((ToHost::ControlSyncResult(page), _)) => Inbound::Page(Ok(page)),
             // A page the reader refused as a whole: a Station fault, for
             // the sync to answer (§11.4).
             Err(e) if is_page(bytes) => Inbound::Page(Err(e)),
             Err(e) => {
-                // Counted, never its content.
-                self.unread += 1;
-                if self.unread.is_power_of_two() {
-                    eprintln!(
-                        "atem runtime: {} Station message(s) the reader refused were dropped (the last: {})",
-                        self.unread,
-                        e.code()
-                    );
-                }
+                self.unread(e);
                 Inbound::Nothing
             }
+        }
+    }
+
+    /// A message the reader refused: counted, never its content.
+    fn unread(&mut self, e: RelayError) {
+        self.unread += 1;
+        if self.unread.is_power_of_two() {
+            eprintln!(
+                "atem runtime: {} Station message(s) the reader refused were dropped (the last: {})",
+                self.unread,
+                e.code()
+            );
         }
     }
 
@@ -298,6 +357,8 @@ impl Station {
     pub fn on_identity(&mut self, identity: super::sync::HostIdentity) {
         if self.feed.on_identity(identity) {
             self.fetch = self.fetch.next_generation();
+            // Every live mailbox call too (host-work-v1 §11.5 rule 8).
+            self.mailbox.on_identity_moved();
         }
     }
 
@@ -315,6 +376,7 @@ impl Station {
             },
             "unread": self.unread,
             "feed": self.feed.dump(),
+            "mailbox": self.senders.then(|| self.mailbox.dump()),
         })
     }
 
@@ -336,6 +398,14 @@ impl Station {
             );
         }
     }
+}
+
+/// The first top-level `op` of `bytes` that `is_op` takes, its names read
+/// with no tree (as [`is_page`]).
+fn top_level_op(bytes: &str, is_op: impl Fn(&str) -> bool) -> Option<String> {
+    crate::session_protocol::r9::peek::top_level_strings(bytes, "op")
+        .into_iter()
+        .find(|op| is_op(op))
 }
 
 /// Whether `bytes` is a `control_sync_result`, its top-level names read
@@ -495,6 +565,170 @@ mod tests {
             fetched(s.receive(&heads(5), Some(head(3)), None)),
             Some(MembershipFetch { after: 3 })
         );
+    }
+
+    /// `heads` with the host's own mailbox head (host-work-v1 §11.5 rule 6).
+    fn heads_with_mailbox(seq: u64, mailbox: Option<(&str, u64)>) -> String {
+        atem_client::control::HeadsWithMailbox {
+            heads: Heads {
+                feeds: Vec::new(),
+                membership: head(seq),
+            },
+            mailbox: mailbox.map(|(id, head)| atem_client::control::MailboxHead {
+                mailbox_id: id.into(),
+                head,
+            }),
+        }
+        .to_json()
+        .unwrap()
+        .to_string()
+    }
+
+    const MAILBOX: &str = "9d2f6c1e-3b4a-4c5d-8e6f-7a8b9c0d1e2f";
+
+    /// host-work-v1 §11.5 rule 6: with `host.senders` on, `heads` is read
+    /// with its optional mailbox head and the host records its own
+    /// mailbox's `{mailbox_id, head}`; a `heads` without one announces
+    /// none. Off (as on main), a `heads` naming a mailbox is refused by the
+    /// strict reader, counted and dropped, and one without it reads as
+    /// before.
+    #[test]
+    fn heads_carry_the_mailbox_head_only_with_host_senders() {
+        let mut s = Station::with_senders(true);
+        up(&mut s, 1);
+        assert!(matches!(
+            s.receive(&heads_with_mailbox(5, Some((MAILBOX, 12))), None, None),
+            Inbound::Heads(..)
+        ));
+        let announced = s.mailbox.announced().unwrap();
+        assert_eq!(
+            (announced.mailbox_id.as_str(), announced.head),
+            (MAILBOX, 12)
+        );
+        assert!(matches!(
+            s.receive(&heads_with_mailbox(5, None), None, None),
+            Inbound::Heads(..)
+        ));
+        assert_eq!(s.mailbox.announced(), None);
+        assert_eq!(s.dump()["unread"], 0);
+
+        // Off: exactly main.
+        let mut s = Station::new();
+        up(&mut s, 1);
+        assert_eq!(
+            s.receive(&heads_with_mailbox(5, Some((MAILBOX, 12))), None, None),
+            Inbound::Nothing
+        );
+        assert_eq!(s.dump()["unread"], 1);
+        assert_eq!(s.mailbox.announced(), None);
+        assert!(matches!(
+            s.receive(&heads_with_mailbox(5, None), None, None),
+            Inbound::Heads(..)
+        ));
+        assert_eq!(s.dump()["heads"], 1);
+    }
+
+    /// host-work-v1 §11.5: with `host.senders` on, the mailbox messages go
+    /// to the mailbox client, read strictly; a `mailbox_sync_result` the
+    /// reader refuses is still a page (a Station fault, for the client);
+    /// any other the reader refuses is counted and dropped. Off (as on
+    /// main), every mailbox message is one the reader refuses.
+    #[test]
+    fn mailbox_messages_reach_the_client_only_with_host_senders() {
+        use atem_client::host_mail::mailbox::{
+            MailboxDoneResult, MailboxSyncResult, MailboxToHost,
+        };
+        let page = MailboxSyncResult {
+            request_id: "55aa5bab-e253-4b6c-a83f-c86e6b028aa1".into(),
+            mailbox_id: MAILBOX.into(),
+            after: 0,
+            head: 0,
+            through: 0,
+            objects: Vec::new(),
+        };
+        let wire = page.to_json().unwrap().to_string();
+        let done = MailboxDoneResult {
+            request_id: "55aa5bab-e253-4b6c-a83f-c86e6b028aa1".into(),
+            mailbox_id: MAILBOX.into(),
+            position: 1,
+        }
+        .to_json()
+        .unwrap()
+        .to_string();
+        let not_strict = wire.replacen(r#""head":0"#, r#""head":0.5"#, 1);
+        let extra = done.replacen('{', r#"{"extra":1,"#, 1);
+        let mut s = Station::with_senders(true);
+        up(&mut s, 1);
+        assert_eq!(
+            s.receive(&wire, None, None),
+            Inbound::Mailbox(Ok(MailboxToHost::SyncResult(page)))
+        );
+        assert!(matches!(
+            s.receive(&done, None, None),
+            Inbound::Mailbox(Ok(MailboxToHost::DoneResult(_)))
+        ));
+        assert_eq!(
+            s.receive(&not_strict, None, None),
+            Inbound::Mailbox(Err(RelayError::NotStrict))
+        );
+        assert_eq!(s.receive(&extra, None, None), Inbound::Nothing);
+        assert_eq!(s.dump()["unread"], 1);
+
+        let mut s = Station::new();
+        up(&mut s, 1);
+        for bytes in [&wire, &done, &not_strict] {
+            assert_eq!(s.receive(bytes, None, None), Inbound::Nothing);
+        }
+        assert_eq!(s.dump()["unread"], 3);
+    }
+
+    /// host-work-v1 §11.5 rule 8, "An identity change": the host's
+    /// identity changing on the live link retires its mailbox calls too
+    /// (the live sync's page is drained) and nothing more is synced on
+    /// that socket; a link on a new socket syncs again.
+    #[test]
+    fn an_identity_change_retires_the_mailbox_calls() {
+        use crate::runtime::delegated::mailbox::{Observed, PageCheck};
+        let mut s = Station::with_senders(true);
+        s.on_identity(identity(1));
+        up(&mut s, 1);
+        let observed = |generation| Observed {
+            identity: identity(generation),
+            cursor: None,
+            inbox: 0,
+            owed: Vec::new(),
+            owed_count: 0,
+            skipped: false,
+            rewind_due: false,
+            skip_expires: None,
+        };
+        s.mailbox.observe(Some(observed(1)));
+        s.mailbox.tick(10_000);
+        s.receive(&heads_with_mailbox(5, Some((MAILBOX, 2))), None, None);
+        let call = s.mailbox.take_outgoing().sync.remove(0);
+        s.on_identity(identity(2));
+        s.mailbox.observe(Some(observed(2)));
+        let page = atem_client::host_mail::mailbox::MailboxSyncResult {
+            request_id: call.request_id,
+            mailbox_id: call.mailbox_id,
+            after: 0,
+            head: 2,
+            through: 2,
+            objects: Vec::new(),
+        };
+        assert_eq!(s.mailbox.on_page(Ok(page)), PageCheck::Drained);
+        s.mailbox.tick(20_000);
+        s.receive(&heads_with_mailbox(5, Some((MAILBOX, 2))), None, None);
+        assert!(s.mailbox.take_outgoing().sync.is_empty(), "that socket");
+        s.sync_link(
+            Some(2),
+            2,
+            || LinkKind::Relay,
+            || Some("https://s.test".into()),
+        );
+        s.mailbox.tick(30_000);
+        s.receive(&heads_with_mailbox(5, Some((MAILBOX, 2))), None, None);
+        assert_eq!(s.mailbox.take_outgoing().sync.len(), 1, "a new socket");
     }
 
     /// Without a device list nothing is fetched; a result is carried only

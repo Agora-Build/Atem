@@ -473,9 +473,8 @@ pub(super) fn hand_out(
 }
 
 /// This host as the receiver of host-sender mail (design II.4.2;
-/// host-work-v1 §11.5), for the receiving side of host senders (nothing
-/// calls it yet): the [`Recipient`] and the provider behind its keys.
-#[cfg_attr(not(test), allow(dead_code))]
+/// host-work-v1 §11.5), for the receiving side of host senders (the
+/// runtime's mailbox): the [`Recipient`] and the provider behind its keys.
 pub struct HostRecipient {
     pub recipient: Recipient,
     pub provider: SoftwareKeys,
@@ -500,8 +499,19 @@ pub fn recipient(src: &crate::profile::Sources) -> Result<HostRecipient, String>
         .verified(&binding.astation_id)
         .map(|entry| entry.device_id.clone())
         .ok_or("this device isn't verified")?;
-    let generation = state.host_trust_gen;
-    let store = Store::new(&src.paths.pairing, &journal_of(&src.paths.pairing));
+    Ok(recipient_at(
+        &src.paths.pairing,
+        host_id,
+        state.host_trust_gen,
+    ))
+}
+
+/// This host as the receiver of host-sender mail as `host_id` at trust
+/// generation `generation` (what [`recipient`] reads from the pairing; the
+/// runtime's mailbox gives its own identity's): the generation's key and
+/// the record, read from `pairing`.
+pub fn recipient_at(pairing: &PairingPaths, host_id: String, generation: u64) -> HostRecipient {
+    let store = Store::new(pairing, &journal_of(pairing));
     let (keys, provider) = match read_key(&store) {
         Held::Key(key) if key.host_trust_gen == generation => {
             (vec![(HostEncKey::key_id(), key.kid)], key.keys)
@@ -515,7 +525,7 @@ pub fn recipient(src: &crate::profile::Sources) -> Result<HostRecipient, String>
         } if host_trust_gen == generation => kids,
         _ => Vec::new(),
     };
-    Ok(HostRecipient {
+    HostRecipient {
         recipient: Recipient {
             host_id,
             host_trust_gen: generation,
@@ -523,7 +533,7 @@ pub fn recipient(src: &crate::profile::Sources) -> Result<HostRecipient, String>
             generated,
         },
         provider,
-    })
+    }
 }
 
 #[cfg(test)]

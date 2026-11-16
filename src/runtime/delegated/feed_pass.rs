@@ -75,7 +75,7 @@ pub(crate) const KEPT_REAPPLIED: usize = 64;
 /// another identity's store, kept while hosting is paused across a
 /// re-verify, or a store not bound yet, takes no page, no re-verification
 /// and sends no ack), the receipt database healthy.
-fn loaded<'a>(
+pub(super) fn loaded<'a>(
     work: &'a State,
     list: Option<&ListState>,
     identity: &HostTarget,
@@ -1064,8 +1064,13 @@ impl HostBridge {
         } else {
             "; services are refused (busy) until the control state loads".to_string()
         };
+        // Host senders' mailbox part (design II.5), with `host.senders`.
+        let mail = self
+            .mail_status()
+            .map(|m| format!("; {m}"))
+            .unwrap_or_default();
         Some(format!(
-            "{gate}{}{alerts}{services}",
+            "{gate}{}{mail}{alerts}{services}",
             counts.unwrap_or_default()
         ))
     }

@@ -4613,6 +4613,42 @@ fn a_station_page_that_isnt_strict_still_reaches_the_station_link() {
     assert_eq!(rig.engine.take_station_messages(), [deep.as_str(), twice]);
 }
 
+/// host-work-v1 §11.5: the Station's mailbox messages to this host (a
+/// page that isn't strict JSON included) go to the Station link only with
+/// `host.senders` on (and `host.delegated`); off, they don't (as on main).
+/// The host's own calls never do.
+#[test]
+fn mailbox_messages_go_to_the_station_link_only_with_host_senders() {
+    let mut rig = Rig::new();
+    rig.link_up();
+    rig.engine.set_delegated_features(true, false);
+    let mailbox = [
+        r#"{"type":"relay","op":"mailbox_sync_result","objects":[]}"#,
+        r#"{"type":"relay","op":"mailbox_done_result"}"#,
+        r#"{"type":"relay","op":"mailbox_stored"}"#,
+        r#"{"type":"relay","op":"mailbox_put_refused"}"#,
+        r#"{"type":"relay","op":"mailbox_sync_refused","code":"forbidden"}"#,
+        r#"{"type":"relay","op":"mailbox_done_refused","code":"forbidden"}"#,
+        r#"{"type":"relay","op":"mailbox_sync_result","mailbox_id":"\ud800"}"#,
+    ];
+    for text in mailbox {
+        rig.engine.relay_message(text);
+    }
+    assert!(rig.engine.take_station_messages().is_empty());
+    rig.engine.set_senders_feature(true);
+    for text in mailbox {
+        rig.engine.relay_message(text);
+    }
+    for text in [
+        r#"{"type":"relay","op":"mailbox_sync","after":0}"#,
+        r#"{"type":"relay","op":"mailbox_done","position":1}"#,
+        r#"{"type":"relay","op":"mailbox_put"}"#,
+    ] {
+        rig.engine.relay_message(text);
+    }
+    assert_eq!(rig.engine.take_station_messages(), mailbox);
+}
+
 /// Ruling T33c, N1: with `host.delegated` off (as on main, and in every
 /// release build) relay messages are read exactly as main reads them: a
 /// whole-value parse, the last `op` winning. A `push_ack` with a duplicate

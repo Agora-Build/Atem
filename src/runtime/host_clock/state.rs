@@ -533,6 +533,12 @@ impl ClockState {
         self.last_change.as_ref()
     }
 
+    /// A forward jump's anchor is pending: `H` (and so `D`) may be lowered
+    /// back to the anchor's prediction by a later reading.
+    pub fn anchored(&self) -> bool {
+        self.anchor.is_some()
+    }
+
     /// The record carries the mark: no synchronized reading yet in its boot.
     pub fn mark(&self) -> bool {
         self.mark
