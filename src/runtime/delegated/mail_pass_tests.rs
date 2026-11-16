@@ -943,3 +943,67 @@ fn a_cancel_left_again_on_a_reread_holds_the_gate_until_read_again() {
         assert!(mb_gate(&rig));
     });
 }
+
+/// Review finding 2 (ruling R39) in the bridge: C's waiting cancel decides
+/// to open while the inbox is full: it keeps waiting and holds host senders'
+/// gate. Admission takes B's row: until C's is judged again, the gate stays
+/// closed (a step that publishes it without judging, as an answer to a
+/// done does); judged, it opens into the inbox.
+#[test]
+fn a_waiting_object_with_no_room_holds_the_gate() {
+    use crate::session_protocol::membership::r9log::secret;
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = mb_host(&mut rig, root, &os);
+        rig.bridge.work.mail_limits.inbox = 1;
+        let admit = |rig: &LocalRig| {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .execute("DELETE FROM mailbox_inbox", [])
+                .unwrap();
+        };
+        mb_heads(&mut rig, MB_MAILBOX, 2);
+        let (syncs, _) = mb_out(&mut rig);
+        let head = rig.bridge.membership.as_ref().unwrap().head();
+        let from_b = mb_cancel(&rig, &host, "host-b", &host.sender, head);
+        mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[from_b]));
+        // C signs at a head this host doesn't hold yet: it waits.
+        let entry = host.s.log.add_host("host-c", 1, &secret("host c"));
+        let mut c = atem_client::SoftwareKeys::new();
+        c.insert_ed25519(atem_client::KeyId::new("host-b"), &secret("host c"));
+        let from_c = mb_cancel(&rig, &host, "host-c", &c, host.s.log.log.head());
+        let (syncs, _) = mb_out(&mut rig);
+        mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[from_c]));
+        // The list moves: C's would open, but the inbox is full.
+        carry(&mut rig, &host.s.log, entry);
+        rig.bridge.sync_list_view();
+        mb_tick(&mut rig, &mut host, 2_000);
+        assert_eq!(mb_store(&rig).waiting_for_room, 1);
+        // Admission takes B's; the gate published before C's is judged
+        // again stays closed.
+        admit(&rig);
+        rig.bridge.mail_observe();
+        rig.bridge.mail_step();
+        let observed = mb_store(&rig);
+        assert_eq!((observed.inbox, observed.waiting_for_room), (0, 1));
+        assert!(!mb_gate(&rig), "C's cancel waits for room");
+        assert!(
+            rig.bridge.mail_status().unwrap().contains("room"),
+            "{:?}",
+            rig.bridge.mail_status()
+        );
+        // Judged again: it opens, then waits for admission.
+        mb_tick(&mut rig, &mut host, 2_000);
+        let observed = mb_store(&rig);
+        assert_eq!((observed.inbox, observed.waiting_for_room), (1, 0));
+        assert!(!mb_gate(&rig));
+        admit(&rig);
+        mb_tick(&mut rig, &mut host, 2_000);
+        assert!(mb_gate(&rig));
+    });
+}

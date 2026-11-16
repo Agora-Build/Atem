@@ -1314,6 +1314,11 @@ fn an_older_cursor_table_gets_its_new_columns() {
         .execute_batch(
             "CREATE TABLE mailbox_cursor (one INTEGER PRIMARY KEY CHECK (one = 1),
                 identity TEXT NOT NULL, mailbox_id TEXT NOT NULL, cursor INTEGER NOT NULL)
+                WITHOUT ROWID;
+            CREATE TABLE mailbox_pending (
+                object_hash TEXT PRIMARY KEY, host_id TEXT NOT NULL,
+                host_trust_gen INTEGER NOT NULL, mailbox_id TEXT NOT NULL,
+                position INTEGER NOT NULL, expires_at INTEGER NOT NULL, bytes BLOB NOT NULL)
                 WITHOUT ROWID;",
         )
         .unwrap();
@@ -1324,6 +1329,10 @@ fn an_older_cursor_table_gets_its_new_columns() {
     let observed = read(&store, &identity(1)).unwrap();
     assert_eq!(observed.cursor, Some((MAILBOX.into(), 4)));
     assert!(!observed.skipped);
+    assert_eq!(
+        observed.waiting_for_room, 0,
+        "the waiting table's new column"
+    );
 }
 
 /// Review P6: a result already expired on `D` can never be delivered
@@ -1541,4 +1550,72 @@ fn a_skip_left_again_on_a_reread_still_holds_the_gate() {
     assert!(observed.skipped_inbox, "not read again yet");
     assert_eq!(read_page(&b, 2, 3, Some(&a)), Some(Decision::Opened));
     assert!(!held(&b), "read again: nothing waits there");
+}
+
+/// Review finding 2 (ruling R39): a waiting object that decides to open
+/// with no room in the inbox keeps waiting, never done, and holds the gate's
+/// mailbox part as a request, cancel or complete left on the Station does;
+/// one waiting for a newer list holds none. Opened once room frees, it no
+/// longer waits.
+#[test]
+fn a_waiting_object_that_opens_with_no_room_holds_the_gate() {
+    let mut mail = Mail::new();
+    let mut b = Box::new();
+    let old = mail.log.log.clone();
+    mail.log.add_host("host-c", 1, &secret("mail host c"));
+    let limits = Limits {
+        inbox: 1,
+        ..Limits::default()
+    };
+    let before = DecideCx {
+        list: &old,
+        limits,
+        ..mail.cx()
+    };
+    // B's cancel fills the inbox; C's, signed at a head the list doesn't
+    // hold yet, waits.
+    let from_b = mail.seal(&mail.fields("host-b", old.head(), now_ms() + HOUR));
+    let mut c = SoftwareKeys::new();
+    c.insert_ed25519(KeyId::new("host-c"), &secret("mail host c"));
+    let from_c = seal_envelope(
+        &c,
+        &KeyId::new("host-c"),
+        &mail.fields("host-c", mail.log.log.head(), now_ms() + HOUR),
+        &EnvelopePlain::Cancel { task_id: uuid() },
+        &mail.enc_pub,
+    )
+    .unwrap();
+    assert_eq!(
+        decided(b.put_with(&before, &from_b.to_json())),
+        Decision::Opened
+    );
+    assert_eq!(
+        decided(b.put_with(&before, &from_c.to_json())),
+        Decision::Pending
+    );
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert_eq!(observed.waiting_for_room, 0, "waiting for the list: none");
+    // The list advances: C's opens, but the inbox is full: it keeps
+    // waiting, and holds the gate.
+    let after = DecideCx {
+        limits,
+        ..mail.cx()
+    };
+    assert!(
+        rejudge_pending(&b.store, &identity(1), &after)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(b.count("mailbox_pending"), 1);
+    assert_eq!(b.owed(), [1], "never done while it waits");
+    assert_eq!(read(&b.store, &identity(1)).unwrap().waiting_for_room, 1);
+    // Admission takes B's: judged again, C's opens and waits no more.
+    b.store.db.execute("DELETE FROM mailbox_inbox", []).unwrap();
+    assert_eq!(
+        rejudge_pending(&b.store, &identity(1), &after).unwrap(),
+        [Decision::Opened]
+    );
+    let observed = read(&b.store, &identity(1)).unwrap();
+    assert_eq!((observed.waiting_for_room, observed.inbox), (0, 1));
+    assert_eq!(b.count("mailbox_pending"), 0);
 }

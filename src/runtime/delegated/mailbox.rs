@@ -64,11 +64,13 @@
 //!   the link up, a mailbox announced on this generation and read up to its
 //!   head (the furthest position read: a rewind's re-read closes nothing on
 //!   its own), no refusal, fault or reset waiting, no request, cancel or
-//!   complete left on the Station for want of room, and the inbox drained
-//!   (the requests, cancels and completes committed but not yet admitted).
-//!   Pending objects don't hold it, nor do results, kept or left on the
-//!   Station (ruling R35: they start no work, and a flood of them must not
-//!   hold task admission). Only host senders wait for it.
+//!   complete left on the Station, or waiting in the store, for want of
+//!   room ([`Observed::waiting_for_room`]), and the inbox drained (the
+//!   requests, cancels and completes committed but not yet admitted).
+//!   Objects waiting for a newer sender generation don't hold it (ruling
+//!   R39: design II.5 exempts only those), nor do results, kept or left on
+//!   the Station (ruling R35: they start no work, and a flood of them must
+//!   not hold task admission). Only host senders wait for it.
 use super::fetch::{HEADS_PACE_MS, REFUSAL_BACKOFF_MS, STALL_PAUSE_MS};
 use super::station::StationLink;
 use super::sync::{ALERT_EVERY_MS, HostIdentity, RETIRED_KEPT, SYNC_TIMEOUT_MS};
@@ -101,6 +103,9 @@ pub struct Observed {
     /// The furthest position read in the cursor's mailbox (at least the
     /// cursor; beyond it while a rewind's re-read runs).
     pub read_to: u64,
+    /// Waiting objects that decided to open with no room in the inbox
+    /// (review finding 2, ruling R39): they hold the gate's mailbox part.
+    pub waiting_for_room: u64,
     /// Room freed since: the store's cursor is to be rewound to just before
     /// it (`mailbox_store::rewind_if_room`).
     pub rewind_due: bool,
@@ -642,6 +647,14 @@ impl MailboxClient {
             return Some(
                 "a mailbox object waits on the Station for room in this host's inbox".into(),
             );
+        }
+        // So does a waiting one that decided to open with no room (review
+        // finding 2, ruling R39).
+        if observed.waiting_for_room > 0 {
+            return Some(format!(
+                "{} waiting mailbox object(s) wait for room in this host's inbox",
+                observed.waiting_for_room
+            ));
         }
         if observed.inbox > 0 {
             return Some(format!(

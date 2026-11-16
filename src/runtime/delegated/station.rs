@@ -701,6 +701,7 @@ mod tests {
             skipped: false,
             skipped_inbox: false,
             read_to: 0,
+            waiting_for_room: 0,
             rewind_due: false,
             skip_expires: None,
         };

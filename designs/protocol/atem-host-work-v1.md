@@ -3537,14 +3537,16 @@ exactly as without this section):
   rewind also comes once the delegated clock passes the expiry of every
   object left there (the Station has dropped them). A waiting object that
   decides to open with no room keeps waiting, never marked done, and is
-  judged again as soon as room frees. A request, cancel or complete left
-  there keeps host senders' gate closed (it isn't committed) until a read
-  after the rewind passes its position; a result left there doesn't
-  (results start no work, and a flood of them must not hold task
-  admission). The host keeps the furthest position it read in the
-  mailbox, which a rewind doesn't lower: the re-read closes no gate on its
-  own, and a head below that position is a reset (rule 7). Unlike
-  a pending overflow, which a sender's resend makes safe to mark done, a
+  judged again as soon as room frees; it keeps host senders' gate closed
+  meanwhile, as one left on the Station does (only an object waiting for
+  a newer sender generation holds none, design II.5). A request, cancel or
+  complete left there keeps host senders' gate closed (it isn't
+  committed) until a read after the rewind passes its position; a result
+  left there doesn't (results start no work, and a flood of them must not
+  hold task admission). The host keeps the furthest position it read in
+  the mailbox, which a rewind doesn't lower: the re-read closes no gate on
+  its own, and a head below that position is a reset (rule 7). Unlike a
+  pending overflow, which a sender's resend makes safe to mark done, a
   result is never resent once stored (design II.4.4);
 - **bounded storage (Atem's reading, for Astation's agreement):** anything
   a sender or the Station can make this host keep is bounded. Refusals keep
@@ -3569,10 +3571,10 @@ exactly as without this section):
   kept longest after the reported ones);
 - host senders' gate also needs the mailbox read to the announced head with
   no refusal, fault or reset waiting, no request, cancel or complete left
-  on the Station for want of room (a result left there holds none), and
-  every inbox row admitted (design II.5); until admission is
-  built an inbox row keeps it closed. `atem status`'s `Control feeds:` line
-  names this part.
+  on the Station, or waiting on this host, for want of room (a result left
+  there holds none), and every inbox row admitted (design II.5); until
+  admission is built an inbox row keeps it closed. `atem status`'s
+  `Control feeds:` line names this part.
 
 The receiving host's mailbox on the Station (design II.4.3): a sending host
 puts objects over its own link, and the receiving host syncs its own mailbox

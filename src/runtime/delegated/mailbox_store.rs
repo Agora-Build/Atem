@@ -72,8 +72,11 @@
 //!   judged again after the device list advances or its expiry passes
 //!   ([`rejudge_pending`]); decided, it owes a done only at a position of
 //!   the mailbox read now: a reset detaches it from its old one. One that
-//!   decides to open with no room for it keeps waiting, and is judged
-//!   again once room frees ([`freed`] moves).
+//!   decides to open with no room for it keeps waiting, marked (`no_room`:
+//!   it holds the gate's mailbox part, as a request, cancel or complete
+//!   left on the Station does; ruling R39: only one waiting for a newer
+//!   sender generation holds none), and is judged again once room frees
+//!   ([`freed`] moves).
 //! - **A reset** ([`mark_reset`], rule 7): marked durably before anything
 //!   is asked for it, as the cursor itself (the announced mailbox at
 //!   position 0, nothing read in it yet), the dones owed to the old mailbox
@@ -212,7 +215,7 @@ const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS mailbox_pending (
         object_hash TEXT PRIMARY KEY, host_id TEXT NOT NULL, host_trust_gen INTEGER NOT NULL,
         mailbox_id TEXT NOT NULL, position INTEGER NOT NULL, expires_at INTEGER NOT NULL,
-        bytes BLOB NOT NULL) WITHOUT ROWID;
+        bytes BLOB NOT NULL, no_room INTEGER NOT NULL DEFAULT 0) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS mailbox_results (
         object_hash TEXT PRIMARY KEY, sender_host TEXT NOT NULL, object_id TEXT NOT NULL,
         mailbox_id TEXT NOT NULL, position INTEGER NOT NULL, bytes BLOB NOT NULL,
@@ -222,34 +225,33 @@ const TABLES: &str = "
         UPDATE mailbox_cursor SET freed=freed+1 WHERE one=1;
     END;";
 
-/// The columns `mailbox_cursor` gained after its first shape (review P5: a
-/// store made by an earlier build of this mailbox gets them when its
-/// tables are made).
-const CURSOR_COLUMNS: [(&str, &str); 7] = [
-    ("skip_at", "INTEGER"),
-    ("skip_freed", "INTEGER NOT NULL DEFAULT 0"),
-    ("freed", "INTEGER NOT NULL DEFAULT 0"),
-    ("skip_expires", "INTEGER"),
-    ("skip_inbox", "INTEGER"),
-    ("read_to", "INTEGER NOT NULL DEFAULT 0"),
-    ("skip_inbox_now", "INTEGER"),
+/// The columns the mailbox's tables gained after their first shape
+/// (review P5: a store made by an earlier build of this mailbox gets them
+/// when its tables are made): `(table, column, kind)`.
+const NEW_COLUMNS: [(&str, &str, &str); 8] = [
+    ("mailbox_cursor", "skip_at", "INTEGER"),
+    ("mailbox_cursor", "skip_freed", "INTEGER NOT NULL DEFAULT 0"),
+    ("mailbox_cursor", "freed", "INTEGER NOT NULL DEFAULT 0"),
+    ("mailbox_cursor", "skip_expires", "INTEGER"),
+    ("mailbox_cursor", "skip_inbox", "INTEGER"),
+    ("mailbox_cursor", "read_to", "INTEGER NOT NULL DEFAULT 0"),
+    ("mailbox_cursor", "skip_inbox_now", "INTEGER"),
+    ("mailbox_pending", "no_room", "INTEGER NOT NULL DEFAULT 0"),
 ];
 
-/// The mailbox's tables in `store`, made if missing (a cursor table of an
-/// earlier shape gets its new columns first).
+/// The mailbox's tables in `store`, made if missing (a table of an earlier
+/// shape gets its new columns first).
 pub fn prepare(store: &Store) -> Result<()> {
     let tx = store.immediate()?;
-    for (column, kind) in CURSOR_COLUMNS {
-        let (table, present): (bool, bool) = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='mailbox_cursor'),
-                EXISTS(SELECT 1 FROM pragma_table_info('mailbox_cursor') WHERE name=?1)",
-            [column],
+    for (table, column, kind) in NEW_COLUMNS {
+        let (made, present): (bool, bool) = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1),
+                EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+            [table, column],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        if table && !present {
-            tx.execute_batch(&format!(
-                "ALTER TABLE mailbox_cursor ADD COLUMN {column} {kind}"
-            ))?;
+        if made && !present {
+            tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
         }
     }
     tx.execute_batch(TABLES)?;
@@ -340,6 +342,11 @@ pub fn read(store: &Store, identity: &HostIdentity) -> Result<Observed> {
         skipped,
         skipped_inbox,
         read_to,
+        waiting_for_room: store.db.query_row(
+            "SELECT count(*) FROM mailbox_pending WHERE no_room=1",
+            [],
+            |r| r.get(0),
+        )?,
         rewind_due,
         skip_expires,
     })
@@ -667,8 +674,19 @@ pub fn rejudge_pending(
                         continue;
                     }
                     match record(&tx, cx, &object, &bytes, verdict, &mailbox_id, position)? {
-                        // No room for it: it keeps waiting (never done).
-                        None | Some(Decision::Skipped) => continue,
+                        None => continue,
+                        // No room for it: it keeps waiting (never done), and
+                        // holds the gate's mailbox part as a request, cancel
+                        // or complete left on the Station does (review
+                        // finding 2, ruling R39; only waiting for a newer
+                        // sender generation holds none).
+                        Some(Decision::Skipped) => {
+                            tx.execute(
+                                "UPDATE mailbox_pending SET no_room=1 WHERE object_hash=?1",
+                                [&hash],
+                            )?;
+                            continue;
+                        }
                         Some(decision) => decision,
                     }
                 }

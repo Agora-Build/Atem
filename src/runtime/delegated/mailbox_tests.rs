@@ -62,6 +62,7 @@ fn observed(cursor: Option<(&str, u64)>) -> Observed {
         skipped: false,
         skipped_inbox: false,
         read_to: cursor.map_or(0, |(_, at)| at),
+        waiting_for_room: 0,
         rewind_due: false,
         skip_expires: None,
     }
