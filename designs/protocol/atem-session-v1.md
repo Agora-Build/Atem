@@ -1676,8 +1676,7 @@ and every later append refused until the journal is reopened.
    within 8 MiB, `MAX_RECORD_BYTES`): an entry that would is refused, and
    nothing is written (R9.14 item 4 says what that means for a withdrawal;
    a failed admission write has halted the journal first, so it never
-   meets a full list in practice). (**Changed agreed meaning, needs
-   Astation's agreement**: §I.2 named neither rule. Before them the only
+   meets a full list in practice). (**Changed agreed meaning, agreed with Astation (2026-11-13, #120 comment 6848326392)**: §I.2 named neither rule. Before them the only
    writer was this one, which halts first, so neither changes r8's
    outcomes.)
 3. **Resolved at restart, never executed.** When the journal reopens,
@@ -2553,8 +2552,7 @@ fenced). Atem sends every attachment `membership_head{head,
 pending_recovery}` (no `re`) when its head moves or a pending entry
 starts, takes effect or is cancelled, so clients fetch. Atem may also fetch the suffix
 from the relay over its own link; it gets no more trust than any
-carrier. **Amended in step 4, 2026-11-13 (Atem's proposal, for
-Astation's agreement):** Atem does so behind `host.delegated` until its
+carrier. **Amended in step 4, 2026-11-13 (Atem's proposal, agreed with Astation (2026-11-13, #164 comment 6858189009)):** Atem does so behind `host.delegated` until its
 activation (a host without it fetches nothing), with `membership_fetch{after}`
 (host-work-v1 §11.4) whenever its Station's `heads` name a device-list head
 beyond its own, the result applied as a carriage; a fetch that stops at a
@@ -2816,7 +2814,7 @@ estimate on the host's clock, recomputed on every report. The 100 ms
 asks the relay over its link for the suffix after its head every 15
 minutes and 5 minutes before `effective_at` (a fetch never delays
 activation: a relay that fails it gains nothing). **Amended in step 4,
-2026-11-13 (changed agreed meaning, needs Astation's agreement):** that
+2026-11-13 (changed agreed meaning, agreed with Astation (2026-11-13, #164 comment 6858189009)):** that
 fetch is R9.3's, run at its Station's `heads` (every (re)connection, every
 30 s, and at once when it stores a control record; host-work-v1 §11.4) in
 place of this schedule, and at once, with no `heads`, when a deferral it
@@ -4121,8 +4119,9 @@ it has neither `state` nor `session_id`, `process_gen` or `approval_id`:
   for an alert: nothing cancels a stage, and an alert's own state is read
   with `alert_list` (it lasts until its task is resolved). The daily reminder
   is Astation's. **Atem's choice, for Astation to confirm.**
-- **When Atem makes and sends it** (**Atem's choices, for Astation to
-  confirm**):
+- **When Atem makes and sends it** (**Atem's choices, agreed with Astation (2026-11-13, #120 comment 6848463998),
+  with suppression, the recipients' current authorization, the relay's and
+  provider's expiry checks and pairing resets still applying**):
   - The host makes an alert's hints once, when the alert is committed. Their
     `created_at` is the alert's, and their window is exactly 900 000 ms.
   - It resends them until acknowledged or until `expires_at + 300 000`. The
@@ -4623,8 +4622,8 @@ and item 6's reconciliation of `executing` prompts (changed agreed
 meaning, needs Astation's agreement). Astation then agreed items 1 to 7
 with those step-4 amendments, and answered item 1's UI question (a generic
 controller label until receipt provenance names the task; no holder
-field), on 2026-11-13 (#120 comment 6848326392): the marks below predate
-that answer. Item 8's request stays open.
+field), on 2026-11-13 (#120 comment 6848326392): each is marked agreed
+below. Item 8's request stays open.
 
 1. **The `host-work` principal.** Its name is `host-work`
    (`atem_client::session::wire::HOST_WORK_PRINCIPAL`), a bare word like
@@ -4652,17 +4651,18 @@ that answer. Item 8's request stays open.
      §F's rules. Except for item 5, the host-work principal never takes
      over a lease. Clients see it as any controller (`controller{
      controller_session, lease_epoch}`, `lease_held`); the receipts of
-     item 2 say which task holds it. (**Needs Astation's agreement:**
-     whether its UI needs to tell the host-work holder apart from a device;
-     this revision adds no field for it.)
-   - **Leases, as built** (**Atem's choice, for Astation to confirm**). A
+     item 2 say which task holds it. (**Answered by Astation (2026-11-13, #120 comment 6848326392):** its UI
+     shows a generic controller label until receipt provenance names the
+     task, never guessing that an opaque controller session is a named
+     device; no holder field is needed, and this revision adds none.)
+   - **Leases, as built** (**Atem's choice, agreed with Astation (2026-11-13, #120 comment 6848326392)**). A
      prompt it submits without `acquire: true`, or with `takeover`, is
      `invalid_request`, and nothing is recorded. After a restart a turn
      still running and rebound (item 6) holds no lease: leases aren't
      persisted and host-work doesn't acquire again, so a native may
      acquire it without a takeover.
    - **How long it holds the lease, as built** (**changed agreed
-     meaning, needs Astation's agreement**: the agreed text above says it
+     meaning, agreed with Astation (2026-11-13, #120 comment 6848326392)**: the agreed text above says it
      holds the lease "for that turn"). It keeps the lease while any
      request of its on that session is open (`accepted` or `executing`),
      not only for one turn, and releases it at the first pass after the
@@ -4720,7 +4720,7 @@ that answer. Item 8's request stays open.
    device list. The requests of every other principal keep §H's dispatch
    check only, which the `host-work` principal passes trivially (item 1).
 
-   As built (**Atem's choice, for Astation to confirm**): with no check
+   As built (**Atem's choice, agreed with Astation (2026-11-13, #120 comment 6848326392)**): with no check
    installed, every request of the `host-work` principal is withdrawn
    (`withdrawn by the host`, fail closed). A refusal whose `rejected`
    write fails halts the journal (§I), and the request goes on the refusal
@@ -4751,7 +4751,7 @@ that answer. Item 8's request stays open.
    applies only to the `host-work` principal's own requests, and is seen
    only as the receipt's `rejected` state.
 
-   As built (**changed agreed meaning, needs Astation's agreement**: the
+   As built (**changed agreed meaning, agreed with Astation (2026-11-13, #120 comment 6848326392)**: the
    refusal list's own rules, §I.2):
    - **One entry per `request_id`.** The first entry stays, whoever
      submitted it. A withdrawal of an id already listed writes nothing and
@@ -4832,7 +4832,7 @@ that answer. Item 8's request stays open.
      - After a restart a pending intent is carried out again, delivering
        once more if that turn is still the session's current turn; a
        turn that has already ended makes it do nothing. **As built
-       (changed agreed meaning, needs Astation's agreement):** the host
+       (changed agreed meaning, agreed with Astation (2026-11-13, #120 comment 6848326392)):** the host
        knows that turn is still current only when the prompt's turn was
        journaled (item 6's `turn_started`) and the adopted worker's chat
        shows it running: then the attempt stays `executing`, rebound to
@@ -4880,8 +4880,7 @@ that answer. Item 8's request stays open.
    refusal list first, as §I.7 rules for every principal) is **Atem's
    choice, agreed with Astation (2026-11-11, #120 comment 6810116314)**.
 
-   **The reconciliation, as built (changed agreed meaning, needs
-   Astation's agreement):**
+   **The reconciliation, as built (changed agreed meaning, agreed with Astation (2026-11-13, #120 comment 6848326392)):**
    - **The turn a prompt started is journaled** (`turn_started`): ids
      only, the turn and the user message, written durably at the chat's
      acceptance (after the paste, while `executing`), for the `host-work`

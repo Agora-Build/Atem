@@ -910,9 +910,9 @@ records applied to the tasks from the host's own Station's feed through
 
 Passages written in step 4 say "as built in step 4" or "step 4". Astation
 answered step 4's contract questions on 2026-11-13 (#120 comments
-6848326392 and 6848463998, #164 comment 6858189009); marks written before
-those answers still read "for Astation" until a docs change marks them
-agreed, as step 3's were. Astation answered the readings written since
+6848326392 and 6848463998, #164 comment 6858189009); each mark written
+before those answers that they agree is marked agreed below, as step 3's
+were. Astation answered the readings written since
 (§11.1's effects on the tasks and its service refusals, §11.4's
 acknowledgments and pacing) on 2026-11-14 (#120 comment 6885269470, which
 also agrees to the narrowed pacing), and the two host changes it asked for there
@@ -1723,7 +1723,7 @@ they serialize back to the same JSON.
 | `task_id` | a UUID v4 |
 | `resolution.kind` | `failed` or `done`, exactly its fields |
 | `failed.detail` | 1–1024 bytes, not blank (something besides White_Space), no control character and no Cf character (bidi controls, zero-width characters; the framing module's General_Category Cf, `framing::is_format`): the detail the task then shows. **Atem's choice, agreed with Astation (2026-11-11, #120 comment 6810116314)**: the design says only `failed{detail}`, so a multi-line, blank or Cf-carrying reason is `invalid_request` |
-| `done.result` | a context snapshot, with `work_complete`'s checks and no more (a `result` kind is local only; **Atem's choice, for Astation to confirm**) |
+| `done.result` | a context snapshot, with `work_complete`'s checks and no more (a `result` kind is local only; **Atem's choice, agreed with Astation (2026-11-13, #120 comment 6848463998)**) |
 
 **Authority.** Both are directed-work requests: the channel checks `notify`
 before decoding (`forbidden`; a native member needs `control`), as for every
@@ -1783,8 +1783,7 @@ not name is `forbidden`, as for `work_query`.
   (`local`, a browser grant, a service no feed covers) is `forbidden`, to
   its sender and to the owner, as for `work_resolve`: only a delegated
   task's turn runs under the host's own principal, which is what the host
-  interrupts (session-v1 R9.14 item 5). **Atem's reading, for Astation to
-  confirm.**
+  interrupts (session-v1 R9.14 item 5). **Atem's reading, agreed with Astation (2026-11-13, #120 comment 6848463998).**
 - **The session's current turn** is the task's current attempt
   `executing`, its turn shown running by the session's chat (R9.14 item
   5's turn check). Anything else answers `not running`: a queued task, an
@@ -1829,8 +1828,8 @@ not name is `forbidden`, as for `work_query`.
   - **Atem's choice.**
 - **While hosting is paused** (`runtime.toml` doesn't load, or `enabled =
   false`), `work_interrupt` is still served: a stop always wins, as for
-  the deadline's interrupt (§11.6). **Atem's reading, for Astation to
-  confirm.**
+  the deadline's interrupt (§11.6). **Atem's reading, agreed with Astation (2026-11-13, #120 comment 6848463998)
+  for `work_interrupt`, with fresh current authorization.**
   - **Which channels.** While hosting is paused, the host takes
     `work_interrupt` only from a channel whose welcome listed
     `host.delegated`, that is one welcomed before the pause. A welcome
@@ -1969,8 +1968,7 @@ outcome is unknown". The 256-byte `reason` is a short phrase (a task's status
     takes. The host passes 64, and no request carries a limit.
 - **An unknown cursor.** An `after` the host has no alert for (the alert
   ended, or never was) is `stale_target`, detail `unknown alert`; the caller
-  lists again from the start (**Atem's choice of code, for Astation to
-  confirm**: the host triple is what §7's `stale_target` usually names, but a
+  lists again from the start (**Atem's choice of code, agreed with Astation (2026-11-13, #120 comment 6848463998)**: the host triple is what §7's `stale_target` usually names, but a
   cursor that no longer points at anything is a stale target too).
 - **What is listed.** Exactly the delegated tasks that are
   `outcome_unknown` and unresolved, one alert each. An alert ends when its
@@ -2038,7 +2036,7 @@ Vectors:
   among them.
 - `fixtures/r9-vectors-push-hint.json`: the hints, and
   `outcome_unknown_invalid_facts` (a `local` and a browser grant's task,
-  and, **for Astation** (amended for step 4: the deferred blank-reason
+  and, **agreed with Astation (2026-11-13, #156 comment 6858184397)** (amended for step 4: the deferred blank-reason
   vector Astation's review of #156 asked for before phone hint support is
   accepted, #120 comment 6848326392), a delegated task whose `reason` is
   blank, a space, a no-break space and an ideographic space, with no
@@ -2435,7 +2433,7 @@ gate are design I.5.2 and I.5.8's, as §11.1 ("Resets") states them:
   identity has read the feed: "An identity change", below), and when
   no head arrived for 60 seconds. While it is closed no unstarted remote
   task of a principal that feed covers starts (`blocked`, `revocations not
-  yet checked`). (**Atem's reading, for Astation**, step 4, 2026-11-13:
+  yet checked`). (**Atem's reading, agreed with Astation (2026-11-13, #164 comment 6858189009)**, step 4, 2026-11-13:
   "up to its head" is the host's list holding the device-list head the
   last `heads` announced as that very entry, `seq` and hash, never a
   `membership_fetch_result`'s `head`; so `heads.membership` must be exactly
@@ -2504,7 +2502,7 @@ own Station's feed:
   and no recursion, so a lone surrogate, a duplicate key (`op`'s
   included), nesting past a parser's depth, or a page cut short after
   its `op` still make it a page, and its fault alert goes.
-- **What stays dropped unread** (**Atem's reading, for Astation**): a
+- **What stays dropped unread** (**Atem's reading, agreed with Astation (2026-11-13, #164 comment 6858189009)**): a
   frame over 256 KiB (dropped and counted at the link, as every relay
   message), and a frame whose top-level `type` and `op` can't be read at
   all (not a JSON object, or broken before its `type` or its `op`):
@@ -4184,7 +4182,7 @@ The sender's channel and online status are not conditions.
     condition 4. A waiting launch reads `starting`, a refused one `failed`;
     the reason goes to `runtime.log` (§3 has no `detail`). A
     `runtime.toml` that doesn't load is waited out at the spawn boundary
-    too. **Atem's reading, for Astation to confirm:** the check just
+    too. **Atem's reading, agreed with Astation (2026-11-13, #120 comment 6848463998):** the check just
     before the worker is spawned is the launch's linearization point; after
     the spawn its guard only fences, as every launch's. A restart turns a
     launch still waiting into `outcome_unknown`, as §3 says of every
@@ -4325,7 +4323,8 @@ As built in step 4:
 - **The detail.** `interrupted at deadline` names only a turn the
   deadline's interrupt reached. A turn that ended interrupted otherwise
   keeps `turn interrupted`.
-- **While hosting is paused. Atem's reading, for Astation to confirm.**
+- **While hosting is paused. Atem's reading, agreed with Astation (2026-11-13, #120 comment 6848463998),
+  which claims no immediate stop in the residuals below.**
   The interrupt, and every pending intent, is carried out while hosting
   is paused (`runtime.toml` doesn't load, or `enabled = false`). A stop
   grants nothing, and the turn's own lease goes on renewing during a
@@ -4338,7 +4337,7 @@ As built in step 4:
   - **Residuals.** A receipt-database fault holds the intents until the
     restart it asks for (recovery step 3 carries them out then). A runtime
     started while paused carries them out once hosting is on.
-- **At a restart. Atem's reading, for Astation to confirm.** A pending
+- **At a restart. Atem's reading, agreed with Astation (2026-11-13, #120 comment 6848463998).** A pending
   intent whose attempt is `rejected` at recovery step 3 gives the task the
   intent's state. That covers `withdrawn at recovery`, and also a
   `session closed` not yet processed: the task becomes `expired`, not
@@ -4368,9 +4367,9 @@ As built in step 4:
   ran: the task moves to `awaiting_result` and still needs
   `work_complete`. A reply that arrives after a `failed` resolution, before
   the deadline, is stored, and the task stays `failed`. **Atem's reading,
-  for Astation:** after the task's deadline (on the delegated clock below),
+  agreed with Astation (2026-11-13, #120 comment 6848463998):** after the task's deadline (on the delegated clock below),
   as for every task, a reply is refused (`expired`) and nothing is stored.
-- **Atem's choice, for Astation:** while the task stays `outcome_unknown`
+- **Atem's choice, agreed with Astation (2026-11-13, #120 comment 6848463998):** while the task stays `outcome_unknown`
   (its reply still publishing, or refused), its `detail` stays its reason
   (the Details table's `outcome_unknown` rows: `agent exited`, `outcome
   could not be established`, `write interrupted`, or the deadline's text);
@@ -4397,7 +4396,7 @@ As built in step 4:
   remote sender, host senders included, with the same code and detail,
   until the owner resolves some. Local tasks are never refused for
   unresolved outcomes. Which requests count, and the one detail for both
-  limits, are **Atem's choice, for Astation to confirm**: the design says
+  limits, are **Atem's choice, agreed with Astation (2026-11-13, #120 comment 6848463998)**: the design says
   "new tasks" and "new remote tasks", and names the 64's detail only.
 
 #### Details
@@ -4411,8 +4410,8 @@ exact.
 | `blocked` | `revocations not yet checked` | the revocation gate (or, for a host sender, the mailbox gate) is closed |
 | `blocked` | `device list update pending` | the last carriage or fetch stopped at a deferred entry |
 | `blocked` | `waiting for unlock` | a locked cred agent leaves the project scope pending |
-| `blocked` | `journal halted; restart Atem` | (**Atem's addition, for Astation**) the session journal halted with the device list usable (no fault): the task waits until the restart; session-v1 §I's own text |
-| `blocked` | `host.delegated is off` | (**Atem's addition, for Astation**) a task accepted while `host.delegated` was on, not started, after a restart without it: it is never dispatched, and expires at its deadline (on the clock below) |
+| `blocked` | `journal halted; restart Atem` | (**Atem's addition, agreed with Astation (2026-11-13, #120 comment 6848463998)**) the session journal halted with the device list usable (no fault): the task waits until the restart; session-v1 §I's own text |
+| `blocked` | `host.delegated is off` | (**Atem's addition, agreed with Astation (2026-11-13, #120 comment 6848463998)**) a task accepted while `host.delegated` was on, not started, after a restart without it: it is never dispatched, and expires at its deadline (on the clock below) |
 | `cancelled` | `sender revoked` | a `revoke` record, an R9 removal, or a host sender's `host_sender_revoke`, `remove_host` or new membership epoch |
 | `failed` | `sender's authorization narrowed` | the current grant (or a host sender's projects) no longer covers the task |
 | `failed` | `route changed` | the route's revision, principals or profile changed |
@@ -4421,7 +4420,7 @@ exact.
 | `failed` | `expired before the spawn` | a launch still waiting at the spawn boundary at its expiry |
 | `awaiting_result` | `interrupted at deadline` | a running turn interrupted at the task's deadline (then `expired` as today) |
 | `outcome_unknown` | `deadline passed; outcome unknown` | its deadline passed unresolved |
-| `outcome_unknown` | `agent exited`, `outcome could not be established`, `write interrupted` | (**Atem's addition, for Astation**) why, as its attempt's receipt says (session-v1 R9.14 item 6; design I.6.3: "the task follows"): its agent exited; no turn state proves its turn ran or is current (a restart's reconciliation); a write failed after it may have reached the agent. The reason the owner's alert names (§11.3) |
+| `outcome_unknown` | `agent exited`, `outcome could not be established`, `write interrupted` | (**Atem's addition, agreed with Astation (2026-11-13, #120 comment 6848463998)**) why, as its attempt's receipt says (session-v1 R9.14 item 6; design I.6.3: "the task follows"): its agent exited; no turn state proves its turn ran or is current (a restart's reconciliation); a write failed after it may have reached the agent. The reason the owner's alert names (§11.3) |
 | (a `work_interrupt` result) | `not running` | the task's turn isn't the session's current turn (§11.2) |
 | (an error) | `too many unresolved outcomes` | `busy`, the 64 or 256 limit |
 | (a receipt) | `withdrawn by the host`, `withdrawn at recovery` | session-v1 R9.14 items 3, 4 and 6; the task's state follows the event |
