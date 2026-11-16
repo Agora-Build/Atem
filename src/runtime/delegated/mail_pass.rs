@@ -184,6 +184,7 @@ impl HostBridge {
                         recipient: &r.recipient,
                         provider: &r.provider,
                         now_ms: *now_ms,
+                        limits: mailbox_store::Limits::default(),
                     });
                 mailbox_store::commit_page(store, &identity, &applying.page, cx.as_ref())
             }
@@ -283,6 +284,7 @@ impl HostBridge {
             recipient: &receiver.recipient,
             provider: &receiver.provider,
             now_ms,
+            limits: mailbox_store::Limits::default(),
         };
         match mailbox_store::rejudge_pending(store, &identity, &cx) {
             Ok(_) => self.work.mail_rejudged = Some(key),

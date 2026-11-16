@@ -57,7 +57,8 @@ use atem_client::encoding::Hash32;
 use atem_client::host_mail::mailbox::{MailboxEntry, MailboxSyncResult};
 use atem_client::host_mail::receive::reason::MALFORMED;
 use atem_client::host_mail::{
-    EnvelopePlain, EnvelopeVerdict, MailBody, Recipient, object_hash, open_envelope, parse_object,
+    EnvelopePlain, EnvelopeVerdict, MailBody, MailKind, Recipient, object_hash, open_envelope,
+    parse_object,
 };
 use atem_client::membership::Membership;
 use rusqlite::{OptionalExtension, Transaction, params};
@@ -71,9 +72,47 @@ pub const MAX_PENDING: usize = 256;
 /// The reason kept for the sender's id with another sealed part
 /// (§11.5, "Which copies claim an id"): evidence only, never on the wire.
 pub const ID_REUSED: &str = "id_reused";
+/// How long after its object's expiry a claim or a refusal is kept (24 h).
+/// A claim must outlive every copy of its object that can still arrive:
+/// the Station keeps an object until its `expires_at` on the Station's own
+/// clock, which this host bounds only from above (I.6.5's cap), and a
+/// sender's clock may lag too. A day past the expiry, an object's whole
+/// longest lifetime again, covers a Station or sender clock up to a day
+/// behind; a copy arriving later still is judged anew (refused `expired`).
+pub const KEEP_MARGIN_MS: u64 = 24 * 60 * 60 * 1000;
+/// The longest an object can still be live after it arrives: its 24 h
+/// lifetime and the 60 s its `created_at` may be ahead (check 5). An
+/// expiry beyond it (`lifetime_too_long`), or none (bytes that don't
+/// parse), counts as this.
+const LONGEST_LIFE_MS: u64 = 24 * 60 * 60 * 1000 + 60_000;
+
+/// What the mailbox keeps at most (review finding 2: anything a sender or
+/// the Station can make this host keep is bounded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// The exact bytes refusals keep, in all: beyond it the oldest go
+    /// first, those not reported before those reported (their evidence
+    /// hash stays).
+    pub evidence_bytes: u64,
+    /// Results kept for the sending host's own check, at most.
+    pub results: u64,
+    /// Their bytes, at most.
+    pub result_bytes: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            evidence_bytes: 16 << 20,
+            results: 256,
+            result_bytes: 64 << 20,
+        }
+    }
+}
 
 /// The mailbox's tables, made by [`prepare`] (only with `host.senders`).
-/// Additive, as every host-work table.
+/// Additive, as every host-work table. `mailbox_kept` is the refusals'
+/// kept bytes, kept by triggers.
 const TABLES: &str = "
     CREATE TABLE IF NOT EXISTS mailbox_cursor (
         one INTEGER PRIMARY KEY CHECK (one = 1), identity TEXT NOT NULL,
@@ -83,24 +122,61 @@ const TABLES: &str = "
         PRIMARY KEY(mailbox_id, position)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS mailbox_claims (
         sender_host TEXT NOT NULL, object_id TEXT NOT NULL, sealed_hash TEXT NOT NULL,
-        expires_at INTEGER NOT NULL, PRIMARY KEY(sender_host, object_id)) WITHOUT ROWID;
+        keep_until INTEGER NOT NULL, PRIMARY KEY(sender_host, object_id)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS mailbox_claims_keep ON mailbox_claims(keep_until);
     CREATE TABLE IF NOT EXISTS mailbox_inbox (
         n INTEGER PRIMARY KEY, sender_host TEXT NOT NULL, object_id TEXT NOT NULL,
         kind TEXT NOT NULL, plain BLOB NOT NULL, object_hash TEXT NOT NULL,
         at_ms INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS mailbox_refused (
         n INTEGER PRIMARY KEY, evidence TEXT NOT NULL UNIQUE, reason TEXT NOT NULL,
-        sender_host TEXT, object_id TEXT, report INTEGER NOT NULL, bytes BLOB NOT NULL,
-        at_ms INTEGER NOT NULL);
+        sender_host TEXT, object_id TEXT, report INTEGER NOT NULL, bytes BLOB,
+        keep_until INTEGER NOT NULL, at_ms INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS mailbox_refused_keep ON mailbox_refused(keep_until);
+    CREATE INDEX IF NOT EXISTS mailbox_refused_bytes ON mailbox_refused(report, n)
+        WHERE bytes IS NOT NULL;
+    CREATE TABLE IF NOT EXISTS mailbox_kept (
+        one INTEGER PRIMARY KEY CHECK (one = 1), bytes INTEGER NOT NULL) WITHOUT ROWID;
+    INSERT OR IGNORE INTO mailbox_kept(one, bytes) VALUES(1, 0);
+    CREATE TRIGGER IF NOT EXISTS mailbox_kept_insert AFTER INSERT ON mailbox_refused BEGIN
+        UPDATE mailbox_kept SET bytes=bytes+coalesce(length(NEW.bytes),0) WHERE one=1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS mailbox_kept_update AFTER UPDATE OF bytes ON mailbox_refused BEGIN
+        UPDATE mailbox_kept SET bytes=bytes-coalesce(length(OLD.bytes),0)
+            +coalesce(length(NEW.bytes),0) WHERE one=1;
+    END;
+    CREATE TRIGGER IF NOT EXISTS mailbox_kept_delete AFTER DELETE ON mailbox_refused BEGIN
+        UPDATE mailbox_kept SET bytes=bytes-coalesce(length(OLD.bytes),0) WHERE one=1;
+    END;
     CREATE TABLE IF NOT EXISTS mailbox_pending (
         object_hash TEXT PRIMARY KEY, host_id TEXT NOT NULL, host_trust_gen INTEGER NOT NULL,
         mailbox_id TEXT NOT NULL, position INTEGER NOT NULL, expires_at INTEGER NOT NULL,
-        bytes BLOB NOT NULL) WITHOUT ROWID;";
+        bytes BLOB NOT NULL) WITHOUT ROWID;
+    CREATE TABLE IF NOT EXISTS mailbox_results (
+        object_hash TEXT PRIMARY KEY, sender_host TEXT NOT NULL, object_id TEXT NOT NULL,
+        mailbox_id TEXT NOT NULL, position INTEGER NOT NULL, bytes BLOB NOT NULL,
+        keep_until INTEGER NOT NULL, at_ms INTEGER NOT NULL) WITHOUT ROWID;";
 
 /// The mailbox's tables in `store`, made if missing.
 pub fn prepare(store: &Store) -> Result<()> {
-    store.db.execute_batch(TABLES)?;
+    let tx = store.immediate()?;
+    tx.execute_batch(TABLES)?;
+    tx.commit()?;
     Ok(())
+}
+
+/// Whether `store` has any of the mailbox's tables (only a host that ran
+/// `host.senders` does).
+#[cfg(test)]
+pub fn made_in(store: &Store) -> bool {
+    store
+        .db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name GLOB 'mailbox_*')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false)
 }
 
 /// The identity a row belongs to, as stored.
@@ -127,7 +203,10 @@ fn cursor_row(db: &rusqlite::Connection) -> Result<Option<(String, String, u64)>
 
 /// The cursor of `identity`'s mailbox (none: never read); an error for a
 /// row of another identity.
-fn own_cursor(db: &rusqlite::Connection, identity: &HostIdentity) -> Result<Option<(String, u64)>> {
+fn own_cursor(
+    db: &rusqlite::Connection,
+    identity: &HostIdentity,
+) -> Result<Option<(String, u64)>> {
     match cursor_row(db)? {
         None => Ok(None),
         Some((of, id, at)) if of == identity_text(identity) => Ok(Some((id, at))),
@@ -163,12 +242,16 @@ fn set_cursor(tx: &Transaction, identity: &HostIdentity, mailbox_id: &str, at: u
 
 /// A reset of `identity`'s mailbox (rule 7), marked durably before
 /// anything is asked for it: the cursor at position 0 of the announced
-/// `mailbox_id`, and the dones owed to the old mailbox dropped.
+/// `mailbox_id`, the dones owed to the old mailbox dropped, and every
+/// waiting object detached from its position (review finding 1: under the
+/// same id a position may hold another object now; a waiting object owes a
+/// done only once the read from 0 lists it again).
 pub fn mark_reset(store: &Store, identity: &HostIdentity, mailbox_id: &str) -> Result<()> {
     let tx = store.immediate()?;
     own_cursor(&tx, identity)?;
     set_cursor(&tx, identity, mailbox_id, 0)?;
     tx.execute("DELETE FROM mailbox_dones", [])?;
+    tx.execute("UPDATE mailbox_pending SET mailbox_id=''", [])?;
     tx.commit()?;
     Ok(())
 }
@@ -204,6 +287,22 @@ pub fn done_answered(
     Ok(())
 }
 
+/// Claims, refusals and kept results whose time is over at `now_ms` (the
+/// delegated clock's `D`): [`KEEP_MARGIN_MS`] after their object's expiry.
+/// How many rows went.
+pub fn prune(store: &Store, now_ms: u64) -> Result<u64> {
+    let tx = store.immediate()?;
+    let mut gone = 0;
+    for table in ["mailbox_claims", "mailbox_refused", "mailbox_results"] {
+        gone += tx.execute(
+            &format!("DELETE FROM {table} WHERE keep_until <= ?1"),
+            [now_ms],
+        )? as u64;
+    }
+    tx.commit()?;
+    Ok(gone)
+}
+
 /// What a page's commit did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Commit {
@@ -234,18 +333,33 @@ pub enum Decision {
     Duplicate,
     /// Kept waiting (not done).
     Pending,
-    /// Over the pending limits: dropped undecided, marked done.
+    /// Over the pending or the results' limits: dropped undecided, marked
+    /// done.
     Overflow,
+    /// An `atem-result`, kept for the sending host's own check.
+    Result,
 }
 
 /// What objects are decided with: this host's committed device list, its
-/// identity and keys as the receiver (`host_enc::recipient_at`), and the
-/// delegated clock's `D` (design I.6.5).
+/// identity and keys as the receiver (`host_enc::recipient_at`), the
+/// delegated clock's `D` (design I.6.5), and what the store keeps at most.
 pub struct DecideCx<'a> {
     pub list: &'a Membership,
     pub recipient: &'a Recipient,
     pub provider: &'a dyn KeyProvider,
     pub now_ms: u64,
+    pub limits: Limits,
+}
+
+impl DecideCx<'_> {
+    /// When a row about an object expiring at `expires_at` (none: not
+    /// known) goes ([`prune`]).
+    fn keep_until(&self, expires_at: Option<u64>) -> u64 {
+        let longest = self.now_ms.saturating_add(LONGEST_LIFE_MS);
+        expires_at
+            .map_or(longest, |at| at.min(longest))
+            .saturating_add(KEEP_MARGIN_MS)
+    }
 }
 
 /// `page` of `identity`'s mailbox, in one `BEGIN IMMEDIATE` transaction
@@ -289,9 +403,10 @@ pub fn commit_page(
 
 /// The waiting objects judged again (after the device list advanced, or
 /// one's expiry passed), in one transaction: each decided now gets its row
-/// and leaves the waiting ones; its done is owed when it waits in the
-/// mailbox read now. The decisions made; an object that can't be decided
-/// now keeps waiting.
+/// and leaves the waiting ones; its done is owed when it waits at a
+/// position of the mailbox read now (a reset detached it: [`mark_reset`]).
+/// One whose bytes no longer parse is refused `malformed`. The decisions
+/// made; an object that can't be decided now keeps waiting.
 pub fn rejudge_pending(
     store: &Store,
     identity: &HostIdentity,
@@ -310,20 +425,26 @@ pub fn rejudge_pending(
     };
     let mut decided = Vec::new();
     for (hash, mailbox_id, position, bytes) in waiting {
-        let Ok(object) = parse_object(&bytes) else {
-            continue;
+        let decision = match parse_object(&bytes) {
+            Err(_) => refuse(&tx, cx, &Hash32::of(&bytes), MALFORMED, None, &bytes, None)?,
+            Ok(object) => {
+                let verdict =
+                    open_envelope(&object, cx.list, cx.recipient, cx.provider, cx.now_ms);
+                if matches!(
+                    verdict,
+                    EnvelopeVerdict::Pending { .. } | EnvelopeVerdict::Unavailable { .. }
+                ) {
+                    continue;
+                }
+                let Some(decision) =
+                    record(&tx, cx, &object, &bytes, verdict, &mailbox_id, position)?
+                else {
+                    continue;
+                };
+                decision
+            }
         };
-        let verdict = open_envelope(&object, cx.list, cx.recipient, cx.provider, cx.now_ms);
-        if matches!(
-            verdict,
-            EnvelopeVerdict::Pending { .. } | EnvelopeVerdict::Unavailable { .. }
-        ) {
-            continue;
-        }
         tx.execute("DELETE FROM mailbox_pending WHERE object_hash=?1", [&hash])?;
-        let Some(decision) = record(&tx, &object, &bytes, verdict, &mailbox_id, position)? else {
-            continue;
-        };
         if mailbox_id == current {
             owe_done(&tx, &mailbox_id, position)?;
         }
@@ -357,42 +478,81 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// One page object decided (none: it can't be now).
+/// One page object decided (none: it can't be now). An `atem-result` is
+/// kept for the sending host's own check (ruling R28), never judged as an
+/// envelope.
 fn decide_entry(
     tx: &Transaction,
     entry: &MailboxEntry,
     cx: &DecideCx,
     mailbox_id: &str,
 ) -> Result<Option<Decision>> {
+    let bytes = entry.bytes();
     let object = match entry.parse_object() {
         Ok(object) => object,
         // Check 1: not a signed object at all, refused under the SHA-256
         // of the bytes as fetched.
-        Err(_) => {
-            return refuse(
-                tx,
-                &Hash32::of(entry.bytes()),
-                MALFORMED,
-                None,
-                entry.bytes(),
-            )
-            .map(Some);
-        }
+        Err(_) => return refuse(tx, cx, &Hash32::of(bytes), MALFORMED, None, bytes, None).map(Some),
     };
+    let (kind, body) = MailBody::from_object(&object)?;
+    if kind == MailKind::Result {
+        return keep_result(tx, cx, &object, &body, bytes, mailbox_id, entry.position).map(Some);
+    }
     let verdict = open_envelope(&object, cx.list, cx.recipient, cx.provider, cx.now_ms);
-    record(
-        tx,
-        &object,
-        entry.bytes(),
-        verdict,
-        mailbox_id,
-        entry.position,
-    )
+    record(tx, cx, &object, bytes, verdict, mailbox_id, entry.position)
+}
+
+/// An `atem-result` kept (ruling R28): its exact bytes, `object_hash`,
+/// sender, id and position, for the sending host's `accept_result`; the
+/// same object again is a duplicate; over [`Limits`] it is dropped
+/// undecided (marked done).
+fn keep_result(
+    tx: &Transaction,
+    cx: &DecideCx,
+    object: &atem_client::SignedObject,
+    body: &MailBody,
+    bytes: &[u8],
+    mailbox_id: &str,
+    position: u64,
+) -> Result<Decision> {
+    let hash = object_hash(object).to_hex();
+    let present: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mailbox_results WHERE object_hash=?1)",
+        [&hash],
+        |r| r.get(0),
+    )?;
+    if present {
+        return Ok(Decision::Duplicate);
+    }
+    let (count, kept): (u64, u64) = tx.query_row(
+        "SELECT count(*), coalesce(sum(length(bytes)), 0) FROM mailbox_results",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if count >= cx.limits.results || kept + bytes.len() as u64 > cx.limits.result_bytes {
+        return Ok(Decision::Overflow);
+    }
+    tx.execute(
+        "INSERT INTO mailbox_results(object_hash, sender_host, object_id, mailbox_id, position,
+            bytes, keep_until, at_ms) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            hash,
+            body.sender.host_id,
+            body.id,
+            mailbox_id,
+            position,
+            bytes,
+            cx.keep_until(Some(body.expires_at)),
+            now_ms()
+        ],
+    )?;
+    Ok(Decision::Result)
 }
 
 /// A verdict's rows (the module docs); none for `Unavailable`.
 fn record(
     tx: &Transaction,
+    cx: &DecideCx,
     object: &atem_client::SignedObject,
     bytes: &[u8],
     verdict: EnvelopeVerdict,
@@ -401,10 +561,11 @@ fn record(
 ) -> Result<Option<Decision>> {
     let (_, body) = MailBody::from_object(object)?;
     let hash = object_hash(object);
+    let expires = Some(body.expires_at);
     Ok(Some(match verdict {
         EnvelopeVerdict::Unavailable { .. } => return Ok(None),
         EnvelopeVerdict::Refused { reason, evidence } => {
-            refuse(tx, &evidence, reason, None, bytes)?
+            refuse(tx, cx, &evidence, reason, None, bytes, expires)?
         }
         EnvelopeVerdict::Pending {
             host_id,
@@ -419,7 +580,7 @@ fn record(
             position,
             bytes,
         )?,
-        EnvelopeVerdict::Open { plain, .. } => match claim(tx, &body, &hash, bytes)? {
+        EnvelopeVerdict::Open { plain, .. } => match claim(tx, cx, &body, &hash, bytes)? {
             Some(other) => other,
             None => {
                 let kind = match &plain {
@@ -428,24 +589,24 @@ fn record(
                     EnvelopePlain::Complete { .. } => "complete",
                 };
                 tx.execute(
-                        "INSERT INTO mailbox_inbox(sender_host, object_id, kind, plain, object_hash, at_ms)
-                        VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-                        params![
-                            body.sender.host_id,
-                            body.id,
-                            kind,
-                            plain.to_bytes()?.as_slice(),
-                            hash.to_hex(),
-                            now_ms()
-                        ],
-                    )?;
+                    "INSERT INTO mailbox_inbox(sender_host, object_id, kind, plain, object_hash, at_ms)
+                    VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        body.sender.host_id,
+                        body.id,
+                        kind,
+                        plain.to_bytes()?.as_slice(),
+                        hash.to_hex(),
+                        now_ms()
+                    ],
+                )?;
                 Decision::Opened
             }
         },
         EnvelopeVerdict::RefusedAuthenticated { reason, .. } => {
-            match claim(tx, &body, &hash, bytes)? {
+            match claim(tx, cx, &body, &hash, bytes)? {
                 Some(other) => other,
-                None => refuse(tx, &hash, reason, Some(&body), bytes)?,
+                None => refuse(tx, cx, &hash, reason, Some(&body), bytes, expires)?,
             }
         }
     }))
@@ -456,6 +617,7 @@ fn record(
 /// is: a duplicate (the same sealed part), or a reused id (another).
 fn claim(
     tx: &Transaction,
+    cx: &DecideCx,
     body: &MailBody,
     hash: &Hash32,
     bytes: &[u8],
@@ -469,16 +631,16 @@ fn claim(
         .optional()?;
     match sealed {
         Some(sealed) if sealed == body.sealed_hash.to_hex() => Ok(Some(Decision::Duplicate)),
-        Some(_) => refuse(tx, hash, ID_REUSED, None, bytes).map(Some),
+        Some(_) => refuse(tx, cx, hash, ID_REUSED, None, bytes, Some(body.expires_at)).map(Some),
         None => {
             tx.execute(
-                "INSERT INTO mailbox_claims(sender_host, object_id, sealed_hash, expires_at)
+                "INSERT INTO mailbox_claims(sender_host, object_id, sealed_hash, keep_until)
                 VALUES(?1, ?2, ?3, ?4)",
                 params![
                     body.sender.host_id,
                     body.id,
                     body.sealed_hash.to_hex(),
-                    body.expires_at
+                    cx.keep_until(Some(body.expires_at))
                 ],
             )?;
             Ok(None)
@@ -486,33 +648,83 @@ fn claim(
     }
 }
 
-/// A refusal row under `evidence` (a duplicate when one is there): `body`
-/// for a refusal of the sender's own copy, reported by admission.
+/// A refusal row under `evidence`, its bytes within the evidence budget
+/// ([`Limits::evidence_bytes`]): `body` for a refusal of the sender's own
+/// copy, reported by admission. The same evidence again is a duplicate,
+/// unless this is the sender's own copy claiming its id now while that
+/// row says nothing to report (the same bytes refused before they could
+/// be verified): the row is upgraded to report it (review finding 4).
 fn refuse(
     tx: &Transaction,
+    cx: &DecideCx,
     evidence: &Hash32,
     reason: &'static str,
     body: Option<&MailBody>,
     bytes: &[u8],
+    expires_at: Option<u64>,
 ) -> Result<Decision> {
-    let written = tx.execute(
-        "INSERT OR IGNORE INTO mailbox_refused(evidence, reason, sender_host, object_id, report, bytes, at_ms)
-        VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            evidence.to_hex(),
-            reason,
-            body.map(|b| b.sender.host_id.as_str()),
-            body.map(|b| b.id.as_str()),
-            body.is_some(),
-            bytes,
-            now_ms()
-        ],
-    )?;
-    Ok(if written == 0 {
-        Decision::Duplicate
-    } else {
-        Decision::Refused(reason)
-    })
+    let report: Option<bool> = tx
+        .query_row(
+            "SELECT report FROM mailbox_refused WHERE evidence=?1",
+            [evidence.to_hex()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match (report, body) {
+        (None, _) => {
+            tx.execute(
+                "INSERT INTO mailbox_refused(evidence, reason, sender_host, object_id, report,
+                    bytes, keep_until, at_ms) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    evidence.to_hex(),
+                    reason,
+                    body.map(|b| b.sender.host_id.as_str()),
+                    body.map(|b| b.id.as_str()),
+                    body.is_some(),
+                    bytes,
+                    cx.keep_until(expires_at),
+                    now_ms()
+                ],
+            )?;
+        }
+        (Some(false), Some(body)) => {
+            tx.execute(
+                "UPDATE mailbox_refused SET reason=?2, sender_host=?3, object_id=?4, report=1,
+                    keep_until=max(keep_until, ?5) WHERE evidence=?1",
+                params![
+                    evidence.to_hex(),
+                    reason,
+                    body.sender.host_id,
+                    body.id,
+                    cx.keep_until(expires_at)
+                ],
+            )?;
+        }
+        (Some(_), _) => return Ok(Decision::Duplicate),
+    }
+    keep_within(tx, cx.limits.evidence_bytes)?;
+    Ok(Decision::Refused(reason))
+}
+
+/// The refusals' kept bytes within `budget`: the oldest go first, those
+/// not reported before those reported; their evidence hash stays.
+fn keep_within(tx: &Transaction, budget: u64) -> Result<()> {
+    loop {
+        let kept: u64 = tx.query_row("SELECT bytes FROM mailbox_kept WHERE one=1", [], |r| {
+            r.get(0)
+        })?;
+        if kept <= budget {
+            return Ok(());
+        }
+        let dropped = tx.execute(
+            "UPDATE mailbox_refused SET bytes=NULL WHERE n=(SELECT n FROM mailbox_refused
+                WHERE bytes IS NOT NULL ORDER BY report, n LIMIT 1)",
+            [],
+        )?;
+        if dropped == 0 {
+            return Ok(());
+        }
+    }
 }
 
 /// A waiting object (held once, at its latest position), or an overflow.
