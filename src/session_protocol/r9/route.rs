@@ -199,6 +199,11 @@ struct LocalAuth {
     /// first authentication, or at its first answer when the device list
     /// couldn't serve then.
     bound: Option<RouteWho>,
+    /// The pairing's host trust generation the link's socket is bound to:
+    /// the client's capture at its first authentication that named one. A
+    /// proof names no trust generation, so the route identity alone can't
+    /// tell a trust generation that moved.
+    trust_gen: Option<u64>,
     /// This host's identity changed on the link's socket: nothing more is
     /// answered on it.
     retired: bool,
@@ -261,6 +266,16 @@ impl LinkRoute {
     /// one challenge. The socket's first authentication binds it to the
     /// host's route identity now (if the device list can serve).
     pub fn authenticated(&mut self) {
+        self.authenticated_under(None);
+    }
+
+    /// [`LinkRoute::authenticated`] under the pairing's host trust
+    /// generation `trust_gen` (the link's client's capture; `None`: not
+    /// known, nothing compared): the socket's first authentication that
+    /// names one binds it, and one under another generation retires the
+    /// link (host-work-v1 §11.4, "An identity change": `atem pair verify`
+    /// rebound the pairing before Astation authenticated the link again).
+    pub fn authenticated_under(&mut self, trust_gen: Option<u64>) {
         // This authentication's allowance of lines (the socket's cap stays).
         self.lines = 0;
         let local = &mut self.local;
@@ -269,6 +284,9 @@ impl LinkRoute {
         // The socket's identity, checked at each authentication too: one
         // that moved while Astation authenticated the link again retires it
         // now, not at the next challenge.
+        if !self.local_same_trust_gen(trust_gen) {
+            return;
+        }
         let state = self
             .handle
             .lock()
@@ -345,6 +363,17 @@ impl LinkRoute {
         if self.line_allowed() {
             eprintln!("atem runtime: r9: host_challenge {line}");
         }
+    }
+
+    /// A local link's [`LinkRoute::answer`] under the pairing's host trust
+    /// generation now (`trust_gen`, the client's capture; `None`: not
+    /// known): one other than the socket's retires the link, unanswered
+    /// (`atem pair verify` rebound the pairing on the live link).
+    pub fn answer_under(&mut self, text: &str, trust_gen: Option<u64>) -> Option<String> {
+        if self.carrier == Carrier::Local && !self.local_same_trust_gen(trust_gen) {
+            return None;
+        }
+        self.answer(text)
     }
 
     /// The `host_route` answer to `text` (a `{"type":"relay","op":
@@ -445,6 +474,30 @@ impl LinkRoute {
             return false;
         }
         true
+    }
+
+    /// Whether `trust_gen` is the pairing's host trust generation a local
+    /// link's socket is bound to (binding it when it isn't bound yet; `None`
+    /// compares nothing); another one retires the link (logged once).
+    fn local_same_trust_gen(&mut self, trust_gen: Option<u64>) -> bool {
+        if self.local.retired {
+            return false;
+        }
+        let Some(now) = trust_gen else {
+            return true;
+        };
+        match self.local.trust_gen {
+            None => {
+                self.local.trust_gen = Some(now);
+                true
+            }
+            Some(bound) if bound == now => true,
+            Some(_) => {
+                self.local.retired = true;
+                self.log("not answered: this host's identity changed on this link; nothing more is answered on it");
+                false
+            }
+        }
     }
 
     /// Whether `state` is the route identity a local link's socket is bound
@@ -999,6 +1052,51 @@ mod tests {
             "a new head, the same identity"
         );
         assert!(!kept.retired());
+    }
+
+    /// A local link is bound to the pairing's host trust generation of its
+    /// first authentication that names one (its client's capture): a later
+    /// authentication, or a challenge, under another one retires it, since
+    /// a proof names no trust generation and the route identity alone can't
+    /// tell. `None` compares nothing; the same generation answers again.
+    #[test]
+    fn a_local_link_is_bound_to_its_pairings_trust_generation() {
+        let mut log = TestLog::genesis("acct-1", &secret("route astation"));
+        log.add_host("host-1", 1, &secret("route host"));
+        let handle = ready(&log);
+        // Another generation at a later authentication.
+        let mut link = LinkRoute::local(handle.clone(), ROOM, "atem-x");
+        link.authenticated_under(Some(1));
+        assert!(link.answer_under(&challenge_for(ROOM).1, Some(1)).is_some());
+        link.unauthenticated();
+        link.authenticated_under(Some(1));
+        assert!(
+            link.answer_under(&challenge_for(ROOM).1, Some(1)).is_some(),
+            "the same generation"
+        );
+        link.unauthenticated();
+        link.authenticated_under(Some(2));
+        assert!(link.retired(), "retired at the authentication");
+        assert_eq!(link.answer_under(&challenge_for(ROOM).1, Some(2)), None);
+        // Another generation at a challenge (a rebind on the live link).
+        let mut live = LinkRoute::local(handle.clone(), ROOM, "atem-x");
+        live.authenticated_under(Some(1));
+        assert_eq!(live.answer_under(&challenge_for(ROOM).1, Some(2)), None);
+        assert!(live.retired());
+        // None compares nothing; the first generation named binds.
+        let mut unknown = LinkRoute::local(handle.clone(), ROOM, "atem-x");
+        unknown.authenticated_under(None);
+        assert!(unknown.answer_under(&challenge_for(ROOM).1, None).is_some());
+        unknown.unauthenticated();
+        unknown.authenticated_under(Some(3));
+        assert!(
+            unknown
+                .answer_under(&challenge_for(ROOM).1, Some(3))
+                .is_some()
+        );
+        unknown.unauthenticated();
+        unknown.authenticated_under(Some(4));
+        assert!(unknown.retired());
     }
 
     /// The route's identity is checked at each authentication too, not only

@@ -531,6 +531,9 @@ fn rv_astation_link(rig: &mut LocalRig, link_gen: u64, socket: u64, local: bool)
 /// live socket): until it answers the link is offline, and the Station link
 /// is down (`r9_app_link` names no generation for it); a pass.
 fn rv_reauth_starts(rig: &mut LocalRig) {
+    rig.app
+        .astation_client
+        .local_route_unauthenticated_for_test();
     rig.app.astation_connected = false;
     rig.app.astation_reauth = Some(Instant::now() + std::time::Duration::from_secs(15));
     passes(rig, 1);
@@ -538,6 +541,28 @@ fn rv_reauth_starts(rig: &mut LocalRig) {
         rig.bridge.station.as_ref().unwrap().link().is_none(),
         "down"
     );
+}
+
+/// The Station's challenge through Astation's local link, as the App hands
+/// it to the link's client (`local_route_message`).
+fn rv_challenge(rig: &mut LocalRig) {
+    let challenge = atem_client::host_route::HostChallenge::new("room")
+        .to_json()
+        .to_string();
+    assert_eq!(
+        rig.app.astation_client.local_route_message(&challenge),
+        None
+    );
+}
+
+/// How many `host_route` proofs are among `texts`.
+fn rv_proofs(texts: &[String]) -> usize {
+    texts
+        .iter()
+        .filter(|text| {
+            serde_json::from_str::<serde_json::Value>(text).is_ok_and(|v| v["op"] == "host_route")
+        })
+        .count()
 }
 
 /// The host's trust generation moves on to `host_trust_gen` alone (the
@@ -592,12 +617,39 @@ fn a_trust_generation_moving_while_astation_reauthenticates_reconnects_the_socke
                 let (s, cover) = rv_covered(&mut rig, root, &os, start);
                 rv_astation_link(&mut rig, 7, 41, local);
                 let handle = rig.app.host_route.clone();
+                let mut sent = rig.app.astation_client.capture_sent_for_test();
                 if local {
+                    // The pairing the socket authenticates under, in trust
+                    // generation 1 (its own profile, so the capture checks).
+                    let pairing = root.join("pairing");
+                    crate::pairing::tests::write_bound(
+                        &pairing,
+                        "room",
+                        1,
+                        "binding-1",
+                        ("session-1", "token-1"),
+                    );
+                    let src = crate::profile::Sources::in_dir(&pairing);
+                    let capture = crate::pairing::Captured::now(&src).unwrap();
+                    rig.app.astation_client.set_capture_for_test(capture);
                     rig.app
                         .astation_client
                         .local_route_for_test(handle.clone(), "room");
+                    // The route answers on it.
+                    rv_challenge(&mut rig);
+                    assert_eq!(rv_proofs(&sent.texts()), 1, "{case}");
+                    // `atem pair verify` rebinds the pairing on the live
+                    // link (`OpCall::Rebind`): the capture adopts it.
+                    let capture = rig.app.astation_client.capture().unwrap().clone();
+                    let before = capture.state.clone();
+                    let after =
+                        crate::pairing::rebind_for_verification(&src, &before, "room").unwrap();
+                    assert_eq!(after.host_trust_gen, 2);
+                    rig.app
+                        .astation_client
+                        .adopt_binding(&before, &after)
+                        .unwrap();
                 }
-                let mut sent = rig.app.astation_client.capture_sent_for_test();
                 let hold = bot_record(&s.log, ControlAction::Hold, 2);
                 let heads = heads_text(&[(ORIGIN, OWN_FEED, 2)], s.log.log.head());
                 station_pass(&mut rig, 0, vec![heads.clone()]);
@@ -652,6 +704,17 @@ fn a_trust_generation_moving_while_astation_reauthenticates_reconnects_the_socke
                         "{case}: not while Astation authenticates it"
                     );
                     assert!(rig.app.identity_reconnect.is_some(), "{case}: kept");
+                }
+                if local {
+                    // Astation answers, as the App's re-authentication
+                    // takes it (`upgrade_routed`), and a challenge read with
+                    // the answer, before the pass: never answered on the old
+                    // socket (the route retired by the bridge, or by itself
+                    // at this authentication under trust generation 2).
+                    rig.app.astation_client.upgrade_routed();
+                    assert!(rig.app.astation_client.local_route_retired(), "{case}");
+                    rv_challenge(&mut rig);
+                    assert_eq!(rv_proofs(&sent.texts()), 0, "{case}: no proof");
                 }
                 // Astation answered: the same socket, a new link generation.
                 rv_astation_link(&mut rig, 8, 41, local);
