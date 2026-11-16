@@ -274,6 +274,7 @@ dependencies = [
  "unicode-properties",
  "unicode-security",
  "url",
+ "uuid",
  "x25519-dalek",
  "zeroize",
 ]

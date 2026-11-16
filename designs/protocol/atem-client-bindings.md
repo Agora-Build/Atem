@@ -21,7 +21,14 @@ the admitted welcome's features, then send session-family JSON through
 `Attached::send`). Results arrive as
 `ClientEvent::Family { family: "session", op: "host_work_result", json }`.
 The core checks the exact host, channel, attachment and request correlation
-before emitting that event; apps still inspect errors and each result state.
+before emitting that event, a `reply_query`'s non-null reply only with the
+asked task's `result_id` (`UUIDv5(NAMESPACE_OID, "result:" + task_id)`,
+exported as `host_work_result_id`); a result that answers nothing fails
+`on_frame` with `malformed` and closes the channel, like any unbound result
+(the app reconnects and asks again with a new id). The core also refuses to
+seal a `message_publish` whose Message has a `select` recipient: no channel
+admits one (host-work-v1 §11.5). Apps still inspect errors and each result
+state.
 
 | Feature | Operations | Contract |
 |---|---|---|
@@ -1054,14 +1061,15 @@ jar); it can be run on a download the same way.
 `WASM_BINDGEN`); CI: `.github/workflows/atem-client-bindings.yml` (Linux:
 Rust, Kotlin, WASM, end to end; macOS: Swift, the package dry run).
 
-- **Conformance** (73 checks in JS, 75 in Kotlin and in Swift: the same 73
+- **Conformance** (74 checks in JS, 76 in Kotlin and in Swift: the same 74
   in each language, plus two in Kotlin and Swift, whose provider sees the
   signing request and so the purposes of the five device-list actions and
   of control records; over `designs/protocol/fixtures/r9-vectors-*.json`,
   the acknowledgment fixtures `r9-control-ack-*.json`, atem-client's own
   `crates/atem-client/vectors/r9-svc-fingerprint.json` and the framing vectors
-  `designs/protocol/fixtures/host-work/{prompt-framing-v1,framing-size-v1}.json`,
-  four checks: the Unicode version, escape cases and marker check; the rendered
+  `designs/protocol/fixtures/host-work/{prompt-framing-v1,framing-size-v1}.json`
+  and `requests-v1.json`'s `result_ids` and `answers` cases,
+  four checks for the framing: the Unicode version, escape cases and marker check; the rendered
   prompts byte for byte and every tag of the vectors; the size section; every
   size case with its complete inputs, and the shapes the preflight refuses):
   `bindings/kotlin/Conformance.kt`

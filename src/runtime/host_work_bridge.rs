@@ -1891,7 +1891,9 @@ impl HostBridge {
     ) -> bool {
         use atem_client::session::messages::Destination;
         match &recipient.destination {
-            // Select expansion is local until the cross-instance contract is agreed.
+            // A channel Message with a `select` recipient doesn't decode
+            // (`Message::valid`, host-work-v1 §11.5: `select` is the `local`
+            // sender's and a host sender's); this arm stays as the last line.
             Destination::Select { .. } => false,
             Destination::Host => a
                 .remote()

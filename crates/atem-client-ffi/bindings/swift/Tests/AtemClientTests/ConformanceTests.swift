@@ -1,7 +1,8 @@
-// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) and the
+// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json), the
 // host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
-// framing-size-v1.json) run through the Swift binding, the same checks as the
-// Kotlin (bindings/kotlin/Conformance.kt) and WASM
+// framing-size-v1.json) and the host-work result_id vectors
+// (fixtures/host-work/requests-v1.json) run through the Swift binding, the
+// same checks as the Kotlin (bindings/kotlin/Conformance.kt) and WASM
 // (bindings/js/conformance.mjs) runs. ATEM_FIXTURES names the fixtures
 // directory.
 import CryptoKit
@@ -2209,9 +2210,33 @@ final class ConformanceTests: XCTestCase {
             }
         }
 
+        // ---------------------------------------------------------- host work
+        // A task's result_id (host-work-v1 §11.5) over
+        // designs/protocol/fixtures/host-work/requests-v1.json: the known
+        // answers (`result_ids`) and an app's own reply check on each
+        // `answers` case (a reply answers its reply_query only with the asked
+        // task's result_id; no reply yet always does). The connection applies
+        // the same check to every result it reads.
+        let requests = try loadWork("requests-v1")
+        check("host work: result_id known answers and the reply check (§11.5)") {
+            let known = a(requests["result_ids"]).map(o)
+            try eq(known.count, 2)
+            for c in known {
+                try eq(hostWorkResultId(taskId: s(c["task_id"])), s(c["result_id"]), s(c["name"]))
+            }
+            let answers = a(requests["answers"]).map(o)
+            try eq(answers.count, 3)
+            for c in answers {
+                let reply = o(o(c["result"])["result"])["reply"]
+                let task = s(o(o(c["request"])["data"])["task_id"])
+                let ok = reply is NSNull || s(o(reply)["result_id"]) == hostWorkResultId(taskId: task)
+                try eq(ok, c["answers"] as! Bool, s(c["name"]))
+            }
+        }
+
         print("swift conformance: \(passed) passed, \(failures.count) failed")
         for f in failures { print("FAIL \(f)") }
         XCTAssertEqual(failures, [], "conformance failures")
-        XCTAssertEqual(passed, 75)
+        XCTAssertEqual(passed, 76)
     }
 }

@@ -1,7 +1,9 @@
-// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json) and the
+// The shared r9 vectors (designs/protocol/fixtures/r9-vectors-*.json), the
 // host-work prompt-framing vectors (fixtures/host-work/prompt-framing-v1.json,
-// framing-size-v1.json) run through the Kotlin binding (UniFFI + JNA), the
-// same checks as the WASM (bindings/js/conformance.mjs) and Swift runs. Usage:
+// framing-size-v1.json) and the host-work result_id vectors
+// (fixtures/host-work/requests-v1.json) run through the Kotlin binding
+// (UniFFI + JNA), the same checks as the WASM (bindings/js/conformance.mjs)
+// and Swift runs. Usage:
 //   java -Djna.library.path=<dir of libatem_client_ffi.so> -cp … \
 //     atem.bindings.test.ConformanceKt <fixtures dir>
 package atem.bindings.test
@@ -1823,6 +1825,27 @@ fun main(args: Array<String>) {
         }
         for (mark in listOf("null", "{}", "[]", """{"mark_id":"m"}""")) {
             throwsCode("malformed") { framingCheckedLen("t", mark, "[]") }
+        }
+    }
+
+    // ----------------------------------------------------------- host work
+    // A task's result_id (host-work-v1 §11.5) over
+    // designs/protocol/fixtures/host-work/requests-v1.json: the known answers
+    // (`result_ids`) and an app's own reply check on each `answers` case (a
+    // reply answers its reply_query only with the asked task's result_id; no
+    // reply yet always does). The connection applies the same check to every
+    // result it reads.
+    val requests = loadWork("requests-v1")
+    check("host work: result_id known answers and the reply check (§11.5)") {
+        val known = requests["result_ids"].arr()
+        eq(known.size, 2)
+        for (c in known) eq(hostWorkResultId(c["task_id"].s()), c["result_id"].s(), c["name"].s())
+        val answers = requests["answers"].arr()
+        eq(answers.size, 3)
+        for (c in answers) {
+            val reply = c["result"]["result"]["reply"]
+            val ok = reply == null || reply["result_id"].s() == hostWorkResultId(c["request"]["data"]["task_id"].s())
+            eq(ok, c["answers"] as Boolean, c["name"].s())
         }
     }
 

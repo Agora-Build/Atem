@@ -106,14 +106,9 @@ pub fn grant(store: &Store, task_id: &str) -> Result<Option<ReturnGrant>> {
 }
 
 /// A task's one result id (UUIDv5 of the task id): the same for every
-/// reply to it, a corrected one included.
-pub fn result_id(task_id: &str) -> String {
-    uuid::Uuid::new_v5(
-        &uuid::Uuid::NAMESPACE_OID,
-        format!("result:{task_id}").as_bytes(),
-    )
-    .to_string()
-}
+/// reply to it, a corrected one included. The shared core's derivation,
+/// the one a client checks a reply against (host-work-v1 §11.5).
+pub use atem_client::session::host_work::result_id;
 
 /// The id of the task that delivers a reply to its local sender.
 pub fn delivery_id(task_id: &str) -> String {
@@ -578,6 +573,78 @@ mod tests {
         let outcome = submit(&tx, row)?;
         tx.commit()?;
         Ok(outcome)
+    }
+
+    /// The runtime's `result_id` is the shared core's one derivation
+    /// (host-work-v1 §11.5, "`result_id`"), equal to what this runtime
+    /// derived before the move (`UUIDv5(NAMESPACE_OID, "result:" +
+    /// task_id)`) for a remote UUID v4 task, a selector's UUID v5 task and
+    /// §11.5's example, so no stored or reported `result_id` changes; and a
+    /// reply row's wire form answers a client's `reply_query` for its task
+    /// (the core's check), and no other task's.
+    #[test]
+    fn the_runtime_and_the_core_derive_the_same_result_id() {
+        use atem_client::session::host_work::{self, HostTarget, Request, ResultBody};
+        let before = |task: &str| {
+            uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                format!("result:{task}").as_bytes(),
+            )
+            .to_string()
+        };
+        let selector_task = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_OID,
+            &serde_json::to_vec(&(
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+                "ses-ab23cd45ef67",
+            ))
+            .unwrap(),
+        )
+        .to_string();
+        for task in [
+            uuid::Uuid::new_v4().to_string(),
+            selector_task,
+            "22222222-2222-4222-8222-222222222222".into(),
+        ] {
+            assert_eq!(result_id(&task), host_work::result_id(&task), "{task}");
+            assert_eq!(host_work::result_id(&task), before(&task), "{task}");
+        }
+        assert_eq!(
+            result_id("22222222-2222-4222-8222-222222222222"),
+            "005c9723-949b-57f6-bfb1-db9b896dcfed"
+        );
+        let host = HostTarget {
+            account_id: "account".into(),
+            atem_device_id: "host".into(),
+            host_trust_gen: 1,
+        };
+        let query = |task_id: &str| Request::ReplyQuery {
+            v: 1,
+            id: uuid::Uuid::new_v4().to_string(),
+            host: host.clone(),
+            task_id: task_id.into(),
+        };
+        let mut remote = reply("done", vec![]);
+        remote.binding.task_id = uuid::Uuid::new_v4().to_string();
+        let row = ResultRow::new(remote, 100);
+        let answer = |request: &Request| {
+            let json = host_work::result(
+                &uuid::Uuid::new_v4().to_string(),
+                request.id(),
+                request.host(),
+                &uuid::Uuid::new_v4().to_string(),
+                "channel",
+                ResultBody::Reply {
+                    reply: Some(row.wire()),
+                },
+            );
+            host_work::Response::from_data(&json["data"]).unwrap()
+        };
+        let mine = query(row.task_id());
+        assert!(answer(&mine).answers(&mine));
+        let other = query(&uuid::Uuid::new_v4().to_string());
+        assert!(!answer(&other).answers(&other));
     }
 
     #[test]

@@ -661,9 +661,26 @@ impl ReplyState {
     }
 }
 
+/// A task's one `result_id`, the same for every reply to it, a corrected
+/// one included: `UUIDv5(NAMESPACE_OID, "result:" + task_id)`, the UTF-8
+/// bytes of `result:` and the task id as written (lowercase, with
+/// hyphens; a UUID v4, or a selector's UUID v5), with RFC 9562's
+/// `NAMESPACE_OID`, written lowercase with hyphens (host-work-v1 §11.5,
+/// "`result_id`"). The host derives every reply's with it, and a client
+/// checks a reply against the task it asked about with it
+/// ([`Response::answers`]): the one definition.
+pub fn result_id(task_id: &str) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_OID,
+        format!("result:{task_id}").as_bytes(),
+    )
+    .to_string()
+}
+
 /// The one reply of a task. `result_id` never changes for the task, a
-/// corrected reply included; `digest` identifies the reply's content (the
-/// same for an identical retry, another for a corrected one).
+/// corrected reply included ([`result_id`]); `digest` identifies the
+/// reply's content (the same for an identical retry, another for a
+/// corrected one).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResultReply {
@@ -827,7 +844,11 @@ impl Response {
                 ResultBody::Launch { launch },
                 Request::Launch { request_id, .. } | Request::LaunchQuery { request_id, .. },
             ) => &launch.request_id == request_id,
-            (ResultBody::Reply { .. }, Request::ReplyQuery { .. }) => true,
+            // No reply yet answers; a reply only when its `result_id` is the
+            // asked task's (host-work-v1 §11.5, "`result_id`").
+            (ResultBody::Reply { reply }, Request::ReplyQuery { task_id, .. }) => reply
+                .as_ref()
+                .is_none_or(|reply| reply.result_id == result_id(task_id)),
             (ResultBody::Work { work }, Request::Enqueue { task, .. }) => {
                 work.task_id == task.task_id
             }
@@ -924,6 +945,21 @@ mod tests {
             ("work_resolve_failed_detail_not_blank", false),
             ("work_resolve_failed_detail_without_cf", false),
             ("work_resolve_failed_detail_kept_as_given", true),
+        ] {
+            assert!(
+                cases
+                    .iter()
+                    .any(|c| c["name"] == name && c["valid"] == valid),
+                "{name}"
+            );
+        }
+        // A channel Message never carries `select` (host-work-v1 §11.5): the
+        // decoder refuses it, alone or beside another recipient, as it does
+        // the other local-only fields.
+        for (name, valid) in [
+            ("message_select_is_local_only", false),
+            ("message_select_beside_a_host_is_refused_whole", false),
+            ("message_from_session_is_local_only", false),
         ] {
             assert!(
                 cases
@@ -1043,6 +1079,56 @@ mod tests {
         }
     }
 
+    /// The shared correlation vectors: `result_ids` are the derivation's
+    /// known answers (host-work-v1 §11.5, "`result_id`"), and each `answers`
+    /// case is a request and a result that decodes, with whether the result
+    /// answers it: a reply answers its `reply_query` only with the asked
+    /// task's `result_id`, and no reply yet always does.
+    #[test]
+    fn shared_host_work_fixture_answers() {
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../../../designs/protocol/fixtures/host-work/requests-v1.json"
+        ))
+        .unwrap();
+        let known = fixtures["result_ids"].as_array().unwrap();
+        assert!(known.len() >= 2);
+        for case in known {
+            let task = case["task_id"].as_str().unwrap();
+            assert!(is_uuid_v4(task) || is_uuid_v5(task), "{}", case["name"]);
+            assert_eq!(
+                result_id(task),
+                case["result_id"].as_str().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+        let cases = fixtures["answers"].as_array().unwrap();
+        for (name, answers) in [
+            ("reply_answers_its_task", true),
+            ("reply_for_another_task_does_not_answer", false),
+            ("null_reply_answers", true),
+        ] {
+            assert!(
+                cases
+                    .iter()
+                    .any(|c| c["name"] == name && c["answers"] == answers),
+                "{name}"
+            );
+        }
+        for case in cases {
+            let request = Request::decode(case["request"].to_string().as_bytes())
+                .unwrap_or_else(|e| panic!("{}: {e}", case["name"]));
+            let response = Response::from_data(&case["result"])
+                .unwrap_or_else(|e| panic!("{}: {e}", case["name"]));
+            assert_eq!(
+                response.answers(&request),
+                case["answers"].as_bool().unwrap(),
+                "{}",
+                case["name"]
+            );
+        }
+    }
+
     #[test]
     fn result_correlation_distinguishes_task_and_message_identities() {
         let request = Request::LaunchQuery {
@@ -1131,6 +1217,14 @@ mod tests {
         }
     }
 
+    /// A submitted reply to the task `request` asks about.
+    fn reply_for(request: &Request) -> ResultReply {
+        ResultReply {
+            result_id: result_id(reply_task(request)),
+            ..submitted_reply()
+        }
+    }
+
     /// `reply_query` names one task, is a `host.reply` request, and has
     /// exactly the fields of `work_query`.
     #[test]
@@ -1170,7 +1264,7 @@ mod tests {
             serde_json::to_value(&none.result).unwrap(),
             json!({"kind":"reply","reply":null})
         );
-        let mut reply = submitted_reply();
+        let mut reply = reply_for(&request);
         let submitted = reply_answer(&request, Some(reply.clone()));
         assert!(submitted.answers(&request));
         let wire = serde_json::to_value(&submitted.result).unwrap();
@@ -1184,7 +1278,7 @@ mod tests {
         );
         // Dropped once its task settled a day past its deadline: the same
         // reply, without its text and context.
-        let mut dropped = submitted_reply();
+        let mut dropped = reply_for(&request);
         dropped.text.clear();
         dropped.context.clear();
         dropped.dropped = true;
@@ -1284,6 +1378,88 @@ mod tests {
         // The longest text the host accepts, and tabs and newlines.
         assert!(build(&|r| r.text = "a\tb\nc".repeat(2_000)).is_ok());
         assert!(build(&|r| r.text = "x".repeat(MAX_REPLY_TEXT_BYTES)).is_ok());
+    }
+
+    fn reply_task(request: &Request) -> &str {
+        match request {
+            Request::ReplyQuery { task_id, .. } => task_id,
+            _ => panic!("not a reply query"),
+        }
+    }
+
+    /// A reply answers a `reply_query` only when its `result_id` is the
+    /// one derivation from the task the query asked about (host-work-v1
+    /// §11.5, "`result_id`"; Astation's SDK point 1 of 2026-11-07): a
+    /// reply naming another task's, or no task's, doesn't answer it, in
+    /// any state, dropped included.
+    #[test]
+    fn a_reply_for_another_task_does_not_answer() {
+        let request = reply_query();
+        let reply = reply_for(&request);
+        assert!(reply_answer(&request, Some(reply.clone())).answers(&request));
+        for (what, other) in [
+            ("another task's", result_id(&super::super::new_id())),
+            ("no task's", "6ba7b810-9dad-51d1-80b4-00c04fd430c8".into()),
+        ] {
+            let mut wrong = reply.clone();
+            wrong.result_id = other;
+            // A result by itself: it decodes, and then answers nothing.
+            let answer = reply_answer(&request, Some(wrong.clone()));
+            assert!(!answer.answers(&request), "{what}");
+            wrong.text.clear();
+            wrong.context.clear();
+            wrong.dropped = true;
+            assert!(
+                !reply_answer(&request, Some(wrong.clone())).answers(&request),
+                "{what}, dropped"
+            );
+            wrong.dropped = false;
+            wrong.state = ReplyState::Publishing;
+            wrong.submitted_at = None;
+            assert!(
+                !reply_answer(&request, Some(wrong)).answers(&request),
+                "{what}, publishing"
+            );
+        }
+    }
+
+    /// No reply yet (`null`) answers its query as before: there is no
+    /// `result_id` to check.
+    #[test]
+    fn a_null_reply_still_answers() {
+        let request = reply_query();
+        let none = reply_answer(&request, None);
+        assert!(none.answers(&request));
+        // Only its own query.
+        assert!(!none.answers(&reply_query()));
+        let Request::ReplyQuery { v, id, host, .. } = request.clone() else {
+            unreachable!()
+        };
+        assert!(!none.answers(&Request::WorkQuery {
+            v,
+            id,
+            host,
+            task_id: reply_task(&request).into(),
+        }));
+    }
+
+    /// The derivation, `UUIDv5(NAMESPACE_OID, "result:" + task_id)`, with
+    /// host-work-v1 §11.5's known answers: a UUID v4 task and a selector's
+    /// UUID v5 task.
+    #[test]
+    fn result_id_is_the_uuid_v5_of_the_task() {
+        assert_eq!(
+            result_id("22222222-2222-4222-8222-222222222222"),
+            "005c9723-949b-57f6-bfb1-db9b896dcfed"
+        );
+        assert_eq!(
+            result_id("80160896-4fcd-5e6e-adac-98bac5497321"),
+            "996a448a-cf99-5e86-aa67-7f9a582a7eaa"
+        );
+        let task = super::super::new_id();
+        assert!(is_uuid_v5(&result_id(&task)));
+        assert_eq!(result_id(&task), result_id(&task));
+        assert_ne!(result_id(&task), result_id(&super::super::new_id()));
     }
 
     #[test]

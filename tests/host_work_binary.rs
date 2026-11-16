@@ -2987,15 +2987,19 @@ fn messages_bind_sender_content_destinations_and_service_scope() {
     changed["message_id"] = json!(uuid());
     changed["sender"] = json!(format!("member:{MAC}"));
     assert_eq!(publish(&mut dev, &mut r, &changed)["code"], "forbidden");
-    // The sending session, the reply link and kinds other than a request are
-    // local-only: a remote envelope with one is invalid. The SDK refuses to
-    // send it (the host refuses it at decode, `invalid_request`; the shared
-    // vectors cover that), and nothing is recorded.
+    // The sending session, the reply link, kinds other than a request and a
+    // `select` recipient (host-work-v1 §11.5) are local-only: a remote
+    // envelope with one is invalid. The SDK refuses to send it (the host
+    // refuses it at decode, `invalid_request`; the shared vectors cover
+    // that), and nothing is recorded.
     let reply_to = json!({"message_id": uuid(), "task_id": uuid()});
+    let select = json!([{"recipient_id":uuid(),"host":host(),
+        "destination":{"kind":"select","selectors":["tag:a"],"budget":1}}]);
     for (field, value, extra) in [
         ("from_session", json!("ses-abcdefghijkl"), None),
         ("reply_to", reply_to.clone(), None),
         ("kind", json!("result"), Some(("reply_to", reply_to))),
+        ("recipients", select, None),
     ] {
         let mut local_only = notice("service:svc-message", "Ready", vec![json!({"kind":"host"})]);
         local_only[field] = value;
