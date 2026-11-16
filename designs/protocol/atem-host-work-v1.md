@@ -2299,14 +2299,21 @@ re-authentication on the socket answers a fresh one; a second challenge in
 one generation is ignored), never before or while Astation authenticates
 the link (ignored with a runtime.log line), never for another room, and
 never again on a socket where the host's identity changed ("An identity
-change" below, a change while Astation authenticates the link again
-included: the new socket answers under the new identity). The verdict is informational on the host,
-a runtime.log line: a `host_route_ok` is the Station's association for the
-link's calls (the link stays an Astation-authenticated local link, never
-routed); a `host_route_refused` keeps the link (owner-present Astation),
-and the Station refuses the link's calls as it does today, so the gate
-stays closed and `atem status`'s `Control feeds:` line shows that refusal.
-The calls themselves (`control_sync`, `membership_fetch`, `control_ack` and
+change" below, a change before or while Astation authenticates the link
+again included: the new socket answers under the new identity). A proof
+names no trust generation, so the local link is also bound to the
+pairing's host trust generation of its socket's first authentication
+(the link's capture, which `atem pair verify`'s rebind moves): an
+authentication or a challenge under another generation retires it, and
+no challenge read with Astation's re-authentication reply is answered
+after the pairing moved, even before the host takes the new generation.
+The verdict is informational on the host, a runtime.log line: a
+`host_route_ok` is the Station's association for the link's calls (the
+link stays an Astation-authenticated local link, never routed); a
+`host_route_refused` keeps the link (owner-present Astation), and the
+Station refuses the link's calls as it does today, so the gate stays
+closed and `atem status`'s `Control feeds:` line shows that refusal. The
+calls themselves (`control_sync`, `membership_fetch`, `control_ack` and
 the Station's `heads`) are unchanged. With the hook off a local link
 ignores the challenge, as before.
 
@@ -2553,9 +2560,10 @@ own Station's feed:
     trust generation, account, genesis or key applied there), and also
     when it changes while Astation authenticates the link again (the link
     is offline until Astation answers, then comes back on the same
-    socket; the host keeps that socket and its identity across the
-    window, so a change there, a trust generation alone included, counts
-    against it):
+    socket; the host keeps that socket, its identity and a change already
+    counted against it across the window, so a change there, a trust
+    generation alone included, counts against it, and one from before
+    the window still does):
     - the live call is retired by its id, so its page is drained when it
       comes. A read from 0 is drained too, however full: it is never the
       new identity's first read, and the feed is asked again under the

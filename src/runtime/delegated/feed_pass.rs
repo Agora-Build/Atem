@@ -186,9 +186,10 @@ impl HostBridge {
     /// first, its Station step, its end). One its link's socket wasn't
     /// authenticated under (a re-verify on the live link, a new trust
     /// generation, account, genesis or key, while the link is up or while
-    /// Astation authenticates it again) ends that link's association: its call retired, nothing more asked, fetched or
-    /// acknowledged on it, its gate closed (`Station::on_identity`), and
-    /// the App asked to reconnect it at the pass's end.
+    /// Astation authenticates it again) ends that link's association: its
+    /// call retired, nothing more asked, fetched or acknowledged on it, its
+    /// gate closed (`Station::on_identity`), and the App asked to reconnect
+    /// it at the pass's end.
     pub(crate) fn station_identity(&mut self) {
         // No Station link without `host.delegated`: nothing to hand over.
         if self.station.is_none() {

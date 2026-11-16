@@ -108,10 +108,12 @@
 //!   generation, the device list's genesis and the host's
 //!   `host_channel_key` ([`HostIdentity`]). When the host's identity
 //!   changes while the link is up (`atem pair verify` rebinding on the
-//!   live link, a new trust generation, account, genesis or key), or while Astation authenticates it again (the link is down
-//!   until Astation answers, then back on the same socket: the socket and
-//!   its identity are kept across the drop, so the change counts against
-//!   it), the old association is never relabelled the new one's: the
+//!   live link, a new trust generation, account, genesis or key), or
+//!   while Astation authenticates it again (the link is down until
+//!   Astation answers, then back on the same socket: the socket, its
+//!   identity and a move are kept across the drop, so a change before or
+//!   during the window counts against it), the old association is never
+//!   relabelled the new one's: the
 //!   live call is retired, its page drained when it comes, a read from 0
 //!   included (never the new identity's store's first read, however full),
 //!   and nothing more is asked or applied on that socket, a new generation
