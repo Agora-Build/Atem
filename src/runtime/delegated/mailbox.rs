@@ -42,6 +42,17 @@
 //!   and keeps the gate's mailbox part closed until a page asked after it
 //!   reads; nothing is asked before a `heads` 30 s or more later (or the
 //!   next link generation).
+//! - **Dones** (rules 5 and 8). A done goes only for a position the store
+//!   owes, written with its page's commit ([`Observed::owed`]): never
+//!   before that commit. Only in the mailbox this link generation's `heads`
+//!   announced and the store has read (none to a mailbox being reset); at
+//!   most [`MAX_LIVE_DONES`] live, each with a fresh id; one answered
+//!   (`request_id`, `mailbox_id` and `position`) is freed for the bridge to
+//!   remove; one unanswered for 35 s goes again with a fresh id; a
+//!   `mailbox_done_refused` retires every live done and none goes again on
+//!   that link generation. Owed dones survive a restart in the store.
+//! - **An identity change** on the live link (§11.4): every live mailbox
+//!   call retired, nothing more synced or marked done on that socket.
 //! - **The gate's mailbox part** (design II.5; [`MailboxClient::open`]):
 //!   the link up, a mailbox announced on this generation and read up to its
 //!   head, no refusal, fault or reset waiting, and the inbox drained (the
@@ -52,7 +63,7 @@ use super::station::StationLink;
 use super::sync::{HostIdentity, RETIRED_KEPT, SYNC_TIMEOUT_MS};
 use atem_client::control::{MailboxHead, RelayError};
 use atem_client::host_mail::mailbox::{
-    MailboxDone, MailboxMismatch, MailboxSync, MailboxSyncResult,
+    MailboxDone, MailboxDoneResult, MailboxMismatch, MailboxSync, MailboxSyncResult,
 };
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -65,6 +76,9 @@ pub struct Observed {
     pub identity: HostIdentity,
     pub cursor: Option<(String, u64)>,
     pub inbox: u64,
+    /// The dones owed to the cursor's mailbox (positions, the first 64),
+    /// each written with its page's commit.
+    pub owed: Vec<u64>,
 }
 
 /// What a page is to the live call ([`MailboxClient::on_page`]).
@@ -121,6 +135,16 @@ struct Ask {
     sent: bool,
 }
 
+/// A live `mailbox_done`.
+#[derive(Debug, Clone)]
+struct DoneAsk {
+    call: MailboxDone,
+    sent_at: u64,
+}
+
+/// The most dones live per link generation (rule 8).
+pub const MAX_LIVE_DONES: usize = 8;
+
 /// The host's side of its own mailbox on its Station link (the module
 /// docs give the rules).
 #[derive(Debug, Default)]
@@ -137,6 +161,12 @@ pub struct MailboxClient {
     observed: Option<Observed>,
     in_flight: Option<Ask>,
     retired: VecDeque<String>,
+    /// The live dones, and the ids of those retired (their answers
+    /// drained), the latest [`RETIRED_KEPT`].
+    dones: Vec<DoneAsk>,
+    retired_dones: VecDeque<String>,
+    /// A `mailbox_done_refused` on this link generation: no more dones.
+    dones_refused: bool,
     resync: Option<Resync>,
     epoch: u64,
     refused_at: Option<u64>,
@@ -151,6 +181,9 @@ pub struct MailboxClient {
     resets: u64,
     refusals: u64,
     timeouts: u64,
+    dones_sent: u64,
+    dones_answered: u64,
+    unsolicited: u64,
 }
 
 /// A fresh `request_id` (rule 8): a lowercase UUID v4 from the operating
@@ -179,6 +212,7 @@ impl MailboxClient {
         self.announced = None;
         self.resync = None;
         self.refused_at = None;
+        self.dones_refused = false;
         if now.map(|(_, socket)| socket) != self.socket {
             self.moved = false;
         }
@@ -205,6 +239,16 @@ impl MailboxClient {
         {
             self.timeouts += 1;
             self.retire_live();
+        }
+        // A done unanswered for 35 s goes again, with a fresh id.
+        let late: Vec<String> = self
+            .dones
+            .iter()
+            .filter(|d| now >= d.sent_at.saturating_add(SYNC_TIMEOUT_MS))
+            .map(|d| d.call.request_id.clone())
+            .collect();
+        for id in late {
+            self.retire_done(&id);
         }
         if self.resync != Some(Resync::Refused) {
             self.ask(true);
@@ -346,14 +390,91 @@ impl MailboxClient {
         self.epoch += 1;
     }
 
-    /// The calls to send now, marked sent: the live sync if it wasn't yet.
+    /// A `mailbox_done_result` (rule 8): it applies only to a live done
+    /// with its `request_id`, `mailbox_id` and `position`, which is then
+    /// retired; the position it frees (`(mailbox_id, position)`), for the
+    /// bridge to remove from the dones owed. Anything else changes nothing
+    /// (an unsolicited one counted, no Station fault).
+    pub fn on_done_result(&mut self, result: MailboxDoneResult) -> Option<(String, u64)> {
+        let live = self
+            .dones
+            .iter()
+            .find(|d| d.call.request_id == result.request_id);
+        match live {
+            Some(done) if result.answers(&done.call).is_ok() => {
+                let freed = (done.call.mailbox_id.clone(), done.call.position);
+                self.retire_done(&result.request_id);
+                self.dones_answered += 1;
+                Some(freed)
+            }
+            _ => {
+                if !self.retired_dones.contains(&result.request_id) {
+                    self.unsolicited += 1;
+                }
+                None
+            }
+        }
+    }
+
+    /// `mailbox_done_refused` (rule 8): every live done retired; they go
+    /// again on the next link generation.
+    pub fn on_done_refused(&mut self) {
+        self.refusals += 1;
+        self.dones_refused = true;
+        for id in self.live_done_ids() {
+            self.retire_done(&id);
+        }
+    }
+
+    /// The calls to send now, marked sent: the live sync if it wasn't yet,
+    /// and a done for each owed position not live (at most
+    /// [`MAX_LIVE_DONES`] live), only in the mailbox this link generation's
+    /// `heads` announced and the store has read (never to one being reset).
     pub fn take_outgoing(&mut self) -> Outgoing {
         let mut out = Outgoing::default();
         if let Some(ask) = self.in_flight.as_mut().filter(|ask| !ask.sent) {
             ask.sent = true;
             out.sync.push(ask.call.clone());
         }
+        if self.link_gen.is_none() || self.moved || self.dones_refused || self.reset {
+            return out;
+        }
+        let (Some(announced), Some(observed)) = (&self.announced, &self.observed) else {
+            return out;
+        };
+        let Some((mailbox_id, _)) = observed
+            .cursor
+            .as_ref()
+            .filter(|(id, _)| *id == announced.mailbox_id)
+        else {
+            return out;
+        };
+        for &position in &observed.owed {
+            if self.dones.len() >= MAX_LIVE_DONES {
+                break;
+            }
+            if self.dones.iter().any(|d| d.call.position == position) {
+                continue;
+            }
+            let call = MailboxDone {
+                request_id: fresh_request_id(),
+                mailbox_id: mailbox_id.clone(),
+                position,
+            };
+            self.dones.push(DoneAsk {
+                call: call.clone(),
+                sent_at: self.now,
+            });
+            self.dones_sent += 1;
+            out.dones.push(call);
+        }
         out
+    }
+
+    /// The done `request_id` wasn't handed to the link: no longer live (it
+    /// goes again), and its id never one an answer may carry.
+    pub fn done_unsent(&mut self, request_id: &str) {
+        self.dones.retain(|d| d.call.request_id != request_id);
     }
 
     /// The call `request_id` wasn't handed to the link: none is live (it
@@ -422,6 +543,7 @@ impl MailboxClient {
     }
 
     /// The host's own mailbox as last announced.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn announced(&self) -> Option<&MailboxHead> {
         self.announced.as_ref()
     }
@@ -442,6 +564,12 @@ impl MailboxClient {
             "resets": self.resets,
             "refusals": self.refusals,
             "timeouts": self.timeouts,
+            "dones": self.dones.iter().map(|d| d.call.position).collect::<Vec<_>>(),
+            "owed": self.observed.as_ref().map(|o| o.owed.clone()),
+            "dones_sent": self.dones_sent,
+            "dones_answered": self.dones_answered,
+            "dones_refused": self.dones_refused,
+            "unsolicited": self.unsolicited,
             "identity_moved": self.moved,
         })
     }
@@ -463,6 +591,24 @@ impl MailboxClient {
 
     fn retire_all(&mut self) {
         self.retire_live();
+        for id in self.live_done_ids() {
+            self.retire_done(&id);
+        }
+    }
+
+    fn live_done_ids(&self) -> Vec<String> {
+        self.dones
+            .iter()
+            .map(|d| d.call.request_id.clone())
+            .collect()
+    }
+
+    fn retire_done(&mut self, request_id: &str) {
+        self.dones.retain(|d| d.call.request_id != request_id);
+        if self.retired_dones.len() >= RETIRED_KEPT {
+            self.retired_dones.pop_front();
+        }
+        self.retired_dones.push_back(request_id.to_string());
     }
 
     /// A Station fault: the gate closed until a page asked after it reads.

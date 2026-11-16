@@ -109,3 +109,477 @@ fn a_reset_mark_is_durable() {
     mark_reset(&store, &identity(1), MAILBOX_2).unwrap();
     assert_eq!(cursor(&store), Some((MAILBOX_2.into(), 0)));
 }
+
+// ------------------------------------------------- the objects' decisions
+
+use crate::session_protocol::membership::r9log::{TestLog, secret};
+use atem_client::host_mail::receive::reason;
+use atem_client::host_mail::{EnvelopePlain, HostRef, MailFields, Recipient, seal_envelope};
+use atem_client::membership::Head;
+use atem_client::{KeyId, KeyProvider, PublicKey, SignedObject, SoftwareKeys};
+
+const HOUR: u64 = 3_600_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// This host (`host`, generation 1) and host B (`host-b`, generation 1)
+/// in one device list; B's `host_key` and this host's encryption key.
+struct Mail {
+    log: TestLog,
+    sender: SoftwareKeys,
+    keys: SoftwareKeys,
+    enc_pub: PublicKey,
+    recipient: Recipient,
+}
+
+impl Mail {
+    fn new() -> Mail {
+        let mut log = TestLog::genesis("acct-m", &secret("mail astation"));
+        log.add_host("host", 1, &secret("mail host"));
+        log.add_host("host-b", 1, &secret("mail host b"));
+        let mut sender = SoftwareKeys::new();
+        sender.insert_ed25519(KeyId::new("host-b"), &secret("mail host b"));
+        let mut keys = SoftwareKeys::new();
+        keys.insert_x25519(KeyId::new("enc"), &secret("mail host enc"));
+        let enc_pub = keys.public_key(&KeyId::new("enc")).unwrap();
+        let kid = atem_client::keys::enc_kid_bytes(&enc_pub).unwrap();
+        Mail {
+            log,
+            sender,
+            keys,
+            enc_pub,
+            recipient: Recipient {
+                host_id: "host".into(),
+                host_trust_gen: 1,
+                keys: vec![(KeyId::new("enc"), kid)],
+                generated: vec![],
+            },
+        }
+    }
+
+    fn cx(&self) -> DecideCx<'_> {
+        DecideCx {
+            list: &self.log.log,
+            recipient: &self.recipient,
+            provider: &self.keys,
+            now_ms: now_ms(),
+        }
+    }
+
+    /// B's object to this host, signed at `head`, from `sender` (claimed).
+    fn fields(&self, sender: &str, head: Head, expires_at: u64) -> MailFields {
+        MailFields {
+            account_id: self.log.account.clone(),
+            genesis_hash: self.log.genesis_hash(),
+            sender: HostRef {
+                host_id: sender.into(),
+                host_trust_gen: 1,
+            },
+            recipient: HostRef {
+                host_id: "host".into(),
+                host_trust_gen: 1,
+            },
+            enc_kid: atem_client::keys::enc_kid(&self.enc_pub).unwrap(),
+            id: uuid(),
+            created_at: now_ms() - 1_000,
+            expires_at,
+            signed_at_head: head,
+        }
+    }
+
+    fn seal(&self, fields: &MailFields) -> SignedObject {
+        let plain = EnvelopePlain::Cancel { task_id: uuid() };
+        seal_envelope(
+            &self.sender,
+            &KeyId::new("host-b"),
+            fields,
+            &plain,
+            &self.enc_pub,
+        )
+        .unwrap()
+    }
+
+    /// A cancel from B at this list's head, valid for an hour.
+    fn cancel(&self) -> SignedObject {
+        self.seal(&self.fields("host-b", self.log.log.head(), now_ms() + HOUR))
+    }
+
+    /// One signed by `sender` at a head beyond this list's: it waits.
+    fn beyond(&self, sender: &str) -> SignedObject {
+        let head = self.log.log.head();
+        let beyond = Head {
+            seq: head.seq + 5,
+            hash: Hash32([7; 32]),
+        };
+        self.seal(&self.fields(sender, beyond, now_ms() + HOUR))
+    }
+}
+
+/// The store's mailbox, read since a cursor at `MAILBOX`'s `at`.
+struct Box {
+    _dir: tempfile::TempDir,
+    store: Store,
+    at: u64,
+}
+
+impl Box {
+    fn new() -> Box {
+        let (dir, store) = store();
+        Box {
+            _dir: dir,
+            store,
+            at: 0,
+        }
+    }
+
+    /// The next position holds `object` (any JSON): its page committed.
+    fn put(&mut self, mail: &Mail, object: &serde_json::Value) -> Commit {
+        self.put_with(&mail.cx(), object)
+    }
+
+    /// [`Box::put`], decided with `cx`.
+    fn put_with(&mut self, cx: &DecideCx, object: &serde_json::Value) -> Commit {
+        let bytes = object.to_string();
+        let page = MailboxSyncResult {
+            request_id: REQUEST.into(),
+            mailbox_id: MAILBOX.into(),
+            after: self.at,
+            head: self.at + 1,
+            through: self.at + 1,
+            objects: vec![entry(self.at + 1, &bytes)],
+        };
+        let commit = commit_page(&self.store, &identity(1), &page, Some(cx)).unwrap();
+        if matches!(commit, Commit::Committed(_)) {
+            self.at += 1;
+        }
+        commit
+    }
+
+    fn count(&self, table: &str) -> u64 {
+        self.store
+            .db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    fn owed(&self) -> Vec<u64> {
+        owed_dones(&self.store, &identity(1)).unwrap()
+    }
+}
+
+/// A page's object at `position`, its bytes `text` (read as a page carries
+/// it: through the shared reader).
+fn entry(position: u64, text: &str) -> MailboxEntry {
+    let page = format!(
+        r#"{{"type":"relay","op":"mailbox_sync_result","request_id":"{REQUEST}","mailbox_id":"{MAILBOX}","after":{},"head":{position},"through":{position},"objects":[{{"position":{position},"object":{text}}}]}}"#,
+        position - 1
+    );
+    MailboxSyncResult::decode(page.as_bytes())
+        .unwrap()
+        .objects
+        .remove(0)
+}
+
+/// The decision a commit recorded for its one object.
+fn decided(commit: Commit) -> Decision {
+    match commit {
+        Commit::Committed(c) => c.decided.into_iter().next().expect("an object"),
+        other => panic!("not committed: {other:?}"),
+    }
+}
+
+/// Design II.4.2, §11.5's verdicts: an opened cancel is an inbox row (and
+/// its claim); a refusal before the copy is shown to be the sender's is a
+/// refusal row with its evidence (`object_hash`) and the exact bytes as
+/// fetched, nothing reported; one after it (expired) is a refusal row to
+/// report and its claim; bytes that don't parse are refused under the
+/// SHA-256 of the bytes; an object signed beyond this host's head waits.
+/// Every one but the waiting one is owed a done, in its page's commit.
+#[test]
+fn each_verdict_has_its_row() {
+    let mail = Mail::new();
+    let mut b = Box::new();
+    let open = mail.cancel();
+    assert_eq!(decided(b.put(&mail, &open.to_json())), Decision::Opened);
+    assert_eq!(b.count("mailbox_inbox"), 1);
+    assert_eq!(read(&b.store, &identity(1)).unwrap().inbox, 1);
+    let (sender, object_id, kind): (String, String, String) = b
+        .store
+        .db
+        .query_row(
+            "SELECT sender_host, object_id, kind FROM mailbox_inbox",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    let body = atem_client::host_mail::MailBody::from_object(&open)
+        .unwrap()
+        .1;
+    assert_eq!(
+        (sender.as_str(), object_id, kind.as_str()),
+        ("host-b", body.id, "cancel")
+    );
+
+    // Not this host's account: refused before verification.
+    let mut fields = mail.fields("host-b", mail.log.log.head(), now_ms() + HOUR);
+    fields.account_id = "acct-other".into();
+    let pin = mail.seal(&fields);
+    let text = pin.to_json().to_string();
+    assert_eq!(
+        decided(b.put(&mail, &pin.to_json())),
+        Decision::Refused(reason::PIN_MISMATCH)
+    );
+    let (evidence, bytes, report): (String, Vec<u8>, i64) = b
+        .store
+        .db
+        .query_row(
+            "SELECT evidence, bytes, report FROM mailbox_refused WHERE reason=?1",
+            [reason::PIN_MISMATCH],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(evidence, atem_client::host_mail::object_hash(&pin).to_hex());
+    assert_eq!(bytes, text.as_bytes());
+    assert_eq!(report, 0);
+
+    // The sender's own copy, expired: refused authenticated, to report.
+    let mut fields = mail.fields("host-b", mail.log.log.head(), now_ms() - 1);
+    fields.created_at = now_ms() - HOUR;
+    let expired = mail.seal(&fields);
+    assert_eq!(
+        decided(b.put(&mail, &expired.to_json())),
+        Decision::Refused(reason::EXPIRED)
+    );
+    let (object_id, report): (String, i64) = b
+        .store
+        .db
+        .query_row(
+            "SELECT object_id, report FROM mailbox_refused WHERE reason=?1",
+            [reason::EXPIRED],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((object_id, report), (fields.id.clone(), 1));
+    assert_eq!(b.count("mailbox_claims"), 2);
+
+    // Bytes that don't parse as a signed object.
+    let junk = serde_json::json!({"not": "an object"});
+    assert_eq!(
+        decided(b.put(&mail, &junk)),
+        Decision::Refused(reason::MALFORMED)
+    );
+    let evidence: String = b
+        .store
+        .db
+        .query_row(
+            "SELECT evidence FROM mailbox_refused WHERE reason=?1",
+            [reason::MALFORMED],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(evidence, Hash32::of(junk.to_string().as_bytes()).to_hex());
+
+    // Signed beyond this host's head: kept, no done.
+    assert_eq!(
+        decided(b.put(&mail, &mail.beyond("host-c").to_json())),
+        Decision::Pending
+    );
+    assert_eq!(b.count("mailbox_pending"), 1);
+    assert_eq!(b.owed(), [1, 2, 3, 4], "every position but the waiting one");
+    assert_eq!(b.count("mailbox_inbox"), 1);
+}
+
+/// §11.5 "Which copies claim an id": the sender's object again (another
+/// position) is a duplicate with the first verdict, done again and nothing
+/// recorded; its id with another sealed part is refused as a reused id
+/// (kept as evidence, the first verdict standing); an unauthenticated
+/// refusal's bytes again are a duplicate of that refusal; a waiting
+/// object again is held once.
+#[test]
+fn duplicates_keep_the_first_verdict() {
+    let mail = Mail::new();
+    let mut b = Box::new();
+    let open = mail.cancel();
+    assert_eq!(decided(b.put(&mail, &open.to_json())), Decision::Opened);
+    assert_eq!(decided(b.put(&mail, &open.to_json())), Decision::Duplicate);
+    // The same id, another sealed part (a new seal of other text).
+    let body = atem_client::host_mail::MailBody::from_object(&open)
+        .unwrap()
+        .1;
+    let mut fields = body.fields();
+    fields.expires_at -= 1;
+    let reused = mail.seal(&fields);
+    assert_eq!(
+        decided(b.put(&mail, &reused.to_json())),
+        Decision::Refused(ID_REUSED)
+    );
+    assert_eq!(b.count("mailbox_inbox"), 1);
+    assert_eq!(
+        decided(b.put(&mail, &reused.to_json())),
+        Decision::Duplicate
+    );
+    let junk = serde_json::json!([1, 2]);
+    assert_eq!(
+        decided(b.put(&mail, &junk)),
+        Decision::Refused(reason::MALFORMED)
+    );
+    assert_eq!(decided(b.put(&mail, &junk)), Decision::Duplicate);
+    assert_eq!(b.count("mailbox_refused"), 2);
+    let waits = mail.beyond("host-c");
+    assert_eq!(decided(b.put(&mail, &waits.to_json())), Decision::Pending);
+    assert_eq!(decided(b.put(&mail, &waits.to_json())), Decision::Pending);
+    assert_eq!(b.count("mailbox_pending"), 1, "held once");
+    let position: u64 = b
+        .store
+        .db
+        .query_row("SELECT position FROM mailbox_pending", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(position, 8, "at its latest position");
+    assert_eq!(b.owed(), [1, 2, 3, 4, 5, 6]);
+}
+
+/// Rule 4 and Astation's ask (#120): an object's decision, its row, the
+/// cursor and the done owed commit in one transaction, before any done is
+/// sent. A crash after the commit (the store reopened) keeps the owed
+/// done; the page delivered again from the old cursor is stale, so
+/// nothing applies twice. An object that can't be decided now (the key
+/// provider failed) commits nothing at all; once answered, a done is no
+/// longer owed; a reset drops the dones owed to the old mailbox.
+#[test]
+fn one_transaction_for_the_decision_the_cursor_and_the_dones() {
+    let mail = Mail::new();
+    let mut b = Box::new();
+    let open = mail.cancel();
+    assert_eq!(decided(b.put(&mail, &open.to_json())), Decision::Opened);
+    let dir = b._dir.path().to_path_buf();
+    let reopened = Store::open(&dir).unwrap();
+    assert_eq!(owed_dones(&reopened, &identity(1)).unwrap(), [1]);
+    let again = MailboxSyncResult {
+        request_id: REQUEST.into(),
+        mailbox_id: MAILBOX.into(),
+        after: 0,
+        head: 1,
+        through: 1,
+        objects: vec![entry(1, &open.to_json().to_string())],
+    };
+    assert_eq!(
+        commit_page(&reopened, &identity(1), &again, Some(&mail.cx())).unwrap(),
+        Commit::Stale
+    );
+    assert_eq!(b.count("mailbox_inbox"), 1, "nothing applied twice");
+
+    // The key provider fails (no key behind the kid): nothing commits.
+    let broken = DecideCx {
+        provider: &SoftwareKeys::new(),
+        ..mail.cx()
+    };
+    assert_eq!(
+        b.put_with(&broken, &mail.cancel().to_json()),
+        Commit::Undecided
+    );
+    assert_eq!(
+        read(&b.store, &identity(1)).unwrap().cursor,
+        Some((MAILBOX.into(), 1))
+    );
+    assert_eq!((b.count("mailbox_inbox"), b.owed()), (1, vec![1]));
+
+    done_answered(&b.store, &identity(1), MAILBOX, 1).unwrap();
+    assert!(b.owed().is_empty());
+    decided(b.put(&mail, &mail.cancel().to_json()));
+    assert_eq!(b.owed(), [2]);
+    mark_reset(&b.store, &identity(1), MAILBOX_2).unwrap();
+    assert!(b.owed().is_empty(), "dropped with the old mailbox");
+}
+
+/// Design II.4.2's limits: at most 64 waiting objects per claimed
+/// `(host_id, host_trust_gen)` and 256 in all; one over either is dropped
+/// undecided (no verdict, no row, no id) and still marked done (Atem's
+/// refinement, agreed 2026-11-16).
+#[test]
+fn the_pending_limits_and_overflow_marked_done() {
+    let mail = Mail::new();
+    let mut b = Box::new();
+    for n in 0..MAX_PENDING_PER_SENDER {
+        assert_eq!(
+            decided(b.put(&mail, &mail.beyond("host-x").to_json())),
+            Decision::Pending,
+            "{n}"
+        );
+    }
+    assert_eq!(
+        decided(b.put(&mail, &mail.beyond("host-x").to_json())),
+        Decision::Overflow
+    );
+    assert_eq!(b.owed(), [MAX_PENDING_PER_SENDER as u64 + 1]);
+    for pair in 1..MAX_PENDING / MAX_PENDING_PER_SENDER {
+        for _ in 0..MAX_PENDING_PER_SENDER {
+            decided(b.put(&mail, &mail.beyond(&format!("host-x{pair}")).to_json()));
+        }
+    }
+    assert_eq!(b.count("mailbox_pending"), MAX_PENDING as u64);
+    assert_eq!(
+        decided(b.put(&mail, &mail.beyond("host-y").to_json())),
+        Decision::Overflow
+    );
+    assert_eq!(b.count("mailbox_pending"), MAX_PENDING as u64);
+    assert_eq!(b.count("mailbox_claims") + b.count("mailbox_refused"), 0);
+    assert_eq!(b.owed().len(), 2);
+}
+
+/// Design II.4.2: a waiting object is judged again after the device list
+/// advances: decided then, its row written and its done owed (its position
+/// in the mailbox read now) in one transaction, and no longer waiting.
+#[test]
+fn a_waiting_object_is_judged_again_when_the_list_advances() {
+    let mut mail = Mail::new();
+    let mut b = Box::new();
+    // Host C signs at a head this host doesn't hold yet: its `add_host`.
+    mail.log.add_host("host-c", 1, &secret("mail host c"));
+    let mut sender = SoftwareKeys::new();
+    sender.insert_ed25519(KeyId::new("host-b"), &secret("mail host c"));
+    let fields = mail.fields("host-c", mail.log.log.head(), now_ms() + HOUR);
+    let object = seal_envelope(
+        &sender,
+        &KeyId::new("host-b"),
+        &fields,
+        &EnvelopePlain::Cancel { task_id: uuid() },
+        &mail.enc_pub,
+    )
+    .unwrap();
+    // This host's list stops before C's `add_host`.
+    let entries = &mail.log.entries;
+    let short = atem_client::membership::Membership::verify_chain(
+        &mail.log.account,
+        &mail.log.genesis_hash(),
+        &entries[..entries.len() - 1],
+        &mail.log.now,
+    )
+    .unwrap()
+    .membership;
+    let full = std::mem::replace(&mut mail.log.log, short);
+    assert_eq!(decided(b.put(&mail, &object.to_json())), Decision::Pending);
+    assert_eq!(
+        rejudge_pending(&b.store, &identity(1), &mail.cx()).unwrap(),
+        Vec::new(),
+        "the list didn't move: it still waits"
+    );
+    mail.log.log = full;
+    assert_eq!(
+        rejudge_pending(&b.store, &identity(1), &mail.cx()).unwrap(),
+        vec![Decision::Opened]
+    );
+    assert_eq!(
+        (b.count("mailbox_pending"), b.count("mailbox_inbox")),
+        (0, 1)
+    );
+    assert_eq!(b.owed(), [1]);
+}

@@ -7,7 +7,7 @@
 use super::*;
 use crate::runtime::delegated::station::{LinkKind, StationLink};
 use atem_client::encoding::Hash32;
-use atem_client::host_mail::mailbox::MailboxSyncResult;
+use atem_client::host_mail::mailbox::{MailboxDone, MailboxDoneResult, MailboxSyncResult};
 use atem_client::session::host_work::HostTarget;
 
 const MAILBOX: &str = "9d2f6c1e-3b4a-4c5d-8e6f-7a8b9c0d1e2f";
@@ -56,6 +56,7 @@ fn observed(cursor: Option<(&str, u64)>) -> Observed {
         identity: identity(1),
         cursor: cursor.map(|(id, at)| (id.to_string(), at)),
         inbox: 0,
+        owed: Vec::new(),
     }
 }
 
@@ -278,4 +279,105 @@ fn the_gate_part_follows_the_read() {
     assert!(c.open());
     c.on_link(None);
     assert!(!c.open());
+}
+
+/// The dones owed `owed` (positions), as the store holds them.
+fn owing(c: &mut MailboxClient, cursor: (&str, u64), owed: impl IntoIterator<Item = u64>) {
+    c.observe(Some(Observed {
+        owed: owed.into_iter().collect(),
+        ..observed(Some(cursor))
+    }));
+}
+
+fn positions(dones: &[MailboxDone]) -> Vec<u64> {
+    dones.iter().map(|d| d.position).collect()
+}
+
+fn answer(done: &MailboxDone) -> MailboxDoneResult {
+    MailboxDoneResult {
+        request_id: done.request_id.clone(),
+        mailbox_id: done.mailbox_id.clone(),
+        position: done.position,
+    }
+}
+
+/// Rules 5 and 8: a done goes only for a position the store owes (written
+/// with its page's commit), in the mailbox a `heads` on this link
+/// generation announced; at most 8 live, each with a fresh id; one
+/// answered (its `request_id`, `mailbox_id` and `position`) is no longer
+/// owed; an answer that doesn't match, or names an id never sent, changes
+/// nothing; one unanswered for 35 s goes again with a fresh id; a
+/// `mailbox_done_refused` retires every live done and none goes again on
+/// that link generation; the next sends them all again.
+#[test]
+fn dones_go_after_their_commit_and_again_until_answered() {
+    let mut c = client(10 * SEC, Some((MAILBOX, 12)));
+    owing(&mut c, (MAILBOX, 12), 1..=10);
+    assert!(c.take_outgoing().dones.is_empty(), "no heads: unconfirmed");
+    c.on_heads(head(MAILBOX, 12));
+    let live = c.take_outgoing().dones;
+    assert_eq!(positions(&live), (1..=8).collect::<Vec<_>>());
+    let ids: std::collections::BTreeSet<_> = live.iter().map(|d| &d.request_id).collect();
+    assert_eq!(ids.len(), 8);
+    assert!(live.iter().all(|d| d.mailbox_id == MAILBOX));
+    assert!(c.take_outgoing().dones.is_empty(), "sent once");
+    let mut other = answer(&live[1]);
+    other.position = 9;
+    assert_eq!(c.on_done_result(other), None);
+    let mut never = answer(&live[1]);
+    never.request_id = "b06daa5d-9f48-4512-8a98-c6d98b159d8e".into();
+    assert_eq!(c.on_done_result(never), None);
+    assert_eq!(
+        c.on_done_result(answer(&live[0])),
+        Some((MAILBOX.to_string(), 1))
+    );
+    assert_eq!(c.on_done_result(answer(&live[0])), None, "retired");
+    // The bridge removed it from the store.
+    owing(&mut c, (MAILBOX, 12), 2..=10);
+    assert_eq!(positions(&c.take_outgoing().dones), [9]);
+    // Unanswered for 35 s: sent again, with fresh ids.
+    c.tick(10 * SEC + 35 * SEC);
+    let again = c.take_outgoing().dones;
+    assert_eq!(positions(&again), (2..=9).collect::<Vec<_>>());
+    assert!(again.iter().all(|d| !ids.contains(&d.request_id)));
+    // Refused: every live done retired; none on this link generation.
+    c.on_done_refused();
+    c.tick(10 * SEC + 80 * SEC);
+    assert!(c.take_outgoing().dones.is_empty());
+    assert_eq!(c.on_done_result(answer(&again[0])), None);
+    c.on_link(Some(&link(2, 1)));
+    c.on_heads(head(MAILBOX, 12));
+    assert_eq!(
+        positions(&c.take_outgoing().dones),
+        (2..=9).collect::<Vec<_>>()
+    );
+    // A reset waiting: nothing goes to the old mailbox.
+    c.on_link(Some(&link(3, 1)));
+    c.on_heads(head(MAILBOX_2, 1));
+    assert!(c.take_outgoing().dones.is_empty());
+}
+
+/// Rule 8, "An identity change": every live mailbox call is retired
+/// (their answers drained) and nothing more is synced or marked done on
+/// that socket; a link on a new socket syncs and marks done again.
+#[test]
+fn an_identity_change_retires_every_mailbox_call() {
+    let mut c = client(10 * SEC, Some((MAILBOX, 2)));
+    owing(&mut c, (MAILBOX, 2), [1]);
+    c.on_heads(head(MAILBOX, 3));
+    let out = c.take_outgoing();
+    let (sync, done) = (out.sync[0].clone(), out.dones[0].clone());
+    c.on_identity_moved();
+    assert_eq!(c.on_page(Ok(page(&sync, 3, 3))), PageCheck::Drained);
+    assert_eq!(c.on_done_result(answer(&done)), None);
+    c.tick(60 * SEC);
+    c.on_heads(head(MAILBOX, 3));
+    c.on_link(Some(&link(2, 1)));
+    c.on_heads(head(MAILBOX, 3));
+    assert_eq!(c.take_outgoing(), Outgoing::default(), "the same socket");
+    assert!(!c.open());
+    c.on_link(Some(&link(3, 2)));
+    c.on_heads(head(MAILBOX, 3));
+    let out = c.take_outgoing();
+    assert_eq!((out.sync.len(), positions(&out.dones)), (1, vec![1]));
 }

@@ -241,6 +241,12 @@ pub(super) struct State {
     /// (`host_senders_pass`; `host_applied_seq` reads it, the store only
     /// while it is unknown).
     applied_seq: Option<(HostTarget, atem_client::encoding::Hash32, u64)>,
+    /// The identity whose store has host senders' mailbox tables
+    /// (`mail_observe`, with `host.senders` on).
+    mail_prepared: Option<HostTarget>,
+    /// The device-list head the mailbox's waiting objects were last judged
+    /// again at (`mail_rejudge`).
+    mail_rejudged: Option<(HostTarget, u64, atem_client::encoding::Hash32)>,
     /// Acknowledgments whose `sent` mark failed to write, and those the
     /// shared builder refused, in this run (their log lines: the first,
     /// then at powers of two).
@@ -334,6 +340,8 @@ impl State {
             followups: Vec::new(),
             host_applied: None,
             applied_seq: None,
+            mail_prepared: None,
+            mail_rejudged: None,
             ack_failures: 0,
             ack_unbuilt: 0,
             kept: None,

@@ -1758,7 +1758,7 @@ impl HostBridge {
                     StationCall::Fetch(_) => station.fetch.unsent(),
                     StationCall::Sync(sync) => station.feed.unsent(&sync.request_id),
                     StationCall::MailboxSync(sync) => station.mailbox.unsent(&sync.request_id),
-                    StationCall::MailboxDone(_) => {}
+                    StationCall::MailboxDone(done) => station.mailbox.done_unsent(&done.request_id),
                 }
             }
         }

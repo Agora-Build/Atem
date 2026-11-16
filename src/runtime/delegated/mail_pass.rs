@@ -49,10 +49,23 @@ impl HostBridge {
     }
 
     /// The store as committed, for the client (none: not loaded, or a
-    /// stored state of another identity, fail closed).
+    /// stored state of another identity, fail closed). The mailbox's
+    /// tables are made in this identity's store first.
     pub(crate) fn mail_observe(&mut self) {
         if !self.features.senders || self.station.is_none() {
             return;
+        }
+        if let Some((store, identity)) = self.mail_store()
+            && self.work.mail_prepared.as_ref() != Some(&identity.host)
+        {
+            match mailbox_store::prepare(store) {
+                Ok(()) => self.work.mail_prepared = Some(identity.host),
+                Err(error) => {
+                    eprintln!(
+                        "atem runtime: host senders' mailbox tables couldn't be made ({error:#})"
+                    )
+                }
+            }
         }
         let observed = self.mail_store().and_then(|(store, identity)| {
             match mailbox_store::read(store, &identity) {
@@ -81,10 +94,19 @@ impl HostBridge {
                 station.mailbox.on_sync_refused();
                 PageCheck::Nothing
             }
+            Ok(MailboxToHost::DoneRefused(_)) => {
+                station.mailbox.on_done_refused();
+                PageCheck::Nothing
+            }
+            Ok(MailboxToHost::DoneResult(result)) => {
+                if let Some((mailbox_id, position)) = station.mailbox.on_done_result(result) {
+                    self.mail_done_answered(&mailbox_id, position);
+                }
+                PageCheck::Nothing
+            }
             // This host puts nothing (the sending host's outbox isn't
-            // built), and marks nothing done yet: answers to calls it never
-            // made change nothing (rule 8).
-            Ok(_) => PageCheck::Nothing,
+            // built): answers to puts it never made change nothing (rule 8).
+            Ok(MailboxToHost::Stored(_) | MailboxToHost::PutRefused(_)) => PageCheck::Nothing,
         };
         if let PageCheck::Apply(applying) = check {
             self.mail_commit(applying);
@@ -92,15 +114,75 @@ impl HostBridge {
         self.mail_step();
     }
 
+    /// The done of `position` answered: no longer owed (a write that fails
+    /// leaves it owed, sent again: harmless).
+    fn mail_done_answered(&mut self, mailbox_id: &str, position: u64) {
+        if let Some((store, identity)) = self.mail_store()
+            && let Err(error) = mailbox_store::done_answered(store, &identity, mailbox_id, position)
+        {
+            eprintln!("atem runtime: an answered mailbox done couldn't be cleared ({error:#})");
+        }
+        self.mail_observe();
+    }
+
+    /// This host as the receiver its objects are decided with (design
+    /// II.4.2): its committed device list, its own identity's host id and
+    /// trust generation with that generation's key and record
+    /// (`host_enc::recipient_at`), and the delegated clock's `D`. None
+    /// while the list doesn't serve or `D` can't be read: nothing is
+    /// decided then.
+    fn mail_receiver(
+        &self,
+    ) -> Option<(
+        crate::session_protocol::membership::ListState,
+        crate::session_protocol::r9::host_enc::HostRecipient,
+        u64,
+    )> {
+        let view = self.start_view();
+        let list = view.list.clone().filter(FeedStore::serves)?;
+        let now_ms = view.now_d_ms?;
+        drop(view);
+        let host = self.work_host();
+        let receiver = crate::session_protocol::r9::host_enc::recipient_at(
+            self.pairing.as_ref()?,
+            host.atem_device_id,
+            host.host_trust_gen,
+        );
+        Some((list, receiver, now_ms))
+    }
+
     /// A page that answers the live call, committed from the store's own
-    /// cursor in one transaction.
+    /// cursor in one transaction: its objects' decisions, their rows, the
+    /// dones owed and the cursor. Only then is any done sent.
     fn mail_commit(&mut self, applying: crate::runtime::delegated::mailbox::Applying) {
+        let receiver = if applying.page.objects.is_empty() {
+            None
+        } else {
+            self.mail_receiver()
+        };
         let committed = match self.mail_store() {
             Some((store, identity)) => {
-                mailbox_store::commit_page(store, &identity, &applying.page, None)
+                let cx = receiver
+                    .as_ref()
+                    .map(|(list, r, now_ms)| mailbox_store::DecideCx {
+                        list: &list.membership,
+                        recipient: &r.recipient,
+                        provider: &r.provider,
+                        now_ms: *now_ms,
+                    });
+                mailbox_store::commit_page(store, &identity, &applying.page, cx.as_ref())
             }
             None => Ok(Commit::Undecided),
         };
+        // Debug builds: the runtime is killed here, the page's decisions
+        // and owed dones durable, no done sent yet.
+        #[cfg(not(test))]
+        if matches!(&committed, Ok(Commit::Committed(c)) if !c.decided.is_empty()) {
+            crate::runtime::test_hooks::crash_point(
+                "crash_after_mailbox_commit",
+                "after a mailbox page's commit, before its dones",
+            );
+        }
         self.mail_observe();
         let Some(station) = self.station.as_mut() else {
             return;
@@ -149,12 +231,47 @@ impl HostBridge {
         }
     }
 
-    /// The pass's tick, after its messages: a call unanswered for 35 s
-    /// retired, a sync due asked.
+    /// The waiting objects judged again, in one transaction, after the
+    /// committed device list moved or once one's expiry passed (design
+    /// II.4.2): those decided owe their dones.
+    fn mail_rejudge(&mut self) {
+        let Some((list, receiver, now_ms)) = self.mail_receiver() else {
+            return;
+        };
+        let Some((store, identity)) = self.mail_store() else {
+            return;
+        };
+        let head = list.membership.head();
+        let key = (identity.host.clone(), head.seq, head.hash);
+        let expired = mailbox_store::pending_expiry(store)
+            .ok()
+            .flatten()
+            .is_some_and(|at| at <= now_ms);
+        if self.work.mail_rejudged.as_ref() == Some(&key) && !expired {
+            return;
+        }
+        let cx = mailbox_store::DecideCx {
+            list: &list.membership,
+            recipient: &receiver.recipient,
+            provider: &receiver.provider,
+            now_ms,
+        };
+        match mailbox_store::rejudge_pending(store, &identity, &cx) {
+            Ok(_) => self.work.mail_rejudged = Some(key),
+            Err(error) => eprintln!(
+                "atem runtime: host senders' waiting mailbox objects couldn't be judged again ({error:#})"
+            ),
+        }
+    }
+
+    /// The pass's tick, after its messages: the waiting objects judged
+    /// again when due, a call unanswered for 35 s retired, a sync due
+    /// asked.
     pub(crate) fn mail_tick(&mut self, now_mono: u64) {
         if !self.features.senders {
             return;
         }
+        self.mail_rejudge();
         self.mail_observe();
         if let Some(station) = self.station.as_mut() {
             station.mailbox.tick(now_mono);

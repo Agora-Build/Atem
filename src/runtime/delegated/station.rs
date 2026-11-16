@@ -175,6 +175,9 @@ fn call_name(call: RefusedCall) -> &'static str {
 }
 
 impl Station {
+    /// A host's link without `host.senders` (tests; the bridge says which:
+    /// [`Station::with_senders`]).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new() -> Station {
         Station::default()
     }
