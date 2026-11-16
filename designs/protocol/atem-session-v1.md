@@ -3660,7 +3660,58 @@ Astation; a later one is ignored and logged, as is a malformed one, one naming a
 the link's, or any challenge on a host without a list is ignored, with
 one bounded runtime.log line and never its content. The challenge is
 authority for nothing else and is never passed on. A relay that sends no
-challenge changes nothing. A local (loopback/LAN) link never answers.
+challenge changes nothing. A local (loopback/LAN) link never answers the
+relay's challenge (it gets none); with `host.delegated` on it answers a
+Station's that Astation's proxy forwards, below.
+
+**Through Astation's `:8080` proxy** (**Atem's reading** of the delegated
+host-work design I.5.8, "Which host is calling": where a call through
+`:8080` can't be tied to its host, the Station requires a fresh host-key
+challenge proof, which the host answers through the proxy; built behind
+the debug-only hook `host.delegated`, which no release build turns on).
+On Astation's local link, Astation's proxy forwards the selected
+Station's `host_challenge{nonce, room}`, the host's `host_route{proof}`
+and the Station's verdict unchanged; a native login or session proof is
+never promoted into host authority. The host answers with the proof its
+relay link gives, made by the same code for the same inputs: `room` the
+relay room (the pairing's Astation id; a challenge naming another room is
+ignored, one runtime.log line) and `atem_id` its own, signed at its
+device list's head on the same conditions (a pinned list that can serve).
+Its rules are a local link's:
+
+- **After Astation's authentication only.** The local link answers once
+  Astation (the paired Astation, the room the proof is made for)
+  authenticated it (`auth_required`, then the saved session's proof
+  accepted); never before, never while Astation authenticates it again,
+  judged in order with Astation's messages on the link (the host's client
+  answers it, not the link's reader, so a challenge forwarded right after
+  Astation's reply is judged after that reply).
+- **Once per authenticated link generation.** A re-authentication on the
+  same socket is a new generation and answers a fresh challenge; a second
+  challenge in one generation is ignored, as on the relay. A verdict counts
+  only for the proof of the link's current generation, once.
+- **The verdict.** `host_route_ok` establishes the Station's association
+  for the Station calls on that link (host-work-v1 §11.4) and nothing
+  else: the link stays an Astation-authenticated local link, never routed
+  (runtime.log: `host_route ok at head N through Astation's local link`).
+  `host_route_refused` keeps the link, which is owner-present Astation's
+  (runtime.log: `host_route refused through Astation's local link:
+  <code>; the link stays, and the Station refuses its calls`); the Station
+  refuses that link's calls as it refuses any caller it can't tie to a
+  host, so the host's revocation gate for that Station stays closed, and
+  `atem status`'s `Control feeds:` line shows the Station's refusal (on
+  the relay a refused proof closes the link, and the line says there is no
+  Station link; neither names the proof).
+- **An identity change** (host-work-v1 §11.4): once the host's identity
+  changed on the live link (a re-verify, a new trust generation, account
+  or genesis), nothing more is answered on that socket, whatever its later
+  authentication; a challenge under another route identity than the
+  socket's (account, genesis, host or `host_channel_key`) is refused the
+  same way. The host reconnects that link as §11.4 says, and the new socket
+  answers the next challenge under the new identity.
+
+With the hook off a local link ignores the challenge, as before (one
+runtime.log line per link).
 
 A held, frozen or faulted host answers no challenge, so it proves no
 route and only has carrier (A): reconciling a held host (R9.3, a
@@ -3692,8 +3743,8 @@ answer a challenge; if the list was held, frozen or faulted meanwhile,
 or its key is gone, the reconnect is dropped (logged once). runtime.log:
 `relay link reconnecting to prove its route`. At most one reconnect per pin or reconciliation, and
 no loop: a new link that still gets no challenge stays as it is. A local
-(loopback/LAN) link, which never sees a challenge, never reconnects for
-this. No wire change.
+(loopback/LAN) link, which never sees the relay's challenge, never
+reconnects for this. No wire change.
 
 Vectors: `r9-vectors-host-route` (proofs at the head, at an ancestor, on
 a verifier ahead, after a key rotation; refused: extra fields in the
