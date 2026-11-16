@@ -64,6 +64,7 @@ use crate::signed::SignedObject;
 pub mod body;
 pub mod mailbox;
 pub mod receive;
+pub mod reference;
 pub mod seal;
 #[cfg(test)]
 mod test_support;
@@ -73,6 +74,9 @@ pub use body::{
     EnvelopePlain, HostRef, MailBody, MailFields, MailKind, REFUSAL_CODES, ResultPlain,
 };
 pub use mailbox::object_hash;
+pub use reference::{
+    CurrentHosts, MailboxTransition, Quota, Quotas, ReferenceMailbox, Reset, Usage,
+};
 pub use receive::{
     EnvelopeVerdict, ExpectedResult, Recipient, ResultVerdict, accept_result, evidence_hash,
     open_envelope,

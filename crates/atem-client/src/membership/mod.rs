@@ -1118,6 +1118,15 @@ impl Membership {
             .map(|h| &h.record)
     }
 
+    /// Every current host's newest record (`add_host`), by host id.
+    pub fn hosts(&self) -> impl Iterator<Item = &HostRecord> {
+        self.derived
+            .hosts
+            .values()
+            .filter(|h| !h.removed)
+            .map(|h| &h.record)
+    }
+
     /// A removed host's newest key: the record of its last `add_host`. `None`
     /// for a current host (use [`host`](Self::host)) and for a host no
     /// `add_host` ever named. A removed host can't send, but what it signed
