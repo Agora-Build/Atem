@@ -9,6 +9,7 @@ pub mod host_clock;
 pub mod profile;
 pub mod r9;
 pub mod r9log;
+pub mod sender;
 pub mod station;
 
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
