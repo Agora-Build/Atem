@@ -196,6 +196,11 @@ fn mb_store(rig: &LocalRig) -> crate::runtime::delegated::mailbox::Observed {
                 .membership()
                 .genesis_hash(),
         ),
+        host_key: rig
+            .bridge
+            .host_key
+            .as_ref()
+            .and_then(|key| key.public_key()),
     };
     crate::runtime::delegated::mailbox_store::read(
         rig.bridge.work.store.as_ref().unwrap(),
@@ -346,6 +351,11 @@ fn a_mailbox_page_that_cant_commit_commits_nothing() {
         let identity = crate::runtime::delegated::sync::HostIdentity {
             host: rig.bridge.work_host(),
             genesis: Some(head_genesis(&rig)),
+            host_key: rig
+                .bridge
+                .host_key
+                .as_ref()
+                .and_then(|key| key.public_key()),
         };
         let moved = atem_client::host_mail::mailbox::MailboxSyncResult {
             request_id: syncs[0].request_id.clone(),

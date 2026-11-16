@@ -56,6 +56,7 @@ impl HostBridge {
         Some(HostIdentity {
             host: self.work_host(),
             genesis: Some(genesis),
+            host_key: self.host_key.as_ref().and_then(|key| key.public_key()),
         })
     }
 

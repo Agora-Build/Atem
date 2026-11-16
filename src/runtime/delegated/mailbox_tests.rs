@@ -22,6 +22,7 @@ fn identity(host_trust_gen: u64) -> HostIdentity {
             host_trust_gen,
         },
         genesis: Some(Hash32([9; 32])),
+        host_key: None,
     }
 }
 
