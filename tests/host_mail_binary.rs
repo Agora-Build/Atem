@@ -624,12 +624,11 @@ fn reauthenticate(rig: &Rig, n: u8) {
 /// The fake Station's puts follow §11.5 rules 1 and 3 (no runtime): stored
 /// once per key while stored (the same bytes again answered `stored`,
 /// other bytes `id_reused`), an answer lost and the put made again stored
-/// once, the key free again once the object is done; `forbidden` for an
-/// object that isn't the calling host's, or for a recipient that isn't a
-/// current host at that generation; `expired`; `quota` at the per-sender
-/// limit and while the switch is on; an object to another host stored in
-/// that host's mailbox. Pages cover removed positions up to the next stored
-/// object.
+/// once; `forbidden` for an object that isn't the calling host's, or for a
+/// recipient that isn't a current host at that generation; `expired`;
+/// `quota` at the per-sender limit and while the switch is on; an object to
+/// another host stored in that host's mailbox. (Its pages and dones are
+/// the runtime tests' below; the key freed by a done too.)
 #[test]
 fn the_fake_mailbox_follows_the_put_rules() {
     let astation = FakeAstation::start();
@@ -855,6 +854,16 @@ fn reads_its_mailbox_to_the_head_on_relay_local_and_routed_links() {
             rig.status_feeds(
                 "host senders' mailbox not checked (1 mailbox object(s) wait for admission)",
             );
+            // Done, its key is free: the same bytes put again are stored
+            // anew (rule 3), and the host takes them as a duplicate: no
+            // new row, marked done.
+            assert_eq!(rig.put(&request), 5);
+            rig.announce_paced();
+            rig.serve_until("the copy read", |rig| {
+                rig.cursor() == Some((mailbox_id.clone(), 5)) && rig.owed().is_empty()
+            });
+            assert_eq!(rig.inbox().len(), 1);
+            assert_eq!(rig.done_positions(&mailbox_id), [1, 2, 3, 4, 5]);
         }
     }
 }
