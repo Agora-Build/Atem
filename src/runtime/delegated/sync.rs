@@ -1542,7 +1542,7 @@ impl GateView for FeedSync {
     /// open; a native's is that one.
     fn open_for(&self, sender: &DelegatedSender, fetched: Option<&str>) -> bool {
         let origin = match sender {
-            DelegatedSender::Native { .. } => self.own.as_deref(),
+            DelegatedSender::Native { .. } | DelegatedSender::Host { .. } => self.own.as_deref(),
             DelegatedSender::Service { feed, .. } => Some(feed.origin.as_str()),
         };
         origin.is_some_and(|origin| {
@@ -1624,11 +1624,8 @@ fn apply_page(
                     if revoked {
                         for again in feeds.reverify_pending(&tx, list, applied_seq)? {
                             followups.extend(act(store, &tx, &again.applied.actions)?);
-                            acked.push(Acked::of(
-                                &again.record,
-                                &again.applied,
-                                again.pos.as_ref(),
-                            ));
+                            // A channel's record: answered there only.
+                            acked.extend(again.acked());
                             reapplied.push(again);
                         }
                     }

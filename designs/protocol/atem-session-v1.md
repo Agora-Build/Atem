@@ -2555,8 +2555,10 @@ deferred entry (R9.5) asks nothing more while the host still defers that
 entry and the Station announces the same head, and it counts as fetched up
 to that entry for the revocation gate (delegated host-work I.4.3, I.5.8).
 
-**Control records on an open channel** (planned: feature `host.senders`,
-which no host advertises yet; the records are host-work-v1 §11.1). A native
+**Control records on an open channel** (feature `host.senders`, which no
+release build advertises: built behind the debug-only hook, a debug build
+serving it with the feature listed, host-work-v1 §11.1 "Carriage", as
+built; the records are host-work-v1 §11.1). A native
 member sends `control_records{id, records}` beside `membership{id,
 entries}`: one to 64 signed control records, at most 256 KiB in all,
 strict like `membership` (exactly `v`, `op`, `id` (a UUID v4), `records`).
@@ -3706,7 +3708,7 @@ replaced key, also for a proof at an ancestor head; `relay_replies`:
 | `host_policy_get` | C→H | → `host_policy_result{re}` (R9.8a; native `manage`) |
 | `host_policy_result` | H→C | `re`, `request_id?`, `outcome`, `policy{relay_only, revision, state}`, `account_id`, `atem_device_id`, `host_trust_gen`, `head`, `channel_id`, `attachment_gen` (R9.8a) |
 | `host_policy_changed` | H→C | event: `policy`, `account_id`, `atem_device_id`, `host_trust_gen`, `head`, `channel_id`, `attachment_gen` (R9.8a; other manager attachments, after a commit) |
-| `control_records` | C→H | `id`, `records` (one to 64 signed control records of host principals, ≤ 256 KiB; a service's record refuses the whole message `invalid_request`) → `control_records_result{re}` (planned, feature `host.senders`; native members only; R9.3) |
+| `control_records` | C→H | `id`, `records` (one to 64 signed control records of host principals, ≤ 256 KiB; a service's record refuses the whole message `invalid_request`) → `control_records_result{re}` (feature `host.senders`: built behind the debug-only hook, listed only with hosting on, by no release build; native members only; R9.3) |
 | `control_records_result` | H→C | `re`, `results`: one `{record_id, result, effects}` per record in the order sent, `result` and each effect's `result` `applied`, `duplicate`, `pending` or `refused`, `effects` `[{effect, result}]` with `effect` `revocation`, `interrupt`, `hold`, `release` or `cover` (host-work-v1 §11.1) |
 | `host_enc_key_get` | C→H | `id` → `host_enc_key{re}` (feature `host.senders`: built behind the debug-only hook, listed only with hosting on, by no release build; native members holding `manage`, checked by the host as in R9.8a; R9.14) |
 | `host_enc_key` | H→C | `re`, `host_id`, `host_trust_gen`, `enc_key{alg:"x25519",pub}`, `enc_sig`: the host's encryption key and its binding, what a manager drafts the `host_enc_key` entry from (R9.14) |
@@ -3723,9 +3725,8 @@ replaced key, also for a proof at an ancestor head; `relay_replies`:
   #120 comment 6810116314)**):
   `control_records` and `host_enc_key_get` on a host that doesn't list
   `host.senders` (no release build does; a debug build lists it only with
-  the hook's `host.senders` and hosting on, and still refuses
-  `control_records` so there) (detail `host.senders is not
-  advertised`). The host-work ops of a feature it doesn't list are
+  the hook's `host.senders` and hosting on, and serves both there)
+  (detail `host.senders is not advertised`). The host-work ops of a feature it doesn't list are
   host-work-v1's (`busy`, detail naming the feature, host-work-v1 §11.2
   and §11.3; `busy` also while hosting is off, §1).
 - One principal may have several attachments (a phone and its widget);
@@ -4512,8 +4513,8 @@ compile the hook out, so without it no `host-work` principal exists and no
 receipt carries `task_id` or `sender`. Item 8 is refused by every release
 build (below). The same hook takes `host.senders` (only with
 `host.delegated`): a debug build then lists it with hosting on and answers
-`host_enc_key_get`; `control_records` is still refused there as on a host
-that doesn't list the feature. The shared core has the
+`host_enc_key_get` and `control_records` (host-work-v1 §11.1 "Carriage",
+as built). The shared core has the
 wire: the principal's name, the receipt fields and their reader, and the op
 and its answer. Each choice that fills in the design is marked. Astation
 agreed R9.14 (2026-11-11, #120

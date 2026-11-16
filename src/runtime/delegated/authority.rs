@@ -193,6 +193,10 @@ fn sender_authority(
                 device_id: device_id.clone(),
             },
         ),
+        // A host sender has no channel (design II.2.1): its interactions are
+        // signed envelopes (II.7), never a channel's request, so no caller
+        // here is it. The owner still reads its tasks.
+        DelegatedSender::Host { .. } => return Err(Refused::NotTheSender),
     };
     let member = at
         .list

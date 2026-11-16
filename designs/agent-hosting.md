@@ -105,6 +105,28 @@ of its own replaces that default. Without a pairing and without a list, the
 file is invalid. The local list adds consent; it never widens the caller's
 account permissions (section 4).
 
+**Host senders (behind the debug-only hook; no release build takes them).**
+A route's `principals` also take two forms for host senders, other Atem hosts
+of the account ([delegated host work](delegated-host-work.md) II.2.3), only
+on a debug build's runtime started with `host.senders` in its
+`ATEM_TEST_HOST_FEATURES` (section 14; it needs `host.delegated`):
+
+| Entry | Accepts | Account permission |
+|---|---|---|
+| `project:<name>` | Every host the signed project lists, when this host is in it too | That project's ops |
+| `host:<host_id>` | That host only | The ops of every project in effect that lists both hosts |
+
+`<name>` is 1 to 32 of `a-z`, `0-9` and `-`; `<host_id>` is the host's id in
+the device list. A profile never takes either. Without the hook, and in every release build, a
+file that names one doesn't load, with the message any principal the file
+doesn't know gets (`… is not a principal: use …`), exactly as before the
+forms existed. Labels never authorize:
+`labels = ["project:astation"]` addresses agents, `principals =
+["project:astation"]` consents to the signed project's hosts; `atem runtime
+check` prints them on separate lines and says so for a route that names one.
+Nothing sends as a host sender yet: the mailbox that would carry its work is
+planned.
+
 **Environment.** A remote request never carries paths, commands, arguments or
 environment values. The agent gets `HOME`, `PATH`, `USER`, `LOGNAME`, `SHELL`,
 `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME` and

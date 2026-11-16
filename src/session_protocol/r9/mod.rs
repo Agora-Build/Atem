@@ -7,7 +7,9 @@
 //! (its `attachment_gen`), a principal's attachments together (its §H
 //! `control_gen`). An op of a feature the welcome doesn't list (such as
 //! `control_records` and `host_enc_key_get`, of `host.senders`, which only
-//! the debug-only hook lists) is `unsupported_version`.
+//! the debug-only hook lists) is `unsupported_version`; with it listed,
+//! `control_records` is handed to the runtime ([`ControlRecordsCall`]) and
+//! `host_enc_key_get` served.
 //!
 //! Sans-I/O. The transport seam is the channel envelope ([`envelope`]):
 //! [`R9Host::link_up`]/[`R9Host::link_down`] for Atem's link, every
@@ -280,6 +282,10 @@ struct Attached {
     /// Task 27 review I1). With hosting on, host-work ops are judged by the
     /// host's current features, not the channel's welcome.
     offered_delegated: bool,
+    /// Its welcome listed `host.senders`: while hosting is paused, the host
+    /// takes `control_records` only from such a channel (a stop, as
+    /// `work_interrupt` is).
+    offered_senders: bool,
 }
 
 enum Phase {
@@ -339,6 +345,22 @@ impl From<&'static str> for HostWorkError {
     }
 }
 
+/// A native member's `control_records` (session-v1 R9.3, R9.8; host-work-v1
+/// §11.1 "Carriage"), with `host.senders` listed: read strictly and waiting
+/// for the runtime, which holds the control state and answers it
+/// ([`R9Host::control_records_reply`]).
+pub struct ControlRecordsCall {
+    pub attachment: String,
+    /// The carrier's principal: it gets no authority from carrying; it only
+    /// names where the records came from (their alerts' rate limits).
+    pub carrier: String,
+    pub request: atem_client::session::r9::ControlRecordsRequest,
+}
+
+/// The most `control_records` calls waiting for the runtime; one more is
+/// `busy`.
+const MAX_CONTROL_RECORDS_CALLS: usize = 16;
+
 pub struct R9Host {
     host_work_enabled: bool,
     /// While host work is off (hosting paused), `work_interrupt` is still
@@ -351,6 +373,7 @@ pub struct R9Host {
     alerts: bool,
     senders: bool,
     host_work_requests: VecDeque<HostWorkRequest>,
+    control_records: VecDeque<ControlRecordsCall>,
     limits: Limits,
     /// The live link generation.
     link: Option<u64>,
@@ -557,15 +580,6 @@ fn close_reason(e: &ChannelError) -> &'static str {
     }
 }
 
-/// `host.senders`'s session ops this host doesn't serve yet, even with the
-/// feature listed (only the debug-only hook lists it): refused as while it
-/// isn't (`unsupported_version`, `host.senders is not advertised`), nothing
-/// read or recorded. `control_records` carries host senders' stops
-/// (session-v1 R9.8, host-work-v1 §11.1), which a later change serves.
-fn senders_op_unserved(op: &str) -> bool {
-    op == "control_records"
-}
-
 /// The feature of an op that exists only for delegated host work (plan
 /// decision 4): `control_records` and `host_enc_key_get` are
 /// `host.senders`'s; `work_interrupt` and `work_resolve` are
@@ -626,8 +640,10 @@ impl R9Host {
     /// like the deadline's interrupt, T26a). The runtime says so only while
     /// it can serve it (its store recovered, no receipt-database fault).
     /// Only from a channel whose welcome listed `host.delegated` (one
-    /// welcomed before the pause; Task 27 review I1). Nothing else is
-    /// taken, and no welcome lists more for it.
+    /// welcomed before the pause; Task 27 review I1). `control_records` of
+    /// `host.senders` is a stop too (host senders' later interrupts): taken
+    /// the same way, from a channel whose welcome listed `host.senders`.
+    /// Nothing else is taken, and no welcome lists more for it.
     pub fn enable_host_work_stops(&mut self, enabled: bool) {
         self.host_work_stops = enabled;
     }
@@ -639,6 +655,15 @@ impl R9Host {
             .get(attachment)
             .and_then(|handle| self.chans.get(handle))
             .is_some_and(|c| matches!(&c.phase, Phase::Open(a) if a.offered_delegated))
+    }
+
+    /// The open channel of `attachment` was offered `host.senders` in its
+    /// welcome.
+    fn offered_senders(&self, attachment: &str) -> bool {
+        self.by_attachment
+            .get(attachment)
+            .and_then(|handle| self.chans.get(handle))
+            .is_some_and(|c| matches!(&c.phase, Phase::Open(a) if a.offered_senders))
     }
 
     /// The delegated features the runtime runs (`host.delegated`,
@@ -709,6 +734,33 @@ impl R9Host {
 
     pub fn take_host_work(&mut self) -> Vec<HostWorkRequest> {
         self.host_work_requests.drain(..).collect()
+    }
+
+    /// The `control_records` calls waiting for the runtime, oldest first.
+    pub fn take_control_records(&mut self) -> Vec<ControlRecordsCall> {
+        self.control_records.drain(..).collect()
+    }
+
+    /// The runtime's answer to the `control_records` `re` that came on
+    /// `attachment`: its `control_records_result` (one result per record, in
+    /// order), or a refusal naming the request. Nothing when the attachment
+    /// is gone.
+    pub fn control_records_reply(
+        &mut self,
+        attachment: &str,
+        re: &str,
+        result: Result<Vec<atem_client::session::r9::RecordResult>, HostWorkError>,
+        now: u64,
+    ) {
+        let bytes = match result {
+            Ok(results) => {
+                atem_client::session::r9::control_records_result(&new_id(), re, &results)
+                    .to_string()
+                    .into_bytes()
+            }
+            Err(e) => error(e.code, Some(re), e.detail).to_bytes(),
+        };
+        self.seal_to(attachment, &bytes, now);
     }
 
     pub fn current_work_authority<J: Journal>(
@@ -807,6 +859,7 @@ impl R9Host {
             alerts: false,
             senders: false,
             host_work_requests: VecDeque::new(),
+            control_records: VecDeque::new(),
             limits,
             link: None,
             chans: BTreeMap::new(),
@@ -1738,6 +1791,9 @@ impl R9Host {
         let offered_delegated = features
             .iter()
             .any(|f| f == atem_client::session::host_work::DELEGATED_FEATURE);
+        let offered_senders = features
+            .iter()
+            .any(|f| f == atem_client::session::host_work::SENDERS_FEATURE);
         let welcome = Welcome {
             id: new_id(),
             re: re.clone(),
@@ -1794,6 +1850,7 @@ impl R9Host {
             grant: hello.grant.clone(),
             caught_up,
             offered_delegated,
+            offered_senders,
         }));
         self.by_attachment.insert(attachment, handle.to_string());
         effects
@@ -2141,18 +2198,22 @@ impl R9Host {
             // advertise, if the op is one: after the authority check (a
             // principal outside the op's right still learns `forbidden`),
             // before anything is read.
+            let op = data.get("op").and_then(Value::as_str);
+            // A stop always wins: while hosting is paused, `work_interrupt`
+            // and `control_records` (host senders' later interrupts) are
+            // still taken when the runtime can serve them, from a channel
+            // whose welcome listed their feature.
             let stop_while_paused = !self.host_work_enabled
                 && self.host_work_stops
                 && self.delegated
-                && data.get("op").and_then(Value::as_str) == Some("work_interrupt")
-                && self.offered_delegated(att);
-            let op = data.get("op").and_then(Value::as_str);
+                && match op {
+                    Some("work_interrupt") => self.offered_delegated(att),
+                    Some("control_records") => self.senders && self.offered_senders(att),
+                    _ => false,
+                };
             let unadvertised = op
                 .and_then(delegated_feature_of)
-                .filter(|feature| {
-                    !self.advertised_features().iter().any(|f| f == feature)
-                        || op.is_some_and(senders_op_unserved)
-                })
+                .filter(|feature| !self.advertised_features().iter().any(|f| f == feature))
                 .filter(|_| !stop_while_paused);
             if matches!(
                 data.get("op").and_then(Value::as_str),
@@ -2211,6 +2272,26 @@ impl R9Host {
             }
             match data.get("op").and_then(Value::as_str) {
                 Some("membership") => return self.membership_op(att, plain, re.as_deref(), parts),
+                // `host.senders` listed (else refused above): a native
+                // member's (the authority check above) host principals'
+                // records, read strictly, one that doesn't parse or a
+                // service's spoiling the whole message (host-work-v1 §11.1,
+                // "Carriage"); the runtime applies them and answers.
+                Some("control_records") => {
+                    if self.control_records.len() >= MAX_CONTROL_RECORDS_CALLS {
+                        refuse(self, code::BUSY, None);
+                        return Vec::new();
+                    }
+                    match atem_client::session::r9::ControlRecordsRequest::decode(plain) {
+                        Ok(request) => self.control_records.push_back(ControlRecordsCall {
+                            attachment: att.to_owned(),
+                            carrier: authority.name(),
+                            request,
+                        }),
+                        Err(why) => refuse(self, code::INVALID_REQUEST, Some(why)),
+                    }
+                    return Vec::new();
+                }
                 Some("revoke_grant") => {
                     return self.revoke_grant(att, authority, &data, re.as_deref(), parts);
                 }

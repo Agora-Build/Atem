@@ -23,7 +23,9 @@
 //! transaction, the senders' standings), what the records do to the
 //! tasks, in that transaction ([`effects`], I.5.5 to I.5.7), and the
 //! acknowledgments of their results to the host's Station, written there
-//! too ([`acks`], I.5.8, §11.4).
+//! too ([`acks`], I.5.8, §11.4). Host senders (`host:<host_id>`, design
+//! Part II), behind `host.senders`, which the hook turns on only with
+//! `host.delegated`: [`host_senders`].
 pub mod acks;
 pub mod alerts;
 pub mod attempts;
@@ -33,6 +35,7 @@ pub mod effects;
 pub mod feeds;
 pub mod fetch;
 pub mod gate;
+pub mod host_senders;
 pub mod intents;
 pub mod resolve;
 pub mod start;
@@ -72,6 +75,19 @@ pub enum DelegatedSender {
     /// A service (`service:<id>`) the feed covers: its stops come from that
     /// feed's control records and the device list.
     Service { device_id: String, feed: FeedRef },
+    /// Another host of the account (`host:<host_id>`, design II.2.1), with
+    /// `host.senders` on: its stops come from the device list
+    /// (`host_sender_revoke`, `remove_host`, project narrowing) and a
+    /// native manager's `interrupt_running` record (II.3). What it held when
+    /// classified: its authorization generation (II.3.1: the `seq` of its
+    /// first `add_host` or latest `host_sender_readmit`) and its membership
+    /// epoch (II.2.2), which a task records at admission and the start check
+    /// compares (I.4.3, condition 2).
+    Host {
+        host_id: String,
+        generation: u64,
+        epoch: u64,
+    },
 }
 
 /// Which lifecycle a sender's tasks get, decided when a task is admitted.
@@ -88,6 +104,12 @@ pub enum SenderClass {
     /// wouldn't stop (ruling T32b: damage loosens nothing). `classify`
     /// never gives it: the bridge does (`HostBridge::sender_class`).
     Unchecked,
+    /// A host sender (`host:<host_id>`) that may not send now: `host.senders`
+    /// off, not a current host of the list, or revoked as a sender. Never v1:
+    /// a host sender has no v1 path (it never opens a channel, design
+    /// II.2.1), so its work is refused. No channel principal is a `host:`
+    /// one, so with the hook off nothing reaches this (as on main).
+    Refused,
 }
 
 /// What the host's control state says of a principal: revoked (by which
@@ -157,9 +179,90 @@ pub struct Admission {
     /// kept: the live comparison is the rule then.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projects_matched: Vec<String>,
+    /// A host sender's grant at admission (design I.4.1, II.2.3): the route
+    /// entry that consented and the projects whose ops admitted it. None
+    /// for every other sender (written as before: no field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostGrant>,
+}
+
+/// What admitted a host sender's task (design I.4.1, "Changed for host
+/// senders"): the route entry that consented (`host:<host_id>` or
+/// `project:<name>`) and the projects whose ops admitted it. Its authority
+/// has no expiry (projects never expire, II.2.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostGrant {
+    pub consent: String,
+    pub projects: Vec<String>,
 }
 
 impl Admission {
+    /// The record of a host sender's task (design I.4.1, II.3.1) admitted
+    /// through `route_id` at `route_revision` under `permit`
+    /// ([`host_senders::host_sender_permits`]) on `list`: its principal
+    /// `host:<host_id>` and principal key (the hex SHA-256 of its newest
+    /// `add_host` key, kept for audit: authorization follows the `host_id`),
+    /// its generation and epoch, the consent and projects, their ops, no
+    /// feed and no expiry. None when `host_id` isn't a current host of
+    /// `list`. Mailbox admission (planned) is its caller; tests make host
+    /// senders' tasks with it meanwhile.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn for_host(
+        list: &Membership,
+        host_id: &str,
+        permit: &host_senders::HostPermit,
+        route_id: &str,
+        route_revision: u64,
+    ) -> Option<Admission> {
+        use atem_client::host_principal::{host_principal, host_principal_key};
+        let key = &list.host(host_id)?.host_key;
+        Some(Admission {
+            principal: host_principal(host_id),
+            principal_key: host_principal_key(key).to_hex(),
+            sender: DelegatedSender::Host {
+                host_id: host_id.to_owned(),
+                generation: permit.generation,
+                epoch: permit.epoch,
+            },
+            feed: None,
+            route_id: route_id.to_owned(),
+            route_revision,
+            ops_at_admission: permit.ops.iter().map(|op| op.as_str().to_owned()).collect(),
+            scope_at_admission: Value::Null,
+            grant_expires_at: None,
+            device_list_seq: list.head().seq,
+            projects_matched: Vec::new(),
+            host: Some(HostGrant {
+                consent: permit.consent.clone(),
+                projects: permit.projects.clone(),
+            }),
+        })
+    }
+
+    /// A host sender's task: its `host_id` and what its admission recorded
+    /// (the generation, epoch and consent [`host_senders`] compares). None
+    /// for every other sender, and for a host sender's record without its
+    /// grant (unreadable as one: fail closed).
+    pub fn host_admitted(&self) -> Option<(&str, host_senders::Admitted<'_>)> {
+        let DelegatedSender::Host {
+            host_id,
+            generation,
+            epoch,
+        } = &self.sender
+        else {
+            return None;
+        };
+        let grant = self.host.as_ref()?;
+        Some((
+            host_id,
+            host_senders::Admitted {
+                generation: *generation,
+                epoch: *epoch,
+                consent: &grant.consent,
+            },
+        ))
+    }
+
     /// The record of a task `authority` enqueued through `route_id` at
     /// `route_revision`, its sender classified `sender` ([`classify`]) on
     /// the device list whose head is `device_list_seq`.
@@ -172,7 +275,7 @@ impl Admission {
     ) -> Admission {
         let feed = match &sender {
             DelegatedSender::Service { feed, .. } => Some(feed.clone()),
-            DelegatedSender::Native { .. } => None,
+            DelegatedSender::Native { .. } | DelegatedSender::Host { .. } => None,
         };
         let ops = Op::ALL
             .into_iter()
@@ -206,6 +309,7 @@ impl Admission {
             grant_expires_at: authority.expires_at,
             device_list_seq,
             projects_matched: Vec::new(),
+            host: None,
         }
     }
 
@@ -246,8 +350,16 @@ impl Admission {
 /// `host.delegated` on: a native member in effect on the host's pinned
 /// device list (`list`), and a service in effect there that a feed this
 /// host syncs covers (`controls`). Everyone else keeps v1: browser grants,
-/// services no feed covers, `local`, host senders (`host.senders` is never
-/// on in step 4) and anything that isn't a principal of the list.
+/// services no feed covers, `local` and anything that isn't a principal of
+/// the list.
+///
+/// A host sender (`host:<host_id>`, design II.2.1) is delegated only with
+/// `host.senders` on (which needs `host.delegated`), while it is a current
+/// host of the list (an `add_host`, no `remove_host` since) and authorized
+/// as a sender (II.3.1), with its generation and epoch now
+/// ([`DelegatedSender::Host`]); otherwise it is [`SenderClass::Refused`],
+/// whatever the hook says: it has no v1 path. Whether a route and a project
+/// let it send is [`host_senders::host_sender_permits`].
 ///
 /// The caller passes the host's device list only while it is open and
 /// serving (pinned, not held, frozen or faulted): otherwise a native member
@@ -258,6 +370,9 @@ pub fn classify(
     controls: &dyn ControlView,
     features: HostFeatures,
 ) -> SenderClass {
+    if principal.starts_with("host:") {
+        return host_senders::classify_host(principal, list, features);
+    }
     if !features.delegated || !is_delegated_sender(principal) {
         return SenderClass::V1;
     }
@@ -460,8 +575,8 @@ mod tests {
 
     /// Design I.1.3: a service is delegated only while a feed this host
     /// syncs covers it (none while the feeds aren't loaded: [`NoFeeds`]); browser
-    /// grants, `local`, host senders (`host.senders` is never on in step 4)
-    /// and anything else keep v1, covered or not.
+    /// grants, `local` and anything else keep v1, covered or not. A host
+    /// sender is never v1 (`host_senders_are_delegated_only_with_the_hook`).
     #[test]
     fn uncovered_service_browser_and_local_keep_v1() {
         let log = list();
@@ -501,7 +616,6 @@ mod tests {
             "service:svc-gone",
             "browser:grant-1",
             "local",
-            "host:host-other",
             "host-work",
             "",
             "member:",
@@ -514,6 +628,108 @@ mod tests {
                 "{principal:?}"
             );
         }
+        // Covered or not, a host sender is never v1.
+        assert_eq!(
+            classify("host:host-other", &log.log, &covers, on()),
+            SenderClass::Refused
+        );
+    }
+
+    /// The hook's value with `host.delegated` and `host.senders` on.
+    fn senders_on() -> HostFeatures {
+        HostFeatures::parse("host.delegated,host.senders").unwrap()
+    }
+
+    fn host_sender(host_id: &str, generation: u64, epoch: u64) -> SenderClass {
+        SenderClass::Delegated(DelegatedSender::Host {
+            host_id: host_id.into(),
+            generation,
+            epoch,
+        })
+    }
+
+    /// Design I.1.3, II.2.1, II.3.1: a host sender (`host:<host_id>`) is
+    /// delegated only with `host.senders` on (it needs `host.delegated`),
+    /// while it is a current host of the list and authorized as a sender;
+    /// its class names its authorization generation and its membership
+    /// epoch. Otherwise it is refused, never v1: hook off, a host no
+    /// `add_host` names, a removed one, a revoked one. Key changes never
+    /// change its authorization: a re-verification keeps both numbers; a
+    /// readmit gives a new generation, a re-add a new epoch.
+    #[test]
+    fn host_senders_are_delegated_only_with_the_hook() {
+        use crate::session_protocol::membership::r9log::MAC;
+        use atem_client::membership::entry::Action;
+        use atem_client::membership::{host_sender_readmit, host_sender_revoke};
+        let mut log = list();
+        log.add_host("host-b", 1, &secret("host b"));
+        let added = log.log.head().seq;
+        let class = |log: &TestLog, features| classify("host:host-b", &log.log, &NoFeeds, features);
+        assert_eq!(
+            class(&log, senders_on()),
+            host_sender("host-b", added, added)
+        );
+        // The hook off, or `host.delegated` alone: refused, never v1.
+        for features in [HostFeatures::default(), on()] {
+            assert_eq!(class(&log, features), SenderClass::Refused, "{features:?}");
+        }
+        // No `add_host` names it, or not a host principal of the grammar.
+        for principal in ["host:host-z", "host:", "host:a b", "host:host-b "] {
+            assert_eq!(
+                classify(principal, &log.log, &NoFeeds, senders_on()),
+                SenderClass::Refused,
+                "{principal:?}"
+            );
+        }
+        // Re-verification (a newer `add_host`, no removal): unchanged.
+        log.add_host("host-b", 2, &secret("host b 2"));
+        assert_eq!(
+            class(&log, senders_on()),
+            host_sender("host-b", added, added)
+        );
+        // Revoked: refused; readmitted: the readmit's generation.
+        log.append(MAC, host_sender_revoke("host-b", false, 0).unwrap());
+        assert_eq!(class(&log, senders_on()), SenderClass::Refused);
+        log.add_host("host-b", 3, &secret("host b 3"));
+        assert_eq!(
+            class(&log, senders_on()),
+            SenderClass::Refused,
+            "a new key never readmits"
+        );
+        log.append(MAC, host_sender_readmit("host-b", 0).unwrap());
+        let readmitted = log.log.head().seq;
+        assert_eq!(
+            class(&log, senders_on()),
+            host_sender("host-b", readmitted, added)
+        );
+        // Removed: refused; added again: a new epoch, the same generation.
+        log.append(
+            MAC,
+            Action::RemoveHost {
+                host_id: "host-b".into(),
+            },
+        );
+        assert_eq!(class(&log, senders_on()), SenderClass::Refused);
+        log.add_host("host-b", 4, &secret("host b 4"));
+        let re_added = log.log.head().seq;
+        assert_eq!(
+            class(&log, senders_on()),
+            host_sender("host-b", readmitted, re_added)
+        );
+        // The admission record reads back (its sender is the task's).
+        let SenderClass::Delegated(sender) = class(&log, senders_on()) else {
+            unreachable!()
+        };
+        let text = serde_json::to_value(&sender).unwrap();
+        assert_eq!(
+            text,
+            serde_json::json!({"kind": "host", "host_id": "host-b",
+                "generation": readmitted, "epoch": re_added})
+        );
+        assert_eq!(
+            serde_json::from_value::<DelegatedSender>(text).unwrap(),
+            sender
+        );
     }
 
     /// Design I.4.1: what a delegated sender held at admission, frozen:
@@ -558,6 +774,7 @@ mod tests {
                 grant_expires_at: None,
                 device_list_seq: head,
                 projects_matched: vec![],
+                host: None,
             }
         );
 

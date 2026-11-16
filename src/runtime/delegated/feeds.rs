@@ -175,12 +175,28 @@ impl std::fmt::Display for NotOwnStation {
 impl std::error::Error for NotOwnStation {}
 
 /// A pending record applied again ([`FeedStore::reverify_pending`]): the
-/// record, where it was read, and what it did now.
+/// record, where it was read, what it did now, and whether a channel
+/// carried it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reapplied {
     pub record: ControlRecord,
     pub pos: Option<FeedPos>,
     pub applied: Applied,
+    /// A native member's channel carried it (`control_records`, design
+    /// II.3.1): its result is reported on that channel only, never
+    /// acknowledged to the Station ([`Reapplied::acked`]).
+    pub carried: bool,
+}
+
+impl Reapplied {
+    /// Its result owed the host's own Station (§11.4 "Acknowledgments":
+    /// what that Station's feed delivered): none for a record a channel
+    /// carried, whose result goes on its channel only (if the Station
+    /// delivers the same record later, that delivery's ack reports it).
+    pub fn acked(&self) -> Option<super::acks::Acked> {
+        (!self.carried)
+            .then(|| super::acks::Acked::of(&self.record, &self.applied, self.pos.as_ref()))
+    }
 }
 
 /// Where records come from: what alerts are rate-limited by (I.5.4).
@@ -751,9 +767,8 @@ impl FeedStore {
 
     /// [`FeedStore::apply`] for a record `carrier` brought over a channel
     /// (no position): its alerts are rate-limited per carrier. Channels
-    /// carry records only with `host.senders` (stage 3, not built): only the
-    /// tests apply one yet.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// carry records only with `host.senders` (host principals' records:
+    /// `HostBridge::apply_carried_records`).
     pub fn apply_carried(
         &mut self,
         tx: &FeedTx,
@@ -1209,6 +1224,7 @@ impl Mem {
                     record: p.record,
                     pos: p.pos,
                     applied: t.applied,
+                    carried: matches!(p.source, Source::Carrier(_)),
                 });
                 changed = true;
             }
@@ -1273,7 +1289,11 @@ impl Mem {
     }
 
     /// `rec` kept pending (once: the same record again is the one kept),
-    /// the oldest beyond [`KEPT`] dropped, the count raised.
+    /// the oldest beyond [`KEPT`] dropped, the count raised. A record a
+    /// channel carried that a feed now delivers is adopted by the feed: the
+    /// one kept takes the feed's source and position, so its final result
+    /// is acknowledged to the Station as any feed record's is (host-work-v1
+    /// §11.1 "Carriage"; the channel had its answer).
     fn keep_pending(
         &mut self,
         tx: &Connection,
@@ -1285,7 +1305,15 @@ impl Mem {
     ) -> Result<()> {
         let text = record_text(rec);
         let principal = rec.principal().name();
-        if self.pending.iter().any(|p| p.text == text) {
+        if let Some(kept) = self.pending.iter_mut().find(|p| p.text == text) {
+            if matches!(kept.source, Source::Carrier(_)) && matches!(source, Source::Feed(_)) {
+                tx.execute(
+                    "UPDATE control_pending SET pos=?2, source=?3 WHERE n=?1",
+                    params![kept.n, pos.as_ref().map(pos_text), source.stored()],
+                )?;
+                kept.pos = pos;
+                kept.source = source.clone();
+            }
             return Ok(());
         }
         tx.execute(

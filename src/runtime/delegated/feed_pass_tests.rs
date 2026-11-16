@@ -351,7 +351,7 @@ fn pending_records_are_reverified_at_load_and_when_the_list_moves() {
         carry(&mut rig, &s.log, entry);
         rig.bridge.feeds_reverify();
         let head = s.log.log.head();
-        rig.bridge.work.reverified = Some((head.seq, head.hash));
+        rig.bridge.work.reverified = Some((head.seq, head.hash, 0));
         rig.bridge.ensure_feeds();
         assert_eq!(pending(&rig), 1, "loaded, not yet re-verified");
         rig.bridge.feeds_reverify();
