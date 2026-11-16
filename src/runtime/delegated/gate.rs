@@ -18,6 +18,12 @@
 //!   host reached only on a local network, with no Station, still runs a
 //!   connected native's work (VII.A test 20).
 //!
+//! - **A host sender** waits for the host's own Station's gate and, with
+//!   it, the gate's mailbox part (design II.5): the host's own mailbox read
+//!   and committed up to the announced head and its inbox drained
+//!   ([`super::mailbox::MailboxClient::open`], [`Gates::set_mailbox`]).
+//!   Natives and services never wait for it.
+//!
 //! The feed part is the host's sync's ([`super::sync::FeedSync`]): it
 //! syncs only its own Station's feed (Decision 14), so only that Station's
 //! gate opens. The start view holds a copy ([`Gates`]), given at each
@@ -47,6 +53,8 @@ pub struct Gates {
     /// The native members (`member:<id>`) holding a caught-up channel
     /// (`R9Host::native_caught_up`).
     caught_up: BTreeSet<String>,
+    /// The mailbox part, host senders' only (design II.5).
+    mailbox: bool,
 }
 
 impl Gates {
@@ -63,6 +71,12 @@ impl Gates {
         self.open = open;
     }
 
+    /// The mailbox part as the host's mailbox client has it now (design
+    /// II.5).
+    pub fn set_mailbox(&mut self, open: bool) {
+        self.mailbox = open;
+    }
+
     /// Every Station's gate closed (design I.6.2 step 7, at a start's
     /// recovery): a delegated sender's remote tasks wait until its feed is
     /// synced again (the sync is told too, `FeedSync::restart`). The
@@ -70,6 +84,7 @@ impl Gates {
     /// this run.
     pub fn close_stations(&mut self) {
         self.open.clear();
+        self.mailbox = false;
         #[cfg(test)]
         self.stood_in.clear();
     }
@@ -87,6 +102,7 @@ impl Gates {
     pub fn open_own_station(&mut self, origin: &str) {
         self.open_feed(origin);
         self.stood_in.insert(origin.to_string());
+        self.mailbox = true;
     }
 
     /// Tests: `origin`'s feed part is open, and it is the host's own
@@ -124,10 +140,14 @@ impl GateView for Gates {
             // device list, which carry every stop of a host sender. No
             // channel opens it: a host sender has none, and a native's
             // caught-up channel speaks for that native only.
-            DelegatedSender::Host { .. } => self
-                .own
-                .as_deref()
-                .is_some_and(|own| self.station_open(own, fetched)),
+            // And the mailbox part (design II.5).
+            DelegatedSender::Host { .. } => {
+                self.mailbox
+                    && self
+                        .own
+                        .as_deref()
+                        .is_some_and(|own| self.station_open(own, fetched))
+            }
         }
     }
 }
@@ -217,6 +237,7 @@ mod tests {
         };
         let mut gates = Gates::default();
         gates.set_caught_up(BTreeSet::from(["member:dev-phone".to_string()]));
+        gates.set_mailbox(true);
         assert!(!gates.open_for(&host, None));
         gates.open_feed(ORIGIN);
         assert!(!gates.open_for(&host, None), "the feed part alone");
@@ -226,5 +247,30 @@ mod tests {
         assert!(!gates.open_for(&host, Some(ORIGIN)));
         gates.open_own_station(ORIGIN);
         assert!(gates.open_for(&host, None));
+    }
+
+    /// Design II.5: a host sender's gate also needs the mailbox part (the
+    /// host's own mailbox read and committed to the announced head, its
+    /// inbox drained); natives and services never wait for it. A start's
+    /// recovery closes it with the Stations' gates.
+    #[test]
+    fn only_host_senders_wait_for_the_mailbox() {
+        let host = DelegatedSender::Host {
+            host_id: "host-b".into(),
+            generation: 1,
+            epoch: 1,
+        };
+        let mut gates = Gates::default();
+        gates.open_feed(ORIGIN);
+        let fetched = Some(ORIGIN);
+        assert!(gates.open_for(&native("dev-tablet"), fetched));
+        assert!(gates.open_for(&service(ORIGIN), fetched));
+        assert!(!gates.open_for(&host, fetched), "the mailbox part");
+        gates.set_mailbox(true);
+        assert!(gates.open_for(&host, fetched));
+        gates.close_stations();
+        gates.open_feed(ORIGIN);
+        assert!(!gates.open_for(&host, fetched), "closed with the Stations");
+        assert!(gates.open_for(&service(ORIGIN), fetched));
     }
 }

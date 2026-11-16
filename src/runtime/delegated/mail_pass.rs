@@ -203,7 +203,8 @@ impl HostBridge {
     }
 
     /// After every mailbox step: a reset found is marked durably before
-    /// it is read (rule 7).
+    /// it is read (rule 7), and the gate's mailbox part goes to the start
+    /// view.
     pub(crate) fn mail_step(&mut self) {
         if !self.features.senders {
             return;
@@ -213,22 +214,24 @@ impl HostBridge {
             .as_ref()
             .and_then(|station| station.mailbox.reset_due());
         if let Some(mailbox_id) = due {
-            let marked = match self.mail_store() {
-                Some((store, identity)) => mailbox_store::mark_reset(store, &identity, &mailbox_id),
-                None => Err(anyhow::anyhow!("the mailbox state isn't loaded")),
-            };
+            let marked = self
+                .mail_store()
+                .map(|(store, identity)| mailbox_store::mark_reset(store, &identity, &mailbox_id));
             match marked {
-                Ok(()) => {
+                Some(Ok(())) => {
                     self.mail_observe();
                     if let Some(station) = self.station.as_mut() {
                         station.mailbox.reset_written();
                     }
                 }
-                Err(error) => eprintln!(
-                    "atem runtime: host senders' mailbox reset couldn't be marked ({error:#}); nothing is asked of it until it is"
-                ),
+                // Nothing is asked of it until it is marked.
+                Some(Err(error)) => {
+                    eprintln!("atem runtime: host senders' mailbox reset not marked ({error:#})")
+                }
+                None => {}
             }
         }
+        self.publish_mail_gate();
     }
 
     /// The waiting objects judged again, in one transaction, after the
@@ -277,6 +280,29 @@ impl HostBridge {
             station.mailbox.tick(now_mono);
         }
         self.mail_step();
+    }
+
+    /// The gate's mailbox part into the start view (host senders only,
+    /// design II.5).
+    pub(crate) fn publish_mail_gate(&mut self) {
+        let open = self
+            .station
+            .as_ref()
+            .is_some_and(|station| station.mailbox.open());
+        self.start_view().gates.set_mailbox(open);
+    }
+
+    /// `atem status`'s mailbox part, on the `Control feeds:` line (with
+    /// `host.senders` on).
+    pub(crate) fn mail_status(&self) -> Option<String> {
+        if !(self.features.delegated && self.features.senders) {
+            return None;
+        }
+        let station = self.station.as_ref()?;
+        Some(match station.mailbox.closed() {
+            None => "host senders' mailbox read to its head".into(),
+            Some(why) => format!("host senders' mailbox not checked ({why})"),
+        })
     }
 
     /// The mailbox calls to hand the link now.
