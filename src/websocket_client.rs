@@ -3278,6 +3278,8 @@ mod tests {
         Auth,
         /// Waits for Atem's next `host_route`.
         Route,
+        /// Waits until the test says (it did its part first).
+        Await(tokio::sync::oneshot::Receiver<()>),
     }
 
     /// A test local Astation (`:8080`) whose proxy forwards the Station's
@@ -3322,6 +3324,9 @@ mod tests {
                         while routes.len() == before {
                             next(&mut socket, &mut routes, WAIT).await.expect("a host_route");
                         }
+                    }
+                    Step::Await(ready) => {
+                        let _ = tokio::time::timeout(WAIT, ready).await;
                     }
                 }
             }
@@ -3378,23 +3383,42 @@ mod tests {
             .with_agent(std::sync::Arc::new(crate::memory::cred_agent::test_agent(&paths)))
     }
 
-    /// Plays the App's part on `client`'s link until `server` ends: the
-    /// local route's messages to `local_route_message` (the verdicts that
-    /// counted returned), Astation's `auth_required` answered and its
-    /// `authenticated` taken as the App's re-authentication does
-    /// (`upgrade_routed`); every other message the client read too.
+    /// The client's next message, until `server` ended and nothing it sent
+    /// before is left unread (`None`): a slow client still handles all of
+    /// it, never only what it read in time.
+    async fn next_message(
+        client: &mut AstationClient,
+        server: &tokio::task::JoinHandle<Vec<String>>,
+    ) -> Option<AstationMessage> {
+        loop {
+            let finished = server.is_finished();
+            let next = tokio::time::timeout(Duration::from_millis(50), client.recv_message_async()).await;
+            if let Ok(Some(message)) = next {
+                return Some(message);
+            }
+            if finished {
+                return None;
+            }
+            if matches!(next, Ok(None)) {
+                // The socket closed: the server ends soon.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    /// Plays the App's part on `client`'s link until `server` ends and
+    /// every message it sent was handled: the local route's messages to
+    /// `local_route_message` (the verdicts that counted returned),
+    /// Astation's `auth_required` answered and its `authenticated` taken as
+    /// the App's re-authentication does (`upgrade_routed`); every other
+    /// message the client read too.
     async fn play_app(
         client: &mut AstationClient,
         server: &tokio::task::JoinHandle<Vec<String>>,
     ) -> (Vec<crate::session_protocol::r9::route::RouteResult>, Vec<AstationMessage>) {
         let mut verdicts = Vec::new();
         let mut others = Vec::new();
-        while !server.is_finished() {
-            let Ok(Some(message)) =
-                tokio::time::timeout(Duration::from_millis(50), client.recv_message_async()).await
-            else {
-                continue;
-            };
+        while let Some(message) = next_message(client, server).await {
             match &message {
                 AstationMessage::LocalRoute(text) => {
                     verdicts.extend(client.local_route_message(text));
@@ -3679,12 +3703,7 @@ mod tests {
         .await;
         client.connect_without_pairing(&url).await.unwrap();
         let mut rebound = None;
-        while !server.is_finished() {
-            let Ok(Some(message)) =
-                tokio::time::timeout(Duration::from_millis(50), client.recv_message_async()).await
-            else {
-                continue;
-            };
+        while let Some(message) = next_message(&mut client, &server).await {
             match &message {
                 AstationMessage::LocalRoute(text) => {
                     client.local_route_message(text);
@@ -3707,16 +3726,19 @@ mod tests {
         assert!(client.local_route_retired(), "retired at the authentication");
         // On the live link: the rebind lands between Astation's
         // authentication and the socket's first challenge.
+        let (rebound, ready) = tokio::sync::oneshot::channel();
         let (url, server) = proxying_astation(vec![
             Step::Send(auth_required_text("mac-local", &"c".repeat(64))),
             Step::Auth,
             Step::Send(authenticated_text()),
+            Step::Await(ready),
             Step::Send(challenge()),
         ])
         .await;
         client.connect_without_pairing(&url).await.unwrap();
         assert!(!client.local_route_retired(), "a new socket");
         assert_eq!(rebind(&mut client), 3);
+        rebound.send(()).unwrap();
         play_app(&mut client, &server).await;
         assert_eq!(server.await.unwrap(), Vec::<String>::new(), "not answered");
         assert!(client.local_route_retired());
