@@ -16,7 +16,7 @@ fn strict(value: &Value) -> StrictValue {
     StrictValue::parse(value.to_string().as_bytes(), usize::MAX).unwrap()
 }
 
-const LABELS: [SignLabel; 10] = [
+const LABELS: [SignLabel; 11] = [
     SignLabel::MembershipEntry,
     SignLabel::RecoveryCosign,
     SignLabel::BrowserGrant,
@@ -25,6 +25,7 @@ const LABELS: [SignLabel; 10] = [
     SignLabel::ChannelHost,
     SignLabel::ChannelClient,
     SignLabel::HostRoute,
+    SignLabel::HostRouteProxy,
     SignLabel::HostEncKey,
     SignLabel::HostWorkControl,
 ];
