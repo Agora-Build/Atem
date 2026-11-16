@@ -756,6 +756,22 @@ fn keep_result(
     if present {
         return Ok(Decision::Duplicate);
     }
+    // Expired on `D`: never delivered (design II.4.4, one that expired
+    // unread isn't), so done as expired whatever the room. Skipped, its skip
+    // would end at once (at its expiry) and it would be read again unpaced.
+    if body.expires_at <= cx.now_ms {
+        let evidence = object_hash(object);
+        return refuse(
+            tx,
+            cx,
+            &evidence,
+            EXPIRED,
+            None,
+            false,
+            bytes,
+            Some(body.expires_at),
+        );
+    }
     let (count, of_sender, kept): (u64, u64, u64) = tx.query_row(
         "SELECT count(*), count(CASE WHEN sender_host=?1 THEN 1 END),
             coalesce(sum(length(bytes)), 0) FROM mailbox_results",

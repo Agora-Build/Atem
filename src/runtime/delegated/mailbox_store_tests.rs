@@ -1324,3 +1324,36 @@ fn an_older_cursor_table_gets_its_new_columns() {
     assert_eq!(observed.cursor, Some((MAILBOX.into(), 4)));
     assert!(!observed.skipped);
 }
+
+/// Review P6: a result already expired on `D` can never be delivered
+/// (design II.4.4: one that expired unread isn't delivered), so it is done
+/// as expired whatever the room, never skipped. Skipped, it would be due
+/// again at once (its skip ends at its expiry, already passed) and read
+/// again without pause.
+#[test]
+fn an_expired_result_is_done_as_expired_never_skipped() {
+    let mail = Mail::new();
+    let mut b = Box::new();
+    let cx = DecideCx {
+        now_ms: now_ms() + 2 * HOUR,
+        limits: Limits {
+            results: 1,
+            ..Limits::default()
+        },
+        ..mail.cx()
+    };
+    let kept = result_from(&mail, "host-b");
+    let expired = result_from(&mail, "host-b");
+    // The first fills the results' room; it expired too, so it isn't kept.
+    assert_eq!(
+        decided(b.put_with(&cx, &kept.to_json())),
+        Decision::Refused(EXPIRED)
+    );
+    assert_eq!(
+        decided(b.put_with(&cx, &expired.to_json())),
+        Decision::Refused(EXPIRED),
+        "never skipped, room or not"
+    );
+    assert_eq!(b.owed(), [1, 2], "both done: neither is read again");
+    assert_eq!(b.count("mailbox_results"), 0);
+}
