@@ -7,6 +7,10 @@
 //! recipient included: no channel admits one, host-work-v1 §11.5), and a
 //! `host_work_result` it reads is taken only when it answers its request (a
 //! `reply_query`'s non-null reply only with the asked task's `result_id`).
+//! One that answers nothing fails `on_frame` with `malformed` and the
+//! connection closes the channel, like any unbound result: the app
+//! reconnects and asks again with a new id. (The Rust core's `Attached`
+//! returns the error and leaves the request pending.)
 //! [`host_work_result_id`] gives an app the same derivation, for a reply it
 //! holds or shows.
 

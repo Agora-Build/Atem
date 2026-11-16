@@ -140,8 +140,9 @@ impl Message {
     /// remote sender) and it carries no attachments in this version: no
     /// `mark`, and so no task with `attachments`. Screenshot bytes reach a
     /// host only through `attachment_put` over a channel, which a host
-    /// sender doesn't have. Every other bound is a remote Message's, and
-    /// [`Message::valid`] and [`Message::valid_local`] are unchanged.
+    /// sender doesn't have. Every other bound is a remote Message's, except
+    /// that it may carry `select` recipients, which a channel Message may not
+    /// ([`Message::valid`]); [`Message::valid_local`] is unchanged.
     pub fn valid_from_host(&self, host_id: &str) -> bool {
         parse_host_principal(&self.sender) == Some(host_id)
             && self.kind == MessageKind::Request
