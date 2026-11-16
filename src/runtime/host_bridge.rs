@@ -265,6 +265,13 @@ fn verified_identity(
         .then_some(identity)
 }
 
+/// The host encryption key's lines for runtime.log (`r9::host_enc`).
+fn host_enc_lines(lines: Vec<String>) {
+    for line in lines {
+        eprintln!("atem runtime: host encryption key: {line}");
+    }
+}
+
 /// The identity of the profile's current pairing (at start), else none.
 fn start_identity(src: &crate::profile::Sources) -> Identity {
     let state = crate::pairing::load(src).ok();
@@ -906,6 +913,19 @@ impl HostBridge {
             }
             _ => (None, None),
         };
+        // Host senders (the hook's `host.senders`): a pinned host that holds
+        // no encryption key for its generation (paired before the key
+        // existed, or its pin's key not made) makes one now.
+        if features.senders
+            && membership.is_some()
+            && let Some(pairing) = &pairing
+        {
+            host_enc_lines(crate::session_protocol::r9::host_enc::ensure(
+                pairing,
+                dir,
+                host.context().host_trust_gen,
+            ));
+        }
         // With `host.delegated` on, the start view is told the list's state
         // at every change (Decision 16) and its deferral is kept on disk.
         let mut membership = membership;
@@ -1847,6 +1867,15 @@ impl HostBridge {
                         m.head().seq,
                         m.pin_of().host_id
                     );
+                    // Host senders: a new pin (`atem pair verify`'s next
+                    // generation) gets its encryption key if it has none.
+                    if self.features.senders {
+                        host_enc_lines(crate::session_protocol::r9::host_enc::ensure(
+                            &pairing,
+                            &self.dir,
+                            self.host.context().host_trust_gen,
+                        ));
+                    }
                     self.membership = Some(m);
                     self.sync_list_view();
                 }

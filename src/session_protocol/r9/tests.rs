@@ -2325,7 +2325,7 @@ fn revoked_grant_id(n: u32) -> String {
 }
 
 /// A browser grant from the phone, issued now, 50 min long.
-fn browser_of(rig: &mut Rig, n: u32) -> Identity {
+pub(super) fn browser_of(rig: &mut Rig, n: u32) -> Identity {
     let wall = rig.now.host.wall_ms;
     let (g, k) = rig.log.grant(
         "dev-phone",
@@ -3525,6 +3525,43 @@ mod control_records {
         assert_eq!(refusal(&mut rig, "ch-phone").0, "unsupported_version");
         assert!(rig.engine.take_host_work().is_empty());
     }
+
+    /// `host.senders` on (the debug hook, with `host.delegated`, hosting
+    /// on): the welcome lists it, and `control_records` is still refused
+    /// as before, `unsupported_version` with today's detail: host senders'
+    /// stops are served by a later change, not this one. A service still
+    /// gets `forbidden`; nothing is applied, queued or sent.
+    #[test]
+    fn control_records_stays_refused_with_host_senders_on() {
+        let mut rig = Rig::new();
+        rig.engine.enable_host_work(true);
+        rig.engine.set_delegated_features(true, false);
+        rig.engine.set_senders_feature(true);
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-bot", bot());
+        for handle in ["ch-phone", "ch-bot"] {
+            let features = welcome(&mut rig, handle).features;
+            assert!(
+                features.iter().any(|f| f == SENDERS_FEATURE),
+                "{features:?}"
+            );
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                refusal(&mut rig, "ch-phone"),
+                (
+                    "unsupported_version".into(),
+                    Some("host.senders is not advertised".into())
+                )
+            );
+        }
+        assert_eq!(refusal(&mut rig, "ch-bot").0, "forbidden");
+        assert_eq!(rig.engine.status().attachments, 2);
+        assert!(rig.engine.take_host_work().is_empty());
+        assert!(rig.relay.is_empty());
+    }
 }
 
 /// `work_interrupt` and `work_resolve` (delegated host-work design I.4.5,
@@ -3767,10 +3804,11 @@ mod delegated_work_ops {
     }
 
     /// Step 4, Decision 10: the runtime hands the engine the hook's
-    /// features (`HostFeatures`, read once when it starts). `host.delegated`
-    /// and `host.alerts` are listed only when the hook turns them on, and
-    /// only while hosting is on (they are host-work features: a host lists
-    /// those only then, §1); `host.senders` never. Listed, their ops are
+    /// features (`HostFeatures`, read once when it starts). `host.delegated`,
+    /// `host.alerts` and `host.senders` are listed only when the hook turns
+    /// them on (the last two only with `host.delegated`), and only while
+    /// hosting is on (they are host-work features: a host lists those only
+    /// then, §1). Listed, `host.delegated`'s and `host.alerts`' ops are
     /// taken: decoded, queued for the runtime, and answered with what it
     /// says (`host.delegated`'s `busy` until their handlers exist, with its
     /// detail; `alert_list` here with `delegated::request`'s plain `busy`:
@@ -3799,12 +3837,30 @@ mod delegated_work_ops {
                 false,
                 [false, false, false],
             ),
+            (
+                Some("host.delegated,host.senders"),
+                true,
+                [true, false, true],
+            ),
+            (
+                Some("host.delegated,host.alerts,host.senders"),
+                true,
+                [true, true, true],
+            ),
+            (
+                Some("host.delegated,host.alerts,host.senders"),
+                false,
+                [false, false, false],
+            ),
+            // Ignored without `host.delegated` (the hook turns nothing on).
+            (Some("host.senders"), true, [false, false, false]),
         ];
         for (n, (hook, hosting, listed)) in cases.into_iter().enumerate() {
             let features =
                 hook.map_or_else(HostFeatures::default, |v| HostFeatures::parse(v).unwrap());
             rig.engine
                 .set_delegated_features(features.delegated, features.alerts);
+            rig.engine.set_senders_feature(features.senders);
             rig.engine.enable_host_work(hosting);
             let handle = format!("ch-{n}");
             rig.advance(1000);
@@ -3826,6 +3882,7 @@ mod delegated_work_ops {
         // nothing is answered before it answers.
         rig.engine
             .set_delegated_features(both.delegated, both.alerts);
+        rig.engine.set_senders_feature(false);
         rig.engine.enable_host_work(true);
         for op in OPS {
             let plain = message(&mut rig, "ch-2", op);
@@ -3863,9 +3920,10 @@ mod delegated_work_ops {
         assert!(rig.relay.is_empty());
     }
 
-    /// `host.alerts` without `host.delegated` is ignored (Decision 10): the
-    /// hook's value turns nothing on, and an engine handed it anyway lists
-    /// neither feature and takes none of the ops.
+    /// `host.alerts` or `host.senders` without `host.delegated` is ignored
+    /// (Decision 10): the hook's value turns nothing on, and an engine
+    /// handed them anyway lists none of the features and takes none of the
+    /// ops.
     #[test]
     fn host_alerts_without_host_delegated_is_ignored() {
         use crate::runtime::test_hooks::HostFeatures;
@@ -3873,9 +3931,14 @@ mod delegated_work_ops {
             HostFeatures::parse("host.alerts"),
             Ok(HostFeatures::default())
         );
+        assert_eq!(
+            HostFeatures::parse("host.alerts,host.senders"),
+            Ok(HostFeatures::default())
+        );
         let mut rig = Rig::new();
         rig.engine.enable_host_work(true);
         rig.engine.set_delegated_features(false, true);
+        rig.engine.set_senders_feature(true);
         rig.link_up();
         rig.connect("ch-phone", phone());
         let features = welcome(&mut rig, "ch-phone").features;
@@ -3900,7 +3963,7 @@ mod delegated_work_ops {
 
 /// `host_enc_key_get` (delegated host-work design II.4.1, feature
 /// `host.senders`): refused like `control_records` until the host
-/// advertises the feature.
+/// advertises the feature (served: `host_enc_tests`).
 mod host_enc_key_get {
     use super::*;
     use atem_client::session::host_work::SENDERS_FEATURE;
@@ -3970,6 +4033,31 @@ mod host_enc_key_get {
             rig.list("ch-phone"),
             vec![SID.to_string(), SID_B.to_string()]
         );
+        assert!(rig.engine.take_host_work().is_empty());
+        assert!(rig.relay.is_empty());
+    }
+
+    /// `host.senders` on (with `host.delegated`, hosting on): listed, and
+    /// the op is the host's to answer (`host_enc_tests`): a native member
+    /// without `manage` is `forbidden` there, a service already at the
+    /// channel's authority check.
+    #[test]
+    fn listed_with_host_senders_on() {
+        let mut rig = Rig::new();
+        rig.engine.enable_host_work(true);
+        rig.engine.set_delegated_features(true, false);
+        rig.engine.set_senders_feature(true);
+        rig.link_up();
+        rig.connect("ch-phone", phone());
+        rig.advance(1000);
+        rig.connect("ch-bot", bot());
+        let features = welcome(&mut rig, "ch-phone").features;
+        assert!(
+            features.iter().any(|f| f == SENDERS_FEATURE),
+            "{features:?}"
+        );
+        assert_eq!(refusal(&mut rig, "ch-phone"), ("forbidden".into(), None));
+        assert_eq!(refusal(&mut rig, "ch-bot").0, "forbidden");
         assert!(rig.engine.take_host_work().is_empty());
         assert!(rig.relay.is_empty());
     }

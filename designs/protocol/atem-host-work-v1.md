@@ -3,7 +3,8 @@
 Status: implemented and released (Atem v0.8.2). §11 (delegated work):
 `host.delegated` and `host.alerts` are built (step 4, 2026-11-14) behind a
 debug-only hook and advertised by no release build; `host.senders` is
-planned.
+planned (behind the same hook a debug build lists it with hosting on and
+answers `host_enc_key_get`; nothing else of it is built).
 
 This extension of atem-session r9 lets an admitted client create sessions
 through launch profiles the host owner approved, queue directed work, publish
@@ -851,7 +852,10 @@ behind a debug-only hook: a debug build's `atem runtime` started with
 `ATEM_TEST_HOST_FEATURES=host.delegated[,host.alerts]` in its own
 environment (no client passes `ATEM_TEST_*` to a runtime it starts) lists
 them in its `welcome` and serves their ops. Release builds compile the hook
-out, and `host.senders` stays off (the hook refuses it). A host refuses
+out. The same hook takes `host.senders` (only with `host.delegated`): a
+debug build then lists it with hosting on, holds its host encryption key
+(design II.4.1) and answers `host_enc_key_get` (session-v1 R9.14 item 8);
+`control_records` is still refused there as below. A host refuses
 each op of a feature it doesn't list as it refuses any such op: a session op
 (`control_records`, `host_enc_key_get`) is `unsupported_version` with no
 effect (session-v1 R9.8; **Atem's choice of code, agreed with Astation (2026-11-11, #120

@@ -11,6 +11,8 @@
 //! <profile>/pairing/membership.freeze    both entries of a freeze
 //! <profile>/pairing/membership.fault     an observed device-list write fault
 //! <profile>/pairing/frozen_genesis       genesis hashes this host froze on (≤ 16)
+//! <profile>/pairing/host_enc_key         the host encryption key (`r9::host_enc`)
+//! <profile>/pairing/host_enc_generated   the ids of the host encryption keys made
 //! <config>/runtime/journal/membership_applied  the head whose fences are durable
 //! <config>/runtime/journal/membership_fault    the fault record's mirror
 //! <config>/runtime/journal/frozen_genesis      frozen_genesis's mirror, written first
@@ -62,6 +64,10 @@ pub enum DlFile {
     FrozenGenesisMirror,
     /// `host_channel_key`.
     HostChannelKey,
+    /// `host_enc_key`: the host encryption key (`r9::host_enc`).
+    HostEncKey,
+    /// `host_enc_generated`: the ids of the host encryption keys made.
+    HostEncGenerated,
     /// `host_policy.json` (§R9.8a).
     HostPolicy,
     /// `host_policy.pending`: an uncertain policy write's bytes.
@@ -82,6 +88,8 @@ impl DlFile {
             DlFile::FrozenGenesis => "frozen_genesis",
             DlFile::FrozenGenesisMirror => "journal frozen_genesis",
             DlFile::HostChannelKey => "host_channel_key",
+            DlFile::HostEncKey => "host_enc_key",
+            DlFile::HostEncGenerated => "host_enc_generated",
             DlFile::HostPolicy => "host_policy.json",
             DlFile::HostPolicyPending => "host_policy.pending",
         }
@@ -273,7 +281,9 @@ pub fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
     if meta.len() > MAX_FILE {
         return Err(io::Error::other("too large"));
     }
-    let mut bytes = Vec::new();
+    // Sized once: a key file's bytes never sit in a buffer that grew and
+    // was freed unwiped.
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
     file.read_to_end(&mut bytes)?;
     Ok(Some(bytes))
 }
@@ -319,6 +329,8 @@ impl Store {
             DlFile::FrozenGenesis => self.pairing.frozen_genesis.clone(),
             DlFile::FrozenGenesisMirror => self.journal_dir.join("frozen_genesis"),
             DlFile::HostChannelKey => self.pairing.host_channel_key.clone(),
+            DlFile::HostEncKey => self.pairing.host_enc_key.clone(),
+            DlFile::HostEncGenerated => self.pairing.host_enc_generated.clone(),
             DlFile::HostPolicy => self.pairing.host_policy.clone(),
             DlFile::HostPolicyPending => self.pairing.host_policy_pending.clone(),
         }
@@ -442,6 +454,37 @@ impl Store {
             });
             io(Step::DirectoryFsync, e)
         })
+    }
+
+    /// Makes `file` as it is durable: the file's fsync, then its
+    /// directory's (a rename whose directory fsync failed is visible but
+    /// may not be durable). Each step can fail on purpose like a write's:
+    /// the file's fsync as `TempFsync`, the directory's as `DirectoryFsync`.
+    pub fn sync(&mut self, file: DlFile) -> Result<(), WriteError> {
+        let path = self.path(file);
+        let dir = self.dir_of(file);
+        let io = |step, e: io::Error| Self::failure(file, step, e.to_string());
+        if self.fails(file, Step::TempFsync) {
+            return Err(Self::failure(
+                file,
+                Step::TempFsync,
+                "injected fsync failure",
+            ));
+        }
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| io(Step::TempFsync, e))?;
+        if self.fails(file, Step::DirectoryFsync) {
+            return Err(Self::failure(
+                file,
+                Step::DirectoryFsync,
+                "injected directory fsync failure",
+            ));
+        }
+        sync_dir(&dir).map_err(|e| io(Step::DirectoryFsync, e))
     }
 
     /// Removes `file` (if present), then fsyncs its directory.

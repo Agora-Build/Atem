@@ -73,6 +73,14 @@ pub struct PairingPaths {
     pub revoked_floor: PathBuf,
     /// `host_channel_key`: the host's atem-ch1 key (deleted by `atem unpair`).
     pub host_channel_key: PathBuf,
+    /// `host_enc_key`: the host encryption key, X25519, of the current trust
+    /// generation (delegated host work II.4.1; only with the debug hook's
+    /// `host.senders`; deleted by `atem unpair` and at a new pin).
+    pub host_enc_key: PathBuf,
+    /// `host_enc_generated`: the `enc_kid` of every host encryption key made
+    /// at the current trust generation, durable before a key is handed out
+    /// (deleted with `host_enc_key`).
+    pub host_enc_generated: PathBuf,
     /// `host_policy.json`: the relay-only policy a manager set (§R9.8a;
     /// deleted by `atem unpair` and at a new pin).
     pub host_policy: PathBuf,
@@ -97,6 +105,8 @@ impl PairingPaths {
             frozen_genesis: dir.join("frozen_genesis"),
             revoked_floor: dir.join("revoked_floor"),
             host_channel_key: dir.join("host_channel_key"),
+            host_enc_key: dir.join("host_enc_key"),
+            host_enc_generated: dir.join("host_enc_generated"),
             host_policy: dir.join("host_policy.json"),
             host_policy_pending: dir.join("host_policy.pending"),
             station_route: dir.join("station_route.json"),
