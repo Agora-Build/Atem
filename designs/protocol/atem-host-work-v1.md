@@ -427,7 +427,7 @@ has no reply, else:
 
 | Field | Meaning |
 |---|---|
-| `result_id` | UUID v5 of the task id: the same for every reply to the task, a corrected one included. Written down on 2026-11-15 as the host derives it, `UUIDv5(NAMESPACE_OID, "result:" + task_id)`, with the check every client makes against the task asked about (§11.5, "`result_id`"; proposed, for Astation's agreement) |
+| `result_id` | UUID v5 of the task id: the same for every reply to the task, a corrected one included. Written down on 2026-11-15 as the host derives it, `UUIDv5(NAMESPACE_OID, "result:" + task_id)`, with the check every client makes against the task asked about (§11.5, "`result_id`"; agreed with Astation 2026-11-16) |
 | `state` | `publishing`, `submitted` or `refused` (below) |
 | `digest` | SHA-256 (hex) identifying the reply's content: the same for an identical retry, another for a corrected reply. Compare it; don't recompute it |
 | `text` | the reply text: at most 16 KiB, no control characters other than newline and tab. Credential values are redacted (`[redacted]`, as chat-v1 redacts agent output) before the host stores the reply; `digest` is over the redacted text |
@@ -878,8 +878,7 @@ marker that still reads "for Astation to confirm" is one the review didn't
 name. Open, or step 4 acceptance: the runtime's enforcement (the feed store,
 the host's gates and cursors), byte-level goldens for the relay messages,
 the clock provider's tests, `no_match`'s wire form and the status of a
-selector-resolved (UUID v5) task (both proposed in §11.5 on 2026-11-15, for
-Astation's agreement). The agreement activates nothing.
+selector-resolved (UUID v5) task (both proposed in §11.5 on 2026-11-15, agreed with Astation 2026-11-16). The agreement activates nothing.
 
 **Step 4 status (2026-11-14).** The host side is built, behind the hook
 above: the session host's `host-work` principal (session-v1 R9.14 items 1
@@ -2901,7 +2900,7 @@ object each and may be up to 512 KiB (owner choice 13, so a host sender's Messag
 §5's 240 KiB bound): R9.9's drop-unread rule then exempts them up to that
 bound (**changed agreed meaning, needs Astation's agreement**; session-v1
 R9.9). Their wire is proposed in §11.5 ("The mailbox calls", 2026-11-15),
-for Astation's agreement.
+agreed with Astation 2026-11-16.
 
 #### Fixtures
 
@@ -3203,8 +3202,7 @@ storage and its receipts are the host's.
   gate). **Agreed with Astation:** an object that arrives over either limit is no
   verdict: it is dropped undecided, with no refusal and no evidence record,
   it claims no id and isn't marked done, so the sender's resend is judged
-  anew. **Proposed refinement (2026-11-15, Atem's proposal, for Astation's
-  agreement):** such an object is marked done all the same (still no
+  anew. **Proposed refinement (2026-11-15, Atem's proposal, agreed with Astation 2026-11-16):** such an object is marked done all the same (still no
   verdict, no evidence, no id), so that the mailbox frees its key and stores
   the sender's identical resend again ("The mailbox calls", rule 5).
 - **Verify before waiting.** When this list already holds the `add_host` of
@@ -3333,29 +3331,26 @@ shared vectors before cross-host selector or mailbox execution is
 activated). Both wait for cross-host `select`
 (collaboration §5): the wire form of `no_match` in a status (a selector of
 the request that matched nothing here), and a status for a task a selector
-resolved (its UUID v5 id). **Proposed (2026-11-15), for Astation's
-agreement:** "Status forms of a selector's resolution" below.
+resolved (its UUID v5 id). **Proposed (2026-11-15), agreed with Astation 2026-11-16:** "Status forms of a selector's resolution" below.
 
 **The mailbox calls** (put, stored, sync, done, heads; design II.4.3) are a
 stage-3 item, written with Astation. Each call carries one object and is
 bounded at 512 KiB (owner decision 2026-11-07, choice 13); R9.9's rule that
 Atem drops a larger relay message unread exempts them (design II.4.2, a
-contract change that needs agreement). **Proposed (2026-11-15), for
-Astation's agreement:** "The mailbox calls" below, where `heads` keeps the
+contract change that needs agreement). **Proposed (2026-11-15), agreed with Astation 2026-11-16:** "The mailbox calls" below, where `heads` keeps the
 256 KiB bound (its rule 9).
 
-**Proposed for Astation's agreement (2026-11-15).** The owner decided on
+**Agreed with Astation 2026-11-16 (proposed 2026-11-15).** The owner decided on
 2026-11-15 that Atem hosts reach each other only as host senders, that the
 mailbox stays, that the first version addresses hosts through the device
 list, and that the host's encryption key is signed in the verification
 ceremony (design status block, II.1, II.4.1, II.4.3, II.6). The five
 subsections below are concrete proposals for the two open items above, for
 the two SDK points Astation raised on 2026-11-07 (#120 comment 6701618182)
-and for the ceremony's fields. Each is **proposed, for Astation's
-agreement**: nothing in them is built, and their shared vectors come with
+and for the ceremony's fields. Each is **agreed with Astation 2026-11-16**: nothing in them is built, and their shared vectors come with
 the shared core once they are agreed.
 
-#### The mailbox calls (proposed, for Astation's agreement)
+#### The mailbox calls (agreed with Astation 2026-11-16)
 
 The receiving host's mailbox on the Station (design II.4.3): a sending host
 puts objects over its own link, and the receiving host syncs its own mailbox
@@ -3453,8 +3448,7 @@ moves to 11, and position 12 comes with the next call, `after: 11`.
      (done or expired), its key is free: a resend of the same bytes is
      stored again, at a new position, and charged again, and the receiving
      host takes it as a duplicate ("Which copies claim an id", above).
-     **Two refinements of design II.4.3 (Atem's proposal, for Astation's
-     agreement):** "identical bytes" are compared in this canonical form,
+     **Two refinements of design II.4.3 (Atem's proposal, agreed with Astation 2026-11-16):** "identical bytes" are compared in this canonical form,
      not as received; and "charged no second time" holds while the object
      is stored, since a resend after its removal is a new delivery.
    - **A put the Station can't read** (no body it parses, or no `id` in
@@ -3508,7 +3502,7 @@ moves to 11, and position 12 comes with the next call, `after: 11`.
    dropped undecided over the pending limits: that one gets no verdict and
    claims no `id` (design II.4.2), and with it removed its key is free, so
    the sender's resend is stored again and judged anew (**Atem's proposed
-   refinement, for Astation's agreement**, of the agreed "isn't marked
+   refinement, agreed with Astation 2026-11-16**, of the agreed "isn't marked
    done" for such an object in design II.4.2 and in "Pending" above:
    without it, the copy left behind the cursor would keep the identical
    resend from being stored until it expired, and the object would never
@@ -3612,7 +3606,7 @@ moves to 11, and position 12 comes with the next call, `after: 11`.
     page that isn't strict I-JSON as a whole is a Station fault, as in
     §11.4.
 
-#### Status forms of a selector's resolution (proposed, for Astation's agreement)
+#### Status forms of a selector's resolution (agreed with Astation 2026-11-16)
 
 A request's recipient whose destination is `select{selectors, budget}`
 ("`select` from host senders" below) is expanded once by the receiving host
@@ -3669,7 +3663,7 @@ other, and a resolution never changes.)
   (`recipients_valid`) takes both forms only in a status object; a `work`
   receipt keeps its `task_id` equal to its `recipient_id`.
 
-#### `result_id` (proposed, for Astation's agreement)
+#### `result_id` (agreed with Astation 2026-11-16)
 
 Every reply to a task has one `result_id` (§4, "Reply"), derived from the
 task id as the host derives it today (`src/runtime/collab_results.rs`,
@@ -3705,7 +3699,7 @@ with hyphens): a UUID v4 (a task's, or an agent recipient's) or a UUID v5
   other is refused authenticated with a new reason, `result_id_mismatch`,
   and, as for every result, nothing is reported back.
 
-#### `select` from host senders (proposed, for Astation's agreement)
+#### `select` from host senders (agreed with Astation 2026-11-16)
 
 - **Only inside host-sender envelopes, on hosts with `host.senders`.** A
   `request` envelope's Message may carry `select{selectors, budget,
@@ -3745,8 +3739,7 @@ with hyphens): a UUID v4 (a task's, or an agent recipient's) or a UUID v5
   reaches no other host. Only label discovery and display (which labels,
   routes and agents a host has) wait for the directory.
 - **A send that reaches both this host's agents and other hosts' is
-  allowed** (proposed, 2026-11-15, Atem's proposal for Astation's
-  agreement). The local part keeps stage 1's path: a Message from `local`
+  allowed** (proposed, 2026-11-15, Atem's proposal, agreed with Astation 2026-11-16). The local part keeps stage 1's path: a Message from `local`
   with its `select` recipient. The remote part is one host-sender Message
   (sender `host:<host_id>`) whose recipients are the other hosts' only, and
   every planned host gets that whole Message in its own envelope (design
@@ -3794,7 +3787,7 @@ The first reaches the agents of host B labelled `project:astation` and
 `tag:auth`; the second, the `auth` route's agent on host B, starting one if
 none runs and the route allows it.
 
-#### The host encryption key in the ceremony (proposed, for Astation's agreement)
+#### The host encryption key in the ceremony (agreed with Astation 2026-11-16)
 
 The owner decided (2026-11-15) that a host's new `host_enc_key` is signed
 inside the verification ceremony, under the same fresh confirmation that
