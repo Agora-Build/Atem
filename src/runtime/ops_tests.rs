@@ -3068,14 +3068,13 @@ fn a_verified_host_keeps_the_key_it_revealed_with_or_without_its_entry() {
             );
             let pinned = crate::session_protocol::membership::peek_pin(&pairing).unwrap();
             assert_eq!(pinned.0, "acct-op");
-            let list = verifier.log.borrow();
-            let listed = list.log.host_enc_key(&verifier.device_id);
-            assert_eq!(
-                listed.map(|k| *k.current.key.as_32().unwrap()),
-                key_entry.then_some(enc_pub),
-                "{key_entry}"
-            );
-            drop(list);
+            let listed = verifier
+                .log
+                .borrow()
+                .log
+                .host_enc_key(&verifier.device_id)
+                .map(|k| *k.current.key.as_32().unwrap());
+            assert_eq!(listed, key_entry.then_some(enc_pub), "{key_entry}");
             rt.shutdown().await;
         });
     }
