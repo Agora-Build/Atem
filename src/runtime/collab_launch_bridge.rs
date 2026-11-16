@@ -228,11 +228,12 @@ impl HostBridge {
             let route = launch.route;
             let profile = self.work.config.profile(&route.profile_id).unwrap().clone();
             let permit = Arc::new(AtomicBool::new(true));
-            let (flag, approved, approved_route, dir) = (
+            let (flag, approved, approved_route, dir, features) = (
                 permit.clone(),
                 profile.clone(),
                 route.clone(),
                 self.work.dir.clone(),
+                self.features,
             );
             // At the spawn boundary, as a remote launch's: a file that
             // doesn't load (it may be the edit that removes the route),
@@ -242,7 +243,7 @@ impl HostBridge {
             let guard = Arc::new(move || {
                 flag.load(Ordering::SeqCst)
                     && host_now().wall_ms < expires_at
-                    && Config::load(&dir).is_ok_and(|c| {
+                    && Config::load_for(&dir, features).is_ok_and(|c| {
                         c.enabled
                             && c.profile(&approved.id) == Some(&approved)
                             && c.route(&approved_route.id) == Some(&approved_route)

@@ -520,20 +520,37 @@ fn left_over(error: &str) -> String {
     )
 }
 
+/// What [`remove_device_list_leftovers`] removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftoversRemoved {
+    /// Nothing was there.
+    Nothing,
+    /// r9 device-list files (and with them any host encryption key).
+    DeviceList,
+    /// Only a host encryption key and its record, which grant nothing
+    /// without a device list (an older build's unpair left them).
+    HostEncKey,
+}
+
 /// `atem unpair` on a profile that isn't paired but still holds r9
-/// device-list files (an unpair that stopped midway): removes them, under
-/// `trust_gen.lock`. True when there was something to remove.
-pub fn remove_device_list_leftovers(src: &Sources) -> Result<bool> {
+/// device-list files (an unpair that stopped midway), or only a host
+/// encryption key and its record (an older build's unpair, which doesn't
+/// know them, left them): removes them, under `trust_gen.lock`.
+pub fn remove_device_list_leftovers(src: &Sources) -> Result<LeftoversRemoved> {
     use crate::session_protocol::membership;
     let _lock = lock(src)?;
-    if !membership::has_device_list_files(&src.paths.pairing) {
-        return Ok(false);
-    }
+    let removed = if membership::has_device_list_files(&src.paths.pairing) {
+        LeftoversRemoved::DeviceList
+    } else if membership::has_delete_only_files(&src.paths.pairing) {
+        LeftoversRemoved::HostEncKey
+    } else {
+        return Ok(LeftoversRemoved::Nothing);
+    };
     membership::forget_on_unpair(&src.paths.pairing)
         .map_err(|e| anyhow::anyhow!("could not remove the device-list files: {e}"))?;
     membership::forget_leftovers(&src.paths.pairing)
         .map_err(|e| anyhow::anyhow!("could not remove the device-list files: {e}"))?;
-    Ok(true)
+    Ok(removed)
 }
 
 /// `atem pair`: a new binding with `astation_id` in the next generation,
@@ -1302,14 +1319,62 @@ pub(crate) mod tests {
         assert!(load(&src).unwrap().binding.is_none(), "unpaired");
         assert!(!opens_as_none(&src, dir.path()), "leftovers fail closed");
         std::fs::remove_dir_all(&failing).unwrap();
-        assert!(remove_device_list_leftovers(&src).unwrap());
+        assert_eq!(
+            remove_device_list_leftovers(&src).unwrap(),
+            LeftoversRemoved::DeviceList
+        );
         assert!(opens_as_none(&src, dir.path()));
-        assert!(!remove_device_list_leftovers(&src).unwrap(), "nothing left");
+        assert_eq!(
+            remove_device_list_leftovers(&src).unwrap(),
+            LeftoversRemoved::Nothing,
+            "nothing left"
+        );
         // A plain r8 profile: nothing to remove, nothing created.
         let r8 = tempfile::tempdir().unwrap();
         let src = Sources::in_dir(r8.path());
-        assert!(!remove_device_list_leftovers(&src).unwrap());
+        assert_eq!(
+            remove_device_list_leftovers(&src).unwrap(),
+            LeftoversRemoved::Nothing
+        );
         assert!(!crate::runtime::state_dir(r8.path()).exists());
+    }
+
+    /// An older build's `atem unpair` (which doesn't know the host
+    /// encryption key's files) left them on a profile that is now unpaired:
+    /// they are no device-list leftover (the profile opens as no list), but
+    /// `atem unpair` still removes them, and says it removed only them.
+    #[test]
+    fn unpair_removes_a_host_encryption_key_an_older_unpair_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = Sources::in_dir(dir.path());
+        let paths = &src.paths.pairing;
+        crate::paths::write_test_file(&paths.host_enc_key, b"{\"v\":1}");
+        crate::paths::write_test_file(&paths.host_enc_generated, b"{\"v\":1}");
+        assert!(!crate::status::profile_paired(&src));
+        assert!(!crate::session_protocol::membership::has_device_list_files(
+            paths
+        ));
+        assert!(opens_as_none(&src, dir.path()));
+        assert_eq!(
+            remove_device_list_leftovers(&src).unwrap(),
+            LeftoversRemoved::HostEncKey
+        );
+        assert!(!paths.host_enc_key.exists() && !paths.host_enc_generated.exists());
+        assert!(
+            load(&src).unwrap().binding.is_none(),
+            "nothing else changed"
+        );
+        assert_eq!(
+            remove_device_list_leftovers(&src).unwrap(),
+            LeftoversRemoved::Nothing
+        );
+        // Either file alone counts.
+        crate::paths::write_test_file(&paths.host_enc_generated, b"{}");
+        assert_eq!(
+            remove_device_list_leftovers(&src).unwrap(),
+            LeftoversRemoved::HostEncKey
+        );
+        assert!(!paths.host_enc_generated.exists());
     }
 
     struct NoFences;

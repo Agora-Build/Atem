@@ -282,7 +282,12 @@ struct Process {
 }
 
 /// How long a hung-up agent gets to exit on its own before it is killed.
+#[cfg(not(test))]
 const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Longer in unit tests: a loaded CI runner (3-core macOS) can take more than
+/// 2 s to run a shell's hangup trap, which isn't what the tests check.
+#[cfg(test)]
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(6);
 
 fn stop_child(child: Arc<Mutex<Box<dyn Child + Send + Sync>>>) {
     std::thread::spawn(move || {

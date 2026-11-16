@@ -106,6 +106,9 @@ struct Client {
     /// from this client meanwhile.
     held: Option<Incoming>,
     closing: bool,
+    /// A copy of its socket's descriptor, polled (never read) to tell
+    /// whether the peer hung up before the reader saw the close.
+    socket: Option<std::os::fd::OwnedFd>,
 }
 
 impl Client {
@@ -244,6 +247,15 @@ pub async fn serve(
     let (bridge, host_error) =
         match HostBridge::open(&journal, options.profile.as_ref(), options.clock.clone()) {
             Ok(bridge) => (Some(bridge), None),
+            // Stopped while it waited for the journal's lock: nothing was
+            // opened, so nothing closes cleanly; the loop ends at once. Any
+            // other failure is logged as such, a stop pending or not.
+            Err(error) if error.to_string() == crate::session_protocol::file_journal::STOPPING => {
+                eprintln!(
+                    "atem runtime: stopped while starting; the session journal wasn't opened"
+                );
+                (None, None)
+            }
             Err(error) => {
                 // Never repaired behind the user's back: remote sessions stay
                 // off until the cause is fixed and the runtime restarts.
@@ -341,6 +353,56 @@ pub async fn serve(
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
     Ok(())
+}
+
+/// Whether the peer of the socket `fd` hung up (closed its end, as a
+/// process that ended does), polled without waiting and never consuming:
+/// a hang-up (`POLLHUP`/`POLLERR`), or a readable socket whose next read
+/// is the end of the stream (peeked). Data waiting, or nothing ready, is
+/// no hang-up. Polled for `POLLIN`: macOS reports a hang-up only for a
+/// descriptor polled for some event.
+pub(super) fn hung_up(fd: std::os::fd::BorrowedFd<'_>) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, no wait.
+    if unsafe { libc::poll(&mut poll, 1, 0) } <= 0 {
+        return false;
+    }
+    if poll.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+        return true;
+    }
+    if poll.revents & libc::POLLIN == 0 {
+        return false;
+    }
+    let mut byte = 0u8;
+    // SAFETY: a one-byte buffer we own; MSG_PEEK leaves the data for the
+    // reader, MSG_DONTWAIT never blocks.
+    let read = unsafe {
+        libc::recv(
+            fd.as_raw_fd(),
+            (&mut byte as *mut u8).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    read == 0
+}
+
+/// Whether a client still in the map went away: its process ended (its
+/// start time no longer `started`), or its socket hung up (`hung_up`), as
+/// a process killed and not yet reaped leaves it, whose start time still
+/// reads.
+pub(super) fn client_gone(
+    peer: Option<(u32, u64)>,
+    socket: Option<std::os::fd::BorrowedFd<'_>>,
+    start_time: impl Fn(u32) -> Option<u64>,
+) -> bool {
+    peer.is_some_and(|(pid, started)| start_time(pid) != Some(started))
+        || socket.is_some_and(hung_up)
 }
 
 /// Refuses a peer whose process can't be verified.
@@ -488,6 +550,7 @@ impl Server {
             });
         let id = self.next_client;
         self.next_client += 1;
+        let socket = std::os::fd::AsFd::as_fd(&stream).try_clone_to_owned().ok();
         let (read, mut write) = stream.into_split();
         let (in_tx, rx) = mpsc::channel(CLIENT_QUEUE);
         let (tx, mut out_rx) = mpsc::unbounded_channel::<Outgoing>();
@@ -557,6 +620,7 @@ impl Server {
                 pending: None,
                 held: None,
                 closing: false,
+                socket,
             },
         );
     }
@@ -678,7 +742,17 @@ impl Server {
     /// relay: unlike `atem message reply`, which commits its reply before it
     /// answers, `done` keeps nothing until it resolves.
     fn owner_done_published(&mut self, done: OwnerDonePublished) {
-        if !self.clients.contains_key(&done.client) {
+        // Gone: removed already, or gone though the reader hasn't seen the
+        // close yet (`client_gone`; both arrive at this loop in either
+        // order: a Ctrl-C just before the snapshot came back).
+        let gone = self.clients.get(&done.client).is_none_or(|client| {
+            client_gone(
+                client.peer,
+                client.socket.as_ref().map(std::os::fd::AsFd::as_fd),
+                super::adopt::process_start_time,
+            )
+        });
+        if gone {
             eprintln!(
                 "atem runtime: task {}: `atem task resolve … done` ended before its snapshot was read back; nothing was resolved (a memory may already be on the relay)",
                 done.task_id

@@ -246,6 +246,13 @@ started only for `atem pair` or `atem cred …`). While it runs and is paired it
 is online for Astation; when it has exited, Astation sees this device offline,
 as it does today when no Atem is running.
 
+SIGTERM and SIGINT are taken before the runtime takes `runtime.lock`, so a stop
+while it starts is never the default action: a wait for the session journal's
+lock gives up at once (nothing opened, nothing closed cleanly), and a stop after
+the journal opened, while workers are still adopted, ends the run in order.
+Its clean close resolves the start first (r8 §I), so it never vouches for work
+an unclean run left queued.
+
 ### Replacing a runtime of another build
 
 A non-passive client (every command that uses the runtime; never `atem

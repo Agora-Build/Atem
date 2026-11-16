@@ -83,6 +83,8 @@ struct Rig {
     hook: bool,
     /// With the hook, `host.alerts` too.
     alerts: bool,
+    /// With the hook, `host.senders` too.
+    senders: bool,
     /// Context snapshots from `<sandbox>/context` (`ATEM_TEST_CONTEXT_DIR`).
     context: bool,
 }
@@ -145,6 +147,7 @@ impl Rig {
             pump: Mutex::new(None),
             hook: true,
             alerts: false,
+            senders: false,
             context: false,
         }
     }
@@ -226,11 +229,13 @@ impl Rig {
         let mut command = Command::new(env!("CARGO_BIN_EXE_atem"));
         command.env_clear();
         if self.hook {
-            let features = if self.alerts {
-                "host.delegated,host.alerts"
-            } else {
-                "host.delegated"
-            };
+            let mut features = String::from("host.delegated");
+            if self.alerts {
+                features.push_str(",host.alerts");
+            }
+            if self.senders {
+                features.push_str(",host.senders");
+            }
             command.env("ATEM_TEST_HOST_FEATURES", features);
         }
         if self.context {
@@ -2048,7 +2053,20 @@ fn a_done_whose_client_goes_away_resolves_nothing_and_says_so() {
         context.join(format!("{name}.held")).exists()
     });
     cli.kill().unwrap();
-    cli.wait().unwrap();
+    // Dead and not reaped (a zombie, its start time still read): its
+    // socket's hang-up says it went away.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe {
+            libc::waitid(
+                libc::P_PID,
+                cli.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        },
+        0
+    );
     std::fs::remove_file(context.join(format!("{name}.hold"))).unwrap();
     let log = rig.sandbox.dir.path().join("runtime.log");
     let line = format!(
@@ -2059,6 +2077,7 @@ fn a_done_whose_client_goes_away_resolves_nothing_and_says_so() {
             .unwrap_or_default()
             .contains(&line)
     });
+    cli.wait().unwrap();
     let status = stored(&rig, &t["task_id"]);
     assert_eq!(
         (status["state"].as_str(), status.get("resolved")),
@@ -2164,12 +2183,10 @@ fn a_turn_running_at_its_deadline_is_interrupted_and_expires() {
     // The agent's turn ends interrupted, as after an Esc.
     std::fs::write(rig.fake.join("interrupt"), "").unwrap();
     wait_stored(&rig, tid, "expired", "expired awaiting a result");
-    let rc = receipt(&rig, &attempt);
-    assert_eq!(
-        (&rc["state"], &rc["detail"]),
-        (&json!("completed"), &json!("interrupted")),
-        "{rc}"
-    );
+    // The expiry is in the store mid-pass; the dump comes at the pass's
+    // end: polled.
+    receipt_becomes(&rig, &attempt, "state", "completed");
+    assert_eq!(receipt(&rig, &attempt)["detail"], "interrupted");
     let stored_intents = intents(&rig, tid);
     let [intent] = stored_intents.as_slice() else {
         panic!("one intent: {stored_intents:?}");
@@ -2466,6 +2483,26 @@ fn spawn_evidence(rig: &Rig, rid: &str, sid: &str) -> String {
     format!("workers: {names:?}; runtime.log: {lines:#?}")
 }
 
+/// Waits until runtime.log has `line`. A launch's failure is stored before
+/// it is logged (`launch_failed_before_spawn`), so a read right after a
+/// wait on the store can miss the line: it is polled, never read once.
+#[track_caller]
+fn log_shows(rig: &Rig, line: &str) {
+    let path = rig.sandbox.dir.path().join("runtime.log");
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let log = std::fs::read_to_string(&path).unwrap_or_default();
+        if log.contains(line) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runtime.log never had {line:?}:\n{log}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// VII.A test 19, its launch half (design I.4.3, "Launches"; host-work-v1
 /// §11.6): in the real runtime, a covered service's `host_launch` that
 /// reaches the spawn boundary while the fake Station's feed holds the
@@ -2557,9 +2594,10 @@ fn a_held_senders_launch_waits_and_a_revoked_ones_fails() {
         "nothing spawned when revoked: {}",
         spawn_evidence(&rig, &waiting, &sid)
     );
-    assert!(logged(&format!(
-        "launch {waiting} failed before its spawn: sender revoked"
-    )));
+    log_shows(
+        &rig,
+        &format!("launch {waiting} failed before its spawn: sender revoked"),
+    );
     // At the request: the revoked service can't come back.
     assert_eq!(
         refused_hello(&mut r, IDS, &rig.log, SVC, true),
@@ -2980,9 +3018,17 @@ fn alert_list(dev: &mut Dev, r: &mut Router) -> Vec<Value> {
 }
 
 /// `n` unresolved outcomes of `sender` recorded in the host's store (their
-/// alerts: what the capacity limits count), on session `sid`.
+/// alerts: what the capacity limits count), on session `sid`. One
+/// transaction: the runtime writes this database at every pass, waiting at
+/// most SQLite's 5 s busy timeout for its lock; `n` commits back to back
+/// (each an fsync) can keep it out longer on a loaded machine, and the
+/// runtime then stops hosting (a receipt-database fault).
 fn unresolved_outcomes(rig: &Rig, sender: &str, sid: &str, n: u32) {
-    let db = host_db(rig);
+    let mut db = host_db(rig);
+    // Immediate: the write lock first (waiting), never a read upgraded.
+    let db = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
     let base: i64 = db
         .query_row("SELECT coalesce(max(seq),0) FROM alerts", [], |r| r.get(0))
         .unwrap();
@@ -3001,6 +3047,7 @@ fn unresolved_outcomes(rig: &Rig, sender: &str, sid: &str, n: u32) {
         )
         .unwrap();
     }
+    db.commit().unwrap();
 }
 
 /// A task of the phone's on a session of its own whose agent exits in its
@@ -3271,10 +3318,9 @@ fn launch_failed(rig: &Rig, rid: &str, sid: &str, detail: &str) {
         "nothing spawned: {}",
         spawn_evidence(rig, rid, sid)
     );
-    let log = std::fs::read_to_string(rig.sandbox.dir.path().join("runtime.log")).unwrap();
-    assert!(
-        log.contains(&format!("launch {rid} failed before its spawn: {detail}")),
-        "{log}"
+    log_shows(
+        rig,
+        &format!("launch {rid} failed before its spawn: {detail}"),
     );
     // No alert (design I.4.3, "Launches"; review M5): the host's alerts
     // hold none.
@@ -3519,4 +3565,77 @@ fn a_record_against_a_live_attempt() {
     assert_eq!(input(&rig).matches("REVOKED_AS_IT_STARTS").count(), 1);
     assert!(intents(&rig, &tid).is_empty());
     assert_eq!(escs(&rig), 0);
+}
+
+/// Host senders (delegated host work II.4.1), behind the hook's
+/// `host.senders`: on this host, pinned before the key existed, the
+/// runtime makes the host encryption key at its start; the Mac (a manager)
+/// gets it over its channel, with an `enc_sig` the shared core verifies
+/// with the host's `host_key`; the phone (no `manage`) is `forbidden`; a
+/// restart keeps the key. Without `host.senders` none is made.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "needs the debug ATEM_TEST_HOST_FEATURES hook"
+)]
+fn host_senders_hand_a_manager_the_host_encryption_key() {
+    let mut rig = Rig::prepared(4 * HOUR, false);
+    let key_file = rig.sandbox.config().join("pairing").join("host_enc_key");
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mac = Dev::new(&mut r, IDS, &rig.log, MAC, false);
+    assert!(
+        !mac.a.welcome().features.iter().any(|f| f == "host.senders"),
+        "host.delegated alone"
+    );
+    assert!(!key_file.exists(), "none without host.senders");
+    mac.close(&mut r);
+    rig.kill();
+
+    rig.senders = true;
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut mac = Dev::new(&mut r, IDS, &rig.log, MAC, false);
+    assert!(
+        mac.a.welcome().features.iter().any(|f| f == "host.senders"),
+        "{:?}",
+        mac.a.welcome().features
+    );
+    let made = std::fs::read(&key_file).expect("made at start");
+    let answer = mac.request(&mut r, json!({"op": "host_enc_key_get"}));
+    let answer = atem_client::session::r9::HostEncKey::from_data(&answer)
+        .unwrap_or_else(|e| panic!("{e}: {answer}"));
+    assert_eq!(answer.host_id, HOST);
+    assert_eq!(answer.host_trust_gen, 1);
+    let host_key = rig.log.log.host(HOST).unwrap().host_key.clone();
+    atem_client::membership::verify_host_enc_sig(
+        &host_key,
+        ACCOUNT,
+        &rig.log.log.genesis_hash(),
+        HOST,
+        1,
+        answer.enc_key.as_32().unwrap(),
+        &answer.enc_sig,
+    )
+    .expect("enc_sig verifies");
+    let file: Value = serde_json::from_slice(&made).unwrap();
+    assert_eq!(
+        file["pub"],
+        atem_client::encoding::b64u(answer.enc_key.as_bytes())
+    );
+    let mut phone = Dev::new(&mut r, IDS, &rig.log, PHONE, false);
+    let refused = phone.request(&mut r, json!({"op": "host_enc_key_get"}));
+    assert_eq!(refused["code"], "forbidden", "{refused}");
+
+    // A restart keeps it.
+    mac.close(&mut r);
+    phone.close(&mut r);
+    rig.kill();
+    rig.start();
+    let mut r = Router::new(&rig.astation);
+    let mut mac = Dev::new(&mut r, IDS, &rig.log, MAC, false);
+    let again = mac.request(&mut r, json!({"op": "host_enc_key_get"}));
+    let again = atem_client::session::r9::HostEncKey::from_data(&again).unwrap();
+    assert_eq!(again.enc_key, answer.enc_key);
+    assert_eq!(std::fs::read(&key_file).unwrap(), made);
 }

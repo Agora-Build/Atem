@@ -734,6 +734,217 @@ fn connect_or_start_starts_a_runtime_when_none_answers() {
     });
 }
 
+/// A runtime that dies with the hello unread resets the connection
+/// (`ECONNRESET`): the client takes it for none answering and starts one,
+/// as after a refused connect.
+#[test]
+fn a_runtime_that_dies_under_the_hello_counts_as_none() {
+    local(async {
+        let dir = short_dir();
+        let locator = super::client::Locator::in_dir(dir.path());
+        let socket = locator.socket.clone();
+        let root = dir.path().to_path_buf();
+        let dying = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::task::spawn_local(async move {
+            let (stream, _) = dying.accept().await.unwrap();
+            // The hello is in, unread: closing now resets the client.
+            stream.readable().await.unwrap();
+            drop(stream);
+            drop(dying);
+        });
+        let (_stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let stopped = std::cell::RefCell::new(Some(stopped));
+        let start = || {
+            let stopped = stopped.borrow_mut().take().expect("started once");
+            // The dead runtime's socket file is left behind.
+            std::fs::remove_file(&socket)?;
+            let listener = tokio::net::UnixListener::bind(&socket)?;
+            tokio::task::spawn_local(serve(
+                app(&root),
+                listener,
+                Options {
+                    idle: Duration::from_secs(600),
+                    uid: own_uid(),
+                    launcher: launcher(&root),
+                    profile: None,
+                    clock: Default::default(),
+                    ops: crate::runtime::ops::OpEnv::unavailable(),
+                },
+                async {
+                    let _ = stopped.await;
+                },
+            ));
+            Ok(())
+        };
+        let client = RuntimeClient::connect_or_start_with(&locator, start, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(client.welcome.pid, std::process::id());
+        assert!(stopped.borrow().is_none(), "a runtime was started");
+    });
+}
+
+/// A runtime still exiting holds `runtime.lock` after its socket stopped
+/// answering (a reset, or refused): the client waits for the lock before
+/// it starts one, which would otherwise find the lock held and exit, and
+/// the start then answers (cleanup review, minor 3).
+#[test]
+fn a_start_waits_for_a_runtime_still_exiting() {
+    local(async {
+        let dir = short_dir();
+        let locator = super::client::Locator::in_dir(dir.path());
+        let held = crate::daemon::lock_exclusive_with_pid(&locator.lock)
+            .unwrap()
+            .expect("the exiting runtime's lock");
+        let exiting = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        let (socket, lock) = (locator.socket.clone(), locator.lock.clone());
+        let root = dir.path().to_path_buf();
+        let (_stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let start = move || {
+            // As `atem runtime` does: a held lock is another runtime's.
+            if crate::daemon::lock_is_held(&lock) == Some(true) {
+                return Ok(());
+            }
+            let listener = tokio::net::UnixListener::bind(&socket)?;
+            tokio::task::spawn_local(serve(
+                app(&root),
+                listener,
+                Options {
+                    idle: Duration::from_secs(600),
+                    uid: own_uid(),
+                    launcher: launcher(&root),
+                    profile: None,
+                    clock: Default::default(),
+                    ops: crate::runtime::ops::OpEnv::unavailable(),
+                },
+                async {
+                    let _ = stopped.await;
+                },
+            ));
+            Ok(())
+        };
+        let client = RuntimeClient::connect_or_start_with(&locator, start, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(client.welcome.pid, std::process::id());
+        exiting.join().unwrap();
+    });
+}
+
+/// A lock whose holder never answers nor exits: no start is tried (it
+/// would lose the lock), and the error names the holder.
+#[test]
+fn a_held_lock_that_never_answers_is_named() {
+    local(async {
+        let dir = short_dir();
+        let locator = super::client::Locator::in_dir(dir.path());
+        let _held = crate::daemon::lock_exclusive_with_pid(&locator.lock)
+            .unwrap()
+            .expect("the lock");
+        let started = std::cell::Cell::new(false);
+        let error = RuntimeClient::connect_or_start_with(
+            &locator,
+            || {
+                started.set(true);
+                Ok(())
+            },
+            Duration::from_millis(300),
+        )
+        .await
+        .err()
+        .expect("nothing answers");
+        assert!(!started.get(), "no start against a held lock");
+        let text = error.to_string();
+        assert!(
+            text.contains(&format!("is held by pid {}", std::process::id())),
+            "{text}"
+        );
+    });
+}
+
+/// The wait for an exiting runtime's lock and the wait for the started one
+/// share one budget (re-review N5): a lock held for most of it, then a
+/// start that never answers, fails at the budget, not at twice it.
+#[test]
+fn a_start_after_a_lock_wait_keeps_one_budget() {
+    local(async {
+        let dir = short_dir();
+        let locator = super::client::Locator::in_dir(dir.path());
+        let held = crate::daemon::lock_exclusive_with_pid(&locator.lock)
+            .unwrap()
+            .expect("the exiting runtime's lock");
+        let exiting = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            drop(held);
+        });
+        let began = Instant::now();
+        let result =
+            RuntimeClient::connect_or_start_with(&locator, || Ok(()), Duration::from_secs(1)).await;
+        let took = began.elapsed();
+        exiting.join().unwrap();
+        assert!(result.is_err(), "nothing answers");
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+    });
+}
+
+/// A client whose peer ended reads as hung up before its reader sees the
+/// close, unread bytes or not, on Linux's and macOS's semantics alike
+/// (cleanup review, minor 5; re-review N1).
+#[test]
+fn a_socket_whose_peer_ended_reads_hung_up() {
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    for unread in [false, true] {
+        let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        assert!(!super::server::hung_up(ours.as_fd()), "unread {unread}");
+        if unread {
+            (&theirs).write_all(b"unread").unwrap();
+            assert!(!super::server::hung_up(ours.as_fd()), "data is no hang-up");
+        }
+        drop(theirs);
+        assert!(super::server::hung_up(ours.as_fd()), "unread {unread}");
+        if unread {
+            // Peeked, never consumed: the reader still gets the bytes.
+            let mut got = Vec::new();
+            std::io::Read::read_to_end(&mut &ours, &mut got).unwrap();
+            assert_eq!(got, b"unread");
+        }
+    }
+    // Only its sending side shut: readable at the end of the stream, which
+    // the peek sees (no POLLHUP on Linux here).
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    theirs.shutdown(std::net::Shutdown::Write).unwrap();
+    assert!(super::server::hung_up(ours.as_fd()), "end of stream");
+}
+
+/// The gone-client check of a `done` whose snapshot came back (re-review
+/// N2): a client still in the map, its process alive (this test's own),
+/// is gone once its socket hung up, and only then.
+#[test]
+fn a_live_client_whose_socket_hung_up_is_gone() {
+    use std::os::fd::AsFd;
+    let pid = std::process::id();
+    let started = super::adopt::process_start_time(pid).expect("this process");
+    let alive = |p: u32| (p == pid).then_some(started);
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let gone = || super::server::client_gone(Some((pid, started)), Some(ours.as_fd()), alive);
+    assert!(!gone(), "connected, alive");
+    drop(theirs);
+    assert!(gone(), "hung up, its process still alive");
+    // Its process ended (another start time): gone, whatever the socket.
+    let (open, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(super::server::client_gone(
+        Some((pid, started)),
+        Some(open.as_fd()),
+        |_| None
+    ));
+    // No peer credentials and no socket copy: nothing says it went.
+    assert!(!super::server::client_gone(None, None, alive));
+}
+
 #[test]
 fn the_runtime_environment_is_sanitized() {
     use std::ffi::OsString;

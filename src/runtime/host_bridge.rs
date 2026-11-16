@@ -265,6 +265,13 @@ fn verified_identity(
         .then_some(identity)
 }
 
+/// The host encryption key's lines for runtime.log (`r9::host_enc`).
+fn host_enc_lines(lines: Vec<String>) {
+    for line in lines {
+        eprintln!("atem runtime: host encryption key: {line}");
+    }
+}
+
 /// The identity of the profile's current pairing (at start), else none.
 fn start_identity(src: &crate::profile::Sources) -> Identity {
     let state = crate::pairing::load(src).ok();
@@ -906,6 +913,19 @@ impl HostBridge {
             }
             _ => (None, None),
         };
+        // Host senders (the hook's `host.senders`): a pinned host that holds
+        // no encryption key for its generation (paired before the key
+        // existed, or its pin's key not made) makes one now.
+        if features.senders
+            && membership.is_some()
+            && let Some(pairing) = &pairing
+        {
+            host_enc_lines(crate::session_protocol::r9::host_enc::ensure(
+                pairing,
+                dir,
+                host.context().host_trust_gen,
+            ));
+        }
         // With `host.delegated` on, the start view is told the list's state
         // at every change (Decision 16) and its deferral is kept on disk.
         let mut membership = membership;
@@ -1772,6 +1792,17 @@ impl HostBridge {
                     && m.pin_of() == pin
                     && m.membership().genesis_hash().to_hex() == *genesis
                     && (self.host_key.is_none() || host_pub == self.host_pub)
+                    // The host runs under the pin's identity: a pin read
+                    // while it was still being written (its key first, the
+                    // list last) can open finished after the older account,
+                    // device or trust generation was taken, and is taken
+                    // again here.
+                    && {
+                        let ctx = self.host.context();
+                        ctx.account_id == *account
+                            && ctx.atem_device_id == pin.host_id
+                            && ctx.host_trust_gen >= pin.host_trust_gen
+                    }
             }
             (None, None) => {
                 self.membership_error.is_none() && !membership::has_device_list_files(&pairing)
@@ -1820,6 +1851,9 @@ impl HostBridge {
             }
         }
         if self.membership_error.is_none() {
+            // Debug builds: a test finishes a pin's writes here (the pin
+            // above read before them, the list below after).
+            super::test_hooks::reopen_hold();
             let epoch = self.host.context().runtime_epoch;
             let mut fences = HostFences::new(&mut self.host);
             let opened = MembershipHost::open(&pairing, &self.dir, epoch, &host_now(), &mut fences);
@@ -1847,6 +1881,15 @@ impl HostBridge {
                         m.head().seq,
                         m.pin_of().host_id
                     );
+                    // Host senders: a new pin (`atem pair verify`'s next
+                    // generation) gets its encryption key if it has none.
+                    if self.features.senders {
+                        host_enc_lines(crate::session_protocol::r9::host_enc::ensure(
+                            &pairing,
+                            &self.dir,
+                            self.host.context().host_trust_gen,
+                        ));
+                    }
                     self.membership = Some(m);
                     self.sync_list_view();
                 }
@@ -2248,7 +2291,10 @@ impl HostBridge {
             })
             .collect();
         let status = self.r9.status();
+        let ctx = self.host.context();
         let mut state = json!({
+            "host": {"account_id": ctx.account_id, "atem_device_id": ctx.atem_device_id,
+                     "host_trust_gen": ctx.host_trust_gen},
             "journal_halted": self.host.journal_halted(),
             "channels": status.channels,
             "attachments": status.attachments,

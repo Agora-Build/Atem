@@ -138,7 +138,8 @@ fn start_runtime(log: &Path) -> Result<()> {
 
 /// Why connecting failed.
 enum Failure {
-    /// Nothing answers: start one.
+    /// Nothing answers: start one. Also a runtime that went away while we
+    /// connected or greeted it (`gone`).
     Absent,
     /// The runtime is restarting for another protocol: start one once it's gone.
     Restarting,
@@ -232,18 +233,30 @@ impl RuntimeClient {
             }
             Err(Failure::Absent) => {}
         }
-        start()?;
+        // A runtime still exiting (its connection reset or refused) can
+        // still hold `runtime.lock`: one started now would find it held and
+        // exit at once. Wait for the lock first, or for an answer after all
+        // (a runtime between taking its lock and listening).
+        // One budget for this wait and the start's below.
         let deadline = tokio::time::Instant::now() + wait;
+        while crate::daemon::lock_is_held(&locator.lock) == Some(true) {
+            match Self::connect(locator).await {
+                Ok(client) => return Ok(client),
+                Err(Failure::Other(error)) => return Err(error),
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(_) => return Err(not_started(locator)),
+            }
+        }
+        start()?;
         loop {
             tokio::time::sleep(Duration::from_millis(50)).await;
             match Self::connect(locator).await {
                 Ok(client) => return Ok(client),
                 Err(Failure::Other(error)) => return Err(error),
                 Err(_) if tokio::time::Instant::now() < deadline => {}
-                Err(_) => bail!(
-                    "the atem runtime didn't start; see {}",
-                    locator.log.display()
-                ),
+                Err(_) => return Err(not_started(locator)),
             }
         }
     }
@@ -279,11 +292,12 @@ impl RuntimeClient {
     async fn connect_as(locator: &Locator, passive: bool) -> Result<Self, Failure> {
         match dial(locator).await {
             Ok(stream) => Self::greet(stream, passive).await,
+            // Reset at the connect: queued on a dying runtime's socket.
             Err(error)
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-                ) =>
+                ) || gone(error.kind()) =>
             {
                 Err(Failure::Absent)
             }
@@ -351,6 +365,11 @@ impl RuntimeClient {
             ))),
             // Closed without a word: it was going away.
             Ok(None) => Err(Failure::Absent),
+            // Reset, or closed before the hello was written: it died with
+            // the hello unread (a dying runtime's socket still takes a
+            // connection until its last thread closes it), as absent as a
+            // refused connect.
+            Err(error) if went_away(&error) => Err(Failure::Absent),
             Err(error) => Err(Failure::Other(error)),
         }
     }
@@ -421,6 +440,44 @@ impl RuntimeWriter {
             .await
             .context("the atem runtime closed the connection")
     }
+}
+
+/// Why no runtime answers after a start: one whose `runtime.lock` is still
+/// held (by a runtime that neither answers nor exits) is named, as the
+/// started one found it held and exited.
+fn not_started(locator: &Locator) -> anyhow::Error {
+    if crate::daemon::lock_is_held(&locator.lock) == Some(true) {
+        let holder = crate::daemon::read_lock_pid(&locator.lock)
+            .map_or_else(|| "another process".to_string(), |pid| format!("pid {pid}"));
+        return anyhow!(
+            "the atem runtime didn't start: {} is held by {holder}, which doesn't answer at {}; see {}",
+            locator.lock.display(),
+            locator.socket.display(),
+            locator.log.display()
+        );
+    }
+    anyhow!(
+        "the atem runtime didn't start; see {}",
+        locator.log.display()
+    )
+}
+
+/// A connection the runtime's end dropped with our bytes unread
+/// (`ECONNRESET`) or before we wrote (`EPIPE`): the runtime went away.
+fn gone(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+    )
+}
+
+/// [`gone`] anywhere in `error`'s chain.
+fn went_away(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| gone(e.kind()))
+    })
 }
 
 /// The recorded socket, else the derived one.
@@ -871,7 +928,7 @@ pub fn look(locator: &Locator, timeout: Duration) -> Look {
             if matches!(
                 error.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
+            ) || gone(error.kind()) =>
         {
             return Look::NotRunning;
         }
@@ -882,7 +939,17 @@ pub fn look(locator: &Locator, timeout: Duration) -> Look {
         Err(error) => return Look::Unreachable(error.to_string()),
     };
     let mut writer = stream;
-    let next = |reader: &mut BufReader<StdStream>| -> Result<Option<RuntimeMsg>, String> {
+    /// What one read of the look got (one short-lived value per read:
+    /// boxing the message buys nothing).
+    #[allow(clippy::large_enum_variant)]
+    enum Read {
+        Message(RuntimeMsg),
+        /// Closed without a word.
+        Closed,
+        /// Reset (`gone`): the runtime went away with our bytes unread.
+        Gone,
+    }
+    let next = |reader: &mut BufReader<StdStream>| -> Result<Read, String> {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
             return Err("it didn't answer in time".into());
@@ -893,8 +960,11 @@ pub fn look(locator: &Locator, timeout: Duration) -> Look {
             .map_err(|e| e.to_string())?;
         let mut line = String::new();
         match reader.read_line(&mut line) {
-            Ok(0) => Ok(None),
-            Ok(_) => decode_runtime(&line).map(Some).map_err(|e| e.to_string()),
+            Ok(0) => Ok(Read::Closed),
+            Ok(_) => decode_runtime(&line)
+                .map(Read::Message)
+                .map_err(|e| e.to_string()),
+            Err(error) if gone(error.kind()) => Ok(Read::Gone),
             Err(_) => Err("it didn't answer in time".into()),
         }
     };
@@ -905,10 +975,15 @@ pub fn look(locator: &Locator, timeout: Duration) -> Look {
         passive: true,
     };
     if let Err(error) = writer.write_all(encode_client(&hello).as_bytes()) {
-        return Look::Unreachable(error.to_string());
+        // A runtime that went away before the hello (`gone`) runs no more.
+        return if gone(error.kind()) {
+            Look::NotRunning
+        } else {
+            Look::Unreachable(error.to_string())
+        };
     }
     let welcome = match next(&mut reader) {
-        Ok(Some(RuntimeMsg::Welcome {
+        Ok(Read::Message(RuntimeMsg::Welcome {
             protocol,
             build,
             pid,
@@ -925,33 +1000,41 @@ pub fn look(locator: &Locator, timeout: Duration) -> Look {
             worker_protocol,
             device_list,
         },
-        Ok(Some(RuntimeMsg::Error { text, .. })) => return Look::Unreachable(text),
-        Ok(Some(other)) => {
+        Ok(Read::Message(RuntimeMsg::Error { text, .. })) => return Look::Unreachable(text),
+        Ok(Read::Message(other)) => {
             return Look::Unreachable(format!("unexpected reply {}", other_op(&other)));
         }
-        // Closed without a word: it was going away.
-        Ok(None) => return Look::NotRunning,
+        // Closed without a word, or reset: it was going away.
+        Ok(Read::Closed | Read::Gone) => return Look::NotRunning,
         Err(error) => return Look::Unreachable(error),
     };
     if let Err(error) = writer.write_all(encode_client(&ClientMsg::Status).as_bytes()) {
-        return Look::Unreachable(error.to_string());
+        // Gone after its welcome: it runs no more.
+        return if gone(error.kind()) {
+            Look::NotRunning
+        } else {
+            Look::Unreachable(error.to_string())
+        };
     }
     loop {
         match next(&mut reader) {
-            Ok(Some(RuntimeMsg::Status { status })) => {
+            Ok(Read::Message(RuntimeMsg::Status { status })) => {
                 return Look::Running {
                     welcome,
                     status: Some(status),
                 };
             }
             // A runtime from before `status` refuses the unknown op.
-            Ok(Some(RuntimeMsg::Error { .. })) | Ok(None) => {
+            Ok(Read::Message(RuntimeMsg::Error { .. }) | Read::Closed) => {
                 return Look::Running {
                     welcome,
                     status: None,
                 };
             }
-            Ok(Some(_)) => {}
+            // Reset after its welcome: it went away while we looked, no
+            // runtime of an older build.
+            Ok(Read::Gone) => return Look::NotRunning,
+            Ok(Read::Message(_)) => {}
             Err(error) => return Look::Unreachable(error),
         }
     }
@@ -962,4 +1045,86 @@ fn other_op(message: &RuntimeMsg) -> String {
         .ok()
         .and_then(|v| v["op"].as_str().map(str::to_string))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::went_away;
+    use std::io::{Error, ErrorKind};
+
+    /// A runtime that welcomes a passive look and then dies with its
+    /// `status` request unread resets the look: no runtime answers, not "a
+    /// runtime from before `status`" (cleanup review, minor 4).
+    // Linux only: a macOS AF_UNIX peer closing with unread data gives EOF,
+    // not a reset, so there a dying runtime reads as one from before `status`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_runtime_reset_after_its_welcome_is_not_running() {
+        use super::super::protocol::{PROTOCOL, RuntimeMsg, encode_runtime};
+        use super::{Locator, Look, look};
+        use std::io::{BufRead, Write};
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::Builder::new()
+            .prefix("atem-look")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let locator = Locator::in_dir(dir.path());
+        let listener = std::os::unix::net::UnixListener::bind(&locator.socket).unwrap();
+        let runtime = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut hello = String::new();
+            reader.read_line(&mut hello).unwrap();
+            let welcome = RuntimeMsg::Welcome {
+                protocol: PROTOCOL,
+                build: "a build".into(),
+                pid: 1,
+                astation: false,
+                host_error: None,
+                worker_protocol: None,
+                device_list: None,
+            };
+            (&stream)
+                .write_all(encode_runtime(&welcome).as_bytes())
+                .unwrap();
+            // The `status` request is in, unread: closing now resets it.
+            let mut poll = libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut poll, 1, 5_000) }, 1);
+        });
+        let seen = look(&locator, std::time::Duration::from_secs(5));
+        runtime.join().unwrap();
+        let what = match seen {
+            Look::NotRunning => "not running",
+            Look::Unreachable(_) => "unreachable",
+            Look::Running { status: None, .. } => "running, from before status",
+            Look::Running { .. } => "running",
+        };
+        assert_eq!(what, "not running");
+    }
+
+    #[test]
+    fn a_reset_or_a_broken_pipe_is_a_runtime_gone() {
+        for kind in [ErrorKind::ConnectionReset, ErrorKind::BrokenPipe] {
+            let error = anyhow::Error::from(Error::from(kind))
+                .context("the atem runtime closed the connection");
+            assert!(went_away(&error), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(
+                !went_away(&anyhow::Error::from(Error::from(kind))),
+                "{kind:?}"
+            );
+        }
+        assert!(!went_away(&anyhow::anyhow!(
+            "the runtime sent invalid text"
+        )));
+    }
 }

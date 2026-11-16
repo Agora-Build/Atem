@@ -5,7 +5,7 @@
 //! verifies the whole chain and the pairing checks, then pins it (the list,
 //! the key and the applied head) before it reports success. A verification
 //! that fails after the pin takes the pin back.
-use super::{HostPin, LEFTOVERS, MembershipHost, frozen_genesis, journal_of, store};
+use super::{DELETE_ONLY, HostPin, LEFTOVERS, MembershipHost, frozen_genesis, journal_of, store};
 use crate::paths::PairingPaths;
 use atem_client::canonical::StrictValue;
 use atem_client::encoding::Hash32;
@@ -96,19 +96,34 @@ pub fn verify_pairing_log(
 }
 
 /// Pins the verified log for this host, with its `host_channel_key`, under
-/// `trust_gen.lock` held by the caller (the ceremony's apply).
+/// `trust_gen.lock` held by the caller (the ceremony's apply). With
+/// `enc_key` (the debug hook's `host.senders`), the host encryption key of
+/// this trust generation is made beside it (`r9::host_enc`).
 pub fn pin_at_pairing_locked(
     pairing: &PairingPaths,
     m: &Membership,
     host_id: &str,
     host_trust_gen: u64,
     host_seed: &[u8; 32],
+    enc_key: bool,
 ) -> Result<(), String> {
     let pin = HostPin {
         host_id: host_id.to_string(),
         host_trust_gen,
     };
-    MembershipHost::pin_locked(pairing, &journal_of(pairing), &pin, m, host_seed)
+    MembershipHost::pin_locked(pairing, &journal_of(pairing), &pin, m, host_seed)?;
+    if enc_key {
+        // The pin removed any earlier key and record. One that can't be
+        // made now is made at the runtime's next start (or its next read
+        // of the list): the pairing doesn't fail for it.
+        match crate::session_protocol::r9::host_enc::make_at_pin_locked(pairing, host_trust_gen) {
+            Ok(lines) => lines
+                .iter()
+                .for_each(|line| eprintln!("atem: host encryption key: {line}")),
+            Err(error) => eprintln!("atem: host encryption key: {error}"),
+        }
+    }
+    Ok(())
 }
 
 /// A verification that failed after its pin (the cred side couldn't be
@@ -121,7 +136,7 @@ pub fn unpin_locked(pairing: &PairingPaths) {
         eprintln!("atem: device list: cannot take the pin back: {e}");
         return;
     }
-    for file in LEFTOVERS {
+    for file in LEFTOVERS.into_iter().chain(DELETE_ONLY) {
         if let Err(e) = store.remove(file) {
             eprintln!("atem: device list: cannot take the pin back: {e}");
         }

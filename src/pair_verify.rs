@@ -300,6 +300,26 @@ pub(crate) struct HostPinning<'a> {
     pub host_id: &'a str,
     /// The `host_channel_key` seed this ceremony revealed.
     pub host_seed: &'a [u8; 32],
+    /// Make the host encryption key with the pin (the runtime's debug hook
+    /// turned `host.senders` on).
+    pub enc_key: bool,
+}
+
+impl<'a> HostPinning<'a> {
+    /// What a ceremony in a runtime whose hook turned on `features` pins.
+    pub(crate) fn new(
+        astation: &'a crate::memory::verification::AstationKeys,
+        host_id: &'a str,
+        host_seed: &'a [u8; 32],
+        features: crate::runtime::test_hooks::HostFeatures,
+    ) -> Self {
+        HostPinning {
+            astation,
+            host_id,
+            host_seed,
+            enc_key: features.senders,
+        }
+    }
 }
 
 /// Applies Astation's `deviceVerified` only while the pairing the
@@ -344,8 +364,15 @@ pub(crate) fn apply_device_verified(
         };
         let log = pin::verify_pairing_log(reply.membership.as_ref(), &inputs, pairing, &host_now())
             .map_err(|e| anyhow!("{e}"))?;
-        pin::pin_at_pairing_locked(pairing, &log, host.host_id, host_trust_gen, host.host_seed)
-            .map_err(|e| anyhow!("couldn't pin the device list: {e}"))?;
+        pin::pin_at_pairing_locked(
+            pairing,
+            &log,
+            host.host_id,
+            host_trust_gen,
+            host.host_seed,
+            host.enc_key,
+        )
+        .map_err(|e| anyhow!("couldn't pin the device list: {e}"))?;
         crate::memory::verification::complete_verification(
             paths,
             agent,
@@ -468,6 +495,34 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
+
+    /// The host encryption key is made with the pin only when the
+    /// runtime's debug hook turned `host.senders` on (with
+    /// `host.delegated`); never with the hook off, as on main.
+    #[test]
+    fn the_pin_makes_the_host_encryption_key_only_with_host_senders() {
+        use crate::runtime::test_hooks::HostFeatures;
+        let astation = crate::memory::verification::AstationKeys {
+            sign_pub: vec![4; 65],
+            enc_pub: [5; 32],
+            recovery_sign_pub: [6; 32],
+            nonce_s: [7; 32],
+            genesis_hash: [8; 32],
+        };
+        for (hook, enc_key) in [
+            ("", false),
+            ("host.delegated", false),
+            ("host.delegated,host.alerts", false),
+            ("host.senders", false),
+            ("host.delegated,host.senders", true),
+            ("host.delegated,host.alerts,host.senders", true),
+        ] {
+            let features = HostFeatures::parse(hook).unwrap();
+            let pinning = HostPinning::new(&astation, "host-1", &[9; 32], features);
+            assert_eq!(pinning.enc_key, enc_key, "{hook:?}");
+            assert_eq!(pinning.host_id, "host-1");
+        }
+    }
 
     /// A terminal with keys typed before the prompt (`pending`) and keys
     /// typed after it (`fresh`).
@@ -862,6 +917,7 @@ mod tests {
                 astation: &astation,
                 host_id: "host-1",
                 host_seed: &[9; 32],
+                enc_key: true,
             };
             let error = apply_device_verified(
                 &capture,
