@@ -80,8 +80,10 @@
 //!   genesis the link's), then rule 3 (the recipient a current host at that
 //!   generation; the times; idempotency on `(calling host, body.id)` by
 //!   `object_hash` while stored, `id_reused` for other bytes; the quotas,
-//!   [`MailboxQuota`], or [`FakeStation::refuse_quota`]). A put it can't
-//!   read gets no answer (dropped, counted).
+//!   [`MailboxQuota`] per sending host, receiving host and account, on
+//!   each object's bytes as received, or [`FakeStation::refuse_quota`]).
+//!   A put it can't read gets no answer (dropped, counted). Capacity
+//!   reserved for control objects isn't modelled.
 //! - `mailbox_sync` (rule 4): the first stored object after `after`, the
 //!   page's `through` covering every position up to the next stored one
 //!   (done or expired positions included), or to the head; a reset's form
@@ -190,24 +192,29 @@ impl Held {
 
 /// The Station's limits on mailbox objects (design II.4.3's starting
 /// limits, whichever comes first), on the encoded bytes of each object:
-/// stored per sending host, and per receiving host's mailbox.
+/// stored per sending host, per receiving host's mailbox and per account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MailboxQuota {
     pub per_sender: usize,
     pub per_sender_bytes: usize,
     pub per_mailbox: usize,
     pub per_mailbox_bytes: usize,
+    pub per_account: usize,
+    pub per_account_bytes: usize,
 }
 
 impl Default for MailboxQuota {
     /// 128 objects or 32 MiB per sending host, 256 objects or 64 MiB per
-    /// receiving host (design II.4.3).
+    /// receiving host, 1,024 objects or 256 MiB per account (design
+    /// II.4.3).
     fn default() -> Self {
         MailboxQuota {
             per_sender: 128,
             per_sender_bytes: 32 << 20,
             per_mailbox: 256,
             per_mailbox_bytes: 64 << 20,
+            per_account: 1024,
+            per_account_bytes: 256 << 20,
         }
     }
 }
@@ -1276,6 +1283,19 @@ fn mailbox_call(bytes: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The length of a put's `object` as the call carried it (its exact text,
+/// whitespace and escapes included).
+fn received_object_len(bytes: &[u8]) -> Option<usize> {
+    #[derive(serde::Deserialize)]
+    struct Put<'a> {
+        #[serde(borrow)]
+        object: &'a serde_json::value::RawValue,
+    }
+    serde_json::from_slice::<Put>(bytes)
+        .ok()
+        .map(|put| put.object.get().len())
+}
+
 /// A mailbox's `mailbox_id`: the `n`th minted at `origin` for `account_id`
 /// (deterministic: a run repeats; never reused within it).
 fn mailbox_id(origin: &str, account_id: &str, n: u64) -> String {
@@ -1431,7 +1451,9 @@ impl FakeStation {
             return Some(refused(PutRefusal::Expired));
         }
         let hash = object_hash(&put.object);
-        let size = put.object.to_json().to_string().len();
+        // Its bytes as received (design II.4.3: limits on the encoded wire
+        // bytes), never a serialization of the fake's own.
+        let size = received_object_len(bytes).unwrap_or(bytes.len());
         let recipient = (
             body.recipient.host_id.clone(),
             body.recipient.host_trust_gen,
@@ -1606,8 +1628,8 @@ impl FakeStation {
         }
     }
 
-    /// Whether `size` more bytes from `sender` fit the quotas, with the
-    /// recipient's mailbox.
+    /// Whether `size` more bytes from `sender` fit the quotas: its own, the
+    /// recipient's mailbox's and the account's.
     fn within_quota(
         &mut self,
         sender: &str,
@@ -1621,8 +1643,12 @@ impl FakeStation {
         for (host, generation) in keys {
             self.mailbox_of(&host, generation, now);
         }
+        // Every mailbox here is the account's (the fake serves one).
         let (mut of_sender, mut sender_bytes) = (0, 0);
+        let (mut in_account, mut account_bytes) = (0, 0);
         for stored in self.mailboxes.values().flat_map(|m| m.stored.values()) {
+            in_account += 1;
+            account_bytes += stored.bytes;
             if stored.sender == sender {
                 of_sender += 1;
                 sender_bytes += stored.bytes;
@@ -1635,6 +1661,8 @@ impl FakeStation {
             && sender_bytes + size <= quota.per_sender_bytes
             && in_mailbox < quota.per_mailbox
             && mailbox_bytes + size <= quota.per_mailbox_bytes
+            && in_account < quota.per_account
+            && account_bytes + size <= quota.per_account_bytes
     }
 
     /// `mailbox_stored` for `put`, unless the next one is lost.

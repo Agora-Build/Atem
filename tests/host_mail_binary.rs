@@ -762,6 +762,55 @@ fn the_fake_mailbox_follows_the_put_rules() {
     assert_eq!(station.mailbox_head(), 3);
 }
 
+/// Review finding 4, design II.4.3: the fake Station charges an object's
+/// bytes as it received them (the same object sent with more whitespace
+/// costs more), and holds an account-wide limit beside the per-sender and
+/// per-mailbox ones (no runtime).
+#[test]
+fn the_fake_mailbox_charges_the_wire_bytes_and_limits_the_account() {
+    let astation = FakeAstation::start();
+    let mut log = TestLog::genesis(ACCOUNT, &secret("host mail astation"));
+    log.add_host(HOST, 1, &secret("host mail host"));
+    log.add_host(SENDER, 1, &secret(SENDER_SEED));
+    log.add_host(OTHER_HOST, 1, &secret("host mail other host"));
+    let mut station = FakeStation::new(&astation, NO_RELAY, &log, HOST, 1);
+    let sender = SenderHost::new(&log, SENDER, 1, &secret(SENDER_SEED));
+    let other = SenderHost::new(&log, OTHER_HOST, 1, &secret("host mail other host"));
+    let to = Receiver::other(HOST, 1, "host mail host enc");
+    let head = log.log.head();
+    // The bytes as received: room for the object written compactly only.
+    let object = sender.cancel(&to, head);
+    let compact = object.to_json().to_string().len();
+    station.set_mailbox_quota(MailboxQuota {
+        per_sender_bytes: compact,
+        ..MailboxQuota::default()
+    });
+    let put = atem_client::host_mail::mailbox::MailboxPut {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        object: object.clone(),
+    };
+    let spaced = serde_json::to_string_pretty(&put.to_json().unwrap()).unwrap();
+    let answer = station
+        .put(SENDER, 1, spaced.as_bytes())
+        .expect("an answer");
+    assert!(answer.contains("\"quota\""), "{answer}");
+    sender.put_stored(&mut station, &object);
+    assert_eq!(station.mailbox_positions(), [1]);
+    // The account's limit: two objects in all, across mailboxes and senders.
+    station.set_mailbox_quota(MailboxQuota {
+        per_account: 2,
+        ..MailboxQuota::default()
+    });
+    let elsewhere = Receiver::other(OTHER_HOST, 1, "other enc");
+    sender.put_stored(&mut station, &sender.cancel(&elsewhere, head));
+    assert_eq!(
+        other.put_refused(&mut station, &other.cancel(&to, head)),
+        PutRefusal::Quota
+    );
+    station.set_mailbox_quota(MailboxQuota::default());
+    other.put_stored(&mut station, &other.cancel(&to, head));
+}
+
 // ── Reading the mailbox ──
 
 /// Rules 4 and 5, design II.4.2: announced a mailbox with a request, a
