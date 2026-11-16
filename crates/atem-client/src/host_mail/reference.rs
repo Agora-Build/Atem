@@ -414,6 +414,13 @@ impl ReferenceMailbox {
         next
     }
 
+    /// Every receiving host with a mailbox, by host id and generation.
+    pub fn receivers(&self) -> impl Iterator<Item = (&str, u64)> {
+        self.mailboxes
+            .keys()
+            .map(|(host_id, host_trust_gen)| (host_id.as_str(), *host_trust_gen))
+    }
+
     /// The mailbox of a receiving host, if one was minted: its id and head.
     pub fn mailbox(&self, host_id: &str, host_trust_gen: u64) -> Option<MailboxHead> {
         self.mailboxes

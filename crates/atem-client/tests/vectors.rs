@@ -253,6 +253,8 @@ fn every_vectors_file_has_a_runner() {
             "r9-vectors-host-route.json",
             "r9-vectors-host-work-control.json",
             "r9-vectors-keys.json",
+            // Its runner is tests/mailbox_calls.rs.
+            "r9-vectors-mailbox-calls.json",
             "r9-vectors-membership-log.json",
             "r9-vectors-pairing.json",
             "r9-vectors-push-hint.json",

@@ -305,6 +305,7 @@ fn a_put_is_stored_at_the_next_position_of_its_recipients_mailbox() {
     assert_eq!(stored[0].expires_at, EXPIRES_AT);
     // The sender's own mailbox isn't touched.
     assert_eq!(st.m.mailbox("host-a", 2), None);
+    assert_eq!(st.m.receivers().collect::<Vec<_>>(), [("host-b", 3)]);
 }
 
 #[test]

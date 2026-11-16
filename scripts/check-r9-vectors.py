@@ -3112,6 +3112,456 @@ def check_station_calls(file, data, report, context):
         case.check({"control_sync_result_65_records", "heads_65_feeds", "control_ack_65_results", "membership_fetch_result_65_entries"} <= counts, "65 records, feeds, results and entries")
 
 
+# ------------------------------------------------ r9-vectors-mailbox-calls
+
+# host-work-v1 §11.5, "The mailbox calls" (rules 1 to 11), written here from
+# the contract: the readers, and a model of the Station's mailbox of its own.
+MAILBOX_MAX_BYTES = 512 * 1024  # rule 9: every mailbox_* message, as sent
+MAILBOX_TO_STATION = ["mailbox_put", "mailbox_sync", "mailbox_done"]
+MAILBOX_TO_HOST = [
+    "mailbox_stored", "mailbox_put_refused", "mailbox_sync_result",
+    "mailbox_done_result", "mailbox_sync_refused", "mailbox_done_refused",
+]
+MAILBOX_PUT_CODES = ["quota", "id_reused", "expired", "forbidden"]
+MAILBOX_ID_LABEL = "atem-reference-mailbox-id-v1"
+UUID_V4_EXAMPLE = "9d2f6c1e-3b4a-4c5d-8e6f-7a8b9c0d1e2f"  # any lowercase UUID v4: they are all 36 characters
+
+
+def mailbox_object_ok(obj):
+    """A put's object: check 1's reading of an envelope or a result (exact
+    fields, a sealed part of the right shape) and a base64url signature."""
+    if not mail_well_formed(obj):
+        return False
+    try:
+        b64u_decode(obj["sig"])
+        return True
+    except ValueError:
+        return False
+
+
+def _mb_position(v, key):
+    n = _relay_uint(v, key)
+    if n < 1:
+        raise Refused("malformed")
+    return n
+
+
+def _read_mailbox_put(v):
+    _relay_exact(v, ["type", "op", "request_id", "object"])
+    _relay_uuid4(_relay_text(v, "request_id"))
+    if "object" not in v or not mailbox_object_ok(v["object"]):
+        raise Refused("malformed")
+
+
+def _read_mailbox_stored(v):
+    _relay_exact(v, ["type", "op", "request_id", "id"])
+    _relay_uuid4(_relay_text(v, "request_id"))
+    _relay_uuid4(_relay_text(v, "id"))
+
+
+def _read_mailbox_put_refused(v):
+    _relay_exact(v, ["type", "op", "request_id", "id", "code"])
+    _relay_uuid4(_relay_text(v, "request_id"))
+    _relay_uuid4(_relay_text(v, "id"))
+    if _relay_text(v, "code") not in MAILBOX_PUT_CODES:
+        raise Refused("malformed")
+
+
+def _read_mailbox_sync(v):
+    _relay_exact(v, ["type", "op", "request_id", "mailbox_id", "after"])
+    _relay_uuid4(_relay_text(v, "request_id"))
+    _relay_uuid4(_relay_text(v, "mailbox_id"))
+    _relay_uint(v, "after")
+
+
+def _read_mailbox_sync_result(v):
+    _relay_exact(v, ["type", "op", "request_id", "mailbox_id", "after", "head", "through", "objects"])
+    items = _relay_array(v, "objects", 1)  # at most one object (rule 11)
+    positions = []
+    for item in items:
+        _relay_exact(item, ["position", "object"])
+        positions.append(_mb_position(item, "position"))
+        if "object" not in item:
+            raise Refused("malformed")  # of any JSON type, but there
+    _relay_uuid4(_relay_text(v, "request_id"))
+    _relay_uuid4(_relay_text(v, "mailbox_id"))
+    after, head, through = (_relay_uint(v, k) for k in ("after", "head", "through"))
+    if head < after:
+        # The mailbox went back under its id (rule 4): nothing listed,
+        # through at the head.
+        if through != head or positions:
+            raise Refused("malformed")
+        return
+    if not after <= through <= head:
+        raise Refused("malformed")
+    previous = after
+    for position in positions:
+        if position <= previous or position > through:
+            raise Refused("malformed")
+        previous = position
+
+
+def _read_mailbox_done(v):
+    _relay_exact(v, ["type", "op", "request_id", "mailbox_id", "position"])
+    _relay_uuid4(_relay_text(v, "request_id"))
+    _relay_uuid4(_relay_text(v, "mailbox_id"))
+    _mb_position(v, "position")
+
+
+def _read_mailbox_refusal(v):
+    _relay_exact(v, ["type", "op", "code"])
+    if _relay_text(v, "code") != "forbidden":
+        raise Refused("malformed")
+
+
+MAILBOX_READERS = {
+    "to_station": {
+        "mailbox_put": _read_mailbox_put,
+        "mailbox_sync": _read_mailbox_sync,
+        "mailbox_done": _read_mailbox_done,
+    },
+    "to_host": {
+        "mailbox_stored": _read_mailbox_stored,
+        "mailbox_put_refused": _read_mailbox_put_refused,
+        "mailbox_sync_result": _read_mailbox_sync_result,
+        "mailbox_done_result": _read_mailbox_done,
+        "mailbox_sync_refused": _read_mailbox_refusal,
+        "mailbox_done_refused": _read_mailbox_refusal,
+    },
+}
+
+
+def read_mailbox(text, reader):
+    """(message, None) if the reader reads `text`, else (None, its code): the
+    512 KiB bound before any parse, one strict parse, a mailbox message of
+    the reader's direction, then its rules."""
+    try:
+        if len(text.encode("utf-8")) > MAILBOX_MAX_BYTES:
+            raise Refused("too_large")
+        try:
+            value = relay_parse(text)
+        except (NotStrict, ValueError, RecursionError):
+            raise Refused("not_strict")
+        op = value.get("op") if isinstance(value, dict) and value.get("type") == "relay" else None
+        reader_for = MAILBOX_READERS[reader].get(op) if isinstance(op, str) else None
+        if reader_for is None:
+            raise Refused("wrong_message")
+        reader_for(value)
+        return value, None
+    except Refused as refused:
+        return None, refused.code
+
+
+def read_heads_with(text, mailbox):
+    """§11.4's heads (256 KiB), with the calling host's mailbox head read
+    only when `mailbox` (rule 6): ({mailbox} or {}, None), or (None, code)."""
+    try:
+        if len(text.encode("utf-8")) > RELAY_MAX_BYTES:
+            raise Refused("too_large")
+        try:
+            value = relay_parse(text)
+        except (NotStrict, ValueError, RecursionError):
+            raise Refused("not_strict")
+        if not (isinstance(value, dict) and value.get("type") == "relay" and value.get("op") == "heads"):
+            raise Refused("wrong_message")
+        _relay_exact(value, ["type", "op", "feeds", "membership"] + (["mailbox"] if mailbox else []))
+        _read_heads({k: v for k, v in value.items() if k != "mailbox"})
+        if "mailbox" not in value:
+            return {}, None
+        m = _relay_exact(value["mailbox"], ["mailbox_id", "head"])
+        _relay_uuid4(_relay_text(m, "mailbox_id"))
+        _relay_uint(m, "head")
+        return {"mailbox": m}, None
+    except Refused as refused:
+        return None, refused.code
+
+
+def mailbox_fill(recipe):
+    return recipe["prefix"] + recipe["fill"] * recipe["count"] + recipe["suffix"]
+
+
+def mailbox_id_of(seed, account_id, genesis, host_id, host_trust_gen, n):
+    """The reference mailbox's minted id: the first 16 bytes of SHA-256 over
+    its fields, as a lowercase UUID v4."""
+    b = bytearray(sha256(enc([MAILBOX_ID_LABEL, seed, account_id, genesis, host_id, u64(host_trust_gen), u64(n)]))[:16])
+    b[6] = (b[6] & 0x0F) | 0x40
+    b[8] = (b[8] & 0x3F) | 0x80
+    h = b.hex()
+    return f"{h[0:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:32]}"
+
+
+class MailStation:
+    """A Station's mailboxes for one device list, written here from §11.5's
+    rules: one mailbox per receiving (host, generation), positions in store
+    order; puts from a current host with its own objects to a current host,
+    times, the key (calling host, id) by object hash, quotas per sending
+    host, receiving host and account in objects and compact bytes; pages of
+    one object with a scan boundary over removed positions; done and sync on
+    the caller's own mailbox only; expiry by the clock; resets."""
+
+    def __init__(self, data, scenario):
+        link = data["link"]
+        self.account, self.genesis = link["account_id"], link["genesis_hash"]
+        self.seed = unhex(data["seed_hex"])
+        self.quotas = scenario["quotas"]
+        self.hosts = {h["host_id"]: h["host_trust_gen"] for h in scenario["hosts"]}
+        self.max_served = data["max_served_object_bytes"]
+        self.lifetime = data["max_lifetime_ms"]
+        self.heads_base = relay_parse(data["heads_base"])
+        self.boxes = {}  # (host_id, gen) -> {"id", "head", "stored": {position: entry}}
+        self.minted = {}
+        self.dropped = 0
+
+    def mint(self, key):
+        n = self.minted.get(key, 0)
+        self.minted[key] = n + 1
+        return mailbox_id_of(self.seed, self.account, unhex(self.genesis), key[0], key[1], n)
+
+    def box(self, key):
+        if key not in self.boxes:
+            self.boxes[key] = {"id": self.mint(key), "head": 0, "stored": {}}
+        return self.boxes[key]
+
+    def expire(self, now):
+        for b in self.boxes.values():
+            b["stored"] = {p: e for p, e in b["stored"].items() if e["expires_at"] > now}
+
+    def usage(self, keep):
+        entries = [e for k, b in self.boxes.items() for e in b["stored"].values() if keep(k, e)]
+        return len(entries), sum(e["bytes"] for e in entries)
+
+    def over(self, used, quota, size):
+        return used[0] + 1 > quota["objects"] or used[1] + size > quota["bytes"]
+
+    def call(self, caller, text, now):
+        self.expire(now)
+        value, code = read_mailbox(text, "to_station")
+        if code:
+            self.dropped += 1
+            return {"outcome": "dropped", "why": code}, None
+        op = value["op"]
+        if op == "mailbox_put":
+            return self.put(caller, value, now)
+        key = (caller["host_id"], caller["host_trust_gen"])
+        own = self.boxes.get(key)
+        if own is None or own["id"] != value["mailbox_id"]:
+            refusal = op + "_refused"
+            return {"outcome": "refused", "op": refusal}, compact_ijson({"type": "relay", "op": refusal, "code": "forbidden"})
+        if op == "mailbox_done":
+            removed = own["stored"].pop(value["position"], None) is not None
+            answer = {k: value[k] for k in ("request_id", "mailbox_id", "position")}
+            return {"outcome": "done", "removed": removed}, compact_ijson(dict(answer, type="relay", op="mailbox_done_result"))
+        after, head = value["after"], own["head"]
+        page = {"type": "relay", "op": "mailbox_sync_result", "request_id": value["request_id"], "mailbox_id": value["mailbox_id"], "after": after, "head": head}
+        later = sorted(p for p in own["stored"] if p > after)
+        if after > head:
+            outcome, through, objects = {"outcome": "page", "through": head, "reset": True}, head, []
+        elif later:
+            through = later[1] - 1 if len(later) > 1 else head
+            objects = [{"position": later[0], "object": own["stored"][later[0]]["object"]}]
+            outcome = {"outcome": "page", "through": through, "reset": False, "position": later[0]}
+        else:
+            outcome, through, objects = {"outcome": "page", "through": head, "reset": False}, head, []
+        return outcome, compact_ijson(dict(page, through=through, objects=objects))
+
+    def put(self, caller, value, now):
+        obj, rid = value["object"], value["request_id"]
+        body = obj["body"]
+        size = len(compact_ijson(obj).encode())
+        if size > self.max_served:
+            self.dropped += 1
+            return {"outcome": "dropped", "why": "unserved"}, None
+
+        def answer(op, **more):
+            return compact_ijson(dict({"type": "relay", "op": op, "request_id": rid, "id": body["id"]}, **more))
+
+        def refuse(code):
+            return {"outcome": "put_refused", "code": code}, answer("mailbox_put_refused", code=code)
+
+        sender, recipient = body["sender"], body["recipient"]
+        if (
+            self.hosts.get(caller["host_id"]) != caller["host_trust_gen"]
+            or sender["host_id"] != caller["host_id"]
+            or (body["account_id"], body["genesis_hash"]) != (self.account, self.genesis)
+            or self.hosts.get(recipient["host_id"]) != recipient["host_trust_gen"]
+        ):
+            return refuse("forbidden")
+        created, expires = body["created_at"], body["expires_at"]
+        if now >= expires or expires <= created or expires - created > self.lifetime:
+            return refuse("expired")
+        object_hash = mail_evidence(obj)
+        rkey = (recipient["host_id"], recipient["host_trust_gen"])
+        box = self.box(rkey)
+        for position, e in box["stored"].items():
+            if (e["sender"], e["id"]) == (caller["host_id"], body["id"]):
+                if e["object_hash"] == object_hash:
+                    return {"outcome": "already_stored", "position": position}, answer("mailbox_stored")
+                return refuse("id_reused")
+        if (
+            self.over(self.usage(lambda k, e: e["sender"] == caller["host_id"]), self.quotas["sender"], size)
+            or self.over(self.usage(lambda k, e: k == rkey), self.quotas["receiver"], size)
+            or self.over(self.usage(lambda k, e: True), self.quotas["account"], size)
+        ):
+            return refuse("quota")
+        box["head"] += 1
+        box["stored"][box["head"]] = {
+            "position": box["head"], "sender": caller["host_id"], "id": body["id"],
+            "object_hash": object_hash, "bytes": size, "expires_at": expires, "object": obj,
+        }
+        return {"outcome": "stored", "position": box["head"]}, answer("mailbox_stored")
+
+    def heads(self, caller, host_senders, now):
+        self.expire(now)
+        message = dict(self.heads_base)
+        outcome = {"outcome": "heads"}
+        if host_senders:
+            box = self.box((caller["host_id"], caller["host_trust_gen"]))
+            message["mailbox"] = outcome["mailbox"] = {"mailbox_id": box["id"], "head": box["head"]}
+        return outcome, compact_ijson(message)
+
+    def reset(self, host_id, gen, how):
+        box = self.boxes[(host_id, gen)]
+        if how == "new_mailbox":
+            self.boxes[(host_id, gen)] = {"id": self.mint((host_id, gen)), "head": 0, "stored": {}}
+        else:
+            back = how["head_back"]
+            assert back < box["head"], "a head below the mailbox's"
+            box["stored"] = {p: e for p, e in box["stored"].items() if p <= back}
+            box["head"] = back
+
+    def state(self):
+        return {
+            "dropped": self.dropped,
+            "mailboxes": [
+                {
+                    "host_id": k[0], "host_trust_gen": k[1], "mailbox_id": b["id"], "head": b["head"],
+                    "stored": [{f: e[f] for f in ("position", "sender", "id", "object_hash", "bytes", "expires_at")} for _, e in sorted(b["stored"].items())],
+                }
+                for k, b in sorted(self.boxes.items())
+            ],
+        }
+
+
+def check_mailbox_calls(file, data, report, context):
+    """The mailbox calls (host-work-v1 §11.5): the bounds and the reference
+    model's constants; each object's shape, signature, object_hash and
+    encoded size; the object_hash known answers; every valid text strict,
+    compact in RFC 8785 order, read as its direction says to its fields and
+    refused by the other; every invalid text refused with its code; heads'
+    mailbox head with and without host.senders; and every scenario run
+    against a model of the Station's mailbox written here, each outcome,
+    answer and state."""
+    keys = context["keys"]
+    with report.case(file, "constants") as case:
+        case.equal((data["max_message_bytes"], data["max_heads_bytes"], data["max_lifetime_ms"]), (MAILBOX_MAX_BYTES, RELAY_MAX_BYTES, MAX_LIFETIME_MS), "512 KiB, heads 256 KiB, 24 hours")
+        largest = 2**53 - 1
+        page = {"type": "relay", "op": "mailbox_sync_result", "request_id": UUID_V4_EXAMPLE, "mailbox_id": UUID_V4_EXAMPLE, "after": largest - 1, "head": largest, "through": largest, "objects": [{"position": largest, "object": {}}]}
+        wrapper = len(compact_ijson(page)) - 2
+        case.equal(data["max_served_object_bytes"], MAILBOX_MAX_BYTES - wrapper, "the largest object a page carries at any position")
+        case.equal(data["link"]["genesis_hash"], context["genesis_hash"].hex(), "log L's account root")
+
+    hashes = {}
+    for v in data["objects"]:
+        with report.case(file, f"object {v['label']}") as case:
+            obj = v["object"]
+            case.check(mailbox_object_ok(obj), "a mailbox object (check 1)")
+            body = obj["body"]
+            signer = body["sender"]["host_id"]
+            case.check(verify("ed25519", keys.public(signer, "host_key"), b64u_decode(obj["sig"]), mail_signing_input(body)), f"signed by {signer}'s host key")
+            case.equal(v["object_hash"], mail_evidence(obj), "object_hash")
+            case.equal(v["bytes"], len(compact_ijson(obj).encode()), "its compact JSON's length")
+            hashes[v["label"]] = v["object_hash"]
+
+    for v in data["object_hash"]:
+        with report.case(file, f"object_hash {v['name']}") as case:
+            obj = relay_parse(v["object_text"])
+            case.check(mailbox_object_ok(obj), "a mailbox object")
+            case.equal(v["object_hash"], mail_evidence(obj), "SHA-256(enc([jcs(body), sig, enc, ct]))")
+    with report.case(file, "object_hash: the same object serialized again") as case:
+        by_name = {v["name"]: v for v in data["object_hash"]}
+        again = by_name["o1_serialized_again"]
+        case.check(again["object_text"] != compact_ijson(relay_parse(again["object_text"])), "not its compact form")
+        case.equal(again["object_hash"], hashes["o1"], "o1's object_hash")
+        case.check(len({hashes["o1"], hashes["o1_other"], hashes["o1_resigned"]}) == 3, "another sealed part, another body: other objects")
+
+    ops = set()
+    for v in data["calls"]:
+        with report.case(file, f"call {v['name']}") as case:
+            value, code = read_mailbox(v["wire"], v["direction"])
+            case.equal(code, None, f"read {v['direction']}")
+            if value is None:
+                continue
+            case.equal(compact_ijson(value), v["wire"], "compact, keys in RFC 8785 order")
+            case.equal({k: x for k, x in value.items() if k not in ("type", "op")}, v["fields"], "its fields")
+            case.equal(value["op"], v["op"], "op")
+            other = "to_host" if v["direction"] == "to_station" else "to_station"
+            case.equal(read_mailbox(v["wire"], other)[1], "wrong_message", "the other direction refuses it")
+            ops.add(v["op"])
+    with report.case(file, "calls coverage") as case:
+        case.equal(sorted(ops), sorted(MAILBOX_TO_STATION + MAILBOX_TO_HOST), "every call and answer")
+        codes = sorted(v["fields"]["code"] for v in data["calls"] if v["op"] == "mailbox_put_refused")
+        case.equal(codes, sorted(MAILBOX_PUT_CODES), "every put refusal's code")
+
+    for v in data["invalid"]:
+        with report.case(file, f"invalid {v['name']}") as case:
+            case.equal(read_mailbox(v["wire"], v["reader"])[1], v["code"], f"refused by {v['reader']}")
+    for v in data["bounds"]:
+        with report.case(file, f"bound {v['name']}") as case:
+            text = mailbox_fill(v["wire_fill"])
+            case.equal(len(text.encode()), v["wire_fill"]["bytes"], "its length")
+            case.equal(read_mailbox(text, v["reader"])[1], v.get("code"), "read" if "accepts" in v else "refused")
+    with report.case(file, "bounds coverage") as case:
+        sizes = {v["name"]: v["wire_fill"]["bytes"] for v in data["bounds"]}
+        case.equal((sizes["put_at_the_bound"], sizes["put_over_the_bound"]), (MAILBOX_MAX_BYTES, MAILBOX_MAX_BYTES + 1), "at and a byte over 512 KiB")
+
+    for v in data["heads"]:
+        with report.case(file, f"heads {v['name']}") as case:
+            text = mailbox_fill(v["wire_fill"]) if "wire_fill" in v else v["wire"]
+            got, code = read_heads_with(text, v["reader"] == "mailbox")
+            if "code" in v:
+                case.equal(code, v["code"], f"refused by the {v['reader']} reader")
+            else:
+                case.equal((got, code), (v["accepts"], None), f"read by the {v['reader']} reader")
+    with report.case(file, "heads coverage") as case:
+        sizes = [len(mailbox_fill(v["wire_fill"]).encode()) for v in data["heads"] if "wire_fill" in v]
+        case.equal(sorted(sizes), [RELAY_MAX_BYTES, RELAY_MAX_BYTES + 1], "heads at and over its 256 KiB bound")
+
+    outcomes = set()
+    for scenario in data["scenarios"]:
+        with report.case(file, f"scenario {scenario['name']}") as case:
+            station = MailStation(data, scenario)
+            for n, event in enumerate(scenario["events"]):
+                kind = event["event"]
+                got = answer = None
+                if kind == "call":
+                    text = event["call"] if "call" in event else mailbox_fill(event["call_fill"])
+                    got, answer = station.call(event["caller"], text, event["at"])
+                elif kind == "heads":
+                    got, answer = station.heads(event["caller"], event["host_senders"], event["at"])
+                elif kind == "reset":
+                    station.reset(event["host_id"], event["host_trust_gen"], event["reset"])
+                elif kind == "hosts":
+                    station.hosts = {h["host_id"]: h["host_trust_gen"] for h in event["hosts"]}
+                elif kind == "tick":
+                    station.expire(event["at"])
+                else:
+                    case.fail(f"event {n}: no event {kind}")
+                if got is not None:
+                    case.equal(got, event["expect"], f"event {n} outcome")
+                    case.equal(answer, event.get("answer"), f"event {n} answer")
+                    outcomes.add(" ".join(str(got.get(k)) for k in ("outcome", "code", "why", "op") if k in got) + (" reset" if got.get("reset") else ""))
+                case.equal(station.state(), event["state"], f"event {n} state")
+            case.done.append(f"{len(scenario['events'])} events")
+    with report.case(file, "scenarios coverage") as case:
+        want = {
+            "stored", "already_stored", "put_refused quota", "put_refused id_reused", "put_refused expired",
+            "put_refused forbidden", "dropped not_strict", "dropped malformed", "dropped wrong_message",
+            "dropped too_large", "dropped unserved", "page", "page reset", "done",
+            "refused mailbox_sync_refused", "refused mailbox_done_refused", "heads",
+        }
+        case.check(want <= outcomes, "every outcome", f"missing {sorted(want - outcomes)}")
+
+
 # ------------------------------------------------- r9-vectors-host-route
 
 # The two kinds of host route proof (session-v1 R9.7b): their body `type` and
@@ -3223,6 +3673,7 @@ CHECKERS = [
     ("r9-vectors-delegated-wire", check_delegated_wire),
     ("r9-vectors-host-envelope", check_host_envelope),
     ("r9-vectors-station-calls", check_station_calls),
+    ("r9-vectors-mailbox-calls", check_mailbox_calls),
 ]
 
 
