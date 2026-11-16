@@ -72,6 +72,7 @@ pub mod verified;
 pub use body::{
     EnvelopePlain, HostRef, MailBody, MailFields, MailKind, REFUSAL_CODES, ResultPlain,
 };
+pub use mailbox::object_hash;
 pub use receive::{
     EnvelopeVerdict, ExpectedResult, Recipient, ResultVerdict, accept_result, evidence_hash,
     open_envelope,

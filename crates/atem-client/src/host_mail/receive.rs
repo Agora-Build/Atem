@@ -396,7 +396,8 @@ pub enum ResultVerdict {
 /// for an object with no sealed part). Every part is length-framed, so two
 /// different objects never share it, and any changed byte of the body, the
 /// signature or the sealed part changes it. Also what a host keeps for an
-/// id seen again with other bytes.
+/// id seen again with other bytes, and the object's identity in its
+/// mailbox: [`super::object_hash`] is this hash under the mailbox's name.
 pub fn evidence_hash(obj: &SignedObject) -> Hash32 {
     let empty: &[u8] = &[];
     let (enc, ct) = obj

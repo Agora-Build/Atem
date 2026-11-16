@@ -64,11 +64,12 @@
 //! names its caller.
 use serde_json::{Map, Value, json};
 
-use super::{MailBody, MailKind};
+use super::{MailBody, MailKind, evidence_hash};
 use crate::canonical::{MAX_SAFE_INTEGER, StrictError, StrictValue};
 use crate::control::relay::{
     Fields, RefusalCode, RelayError, check_request_id, check_safe, message, op_of,
 };
+use crate::encoding::Hash32;
 use crate::session::wire::is_uuid_v4;
 use crate::signed::SignedObject;
 
@@ -114,6 +115,19 @@ pub mod op {
 /// applies a bound.
 pub fn is_mailbox_op(op: &str) -> bool {
     op::ALL.contains(&op)
+}
+
+/// An object's identity in its mailbox (rule 3): `object_hash =
+/// SHA-256(enc([jcs(body), sig, enc, ct]))`, `sig`, `enc` and `ct` as
+/// decoded bytes (empty when absent). It is the evidence hash of the
+/// receiver's verdicts ([`evidence_hash`]): the one function the Station
+/// (idempotency of puts under `(calling host_id, body.id)`) and the hosts
+/// (evidence, duplicates) both use. Computed from the parsed object, so a
+/// copy serialized again (whitespace, key order, escapes) is the same
+/// object, and every part is length-framed, so any changed byte, or a byte
+/// moved between `enc` and `ct`, is another.
+pub fn object_hash(object: &SignedObject) -> Hash32 {
+    evidence_hash(object)
 }
 
 type Result<T> = std::result::Result<T, RelayError>;
@@ -905,12 +919,12 @@ impl MailboxToHost {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{Value, json};
+    use serde_json::{Map, Value, json};
 
     use super::*;
     use crate::control::relay::{Accept, MailboxHead, ToHost};
     use crate::encoding::b64u;
-    use crate::host_mail::test_support::{ID, Rig};
+    use crate::host_mail::test_support::{CREATED_AT, ID, Rig};
     use crate::host_mail::{EnvelopePlain, seal_envelope_with_ikm};
 
     /// Lowercase UUID v4s: calls' ids, a mailbox's.
@@ -1591,6 +1605,59 @@ mod tests {
             MailboxMismatch::Position,
         ] {
             assert_eq!(MailboxMismatch::from_code(m.code()), Some(m));
+        }
+    }
+
+    // ------------------------------------------------------- object_hash
+
+    /// `SHA-256(enc([jcs(body), sig, enc, ct]))`, written out here.
+    fn hash_of(body_jcs: &str, sig: &[u8], enc: &[u8], ct: &[u8]) -> Hash32 {
+        use sha2::{Digest, Sha256};
+        let mut framed = Vec::new();
+        for part in [body_jcs.as_bytes(), sig, enc, ct] {
+            framed.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            framed.extend_from_slice(part);
+        }
+        Hash32(Sha256::digest(&framed).into())
+    }
+
+    #[test]
+    fn object_hash_is_the_evidence_hash_of_the_object_in_canonical_form() {
+        // Rule 3: an object's identity in its mailbox, the evidence hash of
+        // the receiver's verdicts, so the Station and the host agree on it.
+        let obj = object();
+        let sealed = obj.sealed().unwrap();
+        let want = hash_of(obj.jcs(), obj.sig(), &sealed.enc, &sealed.ct);
+        assert_eq!(object_hash(&obj), want);
+        assert_eq!(object_hash(&obj), super::super::evidence_hash(&obj));
+        // Serialized again, with whitespace and another key order, it is the
+        // same object.
+        let wire = obj.to_json();
+        let mut reordered = Map::new();
+        for key in ["sig", "ct", "body", "enc"] {
+            reordered.insert(key.to_owned(), wire[key].clone());
+        }
+        let text = serde_json::to_string_pretty(&Value::Object(reordered)).unwrap();
+        let again = SignedObject::parse(text.as_bytes()).unwrap();
+        assert_eq!(object_hash(&again), want);
+        // Any changed byte, or a byte moved between `enc` and `ct`, is
+        // another object.
+        let moved = {
+            let mut enc = sealed.enc.clone();
+            let mut ct = sealed.ct.clone();
+            enc.push(ct.remove(0));
+            hash_of(obj.jcs(), obj.sig(), &enc, &ct)
+        };
+        assert_ne!(moved, want);
+        let mut other_sig = wire.clone();
+        other_sig["sig"] = json!(b64u(&[0u8; 64]));
+        let mut other_ct = wire.clone();
+        other_ct["ct"] = json!(b64u(&[0u8; 48]));
+        let mut other_body = wire.clone();
+        other_body["body"]["created_at"] = json!(CREATED_AT + 1);
+        for changed in [other_sig, other_ct, other_body] {
+            let changed = SignedObject::parse(changed.to_string().as_bytes()).unwrap();
+            assert_ne!(object_hash(&changed), want);
         }
     }
 
