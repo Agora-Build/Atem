@@ -492,6 +492,8 @@ fn one_transaction_for_the_decision_the_cursor_and_the_dones() {
     );
     assert_eq!((b.count("mailbox_inbox"), b.owed()), (1, vec![1]));
 
+    // Never owed under another identity (the state is identity 1's).
+    assert!(owed_dones(&b.store, &identity(2)).unwrap().is_empty());
     done_answered(&b.store, &identity(1), MAILBOX, 1).unwrap();
     assert!(b.owed().is_empty());
     decided(b.put(&mail, &mail.cancel().to_json()));

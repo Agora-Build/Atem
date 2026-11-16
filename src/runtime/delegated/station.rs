@@ -680,6 +680,51 @@ mod tests {
         assert_eq!(s.dump()["unread"], 3);
     }
 
+    /// host-work-v1 §11.5 rule 8, "An identity change": the host's
+    /// identity changing on the live link retires its mailbox calls too
+    /// (the live sync's page is drained) and nothing more is synced on
+    /// that socket; a link on a new socket syncs again.
+    #[test]
+    fn an_identity_change_retires_the_mailbox_calls() {
+        use crate::runtime::delegated::mailbox::{Observed, PageCheck};
+        let mut s = Station::with_senders(true);
+        s.on_identity(identity(1));
+        up(&mut s, 1);
+        let observed = |generation| Observed {
+            identity: identity(generation),
+            cursor: None,
+            inbox: 0,
+            owed: Vec::new(),
+        };
+        s.mailbox.observe(Some(observed(1)));
+        s.mailbox.tick(10_000);
+        s.receive(&heads_with_mailbox(5, Some((MAILBOX, 2))), None, None);
+        let call = s.mailbox.take_outgoing().sync.remove(0);
+        s.on_identity(identity(2));
+        s.mailbox.observe(Some(observed(2)));
+        let page = atem_client::host_mail::mailbox::MailboxSyncResult {
+            request_id: call.request_id,
+            mailbox_id: call.mailbox_id,
+            after: 0,
+            head: 2,
+            through: 2,
+            objects: Vec::new(),
+        };
+        assert_eq!(s.mailbox.on_page(Ok(page)), PageCheck::Drained);
+        s.mailbox.tick(20_000);
+        s.receive(&heads_with_mailbox(5, Some((MAILBOX, 2))), None, None);
+        assert!(s.mailbox.take_outgoing().sync.is_empty(), "that socket");
+        s.sync_link(
+            Some(2),
+            2,
+            || LinkKind::Relay,
+            || Some("https://s.test".into()),
+        );
+        s.mailbox.tick(30_000);
+        s.receive(&heads_with_mailbox(5, Some((MAILBOX, 2))), None, None);
+        assert_eq!(s.mailbox.take_outgoing().sync.len(), 1, "a new socket");
+    }
+
     /// Without a device list nothing is fetched; a result is carried only
     /// for the fetch asked; what the reader refuses is counted, dropped.
     #[test]
