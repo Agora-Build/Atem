@@ -561,7 +561,7 @@ pub(crate) async fn verify_device<U: OpUi>(
         first = tokio::time::timeout(FIRST_REPLY_TIMEOUT, next_verify_message(client)) => Some(first),
         _ = ui.gone() => None,
     };
-    let astation = match first {
+    let (astation, account_id) = match first {
         None => {
             // Nothing is pinned yet; Astation is still told.
             let failure = code_failure(CodeAnswer::Interrupted).expect("a failure");
@@ -586,6 +586,7 @@ pub(crate) async fn verify_device<U: OpUi>(
                 recovery_sign_pub,
                 nonce,
                 genesis_hash,
+                account_id,
             } => {
                 // r9 (no compatibility): the ceremony pins the account's
                 // device list; an Astation that names none can't pair.
@@ -600,6 +601,21 @@ pub(crate) async fn verify_device<U: OpUi>(
                         abandon_verification(client, &paths.trust, astation_id, failure).await,
                     );
                 };
+                // host-work-v1 §11.5 (no compatibility): the account the
+                // host's encryption key is vouched for, before the reveal.
+                let account_id = match crate::pair_verify::verify_keys_account(account_id.as_ref())
+                {
+                    Ok(account_id) => account_id,
+                    Err(failure) => {
+                        return Err(abandon_verification(
+                            client,
+                            &paths.trust,
+                            astation_id,
+                            failure,
+                        )
+                        .await);
+                    }
+                };
                 match AstationKeys::from_wire(
                     &sign_pub,
                     &enc_pub,
@@ -607,7 +623,7 @@ pub(crate) async fn verify_device<U: OpUi>(
                     &nonce,
                     &genesis_hash,
                 ) {
-                    Ok(keys) => keys,
+                    Ok(keys) => (keys, account_id),
                     Err(error) => {
                         let failure = VerifyFailure::local(
                             format!("atem refused verifyKeys: {error:#}"),
@@ -712,6 +728,7 @@ pub(crate) async fn verify_device<U: OpUi>(
         let astation_id = astation_id.to_string();
         let (keys, host_seed) = handshake.into_parts();
         let (astation, host_id) = (astation.clone(), device_id.clone());
+        let account_id = account_id.clone();
         blocking(move || {
             // Host senders (the debug hook only): the host encryption key
             // is made with the pin.
@@ -719,6 +736,7 @@ pub(crate) async fn verify_device<U: OpUi>(
                 &astation,
                 &host_id,
                 &host_seed,
+                &account_id,
                 crate::runtime::test_hooks::host_features(),
             );
             crate::pair_verify::apply_device_verified(

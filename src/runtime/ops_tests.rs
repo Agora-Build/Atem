@@ -461,6 +461,7 @@ impl Verifier {
             recovery_sign_pub: STANDARD.encode([6u8; 32]),
             nonce: STANDARD.encode(nonce_s),
             genesis_hash: Some(log.genesis_hash().to_hex()),
+            account_id: Some(json!(account)),
         });
         Self {
             fake,
@@ -2835,6 +2836,7 @@ fn a_verify_keys_without_a_genesis_is_refused() {
             recovery_sign_pub: STANDARD.encode([6u8; 32]),
             nonce: STANDARD.encode([7u8; 32]),
             genesis_hash: None,
+            account_id: Some(json!("acct-op")),
         });
         let abort = peer.next("verifyAbort").await;
         assert_eq!(
@@ -2848,6 +2850,114 @@ fn a_verify_keys_without_a_genesis_is_refused() {
         let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
         assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
         assert!(!pending(&rt.keys()), "no pending pin");
+        rt.shutdown().await;
+    });
+}
+
+/// host-work-v1 §11.5 (no compatibility): `verifyKeys` names the account
+/// (`account_id`), whose device list the host's `enc_sig` binds before the
+/// reveal. A `verifyKeys` without one, or with one that isn't an opaque id
+/// (R9.1), fails the ceremony: Atem aborts with a short reason before the
+/// reveal, records no key and pins nothing.
+#[test]
+fn a_verify_keys_without_a_valid_account_is_refused() {
+    const NEEDED: &str = "Atem needs the account in verifyKeys (account_id)";
+    const MALFORMED: &str = "atem refused verifyKeys: account_id isn't an account id";
+    for (account, reason) in [
+        (None, NEEDED),
+        (Some(json!(null)), NEEDED),
+        (Some(json!(7)), MALFORMED),
+        (Some(json!("")), MALFORMED),
+        (Some(json!("acct op")), MALFORMED),
+        (Some(json!("a".repeat(129))), MALFORMED),
+    ] {
+        local(async {
+            let dir = Rc::new(short_dir());
+            paired(&dir.path().join("profile"));
+            let (url, mut peer) = Peer::listen().await;
+            let keys = CredPaths::in_dir(&dir.path().join("profile"));
+            let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+            let mut op =
+                Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+            peer.next("verifyCommit").await;
+            let fake = FakeAstation::new();
+            peer.send(&AstationMessage::VerifyKeys {
+                sign_pub: STANDARD.encode(fake.sign_pub()),
+                enc_pub: STANDARD.encode(fake.enc_pub()),
+                recovery_sign_pub: STANDARD.encode([6u8; 32]),
+                nonce: STANDARD.encode([7u8; 32]),
+                genesis_hash: Some("ab".repeat(32)),
+                account_id: account.clone(),
+            });
+            let abort = peer.next("verifyAbort").await;
+            assert_eq!(abort["data"]["reason"], reason, "{account:?}");
+            assert!(
+                !peer.seen.iter().any(|m| m["type"] == "verifyReveal"),
+                "{account:?}: aborted before the reveal"
+            );
+            assert_eq!(
+                op.done().await.unwrap_err(),
+                crate::pair_verify::PAIRED_NOT_VERIFIED
+            );
+            let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+            assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
+            assert!(
+                !pairing.host_enc_key.exists() && !pairing.host_enc_generated.exists(),
+                "{account:?}: no key made or recorded"
+            );
+            assert!(!pending(&rt.keys()), "no pending pin");
+            rt.shutdown().await;
+        });
+    }
+}
+
+/// host-work-v1 §11.5: Atem refuses a `deviceVerified` whose signed
+/// certificate names another account than `verifyKeys` did (the account
+/// its `enc_sig` was made for): the verification fails and nothing is
+/// pinned or trusted.
+#[test]
+fn a_certificate_for_another_account_than_verify_keys_named_is_refused() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        let mut verifier = Verifier::keys(&mut peer, "acct-op").await;
+        // The certificate (and its list) name another account than the
+        // keys did.
+        verifier.account = "acct-other".into();
+        verifier.log = std::cell::RefCell::new(
+            crate::session_protocol::membership::r9log::TestLog::genesis(
+                "acct-other",
+                &verifier.fake.sign_secret_bytes(),
+            ),
+        );
+        let certificate = verifier
+            .certificate(&mut peer, trust_gen(&rt.profile))
+            .await;
+        let (question, _, _) = op.ask().await;
+        op.answer(question, AnswerValue::Yes).await;
+        op.printed("Waiting for your Mac").await;
+        peer.send(&certificate);
+        let abort = peer.next("verifyAbort").await;
+        assert!(
+            abort["data"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("names another account (acct-other) than its keys did (acct-op)"),
+            "{abort}"
+        );
+        assert_eq!(
+            op.done().await.unwrap_err(),
+            crate::pair_verify::PAIRED_NOT_VERIFIED
+        );
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+        assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
+        assert!(!pairing.host_enc_key.exists(), "no key kept");
+        assert!(!verified_as(&rt.keys(), "acct-op"), "nothing trusted");
+        assert!(!verified_as(&rt.keys(), "acct-other"), "nothing trusted");
         rt.shutdown().await;
     });
 }

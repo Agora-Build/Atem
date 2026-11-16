@@ -78,7 +78,7 @@ fn fake_astation() -> (String, mpsc::Receiver<(String, Value)>) {
                         "verifyCommit" => Some(json!({"type": "verifyKeys", "data": {
                             "sign_pub": b64(&hex(SIGN_PUB)), "enc_pub": b64(&[5; 32]),
                             "recovery_sign_pub": b64(&[6; 32]), "nonce": b64(&[7; 32]),
-                            "genesis_hash": "ab".repeat(32)}})),
+                            "genesis_hash": "ab".repeat(32), "account_id": "acct-bin"}})),
                         _ => None,
                     };
                     let _ = seen_tx.send((kind, value["data"].clone()));

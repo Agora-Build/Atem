@@ -2,7 +2,7 @@
 //! the terminal, never from stdin) and what happens when verification fails
 //! (the pending pin is dropped and Astation is told, unless it cancelled).
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::Duration;
@@ -283,6 +283,36 @@ pub(crate) async fn next_verify_message(client: &mut AstationClient) -> Result<A
     }
 }
 
+/// `verifyKeys.account_id` (host-work-v1 §11.5), read strictly: the account
+/// whose device list `genesis_hash` names, which the host's `enc_sig`
+/// binds before the reveal. Required (no compatibility, as for
+/// `genesis_hash`): missing (or `null`) or anything but an opaque id (R9.1:
+/// 1–128 bytes of `[A-Za-z0-9._:-]`) fails the ceremony, with a short
+/// `verifyAbort` reason.
+pub(crate) fn verify_keys_account(
+    value: Option<&serde_json::Value>,
+) -> Result<String, VerifyFailure> {
+    match value {
+        None | Some(serde_json::Value::Null) => Err(VerifyFailure::local(
+            "Atem needs the account in verifyKeys (account_id)",
+            anyhow!(
+                "This Astation doesn't name the account in its keys yet (verifyKeys.account_id). Update Astation, then run `atem pair verify`."
+            ),
+        )),
+        Some(serde_json::Value::String(account))
+            if crate::session_protocol::wire::is_opaque_id(account) =>
+        {
+            Ok(account.clone())
+        }
+        Some(_) => Err(VerifyFailure::local(
+            "atem refused verifyKeys: account_id isn't an account id",
+            anyhow!(
+                "Astation's keys name a malformed account (verifyKeys.account_id), so nothing was trusted."
+            ),
+        )),
+    }
+}
+
 /// Astation's signed answer after Touch ID.
 pub(crate) struct DeviceVerifiedReply {
     pub device_verified: SignedWire,
@@ -300,6 +330,9 @@ pub(crate) struct HostPinning<'a> {
     pub host_id: &'a str,
     /// The `host_channel_key` seed this ceremony revealed.
     pub host_seed: &'a [u8; 32],
+    /// `verifyKeys.account_id`: the account the ceremony's keys named
+    /// (host-work-v1 §11.5). A certificate naming another is refused.
+    pub account_id: &'a str,
     /// Make the host encryption key with the pin (the runtime's debug hook
     /// turned `host.senders` on).
     pub enc_key: bool,
@@ -311,12 +344,14 @@ impl<'a> HostPinning<'a> {
         astation: &'a crate::memory::verification::AstationKeys,
         host_id: &'a str,
         host_seed: &'a [u8; 32],
+        account_id: &'a str,
         features: crate::runtime::test_hooks::HostFeatures,
     ) -> Self {
         HostPinning {
             astation,
             host_id,
             host_seed,
+            account_id,
             enc_key: features.senders,
         }
     }
@@ -351,6 +386,14 @@ pub(crate) fn apply_device_verified(
             &reply.device_verified,
         )?;
         let account = crate::memory::statements::DeviceVerified::parse(&fields)?.account;
+        // host-work-v1 §11.5: the account `verifyKeys` named, whose device
+        // list the host's encryption key was vouched for.
+        if account != host.account_id {
+            bail!(
+                "Astation's certificate names another account ({account}) than its keys did ({})",
+                host.account_id
+            );
+        }
         let host_pub = ed25519_dalek::SigningKey::from_bytes(host.host_seed)
             .verifying_key()
             .to_bytes();
@@ -518,9 +561,52 @@ mod tests {
             ("host.delegated,host.alerts,host.senders", true),
         ] {
             let features = HostFeatures::parse(hook).unwrap();
-            let pinning = HostPinning::new(&astation, "host-1", &[9; 32], features);
+            let pinning = HostPinning::new(&astation, "host-1", &[9; 32], "acct", features);
             assert_eq!(pinning.enc_key, enc_key, "{hook:?}");
             assert_eq!(pinning.host_id, "host-1");
+        }
+    }
+
+    /// `verifyKeys.account_id` (host-work-v1 §11.5) is required and an
+    /// opaque id (R9.1: 1–128 bytes of `[A-Za-z0-9._:-]`); anything else
+    /// fails the ceremony with a short `verifyAbort` reason.
+    #[test]
+    fn the_verify_keys_account_is_required_and_read_strictly() {
+        use serde_json::json;
+        for good in ["acct-test-1", "a", "A.b_c:d-9", &"a".repeat(128)] {
+            assert_eq!(
+                verify_keys_account(Some(&json!(good))).unwrap(),
+                good,
+                "{good}"
+            );
+        }
+        let missing = verify_keys_account(None).unwrap_err();
+        assert_eq!(
+            missing.abort_reason(),
+            Some("Atem needs the account in verifyKeys (account_id)")
+        );
+        assert!(
+            missing.error().to_string().contains("Update Astation"),
+            "{}",
+            missing.error()
+        );
+        for bad in [
+            json!(""),
+            json!("acct op"),
+            json!("acct/op"),
+            json!("é"),
+            json!("a".repeat(129)),
+            json!(7),
+            json!(["acct"]),
+            json!({"id": "acct"}),
+            json!(true),
+        ] {
+            let refused = verify_keys_account(Some(&bad)).unwrap_err();
+            assert_eq!(
+                refused.abort_reason(),
+                Some("atem refused verifyKeys: account_id isn't an account id"),
+                "{bad}"
+            );
         }
     }
 
@@ -917,6 +1003,7 @@ mod tests {
                 astation: &astation,
                 host_id: "host-1",
                 host_seed: &[9; 32],
+                account_id: "acct",
                 enc_key: true,
             };
             let error = apply_device_verified(

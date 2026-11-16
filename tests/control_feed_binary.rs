@@ -4276,7 +4276,7 @@ fn start_reverify(rig: &Rig) -> support::Frontend {
     let keys = json!({"type": "verifyKeys", "data": {
         "sign_pub": b64(&sign_pub), "enc_pub": b64(&[5; 32]),
         "recovery_sign_pub": b64(&[6; 32]), "nonce": b64(&[7; 32]),
-        "genesis_hash": "ab".repeat(32)}});
+        "genesis_hash": "ab".repeat(32), "account_id": ACCOUNT}});
     rig.astation.send(on, keys.to_string());
     let (on, _) = astation_saw(rig, "verifyReveal");
     assert_eq!(on, rig.link());
