@@ -41,7 +41,7 @@
 //! - **The receiver's view** ([`recipient`]): this host's id and pairing
 //!   generation, the generation's key and the record, as II.4.2's receiver
 //!   takes them (`atem_client::host_mail::Recipient`).
-use atem_client::encoding::{b64u, hex, hex_decode_array};
+use atem_client::encoding::{Hash32, b64u, hex, hex_decode_array};
 use atem_client::host_mail::Recipient;
 use atem_client::keys::enc_kid_bytes;
 use atem_client::membership::{Membership, sign_host_enc_key};
@@ -343,6 +343,130 @@ fn made_lines(key: &HostEncKey, replaced: Option<u64>, prior: &Prior) -> Vec<Str
         ));
     }
     lines
+}
+
+/// What a verification ceremony's key is vouched for (host-work-v1 §11.5):
+/// the account and genesis `verifyKeys` named, and this host's id and trust
+/// generation (`verifyCommit`'s), by the ceremony's new `host_channel_key`.
+pub struct Vouch<'a> {
+    pub account_id: &'a str,
+    pub genesis_hash: &'a Hash32,
+    pub host_id: &'a str,
+    pub host_trust_gen: u64,
+    /// The new `host_channel_key`'s seed (revealed as `host_channel_pub`).
+    pub host_seed: &'a [u8; 32],
+}
+
+/// A host encryption key made in a verification ceremony (host-work-v1
+/// §11.5), after `verifyKeys` and before the reveal: its `enc_sig` by the
+/// ceremony's new `host_channel_key`, and its id durably in the record
+/// before anything hands it out (only [`make_for_ceremony_locked`] makes
+/// one, so a reveal built from it always follows the record). The private
+/// key stays here, wiped on drop, until the pin keeps it as
+/// `pairing/host_enc_key` ([`keep_at_pin`]).
+pub struct CeremonyKey {
+    key: HostEncKey,
+    secret: Zeroizing<[u8; 32]>,
+    host_id: String,
+    enc_sig: [u8; 64],
+}
+
+impl std::fmt::Debug for CeremonyKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CeremonyKey")
+            .field("key", &self.key)
+            .field("host_id", &self.host_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CeremonyKey {
+    /// `verifyCommit.device_id`: this host's id in the device list.
+    pub fn host_id(&self) -> &str {
+        &self.host_id
+    }
+
+    /// `verifyCommit.host_trust_gen`.
+    pub fn host_trust_gen(&self) -> u64 {
+        self.key.host_trust_gen
+    }
+
+    /// The X25519 public half.
+    pub fn enc_pub(&self) -> &[u8; 32] {
+        self.key.enc_pub()
+    }
+
+    /// Ed25519 by the ceremony's `host_channel_key` over
+    /// `enc(["atem-host-enc-key-v1", account_id, genesis_hash, host_id,
+    /// u64(host_trust_gen), enc_pub])`.
+    pub fn enc_sig(&self) -> &[u8; 64] {
+        &self.enc_sig
+    }
+
+    /// Its `enc_kid` (16 hex).
+    pub fn enc_kid(&self) -> String {
+        self.key.enc_kid()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the next record write of a ceremony's key that fails.
+    pub(crate) static CEREMONY_FAULT: std::cell::Cell<Option<store::Injected>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// In a verification ceremony, after `verifyKeys` (host-work-v1 §11.5;
+/// `atem pair` and `atem pair verify`, in every build: the reveal carries
+/// the key, required): a new key for the ceremony's trust generation, its
+/// `enc_sig` by the ceremony's new `host_channel_key` (the shared core's
+/// `sign_host_enc_key`), and its id durably in the record (fsync, rename,
+/// directory fsync; a record of another generation, or one that can't be
+/// read, is replaced by this generation's), before the reveal hands it out.
+/// The caller holds `trust_gen.lock`, under the pairing the ceremony runs
+/// in. Nothing else is written: the key file only at the pin. `Err`: why
+/// (the ceremony aborts before the reveal).
+pub fn make_for_ceremony_locked(
+    pairing: &PairingPaths,
+    vouch: &Vouch<'_>,
+) -> Result<CeremonyKey, String> {
+    if vouch.host_trust_gen == 0 {
+        return Err("no trust generation".into());
+    }
+    let (key, secret) = HostEncKey::generate(vouch.host_trust_gen);
+    let host_key = HostKey::new(vouch.host_seed);
+    let enc_sig = sign_host_enc_key(
+        &host_key.keys,
+        &host_key.id,
+        vouch.account_id,
+        vouch.genesis_hash,
+        vouch.host_id,
+        vouch.host_trust_gen,
+        key.enc_pub(),
+    )
+    .map_err(|e| format!("cannot sign it: {e}"))?
+    .try_into()
+    .map_err(|_| "cannot sign it: not a 64-byte signature".to_string())?;
+    let mut store = Store::new(pairing, &journal_of(pairing));
+    #[cfg(test)]
+    if let Some(fault) = CEREMONY_FAULT.with(|f| f.take()) {
+        store.inject(fault);
+    }
+    let prior = record_kid(&mut store, vouch.host_trust_gen, key.kid)
+        .map_err(|e| format!("cannot record its id: {e}"))?;
+    if let Prior::Unreadable(why) = prior {
+        eprintln!(
+            "atem: host encryption key: the record of keys made was unreadable ({why}); it now lists trust generation {}'s key (enc_kid {}) only",
+            vouch.host_trust_gen,
+            key.enc_kid()
+        );
+    }
+    Ok(CeremonyKey {
+        key,
+        secret,
+        host_id: vouch.host_id.to_string(),
+        enc_sig,
+    })
 }
 
 /// With the device list's pin (`atem pair` and `atem pair verify`; the

@@ -283,6 +283,48 @@ pub(crate) async fn next_verify_message(client: &mut AstationClient) -> Result<A
     }
 }
 
+/// `verifyReveal.host_enc_key` (host-work-v1 §11.5): the host's new
+/// encryption key for the verification's trust generation, in the shape of
+/// session-v1 R9.14's `host_enc_key` answer without its `id` and `re`: the
+/// `host_enc_key` entry's own forms, which Astation copies into the entry it
+/// appends after the `add_host`. `host_id` and `host_trust_gen` are the
+/// `verifyCommit`'s `device_id` and `host_trust_gen`; `enc_sig` (base64url,
+/// 64 bytes) is pure Ed25519 by the new `host_channel_key` over
+/// `enc(["atem-host-enc-key-v1", account_id, genesis_hash, host_id,
+/// u64(host_trust_gen), enc_pub])`, the account and genesis `verifyKeys`'s.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevealHostEncKey {
+    pub host_id: String,
+    pub host_trust_gen: u64,
+    pub enc_key: RevealEncKey,
+    pub enc_sig: String,
+}
+
+impl RevealHostEncKey {
+    /// The reveal's object for the key a ceremony made (and recorded).
+    pub(crate) fn of(key: &crate::session_protocol::r9::host_enc::CeremonyKey) -> Self {
+        RevealHostEncKey {
+            host_id: key.host_id().to_string(),
+            host_trust_gen: key.host_trust_gen(),
+            enc_key: RevealEncKey {
+                alg: "x25519".into(),
+                public: atem_client::encoding::b64u(key.enc_pub()),
+            },
+            enc_sig: atem_client::encoding::b64u(key.enc_sig()),
+        }
+    }
+}
+
+/// `{"alg":"x25519","pub":"<b64u, 32 bytes>"}` (R9.1's key object).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevealEncKey {
+    pub alg: String,
+    #[serde(rename = "pub")]
+    pub public: String,
+}
+
 /// `verifyKeys.account_id` (host-work-v1 §11.5), read strictly: the account
 /// whose device list `genesis_hash` names, which the host's `enc_sig`
 /// binds before the reveal. Required (no compatibility, as for

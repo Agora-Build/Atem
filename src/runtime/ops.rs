@@ -487,6 +487,11 @@ async fn pair_verify<U: OpUi>(
 /// can't be read (no local path; the remedy is shown locally).
 pub(crate) const FROZEN_GENESIS_UNREADABLE: &str = "this host's record of frozen device lists can't be read; pairing is refused until it is restored on the host";
 
+/// `verifyAbort` reason when this host couldn't record its new encryption
+/// key's id before the reveal (host-work-v1 §11.5): nothing is revealed.
+pub(crate) const ENC_KEY_NOT_RECORDED: &str =
+    "atem couldn't record its host encryption key; nothing was revealed";
+
 /// The CLI's answer to "does the code match?".
 fn code_answer(answer: Option<AnswerValue>) -> CodeAnswer {
     match answer {
@@ -662,6 +667,51 @@ pub(crate) async fn verify_device<U: OpUi>(
         return Err(abandon_verification(client, &paths.trust, astation_id, failure).await);
     }
 
+    // host-work-v1 §11.5: this host's new encryption key for the
+    // ceremony's trust generation, vouched for by the new host_channel_key
+    // for the account and genesis verifyKeys named, its id durable in the
+    // record before the reveal hands it out (only while the pairing this
+    // verification runs under is current). In every build: the reveal
+    // carries it (required); the key file is written only at the pin.
+    let enc_key = {
+        let capture = capture.clone();
+        let vouch = (
+            account_id.clone(),
+            atem_client::encoding::Hash32(astation.genesis_hash),
+            device_id.clone(),
+            zeroize::Zeroizing::new(*handshake.host_channel_seed()),
+        );
+        blocking(move || {
+            let (account_id, genesis_hash, host_id, host_seed) = vouch;
+            capture.apply(|| {
+                crate::session_protocol::r9::host_enc::make_for_ceremony_locked(
+                    &capture.sources().paths.pairing,
+                    &crate::session_protocol::r9::host_enc::Vouch {
+                        account_id: &account_id,
+                        genesis_hash: &genesis_hash,
+                        host_id: &host_id,
+                        host_trust_gen,
+                        host_seed: &host_seed,
+                    },
+                )
+                .map_err(|e| anyhow!(e))
+            })
+        })
+        .await
+    };
+    let enc_key = match enc_key {
+        Ok(key) => key,
+        Err(error) => {
+            let failure = VerifyFailure::local(
+                ENC_KEY_NOT_RECORDED,
+                anyhow!(
+                    "Couldn't record this host's new encryption key before revealing it ({error:#}), so nothing was revealed or trusted."
+                ),
+            );
+            return Err(abandon_verification(client, &paths.trust, astation_id, failure).await);
+        }
+    };
+
     let reveal = handshake.reveal();
     client
         .send_message(AstationMessage::VerifyReveal {
@@ -670,6 +720,7 @@ pub(crate) async fn verify_device<U: OpUi>(
             unlock_auth_pub: STANDARD.encode(reveal.unlock_auth_pub),
             host_channel_pub: atem_client::encoding::b64u(&reveal.host_channel_pub),
             nonce: STANDARD.encode(reveal.nonce_a),
+            host_enc_key: crate::pair_verify::RevealHostEncKey::of(&enc_key),
         })
         .await?;
     let code = handshake.safety_code(&astation);

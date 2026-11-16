@@ -508,6 +508,19 @@ impl Verifier {
         }
     }
 
+    /// Astation's checks of the reveal's `host_enc_key` (host-work-v1
+    /// §11.5): its public half and `enc_sig`.
+    fn revealed_key(&self, reveal: &Value) -> ([u8; 32], [u8; 64]) {
+        crate::session_protocol::membership::r9log::reveal_host_enc_key(
+            &reveal["data"],
+            &self.account,
+            &self.log.borrow().genesis_hash(),
+            &self.device_id,
+            self.advertised,
+        )
+        .unwrap_or_else(|e| panic!("Astation refuses the reveal: {e}"))
+    }
+
     /// Waits for `verifyReveal`; the signed `deviceVerified` for it, with
     /// the device list ending at this host's `add_host` (trust generation
     /// `host_trust_gen`, the revealed host channel key).
@@ -521,6 +534,7 @@ impl Verifier {
         .unwrap();
         // Astation copies the advertised generation into the add_host.
         assert_eq!(self.advertised, host_trust_gen, "the binding's generation");
+        self.revealed_key(&reveal);
         self.log
             .borrow_mut()
             .add_host_pub(&self.device_id, self.advertised, &host_pub);
@@ -2911,6 +2925,114 @@ fn a_verify_keys_without_a_valid_account_is_refused() {
     }
 }
 
+/// `pairing/host_enc_generated` (the record of the host encryption keys
+/// made), as JSON.
+fn enc_record(profile: &Path) -> Option<Value> {
+    let path = crate::paths::ProfilePaths::in_dir(profile)
+        .pairing
+        .host_enc_generated;
+    std::fs::read(path)
+        .ok()
+        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+}
+
+/// R9.9's `enc_kid` of an X25519 public half.
+fn kid_of(enc_pub: &[u8; 32]) -> String {
+    let key = atem_client::PublicKey::new(atem_client::Alg::X25519, enc_pub).unwrap();
+    atem_client::keys::enc_kid(&key).unwrap()
+}
+
+/// host-work-v1 §11.5: after `verifyKeys` the host makes a new encryption
+/// key for the ceremony's trust generation and records its `enc_kid`
+/// durably before it sends the reveal, which carries it as
+/// `host_enc_key{host_id, host_trust_gen, enc_key, enc_sig}`: the commit's
+/// host and generation, `enc_sig` by the revealed `host_channel_key` for
+/// the account and genesis `verifyKeys` named (Astation's checks, as it
+/// makes them). No key file before the pin. An aborted ceremony keeps the
+/// record (the key's id was handed out) and pins nothing; the next ceremony
+/// makes a new key for its own generation.
+#[test]
+fn the_reveal_carries_a_new_encryption_key_recorded_before_it() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+        let mut revealed = Vec::new();
+        for attempt in 1..=2 {
+            let mut op =
+                Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+            let verifier = Verifier::keys(&mut peer, "acct-op").await;
+            let reveal = peer.next("verifyReveal").await;
+            let (enc_pub, _) = verifier.revealed_key(&reveal);
+            // Durable before the reveal went: on disk as it arrives.
+            let recorded = json!({"v": 1, "host_trust_gen": verifier.advertised,
+                "kids": [kid_of(&enc_pub)]});
+            assert_eq!(enc_record(&rt.profile), Some(recorded.clone()), "{attempt}");
+            assert!(
+                !pairing.host_enc_key.exists(),
+                "the key file only at the pin"
+            );
+            // The code refused: the ceremony aborts.
+            let (question, _, _) = op.ask().await;
+            op.answer(question, AnswerValue::No).await;
+            let abort = peer.next("verifyAbort").await;
+            assert_eq!(abort["data"]["reason"], "codes didn't match on atem");
+            assert!(op.done().await.is_err());
+            assert!(!pairing.membership.exists(), "nothing pinned");
+            assert!(!pairing.host_enc_key.exists(), "no key kept");
+            assert_eq!(
+                enc_record(&rt.profile),
+                Some(recorded),
+                "{attempt}: the record stays (the id was handed out)"
+            );
+            revealed.push((verifier.advertised, enc_pub));
+        }
+        assert_eq!(revealed[1].0, revealed[0].0 + 1, "the next generation");
+        assert_ne!(revealed[1].1, revealed[0].1, "with a new key");
+        rt.shutdown().await;
+    });
+}
+
+/// host-work-v1 §11.5: a key whose id can't be recorded is never handed
+/// out: the ceremony aborts after `verifyKeys` with a short reason, sends
+/// no reveal, and pins nothing.
+#[test]
+fn a_key_whose_id_cant_be_recorded_is_never_revealed() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let pairing = crate::paths::ProfilePaths::in_dir(&dir.path().join("profile")).pairing;
+        // A directory where the record goes: its write fails.
+        std::fs::create_dir_all(pairing.host_enc_generated.join("in-the-way")).unwrap();
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        let _verifier = Verifier::keys(&mut peer, "acct-op").await;
+        let abort = peer.next("verifyAbort").await;
+        assert_eq!(
+            abort["data"]["reason"],
+            crate::runtime::ops::ENC_KEY_NOT_RECORDED
+        );
+        assert!(
+            !peer.seen.iter().any(|m| m["type"] == "verifyReveal"),
+            "no reveal: the key was never handed out"
+        );
+        op.printed("Couldn't record this host's new encryption key")
+            .await;
+        assert_eq!(
+            op.done().await.unwrap_err(),
+            crate::pair_verify::PAIRED_NOT_VERIFIED
+        );
+        assert!(!pairing.membership.exists() && !pairing.host_enc_key.exists());
+        assert!(!pending(&rt.keys()), "no pending pin");
+        rt.shutdown().await;
+    });
+}
+
 /// host-work-v1 §11.5: Atem refuses a `deviceVerified` whose signed
 /// certificate names another account than `verifyKeys` did (the account
 /// its `enc_sig` was made for): the verification fails and nothing is
@@ -2925,18 +3047,24 @@ fn a_certificate_for_another_account_than_verify_keys_named_is_refused() {
         let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
         let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
         let mut verifier = Verifier::keys(&mut peer, "acct-op").await;
+        let reveal = peer.next("verifyReveal").await;
+        verifier.revealed_key(&reveal);
         // The certificate (and its list) name another account than the
         // keys did.
         verifier.account = "acct-other".into();
-        verifier.log = std::cell::RefCell::new(
-            crate::session_protocol::membership::r9log::TestLog::genesis(
-                "acct-other",
-                &verifier.fake.sign_secret_bytes(),
-            ),
+        let mut log = crate::session_protocol::membership::r9log::TestLog::genesis(
+            "acct-other",
+            &verifier.fake.sign_secret_bytes(),
         );
-        let certificate = verifier
-            .certificate(&mut peer, trust_gen(&rt.profile))
-            .await;
+        let host_pub: [u8; 32] = atem_client::encoding::b64u_decode(
+            reveal["data"]["host_channel_pub"].as_str().unwrap(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        log.add_host_pub(&verifier.device_id, verifier.advertised, &host_pub);
+        verifier.log = std::cell::RefCell::new(log);
+        let certificate = verifier.certificate_for(&reveal);
         let (question, _, _) = op.ask().await;
         op.answer(question, AnswerValue::Yes).await;
         op.printed("Waiting for your Mac").await;

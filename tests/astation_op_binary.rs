@@ -123,6 +123,12 @@ fn pair_verify_runs_through_the_auto_started_runtime() {
     // r9: the reveal carries this pairing's host channel key.
     let reveal = saw(&seen, "verifyReveal");
     assert_eq!(reveal["host_channel_pub"].as_str().map(str::len), Some(43));
+    // host-work-v1 §11.5: and the host's new encryption key, vouched for
+    // by it for the account and genesis `verifyKeys` named.
+    let genesis = atem_client::encoding::Hash32::from_hex(&"ab".repeat(32)).unwrap();
+    let host_id = commit["device_id"].as_str().unwrap();
+    support::r9log::reveal_host_enc_key(&reveal, "acct-bin", &genesis, host_id, 2)
+        .unwrap_or_else(|e| panic!("Astation refuses the reveal: {e}"));
     cli.shows("Safety code:");
     cli.shows("Does the code on your Mac match? Type y or n:");
     // The CLI answers from its terminal; a refusal reaches Astation.

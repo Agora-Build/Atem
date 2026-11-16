@@ -104,6 +104,94 @@ fn record_of(generation: u64, kids: &[&str]) -> Value {
     json!({"v": 1, "host_trust_gen": generation, "kids": kids})
 }
 
+/// A verification ceremony's key (host-work-v1 §11.5) for `generation`,
+/// vouched for by `seed` (the ceremony's `host_channel_key`).
+fn ceremony_key(
+    pairing: &PairingPaths,
+    log: &TestLog,
+    generation: u64,
+    seed: &str,
+) -> Result<host_enc::CeremonyKey, String> {
+    host_enc::make_for_ceremony_locked(
+        pairing,
+        &host_enc::Vouch {
+            account_id: ACCOUNT,
+            genesis_hash: &log.genesis_hash(),
+            host_id: HOST,
+            host_trust_gen: generation,
+            host_seed: &secret(seed),
+        },
+    )
+}
+
+/// host-work-v1 §11.5: a ceremony's key, made after `verifyKeys` and before
+/// the reveal: its `enc_sig` verifies with the ceremony's new host channel
+/// key for the account and genesis `verifyKeys` named (what Astation
+/// checks), and its id is durably in the record of its generation before
+/// anything hands it out; no key file yet (only the pin keeps it). A
+/// second key in the same generation is added to the record; one of the
+/// next generation replaces the record. A record that can't be written
+/// makes no key, and the record stays as it was.
+#[test]
+fn a_ceremonys_key_is_vouched_for_and_recorded_before_the_reveal() {
+    let (_dir, src) = profile();
+    let p = &src.paths.pairing;
+    let log = log_at(1, "enc host");
+    let first = ceremony_key(p, &log, 2, "enc host 2").unwrap();
+    assert_eq!(first.host_id(), HOST);
+    assert_eq!(first.host_trust_gen(), 2);
+    atem_client::membership::verify_host_enc_sig(
+        &PublicKey::new(
+            Alg::Ed25519,
+            &ed25519_dalek::SigningKey::from_bytes(&secret("enc host 2"))
+                .verifying_key()
+                .to_bytes(),
+        )
+        .unwrap(),
+        ACCOUNT,
+        &log.genesis_hash(),
+        HOST,
+        2,
+        first.enc_pub(),
+        first.enc_sig(),
+    )
+    .expect("enc_sig by the ceremony's host channel key");
+    let first_kid = kid_of(&atem_client::encoding::b64u(first.enc_pub()));
+    assert_eq!(first.enc_kid(), first_kid);
+    assert_eq!(record(p), Some(record_of(2, &[&first_kid])));
+    assert!(!p.host_enc_key.exists(), "the key file only at the pin");
+    // Another in the same generation is added; the next generation's
+    // replaces the record.
+    let second = ceremony_key(p, &log, 2, "enc host 2").unwrap();
+    assert_ne!(second.enc_pub(), first.enc_pub());
+    assert_eq!(
+        record(p),
+        Some(record_of(2, &[&first_kid, &second.enc_kid()]))
+    );
+    let third = ceremony_key(p, &log, 3, "enc host 3").unwrap();
+    assert_eq!(record(p), Some(record_of(3, &[&third.enc_kid()])));
+    // A record write that fails: no key, the record unchanged.
+    for step in [Step::TempWrite, Step::TempFsync, Step::Rename] {
+        host_enc::CEREMONY_FAULT.with(|f| {
+            f.set(Some(Injected {
+                file: DlFile::HostEncGenerated,
+                step,
+            }))
+        });
+        let error = ceremony_key(p, &log, 4, "enc host 4").unwrap_err();
+        assert!(
+            error.starts_with("cannot record its id"),
+            "{step:?}: {error}"
+        );
+        assert_eq!(
+            record(p),
+            Some(record_of(3, &[&third.enc_kid()])),
+            "{step:?}"
+        );
+    }
+    assert!(!p.host_enc_key.exists());
+}
+
 /// Made with the pin when a pairing is verified (its trust generation),
 /// its id recorded; `atem pair verify` pins the next generation with a new
 /// `host_channel_key`, and with it a new key, the record now of that

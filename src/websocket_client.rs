@@ -481,6 +481,11 @@ pub enum AstationMessage {
         unlock_auth_pub: String,
         host_channel_pub: String,
         nonce: String,
+        /// host-work-v1 §11.5: this host's new encryption key, vouched for
+        /// by the new `host_channel_key`. Outside the commitment (`enc_sig`
+        /// binds it to `host_channel_pub`, which the commitment covers);
+        /// required.
+        host_enc_key: crate::pair_verify::RevealHostEncKey,
     },
 
     /// Astation → Atem: after Touch ID, the signed device certificate, the
