@@ -559,11 +559,13 @@ fn rv_trust_gen(rig: &mut LocalRig, host_trust_gen: u64) {
 
 /// Item 15 (#120) across a re-authentication, on both carriers (the relay
 /// identity link and Astation's local `:8080` link): Astation authenticates
-/// the live link again and the host's trust generation alone moves while it
-/// does (the same account, device, device list and key), either in the
-/// window or as it ends (the pass's `sync_link` takes it from the new link
-/// generation, just before the Station link comes back on the same socket).
-/// The old association is never relabelled the new identity's: the call
+/// the live link again and the host's trust generation alone moves (the
+/// same account, device, device list and key): before the window, on the
+/// live link, while its reconnect waits (the re-verify's own operation still
+/// runs); in the window; or as it ends (the pass's `sync_link` takes it from
+/// the new link generation, just before the Station link comes back on the
+/// same socket). The old association is never relabelled the new
+/// identity's: the call
 /// retired at the drop is drained when its page comes, nothing is asked or
 /// acknowledged on that socket, a local link's route proof answers nothing
 /// more there, and once Astation answered (never before) the App
@@ -573,10 +575,17 @@ fn rv_trust_gen(rig: &mut LocalRig, host_trust_gen: u64) {
 fn a_trust_generation_moving_while_astation_reauthenticates_reconnects_the_socket() {
     use crate::runtime::delegated::sync::Closed;
     use atem_client::control::AckResult;
+    /// Where the move lands.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Landing {
+        Before,
+        InWindow,
+        AtEnd,
+    }
     for local in [false, true] {
-        for in_window in [true, false] {
+        for landing in [Landing::Before, Landing::InWindow, Landing::AtEnd] {
             local_test(async |root| {
-                let case = format!("local {local}, in the window {in_window}");
+                let case = format!("local {local}, {landing:?}");
                 let mut rig = LocalRig::new(root).await;
                 let start = host_now().wall_ms;
                 let os = ManualOs::at(start);
@@ -599,12 +608,37 @@ fn a_trust_generation_moving_while_astation_reauthenticates_reconnects_the_socke
                         .iter()
                         .all(|ack| ack.host_trust_gen == 1)
                 );
+                if landing == Landing::Before {
+                    // The move on the live link; its reconnect waits while
+                    // the operation runs.
+                    rv_trust_gen(&mut rig, 2);
+                    passes(&mut rig, 1);
+                    assert_eq!(
+                        rig.app.identity_reconnect.map(|(_, socket)| socket),
+                        Some(41),
+                        "{case}"
+                    );
+                    if local {
+                        assert!(rig.app.astation_client.local_route_retired(), "{case}");
+                    }
+                    assert!(
+                        !rig.app.identity_reconnect_due(true, false),
+                        "{case}: the operation still runs"
+                    );
+                    assert!(rig.app.identity_reconnect.is_some(), "{case}: kept");
+                }
                 // Astation authenticates the link again.
                 rv_reauth_starts(&mut rig);
                 assert_eq!(rv_live(&rig), None, "{case}: retired at the drop");
-                if in_window {
-                    rv_trust_gen(&mut rig, 2);
-                    passes(&mut rig, 1);
+                match landing {
+                    Landing::Before => passes(&mut rig, 1),
+                    Landing::InWindow => {
+                        rv_trust_gen(&mut rig, 2);
+                        passes(&mut rig, 1);
+                    }
+                    Landing::AtEnd => rv_trust_gen(&mut rig, 2),
+                }
+                if landing != Landing::AtEnd {
                     assert_eq!(
                         rig.app.identity_reconnect.map(|(_, socket)| socket),
                         Some(41),
@@ -618,8 +652,6 @@ fn a_trust_generation_moving_while_astation_reauthenticates_reconnects_the_socke
                         "{case}: not while Astation authenticates it"
                     );
                     assert!(rig.app.identity_reconnect.is_some(), "{case}: kept");
-                } else {
-                    rv_trust_gen(&mut rig, 2);
                 }
                 // Astation answered: the same socket, a new link generation.
                 rv_astation_link(&mut rig, 8, 41, local);

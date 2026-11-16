@@ -1979,6 +1979,52 @@ fn an_identity_change_while_astation_reauthenticates_is_never_relabelled() {
     assert_eq!(rig.sync.dump()["identity_moves"], 1);
 }
 
+/// Item 15 (#120), the move before the window: the identity moves while
+/// the link is up (the socket marked moved, its reconnect not yet run, as
+/// while the re-verify's own operation still runs), then Astation
+/// authenticates the link again. The down link keeps the move, so the same
+/// socket coming back (its identity unchanged since the move) is still the
+/// old identity's association: the late page is drained, its `heads` and
+/// the pass ask nothing, the gate stays closed and the socket is the one to
+/// reconnect.
+#[test]
+fn an_identity_moved_before_a_reauthentication_stays_moved() {
+    let mut rig = rig();
+    assert!(!rig.sync.on_identity(identity(&rig.log, 1)));
+    let (_cover, _hold) = rig.opened();
+    let release = rig.record(FEED, ControlAction::Release);
+    rig.pass(SEC);
+    assert_eq!(rig.heads(FEED, 3), [sync_call(FEED, 2)]);
+    let continuation = rig.last();
+    // The move, on the live link.
+    rig.new_identity();
+    assert!(rig.sync.on_identity(identity(&rig.log, 2)), "moved");
+    assert_eq!(rig.sync.moved_socket(), Some(SOCKET));
+    // Astation authenticates the link again before the reconnect ran.
+    rig.sync.on_link(None);
+    assert!(!rig.sync.on_identity(identity(&rig.log, 2)), "no new move");
+    assert_eq!(rig.sync.moved_socket(), Some(SOCKET), "kept while down");
+    rig.pass(SEC);
+    rig.sync.on_link(Some(&link(2, ORIGIN)));
+    assert!(!rig.sync.on_identity(identity(&rig.log, 2)));
+    assert_eq!(rig.sync.moved_socket(), Some(SOCKET));
+    assert_eq!(rig.sync.closed(), Some(Closed::IdentityMoved));
+    let drained = rig.drained();
+    let synced = rig.answer(&continuation, 3, &[(3, &release)]);
+    assert!(synced.applied.is_empty());
+    assert_eq!(synced.next, None);
+    assert_eq!(rig.drained(), drained + 1);
+    assert!(rig.feeds.never_read());
+    rig.pass(2 * SEC);
+    assert!(
+        rig.heads(FEED, 3).is_empty(),
+        "nothing asked on that socket"
+    );
+    assert!(rig.pass(2 * SEC).is_empty());
+    assert_eq!(rig.sync.closed(), Some(Closed::IdentityMoved));
+    assert_eq!(rig.sync.dump()["identity_moves"], 1);
+}
+
 /// The same window with no identity change: Astation authenticating the
 /// link again keeps the socket's association. Nothing is marked moved or
 /// to reconnect; the new generation asks the feed again from the committed
