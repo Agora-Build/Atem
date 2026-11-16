@@ -327,7 +327,10 @@ fn a_mailbox_page_that_cant_commit_commits_nothing() {
         let d = rig.bridge.start_view().now_d_ms.take();
         mb_heads(&mut rig, MB_MAILBOX, 1);
         let (syncs, _) = mb_out(&mut rig);
-        mb_receive(&mut rig, &mb_page(&syncs[0], 1, &[cancel.clone()]));
+        mb_receive(
+            &mut rig,
+            &mb_page(&syncs[0], 1, std::slice::from_ref(&cancel)),
+        );
         let observed = mb_store(&rig);
         assert_eq!((observed.cursor, observed.inbox), (None, 0));
         mb_tick(&mut rig, &mut host, 29_000);
@@ -354,7 +357,10 @@ fn a_mailbox_page_that_cant_commit_commits_nothing() {
         };
         crate::runtime::delegated::mailbox_store::commit_page(store, &identity, &moved, None)
             .unwrap();
-        mb_receive(&mut rig, &mb_page(&syncs[0], 1, &[cancel.clone()]));
+        mb_receive(
+            &mut rig,
+            &mb_page(&syncs[0], 1, std::slice::from_ref(&cancel)),
+        );
         assert_eq!(mb_store(&rig).inbox, 0, "stale: nothing");
         assert_eq!(mb_store(&rig).cursor, Some((MB_MAILBOX.into(), 3)));
         // A transaction that fails.
@@ -369,7 +375,10 @@ fn a_mailbox_page_that_cant_commit_commits_nothing() {
             .db
             .execute_batch("DROP TABLE mailbox_inbox")
             .unwrap();
-        mb_receive(&mut rig, &mb_page(&syncs[0], 5, &[cancel.clone()]));
+        mb_receive(
+            &mut rig,
+            &mb_page(&syncs[0], 5, std::slice::from_ref(&cancel)),
+        );
         assert_eq!(mb_store_cursor(&rig), Some((MB_MAILBOX.into(), 3)));
         crate::runtime::delegated::mailbox_store::prepare(rig.bridge.work.store.as_ref().unwrap())
             .unwrap();
