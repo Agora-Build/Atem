@@ -793,6 +793,64 @@ fn a_put_is_charged_its_objects_bytes_as_received() {
 }
 
 #[test]
+fn the_quota_decision_counts_bytes_as_received() {
+    // Each limit is the object's compact size: its spaced copy, larger as
+    // received, is refused `quota`, and its compact copy is stored. A
+    // Station that measured the compact form at any one limit would store
+    // the spaced copy.
+    let compact = size(&object(1));
+    let spaced = respaced_text(&object(1));
+    let roomy = Quota {
+        objects: 100,
+        bytes: 1 << 20,
+    };
+    let tight = Quota {
+        objects: 100,
+        bytes: compact,
+    };
+    for (limit, quotas) in [
+        (
+            "sending host",
+            Quotas {
+                sender: tight,
+                receiver: roomy,
+                account: roomy,
+            },
+        ),
+        (
+            "receiving host",
+            Quotas {
+                sender: roomy,
+                receiver: tight,
+                account: roomy,
+            },
+        ),
+        (
+            "account",
+            Quotas {
+                sender: roomy,
+                receiver: roomy,
+                account: tight,
+            },
+        ),
+    ] {
+        let mut st = Station::with(quotas);
+        let text = format!(
+            r#"{{"type":"relay","op":"mailbox_put","request_id":"{}","object":{spaced}}}"#,
+            uuid(1)
+        );
+        let (_, outcome) = st.send(&a(), text.as_bytes());
+        assert_eq!(outcome, Outcome::PutRefused(PutRefusal::Quota), "{limit}");
+        assert_eq!(
+            st.put(&a(), &object(1)),
+            Outcome::Stored { position: 1 },
+            "{limit}"
+        );
+        assert_eq!(st.m.account_usage().bytes, compact, "{limit}");
+    }
+}
+
+#[test]
 fn only_a_current_host_syncs_or_marks_done() {
     // As for a put (rule 1): the caller is a current host of the list at
     // its link's generation; `heads` is the Station's announcement.

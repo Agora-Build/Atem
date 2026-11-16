@@ -7646,6 +7646,693 @@
           "objects": 1024
         }
       }
+    },
+    {
+      "events": [
+        {
+          "answer": "{\"code\":\"quota\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"op\":\"mailbox_put_refused\",\"request_id\":\"00000013-0000-4000-8000-000000000001\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "call": "{\"type\":\"relay\",\"op\":\"mailbox_put\",\"request_id\":\"00000013-0000-4000-8000-000000000001\",\"object\":{\n  \"sig\" : \"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\" ,\n  \"ct\" : \"RJPseAOHf-xPck3LL7DNc8cLoaeM01FY042O4GqYebYzklWbfKflYKRUDKkslNY5QNdpkwAjo3t0dGQS9cCC7tc92txfTGlCTBQaxhAWx3z_zQ\" ,\n  \"body\" : {\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1} ,\n  \"enc\" : \"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\" }}",
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "code": "quota",
+            "outcome": "put_refused"
+          },
+          "note": "o1 spaced",
+          "state": {
+            "dropped": 0,
+            "mailboxes": []
+          }
+        },
+        {
+          "answer": "{\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"op\":\"mailbox_stored\",\"request_id\":\"00000013-0000-4000-8000-000000000002\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"RJPseAOHf-xPck3LL7DNc8cLoaeM01FY042O4GqYebYzklWbfKflYKRUDKkslNY5QNdpkwAjo3t0dGQS9cCC7tc92txfTGlCTBQaxhAWx3z_zQ\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"00000013-0000-4000-8000-000000000002\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "stored",
+            "position": 1
+          },
+          "note": "o1 compact, at the limit exactly",
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-evil",
+          "host_trust_gen": 1
+        }
+      ],
+      "name": "quota_decided_on_bytes_as_received_per_sending_host",
+      "note": "one limit of exactly o1's compact size: o1 spaced, larger as received, is refused `quota`; o1 compact is stored (a Station measuring the compact form at this limit would store the spaced copy)",
+      "quotas": {
+        "account": {
+          "bytes": 1073741824,
+          "objects": 1024
+        },
+        "receiver": {
+          "bytes": 1073741824,
+          "objects": 1024
+        },
+        "sender": {
+          "bytes": 824,
+          "objects": 100
+        }
+      }
+    },
+    {
+      "events": [
+        {
+          "answer": "{\"code\":\"quota\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"op\":\"mailbox_put_refused\",\"request_id\":\"00000014-0000-4000-8000-000000000001\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "call": "{\"type\":\"relay\",\"op\":\"mailbox_put\",\"request_id\":\"00000014-0000-4000-8000-000000000001\",\"object\":{\n  \"sig\" : \"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\" ,\n  \"ct\" : \"RJPseAOHf-xPck3LL7DNc8cLoaeM01FY042O4GqYebYzklWbfKflYKRUDKkslNY5QNdpkwAjo3t0dGQS9cCC7tc92txfTGlCTBQaxhAWx3z_zQ\" ,\n  \"body\" : {\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1} ,\n  \"enc\" : \"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\" }}",
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "code": "quota",
+            "outcome": "put_refused"
+          },
+          "note": "o1 spaced",
+          "state": {
+            "dropped": 0,
+            "mailboxes": []
+          }
+        },
+        {
+          "answer": "{\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"op\":\"mailbox_stored\",\"request_id\":\"00000014-0000-4000-8000-000000000002\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"RJPseAOHf-xPck3LL7DNc8cLoaeM01FY042O4GqYebYzklWbfKflYKRUDKkslNY5QNdpkwAjo3t0dGQS9cCC7tc92txfTGlCTBQaxhAWx3z_zQ\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"00000014-0000-4000-8000-000000000002\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "stored",
+            "position": 1
+          },
+          "note": "o1 compact, at the limit exactly",
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-evil",
+          "host_trust_gen": 1
+        }
+      ],
+      "name": "quota_decided_on_bytes_as_received_per_receiving_host",
+      "note": "one limit of exactly o1's compact size: o1 spaced, larger as received, is refused `quota`; o1 compact is stored (a Station measuring the compact form at this limit would store the spaced copy)",
+      "quotas": {
+        "account": {
+          "bytes": 1073741824,
+          "objects": 1024
+        },
+        "receiver": {
+          "bytes": 824,
+          "objects": 100
+        },
+        "sender": {
+          "bytes": 1073741824,
+          "objects": 1024
+        }
+      }
+    },
+    {
+      "events": [
+        {
+          "answer": "{\"code\":\"quota\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"op\":\"mailbox_put_refused\",\"request_id\":\"00000015-0000-4000-8000-000000000001\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "call": "{\"type\":\"relay\",\"op\":\"mailbox_put\",\"request_id\":\"00000015-0000-4000-8000-000000000001\",\"object\":{\n  \"sig\" : \"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\" ,\n  \"ct\" : \"RJPseAOHf-xPck3LL7DNc8cLoaeM01FY042O4GqYebYzklWbfKflYKRUDKkslNY5QNdpkwAjo3t0dGQS9cCC7tc92txfTGlCTBQaxhAWx3z_zQ\" ,\n  \"body\" : {\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1} ,\n  \"enc\" : \"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\" }}",
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "code": "quota",
+            "outcome": "put_refused"
+          },
+          "note": "o1 spaced",
+          "state": {
+            "dropped": 0,
+            "mailboxes": []
+          }
+        },
+        {
+          "answer": "{\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"op\":\"mailbox_stored\",\"request_id\":\"00000015-0000-4000-8000-000000000002\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"RJPseAOHf-xPck3LL7DNc8cLoaeM01FY042O4GqYebYzklWbfKflYKRUDKkslNY5QNdpkwAjo3t0dGQS9cCC7tc92txfTGlCTBQaxhAWx3z_zQ\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"00000015-0000-4000-8000-000000000002\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "stored",
+            "position": 1
+          },
+          "note": "o1 compact, at the limit exactly",
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-evil",
+          "host_trust_gen": 1
+        }
+      ],
+      "name": "quota_decided_on_bytes_as_received_per_account",
+      "note": "one limit of exactly o1's compact size: o1 spaced, larger as received, is refused `quota`; o1 compact is stored (a Station measuring the compact form at this limit would store the spaced copy)",
+      "quotas": {
+        "account": {
+          "bytes": 824,
+          "objects": 100
+        },
+        "receiver": {
+          "bytes": 1073741824,
+          "objects": 1024
+        },
+        "sender": {
+          "bytes": 1073741824,
+          "objects": 1024
+        }
+      }
+    },
+    {
+      "events": [
+        {
+          "answer": "{\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"op\":\"mailbox_stored\",\"request_id\":\"00000016-0000-4000-8000-000000000001\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"RJPseAOHf-xPck3LL7DNc8cLoaeM01FY042O4GqYebYzklWbfKflYKRUDKkslNY5QNdpkwAjo3t0dGQS9cCC7tc92txfTGlCTBQaxhAWx3z_zQ\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"00000016-0000-4000-8000-000000000001\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "stored",
+            "position": 1
+          },
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"feeds\":[],\"mailbox\":{\"head\":1,\"mailbox_id\":\"fcf2c48e-5be0-485b-9abd-ee3721901668\"},\"membership\":{\"hash\":\"a8ce1c9e71ac77fbcbfdec5feace4b487efe2357255ba895694819a72a7645f5\",\"seq\":10},\"op\":\"heads\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "caller": {
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "event": "heads",
+          "expect": {
+            "mailbox": {
+              "head": 1,
+              "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668"
+            },
+            "outcome": "heads"
+          },
+          "host_senders": true,
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "event": "hosts",
+          "hosts": [
+            {
+              "host_id": "host-a",
+              "host_trust_gen": 1
+            },
+            {
+              "host_id": "host-b",
+              "host_trust_gen": 2
+            },
+            {
+              "host_id": "host-evil",
+              "host_trust_gen": 1
+            }
+          ],
+          "note": "host-b at generation 2 in the Station's copy of the list",
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"code\":\"forbidden\",\"op\":\"mailbox_sync_refused\",\"type\":\"relay\"}",
+          "at": 1793620920000,
+          "call": "{\"after\":0,\"mailbox_id\":\"fcf2c48e-5be0-485b-9abd-ee3721901668\",\"op\":\"mailbox_sync\",\"request_id\":\"00000016-0000-4000-8000-000000000002\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "op": "mailbox_sync_refused",
+            "outcome": "refused"
+          },
+          "note": "host-b's link at generation 1, its own old mailbox",
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"code\":\"forbidden\",\"op\":\"mailbox_done_refused\",\"type\":\"relay\"}",
+          "at": 1793620920000,
+          "call": "{\"mailbox_id\":\"fcf2c48e-5be0-485b-9abd-ee3721901668\",\"op\":\"mailbox_done\",\"position\":1,\"request_id\":\"00000016-0000-4000-8000-000000000003\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "op": "mailbox_done_refused",
+            "outcome": "refused"
+          },
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"feeds\":[],\"mailbox\":{\"head\":0,\"mailbox_id\":\"3165995e-aa14-44e9-9d58-42312e12916b\"},\"membership\":{\"hash\":\"a8ce1c9e71ac77fbcbfdec5feace4b487efe2357255ba895694819a72a7645f5\",\"seq\":10},\"op\":\"heads\",\"type\":\"relay\"}",
+          "at": 1793620980000,
+          "caller": {
+            "host_id": "host-b",
+            "host_trust_gen": 2
+          },
+          "event": "heads",
+          "expect": {
+            "mailbox": {
+              "head": 0,
+              "mailbox_id": "3165995e-aa14-44e9-9d58-42312e12916b"
+            },
+            "outcome": "heads"
+          },
+          "host_senders": true,
+          "note": "generation 2's own mailbox",
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              },
+              {
+                "head": 0,
+                "host_id": "host-b",
+                "host_trust_gen": 2,
+                "mailbox_id": "3165995e-aa14-44e9-9d58-42312e12916b",
+                "stored": []
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"id\":\"08f8bda0-089d-43b0-859c-c7eff92893dc\",\"op\":\"mailbox_stored\",\"request_id\":\"00000016-0000-4000-8000-000000000004\",\"type\":\"relay\"}",
+          "at": 1793620980000,
+          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"08f8bda0-089d-43b0-859c-c7eff92893dc\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":2},\"sealed_hash\":\"1b0f2bfd5718605be0ca5a4237db47e9f49e7139715d19ee047e64cf77be0eaa\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"oVUYV_rZNM4DVPsb7X0OJYOvG9LUguvS7zqu_OjkZ5Khpo8dUW7a-YMjrIg-RzyeNMBEPkE9853lpuw8iz5CLLYzx_3dRhzfGkiz3GLPHu5QFg\",\"enc\":\"pRY6qS68_E2rA4rYvZMex9wFRs-PKP2IwsXQepb8AiE\",\"sig\":\"eXwZv-rEsmm4gdMtOmcbVQ42uVZacci95VYEnNlPQkDymBtV21PS36nfr1HQJhJNj2h9mnpAk17Ra_9Ks88TDQ\"},\"op\":\"mailbox_put\",\"request_id\":\"00000016-0000-4000-8000-000000000004\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "stored",
+            "position": 1
+          },
+          "note": "to host-b at generation 2",
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              },
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 2,
+                "mailbox_id": "3165995e-aa14-44e9-9d58-42312e12916b",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "08f8bda0-089d-43b0-859c-c7eff92893dc",
+                    "object_hash": "07cb5a0051f39327d3711956f59be929390a123e10d2954631c5d75e72ada553",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"code\":\"forbidden\",\"op\":\"mailbox_sync_refused\",\"type\":\"relay\"}",
+          "at": 1793621040000,
+          "call": "{\"after\":0,\"mailbox_id\":\"fcf2c48e-5be0-485b-9abd-ee3721901668\",\"op\":\"mailbox_sync\",\"request_id\":\"00000016-0000-4000-8000-000000000005\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-b",
+            "host_trust_gen": 2
+          },
+          "event": "call",
+          "expect": {
+            "op": "mailbox_sync_refused",
+            "outcome": "refused"
+          },
+          "note": "the old mailbox is another mailbox now",
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              },
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 2,
+                "mailbox_id": "3165995e-aa14-44e9-9d58-42312e12916b",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "08f8bda0-089d-43b0-859c-c7eff92893dc",
+                    "object_hash": "07cb5a0051f39327d3711956f59be929390a123e10d2954631c5d75e72ada553",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"after\":0,\"head\":1,\"mailbox_id\":\"3165995e-aa14-44e9-9d58-42312e12916b\",\"objects\":[{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"08f8bda0-089d-43b0-859c-c7eff92893dc\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":2},\"sealed_hash\":\"1b0f2bfd5718605be0ca5a4237db47e9f49e7139715d19ee047e64cf77be0eaa\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"oVUYV_rZNM4DVPsb7X0OJYOvG9LUguvS7zqu_OjkZ5Khpo8dUW7a-YMjrIg-RzyeNMBEPkE9853lpuw8iz5CLLYzx_3dRhzfGkiz3GLPHu5QFg\",\"enc\":\"pRY6qS68_E2rA4rYvZMex9wFRs-PKP2IwsXQepb8AiE\",\"sig\":\"eXwZv-rEsmm4gdMtOmcbVQ42uVZacci95VYEnNlPQkDymBtV21PS36nfr1HQJhJNj2h9mnpAk17Ra_9Ks88TDQ\"},\"position\":1}],\"op\":\"mailbox_sync_result\",\"request_id\":\"00000016-0000-4000-8000-000000000006\",\"through\":1,\"type\":\"relay\"}",
+          "at": 1793621040000,
+          "call": "{\"after\":0,\"mailbox_id\":\"3165995e-aa14-44e9-9d58-42312e12916b\",\"op\":\"mailbox_sync\",\"request_id\":\"00000016-0000-4000-8000-000000000006\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-b",
+            "host_trust_gen": 2
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "page",
+            "position": 1,
+            "reset": false,
+            "through": 1
+          },
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              },
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 2,
+                "mailbox_id": "3165995e-aa14-44e9-9d58-42312e12916b",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "08f8bda0-089d-43b0-859c-c7eff92893dc",
+                    "object_hash": "07cb5a0051f39327d3711956f59be929390a123e10d2954631c5d75e72ada553",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-evil",
+          "host_trust_gen": 1
+        }
+      ],
+      "name": "a_host_at_a_new_generation_has_a_new_mailbox",
+      "note": "host-b re-verified at generation 2: its link at generation 1 is no current host, so its sync and done on its old mailbox are refused (a Station checking only that host-b is current at some generation fails here); at generation 2 it has a new mailbox, and the old one's id is another mailbox's",
+      "quotas": {
+        "account": {
+          "bytes": 268435456,
+          "objects": 1024
+        },
+        "receiver": {
+          "bytes": 67108864,
+          "objects": 256
+        },
+        "sender": {
+          "bytes": 33554432,
+          "objects": 128
+        }
+      }
     }
   ],
   "seed_hex": "004ecb5340b988c2b393abddc8811b2438adc2a9a439d39dd9251c5feb26fb01"

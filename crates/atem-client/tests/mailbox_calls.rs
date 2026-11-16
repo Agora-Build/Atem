@@ -2583,6 +2583,102 @@ fn scenarios(objects: &Objects) -> Vec<Value> {
     );
     out.push(sc.finish());
 
+    // 19 to 21: one limit at a time, o1's compact size.
+    let tight = Quota {
+        objects: 100,
+        bytes: one,
+    };
+    for (number, name, quotas) in [
+        (
+            19,
+            "quota_decided_on_bytes_as_received_per_sending_host",
+            Quotas {
+                sender: tight,
+                receiver: roomy,
+                account: roomy,
+            },
+        ),
+        (
+            20,
+            "quota_decided_on_bytes_as_received_per_receiving_host",
+            Quotas {
+                sender: roomy,
+                receiver: tight,
+                account: roomy,
+            },
+        ),
+        (
+            21,
+            "quota_decided_on_bytes_as_received_per_account",
+            Quotas {
+                sender: roomy,
+                receiver: roomy,
+                account: tight,
+            },
+        ),
+    ] {
+        let mut sc = Scenario::new(
+            objects,
+            number,
+            name,
+            "one limit of exactly o1's compact size: o1 spaced, larger as received, is refused `quota`; o1 compact is stored (a Station measuring the compact form at this limit would store the spaced copy)",
+            quotas,
+        );
+        let spaced = format!(
+            "{{\"type\":\"relay\",\"op\":\"mailbox_put\",\"request_id\":\"{}\",\"object\":{}}}",
+            sc.request_id(),
+            respaced(objects.get("o1"))
+        );
+        sc.call(at(1), A, spaced, put_refused("quota"), "o1 spaced");
+        sc.put(
+            at(1),
+            A,
+            "o1",
+            stored(1),
+            "o1 compact, at the limit exactly",
+        );
+        out.push(sc.finish());
+    }
+
+    // 22
+    let mut sc = Scenario::new(
+        objects,
+        22,
+        "a_host_at_a_new_generation_has_a_new_mailbox",
+        "host-b re-verified at generation 2: its link at generation 1 is no current host, so its sync and done on its old mailbox are refused (a Station checking only that host-b is current at some generation fails here); at generation 2 it has a new mailbox, and the old one's id is another mailbox's",
+        Quotas::default(),
+    );
+    sc.put(at(1), A, "o1", stored(1), "");
+    sc.heads(at(1), B, true, Some(1), "");
+    let old = sc.mailbox_id(B);
+    sc.hosts(
+        &[A, ("host-b", 2), EVIL],
+        "host-b at generation 2 in the Station's copy of the list",
+    );
+    sc.sync(
+        at(2),
+        B,
+        &old,
+        0,
+        refused("mailbox_sync_refused"),
+        "host-b's link at generation 1, its own old mailbox",
+    );
+    sc.done(at(2), B, &old, 1, refused("mailbox_done_refused"), "");
+    let b2 = ("host-b", 2);
+    sc.heads(at(3), b2, true, Some(0), "generation 2's own mailbox");
+    let new = sc.mailbox_id(b2);
+    sc.put(at(3), A, "to_b2", stored(1), "to host-b at generation 2");
+    sc.sync(
+        at(4),
+        b2,
+        &old,
+        0,
+        refused("mailbox_sync_refused"),
+        "the old mailbox is another mailbox now",
+    );
+    sc.sync(at(4), b2, &new, 0, page(1, Some(1)), "");
+    out.push(sc.finish());
+
     out
 }
 
