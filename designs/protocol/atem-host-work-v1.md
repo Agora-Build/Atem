@@ -3507,8 +3507,9 @@ exactly as without this section):
   the Station's announcement once the page answers the live call, so a page
   read past the head the last `heads` named is no reset (rule 7's "a head
   below the host's cursor" then comes only from a `heads` or a page whose
-  head is below its `after`); this assumes a Station, its relays included,
-  never sends a `heads` older than a page it has answered;
+  head is below the furthest position the host read: its cursor, or more
+  while a rewind's re-read runs); this assumes a Station, its relays
+  included, never sends a `heads` older than a page it has answered;
 - waiting objects are judged again after each device-list advance and once
   one's expiry passes (one whose bytes no longer parse is refused
   `malformed`); an object over the pending limits is marked done with no

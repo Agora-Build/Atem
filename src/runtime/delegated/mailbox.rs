@@ -126,7 +126,8 @@ pub enum PageCheck {
     Drained,
     /// A Station fault (its code): nothing applies.
     Fault(&'static str),
-    /// The page's head is below its `after`: a reset, to be marked.
+    /// The page's head is below the furthest position read (the cursor, or
+    /// more while a rewind's re-read runs): a reset, to be marked.
     Reset,
     /// No link: nothing arrives.
     Nothing,
@@ -793,7 +794,8 @@ impl MailboxClient {
     }
 
     /// The announcement against the store's cursor: another mailbox, or a
-    /// head below the cursor of the same one, is a reset.
+    /// head of the same one below the furthest position read (the cursor,
+    /// or more while a rewind's re-read runs), is a reset.
     fn check_reset(&mut self) {
         let Some(announced) = &self.announced else {
             return;
