@@ -250,8 +250,13 @@ pub(super) struct State {
     /// When the waiting objects were last judged again for an expiry
     /// (at most every `MAIL_REJUDGE_EVERY` while the list stands still).
     mail_rejudge_at: Option<Instant>,
+    /// The last re-judging failed: tried again only after the throttle.
+    mail_rejudge_failed: bool,
     /// When the mailbox's claims and evidence were last pruned.
     mail_pruned_at: Option<Instant>,
+    /// What the mailbox keeps at most (`mailbox_store::Limits`; tests lower
+    /// them).
+    mail_limits: crate::runtime::delegated::mailbox_store::Limits,
     /// Tests: at the mailbox's crash point (after a page's commit, before
     /// its dones), the dones the store owed and the positions of the dones
     /// live then.
@@ -353,7 +358,9 @@ impl State {
             mail_prepared: None,
             mail_rejudged: None,
             mail_rejudge_at: None,
+            mail_rejudge_failed: false,
             mail_pruned_at: None,
+            mail_limits: Default::default(),
             #[cfg(test)]
             mail_crash_probe: Vec::new(),
             ack_failures: 0,

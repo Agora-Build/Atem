@@ -35,6 +35,8 @@ static UNPREPARED: AtomicU64 = AtomicU64::new(0);
 static UNREADABLE: AtomicU64 = AtomicU64::new(0);
 static UNJUDGED: AtomicU64 = AtomicU64::new(0);
 static UNPRUNED: AtomicU64 = AtomicU64::new(0);
+static UNMARKED: AtomicU64 = AtomicU64::new(0);
+static UNREWOUND: AtomicU64 = AtomicU64::new(0);
 
 /// While the device list stands still, the waiting objects are judged
 /// again for a passed expiry at most this often.
@@ -192,7 +194,7 @@ impl HostBridge {
                         recipient: &r.recipient,
                         provider: &r.provider,
                         now_ms: *now_ms,
-                        limits: mailbox_store::Limits::default(),
+                        limits: self.work.mail_limits,
                     });
                 mailbox_store::commit_page(store, &identity, &applying.page, cx.as_ref())
             }
@@ -263,10 +265,33 @@ impl HostBridge {
                     }
                 }
                 // Nothing is asked of it until it is marked.
-                Some(Err(error)) => {
-                    eprintln!("atem runtime: host senders' mailbox reset not marked ({error:#})")
-                }
+                Some(Err(error)) => log_limited(&UNMARKED, || {
+                    format!("atem runtime: host senders' mailbox reset not marked ({error:#})")
+                }),
                 None => {}
+            }
+        }
+        // Room freed since an object was left on the Station for want of
+        // it (ruling R31): the cursor rewound durably, then read again.
+        if self
+            .station
+            .as_ref()
+            .is_some_and(|station| station.mailbox.rewind_due())
+        {
+            let rewound = self
+                .mail_store()
+                .map(|(store, identity)| mailbox_store::rewind_if_room(store, &identity));
+            match rewound {
+                Some(Ok(true)) => {
+                    self.mail_observe();
+                    if let Some(station) = self.station.as_mut() {
+                        station.mailbox.cursor_rewound();
+                    }
+                }
+                Some(Err(error)) => log_limited(&UNREWOUND, || {
+                    format!("atem runtime: host senders' mailbox not rewound ({error:#})")
+                }),
+                _ => {}
             }
         }
         self.publish_mail_gate();
@@ -288,13 +313,17 @@ impl HostBridge {
             let Some(head) = view.list.as_ref().map(|l| l.membership.head()) else {
                 return;
             };
-            let expired = view.now_d_ms.is_some_and(|now| earliest <= now)
-                && self
-                    .work
-                    .mail_rejudge_at
-                    .is_none_or(|at| at.elapsed() >= MAIL_REJUDGE_EVERY);
+            // A passed expiry, or a failed attempt, is tried again only
+            // after the throttle; a list that moved at once.
+            let throttled = self
+                .work
+                .mail_rejudge_at
+                .is_some_and(|at| at.elapsed() < MAIL_REJUDGE_EVERY);
+            let expired = view.now_d_ms.is_some_and(|now| earliest <= now) && !throttled;
             let key = (identity.host, head.seq, head.hash);
-            (expired || self.work.mail_rejudged.as_ref() != Some(&key)).then_some(key)
+            let moved = self.work.mail_rejudged.as_ref() != Some(&key)
+                && !(self.work.mail_rejudge_failed && throttled);
+            (expired || moved).then_some(key)
         };
         let Some(key) = due else {
             return;
@@ -311,9 +340,11 @@ impl HostBridge {
             recipient: &receiver.recipient,
             provider: &receiver.provider,
             now_ms,
-            limits: mailbox_store::Limits::default(),
+            limits: self.work.mail_limits,
         };
-        match mailbox_store::rejudge_pending(store, &identity, &cx) {
+        let judged = mailbox_store::rejudge_pending(store, &identity, &cx);
+        self.work.mail_rejudge_failed = judged.is_err();
+        match judged {
             Ok(_) => self.work.mail_rejudged = Some(key),
             Err(error) => log_limited(&UNJUDGED, || {
                 format!(
@@ -337,6 +368,19 @@ impl HostBridge {
         let Some(now_ms) = self.start_view().now_d_ms else {
             return;
         };
+        // Not while a forward jump's anchor is pending: `D` may still come
+        // back down, and pruning on it would be early (review O3). A step
+        // the OS reports synchronized makes no anchor: admission's own
+        // dedupe of `(sender host, message id)` against its permanent
+        // records is what keeps a pruned claim from re-admitting a request.
+        if self
+            .work
+            .clock
+            .as_ref()
+            .is_some_and(crate::runtime::host_clock::HostClock::anchored)
+        {
+            return;
+        }
         let Some((store, _)) = self.mail_store() else {
             return;
         };
@@ -355,6 +399,8 @@ impl HostBridge {
         if !self.features.senders {
             return;
         }
+        // The tables made first (N1), then the waiting objects and pruning.
+        self.mail_observe();
         self.mail_rejudge();
         self.mail_prune();
         self.mail_observe();

@@ -567,3 +567,145 @@ fn without_host_senders_no_mailbox_table_is_made() {
         ));
     });
 }
+
+/// B's result to this host (`atem-result`), signed at this list's head.
+fn mb_result(rig: &LocalRig, host: &MbHost) -> Value {
+    let list = rig.bridge.membership.as_ref().unwrap().membership();
+    let now = host_now().wall_ms;
+    let fields = atem_client::host_mail::MailFields {
+        account_id: "acct".into(),
+        genesis_hash: list.genesis_hash(),
+        sender: atem_client::host_mail::HostRef {
+            host_id: "host-b".into(),
+            host_trust_gen: 1,
+        },
+        recipient: atem_client::host_mail::HostRef {
+            host_id: "host".into(),
+            host_trust_gen: 1,
+        },
+        enc_kid: atem_client::keys::enc_kid(&host.enc_pub).unwrap(),
+        id: uuid::Uuid::new_v4().to_string(),
+        created_at: now - 1_000,
+        expires_at: now + HOUR,
+        signed_at_head: list.head(),
+    };
+    atem_client::host_mail::seal_result(
+        &host.sender,
+        &atem_client::KeyId::new("host-b"),
+        &fields,
+        &atem_client::host_mail::ResultPlain::Refusal {
+            object_id: uuid::Uuid::new_v4().to_string(),
+            refused: "invalid_request".into(),
+        },
+        &host.enc_pub,
+    )
+    .unwrap()
+    .to_json()
+}
+
+/// Ruling R31 in the bridge: a result over the results' limits is left on
+/// the Station (no row, no done) and keeps host senders' gate closed; once
+/// room frees (the sending host's check took the kept one), the next step
+/// rewinds the cursor durably, the re-read keeps it and its done goes.
+#[test]
+fn a_result_over_the_limits_is_read_again_once_room_frees() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = mb_host(&mut rig, root, &os);
+        rig.bridge.work.mail_limits.results = 1;
+        mb_heads(&mut rig, MB_MAILBOX, 2);
+        let (syncs, _) = mb_out(&mut rig);
+        let first = mb_result(&rig, &host);
+        mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[first]));
+        let (syncs, dones) = mb_out(&mut rig);
+        assert_eq!(dones.iter().map(|d| d.position).collect::<Vec<_>>(), [1]);
+        let second = mb_result(&rig, &host);
+        mb_receive(
+            &mut rig,
+            &mb_page(&syncs[0], 2, std::slice::from_ref(&second)),
+        );
+        let observed = mb_store(&rig);
+        assert!(observed.skipped);
+        assert_eq!(
+            (observed.cursor, observed.owed),
+            (Some((MB_MAILBOX.into(), 2)), vec![1])
+        );
+        assert_eq!(mb_out(&mut rig), (vec![], vec![]), "no done for it");
+        assert!(!mb_gate(&rig), "not committed yet");
+        rig.bridge
+            .work
+            .store
+            .as_ref()
+            .unwrap()
+            .db
+            .execute("DELETE FROM mailbox_results", [])
+            .unwrap();
+        mb_tick(&mut rig, &mut host, 1_000);
+        let (syncs, _) = mb_out(&mut rig);
+        assert_eq!(syncs.len(), 1);
+        assert_eq!(syncs[0].after, 1, "read again from just before it");
+        mb_receive(&mut rig, &mb_page(&syncs[0], 2, &[second]));
+        let observed = mb_store(&rig);
+        assert!(!observed.skipped);
+        assert_eq!(observed.owed, [1, 2]);
+        let (_, dones) = mb_out(&mut rig);
+        assert_eq!(dones.iter().map(|d| d.position).collect::<Vec<_>>(), [2]);
+    });
+}
+
+/// Review O3: nothing is pruned while a forward jump's anchor is pending
+/// (`D` may still come back down); once the OS's sync drops the anchor,
+/// claims past their margin are pruned.
+#[test]
+fn nothing_is_pruned_while_a_clock_anchor_is_pending() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let os = ManualOs::at(host_now().wall_ms);
+        let mut host = mb_host(&mut rig, root, &os);
+        mb_heads(&mut rig, MB_MAILBOX, 1);
+        let (syncs, _) = mb_out(&mut rig);
+        let head = rig.bridge.membership.as_ref().unwrap().head();
+        let cancel = mb_cancel(&rig, &host, "host-b", &host.sender, head);
+        mb_receive(&mut rig, &mb_page(&syncs[0], 1, &[cancel]));
+        let claims = |rig: &LocalRig| -> u64 {
+            rig.bridge
+                .work
+                .store
+                .as_ref()
+                .unwrap()
+                .db
+                .query_row("SELECT count(*) FROM mailbox_claims", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(claims(&rig), 1);
+        let clock_tick = |rig: &mut LocalRig| {
+            let work = &mut rig.bridge.work;
+            work.clock
+                .as_mut()
+                .unwrap()
+                .tick(work.store.as_ref().unwrap());
+        };
+        // A reading, then an unsynchronized wall clock two minutes ahead
+        // of it: an anchor.
+        clock_tick(&mut rig);
+        {
+            let mut r = os.0.lock().unwrap();
+            r.synced = crate::runtime::host_clock::os::Synced::No;
+            r.wall_ms += 120_000;
+        }
+        clock_tick(&mut rig);
+        assert!(rig.bridge.work.clock.as_ref().unwrap().anchored());
+        rig.bridge.start_view().now_d_ms = Some(host_now().wall_ms + 3 * 24 * HOUR);
+        rig.bridge.work.mail_pruned_at = None;
+        mb_tick(&mut rig, &mut host, 1_000);
+        assert_eq!(claims(&rig), 1, "held under the anchor");
+        // The OS syncs at that reading: the anchor goes; pruning runs.
+        os.0.lock().unwrap().synced = crate::runtime::host_clock::os::Synced::Yes;
+        clock_tick(&mut rig);
+        assert!(!rig.bridge.work.clock.as_ref().unwrap().anchored());
+        rig.bridge.work.mail_pruned_at = None;
+        mb_tick(&mut rig, &mut host, 1_000);
+        assert_eq!(claims(&rig), 0);
+    });
+}
