@@ -62,6 +62,7 @@ use crate::session::messages::MAX_MESSAGE_BYTES;
 use crate::signed::SignedObject;
 
 pub mod body;
+pub mod mailbox;
 pub mod receive;
 pub mod seal;
 #[cfg(test)]

@@ -37,9 +37,9 @@ pub use record::{
     control_signing_input, control_with_signature, principal_key_of,
 };
 pub use relay::{
-    AckResult, CallRefused, ControlAck, ControlSync, ControlSyncResult, EntryRef, FeedEntry,
-    FeedHead, Heads, MembershipFetch, MembershipFetchResult, RefusalCode, RefusedCall, RelayError,
-    SyncMismatch, ToHost, ToStation,
+    Accept, AckResult, CallRefused, ControlAck, ControlSync, ControlSyncResult, EntryRef,
+    FeedEntry, FeedHead, Heads, HeadsWithMailbox, MailboxHead, MembershipFetch,
+    MembershipFetchResult, RefusalCode, RefusedCall, RelayError, SyncMismatch, ToHost, ToStation,
 };
 pub use state::{
     ApplicationResult, Applied, ControlState, Coverage, EffectKind, EffectResult, EffectWhy,
