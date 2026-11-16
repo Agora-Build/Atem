@@ -190,6 +190,10 @@ impl HostBridge {
     /// acknowledged on it, its gate closed (`Station::on_identity`), and
     /// the App asked to reconnect it at the pass's end.
     pub(crate) fn station_identity(&mut self) {
+        // No Station link without `host.delegated`: nothing to hand over.
+        if self.station.is_none() {
+            return;
+        }
         let identity = crate::runtime::delegated::sync::HostIdentity {
             host: self.work_host(),
             genesis: self
