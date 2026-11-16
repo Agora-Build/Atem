@@ -3183,6 +3183,67 @@ mod tests {
         );
     }
 
+    /// The `result_id` check's place (Atem's reading, host-work-v1 §11.5):
+    /// with the plaintext, before the outbox row, whatever the sender's
+    /// standing. A result failing both checks is `result_id_mismatch`, and a
+    /// removed host's mismatched result is refused, never kept as data.
+    #[test]
+    fn the_result_id_check_comes_before_the_row_and_the_standing() {
+        let mut w = World::new();
+        let outbox = expected(&w);
+        let f = w.fields("host-b", "host-a");
+        let outside = "8b3e4c60-5d9f-4a0c-9e23-4f7b9c1d5e60";
+        assert!(!outbox.task_ids.iter().any(|t| t == outside));
+        let mismatched = |task: &str| {
+            let mut reply = reply_to(task, 0);
+            reply.result_id = crate::session::host_work::result_id(ID2);
+            ResultPlain::Result {
+                task_id: task.into(),
+                reply,
+            }
+        };
+        // A task outside the row, with another task's result_id: the
+        // result_id check speaks first.
+        let both = result(&w, &f, &mismatched(outside));
+        assert_eq!(
+            accept(&w, &both, &outbox),
+            result_refused_authenticated(RESULT_ID_MISMATCH)
+        );
+        // The same task with its own result_id fails the row alone.
+        let row_only = result(
+            &w,
+            &f,
+            &ResultPlain::Result {
+                task_id: outside.into(),
+                reply: reply_to(outside, 0),
+            },
+        );
+        assert_eq!(
+            accept(&w, &row_only, &outbox),
+            result_refused_authenticated(DOES_NOT_ANSWER_OUTBOX_ROW)
+        );
+        // A removed host's: refused, where a matching one is kept as data.
+        w.remove_host("host-b");
+        let removed = result(&w, &f, &mismatched(REPLY_ID));
+        assert_eq!(
+            accept(&w, &removed, &outbox),
+            result_refused_authenticated(RESULT_ID_MISMATCH)
+        );
+        let matching = ResultPlain::Result {
+            task_id: REPLY_ID.into(),
+            reply: reply_to(REPLY_ID, 0),
+        };
+        let kept = result(&w, &f, &matching);
+        assert_eq!(
+            accept(&w, &kept, &outbox),
+            ResultVerdict::NotDelivered {
+                plain: matching,
+                sender: "host:host-b".into(),
+                reason: NOT_DELIVERED_SENDER_REMOVED,
+            }
+        );
+    }
+
     /// II.4.4: a result of a host this list holds revoked is not delivered
     /// but kept as data.
     #[test]
