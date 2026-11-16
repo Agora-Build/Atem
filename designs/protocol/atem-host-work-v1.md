@@ -3993,31 +3993,34 @@ Astation requires, so a build without it couldn't pair.
   `sign_host_enc_key`, and writes the key's id to the `generated` record
   (fsync, rename, directory fsync) before the reveal goes
   (`r9::host_enc::make_for_ceremony_locked`). A record that can't be
-  written aborts the ceremony with nothing revealed. The private key stays
-  in memory until the pin.
+  written aborts the ceremony with nothing revealed, as does a pairing
+  changed meanwhile (`atem unpair`, a new `atem pair`), with its own
+  reason. The private key stays in memory until the pin.
 - **At the pin** the key is kept as `pairing/host_enc_key`, written before
   the device list itself (`r9::host_enc::keep_at_pin`): a key that can't be
   kept fails the pin, as any other pin write does. The record stays. Atem
   takes entries ending at its `add_host`, or at the `host_enc_key` at the
   `add_host`'s `seq` + 1 naming exactly the revealed key, its generation
-  and its `enc_sig`, without `retire_previous` (**Atem's reading**: the
-  ceremony's entry is the reveal's object copied unchanged); anything else
-  fails the verification. Ending at the `add_host`, `host_enc_key_get`
-  later answers the same key with the same `enc_sig`.
+  and its `enc_sig` (with or without `retire_previous`, which changes
+  nothing right after the `add_host`); anything else fails the
+  verification. Ending at the `add_host`, `host_enc_key_get` later answers
+  the same key with the same `enc_sig`.
 - **Failures.** An aborted or failed ceremony pins nothing and keeps the
   record (the key's id was handed out); a pin taken back removes the key
   and keeps the record. The next ceremony, in the next trust generation,
   makes a new key and replaces the record with its generation's.
 - **Tests:** `pair_verify` and `runtime/ops_tests.rs` (the account
-  required, the reveal's object and `enc_sig` as Astation checks them, the
-  record durable before the reveal, a record that can't be written, another
-  account refused, `deviceVerified` with and without the key entry, an
-  entry for another key, an aborted ceremony and the next one),
+  required, the reveal's object and `enc_sig` as Astation checks them, no
+  reveal while the record write is held, a record that can't be written, a
+  pairing changed meanwhile, another account refused by that check alone,
+  `deviceVerified` with and without the key entry, an entry for another
+  key, an aborted ceremony and the next one),
   `membership/pairing_tests.rs` (where the entries may end, the key kept
   with the pin or failing it), `r9/host_enc_tests.rs`, and
-  `tests/astation_op_binary.rs` (a full `atem pair verify` through the real
-  binary, Astation's side signed as it signs it,
-  `tests/support/astation.rs` `Ceremony`).
+  `tests/astation_op_binary.rs` (through the real binary, Astation's side
+  signed as it signs it, `tests/support/astation.rs` `Ceremony`: a full
+  `atem pair verify` with and without the key entry, a record that can't be
+  written aborting with no reveal, another account refused).
 
 ### 11.6 Delegated lifecycle (built behind a debug-only hook; not advertised)
 
