@@ -46,8 +46,13 @@ use atem_client::membership::Head;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// runtime.log lines about challenges on one link (one socket) at most.
+/// runtime.log lines about challenges on one link at most: a relay link
+/// once, a local link per authentication (each re-authentication on its
+/// socket has its own allowance, so a long-lived local link keeps logging
+/// its answers and verdicts) ...
 const MAX_LINES_PER_LINK: u32 = 8;
+/// ... under this cap for the whole socket.
+const MAX_LINES_PER_SOCKET: u32 = 32;
 /// How long a challenge that arrives while the runtime is still opening its
 /// device list waits for it (the link connects while the broker starts).
 pub const STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -218,6 +223,9 @@ pub struct LinkRoute {
     /// [`Carrier::Local`] only.
     local: LocalAuth,
     lines: u32,
+    /// Lines on the whole socket (a local link's allowance renews at each
+    /// authentication, under [`MAX_LINES_PER_SOCKET`]).
+    socket_lines: u32,
 }
 
 impl LinkRoute {
@@ -234,6 +242,7 @@ impl LinkRoute {
             routed_ok: Arc::default(),
             local: LocalAuth::default(),
             lines: 0,
+            socket_lines: 0,
         }
     }
 
@@ -252,6 +261,8 @@ impl LinkRoute {
     /// one challenge. The socket's first authentication binds it to the
     /// host's route identity now (if the device list can serve).
     pub fn authenticated(&mut self) {
+        // This authentication's allowance of lines (the socket's cap stays).
+        self.lines = 0;
         let local = &mut self.local;
         local.generations += 1;
         local.generation = local.generations;
@@ -317,12 +328,21 @@ impl LinkRoute {
     /// The runtime.log lines written on this link so far (tests).
     #[cfg(test)]
     pub fn lines(&self) -> u32 {
-        self.lines
+        self.socket_lines
+    }
+
+    /// Whether one more runtime.log line fits the link's bounds (counted).
+    fn line_allowed(&mut self) -> bool {
+        if self.lines >= MAX_LINES_PER_LINK || self.socket_lines >= MAX_LINES_PER_SOCKET {
+            return false;
+        }
+        self.lines += 1;
+        self.socket_lines += 1;
+        true
     }
 
     fn log(&mut self, line: &str) {
-        if self.lines < MAX_LINES_PER_LINK {
-            self.lines += 1;
+        if self.line_allowed() {
             eprintln!("atem runtime: r9: host_challenge {line}");
         }
     }
@@ -573,8 +593,7 @@ impl LinkRoute {
     }
 
     fn log_reply(&mut self, line: &str) {
-        if self.lines < MAX_LINES_PER_LINK {
-            self.lines += 1;
+        if self.line_allowed() {
             eprintln!("atem runtime: r9: host_route {line}");
         }
     }
@@ -1011,20 +1030,22 @@ mod tests {
 
     /// A challenge or verdict that reaches a local link before (or while)
     /// Astation authenticates it is ignored with a runtime.log line
-    /// (`ignore`, never an answer), within the link's bound: per socket,
-    /// never reset by a re-authentication.
+    /// (`ignore`, never an answer). The link's lines are bounded twice: each
+    /// authentication has its own allowance, so a long-lived local link
+    /// keeps logging its answers and verdicts across re-authentications,
+    /// under a cap for the whole socket.
     #[test]
-    fn a_local_links_early_messages_are_logged_within_one_bound_per_socket() {
+    fn a_local_links_lines_are_bounded_per_authentication_and_per_socket() {
         let mut log = TestLog::genesis("acct-1", &secret("route astation"));
         log.add_host("host-1", 1, &secret("route host"));
         let mut link = LinkRoute::local(ready(&log), ROOM, "atem-x");
         link.ignore(&challenge_for(ROOM).1);
-        assert_eq!(link.lines, 1, "an early challenge logged");
+        assert_eq!(link.lines(), 1, "an early challenge logged");
         let refused = RelayReply::refused(&HostRouteRefusal::StaleLog)
             .to_json()
             .to_string();
         link.ignore(&refused);
-        assert_eq!(link.lines, 2, "an early verdict logged");
+        assert_eq!(link.lines(), 2, "an early verdict logged");
         link.authenticated();
         // Even authenticated, `ignore` never answers.
         link.ignore(&challenge_for(ROOM).1);
@@ -1032,12 +1053,23 @@ mod tests {
             link.answer(&challenge_for(ROOM).1).is_some(),
             "still unanswered"
         );
+        // One authentication's allowance.
         for _ in 0..20 {
-            link.unauthenticated();
             link.ignore(&challenge_for(ROOM).1);
-            link.authenticated();
-            link.answer(&challenge_for(ROOM).1);
         }
-        assert_eq!(link.lines, MAX_LINES_PER_LINK, "one bound for the socket");
+        // (The two before the authentication were the earlier allowance's.)
+        assert_eq!(link.lines(), 2 + MAX_LINES_PER_LINK, "one authentication");
+        // Each re-authentication logs its answer and verdict again, until
+        // the socket's cap.
+        for cycle in 0..40 {
+            link.unauthenticated();
+            link.authenticated();
+            let before = link.lines();
+            assert!(link.answer(&challenge_for(ROOM).1).is_some());
+            if before < MAX_LINES_PER_SOCKET {
+                assert_eq!(link.lines(), before + 1, "cycle {cycle}: its answer logged");
+            }
+        }
+        assert_eq!(link.lines(), MAX_LINES_PER_SOCKET, "the socket's cap");
     }
 }

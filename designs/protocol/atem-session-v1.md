@@ -3707,9 +3707,10 @@ never promoted into host authority.
   link's reader, so a challenge forwarded right after Astation's reply is
   judged after that reply). One that comes before or meanwhile is ignored
   with one runtime.log line (`host_challenge ignored: Astation hasn't
-  authenticated this local link`), within the link's bound of 8 lines per
-  socket. A local link another Astation authenticated (the loopback
-  bootstrap proof names any Astation id) answers none.
+  authenticated this local link`), within the link's bounds: 8 lines per
+  authentication (so a long-lived local link keeps logging its answers and
+  verdicts) and 32 per socket. A local link another Astation authenticated
+  (the loopback bootstrap proof names any Astation id) answers none.
 - **Once per authenticated link generation.** A re-authentication on the
   same socket is a new generation and answers a fresh challenge; a second
   challenge in one generation is ignored, as on the relay. A verdict counts

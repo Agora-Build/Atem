@@ -3073,6 +3073,14 @@ def check_host_route(file, data, report, context):
                 label = ROUTE_KINDS[verifier][1]
                 key = host_key(body["host_id"], vector["chain"])
                 case.check(not signed(body, label, sig, key), f"its signature isn't over {label}")
+                # A genuine relabel: restored to the other kind's type, the
+                # signature verifies over that kind's label.
+                original = next(k for k in ROUTE_KINDS if k != verifier)
+                original_type, original_label = ROUTE_KINDS[original]
+                case.check(
+                    signed(dict(body, type=original_type), original_label, sig, key),
+                    f"a genuine {original} proof relabelled (its signature verifies as {original_type} over {original_label})",
+                )
                 case.equal(vector["code"], "bad_signature", "relabelled: bad_signature")
             codes.add((verifier, vector["code"]))
     with report.case(file, "proxy coverage") as case:
