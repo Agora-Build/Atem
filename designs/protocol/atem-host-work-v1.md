@@ -3047,7 +3047,9 @@ II.4.4, III.1): an **`atem-envelope`** from the sending host (a request, a
 cancel or a complete) and an **`atem-result`** back from the host that ran
 the work (a status, a refusal or a result). They belong to `host.senders`,
 which no release build advertises (a debug build lists it only behind the
-debug-only hook): nothing sends, fetches or accepts them yet. Types: `atem_client::host_mail` (the builders `seal_envelope` and
+debug-only hook): nothing sends them yet, and a receiving host fetches and
+judges them only behind that hook, admitting none yet ("The mailbox calls",
+"On the receiving host"). Types: `atem_client::host_mail` (the builders `seal_envelope` and
 `seal_result`, the receiver's `open_envelope` and the sending host's
 `accept_result`); bindings: host role only (feature `host`,
 [atem-client-bindings.md](atem-client-bindings.md)); vectors:
@@ -3398,9 +3400,12 @@ and for the ceremony's fields. Each is **agreed with Astation 2026-11-16**.
 **Built in the shared core:** the mailbox calls' readers and builders,
 `object_hash` and `heads`' mailbox head behind explicit feature handling
 ("The mailbox calls"), the status forms and the selector task id, and
-`result_id` with both of its checks; `select`'s channel rule. Nothing else in
-them is built (the hosts' mailbox client and outbox, the Station's side,
-`select`'s `launch`, the ceremony's fields). The status forms and the
+`result_id` with both of its checks; `select`'s channel rule. **Built on the
+receiving host, behind the debug-only hook:** its mailbox client ("The
+mailbox calls", "On the receiving host"). Nothing else in them is built (the
+sending host's outbox, the admission of what the mailbox delivers and the
+status objects back, the Station's side, `select`'s `launch`, the
+ceremony's fields). The status forms and the
 sending host's `result_id` check have their shared vectors in
 `fixtures/r9-vectors-host-envelope.json`; the mailbox calls' shared vectors
 come with a later change.
@@ -3415,7 +3420,49 @@ received beside its value (`MailboxEntry::bytes`), the evidence of one that
 doesn't parse (check 1); `heads`' `mailbox` in `control::relay`, read
 only with `Accept { mailbox: true }` (`Heads::decode_with`,
 `ToHost::decode_with`), refused by every other reader. Not built: the
-hosts' mailbox client and outbox, and the Station's side.
+sending host's outbox, admission on the receiving host, and the Station's
+side.
+
+**On the receiving host** (built behind the debug-only hook's
+`host.senders`, which needs `host.delegated`; `runtime/delegated/mailbox.rs`,
+`mailbox_store.rs`, `mail_pass.rs`; with the hook off a host reads its link
+exactly as without this section):
+
+- its Station link reads `heads` with its mailbox head (rule 6), keeps 512
+  KiB for the mailbox messages it tells by their top-level `type` and `op`
+  (rule 9), and syncs its own mailbox on every link kind §11.4's calls run
+  on, with rule 8's correlation, pacing, 35-second retirement and refusals,
+  every call bound to the link generation, socket and host identity
+  (account, genesis, host id, trust generation) it was asked under and all
+  of them retired at an identity change (§11.4);
+- each page commits in one `BEGIN IMMEDIATE` transaction of the host's
+  host-work store, only from the store's own cursor (a page continuing
+  another is no read): each object's decision (`open_envelope`, with this
+  host's own identity, keys and record, its committed device list and the
+  delegated clock), its row (an opened object an inbox row; a refusal a row
+  with its evidence, the exact bytes as fetched and its reason, marked for
+  a status when the copy was the sender's; a waiting object a pending row,
+  held once), the claims behind duplicates, the dones owed and the cursor
+  at `through`; only then does a done go (at most 8 live, again with a
+  fresh id after 35 seconds and on each new link generation until
+  answered; a `mailbox_done_refused` holds them to the next generation);
+  owed dones survive a restart, and none goes for another identity's state;
+- **Atem's reading:** a reset's durable mark is the cursor itself, the
+  announced mailbox at position 0, written with the dones owed to the old
+  mailbox dropped before anything is asked for it;
+- **Atem's reading:** a page's `head` counts as the Station's announcement
+  once the page answers the live call, so a page read past the head the
+  last `heads` named is no reset;
+- waiting objects are judged again after each device-list advance and once
+  one's expiry passes; an object over the pending limits is marked done
+  with no verdict (rule 5);
+- **in this version** every object is judged as an envelope: an
+  `atem-result`, which only a sending host's outbox can answer, is refused
+  `wrong_kind` and kept as evidence, until the outbox is built;
+- host senders' gate also needs the mailbox read to the announced head with
+  no refusal, fault or reset waiting and every inbox row admitted (design
+  II.5); until admission is built an inbox row keeps it closed. `atem
+  status`'s `Control feeds:` line names this part.
 
 The receiving host's mailbox on the Station (design II.4.3): a sending host
 puts objects over its own link, and the receiving host syncs its own mailbox
