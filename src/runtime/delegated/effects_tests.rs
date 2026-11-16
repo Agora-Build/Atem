@@ -883,6 +883,7 @@ fn a_new_identity_drops_what_the_old_stores_records_asked() {
             .push(crate::runtime::delegated::feeds::Reapplied {
                 record,
                 pos: None,
+                carried: false,
                 applied: atem_client::control::Applied {
                     record_result: atem_client::control::ApplicationResult::Applied,
                     effects: Vec::new(),

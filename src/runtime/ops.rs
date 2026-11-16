@@ -713,11 +713,14 @@ pub(crate) async fn verify_device<U: OpUi>(
         let (keys, host_seed) = handshake.into_parts();
         let (astation, host_id) = (astation.clone(), device_id.clone());
         blocking(move || {
-            let host = crate::pair_verify::HostPinning {
-                astation: &astation,
-                host_id: &host_id,
-                host_seed: &host_seed,
-            };
+            // Host senders (the debug hook only): the host encryption key
+            // is made with the pin.
+            let host = crate::pair_verify::HostPinning::new(
+                &astation,
+                &host_id,
+                &host_seed,
+                crate::runtime::test_hooks::host_features(),
+            );
             crate::pair_verify::apply_device_verified(
                 &capture,
                 &paths,

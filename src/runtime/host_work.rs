@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use super::adopt::SpawnRequest;
 use super::delegated::details::DEADLINE_PASSED_OUTCOME_UNKNOWN;
 use super::protocol::LaunchEnv;
+use super::test_hooks::HostFeatures;
 
 pub const CONFIG_FILE: &str = "runtime.toml";
 /// The records of each table (`TRACKED`) open at once (`open_records`): a
@@ -216,8 +217,13 @@ fn principal_ok(principal: &str) -> bool {
 }
 
 /// What is wrong with a profile's or route's principals (after the paired
-/// Astation filled an empty list), if anything.
-fn principals_problem(principals: &[String], route: bool) -> Option<String> {
+/// Astation filled an empty list), if anything. With `senders`
+/// (`host.senders` on), a route also takes the host-sender consents
+/// `project:<name>` and `host:<host_id>` (design II.2.3); with it off (and
+/// in every release build) they are principals it doesn't know, refused
+/// with main's message: hook off is main.
+fn principals_problem(principals: &[String], route: bool, senders: bool) -> Option<String> {
+    use super::delegated::host_senders::Consent;
     if principals.is_empty() {
         return Some(
             "no principals: list them, or pair with Astation (`atem pair`) so the paired \
@@ -228,19 +234,27 @@ fn principals_problem(principals: &[String], route: bool) -> Option<String> {
     if principals.len() > 64 {
         return Some("at most 64 principals".into());
     }
-    principals
-        .iter()
-        .find(|p| !(principal_ok(p) || route && p.as_str() == "local"))
-        .map(|p| {
-            format!(
-                "`{p}` is not a principal: use {} (`atem runtime check` lists them)",
-                if route {
+    principals.iter().find_map(|p| {
+        if principal_ok(p) || route && p.as_str() == "local" {
+            return None;
+        }
+        if route && senders && let Some(consent) = Consent::parse(p) {
+            return consent.err().map(|why| format!("`{p}`: {why}"));
+        }
+        Some(format!(
+            "`{p}` is not a principal: use {} (`atem runtime check` lists them)",
+            match (route, senders) {
+                (true, false) => {
                     "`member:<id>`, `service:<id>`, `browser:<id>` or `local` (this runtime's own agents)"
-                } else {
-                    "`member:<id>`, `service:<id>` or `browser:<id>`"
                 }
-            )
-        })
+                (true, true) => {
+                    "`member:<id>`, `service:<id>`, `browser:<id>`, `local` (this runtime's own \
+                     agents), `project:<name>` or `host:<host_id>` (host senders)"
+                }
+                (false, _) => "`member:<id>`, `service:<id>` or `browser:<id>`",
+            }
+        ))
+    })
 }
 
 /// `member:<id>` of the Astation the profile at `dir` is paired with (its
@@ -291,7 +305,16 @@ fn private_read(path: &Path, limit: u64) -> Result<Vec<u8>> {
 }
 
 impl Config {
+    /// The file at `dir`, as this process's hook reads it
+    /// ([`Config::load_for`] with `test_hooks::host_features`).
     pub fn load(dir: &Path) -> Result<Self> {
+        Self::load_for(dir, crate::runtime::test_hooks::host_features())
+    }
+
+    /// The file at `dir`, checked with the host features `features` (the
+    /// runtime's own, so a route's host-sender principals load only where
+    /// `host.senders` runs: [`Config::validate_for`]).
+    pub fn load_for(dir: &Path, features: HostFeatures) -> Result<Self> {
         let path = dir.join(CONFIG_FILE);
         let bytes = match private_read(&path, 256 * 1024) {
             Ok(bytes) => bytes,
@@ -306,7 +329,7 @@ impl Config {
         let text = std::str::from_utf8(&bytes).context("runtime.toml is not UTF-8")?;
         let mut config: Self = toml::from_str(text).map_err(|e| schema_error(text, &e))?;
         config.inherit(paired_member(dir));
-        config.validate()?;
+        config.validate_for(features)?;
         Ok(config)
     }
 
@@ -322,8 +345,20 @@ impl Config {
         }
     }
 
+    /// [`Config::validate_for`] with this process's hook.
+    #[cfg(test)]
     pub fn validate(&self) -> Result<()> {
+        self.validate_for(crate::runtime::test_hooks::host_features())
+    }
+
+    /// The file's rules, with the host features `features`.
+    /// A route's host-sender principals (`project:<name>`, `host:<host_id>`,
+    /// design II.2.3) need `host.senders` in `features` (only the debug-only
+    /// hook turns it on): with it off, a file naming one doesn't load, as on
+    /// main, where they aren't principals at all.
+    pub fn validate_for(&self, features: HostFeatures) -> Result<()> {
         use atem_client::session::wire::is_opaque_id;
+        let senders = features.delegated && features.senders;
         if self.version != 1 || self.profiles.len() > 64 || self.routes.len() > 64 {
             bail!("host config needs version = 1 and at most 64 profiles/routes");
         }
@@ -358,7 +393,7 @@ impl Config {
                     "project must name the cwd's project (its Git remote, else `local:<folder>`)"
                         .into(),
                 )
-            } else if let Some(problem) = principals_problem(&p.principals, false) {
+            } else if let Some(problem) = principals_problem(&p.principals, false, senders) {
                 Some(problem)
             } else if p.args.len() > super::protocol::MAX_ARGS
                 || p.args.iter().map(String::len).sum::<usize>() > super::protocol::MAX_ARGS_BYTES
@@ -401,7 +436,7 @@ impl Config {
             } else if let Some(problem) = labels_problem(&r.labels) {
                 Some(problem)
             } else {
-                principals_problem(&r.principals, true)
+                principals_problem(&r.principals, true, senders)
             };
             if let Some(problem) = problem {
                 bail!("route `{}`: {problem}", r.id);
@@ -423,6 +458,14 @@ impl Config {
     /// another revision or project (host-work v1, and the delegated start
     /// check's condition 4).
     pub fn route_changed(&self, a: &Accepted) -> bool {
+        self.route_changed_as(a, &a.principal)
+    }
+
+    /// [`Config::route_changed`], with `consent` the route principal the
+    /// task was admitted under ([`WorkRecord::consent`]: its sender, or the
+    /// `project:<name>` or `host:<host_id>` entry that admitted a host
+    /// sender, design II.2.3) in place of the sender.
+    pub fn route_changed_as(&self, a: &Accepted, consent: &str) -> bool {
         let Some(route) = self.route(&a.route_id) else {
             return true;
         };
@@ -430,7 +473,7 @@ impl Config {
             return true;
         };
         route.revision != a.route_revision
-            || !route.principals.contains(&a.principal)
+            || !route.principals.iter().any(|p| p == consent)
             || profile.id != a.profile_id
             || profile.revision != a.profile_revision
             || profile.project != a.project
@@ -622,6 +665,16 @@ pub struct Accepted {
 }
 
 impl WorkRecord {
+    /// The route principal the task was admitted under (condition 4 of the
+    /// start check): its sender, or for a host sender the route entry that
+    /// consented (`project:<name>` or `host:<host_id>`, design II.2.3).
+    pub fn consent(&self) -> &str {
+        self.delegated
+            .as_ref()
+            .and_then(|a| a.host.as_ref())
+            .map_or(self.principal.as_str(), |grant| grant.consent.as_str())
+    }
+
     pub fn accepted(&self) -> Accepted {
         Accepted {
             principal: self.principal.clone(),
@@ -2415,6 +2468,60 @@ pub fn validate(dir: &Path) -> Result<Config> {
     Ok(config)
 }
 
+/// What `atem runtime check` prints of `route` (`named` renders a list of
+/// principals): who may send through it (consent), then how agents address
+/// it (labels), on lines of their own. A host-sender principal (design
+/// II.2.3, only with `host.senders`) says what it accepts, and a route that
+/// names one says what a `project:` label and a `project:` principal each
+/// mean; a route without one prints main's lines.
+fn route_lines(route: &Route, named: &dyn Fn(&[String]) -> String) -> Vec<String> {
+    use super::delegated::host_senders::Consent;
+    let mut senders = false;
+    let principals: Vec<String> = route
+        .principals
+        .iter()
+        .map(|p| match Consent::parse(p) {
+            Some(Ok(consent)) => {
+                senders = true;
+                match consent {
+                    Consent::Project(_) => format!("{p} (the hosts of that signed project)"),
+                    Consent::Host(_) => format!("{p} (that host)"),
+                }
+            }
+            _ => p.clone(),
+        })
+        .collect();
+    let mut lines = vec![
+        format!(
+            "  {} -> {}; may send: {}",
+            route.id,
+            route.profile_id,
+            named(&principals)
+        ),
+        format!(
+            "    labels: {}; launch: {}; results: {}; auto_report: {}",
+            route.labels.join(", "),
+            match route.launch {
+                RouteLaunch::Off => "off",
+                RouteLaunch::OnMessage => "on_message",
+            },
+            route.results,
+            match route.auto_report {
+                AutoReport::Status => "status",
+                AutoReport::FinalMessage => "final_message",
+            }
+        ),
+    ];
+    if senders {
+        lines.push(
+            "    a `project:` label addresses agents; a `project:` principal grants consent to the \
+             hosts of that signed project (both may name the same project)"
+                .into(),
+        );
+    }
+    lines
+}
+
 pub fn check(dir: &Path) -> Result<()> {
     let paired = paired_member(dir);
     let config = validate(dir)?;
@@ -2464,25 +2571,9 @@ pub fn check(dir: &Path) -> Result<()> {
     }
     println!("{} notification route(s).", config.routes.len());
     for route in &config.routes {
-        println!(
-            "  {} -> {}; may send: {}",
-            route.id,
-            route.profile_id,
-            named(&route.principals)
-        );
-        println!(
-            "    labels: {}; launch: {}; results: {}; auto_report: {}",
-            route.labels.join(", "),
-            match route.launch {
-                RouteLaunch::Off => "off",
-                RouteLaunch::OnMessage => "on_message",
-            },
-            route.results,
-            match route.auto_report {
-                AutoReport::Status => "status",
-                AutoReport::FinalMessage => "final_message",
-            }
-        );
+        for line in route_lines(route, &named) {
+            println!("{line}");
+        }
     }
     let pairing = crate::paths::ProfilePaths::in_dir(dir).pairing;
     match crate::session_protocol::membership::passive_principals(&pairing) {
@@ -2887,6 +2978,7 @@ mod tests {
                 grant_expires_at: Some(100),
                 device_list_seq: 3,
                 projects_matched: vec![],
+                host: None,
             });
             store
                 .db
@@ -2934,6 +3026,7 @@ mod tests {
             grant_expires_at: None,
             device_list_seq: 3,
             projects_matched: vec![],
+            host: None,
         }
     }
 
@@ -5310,6 +5403,179 @@ profile_id = "backend-codex"
         config.profiles[0].principals = vec!["anyone".into()];
         let error = config.validate().err().unwrap().to_string();
         assert!(!error.contains("`local`"), "{error}");
+    }
+
+    /// The hook's value with host senders on.
+    fn senders_on() -> HostFeatures {
+        HostFeatures::parse("host.delegated,host.senders").unwrap()
+    }
+
+    /// [`PROFILE`] whose route names `principals` (a TOML array).
+    fn route_principals(principals: &str) -> Config {
+        let mut config: Config =
+            toml::from_str(&format!("{PROFILE}principals = {principals}")).unwrap();
+        config.inherit(Some("member:owner".into()));
+        config
+    }
+
+    /// Design II.2.3: a route's `principals` take `project:<name>` (the
+    /// hosts a signed project lists, when this host is in it too) and
+    /// `host:<host_id>` (that host) only with `host.senders` on (the
+    /// debug-only hook's, which needs `host.delegated`). With it off (and in
+    /// every release build) both are refused when the file loads with
+    /// exactly main's message for a principal it doesn't know: hook off is
+    /// main. Names follow the shared core's project grammar, ids the device
+    /// list's; a profile never takes either.
+    #[test]
+    fn host_sender_route_principals_need_the_hook() {
+        let ok = route_principals(r#"["local", "project:astation", "host:Host_B.1-b:2"]"#);
+        ok.validate_for(senders_on()).unwrap();
+        for features in [
+            HostFeatures::default(),
+            HostFeatures::parse("host.delegated").unwrap(),
+        ] {
+            for (principals, refused) in [
+                (r#"["project:astation"]"#, "project:astation"),
+                (r#"["host:host-b"]"#, "host:host-b"),
+                (r#"["local", "project:A b"]"#, "project:A b"),
+            ] {
+                assert_eq!(
+                    route_principals(principals)
+                        .validate_for(features)
+                        .unwrap_err()
+                        .to_string(),
+                    format!(
+                        "route `backend`: `{refused}` is not a principal: use `member:<id>`, \
+                         `service:<id>`, `browser:<id>` or `local` (this runtime's own agents) \
+                         (`atem runtime check` lists them)"
+                    ),
+                    "{features:?}"
+                );
+            }
+        }
+        let too_long = format!("[\"project:{}\"]", "a".repeat(33));
+        for (principals, problem) in [
+            (
+                r#"["project:Astation"]"#,
+                "`project:Astation`: a project name is 1-32 of a-z, 0-9 and -",
+            ),
+            (
+                r#"["project:"]"#,
+                "`project:`: a project name is 1-32 of a-z, 0-9 and -",
+            ),
+            (
+                r#"["project:a_b"]"#,
+                "`project:a_b`: a project name is 1-32 of a-z, 0-9 and -",
+            ),
+            (
+                too_long.as_str(),
+                "a project name is 1-32 of a-z, 0-9 and -",
+            ),
+            (
+                r#"["host:"]"#,
+                "`host:`: a host id is 1-128 letters, digits, `.`, `_`, `:` or `-`",
+            ),
+            (
+                r#"["host:a b"]"#,
+                "`host:a b`: a host id is 1-128 letters, digits, `.`, `_`, `:` or `-`",
+            ),
+            (
+                r#"["host:a/b"]"#,
+                "`host:a/b`: a host id is 1-128 letters, digits, `.`, `_`, `:` or `-`",
+            ),
+        ] {
+            let error = route_principals(principals)
+                .validate_for(senders_on())
+                .unwrap_err()
+                .to_string();
+            assert!(error.starts_with("route `backend`: "), "{error}");
+            assert!(error.contains(problem), "{principals}: {error}");
+        }
+        // Not the forms at all: as on main, and the list names the new ones.
+        for other in [r#"["Project:a"]"#, r#"["hosts:a"]"#, r#"["project"]"#] {
+            let error = route_principals(other)
+                .validate_for(senders_on())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("is not a principal"), "{error}");
+            assert!(
+                error.contains("`project:<name>` or `host:<host_id>` (host senders)"),
+                "{error}"
+            );
+        }
+        // With the hook off the list of principals is main's.
+        let error = route_principals(r#"["hosts:a"]"#)
+            .validate_for(HostFeatures::default())
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("host senders"), "{error}");
+        // A profile never takes them.
+        let mut profile = route_principals(r#"["local"]"#);
+        for principal in ["project:astation", "host:host-b"] {
+            profile.profiles[0].principals = vec![principal.into()];
+            let error = profile.validate_for(senders_on()).unwrap_err().to_string();
+            assert!(
+                error.starts_with(&format!(
+                    "profile `backend-codex`: `{principal}` is not a principal"
+                )),
+                "{error}"
+            );
+        }
+    }
+
+    /// `Config::load_for` checks the file with the features it is given
+    /// (the runtime's own), `Config::load` with this process's hook (off in
+    /// the tests).
+    #[test]
+    fn a_file_with_host_sender_principals_loads_only_with_the_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = PROFILE.replace(
+            "project = \"local:backend\"\n",
+            "project = \"local:backend\"\nprincipals = [\"member:owner\"]\n",
+        );
+        write_config(
+            dir.path(),
+            &format!("{text}principals = [\"project:astation\"]\n"),
+        );
+        let error = load_error(dir.path());
+        assert!(
+            error.starts_with("route `backend`: `project:astation` is not a principal: use"),
+            "{error}"
+        );
+        let config = Config::load_for(dir.path(), senders_on()).unwrap();
+        assert_eq!(config.routes[0].principals, ["project:astation"]);
+    }
+
+    /// `atem runtime check` (design II.2.3): a route's principals (who may
+    /// send: consent) and its labels (how agents address it) on lines of
+    /// their own, as before; a host-sender principal says what it accepts,
+    /// and a route that has one says that a `project:` label addresses
+    /// agents while a `project:` principal grants consent. Without one the
+    /// lines are main's.
+    #[test]
+    fn check_prints_route_labels_and_principals_apart() {
+        let plain = |list: &[String]| list.join(", ");
+        let mut config = route_principals(r#"["local", "project:astation", "host:host-b"]"#);
+        config.routes[0].labels = vec!["project:astation".into(), "tag:auth".into()];
+        assert_eq!(
+            route_lines(&config.routes[0], &plain),
+            [
+                "  backend -> backend-codex; may send: local, project:astation (the hosts of \
+                 that signed project), host:host-b (that host)",
+                "    labels: project:astation, tag:auth; launch: off; results: false; \
+                 auto_report: status",
+                "    a `project:` label addresses agents; a `project:` principal grants consent \
+                 to the hosts of that signed project (both may name the same project)",
+            ]
+        );
+        let config = route_principals(r#"["local"]"#);
+        assert_eq!(
+            route_lines(&config.routes[0], &plain),
+            [
+                "  backend -> backend-codex; may send: local",
+                "    labels: ; launch: off; results: false; auto_report: status",
+            ]
+        );
     }
 
     #[test]

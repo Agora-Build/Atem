@@ -1040,12 +1040,20 @@ pub async fn handle_cli_command(command: Commands) -> Result<()> {
         Commands::Unpair { yes } => {
             let src = crate::profile::Sources::current()?;
             if !crate::status::profile_paired(&src) && !revocation_recorded(&src) {
-                // r9: an unpair that stopped midway left device-list files.
-                if crate::pairing::remove_device_list_leftovers(&src)? {
-                    println!("Removed the leftover device-list files.");
-                    reload_runtime().await;
-                } else {
-                    println!("No pairing to remove.");
+                // r9: an unpair that stopped midway left device-list files,
+                // or an older build's unpair left a host encryption key.
+                use crate::pairing::LeftoversRemoved;
+                match crate::pairing::remove_device_list_leftovers(&src)? {
+                    LeftoversRemoved::DeviceList => {
+                        println!("Removed the leftover device-list files.");
+                        reload_runtime().await;
+                    }
+                    LeftoversRemoved::HostEncKey => {
+                        println!(
+                            "No pairing to remove. Removed a host encryption key left without a device list."
+                        );
+                    }
+                    LeftoversRemoved::Nothing => println!("No pairing to remove."),
                 }
                 return Ok(());
             }

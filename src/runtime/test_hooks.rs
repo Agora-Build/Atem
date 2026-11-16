@@ -81,14 +81,15 @@
 //!
 //! Delegated host work (step 4, Decision 10; nothing is advertised or on
 //! without it):
-//! - `ATEM_TEST_HOST_FEATURES=host.delegated[,host.alerts]`, read once when
-//!   the runtime starts (`host_features`): the features a test or dev host
-//!   runs. `host.alerts` without `host.delegated` is ignored, and
-//!   `host.senders` or an unknown name refuses the value, both with a
-//!   runtime.log line; a refused value turns nothing on. `RuntimeClient`
-//!   never passes it to a runtime it starts (`runtime_env_from` drops every
-//!   `ATEM_TEST_*`), so only a runtime started with it in its own
-//!   environment has it; a release build never reads it.
+//! - `ATEM_TEST_HOST_FEATURES=host.delegated[,host.alerts][,host.senders]`,
+//!   read once when the runtime starts (`host_features`): the features a
+//!   test or dev host runs. `host.alerts` or `host.senders` without
+//!   `host.delegated` is ignored, and an unknown name refuses the value,
+//!   both with a runtime.log line; a refused value turns nothing on.
+//!   `RuntimeClient` never passes it to a runtime it starts
+//!   (`runtime_env_from` drops every `ATEM_TEST_*`), so only a runtime
+//!   started with it in its own environment has it; a release build never
+//!   reads it.
 //! - `ATEM_TEST_HOST_WORK_DRIVE=<dir>` (the delegated fixtures, with
 //!   `host.delegated` on): the test plays host-work's side of delegated
 //!   tasks (session-v1 R9.14). Once host-work's internal attachment exists,
@@ -165,7 +166,8 @@
 
 /// The delegated host-work features this runtime runs (session-v1 R9.14,
 /// host-work-v1 §11.6): off unless the debug-only hook turns them on
-/// (`host_features`). `alerts` is never on without `delegated`.
+/// (`host_features`). `alerts` and `senders` are never on without
+/// `delegated`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HostFeatures {
     /// `host.delegated`: the host-work principal, delegated tasks.
@@ -173,43 +175,51 @@ pub struct HostFeatures {
     /// `host.alerts`: owner alerts (`alert_list`).
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub alerts: bool,
+    /// `host.senders`: host senders (delegated host-work design Part II):
+    /// the host encryption key and `host_enc_key_get`.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    pub senders: bool,
 }
 
 impl HostFeatures {
     /// A hook value: comma-separated feature names (spaces around them
-    /// ignored; empty: none). `host.alerts` without `host.delegated` is
-    /// ignored; `host.senders` (never in step 4) or an unknown name refuses
-    /// the whole value.
+    /// ignored; empty: none). `host.alerts` or `host.senders` without
+    /// `host.delegated` is ignored; an unknown name refuses the whole
+    /// value.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn parse(value: &str) -> Result<Self, String> {
         Self::read(value).map(|(features, _)| features)
     }
 
-    /// [`HostFeatures::parse`], and whether `host.alerts` was named and
-    /// ignored for want of `host.delegated`.
+    /// [`HostFeatures::parse`], and the names that were named and ignored
+    /// for want of `host.delegated`, in the order above.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
-    fn read(value: &str) -> Result<(Self, bool), String> {
+    fn read(value: &str) -> Result<(Self, Vec<&'static str>), String> {
         use atem_client::session::host_work::{ALERTS_FEATURE, DELEGATED_FEATURE, SENDERS_FEATURE};
         let value = value.trim();
-        let (mut delegated, mut alerts) = (false, false);
+        let (mut delegated, mut alerts, mut senders) = (false, false, false);
         if !value.is_empty() {
             for name in value.split(',').map(str::trim) {
                 match name {
                     n if n == DELEGATED_FEATURE => delegated = true,
                     n if n == ALERTS_FEATURE => alerts = true,
-                    n if n == SENDERS_FEATURE => {
-                        return Err(format!("{SENDERS_FEATURE} is not available"));
-                    }
+                    n if n == SENDERS_FEATURE => senders = true,
                     n => return Err(format!("unknown feature {n:?}")),
                 }
             }
         }
+        let ignored = [(alerts, ALERTS_FEATURE), (senders, SENDERS_FEATURE)]
+            .into_iter()
+            .filter(|(named, _)| *named && !delegated)
+            .map(|(_, name)| name)
+            .collect();
         Ok((
             Self {
                 delegated,
                 alerts: alerts && delegated,
+                senders: senders && delegated,
             },
-            alerts && !delegated,
+            ignored,
         ))
     }
 }
@@ -490,15 +500,16 @@ mod imp {
                 .and_then(super::HostFeatures::read);
             match read {
                 Ok((features, ignored)) => {
-                    if ignored {
+                    for name in ignored {
                         eprintln!(
-                            "atem runtime: ATEM_TEST_HOST_FEATURES: host.alerts needs host.delegated; ignored"
+                            "atem runtime: ATEM_TEST_HOST_FEATURES: {name} needs host.delegated; ignored"
                         );
                     }
                     if features.delegated {
                         eprintln!(
-                            "atem runtime: ATEM_TEST_HOST_FEATURES (debug build): host.delegated on{}",
-                            if features.alerts { ", host.alerts on" } else { "" }
+                            "atem runtime: ATEM_TEST_HOST_FEATURES (debug build): host.delegated on{}{}",
+                            if features.alerts { ", host.alerts on" } else { "" },
+                            if features.senders { ", host.senders on" } else { "" }
                         );
                     }
                     features
@@ -941,34 +952,75 @@ mod tests {
         assert_eq!(writes.0, [b"Frozen at seq 4\n".to_vec()]);
     }
 
-    fn on(delegated: bool, alerts: bool) -> HostFeatures {
-        HostFeatures { delegated, alerts }
+    fn on(delegated: bool, alerts: bool, senders: bool) -> HostFeatures {
+        HostFeatures {
+            delegated,
+            alerts,
+            senders,
+        }
     }
 
-    /// Decision 10: `host.delegated[,host.alerts]`; `host.alerts` alone is
-    /// ignored; `host.senders` (never advertised in step 4) and any unknown
-    /// name refuse the whole value, so nothing is turned on.
+    /// Decision 10: `host.delegated[,host.alerts][,host.senders]`;
+    /// `host.alerts` or `host.senders` without `host.delegated` is ignored
+    /// (with a warning, `read` says which); any unknown name refuses the
+    /// whole value, so nothing is turned on.
     #[test]
-    fn host_features_parse_refuses_host_senders_and_unknown_names() {
-        assert_eq!(HostFeatures::parse(""), Ok(on(false, false)));
-        assert_eq!(HostFeatures::parse("host.delegated"), Ok(on(true, false)));
+    fn host_features_parse_ignores_lone_extras_and_refuses_unknown_names() {
+        assert_eq!(HostFeatures::parse(""), Ok(on(false, false, false)));
+        assert_eq!(
+            HostFeatures::parse("host.delegated"),
+            Ok(on(true, false, false))
+        );
         assert_eq!(
             HostFeatures::parse("host.delegated,host.alerts"),
-            Ok(on(true, true))
+            Ok(on(true, true, false))
         );
         assert_eq!(
             HostFeatures::parse(" host.alerts , host.delegated "),
-            Ok(on(true, true))
+            Ok(on(true, true, false))
         );
-        assert_eq!(HostFeatures::parse("host.alerts"), Ok(on(false, false)));
+        assert_eq!(
+            HostFeatures::parse("host.delegated,host.senders"),
+            Ok(on(true, false, true))
+        );
+        assert_eq!(
+            HostFeatures::parse("host.senders, host.delegated ,host.alerts"),
+            Ok(on(true, true, true))
+        );
+        // Without `host.delegated`: ignored, and said so.
+        assert_eq!(
+            HostFeatures::parse("host.alerts"),
+            Ok(on(false, false, false))
+        );
+        assert_eq!(
+            HostFeatures::parse("host.senders"),
+            Ok(on(false, false, false))
+        );
+        assert_eq!(
+            HostFeatures::parse("host.alerts,host.senders"),
+            Ok(on(false, false, false))
+        );
+        assert_eq!(
+            HostFeatures::read("host.senders"),
+            Ok((on(false, false, false), vec!["host.senders"]))
+        );
+        assert_eq!(
+            HostFeatures::read("host.senders,host.alerts"),
+            Ok((on(false, false, false), vec!["host.alerts", "host.senders"]))
+        );
+        assert_eq!(
+            HostFeatures::read("host.delegated,host.senders"),
+            Ok((on(true, false, true), vec![]))
+        );
         for refused in [
-            "host.senders",
-            "host.delegated,host.senders",
-            "host.senders,host.delegated,host.alerts",
+            "host.sender",
+            "host.delegated,host.sender",
+            "host.senders,host.delegated,host.alert",
             "host.delegate",
             "HOST.DELEGATED",
+            "HOST.SENDERS",
             "host.delegated,",
-            "host.delegated;host.alerts",
+            "host.delegated;host.senders",
             "host.reply",
             "host.work",
         ] {
@@ -976,9 +1028,9 @@ mod tests {
             assert!(!error.is_empty(), "{refused}");
         }
         assert!(
-            HostFeatures::parse("host.delegated,host.senders")
+            HostFeatures::parse("host.delegated,host.sender")
                 .unwrap_err()
-                .contains("host.senders")
+                .contains("host.sender")
         );
     }
 
@@ -1091,8 +1143,13 @@ mod tests {
         // SAFETY: the tests that write this variable (this one and
         // `delegated::tests::release_builds_never_turn_on_host_features`)
         // write this one value, and release builds never read it at all.
-        unsafe { std::env::set_var("ATEM_TEST_HOST_FEATURES", "host.delegated,host.alerts") };
+        unsafe {
+            std::env::set_var(
+                "ATEM_TEST_HOST_FEATURES",
+                "host.delegated,host.alerts,host.senders",
+            )
+        };
         assert_eq!(host_features(), HostFeatures::default());
-        assert!(!host_features().delegated && !host_features().alerts);
+        assert!(!host_features().delegated && !host_features().alerts && !host_features().senders);
     }
 }

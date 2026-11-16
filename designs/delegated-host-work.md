@@ -100,8 +100,14 @@ re-signing; host-work-v1 §11.4 wire rule 10). The design text below is unchange
 
 Only a debug build's `atem runtime` started with `ATEM_TEST_HOST_FEATURES=host.delegated[,host.alerts]` in its own
 environment runs any of it, and only such a runtime lists `host.delegated` and `host.alerts` in its `welcome`. Release
-builds compile the hook out: no feature, no Station call, hosting as before. `host.senders` stays off (the hook refuses
-it), and the signing gate stays closed. Activation is a later owner decision, after the joint check (V.2 step 7,
+builds compile the hook out: no feature, no Station call, hosting as before. The same hook takes `host.senders` (only
+with `host.delegated`): a debug build then lists it with hosting on, holds its host encryption key (II.4.1) and answers
+`host_enc_key_get`, and on the receiving host it classifies host senders, takes the route consents of II.2.3, holds a
+host sender's task to both locks in the start check, writes the device list's effects on its tasks with host-work's
+applied device-list `seq` (II.2.2, II.3.1, II.8) and serves `control_records` (host-work-v1 §11.6 "Host senders on the
+receiving host", with Atem's readings for Astation: those effects written in host-work's own pass, and project entries
+judged once per catch-up against the head). The mailbox and its envelopes are not built, and the signing gate stays
+closed. Activation is a later owner decision, after the joint check (V.2 step 7,
 VII.A); a dev host turns the features on as [agent-hosting.md](agent-hosting.md) section 14 says ("Delegated work
 on a dev host"). The contracts say what is built: host-work-v1 §11 (its "as built in step 4" passages) and session-v1
 R9.14. Astation answered step 4's contract questions on 2026-11-13 (#120 comments 6848326392 and 6848463998, #164

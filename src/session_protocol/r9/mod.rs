@@ -5,9 +5,11 @@
 //! r9 `welcome`, `membership`/`membership_head`, `revoke_grant`,
 //! `approval_seen`, and the fences: each attachment is fenced on its own
 //! (its `attachment_gen`), a principal's attachments together (its §H
-//! `control_gen`). An op of a feature the welcome doesn't list (today
-//! `control_records` and `host_enc_key_get`, of `host.senders`) is
-//! `unsupported_version`.
+//! `control_gen`). An op of a feature the welcome doesn't list (such as
+//! `control_records` and `host_enc_key_get`, of `host.senders`, which only
+//! the debug-only hook lists) is `unsupported_version`; with it listed,
+//! `control_records` is handed to the runtime ([`ControlRecordsCall`]) and
+//! `host_enc_key_get` served.
 //!
 //! Sans-I/O. The transport seam is the channel envelope ([`envelope`]):
 //! [`R9Host::link_up`]/[`R9Host::link_down`] for Atem's link, every
@@ -33,6 +35,9 @@ pub mod envelope;
 mod fixtures_tests;
 #[cfg(test)]
 mod hold_tests;
+pub mod host_enc;
+#[cfg(test)]
+mod host_enc_tests;
 pub mod host_policy;
 #[cfg(test)]
 mod host_policy_host_tests;
@@ -277,6 +282,10 @@ struct Attached {
     /// Task 27 review I1). With hosting on, host-work ops are judged by the
     /// host's current features, not the channel's welcome.
     offered_delegated: bool,
+    /// Its welcome listed `host.senders`: while hosting is paused, the host
+    /// takes `control_records` only from such a channel (a stop, as
+    /// `work_interrupt` is).
+    offered_senders: bool,
 }
 
 enum Phase {
@@ -336,17 +345,35 @@ impl From<&'static str> for HostWorkError {
     }
 }
 
+/// A native member's `control_records` (session-v1 R9.3, R9.8; host-work-v1
+/// §11.1 "Carriage"), with `host.senders` listed: read strictly and waiting
+/// for the runtime, which holds the control state and answers it
+/// ([`R9Host::control_records_reply`]).
+pub struct ControlRecordsCall {
+    pub attachment: String,
+    /// The carrier's principal: it gets no authority from carrying; it only
+    /// names where the records came from (their alerts' rate limits).
+    pub carrier: String,
+    pub request: atem_client::session::r9::ControlRecordsRequest,
+}
+
+/// The most `control_records` calls waiting for the runtime; one more is
+/// `busy`.
+const MAX_CONTROL_RECORDS_CALLS: usize = 16;
+
 pub struct R9Host {
     host_work_enabled: bool,
     /// While host work is off (hosting paused), `work_interrupt` is still
     /// taken: a stop (ruling T27a), when the runtime can serve it.
     host_work_stops: bool,
-    /// `host.delegated` and `host.alerts` (`alerts` only with `delegated`),
-    /// as the runtime's debug-only hook turned them on (step 4, Decision
-    /// 10); listed only with hosting on.
+    /// `host.delegated`, `host.alerts` and `host.senders` (the last two
+    /// only with `delegated`), as the runtime's debug-only hook turned them
+    /// on (step 4, Decision 10); listed only with hosting on.
     delegated: bool,
     alerts: bool,
+    senders: bool,
     host_work_requests: VecDeque<HostWorkRequest>,
+    control_records: VecDeque<ControlRecordsCall>,
     limits: Limits,
     /// The live link generation.
     link: Option<u64>,
@@ -449,6 +476,9 @@ pub struct R9Host {
     /// Tests (in-process fixtures): the next host-policy write fails here.
     #[cfg(test)]
     policy_fault: Option<store::Injected>,
+    /// Tests: the next host-encryption-key write of a request fails here.
+    #[cfg(test)]
+    enc_fault: Option<store::Injected>,
 }
 
 fn log(line: &str) {
@@ -610,8 +640,10 @@ impl R9Host {
     /// like the deadline's interrupt, T26a). The runtime says so only while
     /// it can serve it (its store recovered, no receipt-database fault).
     /// Only from a channel whose welcome listed `host.delegated` (one
-    /// welcomed before the pause; Task 27 review I1). Nothing else is
-    /// taken, and no welcome lists more for it.
+    /// welcomed before the pause; Task 27 review I1). `control_records` of
+    /// `host.senders` is a stop too (host senders' later interrupts): taken
+    /// the same way, from a channel whose welcome listed `host.senders`.
+    /// Nothing else is taken, and no welcome lists more for it.
     pub fn enable_host_work_stops(&mut self, enabled: bool) {
         self.host_work_stops = enabled;
     }
@@ -625,6 +657,15 @@ impl R9Host {
             .is_some_and(|c| matches!(&c.phase, Phase::Open(a) if a.offered_delegated))
     }
 
+    /// The open channel of `attachment` was offered `host.senders` in its
+    /// welcome.
+    fn offered_senders(&self, attachment: &str) -> bool {
+        self.by_attachment
+            .get(attachment)
+            .and_then(|handle| self.chans.get(handle))
+            .is_some_and(|c| matches!(&c.phase, Phase::Open(a) if a.offered_senders))
+    }
+
     /// The delegated features the runtime runs (`host.delegated`,
     /// `host.alerts`): off unless its debug-only hook turned them on (step 4
     /// of delegated host work, Decision 10; never in a release build).
@@ -632,6 +673,21 @@ impl R9Host {
     pub fn set_delegated_features(&mut self, delegated: bool, alerts: bool) {
         self.delegated = delegated;
         self.alerts = alerts && delegated;
+    }
+
+    /// `host.senders` (host senders, delegated host-work design Part II):
+    /// off unless the runtime's debug-only hook turned it on with
+    /// `host.delegated` (never in a release build). It counts only with
+    /// `delegated` ([`R9Host::set_delegated_features`]), whichever is set
+    /// first.
+    pub fn set_senders_feature(&mut self, senders: bool) {
+        self.senders = senders;
+    }
+
+    /// Whether this host's welcome lists `host.senders`: hosting on, and the
+    /// hook's `host.delegated` and `host.senders`.
+    fn senders_advertised(&self) -> bool {
+        self.host_work_enabled && self.delegated && self.senders
     }
 
     /// Whether this host's welcome lists `host.alerts`: hosting on, and the
@@ -646,10 +702,9 @@ impl R9Host {
 
     /// The features a welcome lists: the one source of what this host takes
     /// (an op of a feature not listed here is `unsupported_version`,
-    /// session-v1 §A). `host.delegated` and `host.alerts` only as the
-    /// runtime's debug-only hook turned them on, and like the other
-    /// host-work features only with hosting on; `host.senders` never in
-    /// step 4 of delegated host work.
+    /// session-v1 §A). `host.delegated`, `host.alerts` and `host.senders`
+    /// only as the runtime's debug-only hook turned them on, and like the
+    /// other host-work features only with hosting on.
     pub(crate) fn advertised_features(&self) -> Vec<String> {
         let mut features: Vec<String> = crate::session_protocol::revision::FEATURES
             .iter()
@@ -670,12 +725,42 @@ impl R9Host {
             if self.alerts_advertised() {
                 features.push(atem_client::session::host_work::ALERTS_FEATURE.to_owned());
             }
+            if self.senders_advertised() {
+                features.push(atem_client::session::host_work::SENDERS_FEATURE.to_owned());
+            }
         }
         features
     }
 
     pub fn take_host_work(&mut self) -> Vec<HostWorkRequest> {
         self.host_work_requests.drain(..).collect()
+    }
+
+    /// The `control_records` calls waiting for the runtime, oldest first.
+    pub fn take_control_records(&mut self) -> Vec<ControlRecordsCall> {
+        self.control_records.drain(..).collect()
+    }
+
+    /// The runtime's answer to the `control_records` `re` that came on
+    /// `attachment`: its `control_records_result` (one result per record, in
+    /// order), or a refusal naming the request. Nothing when the attachment
+    /// is gone.
+    pub fn control_records_reply(
+        &mut self,
+        attachment: &str,
+        re: &str,
+        result: Result<Vec<atem_client::session::r9::RecordResult>, HostWorkError>,
+        now: u64,
+    ) {
+        let bytes = match result {
+            Ok(results) => {
+                atem_client::session::r9::control_records_result(&new_id(), re, &results)
+                    .to_string()
+                    .into_bytes()
+            }
+            Err(e) => error(e.code, Some(re), e.detail).to_bytes(),
+        };
+        self.seal_to(attachment, &bytes, now);
     }
 
     pub fn current_work_authority<J: Journal>(
@@ -772,7 +857,9 @@ impl R9Host {
             host_work_stops: false,
             delegated: false,
             alerts: false,
+            senders: false,
             host_work_requests: VecDeque::new(),
+            control_records: VecDeque::new(),
             limits,
             link: None,
             chans: BTreeMap::new(),
@@ -819,6 +906,8 @@ impl R9Host {
             revoked_crash: None,
             #[cfg(test)]
             policy_fault: None,
+            #[cfg(test)]
+            enc_fault: None,
         };
         host.load_revoked(pairing.and_then(|p| p.pin_floor));
         host
@@ -840,6 +929,13 @@ impl R9Host {
     #[cfg(test)]
     pub fn inject_policy_fault(&mut self, fault: store::Injected) {
         self.policy_fault = Some(fault);
+    }
+
+    /// Tests: the next host-encryption-key write of a `host_enc_key_get`
+    /// fails at `fault`.
+    #[cfg(test)]
+    pub fn inject_enc_fault(&mut self, fault: store::Injected) {
+        self.enc_fault = Some(fault);
     }
 
     /// The relay-only values committed since the last call, in order.
@@ -1695,6 +1791,9 @@ impl R9Host {
         let offered_delegated = features
             .iter()
             .any(|f| f == atem_client::session::host_work::DELEGATED_FEATURE);
+        let offered_senders = features
+            .iter()
+            .any(|f| f == atem_client::session::host_work::SENDERS_FEATURE);
         let welcome = Welcome {
             id: new_id(),
             re: re.clone(),
@@ -1751,6 +1850,7 @@ impl R9Host {
             grant: hello.grant.clone(),
             caught_up,
             offered_delegated,
+            offered_senders,
         }));
         self.by_attachment.insert(attachment, handle.to_string());
         effects
@@ -2098,14 +2198,20 @@ impl R9Host {
             // advertise, if the op is one: after the authority check (a
             // principal outside the op's right still learns `forbidden`),
             // before anything is read.
+            let op = data.get("op").and_then(Value::as_str);
+            // A stop always wins: while hosting is paused, `work_interrupt`
+            // and `control_records` (host senders' later interrupts) are
+            // still taken when the runtime can serve them, from a channel
+            // whose welcome listed their feature.
             let stop_while_paused = !self.host_work_enabled
                 && self.host_work_stops
                 && self.delegated
-                && data.get("op").and_then(Value::as_str) == Some("work_interrupt")
-                && self.offered_delegated(att);
-            let unadvertised = data
-                .get("op")
-                .and_then(Value::as_str)
+                && match op {
+                    Some("work_interrupt") => self.offered_delegated(att),
+                    Some("control_records") => self.senders && self.offered_senders(att),
+                    _ => false,
+                };
+            let unadvertised = op
                 .and_then(delegated_feature_of)
                 .filter(|feature| !self.advertised_features().iter().any(|f| f == feature))
                 .filter(|_| !stop_while_paused);
@@ -2166,6 +2272,26 @@ impl R9Host {
             }
             match data.get("op").and_then(Value::as_str) {
                 Some("membership") => return self.membership_op(att, plain, re.as_deref(), parts),
+                // `host.senders` listed (else refused above): a native
+                // member's (the authority check above) host principals'
+                // records, read strictly, one that doesn't parse or a
+                // service's spoiling the whole message (host-work-v1 §11.1,
+                // "Carriage"); the runtime applies them and answers.
+                Some("control_records") => {
+                    if self.control_records.len() >= MAX_CONTROL_RECORDS_CALLS {
+                        refuse(self, code::BUSY, None);
+                        return Vec::new();
+                    }
+                    match atem_client::session::r9::ControlRecordsRequest::decode(plain) {
+                        Ok(request) => self.control_records.push_back(ControlRecordsCall {
+                            attachment: att.to_owned(),
+                            carrier: authority.name(),
+                            request,
+                        }),
+                        Err(why) => refuse(self, code::INVALID_REQUEST, Some(why)),
+                    }
+                    return Vec::new();
+                }
                 Some("revoke_grant") => {
                     return self.revoke_grant(att, authority, &data, re.as_deref(), parts);
                 }
@@ -2177,10 +2303,90 @@ impl R9Host {
                     self.host_policy_op(att, authority, &data, re.as_deref(), parts);
                     return Vec::new();
                 }
+                // Only with `host.senders` listed (refused above otherwise).
+                Some("host_enc_key_get") => {
+                    self.host_enc_key_op(att, authority, plain, re.as_deref(), parts);
+                    return Vec::new();
+                }
                 _ => {}
             }
         }
         parts.host.receive(att, plain, parts.now.mono)
+    }
+
+    /// `host_enc_key_get` → `host_enc_key{re}` (session-v1 R9.14 item 8;
+    /// only while the welcome lists `host.senders`): the host encryption key
+    /// of the welcome's trust generation and its `enc_sig`, for a native
+    /// member holding `manage` at the current head, checked here on every
+    /// request as the host policy checks it (R9.8a; services and browsers
+    /// never reach here, `forbidden` before decoding). Its id is in the
+    /// record before the answer goes ([`host_enc::hand_out`]); no key, or a
+    /// record that couldn't be written, is `busy`, nothing handed out.
+    fn host_enc_key_op<J: Journal>(
+        &mut self,
+        att: &str,
+        authority: &Authority,
+        plain: &[u8],
+        re: Option<&str>,
+        parts: &mut Parts<'_, J>,
+    ) {
+        let mono = parts.now.host.mono_ms;
+        let refuse = |me: &mut Self, code: &str, detail: Option<&str>| {
+            me.seal_to(att, &error(code, re, detail).to_bytes(), mono);
+        };
+        let request = match atem_client::session::r9::HostEncKeyGet::decode(plain) {
+            Ok(request) => request,
+            Err(_) => return refuse(self, code::INVALID_REQUEST, None),
+        };
+        let DeviceList::Open { m, key } = &parts.list else {
+            return refuse(self, code::BUSY, Some(DETAIL_UNPAIRED));
+        };
+        if m.held().is_some() {
+            return refuse(self, code::BUSY, Some(DETAIL_NOT_RECONCILED));
+        }
+        if !holds_manage(m, authority) {
+            return refuse(self, code::FORBIDDEN, None);
+        }
+        let Some((pairing, journal)) = self.policy_paths.clone() else {
+            return refuse(self, code::BUSY, Some(host_enc::DETAIL_UNAVAILABLE));
+        };
+        let ctx = parts.host.context();
+        let (host_id, generation) = (ctx.atem_device_id.clone(), ctx.host_trust_gen);
+        let mut store = Store::new(&pairing, &journal);
+        #[cfg(test)]
+        if let Some(fault) = self.enc_fault.take() {
+            store.inject(fault);
+        }
+        let handed = host_enc::hand_out(
+            &mut store,
+            &pairing,
+            m.membership(),
+            key,
+            &host_id,
+            generation,
+        );
+        let (enc, enc_sig, line) = match handed {
+            Ok(handed) => handed,
+            Err(why) => {
+                // A client may ask again and again: the r9 limit for
+                // input-driven lines.
+                self.input_log
+                    .log(mono, || format!("host encryption key: {why}"));
+                return refuse(self, code::BUSY, Some(host_enc::DETAIL_UNAVAILABLE));
+            }
+        };
+        if let Some(line) = line {
+            log(&format!("host encryption key: {line}"));
+        }
+        let answer = atem_client::session::r9::HostEncKey {
+            id: new_id(),
+            re: request.id,
+            host_id,
+            host_trust_gen: generation,
+            enc_key: enc.public,
+            enc_sig,
+        };
+        self.seal_to(att, answer.to_json().to_string().as_bytes(), mono);
     }
 
     /// `host_policy_set`/`host_policy_get` → `host_policy_result{re}`

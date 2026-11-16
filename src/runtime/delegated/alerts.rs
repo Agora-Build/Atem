@@ -467,6 +467,7 @@ mod tests {
                 grant_expires_at: None,
                 device_list_seq: 3,
                 projects_matched: vec![],
+                host: None,
             }),
         }
     }

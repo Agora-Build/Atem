@@ -103,17 +103,18 @@ impl HostBridge {
             profile: profile.clone(),
             expires_at,
         };
-        let (flag, dir, view, approved) = (
+        let (flag, dir, view, approved, features) = (
             permit.clone(),
             self.work.dir.clone(),
             self.start_view.clone(),
             profile.clone(),
+            self.features,
         );
         // After the spawn, up to `start`: the fences, as a v1 launch's
         // guard, its expiry on the delegated clock.
         let guard: SpawnGuard = Arc::new(move || {
             flag.load(Ordering::SeqCst)
-                && Config::load(&dir)
+                && Config::load_for(&dir, features)
                     .is_ok_and(|c| c.enabled && c.profile(&approved.id) == Some(&approved))
                 && view
                     .lock()
@@ -122,11 +123,12 @@ impl HostBridge {
                     .is_some_and(|d| d < expires_at)
                 && crate::memory::project::project_key_for(&approved.cwd) == approved.project
         });
-        let (flag, dir, view, start) = (
+        let (flag, dir, view, start, features) = (
             permit.clone(),
             self.work.dir.clone(),
             self.start_view.clone(),
             launch.clone(),
+            self.features,
         );
         let check: PreSpawnCheck = Arc::new(move || {
             // Hosting §5's fences first: a receipt-database fault, hosting
@@ -137,7 +139,7 @@ impl HostBridge {
             if !flag.load(Ordering::SeqCst) {
                 return PreSpawn::Fence;
             }
-            let Ok(config) = Config::load(&dir) else {
+            let Ok(config) = Config::load_for(&dir, features) else {
                 return PreSpawn::Wait;
             };
             if !config.enabled {
