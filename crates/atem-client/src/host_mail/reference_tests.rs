@@ -3,9 +3,10 @@
 use serde_json::{Map, Value, json};
 
 use super::*;
-use crate::canonical::MAX_SAFE_INTEGER;
 use crate::control::relay::Heads;
-use crate::host_mail::mailbox::{MAX_MAILBOX_MESSAGE_BYTES, MailboxSyncResult, MailboxToHost};
+use crate::host_mail::mailbox::{
+    MAX_MAILBOX_MESSAGE_BYTES, MAX_SERVED_OBJECT_BYTES, MailboxSyncResult, MailboxToHost,
+};
 use crate::host_mail::test_support::{CREATED_AT, EXPIRES_AT, Rig};
 use crate::host_mail::{EnvelopePlain, MailFields, seal_envelope_with_ikm};
 use crate::membership::Head;
@@ -85,6 +86,16 @@ fn size(object: &SignedObject) -> u64 {
     object.to_json().to_string().len() as u64
 }
 
+/// `object` with its keys in another order and spaces: the same object.
+fn respaced_text(object: &SignedObject) -> String {
+    let wire = object.to_json();
+    let mut reordered = Map::new();
+    for key in ["sig", "ct", "body", "enc"] {
+        reordered.insert(key.to_owned(), wire[key].clone());
+    }
+    serde_json::to_string_pretty(&Value::Object(reordered)).unwrap()
+}
+
 /// The Station side of a test: the mailbox it adopts after every
 /// transition, its clock and fresh call ids.
 struct Station {
@@ -129,10 +140,7 @@ impl Station {
 
     fn put_bytes(&mut self, object: &SignedObject) -> (String, Vec<u8>) {
         let request_id = self.request_id();
-        let put = MailboxPut {
-            request_id: request_id.clone(),
-            object: object.clone(),
-        };
+        let put = MailboxPut::new(request_id.clone(), object.clone());
         (request_id, put.to_json().unwrap().to_string().into_bytes())
     }
 
@@ -605,6 +613,24 @@ fn quotas_count_objects_and_encoded_bytes_per_sender_receiver_and_account() {
     });
     assert_eq!(st.put(&a(), &to_c), Outcome::Stored { position: 1 });
 
+    // Per receiving host, in bytes.
+    let mut st = Station::with(Quotas {
+        sender: roomy,
+        receiver: Quota {
+            objects: 100,
+            bytes: 2 * one,
+        },
+        account: roomy,
+    });
+    st.put(&a(), &object(1));
+    st.put(&a(), &object(2));
+    assert_eq!(st.m.receiver_usage("host-b", 3).bytes, 2 * one);
+    assert_eq!(
+        st.put(&a(), &object(3)),
+        Outcome::PutRefused(PutRefusal::Quota)
+    );
+    assert_eq!(st.put(&a(), &to_c), Outcome::Stored { position: 1 });
+
     // Per account: every mailbox of this device list.
     let mut st = Station::with(Quotas {
         sender: roomy,
@@ -684,14 +710,116 @@ fn a_stored_retry_is_never_charged_twice_even_at_the_limit() {
 }
 
 #[test]
+fn a_refused_put_mints_no_mailbox() {
+    // A mailbox is minted by the store to it (or its host's heads), never by
+    // a put refused on the way: quota, id_reused, forbidden or expired.
+    let mut st = Station::with(Quotas {
+        account: Quota {
+            objects: 1,
+            bytes: 1 << 20,
+        },
+        ..Quotas::default()
+    });
+    st.put(&a(), &object(1));
+    let to_c = |id, edit: fn(&mut MailFields)| {
+        object_with(id, 0, |f| {
+            f.recipient.host_id = "host-c".into();
+            f.recipient.host_trust_gen = 1;
+            edit(f);
+        })
+    };
+    assert_eq!(
+        st.put(&a(), &to_c(2, |_| {})),
+        Outcome::PutRefused(PutRefusal::Quota)
+    );
+    assert_eq!(
+        st.put(&a(), &to_c(3, |f| f.expires_at = f.created_at)),
+        Outcome::PutRefused(PutRefusal::Expired)
+    );
+    assert_eq!(
+        st.put(&c(), &to_c(4, |_| {})),
+        Outcome::PutRefused(PutRefusal::Forbidden)
+    );
+    assert_eq!(st.m.mailbox("host-c", 1), None);
+    assert_eq!(st.m.receivers().collect::<Vec<_>>(), [("host-b", 3)]);
+    // An id_reused refusal leaves the existing mailbox as it was.
+    let before = st.mailbox_of(&b());
+    assert_eq!(
+        st.put(&a(), &object_with(1, 7, |_| {})),
+        Outcome::PutRefused(PutRefusal::IdReused)
+    );
+    assert_eq!(st.mailbox_of(&b()), before);
+}
+
+#[test]
+fn a_put_is_charged_its_objects_bytes_as_received() {
+    // Design II.4.3: the encoded wire bytes the Station received, the
+    // object's text in the put, not its compact form; a page serves it
+    // compact.
+    let mut st = Station::new();
+    let spaced = respaced_text(&object(1));
+    assert!(spaced.len() > size(&object(1)) as usize);
+    let text = format!(
+        r#"{{"type":"relay","op":"mailbox_put","request_id":"{}","object":{spaced}}}"#,
+        uuid(1)
+    );
+    let (_, outcome) = st.send(&a(), text.as_bytes());
+    assert_eq!(outcome, Outcome::Stored { position: 1 });
+    let charged = Usage {
+        objects: 1,
+        bytes: spaced.len() as u64,
+    };
+    assert_eq!(st.m.stored("host-b", 3)[0].bytes, spaced.len() as u64);
+    assert_eq!(st.m.sender_usage("host-a"), charged);
+    assert_eq!(st.m.receiver_usage("host-b", 3), charged);
+    assert_eq!(st.m.account_usage(), charged);
+    // The same object again, compact: stored already, charged nothing.
+    assert_eq!(
+        st.put(&a(), &object(1)),
+        Outcome::AlreadyStored { position: 1 }
+    );
+    assert_eq!(st.m.account_usage(), charged);
+    // The page carries it compact.
+    let mailbox = st.heads(&b());
+    let (_, _, page) = st.page(&b(), 0);
+    assert_eq!(
+        page.objects[0].bytes(),
+        object(1).to_json().to_string().as_bytes()
+    );
+    // Removed and sent again compact: charged its compact bytes.
+    st.done(&b(), &mailbox.mailbox_id, 1);
+    st.put(&a(), &object(1));
+    assert_eq!(st.m.account_usage().bytes, size(&object(1)));
+}
+
+#[test]
+fn only_a_current_host_syncs_or_marks_done() {
+    // As for a put (rule 1): the caller is a current host of the list at
+    // its link's generation; `heads` is the Station's announcement.
+    let mut st = Station::new();
+    st.put(&a(), &object(1));
+    let mailbox = st.heads(&b());
+    st.m = st.m.list_moved(CurrentHosts::new([
+        ("host-a".to_owned(), 2),
+        ("host-b".to_owned(), 4),
+    ]));
+    let (answer, outcome) = st.sync(&b(), &mailbox.mailbox_id, 0);
+    assert_eq!(answer, Some(forbidden_sync()));
+    assert_eq!(outcome, Outcome::Refused(MailboxRefusedCall::Sync));
+    let (answer, _) = st.done(&b(), &mailbox.mailbox_id, 1);
+    assert_eq!(answer, Some(forbidden_done()));
+    assert_eq!(st.positions(&b()), [1]);
+    // The Station still announces it (heads isn't a call of the host's).
+    assert_eq!(st.heads(&b()), mailbox);
+    // Current again: served.
+    st.m = st.m.list_moved(current());
+    assert_eq!(st.page(&b(), 0).1, Some(1));
+}
+
+#[test]
 fn a_call_the_station_cant_read_is_dropped_unanswered_and_counted() {
     let mut st = Station::new();
-    let good = MailboxPut {
-        request_id: uuid(1),
-        object: object(1),
-    }
-    .to_json()
-    .unwrap();
+    let good = MailboxPut::new(uuid(1), object(1)).to_json().unwrap();
     let mut no_id = good.clone();
     no_id["object"]["body"]
         .as_object_mut()
@@ -761,38 +889,10 @@ fn object_of_size(target: usize) -> SignedObject {
 
 #[test]
 fn an_object_no_page_could_carry_is_dropped() {
-    // The bound: a page with every field at its largest and one object of
-    // MAX_SERVED_OBJECT_BYTES is exactly 512 KiB.
-    let largest = MAX_SAFE_INTEGER;
-    let wrapper = MailboxSyncResult {
-        request_id: uuid(1),
-        mailbox_id: uuid(2),
-        after: largest - 1,
-        head: largest,
-        through: largest,
-        objects: vec![MailboxEntry::new(largest, &object(1))],
-    }
-    .to_json()
-    .unwrap()
-    .to_string()
-    .len()
-        - size(&object(1)) as usize;
-    assert_eq!(MAX_SERVED_OBJECT_BYTES + wrapper, MAX_MAILBOX_MESSAGE_BYTES);
-    // A put's own fields are 178 bytes fewer.
-    let put_wrapper = MailboxPut {
-        request_id: uuid(1),
-        object: object(1),
-    }
-    .to_json()
-    .unwrap()
-    .to_string()
-    .len()
-        - size(&object(1)) as usize;
-    assert_eq!(wrapper - put_wrapper, 178);
-
+    // The shared put reader refuses an object over MAX_SERVED_OBJECT_BYTES
+    // as received, `too_large` (its own tests pin the bound), and the
+    // Station drops that put as one it can't read.
     let mut st = Station::new();
-    // Sizes are reached to within base64's 4-character steps: the largest
-    // object at or under the bound is stored and served, one over it isn't.
     let under = object_of_size(MAX_SERVED_OBJECT_BYTES);
     assert!(size(&under) as usize <= MAX_SERVED_OBJECT_BYTES);
     assert!(size(&under) as usize > MAX_SERVED_OBJECT_BYTES - 4);
@@ -805,11 +905,18 @@ fn an_object_no_page_could_carry_is_dropped() {
 
     let over = object_of_size(MAX_SERVED_OBJECT_BYTES + 8);
     assert!(size(&over) as usize > MAX_SERVED_OBJECT_BYTES);
-    let (_, bytes) = st.put_bytes(&over);
-    assert!(bytes.len() <= MAX_MAILBOX_MESSAGE_BYTES, "a put carries it");
-    let (answer, outcome) = st.send(&a(), &bytes);
+    let text = format!(
+        r#"{{"type":"relay","op":"mailbox_put","request_id":"{}","object":{}}}"#,
+        uuid(1),
+        over.to_json()
+    );
+    assert!(text.len() <= MAX_MAILBOX_MESSAGE_BYTES, "a put carries it");
+    let (answer, outcome) = st.send(&a(), text.as_bytes());
     assert_eq!(answer, None);
-    assert_eq!(outcome, Outcome::Dropped(Dropped::Unserved));
+    assert_eq!(
+        outcome,
+        Outcome::Dropped(Dropped::Unread(RelayError::TooLarge))
+    );
     assert_eq!(st.m.dropped(), 1);
     assert_eq!(st.m.account_usage(), Usage::default());
 }

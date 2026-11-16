@@ -3,29 +3,57 @@
     {
       "accepts": true,
       "name": "put_at_the_bound",
-      "note": "a put of exactly 524,288 bytes: read (its object's ct a run of zero bytes; the Station never opens it)",
+      "note": "a put of exactly 524,288 bytes whose object, as received, is exactly max_served_object_bytes (524,013): read; a page carries it at every position (the message padded with spaces after it; the object's ct a run of zero bytes: the Station never opens it)",
       "op": "mailbox_put",
       "reader": "to_station",
       "wire_fill": {
         "bytes": 524288,
-        "count": 523476,
+        "count": 523299,
         "fill": "A",
         "prefix": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"",
-        "suffix": "\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"55aa5bab-e253-4b6c-a83f-c86e6b028aa1\",\"type\":\"relay\"} "
+        "suffix": "\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"55aa5bab-e253-4b6c-a83f-c86e6b028aa1\",\"type\":\"relay\"}                                                                                                                                                                                  "
+      }
+    },
+    {
+      "code": "too_large",
+      "name": "put_object_over_what_a_page_carries",
+      "note": "a put of 524,288 bytes whose object, as received, is 524,014 bytes: a page with every number at its largest couldn't carry it (one at position 1 could, up to 524,073, but the bound is position-independent): too_large",
+      "op": "mailbox_put",
+      "reader": "to_station",
+      "wire_fill": {
+        "bytes": 524288,
+        "count": 523300,
+        "fill": "A",
+        "prefix": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"",
+        "suffix": "\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"55aa5bab-e253-4b6c-a83f-c86e6b028aa1\",\"type\":\"relay\"}                                                                                                                                                                                 "
+      }
+    },
+    {
+      "code": "too_large",
+      "name": "put_object_spaced_over_what_a_page_carries",
+      "note": "an object of 524,014 bytes as received, 8 of them spaces inside it: its compact JSON is under the bound, but the bytes as received count: too_large",
+      "op": "mailbox_put",
+      "reader": "to_station",
+      "wire_fill": {
+        "bytes": 524288,
+        "count": 523292,
+        "fill": "A",
+        "prefix": "{\"object\":{        \"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"",
+        "suffix": "\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"55aa5bab-e253-4b6c-a83f-c86e6b028aa1\",\"type\":\"relay\"}                                                                                                                                                                                 "
       }
     },
     {
       "code": "too_large",
       "name": "put_over_the_bound",
-      "note": "a byte more: refused before any parse",
+      "note": "a put of 524,289 bytes: refused before any parse",
       "op": "mailbox_put",
       "reader": "to_station",
       "wire_fill": {
         "bytes": 524289,
-        "count": 523478,
+        "count": 523299,
         "fill": "A",
         "prefix": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"",
-        "suffix": "\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"55aa5bab-e253-4b6c-a83f-c86e6b028aa1\",\"type\":\"relay\"}"
+        "suffix": "\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"55aa5bab-e253-4b6c-a83f-c86e6b028aa1\",\"type\":\"relay\"}                                                                                                                                                                                   "
       }
     },
     {
@@ -846,7 +874,7 @@
   "max_message_bytes": 524288,
   "max_served_object_bytes": 524013,
   "name": "r9-vectors-mailbox-calls",
-  "note": "The mailbox calls of host-work-v1 §11.5 (rules 1 to 11, agreed with Astation 2026-11-16) as the shared core's builders write them and its readers read them, and scenarios run against the Station's reference mailbox (atem_client::host_mail::reference::ReferenceMailbox). `objects`: the mailbox objects the calls carry ({label, note, object, object_hash, bytes}; `bytes` is the object's compact JSON, what a page carries and the quotas count), atem-envelope and atem-result objects sealed and signed by host-a, host-b and host-evil with their r9-vectors-keys host keys (the Station reads the body only and never verifies or opens). `object_hash`: known answers of SHA-256(enc([jcs(body), sig, enc, ct])), sig, enc and ct as decoded bytes, over `object_text` (a copy serialized again is the same object). `calls`: every valid message {name, op, direction, note, fields, wire}: `wire` is the exact text (compact, keys in RFC 8785 order, the builders' order), `direction` the reader that reads it (to_station: a host's call; to_host: a Station's answer; the other refuses it as wrong_message), `fields` what it reads as (a page's object as a value). `invalid`: texts a reader refuses {name, op, reader, code, wire}, one fault each, with the code the reader gives: too_large (over `max_message_bytes`, before any parse), not_strict, wrong_message, unknown_field or malformed. `bounds`: texts at and over the bound as `wire_fill` recipes ({prefix, fill, count, suffix, bytes}: prefix, count times fill, suffix), `accepts` or a `code`. `heads`: the calling host's mailbox head in heads (rule 6), read with the mailbox (`reader: mailbox`, a host whose welcome lists host.senders) or strictly (`reader: strict`, every other host): `accepts.mailbox` (absent: none announced) or a `code`; heads keeps its 256 KiB bound (`max_heads_bytes`). `scenarios`: event sequences against a fresh reference mailbox of the device list (`link.account_id`, `link.genesis_hash`) with the scenario's `quotas` and current `hosts`, seeded with `seed_hex`: each mailbox_id is the first 16 bytes of SHA-256(enc([\"atem-reference-mailbox-id-v1\", seed, account_id, genesis_hash (32 bytes), host_id, u64(host_trust_gen), u64(n)])) as a lowercase UUID v4 (version 4, variant 10), n counting the mailboxes minted for that receiving host from 0 (a Station mints a random one; the seed makes the vectors reproducible). Events: `call` (the bytes `call`, or the `call_fill` recipe, received at `at` ms on the link of `caller`, of `link`'s account, genesis and connection), `heads` (`heads_base` sent to `caller` at `at`, with `host_senders`), `reset` (of a receiving host's mailbox: `new_mailbox`, or `head_back` to a head under the same id), `hosts` (the Station's copy of the device list moved to these current hosts) and `tick` (the clock at `at`). Each call or heads gives `expect` (the outcome: stored or already_stored at a position, put_refused with a code, dropped with why: a reader's code or `unserved`, page with its through, position and reset, done with removed, refused with the refusal's op, heads with the mailbox announced) and `answer` (the exact text sent back; none when dropped). Every event gives `state` after it: dropped calls, and each mailbox minted (receiving host, mailbox_id, head, stored objects: position, sender, id, object_hash, bytes, expires_at). The model's rules (where §11.5 leaves a choice, its \"reference mailbox's readings\", Atem's, for Astation's agreement): every transition first removes each object whose expires_at is at or before its time; a call the reader refuses is dropped and counted; a put whose object's compact JSON is over `max_served_object_bytes` (no page could carry it at any position) is dropped too (Atem's reading, for Astation's agreement); a put is forbidden unless the caller is a current host at its link's generation, the body's sender host, of the link's account and genesis, and the recipient a current host at the generation it names; expired at or past its expires_at, with expires_at not after created_at, or more than `max_lifetime_ms` after it; then the key (calling host, body id) in the recipient's mailbox: the same object_hash is already_stored (charged nothing), another id_reused; then the quotas per sending host (its objects in every mailbox), receiving host (its mailbox) and account (every mailbox), objects and bytes; then stored at head + 1, which mints the recipient's mailbox if it has none. A sync or done naming anything but the caller's own mailbox is refused; a page lists the first stored object after `after` and its through is the position before the next stored object, or the head; with `after` past the head it is the reset page; a done removes what is at its position, if anything. A heads with host_senders mints the caller's mailbox if it has none. A reset to a new mailbox mints the next id and loses everything the old one held; head_back loses what was stored after that head and stores the next object after it.",
+  "note": "The mailbox calls of host-work-v1 §11.5 (rules 1 to 11, agreed with Astation 2026-11-16) as the shared core's builders write them and its readers read them, and scenarios run against the Station's reference mailbox (atem_client::host_mail::reference::ReferenceMailbox). `objects`: the mailbox objects the calls carry ({label, note, object, object_hash, bytes}; `bytes` is the object's compact JSON, what a page carries, and what a put that carries it compact is charged), atem-envelope and atem-result objects sealed and signed by host-a, host-b and host-evil with their r9-vectors-keys host keys (the Station reads the body only and never verifies or opens). `object_hash`: known answers of SHA-256(enc([jcs(body), sig, enc, ct])), sig, enc and ct as decoded bytes, over `object_text` (a copy serialized again is the same object). `calls`: every valid message {name, op, direction, note, fields, wire}: `wire` is the exact text (compact, keys in RFC 8785 order, the builders' order), `direction` the reader that reads it (to_station: a host's call; to_host: a Station's answer; the other refuses it as wrong_message), `fields` what it reads as (a page's object as a value). `invalid`: texts a reader refuses {name, op, reader, code, wire}, one fault each, with the code the reader gives: too_large (over `max_message_bytes`, before any parse), not_strict, wrong_message, unknown_field or malformed. `bounds`: texts at and over the bounds (the message's, and an object's `max_served_object_bytes`) as `wire_fill` recipes ({prefix, fill, count, suffix, bytes}: prefix, count times fill, suffix), `accepts` or a `code`. `heads`: the calling host's mailbox head in heads (rule 6), read with the mailbox (`reader: mailbox`, a host whose welcome lists host.senders) or strictly (`reader: strict`, every other host): `accepts.mailbox` (absent: none announced) or a `code`; heads keeps its 256 KiB bound (`max_heads_bytes`). `scenarios`: event sequences against a fresh reference mailbox of the device list (`link.account_id`, `link.genesis_hash`) with the scenario's `quotas` and current `hosts`, seeded with `seed_hex`: each mailbox_id is the first 16 bytes of SHA-256(enc([\"atem-reference-mailbox-id-v1\", seed, account_id, genesis_hash (32 bytes), host_id, u64(host_trust_gen), u64(n)])) as a lowercase UUID v4 (version 4, variant 10), n counting the mailboxes minted for that receiving host from 0 (a Station mints a random one; the seed makes the vectors reproducible). A Station that mints random ids compares them up to a one-to-one renaming, learned from the heads, the answers and the states: every call names an id announced before it, but one that names an id no mailbox ever had (`only_the_mailboxs_own_host_syncs_and_marks_done`), which stays unknown under any renaming. Events: `call` (the bytes `call`, or the `call_fill` recipe, received at `at` ms on the link of `caller`, of `link`'s account, genesis and connection), `heads` (`heads_base` sent to `caller` at `at`, with `host_senders`), `reset` (of a receiving host's mailbox: `new_mailbox`, or `head_back` to a head under the same id), `hosts` (the Station's copy of the device list moved to these current hosts) and `tick` (the clock at `at`). Each call or heads gives `expect` (the outcome: stored or already_stored at a position, put_refused with a code, dropped with why: the reader's code, page with its through, position and reset, done with removed, refused with the refusal's op, heads with the mailbox announced) and `answer` (the exact text sent back; none when dropped). Every event gives `state` after it: dropped calls, and each mailbox minted (receiving host, mailbox_id, head, stored objects: position, sender, id, object_hash, bytes, expires_at). The model's rules (where §11.5 leaves a choice, its \"reference mailbox's readings\", Atem's, for Astation's agreement): every transition first removes each object whose expires_at is at or before its time; a call the reader refuses is dropped and counted, and the shared put reader refuses (too_large) a put whose object, as received, is over `max_served_object_bytes` (524,013 bytes: 512 KiB less a page's own fields with every number at its largest, so that a page carries the object at every position; a page at position 1 could carry up to 524,073 bytes, but the bound is deliberately position-independent: Atem's reading, for Astation's agreement); a put is forbidden unless the caller is a current host at its link's generation, the body's sender host, of the link's account and genesis, and the recipient a current host at the generation it names; expired at or past its expires_at, with expires_at not after created_at, or more than `max_lifetime_ms` after it; then the key (calling host, body id) in the recipient's mailbox: the same object_hash is already_stored (charged nothing), another id_reused; then the quotas per sending host (its objects in every mailbox), receiving host (its mailbox) and account (every mailbox), in objects and in bytes as received (the object's exact text in the put, not the call's own fields; design II.4.3, \"the encoded wire bytes it received\"); then stored at head + 1, which mints the recipient's mailbox if it has none: a refused put mints none, and a page serves the object compact. A sync or done from a caller that isn't a current host at its link's generation (as for a put), or naming anything but the caller's own mailbox, is refused; a page lists the first stored object after `after` and its through is the position before the next stored object, or the head; with `after` past the head it is the reset page; a done removes what is at its position, if anything. A heads with host_senders mints the caller's mailbox if it has none; heads is the Station's announcement, and checks no current host. A reset to a new mailbox mints the next id and loses everything the old one held; head_back loses what was stored after that head and stores the next object after it.",
   "object_hash": [
     {
       "name": "o1",
@@ -6333,6 +6361,77 @@
               }
             ]
           }
+        },
+        {
+          "answer": "{\"code\":\"forbidden\",\"op\":\"mailbox_sync_refused\",\"type\":\"relay\"}",
+          "at": 1793620920000,
+          "call": "{\"after\":0,\"mailbox_id\":\"fcf2c48e-5be0-485b-9abd-ee3721901668\",\"op\":\"mailbox_sync\",\"request_id\":\"0000000c-0000-4000-8000-000000000009\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "op": "mailbox_sync_refused",
+            "outcome": "refused"
+          },
+          "note": "host-b's own mailbox, but host-b is no current host of the list: refused, as a put would be",
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "c5f32378-8b58-420c-8273-0b869bdb6bdc",
+                    "object_hash": "26ecf5c8e44e0342ce7d2b06a2be0c3545c73ffa973449f9bd830f724513cd28",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"code\":\"forbidden\",\"op\":\"mailbox_done_refused\",\"type\":\"relay\"}",
+          "at": 1793620920000,
+          "call": "{\"mailbox_id\":\"fcf2c48e-5be0-485b-9abd-ee3721901668\",\"op\":\"mailbox_done\",\"position\":1,\"request_id\":\"0000000c-0000-4000-8000-00000000000a\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "op": "mailbox_done_refused",
+            "outcome": "refused"
+          },
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "c5f32378-8b58-420c-8273-0b869bdb6bdc",
+                    "object_hash": "26ecf5c8e44e0342ce7d2b06a2be0c3545c73ffa973449f9bd830f724513cd28",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
         }
       ],
       "hosts": [
@@ -6443,34 +6542,10 @@
           "at": 1793620860000,
           "call_fill": {
             "bytes": 524288,
-            "count": 523476,
+            "count": 523300,
             "fill": "A",
             "prefix": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"",
-            "suffix": "\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"0000000d-0000-4000-8000-000000000004\",\"type\":\"relay\"} "
-          },
-          "caller": {
-            "host_id": "host-a",
-            "host_trust_gen": 1
-          },
-          "event": "call",
-          "expect": {
-            "outcome": "dropped",
-            "why": "unserved"
-          },
-          "note": "a put of exactly 524,288 bytes: read, but no page could carry its object (Atem's reading, for Astation's agreement)",
-          "state": {
-            "dropped": 5,
-            "mailboxes": []
-          }
-        },
-        {
-          "at": 1793620860000,
-          "call_fill": {
-            "bytes": 524289,
-            "count": 523478,
-            "fill": "A",
-            "prefix": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"",
-            "suffix": "\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"0000000d-0000-4000-8000-000000000005\",\"type\":\"relay\"}"
+            "suffix": "\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"0000000d-0000-4000-8000-000000000004\",\"type\":\"relay\"}                                                                                                                                                                                 "
           },
           "caller": {
             "host_id": "host-a",
@@ -6481,15 +6556,64 @@
             "outcome": "dropped",
             "why": "too_large"
           },
+          "note": "a put of 524,288 bytes whose object, as received, is 524,014: the reader refuses it (Atem's reading, for Astation's agreement)",
+          "state": {
+            "dropped": 5,
+            "mailboxes": []
+          }
+        },
+        {
+          "at": 1793620860000,
+          "call_fill": {
+            "bytes": 524288,
+            "count": 523292,
+            "fill": "A",
+            "prefix": "{\"object\":{        \"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"",
+            "suffix": "\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"0000000d-0000-4000-8000-000000000005\",\"type\":\"relay\"}                                                                                                                                                                                 "
+          },
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "dropped",
+            "why": "too_large"
+          },
+          "note": "the same with 8 spaces inside the object: its compact JSON is under the bound, the bytes as received are over",
           "state": {
             "dropped": 6,
             "mailboxes": []
           }
         },
         {
-          "answer": "{\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"op\":\"mailbox_stored\",\"request_id\":\"0000000d-0000-4000-8000-000000000006\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "call_fill": {
+            "bytes": 524289,
+            "count": 523299,
+            "fill": "A",
+            "prefix": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"",
+            "suffix": "\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"0000000d-0000-4000-8000-000000000006\",\"type\":\"relay\"}                                                                                                                                                                                   "
+          },
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "dropped",
+            "why": "too_large"
+          },
+          "note": "a put of 524,289 bytes",
+          "state": {
+            "dropped": 7,
+            "mailboxes": []
+          }
+        },
+        {
+          "answer": "{\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"op\":\"mailbox_stored\",\"request_id\":\"0000000d-0000-4000-8000-000000000007\",\"type\":\"relay\"}",
           "at": 1793620920000,
-          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"RJPseAOHf-xPck3LL7DNc8cLoaeM01FY042O4GqYebYzklWbfKflYKRUDKkslNY5QNdpkwAjo3t0dGQS9cCC7tc92txfTGlCTBQaxhAWx3z_zQ\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"0000000d-0000-4000-8000-000000000006\",\"type\":\"relay\"}",
+          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"RJPseAOHf-xPck3LL7DNc8cLoaeM01FY042O4GqYebYzklWbfKflYKRUDKkslNY5QNdpkwAjo3t0dGQS9cCC7tc92txfTGlCTBQaxhAWx3z_zQ\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"0000000d-0000-4000-8000-000000000007\",\"type\":\"relay\"}",
           "caller": {
             "host_id": "host-a",
             "host_trust_gen": 1
@@ -6501,7 +6625,7 @@
           },
           "note": "nothing was stored before",
           "state": {
-            "dropped": 6,
+            "dropped": 7,
             "mailboxes": [
               {
                 "head": 1,
@@ -6538,7 +6662,7 @@
         }
       ],
       "name": "calls_the_station_drops",
-      "note": "a call the shared core's reader refuses gets no answer: the Station drops and counts it, and the sender retires it at its deadline; so does a put whose object no page could carry",
+      "note": "a call the shared core's reader refuses gets no answer: the Station drops and counts it, and the sender retires it at its deadline; a put whose object a page couldn't carry at every position is one (too_large)",
       "quotas": {
         "account": {
           "bytes": 268435456,
@@ -6792,6 +6916,734 @@
         "sender": {
           "bytes": 33554432,
           "objects": 128
+        }
+      }
+    },
+    {
+      "events": [
+        {
+          "answer": "{\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"op\":\"mailbox_stored\",\"request_id\":\"0000000f-0000-4000-8000-000000000001\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "call_fill": {
+            "bytes": 524288,
+            "count": 523299,
+            "fill": "A",
+            "prefix": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"",
+            "suffix": "\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"0000000f-0000-4000-8000-000000000001\",\"type\":\"relay\"}                                                                                                                                                                                  "
+          },
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "stored",
+            "position": 1
+          },
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 524013,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "9e1c535b9204a6a5cae71eb496e5cee206d79de75479c83c7c772667bd78a1e3",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"feeds\":[],\"mailbox\":{\"head\":1,\"mailbox_id\":\"fcf2c48e-5be0-485b-9abd-ee3721901668\"},\"membership\":{\"hash\":\"a8ce1c9e71ac77fbcbfdec5feace4b487efe2357255ba895694819a72a7645f5\",\"seq\":10},\"op\":\"heads\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "caller": {
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "event": "heads",
+          "expect": {
+            "mailbox": {
+              "head": 1,
+              "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668"
+            },
+            "outcome": "heads"
+          },
+          "host_senders": true,
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 524013,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "9e1c535b9204a6a5cae71eb496e5cee206d79de75479c83c7c772667bd78a1e3",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-evil",
+          "host_trust_gen": 1
+        }
+      ],
+      "name": "the_largest_object_a_page_carries",
+      "note": "a put of exactly 524,288 bytes whose object, as received, is exactly max_served_object_bytes: stored, and charged its 524,013 bytes",
+      "quotas": {
+        "account": {
+          "bytes": 268435456,
+          "objects": 1024
+        },
+        "receiver": {
+          "bytes": 67108864,
+          "objects": 256
+        },
+        "sender": {
+          "bytes": 33554432,
+          "objects": 128
+        }
+      }
+    },
+    {
+      "events": [
+        {
+          "answer": "{\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"op\":\"mailbox_stored\",\"request_id\":\"00000010-0000-4000-8000-000000000001\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "call": "{\"type\":\"relay\",\"op\":\"mailbox_put\",\"request_id\":\"00000010-0000-4000-8000-000000000001\",\"object\":{\n  \"sig\" : \"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\" ,\n  \"ct\" : \"RJPseAOHf-xPck3LL7DNc8cLoaeM01FY042O4GqYebYzklWbfKflYKRUDKkslNY5QNdpkwAjo3t0dGQS9cCC7tc92txfTGlCTBQaxhAWx3z_zQ\" ,\n  \"body\" : {\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1} ,\n  \"enc\" : \"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\" }}",
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "stored",
+            "position": 1
+          },
+          "note": "o1 with its keys in another order and spaces: charged those bytes",
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 848,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"op\":\"mailbox_stored\",\"request_id\":\"00000010-0000-4000-8000-000000000002\",\"type\":\"relay\"}",
+          "at": 1793620920000,
+          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"RJPseAOHf-xPck3LL7DNc8cLoaeM01FY042O4GqYebYzklWbfKflYKRUDKkslNY5QNdpkwAjo3t0dGQS9cCC7tc92txfTGlCTBQaxhAWx3z_zQ\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"00000010-0000-4000-8000-000000000002\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "already_stored",
+            "position": 1
+          },
+          "note": "o1 compact: the same object, charged nothing",
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 848,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"feeds\":[],\"mailbox\":{\"head\":1,\"mailbox_id\":\"fcf2c48e-5be0-485b-9abd-ee3721901668\"},\"membership\":{\"hash\":\"a8ce1c9e71ac77fbcbfdec5feace4b487efe2357255ba895694819a72a7645f5\",\"seq\":10},\"op\":\"heads\",\"type\":\"relay\"}",
+          "at": 1793620920000,
+          "caller": {
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "event": "heads",
+          "expect": {
+            "mailbox": {
+              "head": 1,
+              "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668"
+            },
+            "outcome": "heads"
+          },
+          "host_senders": true,
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 848,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"after\":0,\"head\":1,\"mailbox_id\":\"fcf2c48e-5be0-485b-9abd-ee3721901668\",\"objects\":[{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"RJPseAOHf-xPck3LL7DNc8cLoaeM01FY042O4GqYebYzklWbfKflYKRUDKkslNY5QNdpkwAjo3t0dGQS9cCC7tc92txfTGlCTBQaxhAWx3z_zQ\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"position\":1}],\"op\":\"mailbox_sync_result\",\"request_id\":\"00000010-0000-4000-8000-000000000003\",\"through\":1,\"type\":\"relay\"}",
+          "at": 1793620980000,
+          "call": "{\"after\":0,\"mailbox_id\":\"fcf2c48e-5be0-485b-9abd-ee3721901668\",\"op\":\"mailbox_sync\",\"request_id\":\"00000010-0000-4000-8000-000000000003\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "page",
+            "position": 1,
+            "reset": false,
+            "through": 1
+          },
+          "note": "the page carries o1 compact",
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 848,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"mailbox_id\":\"fcf2c48e-5be0-485b-9abd-ee3721901668\",\"op\":\"mailbox_done_result\",\"position\":1,\"request_id\":\"00000010-0000-4000-8000-000000000004\",\"type\":\"relay\"}",
+          "at": 1793620980000,
+          "call": "{\"mailbox_id\":\"fcf2c48e-5be0-485b-9abd-ee3721901668\",\"op\":\"mailbox_done\",\"position\":1,\"request_id\":\"00000010-0000-4000-8000-000000000004\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "done",
+            "removed": true
+          },
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": []
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"op\":\"mailbox_stored\",\"request_id\":\"00000010-0000-4000-8000-000000000005\",\"type\":\"relay\"}",
+          "at": 1793621040000,
+          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"RJPseAOHf-xPck3LL7DNc8cLoaeM01FY042O4GqYebYzklWbfKflYKRUDKkslNY5QNdpkwAjo3t0dGQS9cCC7tc92txfTGlCTBQaxhAWx3z_zQ\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"00000010-0000-4000-8000-000000000005\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "stored",
+            "position": 2
+          },
+          "note": "sent again compact: charged its compact bytes",
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 2,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 2,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-evil",
+          "host_trust_gen": 1
+        }
+      ],
+      "name": "charged_as_received",
+      "note": "the quotas count an object's exact bytes as received (design II.4.3, \"the encoded wire bytes it received\"), not its compact form; a page serves it compact",
+      "quotas": {
+        "account": {
+          "bytes": 268435456,
+          "objects": 1024
+        },
+        "receiver": {
+          "bytes": 67108864,
+          "objects": 256
+        },
+        "sender": {
+          "bytes": 33554432,
+          "objects": 128
+        }
+      }
+    },
+    {
+      "events": [
+        {
+          "answer": "{\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"op\":\"mailbox_stored\",\"request_id\":\"00000011-0000-4000-8000-000000000001\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"RJPseAOHf-xPck3LL7DNc8cLoaeM01FY042O4GqYebYzklWbfKflYKRUDKkslNY5QNdpkwAjo3t0dGQS9cCC7tc92txfTGlCTBQaxhAWx3z_zQ\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"00000011-0000-4000-8000-000000000001\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "stored",
+            "position": 1
+          },
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"id\":\"6ab12a9c-2616-4301-9609-5b99a792a94d\",\"op\":\"mailbox_stored\",\"request_id\":\"00000011-0000-4000-8000-000000000002\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"6ab12a9c-2616-4301-9609-5b99a792a94d\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"344e8da8d8727db2211b024a405a17777f4f470c4b90b20de242c3bfaf437521\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"Ij9LF9gpAEmEmjBXbuw7XVYycEVERvsY7uNaoXMv5MbtmFr91ty2FeZ0tF2iZWSpn9WR0ffu5ZPKD8_pFkaJGL18Ohfv9br00Uxw1I0y_wyqHQ\",\"enc\":\"N3WzivRedEIOU8dsfGxp21lxknY3Apv6zdvRNLjuXls\",\"sig\":\"2mdFMQ7qgeOSAJwH1aDVXUFhBE4T3yU39udpqbI8MEgA5rd-ztcgdshoLLJHK8THmrQh_2hHTEcPEUWzoF3HAw\"},\"op\":\"mailbox_put\",\"request_id\":\"00000011-0000-4000-8000-000000000002\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "stored",
+            "position": 2
+          },
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 2,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  },
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "6ab12a9c-2616-4301-9609-5b99a792a94d",
+                    "object_hash": "f15847dd8f82d204ba927de0051c6f6b9d69a0ad1371afc342b80f62f4e75a1c",
+                    "position": 2,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"code\":\"quota\",\"id\":\"c02e0c78-f7ee-4fd6-910f-aae183ae056f\",\"op\":\"mailbox_put_refused\",\"request_id\":\"00000011-0000-4000-8000-000000000003\",\"type\":\"relay\"}",
+          "at": 1793620920000,
+          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"c02e0c78-f7ee-4fd6-910f-aae183ae056f\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"7c381272fb769477400d815c9926fb2d3ee76a22c00b97842befc00e502a1983\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"GGDQsajXNCWJGXygfQQV1XRZTn8uxaR-xSHYOIf12QQo4kTLKnOu3yCEaDYyqnWagVybXpyTshB_sgaHhKJZLOGjX76eNoVlummPBvgMI-CNCw\",\"enc\":\"h3VCXAIPBl3QB-TyGQxlRUNae9F2G6uRZIMlOeVzwzA\",\"sig\":\"jQiGwXG7Mj4IKLK8P-2T0KclBhWcxDAd4OYY4TOIIOk7JWkSjlP1aebPwQS7RiVJDeLfIDtkCCtBxJdig0mDBQ\"},\"op\":\"mailbox_put\",\"request_id\":\"00000011-0000-4000-8000-000000000003\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "code": "quota",
+            "outcome": "put_refused"
+          },
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 2,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  },
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "6ab12a9c-2616-4301-9609-5b99a792a94d",
+                    "object_hash": "f15847dd8f82d204ba927de0051c6f6b9d69a0ad1371afc342b80f62f4e75a1c",
+                    "position": 2,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"id\":\"d5f9e93e-1e38-4383-9929-0c56a96419bc\",\"op\":\"mailbox_stored\",\"request_id\":\"00000011-0000-4000-8000-000000000004\",\"type\":\"relay\"}",
+          "at": 1793620920000,
+          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"d5f9e93e-1e38-4383-9929-0c56a96419bc\",\"recipient\":{\"enc_kid\":\"f7b299b3a3dc69cc\",\"host_id\":\"host-a\",\"host_trust_gen\":1},\"sealed_hash\":\"2d9aefc21c93397e8c29639913002b7d84cadfd3bb444f367585d1e5af1f685d\",\"sender\":{\"host_id\":\"host-b\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-result\",\"v\":1},\"ct\":\"RQysSVqy59TiP_Enmqed6I_sKyujkrCo4HujrxbFAveV2kJRejQs8RalN4Gayq0DJKONRNLqswd4_2WYS2orZv91jl-Pfcmzlk5_-NckK9N4etwiehmz6LYbqkmGt1iVb_tEsOudvDKaUqD2g7b-wg\",\"enc\":\"U8o-7AmGa0vo9Pfqa5i37T93FthXpeFesz4mTpHJx1M\",\"sig\":\"1BUzQK4Z43qFVrOVGzfvIseSpYveiH80icpCp19-aLS-eG9vXSiUUnAD2B_uXVaIL5KhgoplGmVFU72QiW5CAA\"},\"op\":\"mailbox_put\",\"request_id\":\"00000011-0000-4000-8000-000000000004\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-b",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "stored",
+            "position": 1
+          },
+          "note": "to host-a",
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-a",
+                "host_trust_gen": 1,
+                "mailbox_id": "f059d749-5017-4245-9b05-53e8179e7df9",
+                "stored": [
+                  {
+                    "bytes": 862,
+                    "expires_at": 1793624400000,
+                    "id": "d5f9e93e-1e38-4383-9929-0c56a96419bc",
+                    "object_hash": "ef4d83cbc276b5f62f2a89cc0c84f9326fd43e895b219eaa1c47d9a63bbfead6",
+                    "position": 1,
+                    "sender": "host-b"
+                  }
+                ]
+              },
+              {
+                "head": 2,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  },
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "6ab12a9c-2616-4301-9609-5b99a792a94d",
+                    "object_hash": "f15847dd8f82d204ba927de0051c6f6b9d69a0ad1371afc342b80f62f4e75a1c",
+                    "position": 2,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-evil",
+          "host_trust_gen": 1
+        }
+      ],
+      "name": "receiving_host_quota_in_encoded_bytes",
+      "note": "a receiving host's quota of twice o1's encoded size: its mailbox takes two, then refuses `quota`; another receiving host's isn't held",
+      "quotas": {
+        "account": {
+          "bytes": 1073741824,
+          "objects": 1024
+        },
+        "receiver": {
+          "bytes": 1648,
+          "objects": 100
+        },
+        "sender": {
+          "bytes": 1073741824,
+          "objects": 1024
+        }
+      }
+    },
+    {
+      "events": [
+        {
+          "answer": "{\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"op\":\"mailbox_stored\",\"request_id\":\"00000012-0000-4000-8000-000000000001\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"64d5806c-3e43-4bfb-bcbe-dc80e4691063\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"ce1430de770840ba015c4220dcf392072c0bd860273d7142f59883c62d17f6bf\",\"sender\":{\"host_id\":\"host-a\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"RJPseAOHf-xPck3LL7DNc8cLoaeM01FY042O4GqYebYzklWbfKflYKRUDKkslNY5QNdpkwAjo3t0dGQS9cCC7tc92txfTGlCTBQaxhAWx3z_zQ\",\"enc\":\"p5QLVH9666Jdx-l-o1kJpJqTaEPaduFX_20ed3DP230\",\"sig\":\"DnUrFsthi2OC9IlzKTDqVOJG4tzoJPP6cko9QDgYOg9Ro2mvEkAheeM3PSVeaI2UZKF-kpjOjer3m5MrV6aAAw\"},\"op\":\"mailbox_put\",\"request_id\":\"00000012-0000-4000-8000-000000000001\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-a",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "stored",
+            "position": 1
+          },
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 1,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"id\":\"374ef4a2-c2bf-4f7f-bff3-849600b8a6d2\",\"op\":\"mailbox_stored\",\"request_id\":\"00000012-0000-4000-8000-000000000002\",\"type\":\"relay\"}",
+          "at": 1793620860000,
+          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"374ef4a2-c2bf-4f7f-bff3-849600b8a6d2\",\"recipient\":{\"enc_kid\":\"5111aaa2578909e8\",\"host_id\":\"host-b\",\"host_trust_gen\":1},\"sealed_hash\":\"c79d308a3eb5d3338bbd7529540a1dea34711b3ea40b1d083af2bee08b795fb1\",\"sender\":{\"host_id\":\"host-evil\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"ocm8s53-SBCCIabRymDzTsC5igcKdo_42uv34btkglRTlTXemR93kOF9sDt6p-_bo714JBScnxMGWJzo3YTaOaneBrDCppUMKqjr0xb4FmNang\",\"enc\":\"UMIz0KsAjQJqfc_PRBplgyO-zqvkOwvJ8n_h4ZFBRxE\",\"sig\":\"5Z2eJklop0M8MIRXCOPMVR1LWynLWtLc-iCtwpJ2QicQujd1MFrMsXOYnPp7VZRpeQByG3I_N_c1t4cNrQpvAg\"},\"op\":\"mailbox_put\",\"request_id\":\"00000012-0000-4000-8000-000000000002\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-evil",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "outcome": "stored",
+            "position": 2
+          },
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 2,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  },
+                  {
+                    "bytes": 827,
+                    "expires_at": 1793624400000,
+                    "id": "374ef4a2-c2bf-4f7f-bff3-849600b8a6d2",
+                    "object_hash": "79cef093f8443bede88667a384349aef38243d40f77b694afc51b361b314dac9",
+                    "position": 2,
+                    "sender": "host-evil"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "answer": "{\"code\":\"quota\",\"id\":\"88d531d1-5e1b-4749-aa49-32dd6fb00516\",\"op\":\"mailbox_put_refused\",\"request_id\":\"00000012-0000-4000-8000-000000000003\",\"type\":\"relay\"}",
+          "at": 1793620920000,
+          "call": "{\"object\":{\"body\":{\"account_id\":\"acct-test-1\",\"created_at\":1793620800000,\"expires_at\":1793624400000,\"genesis_hash\":\"93501542f5f9f4a7ce3d08f79e267d4d80df3f8e35ae852f47216e3cc559cd89\",\"id\":\"88d531d1-5e1b-4749-aa49-32dd6fb00516\",\"recipient\":{\"enc_kid\":\"f7b299b3a3dc69cc\",\"host_id\":\"host-a\",\"host_trust_gen\":1},\"sealed_hash\":\"74d262be4939fa46bc65cfcb9541daa51ead4ce532ada649556e63384060bd05\",\"sender\":{\"host_id\":\"host-evil\",\"host_trust_gen\":1},\"signed_at_head\":{\"hash\":\"0e31ae8e1c92f5686442118f6059a00984bc86a6afb5f62cbd69d96de40c1128\",\"seq\":10},\"type\":\"atem-envelope\",\"v\":1},\"ct\":\"lH-YT4YgXOkzeHTJU7Vzqf_t4kG0JkHWv8aShFN64puN0bTbzrhIeHI0S3UXMp4qJne8vAEHvUYeaDjxHljxLwjWMy7cRp9-DUE3sPu2wfMWvg\",\"enc\":\"RvUUGMAFVU4-fXlTo-MGFUcvosLl-JNPdv73dkRYHiM\",\"sig\":\"fseaRoivcg55YLuPksZb9ZKiciTZLL1HQvcI0F36DfPjUbvNAsm48D219x0bRDOaeVwAYNLxTIy5TaBRQLpJCA\"},\"op\":\"mailbox_put\",\"request_id\":\"00000012-0000-4000-8000-000000000003\",\"type\":\"relay\"}",
+          "caller": {
+            "host_id": "host-evil",
+            "host_trust_gen": 1
+          },
+          "event": "call",
+          "expect": {
+            "code": "quota",
+            "outcome": "put_refused"
+          },
+          "note": "host-a's mailbox isn't minted",
+          "state": {
+            "dropped": 0,
+            "mailboxes": [
+              {
+                "head": 2,
+                "host_id": "host-b",
+                "host_trust_gen": 1,
+                "mailbox_id": "fcf2c48e-5be0-485b-9abd-ee3721901668",
+                "stored": [
+                  {
+                    "bytes": 824,
+                    "expires_at": 1793624400000,
+                    "id": "64d5806c-3e43-4bfb-bcbe-dc80e4691063",
+                    "object_hash": "1bb950422aab1b27e9c325ae6cb1767ecd7b0195b6e87eb12f1d602324ae4291",
+                    "position": 1,
+                    "sender": "host-a"
+                  },
+                  {
+                    "bytes": 827,
+                    "expires_at": 1793624400000,
+                    "id": "374ef4a2-c2bf-4f7f-bff3-849600b8a6d2",
+                    "object_hash": "79cef093f8443bede88667a384349aef38243d40f77b694afc51b361b314dac9",
+                    "position": 2,
+                    "sender": "host-evil"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "hosts": [
+        {
+          "host_id": "host-a",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-b",
+          "host_trust_gen": 1
+        },
+        {
+          "host_id": "host-evil",
+          "host_trust_gen": 1
+        }
+      ],
+      "name": "account_quota_in_encoded_bytes_mints_no_mailbox",
+      "note": "an account quota of o1's and e1's encoded sizes: a third object, to host-a, which has no mailbox yet, is refused `quota`, and a refused put mints no mailbox",
+      "quotas": {
+        "account": {
+          "bytes": 1651,
+          "objects": 100
+        },
+        "receiver": {
+          "bytes": 1073741824,
+          "objects": 1024
+        },
+        "sender": {
+          "bytes": 1073741824,
+          "objects": 1024
         }
       }
     }

@@ -22,13 +22,12 @@ use atem_client::control::{
 };
 use atem_client::encoding::{Hash32, enc, hex};
 use atem_client::host_mail::mailbox::{
-    MAX_MAILBOX_MESSAGE_BYTES, MailboxCallRefused, MailboxDone, MailboxDoneResult, MailboxEntry,
-    MailboxPut, MailboxPutRefused, MailboxRefusedCall, MailboxStored, MailboxSync,
-    MailboxSyncResult, MailboxToHost, MailboxToStation, PutRefusal,
+    MAX_MAILBOX_MESSAGE_BYTES, MAX_SERVED_OBJECT_BYTES, MailboxCallRefused, MailboxDone,
+    MailboxDoneResult, MailboxEntry, MailboxPut, MailboxPutRefused, MailboxRefusedCall,
+    MailboxStored, MailboxSync, MailboxSyncResult, MailboxToHost, MailboxToStation, PutRefusal,
 };
 use atem_client::host_mail::reference::{
-    CurrentHosts, Dropped, MAX_LIFETIME_MS, MAX_SERVED_OBJECT_BYTES, Outcome, Quota, Quotas,
-    ReferenceMailbox, Reset,
+    CurrentHosts, Dropped, MAX_LIFETIME_MS, Outcome, Quota, Quotas, ReferenceMailbox, Reset,
 };
 use atem_client::host_mail::{
     EnvelopePlain, HostRef, MailFields, ResultPlain, object_hash, seal_envelope_with_ikm,
@@ -480,10 +479,7 @@ fn calls(objects: &Objects) -> Vec<Value> {
             "host-b puts an atem-result to host-a: the Station takes both kinds, reading the body only",
         ),
     ] {
-        let put = MailboxPut {
-            request_id: R1.into(),
-            object: object.clone(),
-        };
+        let put = MailboxPut::new(R1, object.clone());
         out.push(call_case(
             name,
             "to_station",
@@ -621,11 +617,7 @@ fn calls(objects: &Objects) -> Vec<Value> {
 fn build(op: &str, f: &Value) -> Value {
     let object = |v: &Value| SignedObject::parse(text(v).as_bytes()).unwrap();
     match op {
-        "mailbox_put" => MailboxPut {
-            request_id: s(f, "request_id").into(),
-            object: object(&f["object"]),
-        }
-        .to_json(),
+        "mailbox_put" => MailboxPut::new(s(f, "request_id"), object(&f["object"])).to_json(),
         "mailbox_stored" => MailboxStored {
             request_id: s(f, "request_id").into(),
             id: s(f, "id").into(),
@@ -685,7 +677,7 @@ fn build(op: &str, f: &Value) -> Value {
 fn describe_to_station(m: &MailboxToStation) -> Value {
     match m {
         MailboxToStation::Put(p) => {
-            json!({"request_id": p.request_id, "object": p.object.to_json()})
+            json!({"request_id": p.request_id, "object": p.object().to_json()})
         }
         MailboxToStation::Sync(c) => {
             json!({"request_id": c.request_id, "mailbox_id": c.mailbox_id, "after": c.after})
@@ -747,27 +739,38 @@ fn from_recipe(recipe: &Value) -> String {
     )
 }
 
-/// A put of `o1` exactly `bytes` long: its `ct` a run of `A`s (zero bytes in
-/// base64url), and a space after the message when a run of that length
-/// isn't base64url. Its object is far over what a page can carry.
-fn big_put(objects: &Objects, request_id: &str, bytes: usize) -> Value {
-    let mut wire = MailboxPut {
-        request_id: request_id.into(),
-        object: objects.get("o1").clone(),
-    }
-    .to_json()
-    .unwrap();
-    wire["object"]["ct"] = json!("@");
-    let whole = text(&wire);
-    let (prefix, suffix) = whole.split_once('@').unwrap();
-    let mut suffix = suffix.to_owned();
-    let mut count = bytes - prefix.len() - suffix.len();
+/// A put of `o1` whose object, as received, is exactly `object_len` bytes:
+/// its `ct` a run of `A`s (zero bytes in base64url), after `inner` spaces
+/// following the object's opening brace (one more when a run of the length
+/// left isn't base64url), the message padded with spaces after it to `total`
+/// bytes. The object's compact JSON is `object_len` less those spaces.
+fn big_put(
+    objects: &Objects,
+    request_id: &str,
+    object_len: usize,
+    inner: usize,
+    total: usize,
+) -> Value {
+    let mut object = objects.get("o1").to_json();
+    object["ct"] = json!("@");
+    let object_text = text(&object);
+    let (o_prefix, o_suffix) = object_text.split_once('@').unwrap();
+    let mut inner = inner;
+    let mut count = object_len - inner - o_prefix.len() - o_suffix.len();
     if count % 4 == 1 {
         count -= 1;
-        suffix.push(' ');
+        inner += 1;
     }
-    let recipe = fill_recipe(prefix, "A", count, &suffix);
-    assert_eq!(from_recipe(&recipe).len(), bytes);
+    let head = format!("{{\"object\":{{{}{}", " ".repeat(inner), &o_prefix[1..]);
+    let tail = format!(
+        "{o_suffix},\"op\":\"mailbox_put\",\"request_id\":\"{request_id}\",\"type\":\"relay\"}}"
+    );
+    let pad = total - head.len() - count - tail.len();
+    let recipe = fill_recipe(&head, "A", count, &format!("{tail}{}", " ".repeat(pad)));
+    let wire = from_recipe(&recipe);
+    assert_eq!(wire.len(), total);
+    let value: Value = serde_json::from_str(&wire).unwrap();
+    assert_eq!(text(&value["object"]).len(), object_len - inner, "compact");
     recipe
 }
 
@@ -1242,10 +1245,10 @@ fn invalid(objects: &Objects, calls: &[Value]) -> Vec<Value> {
     out
 }
 
-/// The texts at and over the bound, as recipes.
+/// The texts at and over the bounds, as recipes.
 fn bounds(objects: &Objects) -> Vec<Value> {
-    let at = big_put(objects, R1, MAX_MAILBOX_MESSAGE_BYTES);
-    let over = big_put(objects, R1, MAX_MAILBOX_MESSAGE_BYTES + 1);
+    let max = MAX_MAILBOX_MESSAGE_BYTES;
+    let served = MAX_SERVED_OBJECT_BYTES;
     let page_over = {
         let wire = MailboxDoneResult {
             request_id: R3.into(),
@@ -1256,23 +1259,39 @@ fn bounds(objects: &Objects) -> Vec<Value> {
         .unwrap();
         let whole = text(&wire);
         // Spaces after the message: a done result of 524,289 bytes.
-        fill_recipe(&whole, " ", MAX_MAILBOX_MESSAGE_BYTES + 1 - whole.len(), "")
+        fill_recipe(&whole, " ", max + 1 - whole.len(), "")
     };
     vec![
         json!({
             "name": "put_at_the_bound",
             "op": "mailbox_put",
             "reader": "to_station",
-            "note": "a put of exactly 524,288 bytes: read (its object's ct a run of zero bytes; the Station never opens it)",
-            "wire_fill": at,
+            "note": "a put of exactly 524,288 bytes whose object, as received, is exactly max_served_object_bytes (524,013): read; a page carries it at every position (the message padded with spaces after it; the object's ct a run of zero bytes: the Station never opens it)",
+            "wire_fill": big_put(objects, R1, served, 0, max),
             "accepts": true,
+        }),
+        json!({
+            "name": "put_object_over_what_a_page_carries",
+            "op": "mailbox_put",
+            "reader": "to_station",
+            "note": "a put of 524,288 bytes whose object, as received, is 524,014 bytes: a page with every number at its largest couldn't carry it (one at position 1 could, up to 524,073, but the bound is position-independent): too_large",
+            "wire_fill": big_put(objects, R1, served + 1, 0, max),
+            "code": "too_large",
+        }),
+        json!({
+            "name": "put_object_spaced_over_what_a_page_carries",
+            "op": "mailbox_put",
+            "reader": "to_station",
+            "note": "an object of 524,014 bytes as received, 8 of them spaces inside it: its compact JSON is under the bound, but the bytes as received count: too_large",
+            "wire_fill": big_put(objects, R1, served + 1, 8, max),
+            "code": "too_large",
         }),
         json!({
             "name": "put_over_the_bound",
             "op": "mailbox_put",
             "reader": "to_station",
-            "note": "a byte more: refused before any parse",
-            "wire_fill": over,
+            "note": "a put of 524,289 bytes: refused before any parse",
+            "wire_fill": big_put(objects, R1, served, 0, max + 1),
             "code": "too_large",
         }),
         json!({
@@ -1562,7 +1581,6 @@ fn outcome_json(o: &Outcome) -> Value {
         }
         Outcome::PutRefused(code) => json!({"outcome": "put_refused", "code": code.code()}),
         Outcome::Dropped(Dropped::Unread(e)) => json!({"outcome": "dropped", "why": e.code()}),
-        Outcome::Dropped(Dropped::Unserved) => json!({"outcome": "dropped", "why": "unserved"}),
         Outcome::Page {
             through,
             position,
@@ -1716,10 +1734,7 @@ impl<'a> Scenario<'a> {
     }
 
     fn put(&mut self, at: u64, caller: (&str, u64), label: &str, expect: Value, note: &str) {
-        let put = MailboxPut {
-            request_id: self.request_id(),
-            object: self.objects.get(label).clone(),
-        };
+        let put = MailboxPut::new(self.request_id(), self.objects.get(label).clone());
         self.call(at, caller, text(&put.to_json().unwrap()), expect, note);
     }
 
@@ -2366,6 +2381,9 @@ fn scenarios(objects: &Objects) -> Vec<Value> {
         "host-b removed from the Station's copy of the list",
     );
     sc.put(at(2), A, "o2", put_refused("forbidden"), "");
+    let mailbox = sc.mailbox_id(B);
+    sc.sync(at(2), B, &mailbox, 0, refused("mailbox_sync_refused"), "host-b's own mailbox, but host-b is no current host of the list: refused, as a put would be");
+    sc.done(at(2), B, &mailbox, 1, refused("mailbox_done_refused"), "");
     out.push(sc.finish());
 
     // 13
@@ -2373,16 +2391,13 @@ fn scenarios(objects: &Objects) -> Vec<Value> {
         objects,
         13,
         "calls_the_station_drops",
-        "a call the shared core's reader refuses gets no answer: the Station drops and counts it, and the sender retires it at its deadline; so does a put whose object no page could carry",
+        "a call the shared core's reader refuses gets no answer: the Station drops and counts it, and the sender retires it at its deadline; a put whose object a page couldn't carry at every position is one (too_large)",
         Quotas::default(),
     );
     sc.call(at(1), A, "not json".into(), dropped("not_strict"), "");
-    let mut no_id = MailboxPut {
-        request_id: sc.request_id(),
-        object: objects.get("o1").clone(),
-    }
-    .to_json()
-    .unwrap();
+    let mut no_id = MailboxPut::new(sc.request_id(), objects.get("o1").clone())
+        .to_json()
+        .unwrap();
     no_id["object"]["body"]
         .as_object_mut()
         .unwrap()
@@ -2394,12 +2409,9 @@ fn scenarios(objects: &Objects) -> Vec<Value> {
         dropped("malformed"),
         "no id in its body",
     );
-    let mut short_enc = MailboxPut {
-        request_id: sc.request_id(),
-        object: objects.get("o1").clone(),
-    }
-    .to_json()
-    .unwrap();
+    let mut short_enc = MailboxPut::new(sc.request_id(), objects.get("o1").clone())
+        .to_json()
+        .unwrap();
     short_enc["object"]["enc"] = json!(atem_client::encoding::b64u(&[7u8; 31]));
     sc.call(
         at(1),
@@ -2421,12 +2433,22 @@ fn scenarios(objects: &Objects) -> Vec<Value> {
         dropped("wrong_message"),
         "a Station's message, sent to it",
     );
+    let (max, served) = (MAX_MAILBOX_MESSAGE_BYTES, MAX_SERVED_OBJECT_BYTES);
     let request_id = sc.request_id();
-    let at_bound = big_put(objects, &request_id, MAX_MAILBOX_MESSAGE_BYTES);
-    sc.call_fill(at(1), A, at_bound, dropped("unserved"), "a put of exactly 524,288 bytes: read, but no page could carry its object (Atem's reading, for Astation's agreement)");
+    let over_served = big_put(objects, &request_id, served + 1, 0, max);
+    sc.call_fill(at(1), A, over_served, dropped("too_large"), "a put of 524,288 bytes whose object, as received, is 524,014: the reader refuses it (Atem's reading, for Astation's agreement)");
     let request_id = sc.request_id();
-    let over = big_put(objects, &request_id, MAX_MAILBOX_MESSAGE_BYTES + 1);
-    sc.call_fill(at(1), A, over, dropped("too_large"), "");
+    let spaced = big_put(objects, &request_id, served + 1, 8, max);
+    sc.call_fill(at(1), A, spaced, dropped("too_large"), "the same with 8 spaces inside the object: its compact JSON is under the bound, the bytes as received are over");
+    let request_id = sc.request_id();
+    let over = big_put(objects, &request_id, served, 0, max + 1);
+    sc.call_fill(
+        at(1),
+        A,
+        over,
+        dropped("too_large"),
+        "a put of 524,289 bytes",
+    );
     sc.put(at(2), A, "o1", stored(1), "nothing was stored before");
     out.push(sc.finish());
 
@@ -2452,12 +2474,121 @@ fn scenarios(objects: &Objects) -> Vec<Value> {
     sc.heads(at(2), B, false, None, "");
     out.push(sc.finish());
 
+    // 15
+    let mut sc = Scenario::new(
+        objects,
+        15,
+        "the_largest_object_a_page_carries",
+        "a put of exactly 524,288 bytes whose object, as received, is exactly max_served_object_bytes: stored, and charged its 524,013 bytes",
+        Quotas::default(),
+    );
+    let request_id = sc.request_id();
+    let at_bound = big_put(objects, &request_id, served, 0, max);
+    sc.call_fill(at(1), A, at_bound, stored(1), "");
+    sc.heads(at(1), B, true, Some(1), "");
+    out.push(sc.finish());
+
+    // 16
+    let mut sc = Scenario::new(
+        objects,
+        16,
+        "charged_as_received",
+        "the quotas count an object's exact bytes as received (design II.4.3, \"the encoded wire bytes it received\"), not its compact form; a page serves it compact",
+        Quotas::default(),
+    );
+    let spaced = format!(
+        "{{\"type\":\"relay\",\"op\":\"mailbox_put\",\"request_id\":\"{}\",\"object\":{}}}",
+        sc.request_id(),
+        respaced(objects.get("o1"))
+    );
+    sc.call(
+        at(1),
+        A,
+        spaced,
+        stored(1),
+        "o1 with its keys in another order and spaces: charged those bytes",
+    );
+    sc.put(
+        at(2),
+        A,
+        "o1",
+        already(1),
+        "o1 compact: the same object, charged nothing",
+    );
+    sc.heads(at(2), B, true, Some(1), "");
+    let mailbox = sc.mailbox_id(B);
+    sc.sync(
+        at(3),
+        B,
+        &mailbox,
+        0,
+        page(1, Some(1)),
+        "the page carries o1 compact",
+    );
+    sc.done(at(3), B, &mailbox, 1, done(true), "");
+    sc.put(
+        at(4),
+        A,
+        "o1",
+        stored(2),
+        "sent again compact: charged its compact bytes",
+    );
+    out.push(sc.finish());
+
+    // 17
+    let mut sc = Scenario::new(
+        objects,
+        17,
+        "receiving_host_quota_in_encoded_bytes",
+        "a receiving host's quota of twice o1's encoded size: its mailbox takes two, then refuses `quota`; another receiving host's isn't held",
+        Quotas {
+            sender: roomy,
+            receiver: Quota {
+                objects: 100,
+                bytes: 2 * one,
+            },
+            account: roomy,
+        },
+    );
+    sc.put(at(1), A, "o1", stored(1), "");
+    sc.put(at(1), A, "o2", stored(2), "");
+    sc.put(at(2), A, "o3", put_refused("quota"), "");
+    sc.put(at(2), B, "r1", stored(1), "to host-a");
+    out.push(sc.finish());
+
+    // 18
+    let e1 = objects.get("e1").to_json().to_string().len() as u64;
+    let mut sc = Scenario::new(
+        objects,
+        18,
+        "account_quota_in_encoded_bytes_mints_no_mailbox",
+        "an account quota of o1's and e1's encoded sizes: a third object, to host-a, which has no mailbox yet, is refused `quota`, and a refused put mints no mailbox",
+        Quotas {
+            sender: roomy,
+            receiver: roomy,
+            account: Quota {
+                objects: 100,
+                bytes: one + e1,
+            },
+        },
+    );
+    sc.put(at(1), A, "o1", stored(1), "");
+    sc.put(at(1), EVIL, "e1", stored(2), "");
+    sc.put(
+        at(2),
+        EVIL,
+        "e_to_a",
+        put_refused("quota"),
+        "host-a's mailbox isn't minted",
+    );
+    out.push(sc.finish());
+
     out
 }
 
 // ----------------------------------------------------------------- file
 
-const NOTE: &str = "The mailbox calls of host-work-v1 §11.5 (rules 1 to 11, agreed with Astation 2026-11-16) as the shared core's builders write them and its readers read them, and scenarios run against the Station's reference mailbox (atem_client::host_mail::reference::ReferenceMailbox). `objects`: the mailbox objects the calls carry ({label, note, object, object_hash, bytes}; `bytes` is the object's compact JSON, what a page carries and the quotas count), atem-envelope and atem-result objects sealed and signed by host-a, host-b and host-evil with their r9-vectors-keys host keys (the Station reads the body only and never verifies or opens). `object_hash`: known answers of SHA-256(enc([jcs(body), sig, enc, ct])), sig, enc and ct as decoded bytes, over `object_text` (a copy serialized again is the same object). `calls`: every valid message {name, op, direction, note, fields, wire}: `wire` is the exact text (compact, keys in RFC 8785 order, the builders' order), `direction` the reader that reads it (to_station: a host's call; to_host: a Station's answer; the other refuses it as wrong_message), `fields` what it reads as (a page's object as a value). `invalid`: texts a reader refuses {name, op, reader, code, wire}, one fault each, with the code the reader gives: too_large (over `max_message_bytes`, before any parse), not_strict, wrong_message, unknown_field or malformed. `bounds`: texts at and over the bound as `wire_fill` recipes ({prefix, fill, count, suffix, bytes}: prefix, count times fill, suffix), `accepts` or a `code`. `heads`: the calling host's mailbox head in heads (rule 6), read with the mailbox (`reader: mailbox`, a host whose welcome lists host.senders) or strictly (`reader: strict`, every other host): `accepts.mailbox` (absent: none announced) or a `code`; heads keeps its 256 KiB bound (`max_heads_bytes`). `scenarios`: event sequences against a fresh reference mailbox of the device list (`link.account_id`, `link.genesis_hash`) with the scenario's `quotas` and current `hosts`, seeded with `seed_hex`: each mailbox_id is the first 16 bytes of SHA-256(enc([\"atem-reference-mailbox-id-v1\", seed, account_id, genesis_hash (32 bytes), host_id, u64(host_trust_gen), u64(n)])) as a lowercase UUID v4 (version 4, variant 10), n counting the mailboxes minted for that receiving host from 0 (a Station mints a random one; the seed makes the vectors reproducible). Events: `call` (the bytes `call`, or the `call_fill` recipe, received at `at` ms on the link of `caller`, of `link`'s account, genesis and connection), `heads` (`heads_base` sent to `caller` at `at`, with `host_senders`), `reset` (of a receiving host's mailbox: `new_mailbox`, or `head_back` to a head under the same id), `hosts` (the Station's copy of the device list moved to these current hosts) and `tick` (the clock at `at`). Each call or heads gives `expect` (the outcome: stored or already_stored at a position, put_refused with a code, dropped with why: a reader's code or `unserved`, page with its through, position and reset, done with removed, refused with the refusal's op, heads with the mailbox announced) and `answer` (the exact text sent back; none when dropped). Every event gives `state` after it: dropped calls, and each mailbox minted (receiving host, mailbox_id, head, stored objects: position, sender, id, object_hash, bytes, expires_at). The model's rules (where §11.5 leaves a choice, its \"reference mailbox's readings\", Atem's, for Astation's agreement): every transition first removes each object whose expires_at is at or before its time; a call the reader refuses is dropped and counted; a put whose object's compact JSON is over `max_served_object_bytes` (no page could carry it at any position) is dropped too (Atem's reading, for Astation's agreement); a put is forbidden unless the caller is a current host at its link's generation, the body's sender host, of the link's account and genesis, and the recipient a current host at the generation it names; expired at or past its expires_at, with expires_at not after created_at, or more than `max_lifetime_ms` after it; then the key (calling host, body id) in the recipient's mailbox: the same object_hash is already_stored (charged nothing), another id_reused; then the quotas per sending host (its objects in every mailbox), receiving host (its mailbox) and account (every mailbox), objects and bytes; then stored at head + 1, which mints the recipient's mailbox if it has none. A sync or done naming anything but the caller's own mailbox is refused; a page lists the first stored object after `after` and its through is the position before the next stored object, or the head; with `after` past the head it is the reset page; a done removes what is at its position, if anything. A heads with host_senders mints the caller's mailbox if it has none. A reset to a new mailbox mints the next id and loses everything the old one held; head_back loses what was stored after that head and stores the next object after it.";
+const NOTE: &str = "The mailbox calls of host-work-v1 §11.5 (rules 1 to 11, agreed with Astation 2026-11-16) as the shared core's builders write them and its readers read them, and scenarios run against the Station's reference mailbox (atem_client::host_mail::reference::ReferenceMailbox). `objects`: the mailbox objects the calls carry ({label, note, object, object_hash, bytes}; `bytes` is the object's compact JSON, what a page carries, and what a put that carries it compact is charged), atem-envelope and atem-result objects sealed and signed by host-a, host-b and host-evil with their r9-vectors-keys host keys (the Station reads the body only and never verifies or opens). `object_hash`: known answers of SHA-256(enc([jcs(body), sig, enc, ct])), sig, enc and ct as decoded bytes, over `object_text` (a copy serialized again is the same object). `calls`: every valid message {name, op, direction, note, fields, wire}: `wire` is the exact text (compact, keys in RFC 8785 order, the builders' order), `direction` the reader that reads it (to_station: a host's call; to_host: a Station's answer; the other refuses it as wrong_message), `fields` what it reads as (a page's object as a value). `invalid`: texts a reader refuses {name, op, reader, code, wire}, one fault each, with the code the reader gives: too_large (over `max_message_bytes`, before any parse), not_strict, wrong_message, unknown_field or malformed. `bounds`: texts at and over the bounds (the message's, and an object's `max_served_object_bytes`) as `wire_fill` recipes ({prefix, fill, count, suffix, bytes}: prefix, count times fill, suffix), `accepts` or a `code`. `heads`: the calling host's mailbox head in heads (rule 6), read with the mailbox (`reader: mailbox`, a host whose welcome lists host.senders) or strictly (`reader: strict`, every other host): `accepts.mailbox` (absent: none announced) or a `code`; heads keeps its 256 KiB bound (`max_heads_bytes`). `scenarios`: event sequences against a fresh reference mailbox of the device list (`link.account_id`, `link.genesis_hash`) with the scenario's `quotas` and current `hosts`, seeded with `seed_hex`: each mailbox_id is the first 16 bytes of SHA-256(enc([\"atem-reference-mailbox-id-v1\", seed, account_id, genesis_hash (32 bytes), host_id, u64(host_trust_gen), u64(n)])) as a lowercase UUID v4 (version 4, variant 10), n counting the mailboxes minted for that receiving host from 0 (a Station mints a random one; the seed makes the vectors reproducible). A Station that mints random ids compares them up to a one-to-one renaming, learned from the heads, the answers and the states: every call names an id announced before it, but one that names an id no mailbox ever had (`only_the_mailboxs_own_host_syncs_and_marks_done`), which stays unknown under any renaming. Events: `call` (the bytes `call`, or the `call_fill` recipe, received at `at` ms on the link of `caller`, of `link`'s account, genesis and connection), `heads` (`heads_base` sent to `caller` at `at`, with `host_senders`), `reset` (of a receiving host's mailbox: `new_mailbox`, or `head_back` to a head under the same id), `hosts` (the Station's copy of the device list moved to these current hosts) and `tick` (the clock at `at`). Each call or heads gives `expect` (the outcome: stored or already_stored at a position, put_refused with a code, dropped with why: the reader's code, page with its through, position and reset, done with removed, refused with the refusal's op, heads with the mailbox announced) and `answer` (the exact text sent back; none when dropped). Every event gives `state` after it: dropped calls, and each mailbox minted (receiving host, mailbox_id, head, stored objects: position, sender, id, object_hash, bytes, expires_at). The model's rules (where §11.5 leaves a choice, its \"reference mailbox's readings\", Atem's, for Astation's agreement): every transition first removes each object whose expires_at is at or before its time; a call the reader refuses is dropped and counted, and the shared put reader refuses (too_large) a put whose object, as received, is over `max_served_object_bytes` (524,013 bytes: 512 KiB less a page's own fields with every number at its largest, so that a page carries the object at every position; a page at position 1 could carry up to 524,073 bytes, but the bound is deliberately position-independent: Atem's reading, for Astation's agreement); a put is forbidden unless the caller is a current host at its link's generation, the body's sender host, of the link's account and genesis, and the recipient a current host at the generation it names; expired at or past its expires_at, with expires_at not after created_at, or more than `max_lifetime_ms` after it; then the key (calling host, body id) in the recipient's mailbox: the same object_hash is already_stored (charged nothing), another id_reused; then the quotas per sending host (its objects in every mailbox), receiving host (its mailbox) and account (every mailbox), in objects and in bytes as received (the object's exact text in the put, not the call's own fields; design II.4.3, \"the encoded wire bytes it received\"); then stored at head + 1, which mints the recipient's mailbox if it has none: a refused put mints none, and a page serves the object compact. A sync or done from a caller that isn't a current host at its link's generation (as for a put), or naming anything but the caller's own mailbox, is refused; a page lists the first stored object after `after` and its through is the position before the next stored object, or the head; with `after` past the head it is the reset page; a done removes what is at its position, if anything. A heads with host_senders mints the caller's mailbox if it has none; heads is the Station's announcement, and checks no current host. A reset to a new mailbox mints the next id and loses everything the old one held; head_back loses what was stored after that head and stores the next object after it.";
 
 fn mailbox_call_vectors() -> Value {
     let objects = Objects::make();
@@ -2799,7 +2930,6 @@ fn mailbox_scenarios_cover_every_outcome() {
         "dropped malformed",
         "dropped wrong_message",
         "dropped too_large",
-        "dropped unserved",
         "page",
         "page reset",
         "done",

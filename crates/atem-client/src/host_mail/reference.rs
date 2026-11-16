@@ -28,16 +28,19 @@
 //! a choice, its "reference mailbox's readings", Atem's, for Astation's
 //! agreement):
 //! - **Mailboxes** (rule 2): one per receiving `(account_id, genesis_hash,
-//!   host_id, host_trust_gen)` of this device list, minted on the first put
-//!   to it or the first `heads` of its host, with a `mailbox_id` that is
-//!   never reused ([`mailbox_id`]) and positions 1, 2, … in store order.
-//! - **Puts** (rules 1 and 3), in this order: a put the reader refuses is
-//!   dropped unanswered and counted ([`Dropped::Unread`]), as is one whose
-//!   object no page could carry ([`Dropped::Unserved`], Atem's reading, for
-//!   Astation's agreement: [`MAX_SERVED_OBJECT_BYTES`]); `forbidden` unless
-//!   the caller is a current host at its generation, the object's sender,
-//!   of the link's account and root, and the recipient is a current host at
-//!   the generation the object names; `expired` when `now_ms` is at or past
+//!   host_id, host_trust_gen)` of this device list, minted by the first
+//!   object stored in it or the first `heads` with `host.senders` of its host
+//!   (a refused put mints none), with a `mailbox_id` that is never reused
+//!   ([`mailbox_id`]) and positions 1, 2, … in store order.
+//! - **Puts** (rules 1 and 3), in this order: a put the shared reader
+//!   refuses is dropped unanswered and counted ([`Dropped::Unread`]), one
+//!   whose object, as received, is over what a page can carry at every
+//!   position included (`too_large`, the reader's
+//!   [`MAX_SERVED_OBJECT_BYTES`](super::mailbox::MAX_SERVED_OBJECT_BYTES):
+//!   Atem's reading, for Astation's agreement); `forbidden` unless the caller
+//!   is a current host at its link's generation, the object's sender, of the
+//!   link's account and root, and the recipient is a current host at the
+//!   generation the object names; `expired` when `now_ms` is at or past
 //!   `expires_at`, or `expires_at` isn't after `created_at`, or is more than
 //!   24 hours after it (Atem's reading, agreed with Astation 2026-11-16);
 //!   then the key `(calling host_id, body.id)` within the recipient's
@@ -48,9 +51,11 @@
 //! - **Quotas** ([`Quotas`], design II.4.3's starting figures by default):
 //!   per sending host (the calling `host_id`), per receiving host (its
 //!   mailbox) and per account (this device list), each in objects and in
-//!   encoded bytes, an object counting its compact JSON, the bytes a page
-//!   carries. A stored object is charged once; a resend after it was
-//!   removed is a new delivery, charged again.
+//!   encoded bytes as received: the object's exact text in the put
+//!   ([`super::mailbox::MailboxPut::object_bytes`]; design II.4.3, "the
+//!   encoded wire bytes it received"), not the call's own fields. A stored
+//!   object is charged once; a resend after it was removed is a new
+//!   delivery, charged again. A page serves the object compact.
 //! - **Pages** (rule 4): at most one object; `through` is fixed and covers
 //!   every removed or expired position up to the next stored object (or
 //!   the head); a call whose `after` is beyond the head gets the reset
@@ -58,14 +63,17 @@
 //! - **Done** (rule 5): only on the caller's own mailbox; removes the object
 //!   there, if any, freeing its key and quota, and answers the same either
 //!   way.
-//! - **Sync and done name only the caller's own mailbox** (rule 1): any
-//!   other `mailbox_id` (another host's, an old one after a reset, an
-//!   unknown one) is refused `forbidden`, and nothing of another mailbox is
-//!   served or removed.
+//! - **Sync and done come only from a current host and name only its own
+//!   mailbox** (rule 1): a caller that isn't a current host of the list at
+//!   its link's generation (as for a put), or any other `mailbox_id`
+//!   (another host's, an old one after a reset, an unknown one), is refused
+//!   `forbidden`, and nothing of another mailbox is served or removed.
 //! - **Expiry**: every transition first removes each object whose
 //!   `expires_at` is at or before its `now_ms` (the receiver's `expired`).
 //! - **Heads** (rule 6): `mailbox:{mailbox_id, head}`, the caller's own,
-//!   only for a host whose `welcome` lists `host.senders`.
+//!   only for a host whose `welcome` lists `host.senders`. It is the
+//!   Station's announcement on the link, not a call: it checks no current
+//!   host.
 //! - **Resets** (rule 7): [`Reset::NewMailbox`], a Station that can't vouch
 //!   for a mailbox's positions minting a new one (what it held is lost and
 //!   its keys and quota freed), or [`Reset::HeadBack`], a mailbox gone back
@@ -74,7 +82,9 @@
 //!
 //! **Not modelled:** reserved capacity for small control objects (rule 3:
 //! the Station's own, from the body's `type` and the object's size),
-//! answering within 30 seconds (rule 8), and persistence.
+//! answering within 30 seconds (rule 8), when `heads` goes (rule 6: on each
+//! connection, every 30 seconds and at once when an object is stored; here
+//! [`ReferenceMailbox::heads`] is asked for), and persistence.
 use std::collections::BTreeMap;
 
 use serde_json::Value;
@@ -95,17 +105,6 @@ use crate::signed::SignedObject;
 /// The longest lifetime an object may have: `expires_at` at most 24 hours
 /// after `created_at` (rule 3).
 pub const MAX_LIFETIME_MS: u64 = 24 * 60 * 60 * 1000;
-
-/// The most bytes an object's compact JSON may take for a page to carry it
-/// at any position: 512 KiB
-/// ([`super::mailbox::MAX_MAILBOX_MESSAGE_BYTES`]) less the page's own
-/// fields at their largest (positions of 2^53 − 1). A put may carry an
-/// object up to 178 bytes larger (its own fields are fewer); such an object
-/// could never be served, and rule 4 would keep every later object behind
-/// it, so the model drops its put as one it can't take (Atem's reading, for
-/// Astation's agreement). No builder makes one: the largest sealed object
-/// is about 328 KB.
-pub const MAX_SERVED_OBJECT_BYTES: usize = 524_013;
 
 /// One limit: at most `objects` objects and `bytes` encoded bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,11 +221,11 @@ pub enum Reset {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dropped {
     /// The shared core's reader refused it (rule 3, "A put the Station can't
-    /// read"; any other call likewise).
+    /// read", a put whose object a page couldn't carry at every position
+    /// included, `too_large`:
+    /// [`MAX_SERVED_OBJECT_BYTES`](super::mailbox::MAX_SERVED_OBJECT_BYTES);
+    /// any other call likewise).
     Unread(RelayError),
-    /// A put whose object no page could carry
-    /// ([`MAX_SERVED_OBJECT_BYTES`]).
-    Unserved,
 }
 
 /// What a transition did.
@@ -294,7 +293,7 @@ struct Stored {
     id: String,
     object_hash: Hash32,
     object: SignedObject,
-    /// Its compact JSON's length, what it is charged.
+    /// Its exact bytes as received, what it is charged.
     bytes: u64,
     expires_at: u64,
 }
@@ -643,22 +642,23 @@ impl ReferenceMailbox {
         self.mailboxes.get_mut(&key).expect("inserted above")
     }
 
-    /// The caller's own mailbox, when `mailbox_id` names it (rule 1).
+    /// The caller's own mailbox, when `mailbox_id` names it and the caller
+    /// is a current host of the list at its link's generation (rule 1, as
+    /// for a put).
     fn own(&self, caller: &LinkAssociation, mailbox_id: &str) -> Option<(String, u64)> {
         let key = (caller.host_id.clone(), caller.host_trust_gen);
-        self.mailboxes
+        let named = self
+            .mailboxes
             .get(&key)
-            .is_some_and(|m| m.mailbox_id == mailbox_id)
-            .then_some(key)
+            .is_some_and(|m| m.mailbox_id == mailbox_id);
+        (named && self.hosts.is_current(&key.0, key.1)).then_some(key)
     }
 
     /// Rules 1 and 3.
     fn put(mut self, caller: &LinkAssociation, put: MailboxPut, now_ms: u64) -> MailboxTransition {
         let (_, body) = put.mail().expect("the reader read the body");
-        let bytes = put.object.to_json().to_string().len();
-        if bytes > MAX_SERVED_OBJECT_BYTES {
-            return self.drop_call(Dropped::Unserved);
-        }
+        // Charged as received (design II.4.3); the reader bounded it.
+        let bytes = put.object_bytes().len() as u64;
         let refuse = |next: ReferenceMailbox, code: PutRefusal| MailboxTransition {
             answer: Some(
                 MailboxPutRefused {
@@ -694,17 +694,20 @@ impl ReferenceMailbox {
         {
             return refuse(self, PutRefusal::Expired);
         }
-        let hash = object_hash(&put.object);
+        let hash = object_hash(put.object());
         let recipient = (
             body.recipient.host_id.clone(),
             body.recipient.host_trust_gen,
         );
-        let mailbox = self.mailbox_or_mint(&recipient.0, recipient.1);
-        let held = mailbox
-            .objects
-            .iter()
-            .find(|(_, s)| s.sender == caller.host_id && s.id == body.id)
-            .map(|(position, s)| (*position, s.object_hash));
+        // Only a store mints the recipient's mailbox: a refused put leaves
+        // none behind.
+        let held = self.mailboxes.get(&recipient).and_then(|mailbox| {
+            mailbox
+                .objects
+                .iter()
+                .find(|(_, s)| s.sender == caller.host_id && s.id == body.id)
+                .map(|(position, s)| (*position, s.object_hash))
+        });
         match held {
             Some((position, held)) if held == hash => {
                 let answer = stored_answer(&put, &body);
@@ -717,7 +720,6 @@ impl ReferenceMailbox {
             Some(_) => return refuse(self, PutRefusal::IdReused),
             None => {}
         }
-        let bytes = bytes as u64;
         if self
             .sender_usage(&caller.host_id)
             .over(self.quotas.sender, bytes)
@@ -738,7 +740,7 @@ impl ReferenceMailbox {
                 sender: caller.host_id.clone(),
                 id: body.id.clone(),
                 object_hash: hash,
-                object: put.object,
+                object: put.object().clone(),
                 bytes,
                 expires_at: body.expires_at,
             },

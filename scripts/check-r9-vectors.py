@@ -3128,6 +3128,9 @@ MAILBOX_TO_HOST = [
 ]
 MAILBOX_PUT_CODES = ["quota", "id_reused", "expired", "forbidden"]
 MAILBOX_ID_LABEL = "atem-reference-mailbox-id-v1"
+# A put's object, as received, is at most 512 KiB less a page's own fields
+# with every number at its largest (rules 4 and 9; Atem's reading): checked
+# against the file's max_served_object_bytes, computed here.
 UUID_V4_EXAMPLE = "9d2f6c1e-3b4a-4c5d-8e6f-7a8b9c0d1e2f"  # any lowercase UUID v4: they are all 36 characters
 
 
@@ -3150,10 +3153,47 @@ def _mb_position(v, key):
     return n
 
 
-def _read_mailbox_put(v):
+def member_text(text, key):
+    """The exact text of the top-level member `key`'s value in the JSON
+    object `text` (strict already): walked token by token."""
+    decoder = json.JSONDecoder()
+    i, n = 0, len(text)
+
+    def skip(i):
+        while i < n and text[i] in " \t\n\r":
+            i += 1
+        return i
+
+    i = skip(i) + 1  # past the opening brace
+    while True:
+        i = skip(i)
+        if text[i] == "}":
+            return None
+        name, i = decoder.raw_decode(text, i)
+        i = skip(skip(i) + 1)  # past the colon
+        start = i
+        _, i = decoder.raw_decode(text, i)
+        if name == key:
+            return text[start:i]
+        i = skip(i)
+        if text[i] == ",":
+            i += 1
+
+
+def put_object_bytes(text):
+    """A put's object as received: its exact text's UTF-8 bytes."""
+    return len(member_text(text, "object").encode("utf-8"))
+
+
+def _read_mailbox_put(v, text, served):
     _relay_exact(v, ["type", "op", "request_id", "object"])
-    _relay_uuid4(_relay_text(v, "request_id"))
-    if "object" not in v or not mailbox_object_ok(v["object"]):
+    rid = _relay_text(v, "request_id")
+    if "object" not in v:
+        raise Refused("malformed")
+    if put_object_bytes(text) > served:
+        raise Refused("too_large")  # no page could carry it at every position
+    _relay_uuid4(rid)
+    if not mailbox_object_ok(v["object"]):
         raise Refused("malformed")
 
 
@@ -3235,10 +3275,11 @@ MAILBOX_READERS = {
 }
 
 
-def read_mailbox(text, reader):
+def read_mailbox(text, reader, served):
     """(message, None) if the reader reads `text`, else (None, its code): the
     512 KiB bound before any parse, one strict parse, a mailbox message of
-    the reader's direction, then its rules."""
+    the reader's direction, then its rules (a put's object, as received, at
+    most `served` bytes)."""
     try:
         if len(text.encode("utf-8")) > MAILBOX_MAX_BYTES:
             raise Refused("too_large")
@@ -3250,7 +3291,10 @@ def read_mailbox(text, reader):
         reader_for = MAILBOX_READERS[reader].get(op) if isinstance(op, str) else None
         if reader_for is None:
             raise Refused("wrong_message")
-        reader_for(value)
+        if op == "mailbox_put":
+            reader_for(value, text, served)
+        else:
+            reader_for(value)
         return value, None
     except Refused as refused:
         return None, refused.code
@@ -3339,16 +3383,17 @@ class MailStation:
 
     def call(self, caller, text, now):
         self.expire(now)
-        value, code = read_mailbox(text, "to_station")
+        value, code = read_mailbox(text, "to_station", self.max_served)
         if code:
             self.dropped += 1
             return {"outcome": "dropped", "why": code}, None
         op = value["op"]
         if op == "mailbox_put":
-            return self.put(caller, value, now)
+            return self.put(caller, value, put_object_bytes(text), now)
         key = (caller["host_id"], caller["host_trust_gen"])
         own = self.boxes.get(key)
-        if own is None or own["id"] != value["mailbox_id"]:
+        # Only a current host, and only its own mailbox (rule 1).
+        if own is None or own["id"] != value["mailbox_id"] or self.hosts.get(key[0]) != key[1]:
             refusal = op + "_refused"
             return {"outcome": "refused", "op": refusal}, compact_ijson({"type": "relay", "op": refusal, "code": "forbidden"})
         if op == "mailbox_done":
@@ -3368,13 +3413,10 @@ class MailStation:
             outcome, through, objects = {"outcome": "page", "through": head, "reset": False}, head, []
         return outcome, compact_ijson(dict(page, through=through, objects=objects))
 
-    def put(self, caller, value, now):
+    def put(self, caller, value, size, now):
+        """`size`: the object's bytes as received, what it is charged."""
         obj, rid = value["object"], value["request_id"]
         body = obj["body"]
-        size = len(compact_ijson(obj).encode())
-        if size > self.max_served:
-            self.dropped += 1
-            return {"outcome": "dropped", "why": "unserved"}, None
 
         def answer(op, **more):
             return compact_ijson(dict({"type": "relay", "op": op, "request_id": rid, "id": body["id"]}, **more))
@@ -3395,8 +3437,8 @@ class MailStation:
             return refuse("expired")
         object_hash = mail_evidence(obj)
         rkey = (recipient["host_id"], recipient["host_trust_gen"])
-        box = self.box(rkey)
-        for position, e in box["stored"].items():
+        held = self.boxes.get(rkey, {"stored": {}})["stored"]  # only a store mints a mailbox
+        for position, e in held.items():
             if (e["sender"], e["id"]) == (caller["host_id"], body["id"]):
                 if e["object_hash"] == object_hash:
                     return {"outcome": "already_stored", "position": position}, answer("mailbox_stored")
@@ -3407,6 +3449,7 @@ class MailStation:
             or self.over(self.usage(lambda k, e: True), self.quotas["account"], size)
         ):
             return refuse("quota")
+        box = self.box(rkey)
         box["head"] += 1
         box["stored"][box["head"]] = {
             "position": box["head"], "sender": caller["host_id"], "id": body["id"],
@@ -3461,7 +3504,10 @@ def check_mailbox_calls(file, data, report, context):
         largest = 2**53 - 1
         page = {"type": "relay", "op": "mailbox_sync_result", "request_id": UUID_V4_EXAMPLE, "mailbox_id": UUID_V4_EXAMPLE, "after": largest - 1, "head": largest, "through": largest, "objects": [{"position": largest, "object": {}}]}
         wrapper = len(compact_ijson(page)) - 2
-        case.equal(data["max_served_object_bytes"], MAILBOX_MAX_BYTES - wrapper, "the largest object a page carries at any position")
+        served = MAILBOX_MAX_BYTES - wrapper
+        case.equal(data["max_served_object_bytes"], served, "the largest object a page carries at every position")
+        low = dict(page, after=0, head=1, through=1, objects=[{"position": 1, "object": {}}])
+        case.equal(MAILBOX_MAX_BYTES - (len(compact_ijson(low)) - 2), 524_073, "a page at position 1 would carry more: the bound is position-independent")
         case.equal(data["link"]["genesis_hash"], context["genesis_hash"].hex(), "log L's account root")
 
     hashes = {}
@@ -3491,7 +3537,7 @@ def check_mailbox_calls(file, data, report, context):
     ops = set()
     for v in data["calls"]:
         with report.case(file, f"call {v['name']}") as case:
-            value, code = read_mailbox(v["wire"], v["direction"])
+            value, code = read_mailbox(v["wire"], v["direction"], served)
             case.equal(code, None, f"read {v['direction']}")
             if value is None:
                 continue
@@ -3499,7 +3545,7 @@ def check_mailbox_calls(file, data, report, context):
             case.equal({k: x for k, x in value.items() if k not in ("type", "op")}, v["fields"], "its fields")
             case.equal(value["op"], v["op"], "op")
             other = "to_host" if v["direction"] == "to_station" else "to_station"
-            case.equal(read_mailbox(v["wire"], other)[1], "wrong_message", "the other direction refuses it")
+            case.equal(read_mailbox(v["wire"], other, served)[1], "wrong_message", "the other direction refuses it")
             ops.add(v["op"])
     with report.case(file, "calls coverage") as case:
         case.equal(sorted(ops), sorted(MAILBOX_TO_STATION + MAILBOX_TO_HOST), "every call and answer")
@@ -3508,15 +3554,26 @@ def check_mailbox_calls(file, data, report, context):
 
     for v in data["invalid"]:
         with report.case(file, f"invalid {v['name']}") as case:
-            case.equal(read_mailbox(v["wire"], v["reader"])[1], v["code"], f"refused by {v['reader']}")
+            case.equal(read_mailbox(v["wire"], v["reader"], served)[1], v["code"], f"refused by {v['reader']}")
     for v in data["bounds"]:
         with report.case(file, f"bound {v['name']}") as case:
             text = mailbox_fill(v["wire_fill"])
             case.equal(len(text.encode()), v["wire_fill"]["bytes"], "its length")
-            case.equal(read_mailbox(text, v["reader"])[1], v.get("code"), "read" if "accepts" in v else "refused")
+            case.equal(read_mailbox(text, v["reader"], served)[1], v.get("code"), "read" if "accepts" in v else "refused")
+            if v["op"] == "mailbox_put" and len(text.encode()) <= MAILBOX_MAX_BYTES:
+                object_bytes = put_object_bytes(text)
+                case.check((object_bytes <= served) == ("accepts" in v), f"its object, {object_bytes} bytes as received, against the served bound")
     with report.case(file, "bounds coverage") as case:
         sizes = {v["name"]: v["wire_fill"]["bytes"] for v in data["bounds"]}
         case.equal((sizes["put_at_the_bound"], sizes["put_over_the_bound"]), (MAILBOX_MAX_BYTES, MAILBOX_MAX_BYTES + 1), "at and a byte over 512 KiB")
+        objects = {v["name"]: put_object_bytes(mailbox_fill(v["wire_fill"])) for v in data["bounds"] if v["op"] == "mailbox_put" and v["wire_fill"]["bytes"] <= MAILBOX_MAX_BYTES}
+        case.equal(
+            (objects["put_at_the_bound"], objects["put_object_over_what_a_page_carries"], objects["put_object_spaced_over_what_a_page_carries"]),
+            (served, served + 1, served + 1),
+            "objects at and a byte over the served bound, as received",
+        )
+        spaced = relay_parse(mailbox_fill(next(v for v in data["bounds"] if v["name"] == "put_object_spaced_over_what_a_page_carries")["wire_fill"]))
+        case.check(len(compact_ijson(spaced["object"]).encode()) <= served, "the spaced object is under the bound compact")
 
     for v in data["heads"]:
         with report.case(file, f"heads {v['name']}") as case:
@@ -3560,7 +3617,7 @@ def check_mailbox_calls(file, data, report, context):
         want = {
             "stored", "already_stored", "put_refused quota", "put_refused id_reused", "put_refused expired",
             "put_refused forbidden", "dropped not_strict", "dropped malformed", "dropped wrong_message",
-            "dropped too_large", "dropped unserved", "page", "page reset", "done",
+            "dropped too_large", "page", "page reset", "done",
             "refused mailbox_sync_refused", "refused mailbox_done_refused", "heads",
         }
         case.check(want <= outcomes, "every outcome", f"missing {sorted(want - outcomes)}")
