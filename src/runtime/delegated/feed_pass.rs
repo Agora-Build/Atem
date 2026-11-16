@@ -75,7 +75,7 @@ pub(crate) const KEPT_REAPPLIED: usize = 64;
 /// another identity's store, kept while hosting is paused across a
 /// re-verify, or a store not bound yet, takes no page, no re-verification
 /// and sends no ack), the receipt database healthy.
-fn loaded<'a>(
+pub(super) fn loaded<'a>(
     work: &'a State,
     list: Option<&ListState>,
     identity: &HostTarget,

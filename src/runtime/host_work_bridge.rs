@@ -62,6 +62,8 @@ pub(super) use delegated_feed_pass::sync_clocks;
 mod delegated_hints;
 #[path = "delegated/host_pass.rs"]
 mod delegated_host_pass;
+#[path = "delegated/mail_pass.rs"]
+mod delegated_mail_pass;
 #[path = "delegated/owner.rs"]
 mod delegated_owner;
 pub use delegated_owner::OwnerDone;

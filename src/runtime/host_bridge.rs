@@ -1634,6 +1634,9 @@ impl HostBridge {
         for text in messages {
             let applied = self.membership.as_ref().map(MembershipHost::head);
             let deferred = self.list_deferral();
+            // The mailbox's committed cursor before its message (a `heads`
+            // compares its head with it).
+            self.mail_observe();
             let Some(station) = self.station.as_mut() else {
                 return;
             };
@@ -1645,6 +1648,8 @@ impl HostBridge {
             self.publish_feed_gates();
             match inbound {
                 StationInbound::Nothing => {}
+                // Host senders' mailbox (host-work-v1 §11.5).
+                StationInbound::Mailbox(message) => self.mail_inbound(message),
                 // The gates closed already (Decision 20); the
                 // acknowledgments' book holds what it owes (Task 36).
                 StationInbound::AckRefused => self.ack_refused(),
@@ -1654,6 +1659,9 @@ impl HostBridge {
                     calls.extend(fetch.map(StationCall::Fetch));
                     calls.extend(self.feed_heads(&heads));
                     self.publish_feed_gates();
+                    // The mailbox head the link took (rule 6): a reset
+                    // marked.
+                    self.mail_step();
                 }
                 StationInbound::Page(page) => {
                     calls.extend(self.feed_page(page));
@@ -1702,6 +1710,7 @@ impl HostBridge {
         // before its call's 35 s deadline answers it first, never drained
         // as a retired call's (Task 33 re-review 3, m1; ruling C1b-a).
         calls.extend(self.feed_tick(now));
+        self.mail_tick(now.mono_ms);
         // The device list may have moved (a carriage): pending control
         // records are applied again.
         self.feeds_reverify();
@@ -1714,6 +1723,7 @@ impl HostBridge {
         // fence), so a result goes once its effects are durable and its
         // fence ran.
         let acks = self.acks_due();
+        let mail = self.mail_outgoing();
         let Some(station) = self.station.as_mut() else {
             return;
         };
@@ -1737,6 +1747,7 @@ impl HostBridge {
                 .into_iter()
                 .map(StationCall::Sync),
         );
+        calls.extend(mail);
         for call in calls {
             let sent = self.r9_link.is_some()
                 && call
@@ -1746,6 +1757,8 @@ impl HostBridge {
                 match call {
                     StationCall::Fetch(_) => station.fetch.unsent(),
                     StationCall::Sync(sync) => station.feed.unsent(&sync.request_id),
+                    StationCall::MailboxSync(sync) => station.mailbox.unsent(&sync.request_id),
+                    StationCall::MailboxDone(_) => {}
                 }
             }
         }

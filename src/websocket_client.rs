@@ -1354,7 +1354,11 @@ impl AstationClient {
                             // 256 KiB is dropped before anything else reads it:
                             // the length first, then a scan of its `type` that
                             // builds no tree; only its size is passed on.
-                            None if text.len() > crate::app::hosted::RELAY_MESSAGE_BYTES && is_relay_message(&text) => {
+                            // With `host.senders` (the debug hook's), a
+                            // mailbox message keeps 512 KiB (host-work-v1
+                            // §11.5 rule 9).
+                            None if text.len() > crate::app::hosted::RELAY_MESSAGE_BYTES && is_relay_message(&text)
+                                && text.len() > crate::app::hosted::relay_bound(&text) => {
                                 Some(AstationMessage::RelayTooLarge(text.len()))
                             }
                             None if removed_op_detail(&text).is_some() => {

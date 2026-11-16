@@ -19,6 +19,24 @@ pub const INBOX_LIMIT: usize = 1024;
 /// bound; the relay splits a larger `push_ack`, about 337 bytes an
 /// identity).
 pub const RELAY_MESSAGE_BYTES: usize = 256 * 1024;
+/// The bound of the relay message `text` (bytes): [`RELAY_MESSAGE_BYTES`],
+/// or, with the debug hook's `host.senders` on, 512 KiB for a mailbox
+/// message (host-work-v1 §11.5 rule 9), told by its top-level `type` and
+/// `op` (a scan that builds no tree). With the hook off, as on main.
+pub fn relay_bound(text: &str) -> usize {
+    relay_bound_with(text, crate::runtime::test_hooks::host_features().senders)
+}
+
+/// [`relay_bound`] with `host.senders` on or off.
+pub fn relay_bound_with(text: &str, senders: bool) -> usize {
+    use atem_client::host_mail::mailbox::{MAX_MAILBOX_MESSAGE_BYTES, is_mailbox_op};
+    if senders && crate::session_protocol::r9::peek::relay_op(text, is_mailbox_op) {
+        MAX_MAILBOX_MESSAGE_BYTES
+    } else {
+        RELAY_MESSAGE_BYTES
+    }
+}
+
 /// Relay messages kept for the broker per pass, at most (the rest are
 /// dropped: what they acknowledged is resent and acknowledged again).
 pub const RELAY_LIMIT: usize = 64;
@@ -133,7 +151,9 @@ impl App {
         let Some(hosted) = self.hosted.as_mut() else {
             return;
         };
-        if hosted.relay.len() < RELAY_LIMIT && text.len() <= RELAY_MESSAGE_BYTES {
+        if hosted.relay.len() < RELAY_LIMIT
+            && (text.len() <= RELAY_MESSAGE_BYTES || text.len() <= relay_bound(&text))
+        {
             hosted.relay.push_back((link, text));
             return;
         }
@@ -384,6 +404,29 @@ mod tests {
         app.astation_routed = true;
         app.relay_dropped(RELAY_MESSAGE_BYTES + 1);
         assert_eq!(app.hosted.as_ref().unwrap().relay_dropped, 1);
+    }
+
+    /// host-work-v1 §11.5 rule 9: with `host.senders` on, a mailbox
+    /// message (told by its top-level `type` and `op`, scanned) keeps a
+    /// 512 KiB bound; every other relay message, `heads` included, and every
+    /// message with the hook off (as on main) keeps 256 KiB.
+    #[test]
+    fn mailbox_messages_keep_their_own_bound_only_with_host_senders() {
+        let padded = |op: &str, len: usize| {
+            let head = format!(r#"{{"type":"relay","op":"{op}","pad":""#);
+            let pad = "a".repeat(len - head.len() - 2);
+            format!(r#"{head}{pad}"}}"#)
+        };
+        let big = padded("mailbox_sync_result", RELAY_MESSAGE_BYTES + 1);
+        assert_eq!(big.len(), RELAY_MESSAGE_BYTES + 1);
+        assert_eq!(relay_bound_with(&big, true), 512 * 1024);
+        assert_eq!(relay_bound_with(&big, false), RELAY_MESSAGE_BYTES);
+        let heads = padded("heads", RELAY_MESSAGE_BYTES + 1);
+        assert_eq!(relay_bound_with(&heads, true), RELAY_MESSAGE_BYTES);
+        let not_relay = big.replacen(r#""relay""#, r#""other""#, 1);
+        assert_eq!(relay_bound_with(&not_relay, true), RELAY_MESSAGE_BYTES);
+        // In tests the hook is off: main's bound.
+        assert_eq!(relay_bound(&big), RELAY_MESSAGE_BYTES);
     }
 
     /// §R9.7b: the reconnect after a pin waits for a running operation (or

@@ -557,6 +557,22 @@ pub(crate) fn is_station_message(op: &str) -> bool {
     .contains(&op)
 }
 
+/// A mailbox message the Station sends a host (host-work-v1 §11.5): the
+/// answers to its puts, syncs and dones, and their refusals; never the
+/// host's own calls.
+pub(crate) fn is_mailbox_message_to_host(op: &str) -> bool {
+    use atem_client::host_mail::mailbox::op;
+    [
+        op::MAILBOX_STORED,
+        op::MAILBOX_PUT_REFUSED,
+        op::MAILBOX_SYNC_RESULT,
+        op::MAILBOX_DONE_RESULT,
+        op::MAILBOX_SYNC_REFUSED,
+        op::MAILBOX_DONE_REFUSED,
+    ]
+    .contains(&op)
+}
+
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -2971,9 +2987,14 @@ impl R9Host {
             struct Peek {
                 op: Option<String>,
             }
+            // With `host.senders` too, the Station's mailbox messages to
+            // this host (host-work-v1 §11.5).
+            let senders = self.senders;
+            let is_station =
+                |op: &str| is_station_message(op) || (senders && is_mailbox_message_to_host(op));
             let station = match serde_json::from_str::<Peek>(text) {
-                Ok(Peek { op }) => op.as_deref().is_some_and(is_station_message),
-                Err(_) => peek::relay_op(text, is_station_message),
+                Ok(Peek { op }) => op.as_deref().is_some_and(is_station),
+                Err(_) => peek::relay_op(text, is_station),
             };
             if station {
                 // At most the App's relay messages of a pass (`RELAY_LIMIT`).

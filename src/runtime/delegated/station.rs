@@ -40,6 +40,7 @@ use atem_client::SignedObject;
 use atem_client::control::{
     Accept, ControlSync, ControlSyncResult, Heads, MembershipFetch, RefusedCall, RelayError, ToHost,
 };
+use atem_client::host_mail::mailbox::{MailboxDone, MailboxSync, MailboxToHost, op as mailbox_op};
 use atem_client::membership::Head;
 use serde_json::{Value, json};
 
@@ -103,6 +104,10 @@ pub enum Inbound {
     /// `control_ack_refused`: the gates closed ([`FeedSync::on_refused`]);
     /// for the acknowledgments' book too (`AckBook::on_refused`).
     AckRefused,
+    /// A mailbox message, with `host.senders` on (host-work-v1 §11.5), or
+    /// a `mailbox_sync_result` the reader refused (a Station fault): for
+    /// the mailbox client.
+    Mailbox(Result<MailboxToHost, RelayError>),
 }
 
 /// A call the host sends its Station on the link.
@@ -110,6 +115,9 @@ pub enum Inbound {
 pub enum Call {
     Fetch(MembershipFetch),
     Sync(ControlSync),
+    /// The host's own mailbox (host-work-v1 §11.5), with `host.senders`.
+    MailboxSync(MailboxSync),
+    MailboxDone(MailboxDone),
 }
 
 impl Call {
@@ -118,6 +126,8 @@ impl Call {
         match self {
             Call::Fetch(fetch) => fetch.to_json().ok(),
             Call::Sync(sync) => sync.to_json().ok(),
+            Call::MailboxSync(sync) => sync.to_json().ok(),
+            Call::MailboxDone(done) => done.to_json().ok(),
         }
     }
 }
@@ -194,6 +204,7 @@ impl Station {
             if self.link.take().is_some() {
                 self.fetch = self.fetch.next_generation();
                 self.feed.on_link_down();
+                self.mailbox.on_link(None);
             }
             return;
         };
@@ -208,6 +219,7 @@ impl Station {
                 });
                 self.fetch = self.fetch.next_generation();
                 self.feed.on_link(self.link.as_ref());
+                self.mailbox.on_link(self.link.as_ref());
             }
         }
     }
@@ -256,6 +268,22 @@ impl Station {
         if self.link.is_none() {
             return Inbound::Nothing;
         }
+        // The mailbox's messages only with `host.senders`.
+        if self.senders
+            && let Some(op) = top_level_op(
+                bytes,
+                crate::session_protocol::r9::is_mailbox_message_to_host,
+            )
+        {
+            return match MailboxToHost::decode(bytes.as_bytes()) {
+                Ok(message) => Inbound::Mailbox(Ok(message)),
+                Err(e) if op == mailbox_op::MAILBOX_SYNC_RESULT => Inbound::Mailbox(Err(e)),
+                Err(e) => {
+                    self.unread(e);
+                    Inbound::Nothing
+                }
+            };
+        }
         // `heads.mailbox` only with `host.senders` (rule 6): every other
         // host reads `heads` exactly as §11.4 has it.
         let accept = Accept {
@@ -297,17 +325,21 @@ impl Station {
             // the sync to answer (§11.4).
             Err(e) if is_page(bytes) => Inbound::Page(Err(e)),
             Err(e) => {
-                // Counted, never its content.
-                self.unread += 1;
-                if self.unread.is_power_of_two() {
-                    eprintln!(
-                        "atem runtime: {} Station message(s) the reader refused were dropped (the last: {})",
-                        self.unread,
-                        e.code()
-                    );
-                }
+                self.unread(e);
                 Inbound::Nothing
             }
+        }
+    }
+
+    /// A message the reader refused: counted, never its content.
+    fn unread(&mut self, e: RelayError) {
+        self.unread += 1;
+        if self.unread.is_power_of_two() {
+            eprintln!(
+                "atem runtime: {} Station message(s) the reader refused were dropped (the last: {})",
+                self.unread,
+                e.code()
+            );
         }
     }
 
@@ -321,6 +353,8 @@ impl Station {
     pub fn on_identity(&mut self, identity: super::sync::HostIdentity) {
         if self.feed.on_identity(identity) {
             self.fetch = self.fetch.next_generation();
+            // Every live mailbox call too (host-work-v1 §11.5 rule 8).
+            self.mailbox.on_identity_moved();
         }
     }
 
@@ -338,6 +372,7 @@ impl Station {
             },
             "unread": self.unread,
             "feed": self.feed.dump(),
+            "mailbox": self.senders.then(|| self.mailbox.dump()),
         })
     }
 
@@ -359,6 +394,14 @@ impl Station {
             );
         }
     }
+}
+
+/// The first top-level `op` of `bytes` that `is_op` takes, its names read
+/// with no tree (as [`is_page`]).
+fn top_level_op(bytes: &str, is_op: impl Fn(&str) -> bool) -> Option<String> {
+    crate::session_protocol::r9::peek::top_level_strings(bytes, "op")
+        .into_iter()
+        .find(|op| is_op(op))
 }
 
 /// Whether `bytes` is a `control_sync_result`, its top-level names read
@@ -578,6 +621,60 @@ mod tests {
             Inbound::Heads(..)
         ));
         assert_eq!(s.dump()["heads"], 1);
+    }
+
+    /// host-work-v1 §11.5: with `host.senders` on, the mailbox messages go
+    /// to the mailbox client, read strictly; a `mailbox_sync_result` the
+    /// reader refuses is still a page (a Station fault, for the client);
+    /// any other the reader refuses is counted and dropped. Off (as on
+    /// main), every mailbox message is one the reader refuses.
+    #[test]
+    fn mailbox_messages_reach_the_client_only_with_host_senders() {
+        use atem_client::host_mail::mailbox::{
+            MailboxDoneResult, MailboxSyncResult, MailboxToHost,
+        };
+        let page = MailboxSyncResult {
+            request_id: "55aa5bab-e253-4b6c-a83f-c86e6b028aa1".into(),
+            mailbox_id: MAILBOX.into(),
+            after: 0,
+            head: 0,
+            through: 0,
+            objects: Vec::new(),
+        };
+        let wire = page.to_json().unwrap().to_string();
+        let done = MailboxDoneResult {
+            request_id: "55aa5bab-e253-4b6c-a83f-c86e6b028aa1".into(),
+            mailbox_id: MAILBOX.into(),
+            position: 1,
+        }
+        .to_json()
+        .unwrap()
+        .to_string();
+        let not_strict = wire.replacen(r#""head":0"#, r#""head":0.5"#, 1);
+        let extra = done.replacen('{', r#"{"extra":1,"#, 1);
+        let mut s = Station::with_senders(true);
+        up(&mut s, 1);
+        assert_eq!(
+            s.receive(&wire, None, None),
+            Inbound::Mailbox(Ok(MailboxToHost::SyncResult(page)))
+        );
+        assert!(matches!(
+            s.receive(&done, None, None),
+            Inbound::Mailbox(Ok(MailboxToHost::DoneResult(_)))
+        ));
+        assert_eq!(
+            s.receive(&not_strict, None, None),
+            Inbound::Mailbox(Err(RelayError::NotStrict))
+        );
+        assert_eq!(s.receive(&extra, None, None), Inbound::Nothing);
+        assert_eq!(s.dump()["unread"], 1);
+
+        let mut s = Station::new();
+        up(&mut s, 1);
+        for bytes in [&wire, &done, &not_strict] {
+            assert_eq!(s.receive(bytes, None, None), Inbound::Nothing);
+        }
+        assert_eq!(s.dump()["unread"], 3);
     }
 
     /// Without a device list nothing is fetched; a result is carried only

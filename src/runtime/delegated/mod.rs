@@ -38,6 +38,7 @@ pub mod gate;
 pub mod host_senders;
 pub mod intents;
 pub mod mailbox;
+pub mod mailbox_store;
 pub mod resolve;
 pub mod start;
 pub mod station;
