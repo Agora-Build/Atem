@@ -3434,31 +3434,55 @@ exactly as without this section):
   on, with rule 8's correlation, pacing, 35-second retirement and refusals,
   every call bound to the link generation, socket and host identity
   (account, genesis, host id, trust generation) it was asked under and all
-  of them retired at an identity change (§11.4);
+  of them retired at an identity change (§11.4); its faults and its two
+  refusals are §11.4's alerts: counted for `atem status`, one runtime.log
+  line an hour per kind;
 - each page commits in one `BEGIN IMMEDIATE` transaction of the host's
   host-work store, only from the store's own cursor (a page continuing
-  another is no read): each object's decision (`open_envelope`, with this
+  another is no read): each envelope's decision (`open_envelope`, with this
   host's own identity, keys and record, its committed device list and the
   delegated clock), its row (an opened object an inbox row; a refusal a row
   with its evidence, the exact bytes as fetched and its reason, marked for
-  a status when the copy was the sender's; a waiting object a pending row,
-  held once), the claims behind duplicates, the dones owed and the cursor
-  at `through`; only then does a done go (at most 8 live, again with a
+  a status when the copy was the sender's, an earlier row of the same
+  bytes upgraded so; a waiting object a pending row, held once), each
+  `atem-result` kept (below), the claims behind duplicates, the dones owed
+  and the cursor at `through`; only then does a done go (at most 8 live, again with a
   fresh id after 35 seconds and on each new link generation until
   answered; a `mailbox_done_refused` holds them to the next generation);
   owed dones survive a restart, and none goes for another identity's state;
-- **Atem's reading:** a reset's durable mark is the cursor itself, the
-  announced mailbox at position 0, written with the dones owed to the old
-  mailbox dropped before anything is asked for it;
-- **Atem's reading:** a page's `head` counts as the Station's announcement
-  once the page answers the live call, so a page read past the head the
-  last `heads` named is no reset;
+- **Atem's reading (for Astation's agreement):** a reset's durable mark is
+  the cursor itself, the announced mailbox at position 0, written before
+  anything is asked for it, with the dones owed to the old mailbox dropped
+  and every waiting object detached from its position: under the same
+  `mailbox_id` a position may hold another object after the reset, so a
+  waiting object owes a done only once the read from 0 lists it again;
+- **Atem's reading (for Astation's agreement):** a page's `head` counts as
+  the Station's announcement once the page answers the live call, so a page
+  read past the head the last `heads` named is no reset (rule 7's "a head
+  below the host's cursor" then comes only from a `heads` or a page whose
+  head is below its `after`); this assumes a Station, its relays included,
+  never sends a `heads` older than a page it has answered;
 - waiting objects are judged again after each device-list advance and once
-  one's expiry passes; an object over the pending limits is marked done
-  with no verdict (rule 5);
-- **in this version** every object is judged as an envelope: an
-  `atem-result`, which only a sending host's outbox can answer, is refused
-  `wrong_kind` and kept as evidence, until the outbox is built;
+  one's expiry passes (one whose bytes no longer parse is refused
+  `malformed`); an object over the pending limits is marked done with no
+  verdict (rule 5);
+- an `atem-result` is never judged as an envelope: it is kept for the
+  sending host's own check (`accept_result`, design II.4.4) with its exact
+  bytes, `object_hash`, sender, id and mailbox position, committed with the
+  cursor and owing its done like any other object, and holds no gate (it
+  starts no work); at most 256 results or 64 MiB are kept, one over them
+  dropped undecided and marked done, like a pending overflow;
+- **bounded storage (Atem's reading, for Astation's agreement):** anything
+  a sender or the Station can make this host keep is bounded. Refusals keep
+  their exact bytes within 16 MiB, those not reported dropped first, oldest
+  first (their evidence hash stays, so the same bytes are still a
+  duplicate). Claims, refusals and kept results are pruned 24 hours after
+  their object's expiry (an expiry beyond 24 hours and 60 seconds after
+  arrival counts as that): a claim must outlive every copy that can still
+  arrive, and the Station keeps an object until its `expires_at` on its own
+  clock, which this host bounds only from above, so the margin covers a
+  Station or sender clock up to a day behind; a copy arriving later still is
+  judged anew (refused `expired`);
 - host senders' gate also needs the mailbox read to the announced head with
   no refusal, fault or reset waiting and every inbox row admitted (design
   II.5); until admission is built an inbox row keeps it closed. `atem

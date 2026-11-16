@@ -26,8 +26,18 @@
 //!   `object_hash`, or for bytes that don't parse the SHA-256 of the bytes
 //!   as fetched), those bytes and the reason, `report` set for a refusal
 //!   after the copy was shown to be the sender's (admission sends its
-//!   status); a waiting object is a pending row (`mailbox_pending`), held
-//!   once by its `object_hash`, never done. A copy that claims an id
+//!   status; an earlier row of the same bytes is upgraded so); a waiting
+//!   object is a pending row (`mailbox_pending`), held once by its
+//!   `object_hash`, never done. An `atem-result` is never judged here
+//!   (ruling R28): it is kept (`mailbox_results`: its exact bytes,
+//!   `object_hash`, sender, id and position) for the sending host's
+//!   `accept_result`, committed and done like any object, never counted
+//!   as inbox (it starts no work).
+//! - **Bounded** ([`Limits`], [`prune`]): refusals keep their bytes within
+//!   a budget (the oldest first, those not reported before those reported;
+//!   the evidence hash stays), results within their own limits (over them
+//!   dropped undecided, done); claims, refusals and results are pruned
+//!   [`KEEP_MARGIN_MS`] after their object's expiry. A copy that claims an id
 //!   (opened or refused authenticated) records its claim (`mailbox_claims`,
 //!   `(sender host, id)` and its `sealed_hash`): the sender's object again
 //!   is a duplicate with the first verdict, its id with another sealed
@@ -39,12 +49,12 @@
 //!   (no verdict, no row, no id) and marked done all the same (Atem's
 //!   refinement, agreed with Astation 2026-11-16). A waiting object is
 //!   judged again after the device list advances or its expiry passes
-//!   ([`rejudge_pending`]); decided, it owes a done only in the mailbox
-//!   read now (a reset dropped its old position).
+//!   ([`rejudge_pending`]); decided, it owes a done only at a position of
+//!   the mailbox read now: a reset detaches it from its old one.
 //! - **A reset** ([`mark_reset`], rule 7): marked durably before anything
 //!   is asked for it, as the cursor itself (the announced mailbox at
-//!   position 0), the dones owed to the old mailbox dropped, in one
-//!   transaction. A start finds it and reads on from there; the gate's
+//!   position 0), the dones owed to the old mailbox dropped and every
+//!   waiting object detached from its position, in one transaction. A start finds it and reads on from there; the gate's
 //!   mailbox part stays closed until the read reaches the announced head.
 //! - **An object that can't be decided now** (the key provider failed):
 //!   nothing of its page commits ([`Commit::Undecided`]); asked again.
@@ -203,10 +213,7 @@ fn cursor_row(db: &rusqlite::Connection) -> Result<Option<(String, String, u64)>
 
 /// The cursor of `identity`'s mailbox (none: never read); an error for a
 /// row of another identity.
-fn own_cursor(
-    db: &rusqlite::Connection,
-    identity: &HostIdentity,
-) -> Result<Option<(String, u64)>> {
+fn own_cursor(db: &rusqlite::Connection, identity: &HostIdentity) -> Result<Option<(String, u64)>> {
     match cursor_row(db)? {
         None => Ok(None),
         Some((of, id, at)) if of == identity_text(identity) => Ok(Some((id, at))),
@@ -428,8 +435,7 @@ pub fn rejudge_pending(
         let decision = match parse_object(&bytes) {
             Err(_) => refuse(&tx, cx, &Hash32::of(&bytes), MALFORMED, None, &bytes, None)?,
             Ok(object) => {
-                let verdict =
-                    open_envelope(&object, cx.list, cx.recipient, cx.provider, cx.now_ms);
+                let verdict = open_envelope(&object, cx.list, cx.recipient, cx.provider, cx.now_ms);
                 if matches!(
                     verdict,
                     EnvelopeVerdict::Pending { .. } | EnvelopeVerdict::Unavailable { .. }
@@ -492,7 +498,9 @@ fn decide_entry(
         Ok(object) => object,
         // Check 1: not a signed object at all, refused under the SHA-256
         // of the bytes as fetched.
-        Err(_) => return refuse(tx, cx, &Hash32::of(bytes), MALFORMED, None, bytes, None).map(Some),
+        Err(_) => {
+            return refuse(tx, cx, &Hash32::of(bytes), MALFORMED, None, bytes, None).map(Some);
+        }
     };
     let (kind, body) = MailBody::from_object(&object)?;
     if kind == MailKind::Result {
