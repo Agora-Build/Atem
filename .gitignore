@@ -1,5 +1,8 @@
 # Build artifacts
 /target
+# atem-client binding packages (scripts/package-atem-client-*.sh output, or a
+# downloaded CI artifact) put in the repository root
+/atem-client-*/
 
 # Local environment configuration
 .env

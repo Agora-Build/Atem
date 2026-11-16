@@ -1792,6 +1792,17 @@ impl HostBridge {
                     && m.pin_of() == pin
                     && m.membership().genesis_hash().to_hex() == *genesis
                     && (self.host_key.is_none() || host_pub == self.host_pub)
+                    // The host runs under the pin's identity: a pin read
+                    // while it was still being written (its key first, the
+                    // list last) can open finished after the older account,
+                    // device or trust generation was taken, and is taken
+                    // again here.
+                    && {
+                        let ctx = self.host.context();
+                        ctx.account_id == *account
+                            && ctx.atem_device_id == pin.host_id
+                            && ctx.host_trust_gen >= pin.host_trust_gen
+                    }
             }
             (None, None) => {
                 self.membership_error.is_none() && !membership::has_device_list_files(&pairing)
@@ -1840,6 +1851,9 @@ impl HostBridge {
             }
         }
         if self.membership_error.is_none() {
+            // Debug builds: a test finishes a pin's writes here (the pin
+            // above read before them, the list below after).
+            super::test_hooks::reopen_hold();
             let epoch = self.host.context().runtime_epoch;
             let mut fences = HostFences::new(&mut self.host);
             let opened = MembershipHost::open(&pairing, &self.dir, epoch, &host_now(), &mut fences);
@@ -2277,7 +2291,10 @@ impl HostBridge {
             })
             .collect();
         let status = self.r9.status();
+        let ctx = self.host.context();
         let mut state = json!({
+            "host": {"account_id": ctx.account_id, "atem_device_id": ctx.atem_device_id,
+                     "host_trust_gen": ctx.host_trust_gen},
             "journal_halted": self.host.journal_halted(),
             "channels": status.channels,
             "attachments": status.attachments,

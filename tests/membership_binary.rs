@@ -477,3 +477,124 @@ fn losing_one_fault_record_keeps_the_runtime_held() {
         b.stop();
     }
 }
+
+/// A pin read while it is still being written (its key first, the list
+/// last) and opened finished: the host still runs under the pinned
+/// identity once the list opened. The debug hook `hold_reopen` holds the
+/// runtime's reopen between reading the pin and opening the list, so the
+/// pin is read before the new list is in place and the list opened after
+/// it: deterministic. Both identities a pin carries the host doesn't run
+/// at yet: a higher trust generation of the same account, and another
+/// account at the generation the host already runs (cleanup review,
+/// finding 2).
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "debug-only test hooks")]
+fn a_pin_read_mid_write_still_moves_the_host_to_its_identity() {
+    use support::r9log::{TestLog, secret};
+    const HOST: &str = "host-repin";
+    for case in ["trust generation", "account"] {
+        let sandbox = support::Sandbox::new();
+        let config = sandbox.config();
+        support::astation::write_verified_pairing(&config, "acct-repin-a", HOST, 1);
+        let mut log = TestLog::genesis("acct-repin-a", &secret("repin astation a"));
+        log.add_host(HOST, 1, &secret("repin host 1"));
+        support::r9::write_pin(&config, &log, HOST, 1, &secret("repin host 1"));
+        let faults = sandbox.dir.path().join("faults");
+        std::fs::create_dir_all(&faults).unwrap();
+        let dump = sandbox.dir.path().join("state.json");
+        let runtime_log = sandbox.dir.path().join("runtime.log");
+        let output = std::fs::File::create(&runtime_log).unwrap();
+        let mut runtime = Command::new(env!("CARGO_BIN_EXE_atem"))
+            .arg("runtime")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &sandbox.home)
+            .env("XDG_RUNTIME_DIR", &sandbox.run)
+            .env("ASTATION_WS", "ws://127.0.0.1:1/ws")
+            .env("ASTATION_RELAY_URL", "http://127.0.0.1:1")
+            .env("ATEM_TEST_PTY_FAULTS", &faults)
+            .env("ATEM_TEST_STATE_DUMP", &dump)
+            .stdin(Stdio::null())
+            .stdout(output.try_clone().unwrap())
+            .stderr(output)
+            .spawn()
+            .unwrap();
+        let host = || -> Value {
+            std::fs::read_to_string(&dump)
+                .ok()
+                .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+                .map(|v| v["host"].clone())
+                .unwrap_or(Value::Null)
+        };
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + WAIT;
+            while !done() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{case}: timed out waiting for {what}; host {}\n{}",
+                    host(),
+                    std::fs::read_to_string(&runtime_log).unwrap_or_default()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let pinned = json!({"account_id": "acct-repin-a", "atem_device_id": HOST,
+                            "host_trust_gen": 1});
+        until("the first pin", &|| host() == pinned);
+        // The new pin: another trust generation, or another account.
+        let seed = secret("repin host 2");
+        let (log, want) = match case {
+            "trust generation" => {
+                log.add_host(HOST, 2, &seed);
+                (
+                    log,
+                    json!({"account_id": "acct-repin-a", "atem_device_id": HOST,
+                             "host_trust_gen": 2}),
+                )
+            }
+            _ => {
+                let mut other = TestLog::genesis("acct-repin-b", &secret("repin astation b"));
+                other.add_host(HOST, 1, &seed);
+                (
+                    other,
+                    json!({"account_id": "acct-repin-b", "atem_device_id": HOST,
+                               "host_trust_gen": 1}),
+                )
+            }
+        };
+        // The pin's key first: the runtime reopens and is held after reading
+        // the old list's pin.
+        std::fs::write(faults.join("hold_reopen"), "").unwrap();
+        let public = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let key = config.join("pairing/host_channel_key");
+        let tmp = key.with_extension("tmp");
+        std::fs::write(
+            &tmp,
+            json!({"v": 1, "seed": atem_client::encoding::b64u(&seed),
+                   "pub": atem_client::encoding::b64u(&public)})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::rename(&tmp, &key).unwrap();
+        until("the held reopen", &|| faults.join("reopen_held").exists());
+        // The rest of the pin, the list last; then the open reads it.
+        support::r9::write_pin(
+            &config,
+            &log,
+            HOST,
+            want["host_trust_gen"].as_u64().unwrap(),
+            &seed,
+        );
+        std::fs::remove_file(faults.join("hold_reopen")).unwrap();
+        until("the host under the new pin", &|| host() == want);
+        unsafe { libc::kill(runtime.id() as libc::pid_t, libc::SIGTERM) };
+        let deadline = Instant::now() + WAIT;
+        while runtime.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "{case}: the runtime didn't stop");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}

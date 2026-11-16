@@ -29,6 +29,9 @@
 set -euo pipefail
 VERSION="$1"
 OUT="$2"
+# A relative <output-dir> is the caller's, not the repository root's (the
+# script changes to the root below).
+case "$OUT" in /*) ;; *) OUT="$PWD/$OUT" ;; esac
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 [ "$(uname -s)-$(uname -m)" = Linux-x86_64 ] || { echo "the r9 harness is packaged on Linux x86_64 only" >&2; exit 1; }
