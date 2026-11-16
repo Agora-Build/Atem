@@ -913,9 +913,11 @@ impl HostBridge {
             }
             _ => (None, None),
         };
-        // Host senders (the hook's `host.senders`): a pinned host that holds
-        // no encryption key for its generation (paired before the key
-        // existed, or its pin's key not made) makes one now.
+        // Host senders (the hook's `host.senders`): every pin keeps its
+        // ceremony's encryption key (host-work-v1 §11.5), so a pinned host
+        // holds none for its generation only when it was pinned before that
+        // change, or its key file was lost or moved aside since: it makes
+        // one now.
         if features.senders
             && membership.is_some()
             && let Some(pairing) = &pairing
@@ -1881,8 +1883,9 @@ impl HostBridge {
                         m.head().seq,
                         m.pin_of().host_id
                     );
-                    // Host senders: a new pin (`atem pair verify`'s next
-                    // generation) gets its encryption key if it has none.
+                    // Host senders: a new pin brings its ceremony's
+                    // encryption key (host-work-v1 §11.5); one is made here
+                    // only if the key file was lost or moved aside since.
                     if self.features.senders {
                         host_enc_lines(crate::session_protocol::r9::host_enc::ensure(
                             &pairing,
