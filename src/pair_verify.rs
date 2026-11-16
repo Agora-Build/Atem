@@ -375,28 +375,9 @@ pub(crate) struct HostPinning<'a> {
     /// `verifyKeys.account_id`: the account the ceremony's keys named
     /// (host-work-v1 §11.5). A certificate naming another is refused.
     pub account_id: &'a str,
-    /// Make the host encryption key with the pin (the runtime's debug hook
-    /// turned `host.senders` on).
-    pub enc_key: bool,
-}
-
-impl<'a> HostPinning<'a> {
-    /// What a ceremony in a runtime whose hook turned on `features` pins.
-    pub(crate) fn new(
-        astation: &'a crate::memory::verification::AstationKeys,
-        host_id: &'a str,
-        host_seed: &'a [u8; 32],
-        account_id: &'a str,
-        features: crate::runtime::test_hooks::HostFeatures,
-    ) -> Self {
-        HostPinning {
-            astation,
-            host_id,
-            host_seed,
-            account_id,
-            enc_key: features.senders,
-        }
-    }
+    /// The host encryption key this ceremony made, recorded and revealed
+    /// (host-work-v1 §11.5): kept as `pairing/host_enc_key` with the pin.
+    pub enc_key: &'a crate::session_protocol::r9::host_enc::CeremonyKey,
 }
 
 /// Applies Astation's `deviceVerified` only while the pairing the
@@ -446,6 +427,8 @@ pub(crate) fn apply_device_verified(
             host_id: host.host_id,
             host_trust_gen,
             host_pub,
+            enc_pub: *host.enc_key.enc_pub(),
+            enc_sig: *host.enc_key.enc_sig(),
         };
         let log = pin::verify_pairing_log(reply.membership.as_ref(), &inputs, pairing, &host_now())
             .map_err(|e| anyhow!("{e}"))?;
@@ -580,34 +563,6 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
-
-    /// The host encryption key is made with the pin only when the
-    /// runtime's debug hook turned `host.senders` on (with
-    /// `host.delegated`); never with the hook off, as on main.
-    #[test]
-    fn the_pin_makes_the_host_encryption_key_only_with_host_senders() {
-        use crate::runtime::test_hooks::HostFeatures;
-        let astation = crate::memory::verification::AstationKeys {
-            sign_pub: vec![4; 65],
-            enc_pub: [5; 32],
-            recovery_sign_pub: [6; 32],
-            nonce_s: [7; 32],
-            genesis_hash: [8; 32],
-        };
-        for (hook, enc_key) in [
-            ("", false),
-            ("host.delegated", false),
-            ("host.delegated,host.alerts", false),
-            ("host.senders", false),
-            ("host.delegated,host.senders", true),
-            ("host.delegated,host.alerts,host.senders", true),
-        ] {
-            let features = HostFeatures::parse(hook).unwrap();
-            let pinning = HostPinning::new(&astation, "host-1", &[9; 32], "acct", features);
-            assert_eq!(pinning.enc_key, enc_key, "{hook:?}");
-            assert_eq!(pinning.host_id, "host-1");
-        }
-    }
 
     /// `verifyKeys.account_id` (host-work-v1 §11.5) is required and an
     /// opaque id (R9.1: 1–128 bytes of `[A-Za-z0-9._:-]`); anything else
@@ -1026,6 +981,19 @@ mod tests {
                 let before = crate::pairing::capture(&src).unwrap();
                 crate::pairing::bind_new(&src, &before, "astation-1").unwrap();
             }
+            // The key this ceremony recorded and revealed (host-work-v1
+            // §11.5) before the certificate came.
+            let enc_key = crate::session_protocol::r9::host_enc::make_for_ceremony_locked(
+                &src.paths.pairing,
+                &crate::session_protocol::r9::host_enc::Vouch {
+                    account_id: "acct",
+                    genesis_hash: &atem_client::encoding::Hash32([8; 32]),
+                    host_id: "host-1",
+                    host_trust_gen: 2,
+                    host_seed: &[9; 32],
+                },
+            )
+            .unwrap();
             let before = crate::status::tests::snapshot(dir.path());
             let reply = DeviceVerifiedReply {
                 device_verified: wire(),
@@ -1046,7 +1014,7 @@ mod tests {
                 host_id: "host-1",
                 host_seed: &[9; 32],
                 account_id: "acct",
-                enc_key: true,
+                enc_key: &enc_key,
             };
             let error = apply_device_verified(
                 &capture,
@@ -1062,6 +1030,7 @@ mod tests {
             assert_eq!(crate::status::tests::snapshot(dir.path()), before);
             assert!(!src.paths.cred.trust.exists());
             assert!(!src.paths.pairing.membership.exists(), "nothing pinned");
+            assert!(!src.paths.pairing.host_enc_key.exists(), "no key kept");
         }
     }
 }

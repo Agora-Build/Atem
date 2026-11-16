@@ -1,10 +1,12 @@
 //! The device list a pairing pins (§R9.2 "Pairing"): `verifyKeys` names the
-//! account's genesis, `verifyReveal` reveals this host's new
-//! `host_channel_key`, and `deviceVerified` carries the log from its genesis
-//! to the `add_host` the verified Astation signed for this host. Atem
-//! verifies the whole chain and the pairing checks, then pins it (the list,
-//! the key and the applied head) before it reports success. A verification
-//! that fails after the pin takes the pin back.
+//! account and its genesis, `verifyReveal` reveals this host's new
+//! `host_channel_key` and its new encryption key (host-work-v1 §11.5), and
+//! `deviceVerified` carries the log from its genesis to the `add_host` the
+//! verified Astation signed for this host, or to the `host_enc_key` of the
+//! revealed key right after it. Atem verifies the whole chain and the
+//! pairing checks, then pins it (the list, both keys and the applied head)
+//! before it reports success. A verification that fails after the pin
+//! takes the pin back.
 use super::{DELETE_ONLY, HostPin, LEFTOVERS, MembershipHost, frozen_genesis, journal_of, store};
 use crate::paths::PairingPaths;
 use atem_client::canonical::StrictValue;
@@ -26,6 +28,10 @@ pub struct PairingInputs<'a> {
     pub host_trust_gen: u64,
     /// The `host_channel_key` this ceremony revealed.
     pub host_pub: [u8; 32],
+    /// The host encryption key this ceremony revealed (host-work-v1
+    /// §11.5): its public half and `enc_sig`.
+    pub enc_pub: [u8; 32],
+    pub enc_sig: [u8; 64],
 }
 
 /// Verifies `deviceVerified.membership` (`{"entries": [...]}`) for a
@@ -83,60 +89,124 @@ pub fn verify_pairing_log(
         }
         other => format!("the device list can't be pinned ({})", other.as_str()),
     })?;
-    if m.head().seq
-        != m.entries()
-            .iter()
-            .rev()
-            .find(|e| matches!(&e.action, atem_client::membership::entry::Action::AddHost { host } if host.host_id == inputs.host_id))
-            .map_or(0, |e| e.seq)
-    {
-        return Err("the device list must end at this host's add_host".into());
-    }
+    ends_at_this_ceremony(&m, inputs)?;
     Ok(m)
 }
 
-/// Pins the verified log for this host, with its `host_channel_key`, under
-/// `trust_gen.lock` held by the caller (the ceremony's apply). With
-/// `enc_key` (the debug hook's `host.senders`), the host encryption key of
-/// this trust generation is made beside it (`r9::host_enc`).
+/// host-work-v1 §11.5: the entries end at this host's `add_host` (seq `A`;
+/// the signing gate closed, or the key entry's append failed), or at its
+/// `host_enc_key` at `A` + 1 naming exactly the key this ceremony revealed
+/// at its trust generation, with its `enc_sig` and no `retire_previous`
+/// (the chain already verified that `enc_sig` against the `add_host`'s key).
+/// Anything else fails the verification.
+fn ends_at_this_ceremony(m: &Membership, inputs: &PairingInputs<'_>) -> Result<(), String> {
+    use atem_client::membership::entry::Action;
+    const NOT_AT_END: &str =
+        "the device list must end at this host's add_host or at its host_enc_key right after it";
+    let add_host = m
+        .entries()
+        .iter()
+        .rev()
+        .find(|e| matches!(&e.action, Action::AddHost { host } if host.host_id == inputs.host_id))
+        .map_or(0, |e| e.seq);
+    let head = m.head().seq;
+    if head == add_host {
+        return Ok(());
+    }
+    if head != add_host + 1 {
+        return Err(NOT_AT_END.into());
+    }
+    match m.entries().last().map(|e| &e.action) {
+        Some(Action::HostEncKey {
+            host_id,
+            host_trust_gen,
+            enc_key,
+            enc_sig,
+            retire_previous,
+        }) if host_id == inputs.host_id => {
+            if *host_trust_gen != inputs.host_trust_gen
+                || enc_key.alg() != Alg::X25519
+                || enc_key.as_bytes() != inputs.enc_pub.as_slice()
+                || enc_sig.as_slice() != inputs.enc_sig.as_slice()
+                || *retire_previous
+            {
+                return Err(
+                    "the device list's host_enc_key for this host isn't the key this ceremony revealed"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
+        _ => Err(NOT_AT_END.into()),
+    }
+}
+
+/// Pins the verified log for this host, with its `host_channel_key` and
+/// the host encryption key the ceremony made and revealed (host-work-v1
+/// §11.5; `r9::host_enc::keep_at_pin`, written before the list: a key that
+/// can't be kept fails the pin), under `trust_gen.lock` held by the caller
+/// (the ceremony's apply). In every build: the reveal carried the key.
 pub fn pin_at_pairing_locked(
     pairing: &PairingPaths,
     m: &Membership,
     host_id: &str,
     host_trust_gen: u64,
     host_seed: &[u8; 32],
-    enc_key: bool,
+    enc_key: &crate::session_protocol::r9::host_enc::CeremonyKey,
 ) -> Result<(), String> {
+    if enc_key.host_id() != host_id || enc_key.host_trust_gen() != host_trust_gen {
+        return Err(format!(
+            "the host encryption key was made for {} at trust generation {}, not {host_id} at {host_trust_gen}",
+            enc_key.host_id(),
+            enc_key.host_trust_gen()
+        ));
+    }
     let pin = HostPin {
         host_id: host_id.to_string(),
         host_trust_gen,
     };
-    MembershipHost::pin_locked(pairing, &journal_of(pairing), &pin, m, host_seed)?;
-    if enc_key {
-        // The pin removed any earlier key and record. One that can't be
-        // made now is made at the runtime's next start (or its next read
-        // of the list): the pairing doesn't fail for it.
-        match crate::session_protocol::r9::host_enc::make_at_pin_locked(pairing, host_trust_gen) {
-            Ok(lines) => lines
-                .iter()
-                .for_each(|line| eprintln!("atem: host encryption key: {line}")),
-            Err(error) => eprintln!("atem: host encryption key: {error}"),
-        }
+    let lines = MembershipHost::pin_locked(
+        pairing,
+        &journal_of(pairing),
+        &pin,
+        m,
+        host_seed,
+        Some(enc_key),
+    )?;
+    let listed = m
+        .host_enc_key(host_id)
+        .is_some_and(|keys| keys.current.key.as_bytes() == enc_key.enc_pub().as_slice());
+    for line in lines {
+        eprintln!("atem: host encryption key: {line}");
     }
+    eprintln!(
+        "atem: host encryption key: {}",
+        if listed {
+            "the device list names it (signed in the verification)"
+        } else {
+            "the device list has no entry for it yet"
+        }
+    );
     Ok(())
 }
 
 /// A verification that failed after its pin (the cred side couldn't be
 /// applied): the pin goes, so the host isn't left with a list its pairing
-/// never confirmed. Best effort; anything left fails closed (a leftover)
-/// until the next pin or `atem unpair`. The caller holds `trust_gen.lock`.
+/// never confirmed, and the encryption key kept with it goes too; the record
+/// of its id stays (the reveal handed it out; host-work-v1 §11.5). Best
+/// effort; anything left fails closed (a leftover) until the next pin or
+/// `atem unpair`. The caller holds `trust_gen.lock`.
 pub fn unpin_locked(pairing: &PairingPaths) {
     let mut store = store::Store::new(pairing, &journal_of(pairing));
     if let Err(e) = store.remove(store::DlFile::State) {
         eprintln!("atem: device list: cannot take the pin back: {e}");
         return;
     }
-    for file in LEFTOVERS.into_iter().chain(DELETE_ONLY) {
+    for file in LEFTOVERS
+        .into_iter()
+        .chain(DELETE_ONLY)
+        .filter(|f| *f != store::DlFile::HostEncGenerated)
+    {
         if let Err(e) = store.remove(file) {
             eprintln!("atem: device list: cannot take the pin back: {e}");
         }

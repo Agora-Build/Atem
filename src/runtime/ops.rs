@@ -781,15 +781,15 @@ pub(crate) async fn verify_device<U: OpUi>(
         let (astation, host_id) = (astation.clone(), device_id.clone());
         let account_id = account_id.clone();
         blocking(move || {
-            // Host senders (the debug hook only): the host encryption key
-            // is made with the pin.
-            let host = crate::pair_verify::HostPinning::new(
-                &astation,
-                &host_id,
-                &host_seed,
-                &account_id,
-                crate::runtime::test_hooks::host_features(),
-            );
+            // The host encryption key this ceremony recorded and revealed
+            // is kept with the pin (host-work-v1 §11.5).
+            let host = crate::pair_verify::HostPinning {
+                astation: &astation,
+                host_id: &host_id,
+                host_seed: &host_seed,
+                account_id: &account_id,
+                enc_key: &enc_key,
+            };
             crate::pair_verify::apply_device_verified(
                 &capture,
                 &paths,

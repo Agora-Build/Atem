@@ -408,6 +408,13 @@ struct Verifier {
     log: std::cell::RefCell<crate::session_protocol::membership::r9log::TestLog>,
     /// `verifyCommit.host_trust_gen` (§R9.2).
     advertised: u64,
+    /// host-work-v1 §11.5: Astation appends the host's `host_enc_key`
+    /// right after its `add_host` (the account's signing gate open); false:
+    /// the `add_host` only (the gate closed, or the key entry's append
+    /// failed).
+    key_entry: bool,
+    /// The public half of the host encryption key the last reveal carried.
+    revealed: std::cell::Cell<Option<[u8; 32]>>,
 }
 
 /// The host trust generation of the profile at `dir`.
@@ -471,6 +478,8 @@ impl Verifier {
             account: account.to_string(),
             log: std::cell::RefCell::new(log),
             advertised,
+            key_entry: true,
+            revealed: Default::default(),
         }
     }
 
@@ -523,7 +532,8 @@ impl Verifier {
 
     /// Waits for `verifyReveal`; the signed `deviceVerified` for it, with
     /// the device list ending at this host's `add_host` (trust generation
-    /// `host_trust_gen`, the revealed host channel key).
+    /// `host_trust_gen`, the revealed host channel key), or at the
+    /// `host_enc_key` of the revealed key right after it (`key_entry`).
     async fn certificate(&self, peer: &mut Peer, host_trust_gen: u64) -> AstationMessage {
         let reveal = peer.next("verifyReveal").await;
         let host_pub: [u8; 32] = atem_client::encoding::b64u_decode(
@@ -534,10 +544,20 @@ impl Verifier {
         .unwrap();
         // Astation copies the advertised generation into the add_host.
         assert_eq!(self.advertised, host_trust_gen, "the binding's generation");
-        self.revealed_key(&reveal);
+        let (enc_pub, enc_sig) = self.revealed_key(&reveal);
+        self.revealed.set(Some(enc_pub));
         self.log
             .borrow_mut()
             .add_host_pub(&self.device_id, self.advertised, &host_pub);
+        // Under the same confirmation, the host's key right after it.
+        if self.key_entry {
+            self.log.borrow_mut().host_enc_key_entry(
+                &self.device_id,
+                self.advertised,
+                &enc_pub,
+                &enc_sig,
+            );
+        }
         let key = |name: &str| -> [u8; 32] {
             STANDARD
                 .decode(reveal["data"][name].as_str().unwrap())
@@ -2992,6 +3012,166 @@ fn the_reveal_carries_a_new_encryption_key_recorded_before_it() {
         }
         assert_eq!(revealed[1].0, revealed[0].0 + 1, "the next generation");
         assert_ne!(revealed[1].1, revealed[0].1, "with a new key");
+        rt.shutdown().await;
+    });
+}
+
+/// host-work-v1 §11.5: a verified host keeps the encryption key it
+/// revealed as `pairing/host_enc_key` (its trust generation, its id
+/// recorded), whether `deviceVerified`'s entries end at the `host_enc_key`
+/// Astation appended for it (the pinned list then names it) or at the
+/// `add_host` (the signing gate closed, or the append failed: no key entry
+/// yet, and `host_enc_key_get` later hands out this same key).
+#[test]
+fn a_verified_host_keeps_the_key_it_revealed_with_or_without_its_entry() {
+    for key_entry in [true, false] {
+        local(async {
+            let dir = Rc::new(short_dir());
+            paired(&dir.path().join("profile"));
+            let (url, mut peer) = Peer::listen().await;
+            let keys = CredPaths::in_dir(&dir.path().join("profile"));
+            let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+            let mut op =
+                Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+            let mut verifier = Verifier::keys(&mut peer, "acct-op").await;
+            verifier.key_entry = key_entry;
+            let certificate = verifier
+                .certificate(&mut peer, trust_gen(&rt.profile))
+                .await;
+            let enc_pub = verifier.revealed.get().unwrap();
+            let (question, _, _) = op.ask().await;
+            op.answer(question, AnswerValue::Yes).await;
+            op.printed("Waiting for your Mac").await;
+            peer.send(&certificate);
+            peer.next("storageKeyRotate").await;
+            peer.send(&AstationMessage::StorageKeyRejected {
+                reason: "not now".into(),
+                pending_kid: None,
+            });
+            op.done().await.unwrap();
+            assert!(verified_as(&rt.keys(), "acct-op"), "{key_entry}");
+            let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+            assert!(pairing.membership.exists(), "{key_entry}: pinned");
+            let file: Value =
+                serde_json::from_slice(&std::fs::read(&pairing.host_enc_key).unwrap()).unwrap();
+            assert_eq!(file["host_trust_gen"], verifier.advertised, "{key_entry}");
+            assert_eq!(
+                file["pub"],
+                atem_client::encoding::b64u(&enc_pub),
+                "{key_entry}: the revealed key, kept"
+            );
+            assert_eq!(
+                enc_record(&rt.profile),
+                Some(json!({"v": 1, "host_trust_gen": verifier.advertised,
+                    "kids": [kid_of(&enc_pub)]})),
+                "{key_entry}"
+            );
+            let pinned = crate::session_protocol::membership::peek_pin(&pairing).unwrap();
+            assert_eq!(pinned.0, "acct-op");
+            let list = verifier.log.borrow();
+            let listed = list.log.host_enc_key(&verifier.device_id);
+            assert_eq!(
+                listed.map(|k| *k.current.key.as_32().unwrap()),
+                key_entry.then_some(enc_pub),
+                "{key_entry}"
+            );
+            drop(list);
+            rt.shutdown().await;
+        });
+    }
+}
+
+/// host-work-v1 §11.5: a `deviceVerified` whose `host_enc_key` entry for
+/// this host names another key than the one it revealed fails the
+/// verification, and nothing is pinned, kept or trusted. (No Astation can
+/// make such an entry valid without this host's `host_channel_key`, so the
+/// shared verifier refuses it first, `bad_enc_sig`; the host's own check of
+/// a chain-valid entry for another key is
+/// `membership::pairing_tests::a_list_ending_anywhere_else_is_refused`.)
+#[test]
+fn a_key_entry_for_another_key_fails_the_verification() {
+    local(async {
+        let dir = Rc::new(short_dir());
+        paired(&dir.path().join("profile"));
+        let (url, mut peer) = Peer::listen().await;
+        let keys = CredPaths::in_dir(&dir.path().join("profile"));
+        let rt = Runtime::start(dir, Some(&url), Arc::new(test_agent(&keys))).await;
+        let mut op = Op::start(rt.client().await, OpKind::PairVerify, OpOptions::default()).await;
+        let verifier = Verifier::keys(&mut peer, "acct-op").await;
+        let reveal = peer.next("verifyReveal").await;
+        let (_, enc_sig) = verifier.revealed_key(&reveal);
+        let host_pub: [u8; 32] = atem_client::encoding::b64u_decode(
+            reveal["data"]["host_channel_pub"].as_str().unwrap(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        verifier
+            .log
+            .borrow_mut()
+            .add_host_pub(&verifier.device_id, verifier.advertised, &host_pub);
+        // Another key under the reveal's enc_sig: the chain doesn't verify.
+        let entry = crate::session_protocol::membership::r9log::secret("another enc key");
+        let other: [u8; 32] =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(entry)).to_bytes();
+        let action = atem_client::membership::host_enc_key(
+            &verifier.device_id,
+            verifier.advertised,
+            &atem_client::PublicKey::new(atem_client::Alg::X25519, &other).unwrap(),
+            &enc_sig,
+            false,
+            1,
+        )
+        .unwrap();
+        let mut wire = verifier.log.borrow().wire();
+        let body = verifier.log.borrow().log.draft(
+            crate::session_protocol::membership::r9log::MAC,
+            1,
+            &action,
+        );
+        let signed = atem_client::membership::sign_entry(
+            &verifier.log.borrow().keys,
+            &crate::session_protocol::membership::r9log::auth(
+                crate::session_protocol::membership::r9log::MAC,
+            ),
+            body,
+        )
+        .unwrap();
+        wire.push(signed.object().to_json());
+        let certificate = match verifier.certificate_for(&reveal) {
+            AstationMessage::DeviceVerified {
+                device_verified,
+                account_state,
+                grants,
+                ..
+            } => AstationMessage::DeviceVerified {
+                device_verified,
+                account_state,
+                grants,
+                membership: Some(json!({ "entries": wire })),
+            },
+            _ => unreachable!(),
+        };
+        let (question, _, _) = op.ask().await;
+        op.answer(question, AnswerValue::Yes).await;
+        op.printed("Waiting for your Mac").await;
+        peer.send(&certificate);
+        let abort = peer.next("verifyAbort").await;
+        assert!(
+            abort["data"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("bad_enc_sig"),
+            "{abort}"
+        );
+        assert_eq!(
+            op.done().await.unwrap_err(),
+            crate::pair_verify::PAIRED_NOT_VERIFIED
+        );
+        let pairing = crate::paths::ProfilePaths::in_dir(&rt.profile).pairing;
+        assert!(!pairing.membership.exists() && !pairing.host_channel_key.exists());
+        assert!(!pairing.host_enc_key.exists(), "no key kept");
+        assert!(!verified_as(&rt.keys(), "acct-op"), "nothing trusted");
         rt.shutdown().await;
     });
 }
