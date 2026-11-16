@@ -444,6 +444,43 @@ impl Rig {
         station["feed"]["open"] == true && station["list_part"] == true
     }
 
+    /// A round trip on the host's link that a release build observes too
+    /// (no state dump): a session `hello` the host must answer (an r9 host
+    /// with a pinned list refuses it, `unsupported_version`), sent again
+    /// each second until its answer comes back. The link is one ordered
+    /// socket: whatever the host sent for an earlier message on it (a
+    /// `host_route` for a challenge) came before that answer, so once the
+    /// answer is here the fake Station's tap holds it too.
+    #[track_caller]
+    fn round_trip(&self) {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let id = uuid();
+            let hello = json!({"type": "session",
+                "data": {"v": 1, "op": "hello", "id": id, "revision": 8}});
+            self.astation.send(self.link(), hello.to_string());
+            let answered = Instant::now() + Duration::from_secs(1);
+            while let Ok(event) = self
+                .astation
+                .events
+                .recv_timeout(answered.saturating_duration_since(Instant::now()))
+            {
+                if let Event::Message(link, reply) = event
+                    && link == self.link()
+                    && reply["type"] == "session"
+                    && reply["data"]["re"] == id.as_str()
+                {
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the host never answered a hello\n{}",
+                self.runtime_log()
+            );
+        }
+    }
+
     /// Waits for two passes of the broker begun after now.
     fn two_passes(&self) {
         let pass = |rig: &Rig| rig.dump()["pass"].as_u64().unwrap_or(0);
@@ -4675,18 +4712,21 @@ fn a_refused_local_proof_keeps_the_link_and_its_calls_are_refused() {
 }
 
 /// Hook off = main: a challenge Astation's proxy forwards on the local link
-/// is ignored as on main (its runtime.log line), nothing answered.
+/// is ignored as on main (its runtime.log line), nothing answered. Observed
+/// through the link itself, so a release build runs it too: a round trip
+/// after the challenge on the same ordered socket ([`Rig::round_trip`]),
+/// then nothing reached the fake Station.
 #[test]
 fn with_the_hook_off_a_local_link_ignores_the_stations_challenge_as_main_does() {
     let rig = Rig::start(Via::Local, false, false);
     let atem_id = rig.atem_id();
     rig.station().require_proof(ASTATION, &atem_id);
     rig.station().on_link(rig.link());
+    rig.round_trip();
     rig.within("the challenge ignored", || {
         rig.runtime_log()
             .contains("a host_challenge on a link that isn't a relay identity link was ignored")
     });
-    rig.two_passes();
     rig.station().serve(rig.link());
     assert!(rig.station().proofs().is_empty(), "nothing answered");
     assert!(!rig.runtime_log().contains("host_challenge answered"));
