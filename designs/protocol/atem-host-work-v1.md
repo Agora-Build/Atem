@@ -2067,7 +2067,7 @@ Each is `{"type":"relay","op":…}` on Atem's one link, like `push_hint`
 |---|---|---|
 | `control_sync` | host → Station | `request_id` (this call's id: a lowercase UUID v4, fresh for every call; wire rule 11), `origin`, `feed_id?`, `after`: read the feed `(origin, feed_id)` after position `after`, the last position the host read (0: none) |
 | `control_sync_result` | Station → host | `request_id` and `after` (the call's, echoed; wire rule 11), `origin`, `feed_id`, `head` (the feed's last position, 0 for an empty feed), `station_time` (ms, I.6.5), `records: [{feed_seq, record}]` (the records strictly after `after`, ascending) |
-| `heads` | Station → host | `feeds: [{origin, feed_id, head, station_time}]` (each feed covering a principal with work on this host) and `membership: {seq, hash}` (the device list's head); stage 3 adds the host's mailbox head (II.5), an unknown field until then (proposed, 2026-11-15: `mailbox: {mailbox_id, head}`, §11.5 "The mailbox calls", rule 6) |
+| `heads` | Station → host | `feeds: [{origin, feed_id, head, station_time}]` (each feed covering a principal with work on this host) and `membership: {seq, hash}` (the device list's head); for a host whose `welcome` lists `host.senders` only, also the host's mailbox head `mailbox: {mailbox_id, head}` (II.5; agreed with Astation 2026-11-16, §11.5 "The mailbox calls", rule 6). The shared core reads it only behind `control::Accept { mailbox: true }` (`Heads::decode_with`, `ToHost::decode_with`); the strict reader (`Heads::decode`, `ToHost::decode`), every other host's, refuses it as an unknown field |
 | `control_ack` | host → Station | `account_id`, `genesis_hash`, `host_id`, `host_trust_gen` (the host's claim, below), `origin`, `feed_id`, `cursor` (the host's scan cursor in that feed), `results` |
 | `membership_fetch` | host → Station | `after`: the head `seq` the host holds (design I.5.8, "the host fetches the device list itself"; R9.3 allows it, and it gets no more trust than any carrier) |
 | `membership_fetch_result` | Station → host | `head: {seq, hash}` and `entries`: the signed entries after `after`, an R9.3 carriage |
@@ -3327,15 +3327,21 @@ envelopes sent for it, and the tasks of this host's recorded resolution),
 with these differences: the sender must be the row's host (step 3); check
 3's `authorized` and current-host parts don't refuse a result, which is
 verified with the key its sender last held (a removed host's newest
-`add_host`, which the list keeps); and the plaintext must answer the row (a
+`add_host`, which the list keeps); a result's reply carries its task's
+`result_id` ("`result_id`" below; else `result_id_mismatch`, refused
+authenticated); and the plaintext must answer the row (a
 status names the row's `message_id`, a refusal the request's id or one of
 its cancel or complete envelopes', a result a task of the resolution; else
-`does_not_answer_outbox_row`, refused authenticated).
+`does_not_answer_outbox_row`, refused authenticated). **Atem's reading, agreed with Astation 2026-11-16,
+#173 comment 6919736991:** the `result_id` check runs with the plaintext, after its strict
+reading and before the row's, whatever the sender's standing: a result
+failing both is `result_id_mismatch`, and a revoked or removed host's
+mismatched result is refused, never kept as data.
 
 | Verdict | When |
 |---|---|
 | `Accepted{plain, sender}` | it answers the row and its sender is a current, `authorized` host; delivering a result into a session is the host's rule (the return grant, the route with `results = true`, the project) |
-| `NotDelivered{plain, sender, reason}` | it verified and answers the row, but its sender is a host this list holds `revoked` or has removed: kept as data (stored with the outbox row, shown by `atem message status`, never prompted); `reason` is the return grant's detail, `result not delivered: sender revoked` or `result not delivered: sender removed` (revoked when both apply) |
+| `NotDelivered{plain, sender, reason}` | it verified, its reply's `result_id` (for a result) is its task's, and it answers the row, but its sender is a host this list holds `revoked` or has removed: kept as data (stored with the outbox row, shown by `atem message status`, never prompted); `reason` is the return grant's detail, `result not delivered: sender revoked` or `result not delivered: sender removed` (revoked when both apply) |
 | `Pending`, `Refused`, `RefusedAuthenticated`, `Unavailable` | as for an envelope; nothing is reported back for a result |
 
 A result that doesn't verify is refused (`bad_signature`), as is one whose
@@ -3388,10 +3394,28 @@ list, and that the host's encryption key is signed in the verification
 ceremony (design status block, II.1, II.4.1, II.4.3, II.6). The five
 subsections below are concrete proposals for the two open items above, for
 the two SDK points Astation raised on 2026-11-07 (#120 comment 6701618182)
-and for the ceremony's fields. Each is **agreed with Astation 2026-11-16**: nothing in them is built, and their shared vectors come with
-the shared core once they are agreed.
+and for the ceremony's fields. Each is **agreed with Astation 2026-11-16**.
+**Built in the shared core:** the mailbox calls' readers and builders,
+`object_hash` and `heads`' mailbox head behind explicit feature handling
+("The mailbox calls"), the status forms and the selector task id, and
+`result_id` with both of its checks; `select`'s channel rule. Nothing else in
+them is built (the hosts' mailbox client and outbox, the Station's side,
+`select`'s `launch`, the ceremony's fields). The status forms and the
+sending host's `result_id` check have their shared vectors in
+`fixtures/r9-vectors-host-envelope.json`; the mailbox calls' shared vectors
+come with a later change.
 
 #### The mailbox calls (agreed with Astation 2026-11-16)
+
+**Built in the shared core** (`atem_client::host_mail::mailbox`): every
+message below, read strictly and built as its reader reads it, each
+answer's match against its call (`answers`, the first echoed field that
+differs) and `object_hash`; a page keeps each object's exact bytes as
+received beside its value (`MailboxEntry::bytes`), the evidence of one that
+doesn't parse (check 1); `heads`' `mailbox` in `control::relay`, read
+only with `Accept { mailbox: true }` (`Heads::decode_with`,
+`ToHost::decode_with`), refused by every other reader. Not built: the
+hosts' mailbox client and outbox, and the Station's side.
 
 The receiving host's mailbox on the Station (design II.4.3): a sending host
 puts objects over its own link, and the receiving host syncs its own mailbox
@@ -3496,12 +3520,18 @@ moves to 11, and position 12 comes with the next call, `after: 11`.
      it) gets no `mailbox_put_refused`, which names the `id`: the Station
      drops it and counts it, and the sender's live put is retired at the
      deadline, as an unanswered call (rule 8). A sender's own shared-core
-     builder never makes one.
+     builder never makes one. **Atem's reading, agreed with Astation 2026-11-16, #173 comment 6919736991:** the shared
+     core's reader also refuses a put whose object's sealed part isn't of
+     the right shape (`enc` and `ct` base64url, `enc` 32 bytes, `ct` at
+     least a tag), so the Station drops that put too; it still never opens
+     or judges the sealed part.
    - **Refusals** (`mailbox_put_refused`, naming the put's `request_id` and
      its object's `id`). `quota`: a limit of design II.4.3 is reached; the
      object isn't stored and never counts as stored or accepted, and the
      sender keeps it and puts it again later. `id_reused`: final for those
-     bytes. `expired`: final. `forbidden`: rule 1, or a recipient that isn't
+     bytes. `expired`: final; **Atem's reading, agreed with Astation 2026-11-16, #173 comment 6919736991:** also the
+     code of an `expires_at` more than 24 h after `created_at`, or not after
+     it (checked above, with no code of its own). `forbidden`: rule 1, or a recipient that isn't
      a current host at that generation; final on this link generation (the
      sender may put it again on a later one, or after its device list moved,
      until the object expires). Unlike §11.4's refusals, these name the put:
@@ -3649,6 +3679,13 @@ moves to 11, and position 12 comes with the next call, `after: 11`.
 
 #### Status forms of a selector's resolution (agreed with Astation 2026-11-16)
 
+**Built in the shared core:** both forms (`Delivery::NoMatch`,
+`Delivery::Resolved`), the status object's receipt check
+(`status_recipients_valid`) and the selector task id
+(`session::select::selector_task_id`, which the runtime's resolution calls).
+Vectors: the two examples below, accepted, and two resolutions refused, in
+`fixtures/r9-vectors-host-envelope.json`.
+
 A request's recipient whose destination is `select{selectors, budget}`
 ("`select` from host senders" below) is expanded once by the receiving host
 into a fixed resolution (collaboration §5; design II.6). A status object
@@ -3700,11 +3737,16 @@ other, and a resolution never changes.)
 - **Where they appear.** Only in a host's `atem-result` status objects,
   and on the sending host in `atem message status`. A channel never
   carries `select` (below), so no `message_publish` receipt or
-  `message_query` answer has them. The client core's receipt check
-  (`recipients_valid`) takes both forms only in a status object; a `work`
+  `message_query` answer has them. The client core's receipt check takes
+  both forms only in a status object (`status_recipients_valid`; a
+  channel's message receipt, `recipients_valid`, refuses them); a `work`
   receipt keeps its `task_id` equal to its `recipient_id`.
 
 #### `result_id` (agreed with Astation 2026-11-16)
+
+**Built in the shared core:** the derivation (`session::host_work::result_id`),
+the client's check (`Response::answers`) and the sending host's
+(`accept_result`, `result_id_mismatch`, with its host-envelope vector).
 
 Every reply to a task has one `result_id` (§4, "Reply"), derived from the
 task id as the host derives it today (`src/runtime/collab_results.rs`,

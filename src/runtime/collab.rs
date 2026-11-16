@@ -9,7 +9,7 @@ use atem_client::session::{
     framing::{Closing, Header, Screenshot, Snapshots, TaskPrompt},
     host_work::{HostTarget, WorkTask},
     messages::Message,
-    select::{AgentLabels, Label, MAX_AGENTS, Selector},
+    select::{AgentLabels, Label, MAX_AGENTS, Selector, selector_task_id},
     wire::MAX_PROMPT_BYTES,
 };
 use rusqlite::{OptionalExtension, Transaction, params};
@@ -97,11 +97,7 @@ pub fn resolve(
         })
         .take(budget.min(MAX_AGENTS) as usize)
         .map(|a| ResolvedTask {
-            task_id: uuid::Uuid::new_v5(
-                &uuid::Uuid::NAMESPACE_OID,
-                &serde_json::to_vec(&(message_id, recipient_id, &a.session_id)).unwrap(),
-            )
-            .to_string(),
+            task_id: selector_task_id(message_id, recipient_id, &a.session_id),
             route_id: a.route_id.clone(),
             route_revision: a.route_revision,
             session_id: a.session_id.clone(),
@@ -830,6 +826,62 @@ mod tests {
                 .unwrap()
                 .get_version_num()
                 == 5
+        );
+    }
+
+    /// The selector task id moved into the shared core
+    /// (`atem_client::session::select::selector_task_id`, host-work-v1
+    /// §11.5): a resolution's ids are the bytes the runtime derived before
+    /// the move, `UUIDv5(NAMESPACE_OID, json([message_id, recipient_id,
+    /// session_id]))`, so no stored or reported task id changes; and §11.5's
+    /// example gives its id.
+    #[test]
+    fn the_runtime_and_the_core_derive_the_same_selector_task_id() {
+        let before = |message: &str, recipient: &str, session: &str| {
+            uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                &serde_json::to_vec(&(message, recipient, session)).unwrap(),
+            )
+            .to_string()
+        };
+        let labels: BTreeSet<Label> = ["tag:a".parse().unwrap()].into_iter().collect();
+        let agents: Vec<_> = (0..3)
+            .map(|n| Candidate {
+                route_id: "a".into(),
+                route_revision: 1,
+                session_id: format!("ses-ab23cd45ef6{n}"),
+                process_gen: "process".into(),
+                started_ms: n,
+                labels: labels.clone(),
+            })
+            .collect();
+        let message = uuid::Uuid::new_v4().to_string();
+        let recipient = uuid::Uuid::new_v4().to_string();
+        let tasks = resolve(
+            "host",
+            &agents,
+            &["tag:a".parse().unwrap()],
+            32,
+            "ses-zzzzzzzzzzzz",
+            &message,
+            &recipient,
+        );
+        assert_eq!(tasks.len(), 3);
+        for task in &tasks {
+            assert_eq!(
+                task.task_id,
+                before(&message, &recipient, &task.session_id),
+                "{}",
+                task.session_id
+            );
+        }
+        assert_eq!(
+            selector_task_id(
+                "3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b",
+                "7c6b5a49-3827-4e16-9d05-f4e3d2c1b0a9",
+                "ses-ab23cd45ef67"
+            ),
+            "80160896-4fcd-5e6e-adac-98bac5497321"
         );
     }
 

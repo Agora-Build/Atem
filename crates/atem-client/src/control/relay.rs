@@ -17,8 +17,12 @@
 //! | `membership_fetch_result` | Station → host | `head`, `entries` |
 //! | `control_sync_refused`, `membership_fetch_refused`, `control_ack_refused` | Station → host | `code` (`forbidden`) |
 //!
-//! A `mailbox` field joins `heads` in stage 3 (II.5); until then it is an
-//! unknown field and refused.
+//! A `mailbox` field joins `heads` for host senders (II.5; host-work-v1
+//! §11.5 rule 6): only a reader asked to accept it ([`Accept`]) reads it
+//! ([`Heads::decode_with`], [`ToHost::decode_with`]); every other reader,
+//! [`Heads::decode`] and [`ToHost::decode`] included, refuses it as an
+//! unknown field. The mailbox calls themselves are
+//! [`crate::host_mail::mailbox`]'s.
 //!
 //! **Strict.** A reader takes the received bytes: at most
 //! [`MAX_RELAY_MESSAGE_BYTES`] (R9.9: every relay message, in either
@@ -211,7 +215,7 @@ fn parse(bytes: &[u8]) -> Result<StrictValue> {
 }
 
 /// The `op` of a relay message: `type` is `relay` and `op` a string.
-fn op_of(root: &Value) -> Option<&str> {
+pub(crate) fn op_of(root: &Value) -> Option<&str> {
     let o = root.as_object()?;
     (o.get("type")?.as_str()? == "relay")
         .then(|| o.get("op")?.as_str())
@@ -219,10 +223,10 @@ fn op_of(root: &Value) -> Option<&str> {
 }
 
 /// An object that holds only the fields `allowed` names.
-struct Fields<'a>(&'a Map<String, Value>);
+pub(crate) struct Fields<'a>(&'a Map<String, Value>);
 
 impl<'a> Fields<'a> {
-    fn of(value: &'a Value, allowed: &[&str], what: &'static str) -> Result<Self> {
+    pub(crate) fn of(value: &'a Value, allowed: &[&str], what: &'static str) -> Result<Self> {
         let o = value.as_object().ok_or(RelayError::Malformed(what))?;
         if o.keys().any(|k| !allowed.contains(&k.as_str())) {
             return Err(RelayError::UnknownField);
@@ -232,18 +236,18 @@ impl<'a> Fields<'a> {
 
     /// The top of a message of `op` with exactly the fields `allowed`
     /// (`type` and `op` among them).
-    fn message(root: &'a Value, op: &str, allowed: &[&str]) -> Result<Self> {
+    pub(crate) fn message(root: &'a Value, op: &str, allowed: &[&str]) -> Result<Self> {
         if op_of(root) != Some(op) {
             return Err(RelayError::WrongMessage);
         }
         Fields::of(root, allowed, "message")
     }
 
-    fn get(&self, key: &'static str) -> Result<&'a Value> {
+    pub(crate) fn get(&self, key: &'static str) -> Result<&'a Value> {
         self.0.get(key).ok_or(RelayError::Malformed(key))
     }
 
-    fn text(&self, key: &'static str) -> Result<&'a str> {
+    pub(crate) fn text(&self, key: &'static str) -> Result<&'a str> {
         self.get(key)?.as_str().ok_or(RelayError::Malformed(key))
     }
 
@@ -256,13 +260,13 @@ impl<'a> Fields<'a> {
     }
 
     /// A whole number of at least 0 (the strict parse keeps it safe).
-    fn uint(&self, key: &'static str) -> Result<u64> {
+    pub(crate) fn uint(&self, key: &'static str) -> Result<u64> {
         self.get(key)?.as_u64().ok_or(RelayError::Malformed(key))
     }
 
     /// An array of at most `max` items: over it is `TooLarge`, before any
     /// item is read.
-    fn array(&self, key: &'static str, max: usize) -> Result<&'a [Value]> {
+    pub(crate) fn array(&self, key: &'static str, max: usize) -> Result<&'a [Value]> {
         let items = self
             .get(key)?
             .as_array()
@@ -275,7 +279,7 @@ impl<'a> Fields<'a> {
 }
 
 /// `{"type":"relay","op":op}`, to add the message's fields to.
-fn message(op: &str) -> Map<String, Value> {
+pub(crate) fn message(op: &str) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("type".into(), json!("relay"));
     m.insert("op".into(), json!(op));
@@ -307,7 +311,7 @@ fn check_feed_id(feed_id: &str) -> Result<()> {
     }
 }
 
-fn check_safe(n: u64, what: &'static str) -> Result<()> {
+pub(crate) fn check_safe(n: u64, what: &'static str) -> Result<()> {
     if n <= MAX_SAFE_INTEGER {
         Ok(())
     } else {
@@ -338,7 +342,7 @@ fn check_head(head: &Head, what: &'static str) -> Result<()> {
 
 // ---------------------------------------------------------- control_sync
 
-fn check_request_id(request_id: &str) -> Result<()> {
+pub(crate) fn check_request_id(request_id: &str) -> Result<()> {
     if is_uuid_v4(request_id) {
         Ok(())
     } else {
@@ -692,8 +696,9 @@ impl FeedHead {
 /// `heads{feeds, membership}` (Station → host): on every (re)connection and
 /// every 30 seconds, and at once when a record is stored, each covering
 /// feed's head and the Station's device-list head. The announced list head
-/// is the Station's word, not signed authority (I.5.8). Stage 3 adds the
-/// host's mailbox head.
+/// is the Station's word, not signed authority (I.5.8). A host with
+/// `host.senders` also reads its mailbox head ([`HeadsWithMailbox`]); this
+/// type and its strict reader never carry it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Heads {
     /// At most [`MAX_HEAD_FEEDS`], a feed once.
@@ -729,13 +734,32 @@ impl Heads {
         finish(m)
     }
 
-    /// Reads received bytes, strictly.
+    /// Reads received bytes, strictly: a `mailbox` field is unknown and
+    /// refused, as on a host without `host.senders` (host-work-v1 §11.5 rule
+    /// 6).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         Self::read(parse(bytes)?.value())
     }
 
     fn read(root: &Value) -> Result<Self> {
-        let f = Fields::message(root, op::HEADS, &["type", "op", "feeds", "membership"])?;
+        Self::read_with(root, Accept::default()).map(|read| read.heads)
+    }
+
+    /// Reads received bytes, strictly, with the fields `accept` turns on: a
+    /// host that lists `host.senders` reads the optional `mailbox` with
+    /// `Accept { mailbox: true }`; with `Accept::default()` this is
+    /// [`Heads::decode`].
+    pub fn decode_with(bytes: &[u8], accept: Accept) -> Result<HeadsWithMailbox> {
+        Self::read_with(parse(bytes)?.value(), accept)
+    }
+
+    fn read_with(root: &Value, accept: Accept) -> Result<HeadsWithMailbox> {
+        let fields: &[&str] = if accept.mailbox {
+            &["type", "op", "feeds", "membership", "mailbox"]
+        } else {
+            &["type", "op", "feeds", "membership"]
+        };
+        let f = Fields::message(root, op::HEADS, fields)?;
         let feeds = f
             .array("feeds", MAX_HEAD_FEEDS)?
             .iter()
@@ -746,7 +770,86 @@ impl Heads {
             membership: read_head(f.get("membership")?, "membership")?,
         };
         heads.check()?;
-        Ok(heads)
+        let mailbox = match f.0.get("mailbox") {
+            None => None,
+            Some(value) => Some(MailboxHead::read(value)?),
+        };
+        Ok(HeadsWithMailbox { heads, mailbox })
+    }
+}
+
+/// Which optional fields a reader takes beyond §11.4's. The default takes
+/// none: every reader is strict unless its host turned a field on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Accept {
+    /// `heads.mailbox` (host-work-v1 §11.5 rule 6): only a host whose
+    /// `welcome` lists `host.senders` reads it; the Station sends it to no
+    /// other host, and any other host refuses it.
+    pub mailbox: bool,
+}
+
+/// The calling host's own mailbox, as `heads` announces it
+/// (`mailbox:{mailbox_id, head}`, host-work-v1 §11.5 rule 6): its id, a
+/// lowercase UUID v4, and its last position (0: none yet).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailboxHead {
+    pub mailbox_id: String,
+    pub head: u64,
+}
+
+impl MailboxHead {
+    fn check(&self) -> Result<()> {
+        if !is_uuid_v4(&self.mailbox_id) {
+            return Err(RelayError::Malformed("mailbox"));
+        }
+        check_safe(self.head, "mailbox")
+    }
+
+    fn read(value: &Value) -> Result<Self> {
+        let f = Fields::of(value, &["mailbox_id", "head"], "mailbox")?;
+        let mailbox = MailboxHead {
+            mailbox_id: f
+                .text("mailbox_id")
+                .map_err(|_| RelayError::Malformed("mailbox"))?
+                .to_owned(),
+            head: f
+                .uint("head")
+                .map_err(|_| RelayError::Malformed("mailbox"))?,
+        };
+        mailbox.check()?;
+        Ok(mailbox)
+    }
+}
+
+/// `heads` with the mailbox head a host with `host.senders` reads
+/// (host-work-v1 §11.5 rule 6): §11.4's [`Heads`] and, when the Station
+/// announces one, the calling host's own mailbox. A `heads` without it
+/// announces no mailbox (host senders' gate stays closed, design II.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadsWithMailbox {
+    pub heads: Heads,
+    pub mailbox: Option<MailboxHead>,
+}
+
+impl HeadsWithMailbox {
+    /// The wire message: [`Heads::to_json`]'s, with `mailbox` when there is
+    /// one (a Station writes it only for a host that lists `host.senders`).
+    /// Checked as the reader checks it, within the 256 KiB bound every relay
+    /// message but the mailbox calls keeps.
+    pub fn to_json(&self) -> Result<Value> {
+        let mut value = self.heads.to_json()?;
+        if let Some(mailbox) = &self.mailbox {
+            mailbox.check()?;
+            let Value::Object(m) = &mut value else {
+                unreachable!("a message is an object")
+            };
+            m.insert(
+                "mailbox".into(),
+                json!({"mailbox_id": mailbox.mailbox_id, "head": mailbox.head}),
+            );
+            return finish(std::mem::take(m));
+        }
+        Ok(value)
     }
 }
 
@@ -1327,8 +1430,10 @@ impl ToHost {
     /// Reads received bytes, strictly: one parse, then the reader of its
     /// `op`.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let root = parse(bytes)?;
-        let root = root.value();
+        Self::read(parse(bytes)?.value())
+    }
+
+    fn read(root: &Value) -> Result<Self> {
         match op_of(root) {
             Some(op::CONTROL_SYNC_RESULT) => {
                 ControlSyncResult::read(root).map(ToHost::ControlSyncResult)
@@ -1343,6 +1448,20 @@ impl ToHost {
             },
             None => Err(RelayError::WrongMessage),
         }
+    }
+
+    /// [`ToHost::decode`] with the fields `accept` turns on: a `heads` gives
+    /// its mailbox head beside it (`None` when it announces none, and for
+    /// every other message). With `Accept::default()` this reads exactly as
+    /// `decode`.
+    pub fn decode_with(bytes: &[u8], accept: Accept) -> Result<(Self, Option<MailboxHead>)> {
+        let root = parse(bytes)?;
+        let root = root.value();
+        if op_of(root) == Some(op::HEADS) {
+            let read = Heads::read_with(root, accept)?;
+            return Ok((ToHost::Heads(read.heads), read.mailbox));
+        }
+        Self::read(root).map(|message| (message, None))
     }
 }
 
@@ -2487,10 +2606,112 @@ mod tests {
     }
 
     #[test]
-    fn heads_without_mailbox_until_stage_3() {
-        // Stage 3 adds `mailbox:{mailbox_id, head}` for host senders (II.5).
-        // Until then a `heads` that carries one is refused, and the builder
-        // never writes one.
+    fn heads_carry_the_mailbox_head_only_to_a_reader_that_accepts_it() {
+        // host-work-v1 §11.5 rule 6: the Station adds `mailbox:{mailbox_id,
+        // head}` only for a host that lists `host.senders`, and only a reader
+        // asked to accept it reads it; it is optional there.
+        let accept = Accept { mailbox: true };
+        let mailbox = MailboxHead {
+            mailbox_id: FEED_2.into(),
+            head: 12,
+        };
+        let sent = HeadsWithMailbox {
+            heads: heads(),
+            mailbox: Some(mailbox.clone()),
+        };
+        let wire = sent.to_json().unwrap();
+        assert_eq!(wire["mailbox"], json!({"mailbox_id": FEED_2, "head": 12}));
+        assert_eq!(Heads::decode_with(&bytes(&wire), accept).unwrap(), sent);
+        assert_eq!(
+            ToHost::decode_with(&bytes(&wire), accept).unwrap(),
+            (ToHost::Heads(heads()), Some(mailbox))
+        );
+        // Every other message reads as `decode` reads it, with no mailbox.
+        let page = sync_result(1).to_json().unwrap();
+        assert_eq!(
+            ToHost::decode_with(&bytes(&page), accept).unwrap(),
+            (ToHost::decode(&bytes(&page)).unwrap(), None)
+        );
+        // Absent: no mailbox announced, under either reading.
+        let plain = heads().to_json().unwrap();
+        let none = HeadsWithMailbox {
+            heads: heads(),
+            mailbox: None,
+        };
+        assert_eq!(none.to_json().unwrap(), plain);
+        for reading in [accept, Accept::default()] {
+            assert_eq!(Heads::decode_with(&bytes(&plain), reading).unwrap(), none);
+        }
+        // The strict reader refuses it, as before.
+        assert_eq!(Heads::decode(&bytes(&wire)), Err(RelayError::UnknownField));
+        assert_eq!(ToHost::decode(&bytes(&wire)), Err(RelayError::UnknownField));
+        // Read strictly where accepted: exactly `{mailbox_id, head}`, a
+        // lowercase UUID v4 and a head from 0 to 2^53 - 1.
+        for (bad, code) in [
+            (json!({"mailbox_id": FEED_2}), "malformed"),
+            (json!({"head": 1}), "malformed"),
+            (
+                json!({"mailbox_id": FEED_2, "head": 1, "seq": 1}),
+                "unknown_field",
+            ),
+            (
+                json!({"mailbox_id": FEED_2.to_uppercase(), "head": 1}),
+                "malformed",
+            ),
+            (json!({"mailbox_id": "not-a-uuid", "head": 1}), "malformed"),
+            (json!({"mailbox_id": FEED_2, "head": -1}), "malformed"),
+            (json!({"mailbox_id": FEED_2, "head": "1"}), "malformed"),
+            (json!(null), "malformed"),
+            (json!([]), "malformed"),
+        ] {
+            let mut message = plain.clone();
+            message["mailbox"] = bad.clone();
+            assert_eq!(
+                Heads::decode_with(&bytes(&message), accept)
+                    .unwrap_err()
+                    .code(),
+                code,
+                "{bad}"
+            );
+        }
+        let zero = HeadsWithMailbox {
+            heads: heads(),
+            mailbox: Some(MailboxHead {
+                mailbox_id: FEED_2.into(),
+                head: 0,
+            }),
+        };
+        let wire = zero.to_json().unwrap();
+        assert_eq!(Heads::decode_with(&bytes(&wire), accept).unwrap(), zero);
+        // The builder checks what the reader checks.
+        for bad in [
+            MailboxHead {
+                mailbox_id: "not-a-uuid".into(),
+                head: 0,
+            },
+            MailboxHead {
+                mailbox_id: FEED_2.into(),
+                head: MAX_SAFE_INTEGER + 1,
+            },
+        ] {
+            let heads = HeadsWithMailbox {
+                heads: heads(),
+                mailbox: Some(bad),
+            };
+            assert!(is_malformed(heads.to_json()));
+        }
+        // `heads` keeps the 256 KiB bound whatever it accepts.
+        let mut big = br#"{"type":"relay","op":"heads","pad":""#.to_vec();
+        big.resize(MAX_RELAY_MESSAGE_BYTES + 1, b'a');
+        assert_eq!(Heads::decode_with(&big, accept), Err(RelayError::TooLarge));
+    }
+
+    #[test]
+    fn strict_heads_refuse_the_mailbox() {
+        // `mailbox:{mailbox_id, head}` is for hosts with `host.senders`
+        // (II.5; host-work-v1 §11.5 rule 6): the strict reader, every other
+        // host's, refuses a `heads` that carries one, and `Heads`' builder
+        // never writes one (`HeadsWithMailbox` does).
         let message = heads().to_json().unwrap();
         assert!(message.get("mailbox").is_none());
         let mut keys: Vec<&str> = message
@@ -2519,6 +2740,17 @@ mod tests {
                 Err(RelayError::UnknownField)
             );
         }
+        // Feature handling asked for nothing new reads as today.
+        let mut with_mailbox = message.clone();
+        with_mailbox["mailbox"] = json!({"mailbox_id": FEED, "head": 3});
+        assert_eq!(
+            Heads::decode_with(&bytes(&with_mailbox), Accept::default()),
+            Err(RelayError::UnknownField)
+        );
+        assert_eq!(
+            ToHost::decode_with(&bytes(&with_mailbox), Accept { mailbox: false }),
+            Err(RelayError::UnknownField)
+        );
         // The device-list head is required, and exactly `{seq, hash}`.
         assert!(is_malformed(read(
             "heads",

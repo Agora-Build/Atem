@@ -8,7 +8,10 @@ publish = false
 [dependencies]
 base64 = "0.22"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+# `raw_value`: a mailbox page keeps each object's exact bytes as received
+# (`host_mail::mailbox::MailboxEntry::bytes`), the evidence of one that
+# doesn't parse.
+serde_json = { version = "1.0", features = ["raw_value"] }
 sha2 = "0.10"
 hmac = "0.12"
 hkdf = "0.12"

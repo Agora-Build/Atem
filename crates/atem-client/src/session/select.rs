@@ -146,3 +146,55 @@ pub fn selectors_problem(selectors: &[String], budget: u32) -> Option<String> {
 pub fn valid_selectors(selectors: &[String], budget: u32) -> bool {
     selectors_problem(selectors, budget).is_none()
 }
+
+/// The task id of one agent of a selector's fixed resolution (collaboration
+/// §5; host-work-v1 §11.5, "Status forms of a selector's resolution"):
+/// `UUIDv5(NAMESPACE_OID, json([message_id, recipient_id, session_id]))`,
+/// the UTF-8 bytes of the compact JSON array of the three strings, with
+/// RFC 9562's `NAMESPACE_OID`, written lowercase with hyphens. `session_id`
+/// is the receiving host's session. The host that resolves derives it; a
+/// sending host can't (it doesn't know the receiver's sessions) and reads it
+/// as an opaque UUID v5 from the receiver's status. The one definition: the
+/// stage-1 runtime calls it too.
+pub fn selector_task_id(message_id: &str, recipient_id: &str, session_id: &str) -> String {
+    let name = serde_json::to_vec(&(message_id, recipient_id, session_id))
+        .expect("three strings serialize");
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &name).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::host_work::result_id;
+    use crate::session::wire::is_uuid_v5;
+
+    const MESSAGE: &str = "3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5b";
+    const RECIPIENT: &str = "7c6b5a49-3827-4e16-9d05-f4e3d2c1b0a9";
+    const SESSION: &str = "ses-ab23cd45ef67";
+
+    #[test]
+    fn a_selector_task_id_is_the_uuid_v5_of_its_message_recipient_and_session() {
+        // host-work-v1 §11.5, "Status forms of a selector's resolution".
+        let task = selector_task_id(MESSAGE, RECIPIENT, SESSION);
+        assert_eq!(task, "80160896-4fcd-5e6e-adac-98bac5497321");
+        assert!(is_uuid_v5(&task));
+        // UUIDv5(NAMESPACE_OID, the compact JSON array of the three), written
+        // out.
+        let name = format!(r#"["{MESSAGE}","{RECIPIENT}","{SESSION}"]"#);
+        assert_eq!(
+            task,
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, name.as_bytes()).to_string()
+        );
+        // Its reply's `result_id` (the contract's example).
+        assert_eq!(result_id(&task), "996a448a-cf99-5e86-aa67-7f9a582a7eaa");
+        // Each id, and their order, makes another task.
+        let others = [
+            selector_task_id(RECIPIENT, MESSAGE, SESSION),
+            selector_task_id(MESSAGE, RECIPIENT, "ses-ab23cd45ef68"),
+            selector_task_id("3f1e2d4c-5b6a-4978-8a9b-0c1d2e3f4a5c", RECIPIENT, SESSION),
+        ];
+        for other in others {
+            assert_ne!(other, task);
+        }
+    }
+}
