@@ -1179,7 +1179,7 @@ check("host mail: every envelope check's verdict (openEnvelope)", () => {
     mailExpect(c, m.openEnvelope(str(mailObject[c.object].object), mailList(c.chain), mailRecipient(c.receiver), store, c.now));
     n++;
   }
-  if (n < 44) throw new Error(`${n} checks`);
+  if (n < 60) throw new Error(`${n} checks`);
 });
 check("host mail: every result check's verdict (acceptResult)", () => {
   const store = mailStore();
@@ -1188,7 +1188,7 @@ check("host mail: every result check's verdict (acceptResult)", () => {
     mailExpect(c, m.acceptResult(str(mailObject[c.object].object), mailList(c.chain), mailRecipient(c.receiver), mailOutbox(c.outbox), store, c.now));
     n++;
   }
-  if (n < 9) throw new Error(`${n} checks`);
+  if (n < 20) throw new Error(`${n} checks`);
 });
 
 // ---------------------------------------------------------------- recovery

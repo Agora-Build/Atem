@@ -2394,6 +2394,20 @@ def check_host_envelope(file, data, report, context):
         case.equal(verdicts, {"open", "pending", "refused", "refused_authenticated", "accepted", "not_delivered"}, "every verdict")
         case.check(len(reasons) >= 31, f"{len(reasons)} reasons")
         case.check("result_id_mismatch" in reasons, "result_id_mismatch")
+        # A result failing both the result_id check and the row's: its
+        # reply names another task's result_id, and the row doesn't list
+        # its task. The result_id check runs first (Atem's reading, agreed).
+        both = []
+        for c in data["checks"]:
+            plain = plaintexts.get(c["object"])
+            if c["call"] != "accept_result" or plain is None:
+                continue
+            value = json.loads(plain)
+            if value.get("kind") != "result":
+                continue
+            if value["reply"]["result_id"] != result_id_of(value["task_id"]) and value["task_id"] not in c["outbox"]["task_ids"]:
+                both.append((c["label"], c["expect"].get("reason")))
+        case.check(both and all(reason == "result_id_mismatch" for _, reason in both), f"a result failing both checks is result_id_mismatch ({both})")
     with report.case(file, "status forms") as case:
         forms = set()
         for v in data["objects"]:

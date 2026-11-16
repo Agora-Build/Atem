@@ -1748,7 +1748,7 @@ final class ConformanceTests: XCTestCase {
                 try mailExpect(c, verdict, plain)
                 n += 1
             }
-            if n < 44 { throw Failure(description: "\(n) checks") }
+            if n < 60 { throw Failure(description: "\(n) checks") }
             #if canImport(CryptoKit)
             // Through a platform provider (CryptoKit, as Astation's): the
             // request opens, and the re-signed copy's seal doesn't
@@ -1782,7 +1782,7 @@ final class ConformanceTests: XCTestCase {
                 try mailExpect(c, verdict, plain)
                 n += 1
             }
-            if n < 9 { throw Failure(description: "\(n) checks") }
+            if n < 20 { throw Failure(description: "\(n) checks") }
         }
 
         // ------------------------------------------------------------ recovery
