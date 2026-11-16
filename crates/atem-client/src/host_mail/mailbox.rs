@@ -307,11 +307,9 @@ impl MailboxPut {
         )?;
         let request_id = f.text("request_id")?.to_owned();
         let value = f.get("object")?;
-        // The bound before the object is read.
+        // The bound before the object is read (and before its bytes are
+        // copied).
         let object_bytes = put_object_bytes(bytes)?;
-        if object_bytes.len() > MAX_SERVED_OBJECT_BYTES {
-            return Err(RelayError::TooLarge);
-        }
         // A part of the strict parse; read as a mailbox object (check 1).
         let object =
             SignedObject::from_value(value).map_err(|_| RelayError::Malformed("object"))?;
@@ -330,9 +328,10 @@ impl MailboxPut {
     }
 }
 
-/// The exact text of a put's object in `bytes`: a second read of a message
-/// the strict parse has already taken, so it only finds where the object's
-/// text starts and ends.
+/// The exact text of a put's object in `bytes`, at most
+/// [`MAX_SERVED_OBJECT_BYTES`] (`too_large` otherwise, before anything is
+/// copied): a second read of a message the strict parse has already taken,
+/// so it only finds where the object's text starts and ends.
 fn put_object_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
     use serde::Deserialize;
     use serde_json::value::RawValue;
@@ -342,7 +341,11 @@ fn put_object_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
         object: &'a RawValue,
     }
     let put: Put = serde_json::from_slice(bytes).map_err(|_| RelayError::NotStrict)?;
-    Ok(put.object.get().as_bytes().to_vec())
+    let text = put.object.get();
+    if text.len() > MAX_SERVED_OBJECT_BYTES {
+        return Err(RelayError::TooLarge);
+    }
+    Ok(text.as_bytes().to_vec())
 }
 
 /// `mailbox_stored{request_id, id}` (Station → host): the put `request_id`

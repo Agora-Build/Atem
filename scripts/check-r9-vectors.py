@@ -3191,7 +3191,7 @@ def _read_mailbox_put(v, text, served):
     if "object" not in v:
         raise Refused("malformed")
     if put_object_bytes(text) > served:
-        raise Refused("too_large")  # no page could carry it at every position
+        raise Refused("too_large")  # a page can't carry it at every position
     _relay_uuid4(rid)
     if not mailbox_object_ok(v["object"]):
         raise Refused("malformed")

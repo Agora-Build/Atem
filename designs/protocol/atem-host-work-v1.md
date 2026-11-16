@@ -3477,7 +3477,7 @@ differs) and `object_hash`; a page keeps each object's exact bytes as
 received beside its value (`MailboxEntry::bytes`), the evidence of one that
 doesn't parse (check 1), and a put keeps its object's exact bytes as
 received (`MailboxPut::object_bytes`), what the Station charges, and
-refuses one no page could carry at every position (the first reading
+refuses one a page can't carry at every position (the first reading
 below); `heads`' `mailbox` in `control::relay`, read
 only with `Accept { mailbox: true }` (`Heads::decode_with`,
 `ToHost::decode_with`), refused by every other reader; and **a reference
