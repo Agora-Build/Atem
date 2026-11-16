@@ -384,3 +384,66 @@ fn a_station_close_after_a_reverify_reconnects_once_with_the_hook_on() {
         });
     }
 }
+
+/// Design I.5.8 on a local link (`host.delegated` on): the host's identity
+/// moving on the live link (a re-verify) retires the socket's local route
+/// proof as the bridge's identity rules say, so nothing more is answered on
+/// that socket (whatever its authentication), and the App reconnects it
+/// once; the next socket's route answers under the new identity.
+#[test]
+fn a_reverify_on_a_live_local_link_retires_its_route_proof_and_reconnects() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        let (mut s, _) = rv_covered(&mut rig, root, &os, start);
+        rv_link(&mut rig, 7, 41);
+        let handle = rig.app.host_route.clone();
+        rig.app
+            .astation_client
+            .local_route_for_test(handle.clone(), "room");
+        passes(&mut rig, 1);
+        assert!(!rig.app.astation_client.local_route_retired());
+        assert_eq!(rig.app.identity_reconnect, None);
+        reverify(&mut rig, root, &mut s);
+        passes(&mut rig, 1);
+        assert!(
+            rig.app.astation_client.local_route_retired(),
+            "nothing more answered on that socket"
+        );
+        assert_eq!(
+            rig.app.identity_reconnect.map(|(_, socket)| socket),
+            Some(41)
+        );
+        assert!(rig.app.identity_reconnect_due(false, false));
+        // The next socket: its route answers under the new identity.
+        rv_link(&mut rig, 8, 42);
+        rig.app.astation_client.local_route_for_test(handle, "room");
+        passes(&mut rig, 1);
+        assert!(!rig.app.astation_client.local_route_retired());
+        assert_eq!(rig.app.identity_reconnect, None);
+    });
+}
+
+/// A local route that found another route identity on its socket itself
+/// (the device list's identity moved while the Station link was down, e.g.
+/// during a re-authentication) has the App reconnect that socket, as the
+/// bridge's own identity rules do.
+#[test]
+fn a_local_route_retired_by_another_identity_reconnects_its_socket() {
+    local_test(async |root| {
+        let mut rig = LocalRig::new(root).await;
+        let start = host_now().wall_ms;
+        let os = ManualOs::at(start);
+        rv_covered(&mut rig, root, &os, start);
+        rv_link(&mut rig, 7, 41);
+        let handle = rig.app.host_route.clone();
+        rig.app.astation_client.local_route_for_test(handle, "room");
+        rig.app.astation_client.retire_local_route();
+        passes(&mut rig, 1);
+        assert_eq!(
+            rig.app.identity_reconnect.map(|(_, socket)| socket),
+            Some(41)
+        );
+    });
+}

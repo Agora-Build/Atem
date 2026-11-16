@@ -51,7 +51,8 @@ pub struct FakeAstation {
 }
 
 /// The host's Station calls (host-work-v1 §11.4: `control_sync`,
-/// `control_ack`, `membership_fetch`) once a fake Station took them
+/// `control_ack`, `membership_fetch`; and a `host_route` answering the
+/// Station's challenge on a local link) once a fake Station took them
 /// ([`FakeAstation::station_calls`]): each with its link, as the bytes Atem
 /// sent, instead of an `Event::Message`.
 type StationTap = Arc<Mutex<Option<mpsc::Sender<(u64, String)>>>>;
@@ -233,8 +234,14 @@ fn deliver(
     use atem_client::control::relay::op;
     const CALLS: [&str; 3] = [op::CONTROL_SYNC, op::CONTROL_ACK, op::MEMBERSHIP_FETCH];
     let call = match &value {
+        // A `host_route` past the relay's own challenge too: the proof a
+        // Station's challenge got through Astation's local proxy (design
+        // I.5.8), for the fake Station to verify.
         Some(value) => {
-            value["type"] == "relay" && value["op"].as_str().is_some_and(|op| CALLS.contains(&op))
+            value["type"] == "relay"
+                && value["op"]
+                    .as_str()
+                    .is_some_and(|op| CALLS.contains(&op) || op == "host_route")
         }
         // Not JSON, but naming a call: its bytes reach the fake Station
         // (whose strict reader refuses them), for the goldens.

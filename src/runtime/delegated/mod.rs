@@ -908,6 +908,8 @@ mod tests {
         let features = crate::runtime::test_hooks::host_features();
         assert_eq!(features, HostFeatures::default());
         assert!(!features.senders);
+        // No local link answers a Station's challenge (design I.5.8).
+        assert!(!crate::app::local_route_proof_for(features));
         let mut r9 = R9Host::default();
         r9.enable_host_work(true);
         r9.set_delegated_features(features.delegated, features.alerts);
